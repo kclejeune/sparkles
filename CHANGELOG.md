@@ -24,6 +24,16 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+An OWL 2 EL classifier computes the inferred class hierarchy and the unsatisfiable
+classes of an ontology (spec F24, roadmap item 580). `sparkles_owl::classify` follows
+ELK's consequence-based calculus on several threads, keeps its state so that a run after
+added or removed axioms saturates again only what they reach, and reports the axioms it
+leaves out as outside OWL 2 EL or uses only in part. `ds.ontology().classify()`,
+`POST /$/ontology/{ds}/classify`, `sparkles ontology classify` and the Python, Node.js
+and JVM bindings run it. A run can write the taxonomy to a named graph in one commit with
+PROV-O provenance on the graph's header, and the dataset keeps its last classification
+so that the next one is incremental.
+
 The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
 `dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and
 axioms, check profiles, edit axioms, remove entities and diff commits in the JSON forms
@@ -120,6 +130,16 @@ search caches. Their compiled programs are kept in a table of at most 64 program
 pool in steps of 64 KiB and can hold about 1 MiB of the pool above its live bytes, and
 cursors keep their decoded values across batches (spec X14 stage 4).
 
+`sparkles ask` takes its question argument as optional, since `--questions FILE` reads
+questions from a batch file instead. A command line that passes a question parses and
+behaves as before, and one that gives neither a question nor `--questions` is refused.
+
+The count and filter reads that visit index blocks in parallel now merge uncompacted
+commits into the blocks they change, instead of reading the whole range in order. On forge,
+`two-hop-count` on a store with 5,000 uncompacted commits went from 8.2 to 6.2 ms at 1.05M
+and from 35.8 to 21.6 ms at 10.5M. A read whose ranges hold more than 65,536 delta keys
+still merges them in order.
+
 Streaming cursors run FOLD and registered aggregates over the key runs of their input,
 sorting it on the group keys when it does not arrive that way, and DESCRIBE describes
 each batch of solutions as it arrives, so the strict policy admits both. A LIMIT without
@@ -146,6 +166,12 @@ request that waited for it often finished its sequential work on an efficiency c
 `serve --request-cpus all` keeps the earlier placement, and `RAYON_NUM_THREADS` still
 sets the pool's size. The default pool on such a processor is smaller, 18 threads instead
 of 20 on an Intel Core i5-13500, which a query bound by its parallel work can feel.
+Request work runs on the performance cores only while at most one request per physical
+performance core is in flight, and on every CPU when more are. With every request on the
+performance cores, sixteen concurrent readers and a writer on an Intel Core i5-13500
+answered about 0.86 of the reads and 0.66 of the writes a second of
+`--request-cpus all`, since the performance cores were full while the efficiency cores
+idled.
 
 A cursor batch of BIND or FILTER rows whose expressions are expensive, such as date
 functions and decimal arithmetic, is mapped over the query pool instead of on the
@@ -307,6 +333,22 @@ hold waits for a commit that is publishing a reference to it. The
 vocabulary adds `ev:Operation`, `ev:graphProtection`, `ev:payloadDigest`,
 `ev:idempotencyKey`, `ev:sourceHold`, `ev:recordDigest`, `ev:retainedBytes`,
 `ev:locator` and `ev:reportedRights`.
+
+`POST /{ds}/claims/review` and `sparkles::evidence::review` append immutable review
+decisions under a named policy of the evidence settings, and a decision supersedes the
+target's current decision by naming it. An acceptance of a positive claim of an admitted
+kind with the required scope records an `ev:AcceptanceSupport` and projects the claim's
+proposition into the policy's output graph. Each occurrence owns its own support, and a
+projected triple leaves the output graph when no live support owns it.
+`POST /{ds}/claims/withdraw` and `sparkles::evidence::withdraw` record an
+`ev:Withdrawal` of claim occurrences, which ends their supports. A reviewer must read
+an acceptance's evidence, and a hidden record answers as an unavailable target. Every
+read of a review is made at its required `ifHead`. The codes `409 policy-changed`,
+`409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`,
+`409 evidence-conflict` and `503 projection-unavailable` are new, and
+`capabilities.claims` lists both routes. The vocabulary and shapes add
+`ev:supersedes`, `ev:AcceptanceSupport`, `ev:Withdrawal`, `ev:Projection` and their
+properties (spec C25 Phase 2).
 
 Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
 and `owl:sameAs` with closure operators instead of joins, and derives the same facts.
@@ -958,6 +1000,76 @@ at its bound, and charges Sonnet 5.5 cache reads at the published $0.20 per mill
 tokens. The DBpedia gold rewrites leave literals and comments alone, never reuse a
 variable of the query and also rewrite `COUNT(*)`. A sampled LC-QuAD 2.0 set records how
 many questions it sampled.
+
+Ask grounding now reads from the data which predicates the linked entities use as
+subject and as object, and which a sample of 200 instances of the two classes that best
+match the question use, and lists them by namespace with their counts. The queries run
+as the caller, each within five seconds and the MCP limits, and search the readable
+named graphs only when the caller can read one. `link_entities` takes `popularity`,
+which orders label matches by how many triples name each one, counted up to 2000, and
+reports that count as `uses`. Ask asks for it, so a well-connected entity comes before
+a namesake that shares its label. Mention detection keeps a capitalized "The" inside a
+question and a number after a name. The draft prompt says that the context lists only
+part of the vocabulary and asks for one predicate per relation instead of a UNION or a
+`VALUES` list of candidates. A first-draft prompt grows by about 8%, and each Ask runs
+two to three more bounded queries per linked entity and one per matched class.
+
+The Ask evaluation scores every case under the guarded secondary policy
+`rdf-term-set-projected-guarded-lenient-v3` beside the strict score. It applies the gold
+errata `gold-errata-v1`, drops empty-string rows, compares numbers by value, matches an
+unambiguous label to the gold IRI it names, fails an answer with more than three extra
+columns and sets apart passes that rely on a predicate column or on rows the projection
+drops. An Ask child that SIGKILL or a failed allocation ends is the failed case `killed`
+instead of a harness fault. `scripts/qald9plus-convert --split train` converts the
+QALD-9-plus training split, and `eval_support/grounding_recall.py` measures from saved
+prompts whether each gold term reached the prompt. The dry-run fake provider reads
+prompts that arrive as cached text blocks.
+
+`sparkles ask --questions FILE` asks every question of a JSON-lines file with one store
+and one model configuration and prints each result in input order, and `--jobs N` runs
+up to N questions at once. Each question keeps its own deadline and budgets, and a
+failed line gets its own error result. `scripts/eval-ask-anthropic` asks each phase
+through one such child in a 16G systemd scope, holds each case's projected cost before
+its line is sent and keeps the outputs in question order. Caches stay warm across a
+phase's questions, which changes latency but not answers.
+
+Ask has four repair options. The exploration, on by default, drafts once more after a
+draft gives no query or an empty result, with further link candidates and the predicates
+the entities use. The shape check repairs once when a result does not fit the
+question's form, `drafts` asks up to five first drafts and keeps the checked, complete
+result most of them share, and type hints link mentions with the classes the words
+around them name. These three are off by default. `assistant.json` sets the options
+under `repairs`, `POST /{ds}/ask` takes `explore`, `shapeCheck`, `drafts` and
+`typeHints`, and `sparkles ask` takes `--explore`, `--shape-check`, `--drafts N` and
+`--type-hints` with `--no-` forms. A request or a command line overrides the dataset. An
+exploration's sample values and a shape repair's rows reach the model only when the
+dataset's `send` policy lets the draft and repair providers receive rows.
+
+An `openai` provider takes `promptCaching` with `enabled` only, false by default. When it
+is true, an Ask repair goes as the first draft's user message, unchanged, followed by a
+second user message with the repair and the format. OpenAI writes a cached prefix only
+where the latest user message ends, so the repair then reads the prefix that the first
+draft wrote, where before every OpenAI repair missed the cache and paid the write price
+again. The settings form still offers prompt caching for the `anthropic` kind only.
+
+The `openai` provider preset starts with GPT-6 Luna in place of `gpt-5-mini`. In a
+comparison of six Claude and OpenAI models on 150 held-out QALD-9-plus questions, Luna
+answers 106 at $0.0021 a question, within the noise of the best model's 113, and is the
+cheapest per correct answer. The `anthropic` preset keeps Sonnet 5.5 by the same rule.
+Both hosted presets give their model the settings the comparison used, a 200,000-token
+context and effort `medium` with its output limit, in the CLI and in the Add provider
+form.
+
+`scripts/eval-ask-paid`, which `scripts/eval-ask-anthropic` still runs, takes a run
+file's `provider`, so a paid run can ask OpenAI's GPT-6 Luna, GPT-6.1 Terra and GPT-6.1
+Sol through the Chat Completions API under a wallet of its own, capped at USD 50 per
+ledger. The proxy prices OpenAI's cache reads and writes, checks the model that served
+each reply for both providers, and its ledger, now format version 3, names its provider.
+Model configurations take `reasoningEffort`, which an `openai` model sends as
+`reasoning_effort` with `max_completion_tokens` and an `anthropic` model as
+`output_config.effort`, and an OpenAI answer's cached and written prompt tokens count
+as cache reads and writes. Sonnet 5.5 cache reads cost $0.10 per million in the proxy,
+as the Console export billed them.
 
 The Ask evaluation scores under `rdf-term-set-projected-columns-v2`. An answer with more
 columns than the gold, such as a name beside each IRI, is projected onto the gold's

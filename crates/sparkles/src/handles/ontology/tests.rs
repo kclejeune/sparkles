@@ -1666,3 +1666,329 @@ fn entity_operations_answer_in_the_route_forms() {
         Err(Error::Invalid(_))
     ));
 }
+
+// OWL 2 EL classification (spec F24)
+
+mod classification {
+    use super::*;
+    use crate::handles::ontology::classify::ClassifyRequest;
+    use crate::handles::ontology::wire;
+    use serde_json::json;
+
+    const ONTO: &str = ":partOf a owl:ObjectProperty .
+        :Nucleus rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :partOf ;
+                                   owl:someValuesFrom :Cell ] .
+        :CellPart owl:equivalentClass [ a owl:Restriction ; owl:onProperty :partOf ;
+                                        owl:someValuesFrom :Cell ] .
+        :Nucleus rdfs:subClassOf :Organelle .
+        :Cell a owl:Class . :Organelle a owl:Class .";
+
+    fn c(local: &str) -> Class {
+        Class::new(ex(local))
+    }
+
+    fn named(g: &str) -> GraphRef {
+        GraphRef::Named(g.to_string())
+    }
+
+    #[test]
+    fn classifies_and_keeps_the_classification_between_commits() {
+        let ds = dataset(ONTO);
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let cr = ClassifyRequest::default();
+        let a = h.classify(&req, &cr, &opts()).unwrap();
+        let t = &a.classification.taxonomy;
+        assert!(a.classification.consistent);
+        assert!(a.complete());
+        assert!(!a.reused);
+        assert!(t.is_subclass(&c("Nucleus"), &c("CellPart")));
+        // the same state answers from the kept classification
+        let b = h.classify(&req, &cr, &opts()).unwrap();
+        assert!(b.reused);
+        assert!(Arc::ptr_eq(&a.classification, &b.classification));
+        // a commit gives the kept classifier the changed axioms
+        ds.update(&format!(
+            "{PREFIXES} INSERT DATA {{ :CellPart rdfs:subClassOf :Part . :Cell a owl:Class . }}"
+        ))
+        .unwrap();
+        let d = h.classify(&req, &cr, &opts()).unwrap();
+        assert!(!d.reused);
+        assert!(d.classification.stats.incremental);
+        assert!(
+            d.classification
+                .taxonomy
+                .is_subclass(&c("Nucleus"), &c("Part"))
+        );
+        // a restricted view never shares the kept classification
+        let mut view = opts();
+        view.graphs = Some(only(&["default"]));
+        let e = h.classify(&req, &cr, &view).unwrap();
+        assert!(!e.reused);
+        assert!(!e.classification.stats.incremental);
+        assert_eq!(e.classification.taxonomy, d.classification.taxonomy);
+    }
+
+    #[test]
+    fn refuses_inferences_and_a_target_it_reads() {
+        let ds = dataset(ONTO);
+        let h = ds.ontology();
+        let req = OntologyRequest {
+            inferences: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            h.classify(&req, &ClassifyRequest::default(), &opts()),
+            Err(Error::Invalid(_))
+        ));
+        let read = OntologyRequest {
+            graphs: vec![named("http://ex.org/onto")],
+            ..Default::default()
+        };
+        let into_read = ClassifyRequest {
+            target: Some(named("http://ex.org/onto")),
+            ..Default::default()
+        };
+        assert!(matches!(
+            h.classify(&read, &into_read, &opts()),
+            Err(Error::Invalid(_))
+        ));
+        let into_default = ClassifyRequest {
+            target: Some(GraphRef::Default),
+            ..Default::default()
+        };
+        assert!(matches!(
+            h.classify(&read, &into_default, &opts()),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn writes_the_taxonomy_with_provenance_and_replaces_it() {
+        let ds = dataset(ONTO);
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let target = "http://ex.org/inferred";
+        let cr = ClassifyRequest {
+            target: Some(named(target)),
+            message: Some("classify".into()),
+            ..Default::default()
+        };
+        let a = h.classify(&req, &cr, &opts()).unwrap();
+        let w = a.written.as_ref().unwrap();
+        assert!(w.receipt.committed);
+        let tq = OntologyRequest {
+            graphs: vec![named(target)],
+            imports: ImportMode::None,
+            ..Default::default()
+        };
+        let o = h.open(&tq, &opts()).unwrap();
+        let sub = Axiom::sub_class_of(c("Nucleus"), c("CellPart"));
+        assert!(o.ontology.contains(&sub));
+        assert_eq!(
+            o.ontology.header.iri.as_ref().map(|i| i.as_str()),
+            Some(target)
+        );
+        let prov = |p: &str| {
+            o.ontology
+                .header
+                .annotations
+                .iter()
+                .filter(|a| a.property.as_str() == format!("http://www.w3.org/ns/prov#{p}"))
+                .count()
+        };
+        assert_eq!(prov("wasGeneratedBy"), 1);
+        assert_eq!(prov("generatedAtTime"), 1);
+        // a change and a second write remove what is no longer entailed
+        ds.update(&format!(
+            "{PREFIXES} DELETE DATA {{ :Nucleus rdfs:subClassOf :Organelle . }}"
+        ))
+        .unwrap();
+        h.classify(&req, &cr, &opts()).unwrap();
+        let o = h.open(&tq, &opts()).unwrap();
+        assert!(
+            !o.ontology
+                .contains(&Axiom::sub_class_of(c("Nucleus"), c("Organelle")))
+        );
+        assert!(o.ontology.contains(&sub));
+        assert_eq!(
+            o.ontology
+                .header
+                .annotations
+                .iter()
+                .filter(|a| a.property.as_str().ends_with("wasGeneratedBy"))
+                .count(),
+            1
+        );
+        // the read graphs are unchanged
+        let src = h.open(&req, &opts()).unwrap();
+        assert!(!src.ontology.contains(&sub));
+    }
+
+    #[test]
+    fn a_write_keeps_the_target_header_and_its_comments() {
+        let ds = dataset(&format!(
+            "{ONTO} GRAPH <http://ex.org/tax> {{ <http://ex.org/taxonomy> a owl:Ontology ; rdfs:comment \"mine\" . }}"
+        ));
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let tq = OntologyRequest {
+            graphs: vec![named("http://ex.org/tax")],
+            imports: ImportMode::None,
+            ..Default::default()
+        };
+        let before = total(&ds);
+        // a class the taxonomy lacks refuses the request before anything is written
+        let missing = ClassifyRequest {
+            target: Some(named("http://ex.org/tax")),
+            about: Some("http://ex.org/Nobody".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            h.classify(&req, &missing, &opts()),
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!(total(&ds), before);
+        let cr = ClassifyRequest {
+            target: Some(named("http://ex.org/tax")),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            h.classify(&req, &cr, &opts()).unwrap();
+            let o = h.open(&tq, &opts()).unwrap();
+            let header = &o.ontology.header;
+            assert_eq!(
+                header.iri.as_ref().map(|i| i.as_str()),
+                Some("http://ex.org/taxonomy")
+            );
+            assert!(
+                o.ontology.other_headers.is_empty(),
+                "{:?}",
+                o.ontology.other_headers
+            );
+            let values = |p: &str| -> Vec<String> {
+                header
+                    .annotations
+                    .iter()
+                    .filter(|a| a.property.as_str() == p)
+                    .map(|a| format!("{:?}", a.value))
+                    .collect()
+            };
+            assert_eq!(values("http://www.w3.org/ns/prov#wasGeneratedBy").len(), 1);
+            let comments = values(sparkles_owl::vocab::RDFS_COMMENT);
+            assert_eq!(comments.len(), 2, "{comments:?}");
+            assert!(comments.iter().any(|c| c.contains("mine")), "{comments:?}");
+        }
+    }
+
+    #[test]
+    fn budgets_bound_a_run() {
+        let ds = dataset(ONTO);
+        let h = ds.ontology();
+        let mut tight = opts();
+        tight.max_memory_bytes = Some(100);
+        let e = h
+            .classify(
+                &OntologyRequest::default(),
+                &ClassifyRequest::default(),
+                &tight,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&e, Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory),
+            "{e:?}"
+        );
+        // the kept classifier starts again after the failure
+        let ok = h
+            .classify(
+                &OntologyRequest::default(),
+                &ClassifyRequest::default(),
+                &opts(),
+            )
+            .unwrap();
+        assert!(
+            ok.classification
+                .taxonomy
+                .is_subclass(&c("Nucleus"), &c("CellPart"))
+        );
+        let mut late = opts();
+        late.deadline = Some(Instant::now());
+        // a kept classification answers without work, so a past deadline does not stop it
+        let kept = h
+            .classify(
+                &OntologyRequest::default(),
+                &ClassifyRequest::default(),
+                &late,
+            )
+            .unwrap();
+        assert!(kept.reused);
+        let fresh = dataset(ONTO);
+        let r = fresh.ontology().classify(
+            &OntologyRequest::default(),
+            &ClassifyRequest::default(),
+            &late,
+        );
+        assert!(matches!(r, Err(Error::Timeout)), "{:?}", r.err());
+    }
+
+    #[test]
+    fn assertions_can_make_the_ontology_inconsistent() {
+        let ds = dataset(&format!(
+            "{ONTO} :Cell owl:disjointWith :Organelle . :x a :Cell , :Organelle ."
+        ));
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let tbox = h
+            .classify(&req, &ClassifyRequest::default(), &opts())
+            .unwrap();
+        assert!(tbox.classification.consistent);
+        let abox = ClassifyRequest {
+            assertions: true,
+            ..Default::default()
+        };
+        let all = h.classify(&req, &abox, &opts()).unwrap();
+        assert!(!all.classification.consistent);
+        assert!(!all.reused);
+    }
+
+    #[test]
+    fn the_json_operation_answers_counts_nodes_and_a_class() {
+        let ds = dataset(&format!(
+            "{ONTO} :X rdfs:subClassOf [ owl:unionOf ( :Cell :Organelle ) ] ."
+        ));
+        let j = wire::call(
+            &ds,
+            "classify",
+            &json!({"about": ex("Nucleus"), "nodes": true, "limit": 2}),
+            &opts(),
+        )
+        .unwrap();
+        assert_eq!(j["consistent"], json!(true));
+        assert_eq!(j["complete"], json!(false));
+        assert_eq!(j["excludedCount"], json!(1));
+        assert!(
+            j["excluded"][0]["rule"]
+                .as_str()
+                .unwrap()
+                .contains("Profiles")
+        );
+        assert_eq!(j["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(j["next"], json!(2));
+        let parents: Vec<&str> = j["class"]["parentClasses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(parents, vec![ex("CellPart"), ex("Organelle")]);
+        assert!(matches!(
+            wire::call(&ds, "classify", &json!({"about": ex("Nope")}), &opts()),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            wire::call(&ds, "classify", &json!({"profiles": []}), &opts()),
+            Err(Error::Invalid(_))
+        ));
+    }
+}

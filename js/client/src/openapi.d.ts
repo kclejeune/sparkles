@@ -2146,6 +2146,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ontology/{ds}/classify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Classify an OWL 2 EL ontology
+         * @description Classifies the terminology with the OWL 2 EL classifier and answers whether it is consistent, the unsatisfiable classes, the axioms outside OWL 2 EL that the classification left out or used in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses and its equivalent classes, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. The dataset keeps the last classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`.
+         */
+        post: operations["classifyOntology"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/ontology/{ds}/diff": {
         parameters: {
             query?: never;
@@ -3929,6 +3949,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/claims/review": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Review claims under a policy
+         * @description Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.
+         */
+        post: operations["reviewClaims"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/{ds}/claims/withdraw": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Withdraw claim occurrences
+         * @description Needs `write` on the dataset or branch through the update endpoint, update grants on each claim's graph, and update and read grants on the output graph and read grants on the decisions and supports graphs of every review policy. Counts as an update. Records a withdrawal with `prov:invalidatedAtTime` in each claim's graph as one commit of the evidence owner, without making a contrary claim. The claims' supports stop being live, and each projected triple left without a live support leaves its output graph. A claim that is already withdrawn is answered as `existing`. Refusals write nothing: `400`, `403`, `409 head-changed`, `409 target-changed`, `409 idempotency-conflict`, `422 evidence-unavailable`, `503 projection-unavailable` and `503 authority-changed`.
+         */
+        post: operations["withdrawClaims"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/data": {
         parameters: {
             query?: never;
@@ -4689,6 +4749,10 @@ export interface components {
                 query: string;
                 question: string;
             }[];
+            /** @description First drafts whose results vote on the query, 1 to 5. Over the dataset's `repairs.drafts`. */
+            drafts?: number;
+            /** @description Explore the data once after a draft without a query or with an empty result. Over the dataset's `repairs.explore`. */
+            explore?: boolean;
             /** @description The rows returned in `result`, 1000 by default. */
             maxRows?: number;
             /**
@@ -4705,10 +4769,14 @@ export interface components {
             reviewedOnly?: boolean;
             /** @description Whether to run the checked query. `true` by default. */
             run?: boolean;
+            /** @description Repair once when the result does not fit the question's form. Over the dataset's `repairs.shapeCheck`. */
+            shapeCheck?: boolean;
             /** @description Whether to summarize the rows. `true` by default when the dataset sends rows. */
             summary?: boolean;
             /** @description The id of an earlier ask of the caller. Drafting starts at the pair after the one that drafted it. */
             tryHarder?: string;
+            /** @description Link mentions with the classes the words around them name. Over the dataset's `repairs.typeHints`. */
+            typeHints?: boolean;
         };
         /** @description The whole answer of an ask in the JSON form. */
         AskResult: {
@@ -4895,6 +4963,17 @@ export interface components {
             historyDays?: number;
             ingest?: boolean;
             optimize?: boolean;
+            /** @description The repair turns of the dataset's asks, which a request may override. */
+            repairs?: {
+                /** @description First drafts whose results vote on the query, 1 to 5. 1 by default. */
+                drafts?: number;
+                /** @description Explore the data once after a draft without a query or with an empty result. `true` by default. */
+                explore?: boolean;
+                /** @description Repair once when the result does not fit the question's form. `false` by default. */
+                shapeCheck?: boolean;
+                /** @description Link mentions with the classes the words around them name. `false` by default. */
+                typeHints?: boolean;
+            };
             /** @description Role lists that replace the server's for this dataset. */
             roles?: {
                 draft?: {
@@ -6735,7 +6814,7 @@ export interface components {
                 iri: string;
                 key: string;
                 /** @enum {string} */
-                kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal";
+                kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection";
                 /** @description The digest of the record's immutable content. */
                 recordDigest: string;
             }[];
@@ -6754,7 +6833,7 @@ export interface components {
                     /** @description The record's IRI. */
                     iri: string;
                     /** @description The kinds the record may have. Any profile kind when absent. */
-                    kinds?: ("SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal")[];
+                    kinds?: ("SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection")[];
                 };
                 storedFact?: {
                     /**
@@ -6791,7 +6870,7 @@ export interface components {
                     graph: string;
                     iri: string;
                     /** @enum {string} */
-                    kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal";
+                    kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection";
                     receipt: {
                         /**
                          * Format: uuid
@@ -6840,6 +6919,86 @@ export interface components {
                     servedBy: string;
                 };
             }[];
+        };
+        /** @description Review decisions under one policy. */
+        EvidenceReview: {
+            decisions: {
+                /** @enum {string} */
+                disposition: "accepted" | "rejected" | "needsEvidence";
+                /** @description The decision's key in this request. */
+                key: string;
+                /** @description The target's current decision under the policy, required when it has one, else `409 decision-superseded`. */
+                supersedes?: string;
+                /** @description The reviewed claim or assessment. */
+                target: string;
+                /** @description The target's record digest as the reviewer saw it, else `409 target-changed`. */
+                targetDigest: string;
+            }[];
+            /** @description Check and preview the review without committing it. */
+            dryRun?: boolean;
+            /** @description Makes a retry with the same payload answer the first receipt. */
+            idempotencyKey?: string;
+            /** @description The branch head the review was prepared at, else `409 head-changed`. Every read is made at this head. */
+            ifHead: number;
+            /** @description The commit message. */
+            message?: string;
+            /** @description The name of a review policy of the evidence settings. */
+            policy: string;
+            /** @description The policy version the reviewer saw, else `409 policy-changed`. */
+            policyVersion: number;
+        };
+        /** @description The outcome of a review. */
+        EvidenceReviewResult: {
+            /**
+             * Format: uuid
+             * @description The branch the commit published on.
+             */
+            branchId: string;
+            /** @description The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay. */
+            changed: {
+                inserted: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                removed: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                supportsAdded: string[];
+                supportsEnded: string[];
+            };
+            /** @description The publishing commit, the first one for a replay, or the head for a dry run. */
+            commit: number;
+            /** @description Whether this request published a commit. */
+            committed: boolean;
+            decisions: {
+                /** @description The contrary links and claims an `admitLabelled` policy admitted the claim against. */
+                conflicts: string[];
+                /** @enum {string} */
+                disposition: "accepted" | "rejected" | "needsEvidence";
+                iri: string;
+                key: string;
+                /** @description Why an acceptance did not project its claim. */
+                notProjected: string | null;
+                supersedes: string | null;
+                /** @description The acceptance support that owns the projected triple. */
+                support: string | null;
+                target: string;
+            }[];
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The operation, every decision's availability receipt. */
+            operation: string;
+            /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
+            replayed: boolean;
         };
         /** @description The evidence settings of a dataset, as `evidence.json` format 1 holds them. */
         EvidenceSettings: {
@@ -6893,6 +7052,72 @@ export interface components {
             /** @description The revision of the managed-graph registry, 0 when there is none. */
             revision: number;
             settings: components["schemas"]["EvidenceSettings"];
+        };
+        /** @description Claim occurrences to withdraw. */
+        EvidenceWithdrawal: {
+            /** @description Check and preview the withdrawal without committing it. */
+            dryRun?: boolean;
+            /** @description Makes a retry with the same payload answer the first receipt. */
+            idempotencyKey?: string;
+            /** @description Publish only while this commit is the branch head, else `409 head-changed`. */
+            ifHead?: number;
+            /** @description The commit message. */
+            message?: string;
+            withdrawals: {
+                /** @description The withdrawal's key in this request. */
+                key: string;
+                /** @description The withdrawn claim occurrence. */
+                target: string;
+                /** @description The claim's record digest, else `409 target-changed`. */
+                targetDigest: string;
+            }[];
+        };
+        /** @description The outcome of a withdrawal. */
+        EvidenceWithdrawalResult: {
+            /**
+             * Format: uuid
+             * @description The branch the commit published on.
+             */
+            branchId: string;
+            /** @description The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay. */
+            changed: {
+                inserted: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                removed: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                supportsAdded: string[];
+                supportsEnded: string[];
+            };
+            /** @description The publishing commit, the first one for a replay, or the head for a dry run. */
+            commit: number;
+            /** @description Whether this request published a commit. */
+            committed: boolean;
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The operation, every withdrawal's availability receipt. */
+            operation: string;
+            /** @description Whether the idempotency key had published the same payload. */
+            replayed: boolean;
+            withdrawals: {
+                /** @description An earlier withdrawal had already withdrawn the claim. */
+                existing: boolean;
+                /** @description The withdrawal record, `null` when the claim was already withdrawn. */
+                iri: string | null;
+                key: string;
+                target: string;
+            }[];
         };
         Explain: {
             /** @description The algebra in SSE. */
@@ -8277,7 +8502,7 @@ export interface components {
                 cacheWrite1hPerMTok?: number;
                 /**
                  * Cache write price
-                 * @description The price of one million input tokens written to the prompt cache with the 5-minute TTL.
+                 * @description The price of one million input tokens written to the prompt cache with the shorter TTL, five minutes for the anthropic kind and 30 minutes for OpenAI.
                  */
                 cacheWritePerMTok?: number;
                 /**
@@ -8298,6 +8523,12 @@ export interface components {
              * @description Text added before each query, replacing the snapshot's query prompt.
              */
             queryPrefix?: string;
+            /**
+             * Reasoning effort
+             * @description How much a reasoning model thinks before it answers, sent as the openai kind's reasoning_effort and the anthropic kind's output_config.effort. The provider decides which values a model accepts. An openai model with an effort limits its output with max_completion_tokens and sends a temperature only when one is set.
+             * @enum {string}
+             */
+            reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
             /**
              * Repository
              * @description The Hugging Face repository that holds the model snapshot.
@@ -8469,7 +8700,7 @@ export interface components {
                 cacheWrite1hPerMTok?: number;
                 /**
                  * Cache write price
-                 * @description The price of one million input tokens written to the prompt cache with the 5-minute TTL.
+                 * @description The price of one million input tokens written to the prompt cache with the shorter TTL, five minutes for the anthropic kind and 30 minutes for OpenAI.
                  */
                 cacheWritePerMTok?: number;
                 /**
@@ -8487,12 +8718,12 @@ export interface components {
             };
             /**
              * Prompt caching
-             * @description Prompt caching of the Anthropic API. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache.
+             * @description Prompt caching of the Anthropic API. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache. The TTL applies to the anthropic kind only.
              */
             promptCaching?: {
                 /**
                  * Prompt caching
-                 * @description Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL.
+                 * @description Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL. An openai provider also takes `enabled`, false by default, in its JSON configuration: true sends an Ask repair as the first draft's user message unchanged followed by a second user message, so that OpenAI's own caching serves the repair.
                  * @default true
                  */
                 enabled: boolean;
@@ -8509,6 +8740,12 @@ export interface components {
              * @description Text added before each query, replacing the snapshot's query prompt.
              */
             queryPrefix?: string;
+            /**
+             * Reasoning effort
+             * @description How much a reasoning model thinks before it answers, sent as the openai kind's reasoning_effort and the anthropic kind's output_config.effort. The provider decides which values a model accepts. An openai model with an effort limits its output with max_completion_tokens and sends a temperature only when one is set.
+             * @enum {string}
+             */
+            reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
             /**
              * Repository
              * @description The Hugging Face repository that holds the model snapshot.
@@ -8661,7 +8898,7 @@ export interface components {
                     structuredOutput: "auto" | "json-schema" | "json-object" | "tool" | "text";
                 }[];
                 name: string;
-                /** @description For the anthropic kind: whether stable prompt prefixes are marked for the provider's cache, and their TTL. */
+                /** @description For the anthropic kind: whether stable prompt prefixes are marked for the provider's cache, and their TTL. For the openai kind, enabled true sends an Ask repair as the first draft's user message followed by a second user message. */
                 promptCaching?: {
                     enabled: boolean;
                     /** @enum {string} */
@@ -17027,6 +17264,105 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    classifyOntology: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Run the write as a preview and roll it back. `dryRun` with no value means true. */
+                dryRun?: components["parameters"]["dryRun"];
+                /** @description With `dryRun`: list up to this many changed quads. */
+                changes?: components["parameters"]["changes"];
+                /** @description Add a commit receipt to the body. */
+                receipt?: components["parameters"]["receipt"];
+                /** @description `false` skips write-time validation when the server allows it (`--allow-unvalidated-writes`). */
+                validate?: components["parameters"]["validate"];
+                /** @description The most validation results reported when a write is rejected. */
+                validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
+                /** @description `json` (the default) or `ofn`. */
+                format?: "json" | "ofn";
+            };
+            header?: {
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+                /** @description `true` runs the write as a preview. */
+                "Sparkles-Dry-Run"?: components["parameters"]["dryRunHeader"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The ontology and what to answer. */
+        requestBody?: {
+            content: {
+                "application/json": {
+                    /** @description A class IRI to describe. */
+                    about?: string;
+                    /** @description Also classify the assertions the store holds, so that they can make the ontology inconsistent. Such a run is not kept. */
+                    assertions?: boolean;
+                    /** @description A graph IRI or `default`, or a list of them. */
+                    graph?: unknown;
+                    imports?: boolean;
+                    /** @description The most nodes, unsatisfiable classes and excluded axioms listed (100 by default). */
+                    limit?: number;
+                    /** @description The commit message of the write, also kept as a comment on the header. */
+                    message?: string;
+                    /** @enum {string} */
+                    mode?: "lenient" | "strict";
+                    /** @description List the taxonomy's nodes. */
+                    nodes?: boolean;
+                    /** @description The first node listed. */
+                    offset?: number;
+                    /** @description A named graph outside the graphs read that takes the direct taxonomy. */
+                    target?: string;
+                    /** @description The worker threads, within the algorithm pool's grant (0 for the grant). */
+                    threads?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description The classification, with the receipt when a write asked for one. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                    "text/owl-functional": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
     diffOntology: {
         parameters: {
             query?: {
@@ -21808,6 +22144,80 @@ export interface operations {
             409: components["responses"]["Conflict"];
             413: components["responses"]["PayloadTooLarge"];
             422: components["responses"]["Unprocessable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    reviewClaims: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceReview"];
+            };
+        };
+        responses: {
+            /** @description The operation and its decisions, published, replayed or previewed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceReviewResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    withdrawClaims: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceWithdrawal"];
+            };
+        };
+        responses: {
+            /** @description The operation and its withdrawals, published, replayed or previewed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceWithdrawalResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };

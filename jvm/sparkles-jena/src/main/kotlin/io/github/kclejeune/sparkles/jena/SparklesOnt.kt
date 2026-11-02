@@ -112,6 +112,12 @@ public object SparklesOnt {
     @JvmOverloads
     public fun diff(dataset: DatasetGraphSparkles, from: String, to: String? = null, graphIri: String? = null): JsonObject =
         dataset.ontology().diff(from, to, OntologyRead(graph = graphIri))
+
+    /** The OWL 2 EL classification of the graph, as [SparklesOntology.classify] answers it. */
+    @JvmStatic
+    @JvmOverloads
+    public fun classify(dataset: DatasetGraphSparkles, graphIri: String? = null, query: ClassifyQuery = ClassifyQuery()): JsonObject =
+        dataset.ontology().classify(OntologyRead(graph = graphIri), query)
 }
 
 /**
@@ -372,5 +378,46 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         to?.let { args.put("to", it) }
         args.put("assertions", assertions)
         return call("diff", args, operation, false)
+    }
+
+    /**
+     * Classify by OWL 2 EL (spec F24): consistency, the unsatisfiable classes, the axioms
+     * left out or used in part, and with [ClassifyQuery] one class and a page of the
+     * taxonomy's nodes. A query with a `target` writes the taxonomy to that named graph in
+     * one commit.
+     */
+    @JvmOverloads public fun classify(read: OntologyRead = OntologyRead(), query: ClassifyQuery = ClassifyQuery()): JsonObject =
+        SparklesOperation().use { classify(read, query, it) }
+    public fun classify(read: OntologyRead, query: ClassifyQuery, operation: SparklesOperation): JsonObject {
+        val args = read.value()
+        query.into(args)
+        return call("classify", args, operation, query.target != null)
+    }
+}
+
+/** What a classification answers besides its counts, and where it writes the taxonomy. */
+public data class ClassifyQuery @JvmOverloads public constructor(
+    public val assertions: Boolean = false,
+    public val about: String? = null,
+    public val nodes: Boolean = false,
+    public val limit: Int = 100,
+    public val offset: Long = 0,
+    public val threads: Int = 0,
+    public val target: String? = null,
+    public val message: String? = null,
+) {
+    init {
+        require(limit > 0 && offset >= 0 && threads >= 0)
+    }
+
+    internal fun into(j: JsonObject) {
+        j.put("assertions", assertions)
+        about?.let { j.put("about", it) }
+        j.put("nodes", nodes)
+        j.put("limit", limit.toLong())
+        j.put("offset", offset)
+        j.put("threads", threads.toLong())
+        target?.let { j.put("target", it) }
+        message?.let { j.put("message", it) }
     }
 }

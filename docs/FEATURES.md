@@ -119,8 +119,12 @@ Connect agents through [MCP](ai/README.md#mcp-server), turn
 [cited memory](ai/README.md#agent-memory). Review
 [document ingestion](ai/README.md#document-ingestion) and build
 [GraphRAG community reports](ai/README.md#community-reports-graphrag).
-MCP entity linking exposes bounded, versioned candidate evidence. Ask uses it for full
-choice identities and conservative ordering while retaining required clarification.
+MCP entity linking exposes bounded, versioned candidate evidence and can order label
+matches by use. Ask uses it for full choice identities and conservative ordering while
+retaining required clarification. Ask also grounds each question with the predicates
+that its entities and best-matching classes use in the data. GPT-6 Luna, the `openai`
+preset's model, answers 106 of 150 held-out QALD-9-plus questions at $0.0021 each,
+within the noise of the best model measured.
 
 [Ask stage diagnostics](ai/README.md#ask-stage-diagnostics) separate grounding, tool
 and execution timings while the remaining accuracy and latency work stays open.
@@ -205,12 +209,13 @@ implementation status.
 | [Validation and forms](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | SHACL, ShEx, write guards and generated forms are available, including nested read models in the Rust library. Form checks use bounded shape-dependent targets and refuse incomplete discovery. Atomic nested editing, remaining editors and producer admission remain planned. |
 | [Schema discovery](reasoning/README.md#reasoning-validation-and-schema) | Complete within the documented discovery scope. | Class and predicate profiles, schema diffs and constrained shape drafts are available. Drafts retain the limits in the compatibility boundaries. |
 | [OWL 2 ontology API](reasoning/README.md#owl-2-ontologies) | Partially complete. | The axiom model, RDF mappings, profile checks and axiom diffs are available in Rust, Python, Node.js, the JVM through `jena-ontapi`, HTTP, MCP and the CLI. Reads with inferences are available in all of them except MCP and the CLI. Entity accessors, typed axiom constructors and the literal rules of OWL 2 DL are included. A read budget, fetched imports, and inferred reads and entity reports over MCP and the CLI remain in items 539, 559, 565 and 578. |
+| [OWL 2 EL classification](reasoning/README.md#owl-2-ontologies) | Partially complete. | An incremental, concurrent EL classifier computes the inferred class hierarchy and the unsatisfiable classes in Rust, Python, Node.js, the JVM, HTTP and the CLI, and can write the taxonomy to a graph with provenance. Complete reasoning with individuals and datatypes, an MCP tool, reads with the classification, durable runs, the reference-reasoner comparison and lower memory remain in items 586 to 592. |
 
 ### Server and security
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Server and Fuseki integration](server/README.md#server-and-protocols) | Partially complete. | Supported Fuseki protocols, configuration conversion and administration are available. On Linux, request threads keep to the performance cores of Intel hybrid processors. Further integration and ARQ extensions remain. |
+| [Server and Fuseki integration](server/README.md#server-and-protocols) | Partially complete. | Supported Fuseki protocols, configuration conversion and administration are available. On Linux, request work keeps to the performance cores of Intel hybrid processors while they can hold it. Further integration and ARQ extensions remain. |
 | [Access control and authentication](server/README.md#access-control-and-security) | Partially complete. | Dataset, graph and triple protections, OIDC and API tokens are available. Derived visibility, guarded caller adoption and authentication extensions remain planned. |
 | [Settings and declared prefixes](server/README.md#server-and-protocols) | Complete within the documented settings scope. | Layered settings, operator locks, runtime administration and prefix completion are available. |
 | [Resource catalog](server/README.md#resource-catalog) | Partially complete. | Versioned resources, SPDX licence classes with propagated obligations and a NOTICE, and vocabulary namespaces are available in DCAT 3. The licence gate reports a verdict that warns by default. Fetching, loading, mirrors and gates on export routes remain under items 458, 525 and 526. |
@@ -230,7 +235,7 @@ implementation status.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals and reference resolution are available with protected records and retained source holds. Review-controlled projections, identity decisions and application integration remain under item 81. |
+| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections and withdrawals are available with protected records and retained source holds. Identity decisions and application integration remain under item 81. |
 | [Shared entity representation](ai/README.md#shared-entity-representation) | Partially complete. | Versioned resources, fixed fixtures and a bounded private offline resolver are available. Authenticated managed integration remains under item 396. |
 | [Durable jobs and delivery](specs/C26-durable-jobs-and-delivery.md) | Planned. | Item 339 specifies checkpointed jobs, fenced workers and a transactional outbox. Current tasks and notifications do not provide that recovery contract. |
 | [Maintained analysis results](specs/F22-analysis-lifecycle.md) | Planned. | Item 340 specifies reproducible runs, dependency checks, freshness and guarded publication. |

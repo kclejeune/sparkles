@@ -1,0 +1,123 @@
+dataset: 10527323 triples
+churn: 3500 inserts, 1500 deletes (1000000 people) -> /home/kclejeune/lanes/comp-452/work-98f1728d-1000000/churn-5000.ru
+[07:27:42] sparkles: applying 5000 commits
+[07:27:50] sparkles: {"commits": 5000, "errors": 0, "seconds": 7.308, "per_s": 684.2, "p50_ms": 1.364, "p99_ms": 3.191, "mean_ms": 1.46, "max_ms": 57.195}
+
+rows                 sparkles
+star-join               29700
+two-hop-count               1
+contains                    1
+regex-iri                   1
+
+== star-join
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time     42.6 ms  ±     1.4 ms      38.6 ms  …    43.6 ms
+  Memory        11.6 MiB ±     0.1 MiB     11.4 MiB …    11.7 MiB
+ 
+
+== two-hop-count
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time     31.1 ms  ±    26.4 ms      21.1 ms  …   105.8 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: The first benchmarking run for this command was significantly slower than the rest (105.8 ms). This could be caused by (filesystem) caches that were not filled until after the first run. You are already using both the '--warmup' option as well as the '--prepare' option. Consider re-running the benchmark on a quiet system. Maybe it was a random outlier. Alternatively, consider increasing the warmup count.
+ 
+
+== contains
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      8.1 ms  ±     0.1 ms       8.0 ms  …     8.4 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.2 MiB …    11.4 MiB
+ 
+
+== regex-iri
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      9.2 ms  ±     0.2 ms       8.9 ms  …     9.5 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.1 MiB …    11.6 MiB
+ 
+
+== update-latency
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.9 ms  ±     0.1 ms       3.7 ms  …     4.2 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.3 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== throughput (160 requests, 16 clients)
+Benchmark 1: sparkles (3 runs)
+                mean     ±       σ          min     …     max
+  Wall Time    882.6 ms  ±     5.6 ms     876.3 ms  …   887.0 ms
+  Memory        11.7 MiB ±     0.0 MiB     11.6 MiB …    11.7 MiB
+ 
+
+RSS (MiB) after the run: {
+ "sparkles": 1061
+}
+| query | sparkles (ms) |
+|---|---:|
+| count-all | — |
+| types-grouped | — |
+| star-join | **42.6 ± 1.4** |
+| two-hop-count | **31.1 ± 26.4** |
+| range-topk | — |
+| optional-count | — |
+| contains | **8.1 ± 0.1** |
+| group-avg | — |
+| path-plus | — |
+| distinct-obj | — |
+| export-500k | — |
+| predicate-counts | — |
+| predicate-subjects | — |
+| class-predicates | — |
+| class-predicate-list | — |
+| order-by-full | — |
+| optional-chain | — |
+| minus | — |
+| not-exists | — |
+| exists-join | — |
+| subquery-agg | — |
+| regex-iri | **9.2 ± 0.2** |
+| knows-reach | — |
+| distinct-join | — |
+| lang-filter | — |
+| star-lookup | — |
+| values-star | — |
+| employee-docs | — |
+| expr-bind-group | — |
+| expr-order-key | — |
+| expr-agg-arg | — |
+| **update** (1-triple INSERT DATA) | **3.9 ± 0.1** |
+| **throughput** star-join, 16 clients (queries/s) | **181** |
+
+Memory: the servers' resident set (VmRSS, and VmHWM for peaks) and each load's peak RSS (GNU time). Lower is better.
+
+| memory | sparkles |
+|---|---:|
+| server RSS 2 s after start, before any query (MiB) | 142 |
+| server RSS after every query ran once (MiB) | 937 |
+| server RSS after the run (MiB) | 1061 |
+| peak RSS during the throughput run (MiB) | 1340 |
+| server RSS after the run less Sparkles' decoded-block cache of 724 MiB (MiB) | 337 |
+
+Memory per query: how far the server's peak RSS rose over its RSS before the request, then the peak, in MiB. The peak is reset (clear_refs) before each request of the answer check.
+
+| query (rise / peak) | sparkles |
+|---|---:|
+| star-join | +114 / 721 |
+| two-hop-count | +229 / 950 |
+| contains | +35 / 985 |
+| regex-iri | +0 / 982 |
+
+Churn before the queries: 5000 single-triple commits, one request each and the same for every engine. They are INSERT DATA and DELETE DATA in the default graph.
+
+| commits | sparkles |
+|---|---:|
+| commits/s | 684 |
+| latency p50 (ms) | 1.36 |
+| latency p99 (ms) | 3.19 |
+| failed commits | 0 |

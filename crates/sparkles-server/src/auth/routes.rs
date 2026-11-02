@@ -73,6 +73,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ontology/{ds}/entities", &["GET"]),
     ("/$/ontology/{ds}/entity", &["GET"]),
     ("/$/ontology/{ds}/check", &["POST"]),
+    ("/$/ontology/{ds}/classify", &["POST"]),
     ("/$/ontology/{ds}/diff", &["GET"]),
     ("/$/graph/{ds}/groups", &["POST"]),
     ("/$/graph/{ds}/facets", &["POST"]),
@@ -282,6 +283,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/claims/resolve", &["POST"]),
     // authenticated claim proposals of the evidence profile (C25 §5 and §7)
     ("/{ds}/claims", &["POST"]),
+    // review decisions, accepted projections and withdrawals (C25 §5 and §6)
+    ("/{ds}/claims/review", &["POST"]),
+    ("/{ds}/claims/withdraw", &["POST"]),
     // `register_source` and `list_sources` over HTTP (C18 Phase 3m-b)
     ("/{ds}/sources", &["GET", "POST"]),
     ("/{ds}/text", &["GET", "POST"]),
@@ -476,6 +480,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/ontology/{ds}/entities"
         | "/$/ontology/{ds}/entity"
         | "/$/ontology/{ds}/check"
+        // a run that writes its taxonomy checks write in the handler
+        | "/$/ontology/{ds}/classify"
         | "/$/ontology/{ds}/diff"
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
@@ -599,6 +605,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/upload"
         | "/{ds}/facts"
         | "/{ds}/claims"
+        | "/{ds}/claims/review"
+        | "/{ds}/claims/withdraw"
         | "/{ds}/mappings/{name}/run" => Dataset(Write),
         "/{ds}/memory/brief" => Dataset(Read),
         "/{ds}/sources" if get => Dataset(Read),
@@ -658,12 +666,17 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         "/$/forms/{ds}/check" | "/$/forms/{ds}/save" => Endpoint::Update,
         "/$/ontology/{ds}"
         | "/$/ontology/{ds}/check"
+        | "/$/ontology/{ds}/classify"
         | "/$/ontology/{ds}/entities"
         | "/$/ontology/{ds}/entity" => Endpoint::Query,
         "/$/ontology/{ds}/axioms" if get => Endpoint::Query,
         "/$/ontology/{ds}/axioms" => Endpoint::Update,
         "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,
-        "/{ds}/update" | "/{ds}/facts" | "/{ds}/claims" => Endpoint::Update,
+        "/{ds}/update"
+        | "/{ds}/facts"
+        | "/{ds}/claims"
+        | "/{ds}/claims/review"
+        | "/{ds}/claims/withdraw" => Endpoint::Update,
         "/{ds}/sources" if get => Endpoint::Query,
         "/{ds}/sources" => Endpoint::Update,
         "/{ds}/get" => Endpoint::GspR,

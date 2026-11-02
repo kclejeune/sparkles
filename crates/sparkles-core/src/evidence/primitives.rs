@@ -163,6 +163,12 @@ pub enum RecordKind {
     Task,
     ReviewDecision,
     IdentityProposal,
+    /// The record of one admitted occurrence that owns a projected triple.
+    AcceptanceSupport,
+    /// The withdrawal of a claim occurrence's admission.
+    Withdrawal,
+    /// A policy's projection under one policy version and its protections.
+    Projection,
 }
 
 impl RecordKind {
@@ -180,6 +186,9 @@ impl RecordKind {
             Self::Task => 10,
             Self::ReviewDecision => 11,
             Self::IdentityProposal => 12,
+            Self::AcceptanceSupport => 13,
+            Self::Withdrawal => 14,
+            Self::Projection => 15,
         }
     }
 }

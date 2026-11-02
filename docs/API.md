@@ -1954,13 +1954,78 @@ the `diff` endpoint. A commit that the dataset's history no longer keeps is `410
   "removed": [], "changedQuads": 2, "method": "log" }
 ```
 
+`POST /$/ontology/{ds}/classify` classifies the ontology by OWL 2 EL, in the manner of
+the ELK reasoner. It takes `graph`, `imports` and `mode` in the body and `at` as a query
+parameter, and answers the inferred class hierarchy and the unsatisfiable classes.
+`consistent` is false when the ontology has no model, and every class is then
+unsatisfiable. An axiom outside OWL 2 EL is left out and listed under `excluded` with
+the rule it breaks. An axiom that the classifier uses only in part, such as one with an
+individual in a class expression, a data range, an assertion on a property with a range
+or the top or bottom property, is listed with `partial` and the reason. An axiom with
+an expression nested more than 256 deep is left out and listed as partial too.
+`complete` is false when anything is listed. Every subsumption the answer gives
+is entailed, and a complete answer has every entailed subsumption between named classes.
+The answer counts the classes, the nodes of the taxonomy, the unsatisfiable classes and
+the excluded axioms, lists at most `limit` of the last two, 100 by default and at most
+10,000, and gives the times of the run under `stats`. `about` names a class and answers
+its node under `class`, with its equivalent classes, direct superclasses and subclasses
+and all its superclasses. An unsatisfiable class is a subclass of every class, so its
+node lists no superclasses and `unsatisfiable` is true. An `about` class that the
+taxonomy does not have is `404`, and a run that would write then writes nothing.
+`nodes: true` lists the taxonomy's nodes, `limit` from `offset`, each with its classes
+and its direct superclasses, and `next` when more remain. Node 0 holds `owl:Thing` and
+node 1 holds `owl:Nothing` and the unsatisfiable classes. `format=ofn` answers the
+taxonomy as a functional-style document of `EquivalentClasses` and `SubClassOf` axioms,
+as ELK and ROBOT write one, and it is `400` with `target`. `assertions: true` also
+classifies with the assertions the
+store holds, which can make the ontology inconsistent. `threads` asks for worker
+threads, which the algorithm pool admits up to its share for one call. `inferences` is
+`400`, since a classification reads the asserted axioms.
+
+The dataset keeps its last classification for callers who read every graph, without
+assertions. A classification of the same ontology at the same commit answers from it
+with `reused: true`. One at a later commit gives the kept classifier the axioms that
+changed, so that it saturates again only the classes those axioms can reach, and
+`stats.incremental` says so. A change to the property hierarchy, chains, reflexivity or
+ranges, or to an axiom with a data property or datatype, saturates everything again.
+The kept state costs memory for the time the dataset is open, about 115 MB estimated
+and 190 MB resident for GO, and it is dropped after a run whose estimate passes one
+gigabyte. A run is bounded by the request's deadline and memory budget, from indexing
+to the taxonomy, and answers `507` with `budget: "memory"` past the budget.
+
+`target` names a graph to write the taxonomy to, in one commit, with `message`. The
+graph must be a named graph that the classification does not read. The commit adds the
+taxonomy's axioms and removes the subsumptions and equivalences between named classes
+that the graph held and the taxonomy no longer has, so a diff of the graph between two
+runs shows how the hierarchy changed. The graph's ontology header carries the
+provenance as annotations: `prov:wasGeneratedBy` a `urn:uuid:` activity,
+`prov:generatedAtTime`, `prov:wasDerivedFrom` each named graph read and an
+`rdfs:comment` with the commit read. They go on the graph's existing header when it has
+one, and a header without an IRI is `409`. A later write replaces the PROV-O
+annotations and the comment that the classifier wrote, and keeps other comments. When
+the terminology read changes between the classification and the write, the write is
+`409` and the classification can run again. With `assertions: true`, any commit in
+between is `409`. A write takes the parameters of the other writes, such as
+`dryRun` and `If-Match`, and needs write access to the target graph.
+
+```json
+{ "dataset": "go", "commit": 3, "mode": "lenient", "graphs": ["default"], "imports": [],
+  "warnings": [], "consistent": true, "complete": true, "reused": false,
+  "classes": 51986, "nodeCount": 51988, "unsatisfiableCount": 0, "unsatisfiable": [],
+  "excludedCount": 0, "excluded": [],
+  "stats": { "incremental": false, "added": 117650, "removed": 0, "cleared": 0,
+    "contexts": 51987, "conclusions": 2801981, "estimatedBytes": 54673800, "threads": 4,
+    "indexMs": 453.1, "saturationMs": 402.7, "taxonomyMs": 251.8 } }
+```
+
 The library's `sparkles::handles::ontology::wire::call` answers the same operations
 in the same JSON forms, and the bindings call it. Python's `Dataset.ontology` has
-`summary`, `axioms`, `entities`, `entity`, `check`, `edit`, `remove_entity` and `diff`,
-with the members as keyword arguments, and `Axiom` reads and writes one axiom with
-structural equality. Node.js's `dataset.ontology` has `summary`, `axiomPage`, `axioms`
-(an async iterable in batches), `entities`, `entity`, `check`, `edit`, `removeEntity`
-and `diff`. On the JVM, `DatasetGraphSparkles.ontology()` has the same operations,
+`summary`, `axioms`, `entities`, `entity`, `check`, `edit`, `remove_entity`, `diff` and
+`classify`, with the members as keyword arguments, and `Axiom` reads and writes one
+axiom with structural equality. Node.js's `dataset.ontology` has `summary`, `axiomPage`,
+`axioms` (an async iterable in batches), `entities`, `entity`, `check`, `edit`,
+`removeEntity`, `diff` and `classify`. On the JVM, `DatasetGraphSparkles.ontology()` has
+the same operations, with `classify` taking a `ClassifyQuery`,
 `SparklesOnt` has them over one graph, and `SparklesOnt.model` returns a `jena-ontapi`
 `OntModel` over a Sparkles graph
 ([integrations](integrations/README.md#libraries-and-bindings)). An axiom given to an
@@ -1990,7 +2055,7 @@ ds.ontology.entity("http://ex.org/Professor", "http://ex.org/onto")["class"]["su
 
 In Rust, `ds.ontology().graph(iri)` starts a scope over the request structures, with
 `imports`, `mode`, `at`, `inferences` and `options`, that ends in `open`, `check`,
-`diff`, `remove_entity` or `edit`. `edit` takes a closure that adds and removes axioms on
+`diff`, `remove_entity`, `classify` or `edit`. `edit` takes a closure that adds and removes axioms on
 an editor and commits once. The open ontology's `class(iri)` and the other lookups answer
 `NotFound` for an IRI that is not that kind of entity, its `ontology` member has the
 accessors such as `super_classes`, and `instances`, `types_of` and `property_assertions`
@@ -10984,7 +11049,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: an exact `spk:vectorSearch` over the stored `spk:vector` literals. The tool never computes embeddings. `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector. |
 | `check_query` | `query` (required, ≤ 65536 characters), `explain` (false), `maxSuggestions` (3, ≤ 10), `terms` (false), `timeoutSeconds` (30) | `{dataset, commit, ok, issues: [{code, severity, message, term?, line?, column?, suggestions?: [{term, label?, count, why}]}], estimatedRows?, terms?, prefixes}`. With `terms`, `terms` lists every constant IRI of the query as `{term, iri, kind, label?, count?, types?, occurs}`, where `kind` is `class`, `property` or `entity` and `occurs` is `null` when the check did not look the term up. The query is parsed and compared with the caller's view without running it. The errors are `syntax` (with line and column), `not-a-query` (an update), `unknown-predicate` and `unknown-class`. The warnings are `unknown-term`, `class-mismatch`, `datatype-mismatch`, `language-tag` and `unbound-projection`, and with `explain` also `no-limit` and `large-estimate` and the plan's `estimatedRows`, which is left out when the caller's view hides the estimates. `ok` is false only when an issue is an error. A suggestion's `why` is `same-local-name`, `edit-distance` or `label` for an unknown term, `class-profile`, `datatype` or `language-tag` for a mismatch, and `same-name`, `namespace` or `edit-distance` for an undefined prefix. |
 | `similar_queries` | `question` (required, ≤ 2000 characters), `k` (5, ≤ 20), `withText` (true), `embeddingIndex` (a vector index name), `timeoutSeconds` (30) | `{dataset, queries: [{name, tool?, description?, score, matchedBy, parameters: [{name, type, required, description?}], questions?, query?}], ranking, prefixes}`. The [stored queries](#stored-queries) the caller may run whose `mcp` is not `false`, ranked by BM25 over their description, parameters, the words of their IRIs and their `questions`. When the dataset has one vector index whose provider embeds query text, or `embeddingIndex` names one, the cosine similarity of embeddings is fused with BM25 by reciprocal rank (k = 60) and `ranking` is `hybrid`. If the provider fails, the ranking falls back to `text`. `tool` is the query's MCP tool name. |
-| `link_entities` | `mentions` (required, 1–20 of `{text (≤ 200 characters), types? (≤ 5 class IRIs), context? (≤ 500 characters)}`), `k` (5, ≤ 20), `labelPredicates` (≤ 20 IRIs, by default the label predicates of `describe_resource` and `skos:altLabel`), `graphs` (≤ 20 IRIs or `default`), `vectors` (true; false leaves the vector index out, so nothing is embedded), `evidence` (false), `timeoutSeconds` (30) | `{dataset, commit, mentions: [{text, verdict, candidates: [{iri, label?, altLabels?, types, score, typeMatch, matchedBy, sameAs?, triples}]}], search: {text, vector}, prefixes}`. Candidates come from exact label matches, labels equal after case folding and collapsing white space, `text:query` over the label predicates the full-text index covers, and `spk:vectorSearch` with the mention and its context on a vector index that embeds labels. `verdict` is `exact`, `ambiguous`, `candidates` or `none`, and it is advice. Candidates of a type in `types`, or of a subclass, come first. `triples` holds up to 5 sampled outgoing triples, and `sameAs` the other candidates linked by `owl:sameAs` or `skos:exactMatch`. `search` says which indexes took part. With `evidence: true`, each mention adds version 1 evidence with `observedCandidates`, `poolTruncated`, `displayTruncated`, `exactStringLabelsComplete`, `typeHintLookupComplete`, `normalizedLabelsComplete` and `candidateUniverseComplete`. Each displayed candidate adds version 1 evidence with its full `iri`, up to 20 retained named `types`, `typesComplete`, up to 20 retained non-vector literal `labels` as `{predicate, term}`, and `labelsComplete`. Evidence type and predicate IRIs and escaped literal terms are unabridged. Completeness concerns the same snapshot and caller's query view, within the requested label predicates and graph selection. A cap, RDFS-on-read expansion or an unproven language/view scope gives incomplete evidence. Evidence-enabled structured content over `--mcp-max-bytes` is refused with `budget-result-bytes`, before MCP adds mirrored text and its envelope. The normalized and complete-universe flags are always false for the bounded searches, so this evidence never establishes unique intent. |
+| `link_entities` | `mentions` (required, 1–20 of `{text (≤ 200 characters), types? (≤ 5 class IRIs), context? (≤ 500 characters)}`), `k` (5, ≤ 20), `labelPredicates` (≤ 20 IRIs, by default the label predicates of `describe_resource` and `skos:altLabel`), `graphs` (≤ 20 IRIs or `default`), `vectors` (true; false leaves the vector index out, so nothing is embedded), `evidence` (false), `popularity` (false), `timeoutSeconds` (30) | `{dataset, commit, mentions: [{text, verdict, candidates: [{iri, label?, altLabels?, types, score, typeMatch, matchedBy, sameAs?, triples, uses?}]}], search: {text, vector}, prefixes}`. Candidates come from exact label matches, labels equal after case folding and collapsing white space, `text:query` over the label predicates the full-text index covers, and `spk:vectorSearch` with the mention and its context on a vector index that embeds labels. `verdict` is `exact`, `ambiguous`, `candidates` or `none`, and it is advice. Candidates of a type in `types`, or of a subclass, come first. `triples` holds up to 5 sampled outgoing triples, and `sameAs` the other candidates linked by `owl:sameAs` or `skos:exactMatch`. With `popularity: true`, label matches of the same kind are ordered by how many triples of the caller's view name each one as their object, counted up to 2000, and each label match reports that count as `uses`. The verdict does not change. `search` says which indexes took part. With `evidence: true`, each mention adds version 1 evidence with `observedCandidates`, `poolTruncated`, `displayTruncated`, `exactStringLabelsComplete`, `typeHintLookupComplete`, `normalizedLabelsComplete` and `candidateUniverseComplete`. Each displayed candidate adds version 1 evidence with its full `iri`, up to 20 retained named `types`, `typesComplete`, up to 20 retained non-vector literal `labels` as `{predicate, term}`, and `labelsComplete`. Evidence type and predicate IRIs and escaped literal terms are unabridged. Completeness concerns the same snapshot and caller's query view, within the requested label predicates and graph selection. A cap, RDFS-on-read expansion or an unproven language/view scope gives incomplete evidence. Evidence-enabled structured content over `--mcp-max-bytes` is refused with `budget-result-bytes`, before MCP adds mirrored text and its envelope. The normalized and complete-universe flags are always false for the bounded searches, so this evidence never establishes unique intent. |
 | `recall` | `query` (≤ 2000 characters) or `seeds` (≤ 20 IRIs) or both, `types` (≤ 5 class IRIs), `graphs` (≤ 20 IRIs or `default`), `hops` (1, ≤ 2), `seedLimit` (10, ≤ 50), `maxTriples` (150, ≤ 1000), `maxBytes` (32768, ≤ `--mcp-max-bytes`), `includeSuperseded` (false), `statuses` (both), `unreviewedWeight` (0.7), `recency` (a half-life such as `90d`), `communities` (false), `communityLevel` (the finest), `format` (`text`\|`json`), `timeoutSeconds` (30) | One text block: the facts around the seeds with their citations, described below. No `structuredContent`. |
 | `community_reports` | `query` (≤ 2000 characters), `level` (the finest level with at most 100 reports), `reviewedOnly` (false), `limit` (10, ≤ 100), `findings` (true), `timeoutSeconds` (30) | `{dataset, available, reason?, message?, reportsGraph, level, levels: [{level, reports}], ranking, stale, reports: [{iri, community, level, title, summary, status, rating, memberCount, score?, findings: [{iri, text, cites}]}]}`, described below. |
 | `why_empty` | `query` (required, ≤ 65536 characters), `timeoutSeconds` (30) | `{dataset, commit, empty, first?, steps, unchecked?, complete, message, prefixes}`, described in [Checking and explaining queries](#checking-and-explaining-queries). |
@@ -12456,6 +12521,104 @@ reference to it, and a commit whose hold was released before it published is a `
 hold-conflict`. Capability discovery is in `GET /$/server`, whose `capabilities.claims`
 lists the profile versions this build serves.
 
+### Evidence reviews
+
+`POST /{ds}/claims/review` appends review decisions under one named review policy of
+the [evidence settings](#evidence-settings), and `POST /{ds}/claims/withdraw` withdraws
+claim occurrences. Both need `write` on the dataset or branch through the update
+endpoint, count as updates and publish one commit of the evidence owner. Neither edits
+a record in place. The design is in
+[C25 §5 and §6](specs/C25-evidence-and-assessments.md#5-writes-review-and-accepted-projections).
+
+```json
+{
+  "policy": "advisories",
+  "policyVersion": 2,
+  "ifHead": 57,
+  "idempotencyKey": "review-2026-01-03",
+  "decisions": [{"key": "d1", "target": "urn:uuid:4f0b…",
+                 "targetDigest": "sha256:9c1e…", "disposition": "accepted"}]
+}
+```
+
+A decision names an exact claim or assessment and the `recordDigest` that the reviewer
+saw, and its disposition is `accepted`, `rejected` or `needsEvidence`. When the target
+already has a decision under the policy, the new decision names it as `supersedes`, and
+the new decision becomes the current one. `ifHead` is required, and every read of the
+review is made at that head. A request holds at most 1,000 decisions, one per target.
+The caller is the reviewer of record, and no client field can name another one. An
+acceptance that does not project records its reason as the decision's
+`ev:projectionNote`, so a replay answers it again.
+
+An acceptance projects a claim when the claim is positive, its kind is one of the
+policy's admitted kinds and it carries every required scope predicate. The server then
+records an `ev:AcceptanceSupport` in the policy's supports graph and inserts the claim's
+proposition into the policy's output graph. Other acceptances are recorded with a
+`notProjected` reason, and negative and uncertain claims never project. A support stays
+live while its decision is current and its claim is not withdrawn. A projected triple
+stays in the output graph while at least one live support owns it, so two occurrences
+of one proposition each own a support, and reversing or withdrawing one leaves the
+triple to the other.
+
+Contrary evidence is an `ev:Contradicts` link to the claim or a negative claim of the
+same proposition in the policy's evidence boundary whose current decision is not a
+rejection. A policy with `conflicts: "refuse"` refuses such an acceptance. A policy with
+`admitLabelled` admits it, lists the contrary records in the support's
+`ev:conflictsWith` and in the answer's `conflicts`, sorted by IRI, and its `ev:Projection` record names
+that mode. Conflicts are decided against the request's final decisions when it is
+admitted. Later contrary evidence does not relabel or remove a support.
+
+A review needs update and read grants on the policy's decisions, supports and output
+graphs and read access to each target. An acceptance also needs read access to every
+evidence link of the target in the policy's boundary, with the link's reference and the
+records and stored fact that the reference names, and to every negative claim of the
+same proposition there. When one of them is unreadable, the answer is the
+`evidence-unavailable` answer of an unreadable target, so it reveals nothing about the
+hidden record.
+
+A withdrawal names a claim and its record digest. The server records an `ev:Withdrawal`
+with `prov:invalidatedAtTime`, the commit's time, in the claim's own graph, and makes no
+contrary claim. The claim's supports stop being live, and each projected triple left
+without a live support leaves its output graph. A claim that is already withdrawn
+answers `existing: true`. A withdrawal needs update grants on each claim's graph and on
+the output graph, and read grants on the decisions, supports and output graphs, of every
+review policy, because a support admitted under an earlier policy version ends with its
+claim whatever the policy's boundary is now. `ifHead` is optional for a withdrawal. A
+withdrawn claim cannot be accepted again, and a new occurrence must be proposed instead.
+
+An acceptance copies a proposition into the output graph, which callers read under
+their own grants. A review checks only the reviewer's access, so an administrator must
+give every reader of an output graph read access to its policy's boundary. Sparkles does
+not yet check that grant, and a reviewed decision does not declassify its evidence.
+
+The review answer is `{operation, committed, replayed, commit, branchId, decisions,
+changed}`, and each decision is `{key, iri, target, disposition, supersedes, support,
+notProjected, conflicts}`. The withdrawal answer is `{operation, committed, replayed,
+commit, branchId, withdrawals, changed}`, and each withdrawal is `{key, iri, target,
+existing}`. `changed` lists `supportsAdded`, `supportsEnded`, and the `inserted` and
+`removed` projected triples with their output graphs, so that consumers can find the
+results that depend on them. A replay answers the first receipt with an empty
+`changed`.
+
+| Status and code | Meaning |
+|---|---|
+| `400 invalid-proposal`, `400 invalid-reference` | The body is malformed, a field is invalid, or the policy is unknown. The message names the field. |
+| `409 immutable-record-conflict` | A record identity the operation mints already holds content, as after content was written while its graph was detached. |
+| `403` | The caller may not update or read a graph the operation needs. |
+| `409 policy-changed` | `policyVersion` is not the policy's version. |
+| `409 head-changed` | `ifHead` is not the branch head, or the head moved while the operation read it. |
+| `409 target-changed` | A target's record digest is not the one the request names. |
+| `409 decision-superseded` | `supersedes` is not the target's current decision under the policy. |
+| `409 target-withdrawn` | An acceptance names a withdrawn claim. |
+| `409 evidence-conflict` | An acceptance meets contrary evidence under a policy that refuses conflicts. |
+| `409 idempotency-conflict` | The key was used with a different payload. |
+| `422 evidence-unavailable` | A target, or evidence that an acceptance must read, is missing, unreadable or outside the policy's boundary. |
+| `422 incomplete-evidence` | The acceptances need more than 10,000 evidence records. |
+| `503 projection-unavailable` | A graph of the policy's projection was detached and protected again, so its supports no longer authenticate, or its output holds triples without a projection record. |
+| `503 authority-changed` | The caller's credential or the access policy changed before the commit published. |
+
+A refusal writes nothing. `GET /$/server` lists both routes in `capabilities.claims`.
+
 ### Suggested examples
 
 A reader who finds a good question and query can suggest it as an example, and a
@@ -12514,10 +12677,17 @@ except `repair`, which uses the `draft` list.
 
 A provider may also set `concurrency` (4 by default), `requestsPerMinute`,
 `allowedModels`, `connectTimeoutSecs`, extra `headers` for the `openai` kind,
-`version` and `promptCaching` for the `anthropic` kind, and the defaults of its models. The `models` member sets `contextTokens`, `maxOutputTokens`,
-`temperature`, `structuredOutput`, `pricing`, `requestTimeoutSecs` and, for Ollama,
-`numCtx` per model. Headers that carry credentials are refused, and so are endpoints
-with credentials, a query or a fragment. Requests go through the server's outbound
+`version` for the `anthropic` kind, `promptCaching` for the `anthropic` and `openai` kinds, and the defaults of its models. The `models` member sets `contextTokens`, `maxOutputTokens`,
+`temperature`, `structuredOutput`, `pricing`, `requestTimeoutSecs`, `reasoningEffort`
+and, for Ollama, `numCtx` per model. `reasoningEffort` is one of `none`, `minimal`,
+`low`, `medium`, `high`, `xhigh` and `max`, and the provider decides which a model
+accepts. The `openai` kind sends it as `reasoning_effort`, and the `anthropic` kind as
+`output_config.effort`. An `openai` model with an effort is treated as a reasoning
+model, so its requests limit the output with `max_completion_tokens`, which counts its
+reasoning tokens, and send a temperature only when one is set. An OpenAI answer counts
+its cache reads and writes inside `prompt_tokens`, and Sparkles takes them out of the
+uncached input and prices the writes at `cacheWritePerMTok`. Headers that carry
+credentials are refused, and so are endpoints with credentials, a query or a fragment. Requests go through the server's outbound
 policy, so a provider on a private address needs `--outbound-allow-private`.
 
 **TLS.** A provider with an `https` endpoint may set `tls`. `tls.caCert` names a PEM CA
@@ -12599,6 +12769,16 @@ and Haiku 5.5 and up to 4,096 on older models, is not cached and costs nothing e
 the write price. The other kinds send their prompts as before, and the OpenAI protocol
 caches long prompts on its own.
 
+OpenAI writes a cached prefix only where the latest user message ends, so a repair that
+changes the text after the question cannot read the prefix that the first draft wrote
+when the whole prompt is one message. An `openai` provider whose `promptCaching` sets
+`enabled` to `true` therefore receives an Ask repair as the first draft's user message,
+unchanged, followed by a second user message with the repair and the answer format.
+Every message keeps the user role. It is off by default because it changes the shape of
+the prompt, and `promptCaching.ttl` applies to the `anthropic` kind only. The settings
+form offers prompt caching for the `anthropic` kind only, so an `openai` provider sets
+it in its JSON configuration.
+
 ```json
 "claude": {
   "kind": "anthropic", "endpoint": "https://api.anthropic.com",
@@ -12679,6 +12859,7 @@ a term the caller cannot read.
 | `tryHarder` | The id of an earlier ask of the caller. Drafting starts at the pair after the one that drafted it, and the earlier answer is marked `rejected`. |
 | `reviewedOnly` | `true` hides the agent memory graphs of the dataset's memory settings from every step, and a global answer then uses only reviewed community reports. |
 | `mode` | `auto` (the default) lets the draft classify the question, `local` always answers with a query, and `global` answers from the dataset's community reports. |
+| `explore`, `shapeCheck`, `drafts`, `typeHints` | The repair turns of this ask, over the dataset's `repairs`. `drafts` is 1 to 5. |
 | `query` | A query to check, run and summarize without a draft, for a query that the caller edited. |
 
 The answer is a stream of server-sent events. Each event's data is one JSON object.
@@ -12871,6 +13052,7 @@ in the shape of `GET`.
 | `deadlineSecs` | The time an ask may take, 120 seconds by default. |
 | `historyDays` | The days an asked question is kept. `0` keeps nothing. Without it, the server's `serve --ask-history-days` applies, 30 by default. |
 | `routing` | `complexityThreshold` and `exampleScore`, which override the server's routing settings. |
+| `repairs` | The repair turns of the dataset's asks, which a request may override. `explore` explores the data once after a draft without a query or with an empty result, `true` by default. `shapeCheck` repairs once when a result does not fit the question's form, `false` by default. `drafts` asks 1 to 5 first drafts whose results vote, 1 by default. `typeHints` links mentions with the classes the words around them name, `false` by default. |
 
 A `PUT` with an `endpoint` or an `apiKey` anywhere is a `400`, because only the server
 configuration names endpoints and keys. The `GET` answer adds `status`, which says

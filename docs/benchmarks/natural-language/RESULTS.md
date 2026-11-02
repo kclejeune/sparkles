@@ -167,6 +167,224 @@ The resource preference only orders offered choices. An ambiguous mention still 
 a clarification, since the displayed candidate, type and alternate-label lists can be
 truncated. The paid run does not isolate this ranking's contribution to answer accuracy.
 
+#### Ask grounding from predicate use
+
+Ask grounding lists the predicates that the question's linked entities and best-matching
+classes use in the data, links with popularity ordering and tells the model that the
+context is partial and to use one predicate per relation.
+[C18](../../specs/C18-natural-language-questions-and-ingest/OUTCOME.md#ask-grounding-from-predicate-use-item-263)
+describes the changes. The table compares it with the baseline on the same questions and
+settings. The QALD rows split into the 72 training questions that tuned the changes and
+the 35 validation questions. The fresh set is 150 questions from the QALD-9-plus
+training split that no tuning step read, chosen by the SHA-256 of a fixed seed and the
+question id after six duplicates of QALD test or db25 questions were dropped.
+
+| Measurement context | |
+|---|---|
+| Date and host | 2026-11-01 on a development laptop that was running other work, with binaries built on atlas |
+| Builds | Commit 570d7062 for the changes, and 30b0a968 for two Haiku QALD runs, which builds the same prompts on this database. The Haiku baselines and the fresh baselines use commit 2d43aa5a, and the Sonnet and Opus QALD and db25 baselines are the 7b3b6df5 runs above. |
+| Settings | Effort `medium`, a 200,000-token context and answered clarifications, as above |
+| Cost | $26.74 in 3,696 requests under a cap of $50 |
+
+| Set and model | Baseline | With the changes |
+|---|---|---|
+| QALD-9-plus training, Haiku 5.5 | 18 and 15 [16 and 14 of 68] | 29, 30 and 28 [29, 29 and 30] |
+| QALD-9-plus training, Sonnet 5.5 | 23 and 23 [21 and 19 of 68] | 34 [34] |
+| QALD-9-plus training, Opus 5.5 | 26 [23 of 68] | 39 [39] |
+| QALD-9-plus validation, Haiku 5.5 | 8 and 7 [7 and 7 of 34] | 14, 12 and 13 [14, 12 and 13] |
+| QALD-9-plus validation, Sonnet 5.5 | 9 and 11 [7 and 7 of 34] | 14 [13] |
+| QALD-9-plus validation, Opus 5.5 | 15 [13 of 34] | 18 [18] |
+| QALD-9-plus, all 107, Haiku 5.5 | 26 and 22 [23 and 21 of 102] | 43, 42 and 41 [43, 41 and 43] |
+| QALD-9-plus, all 107, Sonnet 5.5 | 32 and 34 [28 and 26 of 102] | 48 [47] |
+| QALD-9-plus, all 107, Opus 5.5 | 41 [36 of 102] | 57 [57] |
+| db25, Haiku 5.5 | 21 [23 of 73] | 31 [33] |
+| db25, Sonnet 5.5 | 32 [31 of 73] | 41 [42] |
+| db25, Opus 5.5 | 33 [30 of 73] | 42 [43] |
+| Fresh, Haiku 5.5 | 37 [37 of 150] | 77 [75] |
+| Fresh, Sonnet 5.5 | 64 [59 of 150] | 86 [82] |
+| Cost per run, Haiku, Sonnet and Opus | | $0.15 to $0.28, $2.13 to $4.28 and $4.28 to $6.60 |
+
+Each cell gives the strict projected score of record. The secondary score in brackets is
+`rdf-term-set-projected-guarded-lenient-v3` over the questions its gold rules keep, with
+the passes that rely on a predicate column or on dropped rows left out. The paired gain
+on the fresh set is 26.7 points with a 95% half-width of 7.6 for Haiku, which gained 42
+questions and lost 2, and 14.7 points with a half-width of 7.5 for Sonnet, which gained
+29 and lost 7. On db25 it is 13.5 points for Haiku against the same starting commit and
+12.2 points for Sonnet and for Opus, each with a half-width of about 10, and on QALD it
+is 13 to 20 points for every model.
+
+The gain is largest on the fresh set, so it does not come from tuning to the QALD and
+db25 questions. Predicate-use grounding alone took Haiku from 24.0 to 35.0 on
+QALD over two runs each, and the prompt rules added about 7 more, from 35.0 to 42.5. In
+dry runs with the fake provider, the share of training prompts that hold every gold term
+rose from 20 to 39 of 72 and of validation prompts from 8 to 14 of 35. The prompt rules
+cut Haiku's refusals on QALD from about 48 to 22 per run and its UNION or `VALUES`
+queries from about 12 to 2. Sonnet's UNION or `VALUES` queries fall from about 40 to 3,
+so its equal-width score rises from about 12 to 29. A first-draft prompt grows by about
+8%, from about 29,800 to 32,400 characters, and each Ask runs two to three more bounded
+queries per linked entity and one per matched class. A fresh-set run costs 5 to 8% more,
+and the median Ask time stays within about a second of the baseline on this loaded host.
+With the changes, a gold resource missing from the prompt causes about half of the wrong
+answers and wrong query shape most of the rest.
+
+Haiku at commit 2d43aa5a scored 26 and 22 on QALD, against a mean of 28.0 at 7b3b6df5,
+and 21 on db25 against 19. The difference is within the noise of so few runs, and it may
+come from the grounding reordered for prompt caching. [ROADMAP](../../ROADMAP.md) item
+594 tracks it. A provider outage stopped the first Haiku fresh baseline after 42
+of 150 questions, and the record keeps that attempt and its cost beside the full rerun.
+The [paid record](../2026-11-01-ask-hillclimb-paid.json) gives per-run and per-case
+results under both scores, every case the secondary score changes, costs, token counts
+and source digests.
+
+#### Ask repair options
+
+Four repair turns of Ask were measured as separate options on Haiku 5.5. The exploration
+drafts once more after a draft gives no query or an empty result, with further link
+candidates and the predicates the entities use. The shape check repairs once when the
+result does not fit the question's form. Multi-draft voting asks three first drafts and
+keeps the one whose checked, complete result most of them share. Type hints link each
+mention with the classes the words around it name. Each option ran three times on an
+enlarged validation set of 51 questions, the 35 validation questions of the QALD split
+and the 16 training questions that no tuning step had inspected case by case. Every
+other training question had been read during tuning, so the set could not reach the
+intended 105. An option is on by default only when its mean gain passes the spread of
+the three baseline runs.
+
+| Measurement context | |
+|---|---|
+| Date and host | 2026-11-01 on a development laptop that was running other work, with binaries built on atlas |
+| Build | Commit `dfc799dc`, one batch child per run with six questions at once |
+| Settings | Effort `medium`, a 200,000-token context and answered clarifications |
+| Questions | 51, with the moved IDs and the rule that chose them in the [paid record](../2026-11-01-ask-hillclimb-paid.json) |
+
+| Option | Strict score in three runs | Mean | Cost per question | Default |
+|---|---|---|---|---|
+| None | 25, 26 and 24 | 25.0 | $0.0019 | |
+| Exploration | 29, 28 and 27 | 28.0 | $0.0022 | On |
+| Shape check | 25, 25 and 25 | 25.0 | $0.0020 | Off |
+| Three drafts with a vote | 26, 25 and 27 | 26.0 | $0.0031 | Off |
+| Type hints | 23, 21 and 24 | 22.7 | $0.0021 | Off |
+| Exploration, shape check and three drafts | 29, 26 and 28 | 27.7 | $0.0035 | |
+
+The guarded secondary score equals the strict score in every run. The exploration gains
+3.0 questions, and its lowest run is above the highest baseline run, at about 16% more
+cost per question. It turns refusals into answers, which fall from 24 to 8 over the
+three runs. The shape check fires on at most 3 of the 51 questions in a run, so it
+cannot move the score much on this set, and it may help on data whose questions more
+often ask for counts or dates. Voting gains 1.0 question, inside the baseline's spread
+of 2, for 63% more cost per question. It may help a weaker model or a dataset whose
+drafts disagree more often. Type hints lose 2.3 questions, past the spread. More of
+their queries add a class constraint, and their empty results double from 11 to 22 over
+the three runs. They may help on data whose labels are shared by many entities of
+different classes. The exploration with the shape check and voting scores no higher than
+the exploration alone and costs 59% more per question. Every option stays available
+through `assistant.json`, the ask request and the command line.
+
+#### Ask across providers
+
+Six models answered the same three sets with the baseline build and the final build:
+Claude Haiku 5.5, Sonnet 5.5 and Opus 5.5, and OpenAI GPT-6 Luna, GPT-6.1 Terra and
+GPT-6.1 Sol. The baseline is commit `2d43aa5a`, before the grounding changes above, and
+the final build is commit `dfc799dc` with the exploration on and the other repair
+options off. The OpenAI builds add the OpenAI request support and the follow-up form of
+repairs, which repeats the first draft's message so that OpenAI's prompt cache serves
+the repair, and they make no other change. Unseen is 150 QALD-9-plus training questions
+that no tuning step read, disjoint from the fresh set, and it is the primary held-out
+measure. QALD and db25 shaped the changes, so they are checks.
+
+| Measurement context | |
+|---|---|
+| Date and host | 2026-11-01 and 2026-11-02 on a development laptop that was running other work, with binaries built on atlas |
+| Builds | Anthropic `2d43aa5a` and `dfc799dc`. OpenAI `dd0d5430` and `3a138901`, which are the same commits with the OpenAI support and the follow-up repair form. |
+| Settings | Effort `medium`, a 200,000-token context, answered clarifications and one question per Ask child for the baselines, with six questions at once for the final builds |
+| Cost | $51.72 for the Anthropic runs and $33.95 for the OpenAI runs in the tables |
+| Not run | Opus on unseen with the baseline build, deferred for budget |
+
+The strict projected score is the headline. Guarded is the secondary
+`rdf-term-set-projected-guarded-lenient-v3` score over the questions its gold rules
+keep. Opus answered unseen in three blocks of 50 questions, because the harness admits a
+block only when the 90th-percentile case cost of the model times the block's questions
+fits what the cap leaves. The blocks use the same build, settings and questions, and
+their reports combine into one.
+
+QALD-9-plus test, 107 questions
+
+| Model | Build | Strict | Guarded | Correct after clarification | Macro-F1 | Cost per question | Cost per correct answer |
+|---|---|---|---|---|---|---|---|
+| Haiku 5.5 | Baseline | 26 (24%) | 26 of 102 | 19 | 0.28 | $0.0017 | $0.0072 |
+| Haiku 5.5 | Final | 46 (43%) | 48 of 102 | 38 | 0.47 | $0.0023 | $0.0054 |
+| Sonnet 5.5 | Baseline | 35 (33%) | 34 of 102 | 26 | 0.40 | $0.0274 | $0.0838 |
+| Sonnet 5.5 | Final | 55 (51%) | 56 of 102 | 46 | 0.59 | $0.0296 | $0.0576 |
+| Opus 5.5 | Baseline | 39 (36%) | 41 of 102 | 30 | 0.51 | $0.0619 | $0.1700 |
+| Opus 5.5 | Final | 60 (56%) | 62 of 102 | 48 | 0.66 | $0.0660 | $0.1177 |
+| GPT-6 Luna | Baseline | 28 (26%) | 27 of 102 | 22 | 0.27 | $0.0018 | $0.0069 |
+| GPT-6 Luna | Final | 47 (44%) | 49 of 102 | 37 | 0.50 | $0.0023 | $0.0051 |
+| GPT-6.1 Terra | Baseline | 30 (28%) | 29 of 102 | 24 | 0.36 | $0.0168 | $0.0599 |
+| GPT-6.1 Terra | Final | 52 (49%) | 54 of 102 | 43 | 0.58 | $0.0183 | $0.0376 |
+| GPT-6.1 Sol | Baseline | 33 (31%) | 30 of 102 | 27 | 0.35 | $0.0312 | $0.1013 |
+| GPT-6.1 Sol | Final | 52 (49%) | 53 of 102 | 44 | 0.58 | $0.0345 | $0.0711 |
+
+Text2SPARQL'25 db25, 74 questions
+
+| Model | Build | Strict | Guarded | Correct after clarification | Macro-F1 | Cost per question | Cost per correct answer |
+|---|---|---|---|---|---|---|---|
+| Haiku 5.5 | Baseline | 21 (28%) | 23 of 73 | 16 | 0.34 | $0.0017 | $0.0061 |
+| Haiku 5.5 | Final | 37 (50%) | 39 of 73 | 28 | 0.58 | $0.0020 | $0.0039 |
+| Sonnet 5.5 | Baseline | 32 (43%) | 33 of 73 | 24 | 0.55 | $0.0281 | $0.0649 |
+| Sonnet 5.5 | Final | 45 (61%) | 47 of 73 | 33 | 0.70 | $0.0287 | $0.0473 |
+| Opus 5.5 | Baseline | 34 (46%) | 36 of 73 | 25 | 0.59 | $0.0579 | $0.1260 |
+| Opus 5.5 | Final | 46 (62%) | 48 of 73 | 35 | 0.70 | $0.0613 | $0.0986 |
+| GPT-6 Luna | Baseline | 22 (30%) | 23 of 73 | 16 | 0.34 | $0.0019 | $0.0062 |
+| GPT-6 Luna | Final | 40 (54%) | 42 of 73 | 29 | 0.62 | $0.0021 | $0.0038 |
+| GPT-6.1 Terra | Baseline | 25 (34%) | 27 of 73 | 20 | 0.40 | $0.0163 | $0.0483 |
+| GPT-6.1 Terra | Final | 43 (58%) | 45 of 73 | 32 | 0.67 | $0.0171 | $0.0295 |
+| GPT-6.1 Sol | Baseline | 28 (38%) | 30 of 73 | 22 | 0.41 | $0.0302 | $0.0798 |
+| GPT-6.1 Sol | Final | 42 (57%) | 44 of 73 | 31 | 0.66 | $0.0325 | $0.0572 |
+
+Unseen, 150 QALD-9-plus training questions
+
+| Model | Build | Strict | Guarded | Correct after clarification | Macro-F1 | Cost per question | Cost per correct answer |
+|---|---|---|---|---|---|---|---|
+| Haiku 5.5 | Baseline | 41 (27%) | 42 of 150 | 35 | 0.30 | $0.0017 | $0.0063 |
+| Haiku 5.5 | Final | 95 (63%) | 97 of 150 | 79 | 0.69 | $0.0020 | $0.0032 |
+| Sonnet 5.5 | Baseline | 72 (48%) | 73 of 150 | 64 | 0.55 | $0.0264 | $0.0550 |
+| Sonnet 5.5 | Final | 106 (71%) | 106 of 150 | 92 | 0.76 | $0.0288 | $0.0407 |
+| Opus 5.5 | Baseline | Not run, deferred for budget | | | | | |
+| Opus 5.5 | Final | 111 (74%) | 112 of 150 | 93 | 0.78 | $0.0624 | $0.0843 |
+| GPT-6 Luna | Baseline | 41 (27%) | 41 of 150 | 36 | 0.30 | $0.0019 | $0.0069 |
+| GPT-6 Luna | Final | 106 (71%) | 107 of 150 | 88 | 0.76 | $0.0021 | $0.0029 |
+| GPT-6.1 Terra | Baseline | 42 (28%) | 43 of 150 | 34 | 0.34 | $0.0169 | $0.0604 |
+| GPT-6.1 Terra | Final | 108 (72%) | 109 of 150 | 92 | 0.77 | $0.0170 | $0.0237 |
+| GPT-6.1 Sol | Baseline | 44 (29%) | 44 of 150 | 36 | 0.32 | $0.0313 | $0.1068 |
+| GPT-6.1 Sol | Final | 113 (75%) | 114 of 150 | 96 | 0.79 | $0.0329 | $0.0437 |
+
+The final build gains 12 to 69 questions over the baseline for every model and set.
+Luna rises from 41 to 106 on unseen and Haiku from 41 to 95. The OpenAI baselines score
+lower than the Claude baselines of a similar price, and the final build closes that gap.
+With the follow-up form, an OpenAI repair reads the first draft's prompt from the cache,
+and a final run costs 1 to 28% more per question than its baseline.
+
+##### The default model
+
+The default is the cheapest model per correct answer on unseen whose score is within
+the noise of the best model's. Within the noise means that the paired bootstrap 95%
+interval of the difference between the best model and the candidate, over the 150
+questions with 10,000 resamples, contains zero. Sol scores best with 113, and Opus scores
+111. Luna's interval against Sol runs from 0.7 points below to 10.0 points above, and
+against Opus from 2.7 points below to 9.3 points above, so Luna passes. Its cost per
+correct answer is $0.0029, the lowest of the six. Haiku's interval against Sol runs from
+5.3 to 19.3 points, so Haiku fails. GPT-6 Luna is therefore the default model of the
+`openai` preset. Within the Claude models, the same rule picks Sonnet 5.5, which is
+within the noise of Opus while Haiku is not, so the `anthropic` preset keeps Sonnet.
+
+The tradeoff is plain on unseen. Sol answers 7 more of 150 than Luna at 15.7 times the
+cost per question, Opus 5 more at 29.7 times, Terra 2 more at 8.1 times, and Sonnet the
+same number at 13.7 times. The check sets favour the larger models more. On QALD Luna
+answers 47 of 107 against Opus's 60, and on db25 40 of 74 against Opus's 46, and both
+gaps are outside the noise, so a dataset like the tuning sets gains more from a larger
+model. The [paid record](../2026-11-02-ask-fair-matrix-paid.json) holds every run, the
+per-case results, the bootstrap intervals and the ledgers.
+
 ### Global answering
 
 Sonnet 5.5 answered 30 generated questions about the whole demo organisation graph four

@@ -1885,7 +1885,108 @@ server process under every configuration measured, such as 11 to 13 ms or 16 to 
 a `q2` instance, so their pooled medians move between comparisons. Item 575 looks
 for the cause. The history's fastest runs do not age, so a text whose costs change after
 writes keeps its earlier mode until the history forgets it, which item 577 covers.
-Item 576 measures concurrent clients, other hybrid processors and macOS.
+Item 576 measures other hybrid processors and macOS.
+
+### Request placement under concurrent load
+
+Item 583 measured the placement of item 449 under the mixed load of `scripts/bench.sh` on
+atlas, an Intel Core i5-13500 like forge. Sixteen `star-join` readers ran through `oha`
+and one writer committed new literals for 30 s on a fresh copy of the 1.05M store, with
+Sparkles alone on the host. With every request thread on the performance cores, Sparkles
+`b62d3722` answered a median of 2,005 reads and 241 writes a second over three rounds,
+against 2,354 and 360 with `--request-cpus all`, and forge's published run before item
+449 had 2,491 reads and 374 writes a second. A harness that read every server thread's
+`/proc/<pid>/task/*/schedstat` and the busy time of each CPU over the window found the
+cause. With the placement of item 449, the twelve logical CPUs of the performance cores
+were 95% busy and the eight efficiency cores 33%, and the request threads waited a
+median of 131 s in the run queues over the 30 s. With `--request-cpus all` the two kinds
+were 79% and 92% busy, and the request threads waited 30 s. A query pool of 20 threads
+with the placement and one of 18 without it changed neither rate, so the pool's size
+does not cause the loss. Running each update's work on every CPU while the reads stayed
+on the performance cores raised writes to 309.0 a second and left reads at 1,995, as
+[PERFORMANCE-EXPERIMENTS.md](../PERFORMANCE-EXPERIMENTS.md#server-and-request-handling)
+records.
+
+Fewer clients favour the performance cores. With two readers and the writer, the
+placement of item 449 answered 527.5 reads a second against 404.9 with
+`--request-cpus all`, and with four readers 1,024.7 against 964.0. With eight readers it
+answered 1,603.8 against 1,652.4. The write rates at two to eight readers take one of two
+values in each run under either placement, so three runs do not rank them. So request
+work now runs on the performance cores only while at most one request per physical
+performance core is in flight, six on atlas and forge, and on every CPU when more are.
+The count includes the request itself and every request whose response is still being
+sent. A thread places itself when it starts a request's work, on the receiving thread,
+on the blocking pool or in a streaming producer, and calls `sched_setaffinity` only when
+its placement differs from the one the load asks for, so a steady load makes no system
+calls. A new thread inherits the CPUs of the thread that creates it, so the runtime's
+workers and blocking threads move to every CPU when they start. The engine's block
+decoders, change log writer and vocabulary sync worker start with the first request that
+needs them, which on a fresh server runs alone on the performance cores, and an earlier
+build of this change left them there for the life of the process. They now call a start
+hook, `sparkles::threads::set_start_hook`, through which the server moves them to every
+CPU, as do the engine's other long-lived workers, the text index's checkpoint ticker and
+recovery workers, the vector catch-up worker, the workers of incremental views and the
+server's validation pool. A Tantivy writer starts its workers from the thread that opens
+or commits it, so the engine runs the hook on that thread first. The query pool keeps its
+size.
+
+Five alternating pairs of the `scripts/bench.sh` mixed load on atlas with `f167fc8f`
+answered a median of 2,358.9 reads a second with the new default against 2,365.2 with
+`--request-cpus all`, between 0.993 and 1.053 of them in each pair. Writes had medians of
+363.9 and 286.0 a second. The writer's commits took about 2.4 ms in some runs and 3.2 to
+3.9 ms in others under either placement, so the higher write median is not a gain of the
+placement. Over three rounds of the harness, sixteen readers answered 2,381.3 reads and
+366.0 writes a second against 2,367.4 and 361.2, and four readers 1,019.1 reads a second
+against 976.5. With one client, the BSBM BI harness of item 449 gave `q3` a median of
+18.59 ms against 27.78 ms with every CPU, and 18.64 ms with item 449's build, and the
+third `q3` instance took 22.2 to 23.5 ms in each process. The [run
+record](../benchmarks/writes/runs/2026-11-02-hybrid-mixed-atlas/README.md) gives every
+table. Request placement on hybrid processors other than the i5-13500, and threads that
+other code starts from a request thread on the performance cores, remain under item 576.
+
+### Changed-store reads and the write rows
+
+The changed-store `two-hop-count` loss came from the parallel block reads. Before this
+change, `Snapshot::par_blocks_in_ranges` gave up whenever the delta had a key in a range,
+and its callers then read the whole range in order with the delta merged in. On a store
+with 5,000 uncompacted commits, the runs of `foaf:knows` in both sorted orders were
+therefore read one block after another. On `atlas`, with other work on the host, this took
+the query's server time from about 3 ms on the loaded store to 7.1 to 10.7 ms. The reads
+now merge the delta keys of each changed block into a copy of the columns they need and keep their parallel pieces. A first
+version that called the reader once for each run between two delta keys spent most of its
+time allocating and scheduling those pieces and took 5.4 to 6.1 ms. The copy takes 4.0 to
+4.2 ms. A read whose ranges hold more than 65,536 delta keys keeps the ordered merge,
+because the copies are not charged to the query's memory budget.
+
+On forge, `two-hop-count` on the changed 1.05M store went from 8.16 to 6.21 ms through
+`curl`, against Fluree's recorded 7.8 ms, and on the changed 10.5M store from 35.8 to
+21.6 ms. `contains` and `regex-iri` on the changed stores became 14% to 15% faster at 1.05M and
+44% to 46% faster at 10.5M. A Namespace screen of the loaded store had a geometric mean
+of 1.019 for server time and 0.978 for client time, and its rerun left only
+`predicate-counts`, at 11 against 12 µs, at a ratio of 1.10. That query does not read
+index blocks in parallel, and on `atlas` `star-join` and `predicate-counts` kept their
+times, which the access log there records to 10 µs. Item 585 checks the flag on
+the benchmark host. The [atlas record](../benchmarks/writes/runs/2026-11-02-changed-reads-and-placement-atlas/README.md) has the server
+times, and the forge [run record](../benchmarks/writes/runs/2026-11-02-competitive-writes-forge/README.md)
+has every sample and answer fingerprint.
+
+The same runs refreshed the write rows against Oxigraph after items 501 and 502. The churn
+of 5,000 commits ran at 778 and 935 commits/s against Oxigraph's 809 and 744 at 1.05M, and
+at 681 and 684 at 10.5M against Oxigraph's recorded 715. The single-commit latency through
+`curl` was within 10% of Oxigraph in three of four runs at 1.05M and 1.41× in one, whose
+Sparkles samples all took 5.0 to 5.3 ms. Under 16 unpaced readers, Sparkles committed 246
+and 252 writes/s at 1.05M and 211 at 10.5M, against Oxigraph's 1,264 and 1,277 and its
+recorded 565, while serving 2,101 and 2,198 reads/s against 12 and 16. The default
+placement of request threads on the performance cores of a hybrid processor costs part
+of that write rate. On `atlas`, five alternating pairs of runs gave 195 to 253 writes/s
+with it and 279 to 367 without it, as the [atlas record](../benchmarks/writes/runs/2026-11-02-changed-reads-and-placement-atlas/README.md)
+shows. Item 583 then made the placement depend on load, as the next section describes.
+
+A [WatDiv rerun](../benchmarks/watdiv/runs/2026-11-02-l1-rerun-forge/README.md) of L1, L3
+and S7 in three rounds gave Sparkles the lower mean on L1-1 in every round, by 0.005 to 0.146
+ms, which is within the 0.2 ms that an instance's mean varies between rounds, and on all
+three templates in every round. The 11% `L1-1` loss of the full run did not recur. A Sparkles server
+spends about 0.29 ms on that instance.
 
 ### Rewrite gates
 
@@ -1967,7 +2068,7 @@ These phases belong to [ROADMAP](../ROADMAP.md) item 452, the benchmark gates an
 
 **Reasoning benchmark suite against RDFox, Nemo, VLog, GraphDB, ELK and Konclude.** Add LUBM-1000 and 8000 under OWL RL with UBA data, UOBM, Claros and Claros-LE, Reactome, ChEMBL, UniProt, DBpedia with its ontology, OWL2Bench at 5 to 200, ORE, SNOMED, GO, the RDFox incremental methodology including sameAs deletes, ChaseBench and a query-time reasoning comparison. None of UOBM, Claros, Reactome, ChEMBL, SNOMED or ORE appears in the docs or X06. Query-time reasoning has no peer comparison. It depends on item 1.
 
-**Remaining recorded competitive losses.** Profile and close WatDiv `L1-1` (Fluree 1.11×), the cold small scans at 1.05M where Fluree leads by 1.17–3.0× and DBpedia cold `outlink-classes-2` (QLever 1.25×). It depends on item 4.
+**Remaining recorded competitive losses.** Profile and close the cold small scans at 1.05M where Fluree leads by 1.17–3.0× and DBpedia cold `outlink-classes-2` (QLever 1.25×). It depends on item 4.
 
 **BSBM Explore multi-client throughput gap.** Find why Fluree's driver throughput is two to three times Sparkles' at 1, 4 and 16 clients, separating its answer differences from real per-mix cost. The cell is unranked because Fluree's q8, q11 and q12 answers differ, so the losses table omits a large concurrency signal. It depends on item 1.
 

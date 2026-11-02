@@ -151,6 +151,7 @@ describe('the form of the models kind', () => {
       'temperature',
       'structuredOutput',
       'requestTimeoutSecs',
+      'reasoningEffort',
       'pricing.inputPerMTok',
       'pricing.outputPerMTok',
       'pricing.cacheWritePerMTok',
@@ -360,9 +361,43 @@ describe('presets', () => {
             kind: 'openai',
             endpoint: 'https://api.openai.com/v1',
             apiKey: { secret: 'team-key' },
-            models: { 'gpt-5-mini': { structuredOutput: 'auto' } },
+            models: { 'gpt-6-luna': { structuredOutput: 'auto' } },
           },
         },
+      },
+    });
+    // from the preset, its own model gets the settings the comparison measured, and
+    // another model typed in the form gets none of them
+    const luna = newProviderPatch([], { ...f, preset: 'openai' });
+    expect(luna).toEqual({
+      patch: {
+        providers: {
+          oai: {
+            kind: 'openai',
+            endpoint: 'https://api.openai.com/v1',
+            apiKey: { secret: 'team-key' },
+            models: {
+              'gpt-6-luna': {
+                structuredOutput: 'auto',
+                contextTokens: 200000,
+                maxOutputTokens: 16384,
+                reasoningEffort: 'medium',
+              },
+            },
+          },
+        },
+      },
+    });
+    const other = newProviderPatch([], { ...f, preset: 'openai', model: 'gpt-6.1-sol' });
+    expect(other).toMatchObject({
+      patch: { providers: { oai: { models: { 'gpt-6.1-sol': { structuredOutput: 'auto' } } } } },
+    });
+    expect((other as { patch: Record<string, unknown> }).patch.providers).toEqual({
+      oai: {
+        kind: 'openai',
+        endpoint: 'https://api.openai.com/v1',
+        apiKey: { secret: 'team-key' },
+        models: { 'gpt-6.1-sol': { structuredOutput: 'auto' } },
       },
     });
     const local = presetForm('ollama');

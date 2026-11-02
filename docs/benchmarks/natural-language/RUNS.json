@@ -182,6 +182,60 @@
         }
       },
       "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-9ae1b1aa209edd2013eb823324b29d8d534f946e1d2fc71adae5ec56fa89d80a",
+      "path": "../2026-11-01-ask-hillclimb-paid.json",
+      "sha256": "9ae1b1aa209edd2013eb823324b29d8d534f946e1d2fc71adae5ec56fa89d80a",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": {
+          "effort": "medium",
+          "contextTokens": 200000,
+          "maxOutputTokens": 4096,
+          "requestTimeoutSecs": 120,
+          "askDeadlineSecs": 300,
+          "queryTimeoutSecs": 60,
+          "askTokenBudget": 100000,
+          "clarifications": "answer"
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": "A development laptop with 16 cores and 30 GB of memory that was running other work. Binaries were built on atlas and copied back.",
+          "measurement": "Ask accuracy hill-climb on DBpedia 2022.12.01: predicate-use grounding, popularity-ordered linking and two generic prompt rules, against the main-branch baseline, with Claude Haiku 5.5 and Sonnet 5.5",
+          "schema": 1
+        }
+      }
+    },
+    {
+      "run_id": "sha256-a33f0e5a38ff1cf83648b8585aea5dee395e9469534d535d8e7de6d3d732cc40",
+      "path": "../2026-11-02-ask-fair-matrix-paid.json",
+      "sha256": "a33f0e5a38ff1cf83648b8585aea5dee395e9469534d535d8e7de6d3d732cc40",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": {
+          "effort": "medium",
+          "contextTokens": 200000,
+          "maxOutputTokens": 4096,
+          "requestTimeoutSecs": 120,
+          "askDeadlineSecs": 300,
+          "queryTimeoutSecs": 60,
+          "askTokenBudget": 100000,
+          "clarifications": "answer"
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": "A development laptop with 16 cores and 30 GB of memory that was running other work. Binaries were built on atlas and copied back.",
+          "measurement": "Ask accuracy hill-climb on DBpedia 2022.12.01: predicate-use grounding, popularity-ordered linking, two generic prompt rules and the Ask repair options, against the main-branch baseline, with Claude Haiku 5.5, Sonnet 5.5 and Opus 5.5 and OpenAI GPT-6 Luna, GPT-6.1 Terra and GPT-6.1 Sol",
+          "schema": 1
+        }
+      }
     }
   ]
 }

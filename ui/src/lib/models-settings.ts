@@ -56,6 +56,8 @@ export type ProviderPreset = {
   secret: string | null;
   /** A model to start with. */
   model: string;
+  /** The options of that model's entry, the settings the Ask comparison measured. */
+  modelOptions: JsonObject;
 };
 
 export const PROVIDER_PRESETS = presets as readonly ProviderPreset[];
@@ -375,6 +377,8 @@ export function newProviderPatch(
     endpoint: string;
     secret: string;
     model?: string;
+    /** the preset the form started from, whose model options apply to its own model */
+    preset?: string;
   },
 ): { patch: JsonObject } | { error: string } {
   const name = input.name.trim();
@@ -402,6 +406,8 @@ export function newProviderPatch(
   const provider: JsonObject = { kind: input.kind, endpoint };
   if (secret) provider.apiKey = { secret };
   // an empty entry would vanish in the merge, so it states the default level
-  if (model) provider.models = { [model]: { structuredOutput: 'auto' } };
+  const preset = PROVIDER_PRESETS.find((p) => p.name === input.preset);
+  const options = preset && preset.model === model ? preset.modelOptions : {};
+  if (model) provider.models = { [model]: { structuredOutput: 'auto', ...options } };
   return { patch: { providers: { [name]: provider } } };
 }

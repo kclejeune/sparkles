@@ -1,0 +1,14 @@
+{
+ "sparkles": {
+  "seconds": 0.577853,
+  "max_rss_kib": 472184,
+  "index_bytes": 30015488,
+  "index_apparent_bytes": 29923150
+ },
+ "oxigraph": {
+  "seconds": 4.19757,
+  "max_rss_kib": 843280,
+  "index_bytes": 153890816,
+  "index_apparent_bytes": 153859977
+ }
+}

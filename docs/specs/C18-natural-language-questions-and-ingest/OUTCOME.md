@@ -1793,6 +1793,124 @@ includes $5.34 for a Sonnet attempt and $3.40 for Opus attempts that host failur
 interrupted, and the 22 answers that the first Opus attempt completed are part of its
 result. Two Opus answers count as failures because their queries exhausted memory.
 
+### Ask grounding from predicate use, item 263
+
+Ask grounding now asks the data which predicates the question's entities and classes
+use. For up to three linked entities it lists up to 60 predicates the entity uses as
+subject and 20 as object, and for the two classes that best match the question it lists
+up to 30 predicates of a sample of 200 instances. The lines group predicates by namespace
+with their counts and rank them by the question's words and then by use. Each query runs
+as the caller within five seconds and the MCP limits, and it searches the readable named
+graphs only when the caller can read one. Ask also links with the new `popularity`
+option of `link_entities`, which orders label matches by how many triples name each one
+as their object, counted up to 2000. Mention detection keeps a capitalized "The" inside a
+question and a number after a name. Two generic draft rules say that the context lists
+only part of the vocabulary and ask for the one predicate that fits each relation
+instead of a UNION, a `VALUES` list or a variable predicate over candidates. Nothing in
+the grounding or the prompt names a dataset, a vocabulary or an evaluation question.
+
+The changes were tuned on the 72 training questions of the QALD split and checked on its
+35 validation questions. They were then measured once on db25 and on a fresh set of 150
+questions from the QALD-9-plus training split, which no tuning step read. Each
+comparison runs the same questions with the same settings. The Haiku and fresh baselines
+use the lane's starting commit `2d43aa5a`, and the Sonnet and Opus QALD and db25
+baselines are the runs at `7b3b6df5` above, which predate prompt caching.
+
+| Set | Haiku 5.5 | Sonnet 5.5 | Opus 5.5 |
+|---|---|---|---|
+| QALD-9-plus training, 72 questions | 18 and 15 to 29, 30 and 28 | 23 and 23 to 34 | 26 to 39 |
+| QALD-9-plus validation, 35 questions | 8 and 7 to 14, 12 and 13 | 9 and 11 to 14 | 15 to 18 |
+| QALD-9-plus, all 107 | A mean of 24.0 to 42.0 | A mean of 33.0 to 48 | 41 to 57 |
+| db25, 74 questions | 21 to 31 | 32 to 41 | 33 to 42 |
+| Fresh, 150 questions | 37 to 77 | 64 to 86 | Not run |
+
+Each cell gives the strict projected score of the baseline runs and then of the runs
+with the changes. Two of the three Haiku QALD runs with the changes used commit
+`30b0a968`, which builds the same prompts on this database as the final commit
+`570d7062`, as the dry runs show. The paired gain on the fresh set is 26.7 points with a
+95% half-width of 7.6 for Haiku, which gained 42 questions and lost 2, and 14.7 points
+with a half-width of 7.5 for Sonnet, which gained 29 and lost 7. On db25 the gain is 13.5
+points for Haiku against the same starting commit and 12.2 points for Sonnet and for
+Opus, each with a half-width of about 10. Every gain is above the noise floor of about 6
+points.
+
+The gain is largest on the fresh set, so it does not come from tuning to the QALD or
+db25 questions. Predicate-use grounding alone took Haiku from 24.0 to 35.0 on QALD over
+two runs each, and the two prompt rules added the rest. A dry run with the fake provider
+reproduces the real prompts, so grounding recall can be measured without a model. The
+share of prompts that hold every gold term rose from 20 to 39 of the 72 training
+questions and from 8 to 14 of the 35 validation questions. On the fresh set, Haiku's
+wrong answers whose prompt lacked only a schema term fell from 45 to 12. The prompt
+rules cut Haiku's refusals on QALD from about 48 to 22 per run and its UNION or `VALUES`
+queries from about 12 to 2. Sonnet's UNION or `VALUES` queries fall from about 40 to 3,
+and its equal-width score rises from about 12 to 29. Popularity ordering now links
+"Mars", "Texas" and "The Scream" to the resources the gold names.
+
+A first-draft prompt grows from about 29,800 to 32,400 characters, about 8%, and each Ask
+runs two to three more bounded queries per linked entity and one per matched class. A run
+costs 5 to 8% more on the fresh set, $0.28 against $0.26 for Haiku and $4.28 against
+$4.06 for Sonnet, and the median Ask time stays within about a second of the baseline
+on a loaded host. With the changes, a gold resource missing from the prompt causes about
+half of the remaining wrong answers, as when "President Obama" does not reach
+`dbr:Barack_Obama`, and most of the rest have every gold term in the prompt and a wrong
+query shape.
+
+The secondary score `rdf-term-set-projected-guarded-lenient-v3` applies the guard and
+the gold and scorer fixes that the baseline checks demonstrated. It excludes gold that
+uses `SELECT *`, gold with a column unbound in every row, gold of empty strings alone
+and the one named erratum of `gold-errata-v1`, and it drops rows that hold only empty
+strings. It compares numbers by value, matches an unambiguous label to the gold IRI it
+names, fails an answer with more than three extra columns and reports apart any pass
+that relies on a predicate column or on rows the projection drops. The strict score
+stays the score of record, and the record lists every case that the secondary score
+changes. The comma-separated literal of db25-65 stays wrong under both scores.
+
+High effort for Sonnet was left for a later run. Four repair turns were then built as
+Ask options and measured three times each with Haiku on 51 validation questions, the 35
+of the split and the 16 training questions that no tuning step had inspected case by
+case. The exploration drafts once more after a draft without a query or with an empty
+result, with further link candidates and the predicates the entities use, and it raised
+the mean from 25.0 to 28.0, so it is on by default. The shape check scored 25.0 and
+voting over three drafts 26.0 at 63% more cost per question, both within the baseline's
+spread of 2, and type hints scored 22.7, so all three are off by default. Each option is
+set from `assistant.json`, the ask request or the command line, and a sample value or a
+result row reaches a repair only when the dataset lets its providers receive rows. The
+[results](../../benchmarks/natural-language/RESULTS.md#ask-repair-options) give every
+run. Haiku at `2d43aa5a` scored 24.0 on QALD over two runs against 28.0 over three at
+`7b3b6df5`, and 21 on db25 against 19. The difference is within the noise of so few
+runs, and 594 tracks whether the grounding reordered for prompt caching costs
+accuracy. 593 tracks linking through redirects and aliases. The campaign spent
+$26.74 of a $50 cap in 3,696 requests, with nothing unresolved, and a provider outage
+stopped one Haiku fresh baseline after 42 questions before it was rerun. The eight final
+phases took about three hours, one case at a time. `sparkles ask --questions` now asks a
+whole phase with one store and one model configuration, up to `--jobs` questions at
+once, and the Anthropic runner uses it with exact per-case cost holds. Caches then stay
+warm across a phase's questions, which lowers latency but leaves the answers unchanged.
+The
+[results](../../benchmarks/natural-language/RESULTS.md#ask-grounding-from-predicate-use)
+give the secondary scores and the [paid
+record](../../benchmarks/2026-11-01-ask-hillclimb-paid.json) gives the per-case results,
+costs and source digests.
+
+The final build was then compared with the baseline across six models on QALD, db25 and
+150 held-out QALD-9-plus training questions. OpenAI's prompt cache writes a prefix only
+where the latest user message ends, so OpenAI repairs at first never read the cache. An
+`openai` provider with `promptCaching.enabled` now sends a repair as the first draft's
+message followed by a second user message, and the repair reads the cached question. A
+first version that sent the repair as a developer message was replaced, because a
+document chunk or a diagnosis that carries data would have gained developer authority.
+On the held-out set Sol answers 113, Opus 111, Terra 108, Luna and Sonnet 106 and Haiku
+95, against 41 to 72 for the baseline build. Luna is the cheapest model per correct
+answer whose paired bootstrap interval against the best model contains zero, so it is
+the `openai` preset's model, and Sonnet keeps that place in the `anthropic` preset. The
+larger models lead by more on QALD and db25. Opus with the baseline build was not run on
+the held-out set for budget, and 599 tracks it. The
+[results](../../benchmarks/natural-language/RESULTS.md#ask-across-providers) give every
+set and the [paid record](../../benchmarks/2026-11-02-ask-fair-matrix-paid.json) every
+run. The Anthropic spend of $51.72 and the OpenAI spend of $33.95 stand in the ledgers.
+OpenAI's reports match its ledger, and the Anthropic ledger awaits reconciliation
+against the Console's usage export.
+
 ### Roadmap follow-ups
 
 #### Agent platform workstream

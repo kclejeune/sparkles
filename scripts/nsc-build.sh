@@ -38,6 +38,9 @@ fi
 # Each archived source tree uses its own default target. Boxington normalizes that
 # workspace/target pair while sharing immutable compiler results across revisions.
 unset CARGO_TARGET_DIR
+# A timed binary is built without learned incremental reuse, which can compile one side
+# of an A/B pair differently and make it measurably slower.
+export MBX_LEARNED_INCREMENTAL=false
 exec mbx sparkles-task -- bash -euo pipefail -s -- "$output" "$@" << 'BUILD'
 output=$1
 shift

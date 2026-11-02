@@ -215,6 +215,34 @@ pub struct PromptCaching {
     pub ttl: Option<CacheTtl>,
 }
 
+/// How much a reasoning model thinks before it answers. The provider decides which
+/// values a model accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::None => "none",
+            Effort::Minimal => "minimal",
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
+}
+
 /// Token caps per day.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -234,6 +262,10 @@ pub struct ModelOptions {
     pub structured_output: Option<Level>,
     pub pricing: Option<Pricing>,
     pub request_timeout_secs: Option<f64>,
+    /// OpenAI and Anthropic: the reasoning effort the request asks for. An openai model
+    /// with an effort is a reasoning model, so its requests limit the output with
+    /// `max_completion_tokens` and send a temperature only when one is set.
+    pub reasoning_effort: Option<Effort>,
     /// Ollama: the context option (`num_ctx`)
     pub num_ctx: Option<u64>,
     /// local (spec F12): the Hugging Face repository of the model's snapshot
@@ -268,6 +300,7 @@ impl ModelOptions {
             structured_output: self.structured_output.or(base.structured_output),
             pricing: self.pricing.or(base.pricing),
             request_timeout_secs: self.request_timeout_secs.or(base.request_timeout_secs),
+            reasoning_effort: self.reasoning_effort.or(base.reasoning_effort),
             num_ctx: self.num_ctx.or(base.num_ctx),
             repo: self.repo.clone().or_else(|| base.repo.clone()),
             revision: self.revision.clone().or_else(|| base.revision.clone()),
@@ -342,6 +375,7 @@ pub struct Resolved {
     pub structured_output: Level,
     pub pricing: Option<Pricing>,
     pub request_timeout_secs: f64,
+    pub reasoning_effort: Option<Effort>,
     pub num_ctx: Option<u64>,
 }
 
@@ -357,10 +391,11 @@ impl ProviderConfig {
         Resolved {
             context_tokens: o.context_tokens.unwrap_or(DEFAULT_CONTEXT_TOKENS),
             max_output_tokens: o.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
-            // drafts run deterministic; current Claude models refuse the parameter, so
-            // the anthropic kind sends it only when the configuration sets it
+            // drafts run deterministic; current Claude models and OpenAI reasoning
+            // models refuse the parameter, so they send it only when it is set
             temperature: match self.kind {
                 Kind::Anthropic => o.temperature,
+                Kind::Openai if o.reasoning_effort.is_some() => o.temperature,
                 _ => Some(o.temperature.unwrap_or(0.0)),
             },
             structured_output: o.structured_output.unwrap_or(Level::Auto),
@@ -368,6 +403,7 @@ impl ProviderConfig {
             request_timeout_secs: o
                 .request_timeout_secs
                 .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+            reasoning_effort: o.reasoning_effort,
             num_ctx: o.num_ctx,
         }
     }
@@ -382,6 +418,15 @@ impl ProviderConfig {
         }
         let c = self.prompt_caching.unwrap_or_default();
         c.enabled.unwrap_or(true).then(|| c.ttl.unwrap_or_default())
+    }
+
+    /// Whether an `openai` provider receives a prompt's follow-up form, in which a repair
+    /// repeats the first draft's user message unchanged and adds its own text as a second
+    /// user message. OpenAI caches a prefix only where the latest user message ends, so
+    /// the repair can then read the prefix that the first draft wrote. It is off unless
+    /// `promptCaching.enabled` is true, since it changes the prompt's shape.
+    pub fn follows_up(&self) -> bool {
+        self.kind == Kind::Openai && self.prompt_caching.and_then(|c| c.enabled) == Some(true)
     }
 
     /// Whether certificate checks are off for this provider.
@@ -510,6 +555,7 @@ pub const PROVIDER_MEMBERS: &[&str] = &[
     "structuredOutput",
     "pricing",
     "requestTimeoutSecs",
+    "reasoningEffort",
     "numCtx",
     "repo",
     "revision",
@@ -831,10 +877,16 @@ impl ModelsConfig {
                     "provider {name}: version applies to the anthropic kind only"
                 );
             }
-            if p.prompt_caching.is_some() && p.kind != Kind::Anthropic {
+            if p.prompt_caching.is_some_and(|c| c.ttl.is_some()) && p.kind != Kind::Anthropic {
+                fail!(
+                    ["providers", name, "promptCaching", "ttl"],
+                    "provider {name}: promptCaching.ttl applies to the anthropic kind only"
+                );
+            }
+            if p.prompt_caching.is_some() && !matches!(p.kind, Kind::Anthropic | Kind::Openai) {
                 fail!(
                     ["providers", name, "promptCaching"],
-                    "provider {name}: promptCaching applies to the anthropic kind only"
+                    "provider {name}: promptCaching applies to the anthropic and openai kinds only"
                 );
             }
             if p.concurrency == Some(0) {
@@ -866,6 +918,13 @@ impl ModelsConfig {
                     fail!(
                         at(member),
                         "provider {name}, model {m}: repo, revision, path, dtype, threads, idleUnloadSecs, dimensions, maxTokens, queryPrefix and documentPrefix apply to the local kind only"
+                    );
+                }
+                if o.reasoning_effort.is_some() && !matches!(p.kind, Kind::Openai | Kind::Anthropic)
+                {
+                    fail!(
+                        at("reasoningEffort"),
+                        "provider {name}, model {m}: reasoningEffort applies to the openai and anthropic kinds only"
                     );
                 }
                 if o.num_ctx.is_some() && p.kind != Kind::Ollama {
@@ -1188,6 +1247,79 @@ mod tests {
         // the bare form parses too
         let v: serde_json::Value = serde_json::from_str(EXAMPLE).unwrap();
         assert_eq!(ModelsConfig::parse(&v["models"].to_string()).unwrap(), c);
+    }
+
+    /// A reasoning effort marks an openai model as a reasoning model, which sends a
+    /// temperature only when one is set, and the kinds without one refuse it.
+    #[test]
+    fn reasoning_effort_applies_to_openai_and_anthropic() {
+        let c = ModelsConfig::parse(
+            &serde_json::json!({ "providers": { "o": {
+                "kind": "openai", "endpoint": "https://api.openai.com/v1",
+                "models": { "r": { "reasoningEffort": "medium" }, "t": {},
+                            "rt": { "reasoningEffort": "low", "temperature": 1.0 } }
+            } } })
+            .to_string(),
+        )
+        .unwrap();
+        let o = &c.providers["o"];
+        assert_eq!(o.model("r").reasoning_effort, Some(Effort::Medium));
+        // a provider's effort is the default of its models
+        let d = ModelsConfig::parse(
+            r#"{"providers":{"o":{"kind":"openai","endpoint":"https://x","reasoningEffort":"high","models":{"m":{}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            d.providers["o"].model("m").reasoning_effort,
+            Some(Effort::High)
+        );
+        assert_eq!(o.model("r").temperature, None);
+        assert_eq!(o.model("rt").temperature, Some(1.0));
+        assert_eq!(o.model("t").temperature, Some(0.0));
+        for kind in ["ollama", "local"] {
+            let v = serde_json::json!({ "providers": { "p": {
+                "kind": kind, "endpoint": if kind == "local" { "" } else { "http://127.0.0.1:1" },
+                "reasoningEffort": "high"
+            } } });
+            let e = ModelsConfig::parse(&v.to_string()).unwrap_err();
+            assert!(
+                format!("{e:#}").contains("applies to the openai and anthropic kinds only"),
+                "{kind}: {e:#}"
+            );
+        }
+        assert!(
+            ModelsConfig::parse(
+                r#"{"providers":{"p":{"kind":"openai","endpoint":"https://x","reasoningEffort":"loud"}}}"#
+            )
+            .is_err()
+        );
+    }
+
+    /// An `openai` provider takes `promptCaching.enabled`, which sends follow-up prompts,
+    /// and refuses a TTL. The ollama kind refuses `promptCaching`.
+    #[test]
+    fn openai_prompt_caching_takes_enabled_only() {
+        let parse = |kind: &str, caching: serde_json::Value| {
+            ModelsConfig::parse(
+                &serde_json::json!({ "providers": { "p": {
+                    "kind": kind, "endpoint": "http://127.0.0.1:1", "promptCaching": caching
+                } } })
+                .to_string(),
+            )
+        };
+        let on = parse("openai", serde_json::json!({ "enabled": true })).unwrap();
+        assert!(on.providers["p"].follows_up());
+        assert_eq!(on.providers["p"].cache_ttl(), None);
+        let off = parse("openai", serde_json::json!({ "enabled": false })).unwrap();
+        assert!(!off.providers["p"].follows_up());
+        let ttl = parse("openai", serde_json::json!({ "ttl": "1h" })).unwrap_err();
+        assert!(
+            format!("{ttl:#}").contains("promptCaching.ttl applies to the anthropic kind only")
+        );
+        let ollama = parse("ollama", serde_json::json!({ "enabled": true })).unwrap_err();
+        assert!(format!("{ollama:#}").contains("anthropic and openai kinds only"));
+        let anthropic = parse("anthropic", serde_json::json!({ "ttl": "1h" })).unwrap();
+        assert!(!anthropic.providers["p"].follows_up());
     }
 
     #[test]

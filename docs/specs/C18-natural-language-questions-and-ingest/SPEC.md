@@ -3922,6 +3922,12 @@ Ask consumes recognized candidate evidence for full choice identities and conser
 ordering of explicitly named kinds. Every ambiguous mention still requires a
 clarification, with general contextual resolution retained under item 263.
 
+Ask grounding lists the predicates that a question's linked entities and best-matching
+classes use in the data, links with popularity ordering and asks the model for one
+predicate per relation. On 150 unseen QALD-9-plus questions this raises Haiku 5.5 from 37
+to 77 and Sonnet 5.5 from 64 to 86 under the strict score, as the
+[delivery record](OUTCOME.md#ask-grounding-from-predicate-use-item-263) gives.
+
 Bounded debug stage diagnostics distinguish local grounding, tool calls and nested
 embedding work with bounded process-generated request correlation and no change to
 usage accounting. Item 318 remains open for

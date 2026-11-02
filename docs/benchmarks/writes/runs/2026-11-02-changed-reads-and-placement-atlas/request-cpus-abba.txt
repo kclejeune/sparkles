@@ -1,0 +1,6 @@
+0.12 3.04 9.92 1/620 1005526
+[--request-cpus auto] {'read_qps': 2290.9, 'read_p50_ms': 6.62, 'read_p99_ms': 11.65, 'read_errors': 0, 'writes_per_s': 213.6, 'write_p50_ms': 4.509, 'write_p99_ms': 9.313, 'write_errors': 0}
+[--request-cpus all] {'read_qps': 2659.6, 'read_p50_ms': 5.74, 'read_p99_ms': 10.01, 'read_errors': 0, 'writes_per_s': 373.6, 'write_p50_ms': 2.351, 'write_p99_ms': 5.879, 'write_errors': 0}
+[--request-cpus all] {'read_qps': 2342.1, 'read_p50_ms': 6.63, 'read_p99_ms': 11.12, 'read_errors': 0, 'writes_per_s': 355.5, 'write_p50_ms': 2.439, 'write_p99_ms': 6.212, 'write_errors': 0}
+[--request-cpus auto] {'read_qps': 2029.8, 'read_p50_ms': 7.53, 'read_p99_ms': 13.02, 'read_errors': 0, 'writes_per_s': 241.2, 'write_p50_ms': 3.918, 'write_p99_ms': 8.414, 'write_errors': 0}
+MIXDONE

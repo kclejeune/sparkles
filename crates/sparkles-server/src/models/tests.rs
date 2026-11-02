@@ -86,6 +86,81 @@ fn each_kind_gets_the_schema_in_its_member() {
     }
 }
 
+/// A prompt's follow-up form reaches an `openai` provider with `promptCaching.enabled` as
+/// two user messages, the earlier call's message first and unchanged. Without it, and for
+/// the anthropic kind, the provider gets the prompt's one user message.
+#[test]
+fn the_follow_up_form_reaches_only_an_openai_provider_that_asks_for_it() {
+    let prompt = Prompt {
+        system: vec![Part::cached("system text")],
+        user: vec![Part::cached("grounding"), Part::text("repair and format")],
+        follow: Some((
+            vec![Part::cached("grounding"), Part::text("format")],
+            vec![Part::text("repair and format")],
+        )),
+    };
+    for (kind, caching, want) in [
+        (
+            "openai",
+            json!({ "enabled": true }),
+            vec![
+                "grounding".to_string() + "format",
+                "repair and format".into(),
+            ],
+        ),
+        (
+            "openai",
+            json!({ "enabled": false }),
+            vec!["groundingrepair and format".to_string()],
+        ),
+        (
+            "anthropic",
+            json!({ "enabled": true }),
+            vec!["groundingrepair and format".to_string()],
+        ),
+    ] {
+        let k = if kind == "openai" {
+            Kind::Openai
+        } else {
+            Kind::Anthropic
+        };
+        let mock = MockModel::start(move |_, _| (200, mock::answer(k, r#"{"query":"ASK {}"}"#)));
+        let m = models(
+            json!({ "p": { "kind": kind, "endpoint": mock.url(), "promptCaching": caching } }),
+            &[],
+        );
+        m.call_prompt(
+            Some(Role::Repair),
+            &Pair::new("p", "m1"),
+            &prompt,
+            &draft_schema(),
+            Instant::now() + Duration::from_secs(10),
+            None,
+        )
+        .unwrap();
+        let body = &mock.requests()[0].body;
+        let users: Vec<String> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .map(|m| match &m["content"] {
+                Value::String(s) => s.clone(),
+                Value::Array(b) => b.iter().map(|x| x["text"].as_str().unwrap()).collect(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(users, want, "{kind} {caching}");
+        assert!(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["role"] != "developer")
+        );
+    }
+}
+
 /// An `openai` endpoint that refuses `response_format` and answers plain text: the test
 /// call reports the plain-text level, and the draft is taken from its fenced block (A26).
 #[test]
@@ -339,6 +414,62 @@ fn daily_budget_and_cost() {
     assert_eq!(f.error.code(), "budget-exceeded");
     assert_eq!(mock.requests().len(), 2, "no request over the cap");
     assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 30);
+}
+
+/// A view with other secrets shares the provider's daily budget and concurrency slots,
+/// so a request through either counts against the same limits.
+#[test]
+fn a_secret_view_shares_provider_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    std::fs::write(&a, "key-a").unwrap();
+    std::fs::write(&b, "key-b").unwrap();
+    let mock = MockModel::start(|r, _| {
+        if r.header("authorization") == Some("Bearer key-b") {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        (200, mock::openai(r#"{"query":"ASK {}"}"#))
+    });
+    let fa = format!("file:{}", a.display());
+    let m = models(
+        json!({ "o": {
+            "kind": "openai", "endpoint": mock.url(), "apiKey": {"secret": "k"},
+            "concurrency": 1, "budget": {"tokensPerDay": 60}
+        } }),
+        &[("k", fa.as_str())],
+    );
+    let view = m.with_secrets(
+        [(
+            "k".to_string(),
+            format!("file:{}", b.display()).parse().unwrap(),
+        )]
+        .into(),
+    );
+    // the view's slow request holds the one slot, so a request through the base
+    // waits for it instead of running beside it
+    std::thread::scope(|s| {
+        let slow = s.spawn(|| call(&view, "o"));
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        assert!(call(&m, "o").is_ok());
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(slow.join().unwrap().is_ok());
+    });
+    // each of the two answers counts 15 tokens in the one shared count
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 30);
+    assert_eq!(view.describe()["providers"][0]["budget"]["usedToday"], 30);
+    let keys: Vec<_> = mock
+        .requests()
+        .iter()
+        .filter_map(|r| r.header("authorization").map(str::to_string))
+        .collect();
+    assert!(
+        keys.contains(&"Bearer key-a".to_string()) && keys.contains(&"Bearer key-b".to_string())
+    );
+    // the budget both spent stops further requests through either
+    let more = (0..10).take_while(|_| call(&view, "o").is_ok()).count();
+    assert!(more < 10);
+    assert_eq!(call(&m, "o").unwrap_err().error.code(), "budget-exceeded");
 }
 
 /// An Anthropic answer that reports cache writes and reads is charged each class at its

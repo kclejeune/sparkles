@@ -167,11 +167,7 @@ async fn a12_schema_only_streams_without_a_summary() {
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["status"]["ask"], true);
     assert_eq!(v["status"]["summary"], false);
-    let ev = ask_sse(
-        &app,
-        json!({ "question": "How many teams does Acme have?" }),
-    )
-    .await;
+    let ev = ask_sse(&app, json!({ "question": "Which teams does Acme have?" })).await;
     assert_eq!(
         names(&ev),
         ["ground", "draft", "check", "run", "result", "usage"],
@@ -579,4 +575,45 @@ async fn a28_reviewed_only() {
     )
     .await;
     assert_eq!(rows(&reviewed), 1, "{reviewed:#}");
+}
+
+/// The dataset's `repairs` and a request's own repair fields reach the pipeline, the
+/// request's over the dataset's.
+#[tokio::test(flavor = "multi_thread")]
+async fn repair_options_come_from_the_settings_and_the_request() {
+    let m = scripted(vec![draft(EASY)]);
+    let (_, app) = app(
+        [&m.url(), &m.url(), &m.url()],
+        json!({ "draft": [pair("cheap")] }),
+    );
+    let (s, v) = put_settings(&app, json!({ "enabled": true, "repairs": { "drafts": 9 } })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let (s, v) = put_settings(
+        &app,
+        json!({ "enabled": true, "repairs": { "drafts": 2, "shapeCheck": true, "explore": false } }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let ev = ask_sse(&app, json!({ "question": "How many teams are there?" })).await;
+    assert!(names(&ev).contains(&"vote"), "{ev:?}");
+    let shape = |ev: &[(String, Value)]| {
+        ev.iter()
+            .any(|(n, v)| n == "diagnosis" && v["kind"] == "shape")
+    };
+    assert!(shape(&ev), "{ev:?}");
+    let ev = ask_sse(
+        &app,
+        json!({ "question": "How many teams are there?", "drafts": 1, "shapeCheck": false }),
+    )
+    .await;
+    assert!(!names(&ev).contains(&"vote"), "{ev:?}");
+    assert!(!shape(&ev), "{ev:?}");
+    let (s, b) = ask_json(&app, json!({ "question": "Which teams?", "drafts": 0 })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    let (s, b) = ask_json(
+        &app,
+        json!({ "question": "Which teams?", "typeHints": true, "explore": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
 }

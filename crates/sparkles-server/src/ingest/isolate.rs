@@ -1240,8 +1240,13 @@ mod tests {
         }
     }
 
+    /// The address-space limit of the children these tests start. The debug binary's
+    /// own mappings and the child's threads need about 300 MiB before it reads its
+    /// input, and grow with the binary, so the limit keeps a wide margin above them.
+    const TEST_AS: u64 = 1 << 30;
+
     fn base_args() -> Vec<String> {
-        let mut a = limit_args(300 << 20, Duration::from_secs(5), true);
+        let mut a = limit_args(TEST_AS, Duration::from_secs(5), true);
         a.extend([
             "max_input=10".into(),
             "millis=5000".into(),
@@ -1258,7 +1263,7 @@ mod tests {
         args.push("job=limits".into());
         let out = child_reply(&args, child_env([]));
         let f = refusal_of(&out);
-        assert_eq!(f.message, format!("as={} fsize=0 core=0", 300u64 << 20));
+        assert_eq!(f.message, format!("as={TEST_AS} fsize=0 core=0"));
         // a child without limits refuses to start
         let out = child_reply(
             &[

@@ -1,4 +1,4 @@
-"""The run file of scripts/eval-ask-anthropic."""
+"""The run file of scripts/eval-ask-paid."""
 
 import copy
 import importlib.machinery
@@ -14,7 +14,7 @@ sys.path.insert(0, str(HERE / "eval_support"))
 from evaluator import Invalid
 
 loader = importlib.machinery.SourceFileLoader(
-    "run_under_test", str(HERE.parents[1] / "scripts/eval-ask-anthropic")
+    "run_under_test", str(HERE.parents[1] / "scripts/eval-ask-paid")
 )
 spec = importlib.util.spec_from_loader(loader.name, loader)
 runner = importlib.util.module_from_spec(spec)

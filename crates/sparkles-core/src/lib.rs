@@ -42,6 +42,7 @@ pub mod syntaxes;
 pub mod tabular;
 pub mod task;
 pub mod text;
+pub mod threads;
 pub mod trix;
 pub mod validation;
 pub mod vector;

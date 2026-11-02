@@ -183,6 +183,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/ontology/{ds}/entities", get(ontology::entities))
         .route("/$/ontology/{ds}/entity", get(ontology::entity))
         .route("/$/ontology/{ds}/check", post(ontology::check))
+        .route("/$/ontology/{ds}/classify", post(ontology::classify))
         .route("/$/ontology/{ds}/diff", get(ontology::diff))
         .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/graph/{ds}/facets", post(graph::facets))
@@ -1027,7 +1028,8 @@ pub(crate) fn unavailable_error(name: &str, u: &crate::state::Unavailable) -> Ap
 
 /// Run `f` on a blocking thread, inside the request's span (so engine events carry the
 /// request id and engine spans are its children). The thread holds the request's
-/// concurrency permits until `f` returns, even when the client is gone.
+/// concurrency permits until `f` returns, even when the client is gone, and runs on the
+/// CPUs that request work goes to (see `cpus`).
 pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> ApiResult<T> + Send + 'static,
 ) -> ApiResult<T> {
@@ -1043,6 +1045,7 @@ pub(crate) async fn blocking<T: Send + 'static>(
         if let Some(gate) = probe.blocking {
             gate.wait();
         }
+        crate::cpus::place_request();
         span.in_scope(f)
     })
     .await
@@ -4170,6 +4173,8 @@ async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<
                 "profiles": [1],
                 "propose": "/{ds}/claims",
                 "resolve": "/{ds}/claims/resolve",
+                "review": "/{ds}/claims/review",
+                "withdraw": "/{ds}/claims/withdraw",
             },
         },
     });

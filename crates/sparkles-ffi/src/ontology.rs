@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 #[uniffi::export]
 impl FfiDataset {
-    /// Run ontology operation `op` (`summary`, `axioms`, `check`, `edit`, `removeEntity`
-    /// or `diff`) with the JSON arguments `args`, under the operation's cancellation and
-    /// deadline. Edits and entity removals need a writable dataset and commit on their own.
+    /// Run ontology operation `op` (`summary`, `axioms`, `check`, `edit`, `removeEntity`,
+    /// `diff` or `classify`) with the JSON arguments `args`, under the operation's
+    /// cancellation and deadline. Edits, entity removals and classifications that name a
+    /// target graph need a writable dataset and commit on their own.
     pub fn ontology_call(
         &self,
         op: String,
@@ -17,11 +18,12 @@ impl FfiDataset {
         operation: Arc<FfiOperation>,
     ) -> FfiResult<Vec<u8>> {
         operation.control.check()?;
-        let write = matches!(op.as_str(), "edit" | "removeEntity");
+        let args: serde_json::Value = decode(&args)?;
+        let write = matches!(op.as_str(), "edit" | "removeEntity")
+            || (op == "classify" && args.get("target").is_some_and(|t| !t.is_null()));
         if write {
             self.inner.check_writable()?;
         }
-        let args: serde_json::Value = decode(&args)?;
         let ctl = &operation.control;
         let mut opts = sparkles::sparql::QueryOptions {
             cancel: Some(ctl.cancel.flag()),

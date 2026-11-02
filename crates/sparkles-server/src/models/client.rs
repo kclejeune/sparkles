@@ -89,6 +89,8 @@ pub struct ChatRequest {
     pub max_output_tokens: u32,
     /// `None`: not sent
     pub temperature: Option<f64>,
+    /// `None`: not sent, and an openai request limits its output with `max_tokens`
+    pub reasoning_effort: Option<super::config::Effort>,
     pub num_ctx: Option<u64>,
     pub timeout: Duration,
 }
@@ -290,11 +292,16 @@ pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
                     .iter()
                     .map(|m| json!({"role": m.role, "content": m.text()})),
             );
-            let mut body = json!({
-                "model": req.model,
-                "messages": messages,
-                "max_tokens": req.max_output_tokens,
-            });
+            let mut body = json!({ "model": req.model, "messages": messages });
+            // a reasoning model counts its reasoning in max_completion_tokens and
+            // refuses max_tokens
+            match req.reasoning_effort {
+                Some(e) => {
+                    body["max_completion_tokens"] = json!(req.max_output_tokens);
+                    body["reasoning_effort"] = json!(e.as_str());
+                }
+                None => body["max_tokens"] = json!(req.max_output_tokens),
+            }
             if let Some(t) = req.temperature {
                 body["temperature"] = json!(t);
             }
@@ -374,6 +381,9 @@ pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
                 }
                 _ => {}
             }
+            if let Some(e) = req.reasoning_effort {
+                body["output_config"]["effort"] = json!(e.as_str());
+            }
             (format!("{base}/v1/messages"), body)
         }
         // `Models::call` refuses local providers before building a request
@@ -382,7 +392,10 @@ pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
 }
 
 /// The usage a response body reports, and whether it reported every member a
-/// settlement needs. An Anthropic answer reports its cache writes apart from its
+/// settlement needs. An OpenAI answer counts its cache reads (`cached_tokens`) and
+/// writes (`cache_write_tokens`) inside `prompt_tokens`, so they are taken out of the
+/// uncached input, and its writes, which keep a prefix for 30 minutes at 1.25 times
+/// the input price, are counted in the shorter-TTL class. An Anthropic answer reports its cache writes apart from its
 /// uncached input, split by TTL. A write the answer does not split is taken at `ttl`,
 /// the TTL of every breakpoint of the request, and a split that does not add up, or a
 /// write without a known TTL, is taken at the dearer 1-hour rate.
@@ -402,6 +415,29 @@ fn read_usage(kind: Kind, v: &Value, ttl: Option<CacheTtl>) -> (Usage, bool) {
         output: o.as_u64().unwrap_or(0),
         ..Default::default()
     };
+    if kind == Kind::Openai {
+        let d = &v["usage"]["prompt_tokens_details"];
+        // a member that is present but not a count, details that are not an object,
+        // and counts that pass the prompt leave the usage unknown
+        let count = |k: &str| match d.get(k) {
+            None | Some(Value::Null) => Some(0),
+            Some(x) => x.as_u64(),
+        };
+        let split = if d.is_null() || d.is_object() {
+            count("cached_tokens").zip(count("cache_write_tokens"))
+        } else {
+            None
+        };
+        let rest = split
+            .and_then(|(read, written)| read.checked_add(written))
+            .and_then(|cached| u.input.checked_sub(cached));
+        match (split, rest) {
+            (Some((read, written)), Some(rest)) => {
+                (u.input, u.cache_read, u.cache_write_5m) = (rest, read, written);
+            }
+            _ => complete = false,
+        }
+    }
     if kind == Kind::Anthropic {
         let r = &v["usage"];
         // a cache member that is present, even as null, but not a count, a split that is
@@ -1010,6 +1046,7 @@ mod tests {
             level,
             max_output_tokens: 100,
             temperature: Some(0.0),
+            reasoning_effort: None,
             num_ctx: None,
             timeout: Duration::from_secs(1),
         }
@@ -1047,6 +1084,57 @@ mod tests {
             headers(&provider(Kind::Anthropic), Some("k"))[1].0,
             "anthropic-version"
         );
+    }
+
+    /// A reasoning effort reaches each kind in its own member, and an openai request
+    /// with one limits its output with max_completion_tokens.
+    #[test]
+    fn reasoning_effort_by_kind() {
+        let mut r = req(Level::JsonSchema);
+        r.reasoning_effort = Some(super::super::config::Effort::Medium);
+        let (_, b) = build(&provider(Kind::Openai), &r);
+        assert_eq!(b["reasoning_effort"], "medium");
+        assert_eq!(b["max_completion_tokens"], 100);
+        assert!(b.get("max_tokens").is_none());
+        let (_, b) = build(&provider(Kind::Anthropic), &r);
+        assert_eq!(b["output_config"]["effort"], "medium");
+        assert_eq!(b["output_config"]["format"]["type"], "json_schema");
+        let (_, b) = build(&provider(Kind::Openai), &req(Level::JsonSchema));
+        assert_eq!(b["max_tokens"], 100);
+        assert!(b.get("reasoning_effort").is_none() && b.get("max_completion_tokens").is_none());
+    }
+
+    /// OpenAI counts cache reads and writes inside prompt_tokens.
+    #[test]
+    fn openai_cache_usage() {
+        let usage = |details: &str| {
+            let body = format!(
+                r#"{{"choices":[{{"message":{{"content":"x"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":1000,"completion_tokens":7{details}}}}}"#
+            );
+            usage_of(Kind::Openai, body.as_bytes(), None)
+        };
+        let u = usage(r#","prompt_tokens_details":{"cached_tokens":600,"cache_write_tokens":300,"audio_tokens":0}"#).unwrap();
+        assert_eq!(
+            (
+                u.input,
+                u.cache_read,
+                u.cache_write_5m,
+                u.cache_write_1h,
+                u.output
+            ),
+            (100, 600, 300, 0, 7)
+        );
+        let u = usage("").unwrap();
+        assert_eq!((u.input, u.cache_read, u.cache_write_5m), (1000, 0, 0));
+        let u = usage(r#","prompt_tokens_details":{"cached_tokens":null}"#).unwrap();
+        assert_eq!(u.input, 1000);
+        for bad in [
+            r#","prompt_tokens_details":{"cached_tokens":900,"cache_write_tokens":200}"#,
+            r#","prompt_tokens_details":{"cached_tokens":"5"}"#,
+            r#","prompt_tokens_details":[]"#,
+        ] {
+            assert!(usage(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

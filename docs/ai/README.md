@@ -85,7 +85,10 @@ build community reports.
   own part for its repairs, and ingestion marks the vocabulary of a document's chunks
   ([API.md](../API.md#model-providers)). `promptCaching` turns it off or sets the 1-hour
   TTL. Records report cache writes and reads apart, and token budgets and cost estimates
-  price each class.
+  price each class. OpenAI caches long prompts on its own, but only where the latest
+  user message ends, so an `openai` provider with `promptCaching.enabled` set to true
+  receives each Ask repair as the first draft's message followed by a second user
+  message, and the repair reads the cached question.
 * Ask keeps half of its schema budget for common vocabulary and retrieves the rest by
   matching the question against every visible class and predicate. Recognized candidate
   evidence preserves full choice identities and can order explicitly named kinds using
@@ -94,6 +97,25 @@ build community reports.
   bounded search does not prove unique intent. The generic `link_entities` verdict is
   unchanged. If rich evidence exceeds the result-byte allowance, Ask retries ordinary
   linking once under the same deadline and permissions and keeps its display rule.
+* Ask also asks the data which predicates the linked entities use as subject and as
+  object, and which a sample of 200 instances of the two classes that best match the
+  question use. It lists them by namespace with their counts, ranked by the question's
+  words and then by use. Each query runs as the caller within five seconds and the MCP
+  limits, and a failed one only leaves its line out. Ask links with `popularity`, so
+  label matches are ordered by how many triples name each one. The draft rules tell the
+  model that the context is partial and to use one predicate per relation. This adds
+  about 8% to a first-draft prompt and two to three bounded queries per linked entity.
+* Ask has four repair options. The exploration, on by default, drafts once more after a
+  draft gives no query or an empty result, with further link candidates and the
+  predicates the entities use. The shape check, multi-draft voting and type hints are off
+  by default. A dataset sets them under `repairs` in `assistant.json`, a request sets
+  `explore`, `shapeCheck`, `drafts` and `typeHints`, and `sparkles ask` takes
+  `--explore`, `--shape-check`, `--drafts N` and `--type-hints`, each with a `--no-`
+  form. Over three runs of 51 validation questions with Haiku 5.5, the exploration raised
+  the mean from 25.0 to 28.0 for 16% more cost per question, the shape check and voting
+  stayed within the baseline's spread, and type hints lowered it to 22.7. Voting costs
+  63% more per question. The
+  [results](../benchmarks/natural-language/RESULTS.md#ask-repair-options) give each run.
 * The extra kind preference recognizes the English words film, movie, book, novel,
   song, album, city, town, country, river and person through supported DBpedia,
   schema.org and FOAF class IRIs. Unknown class namespaces and incomplete or competing
@@ -290,7 +312,26 @@ idempotency key returns the first receipt, `ifHead` refuses a moved head, and a
 credential revoked before the commit publishes refuses it. Every graph has a protection
 nonce, which the operation records, so a record written while its graph was detached
 never authenticates. The Python, JVM and Node.js bindings and the MCP tools do not
-propose claims yet.
+propose claims.
+
+[Evidence reviews](../API.md#evidence-reviews) decide what a dataset accepts.
+`POST /{ds}/claims/review` and `sparkles::evidence::review` append immutable review
+decisions under a named policy, and a later decision supersedes an earlier one by name.
+An acceptance of a positive claim that the policy admits records an acceptance support
+and projects the claim's proposition into the policy's dedicated output graph, which is
+the only place the proposition is asserted. Each occurrence owns its own support, and a
+projected triple stays while one live support owns it. A reviewer must be able to read
+the claim's evidence and any negative claim of the same proposition, and a hidden one
+answers as an unavailable target. Contrary evidence refuses an acceptance or is admitted
+and labelled, as the policy says. `POST /{ds}/claims/withdraw` and
+`sparkles::evidence::withdraw` record that claim occurrences are withdrawn, which ends
+their supports without inventing a contrary claim. Both operations report the supports
+and projected triples they changed. A detach and new protection of a projection's graph
+makes later reviews under its policy refuse with `projection-unavailable`, because its
+supports no longer authenticate. Readers of an output graph read it under their own
+grants, so an administrator gives them read access to the policy's evidence boundary.
+Identity proposals and reviewed resolution maps are
+not available, and neither are reviews through the bindings or MCP.
 
 The Rust controlled permission helper can prepare graph, predicate and class masks
 and the built-in disclosure guard under one memory cap and `Control`. It explicitly
@@ -459,13 +500,21 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Ask has been evaluated with Anthropic models only, on the demo set, CK25, QALD-9-plus
   and 74 DBpedia-only questions
   ([C18](../specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12),
-  [BENCHMARKS.md](../benchmarks/natural-language/RESULTS.md#ask-on-dbpedia)). On the 107
-  retained QALD-9-plus questions, which Ask grounding was tuned on, Opus answers 41, Sonnet
-  33 and Haiku 28 under projected-column scoring. On the 74 retained Text2SPARQL'25 DBpedia
-  questions they answer 33, 32 and 19. Missing predicates in the grounding
-  context and missed entity links cause most wrong answers. Property path evaluation
-  runs within Ask's query memory budget and timeout, so a generated query with a
-  property path fails with the usual error rather than exhausting memory. Model-dependent
+  [BENCHMARKS.md](../benchmarks/natural-language/RESULTS.md#ask-grounding-from-predicate-use)).
+  With the current build, on 150 held-out QALD-9-plus training questions that no tuning
+  step read, GPT-6.1 Sol answers 113, Opus 5.5 111, GPT-6.1 Terra 108, GPT-6 Luna and
+  Sonnet 5.5 106 and Haiku 5.5 95 under projected-column scoring, against 41 to 72 for
+  the build before predicate-use grounding. Luna costs $0.0021 per question, Sonnet
+  $0.029 and Opus $0.062. On the 107 retained QALD-9-plus test questions, which Ask
+  grounding was tuned on, Opus answers 60, Sonnet 55 and Luna 47, and on the 74 retained
+  Text2SPARQL'25 DBpedia questions 46, 45 and 40
+  ([results](../benchmarks/natural-language/RESULTS.md#ask-across-providers)). The
+  `openai` provider preset starts with Luna and the `anthropic` preset with Sonnet, the
+  cheapest models per correct answer within the noise of the best one. A gold resource
+  missing from the prompt causes about half of the wrong answers, and wrong query shape
+  most of the rest. Property path evaluation runs within Ask's query memory budget and
+  timeout, so a generated query with a property path fails with the usual error rather
+  than exhausting memory. Model-dependent
   accuracy and contextual namesake resolution remain roadmap item 263, and the higher
   median end-to-end latency is item 318. Local and OpenAI-compatible models, LC-QuAD 2.0,
   which needs a Wikidata load from the full dump, and an evaluation of independent roles

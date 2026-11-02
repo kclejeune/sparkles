@@ -1,0 +1,44 @@
+locks held 2026-11-02T13:12:33Z load 8.75 25.03 21.14 3/658 1443077
+r0       exp1         auto reads/s  2234.8 writes/s  223.0 wp50 4.305 busyP 0.949 busyE 0.297 other:run=611,wait=8978,n=25 rayon:run=52780,wait=73349,n=18 tokio:run=332215,wait=130466,n=46
+r0       exp1          all reads/s  2487.3 writes/s  373.5 wp50 2.34 busyP 0.789 busyE 0.913 other:run=1099,wait=2825,n=27 rayon:run=56438,wait=218556,n=20 tokio:run=399712,wait=31962,n=41
+r0       exp1       adapt8 reads/s  2354.6 writes/s  369.5 wp50 2.347 busyP 0.786 busyE 0.924 other:run=1052,wait=2486,n=25 rayon:run=55460,wait=195939,n=18 tokio:run=401837,wait=27991,n=42
+r0       exp1          upd reads/s  2000.0 writes/s  309.0 wp50 2.855 busyP 0.946 busyE 0.353 other:run=858,wait=3907,n=25 rayon:run=55726,wait=83046,n=18 tokio:run=333304,wait=126000,n=47
+r1       exp1         auto reads/s  2019.2 writes/s  240.5 wp50 3.929 busyP 0.949 busyE 0.33 other:run=650,wait=9578,n=25 rayon:run=56628,wait=77595,n=18 tokio:run=331767,wait=129744,n=47
+r1       exp1          upd reads/s  1994.1 writes/s  307.4 wp50 2.883 busyP 0.947 busyE 0.349 other:run=850,wait=3827,n=25 rayon:run=55637,wait=83205,n=18 tokio:run=333441,wait=124945,n=46
+r1       exp1       adapt8 reads/s  2360.4 writes/s  363.3 wp50 2.388 busyP 0.786 busyE 0.921 other:run=1079,wait=2630,n=25 rayon:run=55659,wait=195837,n=18 tokio:run=401084,wait=29202,n=42
+r1       exp1          all reads/s  2346.3 writes/s  366.6 wp50 2.372 busyP 0.787 busyE 0.918 other:run=1089,wait=2649,n=27 rayon:run=58848,wait=220013,n=20 tokio:run=398641,wait=29620,n=44
+r2       exp1       adapt8 reads/s  2360.6 writes/s  368.9 wp50 2.35 busyP 0.782 busyE 0.921 other:run=1087,wait=2643,n=25 rayon:run=55061,wait=194220,n=18 tokio:run=400896,wait=28156,n=42
+r2       exp1          upd reads/s  2001.3 writes/s  307.8 wp50 2.86 busyP 0.945 busyE 0.353 other:run=844,wait=3836,n=25 rayon:run=55714,wait=83549,n=18 tokio:run=332618,wait=125207,n=49
+r2       exp1         auto reads/s  2017.6 writes/s  241.1 wp50 3.915 busyP 0.95 busyE 0.329 other:run=646,wait=9571,n=25 rayon:run=56173,wait=77784,n=18 tokio:run=331857,wait=130480,n=47
+r2       exp1          all reads/s  2346.0 writes/s  362.0 wp50 2.391 busyP 0.786 busyE 0.921 other:run=1114,wait=2655,n=27 rayon:run=58891,wait=219770,n=20 tokio:run=398698,wait=29883,n=42
+r3       exp1       adapt8 reads/s  2361.6 writes/s  366.5 wp50 2.375 busyP 0.784 busyE 0.92 other:run=1058,wait=2626,n=25 rayon:run=55112,wait=194525,n=18 tokio:run=400432,wait=29132,n=41
+r3       exp1          all reads/s  2345.1 writes/s  361.5 wp50 2.397 busyP 0.786 busyE 0.922 other:run=1041,wait=2618,n=27 rayon:run=59042,wait=221805,n=20 tokio:run=398876,wait=30954,n=42
+r3       exp1         auto reads/s  2013.4 writes/s  240.0 wp50 3.917 busyP 0.949 busyE 0.33 other:run=654,wait=9540,n=25 rayon:run=56430,wait=76996,n=18 tokio:run=331889,wait=130969,n=46
+r3       exp1          upd reads/s  1990.8 writes/s  309.6 wp50 2.827 busyP 0.944 busyE 0.354 other:run=854,wait=3894,n=25 rayon:run=55568,wait=83229,n=18 tokio:run=332458,wait=125320,n=49
+r4       exp1         auto reads/s  2011.4 writes/s  241.1 wp50 3.882 busyP 0.949 busyE 0.333 other:run=655,wait=9536,n=25 rayon:run=56272,wait=77911,n=18 tokio:run=331631,wait=130171,n=47
+r4       exp1          all reads/s  2341.7 writes/s  361.2 wp50 2.392 busyP 0.787 busyE 0.92 other:run=1119,wait=2631,n=27 rayon:run=58557,wait=219439,n=20 tokio:run=399142,wait=28946,n=42
+r4       exp1       adapt8 reads/s  2352.5 writes/s  367.8 wp50 2.355 busyP 0.781 busyE 0.92 other:run=1087,wait=2446,n=25 rayon:run=55211,wait=192864,n=18 tokio:run=400213,wait=28902,n=43
+r4       exp1          upd reads/s  1995.3 writes/s  311.0 wp50 2.834 busyP 0.946 busyE 0.356 other:run=846,wait=3790,n=25 rayon:run=55628,wait=83277,n=18 tokio:run=333022,wait=124676,n=48
+MIXABDONE
+r0       exp1         auto reads/s   527.5 writes/s  847.3 wp50 0.982 busyP 0.232 busyE 0.074 other:run=943,wait=15,n=25 rayon:run=14496,wait=124,n=18 tokio:run=60921,wait=39,n=24
+r0       exp1          all reads/s   416.3 writes/s  656.0 wp50 1.25 busyP 0.133 busyE 0.234 other:run=939,wait=1016,n=27 rayon:run=14148,wait=86,n=20 tokio:run=62249,wait=63,n=24
+r1       exp1         auto reads/s   525.3 writes/s  789.8 wp50 0.994 busyP 0.229 busyE 0.073 other:run=911,wait=9,n=25 rayon:run=14571,wait=137,n=18 tokio:run=60639,wait=30,n=24
+r1       exp1          all reads/s   404.2 writes/s  384.9 wp50 2.629 busyP 0.133 busyE 0.199 other:run=753,wait=14,n=27 rayon:run=14601,wait=56,n=20 tokio:run=60195,wait=57,n=24
+r2       exp1         auto reads/s   529.5 writes/s  819.3 wp50 0.994 busyP 0.231 busyE 0.074 other:run=922,wait=10,n=25 rayon:run=14530,wait=124,n=18 tokio:run=60967,wait=27,n=24
+r2       exp1          all reads/s   404.9 writes/s  342.3 wp50 2.77 busyP 0.134 busyE 0.19 other:run=716,wait=5,n=27 rayon:run=14881,wait=70,n=20 tokio:run=59750,wait=50,n=24
+MIXABDONE
+r0       exp1         auto reads/s  1024.7 writes/s  440.7 wp50 2.531 busyP 0.384 busyE 0.103 other:run=760,wait=20,n=25 rayon:run=27073,wait=1099,n=18 tokio:run=113810,wait=253,n=26
+r0       exp1          all reads/s   954.1 writes/s  510.6 wp50 1.519 busyP 0.235 busyE 0.342 other:run=852,wait=50,n=27 rayon:run=27032,wait=1380,n=20 tokio:run=115455,wait=180,n=26
+r1       exp1         auto reads/s  1027.9 writes/s  425.8 wp50 2.536 busyP 0.382 busyE 0.101 other:run=747,wait=26,n=25 rayon:run=27159,wait=945,n=18 tokio:run=113727,wait=231,n=26
+r1       exp1          all reads/s   964.0 writes/s  417.4 wp50 2.673 busyP 0.233 busyE 0.336 other:run=790,wait=31,n=27 rayon:run=27150,wait=1140,n=20 tokio:run=114720,wait=158,n=26
+r2       exp1         auto reads/s  1000.1 writes/s  865.0 wp50 1.076 busyP 0.401 busyE 0.122 other:run=1020,wait=70,n=25 rayon:run=25555,wait=1757,n=18 tokio:run=116712,wait=365,n=26
+r2       exp1          all reads/s   966.5 writes/s  364.3 wp50 2.727 busyP 0.233 busyE 0.327 other:run=744,wait=33,n=27 rayon:run=27276,wait=1218,n=20 tokio:run=114222,wait=167,n=26
+MIXABDONE
+r0       exp1         auto reads/s  1629.3 writes/s  484.5 wp50 1.505 busyP 0.693 busyE 0.206 other:run=874,wait=327,n=25 rayon:run=45170,wait=21012,n=18 tokio:run=220570,wait=2282,n=30
+r0       exp1          all reads/s  1622.2 writes/s  628.7 wp50 1.558 busyP 0.434 busyE 0.647 other:run=1189,wait=1184,n=27 rayon:run=48000,wait=21666,n=20 tokio:run=223289,wait=1499,n=30
+r1       exp1         auto reads/s  1603.8 writes/s  392.2 wp50 2.883 busyP 0.69 busyE 0.196 other:run=790,wait=284,n=25 rayon:run=45099,wait=19869,n=18 tokio:run=220088,wait=2275,n=31
+r1       exp1          all reads/s  1672.8 writes/s  322.8 wp50 3.051 busyP 0.418 busyE 0.623 other:run=814,wait=1118,n=27 rayon:run=49055,wait=19373,n=20 tokio:run=220402,wait=1174,n=30
+r2       exp1         auto reads/s  1591.0 writes/s  382.4 wp50 2.873 busyP 0.693 busyE 0.254 other:run=775,wait=334,n=25 rayon:run=45299,wait=26971,n=18 tokio:run=218718,wait=2608,n=30
+r2       exp1          all reads/s  1652.4 writes/s  458.7 wp50 1.718 busyP 0.43 busyE 0.631 other:run=979,wait=163,n=27 rayon:run=48658,wait=20584,n=20 tokio:run=221702,wait=1380,n=31
+MIXABDONE
+LOCKRUN-EXIT=0

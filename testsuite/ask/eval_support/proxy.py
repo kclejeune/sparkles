@@ -1,8 +1,8 @@
-"""A loopback proxy and a cost ledger for paid Anthropic evaluation runs.
+"""A loopback proxy and a cost ledger for paid Anthropic and OpenAI evaluation runs.
 
 The proxy alone holds the API key. Children of the evaluator hold a random token
-and reach this proxy, which forwards each request once to the Messages API over
-the standard library's HTTP client. Every upstream request first writes a reserve
+and reach this proxy, which forwards each request once to the provider's Messages
+or Chat Completions API over the standard library's HTTP client. Every upstream request first writes a reserve
 line to an append-only ledger, and the reply settles it. The ledger is the
 authority for the local cost cap, and a restart replays it, so a crash cannot
 lower the recorded liability.
@@ -14,6 +14,7 @@ import http.client
 import json
 import os
 import pathlib
+import re
 import secrets
 import socket
 import ssl
@@ -24,12 +25,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from evaluator import Invalid, strict_json
 
-LEDGER_VERSION = 2
-# The most one ledger may hold, its cap and carryover together, in nanodollars. The
-# person who pays sets each campaign's total, and a campaign may use several ledgers,
-# each in its own directory. USD 25 bounded the first campaign of 2026-10-15 to
-# 2026-10-19. The campaign of 2026-10-24 has USD 90 over ledgers of USD 50 and 30.
-HARD_CAP = 50 * 10**9
+# Version 3 names the provider whose wallet the ledger holds. A version 2 ledger
+# predates OpenAI runs and is read as an Anthropic ledger.
+LEDGER_VERSION = 3
+# The most one ledger may hold, its cap and carryover together, in nanodollars, for
+# each provider's wallet. The person who pays sets each campaign's total, and a
+# campaign may use several ledgers, each in its own directory. USD 25 bounded the
+# first campaign of 2026-10-15 to 2026-10-19. The campaign of 2026-10-24 has USD 90
+# over ledgers of USD 50 and 30. On 2026-11-01 the Anthropic wallet was raised from USD
+# 50 to 95 and the OpenAI wallet from USD 40 to 50. A ledger's cap is fixed in its
+# header, so each raise closed a ledger and a second one holds what the first did not
+# spend.
+HARD_CAPS = {"anthropic": 95 * 10**9, "openai": 50 * 10**9}
+HARD_CAP = HARD_CAPS["anthropic"]
 MODELS = ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
 REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024
 # Integer USD nanodollars per token as input, 5 minute cache write, 1 hour cache
@@ -38,13 +46,16 @@ REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024
 # copy bundled with Claude Code 2.1.296 in its claude-api skill, `shared/models.md` and
 # `shared/prompt-caching.md`, on 2026-10-18, not from the live pricing page. Haiku 5.5 is
 # $0.10 and $0.50 per million up to 100K prompt tokens and $0.50 and $2.50 above.
-# Sonnet 5.5 is $2 and $10 and Opus 5.5 is $4 and $20, both with cache reads at $0.20
-# and no long-context premium. Cache writes are 1.25 times input for five minutes and
-# 2 times for one hour, and a Haiku cache read is 0.1 times input. The Haiku long-context
-# cache columns apply those multipliers to the higher base. A test pins this table.
+# Sonnet 5.5 is $2 and $10 with cache reads at $0.10, and Opus 5.5 is $4 and $20 with
+# cache reads at $0.20, both with no long-context premium. Cache writes are 1.25 times
+# input for five minutes and 2 times for one hour, and a Haiku cache read is 0.1 times
+# input. The Haiku long-context cache columns apply those multipliers to the higher
+# base. The Anthropic console cost export of 2026-11-01 confirmed the input, output,
+# five-minute write and read rates of all three models. It billed Sonnet reads at
+# $0.10, where the earlier table had $0.20. A test pins this table.
 RATES = {
     MODELS[0]: ((100, 125, 200, 10, 500), (500, 625, 1000, 50, 2500)),
-    MODELS[1]: ((2000, 2500, 4000, 200, 10000),) * 2,
+    MODELS[1]: ((2000, 2500, 4000, 100, 10000),) * 2,
     MODELS[2]: ((4000, 5000, 8000, 200, 20000),) * 2,
 }
 LONG_CONTEXT = 100000
@@ -62,7 +73,37 @@ ALLOWED_FIELDS = {
     "metadata",
     "thinking",
 }
-REPLY_HEADERS = ("content-type", "retry-after", "request-id")
+REPLY_HEADERS = ("content-type", "retry-after", "request-id", "x-request-id")
+
+OPENAI_MODELS = ("gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol")
+# Integer USD nanodollars per token as input, 30 minute cache write, 12 hour cache
+# write, cache read and output. A second row applies above 272000 prompt tokens.
+# Source: OpenAI's API pricing page, https://developers.openai.com/api/docs/pricing,
+# standard tier, read on 2026-11-01, and its prompt caching guide,
+# https://developers.openai.com/api/docs/guides/prompt-caching, read the same day.
+# GPT-6 Luna is $0.10 input, $0.01 cached input and $0.50 output per million up to
+# 272K input tokens, and $0.20, $0.02 and $0.75 above. GPT-6.1 Terra is $1, $0.05 and
+# $5, and $2, $0.10 and $7.50 above. GPT-6.1 Sol is $2, $0.10 and $10, and $4, $0.20
+# and $15 above. A 30 minute cache write is 1.25 times input and a 12 hour one 2.5
+# times. Reasoning tokens are billed as output. A test pins this table.
+OPENAI_RATES = {
+    OPENAI_MODELS[0]: ((100, 125, 250, 10, 500), (200, 250, 500, 20, 750)),
+    OPENAI_MODELS[1]: ((1000, 1250, 2500, 50, 5000), (2000, 2500, 5000, 100, 7500)),
+    OPENAI_MODELS[2]: ((2000, 2500, 5000, 100, 10000), (4000, 5000, 10000, 200, 15000)),
+}
+OPENAI_LONG_CONTEXT = 272000
+OPENAI_FIELDS = {
+    "model",
+    "messages",
+    "max_completion_tokens",
+    "reasoning_effort",
+    "response_format",
+    "temperature",
+    "top_p",
+    "stream",
+    "service_tier",
+}
+OPENAI_ROLES = {"system", "developer", "user", "assistant"}
 
 
 class CapExceeded(Invalid):
@@ -233,6 +274,55 @@ def cost(model, usage, limit=0):
     return max(limit, exact * UNKNOWN_PREMIUM)
 
 
+def openai_bound(model, body_len, max_tokens):
+    """An upper bound on one Chat Completions request's cost from its size alone.
+
+    The input is bounded as for Anthropic. Any input token can be written to the
+    prompt cache, which OpenAI does by default with the 30 minute TTL, the only one
+    Chat Completions offers, so the input is bounded at that write rate. Reasoning
+    tokens count in `max_completion_tokens` and are billed as output.
+    """
+    rates = OPENAI_RATES[model]
+    input_rate = max(max(r[0], r[1]) for r in rates)
+    output_rate = max(r[4] for r in rates)
+    return (2 * body_len + 8192) * input_rate + max_tokens * output_rate
+
+
+def openai_cost(model, usage, limit=0, service_tier=None):
+    """The cost in nanodollars of one Chat Completions reply, or None when its usage
+    cannot be read.
+
+    `prompt_tokens` holds the cached reads and the cache writes that its
+    `prompt_tokens_details` reports. A reply that does not report its writes is
+    charged every uncached input token at the write rate. A reply served by another
+    tier than the default is charged at least `limit` and the largest premium.
+    """
+    if not isinstance(usage, dict) or model not in OPENAI_RATES:
+        return None
+    try:
+        prompt, out = count(usage.get("prompt_tokens")), count(usage.get("completion_tokens"))
+        details = usage.get("prompt_tokens_details")
+        if details is None:
+            details = {}
+        if not isinstance(details, dict):
+            return None
+        read = count(details.get("cached_tokens") or 0)
+        if details.get("cache_write_tokens") is None:
+            written = prompt - read
+        else:
+            written = count(details["cache_write_tokens"])
+    except ValueError:
+        return None
+    plain = prompt - read - written
+    if read > prompt or written < 0 or plain < 0:
+        return None
+    rates = OPENAI_RATES[model][int(prompt > OPENAI_LONG_CONTEXT)]
+    exact = plain * rates[0] + written * rates[1] + read * rates[3] + out * rates[4]
+    if service_tier in (None, "default"):
+        return exact
+    return max(limit, exact * UNKNOWN_PREMIUM)
+
+
 def has_key(value, name):
     if isinstance(value, dict):
         return name in value or any(has_key(v, name) for v in value.values())
@@ -271,9 +361,13 @@ class Ledger:
     and names the evidence for that amount.
     """
 
-    def __init__(self, path, cap, carryover=None):
+    def __init__(self, path, cap, carryover=None, provider="anthropic"):
         self.path = pathlib.Path(path)
         self.cap = cap
+        if provider not in HARD_CAPS:
+            raise Invalid("unknown provider")
+        self.provider, self.hard_cap = provider, HARD_CAPS[provider]
+        self.rates = RATES if provider == "anthropic" else OPENAI_RATES
         self.mutex = threading.Lock()
         self.reserved, self.settled, self.next_id = {}, 0, 1
         self.carryover = 0
@@ -283,9 +377,13 @@ class Ledger:
         # Every settled request by id, with its case, model, bound, status and charge.
         self.charges = {}
         self.reconciled = {}  # target -> its reconcile line
+        # Projected costs held for cases in flight, by case. They are not charges and
+        # are never written. They keep one case's requests from spending what another
+        # case in flight needs, so concurrent cases cannot pass the cap together.
+        self.holds = {}
         if not self.path.is_absolute() or ".." in self.path.parts:
             raise Invalid("absolute ledger path required")
-        if not 0 < cap or cap + (carryover["cost"] if carryover else 0) > HARD_CAP:
+        if not 0 < cap or cap + (carryover["cost"] if carryover else 0) > self.hard_cap:
             raise Invalid("the cap and the carryover together pass the hard cap")
         self.lock = self.path.with_name(self.path.name + ".lock")
         self.lock_fd = self.acquire_lock()
@@ -295,7 +393,9 @@ class Ledger:
                 self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600
             )
             if fresh:
-                self.write({"ledger": LEDGER_VERSION, "capNanodollars": cap})
+                self.write(
+                    {"ledger": LEDGER_VERSION, "provider": provider, "capNanodollars": cap}
+                )
                 self.sync_directory()
                 if carryover:
                     self.write(
@@ -365,10 +465,21 @@ class Ledger:
 
     def apply(self, lines, carryover):
         head = strict_json(lines[0]) if lines else None
-        if not isinstance(head, dict) or head.get("ledger") != LEDGER_VERSION:
+        version = head.get("ledger") if isinstance(head, dict) else None
+        if version == 2 and head.keys() == {"ledger", "capNanodollars"}:
+            provider = "anthropic"
+        elif version == LEDGER_VERSION and head.keys() == {
+            "ledger",
+            "provider",
+            "capNanodollars",
+        }:
+            provider = head["provider"]
+        else:
             # Version 1 had no reconcile lines and no times, and no paid run wrote
             # one, so this reader refuses it like any other unknown version.
             raise Invalid("unknown ledger version")
+        if provider != self.provider:
+            raise Invalid("the ledger holds another provider's wallet")
         if head.get("capNanodollars") != self.cap:
             raise Invalid("the ledger has a different cap")
         seen = None
@@ -389,7 +500,7 @@ class Ledger:
             elif line.get("op") == "reserve":
                 ident = request_id(line["id"])
                 amount(line["bound"])
-                if line["model"] not in RATES:
+                if line["model"] not in self.rates:
                     raise Invalid("a reserve names an unknown model")
                 if ident in self.reserved or ident in self.charges:
                     raise Invalid("a reserve id repeats")
@@ -429,9 +540,43 @@ class Ledger:
             + sum(r["bound"] for r in self.reserved.values())
         )
 
+    def case_spent(self, case):
+        """Settled and reserved nanodollars of one case over the whole ledger. The
+        caller holds the mutex."""
+        settled = sum(c["cost"] for c in self.charges.values() if c["case"] == case)
+        return settled + sum(
+            r["bound"] for r in self.reserved.values() if r.get("case") == case
+        )
+
+    def outstanding(self, but=None):
+        """What the holds of the cases in flight still cover beyond what they spent.
+        The caller holds the mutex."""
+        return sum(
+            max(0, amount - (self.case_spent(case) - since))
+            for case, (amount, since) in self.holds.items()
+            if case != but
+        )
+
+    def hold(self, case, amount):
+        """Hold `amount` for a case about to start, or return False when it does not
+        fit beside what is spent and what the other cases in flight hold."""
+        with self.mutex:
+            if case in self.holds:
+                raise Invalid("case already held")
+            if self.spent() + self.outstanding() + amount > self.cap:
+                return False
+            # A case id can recur in a ledger that an earlier run used, so the hold
+            # covers only what the case spends from now on.
+            self.holds[case] = (amount, self.case_spent(case))
+            return True
+
+    def release(self, case):
+        with self.mutex:
+            self.holds.pop(case, None)
+
     def reserve(self, model, request_bound, case=None):
         with self.mutex:
-            if self.spent() + request_bound > self.cap:
+            if self.spent() + self.outstanding(but=case) + request_bound > self.cap:
                 raise CapExceeded("cost cap")
             ident = self.next_id
             line = {
@@ -470,9 +615,10 @@ class Ledger:
     def held_at_bound(self):
         """The charges that stand at an upper bound rather than a billed amount.
 
-        These are the carryover, every reserve without a settle line, and every
-        request that was settled at its bound because the reply was lost or its usage
-        could not be read. A reconcile line takes one off this list.
+        These are the carryover, every reserve without a settle line, every request
+        that was settled at its bound because the reply was lost or its usage could
+        not be read, and every reply of another model than the one asked for, which
+        is charged an estimate. A reconcile line takes one off this list.
         """
         out = []
         if self.carryover_name is not None and "carryover" not in self.reconciled:
@@ -496,9 +642,12 @@ class Ledger:
                 }
             )
         for ident, c in sorted(self.charges.items()):
-            bounded = c["status"] == "usage-unknown" or c["status"].startswith(
-                "failure:"
-            )
+            # A reply of another model is charged an estimate, which billing
+            # evidence may replace like a bound.
+            bounded = c["status"] in (
+                "usage-unknown",
+                "served-model-mismatch",
+            ) or c["status"].startswith("failure:")
             if bounded and c["cost"] and ident not in self.reconciled:
                 out.append(
                     {
@@ -531,7 +680,7 @@ class Ledger:
             raise Invalid(
                 "the billed amount is above the held charge, see --allow-raise"
             )
-        if self.spent() + billed - previous > HARD_CAP:
+        if self.spent() + billed - previous > self.hard_cap:
             raise Invalid("the reconciled ledger would pass the hard cap")
         if target == "carryover":
             self.carryover += billed - previous
@@ -586,6 +735,7 @@ class Ledger:
             return {
                 "ledger": str(self.path),
                 "ledgerVersion": LEDGER_VERSION,
+                "provider": self.provider,
                 "capNanodollars": self.cap,
                 "carryoverNanodollars": self.carryover,
                 "settledNanodollars": self.settled,
@@ -637,7 +787,7 @@ def decode_body(headers, data):
         return data
 
 
-def clean_key(raw):
+def clean_key(raw, name="ANTHROPIC_API_KEY"):
     """Strip the key once at read time and refuse one that cannot be a header value.
 
     A secret manager can leave a trailing newline. A control character inside the key
@@ -646,18 +796,248 @@ def clean_key(raw):
     """
     key = (raw or "").strip()
     if not key:
-        raise Invalid("ANTHROPIC_API_KEY is not set")
+        raise Invalid(f"{name} is not set")
     if not key.isascii() or not key.isprintable() or any(c.isspace() for c in key):
-        raise Invalid("ANTHROPIC_API_KEY holds whitespace or control characters")
+        raise Invalid(f"{name} holds whitespace or control characters")
     return key
+
+
+def text_messages(body):
+    """Whether every message of an Anthropic body holds text alone."""
+    return text_content(body.get("system", "")) and not any(
+        not isinstance(m, dict)
+        or m.keys() - {"role", "content"}
+        or not text_content(m.get("content"))
+        for m in body.get("messages") or [None]
+    )
+
+
+class AnthropicAPI:
+    """The Messages API: its route, headers, request checks, bound and cost."""
+
+    name = "anthropic"
+    host = "api.anthropic.com"
+    path = "/v1/messages"
+    key_env = "ANTHROPIC_API_KEY"
+    models = MODELS
+    rates = RATES
+    dropped_headers = (
+        "anthropic-ratelimit",
+        "anthropic-organization",
+        "anthropic-workspace",
+        "request-id",
+        "x-api-key",
+        "set-cookie",
+    )
+
+    def headers(self, key):
+        return {
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "accept-encoding": "identity",
+            "x-api-key": key,
+        }
+
+    def child_token(self, headers):
+        return headers.get("x-api-key", "")
+
+    def prepare(self, body, proxy):
+        if body.keys() - ALLOWED_FIELDS:
+            raise Refused("unsupported request field, tools are not allowed")
+        max_tokens = body.get("max_tokens")
+        if body.get("model") not in proxy.models:
+            raise Refused("model not allowed")
+        if type(max_tokens) is not int or not 0 < max_tokens <= proxy.max_output_tokens:
+            raise Refused("max_tokens out of range")
+        if not text_messages(body):
+            # Only text bodies keep the byte-based bound valid. An image can cost
+            # more tokens than its bytes.
+            raise Refused("only text content is allowed")
+        # a cache breakpoint anywhere else, such as in the output schema, is refused
+        if has_key(
+            {k: v for k, v in body.items() if k not in ("system", "messages")},
+            "cache_control",
+        ):
+            raise Refused("unsupported cache control")
+        cache_ttl(body)
+        body["stream"] = False
+        if proxy.effort:
+            config = body.setdefault("output_config", {})
+            if not isinstance(config, dict):
+                raise Refused("output_config must be an object")
+            config.setdefault("effort", proxy.effort)
+        return body
+
+    def bound(self, model, payload_len, body):
+        return bound(model, payload_len, body["max_tokens"], cache_ttl(body))
+
+    def cost(self, model, reply, limit):
+        usage = reply.get("usage") if isinstance(reply, dict) else None
+        return cost(model, usage, limit), usage
+
+    def served(self, model, reply):
+        return reply.get("model") == model
+
+    def served_model(self, reply):
+        """The table's model that served a reply, or None for one it does not know."""
+        served = reply.get("model")
+        return served if isinstance(served, str) and served in RATES else None
+
+    def any_cost(self, model, reply, limit):
+        return self.cost(model, reply, limit)[0]
+
+    def provider(self, port, proxy):
+        return {"kind": "anthropic", "endpoint": f"http://127.0.0.1:{port}"}
+
+    def preflight_request(self, name, proxy):
+        return {
+            "model": name,
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "Reply with ok true."}],
+            "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}},
+        }
+
+    def reply_text(self, reply):
+        return "".join(
+            b.get("text", "") for b in reply["content"] if b.get("type") == "text"
+        )
+
+
+class OpenAIAPI:
+    """The Chat Completions API: its route, headers, request checks, bound and cost.
+
+    Requests carry text messages and a structured-output format, never tools or
+    explicit cache options, so OpenAI's default prompt caching with its 30 minute TTL
+    applies. Every request asks for the default service tier.
+    """
+
+    name = "openai"
+    host = "api.openai.com"
+    path = "/v1/chat/completions"
+    key_env = "OPENAI_API_KEY"
+    models = OPENAI_MODELS
+    rates = OPENAI_RATES
+    dropped_headers = (
+        "openai-organization",
+        "openai-project",
+        "x-ratelimit",
+        "x-request-id",
+        "authorization",
+        "set-cookie",
+    )
+
+    def headers(self, key):
+        return {
+            "content-type": "application/json",
+            "accept-encoding": "identity",
+            "authorization": "Bearer " + key,
+        }
+
+    def child_token(self, headers):
+        value = headers.get("authorization", "")
+        return value[len("Bearer ") :] if value.startswith("Bearer ") else ""
+
+    def prepare(self, body, proxy):
+        if body.keys() - OPENAI_FIELDS:
+            raise Refused("unsupported request field, tools are not allowed")
+        if body.get("model") not in proxy.models:
+            raise Refused("model not allowed")
+        max_tokens = body.get("max_completion_tokens")
+        if type(max_tokens) is not int or not 0 < max_tokens <= proxy.max_output_tokens:
+            raise Refused("max_completion_tokens out of range")
+        messages = body.get("messages")
+        if (
+            not isinstance(messages, list)
+            or not messages
+            or any(
+                not isinstance(m, dict)
+                or m.keys() != {"role", "content"}
+                or m["role"] not in OPENAI_ROLES
+                or not isinstance(m["content"], str)
+                for m in messages
+            )
+        ):
+            raise Refused("only text content is allowed")
+        fmt = body.get("response_format")
+        if fmt is not None and (
+            not isinstance(fmt, dict) or fmt.get("type") not in ("json_schema", "json_object")
+        ):
+            raise Refused("unsupported response format")
+        if body.get("service_tier", "default") != "default":
+            raise Refused("only the default service tier is allowed")
+        effort = body.get("reasoning_effort")
+        if effort is not None and not isinstance(effort, str):
+            raise Refused("reasoning_effort must be a string")
+        body["stream"] = False
+        body["service_tier"] = "default"
+        if proxy.effort:
+            body.setdefault("reasoning_effort", proxy.effort)
+        return body
+
+    def bound(self, model, payload_len, body):
+        return openai_bound(model, payload_len, body["max_completion_tokens"])
+
+    def cost(self, model, reply, limit):
+        if not isinstance(reply, dict):
+            return None, None
+        usage = reply.get("usage")
+        tier = reply.get("service_tier")
+        if tier is not None and not isinstance(tier, str):
+            tier = "unknown"
+        return openai_cost(model, usage, limit, tier), usage
+
+    def served(self, model, reply):
+        # OpenAI names the dated snapshot that served an alias.
+        served = reply.get("model")
+        return isinstance(served, str) and (
+            served == model or re.fullmatch(re.escape(model) + r"-\d{4}-\d{2}-\d{2}", served)
+        )
+
+    def served_model(self, reply):
+        """The table's model that served a reply, or None for one it does not know."""
+        return next((m for m in OPENAI_RATES if self.served(m, reply)), None)
+
+    def any_cost(self, model, reply, limit):
+        return self.cost(model, reply, limit)[0]
+
+    def provider(self, port, proxy):
+        # promptCaching sends a repair as the first draft's message and a second user
+        # message, so the repair reads the prefix that the first draft wrote
+        out = {
+            "kind": "openai",
+            "endpoint": f"http://127.0.0.1:{port}/v1",
+            "promptCaching": {"enabled": True},
+        }
+        if proxy.effort:
+            out["reasoningEffort"] = proxy.effort
+        return out
+
+    def preflight_request(self, name, proxy):
+        return {
+            "model": name,
+            "max_completion_tokens": min(2048, proxy.max_output_tokens),
+            "messages": [{"role": "user", "content": "Reply with ok true."}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "Ping", "schema": SCHEMA, "strict": True},
+            },
+        }
+
+    def reply_text(self, reply):
+        return reply["choices"][0]["message"]["content"]
+
+
+ANTHROPIC, OPENAI = AnthropicAPI(), OpenAIAPI()
+APIS = {"anthropic": ANTHROPIC, "openai": OPENAI}
 
 
 class HTTPUpstream:
     """One standard-library request. It never retries, and http.client decodes the
     Content-Length, chunked and close-delimited framings alike."""
 
-    def __init__(self, key, host="api.anthropic.com", port=443, tls=True):
-        self.key, self.host, self.port, self.tls = key, host, port, tls
+    def __init__(self, key, host=None, port=443, tls=True, api=None):
+        self.api = api or ANTHROPIC
+        self.key, self.host, self.port, self.tls = key, host or self.api.host, port, tls
 
     def send(self, path, body, timeout):
         """Return (status, headers, body). Raise UpstreamFailure without a reply."""
@@ -691,12 +1071,7 @@ class HTTPUpstream:
                 "POST",
                 path,
                 body=body,
-                headers={
-                    "content-type": "application/json",
-                    "anthropic-version": "2023-06-01",
-                    "accept-encoding": "identity",
-                    "x-api-key": self.key,
-                },
+                headers=self.api.headers(self.key),
             )
             reply = conn.getresponse()
             data = reply.read(RESPONSE_CAP + 1)
@@ -735,7 +1110,13 @@ class Proxy:
         effort="medium",
         timeout=120,
         replies=None,
+        api=None,
     ):
+        self.api = api or ANTHROPIC
+        if models is MODELS:
+            models = self.api.models
+        if set(models) - set(self.api.models) or ledger.provider != self.api.name:
+            raise Invalid("the models and the ledger must belong to the proxy's provider")
         self.ledger, self.upstream, self.key = ledger, upstream, key
         # A JSON-lines file of every forwarded request and its reply, with the key
         # redacted, so a run's answers can be diagnosed without calling a model again.
@@ -744,6 +1125,11 @@ class Proxy:
         self.effort, self.timeout = effort, timeout
         self.token = secrets.token_urlsafe(32)
         self.case = None
+        # One gate token per concurrent case, so each request names its case.
+        self.case_tokens = {}
+        self.case_in_flight, self.case_refusals = {}, {}
+        # With ordered replies, each case's reply lines wait until flush_replies().
+        self.ordered_replies, self.held_replies = False, {}
         self.cap_refusals = 0
         self.last_headers = []
         self.request_bytes = []
@@ -755,14 +1141,50 @@ class Proxy:
     def set_case(self, case):
         self.case = case
 
-    def wait_idle(self, timeout=None):
-        """Wait until no request is in flight. A child killed on a timeout can leave
-        one behind, and its cost belongs to the case that sent it."""
+    def open_case(self, case):
+        """A gate token for one case that runs beside others."""
+        token = secrets.token_urlsafe(32)
+        with self.mutex:
+            self.case_tokens[token] = case
+        return token
+
+    def close_case(self, token):
+        with self.mutex:
+            self.case_tokens.pop(token, None)
+
+    def case_for(self, token):
+        """The case a gate token names, or False for an unknown token."""
+        if hmac.compare_digest(token.encode(), self.token.encode()):
+            return self.case
+        with self.mutex:
+            for known, case in self.case_tokens.items():
+                if hmac.compare_digest(token.encode(), known.encode()):
+                    return case
+        return False
+
+    def refusals_for(self, case):
+        with self.mutex:
+            return self.case_refusals.get(case, 0)
+
+    def wait_idle(self, timeout=None, case=None):
+        """Wait until no request is in flight, or none of `case`. A child killed on a
+        timeout can leave one behind, and its cost belongs to the case that sent it."""
         with self.idle:
             return self.idle.wait_for(
-                lambda: self.in_flight == 0,
+                lambda: (
+                    self.in_flight == 0
+                    if case is None
+                    else self.case_in_flight.get(case, 0) == 0
+                ),
                 self.timeout + 5 if timeout is None else timeout,
             )
+
+    def flush_replies(self, case):
+        """Append a case's held reply lines, in the order its requests were sent."""
+        with self.mutex:
+            lines = self.held_replies.pop(case, [])
+        for _, text in sorted(lines):
+            self.append_reply(text)
 
     def case_cost(self, case):
         """Nanodollars settled so far for one case, over every model it called."""
@@ -786,76 +1208,58 @@ class Proxy:
             body = strict_json(raw)
         except Invalid:
             raise Refused("request is not JSON") from None
-        if not isinstance(body, dict) or body.keys() - ALLOWED_FIELDS:
-            raise Refused("unsupported request field, tools are not allowed")
-        max_tokens = body.get("max_tokens")
-        if body.get("model") not in self.models:
-            raise Refused("model not allowed")
-        if type(max_tokens) is not int or not 0 < max_tokens <= self.max_output_tokens:
-            raise Refused("max_tokens out of range")
-        if not text_content(body.get("system", "")) or any(
-            not isinstance(m, dict)
-            or m.keys() - {"role", "content"}
-            or not text_content(m.get("content"))
-            for m in body.get("messages") or [None]
-        ):
-            # Only text bodies keep the byte-based bound valid. An image can cost
-            # more tokens than its bytes.
-            raise Refused("only text content is allowed")
-        # a cache breakpoint anywhere else, such as in the output schema, is refused
-        if has_key(
-            {k: v for k, v in body.items() if k not in ("system", "messages")},
-            "cache_control",
-        ):
-            raise Refused("unsupported cache control")
-        cache_ttl(body)
-        body["stream"] = False
-        if self.effort:
-            config = body.setdefault("output_config", {})
-            if not isinstance(config, dict):
-                raise Refused("output_config must be an object")
-            config.setdefault("effort", self.effort)
-        return body
+        if not isinstance(body, dict):
+            raise Refused("request is not an object")
+        return self.api.prepare(body, self)
 
-    def handle(self, raw):
+    def handle(self, raw, case=None):
         """Forward one request. Return (status, headers, body) for the child."""
+        case = self.case if case is None else case
         with self.mutex:
             self.in_flight += 1
+            if case is not None:
+                self.case_in_flight[case] = self.case_in_flight.get(case, 0) + 1
         try:
-            return self.handle_one(raw)
+            return self.handle_one(raw, case)
         finally:
             with self.idle:
                 self.in_flight -= 1
+                if case is not None:
+                    self.case_in_flight[case] -= 1
                 self.idle.notify_all()
 
-    def handle_one(self, raw):
+    def handle_one(self, raw, case=None):
         try:
             body = self.prepare(raw)
         except Refused as refusal:
             return 400, [], error_body("invalid_request_error", str(refusal))
         model = body["model"]
         payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
-        limit = bound(model, len(payload), body["max_tokens"], cache_ttl(body))
+        limit = self.api.bound(model, len(payload), body)
         try:
-            ident = self.ledger.reserve(model, limit, self.case)
+            ident = self.ledger.reserve(model, limit, case)
         except CapExceeded:
             with self.mutex:
                 self.cap_refusals += 1
+                self.case_refusals[case] = self.case_refusals.get(case, 0) + 1
             return 402, [], error_body("evaluation_budget", "the cost cap is reached")
         with self.mutex:
             self.request_bytes.append(len(payload))
-        return self.forward(ident, model, limit, payload, self.case)
+        return self.forward(ident, model, limit, payload, case)
 
     def forward(self, ident, model, limit, payload, case=None):
         try:
             status, headers, data = self.upstream.send(
-                "/v1/messages", payload, self.timeout
+                self.api.path, payload, self.timeout
             )
         except UpstreamFailure as failure:
-            # A request that may have reached the server is charged at its bound.
+            # A request that may have reached the server is charged at its bound, and
+            # its prompt is recorded, since it was sent, with no reply.
             self.ledger.settle(
                 ident, limit if failure.sent else 0, "failure:" + failure.reason
             )
+            if failure.sent:
+                self.record(ident, case, model, payload, 502, b"", None)
             return 502, [], error_body("api_error", "the upstream did not answer")
         except Exception as error:  # noqa: BLE001 -- the reserve must never stay open
             # Any other fault may come after the body left, so it costs the bound.
@@ -863,7 +1267,9 @@ class Proxy:
             return 502, [], error_body("api_error", "the proxy failed")
         self.last_headers = headers
         passed = [(k, v) for k, v in headers if k.lower() in REPLY_HEADERS]
-        request_id = next((v for k, v in headers if k.lower() == "request-id"), None)
+        request_id = next(
+            (v for k, v in headers if k.lower() in ("request-id", "x-request-id")), None
+        )
         if not 200 <= status < 300:
             # The API does not bill an error reply, which is an assumption. A gateway
             # error after generation could be billed. The cap's margin absorbs it.
@@ -877,12 +1283,27 @@ class Proxy:
             reply = strict_json(data)
         except Invalid:
             reply = None
-        usage = reply.get("usage") if isinstance(reply, dict) else None
-        amount = cost(model, usage, limit)
+        try:
+            amount, usage = self.api.cost(model, reply, limit)
+            # A reply from another model than the one asked for is charged at least
+            # its bound and never reaches the child as an answer.
+            mismatch = isinstance(reply, dict) and not self.api.served(model, reply)
+            if mismatch:
+                charged, status_text = self.mismatch_charge(reply, usage, limit, amount, payload), "served-model-mismatch"
+            elif amount is None:
+                charged, status_text = limit, "usage-unknown"
+            else:
+                charged, status_text = amount, "ok"
+        except Exception as error:  # noqa: BLE001 -- a reply the tables cannot price
+            # A reply that breaks the pricing is charged its bound like a lost one,
+            # recorded, and kept from the child.
+            self.ledger.settle(ident, limit, "failure:internal-" + type(error).__name__, request_id=request_id)
+            self.record(ident, case, model, payload, status, self.clean_bytes(data), request_id)
+            return 502, [], error_body("api_error", "the proxy could not price the reply")
         self.ledger.settle(
             ident,
-            limit if amount is None else amount,
-            "ok" if amount is not None else "usage-unknown",
+            charged,
+            status_text,
             usage=usage if isinstance(usage, dict) else None,
             request_id=request_id,
         )
@@ -891,8 +1312,25 @@ class Proxy:
         )
         if reply is None:
             return 502, [], error_body("api_error", "the upstream reply is not JSON")
+        if mismatch:
+            return 502, [], error_body("api_error", "another model served the request")
         clean, _ = redact(reply, self.key)
         return status, passed, json.dumps(clean, ensure_ascii=False).encode()
+
+    def mismatch_charge(self, reply, usage, limit, amount, payload):
+        """The charge of a reply that another model served: at least the request's
+        bound, its usage at the served model's rates, and for a model the table does
+        not know, the largest premium over the dearest model's bound and cost."""
+        served = self.api.served_model(reply)
+        priced = [m for m in self.api.rates] if served is None else [served]
+        body = strict_json(payload)
+        dearest = max(self.api.bound(m, len(payload), body) for m in self.api.rates)
+        # the reply's tier and other modes apply, so a premium tier stays charged
+        costs = [self.api.any_cost(m, reply, dearest) for m in priced]
+        known = max((c for c in costs if c is not None), default=None)
+        if served is None or known is None:
+            return max(limit, amount or 0, dearest * UNKNOWN_PREMIUM, (known or 0) * UNKNOWN_PREMIUM)
+        return max(limit, amount or 0, known)
 
     def record(self, ident, case, model, payload, status, data, request_id):
         """Append the request and its reply to the replies file, key redacted.
@@ -920,6 +1358,16 @@ class Proxy:
                 "reply": reply,
             }
             text = json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n"
+            if self.ordered_replies and case is not None:
+                with self.mutex:
+                    self.held_replies.setdefault(case, []).append((ident, text))
+                return
+            self.append_reply(text)
+        except Exception:  # noqa: BLE001, S110 -- a diagnosis record never fails a request
+            pass
+
+    def append_reply(self, text):
+        try:
             with self.mutex:
                 fd = os.open(
                     self.replies,
@@ -961,11 +1409,10 @@ class Proxy:
 
             def do_POST(self):
                 self.connection.settimeout(proxy.timeout + 30)
-                token = self.headers.get("x-api-key", "")
+                token = proxy.api.child_token(self.headers)
                 length = self.headers.get("Content-Length", "")
-                if self.path != "/v1/messages" or not hmac.compare_digest(
-                    token.encode(), proxy.token.encode()
-                ):
+                case = proxy.case_for(token) if token.isascii() else False
+                if self.path != proxy.api.path or case is False:
                     return self.reply(
                         401, [], error_body("authentication_error", "bad route")
                     )
@@ -982,7 +1429,7 @@ class Proxy:
                     return self.reply(
                         400, [], error_body("invalid_request_error", "short body")
                     )
-                self.reply(*proxy.handle(raw))
+                self.reply(*proxy.handle(raw, case))
 
             def do_GET(self):
                 self.reply(405, [], error_body("invalid_request_error", "method"))
@@ -1000,8 +1447,7 @@ class Proxy:
         the first paid run did.
         """
         provider = {
-            "kind": "anthropic",
-            "endpoint": f"http://127.0.0.1:{self.server_port}",
+            **self.api.provider(self.server_port, self),
             "apiKey": {"secret": "evalgate"},
             "allowedModels": list(self.models),
             "models": {m: {} for m in self.models},
@@ -1034,55 +1480,41 @@ SCHEMA = {
 def preflight(proxy, upstream, timeout=30):
     """Check framing, authentication and every model before any evaluation spend.
 
-    Counting tokens costs nothing. Each configured model then gets one small request
-    with the same structured-output shape and effort that the run uses, through the
-    ledger like every other request. A model that the account cannot use, a parameter
-    it rejects or a reply that is not the requested JSON stops the run here, for a
-    fraction of a cent each. Returns the replies' status lines and header names and
-    values for the record, without the rate-limit, request and key-like headers.
+    For Anthropic, counting tokens costs nothing. Each configured model then gets one
+    small request with the same structured-output shape and effort that the run uses,
+    through the ledger like every other request. A model that the account cannot use,
+    a parameter it rejects or a reply that is not the requested JSON stops the run
+    here, for a fraction of a cent each. Returns the replies' status lines and header
+    names and values for the record, without the rate-limit, request and key-like
+    headers.
     """
-    model = proxy.models[0]
-    counted = upstream.send(
-        "/v1/messages/count_tokens",
-        json.dumps(
-            {"model": model, "messages": [{"role": "user", "content": "ping"}]}
-        ).encode(),
-        timeout,
-    )
-    if counted[0] != 200 or not isinstance(strict_json(counted[2]), dict):
-        raise Invalid("preflight token count failed")
+    api = proxy.api
 
     def keep(headers):
-        dropped = (
-            "anthropic-ratelimit",
-            "anthropic-organization",
-            "anthropic-workspace",
-            "request-id",
-            "x-api-key",
-            "set-cookie",
+        return [[k, v] for k, v in headers if not k.lower().startswith(api.dropped_headers)]
+
+    counted = None
+    if api is ANTHROPIC:
+        counted = upstream.send(
+            "/v1/messages/count_tokens",
+            json.dumps(
+                {"model": proxy.models[0], "messages": [{"role": "user", "content": "ping"}]}
+            ).encode(),
+            timeout,
         )
-        return [[k, v] for k, v in headers if not k.lower().startswith(dropped)]
+        if counted[0] != 200 or not isinstance(strict_json(counted[2]), dict):
+            raise Invalid("preflight token count failed")
 
     models = {}
     for name in proxy.models:
-        request = {
-            "model": name,
-            "max_tokens": 256,
-            "messages": [{"role": "user", "content": "Reply with ok true."}],
-            "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}},
-        }
+        request = api.preflight_request(name, proxy)
         start = time.monotonic()
         status, _, body = proxy.handle(json.dumps(request).encode())
         if status != 200:
             raise Invalid(f"preflight failed for {name} with status {status}")
         try:
-            text = "".join(
-                b.get("text", "")
-                for b in strict_json(body)["content"]
-                if b.get("type") == "text"
-            )
-            valid = isinstance(strict_json(text), dict)
-        except (Invalid, KeyError, TypeError, AttributeError):
+            valid = isinstance(strict_json(api.reply_text(strict_json(body))), dict)
+        except (Invalid, KeyError, IndexError, TypeError, AttributeError):
             valid = False
         if not valid:
             raise Invalid(f"preflight reply of {name} is not the requested JSON")
@@ -1093,7 +1525,9 @@ def preflight(proxy, upstream, timeout=30):
         }
     first = models[proxy.models[0]]
     return {
-        "countTokens": {"status": counted[0], "headers": keep(counted[1])},
+        "countTokens": (
+            {"status": counted[0], "headers": keep(counted[1])} if counted else None
+        ),
         "message": first,
         "models": models,
     }

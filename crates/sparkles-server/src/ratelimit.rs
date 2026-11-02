@@ -182,6 +182,8 @@ pub fn classify(
         | "/{ds}/upload"
         | "/{ds}/facts"
         | "/{ds}/claims"
+        | "/{ds}/claims/review"
+        | "/{ds}/claims/withdraw"
         | "/{ds}/mappings/{name}/run" => Some(Class::Update),
         "/{ds}/sources" => Some(if read { Class::Query } else { Class::Update }),
         "/{ds}/patch" => Some(if read { Class::Query } else { Class::Update }),

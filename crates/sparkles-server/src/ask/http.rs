@@ -67,6 +67,11 @@ struct AskBody {
     /// `auto`, `local` or `global` (C22 §2.4)
     #[serde(default)]
     mode: AskMode,
+    /// the repair turns, over the dataset's `repairs`
+    explore: Option<bool>,
+    shape_check: Option<bool>,
+    drafts: Option<usize>,
+    type_hints: Option<bool>,
 }
 
 fn bad(m: impl Into<String>) -> crate::http::ApiError {
@@ -125,6 +130,13 @@ async fn ask_route(
     {
         return Err(bad("query must hold 1 to 65536 characters"));
     }
+    let asked = assistant::AskRepairs {
+        explore: b.explore,
+        shape_check: b.shape_check,
+        drafts: b.drafts,
+        type_hints: b.type_hints,
+    };
+    asked.check("").map_err(bad)?;
     if b.query.is_some() && b.try_harder.is_some() {
         return Err(bad("query and tryHarder cannot be combined"));
     }
@@ -221,7 +233,8 @@ async fn ask_route(
     let cancel = Arc::new(AtomicBool::new(false));
     let routing = settings.routing.clone().unwrap_or_default();
     let model_routing = models.config.routing.clone().unwrap_or_default();
-    let o = AskOptions {
+    let repairs = settings.repairs.or(asked);
+    let mut o = AskOptions {
         dataset: ds.name.clone(),
         question,
         id: Some(id.clone()),
@@ -271,7 +284,9 @@ async fn ask_route(
         mode: b.mode,
         reviewed_only: b.reviewed_only,
         report_context,
+        ..AskOptions::default()
     };
+    repairs.apply(&mut o);
     let server = crate::mcp::McpServer::new(st.clone(), cfg);
     let finish = {
         let st = st.clone();

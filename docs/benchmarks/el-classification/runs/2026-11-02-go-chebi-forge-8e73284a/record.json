@@ -1,0 +1,271 @@
+{
+ "checks": [
+  {
+   "detail": "1 distinct taxonomy hash(es)",
+   "name": "go/taxonomy-identical-across-threads",
+   "ok": true
+  },
+  {
+   "detail": {
+    "agree": true,
+    "asserted": 57456,
+    "assertedNotEntailed": 0,
+    "direct": 57456,
+    "directNotAsserted": 0,
+    "examples": {
+     "extra": [],
+     "missing": []
+    }
+   },
+   "name": "go/asserted-hierarchy",
+   "ok": true
+  },
+  {
+   "detail": "1 distinct taxonomy hash(es)",
+   "name": "chebi_lite/taxonomy-identical-across-threads",
+   "ok": true
+  },
+  {
+   "detail": {
+    "agree": true,
+    "asserted": 300224,
+    "assertedNotEntailed": 0,
+    "direct": 296173,
+    "directNotAsserted": 0,
+    "examples": {
+     "extra": [],
+     "missing": []
+    }
+   },
+   "name": "chebi_lite/asserted-hierarchy",
+   "ok": true
+  }
+ ],
+ "host": {
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "kernel": "7.2.9",
+  "name": "forge",
+  "ram_mib": 15620
+ },
+ "kind": "measurement",
+ "manifest": {
+  "binary": "crates/sparkles-owl/examples/el_classify.rs",
+  "binary_sha256": "3e217c9234c38ed6ea34da8872a02bc40a02ca63495e94c1639fde19b3debec8",
+  "build": "mbx build --release -p sparkles-owl --example el_classify on stanley, copied to the benchmark host",
+  "build_note": "Built from the lane's working tree, whose sparkles-owl sources equal the commit up to rustfmt formatting.",
+  "commit": "8e73284a",
+  "data": {
+   "chebi_lite": {
+    "ofn_sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4",
+    "rdfxml_sha256": "ebea75e0500818e319245a1bf605a684b2e22a2069680290b5dda638d5d25b16",
+    "release": "256",
+    "url": "http://purl.obolibrary.org/obo/chebi/256/chebi_lite.owl"
+   },
+   "go": {
+    "ofn_sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375",
+    "rdfxml_sha256": "653ce47cd7b02304e67eb67c54d3be02ec5b0ba5e00eb7384dfa0da00f9682ec",
+    "release": "2026-07-26",
+    "url": "http://purl.obolibrary.org/obo/go/releases/2026-07-26/go.owl"
+   }
+  },
+  "ended": "2026-11-02T14:52:29Z",
+  "host_load_after": "2.44 2.34 2.01",
+  "host_load_before": "1.47 1.65 2.32",
+  "started": "2026-11-02T14:14:39Z"
+ },
+ "method": "el_classify --threads N --repeat 5 --taxonomy FILE INPUT.ofn, one process per ontology and thread count, run under the benchmark host's lock. classifyMs holds the wall time of each of five classifications by a fresh classifier with the axioms in memory, and peakRssKib the process's peak resident memory including the axioms read.",
+ "results": [
+  {
+   "axioms": 135031,
+   "classes": 51986,
+   "classifyMedianMs": 583.455236,
+   "classifyMs": [
+    632.334187,
+    575.2254829999999,
+    583.455236,
+    579.002446,
+    584.3659789999999
+   ],
+   "conclusions": 2802242,
+   "consistent": true,
+   "contexts": 51987,
+   "estimatedBytes": 54675192,
+   "indexMs": 159.38940100000002,
+   "input": "data/go.ofn",
+   "nodes": 51988,
+   "ontology": "go",
+   "outside": 1,
+   "partial": {},
+   "peakRssKib": 439028,
+   "peakRssKibAfterRead": 78936,
+   "readMs": 110.57273500000001,
+   "saturationMs": 279.938984,
+   "taxonomyMs": 89.64059400000001,
+   "taxonomy_sha256": "b41aefe1503e32e1266391ca88f74e0555cbb3079599c861381fe82792ae9001",
+   "threads": 1,
+   "unsatisfiable": 0
+  },
+  {
+   "axioms": 135031,
+   "classes": 51986,
+   "classifyMedianMs": 409.913969,
+   "classifyMs": [
+    449.868593,
+    409.913969,
+    402.099404,
+    398.63063,
+    413.106545
+   ],
+   "conclusions": 2802242,
+   "consistent": true,
+   "contexts": 51987,
+   "estimatedBytes": 54675192,
+   "indexMs": 166.311505,
+   "input": "data/go.ofn",
+   "nodes": 51988,
+   "ontology": "go",
+   "outside": 1,
+   "partial": {},
+   "peakRssKib": 448928,
+   "peakRssKibAfterRead": 79148,
+   "readMs": 101.293796,
+   "saturationMs": 93.795541,
+   "taxonomyMs": 90.17191700000001,
+   "taxonomy_sha256": "b41aefe1503e32e1266391ca88f74e0555cbb3079599c861381fe82792ae9001",
+   "threads": 4,
+   "unsatisfiable": 0
+  },
+  {
+   "axioms": 135031,
+   "classes": 51986,
+   "classifyMedianMs": 377.05177899999995,
+   "classifyMs": [
+    415.728812,
+    369.17487900000003,
+    377.05177899999995,
+    376.448282,
+    384.95288300000004
+   ],
+   "conclusions": 2802242,
+   "consistent": true,
+   "contexts": 51987,
+   "estimatedBytes": 54675192,
+   "indexMs": 160.439785,
+   "input": "data/go.ofn",
+   "nodes": 51988,
+   "ontology": "go",
+   "outside": 1,
+   "partial": {},
+   "peakRssKib": 447452,
+   "peakRssKibAfterRead": 79376,
+   "readMs": 99.725071,
+   "saturationMs": 67.59606799999999,
+   "taxonomyMs": 93.74461500000001,
+   "taxonomy_sha256": "b41aefe1503e32e1266391ca88f74e0555cbb3079599c861381fe82792ae9001",
+   "threads": 8,
+   "unsatisfiable": 0
+  },
+  {
+   "axioms": 647721,
+   "classes": 238150,
+   "classifyMedianMs": 3911.593394,
+   "classifyMs": [
+    4106.192686,
+    3887.41944,
+    3911.593394,
+    3918.113664,
+    3908.576901
+   ],
+   "conclusions": 26995717,
+   "consistent": true,
+   "contexts": 238151,
+   "estimatedBytes": 374473680,
+   "indexMs": 912.8987050000001,
+   "input": "data/chebi_lite.ofn",
+   "nodes": 238152,
+   "ontology": "chebi_lite",
+   "outside": 1,
+   "partial": {},
+   "peakRssKib": 1598832,
+   "peakRssKibAfterRead": 275492,
+   "readMs": 452.676674,
+   "saturationMs": 1742.331392,
+   "taxonomyMs": 915.701319,
+   "taxonomy_sha256": "c909192b680de7c2dcc9bf7d68d9df1b08e554a34d3a1523f3378bdda6f29837",
+   "threads": 1,
+   "unsatisfiable": 0
+  },
+  {
+   "axioms": 647721,
+   "classes": 238150,
+   "classifyMedianMs": 2965.773533,
+   "classifyMs": [
+    3015.685582,
+    2887.4902279999997,
+    2965.773533,
+    3000.95512,
+    2904.914104
+   ],
+   "conclusions": 26995717,
+   "consistent": true,
+   "contexts": 238151,
+   "estimatedBytes": 374473680,
+   "indexMs": 924.291502,
+   "input": "data/chebi_lite.ofn",
+   "nodes": 238152,
+   "ontology": "chebi_lite",
+   "outside": 1,
+   "partial": {},
+   "peakRssKib": 1700288,
+   "peakRssKibAfterRead": 275644,
+   "readMs": 428.582576,
+   "saturationMs": 809.3677710000001,
+   "taxonomyMs": 827.364294,
+   "taxonomy_sha256": "c909192b680de7c2dcc9bf7d68d9df1b08e554a34d3a1523f3378bdda6f29837",
+   "threads": 4,
+   "unsatisfiable": 0
+  },
+  {
+   "axioms": 647721,
+   "classes": 238150,
+   "classifyMedianMs": 2840.20343,
+   "classifyMs": [
+    3099.140077,
+    2811.886748,
+    2917.733371,
+    2840.20343,
+    2799.9626200000002
+   ],
+   "conclusions": 26995717,
+   "consistent": true,
+   "contexts": 238151,
+   "estimatedBytes": 374473680,
+   "indexMs": 857.8432750000001,
+   "input": "data/chebi_lite.ofn",
+   "nodes": 238152,
+   "ontology": "chebi_lite",
+   "outside": 1,
+   "partial": {},
+   "peakRssKib": 1846516,
+   "peakRssKibAfterRead": 275492,
+   "readMs": 489.082177,
+   "saturationMs": 738.943171,
+   "taxonomyMs": 867.97044,
+   "taxonomy_sha256": "c909192b680de7c2dcc9bf7d68d9df1b08e554a34d3a1523f3378bdda6f29837",
+   "threads": 8,
+   "unsatisfiable": 0
+  }
+ ],
+ "scale": "GO 2026-07-26 and ChEBI lite 256",
+ "settings": {
+  "harness": "crates/sparkles-owl/examples/el_classify.rs",
+  "repeat": 5,
+  "threads": [
+   1,
+   4,
+   8
+  ]
+ },
+ "suite": "el-classification"
+}

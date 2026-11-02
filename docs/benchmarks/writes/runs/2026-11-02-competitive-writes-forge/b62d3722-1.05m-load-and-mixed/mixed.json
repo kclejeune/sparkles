@@ -1,0 +1,22 @@
+{
+ "sparkles": {
+  "read_qps": 2101.3,
+  "read_p50_ms": 7.25,
+  "read_p99_ms": 12.73,
+  "read_errors": 0,
+  "writes_per_s": 245.7,
+  "write_p50_ms": 3.794,
+  "write_p99_ms": 8.708,
+  "write_errors": 0
+ },
+ "oxigraph": {
+  "read_qps": 11.9,
+  "read_p50_ms": 1249.56,
+  "read_p99_ms": 2088.06,
+  "read_errors": 0,
+  "writes_per_s": 1264.1,
+  "write_p50_ms": 0.779,
+  "write_p99_ms": 1.013,
+  "write_errors": 0
+ }
+}

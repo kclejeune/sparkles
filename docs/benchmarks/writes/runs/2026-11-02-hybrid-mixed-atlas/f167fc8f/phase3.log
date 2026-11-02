@@ -1,0 +1,67 @@
+locks held 2026-11-02T16:59:17Z load 0.59 4.41 8.84 1/643 2779205
+quiet 16:59:17 0.59 4.41 8.84 1/645 2779212
+load 10.05 6.30 9.31 others 1
+accept 1 [default] {'read_qps': 2733.6, 'read_p50_ms': 5.63, 'read_p99_ms': 9.61, 'read_errors': 0, 'writes_per_s': 380.6, 'write_p50_ms': 2.309, 'write_p99_ms': 5.725, 'write_errors': 0}
+load 15.68 8.02 9.79 others 1
+accept 2 [--request-cpus all] {'read_qps': 2595.9, 'read_p50_ms': 5.86, 'read_p99_ms': 10.21, 'read_errors': 0, 'writes_per_s': 367.8, 'write_p50_ms': 2.374, 'write_p99_ms': 5.914, 'write_errors': 0}
+load 19.42 9.66 10.28 others 1
+accept 3 [--request-cpus all] {'read_qps': 2365.2, 'read_p50_ms': 6.57, 'read_p99_ms': 10.78, 'read_errors': 0, 'writes_per_s': 266.7, 'write_p50_ms': 3.665, 'write_p99_ms': 7.435, 'write_errors': 0}
+load 21.64 11.13 10.75 others 1
+accept 4 [default] {'read_qps': 2358.9, 'read_p50_ms': 6.61, 'read_p99_ms': 10.91, 'read_errors': 0, 'writes_per_s': 334.6, 'write_p50_ms': 2.566, 'write_p99_ms': 6.568, 'write_errors': 0}
+load 22.49 12.44 11.20 others 1
+accept 5 [default] {'read_qps': 2348.7, 'read_p50_ms': 6.62, 'read_p99_ms': 10.91, 'read_errors': 0, 'writes_per_s': 363.9, 'write_p50_ms': 2.392, 'write_p99_ms': 6.026, 'write_errors': 0}
+load 22.91 13.45 11.57 others 1
+accept 6 [--request-cpus all] {'read_qps': 2357.7, 'read_p50_ms': 6.59, 'read_p99_ms': 10.99, 'read_errors': 0, 'writes_per_s': 286.0, 'write_p50_ms': 3.474, 'write_p99_ms': 7.238, 'write_errors': 0}
+load 22.97 14.38 11.94 others 1
+accept 7 [--request-cpus all] {'read_qps': 2362.1, 'read_p50_ms': 6.58, 'read_p99_ms': 10.87, 'read_errors': 0, 'writes_per_s': 318.5, 'write_p50_ms': 2.81, 'write_p99_ms': 6.78, 'write_errors': 0}
+load 22.61 15.15 12.28 others 1
+accept 8 [default] {'read_qps': 2357.1, 'read_p50_ms': 6.61, 'read_p99_ms': 10.86, 'read_errors': 0, 'writes_per_s': 364.5, 'write_p50_ms': 2.381, 'write_p99_ms': 5.99, 'write_errors': 0}
+load 24.87 16.41 12.79 others 1
+accept 9 [default] {'read_qps': 2368.7, 'read_p50_ms': 6.57, 'read_p99_ms': 10.77, 'read_errors': 0, 'writes_per_s': 302.9, 'write_p50_ms': 3.218, 'write_p99_ms': 6.858, 'write_errors': 0}
+load 24.45 17.31 13.23 others 1
+accept 10 [--request-cpus all] {'read_qps': 2386.4, 'read_p50_ms': 6.52, 'read_p99_ms': 10.82, 'read_errors': 0, 'writes_per_s': 232.3, 'write_p50_ms': 3.94, 'write_p99_ms': 7.596, 'write_errors': 0}
+r0       fix6         auto reads/s  2417.6 writes/s  234.0 wp50 3.911 busyP 0.772 busyE 0.916 other:run=788,wait=2188,n=25 rayon:run=57236,wait=188733,n=18 tokio:run=398935,wait=26885,n=42
+r0       fix6          all reads/s  2400.6 writes/s  285.5 wp50 3.477 busyP 0.782 busyE 0.919 other:run=943,wait=2472,n=27 rayon:run=60911,wait=221912,n=20 tokio:run=397519,wait=28922,n=41
+r1       fix6         auto reads/s  2380.8 writes/s  366.0 wp50 2.37 busyP 0.784 busyE 0.922 other:run=1103,wait=3472,n=25 rayon:run=56013,wait=195308,n=18 tokio:run=400129,wait=28407,n=42
+r1       fix6          all reads/s  2367.4 writes/s  361.2 wp50 2.411 busyP 0.788 busyE 0.922 other:run=1081,wait=2675,n=27 rayon:run=59712,wait=221904,n=20 tokio:run=398311,wait=29334,n=42
+r2       fix6         auto reads/s  2381.3 writes/s  367.0 wp50 2.373 busyP 0.784 busyE 0.922 other:run=1050,wait=2396,n=25 rayon:run=55884,wait=193976,n=18 tokio:run=399676,wait=29417,n=44
+r2       fix6          all reads/s  2362.9 writes/s  362.5 wp50 2.389 busyP 0.785 busyE 0.921 other:run=1068,wait=2581,n=27 rayon:run=59559,wait=219872,n=20 tokio:run=397098,wait=30117,n=42
+MIXABDONE
+r0       fix6         auto reads/s  1019.1 writes/s  775.2 wp50 1.116 busyP 0.396 busyE 0.127 other:run=1051,wait=26,n=25 rayon:run=26559,wait=1817,n=18 tokio:run=115863,wait=365,n=26
+r0       fix6          all reads/s   977.0 writes/s  409.5 wp50 2.691 busyP 0.236 busyE 0.337 other:run=793,wait=26,n=27 rayon:run=27873,wait=1388,n=20 tokio:run=114480,wait=172,n=26
+r1       fix6         auto reads/s  1035.9 writes/s  549.8 wp50 1.227 busyP 0.387 busyE 0.112 other:run=885,wait=25,n=25 rayon:run=27234,wait=1354,n=18 tokio:run=114354,wait=338,n=26
+r1       fix6          all reads/s   975.9 writes/s  433.7 wp50 2.65 busyP 0.232 busyE 0.343 other:run=797,wait=38,n=27 rayon:run=27550,wait=1234,n=20 tokio:run=114707,wait=173,n=26
+r2       fix6         auto reads/s  1018.8 writes/s  842.3 wp50 1.102 busyP 0.397 busyE 0.129 other:run=1104,wait=35,n=25 rayon:run=26162,wait=1974,n=18 tokio:run=116228,wait=394,n=26
+r2       fix6          all reads/s   976.5 writes/s  395.4 wp50 2.7 busyP 0.234 busyE 0.332 other:run=772,wait=31,n=27 rayon:run=27831,wait=1420,n=20 tokio:run=114371,wait=185,n=26
+MIXABDONE
+1 fix6 auto threads=18 q1-1=11.7 q2-1=14.0 q3-1=8.0 q4-1=242.3 q5-1=7.0 q6-1=11.5 q7-1=78.9 q8-1=245.4
+1 fix6 reqall threads=20 q1-1=10.8 q2-1=13.4 q3-1=16.0 q4-1=243.6 q5-1=6.5 q6-1=17.5 q7-1=77.6 q8-1=249.0
+1 p449 auto threads=18 q1-1=7.1 q2-1=13.5 q3-1=8.0 q4-1=239.7 q5-1=6.9 q6-1=15.8 q7-1=77.5 q8-1=244.0
+1 p449 reqall threads=20 q1-1=9.9 q2-1=13.3 q3-1=16.7 q4-1=241.8 q5-1=7.7 q6-1=12.9 q7-1=77.4 q8-1=244.6
+2 fix6 auto threads=18 q1-1=7.5 q2-1=16.6 q3-1=7.9 q4-1=241.5 q5-1=7.0 q6-1=13.2 q7-1=78.9 q8-1=248.9
+2 p449 reqall threads=20 q1-1=12.8 q2-1=13.6 q3-1=27.6 q4-1=244.7 q5-1=6.9 q6-1=28.7 q7-1=77.9 q8-1=250.7
+2 p449 auto threads=18 q1-1=13.0 q2-1=13.9 q3-1=8.3 q4-1=241.8 q5-1=7.0 q6-1=17.5 q7-1=78.4 q8-1=245.9
+2 fix6 reqall threads=20 q1-1=6.1 q2-1=13.4 q3-1=27.8 q4-1=242.8 q5-1=7.9 q6-1=14.8 q7-1=78.0 q8-1=245.1
+3 p449 auto threads=18 q1-1=14.4 q2-1=13.7 q3-1=8.5 q4-1=243.0 q5-1=7.0 q6-1=13.8 q7-1=78.1 q8-1=245.5
+3 p449 reqall threads=20 q1-1=8.8 q2-1=13.2 q3-1=25.5 q4-1=242.8 q5-1=8.2 q6-1=12.6 q7-1=76.7 q8-1=246.7
+3 fix6 auto threads=18 q1-1=4.8 q2-1=16.7 q3-1=8.5 q4-1=242.5 q5-1=5.3 q6-1=13.0 q7-1=77.7 q8-1=245.9
+3 fix6 reqall threads=20 q1-1=11.7 q2-1=15.2 q3-1=28.0 q4-1=250.7 q5-1=7.0 q6-1=11.2 q7-1=78.7 q8-1=247.5
+4 p449 auto threads=18 q1-1=14.3 q2-1=17.5 q3-1=7.7 q4-1=242.1 q5-1=5.8 q6-1=12.4 q7-1=77.5 q8-1=246.5
+4 fix6 reqall threads=20 q1-1=10.7 q2-1=13.5 q3-1=21.4 q4-1=241.2 q5-1=8.3 q6-1=12.0 q7-1=77.7 q8-1=245.8
+4 fix6 auto threads=18 q1-1=9.2 q2-1=13.3 q3-1=7.9 q4-1=239.9 q5-1=3.6 q6-1=11.6 q7-1=78.7 q8-1=241.7
+4 p449 reqall threads=20 q1-1=14.7 q2-1=15.9 q3-1=27.6 q4-1=244.4 q5-1=7.4 q6-1=18.1 q7-1=79.0 q8-1=248.1
+PLACEMENT-DONE
+metric=server  host=atlas  governor=powersave/balance_performance
+template                 fix6/auto     fix6/reqall       p449/auto     p449/reqall
+bi-q1                        11.35           13.40           13.25           13.77
+bi-q2                        15.60           12.91           14.91           12.94
+bi-q3                        18.59           27.78           18.64           28.08
+bi-q4                       159.06          158.48          158.70          159.66
+bi-q5                        19.72           18.40           19.73           18.77
+bi-q6                        11.54           13.96           11.76           16.85
+bi-q7                        44.31           44.10           43.33           43.25
+bi-q8                        23.94           23.75           24.86           24.08
+
+per-process medians (instance 1 and births):
+PHASE3DONE
+LOCKRUN-EXIT=0

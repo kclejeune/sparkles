@@ -10,3 +10,7 @@ The result report is a manual import. A linked raw record supports only the meas
 and metadata it contains. Missing build revisions, host details, durability settings or
 answer evidence remain unknown and must be supplied by a new run before a broader claim
 is generated. Existing raw records retain their original bytes and paths.
+
+The [comparison of Ask across providers](RESULTS.md#ask-across-providers) gives one
+table per set for six Claude and OpenAI models, with the baseline and the final build,
+and states the rule that chooses the default model.

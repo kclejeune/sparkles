@@ -1,0 +1,121 @@
+dataset: 10527323 triples
+churn: 3500 inserts, 1500 deletes (1000000 people) -> /home/kclejeune/lanes/comp-452/work-b62d3722-1000000/churn-5000.ru
+[07:29:09] sparkles: applying 5000 commits
+[07:29:16] sparkles: {"commits": 5000, "errors": 0, "seconds": 7.338, "per_s": 681.4, "p50_ms": 1.325, "p99_ms": 3.299, "mean_ms": 1.466, "max_ms": 57.78}
+
+rows                 sparkles
+star-join               29700
+two-hop-count               1
+contains                    1
+regex-iri                   1
+
+== star-join
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time     42.0 ms  ±     2.1 ms      39.6 ms  …    44.6 ms
+  Memory        11.5 MiB ±     0.1 MiB     11.4 MiB …    11.6 MiB
+ 
+
+== two-hop-count
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time     35.8 ms  ±     0.1 ms      35.5 ms  …    36.0 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+
+== contains
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time     15.1 ms  ±     2.6 ms      12.8 ms  …    22.0 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.3 MiB …    11.5 MiB
+ 
+
+== regex-iri
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time     16.9 ms  ±     0.4 ms      16.2 ms  …    17.3 ms
+  Memory        11.3 MiB ±     0.0 MiB     11.3 MiB …    11.4 MiB
+ 
+
+== update-latency
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.8 ms  ±     0.1 ms       3.6 ms  …     4.1 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.2 MiB …    11.4 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== throughput (160 requests, 16 clients)
+Benchmark 1: sparkles (3 runs)
+                mean     ±       σ          min     …     max
+  Wall Time    897.5 ms  ±     7.0 ms     893.3 ms  …   905.6 ms
+  Memory        11.6 MiB ±     0.1 MiB     11.6 MiB …    11.7 MiB
+ 
+
+RSS (MiB) after the run: {
+ "sparkles": 1056
+}
+| query | sparkles (ms) |
+|---|---:|
+| count-all | — |
+| types-grouped | — |
+| star-join | **42.0 ± 2.1** |
+| two-hop-count | **35.8 ± 0.1** |
+| range-topk | — |
+| optional-count | — |
+| contains | **15.1 ± 2.6** |
+| group-avg | — |
+| path-plus | — |
+| distinct-obj | — |
+| export-500k | — |
+| predicate-counts | — |
+| predicate-subjects | — |
+| class-predicates | — |
+| class-predicate-list | — |
+| order-by-full | — |
+| optional-chain | — |
+| minus | — |
+| not-exists | — |
+| exists-join | — |
+| subquery-agg | — |
+| regex-iri | **16.9 ± 0.4** |
+| knows-reach | — |
+| distinct-join | — |
+| lang-filter | — |
+| star-lookup | — |
+| values-star | — |
+| employee-docs | — |
+| expr-bind-group | — |
+| expr-order-key | — |
+| expr-agg-arg | — |
+| **update** (1-triple INSERT DATA) | **3.8 ± 0.1** |
+| **throughput** star-join, 16 clients (queries/s) | **178** |
+
+Memory: the servers' resident set (VmRSS, and VmHWM for peaks) and each load's peak RSS (GNU time). Lower is better.
+
+| memory | sparkles |
+|---|---:|
+| server RSS 2 s after start, before any query (MiB) | 143 |
+| server RSS after every query ran once (MiB) | 926 |
+| server RSS after the run (MiB) | 1056 |
+| peak RSS during the throughput run (MiB) | 1228 |
+| server RSS after the run less Sparkles' decoded-block cache of 722 MiB (MiB) | 334 |
+
+Memory per query: how far the server's peak RSS rose over its RSS before the request, then the peak, in MiB. The peak is reset (clear_refs) before each request of the answer check.
+
+| query (rise / peak) | sparkles |
+|---|---:|
+| star-join | +115 / 723 |
+| two-hop-count | +200 / 923 |
+| contains | +24 / 947 |
+| regex-iri | +14 / 961 |
+
+Churn before the queries: 5000 single-triple commits, one request each and the same for every engine. They are INSERT DATA and DELETE DATA in the default graph.
+
+| commits | sparkles |
+|---|---:|
+| commits/s | 681 |
+| latency p50 (ms) | 1.32 |
+| latency p99 (ms) | 3.30 |
+| failed commits | 0 |

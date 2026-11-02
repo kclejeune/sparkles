@@ -1,0 +1,75 @@
+{
+ "host": "atlas",
+ "kernel": "7.2.9",
+ "governor": {
+  "0": {
+   "scaling_governor": "powersave",
+   "energy_performance_preference": "balance_performance",
+   "scaling_max_freq": "4800000",
+   "scaling_min_freq": "800000"
+  },
+  "12": {
+   "scaling_governor": "powersave",
+   "energy_performance_preference": "balance_performance",
+   "scaling_max_freq": "3500000",
+   "scaling_min_freq": "800000"
+  }
+ },
+ "binaries": {
+  "fix6": {
+   "path": "/home/kclejeune/lanes/hybrid-583/bin/fix6",
+   "sha256": "cff334499fffbf56d73502c3e64817ebaa278ea807fee2bc94485a564abb0b37"
+  },
+  "p449": {
+   "path": "/home/kclejeune/lanes/hybrid-583/bin/exp1",
+   "sha256": "9ea44010651f141cca706f6b12ad401460414a8e5e99bedc4ea8c663426aba0b"
+  }
+ },
+ "configs": {
+  "auto": [
+   "0-19",
+   null
+  ],
+  "reqall": [
+   "0-19",
+   null,
+   null,
+   [
+    "--request-cpus",
+    "all"
+   ]
+  ]
+ },
+ "client_cpu": 19,
+ "untimed": 3,
+ "timed": 15,
+ "rounds": 4,
+ "queries": [
+  "bi-q1-1",
+  "bi-q1-2",
+  "bi-q1-3",
+  "bi-q2-1",
+  "bi-q2-2",
+  "bi-q2-3",
+  "bi-q3-1",
+  "bi-q3-2",
+  "bi-q3-3",
+  "bi-q4-1",
+  "bi-q4-2",
+  "bi-q4-3",
+  "bi-q5-1",
+  "bi-q5-2",
+  "bi-q5-3",
+  "bi-q6-1",
+  "bi-q6-2",
+  "bi-q6-3",
+  "bi-q7-1",
+  "bi-q7-2",
+  "bi-q7-3",
+  "bi-q8-1",
+  "bi-q8-2",
+  "bi-q8-3"
+ ],
+ "started": "2026-11-02T17:10:57Z",
+ "loadavg": "6.73 13.93 13.70 1/642 2792182"
+}

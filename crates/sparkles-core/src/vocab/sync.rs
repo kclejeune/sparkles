@@ -65,6 +65,7 @@ impl LazySync {
                     std::thread::Builder::new()
                         .name("vocab-sync".into())
                         .spawn(move || {
+                            crate::threads::started();
                             while let Ok(job) = receive.recv() {
                                 let result = if job.direct {
                                     DeltaFile::sync_direct(&job.file, job.upto)

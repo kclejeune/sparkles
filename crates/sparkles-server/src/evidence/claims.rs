@@ -243,7 +243,7 @@ fn record_key(field: &str, value: &str) -> ApiResult<RecordKey> {
     RecordKey::new(value).map_err(|e| bad(field.to_string(), e))
 }
 
-fn digest(field: &str, value: &str) -> ApiResult<Sha256Digest> {
+pub(super) fn digest(field: &str, value: &str) -> ApiResult<Sha256Digest> {
     value.parse().map_err(|e| bad(field.to_string(), e))
 }
 
@@ -626,7 +626,7 @@ struct Request {
 
 /// The authenticated principal's IRI: `urn:x-sparkles:principal:` and its log name,
 /// percent-encoded, as `assert_facts` records it.
-fn principal_iri(p: &Principal) -> NamedNode {
+pub(super) fn principal_iri(p: &Principal) -> NamedNode {
     use std::fmt::Write as _;
     let name: String = match crate::http::author(p) {
         Some(a) => a.to_string(),
@@ -648,9 +648,9 @@ fn principal_iri(p: &Principal) -> NamedNode {
 /// before the commit publishes and held until it is published: the access generation
 /// the request was authenticated under is unchanged, and its session or token has not
 /// expired or been revoked.
-struct CallerFence {
-    st: Arc<AppState>,
-    p: Principal,
+pub(super) struct CallerFence {
+    pub(super) st: Arc<AppState>,
+    pub(super) p: Principal,
 }
 
 impl sparkles::evidence::AuthorityFence for CallerFence {

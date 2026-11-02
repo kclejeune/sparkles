@@ -941,3 +941,19 @@ async fn scratch_branch_ttl_is_a_dataset_setting() {
     assert_eq!(stored["format"], 1, "{stored}");
     assert!(stored.get("scratchBranches").is_none(), "{stored}");
 }
+
+#[test]
+fn a_repair_setting_can_be_locked() {
+    let d = declared(json!({
+        "defaults": {"assistant": {"repairs": {"drafts": 1}}, "locked": ["assistant.repairs.drafts"]},
+    }));
+    let r = resolve(
+        &ASSISTANT,
+        &d,
+        "slurp",
+        json!({"repairs": {"drafts": 3, "shapeCheck": true}}),
+        Providers::Unchecked,
+    );
+    assert_eq!(r.effective["repairs"]["drafts"], 1);
+    assert_eq!(r.effective["repairs"]["shapeCheck"], true);
+}

@@ -461,7 +461,7 @@ happens to materialized inferences, and the limits.
 | `--cors-origin ORIGIN` | none | A browser origin, such as `https://yasgui.example`, whose pages may call the API cross-origin without credentials. Repeatable. With `--auth-config`, it is added to `cors.origins`. Without auth, such a page may do everything the server allows. |
 | `--timeout S` | `60` | Default query timeout in seconds. `timeout=` sets it per request. |
 | `--default-execution MODE` | `auto` | How a query runs when its request has no `execution=`. `auto` streams the plain scans of a thousand rows or more and the groupings of 20,000 input rows or more, which measured faster as cursors, and runs the rest eagerly. `eager` runs every query eagerly. See [incremental query execution](#incremental-query-execution). |
-| `--request-cpus MODE` | `auto` | `auto` runs the threads that serve requests on the performance cores of a hybrid processor on Linux and leaves one CPU free of query threads for every four efficiency cores. `all` lets every thread run on every CPU. See [Threads on hybrid processors](#threads-on-hybrid-processors). |
+| `--request-cpus MODE` | `auto` | `auto` runs request work on the performance cores of a hybrid processor on Linux while at most one request per performance core is in flight, and leaves one CPU free of query threads for every four efficiency cores. `all` lets every thread run on every CPU. See [Threads on hybrid processors](#threads-on-hybrid-processors). |
 | `--update-timeout S` | `0` | Default SPARQL update timeout in seconds; `0` means none. `timeout=` sets it per request. An update that times out changes nothing. |
 | `--max-timeout S` | `1800` | Largest `timeout=` a query or update may ask for; `0` means unlimited. Never below `--timeout` or `--update-timeout`. |
 | `--query-memory-mb N` | `8192` (`small`: `1024`) | Budget for the estimated memory of a query's intermediate results; `0` means unlimited. |
@@ -605,13 +605,23 @@ performance and efficiency cores, a serving thread that waits for the pool often
 only an efficiency core free when the pool's work ends, and finishes the request there.
 On Linux, the kernel lists the two kinds of core of an Intel hybrid processor in
 `/sys/devices/cpu_core/cpus` and `/sys/devices/cpu_atom/cpus`. When both lists exist
-and the server may run on cores of both kinds, `--request-cpus auto` runs the serving
-threads on the performance cores, and the query pool leaves one CPU free for
-every four efficiency cores, or part of four. The pool's threads run on every CPU. On
-forge, an Intel Core i5-13500 with twelve logical CPUs on its performance cores and
-eight efficiency cores, the pool has 18 threads. The third instance of BSBM BI `q3` at
-10M then takes 23 to 24 ms in every server process, against 37 to 44 ms with
-`--request-cpus all`. The server logs the split at startup.
+and the server may run on cores of both kinds, `--request-cpus auto` runs request work
+on the performance cores, and the query pool leaves one CPU free for every four
+efficiency cores, or part of four. The pool's threads run on every CPU. On forge, an
+Intel Core i5-13500 with six performance cores of two logical CPUs each and eight
+efficiency cores, the pool has 18 threads. The third instance of BSBM BI `q3` at 10M
+then takes 23 to 24 ms in every server process, against 37 to 44 ms with
+`--request-cpus all`.
+
+The performance cores hold only so many requests at once. Request work runs there while
+at most one request per physical performance core is in flight, counting the request
+itself and every response still being sent, and runs on every CPU when more are. A
+thread moves when it starts a request's work, and only when the load asks for the other
+placement. On a host with forge's processor, four readers and a writer get 1,019 reads a
+second against 977 with `--request-cpus all`, and sixteen readers get as many reads and
+writes as with every CPU. The [hybrid placement
+run](benchmarks/writes/runs/2026-11-02-hybrid-mixed-atlas/README.md) records the
+measurements. The server logs the split and the request limit at startup.
 
 `--request-cpus all` keeps every thread free to run anywhere, with a pool thread per
 logical CPU. Both modes behave as `all` on processors with one kind of core, on hybrid
@@ -740,6 +750,9 @@ sparkles ontology axioms  --loc db --type SubClassOf --about http://ex.org/Perso
 sparkles ontology check   --loc db --profile el,rl   # OWL 2 profile checks (exit 1 when outside one)
 sparkles ontology check   onto.ttl --profile all     # check a file without a database
 sparkles ontology edit    --loc db --add new.json --remove old.json   # JSON axioms, in one commit
+sparkles ontology classify --loc db --format text   # OWL 2 EL taxonomy (exit 1 when unsatisfiable)
+sparkles ontology classify go.ofn > go-taxonomy.ofn  # classify a file without a database
+sparkles ontology classify --loc db --target http://ex.org/taxonomy   # write the taxonomy to a graph
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --language en|all,
                                               #   --language fr=french-light (a tag with an analyzer),
                                               #   --rebuild, --status, --disable, --text-dicts DIR
@@ -4650,6 +4663,32 @@ summary and the usage of each model call, and `--events` prints each step as a J
 as it happens. `--no-run` stops after the check, and `--no-summary` leaves the summary
 out.
 
+`--questions FILE` asks every question of a JSON-lines file in place of the question
+argument, or of standard input with `-`. Each line is `{"id", "question",
+"clarification"?, "tryHarder"?, "modelSecrets"?}`, and the command prints one JSON
+result per line with its `id`, in input order. The store and the model configuration
+open once, so caches stay warm across the questions as they do in a running server.
+`--jobs N` asks up to N questions at once. Every other option applies to each question,
+and each keeps its own deadline, token budget and query memory budget. A line that is
+invalid or fails gets its own error result while the rest go on. A line's
+`modelSecrets`, as `NAME=SOURCE` strings, replace the `--model-secret` of the same name
+for that question, and the question still counts against the provider's concurrency,
+request spacing and daily token limits that every other line shares.
+
+When a draft gives no query, or its query still returns no rows after the usual
+repairs, Ask explores the data once. It shows the model further link candidates for the
+question's mentions and the predicates those entities use in either direction, with
+counts, and drafts again. `--no-explore` turns this off. Three more options are off by
+default because they did not raise accuracy measurably in the
+[evaluation](benchmarks/natural-language/RESULTS.md). `--shape-check` repairs once when
+a result does not fit the form of the question, such as several rows for "How many", a
+SELECT for a yes or no question or a count for "Which", and keeps the first answer if
+the repair does not answer. `--drafts N` asks N first drafts and keeps the one whose
+checked, complete result most drafts share, at the cost of N first-draft calls.
+`--type-hints` links each mention with the classes that the words around it name. The
+exploration's sample values and a shape repair's first rows reach the model only when
+the dataset's `send` policy lets the draft and repair providers receive rows.
+
 Each query of an Ask runs under a memory budget of 2048 MiB, as in `sparkles mcp`, and
 `--query-memory-mb N` changes it, with `0` for no budget. On a database of more than ten
 million quads, the schema that grounds the question and checks the query comes from the
@@ -5106,8 +5145,18 @@ sparkles secrets set anthropic < anthropic.key
 | Preset | Kind | Endpoint | Key secret | Model |
 |---|---|---|---|---|
 | `anthropic` | `anthropic` | `https://api.anthropic.com` | `anthropic` | `claude-sonnet-5-5` |
-| `openai` | `openai` | `https://api.openai.com/v1` | `openai` | `gpt-5-mini` |
+| `openai` | `openai` | `https://api.openai.com/v1` | `openai` | `gpt-6-luna` |
 | `ollama` | `ollama` | `http://127.0.0.1:11434` | none | `qwen3:8b` |
+
+The models of the two hosted presets come from the Ask comparison in the
+[natural-language benchmark](benchmarks/natural-language/RESULTS.md#ask-across-providers).
+Each is the cheapest model per correct answer whose score on 150 held-out questions is
+within the noise of its provider's best model. GPT-6 Luna is also the cheapest of all six
+models measured that meets that bar against the best of them. The preset's entry for its
+model also sets the settings that the comparison used, a 200,000-token context, effort
+`medium` and an output limit of 4,096 tokens for Sonnet and 16,384 for Luna, whose
+reasoning counts toward it. Without a context size the server treats a model as a small
+one and trims Ask's grounding.
 
 The command refuses a provider name that is already in use. An OpenAI-compatible
 gateway, such as vLLM or LiteLLM, has no preset. Add it with the `openai` kind and its
@@ -7304,7 +7353,7 @@ models:
           endpoint: https://api.openai.com/v1
           apiKey: {secret: openai}
       roles:
-        draft: [{provider: openai, model: gpt-5-mini}]
+        draft: [{provider: openai, model: gpt-6-luna}]
   secrets:
     openai: {secretName: model-keys, key: openai}
 ```

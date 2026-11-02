@@ -62,9 +62,14 @@ fn dr(r: &DataRange, out: &mut Vec<Broken>) {
 
 /// The rules of one axiom.
 pub(super) fn axiom(ax: &Axiom) -> Vec<Broken> {
+    axiom_kind(&ax.kind)
+}
+
+/// The rules of one axiom, without its annotations.
+pub(super) fn axiom_kind(kind: &AxiomKind) -> Vec<Broken> {
     use AxiomKind as K;
     let mut out = Vec::new();
-    match &ax.kind {
+    match kind {
         K::SubClassOf(a, b) => {
             ce(a, &mut out);
             ce(b, &mut out);
@@ -105,11 +110,11 @@ pub(super) fn axiom(ax: &Axiom) -> Vec<Broken> {
         | K::AsymmetricObjectProperty(_)
         | K::DisjointDataProperties(_) => out.push(broken(
             AXIOMS,
-            format!("{} is not allowed", ax.axiom_type().name()),
+            format!("{} is not allowed", kind.axiom_type().name()),
         )),
         _ => {}
     }
-    for d in datatypes(&ax.kind) {
+    for d in datatypes(kind) {
         if EL_QL_FORBIDDEN_DATATYPES.contains(&d.as_str()) {
             out.push(broken(
                 ENTITIES,
@@ -117,7 +122,7 @@ pub(super) fn axiom(ax: &Axiom) -> Vec<Broken> {
             ));
         }
     }
-    if individuals(&ax.kind)
+    if individuals(kind)
         .iter()
         .any(|i| matches!(i, Individual::Anonymous(_)))
     {

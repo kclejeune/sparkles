@@ -6,12 +6,12 @@ qualifications are preserved, and are not regenerated from the JSON records. Rea
 
 ## Comparison summary
 
-The focused [write assessment](../writes/RESULTS.md#serial-writes-with-reader-work)
-  puts new-literal commits near 1.2 ms for Sparkles and 0.6 ms for unsynced Oxigraph at
-  10.5M. Sparkles synchronizes before acknowledgement. With sixteen readers, Oxigraph
-  completes 2.1–3.0× as many writes but no reads in the thirty-second 10.5M window,
-  against Sparkles' 232–245 reads/s. The separate suite churn table records 878 and
-  909 Sparkles commits/s at 1.05M and 10.5M under its own contract.
+The suite's churn of 5,000 single-triple commits runs at 778 and 935 Sparkles commits/s
+  against 809 and 744 for unsynced Oxigraph at 1.05M, and at 681 and 684 against 715 at
+  10.5M. Sparkles synchronizes before acknowledgement. With sixteen unpaced readers,
+  Oxigraph completes about five times as many writes at 1.05M but 12 to 16 reads/s, against
+  Sparkles' 2,101 to 2,198. The [focused write assessment](#serial-writes-with-reader-work)
+  of 2026-10-25 predates the write-through fences of items 501 and 502.
 
 ## Writes and updates
 
@@ -40,19 +40,25 @@ vocabulary, IRI inserts reuse known terms, and deletes remove triples.
 Oxigraph issued no device writes during these runs, while a run of 5,000 Sparkles commits
 issued 14 device cache flushes.
 
+These rounds ran before items 501 and 502 wrote the commit records and annotation records
+through the device cache, and this serial workload has not been measured since, so the
+table records the earlier build. The churn table below was measured after those items.
+
 The comparative suite's `updates` mode applies the same 5,000 single-triple INSERT and
 DELETE requests, one at a time, to every engine's store. No engine failed a commit.
 `mise run bench 100000 .artifacts/bench --mode updates` reproduces it.
 
 | Churn of 5,000 commits | sparkles | jena-fuseki | qlever | fluree | oxigraph |
 |---|---:|---:|---:|---:|---:|
-| 1.05M: commits/s | **878** | 16 | 423 | 259 | 771 |
-| 1.05M: latency p50 / p99 (ms) | **1.20 / 2.06** | 70.93 / 88.19 | 2.27 / 5.78 | 3.17 / 25.22 | 1.25 / 2.07 |
-| 10.5M: commits/s | **909** | 26 | 387 | 361 | 715 |
-| 10.5M: latency p50 / p99 (ms) | **1.10** / 2.74 | 19.75 / 90.27 | 2.48 / 6.30 | 1.69 / 6.46 | 1.35 / **2.14** |
+| 1.05M: commits/s | **935** | 16 | 423 | 259 | 744 |
+| 1.05M: latency p50 / p99 (ms) | **1.15 / 1.76** | 70.93 / 88.19 | 2.27 / 5.78 | 3.17 / 25.22 | 1.35 / 2.09 |
+| 10.5M: commits/s | 684 | 26 | 387 | 361 | **715** |
+| 10.5M: latency p50 / p99 (ms) | 1.36 / 3.19 | 19.75 / 90.27 | 2.48 / 6.30 | 1.69 / 6.46 | **1.35 / 2.14** |
 
-*Sparkles was measured on forge on 2026-10-23 at commit 6699f27d, and the other engines on
-2026-10-18 and 2026-10-19.*
+*Sparkles and Oxigraph at 1.05M were measured on forge on 2026-11-02 with Sparkles at commit
+98f1728d, Sparkles at 10.5M on the same day, and the other cells on 2026-10-18 and
+2026-10-19. The [run record](runs/2026-11-02-competitive-writes-forge/README.md) also holds
+a second pair at 1.05M, 778 against 809 commits/s, with Sparkles at commit b62d3722.*
 
 The WAL preallocates space in steps from 64 KiB up to 4 MiB (`--wal-prealloc-kb`, `0`
 disables it). Replay, readers, backups and quotas use the logical end of the last commit,
@@ -528,40 +534,61 @@ opens a new connection. `mise run bench 100000 .artifacts/bench --mode mixed` re
 
 | Mixed load | sparkles | jena-fuseki | qlever | fluree | oxigraph |
 |---|---:|---:|---:|---:|---:|
-| 1.05M: reads/s | **2491.3** | 80.6 | 522.9 | 36.5 | 15.0 |
-| 1.05M: read p50 / p99 (ms) | **6.1 / 10.9** | 193.8 / 376.2 | 26.9 / 36.3 | 423.0 / 739.7 | 1014.2 / 1855.0 |
-| 1.05M: writes/s | 374.2 | 15.2 | 97.1 | 249.2 | **1272.6** |
-| 1.05M: write p50 / p99 (ms) | 2.3 / 6.4 | 67.9 / 86.6 | 6.2 / 30.5 | 3.8 / 14.2 | **0.8 / 1.0** |
+| 1.05M: reads/s | **2197.9** | 80.6 | 522.9 | 36.5 | 15.7 |
+| 1.05M: read p50 / p99 (ms) | **6.9 / 12.3** | 193.8 / 376.2 | 26.9 / 36.3 | 423.0 / 739.7 | 935.4 / 2027.4 |
+| 1.05M: writes/s | 252.0 | 15.2 | 97.1 | 249.2 | **1276.9** |
+| 1.05M: write p50 / p99 (ms) | 3.7 / 8.3 | 67.9 / 86.6 | 6.2 / 30.5 | 3.8 / 14.2 | **0.8 / 1.0** |
 | 1.05M: failed reads / writes | 0 / 0 | 0 / 0 | 30034 / 1046 | 0 / 0 | 0 / 0 |
-| 10.5M: reads/s | **244.1** | 5.7 | 74.7 | 3.4 | 0 |
-| 10.5M: read p50 / p99 (ms) | **64.6 / 84.3** | 2704.1 / 3588.4 | 212.1 / 257.6 | 4284.9 / 6931.1 | — |
-| 10.5M: writes/s | 265.8 | 18.1 | 47.5 | 237.8 | **565.1** |
-| 10.5M: write p50 / p99 (ms) | 3.5 / 8.0 | 67.3 / 87.7 | 10.7 / 133.6 | 3.8 / 16.8 | **1.6 / 3.9** |
+| 10.5M: reads/s | **197.1** | 5.7 | 74.7 | 3.4 | 0 |
+| 10.5M: read p50 / p99 (ms) | **78.8 / 125.5** | 2704.1 / 3588.4 | 212.1 / 257.6 | 4284.9 / 6931.1 | — |
+| 10.5M: writes/s | 210.5 | 18.1 | 47.5 | 237.8 | **565.1** |
+| 10.5M: write p50 / p99 (ms) | 4.1 / 12.4 | 67.3 / 87.7 | 10.7 / 133.6 | 3.8 / 16.8 | **1.6 / 3.9** |
 | 10.5M: failed reads / writes | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
 
-*Sparkles was measured on forge on 2026-10-23 at commit 6699f27d, and the other engines on
-2026-10-18 and 2026-10-19.*
+*Sparkles and Oxigraph at 1.05M were measured on forge on 2026-11-02 with Sparkles at commit
+98f1728d, Sparkles at 10.5M on the same day, and the other cells on 2026-10-18 and
+2026-10-19. The [run record](runs/2026-11-02-competitive-writes-forge/README.md) also holds
+a pair at 1.05M with Sparkles at commit b62d3722, 2,101 reads and 246 writes per second
+against Oxigraph's 12 and 1,264.*
 
-Sparkles serves 4.8× QLever's reads at 1.05M and 3.3× at 10.5M. Oxigraph commits more
+Sparkles serves 4.2× QLever's reads at 1.05M and 2.6× at 10.5M. Oxigraph commits more
 writes at both sizes while it serves far fewer reads. At 10.5M no Oxigraph reader finished
-within 30 s. A separate run with the durable-commit harness above, with 16 readers on the
+within 30 s. These forge runs kept every request on the performance cores of the hybrid
+processor, which the placement below replaces, and [item 600](../../ROADMAP.md) measures
+them again with it. On `atlas`, a host like `forge`, that placement committed 195 to 253
+writes/s against 279 to 367 with `--request-cpus all`, as the [run record](runs/2026-11-02-changed-reads-and-placement-atlas/README.md)
+shows. A separate run with the durable-commit harness above, with 16 readers on the
 10.5M store, completed 299 new-literal commits per second at a median of 3.2 ms.
+
+On a hybrid processor the server runs request work on the performance cores only while
+at most one request per performance core is in flight. With sixteen readers it runs on
+every CPU, and on atlas, an i5-13500 like forge, it answered 2,358.9 reads a second at
+1.05M against 2,365.2 with `--request-cpus all` in five alternating pairs. The [hybrid
+placement run](runs/2026-11-02-hybrid-mixed-atlas/README.md) records the measurements
+and why confining every request to the performance cores lost about a third of the writes.
 
 ### Queries after updates
 
 The `updates` mode applies the same 5,000 single-triple changes to each engine's store and
 runs the query suite again. The changes stay in Sparkles' delta until a compaction folds
-them into the base index. At 10.5M the delta changes `two-hop-count` from 17.5 to
-36.9 ms, `contains` from 7.0 to 15.6 ms and `regex-iri` from 8.3 to 18.0 ms, changes
-`star-join` from 36.7 to 39.0 ms, and changes throughput from 239 to 217 q/s, against
-QLever's 85 q/s on its changed store. On the changed stores Sparkles is fastest on 27 of
-28 queries at both sizes. QLever's changed-store `types-grouped` answer differs in value
-and is not ranked. Fluree is ahead on `two-hop-count` by 1.10× at 1.05M, 7.8 against
-8.6 ms, and by 1.06× at 10.5M. Fluree's 10.5M run on its changed store failed the same way
-as its run on the loaded store, with `optional-chain` killed at the memory limit and
-`count-all` recorded as an error.
+them into the base index. The reads that visit index blocks in parallel merge the delta
+into the blocks it changes. At 10.5M the changed store takes 21.6 ms on `two-hop-count`,
+8.1 ms on `contains` and 9.2 ms on `regex-iri`, against 17.5, 7.0 and 8.3 ms on the loaded
+store in the full suite run. At 1.05M it takes 6.2 ms on `two-hop-count`, against
+Fluree's 7.8 ms on its changed store and Sparkles' 5.1 ms on the loaded store. Before these
+reads merged the delta, the changed stores took 8.2 and 35.8 ms on `two-hop-count` in the
+same session.
 
-*Sparkles was measured on forge on 2026-10-23 at commit 6699f27d. The records for
+In the full suite run on the changed stores, Sparkles was fastest on 27 of 28 queries at
+both sizes, with Fluree ahead on `two-hop-count` before the change above. QLever's
+changed-store `types-grouped` answer differs in value and is not ranked. Fluree's 10.5M run
+on its changed store failed the same way as its run on the loaded store, with
+`optional-chain` killed at the memory limit and `count-all` recorded as an error. That run
+changed throughput from 239 to 217 q/s, against QLever's 85 q/s on its changed store.
+
+*The four queries were measured on forge on 2026-11-02 with Sparkles at commits b62d3722 and
+98f1728d, as the [run record](runs/2026-11-02-competitive-writes-forge/README.md) gives. The
+full suite run was measured on forge on 2026-10-23 at commit 6699f27d, and its records for
 [1.05M](../2026-10-23-synthetic-updates-1.05m-forge.json) and
 [10.5M](../2026-10-23-synthetic-updates-10.5m-forge.json) have every sample.*
 

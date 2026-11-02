@@ -497,9 +497,171 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
             "evidence-proposals",
         ),
     );
+    let dry_run = || {
+        closed(
+            &["wouldCommit", "inserted", "deleted", "error"],
+            json!({
+                "wouldCommit": boolean(),
+                "inserted": int(),
+                "deleted": int(),
+                "error": or_null(string()),
+            }),
+        )
+    };
+    let changed = || {
+        let change = || {
+            array(closed(
+                &["output", "triple"],
+                json!({
+                    "output": iri("The output graph."),
+                    "triple": with_desc(string(), "The projected triple in N-Triples."),
+                }),
+            ))
+        };
+        with_desc(
+            closed(
+                &["supportsAdded", "supportsEnded", "inserted", "removed"],
+                json!({
+                    "supportsAdded": array(string()),
+                    "supportsEnded": array(string()),
+                    "inserted": change(),
+                    "removed": change(),
+                }),
+            ),
+            "The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay.",
+        )
+    };
+    put(
+        "EvidenceReview",
+        doc(
+            closed(
+                &["policy", "policyVersion", "ifHead", "decisions"],
+                json!({
+                    "policy": with_desc(string(), "The name of a review policy of the evidence settings."),
+                    "policyVersion": with_desc(int(), "The policy version the reviewer saw, else `409 policy-changed`."),
+                    "ifHead": commit("The branch head the review was prepared at, else `409 head-changed`. Every read is made at this head."),
+                    "idempotencyKey": key("Makes a retry with the same payload answer the first receipt."),
+                    "dryRun": with_desc(boolean(), "Check and preview the review without committing it."),
+                    "message": with_desc(string(), "The commit message."),
+                    "decisions": array(closed(
+                        &["key", "target", "targetDigest", "disposition"],
+                        json!({
+                            "key": key("The decision's key in this request."),
+                            "target": iri("The reviewed claim or assessment."),
+                            "targetDigest": digest("The target's record digest as the reviewer saw it, else `409 target-changed`."),
+                            "disposition": string_enum(&["accepted", "rejected", "needsEvidence"]),
+                            "supersedes": iri("The target's current decision under the policy, required when it has one, else `409 decision-superseded`."),
+                        }),
+                    )),
+                }),
+            ),
+            "Review decisions under one policy.",
+            "evidence-reviews",
+        ),
+    );
+    put(
+        "EvidenceReviewResult",
+        doc(
+            closed(
+                &[
+                    "operation",
+                    "committed",
+                    "replayed",
+                    "commit",
+                    "branchId",
+                    "decisions",
+                    "changed",
+                ],
+                json!({
+                    "operation": iri("The operation, every decision's availability receipt."),
+                    "committed": with_desc(boolean(), "Whether this request published a commit."),
+                    "replayed": with_desc(boolean(), "Whether the idempotency key had published the same payload, whose receipt this is."),
+                    "commit": commit("The publishing commit, the first one for a replay, or the head for a dry run."),
+                    "branchId": uuid("The branch the commit published on."),
+                    "decisions": array(closed(
+                        &["key", "iri", "target", "disposition", "supersedes", "support", "notProjected", "conflicts"],
+                        json!({
+                            "key": string(),
+                            "iri": string(),
+                            "target": string(),
+                            "disposition": string_enum(&["accepted", "rejected", "needsEvidence"]),
+                            "supersedes": or_null(string()),
+                            "support": with_desc(or_null(string()), "The acceptance support that owns the projected triple."),
+                            "notProjected": with_desc(or_null(string()), "Why an acceptance did not project its claim."),
+                            "conflicts": with_desc(array(string()), "The contrary links and claims an `admitLabelled` policy admitted the claim against."),
+                        }),
+                    )),
+                    "changed": changed(),
+                    "dryRun": dry_run(),
+                }),
+            ),
+            "The outcome of a review.",
+            "evidence-reviews",
+        ),
+    );
+    put(
+        "EvidenceWithdrawal",
+        doc(
+            closed(
+                &["withdrawals"],
+                json!({
+                    "ifHead": commit("Publish only while this commit is the branch head, else `409 head-changed`."),
+                    "idempotencyKey": key("Makes a retry with the same payload answer the first receipt."),
+                    "dryRun": with_desc(boolean(), "Check and preview the withdrawal without committing it."),
+                    "message": with_desc(string(), "The commit message."),
+                    "withdrawals": array(closed(
+                        &["key", "target", "targetDigest"],
+                        json!({
+                            "key": key("The withdrawal's key in this request."),
+                            "target": iri("The withdrawn claim occurrence."),
+                            "targetDigest": digest("The claim's record digest, else `409 target-changed`."),
+                        }),
+                    )),
+                }),
+            ),
+            "Claim occurrences to withdraw.",
+            "evidence-reviews",
+        ),
+    );
+    put(
+        "EvidenceWithdrawalResult",
+        doc(
+            closed(
+                &[
+                    "operation",
+                    "committed",
+                    "replayed",
+                    "commit",
+                    "branchId",
+                    "withdrawals",
+                    "changed",
+                ],
+                json!({
+                    "operation": iri("The operation, every withdrawal's availability receipt."),
+                    "committed": with_desc(boolean(), "Whether this request published a commit."),
+                    "replayed": with_desc(boolean(), "Whether the idempotency key had published the same payload."),
+                    "commit": commit("The publishing commit, the first one for a replay, or the head for a dry run."),
+                    "branchId": uuid("The branch the commit published on."),
+                    "withdrawals": array(closed(
+                        &["key", "iri", "target", "existing"],
+                        json!({
+                            "key": string(),
+                            "iri": with_desc(or_null(string()), "The withdrawal record, `null` when the claim was already withdrawn."),
+                            "target": string(),
+                            "existing": with_desc(boolean(), "An earlier withdrawal had already withdrawn the claim."),
+                        }),
+                    )),
+                    "changed": changed(),
+                    "dryRun": dry_run(),
+                }),
+            ),
+            "The outcome of a withdrawal.",
+            "evidence-reviews",
+        ),
+    );
 }
 
-const KINDS: [&str; 12] = [
+const KINDS: [&str; 15] = [
     "SourceRevision",
     "Rendition",
     "Passage",
@@ -512,6 +674,9 @@ const KINDS: [&str; 12] = [
     "Task",
     "ReviewDecision",
     "IdentityProposal",
+    "AcceptanceSupport",
+    "Withdrawal",
+    "Projection",
 ];
 
 fn explaining(put: &mut dyn FnMut(&str, J)) {
@@ -737,6 +902,10 @@ fn asking(put: &mut dyn FnMut(&str, J)) {
                     "reviewedOnly": with_desc(boolean(), "Hide the agent memory graphs of the dataset from the query, and use only reviewed community reports."),
                     "query": with_desc(string(), "A query to check, run and summarize without drafting, for **Summarize again** after an edit."),
                     "mode": with_desc(string_enum(&["auto", "local", "global"]), "Answer from the data (`local`), from the community reports (`global`), or as the draft classifies the question (`auto`, the default)."),
+                    "explore": with_desc(boolean(), "Explore the data once after a draft without a query or with an empty result. Over the dataset's `repairs.explore`."),
+                    "shapeCheck": with_desc(boolean(), "Repair once when the result does not fit the question's form. Over the dataset's `repairs.shapeCheck`."),
+                    "drafts": with_desc(int(), "First drafts whose results vote on the query, 1 to 5. Over the dataset's `repairs.drafts`."),
+                    "typeHints": with_desc(boolean(), "Link mentions with the classes the words around them name. Over the dataset's `repairs.typeHints`."),
                 }),
             ),
             "A question for the dataset.",
@@ -799,6 +968,12 @@ fn asking(put: &mut dyn FnMut(&str, J)) {
                     "deadlineSecs": with_desc(num(), "The time an ask may take, 120 seconds by default."),
                     "historyDays": with_desc(int(), "The days an asked question is kept. 0 keeps nothing."),
                     "routing": any_object("`complexityThreshold` and `exampleScore` of the escalation rules."),
+                    "repairs": with_desc(closed(&[], json!({
+                        "explore": with_desc(boolean(), "Explore the data once after a draft without a query or with an empty result. `true` by default."),
+                        "shapeCheck": with_desc(boolean(), "Repair once when the result does not fit the question's form. `false` by default."),
+                        "drafts": with_desc(int(), "First drafts whose results vote on the query, 1 to 5. 1 by default."),
+                        "typeHints": with_desc(boolean(), "Link mentions with the classes the words around them name. `false` by default."),
+                    })), "The repair turns of the dataset's asks, which a request may override."),
                     "status": with_desc(obj(&["models", "historyDays", "ask"], json!({
                         "models": boolean(),
                         "historyDays": int(),
@@ -1863,7 +2038,7 @@ fn models(put: &mut dyn FnMut(&str, J)) {
             "allowedModels": strings(),
             "requestsPerMinute": int(),
             "budget": with_desc(obj(&["tokensPerDay", "usedToday"], json!({ "tokensPerDay": int(), "usedToday": int() })), "`usedToday` counts input written to the prompt cache at 1.25 tokens, or 2 tokens with the 1-hour TTL, and input read from it at 0.1 token."),
-            "promptCaching": with_desc(obj(&["enabled"], json!({ "enabled": boolean(), "ttl": string_enum(&["5m", "1h"]) })), "For the anthropic kind: whether stable prompt prefixes are marked for the provider's cache, and their TTL."),
+            "promptCaching": with_desc(obj(&["enabled"], json!({ "enabled": boolean(), "ttl": string_enum(&["5m", "1h"]) })), "For the anthropic kind: whether stable prompt prefixes are marked for the provider's cache, and their TTL. For the openai kind, enabled true sends an Ask repair as the first draft's user message followed by a second user message."),
             "unverified": with_desc(boolean(), "True when `tls.insecureSkipVerify` turns certificate verification off for the provider."),
             "tls": with_desc(obj(&["verification"], json!({
                 "verification": with_desc(string_enum(&["system", "custom-ca", "off"]), "How the provider's certificate is checked: against the system roots, against them and `tls.caCert`, or not at all."),

@@ -766,9 +766,10 @@ separate lines.
 minutes. It checks that the TypeScript and Rust clients match `docs/openapi.json`, that
 the Cargo.lock files of the Python, Node.js and JVM binding workspaces resolve as they are,
 that every planned Python binding in `crates/sparkles/bindings.toml` is on the parity
-test's deferred list and no deferred key is stale, and it runs the doc-path check and the
-script tests, which include the CI task-profile test. Each failure names its fix, and
-`--fix` regenerates the clients and lock files and lists the files to commit.
+test's deferred list and no deferred key is stale, and that the third-party licence files
+match the Cargo locks. It also runs the doc-path check and the script tests, which include
+the CI task-profile test. Each failure names its fix, and `--fix` regenerates the clients,
+lock files and licence files and lists the files to commit.
 
 The batch gate before a push runs `scripts/ci.sh --jobs 1`, `test:w3c`, `test:shacl`,
 `test:shex` and the plain and encrypted spill matrices on the build hosts rather than the
