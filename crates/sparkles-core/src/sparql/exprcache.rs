@@ -903,6 +903,10 @@ fn numeric_filter(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<Vec<boo
 /// algorithm separate from eager distinct admission and its reuse estimator.
 /// The widest range of integers that [`cursor_integer_distinct`] maps directly.
 const DENSE_SPAN: usize = 1 << 16;
+/// The rows above which [`cursor_integer_distinct`] maps in parallel. Mapping takes about
+/// a nanosecond a row, which a cursor's batches of a few tens of thousands of rows do not
+/// amortize on the pool.
+const DENSE_PAR_ROWS: usize = 1 << 18;
 
 fn cursor_integer_distinct(
     ctx: &Ctx,
@@ -914,7 +918,7 @@ fn cursor_integer_distinct(
     let Some(column) = t.col_of(v) else {
         return Ok(None);
     };
-    if t.len() > super::exec::PAR_THRESHOLD {
+    if t.len() > DENSE_PAR_ROWS {
         return par_integer_distinct(ctx, t, exprs, v, column, report);
     }
     let mut lo = u64::MAX;
@@ -1572,7 +1576,7 @@ mod tests {
         let store = crate::store::Store::in_memory(Default::default());
         let ctx = Ctx::new(store.snapshot());
         let v = ctx.var("k");
-        let n = 3 * (1 << 16) + 123;
+        let n = DENSE_PAR_ROWS + 2 * (1 << 16) + 123;
         let vals: Vec<i64> = (0..n).map(|i| 1000 + ((i * 7919) % 97) as i64).collect();
         let mut t = Table::new(vec![v]);
         t.cols[0] = ids(&vals);
