@@ -2763,6 +2763,52 @@ mod charge_tests {
         assert!(inline > 20, "most of the values are inline: {inline}");
     }
 
+    /// The executors read the accounting mode in at most this many places outside tests.
+    /// Stage 4 of item 453 lowers it as each `cursor_*` twin merges, to the planning and
+    /// routing sites that stage 6 removes, so that new twins do not come back.
+    const MODE_CHECKS: usize = 26;
+
+    /// Counts the calls of `is_cursor()` in the non-test sources of the SPARQL engine,
+    /// and fails when they exceed [`MODE_CHECKS`] (decision D9 of item 453).
+    #[test]
+    fn the_accounting_mode_is_read_in_a_bounded_number_of_places() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sparql");
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        let mut sites = Vec::new();
+        for file in files {
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            if name == "tests.rs" || name.ends_with("_tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            // a file's unit tests follow its code
+            let code = text
+                .find("\n#[cfg(test)]\nmod ")
+                .map_or(text.as_str(), |end| &text[..end]);
+            for (line, content) in code.lines().enumerate() {
+                if content.contains(".is_cursor()") {
+                    sites.push(format!("{name}:{}", line + 1));
+                }
+            }
+        }
+        assert!(
+            sites.len() <= MODE_CHECKS,
+            "{} reads of the accounting mode, more than {MODE_CHECKS}: {sites:?}",
+            sites.len()
+        );
+    }
+
     /// A program compiled before the context has an owner, as in eager planning, is
     /// uncharged, so the first attachment drops it and the next use charges it.
     #[test]
