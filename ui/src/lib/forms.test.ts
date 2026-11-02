@@ -17,8 +17,13 @@ import {
   savePlan,
   serverPatterns,
   widgetOf,
+  optionOf,
+  reachable,
+  nestedField,
+  templateFits,
   type FormField,
   type FormModel,
+  type FormNode,
 } from './forms';
 import { XSD } from './xsd';
 
@@ -343,5 +348,160 @@ describe('review fixes', () => {
     const few = field({ widget: 'radio', constraints: { in: seven.slice(0, 3) } });
     expect(choiceGroup(few, widgetOf(few))).toBe('radio');
     expect(choiceGroup(field(), 'text')).toBeNull();
+  });
+});
+
+describe('value alternatives (sh:or and sh:xone)', () => {
+  const concept = { class: [`${EX}Concept`], nodeKind: 'http://www.w3.org/ns/shacl#IRI' };
+  const members = (kind: 'or' | 'xone', second = { datatype: `${XSD}string` }) =>
+    field({
+      widget: 'term',
+      constraints: {
+        or: {
+          kind,
+          options: [
+            { shape: '_:a', label: 'Concept', widget: 'entity', constraints: concept },
+            { shape: '_:b', label: 'Text', widget: 'text', constraints: second },
+          ],
+        },
+      },
+    });
+  it('accepts a value that one option allows and names the options otherwise', () => {
+    const f = members('or');
+    expect(checkField(f, [iri('x'), lit('words')])).toEqual([]);
+    expect(checkField(f, [lit('1', `${XSD}integer`)])).toEqual([
+      { index: 0, message: 'must be one of: Concept, Text' },
+    ]);
+  });
+  it('refuses a value that two options of sh:xone allow', () => {
+    const f = members('xone', { nodeKind: 'http://www.w3.org/ns/shacl#IRI' } as never);
+    expect(checkField(f, [iri('x')])).toEqual([
+      { index: 0, message: 'must be exactly one of: Concept, Text' },
+    ]);
+  });
+  it('starts a stored value in the first option it passes', () => {
+    const f = members('or');
+    expect(optionOf(f, lit('words'))).toBe(1);
+    expect(optionOf(f, iri('x'))).toBe(0);
+    expect(optionOf(f, null)).toBe(0);
+  });
+});
+
+describe('list fields', () => {
+  const list = (over: Partial<FormField> = {}) =>
+    field({
+      widget: 'list',
+      constraints: {
+        list: {
+          memberShapes: ['_:m'],
+          member: { nodeKind: 'http://www.w3.org/ns/shacl#IRI' },
+          memberWidget: 'entity',
+          maxLength: 2,
+          unique: true,
+        },
+      },
+      values: [
+        {
+          term: { type: 'bnode', value: 'b1' },
+          graph: null,
+          items: [
+            { term: iri('a'), graph: null },
+            { term: iri('b'), graph: null },
+          ],
+        },
+      ],
+      ...over,
+    });
+  it('checks members, the list lengths and repeated members', () => {
+    expect(checkField(list(), [iri('a'), iri('b')])).toEqual([]);
+    expect(checkField(list(), [iri('a'), lit('x'), iri('a')])).toEqual([
+      { index: 1, message: 'must be an IRI' },
+      { index: null, message: 'takes at most 2 members' },
+      { index: null, message: 'has a member twice' },
+    ]);
+  });
+  it('sends the whole list when the members or their order change', () => {
+    const f = list();
+    const model = { fields: [f] } as unknown as FormModel;
+    expect(changeSet(model, { [f.id]: [iri('a'), iri('b')] }).changes).toEqual([]);
+    const s = changeSet(model, { [f.id]: [iri('b'), iri('a')] });
+    expect(s.changes).toEqual([{ field: f.id, remove: [], add: [], list: [iri('b'), iri('a')] }]);
+    expect(s.expect).toEqual({ [f.id]: [iri('a'), iri('b')] });
+    expect(changeCount(s)).toBe(1);
+  });
+});
+
+describe('nested children', () => {
+  const address = field({
+    id: '<addr>',
+    widget: 'nested',
+    constraints: { node: [`<${EX}Address>`], nodeKind: 'http://www.w3.org/ns/shacl#BlankNode' },
+    values: [{ term: { type: 'bnode', value: 'b7' }, graph: null }],
+  });
+  const street = (values: FormField['values'] = []) => field({ id: '<street>', values });
+  const geo = field({
+    id: '<geo>',
+    widget: 'nested',
+    constraints: { node: [`<${EX}Geo>`], nodeKind: 'http://www.w3.org/ns/shacl#BlankNode' },
+  });
+  const lat = field({ id: '<lat>' });
+  const model = { fields: [address] } as unknown as FormModel;
+  const nodes: Record<string, FormNode> = {
+    b7: {
+      key: 'b7',
+      term: { type: 'bnode', value: 'b7' },
+      fields: [street([{ term: lit('Old'), graph: null }]), geo],
+      isNew: false,
+    },
+    new1: { key: 'new1', term: { type: 'bnode', value: 'new1' }, fields: [lat], isNew: true },
+  };
+  it('knows nested fields and the templates that fit them', () => {
+    expect(nestedField(address)).toBe(true);
+    expect(nestedField(street())).toBe(false);
+    expect(templateFits({ node: [`<${EX}Address>`], fields: [] } as never, address)).toBe(true);
+  });
+  it('sends the edits of a stored child with its expectations', () => {
+    const current = { '<addr>': [address.values[0].term], 'b7 <street>': [lit('New')] };
+    const s = changeSet(model, current, nodes);
+    expect(s.changes).toEqual([]);
+    expect(s.nested).toEqual([
+      {
+        node: { type: 'bnode', value: 'b7' },
+        field: '<addr>',
+        changes: [{ field: '<street>', remove: [lit('Old')], add: [lit('New')] }],
+        expect: { '<street>': [lit('Old')] },
+      },
+    ]);
+  });
+  it('sends a new grandchild with the stored child it hangs from', () => {
+    const current = {
+      '<addr>': [address.values[0].term],
+      'b7 <street>': [lit('Old')],
+      'b7 <geo>': [{ type: 'bnode', value: 'new1' } as Term],
+      'new1 <lat>': [lit('52')],
+    };
+    expect(reachable(model, current, nodes).map((r) => r.node.key)).toEqual(['b7', 'new1']);
+    const s = changeSet(model, current, nodes);
+    expect(s.nested).toEqual([
+      {
+        node: { type: 'bnode', value: 'b7' },
+        field: '<addr>',
+        changes: [{ field: '<geo>', remove: [], add: [{ type: 'bnode', value: 'new1' }] }],
+        expect: { '<geo>': [] },
+      },
+      {
+        node: { type: 'bnode', value: 'new1' },
+        parent: { type: 'bnode', value: 'b7' },
+        field: '<geo>',
+        changes: [{ field: '<lat>', remove: [], add: [lit('52')] }],
+      },
+    ]);
+  });
+  it('drops the entries of a removed child', () => {
+    const s = changeSet(model, { '<addr>': [], 'b7 <street>': [lit('New')] }, nodes);
+    expect(s.changes).toEqual([
+      { field: '<addr>', remove: [{ type: 'bnode', value: 'b7' }], add: [] },
+    ]);
+    expect(s.nested).toBeUndefined();
   });
 });
