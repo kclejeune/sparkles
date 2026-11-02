@@ -18,7 +18,6 @@ mod imp {
     use sparkles::Error;
     use sparkles::commit::AnnotatedCommit;
     use sparkles::forms::{FieldChange, FormChange, FormCheck, FormRequest, FormSettings};
-    use sparkles::overview::rdf_term_from_json;
     use sparkles::preview::{Outcome, Preview};
     use sparkles::sparql::QueryOptions;
     use std::collections::BTreeMap;
@@ -86,15 +85,10 @@ mod imp {
     fn term(ob: &Bound<'_, PyAny>, what: &str) -> PyResult<Term> {
         if ob.cast::<PyMapping>().is_ok() {
             let j: J = admin::from_py(ob, what)?;
-            return rdf_term_from_json(&j, what).py(ob.py());
+            // a blank node names a stored nested child by its model label, or a new one
+            return sparkles::forms::term_from_json(&j, what).py(ob.py());
         }
-        match term_from_py(ob)? {
-            Term::BlankNode(_) => Err(invalid(
-                ob.py(),
-                format!("{what}: blank nodes cannot be named in a change"),
-            )),
-            t => Ok(t),
-        }
+        term_from_py(ob)
     }
 
     fn terms(ob: Option<Bound<'_, PyAny>>, what: &str) -> PyResult<Vec<Term>> {

@@ -10,13 +10,29 @@ fn invalid(m: String) -> Error {
     Error::invalid(m)
 }
 
+/// A term of a change: an IRI, a literal or a triple term as the SPARQL JSON results
+/// form spells it, or a blank node `{"type": "bnode", "value": label}`, which names a
+/// stored nested child by the label the model gave it or a new child of the change.
+pub fn term_from_json(t: &J, what: &str) -> Result<Term> {
+    if t.get("type").and_then(J::as_str) == Some("bnode") {
+        let label = t
+            .get("value")
+            .and_then(J::as_str)
+            .ok_or_else(|| invalid(format!("{what}.value: a blank node label")))?;
+        return BlankNode::new(label.trim_start_matches("_:"))
+            .map(Term::BlankNode)
+            .map_err(|e| invalid(format!("{what}: invalid blank node label: {e}")));
+    }
+    crate::overview::rdf_term_from_json(t, what)
+}
+
 fn terms(v: Option<&J>, what: &str) -> Result<Vec<Term>> {
     match v {
         None | Some(J::Null) => Ok(Vec::new()),
         Some(J::Array(a)) => a
             .iter()
             .enumerate()
-            .map(|(i, t)| crate::overview::rdf_term_from_json(t, &format!("{what}[{i}]")))
+            .map(|(i, t)| term_from_json(t, &format!("{what}[{i}]")))
             .collect(),
         Some(_) => Err(invalid(format!("{what}: an array of terms"))),
     }
@@ -81,7 +97,7 @@ pub fn expect_from_json(v: Option<&J>, what: &str) -> Result<BTreeMap<String, Ve
 fn blank(v: &J, what: &str) -> Result<BlankNode> {
     let label = match v {
         J::String(s) => s.trim_start_matches("_:").to_string(),
-        J::Object(_) => match crate::overview::rdf_term_from_json(v, what)? {
+        J::Object(_) => match term_from_json(v, what)? {
             Term::BlankNode(b) => return Ok(b),
             _ => return Err(invalid(format!("{what}: a blank node"))),
         },

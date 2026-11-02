@@ -43,7 +43,7 @@ pub const MAX_DEPENDENTS: usize = 500;
 mod nested;
 pub use nested::{
     MAX_NESTED_ANCHORS, MAX_NESTED_DEPTH, MAX_NESTED_FIELDS, MAX_NESTED_NODES, NestedAnchor,
-    NestedFormModel, NestedNode,
+    NestedFormModel, NestedNode, NestedTemplate,
 };
 
 #[path = "edit.rs"]
@@ -53,7 +53,7 @@ pub use edit::{MAX_LIST_ITEMS, MAX_SUBTREE_QUADS, NodeChange};
 
 #[path = "wire.rs"]
 mod wire;
-pub use wire::{expect_from_json, field_changes_from_json, nested_from_json};
+pub use wire::{expect_from_json, field_changes_from_json, nested_from_json, term_from_json};
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 use sparkles_core::INFERRED_GRAPH as INFERRED;

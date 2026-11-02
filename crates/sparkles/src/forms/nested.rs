@@ -95,6 +95,19 @@ pub struct NestedFormModel {
     #[serde(flatten)]
     pub root: FormModel,
     pub nested_nodes: Vec<NestedNode>,
+    /// the empty forms a new child takes, one for each distinct set of `sh:node` shapes
+    /// that a field of the root or of a template declares
+    pub templates: Vec<NestedTemplate>,
+}
+
+/// The form of a new nested child under a field whose `sh:node` shapes are `shapes`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedTemplate {
+    /// the shapes as the field's `constraints.node` names them
+    pub shapes: Vec<String>,
+    #[serde(flatten)]
+    pub model: FormModel,
 }
 
 struct Pending {
@@ -136,7 +149,12 @@ impl Forms {
                     .ok_or_else(|| Error::invalid("nested form was not expanded"))?,
             });
         }
-        Ok(NestedFormModel { root, nested_nodes })
+        let templates = built.templates(writable, &branch, &nested_nodes)?;
+        Ok(NestedFormModel {
+            root,
+            nested_nodes,
+            templates,
+        })
     }
 }
 
@@ -352,6 +370,85 @@ impl Built {
             pool.entries[index].model = Some(model);
         }
         Ok((root, pool))
+    }
+
+    /// The templates of new children: the `sh:node` shape sets that fields of the root,
+    /// of pooled children and of templates declare on predicate paths, closed over the
+    /// templates' own fields, at most [`MAX_NESTED_NODES`].
+    fn templates(
+        &self,
+        writable: bool,
+        branch: &str,
+        pooled: &[NestedNode],
+    ) -> Result<Vec<NestedTemplate>> {
+        let declared = |layout: &FormLayout, out: &mut Vec<Vec<usize>>| -> Result<()> {
+            for f in &layout.fields {
+                self.limits.unit()?;
+                if f.constraints.node.is_empty() || !matches!(f.path, FieldPath::Predicate(_)) {
+                    continue;
+                }
+                let set: Vec<usize> = f
+                    .constraints
+                    .node
+                    .iter()
+                    .filter_map(|t| self.shapes.shape_id(t))
+                    .collect();
+                if !set.is_empty() && !out.contains(&set) {
+                    out.push(set);
+                }
+            }
+            Ok(())
+        };
+        let mut sets = Vec::new();
+        declared(&self.layout, &mut sets)?;
+        // the nested fields of pooled children name their shapes in the constraints
+        for node in pooled {
+            for f in &node.model.fields {
+                self.limits.unit()?;
+                if f.inverse || f.reason == Some("complex-path") {
+                    continue;
+                }
+                let Some(J::Array(names)) = f.constraints.get("node") else {
+                    continue;
+                };
+                let mut set = Vec::new();
+                for name in names.iter().filter_map(J::as_str) {
+                    self.limits.lexical(name)?;
+                    let term = match name.strip_prefix("_:") {
+                        Some(label) => oxrdf::BlankNode::new(label).ok().map(Term::BlankNode),
+                        None => NamedNode::new(name.trim_start_matches('<').trim_end_matches('>'))
+                            .ok()
+                            .map(Term::NamedNode),
+                    };
+                    if let Some(id) = term.and_then(|t| self.shapes.shape_id(&t)) {
+                        set.push(id);
+                    }
+                }
+                if !set.is_empty() && !sets.contains(&set) {
+                    sets.push(set);
+                }
+            }
+        }
+        let fresh = Term::BlankNode(oxrdf::BlankNode::new_unchecked("new"));
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < sets.len() {
+            if out.len() >= MAX_NESTED_NODES {
+                return Err(Error::invalid("nested form template allowance exceeded"));
+            }
+            let child = self.fresh_child(&fresh, &sets[i], self.target.clone())?;
+            declared(&child.layout, &mut sets)?;
+            let model = child.model(writable, branch)?;
+            out.push(NestedTemplate {
+                shapes: sets[i]
+                    .iter()
+                    .map(|s| self.shapes.shapes()[*s].node.to_string())
+                    .collect(),
+                model,
+            });
+            i += 1;
+        }
+        Ok(out)
     }
 
     /// A new nested child that a change creates: the fields of `shapes`, no stored
