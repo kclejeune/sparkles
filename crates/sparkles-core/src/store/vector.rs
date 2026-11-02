@@ -830,6 +830,7 @@ impl Store {
         let spawned = std::thread::Builder::new()
             .name("vector-catch-up".into())
             .spawn(move || {
+                crate::threads::started();
                 loop {
                     let (Some(cur), Some(reg)) = (current.upgrade(), registry.upgrade()) else {
                         return;

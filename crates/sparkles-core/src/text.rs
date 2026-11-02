@@ -2559,6 +2559,7 @@ mod imp {
             let ticker = std::thread::Builder::new()
                 .name("sparkles-text".into())
                 .spawn(move || {
+                    crate::threads::started();
                     while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
                         rx.recv_timeout(CHECKPOINT_AFTER)
                     {

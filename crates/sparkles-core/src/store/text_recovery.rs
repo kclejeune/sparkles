@@ -500,7 +500,10 @@ fn enqueue(job: &Arc<Recovery>, delay: Duration) -> bool {
     while q.workers < pool_size() {
         let spawned = std::thread::Builder::new()
             .name("sparkles-text-recovery".into())
-            .spawn(move || work(pool));
+            .spawn(move || {
+                crate::threads::started();
+                work(pool)
+            });
         if spawned.is_err() {
             break;
         }
