@@ -61,6 +61,11 @@ heap and a run with a smaller heap.
 `owl:Nothing`. ELK stops at an inconsistent ontology, and the harness then writes one
 node of every class, as the classifier does.
 
+`--reasoner hermit` runs HermiT 1.4.5.519 in place of ELK over the same OWL API jars, with
+the jars that `scripts/elk-compare/hermit-pins.tsv` pins. HermiT is a complete OWL 2 DL
+reasoner, so it checks the entailments that an EL reasoner may miss on ontologies with
+individuals.
+
 ## Correctness evidence
 
 The property tests in `crates/sparkles-owl/tests/classify.rs` compare the classifier with

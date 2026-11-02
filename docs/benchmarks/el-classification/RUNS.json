@@ -101,6 +101,41 @@
     }
    },
    "metadata_note": "A manual agreement record of el_classify against ELK 0.6.0 on the ORE 2015 EL sample. Read the record for its method and checks."
+  },
+  {
+   "run_id": "sha256-7d7404b51b1e72a032ea2aa0a3aebfbf843d0373f0de1052c9e80b6c2cd82126",
+   "path": "runs/2026-11-02-hermit-agreement-aa0a41a6/record.json",
+   "sha256": "7d7404b51b1e72a032ea2aa0a3aebfbf843d0373f0de1052c9e80b6c2cd82126",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "36 ORE 2015 EL ontologies with nominals, SameIndividual, ranges with assertions or top-property axioms, and four range test ontologies",
+    "manifest": {
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": "0bba3629a057ea5077a9ac61a3d4dd711d239504aa1ff4008e292bd5f988458d",
+     "commit": "aa0a41a6",
+     "companion": "runs/2026-11-02-ore-elk-agreement-aa0a41a6 holds the classifier's and ELK's taxonomies of the same ontologies",
+     "reference": "HermiT 1.4.5.519 on OWL API 5.1.20 through scripts/elk-compare/elk.sh run --reasoner hermit (pins in scripts/elk-compare/hermit-pins.tsv), Temurin 17.0.20, the harness of commit 995e8d6f"
+    },
+    "settings": {
+     "heap": {
+      "cases": "1g",
+      "ore": "8g"
+     },
+     "repeat": 1,
+     "timeout_s": 1800
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "stanley",
+      "role": "laptop, loaded by other work, so the times are a rough screen and not measurements"
+     },
+     "method": "run.sh.txt ran HermiT once on each input and compared each HermiT taxonomy with the classifier's by scripts/el-oracle.py HERMIT.ofn OURS.txt and with ELK's by ref-compare.py.txt, which reads two reference files with el-oracle's own reader. compare.jsonl holds both reports, hermit.jsonl HermiT's JSON lines and cases/ the four test ontologies with each tool's taxonomy.",
+     "kind": "agreement"
+    }
+   },
+   "metadata_note": "A manual agreement record of HermiT 1.4.5.519 against the classifier and ELK on the ORE ontologies whose axioms either EL reasoner uses in part, and on four range test ontologies. Read the record for its method and checks."
   }
  ]
 }

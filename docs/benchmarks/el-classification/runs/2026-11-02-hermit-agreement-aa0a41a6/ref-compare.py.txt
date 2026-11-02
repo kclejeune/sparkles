@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Compare two reference-form taxonomies (ELK or HermiT functional-style output) with
+el-oracle's own reader and normalization: ref-compare.py A.ofn B.ofn."""
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("oracle", sys.argv[3] if len(sys.argv) > 3 else "scripts/el-oracle.py")
+o = importlib.util.module_from_spec(spec); spec.loader.exec_module(o)
+an, ae = o.normalize(*o.read_reference(sys.argv[1]))
+bn, be = o.normalize(*o.read_reference(sys.argv[2]))
+common = set(an) & set(bn)
+an, ae = o.restrict(an, ae, common); bn, be = o.restrict(bn, be, common)
+nodes = sum(1 for c in common if an[c] != bn[c])
+r = {"classes": len(common), "onlyA": len(set(an) ^ set(common)), "onlyB": 0,
+     "nodeDifferences": nodes, "missingEdges": len(ae - be), "extraEdges": len(be - ae),
+     "unsatisfiableA": sum(1 for c in common if o.NOTHING in an[c] and c != o.NOTHING)}
+r["agree"] = not (nodes or ae ^ be)
+print(json.dumps(r))

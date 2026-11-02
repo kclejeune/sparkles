@@ -25,6 +25,21 @@ reasoner leaves out or uses in part do not separate the two on this sample. GO a
 lite each have one `InverseObjectProperties` axiom, which both reasoners leave out and
 report. The classifier's taxonomy is the same on one and eight threads.
 
+<a id="complete-reasoner"></a>
+
+HermiT 1.4.5.519, a complete OWL 2 DL reasoner, checked the 36 ORE ontologies where
+either EL reasoner reports axioms it uses in part or possible incompleteness. Its
+taxonomy equals the classifier's and ELK's on all 36, so neither EL reasoner misses a
+subsumption or an unsatisfiable class there. Four small test ontologies show the
+entailments that both EL reasoners miss when a property's range meets an individual.
+HermiT derives a subsumption through a range on an asserted property and one through a
+range reached by `ObjectHasValue`, and it finds an individual in two disjoint ranges
+inconsistent. ELK and the classifier miss all three, and the classifier reports the
+axioms involved as used in part. A fourth ontology, where one range clashes with a class
+assertion, is inconsistent for all three reasoners. The tests in
+`crates/sparkles-owl/tests/classify.rs` hold these cases as known gaps of roadmap item
+587.
+
 The classifier's direct hierarchy of the Gene Ontology release of 2026-07-26 is also the
 hierarchy that the release asserts, which GO's pipeline computes with ELK. Both sides
 have 57,456 direct subsumptions between named classes, and none is missing or extra.
