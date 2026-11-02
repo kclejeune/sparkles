@@ -1,7 +1,7 @@
 # U12: Ontology workbench
 
-> **Status:** partially complete. The ontology editor phase is built, and the SKOS editor,
-> the DL Query tab and the editable schema diagram are planned.
+> **Status:** partially complete. The ontology editor and DL Query phases are built, and
+> the other phases are planned.
 >
 > **Roadmap:** [item 457](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
@@ -101,14 +101,24 @@ asserted hierarchy only.
 its characteristics as checkboxes for properties, and its axioms in sections such as
 SubClass Of, Equivalent To, Disjoint With, Domains, Ranges, Inverse Of, Types and the
 property assertions of an individual. Class expressions are rendered in Manchester
-syntax with labels. Each axiom row shows its annotations and can be removed. An add
-field per section takes an entity name, an IRI or a class expression in functional-style
-syntax with the dataset's prefixes. Axioms that fit no section are listed last.
+syntax with labels, quoted where a label holds a space or a keyword, so the rendering
+reads back as the same expression. Each axiom row shows its annotations and can be
+removed. An add field per section takes an entity name, an IRI, a class expression or
+data range in Manchester syntax, or one in functional-style syntax with the dataset's
+prefixes. The fields of class expressions and data ranges are Manchester editors that
+complete entity names, labels and keywords and underline the span of a problem the
+server's reader reports, with the candidates of an ambiguous name. An **Add an axiom**
+field at the end of the frame takes a whole axiom in Manchester or functional-style
+syntax. Axioms that fit no section are listed last.
 
 **Annotations.** The annotation editor adds, changes and removes annotations of an entity
 or of one axiom. A value is text with a BCP 47 language tag or a datatype, or an IRI. An
 annotation of an axiom is written as an annotated axiom, so the edit removes the plain
 axiom and adds it with its annotations in one commit.
+
+**View strip.** The entity kinds, **DL Query** and **Header** share one strip of tabs
+above the panes. The strip wraps onto a second line when the window is too narrow for
+it, so every tab keeps its whole label at phone width.
 
 **Header.** The header tab edits the ontology IRI, the version IRI, the imports and the
 header's annotations, and shows the graph's axiom counts by type and the read's
@@ -166,12 +176,62 @@ unchanged main branch against a real server.
 
 The editor reuses neither the shape-driven forms of U02 nor their field editors. Its
 annotation and axiom editors are its own components, so editing an entity's terms
-through a form remains for later. Manchester syntax is rendered but not parsed, so class
-expressions are typed in functional-style syntax. Rename covers the one graph the page
+through a form remains for later. Rename covers the one graph the page
 reads and does not reach IRIs inside triple terms. Real-time co-editing stays with the
 U05 §1 open question. The page decides whether the caller can write from its level on
 the dataset, so write grants on a branch alone leave the page read-only, roadmap item
 611. Roadmap item 607 covers a lazy hierarchy route for large
-ontologies, 608 Manchester input of class expressions, 609 inferred
-property trees and 610 an IRI policy kept on the server with the resource catalog
-of [C30](../C30-resource-catalog/README.md).
+ontologies, 609 inferred property trees and 610 an IRI policy kept on the server with
+the resource catalog of [C30](../C30-resource-catalog/README.md).
+
+### Manchester input
+
+Roadmap item 608 added the Manchester reader that the add fields use. The OWL crate's
+`sparkles_owl::manchester` reads class expressions, data ranges, individuals, literals
+and axioms in the W3C OWL 2 Manchester Syntax against a vocabulary of the ontology's
+prefixes, local names and `rdfs:label` and `skos:prefLabel` values. Operator precedence
+follows the note, with `or` below `and` and `that` and both below `not`, and a
+restriction's filler is a primary. A name that several entities share is an error that
+lists them, and every error carries its span, which the HTTP answer gives in UTF-16 code
+units for the browser. Axioms are single frame lines, with the keywords of the class,
+property and individual frames, property chains, characteristics and facts. Its
+renderer writes a label only where the label names one entity, and property tests check
+that its output reads back as the same value. `POST /$/ontology/{ds}/parse` and the
+bindings' `parse` read text with the caller's grants
+([API](../../API.md#ontology)). Whole Manchester documents with `Prefix:` and frame
+blocks are not read, and stay with F21's syntaxes phase.
+
+### DL Query
+
+The DL Query phase is built as the **DL Query** tab of the Ontology page and the
+`POST /$/ontology/{ds}/dl-query` route, with `ds.ontology().dl_query()` in the library
+and `dl_query` or `dlQuery` in the Python, Node.js and JVM bindings. A query answers a
+class expression's equivalent classes, direct and inferred superclasses and subclasses,
+and instances. The tab's Manchester editor completes names, `Enter` runs the query, and
+the query is kept in the page's address so that a link runs it again. The answers are
+lists of names that open each entity's frame beside them, and the commit the page shows
+runs the query again when it changes.
+
+Inside OWL 2 EL the EL classifier of [F24](../F24-owl-classification/SPEC.md#outcome)
+answers. The query adds `EquivalentClasses(urn:x-sparkles:dl-query C)` to the dataset's
+kept classifier, saturates without building a taxonomy, reads the answers from the
+saturated contexts and removes the axiom, so the ontology's classification is reused and
+left as it was. Outside EL the OWL 2 RL rules answer by demand reasoning over a copy in
+memory of the terminology, the defining axioms and the assertions. Automatic reasoning
+chooses EL when the expression and every logical axiom are inside it. Every answer
+carries its reasoning label, which names the engine and why it was chosen, says whether
+the class answers and the instances are complete, and lists the axioms outside the
+profile. The tab shows the label as badges, with the gaps in a collapsed list. The RL
+class answers are always marked possibly incomplete, since the RL rules are incomplete
+for classification, and their instances are complete for an ontology inside OWL 2 RL.
+
+The library tests check that the answers equal the kept taxonomy for every named class
+of a small ontology with chains and transitivity, that a query leaves the kept
+classification unchanged, and that an ontology with a range that meets an individual,
+the case of item 591, reports the EL answer as incomplete. The server tests cover both
+engines, the three syntaxes of an expression, the error spans and the caller's grants.
+Playwright covers the tab, links that run a query, the underline of an unknown name,
+completion and the Manchester add fields against the mock backend and a real server.
+The instances need a classification with the assertions, which the dataset does not
+keep, so an instance query classifies the ontology again. Roadmap item 588 can reuse
+the same engine to answer the entity accessors from the kept classification.

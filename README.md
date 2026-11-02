@@ -258,6 +258,12 @@ editor. The collapsed panel below it has more workflows and detail views.
     <td>Asserted and inferred class hierarchies side by side</td>
   </tr>
   <tr>
+    <td colspan="2" align="center"><img width="50%" src="docs/images/ontology-dl-query.png" alt="The DL Query tab of the ontology editor answering Person and (teaches some Course), labelled as answered completely by the OWL 2 EL classifier, with Teacher as its equivalent class, Person and Agent above it, Professor below it and Ada Lovelace as its instance, beside the frame of Professor"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">A DL query in Manchester syntax, labelled with the reasoning that answered it</td>
+  </tr>
+  <tr>
     <td><img src="docs/images/forms-nested.png" alt="The editing form of a SKOS concept with its SKOS-XL labels as nested forms, the stored label edited to All animals and a new French label added from the label shape's template, with the previewed commit listing the triples it adds and removes"></td>
     <td><img src="docs/images/forms-list.png" alt="The editing form of a SKOS collection, with its member chosen as a Concept among the alternatives of sh:or and its ordered member list after fish moved up, each member with buttons that move or remove it"></td>
   </tr>

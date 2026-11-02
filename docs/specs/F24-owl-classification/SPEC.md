@@ -202,7 +202,9 @@ taxonomy.
 
 **Roadmap follow-ups.** An MCP tool is item 586. Complete reasoning with
 individuals and datatypes is item 587. Reads that answer from the classification
-and DL Query are item 588. Durable and automatic classification is item
+are item 588. DL queries answer from the kept classifier through `Classifier::saturate`
+and `Classifier::describe`, as [U12's DL Query outcome](../U12-ontology-workbench/SPEC.md#dl-query)
+describes. Durable and automatic classification is item
 589, after item 339. A kept classification with assertions is item 590,
 the comparison and measurements against ELK were item 591, and a classifier that
 shares the ontology's axioms and builds its index and taxonomy in parallel is item
