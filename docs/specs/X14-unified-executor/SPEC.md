@@ -552,9 +552,24 @@ rows before spreading the rest over the pool in both modes.
 reuse with row-by-row evaluation over 32,768 rows in eager execution and in cursors with
 batches on both sides of the threshold.
 
+ORDER BY and its top k choose by input size in the same way. Up to 16,384 rows, numeric
+keys reuse their input ids, a variable's dictionary values are decoded once each in key
+order, and other keys are evaluated on the calling thread with each value admitted
+before the column keeps it. A larger input evaluates each distinct key once in parallel
+through the value cache, and its key column is charged for its slots before evaluation
+and for its values' payload after it, so a query over its budget fails after one column.
+The numeric prefilter of `ORDER BY ?v LIMIT k`, the total-order check of a top-k scan
+and the heap's first key follow the same rule, and their charges, the sort's positions
+and its sorted copy are taken in both modes. An eager top-k scan of pieces without value
+order now reads them in morsels of index blocks into one heap, as cursors did, rather
+than reading every row of the pieces first. `sorts_agree_on_both_sides_of_the_threshold`
+compares full sorts and top k over 8,192 and 32,768 rows eagerly and in cursors with
+batches on both sides of the threshold.
+
 A unit test, `the_accounting_mode_is_read_in_a_bounded_number_of_places`, counts the
 calls of `is_cursor()` outside tests and fails above its bound, which each step lowers. It
-was 26 after the regular expressions and is 17 after per-value reuse. The rest of item
+was 26 after the regular expressions, 17 after per-value reuse and is 7 after the sort
+keys. The rest of item
 NEW-ITEM-4 merges the remaining `cursor_*` twins.
 
 ### Measurements of stage 1

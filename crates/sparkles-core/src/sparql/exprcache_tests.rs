@@ -249,6 +249,17 @@ fn cursor_rows(
     opt: Optimizations,
     batch_rows: usize,
 ) -> Vec<String> {
+    let mut rows = cursor_rows_in_order(snap, text, opt, batch_rows);
+    rows.sort();
+    rows
+}
+
+fn cursor_rows_in_order(
+    snap: &Arc<crate::store::Snapshot>,
+    text: &str,
+    opt: Optimizations,
+    batch_rows: usize,
+) -> Vec<String> {
     let opts = QueryOptions {
         optimizations: Some(opt),
         no_cache: true,
@@ -274,8 +285,46 @@ fn cursor_rows(
             );
         }
     }
-    rows.sort();
     rows
+}
+
+/// ORDER BY and its top k choose their key columns, candidate prefilter and decoding by
+/// input size in both accounting modes. Sorts of inputs on both sides of
+/// `exec::PAR_THRESHOLD` rows give the same rows in the same order eagerly and in
+/// cursors with batches on both sides of it. The keys break every tie between distinct
+/// rows, so the first k rows are one set.
+#[test]
+fn sorts_agree_on_both_sides_of_the_threshold() {
+    let queries = [
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ?v STR(?v) LANG(?v) DATATYPE(?v) ?s",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } \
+         ORDER BY DESC(?v) DESC(STR(?v)) DESC(LANG(?v)) DESC(DATATYPE(?v)) ?s LIMIT 40",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY STR(?v) ?s LIMIT 25",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY UCASE(STR(?v)) STR(?v) ?s",
+        "SELECT (xsd:double(?v) AS ?d) WHERE { ?s ex:v ?v FILTER(isNumeric(?v)) } \
+         ORDER BY ?v LIMIT 30",
+        "SELECT (xsd:double(?v) AS ?d) WHERE { ?s ex:v ?v FILTER(isNumeric(?v)) } \
+         ORDER BY DESC(?v) LIMIT 30",
+    ];
+    for (seed, n) in [
+        (0x2f0e_11d3_95a1_c407, super::exec::PAR_THRESHOLD / 2),
+        (0x6c3a_8e51_02bd_f913, 2 * super::exec::PAR_THRESHOLD),
+    ] {
+        let s = store(seed, n, false);
+        let snap = s.snapshot();
+        for q in queries {
+            let eager = show(&run_on(snap.clone(), q, Optimizations::ALL));
+            assert!(!eager.is_empty(), "{q}");
+            assert_eq!(show(&run_on(snap.clone(), q, without())), eager, "{n} {q}");
+            for batch_rows in [4096, super::exec::PAR_THRESHOLD + 4096] {
+                assert_eq!(
+                    cursor_rows_in_order(&snap, q, Optimizations::ALL, batch_rows),
+                    eager,
+                    "{n} {q}; {batch_rows}"
+                );
+            }
+        }
+    }
 }
 
 /// Inputs above `exec::PAR_THRESHOLD` rows take the table algorithms (an estimate of
