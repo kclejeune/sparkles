@@ -441,12 +441,17 @@ impl Classifier {
             let e = self.interner.class(c);
             ax.classes.push(e);
         }
-        let ix = Index::build(&ax, &mut self.interner, limits.max_memory).map_err(|used| {
-            Error::Memory {
-                limit: limits.max_memory.unwrap_or(usize::MAX),
-                used,
-            }
-        })?;
+        let stop = || poll(limits).is_err();
+        let ix =
+            Index::build(&ax, &mut self.interner, limits.max_memory, &stop).map_err(
+                |h| match h {
+                    index::Halt::Memory(used) => Error::Memory {
+                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                        used,
+                    },
+                    index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
+                },
+            )?;
         // an individual that fills a property with a range has a context for each range,
         // which nominal reasoning would merge
         for (k, h) in &self.axioms {

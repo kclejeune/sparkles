@@ -219,7 +219,10 @@ pub fn saturate(
     match run.stop.load(Ordering::SeqCst) {
         STOP_CANCEL => Err(Stop::Cancelled),
         STOP_TIMEOUT => Err(Stop::Timeout),
-        STOP_MEMORY => Err(Stop::Memory { used: memory }),
+        // the most counted, waiting messages included, which is what passed the limit
+        STOP_MEMORY => Err(Stop::Memory {
+            used: run.peak.load(Ordering::Relaxed).max(memory),
+        }),
         _ => Ok(Totals {
             conclusions: run.applied.load(Ordering::Relaxed),
             memory,

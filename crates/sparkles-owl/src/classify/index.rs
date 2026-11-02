@@ -734,10 +734,15 @@ impl Index {
     /// intersections of fillers with ranges and the roles of chains.
     ///
     /// The property closure can grow with the square of the properties, so it stops with
-    /// the bytes it reached when they pass `limit`.
-    pub fn build(ax: &Axioms, it: &mut Interner, limit: Option<usize>) -> Result<Index, usize> {
+    /// the bytes it reached when they pass `limit`, and when `stop` asks it to.
+    pub fn build(
+        ax: &Axioms,
+        it: &mut Interner,
+        limit: Option<usize>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Index, Halt> {
         let mut ix = Index {
-            roles: roles(ax, it, limit)?,
+            roles: roles(ax, it, limit, stop)?,
             ..Index::default()
         };
         let mut neg_seen: FxHashSet<Ex> = FxHashSet::default();
@@ -863,12 +868,34 @@ fn positive(e: Ex, it: &mut Interner, ix: &mut Index, seen: &mut FxHashSet<Ex>) 
 
 /// The role table: the reflexive and transitive closure of the role hierarchy, the
 /// binarized chains with their compositions, the reflexive roles and the ranges.
-fn roles(ax: &Axioms, it: &mut Interner, limit: Option<usize>) -> Result<Roles, usize> {
+/// Why building the index stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Halt {
+    /// the property closure passed the memory limit, with the bytes it reached
+    Memory(usize),
+    /// the run's deadline or cancellation came
+    Stopped,
+}
+
+/// The roles between two polls of the run's deadline and cancellation.
+const POLL_ROLES: usize = 1024;
+
+fn roles(
+    ax: &Axioms,
+    it: &mut Interner,
+    limit: Option<usize>,
+    stop: &dyn Fn() -> bool,
+) -> Result<Roles, Halt> {
     let mut bytes = 0usize;
-    let mut grow = |b: usize| -> Result<(), usize> {
+    let mut steps = 0usize;
+    let mut grow = |b: usize| -> Result<(), Halt> {
         bytes += b;
         if limit.is_some_and(|l| bytes > l) {
-            return Err(bytes);
+            return Err(Halt::Memory(bytes));
+        }
+        steps += 1;
+        if steps.is_multiple_of(POLL_ROLES) && stop() {
+            return Err(Halt::Stopped);
         }
         Ok(())
     };
@@ -915,7 +942,8 @@ fn roles(ax: &Axioms, it: &mut Interner, limit: Option<usize>) -> Result<Roles, 
                 stack.extend(direct[x as usize].iter().copied());
             }
         }
-        grow(24 + seen.len() * 4)?;
+        // the closure and its inverse, which the chains read
+        grow(48 + seen.len() * 8)?;
         sup.push(seen.into_iter().collect());
     }
     let mut sub: Vec<Vec<Role>> = vec![Vec::new(); n];
@@ -930,11 +958,17 @@ fn roles(ax: &Axioms, it: &mut Interner, limit: Option<usize>) -> Result<Roles, 
     for &(s1, s2, t) in &binary {
         for &r1 in &sub[s1 as usize] {
             left[r1 as usize] = true;
-            grow(sub[s2 as usize].len() * 40)?;
+            let mut b = 0;
             for &r2 in &sub[s2 as usize] {
                 right[r2 as usize] = true;
-                comp.entry((r1, r2)).or_default().push(t);
+                let v = comp.entry((r1, r2)).or_insert_with(|| {
+                    b += 40;
+                    Vec::new()
+                });
+                v.push(t);
+                b += 4;
             }
+            grow(b)?;
         }
     }
     for v in comp.values_mut() {

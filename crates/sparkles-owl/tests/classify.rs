@@ -431,10 +431,62 @@ fn waiting_messages_count_against_the_memory_limit() {
         max_memory: Some(full.stats.memory + 200_000),
         ..Limits::default()
     };
-    assert!(matches!(
-        Classifier::of(&axioms).classify(&limit).unwrap_err(),
-        Error::Memory { .. }
-    ));
+    // the error reports what passed the limit, the waiting messages included
+    match Classifier::of(&axioms).classify(&limit).unwrap_err() {
+        Error::Memory { limit, used } => assert!(used > limit, "{used} <= {limit}"),
+        e => panic!("{e:?}"),
+    }
+}
+
+#[test]
+fn chains_that_share_operands_are_charged_once_per_entry() {
+    let mut axioms = Vec::new();
+    for i in 0..100 {
+        for (base, sub) in [("r", "rs"), ("s", "ss")] {
+            axioms.push(ax(AxiomKind::SubObjectPropertyOf(
+                SubObjectPropertyExpression::Expression(ope(&format!("{sub}{i}"))),
+                ope(base),
+            )));
+        }
+        axioms.push(ax(AxiomKind::SubObjectPropertyOf(
+            SubObjectPropertyExpression::Chain(vec![ope("r"), ope("s")]),
+            ope(&format!("t{i}")),
+        )));
+    }
+    let full = Classifier::of(&axioms)
+        .classify(&Limits::default())
+        .unwrap();
+    let limit = Limits {
+        max_memory: Some(full.stats.memory * 2),
+        ..Limits::default()
+    };
+    Classifier::of(&axioms).classify(&limit).unwrap();
+}
+
+#[test]
+fn the_property_closure_polls_the_cancellation() {
+    let mut axioms = Vec::new();
+    for i in 0..3000 {
+        axioms.push(ax(AxiomKind::SubObjectPropertyOf(
+            SubObjectPropertyExpression::Expression(ope(&format!("r{i}"))),
+            ope(&format!("r{}", i + 1)),
+        )));
+    }
+    // normalization polls once, then the closure is the next to poll
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let m = n.clone();
+    let limits = Limits {
+        cancelled: Some(Arc::new(move || m.fetch_add(1, Ordering::Relaxed) >= 1)),
+        ..Limits::default()
+    };
+    let start = std::time::Instant::now();
+    assert_eq!(
+        Classifier::of(&axioms).classify(&limits).unwrap_err(),
+        Error::Cancelled
+    );
+    // the closure stopped at its first poll, not after its 4.5 million entries
+    assert!(n.load(Ordering::Relaxed) >= 2);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
 }
 
 #[test]
