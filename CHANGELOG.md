@@ -114,8 +114,9 @@ budget, the decoding of dictionary keys, the terms that expressions compute, the
 blank nodes, callback terms, geometries and EXISTS, retained scratch and the programs of
 regular expressions are charged in both execution modes. An eager query close to its
 memory budget can therefore fail with the memory budget where it used to answer. Regular
-expressions compile once per query with bounded search caches and no longer stay in a
-process-wide cache of up to 1,000 programs. A cursor's account reserves from the query
+expressions no longer stay in a process-wide cache of up to 1,000 programs with their
+search caches. Their compiled programs are kept in a table of at most 64 programs and
+16 MiB, and each query charges and drops its own bounded search caches. A cursor's account reserves from the query
 pool in steps of 64 KiB and can hold about 1 MiB of the pool above its live bytes, and
 cursors keep their decoded values across batches (spec X14 stage 4).
 

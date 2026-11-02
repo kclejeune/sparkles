@@ -1,6 +1,13 @@
 //! Query-owned regular expressions with explicitly bounded, charged search caches. Both
 //! accounting modes compile `REGEX`, `REPLACE` and key-filter patterns here, once per
-//! query, and nothing in query evaluation keeps a program past its query.
+//! query. A query charges each program it uses as if it had compiled it, and its search
+//! caches go with the query.
+//!
+//! Compiled programs, without their search caches, are also kept in one process-wide
+//! table of at most [`PROGRAMS_MAX`] programs and [`PROGRAMS_BYTES`] bytes, so that a
+//! pattern that queries repeat compiles once. Compilation takes about as long as a
+//! filter over 10,000 keys, and the table holds at most 16 MiB outside every query's
+//! budget for that time.
 //!
 //! A program has one search cache that any thread can use behind a lock, and a clone of
 //! the program for each Rayon worker that searches it, with the worker's own cache. A
@@ -28,6 +35,55 @@ thread_local! {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     };
+}
+
+/// The programs the process-wide table keeps. Reaching either bound starts the table over.
+const PROGRAMS_MAX: usize = 64;
+/// The program bytes the process-wide table keeps.
+const PROGRAMS_BYTES: usize = 16 << 20;
+
+/// A compiled program with the bounds it was built under. A query whose own bound is at
+/// least `nfa` would have built the same program.
+#[derive(Clone)]
+struct Program {
+    program: Regex,
+    nfa: usize,
+    hybrid: usize,
+}
+
+#[derive(Default)]
+struct Programs {
+    by_text: FxHashMap<Box<str>, Program>,
+    bytes: usize,
+}
+
+fn programs() -> &'static Mutex<Programs> {
+    static PROGRAMS: OnceLock<Mutex<Programs>> = OnceLock::new();
+    PROGRAMS.get_or_init(Mutex::default)
+}
+
+/// The kept program of `text` when a query bounded by `maximum` would have built it. The
+/// clone shares the compiled program and makes its own search caches.
+fn kept_program(text: &str, maximum: usize) -> Option<Program> {
+    let programs = programs().lock();
+    let kept = programs.by_text.get(text)?;
+    (kept.nfa <= maximum).then(|| kept.clone())
+}
+
+fn keep_program(text: &str, program: &Program) {
+    let bytes = program.program.memory_usage() + text.len();
+    if bytes > PROGRAMS_BYTES / 4 {
+        return;
+    }
+    let mut programs = programs().lock();
+    if programs.by_text.contains_key(text) {
+        return;
+    }
+    if programs.by_text.len() >= PROGRAMS_MAX || programs.bytes + bytes > PROGRAMS_BYTES {
+        *programs = Programs::default();
+    }
+    programs.bytes += bytes;
+    programs.by_text.insert(text.into(), program.clone());
 }
 
 /// The patterns a query keeps at once. Reaching it starts the cache over, and the
@@ -208,7 +264,12 @@ impl RegexState {
         };
         let check = || ctx.map_or(Ok(()), Ctx::check);
         let mut nfa = maximum.min(pattern.len().saturating_mul(128).saturating_add(8192));
+        let kept = kept_program(&text, maximum);
         let (program, hybrid, mut charge) = loop {
+            if let Some(kept) = &kept {
+                let charge = retained(kept.program.memory_usage() as u64 + 4096)?;
+                break (kept.program.clone(), kept.hybrid, charge);
+            }
             check()?;
             let hybrid = (nfa * 2).min(2 << 20);
             let charge = retained(nfa as u64 * 32 + hybrid as u64 * 4)?;
@@ -228,7 +289,17 @@ impl RegexState {
                 )
                 .build(&text);
             match built {
-                Ok(program) => break (program, hybrid, charge),
+                Ok(program) => {
+                    keep_program(
+                        &text,
+                        &Program {
+                            program: program.clone(),
+                            nfa,
+                            hybrid,
+                        },
+                    );
+                    break (program, hybrid, charge);
+                }
                 Err(e) if e.size_limit().is_some() && nfa < maximum => {
                     drop(charge);
                     nfa = nfa.saturating_mul(2).min(maximum);
@@ -457,6 +528,20 @@ mod tests {
         }
         assert!(RegexState::compile(None, "[", "").unwrap().is_none());
         assert!(RegexState::compile(None, "a", "!").unwrap().is_none());
+    }
+
+    /// A pattern that queries repeat compiles once. A later compilation shares the kept
+    /// program, and a bound below the one it was built under compiles again.
+    #[test]
+    fn a_repeated_pattern_shares_its_kept_program() {
+        let pattern = "^kept-[0-9]{2}x$";
+        let first = RegexState::compile(None, pattern, "").unwrap().unwrap();
+        let kept = kept_program(pattern, usize::MAX).expect("the program is kept");
+        assert!(kept_program(pattern, kept.nfa - 1).is_none());
+        let second = RegexState::compile(None, pattern, "").unwrap().unwrap();
+        assert!(second.is_match("kept-12x") && !second.is_match("kept-123x"));
+        assert!(first.is_match("kept-99x"));
+        assert_eq!(first.program.memory_usage(), second.program.memory_usage());
     }
 
     /// A worker's clone serves only the thread that made it. A worker of another pool

@@ -508,11 +508,19 @@ distinct EXISTS keys raise an eager query's peak by their entries, and
 EXISTS keys keeps at most 2 MiB of the pool.
 
 Regular expressions have one engine in both modes. `REGEX`, `REPLACE` and the key filters
-on vocabulary keys compile each pattern once per query into a program of
-`regex_automata` with a bounded hybrid DFA and PikeVM, charged to the query with its
-search cache, and the program goes when the query's work ends. Eager execution used a
-process-wide thread-local cache of up to 1,000 uncharged programs of up to 4 MiB, which
-outlived the query, and it is gone. On atlas, a lock on one shared search cache cost
+on vocabulary keys take each pattern's program once per query, a program of
+`regex_automata` with a bounded hybrid DFA and PikeVM. The query is charged for the
+program and its search caches, and the caches go when the query's work ends. Eager
+execution used a process-wide thread-local cache of up to 1,000 uncharged programs of up
+to 4 MiB with their search caches, and it is gone. Compiling `regex-iri`'s pattern took
+about 25 µs on the critical path of a 0.25 ms filter on atlas with 12 threads, and a
+query that compiled each pattern again was 8 to 10% slower on forge than the
+thread-local cache at 1.05M triples. Compiled programs without their search caches are
+therefore kept in one process-wide table of at most 64 programs and 16 MiB, and a query
+whose budget allows the bound a kept program was built under shares it. This memory is
+outside every query's budget, which is the tradeoff that keeps a repeated pattern at the
+speed of the old cache. A query still pays for its own search caches, whose cold start
+cost about 10 µs of the same filter. On atlas, a lock on one shared search cache cost
 about 9 ns a row, nearly as much as the 11 ns of matching `regex-iri`'s pattern against
 an IRI, so each Rayon worker that searches a program gets a clone of it with its own
 cache. The clone's cache is
