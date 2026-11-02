@@ -1,0 +1,17 @@
+binary: /home/kclejeune/lanes/exec-453/bin/sparkles-e52937ca
+binary sha256: b403198489322036131b9e64908761ce12dbd9e67087cc90dca38943fe6b172e
+binary commit: e52937ca
+version: sparkles 0.1.0
+compilers: GCC: (GNU) 15.3.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); clang version 23.1.0git; rustc version 1.99.1 (58cf8f9c3 2026-10-13)
+build config: {"Cargo.toml":{"release":{"codegen-units":4,"debug":1,"lto":"thin","package":{"sparkles-core":{"codegen-units":1}}}},"cargo":"build --release -p sparkles-server --bin sparkles","env":{},"mbx_policy":"d8bf0b48d620f6bf62929d3db32bd253653505cdb33a5bd1efed1e79aaca05b4","profile":"release"}
+runtime env: clean
+scripts commit: unknown
+scripts dirty: 0
+host: forge
+started: 2026-11-02T03:37:44Z
+settings: 31 queries, scales 100000 1000000 people, threads 12 1, 2 rounds of A,B,B,A, 3 warm-up and 10 timed requests per query and server
+variants: A execution=eager, B execution=streaming, one binary and one shared store
+generator sha256: c04719e3cb2b687c0d0575e290cc42cec74314ff1ab815a75063e1a85159923c
+load before: 2.10 2.95 2.04 2/604 3116833
+ended: 2026-11-02T06:03:02Z
+load after: 3.12 3.12 3.20 1/636 3311926

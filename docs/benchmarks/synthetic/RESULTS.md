@@ -489,3 +489,24 @@ of the time goes to writing the rows. It is faster on the grouped aggregates
 threads and at 10.5M triples on `minus` and `not-exists`. Item 534 covers the
 streamed response's fixed cost and its losses on large answers, which the merged executor
 must not inherit.
+
+### Forge record after stages 1 and 3
+
+Items 474 to 478 and 480 to 483 were screened on Namespace only, so the matrix ran again
+on forge alone with a release build of e52937ca and the scripts of that commit. Its
+[run record](runs/2026-11-02-executor-matrix-forge-e52937ca/record.json),
+[summary](runs/2026-11-02-executor-matrix-forge-e52937ca/summary.md) and
+[commands](runs/2026-11-02-executor-matrix-forge-e52937ca/run.sh.txt) are kept beside the
+baseline's, and it is the baseline of stage 4. Both modes returned the same answers in
+every cell, and no answer fingerprint changed against the baseline. The comparison of
+execution times with `bench-gate.py compare` flagged 70 of 248 metrics at the 5% threshold
+([execution times](runs/2026-11-02-executor-matrix-forge-e52937ca/compare-exec.md),
+[wall times](runs/2026-11-02-executor-matrix-forge-e52937ca/compare-wall.md)). Sixty-one
+of them are queries under 0.3 ms, which a single matrix cannot time to that precision.
+
+Interleaved forge A/Bs of the two builds reran the flags above 0.3 ms in eight or ten
+rounds of A,B,B,A in each order. `order-by-full` at 10.5M triples with 12 threads read
+1.012 in eager execution time and 0.956 in wall time, and 1.000 and 0.994 when streamed. `expr-bind-group` and `lang-filter` at 1.05M read 0.988 and 0.997,
+`range-topk` and `subquery-agg` at 10.5M read 1.005 and 1.011, and `optional-chain` at
+10.5M with one thread read 0.978. The flags were therefore noise of the single matrix
+run.

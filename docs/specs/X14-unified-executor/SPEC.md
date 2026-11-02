@@ -206,8 +206,9 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
-479 of stage 2. Stage 4 is under way. Its charged query state and chunked live
-reservations have shipped, and [item 453](../../ROADMAP.md) tracks the rest of the work.
+479 of stage 2. Stage 4's accounting model and mode-neutral kernels have shipped, and the
+hierarchical budget of item NEW-ITEM-5 and the decoding twins of item NEW-ITEM-8 remain.
+[Item 453](../../ROADMAP.md) tracks the rest of the work.
 
 ### Dead compaction arm and one generation switch
 
@@ -510,31 +511,35 @@ EXISTS keys keeps at most 2 MiB of the pool.
 Regular expressions have one engine in both modes. `REGEX`, `REPLACE` and the key filters
 on vocabulary keys take each pattern's program once per query, a program of
 `regex_automata` with a bounded hybrid DFA and PikeVM. The query is charged for the
-program and its search caches, and the caches go when the query's work ends. Eager
-execution used a process-wide thread-local cache of up to 1,000 uncharged programs of up
-to 4 MiB with their search caches, and it is gone. Compiling `regex-iri`'s pattern took
-about 25 µs on the critical path of a 0.25 ms filter on atlas with 12 threads, and a
-query that compiled each pattern again was 8 to 10% slower on forge than the
-thread-local cache at 1.05M triples. Compiled programs without their search caches are
+program and the search caches it holds. Eager execution used a process-wide thread-local
+cache of up to 1,000 uncharged programs of up to 4 MiB with their search caches, and it
+is gone. Compiling `regex-iri`'s pattern took about 25 µs on the critical path of a 0.25
+ms filter on atlas with 12 threads, and a query that compiled each pattern again was 8 to
+10% slower on forge than the thread-local cache at 1.05M triples. Compiled programs are
 therefore kept in one process-wide table of at most 64 programs and 16 MiB, and a query
-whose budget allows the bound a kept program was built under shares it. This memory is
-outside every query's budget, which is the tradeoff that keeps a repeated pattern at the
-speed of the old cache. A query still pays for its own search caches, whose cold start
-cost about 10 µs of the same filter. On atlas, a lock on one shared search cache cost
-about 9 ns a row, nearly as much as the 11 ns of matching `regex-iri`'s pattern against
-an IRI, so each Rayon worker that searches a program gets a clone of it with its own
-cache. The clone's cache is
-charged when it is made and is optional, so a worker whose cache would leave less than
-three quarters of the budget shares the locked cache instead. A key filter copy no
-longer forks a cache of its own. The per-row lookup of a pattern reads the query's map
-of programs without a lock, and the planner reads a filter's key prefixes without
-compiling its patterns. SHACL and ShEx compile their patterns once per shape through
-`compile_regex`, which no longer caches. `a_regular_expression_beyond_the_budget_fails_the_query_in_both_modes`
-checks that a program a 32 KiB budget cannot hold fails an eager query, which compiled it
-uncharged before, and
-`regular_expressions_on_rayon_workers_count_what_the_data_holds` checks key filters,
-`REGEX` on computed strings and `REPLACE` against counts that follow from the data on
-four workers in both modes.
+whose budget allows the bound a kept program was built under shares it. On atlas, a lock
+on one shared search cache cost about 9 ns a row, nearly as much as the 11 ns of matching
+`regex-iri`'s pattern against an IRI, so each Rayon worker that searches a program gets a
+clone of it with its own cache. The clone's cache is charged when the worker takes it and
+is optional, so a worker whose cache would leave less than three quarters of the budget
+shares the locked cache instead. A kept program with cold caches on every worker still
+left `regex-iri` 4 to 6% slower at 1.05M triples with 12 threads on atlas, so when a
+query's work ends each worker's clone of a kept program waits in the table, keyed by the
+thread whose pool serves its cache, and the next query that searches the program on that
+thread takes it back warm and charges it again. Parked clones count their charged cache
+bounds against a second limit of 16 MiB. The table thus holds up to 32 MiB outside every
+query's budget, which is the tradeoff that keeps a repeated pattern at the speed of the
+old cache. A key filter copy no longer forks a cache of its own. The per-row lookup of a
+pattern reads the query's map of programs without a lock, and the planner reads a
+filter's key prefixes without compiling its patterns. SHACL and ShEx compile their
+patterns once per shape through `compile_regex`, which no longer caches.
+`a_regular_expression_beyond_the_budget_fails_the_query_in_both_modes` checks that a
+program a 32 KiB budget cannot hold fails an eager query, which compiled it uncharged
+before, `regular_expressions_on_rayon_workers_count_what_the_data_holds` checks key
+filters, `REGEX` on computed strings and `REPLACE` against counts that follow from the
+data on four workers in both modes, and
+`a_charged_query_charges_the_parked_clones_it_takes` checks that a worker charges the
+clone it takes back and that a worker without room leaves it parked.
 
 Per-value reuse in BIND and FILTER has one implementation, which chooses its algorithm
 by the size of its input rather than by the accounting mode. An input of at most 16,384
@@ -552,12 +557,19 @@ rows before spreading the rest over the pool in both modes.
 reuse with row-by-row evaluation over 32,768 rows in eager execution and in cursors with
 batches on both sides of the threshold.
 
-ORDER BY and its top k choose by input size in the same way. Up to 16,384 rows, numeric
-keys reuse their input ids, a variable's dictionary values are decoded once each in key
-order, and other keys are evaluated on the calling thread with each value admitted
-before the column keeps it. A larger input evaluates each distinct key once in parallel
-through the value cache, and its key column is charged for its slots before evaluation
-and for its values' payload after it, so a query over its budget fails after one column.
+ORDER BY and its top k choose by input size in the same way. A numeric key over one
+variable is evaluated once per distinct input at any size. Up to 16,384 rows its distinct
+inputs come from a dense integer range or one sort, and a larger input maps integers that
+span at most 65,536 values to their slots directly, in parallel above 262,144 rows. A
+variable's dictionary and query-local values are decoded once per distinct term in key
+order at any size, and the decoded column then keeps a charge for its slots, its distinct
+values and their payload rather than the reservation that built it. Up to 16,384 rows,
+other keys are evaluated on the calling thread with each value admitted before the column
+keeps it. A larger input evaluates each distinct key once in parallel through the value
+cache, and so does a large column of inline values, which the decoding would hold once per
+row, or one whose query-local payload the budget refuses. Its key column is charged for its
+slots before evaluation and for its values' payload after it, so a query over its budget
+fails after one column.
 The numeric prefilter of `ORDER BY ?v LIMIT k`, the total-order check of a top-k scan
 and the heap's first key follow the same rule, and their charges, the sort's positions
 and its sorted copy are taken in both modes. An eager top-k scan of pieces without value
@@ -587,16 +599,17 @@ the envelope instead. The sixth keeps cursors from the string floors above, unti
 reconstruct with the decoding admitted. `CursorMemory` is gone, and a context in cursor accounting differs
 from an eager one only by its `streams` flag, its ledger retention and its deadline. The
 result cache and sampled filters stay off for cursors, since they are planning choices
-that stage 6 makes independent of the mode. The rest of item
-NEW-ITEM-4 merges the remaining `cursor_*` twins.
+that stage 6 makes independent of the mode. Item NEW-ITEM-8 holds the two decoding twins
+that remain, the string floors and the dictionary pre-decode of a cursor batch, which
+`decode_for` does not yet serve.
 
 ### Measurements of stage 1
 
 A Namespace screen of the base against the five deletions ran the 30 synthetic queries
 at 1.05M triples with one thread in four A,B,B,A rounds. The geometric mean of server
 time was 0.982 of the base, and no query was 5% or more slower. `regex-iri` read 1.024
-and `class-predicates` 1.020 with every round above 1, which item 514 measures on
-an Intel host. EXPLAIN printed the same plans before and after for four generated groups
+and `class-predicates` 1.020 with every round above 1, and the
+[measurements of stage 4](#measurements-of-stage-4) close both. EXPLAIN printed the same plans before and after for four generated groups
 of 17 to 22 triple patterns over the same data, a chain, a chain with a filter, a star
 and a snowflake, since a group of more than 16 inputs already kept the greedy plan of
 `joinorder.rs`.
@@ -613,3 +626,44 @@ the execution of the plan, which none of the items changes for these queries, so
 524 measures `distinct-obj` on an Intel host. Building the options of a request
 through the caller context and the query request builder adds a few moves of the options
 and one reference count, outside the measured time.
+
+### Measurements of stage 4
+
+Stage 4 was measured on forge, alone under its benchmark lock, against the record of
+e52937ca that the [synthetic results](../../benchmarks/synthetic/RESULTS.md#forge-record-after-stages-1-and-3)
+keep, and in interleaved A/Bs of release builds. Each A/B ran ten rounds of A,B,B,A in
+each order with 12 Rayon threads at 1.05M triples, or four rounds at 10.5M, and the
+latency harness of decision D4 ran the queries under 0.3 ms with 200 requests per round.
+
+Several of the first comparisons were wrong because Boxington's learned incremental
+reuse had compiled one build of a pair and not the other. Such a build of `sparkles-core`
+had a `.text` section about 2% smaller than a fresh compile of the same commit. On atlas
+at 10.5M triples with 12 threads, streamed `expr-agg-arg` took 26.2 ms in a fresh build
+before per-value reuse merged, 26.6 ms in a fresh build after it and 29.4 ms in an
+incremental build of the same code, which forge had read as a regression of 1.19. The
+incremental builds of the charged query state and its base likewise failed the D4 rule on
+`employee-docs`, `star-lookup` and `values-star`, which a fresh pair passes. Every number
+below compares fresh builds, timed binaries are now built without the reuse, and item
+NEW-ITEM-7 records it in the build configuration.
+
+A query that compiled each regular expression again made `regex-iri` 8 to 10% slower at
+1.05M triples with 12 threads than the thread-local cache it replaced, and a kept program
+with cold search caches on every worker still read 1.069 in eager execution and 1.034
+when streamed. With the workers' clones parked between queries it read 1.010 and 1.015,
+and 1.011 and 1.004 at 10.5M triples. With one query thread it read 1.029 and 1.030,
+about 115 µs of 3.9 ms, which item NEW-ITEM-9 investigates.
+
+The first build of the size-chosen sort keys made streamed `expr-order-key` 1.20 times
+slower and `order-by-full` 1.06 times slower at 1.05M triples with 12 threads, because a
+cursor batch above 16,384 rows went to the hashed parallel distinct of per-value reuse
+and a variable key cloned a value per row. With dense integer slots and decoding per
+distinct term at any size they read 0.953, 0.917 and 0.819 for `expr-order-key`,
+`order-by-full` and `range-topk` in eager execution and 0.999, 0.997 and 0.996 when
+streamed.
+
+Against be727388, the build before the mode-neutral kernels, the final build ran every
+query above 0.3 ms that the kernels change within 1.019 of its time at 1.05M triples with
+12 threads in both modes, and eager `order-by-full`, `range-topk` and `regex-iri` read
+0.921, 0.802 and 0.957. `types-grouped`, a GROUP BY of about 0.011 ms with an ORDER BY over
+its few groups, read 1.130 in eager execution and 1.053 when streamed, 1.4 and 1.0 µs more,
+which fails the D4 rule. Item NEW-ITEM-10 investigates it.
