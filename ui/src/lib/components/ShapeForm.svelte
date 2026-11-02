@@ -68,6 +68,7 @@
     cls,
     shapes,
     groups,
+    onmodel,
   }: {
     /** The dataset (its main). */
     ds: string;
@@ -91,6 +92,8 @@
      * shapes do not cover. The other fields keep their values.
      */
     groups?: string[];
+    /** Called with each form model the form reads, so a host can check its graphs. */
+    onmodel?: (m: FormModel) => void;
   } = $props();
 
   const lang = typeof navigator === 'undefined' ? 'en' : (navigator.language || 'en').slice(0, 2);
@@ -164,6 +167,7 @@
       });
       if (c !== ctl) return;
       model = m;
+      onmodel?.(m);
       const es: Record<string, Entry[]> = Object.fromEntries(
         m.fields.map((f) => [f.id, entriesOf(f, m)]),
       );

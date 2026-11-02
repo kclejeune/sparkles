@@ -16,6 +16,7 @@
   import { branchParam, MAIN, onBranch } from '$lib/branches';
   import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
   import { getForm, type FormSaveAnswer } from '$lib/forms-api';
+  import type { FormModel } from '$lib/forms';
   import { fmtInt } from '$lib/format';
   import {
     iriName,
@@ -172,7 +173,8 @@
     const my = ++loadSeq;
     loading = true;
     try {
-      const h = await readHead(t).catch(() => ({ etag: null, commit: 0 }));
+      // without the tag no edit could name the commit it was made against: read-only
+      const h = await readHead(t, graph).catch(() => ({ etag: null, commit: 0 }));
       const [sRows, cRows, lRows] = await Promise.all([
         select(schemesQuery(graph)),
         select(collectionsQuery(graph)),
@@ -435,7 +437,9 @@
   const canWrite = $derived(auth.can(name, 'write'));
   const canAdmin = $derived(auth.can(name, 'admin'));
   const protectedBranch = $derived(!!currentBranch?.protected);
-  const readonly = $derived(!canWrite || protectedBranch);
+  /** The head could not be read, so edits could not carry `If-Match`. */
+  const noHead = $derived(!!head && !head.etag);
+  const readonly = $derived(!canWrite || protectedBranch || noHead);
   let sessionError = $state<string | null>(null);
   async function startSession() {
     sessionError = null;
@@ -713,6 +717,24 @@
     }
   }
 
+  // The notes and members forms read every graph and write where the dataset's forms
+  // setting says, so the page lets them edit only the graph it shows.
+  let formModel = $state<{ key: string; m: FormModel } | null>(null);
+  const formKey = $derived(`${selected}|${branch}|${formShapes}|${view}|${head?.commit}`);
+  const formLock = $derived.by(() => {
+    if (readonly) return 'The page is read-only, so the form is too.';
+    const fm = formModel?.key === formKey ? formModel.m : null;
+    if (!fm) return null;
+    const here = graph ?? null;
+    const name = (g: string | null) => (g ? iriName(g, prefixes) : 'the default graph');
+    if ((fm.graph ?? null) !== here)
+      return `The form would write to ${name(fm.graph ?? null)}, not to ${name(here)} that the page edits, so it is read-only here.`;
+    const elsewhere = fm.fields.some((f) => f.values.some((v) => (v.graph ?? null) !== here));
+    if (elsewhere)
+      return `Some of these values are in other graphs than ${name(here)}, so the form is read-only here.`;
+    return null;
+  });
+
   const title = $derived(selected ? nameOf(selected) : '');
   const typeBadges = $derived(
     (details?.types ?? []).map((t) => iriName(t, prefixes)).filter(Boolean),
@@ -849,6 +871,11 @@
     </p>
   {:else if !canWrite && name}
     <p class="notice" role="status">You can read this dataset but not edit it.</p>
+  {:else if noHead && name}
+    <p class="notice" role="status">
+      The page could not read the commit this graph is at, so it cannot guard its edits against
+      other writers and shows the thesaurus read-only. Reload to try again.
+    </p>
   {/if}
   {#if loadError}
     <div class="error-box" role="alert">
@@ -1160,6 +1187,10 @@
                   langs={languages}
                   {readonly}
                   onedit={edit}
+                  isUsed={async (i) => {
+                    const r = await api.query(target, usedQuery(i, graph), { nocache: true });
+                    return !!r.boolean;
+                  }}
                 />
                 {#if details.notations.length}
                   <p class="small">
@@ -1281,27 +1312,31 @@
                   {/if}
                 </div>
               {:else if view === 'members' || view === 'notes'}
-                {#key `${selected}|${branch}|${formShapes}|${view}|${head?.commit}`}
-                  <ShapeForm
-                    ds={name}
-                    iri={selected}
-                    {branch}
-                    {prefixes}
-                    {title}
-                    shapes={formShapes}
-                    groups={formShapes === 'skos'
-                      ? view === 'members'
-                        ? [`${GROUP}Members`]
-                        : [`${GROUP}Notes`, `${GROUP}Documentation`]
-                      : undefined}
-                    onsaved={(a) =>
-                      formSaved(
-                        a,
-                        view === 'members'
-                          ? `Edit the members of ${title}`
-                          : `Edit the notes of ${title}`,
-                      )}
-                  />
+                {#if formLock}<p class="notice small" role="status">{formLock}</p>{/if}
+                {#key formKey}
+                  <fieldset class="form-lock" disabled={!!formLock}>
+                    <ShapeForm
+                      ds={name}
+                      iri={selected}
+                      {branch}
+                      {prefixes}
+                      {title}
+                      shapes={formShapes}
+                      groups={formShapes === 'skos'
+                        ? view === 'members'
+                          ? [`${GROUP}Members`]
+                          : [`${GROUP}Notes`, `${GROUP}Documentation`]
+                        : undefined}
+                      onsaved={(a) =>
+                        formSaved(
+                          a,
+                          view === 'members'
+                            ? `Edit the members of ${title}`
+                            : `Edit the notes of ${title}`,
+                        )}
+                      onmodel={(m) => (formModel = { key: formKey, m })}
+                    />
+                  </fieldset>
                 {/key}
               {/if}
             {:else if !detailsError}
@@ -1576,6 +1611,12 @@
   .entity-head .who {
     display: grid;
     gap: 2px;
+    min-width: 0;
+  }
+  .form-lock {
+    border: 0;
+    margin: 0;
+    padding: 0;
     min-width: 0;
   }
   .entity-head h2 {

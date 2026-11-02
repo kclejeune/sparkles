@@ -3167,7 +3167,7 @@ const server = http.createServer(async (req, res) => {
           ...commitHeaders(ds),
           ETag: `W/"${ds.branchId ?? ds.id}:${headCommit(ds).seq}:ttl"`,
         };
-        if (req.method === 'HEAD' && url.searchParams.has('default'))
+        if (req.method === 'HEAD' && (graph || url.searchParams.has('default')))
           return send(res, 200, '', 'text/turtle', tagged);
         if (graph || url.searchParams.has('default')) {
           const from = graph ? ox.namedNode(graph) : ox.defaultGraph();

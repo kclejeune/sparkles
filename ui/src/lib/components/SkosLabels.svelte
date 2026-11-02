@@ -8,6 +8,7 @@
   import { validLang } from '$lib/ontology';
   import {
     addProblem,
+    ambiguousXl,
     fromXlEdit,
     KIND_NAME,
     LABEL_KINDS,
@@ -15,6 +16,7 @@
     labelProblems,
     makePreferredEdit,
     normLang,
+    sameEntry,
     sameLabel,
     toXlEdit,
     xlFormEdit,
@@ -33,6 +35,7 @@
     langs,
     readonly,
     onedit,
+    isUsed = async () => false,
   }: {
     iri: string;
     /** The resource's name, for the edits' labels. */
@@ -43,6 +46,8 @@
     langs: string[];
     readonly: boolean;
     onedit: (sparql: string, label: string) => void;
+    /** Whether the graph already uses an IRI, so a minted SKOS-XL label IRI is new. */
+    isUsed?: (iri: string) => Promise<boolean>;
   } = $props();
 
   const problems = $derived(labelProblems(entries));
@@ -73,18 +78,29 @@
         ? 'The language tag is not valid.'
         : addProblem(entries, kind, draft),
   );
-  /** The plain preferred label the new one would replace, for the S14 case. */
-  const replaces = $derived(
-    kind === 'pref' && draft.value
-      ? entries.find(
-          (e) =>
-            e.kind === 'pref' &&
-            e.xl === null &&
-            e.label.lang === draft.lang &&
-            !sameLabel(e.label, draft),
-        )
-      : undefined,
-  );
+  /**
+   * The plain preferred label the new one would replace, for the S14 case. The draft's plain
+   * alternative and hidden copies go with it, and the shortcut is offered only when the
+   * resulting labels keep the rules and the draft is no SKOS-XL label already.
+   */
+  const replaces = $derived.by(() => {
+    if (kind !== 'pref' || !draft.value || !validLang(draft.lang)) return undefined;
+    const old = entries.find(
+      (e) =>
+        e.kind === 'pref' &&
+        e.xl === null &&
+        e.label.lang === draft.lang &&
+        !sameLabel(e.label, draft),
+    );
+    if (!old) return undefined;
+    if (entries.some((e) => e.xl && sameLabel(e.label, draft))) return undefined;
+    const after: LabelEntry[] = [
+      ...entries.filter((e) => !sameEntry(e, old) && !(e.xl === null && sameLabel(e.label, draft))),
+      { kind: 'pref', label: draft, xl: null },
+      { kind: 'alt', label: old.label, xl: null },
+    ];
+    return labelProblems(after).length ? undefined : old;
+  });
 
   function add() {
     if (!draft.value || draftProblem) return;
@@ -97,10 +113,16 @@
 
   function replacePreferred() {
     if (!replaces) return;
+    const copies = entries.filter(
+      (e) => e.xl === null && e.kind !== 'pref' && sameLabel(e.label, draft),
+    );
     onedit(
       labelEdit(
         iri,
-        [{ kind: 'pref', label: replaces.label }],
+        [
+          { kind: 'pref', label: replaces.label },
+          ...copies.map((e) => ({ kind: e.kind, label: e.label })),
+        ],
         [
           { kind: 'pref', label: draft },
           { kind: 'alt', label: replaces.label },
@@ -126,7 +148,7 @@
     if (!editing || !editDraft.value) return null;
     if (!validLang(editDraft.lang)) return 'The language tag is not valid.';
     const cur = editing;
-    const rest = entries.filter((e) => !(e.kind === cur.kind && sameLabel(e.label, cur.label)));
+    const rest = entries.filter((e) => !sameEntry(e, cur));
     return addProblem(rest, cur.kind, editDraft);
   });
   function saveEdit() {
@@ -162,13 +184,22 @@
 
   function makePreferred(e: LabelEntry) {
     onedit(
-      makePreferredEdit(iri, e.label, e.kind, entries, graph),
+      makePreferredEdit(iri, e, entries, graph),
       `Make ${shown(e.label)} the preferred label of ${name}`,
     );
   }
 
-  function toXl(e: LabelEntry) {
-    const node = xlLabelIri(iri, e.kind, e.label, xlTaken);
+  /** A SKOS-XL label IRI that neither this resource nor the rest of the graph uses. */
+  async function mint(e: LabelEntry, taken: Set<string>): Promise<string> {
+    for (;;) {
+      const node = xlLabelIri(iri, e.kind, e.label, taken);
+      if (!(await isUsed(node))) return node;
+      taken.add(node);
+    }
+  }
+
+  async function toXl(e: LabelEntry) {
+    const node = await mint(e, new Set(xlTaken));
     onedit(
       toXlEdit(iri, e.kind, e.label, node, graph),
       `Make ${shown(e.label)} a SKOS-XL label of ${name}`,
@@ -182,15 +213,16 @@
     );
   }
 
-  function allToXl() {
+  async function allToXl() {
     const plain = entries.filter((e) => !e.xl);
     if (!plain.length) return;
     const taken = new Set(xlTaken);
-    const parts = plain.map((e) => {
-      const node = xlLabelIri(iri, e.kind, e.label, taken);
+    const parts: string[] = [];
+    for (const e of plain) {
+      const node = await mint(e, taken);
       taken.add(node);
-      return toXlEdit(iri, e.kind, e.label, node, graph);
-    });
+      parts.push(toXlEdit(iri, e.kind, e.label, node, graph));
+    }
     onedit(parts.join(' ;\n'), `Make the ${plain.length} plain labels of ${name} SKOS-XL labels`);
   }
 </script>
@@ -248,7 +280,13 @@
                             ? `SKOS-XL label ${e.xl.value}`
                             : 'SKOS-XL label (blank node)'}>XL</span
                         >{/if}
-                      {#if !readonly}
+                      {#if !readonly && ambiguousXl(entries, e)}
+                        <span
+                          class="faint xs"
+                          title="Another SKOS-XL label of this kind is a blank node with the same literal form, and an edit cannot tell the two apart. Edit them in the query editor."
+                          >twin</span
+                        >
+                      {:else if !readonly}
                         <span class="acts">
                           {#if k !== 'pref'}
                             <button
@@ -256,7 +294,7 @@
                               title="Make preferred"
                               aria-label="Make {e.label.value} preferred"
                               onclick={() => makePreferred(e)}
-                              disabled={!!e.xl}><Icon name="check" size={11} /></button
+                              ><Icon name="check" size={11} /></button
                             >
                           {/if}
                           {#if e.xl}

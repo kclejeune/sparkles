@@ -13,8 +13,11 @@ import {
   detailsQuery,
   displayLabel,
   fromXlEdit,
+  ambiguousXl,
+  headUrl,
   labelMap,
   labelProblems,
+  sameEntry,
   labelsQuery,
   linkEdit,
   makePreferredEdit,
@@ -257,9 +260,8 @@ describe('the updates', () => {
   it('makes a label preferred and the old one alternative', () => {
     const s = store(THES);
     const d = parseDetails(EX + 'whale', select(s, detailsQuery(EX + 'whale', null)));
-    s.update(
-      makePreferredEdit(EX + 'whale', { value: 'Cetacean', lang: 'en' }, 'alt', d.labels, null),
-    );
+    const cetacean = d.labels.find((l) => l.label.value === 'Cetacean' && !l.xl)!;
+    s.update(makePreferredEdit(EX + 'whale', cetacean, d.labels, null));
     const e = parseDetails(EX + 'whale', select(s, detailsQuery(EX + 'whale', null)));
     expect(
       e.labels
@@ -330,6 +332,77 @@ describe('the updates', () => {
     expect(s.match(null, null, null, ox.defaultGraph()).length).toBe(0);
     s.update(linkEdit(EX + 'a', 'related', EX + 'b', true, 'urn:g'));
     expect(s.match(null, ox.namedNode(SKOS + 'related'), null, null).length).toBe(0);
+  });
+});
+
+describe('label edits keep what other resources and labels need', () => {
+  it('keeps a SKOS-XL label resource that another concept still uses', () => {
+    const s = store(`ex:a skosxl:altLabel ex:shared . ex:b skosxl:altLabel ex:shared .
+      ex:shared a skosxl:Label ; skosxl:literalForm "Feline"@en .`);
+    const node = { type: 'uri', value: EX + 'shared' } as const;
+    s.update(fromXlEdit(EX + 'a', 'alt', node, { value: 'Feline', lang: 'en' }, null, null));
+    expect(ask(s, `ASK { <${EX}a> ?p ?o }`)).toBe(false);
+    expect(ask(s, `ASK { <${EX}shared> <${XL}literalForm> "Feline"@en }`)).toBe(true);
+    s.update(deleteEdit(EX + 'b', null));
+    // the last user removed it: the label goes too
+    expect(s.size).toBe(0);
+  });
+
+  it('keeps a shared label when its concept is deleted', () => {
+    const s = store(`ex:a skosxl:altLabel ex:shared . ex:b skosxl:altLabel ex:shared .
+      ex:shared a skosxl:Label ; skosxl:literalForm "Feline"@en .`);
+    s.update(deleteEdit(EX + 'a', null));
+    expect(ask(s, `ASK { <${EX}shared> <${XL}literalForm> "Feline"@en }`)).toBe(true);
+  });
+
+  it('tells blank-node twins apart only when their forms differ', () => {
+    const s = store(`ex:c skosxl:altLabel [ skosxl:literalForm "Cat"@en ; ex:note "one" ] ,
+      [ skosxl:literalForm "Cat"@en ; ex:note "two" ] , [ skosxl:literalForm "Kitty"@en ] .`);
+    const d = parseDetails(EX + 'c', select(s, detailsQuery(EX + 'c', null)));
+    const cats = d.labels.filter((l) => l.label.value === 'Cat');
+    expect(cats.length).toBe(2);
+    expect(cats.every((c) => ambiguousXl(d.labels, c))).toBe(true);
+    expect(
+      ambiguousXl(
+        d.labels,
+        d.labels.find((l) => l.label.value === 'Kitty')!,
+      ),
+    ).toBe(false);
+  });
+
+  it('makes a label preferred over a SKOS-XL preferred label, which becomes alternative', () => {
+    const s = store(`ex:c skosxl:prefLabel ex:cat ; skos:altLabel "feline"@en .
+      ex:cat a skosxl:Label ; skosxl:literalForm "cat"@en .`);
+    const d = parseDetails(EX + 'c', select(s, detailsQuery(EX + 'c', null)));
+    const feline = d.labels.find((l) => l.label.value === 'feline')!;
+    s.update(makePreferredEdit(EX + 'c', feline, d.labels, null));
+    const e = parseDetails(EX + 'c', select(s, detailsQuery(EX + 'c', null)));
+    expect(e.labels.map((l) => [l.kind, l.label.value, !!l.xl]).sort()).toEqual([
+      ['alt', 'cat', true],
+      ['pref', 'feline', false],
+    ]);
+    expect(labelProblems(e.labels)).toEqual([]);
+    // and back: the XL label is promoted by its link, the plain one demoted
+    const cat = e.labels.find((l) => l.label.value === 'cat')!;
+    s.update(makePreferredEdit(EX + 'c', cat, e.labels, null));
+    const f = parseDetails(EX + 'c', select(s, detailsQuery(EX + 'c', null)));
+    expect(f.labels.map((l) => [l.kind, l.label.value, !!l.xl]).sort()).toEqual([
+      ['alt', 'feline', false],
+      ['pref', 'cat', true],
+    ]);
+  });
+
+  it('checks an edit without the unedited twin of the label', () => {
+    const es = [plain('pref', 'cat'), xl('pref', 'cat', EX + 'cat')];
+    const rest = es.filter((e) => !sameEntry(e, es[0]));
+    expect(addProblem(rest, 'pref', { value: 'feline', lang: 'en' })).toMatch(/S14/);
+  });
+});
+
+describe('the head', () => {
+  it('is read on the graph the editor shows', () => {
+    expect(headUrl('thes@dev', null)).toBe('/thes%40dev/data?default');
+    expect(headUrl('thes', 'urn:g')).toBe('/thes/data?graph=urn%3Ag');
   });
 });
 

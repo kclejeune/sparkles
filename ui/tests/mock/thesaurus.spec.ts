@@ -255,7 +255,23 @@ test('a protected branch is read-only', async ({ page, request }) => {
     await expect(page.getByRole('status').filter({ hasText: 'is protected' })).toBeVisible();
     await expect(page.getByRole('form', { name: 'Add a label' })).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Delete' })).toHaveCount(0);
+    // the notes form follows the page
+    await page.getByRole('tab', { name: 'Notes' }).click();
+    const details = page.getByRole('region', { name: 'Details' });
+    await expect(details.getByRole('status')).toContainText('the form is too');
+    await expect(details.getByRole('button', { name: /^\+ Add/ }).first()).toBeDisabled();
   } finally {
     await request.patch('/$/branches/thes/main', { data: { protected: false } });
   }
+});
+
+test('without the head tag the page cannot guard its edits and is read-only', async ({ page }) => {
+  await page.route('**/thes/data?default', (route) =>
+    route.request().method() === 'HEAD' ? route.fulfill({ status: 503 }) : route.fallback(),
+  );
+  await open(page, `&iri=${encodeURIComponent(TH + 'fish')}`);
+  await expect(
+    page.getByRole('status').filter({ hasText: 'cannot guard its edits' }),
+  ).toBeVisible();
+  await expect(page.getByRole('form', { name: 'Add a label' })).toHaveCount(0);
 });

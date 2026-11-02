@@ -526,13 +526,14 @@ export function createTypedEdit(r: string, type: string, label: Label, graph: st
 /**
  * The removal of a resource: every triple of the graph that has it as subject or object,
  * except as a member of an `rdf:List` (removing `rdf:first` would break the list), and the
- * triples of its SKOS-XL label resources.
+ * triples of the SKOS-XL label resources no other resource of the graph refers to.
  */
 export function deleteEdit(r: string, graph: string | null): string {
   const R = iri(r);
   const where = `{ ${R} ?p ?o BIND(${R} AS ?s) }
     UNION { ?s ?p ${R} BIND(${R} AS ?o) FILTER(?p != ${sparqlIri(RDF + 'first')}) }
-    UNION { ${R} ${x('prefLabel')}|${x('altLabel')}|${x('hiddenLabel')} ?s . ?s ?p ?o }`;
+    UNION { ${R} ${x('prefLabel')}|${x('altLabel')}|${x('hiddenLabel')} ?s . ?s ?p ?o
+      FILTER NOT EXISTS { ?other ?q ?s FILTER(!sameTerm(?other, ${R})) } }`;
   return `DELETE { ${inGraph(graph, '?s ?p ?o')} }\nWHERE { ${inGraph(graph, where)} }`;
 }
 
@@ -547,28 +548,63 @@ export function labelEdit(
 }
 
 /**
- * Make `label` the preferred label of its language: it stops being alternative or hidden,
- * and the preferred plain labels it replaces become alternative labels.
+ * Make an entry the preferred label of its language: it stops being alternative or hidden,
+ * and the preferred labels it replaces become alternative labels, plain or SKOS-XL as they
+ * were. A SKOS-XL entry keeps its label resource and changes the property that links it.
  */
 export function makePreferredEdit(
   r: string,
-  label: Label,
-  from: LabelKind,
+  entry: LabelEntry,
   entries: LabelEntry[],
   graph: string | null,
 ): string {
   const old = entries.filter(
-    (e) =>
-      e.kind === 'pref' &&
-      e.xl === null &&
-      e.label.lang === label.lang &&
-      !sameLabel(e.label, label),
+    (e) => e.kind === 'pref' && e.label.lang === entry.label.lang && !sameEntry(e, entry),
   );
-  return labelEdit(
-    r,
-    [{ kind: from, label }, ...old.map((e) => ({ kind: 'pref' as const, label: e.label }))],
-    [{ kind: 'pref', label }, ...old.map((e) => ({ kind: 'alt' as const, label: e.label }))],
-    graph,
+  const parts: string[] = [];
+  const plainDel: { kind: LabelKind; label: Label }[] = [];
+  const plainAdd: { kind: LabelKind; label: Label }[] = [];
+  if (entry.xl) parts.push(xlKindEdit(r, entry.kind, 'pref', entry.xl, entry.label, graph));
+  else {
+    plainDel.push({ kind: entry.kind, label: entry.label });
+    plainAdd.push({ kind: 'pref', label: entry.label });
+  }
+  for (const e of old) {
+    // a preferred label with the same literal form is the same label in another form
+    if (sameLabel(e.label, entry.label)) continue;
+    if (e.xl) parts.push(xlKindEdit(r, 'pref', 'alt', e.xl, e.label, graph));
+    else {
+      plainDel.push({ kind: 'pref', label: e.label });
+      plainAdd.push({ kind: 'alt', label: e.label });
+    }
+  }
+  if (plainDel.length || plainAdd.length) parts.unshift(labelEdit(r, plainDel, plainAdd, graph));
+  return parts.join(' ;\n');
+}
+
+/** Two entries are the same representation: one kind, one literal and one XL resource. */
+export function sameEntry(a: LabelEntry, b: LabelEntry): boolean {
+  return (
+    a.kind === b.kind &&
+    sameLabel(a.label, b.label) &&
+    (a.xl === null) === (b.xl === null) &&
+    (a.xl === null || (a.xl.type === b.xl!.type && a.xl.value === b.xl!.value))
+  );
+}
+
+/**
+ * The SKOS-XL entries that an update cannot tell apart: blank-node labels of one kind with
+ * one literal form, which a pattern finds only by that form.
+ */
+export function ambiguousXl(entries: LabelEntry[], e: LabelEntry): boolean {
+  if (e.xl?.type !== 'bnode') return false;
+  return entries.some(
+    (o) =>
+      o !== e &&
+      o.xl?.type === 'bnode' &&
+      o.xl.value !== e.xl!.value &&
+      o.kind === e.kind &&
+      sameLabel(o.label, e.label),
   );
 }
 
@@ -606,7 +642,8 @@ function xlPattern(r: string, kind: LabelKind, node: Term, form: Label | null): 
 
 /**
  * A SKOS-XL label made a plain label, or with `add` null removed: the link to the label
- * resource and every triple of the resource go.
+ * resource goes, and so does every triple of the resource unless another resource of the
+ * graph still refers to it.
  */
 export function fromXlEdit(
   r: string,
@@ -616,14 +653,36 @@ export function fromXlEdit(
   add: Label | null,
   graph: string | null,
 ): string {
-  const del = `${iri(r)} ${x(`${kind}Label`)} ?xl . ?xl ?p ?o .`;
+  const link = x(`${kind}Label`);
+  const del = `${iri(r)} ${link} ?xl . ?xl ?p ?o .`;
   const ins = add
     ? `INSERT { ${inGraph(graph, `${iri(r)} ${s(`${kind}Label`)} ${litSparql(add)} .`)} }\n`
     : '';
+  const shared = `FILTER NOT EXISTS { ?other ?q ?xl FILTER(!(sameTerm(?other, ${iri(r)}) && sameTerm(?q, ${link}))) }`;
   return `DELETE { ${inGraph(graph, del)} }\n${ins}WHERE { ${inGraph(
     graph,
-    `${xlPattern(r, kind, node, form)} OPTIONAL { ?xl ?p ?o }`,
+    `${xlPattern(r, kind, node, form)} OPTIONAL { ?xl ?p ?o ${shared} }`,
   )} }`;
+}
+
+/** A SKOS-XL label of `r` linked by another kind of label property, its resource kept. */
+export function xlKindEdit(
+  r: string,
+  from: LabelKind,
+  to: LabelKind,
+  node: Term,
+  form: Label,
+  graph: string | null,
+): string {
+  if (node.type === 'uri')
+    return triplesEdit(
+      [t(r, xlProperty(from), node.value)],
+      [t(r, xlProperty(to), node.value)],
+      graph,
+    );
+  return `DELETE { ${inGraph(graph, `${iri(r)} ${x(`${from}Label`)} ?xl .`)} }
+INSERT { ${inGraph(graph, `${iri(r)} ${x(`${to}Label`)} ?xl .`)} }
+WHERE { ${inGraph(graph, xlPattern(r, from, node, form))} }`;
 }
 
 /** The literal form of a SKOS-XL label replaced. */
@@ -774,8 +833,18 @@ export function skosShapes(): Promise<string> {
  * The head the editor shows: the entity tag an edit's `If-Match` names and the commit,
  * from a Graph Store `HEAD` of the default graph, which sends no data.
  */
-export async function readHead(target: string): Promise<{ etag: string | null; commit: number }> {
-  const res = await request(`/${encodeURIComponent(target)}/data?default`, {
+export const headUrl = (target: string, graph: string | null) =>
+  `/${encodeURIComponent(target)}/data?${graph ? `graph=${encodeURIComponent(graph)}` : 'default'}`;
+
+/**
+ * The commit a target's graph is read at and its entity tag, which `If-Match` names. The
+ * tag is dataset-wide, so the HEAD of the graph the editor reads serves every write.
+ */
+export async function readHead(
+  target: string,
+  graph: string | null,
+): Promise<{ etag: string | null; commit: number }> {
+  const res = await request(headUrl(target, graph), {
     method: 'HEAD',
     cache: 'no-store',
   });
