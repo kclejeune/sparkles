@@ -1,0 +1,14 @@
+lock held 2026-11-02T01:35:07Z load 0.10 0.31 0.71 1/608 2431389
+r1-sparkles-4bd70845-streaming 12.36 13.58 
+r1-sparkles-4bd70845-eager 2.25 2.28 
+r1-sparkles-wip1-streaming 3.62 3.64 
+r1-sparkles-wip1-eager 1.86 1.86 
+r2-sparkles-4bd70845-streaming 8.57 8.57 
+r2-sparkles-4bd70845-eager 2.11 2.14 
+r2-sparkles-wip1-streaming 3.65 3.66 
+r2-sparkles-wip1-eager 1.82 1.83 
+r3-sparkles-4bd70845-streaming 8.78 8.82 
+r3-sparkles-4bd70845-eager 2.1 2.1 
+r3-sparkles-wip1-streaming 3.64 3.64 
+r3-sparkles-wip1-eager 1.84 1.85 
+EXP10-DONE

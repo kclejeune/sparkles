@@ -1,0 +1,300 @@
+{
+ "idle": {
+  "sparkles": 83,
+  "qlever": 41
+ },
+ "queries": {
+  "bi-q1-1": {
+   "sparkles": {
+    "before": 83,
+    "peak": 206,
+    "delta": 123
+   },
+   "qlever": {
+    "before": 41,
+    "peak": 149,
+    "delta": 108
+   }
+  },
+  "bi-q1-2": {
+   "sparkles": {
+    "before": 206,
+    "peak": 251,
+    "delta": 45
+   },
+   "qlever": {
+    "before": 138,
+    "peak": 172,
+    "delta": 34
+   }
+  },
+  "bi-q1-3": {
+   "sparkles": {
+    "before": 251,
+    "peak": 458,
+    "delta": 207
+   },
+   "qlever": {
+    "before": 169,
+    "peak": 191,
+    "delta": 22
+   }
+  },
+  "bi-q2-1": {
+   "sparkles": {
+    "before": 458,
+    "peak": 461,
+    "delta": 3
+   },
+   "qlever": {
+    "before": 177,
+    "peak": 266,
+    "delta": 89
+   }
+  },
+  "bi-q2-2": {
+   "sparkles": {
+    "before": 461,
+    "peak": 471,
+    "delta": 10
+   },
+   "qlever": {
+    "before": 265,
+    "peak": 299,
+    "delta": 34
+   }
+  },
+  "bi-q2-3": {
+   "sparkles": {
+    "before": 471,
+    "peak": 470,
+    "delta": 0
+   },
+   "qlever": {
+    "before": 284,
+    "peak": 350,
+    "delta": 66
+   }
+  },
+  "bi-q3-1": {
+   "sparkles": {
+    "before": 420,
+    "peak": 432,
+    "delta": 12
+   },
+   "qlever": {
+    "before": 339,
+    "peak": 350,
+    "delta": 11
+   }
+  },
+  "bi-q3-2": {
+   "sparkles": {
+    "before": 432,
+    "peak": 470,
+    "delta": 38
+   },
+   "qlever": {
+    "before": 349,
+    "peak": 364,
+    "delta": 15
+   }
+  },
+  "bi-q3-3": {
+   "sparkles": {
+    "before": 470,
+    "peak": 483,
+    "delta": 13
+   },
+   "qlever": {
+    "before": 353,
+    "peak": 388,
+    "delta": 35
+   }
+  },
+  "bi-q4-1": {
+   "sparkles": {
+    "before": 483,
+    "peak": 670,
+    "delta": 187
+   },
+   "qlever": {
+    "before": 365,
+    "peak": 507,
+    "delta": 142
+   }
+  },
+  "bi-q4-2": {
+   "sparkles": {
+    "before": 650,
+    "peak": 651,
+    "delta": 1
+   },
+   "qlever": {
+    "before": 368,
+    "peak": 397,
+    "delta": 29
+   }
+  },
+  "bi-q4-3": {
+   "sparkles": {
+    "before": 651,
+    "peak": 670,
+    "delta": 19
+   },
+   "qlever": {
+    "before": 398,
+    "peak": 517,
+    "delta": 119
+   }
+  },
+  "bi-q5-1": {
+   "sparkles": {
+    "before": 670,
+    "peak": 670,
+    "delta": 0
+   },
+   "qlever": {
+    "before": 451,
+    "peak": 453,
+    "delta": 2
+   }
+  },
+  "bi-q5-2": {
+   "sparkles": {
+    "before": 670,
+    "peak": 674,
+    "delta": 4
+   },
+   "qlever": {
+    "before": 445,
+    "peak": 444,
+    "delta": 0
+   }
+  },
+  "bi-q5-3": {
+   "sparkles": {
+    "before": 580,
+    "peak": 580,
+    "delta": 0
+   },
+   "qlever": {
+    "before": 421,
+    "peak": 428,
+    "delta": 7
+   }
+  },
+  "bi-q6-1": {
+   "sparkles": {
+    "before": 580,
+    "peak": 598,
+    "delta": 18
+   },
+   "qlever": {
+    "before": 418,
+    "peak": 422,
+    "delta": 4
+   }
+  },
+  "bi-q6-2": {
+   "sparkles": {
+    "before": 598,
+    "peak": 598,
+    "delta": 0
+   },
+   "qlever": {
+    "before": 392,
+    "peak": 391,
+    "delta": 0
+   }
+  },
+  "bi-q6-3": {
+   "sparkles": {
+    "before": 598,
+    "peak": 598,
+    "delta": 0
+   },
+   "qlever": {
+    "before": 375,
+    "peak": 383,
+    "delta": 8
+   }
+  },
+  "bi-q7-1": {
+   "sparkles": {
+    "before": 598,
+    "peak": 597,
+    "delta": 0
+   },
+   "qlever": {
+    "before": 374,
+    "peak": 415,
+    "delta": 41
+   }
+  },
+  "bi-q7-2": {
+   "sparkles": {
+    "before": 571,
+    "peak": 572,
+    "delta": 1
+   },
+   "qlever": {
+    "before": 380,
+    "peak": 415,
+    "delta": 35
+   }
+  },
+  "bi-q7-3": {
+   "sparkles": {
+    "before": 572,
+    "peak": 572,
+    "delta": 0
+   },
+   "qlever": {
+    "before": 415,
+    "peak": 433,
+    "delta": 18
+   }
+  },
+  "bi-q8-1": {
+   "sparkles": {
+    "before": 572,
+    "peak": 657,
+    "delta": 85
+   },
+   "qlever": {
+    "before": 431,
+    "peak": 447,
+    "delta": 16
+   }
+  },
+  "bi-q8-2": {
+   "sparkles": {
+    "before": 657,
+    "peak": 655,
+    "delta": 0
+   },
+   "qlever": {
+    "before": 431,
+    "peak": 432,
+    "delta": 1
+   }
+  },
+  "bi-q8-3": {
+   "sparkles": {
+    "before": 595,
+    "peak": 598,
+    "delta": 3
+   },
+   "qlever": {
+    "before": 428,
+    "peak": 441,
+    "delta": 13
+   }
+  }
+ },
+ "warm": {
+  "sparkles": 470,
+  "qlever": 431
+ }
+}

@@ -1797,6 +1797,96 @@ comparison with that change measured `optional-count` at +1.9%, about 10 µs, an
 `subquery-agg` at −7.9%, and every other query within 2.2%. A follow-up item records
 the remaining `optional-count` cost.
 
+### Query threads on hybrid cores
+
+Item 449 measured on forge, an Intel Core i5-13500 whose logical CPUs 0 to 11 are six
+performance cores with two threads each and whose CPUs 12 to 19 are eight efficiency
+cores. The governor was `powersave` with the `balance_performance` energy preference on
+both kinds of core. A harness started one server process per configuration and round, in
+rotated order, over the BSBM 10M store and the DBpedia 50M slice. It set the process's
+CPU affinity and `RAYON_NUM_THREADS`, and could pin every thread but the query pool's
+after startup. It timed three untimed and fifteen timed requests of every BI instance and
+of `births-by-decade`, read the server's own time from the access log, and attributed the
+CPU time of every thread to its kind and to the kind of core it last ran on. Sparkles
+`4bd70845` was the base. The
+[run record](../benchmarks/bsbm/runs/2026-11-02-hybrid-placement-forge/README.md) keeps
+the harness, every record and the summaries.
+
+The efficiency-core hypothesis holds for BI `q3` and not for `births-by-decade`. With the
+default twenty query threads, the third `q3` instance took a median of 39.2 to 41.9 ms
+across three runs, and 23.8 to 24.1 ms with twelve or sixteen threads. The request thread,
+a runtime worker that drives the sequential parts of the plan, spent 29.5 to 41.8 ms of
+CPU per request with twenty threads and 20.7 to 26.6 ms with fewer in all but one process.
+With a query thread on every logical CPU, the request thread often found only an
+efficiency core free when the pool's work ended, and stayed there. A process confined to
+the performance cores took 28.9 ms and one confined to seven efficiency cores 32.3 ms.
+
+`births-by-decade` took about 15 ms for a whole process even when the process ran on six
+performance cores alone, in one of four processes there against three of four with the
+default. The slow processes answered it as an automatic cursor. Automatic admission
+streams its grouping of an estimated 28,565 rows, and the cursor evaluated the BIND of
+`FLOOR(YEAR(?d)/10)*10` on the request thread, because a batch of 4,096 rows is below the
+row count from which eager execution maps expressions in parallel. The cursor took 8.6 to
+13.6 ms and the eager plan 2.1 to 2.3 ms. The server's history of quick texts made the
+next run of a quick text eager and the next run of a slow one automatic, so a process kept
+whichever mode its first runs left it in.
+
+Three changes follow. A cursor batch maps its first 256 rows on the request thread and
+times them, and maps the rest over the query pool in pieces of 256 when they would take
+more than 0.2 ms, with the pieces charged to the query's memory budget. A text whose
+automatic cursor answers whole in 10 to 50 ms has its next run tried eagerly, once, on the
+blocking pool. One request claims the trial, and the trial and a run as the cursor after a
+memory failure share one deadline and one set of cumulative budgets. The history keeps
+each text's fastest eager and fastest cursor run and runs the text in the faster mode, so
+that one slow run does not hold it in the slower one. On Linux, when the process may run
+on cores of both kinds, the runtime's threads run on the performance cores and the query
+pool leaves one logical CPU free for every four efficiency cores, 18 threads on forge.
+`serve --request-cpus all` keeps the earlier placement. The server finds the two kinds
+in `/sys/devices/cpu_core/cpus` and `/sys/devices/cpu_atom/cpus`, which Linux provides
+for Intel hybrid processors. Without those lists, on macOS and on processors with one
+kind of core nothing changes.
+
+Pinning the request threads with twenty query threads took `q3` to 23.3 ms against
+18.5 ms with sixteen, and sixteen threads without pinning made `q6` and `q1` slower.
+[PERFORMANCE-EXPERIMENTS.md](../PERFORMANCE-EXPERIMENTS.md#server-and-request-handling)
+records both. Over four rounds each, sixteen and eighteen threads with pinning summed to
+1,262.5 and 1,241.3 ms over the medians of all 25 requests, against 1,320.3 ms for the
+default, and a later comparison of the two gave 1,272.8 and 1,273.0 ms. Eighteen threads
+took `births-by-decade` in 3.71 ms against 4.14 ms with the client on a performance core,
+so the default leaves two CPUs free.
+
+The final measurements of `bf2b473c` held both forge locks. In four rounds of the harness
+the server's own median over every timed request fell from 30.19 to 18.44 ms for `q3`,
+from 15.53 to 12.59 ms for `q6` and from 5.06 to 3.76 ms for `births-by-decade`, and no
+template became slower by more than 0.3 ms. The third `q3` instance took 23.1 to 24.1 ms
+in each final process and 32.7 to 47.6 ms in each base process. With `--request-cpus all`
+the final build took 26.60 ms for `q3`, so placement causes that gain. Over twelve
+processes of `births-by-decade` alone the base had two at about 15.4 ms and the final
+build none, with every process between 2.94 and 4.14 ms. As an explicit cursor the query
+took 3.2 to 3.3 ms against 8.6 to 13.1 ms for the base.
+
+The complete-HTTP timer of the [births-by-decade
+run](../benchmarks/dbpedia/runs/2026-10-31-births-by-decade-forge/README.md), over twelve
+rounds with the client on CPU 11, gave warm medians of 4.73 ms for the base, 4.77 ms for
+the final build and 16.78 ms for QLever, and means of 6.88, 4.57 and 16.14 ms. Three base
+processes had warm medians from 13.2 to 14.7 ms and no final process did. All three
+engines returned the same 80 groups. In BSBM BI passes with the published contract, `q3`
+went from 31.46 ms against QLever's 29.18 ms with the base to 25.41 and 24.25 ms against
+27.62 and 27.49 ms with the final build, and Sparkles led QLever on every BI template in
+both final passes. The [run
+record](../benchmarks/bsbm/runs/2026-11-02-hybrid-placement-forge/README.md#final-measurements)
+gives every table.
+
+The default pool on a hybrid processor is smaller, so a query whose time is all parallel
+work has two of twenty threads fewer on forge. No measured query became slower for that
+reason. The eager trial runs one eager query for each text whose cursor is slow, under the
+request's own budgets. BI `q1`, `q2` and `q5` instances take one of two times in each
+server process under every configuration measured, such as 11 to 13 ms or 16 to 17 ms for
+a `q2` instance, so their pooled medians move between comparisons. Item 575 looks
+for the cause. The history's fastest runs do not age, so a text whose costs change after
+writes keeps its earlier mode until the history forgets it, which item 577 covers.
+Item 576 measures concurrent clients, other hybrid processors and macOS.
+
 ### Rewrite gates
 
 Roadmap items 469 to 473 add the performance gates that the engine rewrites of items 453

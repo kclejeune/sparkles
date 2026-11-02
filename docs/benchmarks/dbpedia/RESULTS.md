@@ -374,10 +374,17 @@ The hyperfine and curl timer of the comparative tables gives 7.1 ms warm and 37.
 cold for Sparkles, against 13.5 and 43.8 ms for QLever. Its curl process adds about
 2 ms to each request.
 
-Sparkles varies more between server processes than QLever does on this query. Most of its
-warm processes take 3 to 5 ms, but one of the 20 rounds took 15.4 ms for the whole
-process, and one of the five hyperfine passes took about 24 ms for each request. The
-cause is open under roadmap item 449, and the medians above include these processes.
+With `1acdc38a`, most warm processes took 3 to 5 ms, but one of the 20 rounds took
+15.4 ms for the whole process, and one of the five hyperfine passes took about 24 ms for
+each request. The medians above include these processes. Such a process answered the
+query as an automatic cursor that evaluated its BIND on one thread. Sparkles now maps
+expensive cursor batches over its query pool and runs each text in whichever of its
+eager and cursor modes has been faster. In twelve rounds of the same complete-HTTP timer
+on forge, `4bd70845` took 4.73 ms warm with three processes at 13 to 15 ms, and
+`bf2b473c` took 4.77 ms with every process under 5 ms, against 16.78 ms for QLever. The
+cold medians were 28.7, 26.3 and 35.1 ms, as the
+[hybrid placement run](../bsbm/runs/2026-11-02-hybrid-placement-forge/README.md#final-measurements)
+records.
 The [run record](runs/2026-10-31-births-by-decade-forge/record.json) keeps the samples,
 binary hashes and settings of both timers.
 

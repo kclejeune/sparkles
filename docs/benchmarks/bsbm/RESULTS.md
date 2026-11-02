@@ -13,8 +13,8 @@ In the 10M Explore comparison, the paired `q5` pooled median is 4.65 ms against
 
 In the 10M BI comparison, every engine's q4 and q5 averages pass an exact oracle
   within float rounding. The paired `q2` median is 20.54 ms against QLever's 162.30 ms.
-  QLever remains 1.09× faster on q3 in the paired forge run. No engine completes a driver throughput run with
-  answers qualified against the others.
+  The paired `q3` median is 25.41 ms against QLever's 27.62 ms. No engine completes a
+  driver throughput run with answers qualified against the others.
 
 ## BSBM
 
@@ -113,7 +113,7 @@ the run.
 |---|---:|---:|---:|---:|---:|
 | q1 | **13.59** | 3,241.71 | 52.51 | 155.26 | 2,077.28 |
 | q2 | **20.54** | 3,562.21 | 162.30 | 22.50 † | 32,569.39 |
-| q3 | 31.49 | 1,733.90 | **28.95** | 287.78 † | 3,287.87 |
+| q3 | **25.41** | 1,733.90 | 27.62 | 287.78 † | 3,287.87 |
 | q4 | **152.80** | 8,452.57 | 1,848.57 | 162.22 | 6,868.73 |
 | q5 | **27.32** | 198.17 | 98.63 | 693.70 | 138.93 |
 | q6 | **16.50** | 23.72 | 67.88 | 338.27 | 28.77 |
@@ -122,9 +122,9 @@ the run.
 
 *The paired `q2` cells for Sparkles, QLever and Fluree come from the
 [query record](../2026-10-25-competitive-query-pairs-forge.json), with Sparkles
-at `2ec8a266`. The paired `q3` cells for Sparkles and QLever come from the first pass
-of the [Wave A run](runs/2026-10-31-wave-a-forge/README.md), with Sparkles at
-`47bec6f2`, and pool ninety samples after ten warm-ups per instance. The
+at `2ec8a266`. The paired `q3` cells for Sparkles and QLever come from the first final
+pass of the [hybrid placement run](runs/2026-11-02-hybrid-placement-forge/README.md#final-measurements),
+with Sparkles at `bf2b473c`, and pool ninety samples after ten warm-ups per instance. The
 [BI record](../2026-10-23-bsbm-10m-bi-forge.json) preserves
 the other cells, measured with Sparkles at `6699f27d`, including failures.*
 
@@ -156,13 +156,13 @@ differs from that independently verified result, and remains unranked.
 
 Fluree's q3 and q8 answers and two QLever q8 answers remain unresolved fingerprint
 disagreements. The q3 and q8 exclusions have no independent data oracle. Sparkles has
-the lowest median on q1, q2 and q4 to q8. Its q4 lead over Fluree is within 10%.
-QLever remains 1.09 times faster on q3, where its answers agree with Sparkles'. The
-second paired pass gives 33.03 ms against 29.46 ms, 1.12 times. Sparkles leads on the first and third instances and
-trails on the second. Its q3 time depends on the size of the query thread pool on the
-hybrid cores of forge, where twelve threads give 22.65 ms and the default of twenty
-gives 34.37 ms, as the [Wave A run](runs/2026-10-31-wave-a-forge/README.md#thread-pool-size)
-records. Its two
+the lowest median on every template. Its q4 lead over Fluree is within 10%. Sparkles is
+1.09 times faster than QLever on q3, where their answers agree, and the second paired
+pass gives 24.25 ms against 27.49 ms, 1.13 times. Its q3 time depends on where the
+threads that serve requests run on the hybrid cores of forge. With the default twenty
+query threads and no placement, the third q3 instance waits on an efficiency core and
+Sparkles took 31.46 ms against QLever's 29.18 ms in the same run, as the
+[hybrid placement run](runs/2026-11-02-hybrid-placement-forge/README.md) records. Its two
 q8 instances whose answers differ from the majority carry a dagger.
 
 The driver uses generated parameters beyond the three fixed instances. It requested
