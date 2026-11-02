@@ -280,6 +280,116 @@ export async function classifyOntology(
   }
 }
 
+/** What `POST /$/ontology/{ds}/parse` reads Manchester text as. */
+export type ParseAs = 'classExpression' | 'dataRange' | 'individual' | 'literal' | 'axiom';
+
+/** Manchester text that does not parse: the message, the span in UTF-16 code units and the
+ * entities an ambiguous name could stand for. */
+export type ManchesterProblem = {
+  error: string;
+  reason: 'syntax' | 'unknown' | 'ambiguous' | 'kind';
+  start: number;
+  end: number;
+  candidates: { iri: string; kind: string; label: string | null }[];
+};
+
+export type Parsed = { value: unknown; ofn: string; manchester: string | null };
+
+const isProblem = (b: unknown): b is ManchesterProblem =>
+  !!b && typeof b === 'object' && (b as { code?: unknown }).code === 'invalid-manchester';
+
+/**
+ * `POST /$/ontology/{ds}/parse`: Manchester text read against the ontology, or the
+ * problem with its span when it does not parse.
+ */
+export async function parseManchester(
+  target: string,
+  sel: Selection,
+  text: string,
+  as: ParseAs = 'classExpression',
+  signal?: AbortSignal,
+): Promise<{ ok: true; parsed: Parsed } | { ok: false; problem: ManchesterProblem }> {
+  try {
+    const res = await request(`/$/ontology/${enc(target)}/parse`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ ...selBody(sel), text, as }),
+      signal,
+    });
+    return { ok: true, parsed: await readJson<Parsed>(res) };
+  } catch (e) {
+    if (e instanceof ApiError && isProblem(e.body)) return { ok: false, problem: e.body };
+    throw e;
+  }
+}
+
+/** The answers a DL query can ask for, in the order the tab shows them. */
+export const DL_ANSWERS = [
+  ['directSuperclasses', 'Direct superclasses'],
+  ['superclasses', 'Superclasses'],
+  ['equivalents', 'Equivalent classes'],
+  ['directSubclasses', 'Direct subclasses'],
+  ['subclasses', 'Subclasses'],
+  ['instances', 'Instances'],
+] as const;
+
+export type DlAnswer = (typeof DL_ANSWERS)[number][0];
+export type DlReasoning = 'auto' | 'el' | 'rl';
+
+export type DlGap = {
+  message: string;
+  rule: string | null;
+  partial: boolean;
+  type?: string;
+  ofn?: string;
+  manchester?: string | null;
+  axiom?: AxiomJson;
+};
+
+export type DlQueryResult = {
+  commit: number;
+  expression: { manchester: string; ofn: string; json: unknown };
+  reasoning: {
+    engine: 'el' | 'rl';
+    title: string;
+    why: string;
+    complete: boolean;
+    instancesComplete: boolean | null;
+    gapCount: number;
+    gaps: DlGap[];
+    notes: string[];
+  };
+  satisfiable: boolean | null;
+  consistent: boolean | null;
+  incremental: boolean;
+  elapsedMs: number;
+  counts: Partial<Record<DlAnswer, number>>;
+} & Partial<Record<DlAnswer, string[]>>;
+
+/**
+ * `POST /$/ontology/{ds}/dl-query`: a DL query of a Manchester class expression, or the
+ * problem with its span when the expression does not parse.
+ */
+export async function dlQuery(
+  target: string,
+  sel: Selection,
+  q: { expression: string; answers: DlAnswer[]; reasoning: DlReasoning; limit?: number },
+  signal?: AbortSignal,
+): Promise<{ ok: true; result: DlQueryResult } | { ok: false; problem: ManchesterProblem }> {
+  try {
+    const res = await request(`/$/ontology/${enc(target)}/dl-query`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ ...selBody(sel), ...q }),
+      signal,
+    });
+    return { ok: true, result: await readJson<DlQueryResult>(res) };
+  } catch (e) {
+    if (e instanceof ApiError && isProblem(e.body)) return { ok: false, problem: e.body };
+    throw e;
+  }
+}
+
 /** The options of a write: a dry run, the tag of the state the editor shows, a message. */
 export type WriteOpts = {
   dryRun?: boolean;
@@ -863,14 +973,78 @@ const FACETS: Record<string, string> = {
   maxExclusive: '<',
 };
 
-/** A literal as Manchester syntax writes it. */
+/**
+ * A literal as Manchester syntax writes it: an integer, a decimal with digits on both
+ * sides of its point and a boolean bare, as the server's reader reads them back, and
+ * other literals quoted with their language tag or datatype.
+ */
 export function litText(l: Lit, prefixes: PrefixMap): string {
   const v = JSON.stringify(l['@value']);
   if (l['@language']) return `${v}@${l['@language']}`;
   const t = l['@type'];
+  const raw = l['@value'];
   if (!t || t === XSD + 'string') return v;
-  if ([XSD + 'integer', XSD + 'decimal', XSD + 'boolean'].includes(t)) return l['@value'];
+  if (t === XSD + 'integer' && /^[+-]?\d+$/.test(raw)) return raw;
+  if (t === XSD + 'decimal' && /^[+-]?\d+\.\d+$/.test(raw)) return raw;
+  if (t === XSD + 'boolean' && (raw === 'true' || raw === 'false')) return raw;
   return `${v}^^${shorten(t, prefixes) ?? `<${t}>`}`;
+}
+
+/** The words of Manchester syntax that a name written bare would be read as. */
+export const MANCHESTER_KEYWORDS = [
+  'and',
+  'or',
+  'not',
+  'that',
+  'some',
+  'only',
+  'value',
+  'Self',
+  'min',
+  'max',
+  'exactly',
+  'inverse',
+  'true',
+  'false',
+  'o',
+  'SubClassOf',
+  'EquivalentTo',
+  'DisjointWith',
+  'SubPropertyOf',
+  'InverseOf',
+  'Domain',
+  'Range',
+  'Type',
+  'Types',
+  'SameAs',
+  'DifferentFrom',
+  'SubPropertyChain',
+  'Functional',
+  'InverseFunctional',
+  'Reflexive',
+  'Irreflexive',
+  'Symmetric',
+  'Asymmetric',
+  'Transitive',
+];
+
+/**
+ * A name as Manchester syntax writes it: bare when the server's reader reads it back as
+ * one word, and otherwise in single quotes with `'` and `\` escaped. A name with a
+ * space, a bracket, a quote, `^` or `@`, one written as a number, a keyword, and one
+ * that starts as an anonymous individual are quoted. A colon is left bare, since a
+ * prefixed name holds one.
+ */
+export function manchesterName(s: string): string {
+  // a full IRI in angle brackets is a name as it is
+  if (/^<[^\s<>]*>$/.test(s)) return s;
+  const bare =
+    s !== '' &&
+    !/[\s()[\]{},'"<>^@]/.test(s) &&
+    !/^([0-9]|[+\-.][0-9.])/.test(s) &&
+    !MANCHESTER_KEYWORDS.includes(s) &&
+    !s.startsWith('_:');
+  return bare ? s : `'${s.replace(/['\\]/g, (c) => `\\${c}`)}'`;
 }
 
 /**
@@ -880,16 +1054,17 @@ export function litText(l: Lit, prefixes: PrefixMap): string {
  */
 export function manchester(
   e: unknown,
-  name: (iri: string) => string,
+  rawName: (iri: string) => string,
   prefixes: PrefixMap,
   nested = false,
 ): string {
+  const name = (iri: string) => manchesterName(rawName(iri));
   if (typeof e === 'string') return e.startsWith('_:') ? e : name(e);
   if (isLit(e)) return litText(e, prefixes);
   if (!e || typeof e !== 'object') return String(e);
   const x = e as Record<string, unknown>;
   if (typeof x.inverseOf === 'string') return `inverse ${name(x.inverseOf)}`;
-  const m = (v: unknown) => manchester(v, name, prefixes, true);
+  const m = (v: unknown) => manchester(v, rawName, prefixes, true);
   const wrap = (s: string) => (nested ? `(${s})` : s);
   const list = (k: string, sep: string) => ((x[k] as unknown[]) ?? []).map(m).join(sep);
   const card = (word: string) => {
@@ -1535,6 +1710,22 @@ export function diffAxioms(
  * brackets, a prefixed name, an absolute IRI, or else a functional-style expression when
  * it has a parenthesis. Null when it is none of these.
  */
+/**
+ * The IRI that `text` names: an option's name, a full IRI in angle brackets, a prefixed
+ * name or an absolute IRI. Null for anything else, such as an expression.
+ */
+export function resolveName(
+  text: string,
+  options: { iri: string; name: string }[],
+  prefixes: PrefixMap,
+): string | null {
+  const r = resolveInput(text.includes('(') ? '' : text, options, prefixes);
+  return typeof r === 'string' ? r : null;
+}
+
+/** Whether text is in functional-style syntax: a constructor such as `ObjectSomeValuesFrom(`. */
+export const isFunctional = (s: string) => /^\s*[A-Z][A-Za-z]*\s*\(/.test(s);
+
 export function resolveInput(
   text: string,
   options: { iri: string; name: string }[],

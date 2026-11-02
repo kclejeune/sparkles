@@ -1216,8 +1216,9 @@ test('reasoning-support-preview', async ({ page }) => {
 });
 
 // The ontology editor on the mock's `uni` dataset (mock/ontology.mjs): the class tree with
-// the frame of Professor, the asserted and inferred class trees side by side, and the
-// preview of a new subclass, which is cancelled so the mock keeps its ontology.
+// the frame of Professor, the asserted and inferred class trees side by side, a DL query
+// with its answers, and the preview of a new subclass, which is cancelled so the mock
+// keeps its ontology.
 const UNI = 'http://example.org/uni#';
 
 test('ontology-editor', async ({ page }) => {
@@ -1246,6 +1247,22 @@ test('ontology-inferred', async ({ page }) => {
   await inferred.getByRole('button', { name: 'Expand Teacher' }).click();
   await expect(inferred.getByRole('button', { name: 'Professor', exact: true })).toBeVisible();
   await shoot(page, 'ontology-inferred');
+});
+
+test('ontology-dl-query', async ({ page }) => {
+  // the DL Query tab with the answers of a definition-shaped expression, the reasoning
+  // label, and the frame of the instance the answers link to
+  const q = 'Person and (teaches some Course)';
+  await page.goto(
+    `/ui/ontology?ds=uni&tab=dlquery&dl=${encodeURIComponent(q)}&iri=${encodeURIComponent(`${UNI}Professor`)}`,
+  );
+  const answers = page.getByRole('region', { name: 'DL query answers' });
+  await expect(answers.getByRole('region', { name: 'Equivalent classes' })).toContainText(
+    'Teacher',
+    { timeout: 30_000 },
+  );
+  await expect(page.locator('.frame [data-section="sub"]')).toContainText('teaches some Course');
+  await shoot(page, 'ontology-dl-query');
 });
 
 test('ontology-preview', async ({ page }) => {

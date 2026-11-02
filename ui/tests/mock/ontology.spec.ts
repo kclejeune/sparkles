@@ -118,8 +118,8 @@ test('edits on a session branch are previewed, committed, undone and redone', as
   await expect(create.getByRole('textbox', { name: /IRI/ })).toHaveValue(`${UNI}TeachingAssistant`);
   await create.getByRole('button', { name: 'Preview' }).click();
   const d = preview(page);
-  await expect(d).toContainText('Declaration: class teaching assistant');
-  await expect(d).toContainText('teaching assistant SubClassOf Employee');
+  await expect(d).toContainText("Declaration: class 'teaching assistant'");
+  await expect(d).toContainText("'teaching assistant' SubClassOf Employee");
   await commitPreview(page);
   await expect(page).toHaveURL(/TeachingAssistant/);
   await expect(node(page, 'teaching assistant')).toBeVisible();
@@ -176,7 +176,7 @@ test('edits on a session branch are previewed, committed, undone and redone', as
   await axForm.getByRole('textbox', { name: 'Language' }).fill('en');
   await axForm.getByRole('button', { name: 'Preview' }).click();
   await expect(preview(page).locator('.axioms.del')).toContainText(
-    'teaching assistant SubClassOf Employee',
+    "'teaching assistant' SubClassOf Employee",
   );
   await expect(preview(page).locator('.axioms.ins')).toContainText('[1 annotation]');
   await commitPreview(page);
@@ -184,7 +184,7 @@ test('edits on a session branch are previewed, committed, undone and redone', as
 
   // a superclass from a functional-style expression
   await frame
-    .getByRole('combobox', { name: 'Add to SubClass Of' })
+    .getByRole('textbox', { name: 'Add to SubClass Of' })
     .fill('ObjectSomeValuesFrom(uni:teaches uni:Course)');
   await sub.getByRole('button', { name: 'Add', exact: true }).click();
   await commitPreview(page);
