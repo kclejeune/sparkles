@@ -411,7 +411,9 @@ run_remote() {
     echo 96 > "$d/exit"
     return
   fi
-  echo "$h" > "$d/remote-locked"
+  # An ssh share holds the lock until a cleanup stops it. A Namespace share is released by
+  # destroying its instance.
+  [ "$how" = nsc ] || echo "$h" > "$d/remote-locked"
   # Tracked files and the built UI, then each suite directory the machine lacks.
   if ! {
     git -C "$root" ls-files -z
