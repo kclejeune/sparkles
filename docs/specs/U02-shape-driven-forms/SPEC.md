@@ -158,7 +158,7 @@ This admission covers layout preparation and adapter-owned traversal and retenti
 Raw scan work consumes units even when the caller's view filters out a row. Physical
 column and dictionary decoding and permission mask preparation need controlled-reader
 adoption through item 395. Source-shape parsing and prefix metadata admission also
-remain under item NEW-ITEM-3. The preparation allowance is not a total model heap bound.
+remain under item 614. The preparation allowance is not a total model heap bound.
 
 `GET /$/forms/{ds}?nested=true` and Python's `ds.forms.model(…, nested=True)` return the
 same model. A refused nested model answers the flat model with `nested.refused` set to
@@ -498,6 +498,6 @@ describes this phase.
 
 Node-level alternatives with their own properties, nested values through complex paths,
 blank-named graph contexts with model-source admission and the remaining target and
-query producers are follow-ups under roadmap items NEW-ITEM-1 to NEW-ITEM-4. Strict
+query producers are follow-ups under roadmap items 612 to 615. Strict
 physical reader admission uses the bounded-read preparation work of item 395, and the
 discovery allowance is not a total SHACL heap limit.

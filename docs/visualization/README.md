@@ -232,9 +232,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 * Forms edit predicate and inverse paths with literal and IRI values, nested blank-node
   children, lists and value alternatives. Node-level `sh:or` and `sh:xone` alternatives
-  with their own properties are not offered as sub-forms (NEW-ITEM-1), nested values
-  reached through complex paths are read-only (NEW-ITEM-2), and blank-named graph
-  contexts refuse the nested model (NEW-ITEM-3). List members are IRIs or literals, so a
+  with their own properties are not offered as sub-forms (612), nested values
+  reached through complex paths are read-only (613), and blank-named graph
+  contexts refuse the nested model (614). List members are IRIs or literals, so a
   list of blank nodes is read-only. ShEx schemas do not drive forms. Checks admit up to 500
   additional distinct affected targets beyond the directly touched resources, shared
   across shapes and snapshots. They refuse a larger or unfinished discovery instead of
@@ -242,7 +242,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   from constants, lists, focus variables, basic list operators, conditionals and simple
   aggregates. Target filters that inspect only their input node are admitted. Graph-reading
   target filters and other target-node expression producers are refused before evaluation and
-  remain under roadmap item NEW-ITEM-4. Directly anchored SPARQL triple and path dependencies are
+  remain under roadmap item 615. Directly anchored SPARQL triple and path dependencies are
   admitted. Property functions, computed predicates and indirect query-dependency producers
   refuse an incomplete check until bounded
   localization is available, while genuinely global queries enumerate bounded targets.
@@ -301,7 +301,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item NEW-ITEM-1](../ROADMAP.md), [item NEW-ITEM-2](../ROADMAP.md), [item NEW-ITEM-3](../ROADMAP.md), [item NEW-ITEM-4](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
+The remaining work described above refers to [item 612](../ROADMAP.md), [item 613](../ROADMAP.md), [item 614](../ROADMAP.md), [item 615](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

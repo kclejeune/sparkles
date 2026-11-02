@@ -33,7 +33,7 @@ ordered collection. HTTP tests cover the route members and the bodies, and the b
 has unit tests, mock Playwright tests and real-server Playwright tests of the SKOS forms.
 Node-level alternatives, complex nested paths, blank-named graph contexts with
 model-source admission and the remaining target producers remain under items
-NEW-ITEM-1 to NEW-ITEM-4, and controlled reader admission remains under item 395.
+612 to 615, and controlled reader admission remains under item 395.
 
 ## Nested library read models
 

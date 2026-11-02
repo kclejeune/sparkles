@@ -17,7 +17,7 @@ Checks discover shape-dependent targets beyond two hops and refuse incomplete ad
 * [Forms API](../../API.md#editing-forms).
 * [Capabilities and limits](../../visualization/README.md#web-ui).
 
-Roadmap items NEW-ITEM-1 to NEW-ITEM-4 track node-level alternatives, complex nested
+Roadmap items 612 to 615 track node-level alternatives, complex nested
 paths, blank-named graph contexts with model-source admission and the remaining
 target-node expression producers. [Item 395](../../ROADMAP.md) supplies the controlled physical
 readers required for stricter reader-budget coverage. Ordinary SHACL validation has its
