@@ -151,6 +151,21 @@ followed by checks and protected merges, linked-data publishing and git export.
 Fragment composition follows the storage consolidation of item 455. Wave C runs
 alongside Wave A2 on the policy plumbing of items 480 to 483.
 
+The workbench UI runs as one stream of about two lanes beside the engine work. After the
+DL Query tab and the SKOS editor come these, in order:
+1. The ontology browser of item 616, together with lazy trees (607), rendering preferences
+   (625) and metrics (621). Then its edit mode (630).
+2. Inferred axioms in entity frames (622), with the inferred property and individual
+   trees of item 609. Their explanation links wait for F24's justifications.
+3. The visual SHACL shape editor of item 617.
+4. Entity history (620), discussions (618) and watches (619), the last after the
+   notifications of item 46.
+5. Import resolution (624), bulk edits (626) and pattern-based axiom generation (623).
+6. Vocabulary governance and change requests (627), after item 459.
+
+Tagging documents with concepts (628) belongs to Wave B's ingest work, and real-time
+co-editing (629) comes last.
+
 ### How the waves share capacity
 
 The waves run in parallel, and each has its own capacity. Wave B always has one stream
