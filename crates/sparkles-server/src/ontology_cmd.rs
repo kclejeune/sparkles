@@ -462,10 +462,11 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     let j = remote_post(&at, "/classify", &body)?;
                     let doc = if format == "ofn" {
                         // the kept classification answers the second request
-                        body.as_object_mut().map(|o| {
+                        if let Some(o) = body.as_object_mut() {
                             o.remove("target");
                             o.remove("message");
-                        });
+                            o.remove("about");
+                        }
                         remote_post_text(&at, "/classify?format=ofn", &body)?
                     } else {
                         String::new()
