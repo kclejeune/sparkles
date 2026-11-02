@@ -1,0 +1,74 @@
+# The jars of ELK 0.6.0's OWL API binding and their runtime dependencies, which Maven
+# resolved for io.github.liveontologies:elk-owlapi:0.6.0 (OWL API 5.1.20), with
+# slf4j-simple 2.0.13 to print ELK's warnings. Each is fetched from Maven Central under
+# this path and checked against its SHA-256 here and against Maven Central's published
+# SHA-1. ELK is licensed under Apache-2.0 and the OWL API under LGPL-3.0 or Apache-2.0.
+# The jars are fetched at run time and never committed.
+# path	sha256
+com/fasterxml/jackson/core/jackson-annotations/2.10.1/jackson-annotations-2.10.1.jar	673f8ae16becea4fa937404b3a851417faf42df3bbc592028bbe2bfe0cc9d8cb
+com/fasterxml/jackson/core/jackson-core/2.11.4/jackson-core-2.11.4.jar	e1dda269f16f3be00578f3a46c754f098245c7a480b86e07030b6ee7087ee1f1
+com/fasterxml/jackson/core/jackson-databind/2.10.1/jackson-databind-2.10.1.jar	2d23f47001492233565adf5a34f225f2ae89564cee08024873ec36b7842ede46
+com/github/ben-manes/caffeine/caffeine/2.8.1/caffeine-2.8.1.jar	1f67db1906b0db1c7e0d79c0bfe347fb04f0496098832994654b12ef79dfa1a9
+com/github/jsonld-java/jsonld-java/0.13.0/jsonld-java-0.13.0.jar	34191d69adc1584d0ef399116b87886717d5ea39eb5cb66a9851f960f5886c9d
+com/github/vsonnier/hppcrt/0.7.5/hppcrt-0.7.5.jar	f3cfbd511d0bd5a29b72bcca97fcaa81889cf6698f045c5f658744829c8784b9
+com/google/code/findbugs/jsr305/3.0.2/jsr305-3.0.2.jar	766ad2a0783f2687962c8ad74ceecc38a28b9f72a2d085ee438b7813e928d0c7
+com/google/errorprone/error_prone_annotations/2.26.1/error_prone_annotations-2.26.1.jar	de25f2d9a2156529bd765f51d8efdfc0dfa7301e04efb9cc75b7f10cf5d0e0fb
+com/google/guava/failureaccess/1.0.2/failureaccess-1.0.2.jar	8a8f81cf9b359e3f6dfa691a1e776985c061ef2f223c9b2c80753e1b458e8064
+com/google/guava/guava/33.2.0-jre/guava-33.2.0-jre.jar	99f491e86262ce38d13b3581d40f77acdb4696a9505447c3154474c3192908dd
+com/google/guava/listenablefuture/9999.0-empty-to-avoid-conflict-with-guava/listenablefuture-9999.0-empty-to-avoid-conflict-with-guava.jar	b372a037d4230aa57fbeffdef30fd6123f9c0c2db85d0aced00c91b974f33f99
+com/google/j2objc/j2objc-annotations/3.0.0/j2objc-annotations-3.0.0.jar	88241573467ddca44ffd4d74aa04c2bbfd11bf7c17e0c342c94c9de7a70a7c64
+commons-codec/commons-codec/1.11/commons-codec-1.11.jar	e599d5318e97aa48f42136a2927e6dfa4e8881dff0e6c8e3109ddbbff51d7b7d
+commons-io/commons-io/2.7/commons-io-2.7.jar	4547858fff38bbf15262d520685b184a3dce96897bc1844871f055b96e8f6e95
+io/github/liveontologies/elk-owlapi/0.6.0/elk-owlapi-0.6.0.jar	19c21b0e9f9595b61ed67b2fe9343264edeb8a4b9070bd733ba7677fef50e1df
+io/github/liveontologies/elk-owl-implementation/0.6.0/elk-owl-implementation-0.6.0.jar	9425a8e0318a393224a41321422445793ed6f528cdcb4ab05ca32d486b412ad3
+io/github/liveontologies/elk-owl-model/0.6.0/elk-owl-model-0.6.0.jar	896900ccddfbce4a844e0c4643ca2081559ca8244da8ac17d9dd6c93e32da0ae
+io/github/liveontologies/elk-proofs/0.6.0/elk-proofs-0.6.0.jar	81327dda4e7c5358c01f210cab4e7c9661d586ee22c2ba0333d0556f6262c8a3
+io/github/liveontologies/elk-reasoner/0.6.0/elk-reasoner-0.6.0.jar	99e7ecd9d61e4b7c5a2d862e44b0125cd631ca1261cb780aeda85f1d821c9ae3
+io/github/liveontologies/elk-util-collections/0.6.0/elk-util-collections-0.6.0.jar	693806c8802667e89ecb9b095711898e3deebc6faa78fadc8a9739559fa5d587
+io/github/liveontologies/elk-util-common/0.6.0/elk-util-common-0.6.0.jar	ff151bf513960330480ef696b74247be069c93a61c7e4efed6b6e7421407743e
+io/github/liveontologies/elk-util-concurrent/0.6.0/elk-util-concurrent-0.6.0.jar	ef8b21b800a41cab6b3ac6521352163c714af3f6998b08092579b05ef2bd4900
+io/github/liveontologies/elk-util-hashing/0.6.0/elk-util-hashing-0.6.0.jar	61cdaaa246f74c1bda47acf548499e907e9ad5d4fe9454ac09eb7391254de5b6
+io/github/liveontologies/elk-util-io/0.6.0/elk-util-io-0.6.0.jar	ea734c14eceefe58ceb15ede21046c17cf6be915b6807b456f399f8f68fda063
+io/github/liveontologies/elk-util-logging/0.6.0/elk-util-logging-0.6.0.jar	6e834a3f4a4195372695e609c6d7639df41a7b7566078b66694f918c97761d1b
+javax/inject/javax.inject/1/javax.inject-1.jar	91c77044a50c481636c32d916fd89c9118a72195390452c81065080f957de7ff
+net/sourceforge/owlapi/owlapi-api/5.1.20/owlapi-api-5.1.20.jar	d0ccc2ae4f2315132cd49aa84c411869bceb8573acb5a9c3c7231ecf6789a374
+net/sourceforge/owlapi/owlapi-apibinding/5.1.20/owlapi-apibinding-5.1.20.jar	e37eddbb10b896c00c7f20a381d5e13d13a59a18b534d0f9d7ca19cfae9453d4
+net/sourceforge/owlapi/owlapi-impl/5.1.20/owlapi-impl-5.1.20.jar	c6326a106d01b8ecf1af02a86224b1d02b907fa75c7c225f192fa768b9ad3cda
+net/sourceforge/owlapi/owlapi-oboformat/5.1.20/owlapi-oboformat-5.1.20.jar	945c973cd5d2e4f7daec768474f023e40116e5cf9dca7be9ae5b3afe9058e8d2
+net/sourceforge/owlapi/owlapi-parsers/5.1.20/owlapi-parsers-5.1.20.jar	6210599b5fae1608cd1f6e3fbdf906d9874d49189da55f85da8264703713e64c
+net/sourceforge/owlapi/owlapi-rio/5.1.20/owlapi-rio-5.1.20.jar	f1cbeceaf7f9e61050e6aa8e2c5a21c9edf5348e9f22a112ea03d605edf86d32
+net/sourceforge/owlapi/owlapi-tools/5.1.20/owlapi-tools-5.1.20.jar	c2652f7613c75cb72837a2b99b46ba7be76ea71b950a1f11dbd2bc345a568b75
+org/apache/commons/commons-rdf-api/0.5.0/commons-rdf-api-0.5.0.jar	360fd9197008502cbc3fd09afe2ad45d8c8c905e21f42e7cd5b2aa1c39742b5e
+org/apache/httpcomponents/fluent-hc/4.5.10/fluent-hc-4.5.10.jar	f9b60d7a2a9a6944e8f5722c486933f6118dce474c4d8bdc0330f30c7801723a
+org/apache/httpcomponents/httpclient/4.5.13/httpclient-4.5.13.jar	6fe9026a566c6a5001608cf3fc32196641f6c1e5e1986d1037ccdbd5f31ef743
+org/apache/httpcomponents/httpclient-cache/4.5.13/httpclient-cache-4.5.13.jar	66cefdee7475985256af680bf3ae7cd5d7d42e8fdeb939a6277922e1bdeed43a
+org/apache/httpcomponents/httpclient-osgi/4.5.10/httpclient-osgi-4.5.10.jar	d723339b4b69f49ef66bacfbe60baf881dc27eb3da26b7bfd2eace2c7affe7e5
+org/apache/httpcomponents/httpcore/4.4.13/httpcore-4.4.13.jar	e06e89d40943245fcfa39ec537cdbfce3762aecde8f9c597780d2b00c2b43424
+org/apache/httpcomponents/httpcore-nio/4.4.12/httpcore-nio-4.4.12.jar	11448f4b5c7f13d9396a67b33aa938d05f660665e0f14fd08e25acfd3c20ae80
+org/apache/httpcomponents/httpcore-osgi/4.4.12/httpcore-osgi-4.4.12.jar	e6f18dd614c6dd7249124d99a8707344370cab2a4803907ace0db82c88c11bdd
+org/apache/httpcomponents/httpmime/4.5.10/httpmime-4.5.10.jar	2bdf3dc862e39e2c69e42f036759e53d457af35a7ce178d8cf286fdb42528864
+org/checkerframework/checker-qual/3.42.0/checker-qual-3.42.0.jar	ccaedd33af0b7894d9f2f3b644f4d19e43928e32902e61ac4d10777830f5aac7
+org/eclipse/rdf4j/rdf4j-model/3.7.4/rdf4j-model-3.7.4.jar	0a87775adf155831930fbde2835cfbaca16220c1f33f97921dbaf107d6e80984
+org/eclipse/rdf4j/rdf4j-model-api/3.7.4/rdf4j-model-api-3.7.4.jar	6a8ec6b6c2269e35bbead145fe8b6024245e98eca085ad56f6256c1b65087d42
+org/eclipse/rdf4j/rdf4j-model-vocabulary/3.7.4/rdf4j-model-vocabulary-3.7.4.jar	9f209555f7142a0ea791b52dab338d061ee48e622e97c6fdf43f80f712c94753
+org/eclipse/rdf4j/rdf4j-rio-api/3.7.4/rdf4j-rio-api-3.7.4.jar	02db08664713eff1165f916a98f7c6f81c5fe61bca42fab6660a4abfd4f66583
+org/eclipse/rdf4j/rdf4j-rio-binary/3.7.4/rdf4j-rio-binary-3.7.4.jar	57e96a1c8174a3f0b26e72b3b0a2b887cc4be2e5b2c03cac05e7443b72c6c248
+org/eclipse/rdf4j/rdf4j-rio-datatypes/3.7.4/rdf4j-rio-datatypes-3.7.4.jar	b480d26b7973f44ea58bbf41eb16ffcd8e5475996c1bf0eed1d244b41518e750
+org/eclipse/rdf4j/rdf4j-rio-hdt/3.7.4/rdf4j-rio-hdt-3.7.4.jar	2ef33ac96117025fcc383564dd517dfd6b1c4cbdf6f2c88a1e8298112e695e15
+org/eclipse/rdf4j/rdf4j-rio-jsonld/3.7.4/rdf4j-rio-jsonld-3.7.4.jar	78bc62ac881c2ad581265db893460d33614a2df450c3bcf4c4fc7ce6a1bf3ec8
+org/eclipse/rdf4j/rdf4j-rio-languages/3.7.4/rdf4j-rio-languages-3.7.4.jar	9c702c6106d224834c71b487438f9d37efc73f7e0f8b13238d9d23ef01c672a4
+org/eclipse/rdf4j/rdf4j-rio-n3/3.7.4/rdf4j-rio-n3-3.7.4.jar	79f9ed5a9d46ced6eb9e29ae0a7ba0396c201c9232346d49d2e70055addaad04
+org/eclipse/rdf4j/rdf4j-rio-nquads/3.7.4/rdf4j-rio-nquads-3.7.4.jar	d26b75fde0ddc70998326a7c31c55e237369e756c6f863649a393c5f3e3b7f8b
+org/eclipse/rdf4j/rdf4j-rio-ntriples/3.7.4/rdf4j-rio-ntriples-3.7.4.jar	4358ddc4f1ef369953fe8056850493049fdfd4c50ed9efad1bcfcc2bd0a84795
+org/eclipse/rdf4j/rdf4j-rio-rdfjson/3.7.4/rdf4j-rio-rdfjson-3.7.4.jar	3f492b203522162ee30aa293d978bb7ccffe9fa72ec3142f5311b2e7daea7e8a
+org/eclipse/rdf4j/rdf4j-rio-rdfxml/3.7.4/rdf4j-rio-rdfxml-3.7.4.jar	5622ddb358d2c710789a6b6a2b78a1764488587b47044d83181692df70b93d28
+org/eclipse/rdf4j/rdf4j-rio-trig/3.7.4/rdf4j-rio-trig-3.7.4.jar	e8d318c5c20bbad93778322d37d7972eb7a6af9428f4dc1fb3f3f8436abe99df
+org/eclipse/rdf4j/rdf4j-rio-trix/3.7.4/rdf4j-rio-trix-3.7.4.jar	43051296bb1ad712ff6c4f8dbfb5bb90693d3d78a2155e4f51db062aaa403778
+org/eclipse/rdf4j/rdf4j-rio-turtle/3.7.4/rdf4j-rio-turtle-3.7.4.jar	4c4da82bc8f482e9a2c7eb85e7cb998c3b2cb41f0d5e59ebc67b77403bf50f49
+org/eclipse/rdf4j/rdf4j-util/3.7.4/rdf4j-util-3.7.4.jar	f89c361610dc7ca094c9c24b5a222dcb165807ee9eb6022874e3fed6157e1f19
+org/liveontologies/owlapi-proof/0.1.0/owlapi-proof-0.1.0.jar	44032015fed762a31eda8fe975e249280824a8eda82cf32205d736f93a348820
+org/liveontologies/puli/0.1.0/puli-0.1.0.jar	4a2a71a8fee7edbbafbfcaeb8ece9d5e58ac6d70ffc8789f0c5e09dbe052cdf7
+org/slf4j/jcl-over-slf4j/1.7.29/jcl-over-slf4j-1.7.29.jar	d7949af5620aff966e8ee2d72c0a59c972bd069940e0b4cadef5e3b2217b9120
+org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.jar	e7c2a48e8515ba1f49fa637d57b4e2f590b3f5bd97407ac699c3aa5efb1204a9
+org/slf4j/slf4j-simple/2.0.13/slf4j-simple-2.0.13.jar	3153fe1d689cffb94f1530b58470c306685ba68844de8857116e3b6ebb81d9f7
+org/tukaani/xz/1.6/xz-1.6.jar	a594643d73cc01928cf6ca5ce100e094ea9d73af760a5d4fb6b75fa673ecec96

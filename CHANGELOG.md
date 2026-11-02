@@ -34,6 +34,12 @@ and JVM bindings run it. A run can write the taxonomy to a named graph in one co
 PROV-O provenance on the graph's header, and the dataset keeps its last classification
 so that the next one is incremental.
 
+The OWL 2 EL classifier's taxonomies equal those of ELK 0.6.0 on GO, ChEBI lite and the
+298 ontologies of the ORE 2015 EL classification sample, and those of HermiT 1.4.5.519 on
+the 36 ORE ontologies with individuals (roadmap item 591). `scripts/elk-compare/elk.sh`
+runs ELK or HermiT through the OWL API from pinned Maven Central jars, and the EL
+classification report gives times and memory beside ELK's on the benchmark host.
+
 The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
 `dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and
 axioms, check profiles, edit axioms, remove entities and diff commits in the JSON forms

@@ -1,0 +1,12 @@
+Prefix(:=<http://example.org/t#>)
+Ontology(<http://example.org/t>
+Declaration(Class(:C))
+Declaration(Class(:D))
+Declaration(ObjectProperty(:r))
+Declaration(NamedIndividual(:a))
+Declaration(NamedIndividual(:b))
+ObjectPropertyRange(:r :C)
+DisjointClasses(:C :D)
+ClassAssertion(:D :b)
+ObjectPropertyAssertion(:r :a :b)
+)
