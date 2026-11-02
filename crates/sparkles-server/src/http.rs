@@ -1709,7 +1709,7 @@ pub(crate) async fn run_query(
     };
     let quick = match history {
         inline::History::Quick(execution) => Some(execution),
-        inline::History::Unseen | inline::History::Slow => None,
+        inline::History::Unseen | inline::History::Slow | inline::History::TryEager => None,
     };
     // The first run of a text the server has not seen runs in place too when a timeout
     // bounds it, since the blocking pool costs a first request about 2 ms (see
@@ -1730,8 +1730,12 @@ pub(crate) async fn run_query(
     // because its native execution avoids eager candidate storage, so it must keep
     // automatic admission even when scheduled in place. A first run has no history, so
     // it keeps automatic execution as on the blocking pool.
-    let auto =
-        auto && (first_run || !in_place || quick == Some(inline::QuickExecution::PreserveAuto));
+    // A text whose automatic cursor answered whole but slowly runs eagerly once, on the
+    // blocking pool, so that it settles in the faster mode (see `inline`).
+    let trial = auto && history == inline::History::TryEager;
+    let auto = auto
+        && !trial
+        && (first_run || !in_place || quick == Some(inline::QuickExecution::PreserveAuto));
     // the error body of the Sparkles format carries the plan as far as it ran
     let failed_plan = sfmt == SolutionsFormat::Sparkles;
     let run = {
@@ -1741,7 +1745,7 @@ pub(crate) async fn run_query(
             let t0 = crate::otel::start();
             let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
             let seq = snap.commit;
-            let ran = if auto {
+            let automatic = |snap| {
                 sparkles::sparql::query_execution_with_plan(
                     snap,
                     &query,
@@ -1753,6 +1757,19 @@ pub(crate) async fn run_query(
                     sparkles::sparql::QueryExecution::Eager(r) => Ran::Eager(r.into_result()),
                     cursor => Ran::Cursor(Box::new(cursor)),
                 })
+            };
+            let ran = if auto {
+                automatic(snap)
+            } else if trial {
+                // An eager trial that outgrows a budget the cursor kept to runs as the
+                // cursor again, and its text is not tried eagerly again.
+                match sparkles::sparql::query_with_plan(snap.clone(), &query, &opts) {
+                    Err(f) if matches!(f.error, sparkles::Error::BudgetExceeded(_)) => {
+                        QUICK.record(quick_key, inline::EAGER_FAILED_MS);
+                        automatic(snap)
+                    }
+                    ran => ran.map(Ran::Eager),
+                }
             } else {
                 sparkles::sparql::query_with_plan(snap, &query, &opts).map(Ran::Eager)
             };

@@ -331,7 +331,7 @@ pub(super) async fn serve(
                 if kind == QueryKind::Ask {
                     QUICK.record_ask(key, ms);
                 } else {
-                    QUICK.record(key, ms);
+                    QUICK.record_cursor(key, ms);
                 }
             }
             Body::from(body)
