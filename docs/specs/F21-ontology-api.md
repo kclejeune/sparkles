@@ -641,7 +641,9 @@ the thread's transaction or the head, so the per-`find` cost that P04 §3.10 des
 does not apply. A write to the model goes to the copy and to the Sparkles graph, in the
 thread's write transaction when there is one, so a transaction's edits make one commit.
 The copy keeps the changes of a transaction until it ends and undoes them when it does
-not commit, so an aborted transaction leaves the model as the dataset is. `SparklesOnt`
+not commit, so an aborted transaction leaves the model as the dataset is. The copy is
+shared by the threads that use the model, so another thread sees a transaction's writes
+before it commits. `SparklesOnt`
 also runs the native operations over one graph, and
 `DatasetGraphSparkles.ontology()` is the full handle with `summary`, `axioms`, `check`,
 `edit`, `removeEntity` and `diff`.
@@ -663,7 +665,8 @@ the asserted axioms.
 input graphs and their dataset imports in the state it reads, once it holds the writer
 lock and before it derives anything. The reasoner's `ReasonOptions::inspect` hook makes
 this check, so a commit that lands after the run starts and before it locks is checked
-too. The check holds the lock for the time it takes. This holds for the library, the
+too. The check holds the lock for the time it takes, after a progress report, so a run
+that yields to writers can still be superseded during it. This holds for the library, the
 server's `/$/reason/{ds}` and `sparkles infer`. The run adds a warning with the count of
 axioms outside the OWL 2 RL grammar and the first of them with its rule, since the rules
 are complete only for ontologies in the profile (OWL 2 Profiles §4.3, Theorem PR1). A
