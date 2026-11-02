@@ -24,6 +24,20 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+The web UI has an ontology editor, the **Ontology** page (spec U12, roadmap item 457). It
+shows trees of classes, object, data and annotation properties and individuals, an entity
+frame with its axioms in Manchester syntax, an annotation editor with language tags and
+annotations of axioms, a header editor, an axiom-level usage view and the EL classifier's
+inferred class tree beside the asserted one. It creates entities with IRIs from a
+per-dataset IRI policy, renames and deletes them, and previews every edit as a dry run
+before committing it with `If-Match`. **Start session** edits on a branch of its own, an
+undo stack undoes and redoes commits exactly, and the change feed reloads the views after
+another writer's commit. For the editor, the `/$/ontology/{ds}` routes take `?branch=` and
+the `/{ds}@{branch}` form, `DELETE /$/ontology/{ds}/entity` removes an entity with its
+axioms, edits accept axioms in functional-style syntax over HTTP, and an edit's answer
+lists the axioms it added and removed as `addedAxioms` and `removedAxioms` in every
+surface that answers the edit body.
+
 An OWL 2 EL classifier computes the inferred class hierarchy and the unsatisfiable
 classes of an ontology (spec F24, roadmap item 580). `sparkles_owl::classify` follows
 ELK's consequence-based calculus on several threads, keeps its state so that a run after
