@@ -92,19 +92,18 @@ const STREAMED: &[&str] = &[
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER NOT EXISTS { ?s <urn:absent> ?o } }",
 ];
 
-/// EXISTS in BIND, which the cursor answers from a key set as it does a FILTER EXISTS,
-/// so automatic execution streams them.
+/// EXISTS in an OPTIONAL condition and in BIND, which the cursor answers from a key set
+/// as it does a FILTER EXISTS, so automatic execution streams them.
 const KEYED: &[&str] = &[
+    "SELECT ?v (COUNT(?o) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o FILTER EXISTS { ?o <urn:r> ?k } } } GROUP BY ?v ORDER BY ?v",
     "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v BIND(EXISTS { ?s <urn:q> ?o } AS ?b) } GROUP BY ?b ORDER BY ?b",
     "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v BIND(NOT EXISTS { ?s <urn:q> ?o . ?o <urn:r> ?k } AS ?b) } GROUP BY ?b ORDER BY ?b",
 ];
 
-/// EXISTS that automatic execution keeps eager. The cursor evaluates one inside a
-/// larger expression or an aggregate argument once per distinct outer key, which
-/// measured slower, and it answers one in an OPTIONAL condition from its key set, but
-/// its conditional OPTIONAL measured slower than the eager one.
+/// EXISTS that the cursor evaluates once per distinct outer key: inside a larger
+/// expression and in an aggregate argument. These measured slower in the cursor, so
+/// automatic execution keeps them eager.
 const PER_KEY: &[&str] = &[
-    "SELECT ?v (COUNT(?o) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o FILTER EXISTS { ?o <urn:r> ?k } } } GROUP BY ?v ORDER BY ?v",
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER (?v < 10 || EXISTS { ?s <urn:q> <urn:o:5> }) }",
     "SELECT (SUM(IF(EXISTS { ?s <urn:q> ?o }, 1, 0)) AS ?n) { ?s <urn:p> ?v }",
 ];
@@ -307,8 +306,8 @@ fn bind_exists_streams_from_the_key_set() {
         ..Default::default()
     };
     for q in [
-        KEYED[0],
         KEYED[1],
+        KEYED[2],
         "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o } BIND(EXISTS { ?o <urn:r> ?k } AS ?b) } GROUP BY ?b ORDER BY ?b",
     ] {
         let expected = query(s.snapshot(), q, &per_key).unwrap().rows();

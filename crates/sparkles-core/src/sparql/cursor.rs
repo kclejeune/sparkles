@@ -1380,25 +1380,25 @@ pub(super) fn native(node: &Node) -> bool {
 const AUTO_EXISTS_DEPTH: usize = 4;
 
 /// Whether every operator of `node` has a cursor implementation, as [`native`] asks,
-/// where a FILTER conjunct or a BIND expression that is `EXISTS { P }` or
-/// `NOT EXISTS { P }` also counts when the cursor can answer it from a key set and the
-/// plan of `P` counts in turn. The key set is filled by a child cursor under the query's
-/// charges. An EXISTS inside a larger expression, such as IF or OR, is evaluated once
-/// per distinct outer key, which measured slower in the cursor than in eager execution,
-/// so such plans stay eager. So does an OPTIONAL whose condition is an EXISTS. The cursor
-/// answers it from the key set as well, but its conditional OPTIONAL took 3.5 to 4 times
-/// as long as the eager merge on Namespace at 10.5M quads, with any condition.
+/// where a FILTER conjunct, a BIND expression or an OPTIONAL condition that is
+/// `EXISTS { P }` or `NOT EXISTS { P }` also counts when the cursor can answer it from
+/// a key set and the plan of `P` counts in turn. The key set is filled by a child cursor
+/// under the query's charges. An EXISTS inside a larger expression, such as IF or OR,
+/// is evaluated once per distinct outer key, which measured slower in the cursor than
+/// in eager execution, so such plans stay eager.
 /// The patterns are planned here only to read their operators. Planning interns their
 /// variables in `ctx` and runs no part of them.
 pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
     fn at(ctx: &Ctx, node: &Node, depth: usize) -> bool {
         let exists = match &node.kind {
-            Kind::Filter(_) | Kind::Extend(..) => own_exprs(&node.kind).into_iter().all(|e| {
-                !e.has_exists()
-                    || (depth < AUTO_EXISTS_DEPTH
-                        && keyed_exists(ctx, node, e)
-                            .is_some_and(|planned| at(ctx, &planned, depth + 1)))
-            }),
+            Kind::Filter(_) | Kind::Extend(..) | Kind::LeftJoin { .. } => {
+                own_exprs(&node.kind).into_iter().all(|e| {
+                    !e.has_exists()
+                        || (depth < AUTO_EXISTS_DEPTH
+                            && keyed_exists(ctx, node, e)
+                                .is_some_and(|planned| at(ctx, &planned, depth + 1)))
+                })
+            }
             kind => !own_exprs(kind).iter().any(|e| e.has_exists()),
         };
         exists
@@ -4491,15 +4491,14 @@ mod tests {
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER NOT EXISTS {?s <urn:q> ?b . FILTER NOT EXISTS {?b <urn:p> ?s}}}",
                 true,
             ),
-            // an EXISTS answered from a key set in BIND, and in an OPTIONAL condition,
-            // whose conditional OPTIONAL is slower in the cursor
+            // an EXISTS answered from a key set in an OPTIONAL condition or BIND
             (
-                "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(EXISTS {?s <urn:q> ?b} AS ?e)} GROUP BY ?e",
+                "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c}}}",
                 true,
             ),
             (
-                "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c}}}",
-                false,
+                "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(EXISTS {?s <urn:q> ?b} AS ?e)} GROUP BY ?e",
+                true,
             ),
             // and one evaluated per distinct key inside a larger expression
             (
