@@ -222,11 +222,8 @@ fn random_queries_agree_with_and_without_the_cache() {
         for q in &queries {
             cached += check(&before, q) as usize;
         }
-        // The rest read two variables or too few rows, or are aggregate arguments, which
-        // inputs of at most `exec::PAR_THRESHOLD` rows evaluate row by row. The larger
-        // inputs of `the_table_and_batch_algorithms_agree_with_rows_on_both_sides_of_the_threshold`
-        // reuse aggregate arguments.
-        assert!(cached * 4 >= queries.len(), "{cached} of {}", queries.len());
+        // the rest read two variables or too few rows
+        assert!(cached * 3 >= queries.len(), "{cached} of {}", queries.len());
         // deltas that are not compacted: new terms (delta ids), deletions
         update(
             &s,
