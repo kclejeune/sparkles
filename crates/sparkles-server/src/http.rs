@@ -181,7 +181,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(ontology::axioms).post(ontology::edit),
         )
         .route("/$/ontology/{ds}/entities", get(ontology::entities))
-        .route("/$/ontology/{ds}/entity", get(ontology::entity))
+        .route(
+            "/$/ontology/{ds}/entity",
+            get(ontology::entity).delete(ontology::remove_entity),
+        )
         .route("/$/ontology/{ds}/check", post(ontology::check))
         .route("/$/ontology/{ds}/classify", post(ontology::classify))
         .route("/$/ontology/{ds}/diff", get(ontology::diff))

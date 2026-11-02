@@ -71,7 +71,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ontology/{ds}", &["GET"]),
     ("/$/ontology/{ds}/axioms", &["GET", "POST"]),
     ("/$/ontology/{ds}/entities", &["GET"]),
-    ("/$/ontology/{ds}/entity", &["GET"]),
+    ("/$/ontology/{ds}/entity", &["GET", "DELETE"]),
     ("/$/ontology/{ds}/check", &["POST"]),
     ("/$/ontology/{ds}/classify", &["POST"]),
     ("/$/ontology/{ds}/diff", &["GET"]),
@@ -412,6 +412,9 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // the axioms of the ontology are read with read access and edited with write
         "/$/ontology/{ds}/axioms" if get => Dataset(Read),
         "/$/ontology/{ds}/axioms" => Dataset(Write),
+        // an entity is read with read access and removed with write
+        "/$/ontology/{ds}/entity" if get => Dataset(Read),
+        "/$/ontology/{ds}/entity" => Dataset(Write),
         "/$/assistant/{ds}" => Dataset(Admin),
         "/$/graphrag/{ds}"
         | "/$/graphrag/{ds}/communities"
@@ -664,6 +667,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/$/reason/{ds}/justify"
         | "/$/forms/{ds}" => Endpoint::Query,
         "/$/forms/{ds}/check" | "/$/forms/{ds}/save" => Endpoint::Update,
+        "/$/ontology/{ds}/entity" if !get => Endpoint::Update,
         "/$/ontology/{ds}"
         | "/$/ontology/{ds}/check"
         | "/$/ontology/{ds}/classify"

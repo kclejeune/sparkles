@@ -235,14 +235,25 @@ pub fn check_body(
     j
 }
 
-/// The JSON of what an edit did.
+/// The JSON of what an edit did. `addedAxioms` and `removedAxioms` list the axioms the
+/// edit wrote and removed, at most [`MAX_LIMIT`] of each, so that a client can undo the
+/// edit exactly; `axiomsTruncated` says whether a list was cut.
 pub fn edit_body(e: &EditOutcome, r: &Renderer) -> J {
+    let list = |l: &[Axiom]| -> Vec<J> {
+        l.iter()
+            .take(MAX_LIMIT)
+            .map(|a| axiom_json(a, None, r))
+            .collect()
+    };
     json!({
         "added": e.added,
         "present": e.present,
         "removed": e.removed,
         "absent": e.absent.iter().map(|a| r.axiom(a)).collect::<Vec<_>>(),
         "declared": e.declared.iter().map(|d| r.entity(d)).collect::<Vec<_>>(),
+        "addedAxioms": list(&e.added_axioms),
+        "removedAxioms": list(&e.removed_axioms),
+        "axiomsTruncated": e.added_axioms.len() > MAX_LIMIT || e.removed_axioms.len() > MAX_LIMIT,
         "inserted": e.inserted,
         "deleted": e.deleted,
         "kept": e.kept,

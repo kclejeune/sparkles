@@ -674,7 +674,7 @@ fn resources(p: &mut Paths) {
 
 /// Editing forms generated from SHACL shapes (U02).
 fn ontology(p: &mut Paths) {
-    let read = |o: Op| {
+    let sel = |o: Op| {
         o.query(
             "graph",
             s(),
@@ -691,7 +691,15 @@ fn ontology(p: &mut Paths) {
             "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
         )
     };
+    let read = |o: Op| sel(o.param("branch"));
     let object = json!({ "application/json": { "schema": { "type": "object" } } });
+    let edited = json!({
+        "type": "array",
+        "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+        "items": { "type": "object", "properties": {
+            "type": { "type": "string" }, "ofn": { "type": "string" }, "axiom": { "type": "object" }
+        } }
+    });
     let selection = json!({
         "graph": { "description": "A graph IRI or `default`, or a list of them." },
         "imports": { "type": "boolean" },
@@ -757,6 +765,7 @@ fn ontology(p: &mut Paths) {
     );
     p.add(
         op(POST, "/$/ontology/{ds}/check", "checkOntology", "Ontology", "Check OWL 2 profiles")
+            .param("branch")
             .doc("One report per profile in `profiles` (`el`, `ql`, `rl`, `dl` or `all`; `dl` by default), over the terminology and, unless `assertions` is false, the assertions the store holds. Each report lists the violations with the rule of the OWL 2 Profiles or the structural specification that each breaks. The EL, QL and RL reports also list the OWL 2 DL violations.")
             .see("ontology")
             .param("timeout")
@@ -869,7 +878,34 @@ fn ontology(p: &mut Paths) {
                         "removed": { "type": "integer" },
                         "absent": { "type": "array", "items": { "type": "string" } },
                         "declared": { "type": "array", "items": { "type": "string" } },
+                        "addedAxioms": edited.clone(),
+                        "removedAxioms": edited.clone(),
+                        "axiomsTruncated": { "type": "boolean", "description": "Whether `addedAxioms` or `removedAxioms` was cut at 10,000." },
                         "inserted": { "type": "integer" },
+                        "deleted": { "type": "integer" },
+                        "kept": { "type": "integer" },
+                        "committed": { "type": "boolean" }
+                    }
+                } } })),
+            )
+            .errors(&[400, 403, 404, 408, 412, 422, 507]),
+    );
+    p.add(
+        write_params(sel(op(DELETE, "/$/ontology/{ds}/entity", "removeOntologyEntity", "Ontology", "Remove an entity")))
+            .doc("Removes an entity in one commit: its declarations, the axioms of the graphs read that mention it and the assertions about it that the store holds there. The ontology is read from the head under the writer lock. The answer is an edit's, and `removedAxioms` lists what the removal took. An IRI the ontology does not mention removes nothing and makes no commit.")
+            .see("ontology")
+            .param("ifMatch")
+            .query("iri", s(), "The entity's IRI.")
+            .query("message", s(), "The commit message, as the `Sparkles-Commit-Message` header gives it.")
+            .resp(
+                "200",
+                "What the removal did, with the receipt when asked for.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "properties": {
+                        "removed": { "type": "integer" },
+                        "removedAxioms": edited.clone(),
+                        "axiomsTruncated": { "type": "boolean" },
                         "deleted": { "type": "integer" },
                         "kept": { "type": "integer" },
                         "committed": { "type": "boolean" }
