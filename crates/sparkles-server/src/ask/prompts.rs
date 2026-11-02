@@ -369,6 +369,16 @@ mod tests {
         let own = vec![("dbo".to_string(), "http://example.org/own/".to_string())];
         let q = "SELECT * WHERE { ?s dbo:p ?o }";
         assert_eq!(complete_prefixes(q, &own), q);
+        // nor is one that the dataset binds to another namespace, while a known prefix
+        // the dataset lacks is still declared
+        let geo = vec![("geo".to_string(), "http://example.org/geo/".to_string())];
+        let q = "SELECT * WHERE { ?s geo:lat ?l ; dbo:country ?c }";
+        let out = complete_prefixes(q, &geo);
+        assert!(!out.contains("PREFIX geo:"), "{out}");
+        assert!(
+            out.starts_with("PREFIX dbo: <http://dbpedia.org/ontology/>\n"),
+            "{out}"
+        );
     }
     #[test]
     fn the_follow_up_form_repeats_the_first_draft() {

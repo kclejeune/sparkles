@@ -116,6 +116,17 @@ build community reports.
   stayed within the baseline's spread, and type hints lowered it to 22.7. Voting costs
   63% more per question. The
   [results](../benchmarks/natural-language/RESULTS.md#ask-repair-options) give each run.
+* A draft often uses a common vocabulary prefix without declaring it. Before the check,
+  Ask declares each of these that the query uses and neither the query nor the dataset
+  defines: `dbo`, `dbr`, `dbp` and `dbc` for DBpedia's ontology, resources, properties
+  and categories, `yago` for DBpedia's YAGO classes, `dct` for Dublin Core terms, `geo`
+  for the W3C WGS84 vocabulary, and `wd`, `wdt` and `wikibase` for Wikidata. A prefix
+  that the dataset binds to another namespace keeps the dataset's binding, and any other
+  unknown prefix is still reported by the check.
+* The check of a draft reports a typed variable whose class has no instance with the
+  predicate the draft uses. That lookup names the class and the predicate in its query,
+  and a lookup that passes the query memory budget leaves the pattern unjudged instead
+  of failing the check.
 * The extra kind preference recognizes the English words film, movie, book, novel,
   song, album, city, town, country, river and person through supported DBpedia,
   schema.org and FOAF class IRIs. Unknown class namespaces and incomplete or competing
