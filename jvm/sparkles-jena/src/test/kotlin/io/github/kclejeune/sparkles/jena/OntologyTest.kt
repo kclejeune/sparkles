@@ -91,6 +91,26 @@ class OntologyTest {
         }
     }
 
+    /** A read on another thread during a transaction keeps the transaction's writes, which then commit. */
+    @Test fun a_read_on_another_thread_keeps_an_open_transactions_writes() {
+        SparklesDatasets.memory().use { ds ->
+            a1(ds)
+            val m = SparklesOnt.model(ds, "http://ex.org/onto")
+            ds.begin(ReadWrite.WRITE)
+            try {
+                m.createOntClass("urn:X")
+                val other = Thread { m.classes().count() }
+                other.start()
+                other.join()
+                ds.commit()
+            } finally {
+                ds.end()
+            }
+            assertNotNull(m.getOntClass("urn:X"))
+            assertNotNull(SparklesOnt.model(ds, "http://ex.org/onto").getOntClass("urn:X"))
+        }
+    }
+
     /** The copy holds a larger ontology in full: it is filled by one native read, not by batches. */
     @Test fun the_model_copies_a_large_graph_in_one_read() {
         SparklesDatasets.memory().use { ds ->

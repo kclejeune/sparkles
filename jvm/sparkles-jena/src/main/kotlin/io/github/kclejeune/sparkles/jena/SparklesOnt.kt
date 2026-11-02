@@ -97,7 +97,9 @@ public object SparklesOnt {
 /**
  * A graph whose reads come from `copy` and whose writes go to `target` and to `copy`. The
  * changes a write transaction makes to the copy are kept until the transaction ends, and
- * undone when it does not commit, so that the copy keeps the state of the dataset.
+ * undone when it does not commit, so that the copy keeps the state of the dataset. The
+ * copy is shared by the threads that use the model, so another thread sees a
+ * transaction's writes before it commits.
  */
 private class ReadThroughGraph(
     private val copy: Graph,
@@ -112,7 +114,7 @@ private class ReadThroughGraph(
     @Synchronized
     private fun settle() {
         val t = pending ?: return
-        if (t === dataset.txn()) return
+        if (t.active) return
         if (!t.committed) {
             for (i in journal.indices.reversed()) {
                 val (added, triple) = journal[i]
@@ -135,31 +137,45 @@ private class ReadThroughGraph(
         return copy
     }
 
+    // the native write runs outside the monitor, since it may wait for another thread's
+    // transaction, which reads the model meanwhile
     override fun add(t: Triple) {
         settle()
         target.add(t)
-        if (!copy.contains(t)) {
-            copy.add(t)
-            record(true, t)
+        synchronized(this) {
+            if (!copy.contains(t)) {
+                copy.add(t)
+                record(true, t)
+            }
         }
     }
 
     override fun delete(t: Triple) {
         settle()
         target.delete(t)
-        if (copy.contains(t)) {
-            copy.delete(t)
-            record(false, t)
+        synchronized(this) {
+            if (copy.contains(t)) {
+                copy.delete(t)
+                record(false, t)
+            }
         }
     }
 
     override fun remove(s: Node?, p: Node?, o: Node?) {
         settle()
-        val gone = copy.find(s ?: Node.ANY, p ?: Node.ANY, o ?: Node.ANY).toList()
+        if (dataset.txn() == null) {
+            // the removal commits on its own, so nothing needs undoing
+            target.remove(s, p, o)
+            synchronized(this) { copy.remove(s, p, o) }
+            return
+        }
         target.remove(s, p, o)
-        for (t in gone) {
-            copy.delete(t)
-            record(false, t)
+        synchronized(this) {
+            val gone = copy.find(s ?: Node.ANY, p ?: Node.ANY, o ?: Node.ANY).toList()
+            for (t in gone) {
+                copy.delete(t)
+                record(false, t)
+            }
         }
     }
 

@@ -208,9 +208,10 @@ pub struct ReasonOptions {
     /// by their support turns them on.
     pub witnesses: Option<usize>,
     /// Called once with the state the run reads, while the run holds the writer lock and
-    /// before it derives anything. The warnings it returns join the report's, so that
-    /// a check of the input graphs sees exactly what the rules read. An error fails the
-    /// run.
+    /// before it derives anything, after a progress report. The warnings it returns join
+    /// the report's, so that a check of the input graphs sees exactly what the rules
+    /// read. An error fails the run, and a long check observes [`cancel`](Self::cancel)
+    /// itself.
     pub inspect: Option<InspectFn>,
 }
 
@@ -932,7 +933,12 @@ fn materialize_admitted(
     let (mut txn, raw, resolved) = lock_with_changes(store, inc, &opts.inputs);
     let snap = txn.base().clone();
     let inspected = match &opts.inspect {
-        Some(f) => f(&snap)?,
+        Some(f) => {
+            // the first progress report says the run holds the lock, so that a waiting
+            // write can supersede it during the check
+            progress(opts, 0.05, "checking the input axioms");
+            f(&snap)?
+        }
         None => Vec::new(),
     };
     let digest = rules_digest(profile, extras);
