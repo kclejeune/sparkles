@@ -156,13 +156,15 @@ DL Query tab and the SKOS editor come these, in order:
 1. The ontology browser of item 616 with its typo-tolerant search, together with lazy
    trees (607), rendering preferences (625), metrics (621) and the command palette (631).
    Then its edit mode (630).
-2. Inferred axioms in entity frames (622), with the inferred property and individual
+2. The design pass over the whole web UI of item 632, so that later pages follow its layout
+   and components.
+3. Inferred axioms in entity frames (622), with the inferred property and individual
    trees of item 609. Their explanation links wait for F24's justifications.
-3. The visual SHACL shape editor of item 617.
-4. Entity history (620), discussions (618) and watches (619), the last after the
+4. The visual SHACL shape editor of item 617.
+5. Entity history (620), discussions (618) and watches (619), the last after the
    notifications of item 46.
-5. Import resolution (624), bulk edits (626) and pattern-based axiom generation (623).
-6. Vocabulary governance and change requests (627), after item 459.
+6. Import resolution (624), bulk edits (626) and pattern-based axiom generation (623).
+7. Vocabulary governance and change requests (627), after item 459.
 
 Tagging documents with concepts (628) belongs to Wave B's ingest work, and real-time
 co-editing (629) comes last.
@@ -766,6 +768,7 @@ Rows that need backend work name it first.
 | 629 | **Real-time co-editing.** Show other editors' presence and merge concurrent edits to one entity live, which U05 §1 leaves open. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | L |
 | 630 | **Edit mode on browser pages.** Let a caller with write access switch an ontology browser page into edit mode and change its definition, synonyms, annotations, hierarchy and axioms in place, through the ontology editor's previewed commits, session branches, undo and access checks. It follows item 616. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
 | 631 | **Command palette.** Open a launcher-style window anywhere in the web UI with `Ctrl+K` or `Cmd+K`, and `/` to focus a page's search. It searches entities, concepts, datasets, saved queries and pages with the browser's typo-tolerant search, and runs commands that each page registers, such as switching dataset or branch, starting a session, creating an entity, running or formatting a query and opening settings, with recent items first and each command's shortcut shown. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
+| 632 | **Web UI design pass.** Review every page of the web UI for one clean, uncluttered and consistent design that works on large, medium and phone screens in light and dark themes. It settles the app shell and page layouts, including a persistent top search and launcher bar that opens the command palette of item 631, and evens out panel sizes, gutters, spacing, button alignment and count badges. Pages may be reordered, split or collapsed when every function stays reachable, and each change is checked with Playwright against a server seeded with realistic data. It follows the browser and command palette of items 616 and 631. | [Web UI](visualization/README.md#web-ui) | L |
 
 | 285 | **Explain intensional query result cells.** Offer a Why? action on a result row when the query's triple pattern was intensional, carrying the row bindings into the existing explanation panel. | [F18](specs/F18-explanations-and-entailment-diffs.md#outcome) | S–M |
 | 286 | **Why-not explanations for unbound query patterns.** Extend target patterns beyond a ground triple so `why_empty` can explain a failing intensional pattern with unbound variables, without inventing constant values. | [F18](specs/F18-explanations-and-entailment-diffs.md#outcome) | M |
