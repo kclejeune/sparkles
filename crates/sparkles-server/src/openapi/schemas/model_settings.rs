@@ -267,13 +267,13 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
         "version": kinds(default(titled(string(), "API version", "The anthropic-version header."), json!("2023-06-01")), &["anthropic"]),
         "promptCaching": kinds({
             let mut v = ordered(&["enabled", "ttl"], json!({
-                "enabled": default(titled(boolean(), "Prompt caching", "Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL."), json!(true)),
+                "enabled": default(titled(boolean(), "Prompt caching", "Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL. For the openai kind it is off by default, and true sends the text after each user message's last cached part as a developer message so that a repair reads the cached question."), json!(true)),
                 "ttl": default(titled(string_enum(&["5m", "1h"]), "Cache lifetime", "How long the provider keeps a cached prefix after its last use. The 1-hour TTL doubles the write price and pays when calls sharing a prefix come more than 5 minutes apart."), json!("5m")),
             }));
             v["title"] = "Prompt caching".into();
-            v["description"] = "Prompt caching of the Anthropic API. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache.".into();
+            v["description"] = "Prompt caching of the Anthropic API, and for the openai kind the message split that lets OpenAI's own caching serve repairs. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache. The TTL applies to the anthropic kind only.".into();
             v
-        }, &["anthropic"]),
+        }, &["anthropic", "openai"]),
         "tls": tls,
         "models": {
             "type": "object",

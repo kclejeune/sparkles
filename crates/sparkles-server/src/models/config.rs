@@ -420,6 +420,16 @@ impl ProviderConfig {
         c.enabled.unwrap_or(true).then(|| c.ttl.unwrap_or_default())
     }
 
+    /// Whether an `openai` provider ends each user message at its last cached part and
+    /// sends the rest as a developer message. OpenAI caches a prefix only where the
+    /// latest user message ends, so a repair that changes the text after the question
+    /// can then read the prefix the first draft wrote. It is off unless
+    /// `promptCaching.enabled` is true, since a compatible server may refuse the
+    /// developer role.
+    pub fn splits_cached_tail(&self) -> bool {
+        self.kind == Kind::Openai && self.prompt_caching.and_then(|c| c.enabled) == Some(true)
+    }
+
     /// Whether certificate checks are off for this provider.
     pub fn insecure(&self) -> bool {
         self.tls.as_ref().is_some_and(|t| t.insecure_skip_verify)
@@ -868,10 +878,16 @@ impl ModelsConfig {
                     "provider {name}: version applies to the anthropic kind only"
                 );
             }
-            if p.prompt_caching.is_some() && p.kind != Kind::Anthropic {
+            if p.prompt_caching.is_some_and(|c| c.ttl.is_some()) && p.kind != Kind::Anthropic {
+                fail!(
+                    ["providers", name, "promptCaching", "ttl"],
+                    "provider {name}: promptCaching.ttl applies to the anthropic kind only"
+                );
+            }
+            if p.prompt_caching.is_some() && !matches!(p.kind, Kind::Anthropic | Kind::Openai) {
                 fail!(
                     ["providers", name, "promptCaching"],
-                    "provider {name}: promptCaching applies to the anthropic kind only"
+                    "provider {name}: promptCaching applies to the anthropic and openai kinds only"
                 );
             }
             if p.concurrency == Some(0) {
@@ -1278,6 +1294,33 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// An `openai` provider takes `promptCaching.enabled`, which splits the cached tail,
+    /// and refuses a TTL. The ollama kind refuses `promptCaching`.
+    #[test]
+    fn openai_prompt_caching_takes_enabled_only() {
+        let parse = |kind: &str, caching: serde_json::Value| {
+            ModelsConfig::parse(
+                &serde_json::json!({ "providers": { "p": {
+                    "kind": kind, "endpoint": "http://127.0.0.1:1", "promptCaching": caching
+                } } })
+                .to_string(),
+            )
+        };
+        let on = parse("openai", serde_json::json!({ "enabled": true })).unwrap();
+        assert!(on.providers["p"].splits_cached_tail());
+        assert_eq!(on.providers["p"].cache_ttl(), None);
+        let off = parse("openai", serde_json::json!({ "enabled": false })).unwrap();
+        assert!(!off.providers["p"].splits_cached_tail());
+        let ttl = parse("openai", serde_json::json!({ "ttl": "1h" })).unwrap_err();
+        assert!(
+            format!("{ttl:#}").contains("promptCaching.ttl applies to the anthropic kind only")
+        );
+        let ollama = parse("ollama", serde_json::json!({ "enabled": true })).unwrap_err();
+        assert!(format!("{ollama:#}").contains("anthropic and openai kinds only"));
+        let anthropic = parse("anthropic", serde_json::json!({ "ttl": "1h" })).unwrap();
+        assert!(!anthropic.providers["p"].splits_cached_tail());
     }
 
     #[test]

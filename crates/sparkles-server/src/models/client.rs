@@ -248,6 +248,26 @@ fn anthropic_content(parts: &[Part], kept: &[usize], ttl: CacheTtl) -> Value {
     Value::Array(blocks)
 }
 
+/// The OpenAI messages of `m`: one message with its text, or, when `split` is set and a
+/// user message has text after its last cached part, a user message up to the end of
+/// that part and a developer message with the rest. Joined, they hold the same text.
+fn openai_messages(m: &Message, split: bool) -> Vec<Value> {
+    let last = m.parts.iter().rposition(|x| x.cache);
+    match last {
+        Some(i) if split && m.role == "user" => {
+            let (head, rest) = (joined(&m.parts[..=i]), joined(&m.parts[i + 1..]));
+            if head.is_empty() || rest.is_empty() {
+                return vec![json!({"role": m.role, "content": m.text()})];
+            }
+            vec![
+                json!({"role": "user", "content": head}),
+                json!({"role": "developer", "content": rest}),
+            ]
+        }
+        _ => vec![json!({"role": m.role, "content": m.text()})],
+    }
+}
+
 /// The request body and URL of a call, for its provider's kind.
 pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
     let base = p.endpoint.trim_end_matches('/');
@@ -287,11 +307,9 @@ pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
         }
         Kind::Openai => {
             let mut messages = vec![json!({"role": "system", "content": system})];
-            messages.extend(
-                req.messages
-                    .iter()
-                    .map(|m| json!({"role": m.role, "content": m.text()})),
-            );
+            for m in &req.messages {
+                messages.extend(openai_messages(m, p.splits_cached_tail()));
+            }
             let mut body = json!({ "model": req.model, "messages": messages });
             // a reasoning model counts its reasoning in max_completion_tokens and
             // refuses max_tokens
@@ -1284,6 +1302,58 @@ mod tests {
                     .unwrap()
                     .contains("cache_control")
             );
+        }
+    }
+
+    /// With `promptCaching.enabled`, an OpenAI user message ends at its last cached part
+    /// and the rest follows as a developer message, so a repair that changes only the
+    /// tail sends the first draft's messages up to the end of the question unchanged.
+    /// Without it, and for an assistant message, the text stays one message.
+    #[test]
+    fn openai_bodies_split_the_tail_after_the_cached_parts() {
+        let on: ProviderConfig = serde_json::from_value(json!({
+            "kind": "openai", "endpoint": "http://h/v1/", "promptCaching": { "enabled": true }
+        }))
+        .unwrap();
+        let r = layered("Who leads payments?");
+        let (_, b) = build(&on, &r);
+        let roles: Vec<&str> = b["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["system", "user", "developer"]);
+        let (_, plain) = build(&provider(Kind::Openai), &r);
+        assert_eq!(plain["messages"].as_array().unwrap().len(), 2);
+        let whole = plain["messages"][1]["content"].as_str().unwrap();
+        let head = b["messages"][1]["content"].as_str().unwrap();
+        assert!(head.ends_with("Question: Who leads payments?\n"));
+        assert_eq!(
+            format!("{head}{}", b["messages"][2]["content"].as_str().unwrap()),
+            whole
+        );
+        // a repair changes only the tail, so the first two messages stay the same
+        let mut repair = r.clone();
+        repair.messages[0].parts[2] = Part::text("\nYour previous query failed.\nThe format.");
+        let (_, rb) = build(&on, &repair);
+        assert_eq!(
+            rb["messages"].as_array().unwrap()[..2],
+            b["messages"].as_array().unwrap()[..2]
+        );
+        // no cached part, an empty tail and an assistant message stay one message
+        for m in [
+            Message::user("q"),
+            Message::user_parts(vec![Part::text("a"), Part::cached("b")]),
+            Message {
+                role: "assistant",
+                parts: vec![Part::cached("a"), Part::text("b")],
+            },
+        ] {
+            let mut x = r.clone();
+            x.messages = vec![m];
+            let (_, xb) = build(&on, &x);
+            assert_eq!(xb["messages"].as_array().unwrap().len(), 2);
         }
     }
 

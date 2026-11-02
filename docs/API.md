@@ -11856,7 +11856,7 @@ except `repair`, which uses the `draft` list.
 
 A provider may also set `concurrency` (4 by default), `requestsPerMinute`,
 `allowedModels`, `connectTimeoutSecs`, extra `headers` for the `openai` kind,
-`version` and `promptCaching` for the `anthropic` kind, and the defaults of its models. The `models` member sets `contextTokens`, `maxOutputTokens`,
+`version` for the `anthropic` kind, `promptCaching` for the `anthropic` and `openai` kinds, and the defaults of its models. The `models` member sets `contextTokens`, `maxOutputTokens`,
 `temperature`, `structuredOutput`, `pricing`, `requestTimeoutSecs`, `reasoningEffort`
 and, for Ollama, `numCtx` per model. `reasoningEffort` is one of `none`, `minimal`,
 `low`, `medium`, `high`, `xhigh` and `max`, and the provider decides which a model
@@ -11947,6 +11947,15 @@ and Haiku 5.5 and up to 4,096 on older models, is not cached and costs nothing e
 `promptCaching.ttl` is `5m` by default, and `1h` keeps a prefix for an hour at twice
 the write price. The other kinds send their prompts as before, and the OpenAI protocol
 caches long prompts on its own.
+
+OpenAI writes a cached prefix only where the latest user message ends, so a repair that
+changes the text after the question cannot read the prefix that the first draft wrote
+when the whole prompt is one message. An `openai` provider whose `promptCaching` sets
+`enabled` to `true` therefore ends each user message at its last marked part and sends
+the rest, such as a repair's diagnosis and the answer format, as a developer message
+with the same text. It is off by default, since a server that only follows the OpenAI
+protocol may refuse the developer role, and `promptCaching.ttl` applies to the
+`anthropic` kind only.
 
 ```json
 "claude": {

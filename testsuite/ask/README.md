@@ -226,8 +226,8 @@ and the reply writes a settle line with the cost from its usage. A request is re
 when the spent total plus its bound would pass `localCapNanodollars`. The spent total
 includes the carryover, so the cap covers the carryover as well, and new requests can
 spend the cap minus the carryover. The run file is also refused when the cap plus the
-carryover passes the hard cap of one ledger, USD 50, which counts the carryover twice and
-keeps the run on the safe side. The person who pays sets each campaign's total, which can
+carryover passes the hard cap of one ledger, USD 95 for Anthropic and USD 50 for OpenAI,
+which counts the carryover twice and keeps the run on the safe side. The person who pays sets each campaign's total, which can
 span several ledgers in separate directories. An error reply is free, a lost reply costs the bound, a reply without usage costs
 the bound, and any other fault of the request costs the bound. Replaying the ledger
 counts every unsettled reserve at its bound, and the pilot's unresolved $1.002560 is the
@@ -333,6 +333,10 @@ The OpenAI wallet of 2026-11-01 began at USD 40, and the person who pays raised 
 USD 50 the same day after the Luna baselines. A ledger's cap is fixed in its header, so
 the first ledger closed with USD 0.8548 settled and nothing unresolved, and a second
 ledger holds the rest with a cap of USD 49.1452. The two caps together equal the wallet.
+The Anthropic wallet of the same campaign was raised the same way from USD 50 to 95 with
+the approval of the person who pays, so that every model could run its baseline and its
+final build on the same three sets. Its first ledger closed with USD 30.7865 of upper
+liability, and the second has a cap of USD 64.2135.
 
 ## A paid run
 
@@ -340,7 +344,7 @@ ledger holds the rest with a cap of USD 49.1452. The two caps together equal the
 the models of each set, the effort, `maxOutputTokens`, the request and Ask timeouts, the
 query timeout, the cap, the carryover, the ledger, the output directory and the binary
 with its SHA256. The carryover is required, zero for a fresh authorization, and the cap
-plus the carryover cannot pass USD 50 for either provider. `clarifications` is `answer`
+plus the carryover cannot pass the provider's hard cap. `clarifications` is `answer`
 unless the run file sets `score`. `contextTokens` gives every model its context window.
 Without it the server assumes 8192 tokens, treats each model as a small one and trims
 the grounding to 30 classes, 60 predicates, two examples and three candidates per

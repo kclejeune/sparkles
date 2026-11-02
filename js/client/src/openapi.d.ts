@@ -7463,12 +7463,12 @@ export interface components {
             };
             /**
              * Prompt caching
-             * @description Prompt caching of the Anthropic API. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache.
+             * @description Prompt caching of the Anthropic API, and for the openai kind the message split that lets OpenAI's own caching serve repairs. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache. The TTL applies to the anthropic kind only.
              */
             promptCaching?: {
                 /**
                  * Prompt caching
-                 * @description Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL.
+                 * @description Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL. For the openai kind it is off by default, and true sends the text after each user message's last cached part as a developer message so that a repair reads the cached question.
                  * @default true
                  */
                 enabled: boolean;
@@ -7643,7 +7643,7 @@ export interface components {
                     structuredOutput: "auto" | "json-schema" | "json-object" | "tool" | "text";
                 }[];
                 name: string;
-                /** @description For the anthropic kind: whether stable prompt prefixes are marked for the provider's cache, and their TTL. */
+                /** @description For the anthropic kind: whether stable prompt prefixes are marked for the provider's cache, and their TTL. For the openai kind, enabled true sends the text after each user message's last cached part as a developer message. */
                 promptCaching?: {
                     enabled: boolean;
                     /** @enum {string} */
