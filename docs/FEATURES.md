@@ -150,6 +150,12 @@ trees.
 
 ![The ontology editor with the class tree and the frame of Professor](images/ontology-editor.png)
 
+[Editing forms](visualization/README.md#nested-form-read-models) generated from SHACL
+shapes edit a resource with its nested blank-node children, ordered lists and value
+alternatives, and save each form as one previewed commit.
+
+![A SKOS concept's form with its stored SKOS-XL label edited and a new label added as nested forms](images/forms-nested.png)
+
 <a id="libraries-and-bindings"></a>
 
 ### Libraries and integrations
@@ -211,7 +217,7 @@ implementation status.
 |---|---|---|
 | [Reasoning](reasoning/README.md#reasoning) | Partially complete. | RDFS, a documented OWL 2 RL subset and Jena rules are available with incremental materialization and demand derivation. Automatic cost selection, a separate derived layer and canonical equality remain planned. |
 | [Explanations](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | Why, bounded why-not, entailment diffs and minimal supports are available. The reasoner can keep bounded witnesses per fact. Inferred visibility and review protections that read them remain planned. |
-| [Validation and forms](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | SHACL, ShEx, write guards and generated forms are available, including nested read models in the Rust library. Form checks use bounded shape-dependent targets and refuse incomplete discovery. Atomic nested editing, remaining editors and producer admission remain planned. |
+| [Validation and forms](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | SHACL, ShEx, write guards and generated forms are available, and forms edit nested children, lists and value alternatives in one commit. Form checks refuse incomplete discovery. Node-level alternatives, complex nested paths and some target producers remain. |
 | [Schema discovery](reasoning/README.md#reasoning-validation-and-schema) | Complete within the documented discovery scope. | Class and predicate profiles, schema diffs and constrained shape drafts are available. Drafts retain the limits in the compatibility boundaries. |
 | [OWL 2 ontology API](reasoning/README.md#owl-2-ontologies) | Partially complete. | The axiom model, RDF mappings, profile checks and axiom diffs are available in Rust, Python, Node.js, the JVM through `jena-ontapi`, HTTP, MCP and the CLI. Reads with inferences are available in all of them except MCP and the CLI. Entity accessors, typed axiom constructors and the literal rules of OWL 2 DL are included. A read budget, fetched imports, and inferred reads and entity reports over MCP and the CLI remain in items 539, 559, 565 and 578. |
 | [OWL 2 EL classification](reasoning/README.md#owl-2-ontologies) | Partially complete. | An incremental, concurrent EL classifier computes the inferred class hierarchy and the unsatisfiable classes in Rust, Python, Node.js, the JVM, HTTP and the CLI, and can write the taxonomy to a graph with provenance. Its taxonomies equal ELK's on GO, ChEBI lite and the ORE 2015 EL sample. Complete reasoning with individuals and datatypes, an MCP tool, reads with the classification, durable runs and lower memory with parallel indexing remain in items 586 to 590 and 592. |

@@ -1,6 +1,7 @@
 // The README's screenshots of branches, of the agent pages and of the Explore overview
 // grouped by the GraphRAG communities, in the dark theme, against
-// the mock backend that playwright.screenshots-mock.config.ts starts. The `org` dataset
+// the mock backend that playwright.screenshots-mock.config.ts starts. The SKOS editing forms
+// use a `thesaurus` dataset and the SKOS layouts of mock/forms.mjs. The `org` dataset
 // gets a branch whose changes clash with main, so that the dataset page shows branches and
 // the commit graph and the merge page shows conflicts. The Ask bar runs the scripted
 // pipeline of mock/assistant.mjs, and a handoff link stands in for an agent's
@@ -1038,6 +1039,70 @@ test('forms-branch', async ({ page, request }) => {
   } finally {
     await request.patch('/$/branches/world/main', { data: { protected: false } });
   }
+});
+
+const THESAURUS = 'thesaurus';
+const TH = 'http://example.org/thesaurus/';
+
+/** A thesaurus of the mock's SKOS shapes (mock/forms.mjs), made once. */
+async function thesaurus(request: APIRequestContext) {
+  const r = await request.post('/$/datasets', {
+    data: { dbName: THESAURUS, dbType: 'persistent' },
+  });
+  if (r.status() === 409) return;
+  expect(r.ok()).toBe(true);
+  const u = await request.post(`/${THESAURUS}/update`, {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: `PREFIX ex: <${TH}> PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+      PREFIX skosxl: <http://www.w3.org/2008/05/skos-xl#>
+      INSERT DATA {
+        ex:animals a skos:Concept ; skos:prefLabel "Animals"@en , "Animaux"@fr ;
+          skosxl:prefLabel [ skosxl:literalForm "Animals"@en ] .
+        ex:mammals a skos:Concept ; skos:prefLabel "Mammals"@en ; skos:broader ex:animals .
+        ex:birds a skos:Concept ; skos:prefLabel "Birds"@en ; skos:broader ex:animals .
+        ex:fish a skos:Concept ; skos:prefLabel "Fish"@en ; skos:broader ex:animals .
+        ex:pets a skos:Collection ; skos:prefLabel "Pets"@en ; skos:member ex:mammals ;
+          skos:memberList ( ex:mammals ex:birds ex:fish ) .
+      }`,
+  });
+  expect(u.ok()).toBe(true);
+}
+
+async function thesaurusForm(page: Page, local: string, heading: RegExp) {
+  await page.addInitScript((ds) => localStorage.setItem('sparkles.dataset', ds), THESAURUS);
+  await page.goto(`/ui/datasets/${THESAURUS}/edit?iri=${encodeURIComponent(TH + local)}`);
+  const form = page.getByRole('region', { name: heading });
+  await expect(form.locator('.ff').first()).toBeVisible({ timeout: 30_000 });
+  return form;
+}
+
+test('forms-nested', async ({ page, request }) => {
+  // a SKOS concept's SKOS-XL labels as nested forms: the stored label edited and a new
+  // label added from the template, both saved in one commit
+  await thesaurus(request);
+  const form = await thesaurusForm(page, 'animals', /^Edit Anima/);
+  const labels = form.locator('[data-field$="skos-xl#prefLabel>"]');
+  await labels.getByLabel('Literal form', { exact: true }).fill('All animals');
+  await labels.getByRole('button', { name: '+ Add XL labels' }).click();
+  await labels.getByLabel('Literal form', { exact: true }).nth(1).fill('Tous les animaux');
+  await labels.getByLabel('Language of Literal form').nth(1).fill('fr');
+  await form.getByRole('button', { name: 'Preview' }).click();
+  await expect(form.getByRole('region', { name: 'Preview' })).toContainText(
+    'The save would commit.',
+  );
+  await labels.evaluate((e) => e.scrollIntoView({ block: 'center' }));
+  await shoot(page, 'forms-nested');
+});
+
+test('forms-list', async ({ page, request }) => {
+  // an ordered collection: its members chosen among the alternatives of `sh:or`, and its
+  // `skos:memberList` reordered with the list editor
+  await thesaurus(request);
+  const form = await thesaurusForm(page, 'pets', /^Edit .*pets/);
+  const list = form.getByRole('list', { name: 'Ordered members members' });
+  await list.getByRole('button', { name: 'Move Ordered members member 3 up' }).click();
+  await list.evaluate((e) => e.scrollIntoView({ block: 'center' }));
+  await shoot(page, 'forms-list');
 });
 
 /** The server page's model configuration form, scrolled to the row of `field`. */

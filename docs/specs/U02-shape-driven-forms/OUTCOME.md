@@ -3,6 +3,38 @@
 The [design's Outcome overview](SPEC.md#outcome) summarizes current scope. This record
 preserves the initial delivery and the later affected-target validation contract.
 
+## Nested, list and alternative editing
+
+Forms edit the blank-node children that `sh:node` fields reach, SHACL 1.2 lists and
+value-level `sh:or` and `sh:xone` alternatives. The model route takes `nested=true`, and
+check and save bodies take `nested` node changes and `list` field changes, as
+[§2.3.2](SPEC.md#232-nested-list-and-alternative-changes) describes. The plan is a list
+of quad deletions and insertions applied to one write transaction, so the commit keeps
+the graph grants and triple protections of every update, and the update text is rendered
+from the same quads for the preview. Fresh children get labels that never parse as
+stored labels. Removing a child checks references on the unmasked snapshot, deletes its
+visible quads through its blank objects and leaves hidden quads. The writer-locked guard
+rechecks anchors, field expectations, the root's target graph and the subtree of each
+removed child before the commit.
+
+The browser loads the nested model and renders each child as a nested form, with a cycle
+guard and **Add** from the matching template. Lists use an ordered editor, and
+alternatives use a **Kind of** select per value. One save sends the root's changes with
+every child's. A refused nested model falls back to the flat form. The library's
+`FormValue.items`, `FieldChange.list`, `FormChange.nested`, `FieldConflict.node` and
+`NestedFormModel.templates` carry the new members, and Python's `ds.forms.model` takes
+`nested`. The model's format number stays 1, because the new members are additive, and
+nothing on disk changes.
+
+Rust tests cover nested edits, new and removed children, shared children, lost anchors,
+hidden and unwritable quads, lists, malformed lists and the guard, and a SKOS fixture
+covers a concept with labels in two languages, broader links, SKOS-XL labels and an
+ordered collection. HTTP tests cover the route members and the bodies, and the browser
+has unit tests, mock Playwright tests and real-server Playwright tests of the SKOS forms.
+Node-level alternatives, complex nested paths, blank-named graph contexts with
+model-source admission and the remaining target producers remain under items
+612 to 615, and controlled reader admission remains under item 395.
+
 ## Nested library read models
 
 `Forms::nested_model` supplies the ordinary root model plus declared blank-node
@@ -26,11 +58,10 @@ state and resource refusal. The prepared-adapter allocation regression checks gr
 labels before their owned model copy, with parsing and source metadata outside that
 measurement. Existing flat form behavior remains covered separately.
 
-This delivery does not add nested changes to check/save, allocate fresh children or
-wire the HTTP and browser editors. Those consumers, lists and alternative editors
-remain under item 21. Stored blank labels and request-local model ids confer no write
-authority; a future save must validate graph-bearing root anchors and changed-field
-expectations inside the same writer.
+This delivery did not add nested changes to check/save, allocate fresh children or
+wire the HTTP and browser editors. [Nested, list and alternative editing](#nested-list-and-alternative-editing)
+added them. Stored blank labels and request-local model ids confer no write authority,
+and the save validates root anchors and changed-field expectations inside the writer.
 
 ## Bounded affected-target checks
 
@@ -51,7 +82,7 @@ Dependency analysis admits owned path normalization, generated prefixes and memo
 entries. Cancellation and one absolute deadline cover discovery and validation. The
 allowance bounds target discovery and its retained state, not the entire SHACL heap or
 the existing cold index decoder. Controlled physical reader integration remains under
-items 21 and 395.
+item 395.
 
 Form applicability checks admit graph-free target-node expressions before evaluating
 their output. Constants, lists, focus variables, basic list operators, conditionals and

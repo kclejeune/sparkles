@@ -3637,6 +3637,22 @@ complex path is read-only with the reason beside it. A value stored in a graph t
 cannot write is shown read-only inside an editable field. Date-time values keep their
 timezone when edited, and a new `xsd:dateTimeStamp` takes the browser's offset.
 
+A field whose property shape names `sh:node` shows each blank-node value as a nested form
+of that shape, so a SKOS-XL label or an address is edited in place under its resource.
+**Add** under such a field starts a new child from the shape's empty form, and removing a
+child deletes its triples with the edge that points to it. A child that another resource
+or a hidden triple still refers to keeps its triples and loses only the edge. Values that
+appear again through a cycle are shown once, with a note that the node is the same as
+one above. A field with SHACL 1.2 list constraints such as `sh:memberShape` edits its
+`rdf:List` as an ordered list, where each member can move up or down or be removed, and a
+save replaces the stored list with the members in their new order. A field without a
+list gets one when it gains its first member, so the form does not write an empty list.
+A malformed list is read-only. A field whose `sh:or` or `sh:xone` names alternative value shapes offers a
+**Kind of** select for each value, which chooses the alternative whose constraints the
+browser checks and whose widget edits the value. Node-level alternatives with their own
+properties are not offered as a choice, and nested values reached through complex paths
+are read-only.
+
 A class that a node shape targets gets **New instance** in the schema tab, which opens an
 empty form at `/ui/datasets/{name}/edit?class=…`. The first save mints the resource's IRI
 from the `forms` setting's `newIri`, a `urn:uuid:` IRI by default, writes its `rdf:type`
@@ -3669,7 +3685,9 @@ branch.
 A save sends the values the form loaded for each field it changes. When another commit
 changed one of those fields meanwhile, the form lists the value it loaded, the value now
 stored and the person's own, and **Keep mine** or **Take the stored values** settles each
-field before saving again. Changes to other fields never conflict.
+field before saving again. Changes to other fields never conflict. The changes to nested
+children and lists go into the same commit as the rest of the form, and a child that
+another commit removed meanwhile shows a conflict on its parent's field.
 
 The `forms` settings kind sets the shapes source, the shapes graphs, where saves go, the
 branch name template, the graph that new values go to and how new instances get IRIs
@@ -6378,8 +6396,16 @@ since the form loaded it, `save` writes nothing and raises `ConflictError` with 
 `form-conflict` and `fields`, a list of the fields and the values stored now. Both calls
 take `author`, `timeout` and `cancel`, and `check` holds the writer lock while it runs.
 `InvalidInputError` reports a change the form cannot take, such as a field that is not in
-the form or a blank node, and `WriteRejectedError` reports a change that a rejecting guard
-refuses.
+the form, and `WriteRejectedError` reports a change that a rejecting guard refuses.
+
+`ds.forms.model(focus, nested=True)` also returns `nestedNodes`, the blank-node children
+that `sh:node` fields reach, and `templates`, the empty forms of new children. A change
+then takes `nested`, a list of entries that each name a child's `node`, its `parent` and
+the parent's `field`, with the child's own `changes` and `expect`. A new child is a blank
+node term whose label the request chooses and which the parent field's `add` names.
+Removing a stored child's term from the parent field deletes the child. A list field's
+change gives the whole new list as `list`, and its `expect` holds the members the form
+loaded, in order.
 
 Long administration operations accept `cancel`, `progress` and `timeout`. A progress
 callback receives a fraction and a message. Reports come at most once per 100 ms, and

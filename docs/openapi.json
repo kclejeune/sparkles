@@ -30647,6 +30647,14 @@
             }
           },
           {
+            "description": "Also answer the blank-node children that fields declaring `sh:node` reach (`nestedNodes`) and the empty forms of new children (`templates`). A nested model past its allowances answers the flat form with `nested.refused`.",
+            "in": "query",
+            "name": "nested",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
             "$ref": "#/components/parameters/branch"
           },
           {
@@ -30677,7 +30685,7 @@
                     },
                     "fields": {
                       "items": {
-                        "description": "`{id, path, inverse, editable, reason?, label, description?, group, order, widget, editor?, viewer?, constraints, sources, values}`, where each value is `{term, graph, label?, readOnly?}`.",
+                        "description": "`{id, path, inverse, editable, reason?, label, description?, group, order, widget, editor?, viewer?, constraints, sources, values}`, where each value is `{term, graph, label?, readOnly?, items?}` and `items` lists the members of a list field's `rdf:List`. `constraints.list` holds a list field's lengths and member constraints, and `constraints.or` the options of `sh:or` or `sh:xone` over value shapes.",
                         "type": "object"
                       },
                       "type": "array"
@@ -30715,6 +30723,17 @@
                         "null"
                       ]
                     },
+                    "nested": {
+                      "description": "`{refused}`: why the nested model was refused, when it was.",
+                      "type": "object"
+                    },
+                    "nestedNodes": {
+                      "description": "With `nested=true`: `{id, term, anchors, …}` of each stored child, with the fields of a form model. Each anchor is `{parent, field, graph, inverse}`, where `parent` is `root` or another child's `id`.",
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
                     "other": {
                       "items": {
                         "description": "`{predicate, values}`.",
@@ -30729,6 +30748,13 @@
                     "shapes": {
                       "description": "`{source, nodeShapes, missing?, unknownHints}`.",
                       "type": "object"
+                    },
+                    "templates": {
+                      "description": "With `nested=true`: `{node, …}`, the empty form of a new child under a field whose `constraints.node` is `node`.",
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
                     },
                     "types": {
                       "items": {
@@ -30789,7 +30815,7 @@
     },
     "/$/forms/{ds}/check": {
       "post": {
-        "description": "Turns the changes into one update of `DELETE DATA` and `INSERT DATA`, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.",
+        "description": "Turns the changes, with those of nested children, into the quads one update deletes and inserts, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#editing-forms"
         },
@@ -30813,8 +30839,9 @@
                     "items": {
                       "properties": {
                         "add": {
+                          "description": "Values to add. A blank node is a new child that `nested` describes.",
                           "items": {
-                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
                             "type": "object"
                           },
                           "type": "array"
@@ -30823,9 +30850,18 @@
                           "description": "The field's id, its path in SPARQL syntax.",
                           "type": "string"
                         },
-                        "remove": {
+                        "list": {
+                          "description": "For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty.",
                           "items": {
-                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "remove": {
+                          "description": "Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it.",
+                          "items": {
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
                             "type": "object"
                           },
                           "type": "array"
@@ -30845,12 +30881,12 @@
                   "expect": {
                     "additionalProperties": {
                       "items": {
-                        "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                        "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
                         "type": "object"
                       },
                       "type": "array"
                     },
-                    "description": "The values the form loaded, by field id, for every changed field.",
+                    "description": "The values the form loaded, by field id, for every changed field, and for a list field the members of its list in order.",
                     "type": "object"
                   },
                   "focus": {
@@ -30860,6 +30896,82 @@
                   "message": {
                     "description": "The commit message.",
                     "type": "string"
+                  },
+                  "nested": {
+                    "description": "Changes to nested blank-node children, committed atomically with `changes`. Each entry names its `node`, the `parent` it hangs from (absent for the root, else another entry's node) and the parent's `field`. A stored child must be a visible value of that field now, and every node between it and the root needs an entry.",
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "changes": {
+                          "items": {
+                            "properties": {
+                              "add": {
+                                "description": "Values to add. A blank node is a new child that `nested` describes.",
+                                "items": {
+                                  "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "field": {
+                                "description": "The field's id, its path in SPARQL syntax.",
+                                "type": "string"
+                              },
+                              "list": {
+                                "description": "For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty.",
+                                "items": {
+                                  "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "remove": {
+                                "description": "Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it.",
+                                "items": {
+                                  "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "required": [
+                              "field"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "expect": {
+                          "additionalProperties": {
+                            "items": {
+                              "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "description": "For a stored child, the values the form loaded for every changed field.",
+                          "type": "object"
+                        },
+                        "field": {
+                          "description": "The parent's field id.",
+                          "type": "string"
+                        },
+                        "node": {
+                          "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                          "type": "object"
+                        },
+                        "parent": {
+                          "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "node",
+                        "field"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
                   },
                   "shapes": {
                     "description": "The shapes the form was built from, when not the setting's.",
@@ -30891,7 +31003,7 @@
                       "type": "string"
                     },
                     "conflicts": {
-                      "description": "`{id, now}` of each changed field whose stored values differ from `expect`.",
+                      "description": "`{id, node?, now}` of each changed field whose stored values differ from `expect`, with the nested `node` it belongs to, and of each parent field a stored child no longer hangs from.",
                       "items": {
                         "type": "object"
                       },
@@ -30968,7 +31080,7 @@
     },
     "/$/forms/{ds}/save": {
       "post": {
-        "description": "Commits the changes as one update with the message, when the stored values of every changed field are still those `expect` names, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.",
+        "description": "Commits the changes, with those of nested children, as one update with the message, when the stored values of every changed field are still those `expect` names and every stored child still hangs from its parent, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now` and nested `node`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#editing-forms"
         },
@@ -30992,8 +31104,9 @@
                     "items": {
                       "properties": {
                         "add": {
+                          "description": "Values to add. A blank node is a new child that `nested` describes.",
                           "items": {
-                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
                             "type": "object"
                           },
                           "type": "array"
@@ -31002,9 +31115,18 @@
                           "description": "The field's id, its path in SPARQL syntax.",
                           "type": "string"
                         },
-                        "remove": {
+                        "list": {
+                          "description": "For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty.",
                           "items": {
-                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "remove": {
+                          "description": "Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it.",
+                          "items": {
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
                             "type": "object"
                           },
                           "type": "array"
@@ -31024,12 +31146,12 @@
                   "expect": {
                     "additionalProperties": {
                       "items": {
-                        "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                        "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
                         "type": "object"
                       },
                       "type": "array"
                     },
-                    "description": "The values the form loaded, by field id, for every changed field.",
+                    "description": "The values the form loaded, by field id, for every changed field, and for a list field the members of its list in order.",
                     "type": "object"
                   },
                   "focus": {
@@ -31039,6 +31161,82 @@
                   "message": {
                     "description": "The commit message.",
                     "type": "string"
+                  },
+                  "nested": {
+                    "description": "Changes to nested blank-node children, committed atomically with `changes`. Each entry names its `node`, the `parent` it hangs from (absent for the root, else another entry's node) and the parent's `field`. A stored child must be a visible value of that field now, and every node between it and the root needs an entry.",
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "changes": {
+                          "items": {
+                            "properties": {
+                              "add": {
+                                "description": "Values to add. A blank node is a new child that `nested` describes.",
+                                "items": {
+                                  "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "field": {
+                                "description": "The field's id, its path in SPARQL syntax.",
+                                "type": "string"
+                              },
+                              "list": {
+                                "description": "For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty.",
+                                "items": {
+                                  "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "remove": {
+                                "description": "Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it.",
+                                "items": {
+                                  "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "required": [
+                              "field"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "expect": {
+                          "additionalProperties": {
+                            "items": {
+                              "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "description": "For a stored child, the values the form loaded for every changed field.",
+                          "type": "object"
+                        },
+                        "field": {
+                          "description": "The parent's field id.",
+                          "type": "string"
+                        },
+                        "node": {
+                          "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                          "type": "object"
+                        },
+                        "parent": {
+                          "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "node",
+                        "field"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
                   },
                   "shapes": {
                     "description": "The shapes the form was built from, when not the setting's.",

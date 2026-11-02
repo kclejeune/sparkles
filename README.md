@@ -181,8 +181,8 @@ The [benchmark reports](docs/benchmarks/README.md) give the full results, method
 The web UI is embedded in the server at `/ui/`. The first table shows what sets Sparkles
 apart: time travel, branch merges, forms generated from shapes, GraphRAG communities,
 questions in plain language, agent memory, path finding, inference, maps, validation,
-graph algorithms, facets, the embedding map and the visual query builder. The collapsed
-panel below it has more workflows and detail views.
+graph algorithms, facets, the embedding map, the visual query builder and the ontology
+editor. The collapsed panel below it has more workflows and detail views.
 
 <table>
   <tr>
@@ -248,6 +248,22 @@ panel below it has more workflows and detail views.
   <tr>
     <td>A query's pattern drawn beside its text</td>
     <td>A query built on the canvas from the schema</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/ontology-editor.png" alt="The ontology editor with the class tree of a university ontology and the frame of Professor, listing its labels in French and English, its superclasses Employee and teaches some Course, its instance and an axiom on its range, each with an add field"></td>
+    <td><img src="docs/images/ontology-inferred.png" alt="The ontology editor with the asserted and inferred class trees side by side, the EL classifier placing Professor under Teacher, which is defined as a Person who teaches some Course"></td>
+  </tr>
+  <tr>
+    <td>The ontology editor: class trees and an entity's frame</td>
+    <td>Asserted and inferred class hierarchies side by side</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/forms-nested.png" alt="The editing form of a SKOS concept with its SKOS-XL labels as nested forms, the stored label edited to All animals and a new French label added from the label shape's template, with the previewed commit listing the triples it adds and removes"></td>
+    <td><img src="docs/images/forms-list.png" alt="The editing form of a SKOS collection, with its member chosen as a Concept among the alternatives of sh:or and its ordered member list after fish moved up, each member with buttons that move or remove it"></td>
+  </tr>
+  <tr>
+    <td>Nested blank-node children edited in one form and one commit</td>
+    <td>An ordered list editor and a choice among sh:or alternatives</td>
   </tr>
 </table>
 
@@ -326,6 +342,14 @@ panel below it has more workflows and detail views.
   <tr>
     <td>Allowed models and per-model options as form fields</td>
     <td>Errors beside the fields of the model configuration</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/ontology-preview.png" alt="The preview of an ontology edit that creates the class teaching assistant, listing the declaration, label and subclass axioms it adds, the three triples it writes and the commit message"></td>
+    <td></td>
+  </tr>
+  <tr>
+    <td>An ontology edit previewed as axioms and triples before it commits</td>
+    <td></td>
   </tr>
 </table>
 

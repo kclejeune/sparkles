@@ -24,6 +24,18 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+Editing forms edit nested blank-node children, SHACL 1.2 lists and `sh:or` or `sh:xone`
+value alternatives (spec U02, roadmap item 21). `GET /$/forms/{ds}?nested=true` returns
+the children that `sh:node` fields reach and the empty forms of new ones, and check and
+save bodies take `nested` node changes and `list` field changes, which commit with the
+root's changes in one guarded update. The save rechecks every child's anchor under the
+writer lock and answers a conflict on the parent field when a child is gone. Removing a
+child deletes its triples when nothing else refers to it. The browser shows nested forms
+with **Add**, an ordered list editor and a **Kind of** select for alternatives, and the
+Rust library and Python's `ds.forms.model(…, nested=True)` expose the same model. Change
+bodies now accept blank node terms, a conflict on a child's field carries the child's
+`node`, and a form model's values carry a list's `items`.
+
 The web UI has an ontology editor, the **Ontology** page (spec U12, roadmap item 457). It
 shows trees of classes, object, data and annotation properties and individuals, an entity
 frame with its axioms in Manchester syntax, an annotation editor with language tags and

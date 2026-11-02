@@ -18,7 +18,6 @@ mod imp {
     use sparkles::Error;
     use sparkles::commit::AnnotatedCommit;
     use sparkles::forms::{FieldChange, FormChange, FormCheck, FormRequest, FormSettings};
-    use sparkles::overview::rdf_term_from_json;
     use sparkles::preview::{Outcome, Preview};
     use sparkles::sparql::QueryOptions;
     use std::collections::BTreeMap;
@@ -86,15 +85,10 @@ mod imp {
     fn term(ob: &Bound<'_, PyAny>, what: &str) -> PyResult<Term> {
         if ob.cast::<PyMapping>().is_ok() {
             let j: J = admin::from_py(ob, what)?;
-            return rdf_term_from_json(&j, what).py(ob.py());
+            // a blank node names a stored nested child by its model label, or a new one
+            return sparkles::forms::term_from_json(&j, what).py(ob.py());
         }
-        match term_from_py(ob)? {
-            Term::BlankNode(_) => Err(invalid(
-                ob.py(),
-                format!("{what}: blank nodes cannot be named in a change"),
-            )),
-            t => Ok(t),
-        }
+        term_from_py(ob)
     }
 
     fn terms(ob: Option<Bound<'_, PyAny>>, what: &str) -> PyResult<Vec<Term>> {
@@ -128,11 +122,13 @@ mod imp {
             let k = k.extract::<String>().unwrap_or_default();
             if !matches!(
                 k.as_str(),
-                "focus" | "class" | "changes" | "expect" | "message"
+                "focus" | "class" | "changes" | "expect" | "message" | "nested"
             ) {
                 return Err(invalid(
                     py,
-                    format!("unknown member '{k}': focus, class, changes, expect and message"),
+                    format!(
+                        "unknown member '{k}': focus, class, changes, expect, message and nested"
+                    ),
                 ));
             }
         }
@@ -161,10 +157,15 @@ mod imp {
             }
             let field = string(&c, "field")?
                 .ok_or_else(|| invalid(py, format!("changes[{i}].field: a field id")))?;
+            let list = match get(&c, "list")? {
+                Some(l) if !l.is_none() => Some(terms(Some(l), &format!("changes[{i}].list"))?),
+                _ => None,
+            };
             changes.push(FieldChange {
                 field,
                 remove: terms(get(&c, "remove")?, &format!("changes[{i}].remove"))?,
                 add: terms(get(&c, "add")?, &format!("changes[{i}].add"))?,
+                list,
             });
         }
         let mut expect = BTreeMap::new();
@@ -194,6 +195,14 @@ mod imp {
             expect,
             message: string(m, "message")?,
             settings,
+            // nested entries name blank nodes, so they take the JSON spelling of the route
+            nested: match get(m, "nested")? {
+                Some(n) if !n.is_none() => {
+                    let j: J = admin::from_py(&n, "nested")?;
+                    sparkles::forms::nested_from_json(Some(&j)).py(py)?
+                }
+                _ => Vec::new(),
+            },
         })
     }
 
@@ -207,6 +216,7 @@ mod imp {
         at: Option<&Bound<'py, PyAny>>,
         lang: Option<String>,
         writable: bool,
+        nested: bool,
         timeout: Option<f64>,
         cancel: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -240,6 +250,10 @@ mod imp {
         req.lang = lang;
         req.writable = writable;
         let (opts, flag) = options(timeout, cancel, None)?;
+        if nested {
+            let model = interrupt::run(py, &flag, move || ds.forms().nested_model(&req, &opts))?;
+            return admin::to_py(py, &model);
+        }
         let model = interrupt::run(py, &flag, move || ds.forms().model(&req, &opts))?;
         admin::to_py(py, &model)
     }
@@ -455,8 +469,10 @@ impl PyForms {
     /// setting (`shapes`, `graphs`, `targetGraph`, `newIri` and the others), with
     /// `shapes` choosing between `guard`, `graphs` and `drafted`. `at` opens the form at
     /// a past state, which is never editable. `writable=False` makes every field
-    /// read-only. Returns the model as a dict.
-    #[pyo3(signature = (focus = None, *, class_ = None, settings = None, at = None, lang = None, writable = true, timeout = None, cancel = None))]
+    /// read-only. `nested=True` also returns the blank-node children that fields
+    /// declaring `sh:node` reach (`nestedNodes`) and the empty forms of new children
+    /// (`templates`). Returns the model as a dict.
+    #[pyo3(signature = (focus = None, *, class_ = None, settings = None, at = None, lang = None, writable = true, nested = false, timeout = None, cancel = None))]
     #[allow(clippy::too_many_arguments)]
     fn model<'py>(
         &self,
@@ -467,6 +483,7 @@ impl PyForms {
         at: Option<&Bound<'py, PyAny>>,
         lang: Option<String>,
         writable: bool,
+        nested: bool,
         timeout: Option<f64>,
         cancel: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -474,13 +491,13 @@ impl PyForms {
         #[cfg(feature = "shacl")]
         {
             imp::model(
-                py, ds, focus, class_, settings, at, lang, writable, timeout, cancel,
+                py, ds, focus, class_, settings, at, lang, writable, nested, timeout, cancel,
             )
         }
         #[cfg(not(feature = "shacl"))]
         {
             let _ = (
-                ds, focus, class_, settings, at, lang, writable, timeout, cancel,
+                ds, focus, class_, settings, at, lang, writable, nested, timeout, cancel,
             );
             Err(missing(py))
         }
