@@ -383,6 +383,29 @@
     const key = conflictKey(c);
     const f = fieldOf(key);
     if (!f || !model) return;
+    if (!take && f.constraints.node?.length) {
+      // the person keeps a child that another commit removed: it is saved as a new child
+      // with all its values, and so are the stored children under it
+      const lost = (entries[key] ?? [])
+        .map((e) => e.term)
+        .filter(
+          (t): t is Term =>
+            t?.type === 'bnode' && !!nodes[t.value] && !c.now.some((n) => sameTerm(n, t)),
+        )
+        .map((t) => t.value as string);
+      if (lost.length) {
+        const detached = detachLost(nodes, current, lost);
+        if (!detached) {
+          toasts.push(
+            'error',
+            'This child cannot be kept',
+            'Another commit removed it, and the form cannot write it again whole. Take the stored values or reload the form.',
+          );
+          return;
+        }
+        nodes = detached;
+      }
+    }
     const graph = model.graph;
     // a list field's conflict names the members of its list
     f.values = f.constraints.list
@@ -395,18 +418,6 @@
         ]
       : c.now.map((term) => ({ term, graph }));
     if (take) entries[key] = entriesOf(f, model);
-    else if (f.constraints.node?.length) {
-      // the person keeps a child that another commit removed: it is saved as a new child
-      // with all its values, and so are the stored children under it
-      const lost = (entries[key] ?? [])
-        .map((e) => e.term)
-        .filter(
-          (t): t is Term =>
-            t?.type === 'bnode' && !!nodes[t.value] && !c.now.some((n) => sameTerm(n, t)),
-        )
-        .map((t) => t.value as string);
-      if (lost.length) nodes = detachLost(nodes, current, lost);
-    }
     conflicts = (conflicts ?? []).filter((x) => conflictKey(x) !== key);
     if (!conflicts.length) conflicts = null;
   }

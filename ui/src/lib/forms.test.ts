@@ -531,7 +531,7 @@ describe('nested children', () => {
         isNew: false,
       },
     };
-    const detached = detachLost(stored, current, ['b7']);
+    const detached = detachLost(stored, current, ['b7'])!;
     expect(detached.b7.isNew && detached.g1.isNew).toBe(true);
     // the parent field now loads no child, as the conflict said
     const m = { fields: [{ ...address, values: [] }] } as unknown as FormModel;
@@ -553,6 +553,26 @@ describe('nested children', () => {
         changes: [{ field: '<lat>', remove: [], add: [lit('52')] }],
       },
     ]);
+  });
+  it('refuses to keep a child it cannot write again whole', () => {
+    const current = { '<addr>': [address.values[0].term], 'b7 <street>': [lit('Old')] };
+    // a read-only value would be lost
+    const locked: Record<string, FormNode> = {
+      b7: {
+        ...nodes.b7,
+        fields: [{ ...street([{ term: lit('Old'), graph: null }]), editable: false }],
+      },
+    };
+    expect(detachLost(locked, current, ['b7'])).toBeNull();
+    // a child that refers to itself cannot be described as a new node
+    const cyclic: Record<string, FormNode> = { b7: { ...nodes.b7, fields: [geo] } };
+    expect(
+      detachLost(
+        cyclic,
+        { '<addr>': [address.values[0].term], 'b7 <geo>': [address.values[0].term] },
+        ['b7'],
+      ),
+    ).toBeNull();
   });
   it('drops the entries of a removed child', () => {
     const s = changeSet(model, { '<addr>': [], 'b7 <street>': [lit('New')] }, nodes);

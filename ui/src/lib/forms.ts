@@ -726,26 +726,43 @@ export function reachable(
  * the stored nodes reachable from them: their fields lose their loaded values, so a save
  * writes every value the form shows again under new nodes. A person who keeps their own
  * values of a field whose child another commit removed gets the whole child back, not
- * only the fields they changed.
+ * only the fields they changed. `null` when the form cannot rebuild the children whole:
+ * a value it cannot write (a read-only field or a value in another graph), a node
+ * reached twice (a cycle or a shared node), or a node that a node outside them also
+ * holds.
  */
 export function detachLost(
   nodes: Record<string, FormNode>,
   current: Record<string, (Term | null)[]>,
   lost: string[],
-): Record<string, FormNode> {
-  const out = { ...nodes };
+): Record<string, FormNode> | null {
+  const closure = new Set<string>();
   const queue = [...lost];
   while (queue.length) {
     const key = queue.shift()!;
-    const n = out[key];
+    const n = nodes[key];
     if (!n || n.isNew) continue;
-    const fields = n.fields.map((f) => ({ ...f, values: [] }));
-    out[key] = { ...n, fields, isNew: true };
+    if (closure.has(key)) return null;
+    closure.add(key);
     for (const f of n.fields) {
+      const now = current[fieldKey(key, f.id)] ?? [];
+      if ((!f.editable && f.values.length) || f.values.some((v) => v.readOnly)) return null;
       if (!f.constraints.node?.length) continue;
-      for (const t of current[fieldKey(key, f.id)] ?? [])
-        if (t?.type === 'bnode' && out[t.value] && !out[t.value].isNew) queue.push(t.value);
+      for (const t of now)
+        if (t?.type === 'bnode' && nodes[t.value] && !nodes[t.value].isNew) queue.push(t.value);
     }
+  }
+  // a node of the closure that a node outside it holds stays stored for that one
+  for (const [k, es] of Object.entries(current)) {
+    const owner = k.includes(' ') ? k.slice(0, k.indexOf(' ')) : null;
+    if (owner !== null && closure.has(owner)) continue;
+    if (owner === null) continue;
+    if (es.some((t) => t?.type === 'bnode' && closure.has(t.value))) return null;
+  }
+  const out = { ...nodes };
+  for (const key of closure) {
+    const n = nodes[key];
+    out[key] = { ...n, fields: n.fields.map((f) => ({ ...f, values: [] })), isNew: true };
   }
   return out;
 }
