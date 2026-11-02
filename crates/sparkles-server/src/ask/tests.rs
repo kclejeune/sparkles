@@ -177,11 +177,16 @@ fn scripted(drafts: Vec<String>, summary: Value) -> MockModel {
     })
 }
 
+/// The options of a test of the plain pipeline. The exploration, which is on by
+/// default, would add turns to scripts written for a fixed number of model calls, so
+/// its own tests turn it on.
 pub(super) fn opts(question: &str) -> AskOptions {
     AskOptions {
         dataset: "org".into(),
         question: question.into(),
         deadline: Duration::from_secs(60),
+        explore: false,
+        shape_check: false,
         ..AskOptions::default()
     }
 }
@@ -518,6 +523,13 @@ fn mentions_and_words() {
         ["Query Engine team", "Members of Query Engine", "Berlin"]
     );
     assert!(mentions("how many people are there?").is_empty());
+    assert_eq!(
+        mentions("Which museum exhibits The Scream by Munch?"),
+        ["The Scream", "Munch"]
+    );
+    assert_eq!(mentions("The Storage team?"), ["Storage"]);
+    assert_eq!(mentions("Who was on the Apollo 11 mission?"), ["Apollo 11"]);
+    assert_eq!(mentions("Who wrote the Storage guide?"), ["Storage"]);
     assert!(words("startDate of Teams").contains("team"));
     assert!(words("startDate").contains("date"));
 }
@@ -751,3 +763,233 @@ mod profile_tests;
 
 #[path = "consumer_tests.rs"]
 mod consumer_tests;
+
+/// With `explore`, a draft without a query gets one exploration of the data around the
+/// question's entities, and the next draft answers from it.
+#[test]
+fn an_exploration_follows_a_draft_without_a_query() {
+    let s = server(ORG);
+    let mock = scripted(
+        vec![
+            draft(""),
+            draft(&format!(
+                "{PREFIXES}SELECT ?t WHERE {{ ?t ex:partOf res:acme }}"
+            )),
+        ],
+        json!({}),
+    );
+    let m = models(&mock.url(), json!({}));
+    let o = AskOptions {
+        summary: false,
+        explore: true,
+        ..opts("Which teams belong to Acme?")
+    };
+    let (out, events) = run(&s, &m, &o);
+    assert_eq!(out["outcome"], "answered", "{out:#}");
+    assert_eq!(out["result"]["attempt"], 2);
+    assert!(events.contains(&"diagnosis".to_string()));
+    let explored = mock::prompt_of(&mock.requests()[1]);
+    assert!(explored.contains(repair::NO_QUERY), "{explored}");
+    assert!(
+        explored.contains("as object") && explored.contains("ex:partOf"),
+        "{explored}"
+    );
+    // without the option the first answer stands
+    let mock = scripted(vec![draft("")], json!({}));
+    let m = models(&mock.url(), json!({}));
+    let (out, _) = run(
+        &s,
+        &m,
+        &AskOptions {
+            summary: false,
+            ..opts("Which teams belong to Acme?")
+        },
+    );
+    assert_eq!(out["outcome"], "unanswerable");
+    assert_eq!(mock.requests().len(), 1);
+}
+
+/// With `shape_check`, a "How many" answer of several rows is repaired once; a repair
+/// that does not answer keeps the first answer.
+#[test]
+fn a_result_whose_shape_does_not_fit_is_repaired_once() {
+    let s = server(ORG);
+    let list = draft(&format!("{PREFIXES}SELECT ?t WHERE {{ ?t a ex:Team }}"));
+    let count = draft(&format!(
+        "{PREFIXES}SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE {{ ?t a ex:Team }}"
+    ));
+    let mock = scripted(vec![list.clone(), count], json!({}));
+    let m = models(&mock.url(), json!({}));
+    let o = AskOptions {
+        summary: false,
+        shape_check: true,
+        ..opts("How many teams are there?")
+    };
+    let (out, _) = run(&s, &m, &o);
+    assert_eq!(out["outcome"], "answered", "{out:#}");
+    assert!(
+        out["result"]["query"].as_str().unwrap().contains("COUNT"),
+        "{out:#}"
+    );
+    assert!(mock::prompt_of(&mock.requests()[1]).contains("asks how many"));
+    // the repair returns no rows, so the list stands
+    let none = draft(&format!("{PREFIXES}SELECT ?t WHERE {{ ?t a ex:Nothing }}"));
+    let mock = scripted(vec![list, none], json!({}));
+    let m = models(&mock.url(), json!({}));
+    let (out, _) = run(&s, &m, &o);
+    assert_eq!(out["outcome"], "answered", "{out:#}");
+    assert!(
+        !out["result"]["query"].as_str().unwrap().contains("Nothing"),
+        "{out:#}"
+    );
+    assert_eq!(mock.requests().len(), 2);
+    assert!(
+        out["notes"].to_string().contains("first answer stands"),
+        "{out:#}"
+    );
+}
+
+/// With `drafts`, the result that most first drafts share wins.
+#[test]
+fn drafts_vote_by_their_results() {
+    let s = server(ORG);
+    let teams = draft(&format!("{PREFIXES}SELECT ?t WHERE {{ ?t a ex:Team }}"));
+    let people = draft(&format!("{PREFIXES}SELECT ?p WHERE {{ ?p a ex:Person }}"));
+    let same = draft(&format!(
+        "{PREFIXES}SELECT DISTINCT ?x WHERE {{ ?x ex:partOf res:acme }}"
+    ));
+    let mock = scripted(vec![people, teams, same], json!({}));
+    let m = models(&mock.url(), json!({}));
+    let o = AskOptions {
+        summary: false,
+        drafts: 3,
+        ..opts("Which teams are there?")
+    };
+    let mut votes = Vec::new();
+    let mut on = |e: &str, v: &Value| {
+        if e == "vote" {
+            votes.push(v.clone());
+        }
+    };
+    let out = ask(&s, &m, &Principal::local(), &o, &mut on);
+    assert_eq!(out["outcome"], "answered", "{out:#}");
+    assert!(
+        out["result"]["query"].as_str().unwrap().contains("ex:Team"),
+        "{out:#}"
+    );
+    assert_eq!(votes[0]["drafts"], 3);
+    assert_eq!(votes[0]["agree"], 2);
+    assert_eq!(votes[0]["chosen"], 1);
+    assert_eq!(out["usage"]["modelCalls"], 3);
+}
+
+#[test]
+fn a_preview_asks_one_draft_and_runs_no_vote() {
+    let s = server(ORG);
+    let teams = draft(&format!("{PREFIXES}SELECT ?t WHERE {{ ?t a ex:Team }}"));
+    let people = draft(&format!("{PREFIXES}SELECT ?p WHERE {{ ?p a ex:Person }}"));
+    let mock = scripted(vec![teams, people], json!({}));
+    let m = models(&mock.url(), json!({}));
+    let o = AskOptions {
+        summary: false,
+        run: false,
+        drafts: 2,
+        ..opts("Which teams are there?")
+    };
+    let mut votes = 0;
+    let mut on = |e: &str, _: &Value| votes += usize::from(e == "vote");
+    let out = ask(&s, &m, &Principal::local(), &o, &mut on);
+    assert_eq!(out["outcome"], "checked", "{out:#}");
+    assert_eq!(votes, 0);
+    assert_eq!(out["usage"]["modelCalls"], 1);
+}
+
+#[test]
+fn drafts_that_fail_the_check_do_not_vote() {
+    let s = server(ORG);
+    let valid = draft(&format!("{PREFIXES}ASK {{ res:acme a ex:Organization }}"));
+    let unknown = draft(&format!("{PREFIXES}ASK {{ res:acme a ex:Organisation }}"));
+    let mock = scripted(vec![valid, unknown.clone(), unknown], json!({}));
+    let m = models(&mock.url(), json!({}));
+    let o = AskOptions {
+        summary: false,
+        drafts: 3,
+        ..opts("Is Acme an organization?")
+    };
+    let mut votes = Vec::new();
+    let mut on = |e: &str, v: &Value| {
+        if e == "vote" {
+            votes.push(v.clone());
+        }
+    };
+    let out = ask(&s, &m, &Principal::local(), &o, &mut on);
+    assert_eq!(out["outcome"], "answered", "{out:#}");
+    assert_eq!(out["result"]["attempt"], 1, "{out:#}");
+    assert_eq!(votes[0]["withRows"], 1);
+    assert_eq!(votes[0]["chosen"], 0);
+}
+
+#[test]
+fn only_the_exploration_is_on_by_default() {
+    let o = AskOptions::default();
+    assert!(o.explore);
+    assert!(!o.shape_check && !o.type_hints);
+    assert_eq!(o.drafts, 1);
+}
+
+#[test]
+fn a_shape_repair_shows_rows_only_to_a_pair_that_may_receive_them() {
+    let s = server(ORG);
+    for rows in [false, true] {
+        let list = draft(&format!("{PREFIXES}SELECT ?t WHERE {{ ?t a ex:Team }}"));
+        let count = draft(&format!(
+            "{PREFIXES}SELECT (COUNT(?t) AS ?n) WHERE {{ ?t a ex:Team }}"
+        ));
+        let mock = scripted(vec![list, count], json!({}));
+        let m = models(&mock.url(), json!({}));
+        let o = AskOptions {
+            summary: false,
+            shape_check: true,
+            report_context: rows,
+            ..opts("How many teams are there?")
+        };
+        let (out, _) = run(&s, &m, &o);
+        assert_eq!(out["outcome"], "answered", "{out:#}");
+        let repair = mock::prompt_of(&mock.requests()[1]);
+        assert!(repair.contains("does not fit the question"), "{repair}");
+        assert_eq!(repair.contains("Its first rows"), rows, "{repair}");
+    }
+}
+
+#[test]
+fn a_failed_shape_repair_streams_only_the_first_answer() {
+    let s = server(ORG);
+    let list = draft(&format!("{PREFIXES}SELECT ?t WHERE {{ ?t a ex:Team }}"));
+    let calls = Mutex::new(0);
+    // the first draft answers, and the repair's provider then fails
+    let mock = MockModel::start(move |_, _| {
+        let mut n = calls.lock();
+        *n += 1;
+        if *n == 1 {
+            (200, mock::openai(&list))
+        } else {
+            (500, json!({ "error": { "message": "down" } }))
+        }
+    });
+    let m = models(&mock.url(), json!({}));
+    let o = AskOptions {
+        summary: false,
+        shape_check: true,
+        ..opts("How many teams are there?")
+    };
+    let mut events = Vec::new();
+    let mut on = |e: &str, _: &Value| events.push(e.to_string());
+    let out = ask(&s, &m, &Principal::local(), &o, &mut on);
+    assert_eq!(out["outcome"], "answered", "{out:#}");
+    assert!(!events.contains(&"error".to_string()), "{events:?}");
+    assert_eq!(
+        events.iter().filter(|e| *e == "result").count(),
+        1,
+        "{events:?}"
+    );
+}

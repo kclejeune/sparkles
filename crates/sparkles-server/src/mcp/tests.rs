@@ -493,6 +493,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "graphs": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20,"description":"Graph IRIs to search, or `default` (default: every graph you may read)"},
 "vectors": {"type":"boolean","default":true,"description":"false searches by label and full text only, so no mention or context is embedded by a vector index's provider"},
                 "evidence": {"type":"boolean","default":false,"description":"Include versioned query-view evidence, retained types and labels, and explicit completeness bounds; never a uniqueness proof"},
+                "popularity": {"type":"boolean","default":false,"description":"Order label matches by how many triples name each as their object, counted up to 2000, and return that count as uses"},
                 "reasoning": rs,
                 "timeoutSeconds": to,
                 "atCommit": at, "at": sel}}),

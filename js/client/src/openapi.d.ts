@@ -4749,6 +4749,10 @@ export interface components {
                 query: string;
                 question: string;
             }[];
+            /** @description First drafts whose results vote on the query, 1 to 5. Over the dataset's `repairs.drafts`. */
+            drafts?: number;
+            /** @description Explore the data once after a draft without a query or with an empty result. Over the dataset's `repairs.explore`. */
+            explore?: boolean;
             /** @description The rows returned in `result`, 1000 by default. */
             maxRows?: number;
             /**
@@ -4765,10 +4769,14 @@ export interface components {
             reviewedOnly?: boolean;
             /** @description Whether to run the checked query. `true` by default. */
             run?: boolean;
+            /** @description Repair once when the result does not fit the question's form. Over the dataset's `repairs.shapeCheck`. */
+            shapeCheck?: boolean;
             /** @description Whether to summarize the rows. `true` by default when the dataset sends rows. */
             summary?: boolean;
             /** @description The id of an earlier ask of the caller. Drafting starts at the pair after the one that drafted it. */
             tryHarder?: string;
+            /** @description Link mentions with the classes the words around them name. Over the dataset's `repairs.typeHints`. */
+            typeHints?: boolean;
         };
         /** @description The whole answer of an ask in the JSON form. */
         AskResult: {
@@ -4955,6 +4963,17 @@ export interface components {
             historyDays?: number;
             ingest?: boolean;
             optimize?: boolean;
+            /** @description The repair turns of the dataset's asks, which a request may override. */
+            repairs?: {
+                /** @description First drafts whose results vote on the query, 1 to 5. 1 by default. */
+                drafts?: number;
+                /** @description Explore the data once after a draft without a query or with an empty result. `true` by default. */
+                explore?: boolean;
+                /** @description Repair once when the result does not fit the question's form. `false` by default. */
+                shapeCheck?: boolean;
+                /** @description Link mentions with the classes the words around them name. `false` by default. */
+                typeHints?: boolean;
+            };
             /** @description Role lists that replace the server's for this dataset. */
             roles?: {
                 draft?: {
@@ -8483,7 +8502,7 @@ export interface components {
                 cacheWrite1hPerMTok?: number;
                 /**
                  * Cache write price
-                 * @description The price of one million input tokens written to the prompt cache with the 5-minute TTL.
+                 * @description The price of one million input tokens written to the prompt cache with the shorter TTL, five minutes for the anthropic kind and 30 minutes for OpenAI.
                  */
                 cacheWritePerMTok?: number;
                 /**
@@ -8504,6 +8523,12 @@ export interface components {
              * @description Text added before each query, replacing the snapshot's query prompt.
              */
             queryPrefix?: string;
+            /**
+             * Reasoning effort
+             * @description How much a reasoning model thinks before it answers, sent as the openai kind's reasoning_effort and the anthropic kind's output_config.effort. The provider decides which values a model accepts. An openai model with an effort limits its output with max_completion_tokens and sends a temperature only when one is set.
+             * @enum {string}
+             */
+            reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
             /**
              * Repository
              * @description The Hugging Face repository that holds the model snapshot.
@@ -8675,7 +8700,7 @@ export interface components {
                 cacheWrite1hPerMTok?: number;
                 /**
                  * Cache write price
-                 * @description The price of one million input tokens written to the prompt cache with the 5-minute TTL.
+                 * @description The price of one million input tokens written to the prompt cache with the shorter TTL, five minutes for the anthropic kind and 30 minutes for OpenAI.
                  */
                 cacheWritePerMTok?: number;
                 /**
@@ -8693,12 +8718,12 @@ export interface components {
             };
             /**
              * Prompt caching
-             * @description Prompt caching of the Anthropic API. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache.
+             * @description Prompt caching of the Anthropic API. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache. The TTL applies to the anthropic kind only.
              */
             promptCaching?: {
                 /**
                  * Prompt caching
-                 * @description Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL.
+                 * @description Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL. An openai provider also takes `enabled`, false by default, in its JSON configuration: true sends an Ask repair as the first draft's user message unchanged followed by a second user message, so that OpenAI's own caching serves the repair.
                  * @default true
                  */
                 enabled: boolean;
@@ -8715,6 +8740,12 @@ export interface components {
              * @description Text added before each query, replacing the snapshot's query prompt.
              */
             queryPrefix?: string;
+            /**
+             * Reasoning effort
+             * @description How much a reasoning model thinks before it answers, sent as the openai kind's reasoning_effort and the anthropic kind's output_config.effort. The provider decides which values a model accepts. An openai model with an effort limits its output with max_completion_tokens and sends a temperature only when one is set.
+             * @enum {string}
+             */
+            reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
             /**
              * Repository
              * @description The Hugging Face repository that holds the model snapshot.
@@ -8867,7 +8898,7 @@ export interface components {
                     structuredOutput: "auto" | "json-schema" | "json-object" | "tool" | "text";
                 }[];
                 name: string;
-                /** @description For the anthropic kind: whether stable prompt prefixes are marked for the provider's cache, and their TTL. */
+                /** @description For the anthropic kind: whether stable prompt prefixes are marked for the provider's cache, and their TTL. For the openai kind, enabled true sends an Ask repair as the first draft's user message followed by a second user message. */
                 promptCaching?: {
                     enabled: boolean;
                     /** @enum {string} */

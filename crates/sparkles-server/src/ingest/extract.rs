@@ -433,6 +433,7 @@ pub fn extract(
                 Part::cached(vocabulary_prompt(&vocab)),
                 Part::text(chunk_prompt(&context, &chunk)),
             ],
+            follow: None,
         };
         let answer = loop {
             let Some(pair) = pairs.get(pos) else {

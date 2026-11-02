@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Convert the QALD-9-plus DBpedia test split into an Ask question set.
+"""Convert a QALD-9-plus DBpedia split into an Ask question set.
 
-The split comes from the KGQA/QALD_9_plus repository at a pinned commit, and its
+The test split is the default, and `--split train` converts the training split, whose
+question IDs carry a `train-` part so that they never meet a test ID. The split comes from the KGQA/QALD_9_plus repository at a pinned commit, and its
 SHA256 is checked before use. The data is licensed CC BY 4.0 and is not vendored.
 With --loc and --sparkles, each gold query is run on a DBpedia database. Questions
 whose gold returns nothing or that the evaluator cannot score are dropped and counted
@@ -36,14 +37,29 @@ from evaluator import (
 
 REPO = "KGQA/QALD_9_plus"
 COMMIT = "b9fb0380902e6935efc9505170bc3652e8c242c1"
-FILE = "data/qald_9_plus_test_dbpedia.json"
-SHA256 = "7831fd113d9c5ad66c429bfb39b079fdb101578e57c095777a468f206201787f"
+SPLITS = {
+    "test": (
+        "data/qald_9_plus_test_dbpedia.json",
+        "7831fd113d9c5ad66c429bfb39b079fdb101578e57c095777a468f206201787f",
+        "qald9p-",
+    ),
+    "train": (
+        "data/qald_9_plus_train_dbpedia.json",
+        "7eba241064c08212fab7a32501639a5dfb86b03181cc1fc798e93efbadfd8059",
+        "qald9p-train-",
+    ),
+}
+FILE, SHA256, _ = SPLITS["test"]
 URL = f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{FILE}"
 SIZE_CAP = 8 * 1024 * 1024
 
 
-def fetch(target):
-    with urllib.request.urlopen(URL, timeout=60) as reply:
+def url(split):
+    return f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{SPLITS[split][0]}"
+
+
+def fetch(target, split="test"):
+    with urllib.request.urlopen(url(split), timeout=60) as reply:
         data = reply.read(SIZE_CAP + 1)
     if len(data) > SIZE_CAP:
         raise Invalid("QALD-9-plus download is too large")
@@ -75,6 +91,8 @@ def published_answer(entry):
 
 
 def convert(args, source):
+    split = getattr(args, "split", "test")
+    file, sha, id_prefix = SPLITS[split]
     data = strict_json(bounded_file(source, SIZE_CAP))
     questions, dropped = (
         [],
@@ -84,7 +102,7 @@ def convert(args, source):
     scratch = pathlib.Path(tempfile.mkdtemp(prefix="qald9plus-"))
     recompute = bool(args.loc)
     for n, entry in enumerate(data["questions"]):
-        ident = "qald9p-" + str(entry["id"])
+        ident = id_prefix + str(entry["id"])
         text, query = english(entry), (entry.get("query") or {}).get("sparql")
         if not text or not isinstance(query, str) or not query.strip():
             dropped["noEnglish"].append(ident)
@@ -115,7 +133,7 @@ def convert(args, source):
         )
     out = {
         "description": (
-            "The QALD-9-plus test split over DBpedia, converted for scripts/eval-ask. "
+            f"The QALD-9-plus {split} split over DBpedia, converted for scripts/eval-ask. "
             "The text is English. Gold answers "
             + (
                 "were recomputed on the loaded DBpedia release. "
@@ -129,8 +147,8 @@ def convert(args, source):
         "source": {
             "repository": REPO,
             "commit": COMMIT,
-            "file": FILE,
-            "sha256": SHA256,
+            "file": file,
+            "sha256": sha,
             "license": "CC BY 4.0",
         },
         "goldRecomputed": recompute,
@@ -158,6 +176,7 @@ def main():
     ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
     ap.add_argument("--out", required=True, help="a new set file")
     ap.add_argument("--input", help="a local copy of the split, checked by SHA256")
+    ap.add_argument("--split", choices=sorted(SPLITS), default="test")
     ap.add_argument("--loc", help="DBpedia database directory for the gold recompute")
     ap.add_argument("--sparkles", help="absolute path of the binary, with --loc")
     ap.add_argument("--release", default="2022.12.01")
@@ -176,8 +195,8 @@ def main():
     source = args.input
     if not source:
         source = pathlib.Path(tempfile.mkdtemp(prefix="qald9plus-src-")) / "test.json"
-        fetch(source)
-    if digest(source) != SHA256:
+        fetch(source, args.split)
+    if digest(source) != SPLITS[args.split][1]:
         raise Invalid("QALD-9-plus split does not match the pinned SHA256")
     result = convert(args, source)
     with out.open("x") as f:

@@ -4653,6 +4653,32 @@ summary and the usage of each model call, and `--events` prints each step as a J
 as it happens. `--no-run` stops after the check, and `--no-summary` leaves the summary
 out.
 
+`--questions FILE` asks every question of a JSON-lines file in place of the question
+argument, or of standard input with `-`. Each line is `{"id", "question",
+"clarification"?, "tryHarder"?, "modelSecrets"?}`, and the command prints one JSON
+result per line with its `id`, in input order. The store and the model configuration
+open once, so caches stay warm across the questions as they do in a running server.
+`--jobs N` asks up to N questions at once. Every other option applies to each question,
+and each keeps its own deadline, token budget and query memory budget. A line that is
+invalid or fails gets its own error result while the rest go on. A line's
+`modelSecrets`, as `NAME=SOURCE` strings, replace the `--model-secret` of the same name
+for that question, and the question still counts against the provider's concurrency,
+request spacing and daily token limits that every other line shares.
+
+When a draft gives no query, or its query still returns no rows after the usual
+repairs, Ask explores the data once. It shows the model further link candidates for the
+question's mentions and the predicates those entities use in either direction, with
+counts, and drafts again. `--no-explore` turns this off. Three more options are off by
+default because they did not raise accuracy measurably in the
+[evaluation](benchmarks/natural-language/RESULTS.md). `--shape-check` repairs once when
+a result does not fit the form of the question, such as several rows for "How many", a
+SELECT for a yes or no question or a count for "Which", and keeps the first answer if
+the repair does not answer. `--drafts N` asks N first drafts and keeps the one whose
+checked, complete result most drafts share, at the cost of N first-draft calls.
+`--type-hints` links each mention with the classes that the words around it name. The
+exploration's sample values and a shape repair's first rows reach the model only when
+the dataset's `send` policy lets the draft and repair providers receive rows.
+
 Each query of an Ask runs under a memory budget of 2048 MiB, as in `sparkles mcp`, and
 `--query-memory-mb N` changes it, with `0` for no budget. On a database of more than ten
 million quads, the schema that grounds the question and checks the query comes from the
@@ -5109,8 +5135,18 @@ sparkles secrets set anthropic < anthropic.key
 | Preset | Kind | Endpoint | Key secret | Model |
 |---|---|---|---|---|
 | `anthropic` | `anthropic` | `https://api.anthropic.com` | `anthropic` | `claude-sonnet-5-5` |
-| `openai` | `openai` | `https://api.openai.com/v1` | `openai` | `gpt-5-mini` |
+| `openai` | `openai` | `https://api.openai.com/v1` | `openai` | `gpt-6-luna` |
 | `ollama` | `ollama` | `http://127.0.0.1:11434` | none | `qwen3:8b` |
+
+The models of the two hosted presets come from the Ask comparison in the
+[natural-language benchmark](benchmarks/natural-language/RESULTS.md#ask-across-providers).
+Each is the cheapest model per correct answer whose score on 150 held-out questions is
+within the noise of its provider's best model. GPT-6 Luna is also the cheapest of all six
+models measured that meets that bar against the best of them. The preset's entry for its
+model also sets the settings that the comparison used, a 200,000-token context, effort
+`medium` and an output limit of 4,096 tokens for Sonnet and 16,384 for Luna, whose
+reasoning counts toward it. Without a context size the server treats a model as a small
+one and trims Ask's grounding.
 
 The command refuses a provider name that is already in use. An OpenAI-compatible
 gateway, such as vLLM or LiteLLM, has no preset. Add it with the `openai` kind and its
@@ -7307,7 +7343,7 @@ models:
           endpoint: https://api.openai.com/v1
           apiKey: {secret: openai}
       roles:
-        draft: [{provider: openai, model: gpt-5-mini}]
+        draft: [{provider: openai, model: gpt-6-luna}]
   secrets:
     openai: {secretName: model-keys, key: openai}
 ```

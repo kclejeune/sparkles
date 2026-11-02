@@ -50,6 +50,8 @@ struct LinkArgs {
     vectors: Option<bool>,
     /// Include scoped, versioned evidence beyond the bounded display lists.
     evidence: Option<bool>,
+    /// Order label matches by how often the data uses each as an object.
+    popularity: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -99,6 +101,8 @@ pub(crate) struct Candidate {
     pub labels: Vec<(usize, Literal)>,
     pub type_match: bool,
     pub score: f64,
+    /// how many triples name it as their object, up to [`USE_CAP`], when counted
+    pub uses: Option<u64>,
     pub same_as: Vec<NamedNode>,
     pub triples: Vec<(NamedNode, NamedNode, Term)>,
     /// Proof applies to named types and literal labels in this call's query view.
@@ -131,6 +135,7 @@ impl Candidate {
             labels: Vec::new(),
             type_match: true,
             score: 0.0,
+            uses: None,
             same_as: Vec::new(),
             triples: Vec::new(),
             evidence: None,
@@ -270,8 +275,15 @@ impl Tools<'_> {
         let mut evidence_budget =
             (a.evidence == Some(true)).then(|| EvidenceBudget::new(self.cfg().max_bytes));
         for m in &mentions {
-            let (linked, t, v) =
-                self.link_with_evidence(&r, &setup, m, k, a.evidence == Some(true), &ctx)?;
+            let (linked, t, v) = self.link_with_evidence(
+                &r,
+                &setup,
+                m,
+                k,
+                a.evidence == Some(true),
+                a.popularity == Some(true),
+                &ctx,
+            )?;
             text_used |= t;
             vector_used |= v;
             let candidates = linked
@@ -457,7 +469,7 @@ impl Tools<'_> {
         k: usize,
         ctx: &ErrorContext,
     ) -> Result<(Linked, bool, bool), ToolError> {
-        self.link_with_evidence(r, setup, m, k, false, ctx)
+        self.link_with_evidence(r, setup, m, k, false, false, ctx)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -468,6 +480,7 @@ impl Tools<'_> {
         m: &Mention,
         k: usize,
         evidence: bool,
+        popularity: bool,
         ctx: &ErrorContext,
     ) -> Result<(Linked, bool, bool), ToolError> {
         let eng = |e| ctx.engine(e);
@@ -621,10 +634,30 @@ impl Tools<'_> {
                     mention_words.iter().all(|w| lw.contains(w))
                 });
         }
+        if popularity {
+            // Label matches that tie on the label alone are told apart by how much of
+            // the data refers to each, so a well-connected entity comes before a
+            // namesake that a few triples mention. A failed count only keeps the order.
+            let matched: Vec<NamedNode> = all
+                .iter()
+                .filter(|c| c.label_match())
+                .map(|c| c.iri.clone())
+                .collect();
+            if matched.len() > 1
+                && let Ok(uses) = use_counts(r, &matched, &setup.graphs)
+            {
+                for c in &mut all {
+                    if c.label_match() {
+                        c.uses = Some(uses.get(c.iri.as_str()).copied().unwrap_or(0));
+                    }
+                }
+            }
+        }
         all.sort_by(|a, b| {
             b.type_match
                 .cmp(&a.type_match)
                 .then_with(|| a.tier().cmp(&b.tier()))
+                .then_with(|| b.uses.cmp(&a.uses))
                 .then_with(|| b.score.total_cmp(&a.score))
                 .then_with(|| a.iri.as_str().cmp(b.iri.as_str()))
         });
@@ -730,6 +763,40 @@ impl Tools<'_> {
             })
             .collect())
     }
+}
+
+/// The most triples [`use_counts`] counts for one entity.
+pub(crate) const USE_CAP: u64 = 2000;
+
+/// How many triples of the view name each of `iris` as their object, each counted up
+/// to [`USE_CAP`] so that a hub entity costs no more than a bounded scan.
+fn use_counts(
+    r: &Reader,
+    iris: &[NamedNode],
+    graphs: &[NamedNode],
+) -> Result<HashMap<String, u64>, Error> {
+    let parts: Vec<String> = iris
+        .iter()
+        .map(|i| {
+            format!(
+                "{{ SELECT ?x WHERE {{ VALUES ?x {{ {i} }} {} }} LIMIT {USE_CAP} }}",
+                r.quads("?s ?p ?x", graphs)
+            )
+        })
+        .collect();
+    let q = format!(
+        "SELECT ?x (COUNT(*) AS ?n) WHERE {{ {} }} GROUP BY ?x",
+        parts.join(" UNION ")
+    );
+    let mut out = HashMap::new();
+    for row in r.rows(&q, Vec::new())? {
+        if let [Some(Term::NamedNode(x)), Some(Term::Literal(n))] = row.as_slice()
+            && let Ok(n) = n.value().parse::<u64>()
+        {
+            out.insert(x.as_str().to_string(), n);
+        }
+    }
+    Ok(out)
 }
 
 /// The default label predicates: those of C11 §4.4, then `skos:altLabel`.
@@ -1028,6 +1095,9 @@ fn candidate_json(
     });
     if let Some(l) = label {
         j["label"] = l.into();
+    }
+    if let Some(uses) = c.uses {
+        j["uses"] = uses.into();
     }
     if !alt.is_empty() {
         j["altLabels"] = alt.into();

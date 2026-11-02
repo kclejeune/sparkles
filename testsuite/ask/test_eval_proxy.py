@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "eval_support"))
@@ -111,8 +112,14 @@ class Upstream:
         self.script, self.calls = list(script), []
 
     def send(self, path, body, timeout):
-        self.calls.append((path, json.loads(body)))
-        step = self.script.pop(0) if self.script else (200, [], BODY)
+        sent = json.loads(body)
+        self.calls.append((path, sent))
+        # By default the model asked for answers, as the API names it.
+        step = (
+            self.script.pop(0)
+            if self.script
+            else (200, [], json.dumps(dict(REPLY, model=sent.get("model"))).encode())
+        )
         if isinstance(step, Exception):
             raise step
         return step
@@ -463,7 +470,7 @@ class Rates(unittest.TestCase):
             px.RATES,
             {
                 HAIKU: ((100, 125, 200, 10, 500), (500, 625, 1000, 50, 2500)),
-                SONNET: ((2000, 2500, 4000, 200, 10000),) * 2,
+                SONNET: ((2000, 2500, 4000, 100, 10000),) * 2,
                 OPUS: ((4000, 5000, 8000, 200, 20000),) * 2,
             },
         )
@@ -471,7 +478,7 @@ class Rates(unittest.TestCase):
     def test_cache_reads_on_every_model(self):
         usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 1000}
         self.assertEqual(px.cost(HAIKU, usage), 1000 * 10)  # $0.01 per million
-        self.assertEqual(px.cost(SONNET, usage), 1000 * 200)  # $0.20 per million
+        self.assertEqual(px.cost(SONNET, usage), 1000 * 100)  # $0.10 per million
         self.assertEqual(px.cost(OPUS, usage), 1000 * 200)  # $0.20 per million
         big = dict(usage, cache_read_input_tokens=100001)
         self.assertEqual(px.cost(HAIKU, big), 100001 * 50)
@@ -506,6 +513,47 @@ class Errors(Base):
         self.assertEqual(settle["cost"], reserve["bound"])
         self.assertEqual(proxy.handle(raw())[0], 200)
 
+    def test_a_sent_request_whose_reply_was_lost_is_recorded(self):
+        path = self.root / "replies.jsonl"
+        proxy = self.proxy(Upstream(px.UpstreamFailure("timeout", True), px.UpstreamFailure("gaierror", False)),
+                           replies=path)
+        self.assertEqual(proxy.handle(raw())[0], 502)
+        self.assertEqual(proxy.handle(raw())[0], 502)
+        rows = [json.loads(x) for x in path.read_text().splitlines()]
+        # the sent prompt counts for recall, and the one that never left is not there
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], 502)
+        self.assertIn("messages", rows[0]["request"])
+        self.assertNotIn(KEY, path.read_text())
+
+    def test_a_reply_naming_a_model_that_is_not_a_string_is_charged_as_unknown(self):
+        for served in ([], {}, 7):
+            with self.subTest(served=served):
+                name = f"m{type(served).__name__}.jsonl"
+                reply = dict(REPLY, model=served)
+                path = self.root / f"r-{name}"
+                proxy = self.proxy(Upstream((200, [], json.dumps(reply).encode())),
+                                   ledger=self.ledger(name=name), replies=path)
+                self.assertEqual(proxy.handle(raw())[0], 502)
+                reserve, settle = [x for x in self.lines(name) if x.get("op") in ("reserve", "settle")]
+                # charged as a reply of a model the table does not know
+                self.assertEqual(settle["status"], "served-model-mismatch")
+                self.assertGreater(settle["cost"], reserve["bound"])
+                self.assertEqual(len(path.read_text().splitlines()), 1)
+
+    def test_a_reply_that_breaks_the_pricing_is_held_at_its_bound(self):
+        path = self.root / "r.jsonl"
+        proxy = self.proxy(Upstream(), replies=path)
+
+        def broken(*a):
+            raise TypeError("unpriceable")
+
+        with mock.patch.object(proxy.api, "cost", broken):
+            self.assertEqual(proxy.handle(raw())[0], 502)
+        reserve, settle = [x for x in self.lines() if x.get("op") in ("reserve", "settle")]
+        self.assertEqual((settle["cost"], settle["status"]), (reserve["bound"], "failure:internal-TypeError"))
+        self.assertEqual(len(path.read_text().splitlines()), 1)
+
     def test_failure_before_the_body_left_costs_nothing(self):
         proxy = self.proxy(Upstream(px.UpstreamFailure("gaierror", False)))
         proxy.handle(raw())
@@ -522,7 +570,7 @@ class Errors(Base):
         self.assertTrue(caught.exception.sent)
 
     def test_missing_usage_settles_at_the_bound(self):
-        replies = ({"model": HAIKU}, {"usage": {"input_tokens": "x"}}, None)
+        replies = ({"model": HAIKU}, {"model": HAIKU, "usage": {"input_tokens": "x"}}, None)
         for n, reply in enumerate(replies):
             with self.subTest(reply=reply):
                 data = b"not json" if reply is None else json.dumps(reply).encode()
@@ -590,7 +638,7 @@ class Errors(Base):
         }
         self.assertEqual(
             px.cost(SONNET, usage),
-            100 * 2000 + 10 * 2500 + 20 * 4000 + 50 * 200 + 10 * 10000,
+            100 * 2000 + 10 * 2500 + 20 * 4000 + 50 * 100 + 10 * 10000,
         )
         usage = dict(usage, cache_creation={"ephemeral_5m_input_tokens": 1})
         self.assertIsNone(px.cost(SONNET, usage))
@@ -798,7 +846,7 @@ class Cap(Base):
 
     def test_the_cap_is_global_not_per_ledger_file(self):
         carry = {"name": "pilot", "cost": 1_002_560_000}
-        self.assertEqual(px.HARD_CAP, 50 * 10**9)
+        self.assertEqual(px.HARD_CAP, 95 * 10**9)
         with self.assertRaises(Invalid):
             px.Ledger(self.root / "big.jsonl", px.HARD_CAP, carry)  # with carryover
         with self.assertRaises(Invalid):
@@ -860,6 +908,69 @@ class Cap(Base):
         proxy.set_case(None)
         proxy.handle(raw())
         self.assertEqual(proxy.ledger.case_costs(), {("c1", HAIKU): 2 * HAIKU_COST})
+
+
+class ConcurrentCases(Base):
+    def test_a_case_hold_keeps_other_cases_from_its_share(self):
+        ledger = self.ledger(cap=1000)
+        self.assertTrue(ledger.hold("a", 600))
+        self.assertFalse(ledger.hold("b", 500))  # 600 held and 500 more pass 1000
+        self.assertTrue(ledger.hold("b", 400))
+        # b may not spend into what a still holds, though the cap has room.
+        with self.assertRaises(px.CapExceeded):
+            ledger.reserve(HAIKU, 401, "b")
+        ident = ledger.reserve(HAIKU, 400, "b")
+        ledger.settle(ident, 400, "ok")
+        # a spends within its own hold.
+        ident = ledger.reserve(HAIKU, 600, "a")
+        ledger.settle(ident, 100, "ok")
+        ledger.release("a")
+        ledger.release("b")
+        self.assertTrue(ledger.hold("c", 500))
+        self.assertLessEqual(ledger.spent(), 1000)
+        with self.assertRaises(Invalid):
+            ledger.hold("c", 1)
+
+    def test_a_hold_covers_only_what_its_case_spends_after_it(self):
+        ledger = self.ledger(cap=1600)
+        ident = ledger.reserve(HAIKU, 600, "a")  # an earlier run of the same case
+        ledger.settle(ident, 600, "ok")
+        self.assertTrue(ledger.hold("a", 600))
+        self.assertTrue(ledger.hold("b", 400))
+        with self.assertRaises(px.CapExceeded):
+            ledger.reserve(HAIKU, 401, "b")
+        ident = ledger.reserve(HAIKU, 600, "a")
+        ledger.settle(ident, 600, "ok")
+        self.assertLessEqual(ledger.spent(), 1600)
+
+    def test_case_tokens_route_requests_and_replies_flush_in_order(self):
+        proxy = self.proxy(Upstream(), replies=self.root / "replies.jsonl")
+        proxy.ordered_replies = True
+        ta, tb = proxy.open_case("a"), proxy.open_case("b")
+        self.assertEqual(proxy.case_for(ta), "a")
+        self.assertEqual(proxy.case_for(proxy.token), None)
+        self.assertIs(proxy.case_for("unknown"), False)
+        proxy.handle(raw(text="b1"), "b")
+        proxy.handle(raw(text="a1"), "a")
+        proxy.handle(raw(text="a2"), "a")
+        self.assertFalse((self.root / "replies.jsonl").exists())
+        proxy.flush_replies("a")
+        proxy.flush_replies("b")
+        texts = [
+            json.loads(x)["request"]["messages"][0]["content"]
+            for x in (self.root / "replies.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(texts, ["a1", "a2", "b1"])
+        self.assertEqual(proxy.case_cost("a"), 2 * HAIKU_COST)
+        self.assertTrue(proxy.wait_idle(1, case="a"))
+        proxy.close_case(ta)
+        self.assertIs(proxy.case_for(ta), False)
+
+    def test_a_refusal_counts_for_its_own_case(self):
+        proxy = self.proxy(Upstream(), ledger=self.ledger(cap=1))
+        status, _, _ = proxy.handle(raw(), "a")
+        self.assertEqual(status, 402)
+        self.assertEqual((proxy.refusals_for("a"), proxy.refusals_for("b")), (1, 0))
 
 
 class Preflight(Base):
@@ -1056,3 +1167,229 @@ class Requests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+LUNA, TERRA, SOL = px.OPENAI_MODELS
+CHAT_REPLY = {
+    "id": "chatcmpl-x",
+    "object": "chat.completion",
+    "model": LUNA + "-2026-09-30",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": '{"ok":true}'},
+                 "finish_reason": "stop"}],
+    "usage": {
+        "prompt_tokens": 1000,
+        "completion_tokens": 40,
+        "prompt_tokens_details": {"cached_tokens": 600, "cache_write_tokens": 300},
+        "completion_tokens_details": {"reasoning_tokens": 30},
+    },
+    "service_tier": "default",
+}
+
+
+def chat(model=LUNA, **extra):
+    return json.dumps(
+        dict(
+            {
+                "model": model,
+                "messages": [{"role": "system", "content": "s"},
+                             {"role": "user", "content": "q"}],
+                "max_completion_tokens": 1024,
+                "response_format": {"type": "json_object"},
+            },
+            **extra,
+        )
+    ).encode()
+
+
+class OpenAI(Base):
+    def ledger(self, cap=10**10, carryover=None, name="ledger.jsonl"):
+        ledger = px.Ledger(self.root / name, cap, carryover, provider="openai")
+        self.addCleanup(ledger.close)
+        return ledger
+
+    def proxy(self, upstream, **kw):
+        ledger = kw.pop("ledger", None) or self.ledger()
+        return px.Proxy(ledger, upstream, KEY, px.OPENAI_MODELS, api=px.OPENAI, **kw)
+
+    def reply(self, **changes):
+        return (200, [("x-request-id", "req_1")], json.dumps(dict(CHAT_REPLY, **changes)).encode())
+
+    def test_the_rate_table_is_pinned(self):
+        # OpenAI's pricing page of 2026-11-01, standard tier, in nanodollars per token:
+        # input, 30 minute write, 12 hour write, cache read, output, up to 272K and above.
+        self.assertEqual(px.OPENAI_MODELS, ("gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol"))
+        self.assertEqual(px.OPENAI_LONG_CONTEXT, 272000)
+        self.assertEqual(
+            px.OPENAI_RATES,
+            {
+                LUNA: ((100, 125, 250, 10, 500), (200, 250, 500, 20, 750)),
+                TERRA: ((1000, 1250, 2500, 50, 5000), (2000, 2500, 5000, 100, 7500)),
+                SOL: ((2000, 2500, 5000, 100, 10000), (4000, 5000, 10000, 200, 15000)),
+            },
+        )
+        self.assertEqual(px.HARD_CAPS, {"anthropic": 95 * 10**9, "openai": 50 * 10**9})
+
+    def test_cost_splits_reads_writes_and_long_context(self):
+        u = CHAT_REPLY["usage"]
+        self.assertEqual(px.openai_cost(LUNA, u), 100 * 100 + 300 * 125 + 600 * 10 + 40 * 500)
+        self.assertEqual(px.openai_cost(SOL, u), 100 * 2000 + 300 * 2500 + 600 * 100 + 40 * 10000)
+        # unreported writes are all charged as writes
+        bare = {"prompt_tokens": 1000, "completion_tokens": 0}
+        self.assertEqual(px.openai_cost(TERRA, bare), 1000 * 1250)
+        long = {"prompt_tokens": 272001, "completion_tokens": 1,
+                "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}
+        self.assertEqual(px.openai_cost(LUNA, long), 272001 * 200 + 750)
+        self.assertIsNone(px.openai_cost(LUNA, dict(u, prompt_tokens=10)))
+        self.assertIsNone(px.openai_cost(LUNA, dict(u, prompt_tokens_details=[])))
+        self.assertIsNone(px.openai_cost("claude-haiku-5-5", u))
+        # another tier is charged at least the bound and the largest premium
+        exact = px.openai_cost(LUNA, u)
+        self.assertEqual(px.openai_cost(LUNA, u, 10**9, "priority"), 10**9)
+        self.assertEqual(px.openai_cost(LUNA, u, 0, "flex"), exact * px.UNKNOWN_PREMIUM)
+
+    def test_a_request_is_checked_forwarded_and_settled(self):
+        upstream = Upstream(self.reply())
+        proxy = self.proxy(upstream, effort="medium")
+        status, headers, body = proxy.handle(chat())
+        self.assertEqual(status, 200)
+        path, sent = upstream.calls[0]
+        self.assertEqual(path, "/v1/chat/completions")
+        self.assertEqual((sent["reasoning_effort"], sent["service_tier"], sent["stream"]),
+                         ("medium", "default", False))
+        settle = [x for x in self.lines() if x.get("op") == "settle"][0]
+        self.assertEqual(settle["status"], "ok")
+        self.assertEqual(settle["cost"], px.openai_cost(LUNA, CHAT_REPLY["usage"]))
+        self.assertEqual(settle["requestId"], "req_1")
+        head = self.lines()[0]
+        self.assertEqual(head, {"ledger": 3, "provider": "openai", "capNanodollars": 10**10})
+
+    def test_refusals_cost_nothing(self):
+        upstream = Upstream()
+        proxy = self.proxy(upstream)
+        for raw in [
+            chat(model="gpt-4o"),
+            chat(max_completion_tokens=10**6),
+            chat(max_tokens=10),
+            chat(tools=[]),
+            chat(service_tier="priority"),
+            chat(prompt_cache_options={"mode": "explicit"}),
+            chat(messages=[{"role": "user", "content": [{"type": "image_url"}]}]),
+            chat(messages=[{"role": "tool", "content": "x"}]),
+            chat(response_format={"type": "text"}),
+        ]:
+            with self.subTest(raw=raw):
+                self.assertEqual(proxy.handle(raw)[0], 400)
+        self.assertEqual(upstream.calls, [])
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_another_served_model_is_charged_its_bound_and_refused(self):
+        proxy = self.proxy(Upstream(self.reply(model=TERRA)))
+        self.assertEqual(proxy.handle(chat())[0], 502)
+        settle = [x for x in self.lines() if x.get("op") == "settle"][0]
+        reserve = [x for x in self.lines() if x.get("op") == "reserve"][0]
+        self.assertEqual(settle["status"], "served-model-mismatch")
+        self.assertEqual(settle["cost"], reserve["bound"])
+        for served, ok in [(LUNA, True), (LUNA + "-2026-09-30", True),
+                           (LUNA + "-mini", False), (LUNA + "-2026-09-30x", False)]:
+            self.assertEqual(bool(px.OPENAI.served(LUNA, {"model": served})), ok, served)
+
+    def test_a_reply_of_another_model_is_priced_at_its_rates(self):
+        usage = {"prompt_tokens": 1000, "completion_tokens": 1024,
+                 "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}
+        proxy = self.proxy(Upstream(self.reply(model=SOL + "-2026-10-01", usage=usage)))
+        self.assertEqual(proxy.handle(chat())[0], 502)
+        settle = [x for x in self.lines() if x.get("op") == "settle"][-1]
+        self.assertGreaterEqual(settle["cost"], px.openai_cost(SOL, usage))
+        # a model the table does not know is charged past the dearest model's bound
+        proxy = self.proxy(Upstream(self.reply(model="gpt-7", usage=usage)), ledger=self.ledger(name="b.jsonl"))
+        self.assertEqual(proxy.handle(chat())[0], 502)
+        settle = [x for x in self.lines("b.jsonl") if x.get("op") == "settle"][-1]
+        dearest = px.openai_bound(SOL, len(json.dumps(json.loads(chat()), separators=(",", ":"))) + 50, 1024)
+        self.assertGreater(settle["cost"], px.openai_cost(SOL, usage) * px.UNKNOWN_PREMIUM - 1)
+        self.assertGreater(settle["cost"], dearest // 2)
+
+    def test_mismatch_charges_keep_the_premium_and_the_tier(self):
+        tiny = {"prompt_tokens": 1, "completion_tokens": 1}
+        proxy = self.proxy(Upstream(self.reply(model="gpt-7", usage=tiny)))
+        proxy.handle(chat())
+        settle = [x for x in self.lines() if x.get("op") == "settle"][-1]
+        payload = json.dumps(proxy.prepare(chat()), separators=(",", ":"), ensure_ascii=False)
+        dearest = px.openai_bound(SOL, len(payload.encode()), 1024)
+        self.assertGreaterEqual(settle["cost"], dearest * px.UNKNOWN_PREMIUM)
+        usage = {"prompt_tokens": 1000, "completion_tokens": 1024,
+                 "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}
+        ledger = self.ledger(name="b.jsonl")
+        proxy = self.proxy(Upstream(self.reply(model=SOL, usage=usage, service_tier="priority")), ledger=ledger)
+        proxy.handle(chat())
+        settle = [x for x in self.lines("b.jsonl") if x.get("op") == "settle"][-1]
+        self.assertGreaterEqual(settle["cost"], px.openai_cost(SOL, usage) * px.UNKNOWN_PREMIUM)
+
+    def test_a_mismatch_charge_is_held_and_reconcilable_after_reopening(self):
+        ledger = self.ledger()
+        proxy = self.proxy(Upstream(self.reply(model="gpt-7", usage={"prompt_tokens": 1, "completion_tokens": 1})),
+                           ledger=ledger)
+        proxy.handle(chat())
+        settle = [x for x in self.lines() if x.get("op") == "settle"][-1]
+        ledger.close()
+        again = px.Ledger(self.root / "ledger.jsonl", 10**10, provider="openai")
+        self.addCleanup(again.close)
+        held = {h["target"]: h for h in again.report()["heldAtBound"]}
+        self.assertEqual(held[settle["id"]]["status"], "served-model-mismatch")
+        self.assertEqual(held[settle["id"]]["cost"], settle["cost"])
+        before = again.spent()
+        again.reconcile(settle["id"], 30, "usage export row req_1")
+        self.assertEqual(again.spent(), before - settle["cost"] + 30)
+
+    def test_inconsistent_cache_counts_keep_the_bound(self):
+        for details in [{"cached_tokens": 2000}, {"cached_tokens": 600, "cache_write_tokens": 600}]:
+            u = {"prompt_tokens": 1000, "completion_tokens": 0, "prompt_tokens_details": details}
+            self.assertIsNone(px.openai_cost(LUNA, u), details)
+        proxy = self.proxy(Upstream(self.reply(usage={"prompt_tokens": 1000, "completion_tokens": 0,
+                                                      "prompt_tokens_details": {"cached_tokens": 2000}})))
+        self.assertEqual(proxy.handle(chat())[0], 200)
+        reserve, settle = [x for x in self.lines() if x.get("op") in ("reserve", "settle")]
+        self.assertEqual((settle["status"], settle["cost"]), ("usage-unknown", reserve["bound"]))
+
+    def test_the_bound_covers_a_write_of_every_input_token(self):
+        u = {"prompt_tokens": 2 * 500 + 8192, "completion_tokens": 1024,
+             "prompt_tokens_details": {"cache_write_tokens": 2 * 500 + 8192}}
+        for model in px.OPENAI_MODELS:
+            self.assertGreaterEqual(px.openai_bound(model, 500, 1024), px.openai_cost(model, u))
+
+    def test_the_child_token_comes_from_the_bearer_header(self):
+        self.assertEqual(px.OPENAI.child_token({"authorization": "Bearer abc"}), "abc")
+        self.assertEqual(px.OPENAI.child_token({"x-api-key": "abc"}), "")
+        self.assertEqual(px.OPENAI.headers("k")["authorization"], "Bearer k")
+
+    def test_ledgers_keep_their_provider(self):
+        self.ledger().close()
+        with self.assertRaises(Invalid):
+            px.Ledger(self.root / "ledger.jsonl", 10**10)  # read as an Anthropic ledger
+        with self.assertRaises(Invalid):
+            px.Ledger(self.root / "other.jsonl", 50 * 10**9 + 1, provider="openai")
+        # a version 2 ledger is an Anthropic ledger
+        old = self.root / "old.jsonl"
+        old.write_text('{"ledger":2,"capNanodollars":5}\n')
+        px.Ledger(old, 5).close()
+        with self.assertRaises(Invalid):
+            px.Ledger(old, 5, provider="openai")
+        with self.assertRaises(Invalid):
+            px.Proxy(px.Ledger(self.root / "a.jsonl", 5), Upstream(), KEY, api=px.OPENAI)
+
+    def test_preflight_asks_each_model_for_the_schema(self):
+        upstream = Upstream(*[self.reply(model=m) for m in px.OPENAI_MODELS])
+        proxy = self.proxy(upstream, effort="medium")
+        result = px.preflight(proxy, upstream)
+        self.assertIsNone(result["countTokens"])
+        self.assertEqual([b["model"] for _, b in upstream.calls], list(px.OPENAI_MODELS))
+        self.assertTrue(all(b["response_format"]["json_schema"]["strict"] for _, b in upstream.calls))
+        self.assertNotIn("x-request-id", json.dumps(result))
+
+    def test_the_child_configuration_is_an_openai_reasoning_provider(self):
+        proxy = self.proxy(Upstream(), effort="medium")
+        proxy.server_port = 5
+        p = proxy.config(200000)["models"]["providers"]["evaluation"]
+        self.assertEqual((p["kind"], p["endpoint"], p["reasoningEffort"]),
+                         ("openai", "http://127.0.0.1:5/v1", "medium"))
+        # a repair repeats the first draft's message, so it reads the cached question
+        self.assertEqual(p["promptCaching"], {"enabled": True})

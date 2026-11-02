@@ -94,6 +94,7 @@ fn model_options() -> (Vec<&'static str>, J) {
         "temperature",
         "structuredOutput",
         "requestTimeoutSecs",
+        "reasoningEffort",
         "numCtx",
         "pricing",
         "repo",
@@ -118,6 +119,7 @@ fn model_options() -> (Vec<&'static str>, J) {
         }, "0, or none for anthropic"),
         "structuredOutput": default(level, json!("auto")),
         "requestTimeoutSecs": default(seconds("Request timeout", "How long one call may take."), json!(60)),
+        "reasoningEffort": kinds(titled(string_enum(&["none", "minimal", "low", "medium", "high", "xhigh", "max"]), "Reasoning effort", "How much a reasoning model thinks before it answers, sent as the openai kind's reasoning_effort and the anthropic kind's output_config.effort. The provider decides which values a model accepts. An openai model with an effort limits its output with max_completion_tokens and sends a temperature only when one is set."), &["openai", "anthropic"]),
         "numCtx": kinds(unit(at_least(titled(int(), "Context (num_ctx)", "Ollama's context option, sent with each call."), 1.0), "tokens"), &["ollama"]),
         "pricing": {
             "type": "object",
@@ -128,7 +130,7 @@ fn model_options() -> (Vec<&'static str>, J) {
             "properties": {
                 "inputPerMTok": default(at_least(titled(num(), "Input price", "The price of one million input tokens. A model's prices replace all of the provider's prices."), 0.0), json!(0)),
                 "outputPerMTok": default(at_least(titled(num(), "Output price", "The price of one million output tokens. A model's prices replace all of the provider's prices."), 0.0), json!(0)),
-                "cacheWritePerMTok": unset(at_least(titled(num(), "Cache write price", "The price of one million input tokens written to the prompt cache with the 5-minute TTL."), 0.0), "1.25 times the input price"),
+                "cacheWritePerMTok": unset(at_least(titled(num(), "Cache write price", "The price of one million input tokens written to the prompt cache with the shorter TTL, five minutes for the anthropic kind and 30 minutes for OpenAI."), 0.0), "1.25 times the input price"),
                 "cacheWrite1hPerMTok": unset(at_least(titled(num(), "1-hour cache write price", "The price of one million input tokens written to the prompt cache with the 1-hour TTL."), 0.0), "2 times the input price"),
                 "cacheReadPerMTok": unset(at_least(titled(num(), "Cache read price", "The price of one million input tokens read from the prompt cache. Claude Opus 5.5 and Sonnet 5.5 read at 0.05 times the input price and Claude Fable 5.1 at 0.025 times."), 0.0), "0.1 times the input price"),
             },
@@ -265,11 +267,11 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
         "version": kinds(default(titled(string(), "API version", "The anthropic-version header."), json!("2023-06-01")), &["anthropic"]),
         "promptCaching": kinds({
             let mut v = ordered(&["enabled", "ttl"], json!({
-                "enabled": default(titled(boolean(), "Prompt caching", "Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL."), json!(true)),
-                "ttl": default(titled(string_enum(&["5m", "1h"]), "Cache lifetime", "How long the provider keeps a cached prefix after its last use. The 1-hour TTL doubles the write price and pays when calls sharing a prefix come more than 5 minutes apart."), json!("5m")),
+                "enabled": default(titled(boolean(), "Prompt caching", "Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL. An openai provider also takes `enabled`, false by default, in its JSON configuration: true sends an Ask repair as the first draft's user message unchanged followed by a second user message, so that OpenAI's own caching serves the repair."), json!(true)),
+                "ttl": kinds(default(titled(string_enum(&["5m", "1h"]), "Cache lifetime", "How long the provider keeps a cached prefix after its last use. The 1-hour TTL doubles the write price and pays when calls sharing a prefix come more than 5 minutes apart."), json!("5m")), &["anthropic"]),
             }));
             v["title"] = "Prompt caching".into();
-            v["description"] = "Prompt caching of the Anthropic API. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache.".into();
+            v["description"] = "Prompt caching of the Anthropic API. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache. The TTL applies to the anthropic kind only.".into();
             v
         }, &["anthropic"]),
         "tls": tls,

@@ -658,7 +658,11 @@ fn provider_presets_and_insecure_warning() {
         provider("claude"),
         json!({
             "kind": "anthropic", "endpoint": "https://api.anthropic.com",
-            "apiKey": { "secret": "anthropic" }, "models": { "claude-sonnet-5-5": { "structuredOutput": "auto" } }
+            "apiKey": { "secret": "anthropic" },
+            "models": { "claude-sonnet-5-5": {
+                "structuredOutput": "auto", "contextTokens": 200000, "maxOutputTokens": 4096,
+                "reasoningEffort": "medium"
+            } }
         })
     );
     // the assignments replace the preset's fields

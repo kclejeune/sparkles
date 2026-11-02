@@ -9,12 +9,13 @@ the same format, and `--loc DIR` runs a set against a database.
 ## Public sets
 
 `scripts/qald9plus-convert` converts the 150 questions of the QALD-9-plus DBpedia test
-split. `scripts/text2sparql-convert --set db25` converts the 100 DBpedia questions of
-Text2SPARQL'25, and `--set ck25` the 50 questions over CK25, the challenge's corporate
-graph. `scripts/lcquad2-convert` converts the 6,046 questions of the LC-QuAD 2.0 test
-split over Wikidata, and `--sample N` keeps a fixed sample of them. Each converter pins
-its source files by commit and SHA256 and fetches them, or reads local copies with
-`--input`. None of the data is kept in the repository.
+split, and `--split train` converts the 408 questions of its training split, whose IDs
+start with `qald9p-train-`. `scripts/text2sparql-convert --set db25` converts the 100
+DBpedia questions of Text2SPARQL'25, and `--set ck25` the 50 questions over CK25, the
+challenge's corporate graph. `scripts/lcquad2-convert` converts the 6,046 questions of
+the LC-QuAD 2.0 test split over Wikidata, and `--sample N` keeps a fixed sample of them.
+Each converter pins its source files by commit and SHA256 and fetches them, or reads
+local copies with `--input`. None of the data is kept in the repository.
 
 Given `--sparkles` and a database with `--loc`, a converter runs every gold query on that
 database and drops the questions whose gold returns nothing, fails or cannot be scored.
@@ -63,6 +64,32 @@ Each report row therefore also gives `executionAccuracyEqualWidth` and
 `correctByProjection`, and `--scoring-policy rdf-term-set-global-columns-v1` scores under
 the first policy.
 
+Every case is also scored under a guarded secondary policy,
+`rdf-term-set-projected-guarded-lenient-v3`, which `eval_support/guarded.py` defines.
+The strict policy above stays the score of record, and the report gives both side by
+side. The guarded score repairs evaluation defects that checks of the paid baseline
+demonstrated, and it closes the ways the projected policy can be gamed.
+
+- The gold errata `gold-errata-v1` take a question out of the guarded denominator when
+  its gold uses `SELECT *`, when a gold column is unbound in every row, as after a cast
+  that fails, or when `gold-errata-v1.json` names the question with the SHA256 of its
+  gold text and a reason.
+- A row that holds an empty string is dropped from the gold and from the answer.
+- Two literals with XSD numeric datatypes match when their values are equal.
+- A literal in the answer matches a gold IRI when its text is an `rdfs:label` or
+  `skos:prefLabel` of that IRI and of no other gold IRI. A literal in a gold column that
+  also holds IRIs matches an answer IRI the same way.
+- An answer with more than three columns beyond the gold's is wrong.
+- A pass whose extra column holds only predicates of the data, or whose projection drops
+  answer rows, is flagged, and `executionAccuracyGuardedUnflagged` leaves it out. A pass
+  whose matched column is not the first while another extra column holds terms of the
+  same kind is flagged as a rival column and only counted, since a related resource
+  beside the answer raises that flag as well.
+
+Each case keeps its guarded detail under `guarded`, and each row gives
+`executionAccuracyGuarded`, `executionAccuracyGuardedUnflagged`, the excluded questions,
+the flagged and lenient passes and the count of each flag.
+
 `scripts/eval-ask-rescore --report OUT/SET/report.json --sparkles BIN --out DIR` scores
 the saved answers of a run again under the current policy, or the first one with
 `--scoring-policy`. It runs only `sparkles query` on the set's data. It refuses a set, a
@@ -99,9 +126,12 @@ Answerable accuracy, clarification precision and refusal accuracy have separate
 denominators. Only the `unanswerable` outcome is a successful refusal. A provider error,
 a refusal by the model, an Ask timeout or an unusable draft is a failed answer with the
 status `provider_error`, `refusal`, `timeout`, `budget_exceeded` or `invalid_output`,
-and the run goes on. A case that the cost cap refused is `budget_refused`. It leaves the
-denominators, marks its row incomplete and ends the run. A harness fault stops a run,
-such as failing gold, a wrong binary hash or a child with an unknown exit status.
+and the run goes on. An Ask child that ends by SIGKILL, as when the kernel's
+out-of-memory killer or a memory cap stops it, or by SIGABRT after a failed allocation
+is the failed case `killed`, since its generated query is the likely cause. A case that
+the cost cap refused is `budget_refused`. It leaves the denominators, marks its row
+incomplete and ends the run. A harness fault stops a run, such as failing gold, a wrong
+binary hash or a child with an unknown exit status.
 
 Each child has capped output, its own process group and cleanup. A matrix has no
 wall-clock deadline unless `--phase-deadline` sets one. Ask gets 300 seconds, a query
@@ -114,27 +144,81 @@ names its binary by absolute path and SHA256.
 ```
 python3 -I -B -m unittest discover -s testsuite/ask -p 'test_eval*.py'
 python3 -I -S -B scripts/eval-ask --self-test --sparkles /ABSOLUTE/sparkles
-scripts/eval-ask-anthropic --run RUN.json --dry-run
+scripts/eval-ask-paid --run RUN.json --dry-run
 ```
+
+`eval_support/grounding_recall.py SET RUN_DIR` measures grounding recall from a run's
+saved prompts. For each answerable question it takes the last first-draft prompt, after
+any clarification, and checks whether every schema term and every resource of the gold
+query occurs in it, by full IRI or by a prefixed name under the prompt's own prefixes.
+A dry run gives the same prompts as a paid run, so the metric costs no provider call.
+It reports the questions whose prompt holds every gold term and the prompt size. With
+`--resource-namespace IRI`, such as `http://dbpedia.org/resource/`, or a set's
+`resourceNamespaces`, it also splits the gold terms into resources under those namespaces
+and schema terms, and reports each kind apart.
 
 The self-test drives the real CLI through the proxy against a local fake API. It covers
 chunked and close-delimited replies, structured-output retries, a downgrade, a
 rate limit, an overload that clears and a cascade. `--dry-run` runs a whole run file
 against the fake, reads no key and reports request sizes. Neither contacts a provider.
 
+## Batch runs
+
+`sparkles ask --questions FILE` reads JSON lines of `{"id", "question",
+"clarification"?, "tryHarder"?, "modelSecrets"?}`, or standard input for `-`. It opens
+the store and the model configuration once and prints one JSON result with its `id` per
+line, in input order. `--jobs N` runs up to N questions at once on the shared state.
+Every other flag applies to each question, and each question keeps its own deadline,
+token budget and query memory budget. A line that is invalid, fails or panics gets its
+own error result while the rest go on. A line's `modelSecrets` replace the
+`--model-secret` of the same name for that question. The question still counts against
+the provider's concurrency, request spacing and daily token limits that every other
+line shares.
+
+`scripts/eval-ask-paid` asks each phase's cases through one such child, run in its
+own systemd user scope with 16G of memory and no swap. `--no-batch` asks each case in
+its own child as earlier runs did, and `scripts/eval-ask --batch` chooses the batch
+directly. Each case's line names its own gate token through a secret file, so the proxy
+books every request to the case that sent it. Before the runner sends a case's line,
+the ledger holds the case's projected cost, the 90th percentile of the model's case
+costs so far times the projection margin, and no request may spend what another case
+in flight still holds. A case whose hold does not fit waits for the cases in flight,
+and with none in flight it ends the run as the cap would. The runner keeps at most
+`--jobs` lines in flight, sends a second line with the chosen answer for a clarified
+case, and holds each case's reply lines until that case and every earlier one are done,
+so the report, the case files and `replies.jsonl` keep question order. A batch child
+holds a database directory's lock, so the cases are scored after it ends. A line that
+the child's input does not take, because the input closed or the child stopped
+reading, goes to the next child, and the results of the lines the child did take are
+still read to its end. When the kernel or a memory cap kills the child, or a line
+passes its deadline, the cases in flight that got no result fail as `killed` or
+`timeout` and a new child asks the rest. A child that ends in any other way while lines
+are in flight, or prints a result line longer than 4 MiB, ends the run.
+Writes, waits and the proxy's drain of a case's requests all end at the phase
+deadline, and a run that ends with an error keeps every case that finished, unscored.
+A case's wall time is its result's `usage.elapsedMs`.
+
+The store's caches stay warm from one question to the next within a phase, as a running
+server's do. This lowers latency against one child per case but leaves the answers
+unchanged, and a dry run of the demo set gives the same results and the same replies in
+both modes. A query's memory budget applies to each query, but one runaway query that
+escapes it ends the whole batch child and fails the cases in flight with it.
+
 ## The cost cap
 
-`scripts/eval-ask-anthropic` starts a proxy on a loopback port and gives the children a
-random token in place of the key. Only the proxy reads `ANTHROPIC_API_KEY`. It sends
-each request once to `api.anthropic.com` with the standard library, so Content-Length,
-chunked and close-delimited replies all work. A reply that comes back gzip or deflate
-encoded, although the request asks for none, is decoded. It sets `stream` to false and
-the effort from the run file, and it refuses tools, cache control and any model outside
-the run. The key is stripped once when it is read, and a key with whitespace or control
-characters inside is refused. An error inside the request keeps only its class, so the
-key cannot reach a message. The key does stay in the proxy's initial process
-environment, which another process of the same user can read, so the machine should be
-one only the operator uses.
+`scripts/eval-ask-paid` starts a proxy on a loopback port and gives the children a
+random token in place of the key. `scripts/eval-ask-anthropic` is the same command under
+its earlier name. Only the proxy reads `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` for a
+run file whose `provider` is `openai`, and neither key reaches a child. It sends each
+request once to `api.anthropic.com`, or to `api.openai.com` for OpenAI, with the
+standard library, so Content-Length, chunked and close-delimited replies all work. A
+reply that comes back gzip or deflate encoded, although the request asks for none, is
+decoded. It sets `stream` to false and the effort from the run file, and it refuses
+tools, cache control and any model outside the run. The key is stripped once when it is
+read, and a key with whitespace or control characters inside is refused. An error inside
+the request keeps only its class, so the key cannot reach a message. The key does stay
+in the proxy's initial process environment, which another process of the same user can
+read, so the machine should be one only the operator uses.
 
 A JSON-lines ledger at the run file's `ledger` path holds the cap. Before each request the
 proxy writes a reserve line with an upper bound from the request size and `max_tokens`,
@@ -142,13 +226,15 @@ and the reply writes a settle line with the cost from its usage. A request is re
 when the spent total plus its bound would pass `localCapNanodollars`. The spent total
 includes the carryover, so the cap covers the carryover as well, and new requests can
 spend the cap minus the carryover. The run file is also refused when the cap plus the
-carryover passes the hard cap of one ledger, USD 50, which counts the carryover twice and
-keeps the run on the safe side. The person who pays sets each campaign's total, which can
+carryover passes the hard cap of one ledger, USD 95 for Anthropic and USD 50 for OpenAI,
+which counts the carryover twice and keeps the run on the safe side. The person who pays sets each campaign's total, which can
 span several ledgers in separate directories. An error reply is free, a lost reply costs the bound, a reply without usage costs
 the bound, and any other fault of the request costs the bound. Replaying the ledger
 counts every unsettled reserve at its bound, and the pilot's unresolved $1.002560 is the
 carryover line. Reopening a ledger resumes it. Nothing resets it. The ledger's first line
-holds its format version, 2, and a reader refuses any other version.
+holds its format version, 3, and the provider whose wallet it holds. A reader reads a
+version 2 ledger, which predates OpenAI runs, as an Anthropic ledger, refuses a ledger
+of another provider than the run's and refuses any other version.
 
 Replay is strict. It refuses a cost or bound that is not a nonnegative integer, a request
 ID that is not a positive integer, a settle without its reserve, a repeated reserve, a
@@ -159,28 +245,38 @@ are refused the same way, and need a new ledger directory or an edit by hand.
 
 A charge that stands at an upper bound can be reconciled with the amount the provider
 billed. Such charges are the carryover, a reserve that a crash left without a settle
-line, and a request settled at its bound because its reply was lost or its usage could
-not be read. `--held` lists them with each request's model, case, time and request ID.
-`--reconcile TARGET --billed-nanodollars N --evidence TEXT` appends a reconcile line
-that replaces one of them, where TARGET is `carryover` or a request ID. The evidence is
-10 to 1000 printable characters that name the source of the amount, such as the
-Console's cost for one day of an API key that only the run used. The held charge is an
-upper bound, so an amount above it is refused unless `--allow-raise` is given, and the
-line then records the raise. The command prints the previous and the new amount. Each
-charge is reconciled once, and replay checks every reconcile line against the charge it
-replaced. Neither command reads a key or sends a request, and both create the ledger
-with its carryover when it does not exist yet. Both take the ledger's lock, so they
-cannot run while a paid run holds it.
+line, a request settled at its bound because its reply was lost or its usage could not
+be read, and a reply of another model, whose charge is an estimate. `--held` lists them
+with each request's model, case, time and request ID. `--reconcile TARGET
+--billed-nanodollars N --evidence TEXT` appends a reconcile line that replaces one of
+them, where TARGET is `carryover` or a request ID. The evidence is 10 to 1000 printable
+characters that name the source of the amount, such as the Console's cost for one day of
+an API key that only the run used. The held charge is an upper bound, so an amount above
+it is refused unless `--allow-raise` is given, and the line then records the raise. The
+command prints the previous and the new amount. Each charge is reconciled once, and
+replay checks every reconcile line against the charge it replaced. Neither command reads
+a key or sends a request, and both create the ledger with its carryover when it does not
+exist yet. Both take the ledger's lock, so they cannot run while a paid run holds it.
 
 ```
-scripts/eval-ask-anthropic --run RUN.json --held
-scripts/eval-ask-anthropic --run RUN.json --reconcile carryover \
+scripts/eval-ask-paid --run RUN.json --held
+scripts/eval-ask-paid --run RUN.json --reconcile carryover \
   --billed-nanodollars 1600000 --evidence "Console cost of key K on 2026-10-15"
 ```
 
 The local ledger is the authority. A Console workspace spend limit below the account's
 balance is a backstop against a defect, and it can lag billing, so the run does not rely
 on it.
+
+The Anthropic Console cost export of 2026-10-03 to 2026-11-01 was checked against every
+campaign ledger of that period. The ledgers match the export to the cent for each model
+on the full days of 2026-10-19, 2026-10-24, 2026-10-25 and 2026-10-31. On 2026-11-01,
+up to 12:00 UTC where the export ends, every Opus and Haiku rate matches. Sonnet 5.5
+cache reads were billed at $0.10 per million tokens against the $0.20 in the proxy's
+table, so the ledger charged $0.57 more than the bill, and the table now holds $0.10.
+The Haiku ledger stands about $0.05 above the bill, which is one request that timed out
+upstream and was settled at its bound but never billed. Existing ledgers keep the costs
+they recorded, and only new settlements use the corrected rate.
 
 Before spending, the run counts tokens, which is free, and sends each model of the run
 one structured-output request of at most 256 tokens. It records the status and headers
@@ -197,18 +293,66 @@ so it must not be kept for a private graph beyond the diagnosis and must never b
 copied into the repository as a fixture. The first paid run predates this file, so its empty drafts
 cannot be traced to the reply that produced them.
 
+## OpenAI runs
+
+A run file with `"provider": "openai"` asks `gpt-6-luna`, `gpt-6.1-terra` or
+`gpt-6.1-sol` through the Chat Completions API. The children get an `openai` provider
+with the run's effort as `reasoningEffort`, so their requests carry
+`reasoning_effort` and limit the output, reasoning included, with
+`max_completion_tokens`. The proxy accepts text messages and a JSON Schema or JSON
+object format and nothing else, so it refuses tools and explicit cache options. It asks
+for the default service tier and relies on OpenAI's default prompt caching, whose
+writes last 30 minutes. Ask's prompts keep the stable grounding before the question, so
+repairs read the prefix that the first draft wrote. One ledger holds at most USD 50 of
+the OpenAI wallet, apart from any Anthropic ledger.
+
+The rates come from OpenAI's pricing page and prompt caching guide of 2026-11-01. A
+reply is charged its uncached input, its cache writes at 1.25 times input, its cache
+reads and its output, reasoning included, at the rate above 272,000 prompt tokens when
+the prompt passes that. A reply that does not report its writes is charged every
+uncached input token as a write. A reply from another tier than the default is charged
+at least its bound. OpenAI names the dated snapshot that served a model, so a reply
+must name the model asked for or that name followed by a date. A reply from another
+model, for either provider, fails as a provider error and is charged at least its bound
+and its usage at the served model's rates. A model the rate table does not know is
+charged the largest premium over the dearest model's bound. Cache counts that pass the
+prompt leave the usage unknown, so the reply is charged its bound. The preflight sends one
+structured-output request to each model, since Chat Completions has no free token
+count.
+
+`scripts/provider-spend openai --since DAY --ledger LEDGER` reads OpenAI's organization
+cost and usage reports by day and model and prints them beside the ledger's settlements.
+After the Luna baseline phases of 2026-11-01, OpenAI reported $0.8165 for `gpt-6-luna`
+in 704 requests against $0.8544 in the ledger, and the smoke requests of Terra and Sol
+matched to the cent. Luna's replies reported 4.58 million cache-write tokens of 5.07
+million prompt tokens, and the ledger charges them at 1.25 times input. It stands about
+4.6% above the bill, which suggests that some of those writes were billed at a lower
+rate. The provider never reported more than the ledger.
+
+The OpenAI wallet of 2026-11-01 began at USD 40, and the person who pays raised it to
+USD 50 the same day after the Luna baselines. A ledger's cap is fixed in its header, so
+the first ledger closed with USD 0.8548 settled and nothing unresolved, and a second
+ledger holds the rest with a cap of USD 49.1452. The two caps together equal the wallet.
+The Anthropic wallet of the same campaign was raised the same way from USD 50 to 95 with
+the approval of the person who pays, so that every model could run its baseline and its
+final build on the same three sets. Its first ledger closed with USD 30.7865 of upper
+liability, and the second has a cap of USD 64.2135. The ledgers stay the record of
+Anthropic spend until the person who pays reconciles them against the Console's usage
+export, which stays outside the repository. Only the reconciled totals are recorded.
+
 ## A paid run
 
 `run.example.json` shows the run file. Copy it and set the paths. It holds the sets and
 the models of each set, the effort, `maxOutputTokens`, the request and Ask timeouts, the
 query timeout, the cap, the carryover, the ledger, the output directory and the binary
 with its SHA256. The carryover is required, zero for a fresh authorization, and the cap
-plus the carryover cannot pass USD 50. `clarifications` is `answer` unless the run file
-sets `score`. `contextTokens` gives every model its context window. Without it the server
-assumes 8192 tokens, treats each model as a small one and trims the grounding to 30
-classes, 60 predicates, two examples and three candidates per mention, which is how the
-first paid run asked. A real run refuses a second `.jsonl` file in the ledger directory, so the ledger
-file stays the account of record for the whole spend.
+plus the carryover cannot pass the provider's hard cap. `clarifications` is `answer`
+unless the run file sets `score`. `contextTokens` gives every model its context window.
+Without it the server assumes 8192 tokens, treats each model as a small one and trims
+the grounding to 30 classes, 60 predicates, two examples and three candidates per
+mention, which is how the first paid run asked. A real run refuses a second `.jsonl`
+file in the ledger directory, so the ledger file stays the account of record for the
+whole spend.
 
 `askTokenBudget` is the total token limit of one Ask. The default of 32768 ends most
 repaired or DBpedia-grounded Asks after one or two calls, so the example sets 100000. The
@@ -226,7 +370,7 @@ A binary built from a named commit outside `docs/plans` is the one to use. After
 run passes, one command starts the run.
 
 ```
-fnox exec -- scripts/eval-ask-anthropic --run /ABSOLUTE/PATH/TO/run.json
+fnox exec -- scripts/eval-ask-paid --run /ABSOLUTE/PATH/TO/run.json
 ```
 
 A crash such as SIGKILL leaves `ledger.jsonl.lock` holding the owner's PID. The next start

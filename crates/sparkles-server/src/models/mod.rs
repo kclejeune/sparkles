@@ -251,6 +251,11 @@ pub fn usage_total<'a>(steps: impl IntoIterator<Item = &'a StepRecord>) -> admis
 pub struct Prompt {
     pub system: Vec<Part>,
     pub user: Vec<Part>,
+    /// The same request as two user messages, for a provider that caches a prefix only
+    /// where the latest user message ends ([`ProviderConfig::follows_up`]): an earlier
+    /// call's message unchanged, then what this call adds. Every other provider gets
+    /// `user`.
+    pub follow: Option<(Vec<Part>, Vec<Part>)>,
 }
 
 impl Prompt {
@@ -259,6 +264,7 @@ impl Prompt {
         Prompt {
             system: vec![Part::cached(system)],
             user: vec![Part::text(user)],
+            follow: None,
         }
     }
 }
@@ -370,10 +376,11 @@ pub struct Models {
     pub config: ModelsConfig,
     secrets: BTreeMap<String, SecretSource>,
     outbound: sparkles::outbound::OutboundPolicy,
-    runtime: BTreeMap<String, Runtime>,
+    /// shared with the views that [`Models::with_secrets`] makes
+    runtime: Arc<BTreeMap<String, Runtime>>,
     /// the level detected for each (provider, model) pair under `auto`
-    levels: Mutex<HashMap<(String, String), Level>>,
-    status: Mutex<HashMap<(String, String), PairStatus>>,
+    levels: Arc<Mutex<HashMap<(String, String), Level>>>,
+    status: Arc<Mutex<HashMap<(String, String), PairStatus>>>,
     /// the secrets whose source is a value stored through the API (spec C19 §11.2)
     runtime_secrets: std::collections::BTreeSet<String>,
     /// how those runtime values are kept (`serve --secrets-key`)
@@ -432,9 +439,9 @@ impl Models {
             config,
             secrets,
             outbound,
-            runtime,
-            levels: Mutex::new(HashMap::new()),
-            status: Mutex::new(HashMap::new()),
+            runtime: Arc::new(runtime),
+            levels: Default::default(),
+            status: Default::default(),
             runtime_secrets: Default::default(),
             sealing: Default::default(),
         }
@@ -467,8 +474,12 @@ impl Models {
     /// against the same budget, and for a provider whose kind and endpoint did not change, the
     /// detected levels and the last outcome of its pairs. Concurrency slots start
     /// empty, so requests that run on `old` do not count against the new slots.
+    ///
+    /// It runs on a configuration that no view shares yet, as a new one is.
     pub fn inherit(&mut self, old: &Models) {
-        for (name, rt) in &mut self.runtime {
+        let runtime = Arc::get_mut(&mut self.runtime)
+            .expect("a configuration inherits state before any view shares it");
+        for (name, rt) in runtime.iter_mut() {
             if let Some(o) = old.runtime.get(name) {
                 rt.tokens = o.tokens.clone();
             }
@@ -488,6 +499,24 @@ impl Models {
             if same(&k.0) {
                 status.insert(k.clone(), v.clone());
             }
+        }
+    }
+
+    /// This configuration with `secrets` as its secret sources, sharing the state of
+    /// its providers: their concurrency slots, request spacing and daily token counts,
+    /// and the detected levels and last outcome of each pair. Requests made through
+    /// the view count against the same provider limits as requests made through this
+    /// configuration, so a batch line with its own keys cannot bypass them.
+    pub fn with_secrets(&self, secrets: BTreeMap<String, SecretSource>) -> Models {
+        Models {
+            config: self.config.clone(),
+            secrets,
+            outbound: self.outbound.clone(),
+            runtime: self.runtime.clone(),
+            levels: self.levels.clone(),
+            status: self.status.clone(),
+            runtime_secrets: self.runtime_secrets.clone(),
+            sealing: self.sealing.clone(),
         }
     }
 
@@ -751,7 +780,14 @@ impl Models {
         let mut last: Option<StepError> = None;
         for (i, &level) in levels.iter().enumerate() {
             let has_next = detecting && i + 1 < levels.len();
-            let mut messages = structured::messages(&prompt.user, out, level);
+            let mut messages = match &prompt.follow {
+                Some((first, then)) if p.follows_up() => {
+                    let mut m = structured::messages(first, out, level);
+                    m.extend(structured::messages(then, out, level));
+                    m
+                }
+                _ => structured::messages(&prompt.user, out, level),
+            };
             for attempt in 0..2 {
                 if let Some(cap) = p.budget.and_then(|b| b.tokens_per_day) {
                     let mut t = rt.tokens.lock();
@@ -785,6 +821,7 @@ impl Models {
                     level,
                     max_output_tokens: pair.max_output_tokens.unwrap_or(m.max_output_tokens),
                     temperature: m.temperature,
+                    reasoning_effort: m.reasoning_effort,
                     num_ctx: m.num_ctx,
                     timeout: Duration::from_secs_f64(timeout).min(left),
                 };

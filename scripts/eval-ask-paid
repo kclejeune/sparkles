@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Run Ask evaluation sets against Anthropic or OpenAI models under a local cost cap.
+
+A run file names the provider, sets, models, cap and binary. The provider is
+`anthropic` unless the run file's `provider` says `openai`. The proxy alone reads
+ANTHROPIC_API_KEY or OPENAI_API_KEY, so launch it through a secret manager, for
+example `fnox exec -- scripts/eval-ask-paid --run RUN.json`. `eval-ask-anthropic` is
+the same command under its earlier name. --dry-run replaces the API with a local fake
+and reads no key. --preflight-only stops after the checks.
+"""
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import pathlib
+import sys
+import tempfile
+import threading
+import time
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
+import proxy as px
+from cli_checks import FAKE_KEY, FakeAnthropic
+from evaluator import Invalid, bounded_file, digest, strict_json
+
+FIELDS = {
+    "schema",
+    "provider",
+    "binary",
+    "binarySha256",
+    "ledger",
+    "out",
+    "localCapNanodollars",
+    "carryover",
+    "effort",
+    "maxOutputTokens",
+    "requestTimeoutSecs",
+    "askDeadlineSecs",
+    "queryTimeoutSecs",
+    "askTokenBudget",
+    "projectionMargin",
+    "priorCaseCostNanodollars",
+    "sets",
+    "clarifications",
+    "contextTokens",
+    "askOptions",
+}
+
+
+def evaluator_module():
+    loader = importlib.machinery.SourceFileLoader(
+        "eval_ask", str(ROOT / "scripts/eval-ask")
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def load_run(path):
+    run = strict_json(bounded_file(path, 1024 * 1024))
+    if not isinstance(run, dict) or run.get("schema") != 1 or run.keys() - FIELDS:
+        raise Invalid("unknown run file schema or field")
+    if run.setdefault("provider", "anthropic") not in px.APIS:
+        raise Invalid("unknown provider")
+    api = px.APIS[run["provider"]]
+    for name in ("binary", "ledger", "out"):
+        if not pathlib.Path(run[name]).is_absolute():
+            raise Invalid("absolute paths required")
+    ints = ("localCapNanodollars", "maxOutputTokens", "askTokenBudget")
+    if any(type(run[k]) is not int or run[k] <= 0 for k in ints):
+        raise Invalid("positive integers required")
+    carry = run["carryover"]
+    if (
+        not isinstance(carry, dict)
+        or not isinstance(carry.get("name"), str)
+        or type(carry.get("nanodollars")) is not int
+        or carry["nanodollars"] < 0
+    ):
+        # An earlier run's unresolved liability counts against the same authorization,
+        # so a run file must say what it carries, zero for a fresh authorization.
+        raise Invalid("a carryover with a name and nanodollars is required")
+    if run["localCapNanodollars"] + carry["nanodollars"] > px.HARD_CAPS[api.name]:
+        raise Invalid("the cap and the carryover pass the hard cap of one ledger")
+    context = run.get("contextTokens")
+    if context is not None and (type(context) is not int or not 0 < context <= 10**7):
+        raise Invalid("contextTokens is a positive integer")
+    if run.get("clarifications", "answer") not in mod_clarifications():
+        raise Invalid("unknown clarification policy")
+    for set_ in run["sets"]:
+        if not set_["models"] or set(set_["models"]) - set(api.models):
+            raise Invalid("each set needs models from the allowed list")
+        if any(m not in run["priorCaseCostNanodollars"] for m in set_["models"]):
+            raise Invalid("a prior case cost is needed for every model")
+    return run
+
+
+def mod_clarifications():
+    return evaluator_module().CLARIFICATIONS
+
+
+def percentile(values, share):
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(share * len(ordered)) - 1)] if ordered else None
+
+
+def admission(ledger, run):
+    """Admit a model's block only when its projected cost fits what the cap leaves."""
+
+    def unit(pair):
+        model = pair.split("/", 1)[1]
+        seen = [v for (_, m), v in ledger.case_costs().items() if m == model]
+        return (
+            percentile(seen, 0.9)
+            if len(seen) >= 5
+            else run["priorCaseCostNanodollars"][model]
+        )
+
+    def admit(pair, questions):
+        projected = len(questions) * unit(pair) * run["projectionMargin"]
+        return ledger.spent() + projected <= ledger.cap
+
+    # What a concurrent case holds of the cap before it starts.
+    admit.case_bound = lambda pair: math.ceil(unit(pair) * run["projectionMargin"])
+    return admit
+
+
+def ledger_command(run, args):
+    """List or reconcile the run's ledger. It reads no key and sends no request.
+
+    A ledger that does not exist yet is created with the run's cap and carryover,
+    so the pilot's carryover can be reconciled before the first paid request.
+    """
+    if args.held == bool(args.reconcile):
+        raise Invalid("give --held or --reconcile")
+    px.require_single_ledger(run["ledger"])
+    carry = run["carryover"]
+    ledger = px.Ledger(
+        run["ledger"],
+        run["localCapNanodollars"],
+        {"name": carry["name"], "cost": carry["nanodollars"]},
+        provider=run.get("provider", "anthropic"),
+    )
+    try:
+        if args.reconcile:
+            if args.billed_nanodollars is None or args.evidence is None:
+                raise Invalid("--reconcile needs --billed-nanodollars and --evidence")
+            target = args.reconcile
+            if target != "carryover":
+                if not target.isdecimal():
+                    raise Invalid("the target is 'carryover' or a request id")
+                target = int(target)
+            line = ledger.reconcile(
+                target, args.billed_nanodollars, args.evidence, args.allow_raise
+            )
+            print(
+                f"reconciled {target}: {line['previous']} -> {line['cost']} nanodollars",
+                file=sys.stderr,
+            )
+        elif args.allow_raise:
+            raise Invalid("--allow-raise goes with --reconcile")
+        report = ledger.report()
+        print(
+            json.dumps(
+                {
+                    k: report[k]
+                    for k in (
+                        "carryoverNanodollars",
+                        "settledNanodollars",
+                        "unresolvedNanodollars",
+                        "upperLiabilityNanodollars",
+                        "heldAtBound",
+                        "reconciled",
+                    )
+                },
+                indent=2,
+            )
+        )
+    finally:
+        ledger.close()
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
+    ap.add_argument("--run", required=True)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--preflight-only", action="store_true")
+    ap.add_argument(
+        "--held",
+        action="store_true",
+        help="list the ledger's charges that stand at an upper bound, and stop",
+    )
+    ap.add_argument(
+        "--reconcile",
+        metavar="TARGET",
+        help="replace a held charge, 'carryover' or a request id, with the billed amount",
+    )
+    ap.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="cases one batch child asks at once; each holds its projected cost first",
+    )
+    ap.add_argument(
+        "--no-batch",
+        action="store_true",
+        help="ask each case in its own child, as runs before the batch mode did",
+    )
+    ap.add_argument(
+        "--child-memory-max",
+        help="the memory limit of each child's own systemd scope, 16G for a batch",
+    )
+    ap.add_argument("--billed-nanodollars", type=int)
+    ap.add_argument("--evidence", help="where the billed amount comes from")
+    ap.add_argument(
+        "--allow-raise",
+        action="store_true",
+        help="allow a billed amount above the held charge, which is otherwise refused",
+    )
+    args = ap.parse_args()
+    run = load_run(args.run)
+    if args.held or args.reconcile:
+        return ledger_command(run, args)
+    mod = evaluator_module()
+    api = px.APIS[run.get("provider", "anthropic")]
+    started = time.monotonic()
+    fake = None
+    key = None
+    if args.dry_run:
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix="sparkles-ask-dry-"))
+        run["ledger"], run["out"] = str(scratch / "ledger.jsonl"), str(scratch / "out")
+        qsets = [
+            strict_json(bounded_file(ROOT / s["path"], 4 * 1024 * 1024))
+            for s in run["sets"]
+        ]
+        fake = FakeAnthropic(qsets, api=api.name)
+        upstream, key = fake.upstream(), FAKE_KEY
+    else:
+        key = px.clean_key(os.environ.pop(api.key_env, ""), api.key_env)
+        upstream = px.HTTPUpstream(key, api=api)
+    # Neither provider's key reaches a child.
+    for other in px.APIS.values():
+        os.environ.pop(other.key_env, None)
+    out = pathlib.Path(run["out"])
+    if not args.dry_run:
+        px.require_single_ledger(run["ledger"])
+    out.mkdir(mode=0o700)
+    carry = run["carryover"]
+    ledger = px.Ledger(
+        run["ledger"],
+        run["localCapNanodollars"],
+        {"name": carry["name"], "cost": carry["nanodollars"]},
+        provider=api.name,
+    )
+    used = {m for s in run["sets"] for m in s["models"]}
+    models = [m for m in api.models if m in used]  # the cheapest model first
+    proxy = px.Proxy(
+        ledger,
+        upstream,
+        key,
+        models,
+        run["maxOutputTokens"],
+        run["effort"],
+        run["requestTimeoutSecs"],
+        replies=out / "replies.jsonl",
+        api=api,
+    )
+    server = proxy.serve()
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    summary = {
+        "schema": 1,
+        "provider": api.name,
+        "dryRun": args.dry_run,
+        "runFileSha256": digest(args.run),
+        "binary": run["binary"],
+        "binarySha256": run["binarySha256"],
+        "effort": run["effort"],
+        "maxOutputTokens": run["maxOutputTokens"],
+        "askTokenBudget": run["askTokenBudget"],
+        "clarifications": run.get("clarifications", "answer"),
+        "contextTokens": run.get("contextTokens"),
+        "askOptions": run.get("askOptions", []),
+        "jobs": args.jobs,
+        "batch": not args.no_batch,
+        "sets": {},
+    }
+    code = 2
+    try:
+        summary["preflight"] = px.preflight(proxy, upstream)
+        (out / "preflight.json").write_text(
+            json.dumps(summary["preflight"], indent=2) + "\n"
+        )
+        if not args.dry_run and api is px.ANTHROPIC:
+            # The shape of testsuite/ask/fixtures/anthropic-reply-headers.json, which
+            # test_eval_proxy replays as a chunked reply. Copy it there after review.
+            (out / "anthropic-reply-headers.json").write_text(
+                json.dumps(
+                    {
+                        "countTokens": summary["preflight"]["countTokens"],
+                        "message": summary["preflight"]["message"],
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+        config = proxy.config(run.get("contextTokens"))
+        (out / "models.json").write_text(json.dumps(config, indent=2) + "\n")
+        done = []
+        for set_ in run["sets"] if not args.preflight_only else []:
+            argv = [
+                "--sparkles",
+                run["binary"],
+                "--sparkles-sha256",
+                run["binarySha256"],
+                "--set",
+                str(ROOT / set_["path"]),
+                "--out",
+                str(out / set_["name"]),
+                "--deadline",
+                str(run["askDeadlineSecs"]),
+                "--timeout",
+                str(run["queryTimeoutSecs"]),
+                "--max-tokens",
+                str(run["askTokenBudget"]),
+                "--allow-loopback",
+                "--model-config",
+                str(out / "models.json"),
+                "--model-secret",
+                "evalgate=env:SPARKLES_EVAL_GATE_TOKEN",
+            ]
+            if set_.get("loc"):
+                argv += ["--loc", set_["loc"]]
+            argv += ["--clarifications", run.get("clarifications", "answer")]
+            for flag in run.get("askOptions", []):
+                argv += ["--ask-option=" + flag]
+            argv += ["--jobs", str(args.jobs)]
+            if not args.no_batch:
+                argv.append("--batch")
+            memory = args.child_memory_max or (None if args.no_batch else "16G")
+            if memory:
+                argv += ["--child-memory-max", memory]
+            for model in set_["models"]:
+                argv += ["--pair", "evaluation/" + model]
+            ev = mod.parse_args(argv)
+            prepared = mod.validate_args(ev)
+            _, report = mod.run_matrix(ev, proxy, prepared, admission(ledger, run))
+            summary["sets"][set_["name"]] = {
+                "complete": report["complete"],
+                "report": str(out / set_["name"] / "report.json"),
+                "notRun": report["notRun"],
+                "budgetStopped": report["budgetStopped"],
+                "error": report["error"],
+                "errorDetail": report.get("errorDetail"),
+                "failureStatuses": {
+                    r["pair"]: r["failureStatuses"]
+                    for r in report["rows"]
+                    if "failureStatuses" in r
+                },
+            }
+            done.append(report["complete"])
+        code = 0 if all(done) else 2
+        if args.preflight_only:
+            code = 0
+    finally:
+        server.shutdown()
+        thread.join(5)
+        server.server_close()
+        summary["ledger"] = proxy.report()
+        sizes = proxy.request_bytes
+        summary["requestBytes"] = {
+            "count": len(sizes),
+            "p50": percentile(sizes, 0.5),
+            "p90": percentile(sizes, 0.9),
+            "max": max(sizes, default=None),
+        }
+        summary["elapsedSeconds"] = time.monotonic() - started
+        (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        ledger.close()
+        if fake:
+            fake.close()
+    print(f"eval-ask-paid: summary in {out / 'summary.json'}")
+    return code
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as error:  # noqa: BLE001 -- never print a message that could hold the key
+        text = str(error) if isinstance(error, Invalid) else ""
+        print(
+            f"eval-ask-paid: {type(error).__name__} {text}".strip(),
+            file=sys.stderr,
+        )
+        sys.exit(2)

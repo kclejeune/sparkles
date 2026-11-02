@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use sparkles::io::Source;
 use sparkles::store::StoreOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +36,17 @@ pub struct AskArgs {
     /// The dataset's name, which the prompts and the result report
     pub dataset: String,
     /// The question, at most 2000 characters
-    pub question: String,
+    #[arg(required_unless_present = "questions", conflicts_with = "questions")]
+    pub question: Option<String>,
+    /// Ask every question of a JSON-lines file, or `-` for standard input, with one
+    /// store and model configuration. Each line is `{"id", "question",
+    /// "clarification"?, "tryHarder"?, "modelSecrets"?}`, and each result is printed as
+    /// one JSON line with its `id`, in the order of the input
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["events", "clarification", "try_harder"])]
+    pub questions: Option<PathBuf>,
+    /// With --questions, how many questions run at once
+    #[arg(long, value_name = "N", default_value_t = 1, requires = "questions")]
+    pub jobs: usize,
     /// Force a pair for one role, as ROLE=PROVIDER/MODEL (repeatable). The role then
     /// uses that pair alone and never escalates; the other roles use their lists, from
     /// the database's assistant.json over --model-config, and escalate (spec C18 §5.5)
@@ -86,6 +97,33 @@ pub struct AskArgs {
     /// index statistics instead of scanning the indexes; `off` always scans
     #[arg(long, value_name = "QUADS", default_value_t = crate::state::StatisticsAbove::default())]
     pub schema_statistics_above: crate::state::StatisticsAbove,
+    /// Explore the data once when a draft gives no query or its query returns no rows,
+    /// with further link candidates and the predicates the entities use, and draft
+    /// again. On by default
+    #[arg(long, overrides_with = "no_explore")]
+    pub explore: bool,
+    /// Do not explore the data after a failed draft
+    #[arg(long, overrides_with = "explore")]
+    pub no_explore: bool,
+    /// Repair once when the result's shape does not fit the question's form, such as
+    /// several rows for "How many", keeping the first answer if the repair fails. Off
+    /// by default
+    #[arg(long, overrides_with = "no_shape_check")]
+    pub shape_check: bool,
+    /// Do not check the result's shape
+    #[arg(long, overrides_with = "shape_check")]
+    pub no_shape_check: bool,
+    /// Ask this many first drafts and keep the one whose result most drafts share, 1 by
+    /// default. A preview with --no-run asks one, since the vote runs each draft
+    #[arg(long, value_name = "N")]
+    pub drafts: Option<usize>,
+    /// Link each mention with the classes the words around it name, and show how many
+    /// triples name each candidate. Off by default
+    #[arg(long, overrides_with = "no_type_hints")]
+    pub type_hints: bool,
+    /// Do not hint mention types
+    #[arg(long, overrides_with = "type_hints")]
+    pub no_type_hints: bool,
     /// Print the result as one JSON object
     #[arg(long, conflicts_with = "events")]
     pub json: bool,
@@ -125,12 +163,81 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
     if args.max_rows == 0 {
         bail!("--max-rows must be at least 1");
     }
+    if !(1..=64).contains(&args.jobs) {
+        bail!("--jobs expects 1 to 64");
+    }
+    if let Some(n) = args.drafts
+        && !(1..=super::MAX_DRAFTS).contains(&n)
+    {
+        bail!("--drafts expects 1 to {}", super::MAX_DRAFTS);
+    }
     let pairs = parse_pairs(&args.pairs)?;
     // a local command reaches local providers such as Ollama by default
     let Some(models) = args.models.load(args.outbound.local_policy()?)? else {
         bail!("sparkles ask needs --model-config");
     };
-    for (role, p) in &pairs {
+    check_pairs(&models, &pairs)?;
+    // a database's assistant.json: its role overrides and routing, as the server reads them
+    let settings = match &args.loc {
+        Some(path) => crate::assistant::settings_at(path)?,
+        None => None,
+    }
+    .unwrap_or_default();
+    if let Err(e) = settings.validate(crate::settings::Providers::Checked(Some(&models))) {
+        bail!("assistant.json: {e}");
+    }
+    let server = open_server(&args, store_opts)?;
+    let base = |models: &crate::models::Models, question: String| {
+        options(&args, &settings, models, pairs.clone(), question)
+    };
+    if let Some(file) = &args.questions {
+        let input: Box<dyn std::io::BufRead + Send> = if file.as_os_str() == "-" {
+            Box::new(std::io::BufReader::new(std::io::stdin()))
+        } else {
+            Box::new(std::io::BufReader::new(
+                std::fs::File::open(file)
+                    .with_context(|| format!("--questions {}", file.display()))?,
+            ))
+        };
+        let line_models = |own: &[String]| line_view(&models, &args.models.model_secret, own);
+        let mut stdout = std::io::stdout();
+        return batch(
+            input,
+            &mut stdout,
+            args.jobs,
+            &server,
+            &models,
+            &line_models,
+            &base,
+        );
+    }
+    let mut o = base(&models, args.question.clone().unwrap_or_default());
+    o.clarification = args.clarification.clone();
+    o.draft_start = match args.try_harder {
+        Some(i) => Some(i.checked_add(1).context("--try-harder is too large")?),
+        None => None,
+    };
+    let events = args.events;
+    let mut on = |event: &str, v: &Value| {
+        if events {
+            println!("{}", serde_json::json!({ "event": event, "data": v }));
+        }
+    };
+    let out = ask(&server, &models, &Principal::local(), &o, &mut on);
+    if args.json || args.events {
+        println!("{out}");
+    } else {
+        print_human(&out);
+    }
+    if out["outcome"] == "error" {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+/// Refuse a forced pair whose provider is missing or does not allow its model.
+fn check_pairs(models: &crate::models::Models, pairs: &[(Role, Pair)]) -> Result<()> {
+    for (role, p) in pairs {
         let Some(provider) = models.provider(&p.provider) else {
             bail!(
                 "--pair {}={}: no provider named {:?}",
@@ -148,24 +255,12 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
             );
         }
     }
-    // a database's assistant.json: its role overrides and routing, as the server reads them
-    let settings = match &args.loc {
-        Some(path) => crate::assistant::settings_at(path)?,
-        None => None,
-    }
-    .unwrap_or_default();
-    if let Err(e) = settings.validate(crate::settings::Providers::Checked(Some(&models))) {
-        bail!("assistant.json: {e}");
-    }
-    let lists = crate::assistant::lists(&models, &settings);
-    let report_context = crate::assistant::rows_allowed(
-        &settings,
-        &lists,
-        &pairs,
-        &[crate::models::Role::Draft, crate::models::Role::Repair],
-    );
-    let routing = settings.routing.clone().unwrap_or_default();
-    let model_routing = models.config.routing.clone().unwrap_or_default();
+    Ok(())
+}
+
+/// The read-only state and MCP server that every question of a run shares, so a batch
+/// opens the store once and keeps its caches warm across questions.
+fn open_server(args: &AskArgs, store_opts: StoreOptions) -> Result<McpServer> {
     let timeout = Duration::from_secs_f64(args.timeout);
     let mut st = AppState::standalone(store_opts, timeout);
     st.read_only = true;
@@ -204,19 +299,38 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
         query_memory_bytes: memory,
         ..McpConfig::default()
     };
-    let server = McpServer::new(st, cfg);
-    let o = AskOptions {
+    Ok(McpServer::new(st, cfg))
+}
+
+/// The options of one question under the run's flags.
+fn options(
+    args: &AskArgs,
+    settings: &crate::assistant::AssistantSettings,
+    models: &crate::models::Models,
+    pairs: Vec<(Role, Pair)>,
+    question: String,
+) -> AskOptions {
+    let lists = crate::assistant::lists(models, settings);
+    let report_context = crate::assistant::rows_allowed(
+        settings,
+        &lists,
+        &pairs,
+        &[crate::models::Role::Draft, crate::models::Role::Repair],
+    );
+    let routing = settings.routing.clone().unwrap_or_default();
+    let model_routing = models.config.routing.clone().unwrap_or_default();
+    let mut o = AskOptions {
         dataset: args.dataset.clone(),
-        question: args.question.clone(),
+        question,
         pairs,
-        clarification: args.clarification.clone(),
+        clarification: None,
         run: !args.no_run,
         summary: !args.no_summary,
         max_rows: args.max_rows,
         deadline: Duration::from_secs_f64(args.deadline),
         max_tokens: args.max_tokens,
         lists: Some(lists),
-        draft_start: args.try_harder.map(|i| i + 1),
+        draft_start: None,
         mode: args.mode,
         reviewed_only: args.reviewed_only,
         report_context,
@@ -230,22 +344,200 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
             .unwrap_or(super::DEFAULT_EXAMPLE_SCORE),
         ..AskOptions::default()
     };
-    let events = args.events;
-    let mut on = |event: &str, v: &Value| {
-        if events {
-            println!("{}", serde_json::json!({ "event": event, "data": v }));
+    settings.repairs.or(repairs_of(args)).apply(&mut o);
+    o
+}
+
+/// The repair flags that the command line sets, each unset when neither its flag nor
+/// its `--no-` flag is given.
+pub(super) fn repairs_of(args: &AskArgs) -> crate::assistant::AskRepairs {
+    let flag = |on: bool, off: bool| (on || off).then_some(on);
+    crate::assistant::AskRepairs {
+        explore: flag(args.explore, args.no_explore),
+        shape_check: flag(args.shape_check, args.no_shape_check),
+        drafts: args.drafts,
+        type_hints: flag(args.type_hints, args.no_type_hints),
+    }
+}
+
+/// One line of `--questions`.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct BatchLine {
+    id: String,
+    question: String,
+    clarification: Option<String>,
+    try_harder: Option<usize>,
+    /// NAME=SOURCE secrets that replace the --model-secret of the same NAME for this
+    /// question, such as a key that bills it to its own account
+    #[serde(default)]
+    model_secrets: Vec<String>,
+}
+
+fn line_error(id: Value, code: &str, message: String) -> Value {
+    serde_json::json!({
+        "id": id,
+        "outcome": "error",
+        "error": {"code": code, "message": message},
+    })
+}
+
+/// `base` with each NAME=SOURCE of `own` in place of the one with the same NAME.
+/// The models of a batch line that names its own secrets: a view of `models` with
+/// those secrets in place of the `--model-secret` flags of the same names. The view
+/// shares the providers' state, so the line's requests count against the same
+/// concurrency, spacing and daily token limits as every other line.
+fn line_view(
+    models: &crate::models::Models,
+    flags: &[String],
+    own: &[String],
+) -> Result<Arc<crate::models::Models>> {
+    let secrets = crate::models::parse_secrets(&merged_secrets(flags, own))?;
+    Ok(Arc::new(models.with_secrets(secrets)))
+}
+
+fn merged_secrets(base: &[String], own: &[String]) -> Vec<String> {
+    let name = |s: &String| s.split_once('=').map_or(s.clone(), |(n, _)| n.to_string());
+    let mut out: Vec<String> = base
+        .iter()
+        .filter(|b| own.iter().all(|o| name(o) != name(b)))
+        .cloned()
+        .collect();
+    out.extend(own.iter().cloned());
+    out
+}
+
+type LineModels<'a> = dyn Fn(&[String]) -> Result<Arc<crate::models::Models>> + Sync + 'a;
+type BaseOptions<'a> = dyn Fn(&crate::models::Models, String) -> AskOptions + Sync + 'a;
+
+/// Ask every line of `input` and write each result to `output` in input order. Up to
+/// `jobs` questions run at once on the shared server. Each keeps its own deadline,
+/// token budget and query limits, and a line that is invalid, fails or panics yields
+/// its own error result while the others go on.
+fn batch(
+    input: Box<dyn std::io::BufRead + Send>,
+    output: &mut (dyn std::io::Write + Send),
+    jobs: usize,
+    server: &McpServer,
+    models: &Arc<crate::models::Models>,
+    line_models: &LineModels<'_>,
+    base: &BaseOptions<'_>,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::io::BufRead;
+    let lines = parking_lot::Mutex::new((input.lines(), 0usize));
+    // results wait here until every earlier line is written
+    let out = parking_lot::Mutex::new((output, 0usize, BTreeMap::<usize, String>::new()));
+    let failed = parking_lot::Mutex::new(None::<anyhow::Error>);
+    let run_line = |raw: String| -> Value {
+        let line: BatchLine = match serde_json::from_str(&raw) {
+            Ok(l) => l,
+            Err(e) => {
+                let id = serde_json::from_str::<Value>(&raw)
+                    .ok()
+                    .and_then(|v| v.get("id").cloned())
+                    .unwrap_or(Value::Null);
+                return line_error(id, "invalid-request", format!("--questions line: {e}"));
+            }
+        };
+        let id = Value::String(line.id.clone());
+        let own;
+        let models: &crate::models::Models = if line.model_secrets.is_empty() {
+            models
+        } else {
+            match line_models(&line.model_secrets) {
+                Ok(m) => {
+                    own = m;
+                    &own
+                }
+                Err(e) => return line_error(id, "invalid-request", format!("{e:#}")),
+            }
+        };
+        let draft_start = match line.try_harder.map(|i| i.checked_add(1)) {
+            Some(None) => {
+                return line_error(id, "invalid-request", "tryHarder is too large".into());
+            }
+            Some(start) => start,
+            None => None,
+        };
+        let mut o = base(models, line.question);
+        o.clarification = line.clarification;
+        o.draft_start = draft_start;
+        let mut on = |_: &str, _: &Value| {};
+        let mut result = ask(server, models, &Principal::local(), &o, &mut on);
+        let mut m = serde_json::Map::new();
+        m.insert("id".into(), id);
+        if let Some(obj) = result.as_object_mut() {
+            for (k, v) in std::mem::take(obj) {
+                m.entry(k).or_insert(v);
+            }
         }
+        Value::Object(m)
     };
-    let out = ask(&server, &models, &Principal::local(), &o, &mut on);
-    if args.json || args.events {
-        println!("{out}");
-    } else {
-        print_human(&out);
+    std::thread::scope(|s| {
+        for _ in 0..jobs {
+            s.spawn(|| {
+                loop {
+                    if failed.lock().is_some() {
+                        return;
+                    }
+                    let (index, raw) = {
+                        let mut g = lines.lock();
+                        let (it, n) = &mut *g;
+                        // a blank line asks nothing and keeps no place
+                        let next = loop {
+                            match it.next() {
+                                None => break None,
+                                Some(Ok(l)) if l.trim().is_empty() => continue,
+                                Some(r) => break Some(r),
+                            }
+                        };
+                        match next {
+                            None => return,
+                            Some(Err(e)) => {
+                                *failed.lock() =
+                                    Some(anyhow::Error::from(e).context("--questions"));
+                                return;
+                            }
+                            Some(Ok(l)) => {
+                                *n += 1;
+                                (*n - 1, l)
+                            }
+                        }
+                    };
+                    // a panic anywhere in a line's work fails that line alone
+                    let id = serde_json::from_str::<Value>(&raw)
+                        .ok()
+                        .and_then(|v| v.get("id").cloned())
+                        .unwrap_or(Value::Null);
+                    let text =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_line(raw)))
+                            .unwrap_or_else(|_| {
+                                line_error(
+                                    id,
+                                    "internal",
+                                    "the question's pipeline panicked".into(),
+                                )
+                            })
+                            .to_string();
+                    let mut g = out.lock();
+                    let (w, next, pending) = &mut *g;
+                    pending.insert(index, text);
+                    while let Some(t) = pending.remove(next) {
+                        if writeln!(w, "{t}").and_then(|()| w.flush()).is_err() {
+                            *failed.lock() = Some(anyhow::anyhow!("the output closed"));
+                            return;
+                        }
+                        *next += 1;
+                    }
+                }
+            });
+        }
+    });
+    match failed.into_inner() {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
-    if out["outcome"] == "error" {
-        std::process::exit(2);
-    }
-    Ok(())
 }
 
 fn print_human(out: &Value) {
@@ -316,4 +608,202 @@ fn print_human(out: &Value) {
         "\n{outcome}: {} model calls, {} input and {} output tokens, {} ms",
         u["modelCalls"], u["inputTokens"], u["outputTokens"], u["elapsedMs"]
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{ORG, draft, is_summary, opts, server};
+    use super::*;
+
+    #[derive(clap::Parser)]
+    struct Cmd {
+        #[command(flatten)]
+        ask: AskArgs,
+    }
+
+    fn repairs(flags: &[&str]) -> crate::assistant::AskRepairs {
+        use clap::Parser;
+        let mut argv = vec!["ask", "ds", "q"];
+        argv.extend(flags);
+        argv.extend(["--data", "x.ttl"]);
+        repairs_of(&Cmd::try_parse_from(argv).unwrap().ask)
+    }
+
+    #[test]
+    fn each_repair_flag_reaches_the_options() {
+        use crate::assistant::AskRepairs;
+        assert_eq!(repairs(&[]), AskRepairs::default());
+        let on = repairs(&[
+            "--explore",
+            "--shape-check",
+            "--drafts",
+            "3",
+            "--type-hints",
+        ]);
+        assert_eq!(
+            on,
+            AskRepairs {
+                explore: Some(true),
+                shape_check: Some(true),
+                drafts: Some(3),
+                type_hints: Some(true)
+            }
+        );
+        let off = repairs(&["--no-explore", "--no-shape-check", "--no-type-hints"]);
+        assert_eq!(
+            (off.explore, off.shape_check, off.type_hints),
+            (Some(false), Some(false), Some(false))
+        );
+        // the later of a flag and its --no- flag wins
+        assert_eq!(repairs(&["--explore", "--no-explore"]).explore, Some(false));
+        assert_eq!(repairs(&["--no-explore", "--explore"]).explore, Some(true));
+        // a command line flag wins over assistant.json, which wins over the default
+        let file = AskRepairs {
+            explore: Some(false),
+            shape_check: Some(true),
+            ..AskRepairs::default()
+        };
+        let mut o = AskOptions::default();
+        file.or(repairs(&["--explore"])).apply(&mut o);
+        assert!(o.explore && o.shape_check && !o.type_hints && o.drafts == 1);
+    }
+    use crate::models::mock::{self, MockModel};
+    use crate::models::{Models, ModelsConfig};
+    use serde_json::json;
+
+    fn models(url: &str, secrets: &[String]) -> Arc<Models> {
+        let cfg = json!({
+            "providers": {"p": {"kind": "openai", "endpoint": url, "requestTimeoutSecs": 5,
+                                "apiKey": {"secret": "k"}}},
+            "roles": {"draft": [{"provider": "p", "model": "m"}],
+                      "repair": [{"provider": "p", "model": "m"}],
+                      "summarize": [{"provider": "p", "model": "m"}]}
+        });
+        Arc::new(Models::new(
+            ModelsConfig::parse(&cfg.to_string()).unwrap(),
+            crate::models::parse_secrets(secrets).unwrap(),
+            sparkles::outbound::OutboundPolicy {
+                allow_private: true,
+                ..Default::default()
+            },
+        ))
+    }
+
+    fn run(input: &str, jobs: usize, mock: &MockModel, key: &std::path::Path) -> Vec<Value> {
+        let s = server(ORG);
+        let base_secret = vec![format!("k=file:{}", key.display())];
+        let m = models(&mock.url(), &base_secret);
+        let line_models = |own: &[String]| line_view(&m, &base_secret, own);
+        let base = |_: &Models, q: String| opts(&q);
+        let mut out = Vec::new();
+        batch(
+            Box::new(std::io::Cursor::new(input.to_string())),
+            &mut out,
+            jobs,
+            &s,
+            &m,
+            &line_models,
+            &base,
+        )
+        .unwrap();
+        String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn mock() -> MockModel {
+        MockModel::start(|r, _| {
+            if is_summary(r) {
+                let text = json!({"text": "Rows [1].", "citations": [1]}).to_string();
+                return (200, mock::openai(&text));
+            }
+            if r.body.to_string().contains("slow") {
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            (
+                200,
+                mock::openai(&draft("SELECT ?t WHERE { ?t a ex:Team }")),
+            )
+        })
+    }
+
+    #[test]
+    fn a_batch_answers_in_input_order_with_jobs_at_once() {
+        let mock = mock();
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("key");
+        std::fs::write(&key, "base-key").unwrap();
+        let input = [
+            json!({"id": "a", "question": "Which teams are there? slow"}),
+            json!({"id": "b", "question": "Which teams are there?"}),
+            json!({"id": "c", "question": "Which teams exist?"}),
+        ]
+        .map(|l| l.to_string())
+        .join("\n");
+        let out = run(&format!("{input}\n\n"), 3, &mock, &key);
+        let ids: Vec<&str> = out.iter().map(|v| v["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+        for v in &out {
+            assert_eq!(v["outcome"], "answered", "{v}");
+        }
+        // the same question gives the same answer alone and in a batch
+        let alone = ask(
+            &server(ORG),
+            &models(&mock.url(), &[format!("k=file:{}", key.display())]),
+            &Principal::local(),
+            &opts("Which teams are there?"),
+            &mut |_, _| {},
+        );
+        assert_eq!(out[1]["result"]["query"], alone["result"]["query"]);
+        assert_eq!(
+            out[1]["result"]["results"]["rows"],
+            alone["result"]["results"]["rows"]
+        );
+    }
+
+    #[test]
+    fn a_line_names_its_own_secret_and_a_bad_line_fails_alone() {
+        let mock = mock();
+        let dir = tempfile::tempdir().unwrap();
+        let (key, own) = (dir.path().join("key"), dir.path().join("own"));
+        std::fs::write(&key, "base-key").unwrap();
+        std::fs::write(&own, "own-key").unwrap();
+        let input = [
+            json!({"id": "a", "question": "Which teams are there?",
+                   "modelSecrets": [format!("k=file:{}", own.display())]})
+            .to_string(),
+            "{\"id\": \"b\", \"question\": 3}".to_string(),
+            "not json".to_string(),
+            json!({"id": "e", "question": "Which teams?", "tryHarder": u64::MAX}).to_string(),
+            json!({"id": "d", "question": "Which teams are there?"}).to_string(),
+        ]
+        .join("\n");
+        let out = run(&input, 2, &mock, &key);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0]["outcome"], "answered");
+        assert_eq!(out[1]["id"], "b");
+        assert_eq!(out[1]["error"]["code"], "invalid-request");
+        assert_eq!(out[2]["id"], Value::Null);
+        assert_eq!(out[3]["id"], "e");
+        assert_eq!(out[3]["error"]["code"], "invalid-request");
+        assert_eq!(out[4]["outcome"], "answered");
+        let keys: Vec<String> = mock
+            .requests()
+            .iter()
+            .filter_map(|r| r.header("authorization").map(str::to_string))
+            .collect();
+        assert!(keys.contains(&"Bearer own-key".to_string()), "{keys:?}");
+        assert!(keys.contains(&"Bearer base-key".to_string()), "{keys:?}");
+    }
+
+    #[test]
+    fn a_line_secret_replaces_the_flag_of_its_name() {
+        let base = vec!["k=env:A".to_string(), "j=env:B".to_string()];
+        assert_eq!(
+            merged_secrets(&base, &["k=file:/x".to_string()]),
+            ["j=env:B", "k=file:/x"]
+        );
+    }
 }
