@@ -1821,7 +1821,7 @@ pub(crate) async fn run_query(
                                 if matches!(b.kind, BudgetKind::Memory | BudgetKind::ServerMemory)
                         ) =>
                     {
-                        QUICK.record(quick_key, inline::EAGER_FAILED_MS);
+                        QUICK.record_eager_failure(quick_key);
                         automatic(snap, &shared)
                     }
                     ran => ran.map(Ran::Eager),
