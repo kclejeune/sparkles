@@ -445,6 +445,23 @@ impl Dataset {
         })
     }
 
+    /// The views runtimes of this dataset and of the branches it keeps open, each
+    /// once, for a catalog that pauses their workers around a close.
+    pub(crate) fn views_runtimes(&self) -> Vec<Arc<crate::incr::Runtime>> {
+        fn collect(state: &DatasetState, out: &mut Vec<Arc<crate::incr::Runtime>>) {
+            if out.iter().any(|r| Arc::ptr_eq(r, &state.views)) {
+                return;
+            }
+            out.push(state.views.clone());
+            for branch in state.branches.lock().values() {
+                collect(&branch.inner, out);
+            }
+        }
+        let mut out = Vec::new();
+        collect(&self.inner, &mut out);
+        out
+    }
+
     #[cfg(feature = "backup")]
     pub(crate) fn in_use_without_self(&self) -> bool {
         Arc::strong_count(&self.inner) > 2 || self.branches_in_use()
