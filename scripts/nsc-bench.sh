@@ -58,6 +58,15 @@
 #   --out DIR           results directory (default .artifacts/nsc-bench/<UTC time>)
 #   --allow-mixed-compilers
 #                       compare binaries built with different compilers anyway
+#   --flag-ratio R      a query whose execution-time ratio B/A is R or more is flagged
+#                       (default 1.10)
+#   --rerun-rounds N    rounds of the rerun of the flagged queries (default 8)
+#   --rerun-reps N      timed requests per query and server process in the rerun (default 40)
+#   --no-rerun          report the first pass alone
+#
+# When the first pass flags queries, the same instance runs them again with more rounds and
+# requests before it is destroyed, and summary.md reports both passes. The rerun's results
+# are in OUT/rerun, with its own summary.md and summary.json.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -84,6 +93,10 @@ MACHINE=linux/amd64:8x16
 DURATION=2h
 OUT=
 MIXED=0
+FLAG_RATIO=1.10
+RERUN_ROUNDS=8
+RERUN_REPS=40
+RERUN=1
 POLL=${POLL:-20}
 REMOTE=/root/nsc-bench
 
@@ -117,6 +130,14 @@ while [ $# -gt 0 ]; do
       shift
       continue
       ;;
+    --no-rerun)
+      RERUN=0
+      shift
+      continue
+      ;;
+    --flag-ratio) FLAG_RATIO=$2 ;;
+    --rerun-rounds) RERUN_ROUNDS=$2 ;;
+    --rerun-reps) RERUN_REPS=$2 ;;
     --serve-args) SERVE_ARGS=$2 ;;
     --execution) EXECUTION=$2 ;;
     --cargo-args) CARGO_ARGS=$2 ;;
@@ -340,66 +361,117 @@ done
 T_SENT=$(now)
 note "phase upload: $(secs "$T_UP" "$T_SENT") s for $(du -ch "$STAGE"/{bin-A.zst,bin-B.zst,data.nt.zst,queries.tar} | tail -1 | cut -f1)"
 
+# wait_remote: poll the detached remote run, print its progress and set status
+wait_remote() {
+  local seen=0 fails=0 r line
+  status=
+  while :; do
+    sleep "$POLL"
+    if ! r=$(rsh "tail -n +$((seen + 1)) $REMOTE/results/progress.log 2> /dev/null; if [ -f $REMOTE/results/done ]; then echo __DONE__ \$(cat $REMOTE/results/done); fi" 2> /dev/null); then
+      fails=$((fails + 1))
+      [ "$fails" -lt 60 ] || die "lost contact with $ID"
+      continue
+    fi
+    fails=0
+    while IFS= read -r line; do
+      case $line in
+        __DONE__*) status=${line#__DONE__ } ;;
+        '') ;;
+        *)
+          echo "  $line"
+          seen=$((seen + 1))
+          ;;
+      esac
+    done <<< "$r"
+    [ -z "$status" ] || break
+  done
+}
+
+# fetch_results DIR: pack the remote results directory and unpack it into DIR
+fetch_results() {
+  local dir=$1 ok=0 _try
+  for _try in $(seq 40); do
+    if rsh "cd $REMOTE && tar -czf results.tgz results" 2> "$OUT/logs/pack.log"; then
+      ok=1
+      break
+    fi
+    echo "pack failed (try $_try), retrying" >&2
+    sleep 5
+  done
+  [ "$ok" = 1 ] || die "could not pack the results"
+  ok=0
+  for _try in $(seq 40); do
+    if nsc instance download "$ID" "$REMOTE/results.tgz" "$dir/results.tgz" > "$OUT/logs/download.log" 2>&1; then
+      ok=1
+      break
+    fi
+    if rsh "cat $REMOTE/results.tgz" > "$dir/results.tgz.ssh" 2>> "$OUT/logs/download.log" && [ -s "$dir/results.tgz.ssh" ] && tar -tzf "$dir/results.tgz.ssh" > /dev/null 2>&1; then
+      mv "$dir/results.tgz.ssh" "$dir/results.tgz"
+      ok=1
+      break
+    fi
+    echo "download failed (try $_try), retrying" >&2
+    sleep 5
+  done
+  [ "$ok" = 1 ] || die "download failed"
+  tar -xzf "$dir/results.tgz" -C "$dir"
+}
+
 rsh "cd $REMOTE && tar -xf queries.tar && setsid nohup bash nsc-bench-remote.sh > nohup.log 2>&1 < /dev/null &" ||
   die "could not start the remote run"
-seen=0
-fails=0
-status=
-while :; do
-  sleep "$POLL"
-  if ! r=$(rsh "tail -n +$((seen + 1)) $REMOTE/results/progress.log 2> /dev/null; if [ -f $REMOTE/results/done ]; then echo __DONE__ \$(cat $REMOTE/results/done); fi" 2> /dev/null); then
-    fails=$((fails + 1))
-    [ "$fails" -lt 60 ] || die "lost contact with $ID"
-    continue
-  fi
-  fails=0
-  while IFS= read -r line; do
-    case $line in
-      __DONE__*) status=${line#__DONE__ } ;;
-      '') ;;
-      *)
-        echo "  $line"
-        seen=$((seen + 1))
-        ;;
-    esac
-  done <<< "$r"
-  [ -z "$status" ] || break
-done
+wait_remote
 T_RAN=$(now)
 note "phase remote run: $(secs "$T_SENT" "$T_RAN") s"
-
-ok=0
-for _try in $(seq 40); do
-  if rsh "cd $REMOTE && tar -czf results.tgz results" 2> "$OUT/logs/pack.log"; then
-    ok=1
-    break
-  fi
-  echo "pack failed (try $_try), retrying" >&2
-  sleep 5
-done
-[ "$ok" = 1 ] || die "could not pack the results"
-ok=0
-for _try in $(seq 40); do
-  if nsc instance download "$ID" "$REMOTE/results.tgz" "$OUT/results.tgz" > "$OUT/logs/download.log" 2>&1; then
-    ok=1
-    break
-  fi
-  if rsh "cat $REMOTE/results.tgz" > "$OUT/results.tgz.ssh" 2>> "$OUT/logs/download.log" && [ -s "$OUT/results.tgz.ssh" ] && tar -tzf "$OUT/results.tgz.ssh" > /dev/null 2>&1; then
-    mv "$OUT/results.tgz.ssh" "$OUT/results.tgz"
-    ok=1
-    break
-  fi
-  echo "download failed (try $_try), retrying" >&2
-  sleep 5
-done
-[ "$ok" = 1 ] || die "download failed"
-tar -xzf "$OUT/results.tgz" -C "$OUT"
+fetch_results "$OUT"
 note "phase download: $(secs "$T_RAN" "$(now)") s"
+[ "$status" = ok ] || die "the remote run failed ($status), see $OUT/results/progress.log"
+python3 "$ROOT/scripts/nsc-bench-summary.py" "$OUT" > "$OUT/summary.md"
+
+# The flagged queries run again on the same instance with more rounds and requests, as a
+# screen's flags are rerun before anyone reads them as regressions.
+FLAGGED=$(python3 -c '
+import json, sys
+s = json.load(open(sys.argv[1]))
+print(" ".join(q for q, m in s["queries"].items() if "exec_ms" in m and m["exec_ms"]["ratio"] >= float(sys.argv[2])))
+' "$OUT/summary.json" "$FLAG_RATIO")
+if [ -n "$FLAGGED" ] && [ "$RERUN" = 1 ]; then
+  note "flagged at B/A >= $FLAG_RATIO: $FLAGGED"
+  note "rerun: $RERUN_ROUNDS rounds of A,B,B,A, $RERUN_REPS timed requests per query and server"
+  # shellcheck disable=SC2086 # FLAGGED is a list of query names
+  keep=$(printf '%s.rq ' $FLAGGED)
+  rsh "cd $REMOTE && mv results results-first && rm -f results.tgz && cd queries && for f in *.rq; do case ' $keep' in *\" \$f \"*) ;; *) rm \"\$f\" ;; esac; done && cd .. && sed -i -e 's/^ROUNDS=.*/ROUNDS=$RERUN_ROUNDS/' -e 's/^REPS=.*/REPS=$RERUN_REPS/' run.env && setsid nohup bash nsc-bench-remote.sh > nohup-rerun.log 2>&1 < /dev/null &" ||
+    die "could not start the rerun"
+  T_RERUN=$(now)
+  wait_remote
+  mkdir -p "$OUT/rerun"
+  fetch_results "$OUT/rerun"
+  note "phase rerun: $(secs "$T_RERUN" "$(now)") s"
+  [ "$status" = ok ] || die "the rerun failed ($status), see $OUT/rerun/results/progress.log"
+  {
+    grep -v '^settings: ' "$MANIFEST"
+    echo "settings: the flagged queries, $RERUN_ROUNDS rounds of A,B,B,A, $WARMUP warm-up and $RERUN_REPS timed requests per query and server"
+  } > "$OUT/rerun/manifest.txt"
+  python3 "$ROOT/scripts/nsc-bench-summary.py" "$OUT/rerun" > "$OUT/rerun/summary.md"
+  STILL=$(python3 -c '
+import json, sys
+s = json.load(open(sys.argv[1]))
+print(" ".join(q for q, m in s["queries"].items() if "exec_ms" in m and m["exec_ms"]["ratio"] >= float(sys.argv[2])))
+' "$OUT/rerun/summary.json" "$FLAG_RATIO")
+  # appended to summary.md at the end, after the first pass's prepare timings
+  {
+    echo
+    echo "# Rerun of the flagged queries"
+    echo
+    if [ -n "$STILL" ]; then verdict="Still flagged: ${STILL// /, }."; else verdict="None of them stays flagged."; fi
+    echo "The first pass flagged ${FLAGGED// /, } at an execution-time ratio of $FLAG_RATIO or more. The same instance ran them again in $RERUN_ROUNDS rounds with $RERUN_REPS timed requests per query and server process. $verdict"
+    echo
+    sed '1,/^## /{/^## /!d}' "$OUT/rerun/summary.md"
+  } > "$OUT/rerun-section.md"
+elif [ -n "$FLAGGED" ]; then
+  note "flagged at B/A >= $FLAG_RATIO: $FLAGGED (no rerun)"
+fi
 destroy
 rm -f "$STAGE"/{bin-A.zst,bin-B.zst,data.nt.zst}
-[ "$status" = ok ] || die "the remote run failed ($status), see $OUT/results/progress.log"
-
-python3 "$ROOT/scripts/nsc-bench-summary.py" "$OUT" > "$OUT/summary.md"
 if [ -s "$OUT/results/prepare.tsv" ]; then
   {
     echo
@@ -411,6 +483,10 @@ if [ -s "$OUT/results/prepare.tsv" ]; then
         med = (m % 2) ? a[(m + 1) / 2] : (a[m / 2] + a[m / 2 + 1]) / 2
         printf "- %s: %.3f s over %d runs (%s)\n", k, med, m, c[k]}}' "$OUT/results/prepare.tsv" | sort
   } >> "$OUT/summary.md"
+fi
+if [ -f "$OUT/rerun-section.md" ]; then
+  cat "$OUT/rerun-section.md" >> "$OUT/summary.md"
+  rm "$OUT/rerun-section.md"
 fi
 cat "$OUT/summary.md"
 echo

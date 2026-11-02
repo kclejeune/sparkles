@@ -1287,6 +1287,10 @@ flag "--execution <mode>" help="execution=MODE with every query, or A_MODE,B_MOD
 flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
 flag "--duration <d>" default="2h" help="the instance's lifetime cap"
 flag "--out <dir>" help="results directory (default .artifacts/nsc-bench/<UTC time>)"
+flag "--flag-ratio <r>" default="1.10" help="flag a query whose execution-time ratio B/A is at least this"
+flag "--rerun-rounds <n>" default="8" help="rounds of the rerun of the flagged queries on the same instance"
+flag "--rerun-reps <n>" default="40" help="timed requests per query and server process in the rerun"
+flag "--no-rerun" help="report the first pass alone"
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
@@ -1295,7 +1299,8 @@ scripts/nsc-bench.sh --people "$usage_people" --rounds "$usage_rounds" --reps "$
   ${usage_queries:+--queries "$usage_queries"} ${usage_query_dir:+--query-dir "$usage_query_dir"} \
   ${usage_serve_args:+--serve-args "$usage_serve_args"} ${usage_execution:+--execution "$usage_execution"} \
   ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
-  ${usage_out:+--out "$usage_out"} ${usage_no_spin:+--no-spin} "$usage_a" "$usage_b"
+  --flag-ratio "$usage_flag_ratio" --rerun-rounds "$usage_rerun_rounds" --rerun-reps "$usage_rerun_reps" \
+  ${usage_no_rerun:+--no-rerun} ${usage_out:+--out "$usage_out"} ${usage_no_spin:+--no-spin} "$usage_a" "$usage_b"
 SPARKLES_TASK
 '''
 

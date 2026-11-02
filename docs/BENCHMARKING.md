@@ -1070,6 +1070,13 @@ geometric mean of the ratios. It also reports differing answers and both load ti
 `manifest.txt` records each binary's commit and SHA-256, the instance, the time of each
 phase and the billed vCPU-minutes. `results/samples.tsv` has every timed request.
 
+A query whose execution-time ratio B/A is 1.10 or more is flagged (`--flag-ratio`). Before
+the instance is destroyed, it runs the flagged queries again in 8 rounds with 40 timed
+requests per query and server process (`--rerun-rounds`, `--rerun-reps`), after loading
+fresh stores. `summary.md` then ends with the rerun's tables and names the queries that
+stay flagged, and `rerun/` holds the rerun's own results and summary. `--no-rerun` reports
+the first pass alone.
+
 The C compiler builds mimalloc, so two binaries built with different C compilers differ
 on every request, by 11 to 33 thousand instructions per request between GCC 16.2 with
 Clang 21 and the development shell's GCC 15.3 with Clang 22. The script therefore reads
