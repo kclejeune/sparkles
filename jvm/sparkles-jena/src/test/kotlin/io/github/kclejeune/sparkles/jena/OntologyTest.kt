@@ -132,8 +132,7 @@ class OntologyTest {
                 try {
                     if (adding) g.add(t) else g.delete(t)
                     other.start()
-                    // the other thread's autocommit write waits for the writer lock
-                    Thread.sleep(200)
+                    awaitWriterWait(other)
                     ds.abort()
                 } finally {
                     ds.end()
@@ -142,6 +141,55 @@ class OntologyTest {
                 val stored = SparklesOnt.graph(ds, "http://ex.org/onto").contains(t)
                 assertEquals(adding, stored, "the dataset after the other thread's write")
                 assertEquals(stored, g.contains(t), "the model keeps the committed write")
+            }
+        }
+    }
+
+    /** Wait until `thread` is in the native call that waits for the writer lock. */
+    private fun awaitWriterWait(thread: Thread) {
+        val until = System.nanoTime() + 10_000_000_000L
+        while (thread.stackTrace.none { it.methodName == "beginWrite" }) {
+            assertTrue(System.nanoTime() < until, "the other thread never waited for the writer lock")
+            Thread.sleep(5)
+        }
+    }
+
+    /**
+     * A transaction that follows a committed one without a read in between, and aborts,
+     * leaves the model with the committed state, for an addition, a deletion and a
+     * removal by pattern.
+     */
+    @Test fun successive_transactions_keep_the_committed_state() {
+        val s = org.apache.jena.graph.NodeFactory.createURI("urn:s")
+        val label = org.apache.jena.vocabulary.RDFS.label.asNode()
+        val t = org.apache.jena.graph.Triple.create(s, label, org.apache.jena.graph.NodeFactory.createLiteralString("x"))
+        for (op in listOf("add", "delete", "remove")) {
+            SparklesDatasets.memory().use { ds ->
+                a1(ds)
+                val m = SparklesOnt.model(ds, "http://ex.org/onto")
+                val g = m.graph
+                fun txn(commit: Boolean, write: () -> Unit) {
+                    ds.begin(ReadWrite.WRITE)
+                    try {
+                        write()
+                        if (commit) ds.commit() else ds.abort()
+                    } finally {
+                        ds.end()
+                    }
+                }
+                // the committed transactions set the state the last one changes
+                txn(true) { g.add(t) }
+                if (op == "add") txn(true) { g.delete(t) }
+                txn(false) {
+                    when (op) {
+                        "add" -> g.add(t)
+                        "delete" -> g.delete(t)
+                        else -> g.remove(s, null, null)
+                    }
+                }
+                val stored = SparklesOnt.graph(ds, "http://ex.org/onto").contains(t)
+                assertEquals(op != "add", stored, op)
+                assertEquals(stored, g.contains(t), op)
             }
         }
     }

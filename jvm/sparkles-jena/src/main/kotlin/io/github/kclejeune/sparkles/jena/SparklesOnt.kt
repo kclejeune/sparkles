@@ -97,26 +97,28 @@ public object SparklesOnt {
 
 /**
  * A graph whose reads come from `copy` and whose writes go to `target` and to `copy`. The
- * triples a write transaction changes in the copy are noted until the transaction ends,
- * and then set to what the dataset holds, so that the copy keeps the state of the dataset
- * when the transaction aborts. Like Jena's in-memory graphs, the copy needs the caller's
- * locking when threads use it at once, and another thread sees a transaction's writes
- * before it commits.
+ * triples a write transaction writes are noted until the transaction ends, and then set
+ * to what the dataset holds, so that the copy keeps the state of the dataset when the
+ * transaction aborts. Like Jena's in-memory graphs, the copy needs the caller's locking
+ * when threads use it at once, and another thread sees a transaction's writes before it
+ * commits.
  */
 private class ReadThroughGraph(
     private val copy: Graph,
     private val dataset: DatasetGraphSparkles,
     private val target: Graph,
 ) : GraphWrapper(copy) {
-    // the triples the transaction `pending` changed in the copy
+    // the triples the transaction `pending` wrote
     private val journal = LinkedHashSet<Triple>()
     private var pending: TxnState? = null
 
     /**
-     * Set the triples of an ended transaction to what the dataset holds. It waits for
-     * nothing: a transaction that is still open, or a read whose own transaction reads an
-     * older state, leaves them for later. After a write of the caller's, `written`, the
-     * transaction that held the writer lock before it has ended.
+     * Set the triples of an ended transaction to what the dataset holds in the caller's
+     * view. It waits for nothing: a transaction that is still open, or a read whose own
+     * transaction reads an older state, leaves them for later. After a write of the
+     * caller's, `written`, the transaction that held the writer lock before it has ended,
+     * and the caller notes the triples it wrote itself, so that its own abort sets them
+     * back.
      */
     @Synchronized
     private fun settle(written: Boolean) {
@@ -131,11 +133,11 @@ private class ReadThroughGraph(
         pending = null
     }
 
-    /** Note a change to the copy; a change outside a transaction has committed already. */
-    private fun record(t: Triple) {
+    /** Note triples the caller wrote; a write outside a transaction has committed already. */
+    private fun record(written: Collection<Triple>) {
         val txn = dataset.txn() ?: return
         pending = txn
-        journal.add(t)
+        journal.addAll(written)
     }
 
     override fun get(): Graph {
@@ -148,10 +150,8 @@ private class ReadThroughGraph(
         target.add(t)
         synchronized(this) {
             settle(true)
-            if (!copy.contains(t)) {
-                copy.add(t)
-                record(t)
-            }
+            copy.add(t)
+            record(listOf(t))
         }
     }
 
@@ -159,27 +159,28 @@ private class ReadThroughGraph(
         target.delete(t)
         synchronized(this) {
             settle(true)
-            if (copy.contains(t)) {
-                copy.delete(t)
-                record(t)
-            }
+            copy.delete(t)
+            record(listOf(t))
         }
     }
 
     override fun remove(s: Node?, p: Node?, o: Node?) {
+        val ms = s ?: Node.ANY
+        val mp = p ?: Node.ANY
+        val mo = o ?: Node.ANY
+        // the triples the removal may write, when a transaction will need to set them back
+        val touched: List<Triple> = if (dataset.txn() == null) {
+            emptyList()
+        } else {
+            synchronized(this) {
+                copy.find(ms, mp, mo).toList() + journal.filter { it.matches(ms, mp, mo) }
+            }
+        }
         target.remove(s, p, o)
         synchronized(this) {
             settle(true)
-            if (dataset.txn() == null) {
-                // the removal committed on its own, so nothing needs noting
-                copy.remove(s, p, o)
-                return
-            }
-            val gone = copy.find(s ?: Node.ANY, p ?: Node.ANY, o ?: Node.ANY).toList()
-            for (t in gone) {
-                copy.delete(t)
-                record(t)
-            }
+            copy.remove(ms, mp, mo)
+            record(touched)
         }
     }
 
