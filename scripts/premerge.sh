@@ -65,7 +65,8 @@ main() {
     after=$(git status --porcelain)
     if [ "$before" != "$after" ]; then
       echo "fix: these files changed and need a commit:"
-      diff <(echo "$before") <(echo "$after") | sed -n 's/^> /  /p'
+      # diff exits 1 when the lists differ, which is the expected case here
+      { diff <(echo "$before") <(echo "$after") || [ $? -eq 1 ]; } | sed -n 's/^> /  /p'
     else
       echo "fix: nothing changed"
     fi

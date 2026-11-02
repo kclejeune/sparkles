@@ -1695,6 +1695,7 @@ fn crash_images_of_a_dataset_with_full_text_search_ordinary() {
 /// after sync entry and holds that sync until its receipt. The test rejects a run
 /// without either a real checkpoint or fresh publication inside one successful sync.
 /// Ordinary and grouped commits are separate tests so that they run in parallel.
+#[cfg(all(feature = "text", feature = "failpoints"))]
 fn background_full_text_checkpoints(group: bool) {
     crash_images(
         if group {

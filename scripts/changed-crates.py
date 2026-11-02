@@ -32,6 +32,7 @@ Usage:
 import fnmatch
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -61,7 +62,15 @@ READ_BY = [
     ("scripts/api-compat.py", ["sparkles-server"]),
     ("scripts/api-compat-tests/*", ["sparkles-server"]),
     ("scripts/bench-lubm/*", ["sparkles-reasoner"]),
+    # tests/parity.rs checks that the named bindings exist in these sources
+    ("js/engine/src/*", ["sparkles"]),
+    ("jvm/sparkles-jena/src/*", ["sparkles"]),
 ]
+
+# A literal path into another crate's directory, such as `#[path = "../../sparkles-shacl/…"]`
+# or `include_str!("../../sparkles-fmt/tests/…")`, makes the reading package depend on
+# that crate's files as a Cargo dependency would.
+CROSS_READ = re.compile(r'"(?:\.\./)+(sparkles[a-z0-9-]*)/')
 
 # Files outside the crates that no Rust build or test of the main workspace reads.
 NO_RUST = [
@@ -95,7 +104,8 @@ def git(*args):
 
 def changed_files(base):
     merge_base = git("merge-base", base, "HEAD").strip()
-    files = set(git("diff", "--name-only", merge_base).split("\n"))
+    # --no-renames reports both the old and the new path of a moved file
+    files = set(git("diff", "--name-only", "--no-renames", merge_base).split("\n"))
     files |= set(git("ls-files", "--others", "--exclude-standard").split("\n"))
     files.discard("")
     return sorted(files)
@@ -118,10 +128,24 @@ def workspace():
             continue
         rel = os.path.relpath(os.path.dirname(p["manifest_path"]), root)
         deps = {d["name"] for d in p["dependencies"] if d.get("path")}
+        deps |= cross_reads(os.path.join(root, rel))
         packages[p["name"]] = (rel, deps)
         if any("lib" in t["kind"] or "proc-macro" in t["kind"] for t in p["targets"]):
             LIBS.add(p["name"])
     return packages
+
+
+def cross_reads(directory):
+    """The crate directory names that literal paths in the Rust files under DIRECTORY name."""
+    names = set()
+    for base, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if d != "target"]
+        for f in files:
+            if f.endswith(".rs"):
+                with open(os.path.join(base, f), errors="replace") as fh:
+                    names |= set(CROSS_READ.findall(fh.read()))
+    names.discard(os.path.basename(directory))
+    return names
 
 
 def matches(path, patterns):
@@ -131,6 +155,9 @@ def matches(path, patterns):
 def choose(base):
     packages = workspace()
     names = set(packages)
+    # a cross read names a crate directory, which is the package's name in this workspace
+    by_dir = {os.path.basename(rel): name for name, (rel, _) in packages.items()}
+    packages = {n: (rel, {by_dir.get(d, d) for d in deps}) for n, (rel, deps) in packages.items()}
     chosen = {}
     for f in changed_files(base):
         if matches(f, ALL):

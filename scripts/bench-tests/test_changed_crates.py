@@ -1,6 +1,8 @@
 """Exercise the changed-crates selection of `scripts/ci.sh --changed` on a fixed workspace."""
 import importlib.util
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -20,6 +22,31 @@ PACKAGES = {
     "sparkles-server": ("crates/sparkles-server", {"sparkles", "sparkles-fmt"}),
     "sparkles-fmt-wasm": ("crates/sparkles-fmt-wasm", {"sparkles-fmt"}),
 }
+
+
+class RenamedFiles(unittest.TestCase):
+    def test_a_moved_file_reports_both_paths(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = lambda *a: subprocess.run(["git", "-C", d, *a], check=True, capture_output=True, text=True)
+            run("init", "-q", "-b", "main")
+            run("config", "user.email", "t@example.invalid")
+            run("config", "user.name", "t")
+            run("config", "commit.gpgsign", "false")
+            os.makedirs(os.path.join(d, "crates/sparkles-core/tests"))
+            with open(os.path.join(d, "crates/sparkles-core/tests/f.rdfp"), "w") as f:
+                f.write("fixture\n" * 20)
+            run("add", ".")
+            run("commit", "-q", "-m", "base")
+            os.makedirs(os.path.join(d, "docs"))
+            run("mv", "crates/sparkles-core/tests/f.rdfp", "docs/f.rdfp")
+            run("commit", "-q", "-m", "move")
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                files = cc.changed_files("HEAD~1")
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(files, ["crates/sparkles-core/tests/f.rdfp", "docs/f.rdfp"])
 
 
 class ChangedCrates(unittest.TestCase):
@@ -55,6 +82,20 @@ class ChangedCrates(unittest.TestCase):
     def test_files_read_from_outside_the_crates(self):
         self.assertEqual(self.choose("docs/openapi.json"), ["sparkles", "sparkles-client", "sparkles-server"])
         self.assertEqual(self.choose("ui/src/lib/x.svelte"), ["sparkles-fmt-wasm", "sparkles-server"])
+
+    def test_binding_sources_that_the_parity_test_reads(self):
+        self.assertEqual(self.choose("js/engine/src/index.ts"), ["sparkles", "sparkles-server"])
+        self.assertEqual(self.choose("jvm/sparkles-jena/src/main/kotlin/A.kt"), ["sparkles", "sparkles-server"])
+        self.assertEqual(self.choose("js/client/src/x.ts"), "none")
+
+    def test_literal_paths_into_another_crate_count_as_dependencies(self):
+        packages = dict(PACKAGES, **{"sparkles-shex": ("crates/sparkles-shex", {"sparkles-shacl"})})
+        with mock.patch.object(cc, "workspace", return_value=packages), mock.patch.object(
+            cc, "changed_files", return_value=["crates/sparkles-shacl/tests/draft_fixture/mod.rs"]
+        ):
+            self.assertIn("sparkles-shex", cc.choose("base")[0])
+        self.assertIn("sparkles-shacl", cc.cross_reads(str(ROOT / "crates/sparkles-shex")))
+        self.assertIn("sparkles-fmt", cc.cross_reads(str(ROOT / "crates/sparkles-server")))
 
     def test_binding_workspaces_outside_the_main_workspace(self):
         self.assertEqual(self.choose("crates/sparkles-py/src/lib.rs"), "none")
