@@ -142,9 +142,10 @@ check them against the W3C suites and Jena's own answers.
   the LIMIT is answered even when the search matches more than `maxHits`.
 * An EXISTS or NOT EXISTS that is a FILTER conjunct, a BIND expression or an OPTIONAL
   condition is answered from a key set of its pattern, built once per query, when the
-  pattern costs more than evaluating it for each distinct outer key. A row that binds a
-  variable a FILTER inside the pattern reads is evaluated on its own. An EXISTS inside a
-  larger expression, such as IF or OR, is evaluated once per distinct outer key.
+  pattern costs less than evaluating it for each distinct outer key. A row is evaluated
+  on its own when it binds a variable that a FILTER inside the pattern reads and the
+  pattern under that FILTER may leave unbound. An EXISTS inside a larger expression, such
+  as IF or OR, is evaluated once per distinct outer key.
 * Eager ASK execution can visit a pure UNION branch with lower estimated work before
   its first answer. On an unchanged snapshot without a total produced-row cap, a
   bounded whitelist of the whole ASK lets pure input operators request only the rows
