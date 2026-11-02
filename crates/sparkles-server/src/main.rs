@@ -859,9 +859,9 @@ enum LogFormat {
 /// (`serve --request-cpus`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum RequestCpus {
-    /// On a hybrid processor, request threads run on the performance cores and the
-    /// query pool leaves a CPU free for every four efficiency cores. Elsewhere, as
-    /// `all`.
+    /// On a hybrid processor, request work runs on the performance cores while at most
+    /// one request per performance core is in flight, and the query pool leaves a CPU
+    /// free for every four efficiency cores. Elsewhere, as `all`.
     Auto,
     /// Every thread may run on every CPU, and the query pool has a thread per logical CPU.
     All,
@@ -1335,10 +1335,11 @@ enum Cmd {
         /// Datasets opened at once at startup (default: the number of cores, at most 4)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         open_threads: Option<u32>,
-        /// Where request threads run on a processor with performance and efficiency
-        /// cores: `auto` runs them on the performance cores and sizes the query pool to
-        /// leave room for them, `all` lets every thread run anywhere. RAYON_NUM_THREADS
-        /// still sets the query pool's size
+        /// Where request work runs on a processor with performance and efficiency cores:
+        /// `auto` runs it on the performance cores while at most one request per
+        /// performance core is in flight and sizes the query pool to leave room for it,
+        /// `all` lets every thread run anywhere. RAYON_NUM_THREADS still sets the query
+        /// pool's size
         #[arg(long, value_enum, default_value_t = RequestCpus::Auto)]
         request_cpus: RequestCpus,
         /// Background tasks (compaction, clones, reasoning, full-text builds, N-Quads
@@ -3275,8 +3276,8 @@ fn run() -> Result<()> {
             // spawning a thread per core, which made a cold point lookup several times
             // slower than the second. Starting the pool here, and waiting until each
             // worker has run once, moves that cost before the server listens.
-            // On a hybrid processor the request threads run on the performance cores, and
-            // the query pool leaves room for them (see `cpus`).
+            // On a hybrid processor request work runs on the performance cores while they
+            // can hold it, and the query pool leaves room for it (see `cpus`).
             let hybrid = match request_cpus {
                 RequestCpus::Auto => cpus::Hybrid::detect(),
                 RequestCpus::All => None,
@@ -3295,14 +3296,17 @@ fn run() -> Result<()> {
                 warm::spawn_prefault();
             }
             if let Some(h) = &hybrid {
+                let placement = cpus::Placement::new(h, cpus::physical_cores(&h.performance));
                 tracing::info!(
                     performance = h.performance.len(),
                     efficiency = h.efficiency.len(),
                     query_threads = rayon::current_num_threads(),
-                    "hybrid processor: request threads run on the performance cores"
+                    request_limit = placement.limit(),
+                    "hybrid processor: request work runs on the performance cores while at \
+                     most request_limit requests are in flight"
                 );
+                cpus::start(placement);
             }
-            let request_cpus = hybrid.map(|h| h.performance);
             alloc::start_clock();
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             // at least a second, and small enough for an `Instant` deadline
@@ -3312,10 +3316,6 @@ fn run() -> Result<()> {
             };
             let mut rt = tokio::runtime::Builder::new_multi_thread();
             rt.thread_stack_size(THREAD_STACK).enable_all();
-            if let Some(cpus) = request_cpus {
-                // runtime workers and blocking threads alike
-                rt.on_thread_start(move || cpus::pin_current_thread(&cpus));
-            }
             let rt = rt.build()?;
             // Queries run on the runtime's blocking threads, which it also starts on first
             // use. One started here serves a first query that arrives soon after the

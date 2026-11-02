@@ -1027,7 +1027,8 @@ pub(crate) fn unavailable_error(name: &str, u: &crate::state::Unavailable) -> Ap
 
 /// Run `f` on a blocking thread, inside the request's span (so engine events carry the
 /// request id and engine spans are its children). The thread holds the request's
-/// concurrency permits until `f` returns, even when the client is gone.
+/// concurrency permits until `f` returns, even when the client is gone, and runs on the
+/// CPUs that request work goes to (see `cpus`).
 pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> ApiResult<T> + Send + 'static,
 ) -> ApiResult<T> {
@@ -1043,6 +1044,7 @@ pub(crate) async fn blocking<T: Send + 'static>(
         if let Some(gate) = probe.blocking {
             gate.wait();
         }
+        crate::cpus::place_request();
         span.in_scope(f)
     })
     .await
