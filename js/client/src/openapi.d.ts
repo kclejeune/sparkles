@@ -3889,6 +3889,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/claims/review": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Review claims under a policy
+         * @description Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.
+         */
+        post: operations["reviewClaims"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/{ds}/claims/withdraw": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Withdraw claim occurrences
+         * @description Needs `write` on the dataset or branch through the update endpoint, update grants on each claim's graph, and update and read grants on the output graph and read grants on the decisions and supports graphs of every policy whose evidence boundary holds a claim's graph. Counts as an update. Records a withdrawal with `prov:invalidatedAtTime` in each claim's graph as one commit of the evidence owner, without making a contrary claim. The claims' supports stop being live, and each projected triple left without a live support leaves its output graph. A claim that is already withdrawn is answered as `existing`. Refusals write nothing: `400`, `403`, `409 head-changed`, `409 target-changed`, `409 idempotency-conflict`, `422 evidence-unavailable`, `503 projection-unavailable` and `503 authority-changed`.
+         */
+        post: operations["withdrawClaims"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/data": {
         parameters: {
             query?: never;
@@ -6695,7 +6735,7 @@ export interface components {
                 iri: string;
                 key: string;
                 /** @enum {string} */
-                kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal";
+                kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection";
                 /** @description The digest of the record's immutable content. */
                 recordDigest: string;
             }[];
@@ -6714,7 +6754,7 @@ export interface components {
                     /** @description The record's IRI. */
                     iri: string;
                     /** @description The kinds the record may have. Any profile kind when absent. */
-                    kinds?: ("SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal")[];
+                    kinds?: ("SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection")[];
                 };
                 storedFact?: {
                     /**
@@ -6751,7 +6791,7 @@ export interface components {
                     graph: string;
                     iri: string;
                     /** @enum {string} */
-                    kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal";
+                    kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection";
                     receipt: {
                         /**
                          * Format: uuid
@@ -6800,6 +6840,86 @@ export interface components {
                     servedBy: string;
                 };
             }[];
+        };
+        /** @description Review decisions under one policy. */
+        EvidenceReview: {
+            decisions: {
+                /** @enum {string} */
+                disposition: "accepted" | "rejected" | "needsEvidence";
+                /** @description The decision's key in this request. */
+                key: string;
+                /** @description The target's current decision under the policy, required when it has one, else `409 decision-superseded`. */
+                supersedes?: string;
+                /** @description The reviewed claim or assessment. */
+                target: string;
+                /** @description The target's record digest as the reviewer saw it, else `409 target-changed`. */
+                targetDigest: string;
+            }[];
+            /** @description Check and preview the review without committing it. */
+            dryRun?: boolean;
+            /** @description Makes a retry with the same payload answer the first receipt. */
+            idempotencyKey?: string;
+            /** @description The branch head the review was prepared at, else `409 head-changed`. Every read is made at this head. */
+            ifHead: number;
+            /** @description The commit message. */
+            message?: string;
+            /** @description The name of a review policy of the evidence settings. */
+            policy: string;
+            /** @description The policy version the reviewer saw, else `409 policy-changed`. */
+            policyVersion: number;
+        };
+        /** @description The outcome of a review. */
+        EvidenceReviewResult: {
+            /**
+             * Format: uuid
+             * @description The branch the commit published on.
+             */
+            branchId: string;
+            /** @description The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay. */
+            changed: {
+                inserted: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                removed: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                supportsAdded: string[];
+                supportsEnded: string[];
+            };
+            /** @description The publishing commit, the first one for a replay, or the head for a dry run. */
+            commit: number;
+            /** @description Whether this request published a commit. */
+            committed: boolean;
+            decisions: {
+                /** @description The contrary links and claims an `admitLabelled` policy admitted the claim against. */
+                conflicts: string[];
+                /** @enum {string} */
+                disposition: "accepted" | "rejected" | "needsEvidence";
+                iri: string;
+                key: string;
+                /** @description Why an acceptance did not project its claim. */
+                notProjected: string | null;
+                supersedes: string | null;
+                /** @description The acceptance support that owns the projected triple. */
+                support: string | null;
+                target: string;
+            }[];
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The operation, every decision's availability receipt. */
+            operation: string;
+            /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
+            replayed: boolean;
         };
         /** @description The evidence settings of a dataset, as `evidence.json` format 1 holds them. */
         EvidenceSettings: {
@@ -6853,6 +6973,72 @@ export interface components {
             /** @description The revision of the managed-graph registry, 0 when there is none. */
             revision: number;
             settings: components["schemas"]["EvidenceSettings"];
+        };
+        /** @description Claim occurrences to withdraw. */
+        EvidenceWithdrawal: {
+            /** @description Check and preview the withdrawal without committing it. */
+            dryRun?: boolean;
+            /** @description Makes a retry with the same payload answer the first receipt. */
+            idempotencyKey?: string;
+            /** @description Publish only while this commit is the branch head, else `409 head-changed`. */
+            ifHead?: number;
+            /** @description The commit message. */
+            message?: string;
+            withdrawals: {
+                /** @description The withdrawal's key in this request. */
+                key: string;
+                /** @description The withdrawn claim occurrence. */
+                target: string;
+                /** @description The claim's record digest, else `409 target-changed`. */
+                targetDigest: string;
+            }[];
+        };
+        /** @description The outcome of a withdrawal. */
+        EvidenceWithdrawalResult: {
+            /**
+             * Format: uuid
+             * @description The branch the commit published on.
+             */
+            branchId: string;
+            /** @description The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay. */
+            changed: {
+                inserted: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                removed: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                supportsAdded: string[];
+                supportsEnded: string[];
+            };
+            /** @description The publishing commit, the first one for a replay, or the head for a dry run. */
+            commit: number;
+            /** @description Whether this request published a commit. */
+            committed: boolean;
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The operation, every withdrawal's availability receipt. */
+            operation: string;
+            /** @description Whether the idempotency key had published the same payload. */
+            replayed: boolean;
+            withdrawals: {
+                /** @description An earlier withdrawal had already withdrawn the claim. */
+                existing: boolean;
+                /** @description The withdrawal record, `null` when the claim was already withdrawn. */
+                iri: string | null;
+                key: string;
+                target: string;
+            }[];
         };
         Explain: {
             /** @description The algebra in SSE. */
@@ -21674,6 +21860,80 @@ export interface operations {
             409: components["responses"]["Conflict"];
             413: components["responses"]["PayloadTooLarge"];
             422: components["responses"]["Unprocessable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    reviewClaims: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceReview"];
+            };
+        };
+        responses: {
+            /** @description The operation and its decisions, published, replayed or previewed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceReviewResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    withdrawClaims: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceWithdrawal"];
+            };
+        };
+        responses: {
+            /** @description The operation and its withdrawals, published, replayed or previewed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceWithdrawalResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
