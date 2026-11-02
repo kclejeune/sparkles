@@ -139,62 +139,16 @@ impl Placement {
     }
 
     fn set(&self, want: Placed) {
-        PLACED.with(|this| {
-            if this.placed.get() != want {
-                // A thread is listed while it runs on the performance cores, so that a
-                // sweep leaves it there.
-                let mut listed = ON_PERFORMANCE.lock();
-                if want == Placed::Performance {
-                    listed.insert(this.tid);
-                    pin_current_thread(&self.performance);
-                } else {
-                    pin_current_thread(&self.every);
-                    if listed.remove(&this.tid) {
-                        // threads it started while listed may still hold its CPUs
-                        SWEEP.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-                this.placed.set(want);
+        PLACED.with(|placed| {
+            if placed.get() != want {
+                pin_current_thread(match want {
+                    Placed::Performance => &self.performance,
+                    _ => &self.every,
+                });
+                placed.set(want);
             }
         });
     }
-
-    /// Move to every CPU each of `threads` that runs on the performance cores without
-    /// having placed itself there. Such a thread inherited its CPUs from a request thread
-    /// that started it, as the block decoders, the vocabulary sync worker and the change
-    /// log publisher are started by the first request that needs them, and it would
-    /// otherwise stay on the performance cores for its life.
-    ///
-    /// The list's lock is held for each thread, so a thread that places itself on the
-    /// performance cores meanwhile, which lists itself before it moves, is left there. A
-    /// thread id is acted on only through a pidfd that keeps it from being reused, and
-    /// only once the id is known to be a thread of this process.
-    fn sweep(&self, threads: impl IntoIterator<Item = i32>) -> usize {
-        let mut moved = 0;
-        for tid in threads {
-            let listed = ON_PERFORMANCE.lock();
-            if listed.contains(&tid) {
-                continue;
-            }
-            let Some(_held) = own_thread(tid) else {
-                continue;
-            };
-            if thread_cpus(tid).is_some_and(|c| c == self.performance)
-                && pin_thread(tid, &self.every)
-            {
-                moved += 1;
-            }
-            drop(listed);
-        }
-        moved
-    }
-}
-
-/// Whether a sweep is due: a thread runs on the performance cores by its own placement,
-/// and may start threads that inherit them, or a thread left them since the last sweep.
-fn sweep_due() -> bool {
-    let left = SWEEP.swap(false, std::sync::atomic::Ordering::Relaxed);
-    left || !ON_PERFORMANCE.lock().is_empty()
 }
 
 /// Where a thread last placed itself.
@@ -209,60 +163,14 @@ enum Placed {
 
 static PLACEMENT: std::sync::OnceLock<Placement> = std::sync::OnceLock::new();
 
-/// The threads that run on the performance cores because they placed themselves there.
-static ON_PERFORMANCE: parking_lot::Mutex<std::collections::BTreeSet<i32>> =
-    parking_lot::Mutex::new(std::collections::BTreeSet::new());
-
-/// Whether a thread left the performance cores since the last sweep.
-static SWEEP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// How often the server looks for threads that inherited the performance cores, while
-/// any thread runs there by its own placement.
-const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// A thread's placement, which leaves the list of threads on the performance cores when
-/// the thread ends, before the kernel may give its id to another thread.
-struct ThreadPlacement {
-    tid: i32,
-    placed: std::cell::Cell<Placed>,
-}
-
-impl Drop for ThreadPlacement {
-    fn drop(&mut self) {
-        if self.placed.get() == Placed::Performance {
-            ON_PERFORMANCE.lock().remove(&self.tid);
-        }
-    }
-}
-
 thread_local! {
-    static PLACED: ThreadPlacement = ThreadPlacement {
-        tid: current_tid(),
-        placed: std::cell::Cell::new(Placed::Unknown),
-    };
+    static PLACED: std::cell::Cell<Placed> = const { std::cell::Cell::new(Placed::Unknown) };
 }
 
 /// Place request work by `placement` from now on. The server calls it once at start, on
-/// a hybrid processor with `--request-cpus auto`. A thread then sweeps the process's
-/// threads once a second while a sweep is due (see [`sweep_due`]).
+/// a hybrid processor with `--request-cpus auto`.
 pub fn start(placement: Placement) {
-    if PLACEMENT.set(placement).is_err() {
-        return;
-    }
-    let _ = std::thread::Builder::new()
-        .name("cpu-placement".into())
-        .spawn(|| {
-            let p = PLACEMENT.get().expect("placement set");
-            loop {
-                std::thread::sleep(SWEEP_INTERVAL);
-                if sweep_due() {
-                    let moved = p.sweep(process_threads());
-                    if moved > 0 {
-                        tracing::debug!(moved, "threads moved off the performance cores");
-                    }
-                }
-            }
-        });
+    let _ = PLACEMENT.set(placement);
 }
 
 /// Run a thread the runtime starts on every CPU. A new thread inherits the CPUs of the
@@ -337,113 +245,20 @@ pub fn parse_list(s: &str) -> Option<Vec<usize>> {
 /// refuses, the thread keeps running where it may.
 pub fn pin_current_thread(cpus: &[usize]) {
     #[cfg(target_os = "linux")]
-    linux::pin(0, cpus);
+    linux::pin(cpus);
     #[cfg(not(target_os = "linux"))]
     let _ = cpus;
 }
 
-/// Run the thread `tid` of this process only on `cpus`, and whether that succeeded.
-fn pin_thread(tid: i32, cpus: &[usize]) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        linux::pin(tid, cpus)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (tid, cpus);
-        false
-    }
-}
-
-/// The CPUs the thread `tid` of this process may run on.
-fn thread_cpus(tid: i32) -> Option<Vec<usize>> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::allowed_of(tid)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = tid;
-        None
-    }
-}
-
-/// A hold on the thread `tid` that keeps its id from being given to another thread, once
-/// the id is known to name a thread of this process, or `None` when it does not or the
-/// kernel cannot hold a thread (Linux before 6.9).
-fn own_thread(tid: i32) -> Option<ThreadHold> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::own_thread(tid)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = tid;
-        None
-    }
-}
-
-#[cfg(target_os = "linux")]
-type ThreadHold = std::os::fd::OwnedFd;
-#[cfg(not(target_os = "linux"))]
-type ThreadHold = ();
-
-/// The kernel's id of the calling thread.
-fn current_tid() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: gettid has no preconditions.
-        unsafe { libc::gettid() }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0
-    }
-}
-
-/// The kernel's ids of this process's threads.
-fn process_threads() -> Vec<i32> {
-    std::fs::read_dir("/proc/self/task")
-        .map(|d| {
-            d.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 #[cfg(target_os = "linux")]
 mod linux {
-    /// A pidfd of the thread `tid`, which holds its id while it is open, once the id is
-    /// known to name a thread of this process.
-    pub fn own_thread(tid: i32) -> Option<std::os::fd::OwnedFd> {
-        use std::os::fd::FromRawFd;
-        // PIDFD_THREAD, which lets a pidfd name a thread other than the leader
-        const PIDFD_THREAD: libc::c_uint = libc::O_EXCL as libc::c_uint;
-        // SAFETY: pidfd_open takes a pid and flags and returns a new descriptor or -1.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, tid, PIDFD_THREAD) };
-        if fd < 0 {
-            return None;
-        }
-        // SAFETY: the descriptor is new and owned by nothing else.
-        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
-        // the id cannot change hands while the pidfd is open, so this check holds
-        std::path::Path::new(&format!("/proc/self/task/{tid}"))
-            .exists()
-            .then_some(fd)
-    }
-
     /// The CPUs the calling thread may run on.
     pub fn allowed() -> Option<Vec<usize>> {
-        allowed_of(0)
-    }
-
-    /// The CPUs the thread `tid` may run on, or the calling thread's for 0.
-    pub fn allowed_of(tid: i32) -> Option<Vec<usize>> {
         // SAFETY: a zeroed cpu_set_t is an empty set, and sched_getaffinity writes at
         // most size_of::<cpu_set_t>() bytes into it.
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
-            if libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
                 return None;
             }
             Some(
@@ -454,9 +269,7 @@ mod linux {
         }
     }
 
-    /// Run the thread `tid`, or the calling thread for 0, only on `cpus`, and whether
-    /// the kernel took it. A thread that has ended is refused.
-    pub fn pin(tid: i32, cpus: &[usize]) -> bool {
+    pub fn pin(cpus: &[usize]) {
         // SAFETY: CPU_SET writes within the zeroed set for CPUs below CPU_SETSIZE, and
         // sched_setaffinity reads size_of::<cpu_set_t>() bytes of it.
         unsafe {
@@ -464,14 +277,12 @@ mod linux {
             for &c in cpus.iter().filter(|&&c| c < libc::CPU_SETSIZE as usize) {
                 libc::CPU_SET(c, &mut set);
             }
-            if libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
                 tracing::debug!(
-                    "could not place a thread: {}",
+                    "could not pin a request thread: {}",
                     std::io::Error::last_os_error()
                 );
-                return false;
             }
-            true
         }
     }
 }
@@ -605,106 +416,6 @@ mod tests {
         assert_eq!(got.0, vec![allowed[0]]);
         assert_eq!(got.1, allowed);
         assert_eq!(got.2, (allowed.clone(), allowed));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_sweep_moves_threads_that_inherited_the_performance_cores() {
-        let allowed = linux::allowed().unwrap();
-        if allowed.len() < 2 {
-            return;
-        }
-        let p = std::sync::Arc::new(Placement {
-            performance: vec![allowed[0]],
-            every: allowed.clone(),
-            limit: 2,
-        });
-        let (to_test, from_parent) = std::sync::mpsc::channel::<(&str, i32)>();
-        let (to_parent, from_test) = std::sync::mpsc::channel::<()>();
-        let (release, wait) = std::sync::mpsc::channel::<()>();
-        let q = p.clone();
-        let parent = std::thread::spawn(move || {
-            // a request thread on the performance cores
-            q.place(1);
-            to_test.send(("parent", current_tid())).unwrap();
-            // it starts a long-lived worker only after a sweep has run
-            from_test.recv().unwrap();
-            let sent = to_test.clone();
-            let child = std::thread::spawn(move || {
-                sent.send(("child", current_tid())).unwrap();
-                wait.recv().unwrap();
-                linux::allowed().unwrap()
-            });
-            from_test.recv().unwrap();
-            // and then leaves the performance cores under load
-            q.place(5);
-            to_test.send(("left", 0)).unwrap();
-            child
-        });
-        let parent_tid = from_parent.recv().unwrap().1;
-        assert!(ON_PERFORMANCE.lock().contains(&parent_tid));
-        // a sweep stays due while a thread is listed
-        assert!(sweep_due());
-        assert_eq!(p.sweep(process_threads()), 0);
-        to_parent.send(()).unwrap();
-        let child_tid = from_parent.recv().unwrap().1;
-        assert_eq!(thread_cpus(child_tid), Some(vec![allowed[0]]));
-        assert!(sweep_due());
-        assert_eq!(p.sweep(process_threads()), 1);
-        assert_eq!(thread_cpus(child_tid), Some(allowed.clone()));
-        to_parent.send(()).unwrap();
-        assert_eq!(from_parent.recv().unwrap().0, "left");
-        // leaving the performance cores makes a sweep due, for threads started meanwhile
-        assert!(!ON_PERFORMANCE.lock().contains(&parent_tid));
-        assert!(sweep_due());
-        let child = parent.join().unwrap();
-        release.send(()).unwrap();
-        assert_eq!(child.join().unwrap(), allowed);
-
-        // a thread on the performance cores by its own placement stays there, and leaves
-        // the list when it ends, also by a panic
-        for panics in [false, true] {
-            let q = p.clone();
-            let (tids, got_tids) = std::sync::mpsc::channel();
-            let (release, wait) = std::sync::mpsc::channel::<()>();
-            let placed = std::thread::spawn(move || {
-                q.place(1);
-                tids.send(current_tid()).unwrap();
-                wait.recv().unwrap();
-                assert!(!panics, "a request that panics");
-                linux::allowed().unwrap()
-            });
-            let tid = got_tids.recv().unwrap();
-            assert_eq!(p.sweep([tid]), 0);
-            assert_eq!(thread_cpus(tid), Some(vec![allowed[0]]));
-            release.send(()).unwrap();
-            assert_eq!(placed.join().ok(), (!panics).then(|| vec![allowed[0]]));
-            assert!(!ON_PERFORMANCE.lock().contains(&tid));
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_sweep_leaves_other_processes_alone() {
-        let allowed = linux::allowed().unwrap();
-        if allowed.len() < 2 {
-            return;
-        }
-        let p = Placement {
-            performance: vec![allowed[0]],
-            every: allowed.clone(),
-            limit: 2,
-        };
-        let mut other = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let pid = other.id() as i32;
-        assert!(linux::pin(pid, &[allowed[0]]));
-        assert_eq!(p.sweep([pid]), 0);
-        assert_eq!(linux::allowed_of(pid), Some(vec![allowed[0]]));
-        let _ = other.kill();
-        let _ = other.wait();
     }
 
     #[cfg(target_os = "linux")]
