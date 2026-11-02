@@ -103,9 +103,9 @@
    "metadata_note": "A manual agreement record of el_classify against ELK 0.6.0 on the ORE 2015 EL sample. Read the record for its method and checks."
   },
   {
-   "run_id": "sha256-7d7404b51b1e72a032ea2aa0a3aebfbf843d0373f0de1052c9e80b6c2cd82126",
+   "run_id": "sha256-3e2d5e1c2ecd834611bfa04df44bca51b8c79d138132b2de878d8947f006b9cb",
    "path": "runs/2026-11-02-hermit-agreement-aa0a41a6/record.json",
-   "sha256": "7d7404b51b1e72a032ea2aa0a3aebfbf843d0373f0de1052c9e80b6c2cd82126",
+   "sha256": "3e2d5e1c2ecd834611bfa04df44bca51b8c79d138132b2de878d8947f006b9cb",
    "format": "legacy-assessment",
    "context": {
     "suite": "el-classification",
@@ -131,7 +131,7 @@
       "name": "stanley",
       "role": "laptop, loaded by other work, so the times are a rough screen and not measurements"
      },
-     "method": "run.sh.txt ran HermiT once on each input and compared each HermiT taxonomy with the classifier's by scripts/el-oracle.py HERMIT.ofn OURS.txt and with ELK's by ref-compare.py.txt, which reads two reference files with el-oracle's own reader. compare.jsonl holds both reports, hermit.jsonl HermiT's JSON lines and cases/ the four test ontologies with each tool's taxonomy.",
+     "method": "run.sh.txt ran HermiT once on each input. Its comparison step passed ELK's taxonomy to el-oracle.py in the wrong form, so oracle.sh.txt made the retained comparisons again from the same taxonomies without running HermiT: scripts/el-oracle.py HERMIT.ofn OURS.txt against the classifier, and ref-compare.py.txt HERMIT.ofn ELK.ofn, which reads two reference files with el-oracle's own reader and counts the classes either side names alone. compare.jsonl holds both reports, hermit.jsonl HermiT's JSON lines and cases/ the four test ontologies with each tool's taxonomy. HermiT ran on one thread; the threads field of hermit.jsonl gives the unused --threads default of that harness version.",
      "kind": "agreement"
     }
    },

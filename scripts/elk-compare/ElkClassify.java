@@ -5,7 +5,7 @@
 //   ElkClassify [--reasoner elk|hermit] [--threads N] [--repeat N] [--taxonomy FILE] INPUT
 //
 // --reasoner hermit runs HermiT, a complete OWL 2 DL reasoner, in place of ELK, with its
-// default configuration and on one thread.
+// default configuration and on one thread, which the JSON line reports as its threads.
 //
 // Each of the N runs loads INPUT with a fresh OWL API manager, creates an ELK reasoner with
 // N worker threads and precomputes the class hierarchy. loadMs is the OWL API's parse of
@@ -76,8 +76,8 @@ public class ElkClassify {
                 default: input = args[i];
             }
         }
-        if (input == null || threads < 1 || repeat < 1) {
-            System.err.println("usage: ElkClassify [--threads N] [--repeat N] [--taxonomy FILE] INPUT");
+        if (input == null || threads < 1 || repeat < 1 || !(which.equals("elk") || which.equals("hermit"))) {
+            System.err.println("usage: ElkClassify [--reasoner elk|hermit] [--threads N] [--repeat N] [--taxonomy FILE] INPUT");
             System.exit(2);
         }
         File file = new File(input);
@@ -151,7 +151,8 @@ public class ElkClassify {
         field(out, "reasoner", "\"" + (which.equals("elk") ? "ELK " : "HermiT ")
             + impl.getPackage().getImplementationVersion() + "\"");
         field(out, "java", "\"" + System.getProperty("java.vm.name") + " " + System.getProperty("java.version") + "\"");
-        field(out, "threads", Integer.toString(threads));
+        // HermiT classifies on one thread whatever --threads asks for.
+        field(out, "threads", Integer.toString(which.equals("elk") ? threads : 1));
         field(out, "classes", Integer.toString(classes));
         field(out, "logicalAxioms", Integer.toString(logicalAxioms));
         field(out, "consistent", Boolean.toString(consistent));

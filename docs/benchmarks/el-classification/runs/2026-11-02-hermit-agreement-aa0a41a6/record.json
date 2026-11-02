@@ -1,12 +1,12 @@
 {
  "checks": [
   {
-   "detail": "36 of 36",
+   "detail": "36 of 36, and no class named on one side only",
    "name": "ore/hermit-agrees-with-classifier",
    "ok": true
   },
   {
-   "detail": "36 of 36",
+   "detail": "36 of 36, and no class named on one side only",
    "name": "ore/hermit-agrees-with-elk",
    "ok": true
   },
@@ -38,7 +38,7 @@
   "companion": "runs/2026-11-02-ore-elk-agreement-aa0a41a6 holds the classifier's and ELK's taxonomies of the same ontologies",
   "reference": "HermiT 1.4.5.519 on OWL API 5.1.20 through scripts/elk-compare/elk.sh run --reasoner hermit (pins in scripts/elk-compare/hermit-pins.tsv), Temurin 17.0.20, the harness of commit 995e8d6f"
  },
- "method": "run.sh.txt ran HermiT once on each input and compared each HermiT taxonomy with the classifier's by scripts/el-oracle.py HERMIT.ofn OURS.txt and with ELK's by ref-compare.py.txt, which reads two reference files with el-oracle's own reader. compare.jsonl holds both reports, hermit.jsonl HermiT's JSON lines and cases/ the four test ontologies with each tool's taxonomy.",
+ "method": "run.sh.txt ran HermiT once on each input. Its comparison step passed ELK's taxonomy to el-oracle.py in the wrong form, so oracle.sh.txt made the retained comparisons again from the same taxonomies without running HermiT: scripts/el-oracle.py HERMIT.ofn OURS.txt against the classifier, and ref-compare.py.txt HERMIT.ofn ELK.ofn, which reads two reference files with el-oracle's own reader and counts the classes either side names alone. compare.jsonl holds both reports, hermit.jsonl HermiT's JSON lines and cases/ the four test ontologies with each tool's taxonomy. HermiT ran on one thread; the threads field of hermit.jsonl gives the unused --threads default of that harness version.",
  "results": [],
  "scale": "36 ORE 2015 EL ontologies with nominals, SameIndividual, ranges with assertions or top-property axioms, and four range test ontologies",
  "settings": {
