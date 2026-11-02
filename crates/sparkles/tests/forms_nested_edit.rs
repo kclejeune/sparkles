@@ -455,6 +455,93 @@ fn a_malformed_list_is_read_only() {
     let tags = m.fields.iter().find(|f| f.id == id("tags")).unwrap();
     assert!(!tags.editable);
     assert_eq!(tags.reason, Some("list"));
+    // a change that names the head as the loaded value is refused too
+    let head = tags.values[0].term.clone();
+    let before = quads(&ds);
+    let c = change(
+        vec![FieldChange {
+            field: id("tags"),
+            list: Some(vec![iri("z")]),
+            ..Default::default()
+        }],
+        vec![(id("tags"), vec![head])],
+        vec![],
+    );
+    assert!(matches!(
+        ds.forms().save(&c, &Default::default()),
+        Err(sparkles::Error::NotPermitted(_))
+    ));
+    assert_eq!(quads(&ds), before);
+}
+
+#[test]
+fn a_node_left_unreferenced_by_a_later_deletion_is_removed_too() {
+    // alice -> a, alice -> b, a -> c, b -> d, d -> c: c loses its last reference only
+    // once d's quads go
+    let ds = dataset(
+        "ex:alice ex:address _:a , _:b . _:a ex:street \"A\" ; ex:geo _:c .
+         _:b ex:street \"B\" ; ex:geo _:d . _:d ex:geo _:c . _:c ex:lat 1 .",
+    );
+    let req = FormRequest::new(ex("alice"), settings());
+    let m = ds.forms().model(&req, &Default::default()).unwrap();
+    let both: Vec<Term> = m
+        .fields
+        .iter()
+        .find(|f| f.id == id("address"))
+        .unwrap()
+        .values
+        .iter()
+        .map(|v| v.term.clone())
+        .collect();
+    assert_eq!(both.len(), 2);
+    let c = change(
+        vec![field(id("address"), both.clone(), vec![])],
+        vec![(id("address"), both)],
+        vec![],
+    );
+    saved(ds.forms().save(&c, &Default::default()).unwrap());
+    let left: Vec<String> = quads(&ds)
+        .into_iter()
+        .filter(|l| !l.ends_with("<urn:shapes> ."))
+        .collect();
+    assert!(
+        !left.iter().any(|l| l.contains("<http://ex/lat>")),
+        "{left:?}"
+    );
+    assert!(
+        !left.iter().any(|l| l.contains("<http://ex/geo>")),
+        "{left:?}"
+    );
+    assert!(left.iter().any(|l| l.contains("\"Alice\"")));
+}
+
+#[test]
+fn a_child_with_more_references_than_one_scan_reads_is_not_emptied() {
+    // the child hangs from alice in more graphs than one reference scan reads, and also
+    // from bob: its street must stay whichever references the scan sees first
+    let edges: String = (0..=sparkles::forms::MAX_SUBTREE_QUADS)
+        .map(|i| format!("GRAPH <urn:g{i}> {{ ex:alice ex:address _:a }} "))
+        .collect();
+    let ds = dataset(&format!(
+        "{edges} _:a ex:street \"Main\" . ex:bob ex:address _:a ."
+    ));
+    let req = FormRequest::new(ex("alice"), settings());
+    let m = ds.forms().model(&req, &Default::default()).unwrap();
+    let child = m
+        .fields
+        .iter()
+        .find(|f| f.id == id("address"))
+        .unwrap()
+        .values[0]
+        .term
+        .clone();
+    let c = change(
+        vec![field(id("address"), vec![child.clone()], vec![])],
+        vec![(id("address"), vec![child])],
+        vec![],
+    );
+    let _ = ds.forms().save(&c, &Default::default());
+    assert!(quads(&ds).iter().any(|l| l.contains("\"Main\"")));
 }
 
 #[test]
@@ -568,4 +655,36 @@ fn a_check_maps_a_child_violation_to_the_child_field() {
             .any(|r| r["field"] == id("address") || r["field"] == id("street")),
         "{results:?}"
     );
+}
+
+#[test]
+fn a_result_on_a_new_child_names_it_as_the_request_does() {
+    // the address shape also targets the subjects of ex:geo, so the new child is a focus
+    // node of its own
+    let ds = dataset(
+        "GRAPH <urn:shapes> { ex:Address <http://www.w3.org/ns/shacl#targetSubjectsOf> ex:geo }",
+    );
+    let c = change(
+        vec![field(
+            id("address"),
+            vec![],
+            vec![Term::BlankNode(bn("a1"))],
+        )],
+        vec![(id("address"), vec![])],
+        vec![NodeChange {
+            node: bn("a1"),
+            parent: None,
+            field: id("address"),
+            changes: vec![field(id("geo"), vec![], vec![iri("somewhere")])],
+            expect: BTreeMap::new(),
+        }],
+    );
+    let check = ds.forms().check(&c, &Default::default()).unwrap();
+    let results = check.results.unwrap();
+    let street = results
+        .iter()
+        .find(|r| r["field"] == id("street"))
+        .unwrap_or_else(|| panic!("the child's street result in {results:?}"));
+    assert_eq!(street["node"]["type"], "bnode", "{street:?}");
+    assert_eq!(street["node"]["value"], "a1", "{street:?}");
 }

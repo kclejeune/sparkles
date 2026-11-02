@@ -488,7 +488,21 @@ fn merge(c: &mut FieldConstraints, shapes: &Shapes, list: &[Constraint]) {
                 let t = shapes.shapes()[*n].node.clone();
                 if !l.member_shapes.contains(&t) {
                     l.member_shapes.push(t);
-                    merge(&mut l.member, shapes, &shapes.shapes()[*n].constraints);
+                    // a member's own list constraints stay with the server, so a list of
+                    // lists, or a member shape that names itself, ends at one level
+                    for mc in &shapes.shapes()[*n].constraints {
+                        if matches!(
+                            mc,
+                            Constraint::MemberShape(_)
+                                | Constraint::MinListLength(_)
+                                | Constraint::MaxListLength(_)
+                                | Constraint::UniqueMembers(_)
+                        ) {
+                            l.member.server.insert(mc.component().into_string());
+                        } else {
+                            merge(&mut l.member, shapes, std::slice::from_ref(mc));
+                        }
+                    }
                 }
                 c.server.insert(k.component().into_string());
             }

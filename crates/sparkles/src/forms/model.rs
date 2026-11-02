@@ -1227,13 +1227,14 @@ impl Built {
                 };
                 if r.focus_node == self.focus {
                     j["field"] = json!(field_of(&self.layout));
-                } else if let Some((term, layout)) = plan
+                } else if let Some((_, named, layout)) = plan
                     .nodes
                     .iter()
-                    .find(|(t, _)| edit::stored(t, fresh) == r.focus_node)
+                    .find(|(t, _, _)| edit::stored(t, fresh) == r.focus_node)
                 {
+                    // a new child is named as the request names it
                     j["field"] = json!(field_of(layout));
-                    j["node"] = term_json(&edit::stored(term, fresh));
+                    j["node"] = term_json(named);
                 } else {
                     j["field"] = J::Null;
                 }
@@ -1820,6 +1821,76 @@ mod tests {
         // the request is cancelled after the shapes were read: the values are not
         built.limits.cancel = Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
         assert!(matches!(built.model(true, "main"), Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn a_child_whose_type_moved_to_another_graph_makes_the_plan_stale() {
+        let ds = Dataset::memory();
+        ds.update(
+            r#"PREFIX ex: <http://ex/> PREFIX sh: <http://www.w3.org/ns/shacl#>
+            INSERT DATA {
+              GRAPH <urn:shapes> { ex:S a sh:NodeShape ; sh:targetClass ex:P ;
+                sh:property [ sh:path ex:address ; sh:node ex:A ] .
+                ex:A sh:property [ sh:path ex:street ] }
+              ex:a a ex:P ; ex:address _:x .
+              GRAPH <urn:g1> { _:x a ex:Address } }"#,
+        )
+        .unwrap();
+        let settings = FormSettings {
+            shapes: ShapesSource::Graphs,
+            graphs: vec!["urn:shapes".into()],
+            target_graph: "type".into(),
+            ..Default::default()
+        };
+        let req = FormRequest::new("http://ex/a", settings.clone());
+        let m = ds.forms().nested_model(&req, &Default::default()).unwrap();
+        let Term::BlankNode(child) = m.nested_nodes[0].term.clone() else {
+            panic!("a blank child");
+        };
+        let change = FormChange {
+            focus: "http://ex/a".into(),
+            settings,
+            nested: vec![NodeChange {
+                node: child,
+                parent: None,
+                field: "<http://ex/address>".into(),
+                changes: vec![FieldChange {
+                    field: "<http://ex/street>".into(),
+                    add: vec![Term::Literal(oxrdf::Literal::new_simple_literal("Main"))],
+                    ..Default::default()
+                }],
+                expect: BTreeMap::from([("<http://ex/street>".into(), vec![])]),
+            }],
+            ..Default::default()
+        };
+        let opts = QueryOptions::default();
+        let forms = ds.forms();
+        let head = ds.store().snapshot();
+        let built = forms.build_for(&head, &change, &opts).unwrap();
+        let plan = built.plan(&change, false).unwrap();
+        let guard = Guard::of(&built, &plan, &change).unwrap();
+        let limits = Limits::of(&opts);
+        let (conflicts, stale) = guard.differ(&head, None, &limits).unwrap();
+        assert!(conflicts.is_empty() && !stale);
+        // the child's type moves to another graph, so its new values belong there
+        ds.update(
+            r#"PREFIX ex: <http://ex/>
+            DELETE { GRAPH <urn:g1> { ?x a ex:Address } } INSERT { GRAPH <urn:g2> { ?x a ex:Address } }
+            WHERE { ex:a ex:address ?x }"#,
+        )
+        .unwrap();
+        let now = ds.store().snapshot();
+        let (conflicts, stale) = guard.differ(&now, None, &limits).unwrap();
+        assert!(conflicts.is_empty() && stale);
+        // the save plans again and writes the street into the new graph
+        assert!(matches!(
+            forms.save(&change, &opts).unwrap(),
+            FormSaved::Saved(_)
+        ));
+        assert!(
+            ds.ask(r#"ASK { GRAPH <urn:g2> { ?x <http://ex/street> "Main" } }"#)
+                .unwrap()
+        );
     }
 }
 

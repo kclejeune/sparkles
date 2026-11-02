@@ -621,24 +621,7 @@ impl Built {
         })
         .map_err(crate::handles::from_anyhow)?;
         let read = self.read()?;
-        let mut target = target_graph(&read, focus, &self.target_policy)?;
-        let mut types = BTreeSet::new();
-        for value in read.values(
-            focus,
-            &FieldPath::Predicate(NamedNode::new_unchecked(RDF_TYPE)),
-        )? {
-            if let Term::NamedNode(iri) = value.term {
-                self.limits.lexical(iri.as_str())?;
-                self.limits.unit()?;
-                types.insert(iri.into_string());
-            }
-        }
-        if self.target_policy == "type"
-            && types.is_empty()
-            && let Some(graph) = anchor
-        {
-            target = graph;
-        }
+        let (target, types) = child_target(&read, focus, &self.target_policy, anchor)?;
         Ok(Built {
             focus: focus.clone(),
             new_class: None,
@@ -662,4 +645,34 @@ impl Built {
             prefixes: self.prefixes.clone(),
         })
     }
+}
+
+/// The target graph of a stored nested child and its types: the policy resolved against
+/// the child, and with `targetGraph: "type"` the graph of its edge (`anchor`) when the
+/// child has no type.
+pub(super) fn child_target(
+    read: &Reader<'_>,
+    focus: &Term,
+    policy: &str,
+    anchor: Option<Option<String>>,
+) -> Result<(Option<String>, BTreeSet<String>)> {
+    let mut target = target_graph(read, focus, policy)?;
+    let mut types = BTreeSet::new();
+    for value in read.values(
+        focus,
+        &FieldPath::Predicate(NamedNode::new_unchecked(RDF_TYPE)),
+    )? {
+        if let Term::NamedNode(iri) = value.term {
+            read.limits.lexical(iri.as_str())?;
+            read.limits.unit()?;
+            types.insert(iri.into_string());
+        }
+    }
+    if policy == "type"
+        && types.is_empty()
+        && let Some(graph) = anchor
+    {
+        target = graph;
+    }
+    Ok((target, types))
 }

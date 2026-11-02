@@ -518,3 +518,36 @@ ex:S a sh:NodeShape ; sh:targetNode ex:a ;
     }
     assert!(units > 0);
 }
+
+#[test]
+fn a_member_shape_that_names_itself_ends_at_one_level() {
+    let text = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://ex.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+  sh:property [ sh:path ex:l ; sh:memberShape ex:M ] .
+ex:M sh:memberShape ex:M ; sh:minListLength 1 ; sh:datatype xsd:integer .
+"#;
+    let shapes = Shapes::parse(text, RdfFormat::Turtle, None).unwrap();
+    let s = shapes
+        .shape_id(&Term::NamedNode(ex("S")))
+        .expect("the node shape");
+    for layout in [
+        form_layout(&shapes, &[s]),
+        form_layout_with(&shapes, &[s], &mut || Ok(())).unwrap(),
+    ] {
+        let l = &layout.fields[0];
+        let list = l.constraints.list.as_ref().expect("a list field");
+        assert!(list.member.list.is_none());
+        assert_eq!(
+            list.member.datatype.as_ref().map(|d| d.as_str()),
+            Some("http://www.w3.org/2001/XMLSchema#integer")
+        );
+        assert!(
+            list.member
+                .server
+                .iter()
+                .any(|c| c.ends_with("MemberShapeConstraintComponent"))
+        );
+    }
+}

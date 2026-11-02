@@ -64,6 +64,8 @@ struct Anchor {
     field: String,
     path: FieldPath,
     child: Term,
+    /// the child's target graph as planned, which its type or its edge can move
+    target: Option<String>,
 }
 
 /// The quads a change deletes and inserts, and what its save checks under the writer.
@@ -82,8 +84,9 @@ pub(super) struct Plan {
     pub(super) touched: Vec<Term>,
     /// distinct changed triples in graphs of the validation data graph
     pub(super) quads: Vec<Quad>,
-    /// the nested nodes of the change, with their fields, for mapping check results
-    pub(super) nodes: Vec<(Term, FormLayout)>,
+    /// the nested nodes of the change, with the term the request names them by and their
+    /// fields, for mapping check results
+    pub(super) nodes: Vec<(Term, Term, FormLayout)>,
     /// nested entries whose node no longer hangs from its parent: answered as conflicts
     pub(super) lost: Vec<FieldConflict>,
 }
@@ -265,8 +268,11 @@ fn quad_of(snap: &Snapshot, q: [Id; 4]) -> Option<Quad> {
 
 /// The quads that removing the stored blank nodes `roots` deletes with them: for each
 /// node that no quad refers to once `deleted` are gone, in the state without the view's
-/// mask, its outgoing quads the view sees, and so on through their blank objects. A seen
-/// quad in a graph the caller cannot write refuses the change; hidden quads stay.
+/// mask, its outgoing quads the view sees, and so on through their blank objects. A node
+/// that another quad still refers to is looked at again when a later deletion removes
+/// one of its references. A seen quad in a graph the caller cannot write refuses the
+/// change; hidden quads stay. A node with more references or quads than one scan reads
+/// refuses the change, since its references cannot be ruled out.
 fn subtree_at(
     raw: &Arc<Snapshot>,
     view: &Reader<'_>,
@@ -284,18 +290,25 @@ fn subtree_at(
         masked: false,
         limits: view.limits.clone(),
     };
+    let too_many = || {
+        Error::invalid(format!(
+            "removing nested values would read more than {MAX_SUBTREE_QUADS} quads of one node"
+        ))
+    };
     while let Some(node) = work.pop_front() {
         view.limits.unit()?;
-        if !done.insert(node.to_string()) {
+        if done.contains(&node.to_string()) {
             continue;
         }
         let Some(id) = raw.lookup_term(&node) else {
             continue;
         };
-        // another quad still refers to the node: only the removed edges go
+        // another quad still refers to the node: only the removed edges go, and the
+        // node is looked at again if a later deletion removes that reference
         let mut referenced = false;
-        for q in everything.scan(Perm::Osp, &[id.0], MAX_SUBTREE_QUADS + 1)? {
-            match quad_of(raw, q) {
+        let refs = everything.scan(Perm::Osp, &[id.0], MAX_SUBTREE_QUADS + 1)?;
+        for q in &refs {
+            match quad_of(raw, *q) {
                 Some(quad) if gone.contains(&quad.to_string()) => {}
                 _ => {
                     referenced = true;
@@ -306,10 +319,18 @@ fn subtree_at(
         if referenced {
             continue;
         }
+        if refs.len() > MAX_SUBTREE_QUADS {
+            return Err(too_many());
+        }
+        done.insert(node.to_string());
         let Some(vid) = view.snap.lookup_term(&node) else {
             continue;
         };
-        for q in view.scan(Perm::Spo, &[vid.0], MAX_SUBTREE_QUADS + 1)? {
+        let own = view.scan(Perm::Spo, &[vid.0], MAX_SUBTREE_QUADS + 1)?;
+        if own.len() > MAX_SUBTREE_QUADS {
+            return Err(too_many());
+        }
+        for q in own {
             let Some(graph) = view.graph(q[3])? else {
                 continue;
             };
@@ -515,7 +536,13 @@ impl Built {
             nodes: nodes
                 .iter()
                 .skip(1)
-                .map(|n| (n.term.clone(), n.built.layout.clone()))
+                .map(|n| {
+                    let named = n
+                        .label
+                        .clone()
+                        .map_or_else(|| n.term.clone(), Term::BlankNode);
+                    (n.term.clone(), named, n.built.layout.clone())
+                })
                 .collect(),
             lost,
         })
@@ -677,6 +704,7 @@ impl Built {
                     field: e.field.clone(),
                     path: f.path.clone(),
                     child: child_term.clone(),
+                    target: built.target.clone(),
                 });
                 nodes.push(Node {
                     term: child_term,
@@ -871,7 +899,20 @@ impl Built {
                         c.field
                     )));
                 }
-                // the stored lists go, with their cells
+                // a field edits one well-formed list, as the model offers it
+                if stored.len() > 1 || {
+                    let mut bad = false;
+                    for v in &stored {
+                        bad |= read.list_items(&v.term)?.is_none();
+                    }
+                    bad
+                } {
+                    return Err(Error::NotPermitted(format!(
+                        "field {}{on} does not hold one well-formed list, so it is read-only",
+                        c.field
+                    )));
+                }
+                // the stored list goes, with its cells
                 let old: Vec<Term> = stored.iter().map(|v| v.term.clone()).collect();
                 let mut done = BTreeSet::new();
                 for v in &old {
@@ -1128,6 +1169,16 @@ impl Guard {
         let mut stale = false;
         for a in &self.anchors {
             let values = read.values(&a.parent, &a.path)?;
+            // a child's new values go to a graph that its type or its edge decides
+            if let Some(edge) = values.iter().find(|v| v.term == a.child) {
+                let (target, _) = super::nested::child_target(
+                    &read,
+                    &a.child,
+                    &self.policy,
+                    Some(edge.graph.clone()),
+                )?;
+                stale |= target != a.target;
+            }
             if !values.iter().any(|v| v.term == a.child)
                 && !out
                     .iter()
