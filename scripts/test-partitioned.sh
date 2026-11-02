@@ -441,6 +441,12 @@ if ! rustfmt --version > /dev/null 2>&1 && command -v rustup > /dev/null; then
   rustup toolchain install "\$channel" --profile minimal -c rustfmt > /dev/null 2>&1
   PATH=\$(dirname "\$(rustup which rustfmt --toolchain "\$channel")"):\$PATH
 fi
+# Tests take their temporary directories from TMPDIR, and some, such as the spill default,
+# behave differently on a file system in memory. Where /tmp is one, they use the disk.
+if [ "\$(stat -f -c %T /tmp 2> /dev/null)" = tmpfs ]; then
+  export TMPDIR=$root/target/share-tmp
+  mkdir -p "\$TMPDIR"
+fi
 date +%s > $s/started
 env $(suite_env)"\${lock[@]}" "\${cap[@]}" $s/cargo-nextest nextest run \\
   --binaries-metadata $root/target/nextest/binaries-metadata.json \\
