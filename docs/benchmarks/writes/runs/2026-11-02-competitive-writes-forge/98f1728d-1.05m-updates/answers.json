@@ -1,0 +1,58 @@
+{
+ "star-join": {
+  "sparkles": {
+   "rows": 2911,
+   "exact": "c85c777b097e76a2",
+   "value": "fdc4296603113d0b",
+   "query_sha256": "c0e213f99c77d7177c973f0010ccf3c4caf15387279ac98237297ad3d4e248be"
+  },
+  "oxigraph": {
+   "rows": 2911,
+   "exact": "c85c777b097e76a2",
+   "value": "fdc4296603113d0b",
+   "query_sha256": "c0e213f99c77d7177c973f0010ccf3c4caf15387279ac98237297ad3d4e248be"
+  }
+ },
+ "two-hop-count": {
+  "sparkles": {
+   "rows": 1,
+   "exact": "7cdf37232ba443f4",
+   "value": "c09ada0d5465cf59",
+   "query_sha256": "08688547ff57d52458e30357b5550443eaa4e241346e47e67418bbd94fb62ff2"
+  },
+  "oxigraph": {
+   "rows": 1,
+   "exact": "7cdf37232ba443f4",
+   "value": "c09ada0d5465cf59",
+   "query_sha256": "08688547ff57d52458e30357b5550443eaa4e241346e47e67418bbd94fb62ff2"
+  }
+ },
+ "contains": {
+  "sparkles": {
+   "rows": 1,
+   "exact": "fc50722246e394bc",
+   "value": "473a7a1682ce049a",
+   "query_sha256": "fc2b300132e013ea07fb1f399f5110f7a02dd6de7b9d6b2d2ec3ec4cad17afb2"
+  },
+  "oxigraph": {
+   "rows": 1,
+   "exact": "fc50722246e394bc",
+   "value": "473a7a1682ce049a",
+   "query_sha256": "fc2b300132e013ea07fb1f399f5110f7a02dd6de7b9d6b2d2ec3ec4cad17afb2"
+  }
+ },
+ "regex-iri": {
+  "sparkles": {
+   "rows": 1,
+   "exact": "ee0b9741a5bfe7ff",
+   "value": "08d4ef016c641dc9",
+   "query_sha256": "ae4ab66cc61e0a9204671bde5d789b161e800e6fa05c308a390095e62b9e02b8"
+  },
+  "oxigraph": {
+   "rows": 1,
+   "exact": "ee0b9741a5bfe7ff",
+   "value": "08d4ef016c641dc9",
+   "query_sha256": "ae4ab66cc61e0a9204671bde5d789b161e800e6fa05c308a390095e62b9e02b8"
+  }
+ }
+}

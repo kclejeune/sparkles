@@ -1,0 +1,12 @@
+{
+ "sparkles": {
+  "commits": 5000,
+  "errors": 0,
+  "seconds": 7.338,
+  "per_s": 681.4,
+  "p50_ms": 1.325,
+  "p99_ms": 3.299,
+  "mean_ms": 1.466,
+  "max_ms": 57.78
+ }
+}

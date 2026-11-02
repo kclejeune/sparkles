@@ -1,0 +1,87 @@
+dataset: 10527323 triples
+[07:27:08] sparkles: loading (log: logs/load-sparkles.log)
+sparkles: 4.5 s, peak RSS 1872 MiB, index 298 MiB
+
+rows                 sparkles
+star-join               29717
+
+== star-join
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time     34.8 ms  ±     3.1 ms      31.0 ms  …    38.5 ms
+  Memory        11.6 MiB ±     0.0 MiB     11.5 MiB …    11.6 MiB
+ 
+
+== update-latency
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      4.0 ms  ±     0.2 ms       3.8 ms  …     4.4 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.2 MiB …    11.4 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== throughput (160 requests, 16 clients)
+Benchmark 1: sparkles (3 runs)
+                mean     ±       σ          min     …     max
+  Wall Time    788.6 ms  ±    25.5 ms     773.0 ms  …   818.0 ms
+  Memory        11.7 MiB ±     0.0 MiB     11.6 MiB …    11.7 MiB
+ 
+
+RSS (MiB) after the run: {
+ "sparkles": 431
+}
+| query | sparkles (ms) |
+|---|---:|
+| **load** (s) | **4.46** |
+| count-all | — |
+| types-grouped | — |
+| star-join | **34.8 ± 3.1** |
+| two-hop-count | — |
+| range-topk | — |
+| optional-count | — |
+| contains | — |
+| group-avg | — |
+| path-plus | — |
+| distinct-obj | — |
+| export-500k | — |
+| predicate-counts | — |
+| predicate-subjects | — |
+| class-predicates | — |
+| class-predicate-list | — |
+| order-by-full | — |
+| optional-chain | — |
+| minus | — |
+| not-exists | — |
+| exists-join | — |
+| subquery-agg | — |
+| regex-iri | — |
+| knows-reach | — |
+| distinct-join | — |
+| lang-filter | — |
+| star-lookup | — |
+| values-star | — |
+| employee-docs | — |
+| expr-bind-group | — |
+| expr-order-key | — |
+| expr-agg-arg | — |
+| **update** (1-triple INSERT DATA) | **4.0 ± 0.2** |
+| **throughput** star-join, 16 clients (queries/s) | **203** |
+
+Memory: the servers' resident set (VmRSS, and VmHWM for peaks) and each load's peak RSS (GNU time). Lower is better.
+
+| memory | sparkles |
+|---|---:|
+| server RSS 2 s after start, before any query (MiB) | 144 |
+| server RSS after every query ran once (MiB) | 274 |
+| server RSS after the run (MiB) | 431 |
+| peak RSS during the throughput run (MiB) | 664 |
+| server RSS after the run less Sparkles' decoded-block cache of 107 MiB (MiB) | 324 |
+| load peak RSS (MiB) | 1873 |
+| index size on disk | 298 MiB |
+
+Memory per query: how far the server's peak RSS rose over its RSS before the request, then the peak, in MiB. The peak is reset (clear_refs) before each request of the answer check.
+
+| query (rise / peak) | sparkles |
+|---|---:|
+| star-join | +134 / 280 |

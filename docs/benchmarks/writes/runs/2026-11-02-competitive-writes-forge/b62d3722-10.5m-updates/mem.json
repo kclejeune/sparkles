@@ -1,0 +1,44 @@
+{
+ "idle": {
+  "sparkles": 143
+ },
+ "queries": {
+  "star-join": {
+   "sparkles": {
+    "before": 608,
+    "peak": 723,
+    "delta": 115
+   }
+  },
+  "two-hop-count": {
+   "sparkles": {
+    "before": 723,
+    "peak": 923,
+    "delta": 200
+   }
+  },
+  "contains": {
+   "sparkles": {
+    "before": 923,
+    "peak": 947,
+    "delta": 24
+   }
+  },
+  "regex-iri": {
+   "sparkles": {
+    "before": 947,
+    "peak": 961,
+    "delta": 14
+   }
+  }
+ },
+ "warm": {
+  "sparkles": 926
+ },
+ "throughput_peak": {
+  "sparkles": 1228
+ },
+ "block_cache": {
+  "sparkles": 722
+ }
+}

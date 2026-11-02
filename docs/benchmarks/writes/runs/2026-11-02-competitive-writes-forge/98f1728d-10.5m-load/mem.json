@@ -1,0 +1,23 @@
+{
+ "idle": {
+  "sparkles": 144
+ },
+ "queries": {
+  "star-join": {
+   "sparkles": {
+    "before": 146,
+    "peak": 280,
+    "delta": 134
+   }
+  }
+ },
+ "warm": {
+  "sparkles": 274
+ },
+ "throughput_peak": {
+  "sparkles": 664
+ },
+ "block_cache": {
+  "sparkles": 107
+ }
+}

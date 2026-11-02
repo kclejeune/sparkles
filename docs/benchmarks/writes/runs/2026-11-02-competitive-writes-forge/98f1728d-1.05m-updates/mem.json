@@ -1,0 +1,67 @@
+{
+ "idle": {
+  "sparkles": 142,
+  "oxigraph": 22
+ },
+ "queries": {
+  "star-join": {
+   "sparkles": {
+    "before": 203,
+    "peak": 240,
+    "delta": 37
+   },
+   "oxigraph": {
+    "before": 24,
+    "peak": 69,
+    "delta": 45
+   }
+  },
+  "two-hop-count": {
+   "sparkles": {
+    "before": 240,
+    "peak": 276,
+    "delta": 36
+   },
+   "oxigraph": {
+    "before": 69,
+    "peak": 70,
+    "delta": 1
+   }
+  },
+  "contains": {
+   "sparkles": {
+    "before": 276,
+    "peak": 282,
+    "delta": 6
+   },
+   "oxigraph": {
+    "before": 70,
+    "peak": 74,
+    "delta": 4
+   }
+  },
+  "regex-iri": {
+   "sparkles": {
+    "before": 282,
+    "peak": 283,
+    "delta": 1
+   },
+   "oxigraph": {
+    "before": 74,
+    "peak": 74,
+    "delta": 0
+   }
+  }
+ },
+ "warm": {
+  "sparkles": 264,
+  "oxigraph": 74
+ },
+ "throughput_peak": {
+  "sparkles": 346,
+  "oxigraph": 728
+ },
+ "block_cache": {
+  "sparkles": 85
+ }
+}

@@ -1,0 +1,22 @@
+{
+ "sparkles": {
+  "commits": 5000,
+  "errors": 0,
+  "seconds": 6.431,
+  "per_s": 777.5,
+  "p50_ms": 1.29,
+  "p99_ms": 1.788,
+  "mean_ms": 1.285,
+  "max_ms": 12.234
+ },
+ "oxigraph": {
+  "commits": 5000,
+  "errors": 0,
+  "seconds": 6.177,
+  "per_s": 809.4,
+  "p50_ms": 1.277,
+  "p99_ms": 1.809,
+  "mean_ms": 1.233,
+  "max_ms": 7.01
+ }
+}

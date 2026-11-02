@@ -1,0 +1,16 @@
+{
+ "star-join": {
+  "sparkles": {
+   "rows": 2916,
+   "exact": "607cc23850ee468a",
+   "value": "73d2d1f47c4e0a3e",
+   "query_sha256": "c0e213f99c77d7177c973f0010ccf3c4caf15387279ac98237297ad3d4e248be"
+  },
+  "oxigraph": {
+   "rows": 2916,
+   "exact": "607cc23850ee468a",
+   "value": "73d2d1f47c4e0a3e",
+   "query_sha256": "c0e213f99c77d7177c973f0010ccf3c4caf15387279ac98237297ad3d4e248be"
+  }
+ }
+}

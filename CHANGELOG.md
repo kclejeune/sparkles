@@ -91,6 +91,12 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+The count and filter reads that visit index blocks in parallel now merge uncompacted
+commits into the blocks they change, instead of reading the whole range in order. On forge,
+`two-hop-count` on a store with 5,000 uncompacted commits went from 8.2 to 6.2 ms at 1.05M
+and from 35.8 to 21.6 ms at 10.5M. A read whose ranges hold more than 65,536 delta keys
+still merges them in order.
+
 Streaming cursors run FOLD and registered aggregates over the key runs of their input,
 sorting it on the group keys when it does not arrive that way, and DESCRIBE describes
 each batch of solutions as it arrives, so the strict policy admits both. A LIMIT without
