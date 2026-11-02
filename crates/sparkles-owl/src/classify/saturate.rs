@@ -6,9 +6,12 @@
 //! instance of the root as a role successor, the forward links that property chains need
 //! and the role loops of `ObjectHasSelf` and reflexive roles. Every rule reads only the
 //! state of the context it runs in and sends conclusions to other contexts as messages.
-//! A context is processed by one worker at a time: a worker takes an active context from
-//! the shared queue, applies the rules to the conclusions waiting in its to-do list, and
-//! a conclusion sent to an inactive context activates it.
+//! A context is processed by one worker at a time: a worker takes an active context,
+//! applies the rules to the conclusions waiting in its to-do list, and a conclusion sent
+//! to an inactive context activates it. A worker keeps the contexts it activates on a
+//! stack of its own and moves half of them to the shared queue when another worker is
+//! idle, so that the workers do not meet at one lock and one condition variable for each
+//! activation.
 
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use parking_lot::{Condvar, Mutex};
@@ -145,7 +148,10 @@ struct Run<'a> {
     ctx: &'a Contexts,
     queue: Mutex<Vec<Ex>>,
     ready: Condvar,
+    /// the active contexts, on a worker's stack, in the queue or being processed
     pending: AtomicUsize,
+    /// the workers waiting for the queue
+    idle: AtomicUsize,
     stop: AtomicU8,
     memory: AtomicUsize,
     applied: AtomicUsize,
@@ -175,15 +181,19 @@ pub fn saturate(
         queue: Mutex::new(Vec::new()),
         ready: Condvar::new(),
         pending: AtomicUsize::new(0),
+        idle: AtomicUsize::new(0),
         stop: AtomicU8::new(STOP_NONE),
         memory: AtomicUsize::new(bounds.base_memory),
         applied: AtomicUsize::new(0),
         bounds,
     };
-    for &r in roots {
-        let c = run.get(r);
-        if !c.st.lock().init {
-            run.activate(r, c);
+    {
+        let mut q = run.queue.lock();
+        for &r in roots {
+            let c = run.get(r);
+            if !c.st.lock().init && run.mark(c) {
+                q.push(r);
+            }
         }
     }
     let threads = bounds.threads.max(1);
@@ -214,6 +224,8 @@ struct Out<'r, 'a> {
     run: &'r Run<'a>,
     me: Ex,
     local: Vec<Concl>,
+    /// the contexts this worker activated
+    woke: &'r mut Vec<Ex>,
 }
 
 impl Out<'_, '_> {
@@ -224,7 +236,9 @@ impl Out<'_, '_> {
         } else {
             let ctx = self.run.get(to);
             ctx.todo.lock().push(c);
-            self.run.activate(to, ctx);
+            if self.run.mark(ctx) {
+                self.woke.push(to);
+            }
         }
     }
 
@@ -239,11 +253,35 @@ impl<'a> Run<'a> {
         self.ctx[e as usize].get_or_init(Box::default)
     }
 
-    fn activate(&self, e: Ex, c: &Ctx) {
-        if !c.active.swap(true, Ordering::SeqCst) {
-            self.pending.fetch_add(1, Ordering::SeqCst);
-            self.queue.lock().push(e);
-            self.ready.notify_one();
+    /// Marks a context active, and says whether this call did, so that the caller
+    /// schedules it. The plain load first keeps a busy context's flag from bouncing
+    /// between cores. It cannot miss a context that is going idle: a sender pushes to the
+    /// to-do list before it looks at the flag, and the processing worker clears the flag
+    /// before it looks at the list, both under the list's lock.
+    #[inline]
+    fn mark(&self, c: &Ctx) -> bool {
+        if c.active.load(Ordering::SeqCst) || c.active.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    /// Moves half of a worker's stack to the shared queue when a worker waits for it.
+    fn share(&self, mine: &mut Vec<Ex>) {
+        let idle = self.idle.load(Ordering::SeqCst);
+        if idle == 0 || mine.is_empty() {
+            return;
+        }
+        let give = mine.len().div_ceil(2);
+        let mut q = self.queue.lock();
+        q.extend(mine.drain(..give));
+        if give >= idle {
+            self.ready.notify_all();
+        } else {
+            for _ in 0..give {
+                self.ready.notify_one();
+            }
         }
     }
 
@@ -260,23 +298,33 @@ impl<'a> Run<'a> {
     }
 
     fn worker(&self) {
+        let mut mine: Vec<Ex> = Vec::new();
         loop {
-            let next = {
-                let mut q = self.queue.lock();
-                loop {
-                    if self.stopped() {
-                        return;
+            let next = match mine.pop() {
+                Some(e) => e,
+                None => {
+                    let mut q = self.queue.lock();
+                    loop {
+                        if self.stopped() {
+                            return;
+                        }
+                        if let Some(e) = q.pop() {
+                            break e;
+                        }
+                        if self.pending.load(Ordering::SeqCst) == 0 {
+                            return;
+                        }
+                        self.idle.fetch_add(1, Ordering::SeqCst);
+                        self.ready.wait(&mut q);
+                        self.idle.fetch_sub(1, Ordering::SeqCst);
                     }
-                    if let Some(e) = q.pop() {
-                        break e;
-                    }
-                    if self.pending.load(Ordering::SeqCst) == 0 {
-                        return;
-                    }
-                    self.ready.wait(&mut q);
                 }
             };
-            self.process(next);
+            if self.stopped() {
+                return;
+            }
+            self.process(next, &mut mine);
+            self.share(&mut mine);
             if self.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
                 let _q = self.queue.lock();
                 self.ready.notify_all();
@@ -309,13 +357,14 @@ impl<'a> Run<'a> {
         true
     }
 
-    fn process(&self, me: Ex) {
+    fn process(&self, me: Ex, mine: &mut Vec<Ex>) {
         let ctx = self.get(me);
         let mut st = ctx.st.lock();
         let mut out = Out {
             run: self,
             me,
             local: Vec::new(),
+            woke: mine,
         };
         let mut applied = 0usize;
         let mut stored = 0usize;
@@ -355,10 +404,11 @@ impl<'a> Run<'a> {
             out.local.append(&mut batch);
         }
         self.check(applied, stored * CONCLUSION_BYTES);
+        drop(out);
         drop(st);
         ctx.active.store(false, Ordering::SeqCst);
-        if !self.stopped() && !ctx.todo.lock().is_empty() {
-            self.activate(me, ctx);
+        if !self.stopped() && !ctx.todo.lock().is_empty() && self.mark(ctx) {
+            mine.push(me);
         }
     }
 

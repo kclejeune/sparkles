@@ -95,6 +95,10 @@ fn main() {
     let mut out = None;
     let mut k = None;
     for _ in 0..repeat {
+        // the previous run's classifier and answer go first, so that the peak resident
+        // memory is that of one run
+        drop(out.take());
+        drop(k.take());
         let t = Instant::now();
         let mut c = Classifier::of(&axioms);
         let o = c.classify(&limits).expect("classify");
