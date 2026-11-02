@@ -102,6 +102,14 @@ OPTIONAL condition from the key set of its pattern, and automatic execution stre
 a BIND. On an 8-vCPU Namespace instance at 10.5M quads, automatic execution of a COUNT
 grouped by BIND(EXISTS) went from 860 ms to 8.4 ms.
 
+`sparkles serve` runs one query that reads no data on a scratch in-memory dataset before it
+reports ready, and maps its executable's code into memory on a background thread, so that
+the first request after a start does not build the query path or fault in its code. The
+mapping adds about 100 MB of shared file pages to the resident set. `--no-warm-up` and
+`--no-code-prefault` turn the steps off, and the embedded library takes neither. On forge
+the first cold `path-plus` takes 1.80 ms at 10.5M and 2.49 ms at 1.05M instead of 3.52 and
+4.15 ms, which meets roadmap item 4's target against Oxigraph.
+
 An OWL 2 ontology API reads the axioms of a dataset's graphs through the OWL 2 Mapping to
 RDF Graphs, checks them against OWL 2 DL, EL, QL and RL, and edits them in one commit.
 The new `sparkles-owl` crate holds the axiom model, both mappings with lenient and strict

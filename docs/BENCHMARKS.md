@@ -35,7 +35,6 @@ DBpedia 50M queries are within 10%. SP²Bench `q12b` is also within 8% of Oxigra
 | Changed-store `two-hop-count`, 1.05M | Fluree 1.10× | Sparkles takes 8.6 ms against 7.8 ms with 5,000 changes in its delta, and 5.1 ms on the loaded store. |
 | Serial durable commits | Unsynced Oxigraph about 2.0× on literal inserts at 10.5M in the focused assessment | Sparkles takes 1.167–1.254 ms against 0.594–0.625 ms. The separate suite latency table gives Oxigraph a 1.84× advantage at 1.05M under its sampling contract. |
 | Writes during mixed load | Oxigraph 3.4× at 1.05M in the suite and 2.1–3.0× at 10.5M in the focused assessment | At 10.5M in the focused assessment, Oxigraph completes no reads in the thirty-second window, while Sparkles completes 232–245 reads/s. Durability and completed reader work differ. |
-| Cold `path-plus` | Oxigraph 1.24× at 1.05M and 1.49× at 10.5M | Sparkles takes 3.3 ms at both scales against 2.7 and 2.2 ms. In the same comparison Sparkles is ahead on cold `star-lookup`, `values-star` and `employee-docs`, as [Cold starts](benchmarks/synthetic/RESULTS.md#cold-starts) shows. |
 | Cold small scans at 1.05M | Fluree 1.17–3.0× on `count-all`, `contains`, `distinct-obj` and `employee-docs` | Fluree is not ahead on any cold query at 10.5M. |
 | DBpedia cold `outlink-classes-2` | QLever 1.25× | Sparkles wins 29 of 31 cold queries. |
 | Server RSS after the run, 1.05M | QLever 1.32× | Without its block cache, Sparkles holds 345 MiB. Sparkles has the lowest RSS after the run at 10.5M. |

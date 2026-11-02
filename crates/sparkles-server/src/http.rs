@@ -1594,6 +1594,29 @@ async fn query_endpoint(
     run_query(st, ds, p, uri, headers, params, query, Vec::new()).await
 }
 
+/// The query of the startup warm-up ([`crate::warm`]) on `ds`, run as `/{ds}/sparql`
+/// runs a request from a local caller, without the layers in front of the handler.
+pub(crate) async fn warm_up_query(
+    st: Arc<AppState>,
+    ds: Arc<Dataset>,
+    uri: Uri,
+    headers: HeaderMap,
+    query: String,
+) -> ApiResult {
+    let params = Params::from_query(&uri);
+    run_query(
+        st,
+        ds,
+        Principal::local(),
+        uri,
+        headers,
+        params,
+        query,
+        Vec::new(),
+    )
+    .await
+}
+
 /// What the blocking part of a query gave: a materialized result, or a cursor that
 /// automatic execution opened. The result stays unboxed: it is moved once, and every
 /// eager query would pay for a box.

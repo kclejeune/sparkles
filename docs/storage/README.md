@@ -69,6 +69,12 @@ These read paths are tuned for queries over data that is not yet in memory
   the load left there, up to 4 GiB. On forge at 10.5M, with the list of a warm pass, cold
   `star-lookup` takes 3.3 ms instead of 11.4 ms and `star-join` 33 ms instead of 78 ms,
   after a background read of 15 and 71 ms. The interval is 300 seconds by default.
+* Before `sparkles serve` reports ready, it runs one query that reads no data on a scratch
+  in-memory dataset, and a background thread maps the executable's code into memory. The
+  first request after a start then finds the query path built and its code resident, and
+  the served stores stay as cold as before. The mapped code adds about 100 MB of shared
+  file pages to the resident set. `--no-warm-up` and `--no-code-prefault` turn the steps
+  off, and the embedded library takes neither ([USAGE.md](../USAGE.md#memory-and-caches)).
 * `profile=io` on a query returns its phase times, the index columns it decoded, the
   bytes it requested and sampled page residency, for callers with the `metrics`
   permission. `/$/metrics` counts decoded columns, read-ahead bytes and vocabulary
@@ -340,9 +346,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Vocabulary codec and predicate-pattern choices have no dataset-local layered settings.
   Roadmap item 343 adds settings for subsequent builds and compactions while retaining
   each existing generation's recorded format.
-* Cold `path-plus` takes 3.3 ms against Oxigraph's 2.7 ms at 1.05M and 2.2 ms at 10.5M.
-  Cold `star-lookup`, `values-star` and `employee-docs` are faster than Oxigraph at both
-  scales. Dense reads on the 1.01B dataset are unmeasured. Roadmap item 4.
+* The first query that arrives about 2 s after a start is slower than one that arrives at
+  once, because the server's idle threads and cores wake up for it. Roadmap item 572.
+* Cold `export-1m` at 1.01B takes 1,293 ms in index format 3, 4% above the earlier format 2
+  measurement, and 17 times as long with `SPARKLES_IO_HINTS=off`. Roadmap item 573.
 * Warm point lookups run 1.6% to 2.5% more instructions per request for the index join's
   check of cold segments. Roadmap item 516.
 * The prewarm restores the block cache and the pages of the generation's files. It does
