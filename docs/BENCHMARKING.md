@@ -944,7 +944,7 @@ same known-failure lists apply as in the default run. Each suite prints its pass
 failures, the queries that needed eager fallback and how many of the failures are on its
 known-failure list, and the task writes these into a gate record. A failure that is not
 on the list, more fallbacks or fewer passes fail the comparison. `mise run test`, and with
-it CI, runs these tests too. `sparql_query_cursors` runs batches of 1, 2 and 3 rows.
+it CI, runs these tests too. The `sparql_query_cursors_` tests run batches of 1, 2 and 3 rows.
 
 #### Incremental view maintenance
 
@@ -1069,6 +1069,13 @@ each round and the spread of each binary between its server processes, followed 
 geometric mean of the ratios. It also reports differing answers and both load times.
 `manifest.txt` records each binary's commit and SHA-256, the instance, the time of each
 phase and the billed vCPU-minutes. `results/samples.tsv` has every timed request.
+
+A query whose execution-time ratio B/A is 1.10 or more is flagged (`--flag-ratio`). Before
+the instance is destroyed, it runs the flagged queries again in 8 rounds with 40 timed
+requests per query and server process (`--rerun-rounds`, `--rerun-reps`), after loading
+fresh stores. `summary.md` then ends with the rerun's tables and names the queries that
+stay flagged, and `rerun/` holds the rerun's own results and summary. `--no-rerun` reports
+the first pass alone.
 
 The C compiler builds mimalloc, so two binaries built with different C compilers differ
 on every request, by 11 to 33 thousand instructions per request between GCC 16.2 with

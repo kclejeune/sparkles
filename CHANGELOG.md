@@ -582,6 +582,16 @@ fewer instructions.
 `scripts/nsc-bench.sh` now records the compilers of each binary and refuses to compare
 two binaries built with different ones unless `--allow-mixed-compilers` is given.
 
+`scripts/nsc-bench.sh` reruns the queries it flags, at an execution-time ratio of 1.10 or
+more, on the same instance in 8 rounds of 40 timed requests, and reports both passes.
+`mise run test:partitioned` runs the nextest tests in shares on several machines from one
+archive and checks that the shares ran every selected test. `scripts/ci.sh --changed
+BASE` narrows a lane's Clippy and tests to the packages its change can affect.
+`scripts/premerge.sh` checks the generated clients, binding lock files and Python parity
+list of a merged batch. `scripts/gate/gate.sh` refuses to start on a host that lacks the
+free disk after `mbx gc`. nextest retries the tests that `.config/nextest.toml` lists as
+flaky and reports each retry. The four longest tests run as one test per configuration.
+
 The first run of a query text that the server does not remember now runs on the thread
 that received it under the request's timeout when the server has been idle for 10 ms,
 instead of on the blocking pool. On forge that took about 1.8 ms off a fresh server's

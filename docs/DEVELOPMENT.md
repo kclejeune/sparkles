@@ -149,6 +149,7 @@ mise run fmt:wasm     # clippy for the formatter's wasm32 build (in ci)
 mise run fmt:fuzz     # fuzz the formatter with cargo-fuzz (needs nightly and cargo-fuzz; not in ci)
 mise run office:fuzz  # fuzz the Office converter of ingestion the same way
 mise run test         # all Rust tests with cargo-nextest, then doctests (test:cargo runs plain mbx test)
+mise run test:partitioned # the nextest tests built once and run in shares on several machines
 mise run ui:wasm      # the formatter's WebAssembly module for the UI (optional)
 mise run ui:dev       # UI dev server, proxying the API to $SPARKLES_API (default http://localhost:3030)
 mise run ui:mock      # mock API server for UI work without the Rust backend
@@ -281,6 +282,76 @@ build that runs both at once needs about 20 GB. `mise run test` therefore first 
 `mbx test --workspace --no-run --bin sparkles` to build the unit-test binary on its own,
 and only then runs nextest. That keeps the peak near 10 GB and costs a few minutes of build
 time, because the two server compiles do not overlap.
+
+No single test should dominate a run, since nextest ends only when its slowest test does.
+A test that loops over independent configurations, such as the crash images of each
+commit mode in `power_loss.rs` or the cursor batch sizes in `w3c.rs`, is therefore split
+into one test per configuration with the same assertions, so that the configurations run
+in parallel. `.config/nextest.toml` starts the slowest tests first.
+
+### Checks of a change
+
+`scripts/ci.sh --fast --changed <base>` narrows the `lint` and `test` tasks to the
+workspace packages that the change since the merge base of `<base>` and `HEAD` can
+affect. `scripts/changed-crates.py` maps each changed, uncommitted or untracked file to
+the packages that read it. A file in a package's directory belongs to that package, and a
+few files outside the crates, such as `docs/openapi.json` and `ui/`, belong to the
+packages whose builds or tests read them. The selection then grows by every package that
+depends on a chosen one through normal, build or dev-dependencies. Documentation and
+scripts select no package. A change to a shared root, such as `Cargo.toml`, `Cargo.lock`,
+`mise.toml`, `.config/`, `testsuite/` or `crates/sparkles-core`, or to a file that the
+rules do not cover, keeps the whole workspace.
+
+Clippy runs with `-p` for each chosen package. nextest still builds the whole workspace,
+so its test binaries are the ones a full run builds and the shared cache already holds,
+and a `package()` filter runs only the chosen packages' tests. The doctests run for the
+chosen packages that have a library. The chosen packages are part of the task cache key,
+so a narrowed pass never stands in for a full one. The batch gate runs without
+`--changed`.
+
+### Known flaky tests
+
+nextest retries a test only when `.config/nextest.toml` lists it by name as flaky, and
+each listed test has a roadmap item to make it deterministic. A retry prints a `TRY` line
+when it happens, and the final summary lists the test as `FLAKY`. `mise run test` writes
+the tests that passed only on a retry to `.artifacts/ci/flaky-tests.txt`, and
+`scripts/ci.sh` repeats them at the end of its summary. A test that fails every attempt
+still fails the run.
+
+### Partitioned test runs
+
+`mise run test:partitioned` builds every test binary once with `mbx nextest archive`,
+runs one share of the tests on this machine and sends the archive to the other machines,
+where nextest runs the other shares with `--partition slice:K/N`. The machines come from
+`--hosts`, `TEST_PARTITION_HOSTS` or a `TEST_PARTITION_HOSTS=` line in
+`~/.config/sparkles/test-partition.env`. An entry is an ssh host, or `nsc` or
+`nsc:MACHINE` for an ephemeral Namespace instance that the run creates and destroys. An
+ssh host that is busy is left out, which means that another process holds its
+`~/lanes/.heavy.lock`, a gate unit runs there, its load exceeds half its processors or it
+has less than `TEST_PARTITION_MIN_FREE_GB` (default 40) GiB free. `--transport hc` starts
+each ssh host's share as a named terminal of the maintainer's terminal service, and the
+default starts it detached over plain ssh. Either way the share survives a dropped
+connection.
+
+The test binaries hold the absolute paths of the checkout that built them, from
+`CARGO_MANIFEST_DIR`, `CARGO_BIN_EXE_*` and `CARGO_TARGET_TMPDIR`. Each share therefore
+runs at the same absolute path as the building checkout. The run creates that directory
+on each machine, marks it as a share directory and refuses a machine where the path exists
+without the mark. It copies the tracked files, `ui/build` and the conformance suite
+directories the local tests read, and it extracts the archive there as it arrives. A
+Namespace instance also gets a C compiler, Python, Node.js, patchelf and the pinned
+rustfmt, and its share runs as an unprivileged user, since tests of permission checks
+fail as root. A binary whose loader the machine lacks, such as one built against a Nix
+store, gets the machine's own loader.
+Each share's JUnit report, log and exit code land in
+`.artifacts/test-partitioned/<time>/share-K/`, and the run fails unless every share passed
+and the shares together ran exactly the tests that an unpartitioned run selects.
+A run that ends, times out or is interrupted stops each remote share's process group,
+with KILL after 30 seconds, and removes the share's directory and lock only once the group
+is gone. When the group survives, the directory and its lock stay and the run names them.
+Arguments after `--` are nextest filters for both the listing and the shares, and
+`--reuse DIR` sends an earlier run's archive again without a build. Doctests do not
+archive, so `mise run test` still runs them.
 
 ### Conformance suites
 
@@ -687,6 +758,14 @@ separate lines.
 
 ## Batch gate
 
+`scripts/premerge.sh` runs on the merged batch before the gate starts and takes a few
+minutes. It checks that the TypeScript and Rust clients match `docs/openapi.json`, that
+the Cargo.lock files of the Python, Node.js and JVM binding workspaces resolve as they are,
+that every planned Python binding in `crates/sparkles/bindings.toml` is on the parity
+test's deferred list and no deferred key is stale, and it runs the doc-path check and the
+script tests, which include the CI task-profile test. Each failure names its fix, and
+`--fix` regenerates the clients and lock files and lists the files to commit.
+
 The batch gate before a push runs `scripts/ci.sh --force --jobs 1`, `test:w3c`,
 `test:shacl`, `test:shex` and the plain and encrypted spill matrices on the build hosts
 rather than the laptop. `scripts/gate/gate.sh <rev>` pushes the commit to the host's bare
@@ -743,6 +822,15 @@ never rewrites a script that a queued or running gate is reading. The host also 
 `~/gate/py-venv`. `scripts/gate/setup-host.sh <host>` creates them, copies the suites from
 wally through the laptop and checks linger, mbx and free disk. A ci half needs about
 30 GiB of free disk for its target and a conformance half about 15 GiB.
+
+The driver checks the free disk under the home directory of each chosen host before it
+starts anything there. A whole gate needs what a ci half needs. When a host has less, the
+driver runs `mbx gc` on it, which collects idle managed targets and evicts cache objects to
+the cache's budgets, and checks again. A host that is still short makes the driver stop
+with a message that names the host, the free space and the space needed. The check runs
+before the start because a running build holds its target's lease, so the cache cannot
+give back that space until the gate ends. `GATE_NEED_CI_GB` and `GATE_NEED_CONF_GB` change
+the two amounts, in the environment or in `~/.config/sparkles/gate.env`.
 
 ## Continuous integration
 
