@@ -1,0 +1,242 @@
+[
+ {
+  "bin": "exp1",
+  "config": "auto",
+  "run": 1,
+  "read_qps": 1024.7,
+  "read_p50_ms": 3.75,
+  "read_p99_ms": 5.32,
+  "read_errors": 0,
+  "writes_per_s": 440.7,
+  "write_p50_ms": 2.531,
+  "write_p99_ms": 3.03,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 759.5,
+    "wait_ms": 20.4,
+    "slices": 49736,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 27072.9,
+    "wait_ms": 1099.1,
+    "slices": 710163,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 113810.3,
+    "wait_ms": 252.8,
+    "slices": 193883,
+    "threads": 26
+   }
+  },
+  "busy_p": 0.384,
+  "busy_e": 0.103,
+  "loadavg": [
+   "5.85",
+   "13.19",
+   "18.14"
+  ]
+ },
+ {
+  "bin": "exp1",
+  "config": "all",
+  "run": 2,
+  "read_qps": 954.1,
+  "read_p50_ms": 4.04,
+  "read_p99_ms": 5.52,
+  "read_errors": 0,
+  "writes_per_s": 510.6,
+  "write_p50_ms": 1.519,
+  "write_p99_ms": 3.132,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 851.8,
+    "wait_ms": 49.7,
+    "slices": 56887,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 27032.4,
+    "wait_ms": 1379.5,
+    "slices": 858919,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 115454.9,
+    "wait_ms": 180.3,
+    "slices": 199978,
+    "threads": 26
+   }
+  },
+  "busy_p": 0.235,
+  "busy_e": 0.342,
+  "loadavg": [
+   "5.76",
+   "12.34",
+   "17.67"
+  ]
+ },
+ {
+  "bin": "exp1",
+  "config": "auto",
+  "run": 3,
+  "read_qps": 1027.9,
+  "read_p50_ms": 3.73,
+  "read_p99_ms": 5.32,
+  "read_errors": 0,
+  "writes_per_s": 425.8,
+  "write_p50_ms": 2.536,
+  "write_p99_ms": 3.022,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 746.8,
+    "wait_ms": 26.2,
+    "slices": 48319,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 27158.7,
+    "wait_ms": 945.1,
+    "slices": 706527,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 113726.9,
+    "wait_ms": 231.2,
+    "slices": 192419,
+    "threads": 26
+   }
+  },
+  "busy_p": 0.382,
+  "busy_e": 0.101,
+  "loadavg": [
+   "5.67",
+   "11.68",
+   "17.28"
+  ]
+ },
+ {
+  "bin": "exp1",
+  "config": "all",
+  "run": 4,
+  "read_qps": 964.0,
+  "read_p50_ms": 3.99,
+  "read_p99_ms": 5.54,
+  "read_errors": 0,
+  "writes_per_s": 417.4,
+  "write_p50_ms": 2.673,
+  "write_p99_ms": 3.344,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 790.0,
+    "wait_ms": 30.8,
+    "slices": 48490,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 27150.0,
+    "wait_ms": 1140.5,
+    "slices": 829928,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 114719.9,
+    "wait_ms": 157.7,
+    "slices": 187692,
+    "threads": 26
+   }
+  },
+  "busy_p": 0.233,
+  "busy_e": 0.336,
+  "loadavg": [
+   "5.93",
+   "11.05",
+   "16.86"
+  ]
+ },
+ {
+  "bin": "exp1",
+  "config": "auto",
+  "run": 5,
+  "read_qps": 1000.1,
+  "read_p50_ms": 3.84,
+  "read_p99_ms": 5.42,
+  "read_errors": 0,
+  "writes_per_s": 865.0,
+  "write_p50_ms": 1.076,
+  "write_p99_ms": 2.796,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 1019.8,
+    "wait_ms": 70.3,
+    "slices": 88930,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 25555.1,
+    "wait_ms": 1757.4,
+    "slices": 787119,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 116711.9,
+    "wait_ms": 364.7,
+    "slices": 248282,
+    "threads": 26
+   }
+  },
+  "busy_p": 0.401,
+  "busy_e": 0.122,
+  "loadavg": [
+   "5.89",
+   "10.55",
+   "16.50"
+  ]
+ },
+ {
+  "bin": "exp1",
+  "config": "all",
+  "run": 6,
+  "read_qps": 966.5,
+  "read_p50_ms": 3.99,
+  "read_p99_ms": 5.5,
+  "read_errors": 0,
+  "writes_per_s": 364.3,
+  "write_p50_ms": 2.727,
+  "write_p99_ms": 3.472,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 743.5,
+    "wait_ms": 32.9,
+    "slices": 43806,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 27276.1,
+    "wait_ms": 1218.1,
+    "slices": 840361,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 114221.7,
+    "wait_ms": 167.4,
+    "slices": 180425,
+    "threads": 26
+   }
+  },
+  "busy_p": 0.233,
+  "busy_e": 0.327,
+  "loadavg": [
+   "5.67",
+   "9.95",
+   "16.08"
+  ]
+ }
+]

@@ -553,13 +553,19 @@ against Oxigraph's 12 and 1,264.*
 
 Sparkles serves 4.2× QLever's reads at 1.05M and 2.6× at 10.5M. Oxigraph commits more
 writes at both sizes while it serves far fewer reads. At 10.5M no Oxigraph reader finished
-within 30 s. On a processor with performance and efficiency cores, the server runs its
-request threads, which also commit the writes, on the performance cores by default. On
-`atlas`, a host like `forge`, five alternating pairs of 1.05M runs committed 195 to 253
-writes/s with that placement and 279 to 367 with `--request-cpus all`, and served 9% to 14%
-fewer reads, as the [run record](runs/2026-11-02-changed-reads-and-placement-atlas/README.md) shows. [Item 583](../../ROADMAP.md) covers this
-placement. A separate run with the durable-commit harness above, with 16 readers on the
+within 30 s. These forge runs kept every request on the performance cores of the hybrid
+processor, which the placement below replaces, and [item 600](../../ROADMAP.md) measures
+them again with it. On `atlas`, a host like `forge`, that placement committed 195 to 253
+writes/s against 279 to 367 with `--request-cpus all`, as the [run record](runs/2026-11-02-changed-reads-and-placement-atlas/README.md)
+shows. A separate run with the durable-commit harness above, with 16 readers on the
 10.5M store, completed 299 new-literal commits per second at a median of 3.2 ms.
+
+On a hybrid processor the server runs request work on the performance cores only while
+at most one request per performance core is in flight. With sixteen readers it runs on
+every CPU, and on atlas, an i5-13500 like forge, it answered 2,358.9 reads a second at
+1.05M against 2,365.2 with `--request-cpus all` in five alternating pairs. The [hybrid
+placement run](runs/2026-11-02-hybrid-mixed-atlas/README.md) records the measurements
+and why confining every request to the performance cores lost about a third of the writes.
 
 ### Queries after updates
 

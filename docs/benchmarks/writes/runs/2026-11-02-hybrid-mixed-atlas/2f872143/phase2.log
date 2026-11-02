@@ -1,0 +1,94 @@
+locks held 2026-11-02T14:35:53Z load 2.36 18.76 18.08 1/646 1971589
+accept 1 [default] {'read_qps': 2789.7, 'read_p50_ms': 5.51, 'read_p99_ms': 9.47, 'read_errors': 0, 'writes_per_s': 318.1, 'write_p50_ms': 2.92, 'write_p99_ms': 6.644, 'write_errors': 0}
+accept 2 [--request-cpus all] {'read_qps': 2456.2, 'read_p50_ms': 6.37, 'read_p99_ms': 10.8, 'read_errors': 0, 'writes_per_s': 360.2, 'write_p50_ms': 2.421, 'write_p99_ms': 6.073, 'write_errors': 0}
+accept 3 [--request-cpus all] {'read_qps': 2361.6, 'read_p50_ms': 6.58, 'read_p99_ms': 10.89, 'read_errors': 0, 'writes_per_s': 359.8, 'write_p50_ms': 2.424, 'write_p99_ms': 6.117, 'write_errors': 0}
+accept 4 [default] {'read_qps': 2379.0, 'read_p50_ms': 6.55, 'read_p99_ms': 10.76, 'read_errors': 0, 'writes_per_s': 363.3, 'write_p50_ms': 2.391, 'write_p99_ms': 6.031, 'write_errors': 0}
+accept 5 [default] {'read_qps': 2371.0, 'read_p50_ms': 6.56, 'read_p99_ms': 10.86, 'read_errors': 0, 'writes_per_s': 361.3, 'write_p50_ms': 2.41, 'write_p99_ms': 6.041, 'write_errors': 0}
+accept 6 [--request-cpus all] {'read_qps': 2357.3, 'read_p50_ms': 6.58, 'read_p99_ms': 11.03, 'read_errors': 0, 'writes_per_s': 354.9, 'write_p50_ms': 2.449, 'write_p99_ms': 6.045, 'write_errors': 0}
+accept 7 [--request-cpus all] {'read_qps': 2362.8, 'read_p50_ms': 6.58, 'read_p99_ms': 10.96, 'read_errors': 0, 'writes_per_s': 354.5, 'write_p50_ms': 2.437, 'write_p99_ms': 6.305, 'write_errors': 0}
+accept 8 [default] {'read_qps': 2395.2, 'read_p50_ms': 6.51, 'read_p99_ms': 10.76, 'read_errors': 0, 'writes_per_s': 285.0, 'write_p50_ms': 3.504, 'write_p99_ms': 7.098, 'write_errors': 0}
+accept 9 [default] {'read_qps': 2402.1, 'read_p50_ms': 6.49, 'read_p99_ms': 10.84, 'read_errors': 0, 'writes_per_s': 277.5, 'write_p50_ms': 3.57, 'write_p99_ms': 7.159, 'write_errors': 0}
+accept 10 [--request-cpus all] {'read_qps': 2361.9, 'read_p50_ms': 6.58, 'read_p99_ms': 11.01, 'read_errors': 0, 'writes_per_s': 357.7, 'write_p50_ms': 2.435, 'write_p99_ms': 6.136, 'write_errors': 0}
+r0       fix2         auto reads/s  2426.7 writes/s  287.2 wp50 3.499 busyP 0.777 busyE 0.919 other:run=913,wait=3163,n=25 rayon:run=57133,wait=192505,n=18 tokio:run=398202,wait=27375,n=40
+r0       fix2          all reads/s  2408.2 writes/s  254.8 wp50 3.766 busyP 0.779 busyE 0.917 other:run=882,wait=2246,n=27 rayon:run=61178,wait=216620,n=20 tokio:run=395203,wait=29796,n=43
+r0       p449         auto reads/s  2024.3 writes/s  213.7 wp50 4.486 busyP 0.95 busyE 0.332 other:run=584,wait=8454,n=25 rayon:run=56872,wait=77523,n=18 tokio:run=332308,wait=129171,n=46
+r0       p449          all reads/s  2344.8 writes/s  364.1 wp50 2.386 busyP 0.79 busyE 0.921 other:run=1046,wait=2548,n=27 rayon:run=58869,wait=222486,n=20 tokio:run=399028,wait=29756,n=42
+r1       fix2         auto reads/s  2391.1 writes/s  366.2 wp50 2.378 busyP 0.786 busyE 0.921 other:run=1056,wait=4447,n=25 rayon:run=55931,wait=195324,n=18 tokio:run=398902,wait=28308,n=42
+r1       p449          all reads/s  2341.9 writes/s  363.6 wp50 2.376 busyP 0.788 busyE 0.923 other:run=1046,wait=2628,n=27 rayon:run=58505,wait=221595,n=20 tokio:run=399252,wait=28985,n=41
+r1       p449         auto reads/s  2006.6 writes/s  242.1 wp50 3.891 busyP 0.948 busyE 0.33 other:run=664,wait=9516,n=25 rayon:run=55864,wait=77591,n=18 tokio:run=331042,wait=130275,n=48
+r1       fix2          all reads/s  2381.8 writes/s  360.9 wp50 2.41 busyP 0.79 busyE 0.922 other:run=1067,wait=2587,n=27 rayon:run=59898,wait=221534,n=20 tokio:run=397212,wait=30958,n=42
+r2       p449         auto reads/s  2009.4 writes/s  239.8 wp50 3.935 busyP 0.948 busyE 0.332 other:run=640,wait=9401,n=25 rayon:run=56123,wait=77220,n=18 tokio:run=331275,wait=130699,n=48
+r2       p449          all reads/s  2342.3 writes/s  364.1 wp50 2.381 busyP 0.792 busyE 0.923 other:run=1098,wait=2602,n=27 rayon:run=59019,wait=223209,n=20 tokio:run=399227,wait=29363,n=42
+r2       fix2         auto reads/s  2394.1 writes/s  365.1 wp50 2.383 busyP 0.784 busyE 0.923 other:run=1089,wait=2415,n=25 rayon:run=56310,wait=196139,n=18 tokio:run=398639,wait=29553,n=43
+r2       fix2          all reads/s  2385.1 writes/s  358.3 wp50 2.432 busyP 0.787 busyE 0.922 other:run=1090,wait=2656,n=27 rayon:run=60172,wait=220951,n=20 tokio:run=396648,wait=30304,n=42
+MIXABDONE
+r0       fix2         auto reads/s   546.6 writes/s  811.5 wp50 0.985 busyP 0.231 busyE 0.075 other:run=953,wait=16,n=25 rayon:run=15062,wait=184,n=18 tokio:run=60594,wait=39,n=24
+r0       fix2          all reads/s   438.3 writes/s  634.6 wp50 1.262 busyP 0.137 busyE 0.227 other:run=915,wait=15,n=27 rayon:run=14710,wait=292,n=20 tokio:run=61781,wait=156,n=24
+r0       p449         auto reads/s   529.1 writes/s  572.2 wp50 2.269 busyP 0.219 busyE 0.064 other:run=790,wait=12,n=25 rayon:run=14912,wait=100,n=18 tokio:run=59370,wait=26,n=24
+r0       p449          all reads/s   415.3 writes/s  388.5 wp50 2.633 busyP 0.134 busyE 0.198 other:run=736,wait=11,n=27 rayon:run=14628,wait=56,n=20 tokio:run=60153,wait=47,n=24
+r1       fix2         auto reads/s   555.4 writes/s  477.6 wp50 2.39 busyP 0.217 busyE 0.061 other:run=754,wait=8,n=25 rayon:run=15652,wait=106,n=18 tokio:run=58639,wait=25,n=24
+r1       p449          all reads/s   422.9 writes/s  716.2 wp50 1.218 busyP 0.132 busyE 0.242 other:run=996,wait=17,n=27 rayon:run=13974,wait=104,n=20 tokio:run=62646,wait=70,n=24
+r1       p449         auto reads/s   538.0 writes/s  470.1 wp50 2.396 busyP 0.214 busyE 0.061 other:run=741,wait=11,n=25 rayon:run=15228,wait=94,n=18 tokio:run=58759,wait=22,n=24
+r1       fix2          all reads/s   419.1 writes/s  402.2 wp50 2.596 busyP 0.135 busyE 0.202 other:run=761,wait=1014,n=27 rayon:run=14902,wait=55,n=20 tokio:run=60186,wait=56,n=24
+r2       p449         auto reads/s   530.0 writes/s  577.8 wp50 2.234 busyP 0.22 busyE 0.063 other:run=789,wait=20,n=25 rayon:run=14931,wait=93,n=18 tokio:run=59328,wait=28,n=24
+r2       p449          all reads/s   412.2 writes/s  370.7 wp50 2.669 busyP 0.134 busyE 0.197 other:run=733,wait=11,n=27 rayon:run=14770,wait=56,n=20 tokio:run=59970,wait=51,n=24
+r2       fix2         auto reads/s   556.6 writes/s  568.2 wp50 2.282 busyP 0.22 busyE 0.065 other:run=801,wait=17,n=25 rayon:run=15540,wait=94,n=18 tokio:run=59178,wait=26,n=24
+r2       fix2          all reads/s   433.8 writes/s  414.8 wp50 2.57 busyP 0.137 busyE 0.197 other:run=762,wait=7,n=27 rayon:run=15013,wait=64,n=20 tokio:run=60148,wait=48,n=24
+MIXABDONE
+r0       fix2         auto reads/s  1042.0 writes/s  426.1 wp50 2.576 busyP 0.39 busyE 0.15 other:run=771,wait=34,n=25 rayon:run=27210,wait=2073,n=18 tokio:run=113284,wait=415,n=26
+r0       fix2          all reads/s   971.7 writes/s  515.5 wp50 1.464 busyP 0.233 busyE 0.351 other:run=869,wait=46,n=27 rayon:run=27406,wait=1460,n=20 tokio:run=115318,wait=233,n=26
+r0       p449         auto reads/s  1016.2 writes/s  490.7 wp50 2.491 busyP 0.384 busyE 0.103 other:run=789,wait=34,n=25 rayon:run=26659,wait=1356,n=18 tokio:run=114154,wait=292,n=26
+r0       p449          all reads/s   963.9 writes/s  421.7 wp50 2.666 busyP 0.235 busyE 0.337 other:run=788,wait=43,n=27 rayon:run=27200,wait=1281,n=20 tokio:run=114754,wait=166,n=26
+r1       fix2         auto reads/s  1045.7 writes/s  823.7 wp50 1.077 busyP 0.398 busyE 0.122 other:run=1026,wait=54,n=25 rayon:run=26296,wait=1999,n=18 tokio:run=116015,wait=386,n=27
+r1       p449          all reads/s   967.4 writes/s  406.5 wp50 2.68 busyP 0.233 busyE 0.337 other:run=789,wait=27,n=27 rayon:run=27248,wait=1214,n=20 tokio:run=114653,wait=178,n=26
+r1       p449         auto reads/s  1021.3 writes/s  506.3 wp50 2.473 busyP 0.386 busyE 0.105 other:run=804,wait=19,n=25 rayon:run=26844,wait=1051,n=18 tokio:run=114279,wait=230,n=26
+r1       fix2          all reads/s   985.9 writes/s  417.7 wp50 2.694 busyP 0.233 busyE 0.336 other:run=792,wait=26,n=27 rayon:run=27802,wait=1392,n=20 tokio:run=114421,wait=204,n=26
+r2       p449         auto reads/s  1026.6 writes/s  440.2 wp50 2.533 busyP 0.385 busyE 0.105 other:run=760,wait=41,n=25 rayon:run=27204,wait=1044,n=18 tokio:run=113816,wait=215,n=26
+r2       p449          all reads/s   933.0 writes/s  722.5 wp50 1.265 busyP 0.237 busyE 0.374 other:run=1036,wait=34,n=27 rayon:run=26299,wait=1472,n=20 tokio:run=117270,wait=189,n=26
+r2       fix2         auto reads/s  1059.2 writes/s  437.3 wp50 2.564 busyP 0.384 busyE 0.105 other:run=769,wait=37,n=25 rayon:run=27860,wait=1297,n=18 tokio:run=113419,wait=307,n=26
+r2       fix2          all reads/s   996.2 writes/s  361.5 wp50 2.744 busyP 0.234 busyE 0.333 other:run=752,wait=44,n=27 rayon:run=28261,wait=1255,n=20 tokio:run=113958,wait=163,n=26
+MIXABDONE
+r0       fix2         auto reads/s  1697.4 writes/s  508.5 wp50 1.655 busyP 0.448 busyE 0.605 other:run=1038,wait=172,n=25 rayon:run=47222,wait=19191,n=18 tokio:run=221426,wait=1692,n=30
+r0       fix2          all reads/s  1663.9 writes/s  625.5 wp50 1.571 busyP 0.437 busyE 0.65 other:run=1200,wait=1174,n=27 rayon:run=49692,wait=23343,n=20 tokio:run=222470,wait=1526,n=30
+r0       p449         auto reads/s  1602.6 writes/s  377.5 wp50 2.895 busyP 0.688 busyE 0.195 other:run=774,wait=1313,n=25 rayon:run=45218,wait=20214,n=18 tokio:run=219714,wait=2442,n=32
+r0       p449          all reads/s  1668.8 writes/s  320.7 wp50 3.072 busyP 0.421 busyE 0.619 other:run=811,wait=127,n=27 rayon:run=49164,wait=19433,n=20 tokio:run=220316,wait=1185,n=30
+r1       fix2         auto reads/s  1705.4 writes/s  399.8 wp50 2.879 busyP 0.439 busyE 0.6 other:run=911,wait=131,n=25 rayon:run=47520,wait=17264,n=18 tokio:run=220521,wait=1640,n=30
+r1       p449          all reads/s  1663.4 writes/s  366.1 wp50 2.984 busyP 0.422 busyE 0.624 other:run=867,wait=136,n=27 rayon:run=49050,wait=20418,n=20 tokio:run=220921,wait=1257,n=30
+r1       p449         auto reads/s  1577.8 writes/s  643.7 wp50 1.406 busyP 0.699 busyE 0.22 other:run=1021,wait=407,n=25 rayon:run=44528,wait=22605,n=18 tokio:run=221810,wait=2759,n=30
+r1       fix2          all reads/s  1685.2 writes/s  420.7 wp50 2.759 busyP 0.426 busyE 0.63 other:run=938,wait=144,n=27 rayon:run=50023,wait=21207,n=20 tokio:run=220578,wait=1422,n=30
+r2       p449         auto reads/s  1589.1 writes/s  604.1 wp50 1.426 busyP 0.698 busyE 0.217 other:run=1004,wait=414,n=25 rayon:run=45079,wait=21715,n=18 tokio:run=221490,wait=2611,n=31
+r2       p449          all reads/s  1654.9 writes/s  381.6 wp50 2.954 busyP 0.426 busyE 0.626 other:run=885,wait=136,n=27 rayon:run=48730,wait=20067,n=20 tokio:run=220987,wait=1237,n=30
+r2       fix2         auto reads/s  1681.4 writes/s  362.7 wp50 3.006 busyP 0.445 busyE 0.615 other:run=862,wait=152,n=25 rayon:run=47148,wait=19113,n=18 tokio:run=219782,wait=1513,n=30
+r2       fix2          all reads/s  1668.7 writes/s  425.0 wp50 1.926 busyP 0.43 busyE 0.638 other:run=936,wait=187,n=27 rayon:run=49874,wait=22291,n=20 tokio:run=220493,wait=1583,n=33
+MIXABDONE
+1 fix2 auto threads=18 q1-1=7.9 q2-1=13.6 q3-1=8.1 q4-1=247.3 q5-1=7.2 q6-1=11.5 q7-1=78.4 q8-1=241.4
+1 fix2 reqall threads=20 q1-1=6.5 q2-1=13.8 q3-1=21.5 q4-1=249.1 q5-1=8.6 q6-1=12.9 q7-1=76.2 q8-1=239.6
+1 p449 auto threads=18 q1-1=7.7 q2-1=13.3 q3-1=8.1 q4-1=250.1 q5-1=5.9 q6-1=11.3 q7-1=79.3 q8-1=246.7
+1 p449 reqall threads=20 q1-1=8.6 q2-1=13.7 q3-1=27.7 q4-1=250.8 q5-1=6.6 q6-1=22.6 q7-1=79.4 q8-1=255.8
+2 fix2 auto threads=18 q1-1=7.6 q2-1=14.2 q3-1=7.7 q4-1=259.6 q5-1=6.0 q6-1=12.6 q7-1=77.4 q8-1=250.1
+2 p449 reqall threads=20 q1-1=10.8 q2-1=13.7 q3-1=26.3 q4-1=255.0 q5-1=5.7 q6-1=17.6 q7-1=80.0 q8-1=256.5
+2 p449 auto threads=18 q1-1=13.3 q2-1=13.8 q3-1=8.9 q4-1=250.8 q5-1=7.4 q6-1=12.5 q7-1=80.0 q8-1=250.9
+2 fix2 reqall threads=20 q1-1=7.3 q2-1=14.0 q3-1=27.8 q4-1=260.4 q5-1=6.7 q6-1=18.4 q7-1=77.5 q8-1=245.5
+3 p449 auto threads=18 q1-1=11.2 q2-1=15.7 q3-1=9.7 q4-1=249.4 q5-1=6.9 q6-1=12.1 q7-1=79.1 q8-1=252.8
+3 p449 reqall threads=20 q1-1=8.3 q2-1=13.6 q3-1=25.9 q4-1=250.3 q5-1=8.3 q6-1=12.6 q7-1=77.9 q8-1=252.5
+3 fix2 auto threads=18 q1-1=4.5 q2-1=17.2 q3-1=7.6 q4-1=250.5 q5-1=3.1 q6-1=12.8 q7-1=77.6 q8-1=247.1
+3 fix2 reqall threads=20 q1-1=12.0 q2-1=16.2 q3-1=29.1 q4-1=259.5 q5-1=7.1 q6-1=21.2 q7-1=79.0 q8-1=258.1
+4 p449 auto threads=18 q1-1=11.4 q2-1=14.0 q3-1=12.0 q4-1=249.9 q5-1=2.8 q6-1=19.4 q7-1=78.7 q8-1=255.3
+4 fix2 reqall threads=20 q1-1=10.5 q2-1=13.6 q3-1=25.0 q4-1=253.2 q5-1=7.9 q6-1=12.3 q7-1=76.3 q8-1=242.4
+4 fix2 auto threads=18 q1-1=5.8 q2-1=13.6 q3-1=8.6 q4-1=256.5 q5-1=7.8 q6-1=15.0 q7-1=76.9 q8-1=245.1
+4 p449 reqall threads=20 q1-1=11.8 q2-1=13.4 q3-1=27.2 q4-1=252.9 q5-1=8.2 q6-1=11.7 q7-1=77.4 q8-1=251.3
+PLACEMENT-DONE
+metric=server  host=atlas  governor=powersave/balance_performance
+template                 fix2/auto     fix2/reqall       p449/auto     p449/reqall
+bi-q1                        10.41           13.13           12.45           14.27
+bi-q2                        15.03           13.39           14.61           13.27
+bi-q3                        18.44           28.16           18.89           27.96
+bi-q4                       162.62          161.53          160.21          163.06
+bi-q5                        18.59           18.11           18.87           19.37
+bi-q6                        12.38           17.79           11.52           15.82
+bi-q7                        42.78           43.09           43.36           44.80
+bi-q8                        24.31           23.48           24.41           24.47
+
+per-process medians (instance 1 and births):
+PHASE2DONE
+LOCKRUN-EXIT=0

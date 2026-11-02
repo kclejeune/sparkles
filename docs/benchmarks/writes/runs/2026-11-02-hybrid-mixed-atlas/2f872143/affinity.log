@@ -1,0 +1,25 @@
+== pid=1980675 14:43:29
+      6 sparkles-decode 0-11
+== pid=1984400 14:46:43
+      6 sparkles-decode 0-11
+== pid=1985942 14:47:47
+      7 tokio-rt-worker 0-11
+      6 sparkles-decode 0-11
+      1 vocab-sync 0-11
+      1 sparkles-change 0-11
+== pid=1988374 14:49:56
+      8 tokio-rt-worker 0-11
+      6 sparkles-decode 0-11
+      1 vocab-sync 0-11
+      1 sparkles-change 0-11
+== pid=1991822 14:53:10
+      8 tokio-rt-worker 0-11
+      6 sparkles-decode 0-11
+      1 vocab-sync 0-11
+      1 sparkles-change 0-11
+== pid=1993215 14:54:14
+     12 tokio-rt-worker 0-11
+      6 sparkles-decode 0-11
+      1 vocab-sync 0-11
+      1 sparkles-change 0-11
+SNAPDONE

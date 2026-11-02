@@ -118,6 +118,8 @@ pub fn validation_pool() -> Option<std::sync::Arc<rayon::ThreadPool>> {
             .num_threads((n / 2).max(1))
             .thread_name(|i| format!("validate-{i}"))
             .stack_size(crate::THREAD_STACK)
+            // the first validation request starts the pool (see `cpus`)
+            .start_handler(|_| crate::cpus::thread_started())
             .build()
             .map(std::sync::Arc::new)
             .ok()

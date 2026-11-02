@@ -1932,6 +1932,8 @@ mod imp {
         dir: Option<LazySyncDir>,
         seq: u64,
     ) -> Result<Live> {
+        // the writer starts Tantivy's workers from this thread
+        crate::threads::spawning();
         let writer = index
             .writer_with_num_threads(1, 32 << 20)
             .map_err(text_err)?;
@@ -2559,6 +2561,7 @@ mod imp {
             let ticker = std::thread::Builder::new()
                 .name("sparkles-text".into())
                 .spawn(move || {
+                    crate::threads::started();
                     while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
                         rx.recv_timeout(CHECKPOINT_AFTER)
                     {
@@ -2897,6 +2900,7 @@ mod imp {
         let (index, fields) = new_index(new_dir.as_deref(), config)?;
         let mut docs = 0u64;
         {
+            crate::threads::spawning();
             let mut writer: IndexWriter<TantivyDocument> = index
                 .writer_with_num_threads(threads, memory_budget)
                 .map_err(text_err)?;
@@ -2916,6 +2920,8 @@ mod imp {
             for_each_candidate(snap, config, &mut add)?;
             check()?;
             let payload = payload(config, snap.commit, epoch);
+            // a commit starts new Tantivy workers from this thread
+            crate::threads::spawning();
             let mut prepared = writer.prepare_commit().map_err(text_err)?;
             prepared.set_payload(&payload);
             prepared.commit().map_err(text_err)?;
@@ -3043,6 +3049,7 @@ mod imp {
         epoch: u64,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        crate::threads::spawning();
         let mut writer: IndexWriter<TantivyDocument> = index
             .writer_with_num_threads(1, 32 << 20)
             .map_err(text_err)?;
@@ -3070,6 +3077,8 @@ mod imp {
             }
         }
         check()?;
+        // a commit starts new Tantivy workers from this thread
+        crate::threads::spawning();
         let mut prepared = writer.prepare_commit().map_err(text_err)?;
         prepared.set_payload(&payload(config, head.commit, epoch));
         prepared.commit().map_err(text_err)?;
@@ -3365,6 +3374,8 @@ mod imp {
         fn commit_locked(&self, live: &mut Live) -> Result<()> {
             let seq = live.removed_since.map_or(live.applied, |s| s - 1);
             let payload = self.payload(seq);
+            // a commit starts new Tantivy workers from this thread
+            crate::threads::spawning();
             let mut prepared = live.writer()?.prepare_commit().map_err(text_err)?;
             prepared.set_payload(&payload);
             prepared.commit().map_err(text_err)?;

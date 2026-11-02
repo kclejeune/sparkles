@@ -1781,6 +1781,7 @@ fn worker() -> &'static Worker {
         std::thread::Builder::new()
             .name("sparkles-changelog".into())
             .spawn(move || {
+                crate::threads::started();
                 while let Ok(first) = rx.recv() {
                     std::thread::sleep(DEBOUNCE);
                     let mut batch = vec![first];

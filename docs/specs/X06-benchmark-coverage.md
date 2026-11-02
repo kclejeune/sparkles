@@ -1885,7 +1885,64 @@ server process under every configuration measured, such as 11 to 13 ms or 16 to 
 a `q2` instance, so their pooled medians move between comparisons. Item 575 looks
 for the cause. The history's fastest runs do not age, so a text whose costs change after
 writes keeps its earlier mode until the history forgets it, which item 577 covers.
-Item 576 measures concurrent clients, other hybrid processors and macOS.
+Item 576 measures other hybrid processors and macOS.
+
+### Request placement under concurrent load
+
+Item 583 measured the placement of item 449 under the mixed load of `scripts/bench.sh` on
+atlas, an Intel Core i5-13500 like forge. Sixteen `star-join` readers ran through `oha`
+and one writer committed new literals for 30 s on a fresh copy of the 1.05M store, with
+Sparkles alone on the host. With every request thread on the performance cores, Sparkles
+`b62d3722` answered a median of 2,005 reads and 241 writes a second over three rounds,
+against 2,354 and 360 with `--request-cpus all`, and forge's published run before item
+449 had 2,491 reads and 374 writes a second. A harness that read every server thread's
+`/proc/<pid>/task/*/schedstat` and the busy time of each CPU over the window found the
+cause. With the placement of item 449, the twelve logical CPUs of the performance cores
+were 95% busy and the eight efficiency cores 33%, and the request threads waited a
+median of 131 s in the run queues over the 30 s. With `--request-cpus all` the two kinds
+were 79% and 92% busy, and the request threads waited 30 s. A query pool of 20 threads
+with the placement and one of 18 without it changed neither rate, so the pool's size
+does not cause the loss. Running each update's work on every CPU while the reads stayed
+on the performance cores raised writes to 309.0 a second and left reads at 1,995, as
+[PERFORMANCE-EXPERIMENTS.md](../PERFORMANCE-EXPERIMENTS.md#server-and-request-handling)
+records.
+
+Fewer clients favour the performance cores. With two readers and the writer, the
+placement of item 449 answered 527.5 reads a second against 404.9 with
+`--request-cpus all`, and with four readers 1,024.7 against 964.0. With eight readers it
+answered 1,603.8 against 1,652.4. The write rates at two to eight readers take one of two
+values in each run under either placement, so three runs do not rank them. So request
+work now runs on the performance cores only while at most one request per physical
+performance core is in flight, six on atlas and forge, and on every CPU when more are.
+The count includes the request itself and every request whose response is still being
+sent. A thread places itself when it starts a request's work, on the receiving thread,
+on the blocking pool or in a streaming producer, and calls `sched_setaffinity` only when
+its placement differs from the one the load asks for, so a steady load makes no system
+calls. A new thread inherits the CPUs of the thread that creates it, so the runtime's
+workers and blocking threads move to every CPU when they start. The engine's block
+decoders, change log writer and vocabulary sync worker start with the first request that
+needs them, which on a fresh server runs alone on the performance cores, and an earlier
+build of this change left them there for the life of the process. They now call a start
+hook, `sparkles::threads::set_start_hook`, through which the server moves them to every
+CPU, as do the engine's other long-lived workers, the text index's checkpoint ticker and
+recovery workers, the vector catch-up worker, the workers of incremental views and the
+server's validation pool. A Tantivy writer starts its workers from the thread that opens
+or commits it, so the engine runs the hook on that thread first. The query pool keeps its
+size.
+
+Five alternating pairs of the `scripts/bench.sh` mixed load on atlas with `f167fc8f`
+answered a median of 2,358.9 reads a second with the new default against 2,365.2 with
+`--request-cpus all`, between 0.993 and 1.053 of them in each pair. Writes had medians of
+363.9 and 286.0 a second. The writer's commits took about 2.4 ms in some runs and 3.2 to
+3.9 ms in others under either placement, so the higher write median is not a gain of the
+placement. Over three rounds of the harness, sixteen readers answered 2,381.3 reads and
+366.0 writes a second against 2,367.4 and 361.2, and four readers 1,019.1 reads a second
+against 976.5. With one client, the BSBM BI harness of item 449 gave `q3` a median of
+18.59 ms against 27.78 ms with every CPU, and 18.64 ms with item 449's build, and the
+third `q3` instance took 22.2 to 23.5 ms in each process. The [run
+record](../benchmarks/writes/runs/2026-11-02-hybrid-mixed-atlas/README.md) gives every
+table. Request placement on hybrid processors other than the i5-13500, and threads that
+other code starts from a request thread on the performance cores, remain under item 576.
 
 ### Changed-store reads and the write rows
 
@@ -1923,7 +1980,7 @@ recorded 565, while serving 2,101 and 2,198 reads/s against 12 and 16. The defau
 placement of request threads on the performance cores of a hybrid processor costs part
 of that write rate. On `atlas`, five alternating pairs of runs gave 195 to 253 writes/s
 with it and 279 to 367 without it, as the [atlas record](../benchmarks/writes/runs/2026-11-02-changed-reads-and-placement-atlas/README.md)
-shows, and item 583 follows this up.
+shows. Item 583 then made the placement depend on load, as the next section describes.
 
 A [WatDiv rerun](../benchmarks/watdiv/runs/2026-11-02-l1-rerun-forge/README.md) of L1, L3
 and S7 in three rounds gave Sparkles the lower mean on L1-1 in every round, by 0.005 to 0.146

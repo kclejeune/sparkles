@@ -158,6 +158,7 @@ impl Runtime {
         let rt = Arc::downgrade(self);
         let kick = self.kick.clone();
         std::thread::Builder::new().name(name).spawn(move || {
+            crate::threads::started();
             let Ok(exec) = tokio::runtime::Builder::new_current_thread().build() else {
                 return;
             };

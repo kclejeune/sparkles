@@ -33,7 +33,7 @@ where the two engines' means differed by less than an instance's variation betwe
 | Case | Reference advantage | Qualification |
 |---|---|---|
 | Serial durable commits | Unsynced Oxigraph 1.41× in one of four single-commit latency runs at 1.05M | The other three runs were within 10%, and Sparkles leads or ties on the 5,000-commit churn at both sizes. Sparkles synchronizes each commit, so its latency depends on the drive's write latency. |
-| Writes during mixed load | Oxigraph 5.0–5.2× at 1.05M and 2.7× at 10.5M | Oxigraph completes 12–16 reads/s at 1.05M and none at 10.5M, against Sparkles' 2,101–2,198 and 197. Durability and completed reader work differ, and [item 583](ROADMAP.md) covers the request-thread placement that slows these writes. |
+| Writes during mixed load | Oxigraph 5.0–5.2× at 1.05M and 2.7× at 10.5M | Oxigraph completes 12–16 reads/s at 1.05M and none at 10.5M, against Sparkles' 2,101–2,198 and 197. Durability and completed reader work differ. These runs predate load-based request placement, and [item 600](ROADMAP.md) measures them again. |
 | Cold small scans at 1.05M | Fluree 1.17–3.0× on `count-all`, `contains`, `distinct-obj` and `employee-docs` | Fluree is not ahead on any cold query at 10.5M. |
 | DBpedia cold `outlink-classes-2` | QLever 1.25× | Sparkles wins 29 of 31 cold queries. |
 | Server RSS after the run, 1.05M | QLever 1.32× | Without its block cache, Sparkles holds 345 MiB. Sparkles has the lowest RSS after the run at 10.5M. |

@@ -1,0 +1,242 @@
+[
+ {
+  "bin": "exp1",
+  "config": "auto",
+  "run": 1,
+  "read_qps": 1629.3,
+  "read_p50_ms": 4.88,
+  "read_p99_ms": 7.31,
+  "read_errors": 0,
+  "writes_per_s": 484.5,
+  "write_p50_ms": 1.505,
+  "write_p99_ms": 4.247,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 873.6,
+    "wait_ms": 326.8,
+    "slices": 54252,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 45169.7,
+    "wait_ms": 21012.3,
+    "slices": 3546891,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 220569.7,
+    "wait_ms": 2281.9,
+    "slices": 273336,
+    "threads": 30
+   }
+  },
+  "busy_p": 0.693,
+  "busy_e": 0.206,
+  "loadavg": [
+   "8.18",
+   "10.19",
+   "15.97"
+  ]
+ },
+ {
+  "bin": "exp1",
+  "config": "all",
+  "run": 2,
+  "read_qps": 1622.2,
+  "read_p50_ms": 4.78,
+  "read_p99_ms": 7.03,
+  "read_errors": 0,
+  "writes_per_s": 628.7,
+  "write_p50_ms": 1.558,
+  "write_p99_ms": 3.177,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 1189.1,
+    "wait_ms": 1183.6,
+    "slices": 67301,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 48000.0,
+    "wait_ms": 21666.0,
+    "slices": 4213612,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 223288.8,
+    "wait_ms": 1499.3,
+    "slices": 314752,
+    "threads": 30
+   }
+  },
+  "busy_p": 0.434,
+  "busy_e": 0.647,
+  "loadavg": [
+   "9.04",
+   "10.20",
+   "15.79"
+  ]
+ },
+ {
+  "bin": "exp1",
+  "config": "auto",
+  "run": 3,
+  "read_qps": 1603.8,
+  "read_p50_ms": 5.0,
+  "read_p99_ms": 7.4,
+  "read_errors": 0,
+  "writes_per_s": 392.2,
+  "write_p50_ms": 2.883,
+  "write_p99_ms": 4.669,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 789.5,
+    "wait_ms": 283.8,
+    "slices": 45819,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 45098.7,
+    "wait_ms": 19869.0,
+    "slices": 3385480,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 220088.0,
+    "wait_ms": 2274.8,
+    "slices": 252235,
+    "threads": 31
+   }
+  },
+  "busy_p": 0.69,
+  "busy_e": 0.196,
+  "loadavg": [
+   "11.03",
+   "10.49",
+   "15.67"
+  ]
+ },
+ {
+  "bin": "exp1",
+  "config": "all",
+  "run": 4,
+  "read_qps": 1672.8,
+  "read_p50_ms": 4.62,
+  "read_p99_ms": 6.99,
+  "read_errors": 0,
+  "writes_per_s": 322.8,
+  "write_p50_ms": 3.051,
+  "write_p99_ms": 4.671,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 814.3,
+    "wait_ms": 1118.1,
+    "slices": 39294,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 49054.7,
+    "wait_ms": 19373.4,
+    "slices": 3854408,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 220402.2,
+    "wait_ms": 1173.7,
+    "slices": 277029,
+    "threads": 30
+   }
+  },
+  "busy_p": 0.418,
+  "busy_e": 0.623,
+  "loadavg": [
+   "10.82",
+   "10.49",
+   "15.50"
+  ]
+ },
+ {
+  "bin": "exp1",
+  "config": "auto",
+  "run": 5,
+  "read_qps": 1591.0,
+  "read_p50_ms": 5.01,
+  "read_p99_ms": 7.54,
+  "read_errors": 0,
+  "writes_per_s": 382.4,
+  "write_p50_ms": 2.873,
+  "write_p99_ms": 4.918,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 774.7,
+    "wait_ms": 334.3,
+    "slices": 44819,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 45299.4,
+    "wait_ms": 26971.0,
+    "slices": 3920486,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 218718.4,
+    "wait_ms": 2608.1,
+    "slices": 252493,
+    "threads": 30
+   }
+  },
+  "busy_p": 0.693,
+  "busy_e": 0.254,
+  "loadavg": [
+   "12.07",
+   "10.78",
+   "15.41"
+  ]
+ },
+ {
+  "bin": "exp1",
+  "config": "all",
+  "run": 6,
+  "read_qps": 1652.4,
+  "read_p50_ms": 4.69,
+  "read_p99_ms": 6.97,
+  "read_errors": 0,
+  "writes_per_s": 458.7,
+  "write_p50_ms": 1.718,
+  "write_p99_ms": 3.913,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 979.2,
+    "wait_ms": 163.1,
+    "slices": 51810,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 48658.2,
+    "wait_ms": 20584.3,
+    "slices": 4058621,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 221702.4,
+    "wait_ms": 1380.4,
+    "slices": 295673,
+    "threads": 31
+   }
+  },
+  "busy_p": 0.43,
+  "busy_e": 0.631,
+  "loadavg": [
+   "12.37",
+   "10.96",
+   "15.32"
+  ]
+ }
+]

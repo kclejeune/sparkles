@@ -208,12 +208,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   publication routes do not apply the licence gate's verdict, item 525, and the
   catalog has no Croissant export, item 526. Only server administrators read the
   catalog.
-* Request threads keep to the performance cores of a hybrid processor only on Linux and
+* Request work keeps to the performance cores of a hybrid processor only on Linux and
   only when the kernel lists its cores in `/sys/devices/cpu_core/cpus` and
   `/sys/devices/cpu_atom/cpus`, as it does for Intel hybrid processors. The default
-  query pool size there was measured on one Intel processor with one client at a time.
-  Other hybrid processors, concurrent clients and macOS remain under roadmap item
-  576.
+  query pool size and the limit of one request in flight per performance core were
+  measured on one Intel processor. Other hybrid processors and macOS remain under
+  roadmap item 576.
 * Sparkles runs as a single node on local disk. There is no clustering and there are no
   replicas, roadmap item 66. Live RDF data on local disk is not encrypted at rest, item 65.
 * Backups cover individual datasets, with no whole-server backup, roadmap item 61.
