@@ -48,7 +48,9 @@ pub use internal::{AnnotatedRows, Counts, InternalAccess, InternalRows, Internal
 pub use live::{LiveEvent, LiveOptions, LiveQuery, LiveRow};
 pub use ops::{Mode, PlanNode};
 pub use prov::{Absence, Annotation, Atom, FactKey, Provenance, Witness};
-pub use runtime::{Host, InternalCircuit, OpenHost, Runtime, RuntimeOptions, RuntimeStats};
+pub use runtime::{
+    Host, InternalCircuit, OpenHost, Runtime, RuntimeOptions, RuntimeStats, WorkerPause,
+};
 pub use views::{ViewDef, ViewInfo, ViewState};
 
 /// The IRI of the local SERVICE that reads a `table` view (`view:read`).

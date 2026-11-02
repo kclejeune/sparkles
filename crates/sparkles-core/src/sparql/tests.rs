@@ -2485,3 +2485,151 @@ mod generator_divergences {
         assert!(has_op(&r.plan, "KeyedJoin"), "{:#?}", r.plan);
     }
 }
+
+/// A cursor batch maps an expensive expression on several threads and a cheap one on
+/// the calling thread, in row order either way (item 449).
+#[test]
+fn cursor_batches_spread_expensive_rows_over_the_pool() {
+    use std::collections::HashSet;
+    let s = store();
+    let mut ctx = Ctx::new(s.snapshot());
+    ctx.enable_cursor_accounting().unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    // about 20 µs a row: a batch of 4096 rows costs 80 ms on one thread
+    let slow = |i: usize| {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_micros(20) {
+            std::hint::spin_loop();
+        }
+        (i, std::thread::current().id())
+    };
+    let rows = pool
+        .install(|| exec::map_batch(&ctx, 4096, true, slow))
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        (0..4096).collect::<Vec<_>>()
+    );
+    let threads: HashSet<_> = rows.iter().map(|r| r.1).collect();
+    assert!(threads.len() > 1, "an expensive batch ran on one thread");
+    // a batch that may not run in parallel, and a cheap one, stay on the calling thread
+    let caller = |par: bool, f: &(dyn Fn(usize) -> (usize, std::thread::ThreadId) + Sync)| {
+        pool.install(|| {
+            let me = std::thread::current().id();
+            let rows = exec::map_batch(&ctx, 4096, par, f).unwrap();
+            assert_eq!(
+                rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                (0..4096).collect::<Vec<_>>()
+            );
+            rows.iter().all(|r| r.1 == me)
+        })
+    };
+    assert!(caller(false, &slow));
+    // a cheap row costs a few nanoseconds, far below the cost that pays for the pool
+    let cheap = pool.install(|| {
+        let me = rayon::current_thread_index();
+        let rows =
+            exec::map_batch(&ctx, 1024, true, |i| (i, rayon::current_thread_index())).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            (0..1024).collect::<Vec<_>>()
+        );
+        rows.iter().all(|r| r.1 == me)
+    });
+    assert!(cheap, "a cheap batch left the calling thread");
+    // a short batch is mapped whole, without the pool
+    let short = pool
+        .install(|| exec::map_batch(&ctx, 300, true, slow))
+        .unwrap();
+    assert_eq!(short.len(), 300);
+    // a budget without room for the parallel pieces keeps the batch on the calling
+    // thread, and with room the pieces are charged
+    let mut tight = Ctx::new(s.snapshot());
+    tight.enable_cursor_accounting().unwrap();
+    tight.mem_limit = 1024;
+    assert!(caller_in(&pool, &tight, &slow));
+    let before = tight.mem_peak();
+    tight.mem_limit = u64::MAX;
+    assert!(!caller_in(&pool, &tight, &slow));
+    assert!(
+        tight.mem_peak() >= before + 3840 * 16,
+        "the pieces were charged"
+    );
+}
+
+/// Whether every row of a 4096-row batch of `f` ran on the thread that called
+/// [`exec::map_batch`] under `ctx`.
+fn caller_in(
+    pool: &rayon::ThreadPool,
+    ctx: &Ctx,
+    f: &(dyn Fn(usize) -> (usize, std::thread::ThreadId) + Sync),
+) -> bool {
+    pool.install(|| {
+        let me = std::thread::current().id();
+        let rows = exec::map_batch(ctx, 4096, true, f).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            (0..4096).collect::<Vec<_>>()
+        );
+        rows.iter().all(|r| r.1 == me)
+    })
+}
+
+/// Cursor BIND and FILTER over date functions and decimal arithmetic, which the cursor
+/// maps in parallel within a batch, give the eager answers.
+#[test]
+fn cursor_bind_and_filter_in_parallel_match_eager() {
+    let s = Store::in_memory(StoreOptions::default());
+    let data = (0..20_000)
+        .map(|i| {
+            format!(
+                "<urn:p:{i}> <urn:born> \"{:04}-{:02}-{:02}\"^^<http://www.w3.org/2001/XMLSchema#date> .\n",
+                1500 + i % 500,
+                1 + i % 12,
+                1 + i % 28
+            )
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    for q in [
+        "SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p <urn:born> ?d \
+         BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade",
+        "SELECT ?p ?d WHERE { ?p <urn:born> ?d FILTER(MONTH(?d) * 31 + DAY(?d) > 200) }",
+    ] {
+        let eager = query(s.snapshot(), q, &QueryOptions::default()).unwrap();
+        let mut want: Vec<String> = eager.rows().iter().map(|r| format!("{r:?}")).collect();
+        want.sort();
+        let options = CursorOptions {
+            batch_rows: 4096,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let got = pool.install(|| {
+            let mut c = select_cursor(s.snapshot(), q, &QueryOptions::default(), &options).unwrap();
+            let mut got = Vec::new();
+            while let Some(b) = c.next_batch().unwrap() {
+                for row in 0..b.len() {
+                    got.push(format!("{:?}", b.row(row).unwrap()));
+                }
+            }
+            got
+        });
+        let mut got = got;
+        got.sort();
+        assert_eq!(got.len(), want.len(), "{q}");
+        assert!(!got.is_empty(), "{q}");
+        assert_eq!(got, want, "{q}");
+    }
+}

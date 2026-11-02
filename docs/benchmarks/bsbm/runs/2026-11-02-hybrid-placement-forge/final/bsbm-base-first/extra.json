@@ -1,0 +1,21 @@
+{
+ "settings": {
+  "maxTimeSeconds": 300,
+  "serverTimeoutSeconds": 315,
+  "sparklesArgs": "",
+  "answerStreamTSVQueries": "",
+  "correctnessEngineIsolation": true,
+  "jenaHeap": "8G",
+  "jenaStack": "default",
+  "qleverMemory": "8G",
+  "bsbmMaxTimeSeconds": 1800.0,
+  "bsbmKillAfterSeconds": 5.0,
+  "bsbmWarmup": 50,
+  "bsbmRuns": 500,
+  "bsbmClients": [
+   1,
+   4,
+   16
+  ]
+ }
+}

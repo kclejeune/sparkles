@@ -461,6 +461,7 @@ happens to materialized inferences, and the limits.
 | `--cors-origin ORIGIN` | none | A browser origin, such as `https://yasgui.example`, whose pages may call the API cross-origin without credentials. Repeatable. With `--auth-config`, it is added to `cors.origins`. Without auth, such a page may do everything the server allows. |
 | `--timeout S` | `60` | Default query timeout in seconds. `timeout=` sets it per request. |
 | `--default-execution MODE` | `auto` | How a query runs when its request has no `execution=`. `auto` streams the plain scans of a thousand rows or more and the groupings of 20,000 input rows or more, which measured faster as cursors, and runs the rest eagerly. `eager` runs every query eagerly. See [incremental query execution](#incremental-query-execution). |
+| `--request-cpus MODE` | `auto` | `auto` runs the threads that serve requests on the performance cores of a hybrid processor on Linux and leaves one CPU free of query threads for every four efficiency cores. `all` lets every thread run on every CPU. See [Threads on hybrid processors](#threads-on-hybrid-processors). |
 | `--update-timeout S` | `0` | Default SPARQL update timeout in seconds; `0` means none. `timeout=` sets it per request. An update that times out changes nothing. |
 | `--max-timeout S` | `1800` | Largest `timeout=` a query or update may ask for; `0` means unlimited. Never below `--timeout` or `--update-timeout`. |
 | `--query-memory-mb N` | `8192` (`small`: `1024`) | Budget for the estimated memory of a query's intermediate results; `0` means unlimited. |
@@ -531,6 +532,8 @@ happens to materialized inferences, and the limits.
 | `--service-bulk-max N` | `100` | The most inputs per request of any bulk SERVICE. `bulk+n` is capped to it. |
 | `--service-cache-mb N` | `64` (`small`: `16`) | The cache of remote results that `SERVICE <cache:…>` uses, for the whole server. `0` turns it off. A global flag. |
 | `--cache-mb N` | `1024` (`small`: `256`) | The block cache, for the whole server. A global flag. |
+| `--no-warm-up` | | Skip the query that `serve` runs before it reports ready. That query reads no data, runs on a scratch in-memory dataset and is neither logged nor counted, and it builds the state the query path builds once, so that the first request after a start does not wait for it. See [Memory and caches](#memory-and-caches). |
+| `--no-code-prefault` | | Do not map the executable's code into memory at start. Without the flag, a background thread maps it so that the first requests do not fault it in, which adds about 100 MB of shared file pages to the resident set. The kernel can reclaim those pages under memory pressure. |
 | `--prewarm` | off | Record the decoded blocks and file pages each persistent dataset used, and read the recorded ones again in the background after the next start is ready. See [Memory and caches](#memory-and-caches). |
 | `--prewarm-interval S` | `300` | Seconds between two recordings of the prewarm lists while the server runs, with `--prewarm`, from 1 to 1e9. The shutdown records them too. |
 | `--result-cache-mb N` | `256` (`small`: `64`) | The query result cache, for the whole server. `0` turns it off. A global flag. |
@@ -549,7 +552,7 @@ happens to materialized inferences, and the limits.
 | `--vocab-codec front\|fsst` | | How a bulk load or a full compaction stores the vocabulary. `front` front-codes the keys. `fsst` also compresses each key's suffix with FSST when that makes it shorter, with symbol tables in `vocab.fsst`, which makes the generation index format 4. Releases that read only format 3 cannot open it. Without the flag, a new database is front-coded and a compaction keeps the codec of the generation it replaces. A compaction asked for another codec rebuilds the generation in full. A global flag. |
 | `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. Declared prefixes count toward the limit, and well-known ones do not. |
 | `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. The limit counts the closure's derived triples, which take about 135 bytes each, and the input graphs are read from the store's indexes. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
-| `--reason-threads N` | half the cores | The threads that materializations evaluate rules on. All runs share this pool, so a run leaves the other cores to queries and writes. A request's `threads` field can ask for fewer. Runs are admitted in arrival order while their threads fit the pool, so a run that asks for fewer threads waits until they are free, and runs that use the whole pool run together. With `0`, runs use the pool that queries also use, which has a thread per core. |
+| `--reason-threads N` | half the cores | The threads that materializations evaluate rules on. All runs share this pool, so a run leaves the other cores to queries and writes. A request's `threads` field can ask for fewer. Runs are admitted in arrival order while their threads fit the pool, so a run that asks for fewer threads waits until they are free, and runs that use the whole pool run together. With `0`, runs use the pool that queries also use. |
 | `--reason-max-inferred N` | `50000000` | The derived triples a materialization may produce before it fails. Every run of the server has this limit, including automatic runs, and a request's `maxInferred` can ask for a lower one. A run that passes the limit fails with the rule that produced the most candidates and commits nothing. With `0`, runs have no limit, and only `ReasonOptions::max_memory` or the memory of the host stops a runaway rule. |
 | `--reason-max-derived N` | `1000000` | The facts one query may derive with `reasoning=demand`, not counting the magic facts of the demand transformation. A request's `maxDerived` can ask for fewer. A query that passes the limit fails with `422` and the code `reasoning-budget` ([API](API.md#query-time-reasoning)). With `0`, queries have no limit, and the query's timeout and memory budget stop a runaway derivation. |
 
@@ -580,6 +583,41 @@ applies, so a client that abandons a slow query the server has not seen before l
 running until its timeout. Once a run of a text is slow or fails, its later runs use the
 pool, where they stop on a disconnect, until a run of it is quick again. Everything else
 runs on the pool and stops on a disconnect.
+
+Automatic execution streams some groupings as cursors that an eager run answers faster,
+because eager execution spreads more of its work over the query threads. When such a
+text's cursor answers whole in 10 to 50 ms and no eager run of it is known, its next run
+is eager, on the pool. The server keeps the fastest eager run and the fastest cursor run
+of each text, and once both are known the text runs in the faster mode, so one slow run
+does not change it. The remembered times do not age. The server remembers up to 4,096
+texts and forgets all of them at once when a new text arrives after that, and roadmap
+item 577 covers aging. On forge, DBpedia's
+`births-by-decade` at 50M triples takes 3.2 ms as a cursor and 1.8 ms eagerly, and it
+runs eagerly after its first run. An eager trial that outgrows its memory budget runs
+again with automatic execution within the same deadline and budgets, and the text keeps
+automatic execution after it.
+
+### Threads on hybrid processors
+
+A request runs its sequential parts on the thread that serves it and its parallel parts
+on the query pool, which by default has a thread per logical CPU. On a processor with
+performance and efficiency cores, a serving thread that waits for the pool often finds
+only an efficiency core free when the pool's work ends, and finishes the request there.
+On Linux, the kernel lists the two kinds of core of an Intel hybrid processor in
+`/sys/devices/cpu_core/cpus` and `/sys/devices/cpu_atom/cpus`. When both lists exist
+and the server may run on cores of both kinds, `--request-cpus auto` runs the serving
+threads on the performance cores, and the query pool leaves one CPU free for
+every four efficiency cores, or part of four. The pool's threads run on every CPU. On
+forge, an Intel Core i5-13500 with twelve logical CPUs on its performance cores and
+eight efficiency cores, the pool has 18 threads. The third instance of BSBM BI `q3` at
+10M then takes 23 to 24 ms in every server process, against 37 to 44 ms with
+`--request-cpus all`. The server logs the split at startup.
+
+`--request-cpus all` keeps every thread free to run anywhere, with a pool thread per
+logical CPU. Both modes behave as `all` on processors with one kind of core, on hybrid
+processors whose kernel does not provide those two lists, on systems other than Linux,
+and when the server's CPU affinity holds cores of only one kind. `RAYON_NUM_THREADS` sets the
+pool's size in either mode.
 
 ### Memory and caches
 
@@ -613,6 +651,18 @@ stale. On forge at 10.5M, with the list of a warm pass, a cold `star-lookup` too
 instead of 11.4 ms after a background read of 15 ms, and the time to ready stayed at
 52 ms. The prewarm reads data that the next queries may never touch, so it is off by
 default.
+
+Two steps that `serve` takes by default shorten the first request after a start without
+reading any data. Before the server reports ready, it runs one query that reads nothing
+through its query path on a scratch in-memory dataset, so that the first real query finds
+the parser, the planner, the executor and the result writer ready. That query is not
+logged, counted or visible to clients. A background thread also maps the executable's code
+into memory, so that the first requests do not fault it in page by page. The code stays
+mapped, which adds about 100 MB of shared file pages to the resident set. An idle server
+with one empty dataset measured 122 MB resident with the mapping and 50 MB without it. The
+kernel can drop those pages under memory pressure and fault them in again later.
+`--no-warm-up` and `--no-code-prefault` turn the steps off, and neither runs outside
+`serve`, so the embedded library is unaffected.
 
 The query memory pool bounds what all running queries may hold together, so that sixteen
 queries that each stay within `--query-memory-mb` cannot add up to more than the host has.

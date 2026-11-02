@@ -19,6 +19,20 @@
 //! until a later run of it is quick again, and so does a text that may call a SERVICE.
 //! Timeouts apply either way.
 //!
+//! Automatic execution may stream a query as a cursor that eager execution answers
+//! faster, since eager execution spreads more of its work over the query pool. A quick run
+//! of either kind makes the next run eager and a slow run sends the next one to the
+//! blocking pool with automatic execution, so without more history such a text settles
+//! into whichever mode its first quick or slow run leaves it in. On forge, one server process answered
+//! DBpedia's `births-by-decade` in 3 ms eagerly for its whole life and the next in 15 ms as
+//! a cursor (roadmap item 449), and a text whose eager runs were slow but whose cursor runs
+//! were quick alternated between them. So the history keeps the fastest eager run and the
+//! fastest whole cursor run of each text, and a text runs in the faster of the two modes
+//! once both are known. A cursor run that answered whole in [`QUICK_QUERY_MS`] to
+//! [`EAGER_TRIAL_MS`] has its next run tried eagerly on the blocking pool when no eager run
+//! of the text is known. The fastest runs, not the last ones, decide, so that one slow run
+//! of the faster mode, as a busy moment gives, does not hold the text in the slower mode.
+//!
 //! The blocking pool costs a first request about 2 ms more on an idle machine. On forge
 //! at 10.5M triples, a fresh server answered its first `path-plus` in a median of 6.5 ms
 //! through the pool and 4.3 ms in place, and a text it had not seen in 0.72 and 0.50 ms.
@@ -37,6 +51,10 @@ use std::hash::{Hash, Hasher};
 /// A query whose previous run (parse, plan, execution and serialization) took less
 /// than this runs in place.
 pub const QUICK_QUERY_MS: f64 = 10.0;
+
+/// A cursor run that answered whole in less than this, but not in [`QUICK_QUERY_MS`],
+/// has the next run of its text tried eagerly.
+pub const EAGER_TRIAL_MS: f64 = 50.0;
 
 /// Results with up to this many cells (rows × variables) are serialized in place.
 pub const QUICK_RESULT_CELLS: usize = 1 << 14;
@@ -115,6 +133,9 @@ pub enum History {
     Quick(QuickExecution),
     /// The last run was slow, streamed past one body or failed.
     Slow,
+    /// The last run was an automatic cursor that answered whole but not quickly: the next
+    /// run is eager, on the blocking pool.
+    TryEager,
 }
 
 /// How long the server must have been without requests for the first run of a text it
@@ -142,6 +163,16 @@ pub fn first_run_in_place(query: &str) -> bool {
             .any(|w| w.eq_ignore_ascii_case(b"service"))
 }
 
+/// The kind of a run that [`QuickQueries`] records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Run {
+    Eager,
+    /// an eager trial that outgrew its memory budget
+    EagerFailed,
+    Ask,
+    Cursor,
+}
+
 /// How a quick query may execute on its next automatic request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuickExecution {
@@ -150,10 +181,23 @@ pub enum QuickExecution {
     PreserveAuto,
 }
 
+/// What is remembered of one text: its [`History`], its fastest eager run and its fastest
+/// whole cursor run in milliseconds (infinite: none yet), and the token of the request that
+/// holds its eager trial (0: none).
+#[derive(Clone, Copy, Debug)]
+struct Seen {
+    history: History,
+    eager_best: f64,
+    cursor_best: f64,
+    trial: u64,
+}
+
 /// The query texts (per dataset) whose last run is remembered, quick or not.
 #[derive(Default)]
 pub struct QuickQueries {
-    quick: Mutex<HashMap<u64, History>>,
+    quick: Mutex<HashMap<u64, Seen>>,
+    /// the last token that [`Self::claim_trial`] gave out
+    trials: std::sync::atomic::AtomicU64,
     /// test hook: queries whose runs count as quick however long they took
     #[cfg(test)]
     timeless: Mutex<HashSet<u64>>,
@@ -175,7 +219,7 @@ impl QuickQueries {
     pub fn execution(&self, key: u64) -> Option<QuickExecution> {
         match self.history(key) {
             History::Quick(execution) => Some(execution),
-            History::Unseen | History::Slow => None,
+            History::Unseen | History::Slow | History::TryEager => None,
         }
     }
 
@@ -190,8 +234,7 @@ impl QuickQueries {
         self.quick
             .lock()
             .get(&key)
-            .copied()
-            .unwrap_or(History::Unseen)
+            .map_or(History::Unseen, |seen| seen.history)
     }
 
     #[cfg(test)]
@@ -213,20 +256,64 @@ impl QuickQueries {
         self.timeless.lock().insert(key);
     }
 
-    /// Record how long a run of the query took, in milliseconds of work.
+    /// Claim the eager trial of a text whose history is [`History::TryEager`]. One caller
+    /// gets a token, which holds the trial until it passes the token to
+    /// [`Self::end_trial`], and requests that overlap the trial keep automatic execution,
+    /// whatever their own runs record.
+    pub fn claim_trial(&self, key: u64) -> Option<u64> {
+        let mut set = self.quick.lock();
+        match set.get_mut(&key) {
+            Some(seen) if seen.history == History::TryEager && seen.trial == 0 => {
+                let token = self
+                    .trials
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                seen.trial = token;
+                Some(token)
+            }
+            _ => None,
+        }
+    }
+
+    /// Release the eager trial that [`Self::claim_trial`] gave out as `token`. A trial
+    /// claimed since by another request, after the text was forgotten and seen again,
+    /// stays held.
+    pub fn end_trial(&self, key: u64, token: u64) {
+        if let Some(seen) = self.quick.lock().get_mut(&key)
+            && seen.trial == token
+        {
+            seen.trial = 0;
+        }
+    }
+
+    /// Record how long an eager run of the query took, in milliseconds of work, or
+    /// infinity for a run of either kind that failed or streamed past one body.
     pub fn record(&self, key: u64, ms: f64) {
-        self.record_execution(key, ms, QuickExecution::Eager);
+        self.record_run(key, ms, Run::Eager);
     }
 
     /// A quick ASK can run in place, but still needs its automatic admission check.
     /// Its eager execution may exceed a lower budget on a later request.
     pub fn record_ask(&self, key: u64, ms: f64) {
-        self.record_execution(key, ms, QuickExecution::PreserveAuto);
+        self.record_run(key, ms, Run::Ask);
     }
 
-    fn record_execution(&self, key: u64, ms: f64, execution: QuickExecution) {
+    /// Record how long a run of the query as an automatic cursor took that answered
+    /// whole.
+    pub fn record_cursor(&self, key: u64, ms: f64) {
+        self.record_run(key, ms, Run::Cursor);
+    }
+
+    /// Record that an eager run of the query outgrew its memory budget, so that later runs
+    /// keep automatic execution whatever eager runs took before.
+    pub fn record_eager_failure(&self, key: u64) {
+        self.record_run(key, f64::MAX, Run::EagerFailed);
+    }
+
+    fn record_run(&self, key: u64, ms: f64, run: Run) {
         #[cfg(test)]
-        let ms = if ms.is_finite() && self.timeless.lock().contains(&key) {
+        let ms = if run != Run::EagerFailed && ms.is_finite() && self.timeless.lock().contains(&key)
+        {
             0.0
         } else {
             ms
@@ -235,12 +322,70 @@ impl QuickQueries {
         if set.len() >= REMEMBERED && !set.contains_key(&key) {
             set.clear();
         }
-        let seen = if ms < QUICK_QUERY_MS {
-            History::Quick(execution)
-        } else {
-            History::Slow
+        let seen = set.get(&key).copied();
+        let mut eager_best = seen.map_or(f64::INFINITY, |seen| seen.eager_best);
+        let mut cursor_best = seen.map_or(f64::INFINITY, |seen| seen.cursor_best);
+        let trial = seen.map_or(0, |seen| seen.trial);
+        let history = match run {
+            _ if !ms.is_finite() => History::Slow,
+            Run::Ask if ms < QUICK_QUERY_MS => History::Quick(QuickExecution::PreserveAuto),
+            Run::Ask => History::Slow,
+            Run::EagerFailed => {
+                eager_best = ms;
+                History::Slow
+            }
+            Run::Eager => {
+                eager_best = eager_best.min(ms);
+                if cursor_best < eager_best {
+                    // the cursor is the faster mode
+                    if cursor_best < QUICK_QUERY_MS {
+                        History::Quick(QuickExecution::PreserveAuto)
+                    } else {
+                        History::Slow
+                    }
+                } else if ms < QUICK_QUERY_MS {
+                    History::Quick(QuickExecution::Eager)
+                } else if cursor_best.is_finite() {
+                    // eager measured faster than the cursor, though not quick: eager on
+                    // the pool
+                    History::TryEager
+                } else {
+                    History::Slow
+                }
+            }
+            Run::Cursor => {
+                cursor_best = cursor_best.min(ms);
+                if eager_best < cursor_best {
+                    if eager_best < QUICK_QUERY_MS {
+                        History::Quick(QuickExecution::Eager)
+                    } else {
+                        History::TryEager
+                    }
+                } else if eager_best.is_finite() {
+                    // the cursor is the faster mode
+                    if ms < QUICK_QUERY_MS {
+                        History::Quick(QuickExecution::PreserveAuto)
+                    } else {
+                        History::Slow
+                    }
+                } else if ms < QUICK_QUERY_MS {
+                    History::Quick(QuickExecution::Eager)
+                } else if ms < EAGER_TRIAL_MS {
+                    History::TryEager
+                } else {
+                    History::Slow
+                }
+            }
         };
-        set.insert(key, seen);
+        set.insert(
+            key,
+            Seen {
+                history,
+                eager_best,
+                cursor_best,
+                trial,
+            },
+        );
     }
 }
 
@@ -284,6 +429,130 @@ mod tests {
             q.record(i, 0.1);
         }
         assert_eq!(q.execution(key), None);
+    }
+
+    /// A text that automatic execution streams settles in the faster mode whichever
+    /// run comes first (item 449).
+    #[test]
+    fn a_text_runs_in_its_faster_mode() {
+        let q = QuickQueries::default();
+        // births-by-decade: a 15 ms cursor, a 3 ms eager run
+        let a = 1;
+        q.record_cursor(a, 15.0);
+        assert_eq!(q.history(a), History::TryEager);
+        q.record(a, 3.0);
+        assert_eq!(q.history(a), History::Quick(QuickExecution::Eager));
+        // one slow eager run, as a busy moment gives, keeps the text eager
+        q.record(a, 10.4);
+        assert_eq!(q.history(a), History::TryEager);
+        q.record_cursor(a, 9.9);
+        assert_eq!(q.history(a), History::Quick(QuickExecution::Eager));
+        q.record(a, 3.0);
+        assert_eq!(q.history(a), History::Quick(QuickExecution::Eager));
+        // a quick cursor and a slow eager run: the cursor stays, in place
+        let b = 2;
+        q.record_cursor(b, 6.0);
+        assert_eq!(q.history(b), History::Quick(QuickExecution::Eager));
+        q.record(b, 14.0);
+        assert_eq!(q.history(b), History::Quick(QuickExecution::PreserveAuto));
+        q.record_cursor(b, 6.0);
+        assert_eq!(q.history(b), History::Quick(QuickExecution::PreserveAuto));
+        q.record_cursor(b, 9.0);
+        assert_eq!(q.history(b), History::Quick(QuickExecution::PreserveAuto));
+        // both slow: the cursor is tried eagerly once, then stays a cursor on the pool
+        let c = 3;
+        q.record_cursor(c, 20.0);
+        assert_eq!(q.history(c), History::TryEager);
+        q.record(c, 30.0);
+        assert_eq!(q.history(c), History::Slow);
+        q.record_cursor(c, 20.0);
+        assert_eq!(q.history(c), History::Slow);
+        // a slow eager run with no cursor measured leaves automatic execution
+        let h = 8;
+        q.record(h, 30.0);
+        assert_eq!(q.history(h), History::Slow);
+        // a quick eager run that a faster cursor beat keeps automatic execution
+        let i = 9;
+        q.record_cursor(i, 40.0);
+        q.record(i, 20.0);
+        assert_eq!(q.history(i), History::TryEager);
+        q.record_cursor(i, 4.0);
+        assert_eq!(q.history(i), History::Quick(QuickExecution::PreserveAuto));
+        q.record(i, 8.0);
+        assert_eq!(q.history(i), History::Quick(QuickExecution::PreserveAuto));
+        // eager faster but not quick: the next runs stay eager, on the pool
+        let f = 6;
+        q.record_cursor(f, 40.0);
+        q.record(f, 20.0);
+        assert_eq!(q.history(f), History::TryEager);
+        q.record_cursor(f, 45.0);
+        assert_eq!(q.history(f), History::TryEager);
+        // a long cursor run is not tried eagerly, and a failure never is
+        let d = 4;
+        q.record_cursor(d, EAGER_TRIAL_MS);
+        assert_eq!(q.history(d), History::Slow);
+        q.record_cursor(d, f64::INFINITY);
+        assert_eq!(q.history(d), History::Slow);
+        // an eager run that outgrew its budget keeps the cursor, whatever came before
+        let g = 7;
+        q.record_cursor(g, 15.0);
+        q.record(g, 3.0);
+        q.record_eager_failure(g);
+        assert_eq!(q.history(g), History::Slow);
+        q.record_cursor(g, 15.0);
+        assert_eq!(q.history(g), History::Slow);
+        q.record_cursor(g, 5.0);
+        assert_eq!(q.history(g), History::Quick(QuickExecution::PreserveAuto));
+        let e = 5;
+        q.record_cursor(e, 15.0);
+        q.record(e, f64::INFINITY);
+        assert_eq!(q.history(e), History::Slow);
+        q.record_cursor(e, 15.0);
+        assert_eq!(
+            q.history(e),
+            History::TryEager,
+            "a failure says nothing of eager time"
+        );
+        // one request holds the trial until it ends it, even when an overlapping cursor
+        // run records another slow cursor
+        let a = q.claim_trial(e).unwrap();
+        assert_eq!(q.claim_trial(e), None);
+        q.record_cursor(e, 15.0);
+        assert_eq!(q.history(e), History::TryEager);
+        assert_eq!(
+            q.claim_trial(e),
+            None,
+            "an overlapping cursor run starts no second trial"
+        );
+        q.end_trial(e, a);
+        let b = q.claim_trial(e).unwrap();
+        assert_ne!(a, b);
+        q.record(e, 3.0);
+        q.end_trial(e, b);
+        assert_eq!(q.history(e), History::Quick(QuickExecution::Eager));
+        assert_eq!(q.claim_trial(e), None);
+        assert_eq!(q.claim_trial(99), None, "an unseen text has no trial");
+        q.end_trial(99, a);
+        assert_eq!(q.history(99), History::Unseen);
+    }
+
+    /// A trial whose text was forgotten and claimed again by another request stays held
+    /// when the first request ends.
+    #[test]
+    fn ending_a_forgotten_trial_keeps_a_newer_claim() {
+        let q = QuickQueries::default();
+        q.record_cursor(1, 15.0);
+        let a = q.claim_trial(1).unwrap();
+        for k in 2..=REMEMBERED as u64 + 1 {
+            q.record(k, 1.0);
+        }
+        assert_eq!(q.history(1), History::Unseen, "the text was forgotten");
+        q.record_cursor(1, 15.0);
+        let b = q.claim_trial(1).unwrap();
+        q.end_trial(1, a);
+        assert_eq!(q.claim_trial(1), None, "the newer claim stays held");
+        q.end_trial(1, b);
+        assert!(q.claim_trial(1).is_some());
     }
 
     #[test]

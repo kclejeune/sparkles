@@ -188,6 +188,22 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   and the axiom it concerns. A report on a profile also lists the DL violations, since
   each profile is a subset of OWL 2 DL. The checks cover the assertions the store holds
   unless the caller leaves them out.
+* The DL check, and so every profile report, also checks literals. A literal of a
+  datatype in the OWL 2 datatype map needs a lexical form of that datatype, such as an
+  `xsd:byte` from -128 to 127 or an `owl:rational` such as `1/3`, and no literal can be
+  of type `owl:real` or of a datatype that a datatype definition introduces. A datatype
+  restriction can use only the facets its datatype supports, with values in the value
+  space each facet takes, a pattern that parses as an XML Schema regular expression and
+  a language range of RFC 4647. Annotation literals and the annotations of the headers
+  of the ontology and its imports are checked as well. An edit can still write an ill-typed literal, and a check reports it.
+* Entity accessors answer what an ontology says about an entity: its kinds, labels and
+  annotations, the superclasses, subclasses, equivalent and disjoint classes and keys of
+  a class, the domains, ranges, hierarchy, inverses and characteristics of a property,
+  and the types and property assertions of an individual. The instances of a class and
+  the assertions about an individual stream from the store, through its indexes, since a
+  read keeps assertions out of memory. Rust has them as methods of the read ontology and
+  of the open handle, and the HTTP routes and the bindings answer them as one entity
+  report.
 * An edit adds and removes axioms in one commit. Added axioms declare the entities they
   use unless the caller turns this off. A removal deletes the axiom's triples and the
   anonymous structures it alone uses, and keeps any structure that another axiom or
@@ -391,14 +407,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * The MCP ontology tool and the CLI's ontology commands read the asserted axioms only,
   without the materialized inferences that the library, the bindings and the HTTP routes
   can include. Roadmap item 565.
+* The CLI's ontology commands and the MCP ontology tool have no entity listing or entity
+  report. Roadmap item 578.
 * An ontology read has no size budget of its own beyond the query deadline, and its cost
   on large ontologies is not measured. Roadmap item 539.
-* The Rust ontology handle has no entity accessors such as the superclasses of a class
-  and no edit builder, and the Python and Node.js bindings have no typed axiom
-  constructors. Callers filter axioms by type and entity and write axioms in
-  functional-style syntax or the JSON form instead. Roadmap item 540.
-* The profile checks do not check the lexical forms of literals against their datatypes.
-  Roadmap item 541.
 
 ## Configuration and usage
 
@@ -419,7 +431,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 540](../ROADMAP.md), [item 541](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

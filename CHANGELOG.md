@@ -45,6 +45,23 @@ carry when asked. The MCP tool `ontology_axioms` lists axioms, and on a server t
 allows updates adds and removes them with previews, `ifHead` and PROV-O provenance
 written as axiom annotations (spec F21 Phase 3).
 
+The ontology handle answers entity accessors (roadmap item 540). Rust's read ontology
+lists entities by kind and answers the superclasses, subclasses, equivalent and disjoint
+classes of a class, the domains, ranges, hierarchy and characteristics of a property and
+the types of an individual, and the open handle streams the instances of a class and an
+individual's assertions from the store. `ds.ontology().graph(iri)` builds a read and
+takes a closure that edits in one commit. `GET /$/ontology/{ds}/entities` and
+`GET /$/ontology/{ds}/entity` serve the accessors, as `entities` and `entity` do in
+Python, Node.js and on the JVM. Python's `sparkles.owl` and Node.js's `owl` namespace
+build axioms with typed constructors named after their functional-style forms.
+
+The OWL 2 DL check, and so every profile report, checks literals. A literal of a
+datatype in the OWL 2 datatype map needs a lexical form of that datatype, a datatype
+restriction needs facets and values that its datatype supports, and a datatype that a
+datatype definition introduces types no literal and takes no restriction. An ontology
+with an ill-typed literal, such as `"300"^^xsd:byte`, that conformed before now fails
+the check (roadmap item 541).
+
 The reasoner can keep witnesses for each fact of a materialization, the sets of input
 quads from which the rules derive it, with the provenance algebra of incremental views.
 `ReasonOptions::witnesses` sets the bound per fact, and `Cache::witnesses` and
@@ -101,6 +118,30 @@ first batch instead of after 1 MiB. Both executors answer an EXISTS in BIND or a
 OPTIONAL condition from the key set of its pattern, and automatic execution streams such
 a BIND. On an 8-vCPU Namespace instance at 10.5M quads, automatic execution of a COUNT
 grouped by BIND(EXISTS) went from 860 ms to 8.4 ms.
+
+`sparkles serve` runs one query that reads no data on a scratch in-memory dataset before it
+reports ready, and maps its executable's code into memory on a background thread, so that
+the first request after a start does not build the query path or fault in its code. The
+mapping adds about 100 MB of shared file pages to the resident set. `--no-warm-up` and
+`--no-code-prefault` turn the steps off, and the embedded library takes neither. On forge
+the first cold `path-plus` takes 1.80 ms at 10.5M and 2.49 ms at 1.05M instead of 3.52 and
+4.15 ms, which meets roadmap item 4's target against Oxigraph.
+
+On Linux, a server on a processor with performance and efficiency cores runs the threads
+that serve requests on the performance cores, and its query pool leaves one logical CPU
+free for every four efficiency cores. Before, the pool held every logical CPU, and a
+request that waited for it often finished its sequential work on an efficiency core.
+`serve --request-cpus all` keeps the earlier placement, and `RAYON_NUM_THREADS` still
+sets the pool's size. The default pool on such a processor is smaller, 18 threads instead
+of 20 on an Intel Core i5-13500, which a query bound by its parallel work can feel.
+
+A cursor batch of BIND or FILTER rows whose expressions are expensive, such as date
+functions and decimal arithmetic, is mapped over the query pool instead of on the
+request thread, and the rows it holds while it does count against the query's memory
+budget. A query text whose automatic cursor answers whole in 10 to 50 ms has its next
+run tried eagerly, once, and settles in the faster mode. Before, DBpedia's
+`births-by-decade` could stay a cursor of about 15 ms for a server's whole life where an
+eager run takes 2 ms.
 
 An OWL 2 ontology API reads the axioms of a dataset's graphs through the OWL 2 Mapping to
 RDF Graphs, checks them against OWL 2 DL, EL, QL and RL, and edits them in one commit.
@@ -972,6 +1013,17 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 (X14, item 478).
 
 ### Fixed
+
+A rename or delete of a persistent dataset no longer fails with `409` and "still has
+live handles" because the dataset's own views worker started a round at the wrong
+moment. Each open dataset runs a views worker, and a round of that worker holds the
+dataset until it ends. The first round of a new dataset could start after the server's
+wait for holders had seen the dataset free and before the catalog checked it, which
+happened on loaded hosts right after a dataset was created. The catalog now keeps the
+views workers of the dataset and its open branches from starting a round while it checks
+for other handles and closes the dataset, and waits up to two seconds for a round in
+progress to end. Handles of clients and requests still refuse the change, and a round
+that outlasts the wait answers `409` with "is still updating its views".
 
 Zero-or-more, one-or-more and zero-or-one property paths stay within the query memory
 budget and the timeout in eager execution. A path with two unbound ends, such as

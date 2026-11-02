@@ -76,6 +76,75 @@ pub(super) fn map_rows<T: Send>(
     Ok(out)
 }
 
+/// Rows of a cursor batch that [`map_batch`] maps on the calling thread while it times
+/// them.
+const BATCH_SAMPLE_ROWS: usize = 256;
+
+/// The projected time of a batch's remaining rows from which [`map_batch`] maps them in
+/// parallel. Waking the pool's threads and joining them costs tens of microseconds.
+const BATCH_PAR_NANOS: u128 = 200_000;
+
+/// Rows per parallel piece of a cursor batch.
+const BATCH_PAR_PIECE: usize = 256;
+
+/// [`map_rows`] for one batch of a cursor, whose rows are too few for the row count
+/// alone to say whether the pool pays. The first [`BATCH_SAMPLE_ROWS`] rows are mapped
+/// on this thread and timed, and the rest are mapped in parallel when `par` allows it
+/// and their projected time reaches [`BATCH_PAR_NANOS`]. A cheap expression, such as
+/// arithmetic on inline numbers, stays on this thread, and an expensive one, such as
+/// date functions and decimal arithmetic on every row, is spread over the pool instead
+/// of leaving the whole batch on one core.
+pub(super) fn map_batch<T: Send>(
+    ctx: &Ctx,
+    n: usize,
+    par: bool,
+    f: impl Fn(usize) -> T + Sync + Send,
+) -> Result<Vec<T>> {
+    let sample = n.min(BATCH_SAMPLE_ROWS);
+    let rest = n - sample;
+    let mut out = Vec::with_capacity(n);
+    ctx.check()?;
+    let t0 = Instant::now();
+    out.extend((0..sample).map(&f));
+    if par
+        && rest >= 2 * BATCH_PAR_PIECE
+        && rayon::current_num_threads() > 1
+        && t0.elapsed().as_nanos() * rest as u128 >= BATCH_PAR_NANOS * sample as u128
+    {
+        // Each piece of the rest is its own vector until it is appended to `out`, which
+        // already holds room for every row, so the pieces are the memory this adds.
+        let starts: Vec<usize> = (sample..n).step_by(BATCH_PAR_PIECE).collect();
+        let bytes = (rest as u64)
+            .saturating_mul(std::mem::size_of::<T>() as u64)
+            .saturating_add(
+                (starts.len() as u64)
+                    .saturating_mul(std::mem::size_of::<Result<Vec<T>>>() as u64 + 16),
+            );
+        if let Ok(_scratch) = ctx.charge(bytes) {
+            // an indexed collect writes each piece's slot in place
+            let pieces: Vec<Result<Vec<T>>> = starts
+                .into_par_iter()
+                .map(|start| {
+                    ctx.check()?;
+                    Ok((start..(start + BATCH_PAR_PIECE).min(n)).map(&f).collect())
+                })
+                .collect();
+            for piece in pieces {
+                out.extend(piece?);
+            }
+            return Ok(out);
+        }
+    }
+    let mut start = sample;
+    while start < n {
+        ctx.check()?;
+        let end = (start + 1024).min(n);
+        out.extend((start..end).map(&f));
+        start = end;
+    }
+    Ok(out)
+}
+
 /// Executed operator tree with runtime information (QLever `RuntimeInformation`).
 ///
 /// A written node carries an `id`, the path of child indexes from the root (`0`, `0.1`,
@@ -5666,8 +5735,12 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
         };
         exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
     };
-    let par = t.len() > PAR_THRESHOLD && exprs.iter().all(Expr::parallel);
-    let keep = map_rows(ctx, t.len(), par, test)?;
+    let parallel = exprs.iter().all(Expr::parallel);
+    let keep = if ctx.is_cursor() && t.len() <= PAR_THRESHOLD {
+        map_batch(ctx, t.len(), parallel, test)?
+    } else {
+        map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && parallel, test)?
+    };
     tracing::debug!(target: "sparkles::sparql::exec", "filter evaluated {} rows in {:?}", t.len(), t0.elapsed());
     Ok(keep)
 }
@@ -5824,6 +5897,9 @@ fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
         Ok(v) => v.into_id(ctx),
         Err(_) => Id::UNDEF,
     };
+    if ctx.is_cursor() && t.len() <= PAR_THRESHOLD {
+        return map_batch(ctx, t.len(), e.parallel(), f);
+    }
     map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && e.parallel(), f)
 }
 

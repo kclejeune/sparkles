@@ -1280,8 +1280,9 @@ impl AppState {
             .or_else(|| self.catalog.info(name).map(|info| info.id));
         drop(cached);
         if managed {
-            // Workers such as a starting view worker hold the dataset itself, not this
-            // server's wrapper. The catalog refuses if one still does after the wait.
+            // Other holders of the dataset itself, not this server's wrapper, get the
+            // same window. The catalog then refuses if one still does, except the
+            // dataset's own views worker, which it pauses instead.
             wait_until(end, || !self.catalog.in_use(name));
         }
         #[cfg(test)]
@@ -1839,7 +1840,8 @@ pub fn uptime_secs(state: &AppState) -> u64 {
 }
 
 /// How long a delete or rename waits for the requests and workers that still hold a
-/// leaving dataset, such as the first round of a new dataset's view worker.
+/// leaving dataset. The catalog separately waits for a views round in progress and
+/// keeps new rounds from starting while it closes the dataset.
 const LEAVE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Whether `ds` is held by its caller alone, waiting until `end` for other holders to

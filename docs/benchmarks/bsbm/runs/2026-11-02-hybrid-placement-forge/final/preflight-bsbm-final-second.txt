@@ -1,0 +1,9 @@
+2026-11-02T08:19:42Z
+1.51 1.53 2.01 1/608 3390340
+               total        used        free      shared  buff/cache   available
+Mem:           15620        1325        2952          10       11771       14295
+Swap:           8191         292        7899
+Filesystem           Size  Used Avail Use% Mounted on
+/dev/mapper/vg-root  460G  348G   89G  80% /
+cpu0 powersave balance_performance
+cpu12 powersave balance_performance

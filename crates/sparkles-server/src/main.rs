@@ -23,6 +23,7 @@ mod compaction_cmd;
 mod compress;
 mod config_cmd;
 mod config_watch;
+mod cpus;
 mod csv_cmd;
 mod dataset_cmd;
 mod describe_cmd;
@@ -98,6 +99,7 @@ mod validation_cmd;
 mod validation_common;
 mod vector;
 mod vector_cmd;
+mod warm;
 mod write_validation;
 
 use anyhow::{Context, Result, bail};
@@ -853,6 +855,18 @@ enum LogFormat {
     Json,
 }
 
+/// Where request threads run on a processor with performance and efficiency cores
+/// (`serve --request-cpus`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum RequestCpus {
+    /// On a hybrid processor, request threads run on the performance cores and the
+    /// query pool leaves a CPU free for every four efficiency cores. Elsewhere, as
+    /// `all`.
+    Auto,
+    /// Every thread may run on every CPU, and the query pool has a thread per logical CPU.
+    All,
+}
+
 /// Compression of a dump or backup.
 #[derive(clap::Args, Clone, Debug)]
 struct CompressArgs {
@@ -1065,6 +1079,14 @@ enum Cmd {
         /// Return free heap memory to the OS after this many idle milliseconds (0: never)
         #[arg(long, default_value_t = 1000)]
         idle_release_ms: u64,
+        /// Do not run the query that builds the query path's one-time state before the
+        /// server reports ready
+        #[arg(long)]
+        no_warm_up: bool,
+        /// Do not map the executable's code into memory at start, which keeps about 100 MB
+        /// of shared file pages out of the resident set
+        #[arg(long)]
+        no_code_prefault: bool,
         /// Record the index blocks and file pages that each persistent dataset used, at
         /// shutdown and every --prewarm-interval seconds, and after a start is ready read
         /// the ones recorded before in the background (off by default)
@@ -1313,6 +1335,12 @@ enum Cmd {
         /// Datasets opened at once at startup (default: the number of cores, at most 4)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         open_threads: Option<u32>,
+        /// Where request threads run on a processor with performance and efficiency
+        /// cores: `auto` runs them on the performance cores and sizes the query pool to
+        /// leave room for them, `all` lets every thread run anywhere. RAYON_NUM_THREADS
+        /// still sets the query pool's size
+        #[arg(long, value_enum, default_value_t = RequestCpus::Auto)]
+        request_cpus: RequestCpus,
         /// Background tasks (compaction, clones, reasoning, full-text builds, N-Quads
         /// backups) that run at once; more wait, queued (0: no limit). Backup repository
         /// tasks have their own --backup-max-tasks
@@ -2716,6 +2744,8 @@ fn run() -> Result<()> {
             ask_history_days,
             load_dir,
             idle_release_ms,
+            no_warm_up,
+            no_code_prefault,
             prewarm,
             prewarm_interval,
             mut text,
@@ -2779,6 +2809,7 @@ fn run() -> Result<()> {
             license_policy,
             require_all_datasets,
             open_threads,
+            request_cpus,
             mut auth_config,
             #[cfg(feature = "backup")]
             backup_config,
@@ -3244,10 +3275,34 @@ fn run() -> Result<()> {
             // spawning a thread per core, which made a cold point lookup several times
             // slower than the second. Starting the pool here, and waiting until each
             // worker has run once, moves that cost before the server listens.
-            let _ = rayon::ThreadPoolBuilder::new()
-                .thread_name(|i| format!("query-{i}"))
-                .build_global();
+            // On a hybrid processor the request threads run on the performance cores, and
+            // the query pool leaves room for them (see `cpus`).
+            let hybrid = match request_cpus {
+                RequestCpus::Auto => cpus::Hybrid::detect(),
+                RequestCpus::All => None,
+            };
+            let mut pool = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("query-{i}"));
+            if let Some(h) = &hybrid
+                && std::env::var_os("RAYON_NUM_THREADS").is_none()
+            {
+                let limit = std::thread::available_parallelism().map_or(1, |n| n.get());
+                pool = pool.num_threads(h.query_threads().min(limit));
+            }
+            let _ = pool.build_global();
             rayon::broadcast(|_| ());
+            // the first request would otherwise fault in the code it runs (see `warm`)
+            if !no_code_prefault {
+                warm::spawn_prefault();
+            }
+            if let Some(h) = &hybrid {
+                tracing::info!(
+                    performance = h.performance.len(),
+                    efficiency = h.efficiency.len(),
+                    query_threads = rayon::current_num_threads(),
+                    "hybrid processor: request threads run on the performance cores"
+                );
+            }
+            let request_cpus = hybrid.map(|h| h.performance);
             alloc::start_clock();
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             // at least a second, and small enough for an `Instant` deadline
@@ -3255,14 +3310,31 @@ fn run() -> Result<()> {
                 Ok(d) if (1.0..=1e9).contains(&prewarm_interval) => d,
                 _ => bail!("--prewarm-interval expects a number of seconds from 1 to 1e9"),
             };
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .thread_stack_size(THREAD_STACK)
-                .enable_all()
-                .build()?;
+            let mut rt = tokio::runtime::Builder::new_multi_thread();
+            rt.thread_stack_size(THREAD_STACK).enable_all();
+            if let Some(cpus) = request_cpus {
+                // runtime workers and blocking threads alike
+                rt.on_thread_start(move || cpus::pin_current_thread(&cpus));
+            }
+            let rt = rt.build()?;
             // Queries run on the runtime's blocking threads, which it also starts on first
             // use. One started here serves a first query that arrives soon after the
             // server is ready, which then does not wait for a thread to be created.
             rt.block_on(async { tokio::task::spawn_blocking(|| ()).await })?;
+            // After the datasets open and before the server reports ready, one query that
+            // reads no data builds what a first query would build once (see `warm`).
+            let after_open = {
+                let rt = rt.handle().clone();
+                move |st: &Arc<state::AppState>, stop: &startup::StopFlag| -> Result<()> {
+                    after_open(st, stop)?;
+                    if !no_warm_up {
+                        stop.check()?;
+                        // the outcome is in the debug log: the server serves either way
+                        let _ = warm::warm_up(st, &rt);
+                    }
+                    Ok(())
+                }
+            };
             // backup tasks drive the repository engine on this runtime
             #[cfg(feature = "backup")]
             backup::start(&st, rt.handle());

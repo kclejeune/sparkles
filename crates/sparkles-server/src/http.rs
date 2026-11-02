@@ -180,6 +180,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/$/ontology/{ds}/axioms",
             get(ontology::axioms).post(ontology::edit),
         )
+        .route("/$/ontology/{ds}/entities", get(ontology::entities))
+        .route("/$/ontology/{ds}/entity", get(ontology::entity))
         .route("/$/ontology/{ds}/check", post(ontology::check))
         .route("/$/ontology/{ds}/diff", get(ontology::diff))
         .route("/$/graph/{ds}/groups", post(graph::groups))
@@ -1594,6 +1596,29 @@ async fn query_endpoint(
     run_query(st, ds, p, uri, headers, params, query, Vec::new()).await
 }
 
+/// The query of the startup warm-up ([`crate::warm`]) on `ds`, run as `/{ds}/sparql`
+/// runs a request from a local caller, without the layers in front of the handler.
+pub(crate) async fn warm_up_query(
+    st: Arc<AppState>,
+    ds: Arc<Dataset>,
+    uri: Uri,
+    headers: HeaderMap,
+    query: String,
+) -> ApiResult {
+    let params = Params::from_query(&uri);
+    run_query(
+        st,
+        ds,
+        Principal::local(),
+        uri,
+        headers,
+        params,
+        query,
+        Vec::new(),
+    )
+    .await
+}
+
 /// What the blocking part of a query gave: a materialized result, or a cursor that
 /// automatic execution opened. The result stays unboxed: it is moved once, and every
 /// eager query would pay for a box.
@@ -1601,6 +1626,45 @@ async fn query_endpoint(
 enum Ran {
     Eager(sparkles::sparql::QueryResult),
     Cursor(Box<sparkles::sparql::QueryExecution>),
+}
+
+/// The eager trial of a text that [`inline::QuickQueries::claim_trial`] gave a request,
+/// released when the last clone drops: the request's own once it has recorded the run, and
+/// the blocking work's once that work has ended, even after its client left.
+struct TrialClaim {
+    key: u64,
+    token: u64,
+}
+
+impl Drop for TrialClaim {
+    fn drop(&mut self) {
+        QUICK.end_trial(self.key, self.token);
+    }
+}
+
+/// `opts` for runs that count as one request: a relative timeout becomes one deadline from
+/// now, and the runs share one count of rows produced and one outbound budget. A timeout
+/// too large for a deadline stays relative, so that the run refuses it as it would alone.
+pub(crate) fn one_request(opts: &sparkles::sparql::QueryOptions) -> sparkles::sparql::QueryOptions {
+    let mut shared = opts.clone();
+    if let Some(timeout) = shared.timeout
+        && let Some(deadline) = std::time::Instant::now().checked_add(timeout)
+    {
+        shared.timeout = None;
+        shared.deadline = Some(shared.deadline.map_or(deadline, |d| d.min(deadline)));
+    }
+    shared.work.get_or_insert_with(Default::default);
+    if shared.outbound_budget.is_none() {
+        shared.outbound_budget = Some(sparkles::outbound::RequestBudget::new(&shared.outbound));
+    }
+    shared
+}
+
+/// Whether a run failed for want of query memory, the failure after which a cursor that
+/// keeps to the budget may still answer.
+fn outgrew_memory(e: &sparkles::Error) -> bool {
+    matches!(e, sparkles::Error::BudgetExceeded(b)
+        if matches!(b.kind, BudgetKind::Memory | BudgetKind::ServerMemory))
 }
 
 /// Run a query as `/{ds}/sparql` does: the request's budgets, graph view, result format
@@ -1714,7 +1778,7 @@ pub(crate) async fn run_query(
     };
     let quick = match history {
         inline::History::Quick(execution) => Some(execution),
-        inline::History::Unseen | inline::History::Slow => None,
+        inline::History::Unseen | inline::History::Slow | inline::History::TryEager => None,
     };
     // The first run of a text the server has not seen runs in place too when a timeout
     // bounds it, since the blocking pool costs a first request about 2 ms (see
@@ -1735,22 +1799,41 @@ pub(crate) async fn run_query(
     // because its native execution avoids eager candidate storage, so it must keep
     // automatic admission even when scheduled in place. A first run has no history, so
     // it keeps automatic execution as on the blocking pool.
-    let auto =
-        auto && (first_run || !in_place || quick == Some(inline::QuickExecution::PreserveAuto));
+    // A text whose automatic cursor answered whole but slowly runs eagerly once, on the
+    // blocking pool, so that it settles in the faster mode (see `inline`). One request
+    // claims the trial, and requests that overlap it keep automatic execution.
+    // The claim ends when both this request and its blocking work are done, whether the
+    // request answers, fails or its client leaves.
+    let claim = if auto && history == inline::History::TryEager {
+        QUICK.claim_trial(quick_key).map(|token| {
+            Arc::new(TrialClaim {
+                key: quick_key,
+                token,
+            })
+        })
+    } else {
+        None
+    };
+    let trial = claim.is_some();
+    let auto = auto
+        && !trial
+        && (first_run || !in_place || quick == Some(inline::QuickExecution::PreserveAuto));
     // the error body of the Sparkles format carries the plan as far as it ran
     let failed_plan = sfmt == SolutionsFormat::Sparkles;
     let run = {
         let ds = ds.clone();
+        let claim = claim.clone();
         move || {
+            let _claim = claim;
             let t = std::time::Instant::now();
             let t0 = crate::otel::start();
             let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
             let seq = snap.commit;
-            let ran = if auto {
+            let automatic = |snap, opts: &sparkles::sparql::QueryOptions| {
                 sparkles::sparql::query_execution_with_plan(
                     snap,
                     &query,
-                    &opts,
+                    opts,
                     &Default::default(),
                     sparkles::sparql::ExecutionMode::Auto,
                 )
@@ -1758,8 +1841,31 @@ pub(crate) async fn run_query(
                     sparkles::sparql::QueryExecution::Eager(r) => Ran::Eager(r.into_result()),
                     cursor => Ran::Cursor(Box::new(cursor)),
                 })
+            };
+            let ran = if auto {
+                automatic(snap, &opts)
+            } else if trial {
+                // An eager trial that outgrows its memory budget runs again with automatic
+                // execution, as an eager run that automatic execution chose would, and its
+                // text is not tried eagerly again. The two runs count as one request: they
+                // share one deadline, one count of rows produced and one outbound budget.
+                let shared = one_request(&opts);
+                match sparkles::sparql::query_with_plan(snap.clone(), &query, &shared) {
+                    Err(f) if outgrew_memory(&f.error) => {
+                        QUICK.record_eager_failure(quick_key);
+                        automatic(snap, &shared)
+                    }
+                    ran => ran.map(Ran::Eager),
+                }
             } else {
-                sparkles::sparql::query_with_plan(snap, &query, &opts).map(Ran::Eager)
+                let ran = sparkles::sparql::query_with_plan(snap, &query, &opts);
+                if let Err(f) = &ran
+                    && outgrew_memory(&f.error)
+                {
+                    // a cursor that keeps to the budget stays the text's mode
+                    QUICK.record_eager_failure(quick_key);
+                }
+                ran.map(Ran::Eager)
             };
             let r = match ran {
                 Ok(Ran::Cursor(cursor)) => return Ok((Ran::Cursor(cursor), seq, resolved, t0, t)),

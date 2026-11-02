@@ -208,6 +208,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   publication routes do not apply the licence gate's verdict, item 525, and the
   catalog has no Croissant export, item 526. Only server administrators read the
   catalog.
+* Request threads keep to the performance cores of a hybrid processor only on Linux and
+  only when the kernel lists its cores in `/sys/devices/cpu_core/cpus` and
+  `/sys/devices/cpu_atom/cpus`, as it does for Intel hybrid processors. The default
+  query pool size there was measured on one Intel processor with one client at a time.
+  Other hybrid processors, concurrent clients and macOS remain under roadmap item
+  576.
 * Sparkles runs as a single node on local disk. There is no clustering and there are no
   replicas, roadmap item 66. Live RDF data on local disk is not encrypted at rest, item 65.
 * Backups cover individual datasets, with no whole-server backup, roadmap item 61.
@@ -224,6 +230,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 The following guides describe configuration and supported UI, command-line, HTTP
 or library workflows. Exact HTTP contracts remain in the API reference.
 
+* Read [Threads on hybrid processors](../USAGE.md#threads-on-hybrid-processors).
 * Read [Outbound requests (SERVICE and LOAD)](../USAGE.md#outbound-requests-service-and-load).
 * Read [Service description](../API.md#service-description).
 * Read [OpenAPI description](../API.md#openapi-description).
@@ -237,7 +244,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 37](../ROADMAP.md), [item 39](../ROADMAP.md), [item 69](../ROADMAP.md), [item 61](../ROADMAP.md), [item 65](../ROADMAP.md), [item 66](../ROADMAP.md), [item 71](../ROADMAP.md), [item 75](../ROADMAP.md), [item 76](../ROADMAP.md), [item 342](../ROADMAP.md), [item 458](../ROADMAP.md), [item 525](../ROADMAP.md), [item 526](../ROADMAP.md).
+The remaining work described above refers to [item 37](../ROADMAP.md), [item 39](../ROADMAP.md), [item 69](../ROADMAP.md), [item 61](../ROADMAP.md), [item 65](../ROADMAP.md), [item 66](../ROADMAP.md), [item 71](../ROADMAP.md), [item 75](../ROADMAP.md), [item 76](../ROADMAP.md), [item 342](../ROADMAP.md), [item 458](../ROADMAP.md), [item 525](../ROADMAP.md), [item 526](../ROADMAP.md), [item 576](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

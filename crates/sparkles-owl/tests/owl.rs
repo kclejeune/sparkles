@@ -699,6 +699,163 @@ fn rl_forbids_owl_real() {
     assert_profiles(&o, &[Profile::Dl], &[(Profile::Rl, "§4.2.1")]);
 }
 
+// ---- literals (roadmap item 541) --------------------------------------------------
+
+#[test]
+fn literals_need_lexical_forms_of_their_datatype() {
+    let ok = strict(&decl(
+        ":a :d \"12\"^^xsd:integer , \"-INF\"^^xsd:double , \"2000-01-01T00:00:00Z\"^^xsd:dateTimeStamp .
+         :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :d ; owl:hasValue \"1/3\"^^owl:rational ] .",
+    ));
+    assert_profiles(&ok, &[Profile::Dl], &[]);
+    // §5.7: each report lists the DL violation, whichever datatypes the profile allows
+    let bad = strict(&decl(":a :d \"twelve\"^^xsd:integer ."));
+    assert_profiles(
+        &bad,
+        &[],
+        &[
+            (Profile::Dl, "§5.7"),
+            (Profile::El, "§5.7"),
+            (Profile::Ql, "§5.7"),
+            (Profile::Rl, "§5.7"),
+        ],
+    );
+    for lit in [
+        "\"300\"^^xsd:byte",
+        "\" 1\"^^xsd:integer",
+        "\"1.5\"^^xsd:integer",
+        "\"1\"^^owl:real",
+        "\"1/0\"^^owl:rational",
+        "\"maybe\"^^xsd:boolean",
+        "\"2000-01-01T00:00:00\"^^xsd:dateTimeStamp",
+        "\"a  b\"^^xsd:token",
+        "\"0FB\"^^xsd:hexBinary",
+        "\"<a>\"^^rdf:XMLLiteral",
+    ] {
+        let o = strict(&decl(&format!(":a :d {lit} .")));
+        assert_profiles(&o, &[], &[(Profile::Dl, "§5.7")]);
+    }
+}
+
+#[test]
+fn annotation_literals_are_checked() {
+    let o = strict(&decl(":A rdfs:comment \"x\"^^xsd:integer ."));
+    assert_profiles(&o, &[], &[(Profile::Dl, "§5.7")]);
+    let header = strict(&decl(
+        "<http://example.org/onto> rdfs:comment \"x\"^^xsd:boolean .",
+    ));
+    let r = report(&header, Profile::Dl);
+    assert!(!r.conforms);
+    assert!(
+        r.violations
+            .iter()
+            .any(|v| v.axiom.is_none() && v.rule.ends_with("§5.7"))
+    );
+    // a datatype outside the map has no known lexical space: the datatype check
+    // reports the datatype, and no lexical form is reported
+    let other = strict(&decl(":A rdfs:comment \"x\"^^<http://example.org/dt> ."));
+    assert!(
+        !rules(&report(&other, Profile::Dl))
+            .iter()
+            .any(|v| v.contains("§5.7"))
+    );
+}
+
+#[test]
+fn imported_header_literals_are_checked() {
+    let main = ttl(&decl(
+        "<http://example.org/onto> owl:imports <http://example.org/lib> .",
+    ));
+    let lib = ttl("<http://example.org/lib> a owl:Ontology ; rdfs:comment \"x\"^^xsd:integer .");
+    let graph_of: Vec<u32> = std::iter::repeat_n(0, main.len())
+        .chain(std::iter::repeat_n(1, lib.len()))
+        .collect();
+    let triples = main.into_iter().chain(lib).collect();
+    let o = read::read(
+        triples,
+        graph_of,
+        &[0],
+        ReadOptions {
+            mode: Mode::Strict,
+            ..Default::default()
+        },
+    );
+    assert_eq!(o.other_headers.len(), 1);
+    let r = report(&o, Profile::Dl);
+    assert!(
+        r.violations
+            .iter()
+            .any(|v| v.rule.ends_with("§5.7") && v.graph == Some(1)),
+        "{:?}",
+        r.violations
+    );
+}
+
+#[test]
+fn defined_datatypes_have_no_literals_or_facets() {
+    let body = ":SSN a rdfs:Datatype ; owl:equivalentClass [ a rdfs:Datatype ;
+         owl:onDatatype xsd:string ; owl:withRestrictions ( [ xsd:pattern \"[0-9]+\" ] ) ] .";
+    assert_profiles(&strict(&decl(body)), &[Profile::Dl], &[]);
+    let lit = strict(&decl(&format!("{body} :a :d \"123\"^^:SSN .")));
+    assert_profiles(&lit, &[], &[(Profile::Dl, "§9.4")]);
+    let restricted = strict(&decl(&format!(
+        "{body} :d rdfs:range [ a rdfs:Datatype ; owl:onDatatype :SSN ;
+           owl:withRestrictions ( [ xsd:maxLength \"3\"^^xsd:integer ] ) ] ."
+    )));
+    assert_profiles(&restricted, &[], &[(Profile::Dl, "§9.4")]);
+}
+
+#[test]
+fn facets_must_be_in_the_facet_space() {
+    let range = |dt: &str, facet: &str, value: &str| {
+        strict(&decl(&format!(
+            ":d rdfs:range [ a rdfs:Datatype ; owl:onDatatype {dt} ;
+               owl:withRestrictions ( [ {facet} {value} ] ) ] ."
+        )))
+    };
+    for (dt, facet, value) in [
+        ("xsd:integer", "xsd:minInclusive", "\"5\"^^xsd:integer"),
+        ("xsd:integer", "xsd:maxExclusive", "\"5.5\"^^xsd:decimal"),
+        ("xsd:double", "xsd:minInclusive", "\"0\"^^xsd:double"),
+        (
+            "xsd:string",
+            "xsd:maxLength",
+            "\"3\"^^xsd:nonNegativeInteger",
+        ),
+        ("xsd:string", "xsd:pattern", "\"a+\""),
+        ("rdf:PlainLiteral", "rdf:langRange", "\"en\""),
+        (
+            "xsd:dateTime",
+            "xsd:minInclusive",
+            "\"2000-01-01T00:00:00\"^^xsd:dateTime",
+        ),
+    ] {
+        let o = range(dt, facet, value);
+        assert!(
+            report(&o, Profile::Dl).conforms,
+            "{dt} {facet} {value}: {:?}",
+            rules(&report(&o, Profile::Dl))
+        );
+    }
+    for (dt, facet, value) in [
+        ("xsd:integer", "xsd:minInclusive", "\"5\"^^xsd:double"),
+        ("xsd:integer", "xsd:length", "\"5\"^^xsd:integer"),
+        ("xsd:double", "xsd:minInclusive", "\"0\"^^xsd:integer"),
+        ("xsd:string", "xsd:maxLength", "\"-1\"^^xsd:integer"),
+        ("xsd:string", "xsd:maxLength", "\"three\""),
+        ("xsd:boolean", "xsd:pattern", "\"t.*\""),
+        ("xsd:string", "xsd:totalDigits", "\"3\"^^xsd:integer"),
+        (
+            "xsd:dateTimeStamp",
+            "xsd:minInclusive",
+            "\"2000-01-01T00:00:00\"^^xsd:dateTime",
+        ),
+    ] {
+        let o = range(dt, facet, value);
+        assert_profiles(&o, &[], &[(Profile::Dl, "§7.5")]);
+    }
+}
+
 // ---- OWL 2 DL ------------------------------------------------------------------
 
 #[test]

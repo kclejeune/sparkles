@@ -226,6 +226,13 @@ class OntologyTest {
             val check = SparklesOnt.check(ds, "http://ex.org/onto", listOf("el", "ql"))
             assertTrue(check.getBoolean("conforms"))
             assertEquals(2, check.get("reports").asArray.size)
+            // roadmap item 540: the entity accessors
+            val classes = SparklesOnt.entities(ds, "http://ex.org/onto", listOf("Class"))
+            assertEquals(2, classes.getNumber("total").toInt())
+            val prof = SparklesOnt.entity(ds, "http://ex.org/Professor", "http://ex.org/onto")
+            val sup = prof.get("class").asObject.get("superClasses").asArray[0].asObject
+            assertEquals("ObjectSomeValuesFrom", sup.get("expression").asObject.getString("type"))
+            assertThrows(SparklesNotFoundException::class.java) { onto.entity("http://ex.org/nothing", read) }
             val before = ds.headCommit().seq
             val done = SparklesOnt.edit(
                 ds,

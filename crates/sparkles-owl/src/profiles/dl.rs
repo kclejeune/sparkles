@@ -3,6 +3,7 @@
 //! the axiom closure (§11), with the triples a strict read cannot map.
 
 use super::{Broken, Violation, broken, datatypes, individuals};
+use crate::datatypes::Literals;
 use crate::model::*;
 use crate::read::{Ontology, Typing};
 use crate::vocab;
@@ -13,6 +14,9 @@ const RESERVED: &str = "OWL 2 Structural Specification §5";
 const GLOBAL: &str = "OWL 2 Structural Specification §11.2";
 const HEADER: &str = "OWL 2 Mapping to RDF Graphs §3.1.2";
 const MAPPING: &str = "OWL 2 Mapping to RDF Graphs §3";
+const LITERALS: &str = "OWL 2 Structural Specification §5.7";
+const RESTRICTIONS: &str = "OWL 2 Structural Specification §7.5";
+const DEFINITIONS: &str = "OWL 2 Structural Specification §9.4";
 
 /// The most unmapped triples listed one by one; the rest are counted in one violation.
 const MAX_UNMAPPED: usize = 100;
@@ -219,6 +223,20 @@ impl Dl {
                 });
             }
         }
+        // the literals of the annotations of the ontology's header and of the headers of
+        // the graphs it imports
+        let headers = std::iter::once((o.header_graph, &o.header))
+            .chain(o.other_headers.iter().map(|(g, h)| (Some(*g), h)));
+        for (graph, h) in headers {
+            let mut found = Vec::new();
+            dl.literals(&Literals::of_annotations(&h.annotations), &mut found);
+            dl.global.extend(found.into_iter().map(|b| Violation {
+                axiom: None,
+                graph,
+                rule: b.rule.into(),
+                message: b.message,
+            }));
+        }
         dl
     }
 
@@ -370,6 +388,45 @@ impl Dl {
         }
     }
 
+    /// The lexical forms of literals (§5.7), the facet pairs of datatype restrictions
+    /// (§7.5) and the use of defined datatypes in either (§9.4). A literal whose
+    /// datatype is outside the OWL 2 datatype map and is not defined has no known lexical
+    /// space; the datatype check reports that datatype instead.
+    fn literals(&self, lits: &Literals<'_>, out: &mut Vec<Broken>) {
+        let r = crate::ofn::Renderer::new(Vec::<(String, String)>::new());
+        for (l, _annotation) in &lits.literals {
+            let dt = l.datatype();
+            if self.definitions.contains_key(dt) && !vocab::is_builtin_datatype(dt) {
+                out.push(broken(
+                    DEFINITIONS,
+                    format!(
+                        "the literal {} has the datatype <{dt}>, which a datatype definition defines and which therefore has no lexical forms",
+                        r.literal(l)
+                    ),
+                ));
+            } else if crate::datatypes::lexical(dt, l.value()) == Some(false) {
+                out.push(broken(
+                    LITERALS,
+                    format!(
+                        "the lexical form of {} is not in the lexical space of <{dt}>",
+                        r.literal(l)
+                    ),
+                ));
+            }
+        }
+        for (d, f) in &lits.restrictions {
+            let d = d.as_str();
+            if self.definitions.contains_key(d) && !vocab::is_builtin_datatype(d) {
+                out.push(broken(
+                    DEFINITIONS,
+                    format!("the datatype <{d}> is defined by a datatype definition, so it supports no facets and cannot be restricted"),
+                ));
+            } else if let Some(m) = crate::datatypes::facet_problem(d, f.facet.as_str(), &f.value) {
+                out.push(broken(RESTRICTIONS, m));
+            }
+        }
+    }
+
     pub(super) fn axiom(&mut self, ax: &Axiom) -> Vec<Broken> {
         use AxiomKind as K;
         let mut out = Vec::new();
@@ -456,6 +513,8 @@ impl Dl {
                 format!("the definition of <{}> is cyclic", d.as_str()),
             ));
         }
+        // literals and facets
+        self.literals(&Literals::of(ax), &mut out);
         // simple properties
         for c in Self::class_expressions(&ax.kind) {
             self.simple_ce(c, &mut out);

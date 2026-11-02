@@ -4,8 +4,8 @@
 >
 > **Phases:** I/O accounting, batched constant resolution, prefetch, scan-specific read
 > windows, segmented index-format-3 blocks and the optional prewarm of `serve --prewarm`
-> are available. The 1.01B gates and the cold targets that the
-> [Outcome](#not-done) lists remain open.
+> are available. The four cold targets are met and the 1.01B dense gate A5 holds. The
+> counter-cost gate A2 and the follow-ups that the [Outcome](#not-done) lists remain open.
 >
 > **User docs:** [I/O profile](../API.md#the-io-profile),
 > [cold reads](../internals/OPTIMIZATIONS.md#cold-reads) and
@@ -535,10 +535,14 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
-Phases 1 to 4 are built. The [Phase 3 decision](#phase-3-decision) records why Phase 3
-was started, [Phase 3 results](#phase-3-results) records how it landed, and
+Phases 1 to 4 are built, and the four cold targets of §9 are met. The
+[Phase 3 decision](#phase-3-decision) records why Phase 3 was started,
+[Phase 3 results](#phase-3-results) records how it landed, and
 [Phase 4 and the join read](#phase-4-and-the-join-read) records the prewarm and the
 removal of the cold cost that format 3 added to `star-join`.
+[First request after a start](#first-request-after-a-start) records how the last target,
+cold `path-plus`, was met, and [Dense reads at 1.01B](#dense-reads-at-101b) records gate
+A5 and the window sweep.
 
 ### What was built
 
@@ -1102,10 +1106,157 @@ run.
 | `employee-docs` | 19.2 | 9.2 | 16.0 | 10.1 | Met at both scales, and below Fluree's 10.2 ms at 1.05M from §9. |
 | `path-plus` | 2.7 | 3.3 | 2.2 | 3.3 | Not met. |
 
+### First request after a start
+
+The remaining `path-plus` gap was not in the reads of the store. A probe that starts a
+fresh server on an evicted store, polls `/$/ready` as `bench.sh` does and times the first
+query with curl found the server's own total at about 2.4 ms on forge at 10.5M, of which
+parsing, planning, execution and serialization took 0.8 ms. The process spent about
+0.15 ms of user time on the request. The rest of the first request went to three costs
+that any query pays once per process. The first was 100 to 150 page faults on the 100 MB
+of machine code. The second was mimalloc clearing fresh pages on first touch. The third
+was state that the query path builds on first use, such as the regular expression that
+`select_star_columns` compiles and the CPU limits that `available_parallelism` reads from
+the cgroup files. A second, unseen query text in the same process took a fraction of
+that time.
+
+The harness hides this cost from Oxigraph and not from Sparkles. `bench.sh` waits for
+Oxigraph with the query `ASK{}`, so Oxigraph's query path has run once before the timed
+request, while it waits for Sparkles on `/$/ready`, which runs no query. The harness is
+unchanged, and the timed requests of both engines are the same queries as before.
+
+`serve` now takes two steps before it reports ready, in `crates/sparkles-server/src/warm.rs`.
+
+* It runs one query that reads no data, `SELECT (COUNT(*) AS ?c) WHERE { VALUES ?x { 1 } }`,
+  through the query path of the HTTP API on a tokio worker, against a scratch in-memory
+  dataset that is not registered. No request can reach that dataset, and the query is
+  neither logged nor counted in the metrics. The served stores are not read, so their
+  files stay as cold as before. `--no-warm-up` turns it off.
+* A background thread maps the executable's code with `madvise(MADV_POPULATE_READ)` on
+  the ranges that `/proc/self/maps` lists as executable for `/proc/self/exe`. It takes
+  about 5 ms from the page cache and adds about 100 MB of shared file pages to the
+  resident set, which the kernel can reclaim under memory pressure. An idle server with one
+  empty dataset measured 122 MB resident with the mapping and 50 MB without it.
+  `--no-code-prefault` turns it off, and it does nothing outside Linux 5.14 or later.
+
+Only `serve` takes either step, so the embedded library and the other commands are
+unaffected. The time to ready stayed at about 75 ms in every variant below.
+
+The variants were measured on forge with the probe, in interleaved rounds of 10 to 12
+fresh servers per variant, and these are the medians of curl's total time for the first
+`path-plus`. The base is `6d518b71`, and the other variants ran in an experiment build of
+the same source whose environment switches turned each step on. The final code is compared
+with main further below.
+
+| First cold `path-plus`, forge, median ms | 10.5M | 1.05M |
+|---|---:|---:|
+| Base | 3.59 | 3.87 |
+| Code mapped ahead | 2.52 | 3.34 |
+| Warm-up query on the served dataset | 1.70 | 2.34 |
+| Warm-up query on a scratch dataset | 1.55 | 2.28 |
+| Both, with the scratch dataset | 1.60 | 2.25 |
+| Both, with the served dataset | 1.51 | 2.04 |
+
+The scratch dataset was kept over the served one, because a warm-up on the served store
+would read its files and make every later measurement of a cold store less cold. The
+mapping of the code is kept although `path-plus` gains little from it next to the warm-up,
+because the larger first queries gain from it consistently.
+
+| First cold query, forge, 10.5M, median ms | Base | Warm-up | Warm-up and code mapped |
+|---|---:|---:|---:|
+| `star-lookup` | 11.64 | 9.89 | 9.51 |
+| `values-star` | 6.98 | 4.79 | 4.59 |
+| `employee-docs` | 10.47 | 9.32 | 8.59 |
+| `star-join` | 125.4 | 115.7 | 115.7 |
+
+Two other ideas were measured and not kept, as
+[PERFORMANCE-EXPERIMENTS.md](../PERFORMANCE-EXPERIMENTS.md#server-and-request-handling)
+records. Leaving readiness probes out of the quiet time that decides whether a first run
+stays on the receiving thread changed nothing measurable. Turning transparent huge pages
+off for mimalloc helped a server without the warm-up but less than the warm-up did.
+
+A first query that arrives about 2 s after the server became ready is slower again. With
+10 fresh servers per variant at 10.5M, curl timed it at 11.6 ms on the base, where the
+execution took 8.1 ms, and at 9.6 ms when a client sent a warm-up query before the wait,
+where the execution took 0.03 ms and most of the time passed outside the server's timers.
+That cost follows the wake-up of idle threads and cores rather than any work of the query,
+and it is a follow-up under roadmap item 572.
+
+The final code was compared with main at `21da069d` on forge on 2026-11-02, with both
+binaries built the same way and both forge locks held for the whole run. The
+[run record](../benchmarks/synthetic/runs/2026-11-02-first-request-forge/validation.json)
+holds every sample. In interleaved cold rounds with `bench-regressions.py`, every one of
+the 31 queries ran faster at both scales, with one answer hash per query. The geometric
+mean of the ratios was 0.822 at 10.5M and 0.786 at 1.05M, and the slowest query was
+`order-by-full` at 0.993 and 0.997. The small queries gain the most, because the first
+request no longer pays for the process's first query.
+
+| Cold, forge, median ms | 10.5M main | 10.5M new | 1.05M main | 1.05M new |
+|---|---:|---:|---:|---:|
+| `path-plus` | 4.07 | 2.28 | 4.41 | 2.37 |
+| `star-lookup` | 11.70 | 9.24 | 13.28 | 11.50 |
+| `values-star` | 7.30 | 4.70 | 7.55 | 5.93 |
+| `employee-docs` | 10.52 | 8.67 | 9.76 | 8.43 |
+| `count-all` | 3.57 | 1.71 | 3.33 | 1.69 |
+| `star-join` | 80.03 | 78.58 | 22.05 | 20.07 |
+
+Warm, `regex-iri` ran 8.1% and `lang-filter` 5.3% slower than main at 10.5M, consistently
+in each of eight rounds, while the other flagged queries were within 1%. The new build
+with `--no-warm-up --no-code-prefault` ran both as fast as with the steps on, so the cost
+comes with the rebuilt binary rather than with either step, as with the code placement
+that [Phase 4 and the join read](#phase-4-and-the-join-read) describes. The Namespace
+screen measured both within 2% of main. Roadmap item 574 follows it up.
+
+The cold rows of `bench.sh` against Oxigraph ran in two rounds of five restarts per engine
+and query. These rows measure the server's first request after a start. The harness is
+unchanged, so it still waits for Oxigraph with a query and for Sparkles without one, and
+both engines answer the same timed queries as before.
+
+| Query, cold, ms | Oxigraph 1.05M | Sparkles 1.05M | Oxigraph 10.5M | Sparkles 10.5M | Targets |
+|---|---:|---:|---:|---:|---|
+| `path-plus` | 2.54 | 2.49 | 2.25 | 1.80 | Met at both scales. |
+| `star-lookup` | 20.26 | 10.69 | 20.02 | 9.15 | Met at both scales. |
+| `values-star` | 7.52 | 4.68 | 6.94 | 3.95 | Met at both scales. |
+| `employee-docs` | 19.16 | 7.99 | 18.37 | 8.73 | Met at both scales. |
+
+Main took 4.15 and 3.52 ms on `path-plus` in the same rounds. The four targets of §9 are
+met, at 1.1 times Oxigraph's times of the same run.
+
+### Dense reads at 1.01B
+
+Gate A5 and the window sweep ran on forge on a format 3 store of 1,014,683,275 quads, which
+`6d518b71` loaded in 485 s with a peak resident memory of 7.7 GB. The 30 GB store was read
+cold, evicted with `posix_fadvise(POSIX_FADV_DONTNEED)` before each fresh server, in two
+interleaved passes of 7 samples per variant with `bench-regressions.py --cold`. Every
+variant returned one answer hash per query. The default window is 4 MiB, and "off" sets
+`SPARKLES_IO_HINTS=off`, while "both off" also sets `SPARKLES_SPARSE_VOCAB=off`.
+
+| Cold, forge, 1.01B, median ms | Default | Hints off | Both off | 1 MiB window | 16 MiB window |
+|---|---:|---:|---:|---:|---:|
+| `export-1m` | 1,293 | 22,118 | 22,108 | 1,292 | 1,296 |
+| `entity-facts-1` | 8.7 | 59.7 | 84.1 | 8.7 | 8.7 |
+| `entity-facts-2` | 10.3 | 84.1 | 100.7 | 9.7 | 9.2 |
+| `entity-summary-1` | 7.3 | 18.9 | 67.9 | 6.8 | 6.9 |
+| `label-regex` | 39.4 | 85.8 | 137.1 | 50.3 | 41.5 |
+| `abstract-contains` | 523 | 833 | 846 | 529 | 524 |
+
+A5 holds. With hints on, `export-1m` takes 1,293 ms, far below the 22,118 ms of the same
+build with hints off, and `entity-facts-1` takes 8.7 ms against its gate of 15.2 ms.
+`label-regex` takes 39.4 ms against its gate of 68.5 ms. `export-1m` is 4% above the 1,239
+ms of §9, which was measured on a format 2 store with an earlier build, and no format 2
+store of this size was available to repeat that measurement. The hints-off export of a
+format 3 store is now 17 times slower than with hints, where on format 2 it took 1,231 to
+1,239 ms and was faster than the 1,883 to 1,956 ms with hints. Both are follow-ups under
+roadmap item 573. The windows of 1, 4 and 16 MiB are within the noise of each other
+on every query except `label-regex`, where the 1 MiB window is 28% slower than the
+default, so the default of 4 MiB stays.
+
 ### Not done
 
-The 1.01B gates (A5 and its window sweep) and the cold `path-plus` target remain, under
-roadmap item 4. The rest of the follow-ups from the earlier phases also remain. These are
+The first query after an idle start, dense exports at 1.01B and the warm cost of the
+build that added the warm-up are roadmap items 572 to 574. The full
+counter-cost gate A2 is not isolated. The rest of the follow-ups from the earlier phases
+remain. These are
 cheaper join probes at planning time on a cold process, a per-query set of hinted blocks in
 the context to avoid a second hint of a block, I/O priority for read-ahead, and a `FILTER`
 constant collector beyond the common comparison nodes. `bench-regressions.py` has `--io`,

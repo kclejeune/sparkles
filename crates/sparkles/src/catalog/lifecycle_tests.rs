@@ -1529,3 +1529,190 @@ mod callback_management {
         assert!(cat.reserved_by("target").is_none());
     }
 }
+
+/// A views host that holds its worker inside a round once armed, as a slow round
+/// does, until the test releases it.
+struct HeldRoundHost {
+    armed: std::sync::atomic::AtomicBool,
+    entered: parking_lot::Mutex<std::sync::mpsc::Sender<()>>,
+    release: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl crate::incr::Host for HeldRoundHost {
+    fn access(&self, _: Option<&str>) -> Result<Option<Arc<crate::access::GraphAccess>>> {
+        Ok(None)
+    }
+    fn stored_query(&self, _: &str) -> Result<String> {
+        unreachable!()
+    }
+    fn inference(&self) -> Option<crate::incr::Inference> {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let _ = self.entered.lock().send(());
+            let _ = self
+                .release
+                .lock()
+                .recv_timeout(std::time::Duration::from_secs(10));
+        }
+        None
+    }
+}
+
+/// A views worker round that starts after a rename's or delete's preflight found no
+/// other handle, as the first round of a new dataset does on a loaded host, holds the
+/// dataset only for that round. It must not make the change fail, so the catalog keeps
+/// the worker out of a round from the preflight until the close is over. `branch` puts
+/// the worker on a cached branch instead of the dataset itself.
+fn views_round_after_the_preflight(rename: bool, branch: bool) {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+    let ds = cat.create("source", &Default::default()).unwrap();
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let host = Arc::new(HeldRoundHost {
+        armed: Default::default(),
+        entered: parking_lot::Mutex::new(entered_tx),
+        release: parking_lot::Mutex::new(release_rx),
+    });
+    let views = if branch {
+        ds.create_branch("child", &Default::default()).unwrap();
+        let child = ds.branch("child").unwrap();
+        child.start_views(host.clone());
+        child.inner_state().views.clone()
+    } else {
+        ds.start_views(host.clone());
+        ds.inner_state().views.clone()
+    };
+    views.settle(Duration::from_secs(10));
+    drop(ds);
+    let armed = host.clone();
+    let worker = views.clone();
+    let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let copy = seen.clone();
+    BEFORE_CLOSE.with_borrow_mut(|hook| {
+        *hook = Some(Box::new(move || {
+            armed.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            worker.kick();
+            // Without the pause the worker's round starts here and holds the state.
+            let held = entered.recv_timeout(Duration::from_millis(500)).is_ok();
+            copy.store(held, std::sync::atomic::Ordering::SeqCst);
+        }))
+    });
+    let result = if rename {
+        cat.rename("source", "renamed").map(drop)
+    } else {
+        cat.delete("source").map(|deleted| assert!(deleted))
+    };
+    BEFORE_CLOSE.with_borrow_mut(|hook| *hook = None);
+    let _ = release.send(());
+    result.unwrap();
+    assert!(
+        !seen.load(std::sync::atomic::Ordering::SeqCst),
+        "a views round started between the preflight and the close"
+    );
+    if rename {
+        assert!(cat.get("renamed").is_some());
+    }
+    assert!(cat.get("source").is_none());
+}
+
+#[test]
+fn a_views_round_after_the_preflight_does_not_refuse_a_rename() {
+    views_round_after_the_preflight(true, false);
+}
+
+#[test]
+fn a_views_round_after_the_preflight_does_not_refuse_a_delete() {
+    views_round_after_the_preflight(false, false);
+}
+
+#[test]
+fn a_branch_views_round_after_the_preflight_does_not_refuse_a_rename() {
+    views_round_after_the_preflight(true, true);
+}
+
+#[test]
+fn a_branch_views_round_after_the_preflight_does_not_refuse_a_delete() {
+    views_round_after_the_preflight(false, true);
+}
+
+/// A thread that deletes a cached branch drops it while it holds the branch cache, and
+/// waits there for the branch's views round. A delete of the dataset from that round, as
+/// a views host callback can start, must refuse once its wait for the cache ends instead
+/// of waiting for the cache forever.
+#[test]
+fn a_delete_from_a_branch_round_does_not_wait_forever_for_the_branch_cache() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    struct CallbackHost {
+        armed: AtomicBool,
+        entered: parking_lot::Mutex<mpsc::Sender<()>>,
+        go: parking_lot::Mutex<mpsc::Receiver<()>>,
+        // taken by the callback, so that the host does not keep the catalog alive
+        catalog: parking_lot::Mutex<Option<Catalog>>,
+        result: parking_lot::Mutex<Option<Result<bool>>>,
+    }
+    impl crate::incr::Host for CallbackHost {
+        fn access(&self, _: Option<&str>) -> Result<Option<Arc<crate::access::GraphAccess>>> {
+            Ok(None)
+        }
+        fn stored_query(&self, _: &str) -> Result<String> {
+            unreachable!()
+        }
+        fn inference(&self) -> Option<crate::incr::Inference> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let _ = self.entered.lock().send(());
+                let _ = self.go.lock().recv_timeout(Duration::from_secs(10));
+                let catalog = self.catalog.lock().take();
+                *self.result.lock() = catalog.map(|c| c.delete("source"));
+            }
+            None
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+    let ds = cat.create("source", &Default::default()).unwrap();
+    ds.create_branch("child", &Default::default()).unwrap();
+    let child = ds.branch("child").unwrap();
+    let (entered_tx, entered) = mpsc::channel();
+    let (go, go_rx) = mpsc::channel();
+    let host = Arc::new(CallbackHost {
+        armed: AtomicBool::new(false),
+        entered: parking_lot::Mutex::new(entered_tx),
+        go: parking_lot::Mutex::new(go_rx),
+        catalog: parking_lot::Mutex::new(Some(cat.clone())),
+        result: parking_lot::Mutex::new(None),
+    });
+    child.start_views(host.clone());
+    let views = child.inner_state().views.clone();
+    views.settle(Duration::from_secs(10));
+    drop(child);
+    host.armed.store(true, Ordering::SeqCst);
+    views.kick();
+    entered.recv_timeout(Duration::from_secs(10)).unwrap();
+    let parent = ds.clone();
+    let (done_tx, done) = mpsc::channel();
+    let deleter = std::thread::spawn(move || {
+        let deleted = parent.delete_branch("child", true);
+        let _ = done_tx.send(deleted.is_ok());
+    });
+    let start = Instant::now();
+    while !ds.inner.branches.is_locked() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "no branch deletion"
+        );
+        std::thread::yield_now();
+    }
+    go.send(()).unwrap();
+    // The round ends once the delete gives up, and the branch deletion then finishes.
+    let deleted = done
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the delete waited for the branch cache without a bound");
+    deleter.join().unwrap();
+    assert!(deleted);
+    let result = host.result.lock().take().expect("the callback ran");
+    assert!(matches!(result, Err(Error::Conflict(_))), "{result:?}");
+    drop(ds);
+    assert!(cat.delete("source").unwrap());
+}
