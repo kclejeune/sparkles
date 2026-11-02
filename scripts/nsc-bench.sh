@@ -452,20 +452,36 @@ if [ -n "$FLAGGED" ] && [ "$RERUN" = 1 ]; then
     echo "settings: the flagged queries, $RERUN_ROUNDS rounds of A,B,B,A, $WARMUP warm-up and $RERUN_REPS timed requests per query and server"
   } > "$OUT/rerun/manifest.txt"
   python3 "$ROOT/scripts/nsc-bench-summary.py" "$OUT/rerun" > "$OUT/rerun/summary.md"
-  STILL=$(python3 -c '
+  # A flagged query without execution times in the rerun, such as one whose requests all
+  # failed, is inconclusive rather than cleared.
+  read -r STILL INCONCLUSIVE < <(python3 -c '
 import json, sys
-s = json.load(open(sys.argv[1]))
-print(" ".join(q for q, m in s["queries"].items() if "exec_ms" in m and m["exec_ms"]["ratio"] >= float(sys.argv[2])))
-' "$OUT/rerun/summary.json" "$FLAG_RATIO")
+s = json.load(open(sys.argv[1]))["queries"]
+still, unknown = [], []
+for q in sys.argv[3].split():
+    m = s.get(q, {}).get("exec_ms")
+    if m is None:
+        unknown.append(q)
+    elif m["ratio"] >= float(sys.argv[2]):
+        still.append(q)
+print(",".join(still) or "-", ",".join(unknown) or "-")
+' "$OUT/rerun/summary.json" "$FLAG_RATIO" "$FLAGGED")
+  [ "$STILL" != - ] || STILL=
+  [ "$INCONCLUSIVE" != - ] || INCONCLUSIVE=
+  STILL=${STILL//,/ }
+  INCONCLUSIVE=${INCONCLUSIVE//,/ }
   # appended to summary.md at the end, after the first pass's prepare timings
   {
     echo
     echo "# Rerun of the flagged queries"
     echo
     if [ -n "$STILL" ]; then verdict="Still flagged: ${STILL// /, }."; else verdict="None of them stays flagged."; fi
+    [ -z "$INCONCLUSIVE" ] || verdict+=" Inconclusive, with no execution times in the rerun: ${INCONCLUSIVE// /, }."
     echo "The first pass flagged ${FLAGGED// /, } at an execution-time ratio of $FLAG_RATIO or more. The same instance ran them again in $RERUN_ROUNDS rounds with $RERUN_REPS timed requests per query and server process. $verdict"
     echo
-    sed '1,/^## /{/^## /!d}' "$OUT/rerun/summary.md"
+    # the rerun's summary without its title and manifest lines, keeping its answer checks
+    # and failed-request warnings
+    sed '1,/^## /{/^# Interleaved/d; /^- /d}' "$OUT/rerun/summary.md" | cat -s
   } > "$OUT/rerun-section.md"
 elif [ -n "$FLAGGED" ]; then
   note "flagged at B/A >= $FLAG_RATIO: $FLAGGED (no rerun)"
