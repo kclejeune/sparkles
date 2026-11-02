@@ -1386,8 +1386,8 @@ const AUTO_EXISTS_DEPTH: usize = 4;
 /// charges. An EXISTS inside a larger expression, such as IF or OR, is evaluated once
 /// per distinct outer key, which measured slower in the cursor than in eager execution,
 /// so such plans stay eager. So does an OPTIONAL whose condition is an EXISTS. The cursor
-/// answers it from the key set as well, but its conditional OPTIONAL took 3.5 to 4 times
-/// as long as the eager merge on Namespace at 10.5M quads, with any condition.
+/// answers it from the key set as well, but its conditional OPTIONAL took 3.7 to 4.6
+/// times as long as eager execution on Namespace at 10.5M quads, whatever the condition.
 /// The patterns are planned here only to read their operators. Planning interns their
 /// variables in `ctx` and runs no part of them.
 pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {

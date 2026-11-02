@@ -1,0 +1,14 @@
+A: commit 4bd708458020f7db0fea5783953fc50f313109fe (4bd70845)
+A sha256: b5b63440c3c389066c0ccb9cf4f216cc8bbb792317bf3fbfbaf2641935996892
+A compilers: clang version 21.1.8; GCC: (GNU) 16.2.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); rustc version 1.99.1 (58cf8f9c3 2026-10-13)
+B: commit ec6cd3269fd0314245cfa333e29dc771a364e025 (ec6cd326)
+B sha256: a71374924e502753e3608b8c434d2465b340076a8422214b09a6a158febde660
+B compilers: clang version 21.1.8; GCC: (GNU) 16.2.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); rustc version 1.99.1 (58cf8f9c3 2026-10-13)
+data: 1000000 people (scripts/gen-data.py), 63M compressed
+settings: 6 queries, 3 rounds of A,B,B,A, 3 warm-up and 10 timed requests per query and server, RAYON_NUM_THREADS=1, server CPU 2, client CPU 4, spinners on
+instance: luul2vjeqr2co (linux/amd64:8x16, capped at 90m), https://cloud.namespace.so/itohmrcedlsbs/instance/luul2vjeqr2co
+phase create: 3.2 s
+phase upload: 9.3 s for 422M
+phase remote run: 1075.1 s
+phase download: 1.2 s
+instance lifetime: 1089.2 s, billed as 19 minutes x 8 vCPUs = 152 vCPU-minutes ($0.228 at the overage rate)

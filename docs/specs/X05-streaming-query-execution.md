@@ -1620,3 +1620,88 @@ its flag is set, and that under budgets from 512 KiB to 64 MiB it either matches
 execution within its budget or fails on memory. The decision tables in `cursor.rs` cover
 the same rules for groupings and for spill admission.
 
+
+### Item 7 follow-ups (2026-11-01)
+
+FOLD and registered aggregates now stream. A grouping whose aggregates need each
+group's rows in input order reads its input ordered on the group keys and holds only the
+rows of the groups it has not finished. When its held rows reach a batch and hold a
+finished group, the eager kernel aggregates the finished groups and their rows are
+freed, so every aggregate sees the rows that eager execution gives it, in the same order.
+An input whose operator does not keep the key order goes through a sort on the keys,
+which spills as the other cursor sorts do. The in-memory sort of raw ids breaks ties on
+the row position, which makes it stable at the cost of one comparison per tie, and the
+external merge already took the earliest run on a tie. The grouping holds its largest
+group whole, and an ungrouped aggregate holds all of its input, as eager execution does.
+The strict policy admits these groupings, and automatic execution keeps them eager.
+`tests/group_runs.rs` compares FOLD, registered aggregates that record the order of their
+arguments, mixed aggregates, empty inputs and HAVING with eager execution at two batch
+sizes, and checks a sorted input against a spilled sort under a 24 MiB budget.
+
+A LIMIT reaches the fallbacks where a prefix is provably enough. The planner passes a
+LIMIT without OFFSET through projections and BINDs into a SERVICE that reads no input,
+whose remote query is then sent with the limit, and into a full-text search without a
+variable query string, which keeps that many of its best hits and is cached under that
+limit. Any `k` solutions answer a
+LIMIT without ORDER BY, so both are correct, and both executors gain because the planner
+makes the rewrite. A search that would exceed `maxHits` now answers such a LIMIT. An
+OFFSET, any other operator in between and a SERVICE that loops over its input, in bulk or
+not, pass nothing. A spatial nearest-neighbour search already stops at its own `k`. A
+registered property function whose registration sets `prefix_output` runs a batch of its
+input at a time, as the ARQ property functions do, so a LIMIT above it stops its input.
+Without the declaration it still collects its whole input, because its calls may have
+effects that a skipped row would change. Remote LATERAL keeps draining its input.
+
+A request with `execution=streaming` now commits its response after the cursor's first
+batch or after 64 KiB, whichever comes first, instead of after 1 MiB. The SELECT writers,
+the RDF and Jena graph writers and the native JSON writers flush once after their first
+batch, and the server's switching writer starts the stream on that flush. Later batches
+fill 64 KiB chunks as before. A failure after the commit aborts the transfer as §6 specifies, and an answer that
+automatic execution streams keeps the 1 MiB threshold, so it keeps its status codes and
+`Content-Length` for small answers. The stall bound is still the request's timeout.
+
+An EXISTS that is a BIND expression or an OPTIONAL condition is now answered from the key
+set of its pattern, as a FILTER EXISTS is, in both executors. Before, both evaluated it
+once per distinct outer key, and the cursor was the slower of the two, so automatic
+execution kept such plans eager. The BIND column takes each row's value from a probe, and
+the OPTIONAL condition tests its candidate pairs the same way. A row whose key the key set
+cannot answer, because it binds a risky variable or leaves a key unbound, is evaluated on
+its own, and an eager plan reports the keys and probes. Automatic execution streams a BIND
+whose EXISTS has a key set. An OPTIONAL whose condition is an EXISTS stays eager, because
+the cursor's conditional OPTIONAL takes several times as long as the eager one whatever
+its condition, which item NEW-ITEM-1 covers. The commit that admitted it and its revert
+are recorded in [PERFORMANCE-EXPERIMENTS.md](../PERFORMANCE-EXPERIMENTS.md#query-execution).
+On an 8-vCPU Namespace instance at 10.5M quads, automatic execution of `exists-bind` went
+from 860 ms to 8.4 ms, `exists-bind-join` from 2,003 ms to 7.4 ms and `exists-optional`
+from 1,079 ms to 12.9 ms. The streamed BIND shapes took 0.88 and 0.92 times as long as
+eager execution, while the streamed `exists-optional` took 4.6 times as long and the same
+OPTIONAL with a plain FILTER 3.7 times. An EXISTS inside a larger expression, such as
+IF, is still evaluated per key and stays eager, and `exists-if` took 1.17 times as long
+streamed. The [memory results](../benchmarks/memory/RESULTS.md#automatic-exists) give the
+table. `exists_tests` and `tests/exists_auto.rs` compare the key-set answers with
+evaluation per key for BIND and OPTIONAL shapes, including rows that leave a key unbound.
+
+DESCRIBE now streams. The graph cursor describes the resources of each WHERE batch that
+no earlier batch named as the batch arrives, so its first triples come before the WHERE
+clause has finished, and the strict policy admits it. The resources described, the
+triples returned, the visited nodes, the reifiers found and the IRIs whose labels come
+last stay in memory under one retained charge for the rest of the query, as the eager
+traversal's state does, so no triple is returned twice. The triples of a batch and the
+traversal queue are charged only until the batch is handed on, and closing the cursor
+releases the retained state. The labels of linked IRIs follow the last batch, and
+`maxTriples` and the row budget count the triples of earlier batches. When `maxTriples`
+cuts a description short, the triples kept can differ from the eager ones, because the
+resources are described in the order the batches name them. Otherwise the description
+equals the eager one. `tests/describe.rs` compares streamed and eager descriptions at
+several batch sizes and checks the budget and the release on close. On the laptop, which
+other builds kept busy, a DESCRIBE of 50,000 students at 10.5M quads sent its first
+N-Triples bytes after 48 to 146 ms streamed and after 579 to 1,101 ms eager, over three
+requests each, and both sent the same 410,324 triples in the same total time within
+noise. The [run record](../benchmarks/memory/records/exists-keyed-2026-11-01/describe-first-bytes.txt)
+holds the timings.
+
+A Namespace screen of the 30 bench queries at 1.05M quads, four A, B, B, A rounds with
+one query thread, compared 4bd70845 with ec6cd326. Both returned the same answers, and
+the geometric mean of server time was 1.011 and of client time 0.997. Four queries of 15
+to 26 µs were 7 to 14% slower in server time with spreads of 18 to 80%, and item
+NEW-ITEM-2 rechecks them on a quiet Intel host.
