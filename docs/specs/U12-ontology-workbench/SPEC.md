@@ -34,6 +34,18 @@ The workbench edits entities, axioms and annotations through the axiom model of
 
 **Editable schema diagram.** Draw the schema diagram from declared axioms as well as observed data, with restrictions as labelled edges, an optional VOWL notation and SVG, Mermaid and PlantUML export, and turn it into a modeling canvas that adds classes, properties and restrictions by drawing. Stardog Designer and Gra.fo offer the same canvas. It depends on item 31.
 
+**Ontology browser.** Browse an ontology or thesaurus as linked articles: a search page ranks entities by label, synonym and definition in any language, and each entity's page shows its definition, an infobox of types and key annotations, breadcrumbs up the hierarchy, its axioms rendered as prose with links, related entities and a "what links here" list. The editor, the DL Query tab and the term pages of [C32](../C32-linked-data-publishing/README.md) reuse these pages.
+
+**Visual SHACL shape editor.** Author node and property shapes as trees and forms, with targets, paths, constraints and severities, validated live against sample data and written as previewed commits. TopBraid Composer and EDG offer it.
+
+**Discussions, watches and entity history.** Comment threads on entities and axioms with mentions and resolution, watches that notify a user of changes to an entity or its subtree, and a history tab with each commit that changed the entity, as WebProtégé offers.
+
+**Metrics and inferred frames.** Show axiom and entity counts by type and the DL expressivity, and show the classifier's inferences inline in entity frames with an explanation link from F24's justifications, as Protégé does.
+
+**Patterns, imports, rendering and bulk edits.** Generate axioms from spreadsheet rows through templates and design patterns, as Cellfie, ROBOT template and DOSDP do. Resolve `owl:imports` through local copies, the resource catalog and XML catalogs. Let users choose rendering by label, prefixed name or IRI with a language order, and apply find-and-replace and annotation changes to many entities in one commit.
+
+**Governance, tagging and co-editing.** Add vocabulary roles and change requests that gather edits on a branch for review and approval, suggest a thesaurus's concepts for ingested documents, and show other editors' presence with live merging of concurrent edits, which the U05 §1 open question leaves undecided.
+
 ## Dependencies
 
 * Item 71 supplies the axiom model, and the classifier of F24 supplies inferred trees.
@@ -57,7 +69,7 @@ The ontology-editing exclusions of U02 §1 and U07 §1 are lifted for this spec.
 
 ## Provenance
 
-This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: VocBench, PoolParty, EDG Taxonomy, Protégé, WebProtégé, Protégé DL Query, Stardog Designer and OntoGraf. No code from another project is copied.
+This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: VocBench, PoolParty, EDG Taxonomy, EDG Tagger, TopBraid Composer, Protégé, WebProtégé, Protégé DL Query, Cellfie, ROBOT template, DOSDP, Stardog Designer and OntoGraf. No code from another project is copied.
 
 ## Outcome
 
