@@ -40,6 +40,7 @@
 //! assert!(el.conforms);
 //! ```
 
+pub mod classify;
 pub mod datatypes;
 pub mod entities;
 pub mod json;
