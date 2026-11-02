@@ -1105,10 +1105,10 @@ mod tests {
         let mut ctx = context();
         let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
         assert!(ctx.enable_cursor_accounting().is_err());
-        assert!(!ctx.is_cursor());
+        assert!(!ctx.streams());
         drop(ctl);
         ctx.enable_cursor_accounting().unwrap();
-        assert!(ctx.is_cursor());
+        assert!(ctx.streams());
     }
     #[test]
     fn shared_service_frames_transfer_retire_and_close_without_query_release() {
@@ -1217,7 +1217,7 @@ mod tests {
         );
         drop(ctl);
         ctx.enable_cursor_accounting().unwrap();
-        assert!(ctx.is_cursor());
+        assert!(ctx.streams());
     }
     #[test]
     fn concurrent_native_admission_peak_excludes_rejected_pending_capacity() {

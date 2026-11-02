@@ -2396,7 +2396,7 @@ impl<'a> Planner<'a> {
         if vars.len() == [s, p].iter().filter(|x| matches!(x, PT::V(_))).count()
             && matches!(p, PT::V(_))
             // a cursor streams the scan, and stops at a LIMIT
-            && !self.ctx.is_cursor()
+            && !self.ctx.streams()
             && !matches!(g, ActiveGraph::Var(_))
             && let Some((gf, None)) = self.graph_filter(g)
             && let Some(uses) = usable(self.ctx, &gf)

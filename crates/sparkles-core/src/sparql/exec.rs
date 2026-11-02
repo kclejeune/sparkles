@@ -5562,11 +5562,10 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<Decoded> {
     let vocab = &ctx.snap.generation.vocab;
     let mut out: super::expr::DecodedCols = vec![None; t.width()];
     let mut charge: Option<super::ctx::RetainedCharge> = None;
-    let mut charged = 0u64;
-    // `false` when the query cannot hold `bytes` more
-    let mut grow = |bytes: u64| -> bool {
-        let total = charged.saturating_add(bytes);
-        let fits = match &mut charge {
+    // Charge `total` bytes in all, `false` when the query cannot hold them. Shrinking
+    // always fits.
+    let mut set = |total: u64| -> bool {
+        match &mut charge {
             Some(charge) => charge.resize(total).is_ok(),
             None => match ctx.retained_charge(total) {
                 Ok(c) => {
@@ -5575,12 +5574,10 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<Decoded> {
                 }
                 Err(_) => false,
             },
-        };
-        if fits {
-            charged = total;
         }
-        fits
     };
+    // what the finished columns hold
+    let mut kept = 0u64;
     for v in vars {
         let Some(c) = t.col_of(v) else { continue };
         let col = &t.cols[c];
@@ -5590,9 +5587,12 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<Decoded> {
         if idx.len() < 4096 {
             continue;
         }
-        // the column's slots, and the sorted rows with their distinct ids while it is made
+        // While the column is made: its slots, the sorted rows with their distinct ids,
+        // and the distinct decoded values before they move to their rows.
         let slots = col.len() as u64 * std::mem::size_of::<Option<Value>>() as u64;
-        if !grow(slots.saturating_add(idx.len() as u64 * 12)) {
+        let scratch = idx.len() as u64 * (12 + std::mem::size_of::<Value>() as u64);
+        if !set(kept.saturating_add(slots).saturating_add(scratch)) {
+            set(kept);
             break;
         }
         idx.par_sort_unstable_by_key(|&i| col[i as usize]);
@@ -5600,6 +5600,7 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<Decoded> {
         uniq.dedup();
         let decoded = decode_sorted(vocab, &uniq);
         if decoded.len() != uniq.len() {
+            set(kept);
             continue;
         }
         let mut vals: Vec<Option<Value>> = vec![None; col.len()];
@@ -5623,12 +5624,16 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<Decoded> {
             .with_min_len(PAR_MIN_LEN)
             .map(key_payload)
             .sum();
-        if !grow(payload.saturating_sub(idx.len() as u64 * 12)) {
+        // A column that does not fit gives back everything it charged.
+        let total = kept.saturating_add(slots).saturating_add(payload);
+        if !set(total) {
+            set(kept);
             break;
         }
+        kept = total;
         out[c] = Some(vals);
     }
-    drop(grow);
+    drop(set);
     Some(Decoded {
         cols: out,
         _charge: charge,
@@ -5811,7 +5816,10 @@ fn string_order_mask(
     let (Some(cx), Some(cy)) = (t.col_of(x), t.col_of(y)) else {
         return Ok(None);
     };
-    if n < STRING_ORDER_ROWS {
+    // A cursor's batch would reconstruct the floors of its strings without reserving
+    // the decoding, which only an eager query may do. Its rows compare their two keys
+    // directly instead (see `val_cmp`), with the decoding admitted.
+    if n < STRING_ORDER_ROWS || ctx.streams() {
         return Ok(None);
     }
     let (xs, ys) = (&t.cols[cx], &t.cols[cy]);

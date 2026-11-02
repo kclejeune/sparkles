@@ -1594,7 +1594,7 @@ pub fn query_execution_with_plan(
                 && options.initial_bindings.is_empty()
                 && retryable(&prepared.node)
                 && !matches!(&parsed, spargebra::Query::Select { pattern, .. } if calls_service(pattern));
-            if prepared.ctx.is_cursor() {
+            if prepared.ctx.streams() {
                 if kind == QueryKind::Ask {
                     orient_filtered_ask(&mut prepared.node, &prepared.ctx, cursor);
                 }

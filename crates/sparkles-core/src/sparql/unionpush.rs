@@ -107,7 +107,7 @@ pub(super) fn limited_input(ctx: &super::ctx::Ctx, node: &Node) -> bool {
         _ => None,
     };
 
-    !ctx.is_cursor()
+    !ctx.streams()
         && matches!(
             node.kind,
             Kind::Project(_)

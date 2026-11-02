@@ -679,7 +679,9 @@ pub struct Ctx {
     /// the query's compiled regular expressions, charged in both accounting modes
     regex: super::query_regex::RegexCache,
     // Opt-in cursor accounting stays after the ordinary execution fields.
-    cursor_memory: Option<Box<CursorMemory>>,
+    /// whether the query streams through pull cursors, whose grant follows their live
+    /// bytes (see [`Ctx::streams`])
+    streams: bool,
     // Data and weak retained caches drop before final ledger ownership.
     fast: FastMemory,
     memory: std::sync::OnceLock<Arc<QueryMemoryLedger>>,
@@ -789,10 +791,6 @@ struct DecodeEnvelope {
     /// the reserved bytes, read without the lock
     reserved: AtomicU64,
 }
-
-/// The mark of a context in cursor accounting (see [`Ctx::accounting`]).
-#[derive(Default)]
-struct CursorMemory;
 
 #[cfg(test)]
 thread_local! {
@@ -996,7 +994,7 @@ impl Ctx {
             retained: Default::default(),
             owner: Default::default(),
             regex: Default::default(),
-            cursor_memory: None,
+            streams: false,
             fast: Default::default(),
             memory: Default::default(),
             snap,
@@ -1329,7 +1327,9 @@ impl Ctx {
         // charged already, and the ledger carries their reservations over, so the
         // cursor keeps them.
         self.memory().cursor_mode()?;
-        self.cursor_memory = Some(Box::default());
+        self.streams = true;
+        // The result cache and sampled filters are planning choices that stage 6 of
+        // item 453 makes independent of the execution mode.
         self.use_cache = false;
         self.opt.sampled_filters = false;
         Ok(())
@@ -1338,15 +1338,18 @@ impl Ctx {
     /// How this context accounts its memory.
     #[inline]
     pub(super) fn accounting(&self) -> Accounting {
-        if self.cursor_memory.is_some() {
+        if self.streams {
             Accounting::Cursor
         } else {
             Accounting::Collect
         }
     }
 
+    /// Whether the query streams through pull cursors. Both modes charge the same state,
+    /// so only planning and routing choices, the accumulation of an EXISTS key set across
+    /// batches and whether a decoding envelope can refuse read it.
     #[inline]
-    pub(super) fn is_cursor(&self) -> bool {
+    pub(super) fn streams(&self) -> bool {
         self.accounting() == Accounting::Cursor
     }
 
@@ -1376,7 +1379,9 @@ impl Ctx {
     /// The cursor's own context, for state that runs a cursor operator tree of its own
     /// (the key set of an EXISTS pattern). `None` in eager execution.
     pub(super) fn cursor_owner(&self) -> Option<Arc<Ctx>> {
-        self.cursor_memory.as_ref()?;
+        if !self.streams {
+            return None;
+        }
         self.owner.lock().upgrade()
     }
 
@@ -1388,7 +1393,7 @@ impl Ctx {
     pub(super) fn retained_charge(&self, bytes: u64) -> Result<Option<RetainedCharge>> {
         let owner = self.owner.lock().clone();
         if owner.strong_count() == 0 {
-            if self.cursor_memory.is_none() {
+            if !self.streams {
                 return Ok(None);
             }
             return Err(Error::invalid("cursor context owner has not been attached"));
@@ -1577,7 +1582,9 @@ impl Ctx {
         let mut state = envelope.state.lock();
         let (peak, owner) = &mut *state;
         if need > *peak {
-            if self.is_cursor() {
+            // A cursor's callers of `term` and `value` report a refusal through the
+            // next check, so its envelope reserves on the ledger and can fail.
+            if self.streams() {
                 let ledger = self.memory();
                 let account = ledger.owner(self.grant.as_ref())?;
                 ledger.reserve(&account, self.mem_limit, need - *peak, true)?;
@@ -1749,7 +1756,7 @@ impl Ctx {
     /// context drops. A fast account within [`RETAIN_SLACK`] of what the result keeps is
     /// left alone, so that a small query never takes the ledger.
     pub(super) fn shrink_retained(&self, result: u64) -> Result<()> {
-        if self.cursor_memory.is_some() {
+        if self.streams {
             return Ok(());
         }
         let fast = match self.memory.get() {
@@ -2766,9 +2773,9 @@ mod charge_tests {
     /// The executors read the accounting mode in at most this many places outside tests.
     /// Stage 4 of item 453 lowers it as each `cursor_*` twin merges, to the planning and
     /// routing sites that stage 6 removes, so that new twins do not come back.
-    const MODE_CHECKS: usize = 5;
+    const MODE_CHECKS: usize = 6;
 
-    /// Counts the calls of `is_cursor()` in the non-test sources of the SPARQL engine,
+    /// Counts the calls of `streams()` in the non-test sources of the SPARQL engine,
     /// and fails when they exceed [`MODE_CHECKS`] (decision D9 of item 453).
     #[test]
     fn the_accounting_mode_is_read_in_a_bounded_number_of_places() {
@@ -2797,7 +2804,7 @@ mod charge_tests {
                 .find("\n#[cfg(test)]\nmod ")
                 .map_or(text.as_str(), |end| &text[..end]);
             for (line, content) in code.lines().enumerate() {
-                if content.contains(".is_cursor()") {
+                if content.contains(".streams()") {
                     sites.push(format!("{name}:{}", line + 1));
                 }
             }

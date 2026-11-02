@@ -596,7 +596,7 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
     };
     // A cursor keeps the keys of its earlier batches, charged as retained state.
     let mut local: FxHashSet<Vec<Id>> = FxHashSet::default();
-    let mut cumulative = ctx.is_cursor().then(|| decor.seen.lock());
+    let mut cumulative = ctx.streams().then(|| decor.seen.lock());
     let entry = plan.keys.len() as u64 * 8 + 128;
     if let Some(seen) = cumulative.as_deref_mut() {
         let room = need.saturating_sub(seen.keys.len()).min(t.len()) as u64;

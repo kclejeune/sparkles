@@ -569,15 +569,25 @@ batches on both sides of the threshold.
 The sorted pre-decode of the columns that row-by-row FILTER, BIND and ORDER BY
 evaluation reads runs for inputs of more than 16,384 rows in both modes, and smaller
 inputs read their values through the value cache. Each decoded column's slots are
-charged before it is decoded and its values after, and a column whose charge does not
-fit is left to the rows. The comparison of two string columns through cached
-lexicographic floors needs only its 4,096-row minimum, so a cursor batch can use it.
+charged before it is decoded, with the distinct values it decodes on the way, and its
+values after. A column whose charge does not fit gives that charge back and is left to the
+rows. The comparison of two string columns through cached lexicographic floors stays off
+for cursor batches, because the floors reconstruct strings without reserving the
+decoding, which only an eager query may do.
 
 A unit test, `the_accounting_mode_is_read_in_a_bounded_number_of_places`, counts the
-calls of `is_cursor()` outside tests and fails above its bound, which each step lowers. It
-was 26 after the regular expressions, 17 after per-value reuse, 7 after the sort keys and
-is 5 after the decoded columns. The five are the planning and routing choices that stage 6
-removes and the accumulation of an EXISTS key set across a cursor's batches. The rest of item
+calls of `streams()`, formerly `is_cursor()`, outside tests and fails above its bound,
+which each step lowered. It was 26 after the regular expressions, 17 after per-value
+reuse, 7 after the sort keys and is 6 after the decoded columns. Three are the planning and
+routing choices that stage 6 removes, in `plan.rs`, `unionpush.rs` and `cursor.rs`. The
+fourth accumulates an EXISTS key set across a cursor's batches, which an eager table
+builds in one batch. The fifth lets a cursor's decoding envelope refuse on the ledger,
+because eager callers of `term` and `value` cannot report a refusal and decode without
+the envelope instead. The sixth keeps cursors from the string floors above, until those
+reconstruct with the decoding admitted. `CursorMemory` is gone, and a context in cursor accounting differs
+from an eager one only by its `streams` flag, its ledger retention and its deadline. The
+result cache and sampled filters stay off for cursors, since they are planning choices
+that stage 6 makes independent of the mode. The rest of item
 NEW-ITEM-4 merges the remaining `cursor_*` twins.
 
 ### Measurements of stage 1
