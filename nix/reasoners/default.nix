@@ -116,6 +116,8 @@ let
         done
         cp ${../../scripts/elk-compare/ElkClassify.java} ElkClassify.java
         javac -proc:none -nowarn -cp ${classpath} -d $out/share/${pname}/classes ElkClassify.java
+        # writeTaxonomy against a stub reasoner, with the OWL API alone
+        java -cp $out/share/${pname}/classes:${classpath} ElkClassify --self-test
         cat > $out/bin/${pname}-classify <<EOF
         #!${stdenv.shell}
         # shellcheck disable=SC2086

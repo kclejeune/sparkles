@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -122,6 +123,15 @@ class KoncludeConvertTests(unittest.TestCase):
         text = text.replace("SubClassOf(:D :B)", "SubClassOf(:B :U)")
         (consistent, _, _), got = self.convert(text, ".ofn")
         self.assertFalse(consistent)
+
+    def test_reduction_of_a_flat_hierarchy_stays_linear(self):
+        text = "Ontology(\n" + "".join(f"Declaration(Class(<{EX}C{i}>))\n" for i in range(20000)) + ")\n"
+        started = time.monotonic()
+        (_, classes, _), got = self.convert(text, ".ofn", reduce=True)
+        self.assertEqual(classes, 20000)
+        self.assertIn(f"SubClassOf(<{EX}C0> <{konclude.THING}>)", got)
+        # quadratic work over the 20,000 classes takes minutes
+        self.assertLess(time.monotonic() - started, 20)
 
     def test_relative_iris_resolve_against_the_xml_base(self):
         text = """<?xml version="1.0"?>

@@ -78,6 +78,7 @@ public class ElkClassify {
                 case "--repeat": repeat = Integer.parseInt(args[++i]); break;
                 case "--taxonomy": taxonomy = args[++i]; break;
                 case "--reasoner": which = args[++i]; break;
+                case "--self-test": selfTest(); return;
                 default: input = args[i];
             }
         }
@@ -228,14 +229,27 @@ public class ElkClassify {
             }
             lines.add(equivalent(every));
         } else {
-            all.add(reasoner.getTopClassNode().getRepresentativeElement());
-            all.add(reasoner.getBottomClassNode().getRepresentativeElement());
+            OWLClass top = ontology.getOWLOntologyManager().getOWLDataFactory().getOWLThing();
+            OWLClass bottom = ontology.getOWLOntologyManager().getOWLDataFactory().getOWLNothing();
+            all.add(top);
+            all.add(bottom);
+            // A reasoner may answer a class's equivalents or its superclasses with an empty
+            // node, as Whelk does for owl:Nothing when no class is unsatisfiable, so every
+            // node holds its own class, the unsatisfiable classes join owl:Nothing's node and
+            // a class without a named superclass gets owl:Thing.
+            Set<OWLClass> unsatisfiable = new HashSet<>(reasoner.getUnsatisfiableClasses().getEntities());
+            unsatisfiable.add(bottom);
             Set<OWLClass> done = new HashSet<>();
             for (OWLClass c : all) {
                 if (done.contains(c)) {
                     continue;
                 }
-                Node<OWLClass> node = reasoner.getEquivalentClasses(c);
+                boolean isBottom = unsatisfiable.contains(c);
+                Set<OWLClass> node = new HashSet<>(reasoner.getEquivalentClasses(c).getEntities());
+                node.add(c);
+                if (isBottom) {
+                    node.addAll(unsatisfiable);
+                }
                 TreeSet<String> members = new TreeSet<>();
                 for (OWLClass m : node) {
                     members.add(m.getIRI().toString());
@@ -246,13 +260,19 @@ public class ElkClassify {
                 } else {
                     lines.add("Declaration(Class(<" + members.first() + ">))");
                 }
-                if (node.isBottomNode()) {
+                if (isBottom || node.contains(top)) {
                     continue;
                 }
                 String first = members.first();
+                TreeSet<String> parents = new TreeSet<>();
                 for (Node<OWLClass> parent : reasoner.getSuperClasses(c, true)) {
-                    String p = parent.getEntities().stream().map(x -> x.getIRI().toString())
-                        .min(Comparator.naturalOrder()).get();
+                    parent.getEntities().stream().map(x -> x.getIRI().toString())
+                        .min(Comparator.naturalOrder()).ifPresent(parents::add);
+                }
+                if (parents.isEmpty()) {
+                    parents.add(THING);
+                }
+                for (String p : parents) {
                     lines.add("SubClassOf(<" + first + "> <" + p + ">)");
                 }
             }
@@ -264,6 +284,54 @@ public class ElkClassify {
                 w.newLine();
             }
         }
+    }
+
+    // Checks writeTaxonomy against a reasoner that answers every query with an empty node, as
+    // Whelk does for some, on an ontology of three classes with B under A. The nix packages
+    // run it when they compile this file.
+    static void selfTest() throws Exception {
+        OWLOntologyManager m = OWLManager.createOWLOntologyManager();
+        org.semanticweb.owlapi.model.OWLDataFactory f = m.getOWLDataFactory();
+        OWLOntology o = m.createOntology();
+        OWLClass a = f.getOWLClass(org.semanticweb.owlapi.model.IRI.create("urn:t:A"));
+        OWLClass b = f.getOWLClass(org.semanticweb.owlapi.model.IRI.create("urn:t:B"));
+        OWLClass u = f.getOWLClass(org.semanticweb.owlapi.model.IRI.create("urn:t:U"));
+        for (OWLClass c : new OWLClass[] {a, b, u}) {
+            m.addAxiom(o, f.getOWLDeclarationAxiom(c));
+        }
+        OWLReasoner r = (OWLReasoner) java.lang.reflect.Proxy.newProxyInstance(
+            OWLReasoner.class.getClassLoader(), new Class<?>[] {OWLReasoner.class}, (proxy, method, margs) -> {
+                switch (method.getName()) {
+                    case "getEquivalentClasses":
+                        return new org.semanticweb.owlapi.reasoner.impl.OWLClassNode();
+                    case "getUnsatisfiableClasses":
+                        return new org.semanticweb.owlapi.reasoner.impl.OWLClassNode(u);
+                    case "getSuperClasses":
+                        return margs[0].equals(b)
+                            ? new org.semanticweb.owlapi.reasoner.impl.OWLClassNodeSet(
+                                new org.semanticweb.owlapi.reasoner.impl.OWLClassNode(a))
+                            : new org.semanticweb.owlapi.reasoner.impl.OWLClassNodeSet(
+                                new org.semanticweb.owlapi.reasoner.impl.OWLClassNode());
+                    default:
+                        throw new UnsupportedOperationException(method.getName());
+                }
+            });
+        File out = File.createTempFile("taxonomy", ".ofn");
+        out.deleteOnExit();
+        writeTaxonomy(o, r, true, out);
+        List<String> got = Files.readAllLines(out.toPath());
+        List<String> want = java.util.Arrays.asList(
+            "Declaration(Class(<" + THING + ">))",
+            "Declaration(Class(<urn:t:A>))",
+            "Declaration(Class(<urn:t:B>))",
+            "EquivalentClasses(<" + NOTHING + "> <urn:t:U>)",
+            "SubClassOf(<urn:t:A> <" + THING + ">)",
+            "SubClassOf(<urn:t:B> <urn:t:A>)");
+        if (!got.equals(want)) {
+            System.err.println("self-test: got " + got + ", want " + want);
+            System.exit(1);
+        }
+        System.out.println("self-test passed");
     }
 
     static String equivalent(TreeSet<String> members) {

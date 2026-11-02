@@ -239,6 +239,8 @@ def taxonomy(declared, subs, eqs, reduce=False, extra_classes=()):
                 parents.setdefault(a, set()).add(b)
     first = [min(comp) for comp in comps]
     bottom, top = of[NOTHING], of[THING]
+    # owl:Nothing's node takes no edges, and its implicit ones would make --reduce quadratic.
+    parents.pop(bottom, None)
     if reduce:
         parents = reduced(parents)
     lines = []
