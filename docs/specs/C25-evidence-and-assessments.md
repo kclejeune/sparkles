@@ -1117,12 +1117,115 @@ conformance of the written records to the shapes, and the HTTP routes.
    supports, one target's decisions and one decision's successors are each read up to
    10,000 records, beyond which the operation answers `incomplete-evidence`.
 
-Roadmap item 81 retains the rest of this contract. Phase 2 still adds identity proposals
-with reviewed, reversible resolution maps. The shared
-managed-write and admission boundary described above is the one C26 reuses for its
-control graphs. Phase 3 integrates the new records with C17/C18, F22 and C22.
-The state-machine, authorization, direct-write, crash and retry acceptance cases remain
-required before those runtime phases are complete.
+Identity proposals with reviewed, reversible resolution maps are the seventh and last
+Phase 2 step. A claims batch takes `identities`, each naming 2 to 64 distinct entity
+IRIs, the relation `ev:PossibleMatch` or `ev:DistinctEntities`, an optional
+`ev:preferredEntity` of a match among its entities, the attributed proposer and an
+optional matching method. They are minted from the set of entities and the occurrence
+key, so the order of the entities changes neither the identity nor the digest, and go
+to the settings' identity graph or the one `identityGraph` names. They carry the same
+receipts, nonces, digests, idempotency and authority fence as every other record.
+Evidence links and assessments may target them.
+
+`evidence.json` format 1 and profile 1 gain `matchingPolicies`. Each has a `version`, a
+`boundary` of identity, source-record and proposal graphs that holds at least one
+identity graph, a `decisions` graph, a `maps` graph of the identity role and an
+`output` graph of the projections role. Names and the bound of 64 are shared with
+review policies, so `urn:x-sparkles:evidence:policy:{name}` names one policy, and a
+projection graph belongs to exactly one policy of either kind. A build that predates
+the member refuses it through its unknown-member check, so such settings read as
+`managed-unavailable` there.
+
+`sparkles::evidence::review` and `POST /{ds}/claims/review` dispatch on the policy's
+name, and under a matching policy the targets are identity proposals in an identity
+graph of the boundary. Decision records, supersession, the stale-target, policy-version
+and head preconditions, replay, dry runs and the commit are those of a claim review.
+The policy's effective matches are its authenticated `PossibleMatch` proposals whose
+current decision under the policy accepts them, and they join entities into clusters,
+the connected components of the entities they name. The output graph holds the current
+map, `<member> ev:resolvesTo <representative>` for every member of every cluster of
+two or more entities, the representative included. The representative is the smallest
+IRI among the preferred entities of the cluster's effective matches, or the smallest
+member IRI when none names one, so the map does not depend on the order of decisions.
+An effective `DistinctEntities` proposal is a constraint, and an operation whose final
+decisions put two of its entities in one cluster answers `409 identity-conflict` and
+writes nothing, in either order.
+
+An operation reads the clusters of its targets' entities before and after its
+decisions, and rewrites exactly those entities' output triples. When it adds an
+acceptance or supersedes one, it writes an immutable `ev:ResolutionMap` record in the
+maps graph, minted in the policy's namespace from its number. The record names the
+policy, its version, `ev:mapRevision`, `prov:wasRevisionOf` the revision before it,
+the output graph, `ev:adds` for each acceptance that became effective, `ev:ends` for
+each accepted decision it superseded, and the protection nonces of the decisions, maps
+and output graphs. The latest revision is found by galloping and binary search over the
+minted identities. A revision that does not authenticate, a latest revision under other
+nonces than the current ones, and an output that holds triples while no revision exists
+answer `projection-unavailable`. A split is a superseding rejection, and accepting the
+match again restores the earlier map. Proposals, decisions and earlier revisions are
+never edited, and the output graph's history serves the map of any retained commit.
+`Changed::map` and the answer's `changed.map` name the policy, the new revision and its
+predecessor, the decisions added and ended, and the entities whose selected entity
+changed, and `mapRevision` is answered on a replay as well. These are the changed IDs
+that F22 needs to find the consumers of the earlier revision.
+
+A review under a matching policy needs update and read grants on its decisions, maps
+and output graphs and read access to each target. An acceptance also needs read access
+to the target's evidence links in the boundary, as for claims, and every review that
+changes the map needs read access to each effective proposal of the clusters it reads
+in either state. A hidden one answers as the decision's target being unavailable, byte
+for byte. One operation visits at most 10,000 entities and proposals in each state,
+beyond which it answers `incomplete-evidence`.
+
+`sparkles::evidence::resolve_entities` and `POST /{ds}/claims/identities` read the map
+at the head of a branch. They need read grants on the policy's decisions, maps and
+output graphs and on the identity graphs of its boundary, and the route needs `read`
+through the query endpoint. Each of 1 to 100 entities answers its representative, up to
+1,000 sorted members with a completeness flag, and the current accepted decisions that
+join its cluster. An entity the map does not name resolves to itself. Queries join the
+output graph explicitly and are never rewritten through a map, so the query path is
+unchanged. The vocabulary and shapes add `ev:preferredEntity`, `ev:ResolutionMap`,
+`ev:mapRevision`, `ev:adds`, `ev:ends`, `ev:resolvesTo` and `ev:mapsProtection`, and
+`GET /$/server` lists the route as `capabilities.claims.identities`.
+
+Tests state the expected maps independently and cover merges, transitive merges, a
+split and the exact restoration of the earlier map, the revision chain, representatives
+under preferred entities and request order, decisions that change no acceptance and
+write no revision, separations in both orders and within one request, a split that
+accepts a separation in the same request, replays, keyless retries, stale heads,
+digests and policy versions, dry runs, an authority fence that refuses at publication
+and a cancelled request writing nothing, missing grants, a hidden proposal of a
+cluster compared with an unreadable target, direct SPARQL edits of the identity, maps,
+output and decisions graphs, changed protections of the maps and output graphs, earlier
+policy versions, the resolution read and its refusals, a review on a branch, the
+written records against the shapes, settings goldens and validation, and the HTTP
+routes.
+
+#### Identity decisions
+
+1. **Proposals in the claims batch.** Identity proposals reuse the proposal writer
+   instead of adding a parallel path, so their receipts and holds are the same.
+2. **One review route.** A matching policy is reviewed through `claims/review`, and the
+   policy's kind decides which records it reviews. A claim review of an identity
+   proposal answers as for any record of another kind.
+3. **Deterministic representatives.** The smallest preferred entity, or the smallest
+   member, keeps a cluster's selected entity stable as members join, without a minted
+   identity that would change with membership.
+4. **Deltas, not snapshots.** A revision records the decisions it adds and ends rather
+   than the whole map, so a review writes in proportion to its change. The map at a
+   revision is the fold of its chain, and the output graph's history serves it at any
+   retained commit.
+5. **Separations refuse.** A separation that meets a cluster refuses rather than
+   splitting it, so a split is always an explicit reversal of the match that joined the
+   entities.
+6. **No withdrawal of proposals.** Identity proposals are reversed by decisions.
+   `claims/withdraw` stays specific to claims.
+7. **Bindings and MCP.** The routes are HTTP, OpenAPI and Rust only. MCP waits for Phase
+   3 and the bindings for roadmap item 509.
+
+Phase 2 is complete. Roadmap item 81 retains Phase 3, which integrates the new records
+with C17/C18, F22 and C22. The shared managed-write and admission boundary described
+above is the one C26 reuses for its control graphs.
 
 Retained-reference resolution uses C29's bounded history and controlled permission
 preparation. Guarded Dataset queries and U02 readers still adopt them under item 395.

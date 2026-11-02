@@ -247,7 +247,7 @@ implementation status.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections and withdrawals are available with protected records and retained source holds. Identity decisions and application integration remain under item 81. |
+| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections, withdrawals and reviewed, reversible identity resolution maps are available with protected records and retained source holds. Integration with memory, ingestion, reports and maintained analyses remains under item 81. |
 | [Shared entity representation](ai/README.md#shared-entity-representation) | Partially complete. | Versioned resources, fixed fixtures and a bounded private offline resolver are available. Authenticated managed integration remains under item 396. |
 | [Durable jobs and delivery](specs/C26-durable-jobs-and-delivery.md) | Planned. | Item 339 specifies checkpointed jobs, fenced workers and a transactional outbox. Current tasks and notifications do not provide that recovery contract. |
 | [Maintained analysis results](specs/F22-analysis-lifecycle.md) | Planned. | Item 340 specifies reproducible runs, dependency checks, freshness and guarded publication. |

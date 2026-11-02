@@ -371,6 +371,24 @@ read of a review is made at its required `ifHead`. The codes `409 policy-changed
 `ev:supersedes`, `ev:AcceptanceSupport`, `ev:Withdrawal`, `ev:Projection` and their
 properties (spec C25 Phase 2).
 
+Identity proposals are reviewed into reversible resolution maps (spec C25 §6, roadmap
+item 81). A claims batch takes `identities`, which name two to 64 entity IRIs as a
+possible match or as distinct entities and assert no `owl:sameAs`, and `identityGraph`.
+Evidence settings take `matchingPolicies`, each with its version, boundary, decisions,
+maps and output graphs, as an additive amendment of `evidence.json` format 1 that a
+build without it refuses as unreadable settings. `POST /{ds}/claims/review` under a
+matching policy decides proposals, and the policy's output graph holds the current map
+as `ev:resolvesTo` triples from each member of a cluster to its representative. An
+accepted separation keeps entities apart, and joining them is the new `409
+identity-conflict`. A split is a superseding decision, and every change of the
+decisions a map follows writes an immutable `ev:ResolutionMap` revision with the
+decisions it added and ended. The review answer adds `mapRevision` and `changed.map`
+with the entities whose selected entity changed. `POST /{ds}/claims/identities` and
+`sparkles::evidence::resolve_entities` read the current map, and `capabilities.claims`
+lists the route. Evidence links and assessments may target identity proposals. The
+vocabulary and shapes add `ev:preferredEntity`, `ev:ResolutionMap`, `ev:mapRevision`,
+`ev:adds`, `ev:ends`, `ev:resolvesTo` and `ev:mapsProtection`.
+
 Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
 and `owl:sameAs` with closure operators instead of joins, and derives the same facts.
 An operator condenses a relation's strongly connected components and computes each
