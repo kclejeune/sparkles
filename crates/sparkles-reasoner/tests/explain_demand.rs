@@ -391,10 +391,15 @@ fn random_triple(r: &mut Rng, owl: bool) -> String {
 }
 
 /// F18 §11: every triple of the inferred graph has a demand tree, and every tree is well
-/// founded, with leaves the store asserts, for every profile on random data. Each profile
-/// is its own test below, with the same seeds, so that the three run in parallel.
-fn every_inferred_triple_has_a_sound_demand_tree(p: Profile, owl: bool) {
-    for seed in 1..=3u64 {
+/// founded, with leaves the store asserts, for every profile on random data from the seeds
+/// 1 to 3. Each profile is its own test below, and OWL 2 RL, the slowest, runs one seed per
+/// test, so that they run in parallel.
+fn every_inferred_triple_has_a_sound_demand_tree(
+    p: Profile,
+    owl: bool,
+    seeds: std::ops::RangeInclusive<u64>,
+) {
+    for seed in seeds {
         let mut r = Rng(seed * 104_729 + 7);
         let mut ttl = String::new();
         for _ in 0..40 {
@@ -433,12 +438,22 @@ fn every_inferred_triple_has_a_sound_demand_tree(p: Profile, owl: bool) {
 
 #[test]
 fn every_inferred_triple_has_a_sound_demand_tree_rdfs() {
-    every_inferred_triple_has_a_sound_demand_tree(Profile::Rdfs, false);
+    every_inferred_triple_has_a_sound_demand_tree(Profile::Rdfs, false, 1..=3);
 }
 
 #[test]
-fn every_inferred_triple_has_a_sound_demand_tree_owl_rl() {
-    every_inferred_triple_has_a_sound_demand_tree(Profile::OwlRl, true);
+fn every_inferred_triple_has_a_sound_demand_tree_owl_rl_seed_1() {
+    every_inferred_triple_has_a_sound_demand_tree(Profile::OwlRl, true, 1..=1);
+}
+
+#[test]
+fn every_inferred_triple_has_a_sound_demand_tree_owl_rl_seed_2() {
+    every_inferred_triple_has_a_sound_demand_tree(Profile::OwlRl, true, 2..=2);
+}
+
+#[test]
+fn every_inferred_triple_has_a_sound_demand_tree_owl_rl_seed_3() {
+    every_inferred_triple_has_a_sound_demand_tree(Profile::OwlRl, true, 3..=3);
 }
 
 #[test]
@@ -454,6 +469,7 @@ fn every_inferred_triple_has_a_sound_demand_tree_rules() {
                 .into(),
         ),
         false,
+        1..=3,
     );
 }
 

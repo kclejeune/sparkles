@@ -197,10 +197,15 @@ fn forward(p: &Profile) -> Profile {
 }
 
 /// For random data and random queries of one or two patterns, the solutions under
-/// `demand` equal those over a full materialization, for every profile. Each profile is
-/// its own test below, with the same seeds, so that the four run in parallel.
-fn demand_answers_like_materialization(p: Profile, owl: bool) {
-    for seed in 1..=6u64 {
+/// `demand` equal those over a full materialization, for every profile and the seeds 1
+/// to 6. Each profile is its own test below, and OWL 2 RL, the slowest, runs two seeds per
+/// test, so that they run in parallel.
+fn demand_answers_like_materialization(
+    p: Profile,
+    owl: bool,
+    seeds: std::ops::RangeInclusive<u64>,
+) {
+    for seed in seeds {
         let mut r = Rng(seed * 7919 + 13);
         let mut ttl = String::new();
         for _ in 0..50 {
@@ -227,22 +232,32 @@ fn demand_answers_like_materialization(p: Profile, owl: bool) {
 
 #[test]
 fn demand_answers_like_materialization_rdfs() {
-    demand_answers_like_materialization(Profile::Rdfs, false);
+    demand_answers_like_materialization(Profile::Rdfs, false, 1..=6);
 }
 
 #[test]
 fn demand_answers_like_materialization_rdfs_simple() {
-    demand_answers_like_materialization(Profile::RdfsSimple, false);
+    demand_answers_like_materialization(Profile::RdfsSimple, false, 1..=6);
 }
 
 #[test]
-fn demand_answers_like_materialization_owl_rl() {
-    demand_answers_like_materialization(Profile::OwlRl, true);
+fn demand_answers_like_materialization_owl_rl_seeds_1_and_2() {
+    demand_answers_like_materialization(Profile::OwlRl, true, 1..=2);
+}
+
+#[test]
+fn demand_answers_like_materialization_owl_rl_seeds_3_and_4() {
+    demand_answers_like_materialization(Profile::OwlRl, true, 3..=4);
+}
+
+#[test]
+fn demand_answers_like_materialization_owl_rl_seeds_5_and_6() {
+    demand_answers_like_materialization(Profile::OwlRl, true, 5..=6);
 }
 
 #[test]
 fn demand_answers_like_materialization_rules() {
-    demand_answers_like_materialization(rules_profile(), false);
+    demand_answers_like_materialization(rules_profile(), false, 1..=6);
 }
 
 /// A1: backward rules answer on demand and derive nothing outside the cone of the

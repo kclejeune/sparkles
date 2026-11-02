@@ -377,8 +377,8 @@ fn optional_and_join_queries_give_the_same_rows_with_each_switch() {
 /// blocks, probed for random, clustered and absent keys: the galloping reader gives the
 /// rows of the reader with a scan per cluster, before and after updates. Every part draws
 /// the keys of every round from the same random stream, so the rounds are the same in
-/// any split, and checks the queries whose position leaves `part` modulo `parts`. The
-/// three tests run in parallel.
+/// any split, and checks the queries whose position leaves `part` modulo `parts`. The six
+/// tests, one per query, run in parallel.
 fn galloping_index_joins_part(part: usize, parts: usize) {
     let s = Store::in_memory(StoreOptions::default());
     let mut t = String::from("@prefix ex: <http://ex.org/> .\n");
@@ -461,16 +461,31 @@ fn galloping_index_joins_part(part: usize, parts: usize) {
 }
 
 #[test]
-fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_1_of_3() {
-    galloping_index_joins_part(0, 3);
+fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_1_of_6() {
+    galloping_index_joins_part(0, 6);
 }
 
 #[test]
-fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_2_of_3() {
-    galloping_index_joins_part(1, 3);
+fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_2_of_6() {
+    galloping_index_joins_part(1, 6);
 }
 
 #[test]
-fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_3_of_3() {
-    galloping_index_joins_part(2, 3);
+fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_3_of_6() {
+    galloping_index_joins_part(2, 6);
+}
+
+#[test]
+fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_4_of_6() {
+    galloping_index_joins_part(3, 6);
+}
+
+#[test]
+fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_5_of_6() {
+    galloping_index_joins_part(4, 6);
+}
+
+#[test]
+fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_6_of_6() {
+    galloping_index_joins_part(5, 6);
 }
