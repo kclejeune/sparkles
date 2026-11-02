@@ -121,7 +121,10 @@ public class ElkClassify {
             // inconsistency, which ends that classification.
             try {
                 reasoner.precomputeInferences(InferenceType.CLASS_HIERARCHY);
-                consistent = reasoner.isConsistent();
+                // Whelk can call an ontology consistent whose owl:Thing it finds
+                // unsatisfiable, which makes it inconsistent.
+                consistent = reasoner.isConsistent() && !reasoner.getUnsatisfiableClasses()
+                    .contains(ontology.getOWLOntologyManager().getOWLDataFactory().getOWLThing());
             } catch (InconsistentOntologyException e) {
                 consistent = false;
             }
