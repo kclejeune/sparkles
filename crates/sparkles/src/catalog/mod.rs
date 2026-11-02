@@ -29,6 +29,22 @@ pub use restore::RESTORE_PREFIX;
 #[cfg(feature = "backup")]
 mod swap;
 
+/// How long a rename or delete waits for a views round of the dataset in progress to
+/// end. A views worker holds its dataset only during a round, and a round can start at
+/// any time, as the first round of a new dataset does. The catalog keeps the workers out
+/// of rounds from its check for other handles until the close is over, so that only
+/// real handles refuse the change. It holds the registry's management lock meanwhile.
+const WORKER_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Pause the views workers of `runtimes`, waiting until `until` for rounds in progress.
+/// `None` when a round outlasts it.
+fn pause_workers(
+    runtimes: &[Arc<crate::incr::Runtime>],
+    until: std::time::Instant,
+) -> Option<Vec<crate::incr::WorkerPause<'_>>> {
+    runtimes.iter().map(|r| r.pause_worker(until)).collect()
+}
+
 /// How a catalog sizes the caches of its datasets (spec X08 §3).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CatalogCaches {
@@ -607,8 +623,36 @@ impl Catalog {
         }
         Ok(self.get(name))
     }
+    /// Pause the views workers of a managed persistent dataset and its branches while
+    /// a rename or delete checks for other handles and closes it, waiting up to
+    /// [`WORKER_WAIT`] in all. The pauses borrow `runtimes`. Other datasets need no pause.
+    fn pause_managed_views<'a>(
+        &self,
+        name: &str,
+        runtimes: &'a mut Vec<Arc<crate::incr::Runtime>>,
+    ) -> Result<Vec<crate::incr::WorkerPause<'a>>> {
+        let until = std::time::Instant::now() + WORKER_WAIT;
+        // A clone, so that no registry lock is held while the branch caches are waited for.
+        let dataset = self
+            .inner
+            .entries
+            .read()
+            .get(name)
+            .filter(|e| e.kind == DatasetKind::Persistent && !e.attached)
+            .map(|e| e.dataset.clone());
+        if let Some(dataset) = dataset {
+            *runtimes = dataset.views_runtimes(until).ok_or_else(|| {
+                Error::Conflict(format!("dataset /{name} still has live handles"))
+            })?;
+        }
+        pause_workers(runtimes, until)
+            .ok_or_else(|| Error::Conflict(format!("dataset /{name} is still updating its views")))
+    }
+
     /// Whether a registered dataset has handles besides the catalog's own, including
     /// branch handles. A rename or delete of a persistent dataset refuses while it has.
+    /// A views round in progress counts, since its worker holds the dataset until the
+    /// round ends.
     pub fn in_use(&self, name: &str) -> bool {
         self.inner
             .entries
@@ -804,9 +848,11 @@ impl Catalog {
     /// Unregister a dataset and remove the directory of a managed persistent one.
     /// Like [`rename`](Self::rename), it refuses while a managed persistent dataset has
     /// live handles, including branch handles, so that no old handle can write into a
-    /// dataset later created under the same name. The directory is renamed aside while
-    /// the registry is locked and removed after the lock is released, so deleting a
-    /// large dataset does not hold up other catalog operations.
+    /// dataset later created under the same name. The views workers of the dataset and
+    /// its branches are not such handles. A round in progress gets up to two seconds to
+    /// end, and no round starts until the close is over. The directory is renamed aside
+    /// while the registry is locked and removed after the lock is released, so deleting
+    /// a large dataset does not hold up other catalog operations.
     pub fn delete(&self, name: &str) -> Result<bool> {
         let trash = {
             let _g = self.manage()?;
@@ -818,6 +864,8 @@ impl Catalog {
                     "dataset /{name} is reserved by task {holder}"
                 )));
             }
+            let mut runtimes = Vec::new();
+            let paused = self.pause_managed_views(name, &mut runtimes)?;
             let mut map = Some(self.inner.entries.write());
             let Some(entry) = map.as_ref().expect("entries").get(name) else {
                 return Ok(false);
@@ -843,6 +891,7 @@ impl Catalog {
                     let _disposing = self.disposal_scope();
                     entry.dataset.close_for_disposal(|| drop(map.take()))
                 };
+                drop(paused);
                 // A committed close that unwinds out of this call leaves the dataset
                 // registered and closed, never absent from what later saves write.
                 self.inner.detached.lock().remove(name);
@@ -983,7 +1032,8 @@ impl Catalog {
     }
 
     /// Rename an alias, retaining its UUID. Persistent datasets must have no live
-    /// handles, including branch handles, so that the old store can be closed.
+    /// handles, including branch handles, so that the old store can be closed. As in
+    /// [`delete`](Self::delete), the dataset's own views workers do not count.
     pub fn rename(&self, from: &str, to: &str) -> Result<Dataset> {
         let _g = self.manage()?;
         self.available(to, true)?;
@@ -993,6 +1043,8 @@ impl Catalog {
         if self.reserved_by(from).is_some() {
             return Err(Error::Conflict(format!("dataset /{from} is reserved")));
         }
+        let mut runtimes = Vec::new();
+        let paused = self.pause_managed_views(from, &mut runtimes)?;
         let mut map = Some(self.inner.entries.write());
         let mut entry = {
             let map = map.as_mut().expect("entries");
@@ -1035,6 +1087,7 @@ impl Catalog {
             let _disposing = self.disposal_scope();
             entry.dataset.close_for_disposal(|| drop(map.take()))
         };
+        drop(paused);
         // As in delete, only an unwinding committed close keeps this record.
         self.inner.detached.lock().remove(from);
         let reasoning = match closed {

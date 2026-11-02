@@ -445,6 +445,35 @@ impl Dataset {
         })
     }
 
+    /// The views runtimes of this dataset and of the branches it keeps open, each
+    /// once, for a catalog that pauses their workers around a close. `None` when a
+    /// branch cache stays locked until `until`. A thread that drops a cached branch
+    /// holds the cache while it waits for that branch's views round, and the round can
+    /// be the caller, so the wait for the cache is bounded.
+    pub(crate) fn views_runtimes(
+        &self,
+        until: std::time::Instant,
+    ) -> Option<Vec<Arc<crate::incr::Runtime>>> {
+        fn collect(
+            state: &DatasetState,
+            until: std::time::Instant,
+            out: &mut Vec<Arc<crate::incr::Runtime>>,
+        ) -> bool {
+            if out.iter().any(|r| Arc::ptr_eq(r, &state.views)) {
+                return true;
+            }
+            out.push(state.views.clone());
+            let Some(branches) = state.branches.try_lock_until(until) else {
+                return false;
+            };
+            branches
+                .values()
+                .all(|branch| collect(&branch.inner, until, out))
+        }
+        let mut out = Vec::new();
+        collect(&self.inner, until, &mut out).then_some(out)
+    }
+
     #[cfg(feature = "backup")]
     pub(crate) fn in_use_without_self(&self) -> bool {
         Arc::strong_count(&self.inner) > 2 || self.branches_in_use()

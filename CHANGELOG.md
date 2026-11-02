@@ -981,6 +981,17 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+A rename or delete of a persistent dataset no longer fails with `409` and "still has
+live handles" because the dataset's own views worker started a round at the wrong
+moment. Each open dataset runs a views worker, and a round of that worker holds the
+dataset until it ends. The first round of a new dataset could start after the server's
+wait for holders had seen the dataset free and before the catalog checked it, which
+happened on loaded hosts right after a dataset was created. The catalog now keeps the
+views workers of the dataset and its open branches from starting a round while it checks
+for other handles and closes the dataset, and waits up to two seconds for a round in
+progress to end. Handles of clients and requests still refuse the change, and a round
+that outlasts the wait answers `409` with "is still updating its views".
+
 Zero-or-more, one-or-more and zero-or-one property paths stay within the query memory
 budget and the timeout in eager execution. A path with two unbound ends, such as
 `?cat skos:broader* ?c`, listed its start nodes by copying every quad of the active

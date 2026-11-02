@@ -66,7 +66,26 @@ impl Drop for WorkerRound<'_> {
     }
 }
 
+/// Keeps a views worker from starting a round while it lives (from
+/// [`Runtime::pause_worker`]).
+#[must_use]
+pub struct WorkerPause<'a> {
+    _gate: parking_lot::ReentrantMutexGuard<'a, ()>,
+}
+
 impl Runtime {
+    /// Keep the worker from starting a round until the returned pause drops, waiting
+    /// until `until` for a round in progress to end. `None` means that the round
+    /// outlasted the wait. The worker holds its dataset only during a round, so a
+    /// catalog pauses it to tell the dataset's own work apart from other handles before
+    /// it closes the dataset. The gate is reentrant, so the pausing thread can still
+    /// close this runtime while it holds the pause.
+    pub fn pause_worker(&self, until: Instant) -> Option<WorkerPause<'_>> {
+        self.worker
+            .try_lock_until(until)
+            .map(|gate| WorkerPause { _gate: gate })
+    }
+
     /// Coordinate an owned dataset close with this thread's runtime operations.
     /// Synchronous callbacks retain the owner until their outer operation ends.
     /// A worker round already defers close and retains its store until cleanup.

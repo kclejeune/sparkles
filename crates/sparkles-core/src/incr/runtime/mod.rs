@@ -62,6 +62,7 @@ pub use internal::InternalCircuit;
 pub use key::{access_fingerprint, covers, whole_reason};
 use stats::Counters;
 pub use stats::{RuntimeStats, ViewStat};
+pub use worker::WorkerPause;
 
 /// The branch whose state Phase 1 keeps.
 const BRANCH: &str = "main";
