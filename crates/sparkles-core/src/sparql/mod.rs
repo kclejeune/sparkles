@@ -1029,6 +1029,8 @@ fn execute_prepared(
     // The operators' state is gone, so the pool keeps only what the result holds. A
     // graph result's triples are not measured, and it keeps its query's highest
     // estimate as before.
+    // Decoding the result reserves its envelope again when it needs one.
+    ctx.release_work();
     if matches!(kind, QueryKind::Select | QueryKind::Ask)
         && let Err(error) = ctx.shrink_retained(result.table.capacity_bytes())
     {
@@ -1295,7 +1297,7 @@ fn template_term(
             let id = t.cols[c][row];
             if id.is_undef() {
                 None
-            } else if ctx.is_cursor() {
+            } else {
                 match ctx.batch_term(id) {
                     Ok(term) => term,
                     Err(error) => {
@@ -1303,8 +1305,6 @@ fn template_term(
                         None
                     }
                 }
-            } else {
-                ctx.term(id)
             }
         },
         &mut |b| {

@@ -637,6 +637,8 @@ pub struct Ctx {
     /// A budget refusal in infallible code, which fails the next check (see
     /// [`Ctx::fail_memory`]).
     memory_failure: MemoryFailure,
+    /// the envelope of transient dictionary decoding
+    decode: DecodeEnvelope,
     // Opt-in cursor accounting stays after the ordinary execution fields.
     cursor_memory: Option<Box<CursorMemory>>,
     // Data and weak retained caches drop before final ledger ownership.
@@ -738,18 +740,19 @@ struct MemoryFailure {
     failed: AtomicBool,
 }
 
-/// The high-water envelope that transient dictionary decoding reserves: a key of the
-/// largest size seen so far on every worker, charged once when it grows (see
-/// [`Ctx::cursor_decode_checked`]).
+/// The high-water envelope that transient dictionary decoding reserves in both
+/// accounting modes: a key of the largest size seen so far on every worker, charged once
+/// when it grows and released when the work ends (see [`Ctx::reserve_decode_checked`]).
 #[derive(Default)]
 struct DecodeEnvelope {
-    peak: parking_lot::Mutex<u64>,
+    /// the reserved bytes, with the owner of an eager reservation
+    state: parking_lot::Mutex<(u64, Option<u64>)>,
+    /// the reserved bytes, read without the lock
     reserved: AtomicU64,
 }
 
 #[derive(Default)]
 struct CursorMemory {
-    decode: DecodeEnvelope,
     owner: parking_lot::Mutex<Weak<Ctx>>,
     regex: super::cursor_regex::RegexCache,
 }
@@ -946,6 +949,7 @@ impl Ctx {
             callback_bnodes: Default::default(),
             callback_terms: Default::default(),
             memory_failure: Default::default(),
+            decode: Default::default(),
             cursor_memory: None,
             fast: Default::default(),
             memory: Default::default(),
@@ -1273,6 +1277,8 @@ impl Ctx {
 
     pub(super) fn enable_cursor_accounting(&mut self) -> Result<()> {
         self.memory().check_cursor_transition()?;
+        // A cursor reserves its decoding on the ledger, so the eager envelope goes.
+        self.release_decode_envelope();
         // The decoded value cache is charged already, and the ledger carries its
         // reservation over, so the cursor keeps it.
         let bytes = self.local.read().bytes() as u64;
@@ -1387,12 +1393,34 @@ impl Ctx {
         }
     }
 
-    pub(super) fn release_cursor_work(&self) {
+    /// Release the state that only running work needs: the decode envelope and the
+    /// cursor's regular expressions. Execution ends with it in both accounting modes.
+    pub(super) fn release_work(&self) {
         if let Some(memory) = &self.cursor_memory {
             memory.regex.clear();
-            let _bytes = std::mem::take(&mut *memory.decode.peak.lock());
-            memory.decode.reserved.store(0, Ordering::Release);
-            self.memory().release_decode();
+        }
+        self.release_decode_envelope();
+    }
+
+    /// [`Ctx::release_work`] under the name the cursor executor calls.
+    pub(super) fn release_cursor_work(&self) {
+        self.release_work();
+    }
+
+    fn release_decode_envelope(&self) {
+        let envelope = &self.decode;
+        let mut state = envelope.state.lock();
+        let (bytes, owner) = std::mem::take(&mut *state);
+        envelope.reserved.store(0, Ordering::Release);
+        drop(state);
+        if bytes == 0 {
+            return;
+        }
+        match owner {
+            // An eager envelope is a charge of its own.
+            Some(owner) => self.release_live(Some(owner), bytes),
+            // A cursor's is decode bytes on the ledger.
+            None => self.memory().release_decode(),
         }
     }
 
@@ -1417,12 +1445,9 @@ impl Ctx {
     }
 
     /// Record a budget refusal that infallible code met, so that the next check fails
-    /// with it. Only cursor accounting records one so far, since eager scalar code
-    /// charges nothing it could be refused.
+    /// with it, in both accounting modes.
     pub(super) fn fail_memory(&self, error: &Error) {
-        if self.is_cursor()
-            && let Error::BudgetExceeded(budget) = error
-        {
+        if let Error::BudgetExceeded(budget) = error {
             self.record_failure(*budget);
         }
     }
@@ -1455,14 +1480,13 @@ impl Ctx {
         }
     }
 
-    /// Admit transient decoding for an explicitly fallible operation. A refused
-    /// sort trial can release its storage and try a smaller piece; it must not
-    /// poison the cursor as an infallible scalar evaluation would.
-    pub(super) fn cursor_decode_checked(&self, bytes: usize) -> Result<()> {
-        let Some(memory) = &self.cursor_memory else {
-            return Ok(());
-        };
-        let envelope = &memory.decode;
+    /// Admit transient decoding of a key of `bytes` bytes for an explicitly fallible
+    /// operation. A refused sort trial can release its storage and try a smaller piece,
+    /// so it must not poison the context as an infallible scalar evaluation would. The
+    /// envelope covers a key of the largest size seen so far on every worker, so the
+    /// common path is one atomic load.
+    #[inline]
+    pub(super) fn reserve_decode_checked(&self, bytes: usize) -> Result<()> {
         self.check_memory_failure()?;
         let workers = if rayon::current_thread_index().is_some() {
             rayon::current_num_threads() as u64 + 1
@@ -1473,28 +1497,64 @@ impl Ctx {
             .saturating_mul(8)
             .saturating_add(1024)
             .saturating_mul(workers);
-        if envelope.reserved.load(Ordering::Acquire) >= need {
-            return self.check_memory_failure();
+        if self.decode.reserved.load(Ordering::Acquire) >= need {
+            return Ok(());
         }
-        let mut peak = envelope.peak.lock();
+        self.grow_decode(need)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_decode(&self, need: u64) -> Result<()> {
+        let envelope = &self.decode;
+        let mut state = envelope.state.lock();
+        let (peak, owner) = &mut *state;
         if need > *peak {
-            let owner = self.memory().owner(self.grant.as_ref())?;
-            self.memory()
-                .reserve(&owner, self.mem_limit, need - *peak, true)?;
+            if self.is_cursor() {
+                let ledger = self.memory();
+                let account = ledger.owner(self.grant.as_ref())?;
+                ledger.reserve(&account, self.mem_limit, need - *peak, true)?;
+            } else {
+                let charge = self.charge(need - *peak)?;
+                let id = charge.disarm();
+                debug_assert!(owner.is_none() || id.is_none() || *owner == id);
+                if owner.is_none() {
+                    *owner = id;
+                }
+            }
             *peak = need;
             envelope.reserved.store(need, Ordering::Release);
         }
+        drop(state);
         self.check_memory_failure()
     }
 
-    /// Reserve the same high-water envelope for an infallible scalar caller.
-    /// Its failure must stay sticky so an expression cannot become unbound.
-    pub(super) fn cursor_decode(&self, bytes: usize) -> bool {
-        match self.cursor_decode_checked(bytes) {
+    /// Reserve the same envelope for an infallible scalar caller. Its failure stays
+    /// sticky so an expression cannot become unbound.
+    #[inline]
+    pub(super) fn reserve_decode(&self, bytes: usize) -> bool {
+        match self.reserve_decode_checked(bytes) {
             Ok(()) => true,
             Err(error) => {
                 self.fail_memory(&error);
                 false
+            }
+        }
+    }
+
+    /// `f` of the key of base vocabulary id `id`, with its reconstruction and its
+    /// decoding inside the envelope. A refusal records a failure and gives `None`.
+    #[inline]
+    fn with_vocab_key<T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
+        match self.snap.generation.vocab.get_with_checked(
+            id,
+            |need| self.reserve_decode_checked(need),
+            |key| self.reserve_decode(key.len()).then(|| f(key)),
+        ) {
+            Ok(found) => found.flatten(),
+            Err(error) => {
+                self.fail_memory(&error);
+                None
             }
         }
     }
@@ -1964,31 +2024,18 @@ impl Ctx {
     }
 
     pub fn term(&self, id: Id) -> Option<Term> {
-        if self.is_cursor() {
-            return match id.tag() {
-                Tag::Local => {
-                    let local = self.local.read();
-                    let key = local.get(id.payload())?;
-                    self.cursor_decode(key.len()).then(|| id::key_to_term(key))
-                }
-                Tag::Vocab => self
-                    .with_cursor_vocab_key(id.payload(), |key| {
-                        self.cursor_decode(key.len()).then(|| id::key_to_term(key))
-                    })
-                    .inspect_err(|error| self.fail_memory(error))
-                    .ok()
-                    .flatten()
-                    .flatten(),
-                Tag::Delta => self.snap.generation.dvocab.with(|vocab| {
-                    vocab
-                        .get(id.payload())
-                        .and_then(|key| self.cursor_decode(key.len()).then(|| id::key_to_term(key)))
-                }),
-                _ => self.snap.term(id),
-            };
-        }
         match id.tag() {
-            Tag::Local => self.local.read().get(id.payload()).map(id::key_to_term),
+            Tag::Local => {
+                let local = self.local.read();
+                let key = local.get(id.payload())?;
+                self.reserve_decode(key.len()).then(|| id::key_to_term(key))
+            }
+            Tag::Vocab => self.with_vocab_key(id.payload(), id::key_to_term),
+            Tag::Delta => self.snap.generation.dvocab.with(|vocab| {
+                vocab
+                    .get(id.payload())
+                    .and_then(|key| self.reserve_decode(key.len()).then(|| id::key_to_term(key)))
+            }),
             Tag::BNode => Some(Term::BlankNode(bnode_for(id))),
             _ => self.snap.term(id),
         }
@@ -2173,10 +2220,9 @@ impl Ctx {
     /// Inline and numeric-column values keep their existing paths. Dictionary
     /// reconstruction and admitted decoding retain the same owner and charges.
     pub(super) fn cursor_value_checked(&self, id: Id) -> Result<Option<Value>> {
-        debug_assert!(self.is_cursor());
         self.check_memory_failure()?;
         let decode = |key: &[u8]| -> Result<Value> {
-            self.cursor_decode_checked(key.len())?;
+            self.reserve_decode_checked(key.len())?;
             Ok(Value::from_key(key))
         };
         match id.tag() {
@@ -2218,42 +2264,17 @@ impl Ctx {
                 if let Some(v) = self.values.get(id) {
                     return Some(v);
                 }
-                let v = if self.is_cursor() {
-                    let decode =
-                        |key: &[u8]| self.cursor_decode(key.len()).then(|| Value::from_key(key));
-                    match id.tag() {
-                        Tag::Vocab => match self.with_cursor_vocab_key(id.payload(), decode) {
-                            Ok(value) => value.flatten(),
-                            Err(error) => {
-                                self.fail_memory(&error);
-                                None
-                            }
-                        },
-                        Tag::Delta => self
-                            .snap
-                            .generation
-                            .dvocab
-                            .with(|v| v.get(id.payload()).and_then(decode)),
-                        Tag::Local => self.local.read().get(id.payload()).and_then(decode),
-                        _ => unreachable!("dictionary value tag"),
-                    }
-                } else {
-                    // straight from the key: building an RDF term first cost two string
-                    // allocations per value (lexical form and datatype IRI)
-                    match id.tag() {
-                        Tag::Vocab => self
-                            .snap
-                            .generation
-                            .vocab
-                            .get_with(id.payload(), Value::from_key),
-                        Tag::Delta => self
-                            .snap
-                            .generation
-                            .dvocab
-                            .with(|v| v.get(id.payload()).map(Value::from_key)),
-                        Tag::Local => self.local.read().get(id.payload()).map(Value::from_key),
-                        _ => Some(Value::from_term(&self.term(id)?)),
-                    }
+                let decode =
+                    |key: &[u8]| self.reserve_decode(key.len()).then(|| Value::from_key(key));
+                let v = match id.tag() {
+                    Tag::Vocab => self.with_vocab_key(id.payload(), Value::from_key),
+                    Tag::Delta => self
+                        .snap
+                        .generation
+                        .dvocab
+                        .with(|v| v.get(id.payload()).and_then(decode)),
+                    Tag::Local => self.local.read().get(id.payload()).and_then(decode),
+                    _ => unreachable!("dictionary value tag"),
                 }?;
                 self.cache_value(id, &v);
                 Some(v)
@@ -2364,42 +2385,31 @@ impl Ctx {
         let lexical = |k: &[u8]| -> Option<std::ops::Range<usize>> {
             (k.len() >= 2 && k[0] == b'"' && k[k.len() - 1] == id::KEY_SEP).then(|| 1..k.len() - 1)
         };
-        if self.is_cursor() {
-            // A cursor reserves the reconstruction of both keys before it grows them,
-            // within the high-water envelope of its transient decoding
-            // ([`Ctx::cursor_decode`]). That envelope covers a key of the largest size
-            // seen so far on every worker, both keys of a comparison included, is
-            // charged once when it grows and is released when the cursor ends, so a
-            // comparison of keys within it takes no lock. A reservation that fails
-            // fails the cursor, and the generic comparison follows.
-            let reserve = |need: usize| {
-                if self.cursor_decode(need) {
-                    Ok(())
-                } else {
-                    Err(())
-                }
-            };
-            let order = v.get_with_checked(x, reserve, |kx| {
-                let rx = lexical(kx)?;
-                v.get_with_checked(y, reserve, |ky| {
-                    let ry = lexical(ky)?;
-                    Some(kx[rx.clone()].cmp(&ky[ry]))
-                })
-                .ok()
-                .flatten()
-                .flatten()
-            });
-            return order.ok().flatten().flatten();
-        }
-        v.get_with(x, |kx| {
+        // The reconstruction of both keys is reserved before it grows them, within the
+        // high-water envelope of transient decoding ([`Ctx::reserve_decode`]). That
+        // envelope covers a key of the largest size seen so far on every worker, both
+        // keys of a comparison included, is charged once when it grows and is released
+        // when the work ends, so a comparison of keys within it takes no lock. A
+        // reservation that fails records the failure, and the generic comparison
+        // follows.
+        let reserve = |need: usize| {
+            if self.reserve_decode(need) {
+                Ok(())
+            } else {
+                Err(())
+            }
+        };
+        let order = v.get_with_checked(x, reserve, |kx| {
             let rx = lexical(kx)?;
-            v.get_with(y, |ky| {
+            v.get_with_checked(y, reserve, |ky| {
                 let ry = lexical(ky)?;
                 Some(kx[rx.clone()].cmp(&ky[ry]))
             })
+            .ok()
             .flatten()
-        })
-        .flatten()
+            .flatten()
+        });
+        order.ok().flatten().flatten()
     }
 
     /// For a base-vocabulary simple literal, the first base id whose key starts with its
@@ -2939,6 +2949,37 @@ mod charge_tests {
             }
             assert_eq!(ctx.values.reserved(), 0, "cursor {cursor}");
             assert!(ctx.check().is_ok(), "cursor {cursor}");
+            drop(held);
+        }
+    }
+
+    /// Decoding a term reserves the decode envelope in both accounting modes. A refused
+    /// envelope gives no term and fails the next check, so a refused decode never
+    /// becomes an unbound value, and the end of the work releases the envelope.
+    #[test]
+    fn refused_decode_envelopes_fail_the_next_check() {
+        let store = Store::in_memory(StoreOptions::default());
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = MIB;
+            let literals = local_literals(&ctx, 2);
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let live = ctx.live_bytes();
+            assert!(ctx.term(literals[0].0).is_some(), "cursor {cursor}");
+            assert!(
+                ctx.live_bytes() > live,
+                "cursor {cursor}: the envelope is charged"
+            );
+            ctx.release_work();
+            assert_eq!(ctx.live_bytes(), live, "cursor {cursor}: and released");
+            let held = ctx.charge(MIB - live - 100).unwrap();
+            assert_eq!(ctx.term(literals[1].0), None, "cursor {cursor}");
+            assert!(
+                matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+                "cursor {cursor}"
+            );
             drop(held);
         }
     }

@@ -264,7 +264,7 @@ impl RegexState {
         output.reserve_exact(need - output.len());
         output.push_str(&text[end..]);
         // The expression's returned value remains live after this helper.
-        if !ctx.cursor_decode(output.capacity()) {
+        if !ctx.reserve_decode(output.capacity()) {
             ctx.check()?;
         }
         Ok(output)

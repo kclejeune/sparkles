@@ -704,6 +704,9 @@ mod tests {
             ..Default::default()
         };
         for q in [
+            "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }",
+            "SELECT DISTINCT ?o WHERE { ?s ex:knows ?o }",
+            "SELECT ?n WHERE { ?s ex:name ?n } ORDER BY ?n LIMIT 20",
             "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ex:knows ?o }",
             "SELECT ?p (COUNT(*) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?p",
             "SELECT ?t (COUNT(?s) AS ?c) WHERE { ?s a ?t } GROUP BY ?t ORDER BY DESC(?c)",
@@ -927,11 +930,11 @@ mod tests {
         std::mem::forget(ctx.charge(2 * MB).unwrap());
         ctx.enable_cursor_accounting().unwrap();
         assert_eq!((a.used(), b.used()), (0, 2 * MB));
-        assert!(ctx.cursor_decode(2000));
+        assert!(ctx.reserve_decode(2000));
         let b_before = b.used();
         assert!(b_before > 2 * MB);
         ctx.reconfigure_grant(Some(a.clone()));
-        assert!(ctx.cursor_decode(4000));
+        assert!(ctx.reserve_decode(4000));
         assert!(a.used() > 0);
         let keep = ctx.charge(300).unwrap();
         ctx.release_cursor_work();
