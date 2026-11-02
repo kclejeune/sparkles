@@ -1352,8 +1352,18 @@ impl Ctx {
 
     /// Let retained charges release through this shared context, in both accounting
     /// modes. Query preparation attaches every context it shares.
+    ///
+    /// Regular expressions compiled before, such as those of sampled filters in eager
+    /// planning, are uncharged, so the first attachment drops them and execution
+    /// compiles them again with their charges.
     pub(super) fn attach_owner(self: &Arc<Self>) {
-        *self.owner.lock() = Arc::downgrade(self);
+        let mut owner = self.owner.lock();
+        let first = owner.strong_count() == 0;
+        *owner = Arc::downgrade(self);
+        drop(owner);
+        if first {
+            self.regex.clear();
+        }
     }
 
     /// Drop the context's weak reference to itself, which lets a test take the prepared
@@ -2751,6 +2761,30 @@ mod charge_tests {
             assert_eq!(context.term(id), Some(value.to_term()));
         }
         assert!(inline > 20, "most of the values are inline: {inline}");
+    }
+
+    /// A program compiled before the context has an owner, as in eager planning, is
+    /// uncharged, so the first attachment drops it and the next use charges it.
+    #[test]
+    fn regex_programs_compiled_before_the_owner_are_compiled_again_with_charges() {
+        let store = Store::in_memory(StoreOptions::default());
+        let context = Arc::new(Ctx::new(store.snapshot()));
+        let before = context.live_bytes();
+        let planned = context.regex("^ab+c$", "").unwrap().unwrap();
+        assert_eq!(context.live_bytes(), before, "no owner, no retained charge");
+        context.attach_owner();
+        let executed = context.regex("^ab+c$", "").unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&planned, &executed));
+        assert!(context.live_bytes() > before);
+        let charged = context.live_bytes();
+        // a second attachment keeps the charged programs
+        context.attach_owner();
+        let again = context.regex("^ab+c$", "").unwrap().unwrap();
+        assert!(Arc::ptr_eq(&executed, &again));
+        assert_eq!(context.live_bytes(), charged);
+        drop((planned, executed, again));
+        context.release_work();
+        assert_eq!(context.live_bytes(), before);
     }
 
     #[test]

@@ -163,7 +163,7 @@ fn a_regular_expression_beyond_the_budget_fails_the_query_in_both_modes() {
 }
 
 fn count(rows: &[Vec<Option<oxrdf::Term>>]) -> u64 {
-    match &rows[..] {
+    match rows {
         [row] => match &row[0] {
             Some(oxrdf::Term::Literal(l)) => l.value().parse().unwrap(),
             other => panic!("not a count: {other:?}"),
@@ -211,4 +211,33 @@ fn regular_expressions_on_rayon_workers_count_what_the_data_holds() {
                 assert_eq!(count(&rows), expected, "cursor {filter}");
             }
         });
+}
+
+/// A REPLACE reserves its output by the length of each match and the references in the
+/// replacement, so one match of a 10,000-byte literal replacement in a 10,000-byte
+/// string fits a 16 MiB budget in both modes. A bound of the whole input per byte of
+/// the replacement asked for about 200 MB.
+#[test]
+fn a_long_literal_replacement_reserves_what_it_writes() {
+    let s = store();
+    let long = "b".repeat(10_000);
+    let q = format!(
+        r#"SELECT (STRLEN(REPLACE(?x, "^a", "{long}")) AS ?n) WHERE {{ VALUES ?x {{ "a{long}" }} }}"#
+    );
+    let eager = query(s.snapshot(), &q, &budget(16 << 20)).unwrap().rows();
+    assert_eq!(count(&eager), 20_000);
+    let mut c = select_cursor(
+        s.snapshot(),
+        &q,
+        &budget(16 << 20),
+        &CursorOptions::default(),
+    )
+    .unwrap();
+    let mut rows = Vec::new();
+    while let Some(b) = c.next_batch().unwrap() {
+        for i in 0..b.len() {
+            rows.push(b.row(i).unwrap());
+        }
+    }
+    assert_eq!(count(&rows), 20_000);
 }

@@ -6,7 +6,7 @@
 //! the program for each Rayon worker that searches it, with the worker's own cache. A
 //! worker's clone searches without a lock, which keeps a parallel filter as fast as one
 //! regular expression per thread. Each clone's cache is charged when it is made, and a
-//! worker whose cache does not fit shares the locked one.
+//! worker whose cache does not fit shares the locked one, as do threads outside Rayon.
 
 use super::ctx::{Ctx, RetainedCharge};
 use crate::error::Result;
@@ -20,11 +20,24 @@ use regex_automata::{
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, OnceLock};
 
+thread_local! {
+    /// A number for this thread, unique in the process, which tells a worker's clone of
+    /// a program from the thread that made it without the reference count of
+    /// `std::thread::current()`.
+    static THREAD: usize = {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    };
+}
+
 /// The patterns a query keeps at once. Reaching it starts the cache over, and the
 /// programs go once the last search that holds one ends.
 const MAX_PATTERNS: usize = 64;
 
-type Entries = FxHashMap<Box<str>, FxHashMap<Box<str>, Arc<Entry>>>;
+/// Patterns and flags are shared with every copy of the map, so a copy holds only its
+/// tables, at most [`MAX_PATTERNS`] entries of pointers. Each entry's charge covers its
+/// strings.
+type Entries = FxHashMap<Arc<str>, FxHashMap<Arc<str>, Arc<Entry>>>;
 
 /// A query's compiled patterns by pattern and flags. A lookup reads the current map
 /// without a lock, and an insert replaces the whole map, which holds at most
@@ -91,14 +104,21 @@ impl RegexCache {
         if let Some(entry) = current.get(pattern).and_then(|e| e.get(flags)) {
             return Ok(entry.state.clone());
         }
-        let charge = ctx.retained_charge((pattern.len() + flags.len()) as u64 * 2 + 1024)?;
-        let state = RegexState::compile(Some(ctx), pattern, flags)?.map(Arc::new);
+        // A full cache starts over before the new program is admitted, so that the old
+        // programs' charges go once no search holds them.
         let mut next = if current.values().map(FxHashMap::len).sum::<usize>() >= MAX_PATTERNS {
+            drop(current);
+            self.entries.store(Arc::default());
             Entries::default()
         } else {
             (*current).clone()
         };
-        next.entry(pattern.into()).or_default().insert(
+        let charge = ctx.retained_charge((pattern.len() + flags.len()) as u64 * 2 + 1024)?;
+        let state = RegexState::compile(Some(ctx), pattern, flags)?.map(Arc::new);
+        let pattern: Arc<str> = next
+            .get_key_value(pattern)
+            .map_or_else(|| pattern.into(), |(k, _)| k.clone());
+        next.entry(pattern).or_default().insert(
             flags.into(),
             Arc::new(Entry {
                 state: state.clone(),
@@ -119,8 +139,8 @@ pub(super) struct RegexState {
     shared: Mutex<Cache>,
     /// the charged bound of one search cache
     cache_bytes: u64,
-    /// one clone of the program per Rayon worker of the pool that compiled it, and slot 0
-    /// for other threads, each made on first use
+    /// one clone of the program per Rayon worker of the pool that compiled it, each made
+    /// on first use
     workers: Box<[OnceLock<Worker>]>,
     _charge: Option<RetainedCharge>,
     _shared_charge: Option<RetainedCharge>,
@@ -129,6 +149,9 @@ pub(super) struct RegexState {
 /// A worker's clone of a program, whose own pool keeps the worker's search cache, or
 /// `None` when the cache did not fit and the worker shares the locked one.
 struct Worker {
+    /// the thread that made the clone, the only one that searches with it, so that its
+    /// pool only ever holds the one cache of its owner thread
+    thread: usize,
     program: Option<Regex>,
     _charge: Option<RetainedCharge>,
 }
@@ -233,7 +256,7 @@ impl RegexState {
             .is_some();
         drop(text_charge);
         check()?;
-        let workers = (0..=rayon::current_num_threads())
+        let workers = (0..rayon::current_num_threads())
             .map(|_| OnceLock::new())
             .collect();
         Ok(Some(Self {
@@ -255,28 +278,34 @@ impl RegexState {
         self.matches_empty
     }
 
-    /// This thread's clone of the program, made on its first search, or `None` when the
-    /// thread shares the locked cache.
+    /// This Rayon worker's clone of the program, made on its first search, or `None` when
+    /// the thread shares the locked cache. A thread outside Rayon, such as the one that
+    /// pulls a cursor's batches and may change from batch to batch, and a worker of
+    /// another pool whose index collides with a clone's maker, share the locked cache, so
+    /// no clone's pool makes a cache for a second thread.
     #[inline]
     fn worker(&self) -> Option<&Regex> {
-        let slot = rayon::current_thread_index().map_or(0, |i| i + 1);
-        self.workers
-            .get(slot)?
-            .get_or_init(|| self.new_worker())
-            .program
-            .as_ref()
+        let slot = self.workers.get(rayon::current_thread_index()?)?;
+        let thread = THREAD.with(|t| *t);
+        let worker = slot.get_or_init(|| self.new_worker(thread));
+        if worker.thread != thread {
+            return None;
+        }
+        worker.program.as_ref()
     }
 
     #[cold]
-    fn new_worker(&self) -> Worker {
+    fn new_worker(&self, thread: usize) -> Worker {
         // A program compiled without an owner is uncharged, and so are its clones.
         let Some(charge) = &self._charge else {
             return Worker {
+                thread,
                 program: Some(self.program.clone()),
                 _charge: None,
             };
         };
         let refused = Worker {
+            thread,
             program: None,
             _charge: None,
         };
@@ -289,6 +318,7 @@ impl RegexState {
             && ctx.memory_remaining().saturating_sub(self.cache_bytes) > ctx.mem_limit / 4 * 3;
         match room.then(|| ctx.retained_charge(self.cache_bytes)) {
             Some(Ok(charge)) => Worker {
+                thread,
                 program: Some(self.program.clone()),
                 _charge: charge,
             },
@@ -316,6 +346,8 @@ impl RegexState {
         let mut captures = self.program.create_captures();
         let mut searcher = Searcher::new(Input::new(text));
         let charge = ctx.charge(1024)?;
+        // `$` starts every group reference, and `$$` counts twice, which only overstates
+        let references = replacement.bytes().filter(|&b| b == b'$').count();
         let mut reserved = 0u64;
         let mut output = String::new();
         let mut end = 0;
@@ -331,20 +363,20 @@ impl RegexState {
             Ok(captures.get_match())
         }) {
             ctx.check()?;
-            // Each replacement byte can at most reference one full input.
-            // Reserve before interpolation and before growing the output.
+            // A group lies inside its match, so each reference in the replacement adds
+            // at most the match's length to the replacement's own bytes. Reserve that
+            // bound before interpolation and before growing the output.
             let need = output
                 .len()
                 .saturating_add(found.start() - end)
-                .saturating_add(
-                    replacement
-                        .len()
-                        .saturating_mul(text.len().saturating_add(1)),
-                );
+                .saturating_add(replacement.len())
+                .saturating_add(references.saturating_mul(found.len()));
             let bytes = (need as u64).saturating_mul(2);
             charge.add(bytes.saturating_sub(reserved))?;
-            reserved = bytes;
-            output.reserve_exact(need.saturating_sub(output.len()));
+            reserved = reserved.max(bytes);
+            // Amortized growth keeps the capacity within twice the bound, which the
+            // charge covers.
+            output.reserve(need.saturating_sub(output.len()));
             output.push_str(&text[end..found.start()]);
             captures.interpolate_string_into(text, replacement, &mut output);
             end = found.end();
@@ -425,5 +457,46 @@ mod tests {
         }
         assert!(RegexState::compile(None, "[", "").unwrap().is_none());
         assert!(RegexState::compile(None, "a", "!").unwrap().is_none());
+    }
+
+    /// A worker's clone serves only the thread that made it. A worker of another pool
+    /// whose index is the same, and a thread outside Rayon, search with the locked cache.
+    #[test]
+    fn a_worker_clone_serves_only_the_thread_that_made_it() {
+        let a = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let b = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let state = a.install(|| RegexState::compile(None, "^x[0-9]+$", "").unwrap().unwrap());
+        let makers: Vec<usize> = a.broadcast(|_| {
+            assert!(state.is_match("x12"));
+            THREAD.with(|t| *t)
+        });
+        let slots = |state: &RegexState| -> Vec<Option<usize>> {
+            state
+                .workers
+                .iter()
+                .map(|w| w.get().map(|w| w.thread))
+                .collect()
+        };
+        let mut made: Vec<usize> = slots(&state).into_iter().map(Option::unwrap).collect();
+        made.sort_unstable();
+        let mut expected = makers.clone();
+        expected.sort_unstable();
+        assert_eq!(made, expected);
+        let others: Vec<bool> = b.broadcast(|_| {
+            assert!(state.worker().is_none());
+            state.is_match("x7") && !state.is_match("y7")
+        });
+        assert!(others.into_iter().all(|ok| ok));
+        assert!(state.worker().is_none());
+        assert!(state.is_match("x1"));
+        let mut after: Vec<usize> = slots(&state).into_iter().map(Option::unwrap).collect();
+        after.sort_unstable();
+        assert_eq!(after, expected);
     }
 }
