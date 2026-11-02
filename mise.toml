@@ -448,7 +448,9 @@ mbx test --workspace
 
 [tasks."test:w3c"]
 description = "W3C SPARQL 1.0/1.1/1.2 conformance with per-suite summaries"
-run = "mbx test -p sparkles-core --test w3c -- --nocapture --test-threads=1"
+# Each suite and cursor batch size is its own test with its own state, so the tests run
+# in parallel. Each summary is one line, so their output stays readable.
+run = "mbx test -p sparkles-core --test w3c -- --nocapture"
 
 [tasks."test:shacl"]
 description = "W3C SHACL Core + SHACL-SPARQL conformance, the SHACL 1.2 list and node expression tests and the SHACLC test pairs"
