@@ -222,21 +222,29 @@ these features limit what a cold lookup reads:
   the [numeric column](../dbpedia/RESULTS.md#numeric-literals-in-the-vocabulary) instead of decoding each key
   from the vocabulary.
 
-The tradeoff is faster sparse lookups against less automatic read-ahead for dense scans.
-These cold medians switch the first two features together.
+Random-access mappings give up the kernel's automatic read-ahead, and the read windows
+described below request it again per scan pass, so dense scans are faster with the
+features than without them as well. These cold medians switch the first two features
+together.
 
-| Cold, median of 3, ms | Both off | Both on (default) |
+| Cold, median, ms | Both off | Both on (default) |
 |---|---:|---:|
 | 10.5M `star-lookup` | 69.3 | **46.7** |
 | 10.5M `star-join` | 99.9 | **93.3** |
 | 10.5M `contains` | 82.4 | **33.5** |
 | 10.5M `regex-iri` | 55.2 | **31.3** |
 | 10.5M `lang-filter` | 36.1 | **27.9** |
-| 1.01B `entity-facts-1` | 36.0 to 38.3 | **14.6 to 15.2** |
-| 1.01B `label-regex` | **66.4 to 68.5** | 119.5 to 130.8 |
-| 1.01B `export-1m` | **1,231 to 1,239** | 1,883 to 1,956 |
-| 1.01B `category-tree` | 369.7 to 371.1 | 364.5 to 365.2 |
-| 1.01B `top-linked` | 949 to 1,000 | 946 to 964 |
+| 1.01B `entity-facts-1` | 84.1 | **8.7** |
+| 1.01B `entity-summary-1` | 67.9 | **7.3** |
+| 1.01B `label-regex` | 137.1 | **39.4** |
+| 1.01B `abstract-contains` | 846 | **523** |
+| 1.01B `export-1m` | 22,108 | **1,293** |
+
+*The 1.01B rows are medians of 14 cold samples on a format 3 store, measured on forge with
+`bench-regressions.py --cold` at commit 6d518b71. The 10.5M rows are older medians of
+three restarts.* [X07](../../specs/X07-cold-sparse-reads.md#dense-reads-at-101b) also
+compares read windows of 1, 4 and 16 MiB at 1.01B, which are within the noise of each
+other except on `label-regex`.
 
 [X07](../../specs/X07-cold-sparse-reads.md#remaining-cold-gaps) adds one read window per scan
 pass, batched hints for a query's constants and first-scan prefetch, and profiles the
@@ -282,20 +290,33 @@ interleaved rounds of A, B, B and A. The unsegmented column comes from the build
 72d85c7f on its own store, and the format 3 columns from 04d49b57 and from 38deb1e8 and
 cd46d9c3, which differ only in the inlining of the lookahead.*
 
-The same build ran the cold rows of `bench.sh` against Oxigraph on forge, in two rounds of
-five restarts per engine and query. Sparkles leads on the three point lookups and still
-loses `path-plus`.
+Before it reports ready, `sparkles serve` now runs one query that reads no data on a
+scratch in-memory dataset and maps its own code into memory, which costs about 100 MB of
+shared file pages in the resident set. This improves the server's first request after a
+start, which is what a cold row measures. The harness is unchanged. It still waits for
+Oxigraph with the query `ASK{}`, which runs Oxigraph's query path once before the timed
+request, and for Sparkles on `/$/ready`, and both engines answer the same timed queries as
+before, so the comparison stays fair. The cold rows of `bench.sh` against Oxigraph, in two
+rounds of five restarts per engine and query, show Sparkles ahead on all five queries.
 
 | Cold, `bench.sh`, median of 10, ms | Oxigraph 1.05M | Sparkles 1.05M | Oxigraph 10.5M | Sparkles 10.5M |
 |---|---:|---:|---:|---:|
-| `star-lookup` | 21.2 | **12.4** | 19.0 | **10.0** |
-| `values-star` | 7.3 | **6.7** | 7.2 | **5.9** |
-| `employee-docs` | 19.2 | **9.2** | 16.0 | **10.1** |
-| `path-plus` | **2.7** | 3.3 | **2.2** | 3.3 |
-| `star-join` | 1,165.6 | **19.3** | 12,176.3 | **87.8** |
+| `star-lookup` | 20.26 | **10.69** | 20.02 | **9.15** |
+| `values-star` | 7.52 | **4.68** | 6.94 | **3.95** |
+| `employee-docs` | 19.16 | **7.99** | 18.37 | **8.73** |
+| `path-plus` | 2.54 | **2.49** | 2.25 | **1.80** |
+| `star-join` | 1,189.0 | **19.0** | 12,466.8 | **78.6** |
 
-*Measured on forge on 2026-11-01 at commit 38deb1e8, with Oxigraph from the repository's
-pinned packages. These rows come from a separate run from the 28-query table above.*
+*Measured on forge on 2026-11-02 at commit b1f206b9, with Oxigraph from the repository's
+pinned packages. The build before the warm-up, 21da069d, took 4.15 and 3.52 ms on
+`path-plus` in the same rounds. These rows come from a separate run from the 28-query
+table above, and they supersede its rows for these five queries.*
+
+Across all 31 queries of `bench-regressions.py --cold`, the warm-up build ran every query
+faster than 21da069d, with a geometric mean ratio of 0.822 at 10.5M and 0.786 at 1.05M.
+[X07](../../specs/X07-cold-sparse-reads.md#first-request-after-a-start) has the per-query
+numbers and the warm comparison, and the
+[run record](runs/2026-11-02-first-request-forge/validation.json) holds every sample.
 
 `serve --prewarm` restarts with the blocks and pages that the last run used. Each sample
 below starts a fresh server on an evicted store with the list that a warm pass of the same
