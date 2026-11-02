@@ -1564,6 +1564,48 @@ mod tests {
         v.iter().map(|&i| Id::from_i64(i).unwrap()).collect()
     }
 
+    /// The parallel mapping of a dense range of integers, over several pieces, finds the
+    /// distinct values in order and a slot for every row, and declines a range wider than
+    /// it maps or a column with another kind of id.
+    #[test]
+    fn the_parallel_dense_mapping_finds_every_value_and_slot() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let ctx = Ctx::new(store.snapshot());
+        let v = ctx.var("k");
+        let n = 3 * (1 << 16) + 123;
+        let vals: Vec<i64> = (0..n).map(|i| 1000 + ((i * 7919) % 97) as i64).collect();
+        let mut t = Table::new(vec![v]);
+        t.cols[0] = ids(&vals);
+        t.len = n;
+        let e = Expr::Var(v);
+        let mut report = Report::default();
+        let d = cursor_integer_distinct(&ctx, &t, &[&e], v, &mut report)
+            .unwrap()
+            .expect("a dense range maps directly");
+        let mut uniq = vals.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        let found: Vec<i64> = d.values.cols[0].iter().map(|id| id.as_i64()).collect();
+        assert_eq!(found, uniq);
+        let slot = d.slot.expect("every row has a slot");
+        assert_eq!(slot.len(), n);
+        for (row, &x) in vals.iter().enumerate() {
+            assert_eq!(uniq[slot[row] as usize], x, "row {row}");
+        }
+        t.cols[0][n - 1] = Id::from_i64(1000 + DENSE_SPAN as i64).unwrap();
+        assert!(
+            cursor_integer_distinct(&ctx, &t, &[&e], v, &mut report)
+                .unwrap()
+                .is_none()
+        );
+        t.cols[0][n - 1] = Id::UNDEF;
+        assert!(
+            cursor_integer_distinct(&ctx, &t, &[&e], v, &mut report)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn estimates_follow_repeats() {
         // small columns are counted exactly
