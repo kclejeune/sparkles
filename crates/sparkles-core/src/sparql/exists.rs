@@ -276,18 +276,20 @@ fn exists_of(e: &Expr) -> Option<(&ExistsSpec, bool)> {
     }
 }
 
-/// The unsubstituted plan of the key set that would answer the filter conjunct `e`,
-/// when `e` is `EXISTS { P }` or `NOT EXISTS { P }` and `P` is in the admitted algebra.
-/// Automatic execution streams only an EXISTS that it can answer this way. Any other
-/// EXISTS is evaluated once per distinct outer key, which measured slower in the cursor
-/// than in eager execution.
+/// The unsubstituted plan of the key set that would answer `e`, when `e` is
+/// `EXISTS { P }` or `NOT EXISTS { P }` and `P` is in the admitted algebra. `e` is a
+/// FILTER conjunct, a BIND expression or an OPTIONAL condition. Automatic execution
+/// streams only an EXISTS that it can answer this way. Any other EXISTS is evaluated
+/// once per distinct outer key, which measured slower in the cursor than in eager
+/// execution.
 ///
-/// `input` is the FILTER's input. The key set cannot answer a row that binds a risky
-/// variable, one that a FILTER inside `P` reads, so a risky variable that a constant or
-/// every input row binds forces evaluation per key, as does an input that binds none of
-/// the key variables. Both are rejected here. A risky variable that only some input rows
-/// bind stays admitted, since the rows that leave it unbound use the key set.
-pub(super) fn keyed_plan(ctx: &Ctx, e: &Expr, input: &Node) -> Option<Node> {
+/// `vars` are the variables of the rows `e` tests and `certain` those that every such
+/// row binds. The key set cannot answer a row that binds a risky variable, one that a
+/// FILTER inside `P` reads, so a risky variable that a constant or every row binds
+/// forces evaluation per key, as do rows that bind none of the key variables. Both are
+/// rejected here. A risky variable that only some rows bind stays admitted, since the
+/// rows that leave it unbound use the key set.
+pub(super) fn keyed_plan(ctx: &Ctx, e: &Expr, vars: &[VarId], certain: &[VarId]) -> Option<Node> {
     if !ctx.opt.decorrelate_exists {
         return None;
     }
@@ -297,15 +299,11 @@ pub(super) fn keyed_plan(ctx: &Ctx, e: &Expr, input: &Node) -> Option<Node> {
     if plan
         .risky
         .iter()
-        .any(|v| constant(v) || input.certain.contains(v))
+        .any(|v| constant(v) || certain.contains(v))
     {
         return None;
     }
-    if !plan
-        .keys
-        .iter()
-        .any(|v| constant(v) || input.vars.contains(v))
-    {
+    if !plan.keys.iter().any(|v| constant(v) || vars.contains(v)) {
         return None;
     }
     Some(plan.node)

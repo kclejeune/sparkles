@@ -92,15 +92,40 @@ const STREAMED: &[&str] = &[
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER NOT EXISTS { ?s <urn:absent> ?o } }",
 ];
 
-/// EXISTS that the cursor evaluates once per distinct outer key: in an OPTIONAL
-/// condition, in BIND, inside a larger expression and in an aggregate argument. These
-/// measured slower in the cursor, so automatic execution keeps them eager.
+/// EXISTS in BIND, which the cursor answers from a key set as it does a FILTER EXISTS,
+/// so automatic execution streams them.
+const KEYED: &[&str] = &[
+    "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v BIND(EXISTS { ?s <urn:q> ?o } AS ?b) } GROUP BY ?b ORDER BY ?b",
+    "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v BIND(NOT EXISTS { ?s <urn:q> ?o . ?o <urn:r> ?k } AS ?b) } GROUP BY ?b ORDER BY ?b",
+];
+
+/// EXISTS that automatic execution keeps eager. The cursor evaluates one inside a
+/// larger expression or an aggregate argument once per distinct outer key, which
+/// measured slower, and it answers one in an OPTIONAL condition from its key set, but
+/// its conditional OPTIONAL measured slower than the eager one.
 const PER_KEY: &[&str] = &[
     "SELECT ?v (COUNT(?o) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o FILTER EXISTS { ?o <urn:r> ?k } } } GROUP BY ?v ORDER BY ?v",
-    "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v BIND(EXISTS { ?s <urn:q> ?o } AS ?b) } GROUP BY ?b ORDER BY ?b",
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER (?v < 10 || EXISTS { ?s <urn:q> <urn:o:5> }) }",
     "SELECT (SUM(IF(EXISTS { ?s <urn:q> ?o }, 1, 0)) AS ?n) { ?s <urn:p> ?v }",
 ];
+
+#[test]
+fn keyed_bind_and_optional_exists_stream_and_match_eager() {
+    let s = store();
+    for q in KEYED {
+        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        for rows in [4096, 10_000] {
+            let cursor = CursorOptions {
+                batch_rows: rows,
+                ..Default::default()
+            };
+            let (got, streamed) = automatic(&s, q, &Default::default(), &cursor)
+                .unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert!(streamed, "{q}: automatic execution kept the plan eager");
+            assert_eq!(ordered(got), ordered(expected.clone()), "{q}; {rows}");
+        }
+    }
+}
 
 #[test]
 fn large_groupings_with_exists_stream_and_match_eager() {
@@ -282,8 +307,8 @@ fn bind_exists_streams_from_the_key_set() {
         ..Default::default()
     };
     for q in [
-        PER_KEY[1],
-        "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v BIND(NOT EXISTS { ?s <urn:q> ?o . ?o <urn:r> ?k } AS ?b) } GROUP BY ?b ORDER BY ?b",
+        KEYED[0],
+        KEYED[1],
         "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o } BIND(EXISTS { ?o <urn:r> ?k } AS ?b) } GROUP BY ?b ORDER BY ?b",
     ] {
         let expected = query(s.snapshot(), q, &per_key).unwrap().rows();

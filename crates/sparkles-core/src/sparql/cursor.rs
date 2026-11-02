@@ -1285,27 +1285,69 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
         Kind::Sort(_) => rows(node, node.est),
         Kind::OrderBy { limit: Some(k), .. } => rows(node, (*k as f64).min(node.est)),
         Kind::OrderBy { limit: None, .. } => rows(node, node.est),
-        Kind::Filter(exprs) if node.children.len() == 1 => exprs
-            .iter()
-            .filter(|e| e.has_exists())
-            .map(|e| {
-                super::exists::keyed_plan(ctx, e, &node.children[0])
-                    .map_or(f64::INFINITY, |planned| {
-                        hashed(&planned, planned.est) + cursor_state_bytes(ctx, &planned)
-                    })
-            })
-            .sum(),
+        Kind::Filter(_) if node.children.len() == 1 => keyed_exists_bytes(ctx, node),
         // a variable or a constant generates no term
         Kind::Extend(_, Expr::Var(_) | Expr::Const(_) | Expr::Lit(..)) => 0.0,
         Kind::Extend(..) => node.est.max(0.0) * GENERATED_TERM_BYTES,
         _ if supported(&node.kind) => 0.0,
         _ => rows(node, node.est),
     };
-    own + node
-        .children
-        .iter()
-        .map(|c| cursor_state_bytes(ctx, c))
-        .sum::<f64>()
+    // the key sets of a BIND's or an OPTIONAL condition's EXISTS, beside the
+    // operator's own state
+    let keyed = match &node.kind {
+        Kind::Extend(_, e) | Kind::LeftJoin { expr: Some(e) } if e.has_exists() => {
+            keyed_exists_bytes(ctx, node)
+        }
+        _ => 0.0,
+    };
+    own + keyed
+        + node
+            .children
+            .iter()
+            .map(|c| cursor_state_bytes(ctx, c))
+            .sum::<f64>()
+}
+
+/// The estimated bytes of the key sets that answer the EXISTS expressions of `node`,
+/// with the cursor state of their plans, or infinity when one has no key set.
+fn keyed_exists_bytes(ctx: &Ctx, node: &Node) -> f64 {
+    let hashed = |n: &Node| {
+        let est = n.est.max(0.0);
+        let entries = est.min(usize::MAX as f64) as usize;
+        est * (n.vars.len().max(1) * 8) as f64 * 2.0
+            + binary::map_bytes(entries, 16) as f64 * 1.5
+            + est * 12.0
+            + 1024.0
+    };
+    own_exprs(&node.kind)
+        .into_iter()
+        .filter(|e| e.has_exists())
+        .map(|e| {
+            keyed_exists(ctx, node, e).map_or(f64::INFINITY, |planned| {
+                hashed(&planned) + cursor_state_bytes(ctx, &planned)
+            })
+        })
+        .sum()
+}
+
+/// The plan of the key set that answers the EXISTS expression `e` of `node`: a FILTER
+/// conjunct, a BIND expression or an OPTIONAL condition. The rows a FILTER or a BIND
+/// tests are its input's, and those an OPTIONAL condition tests are the pairs of its
+/// two sides, which bind every variable that either side always binds.
+fn keyed_exists(ctx: &Ctx, node: &Node, e: &Expr) -> Option<Node> {
+    match (&node.kind, node.children.as_slice()) {
+        (Kind::Filter(_) | Kind::Extend(..), [input]) => {
+            super::exists::keyed_plan(ctx, e, &input.vars, &input.certain)
+        }
+        (Kind::LeftJoin { .. }, [left, right]) => {
+            let mut vars = left.vars.clone();
+            vars.extend(right.vars.iter().filter(|v| !left.vars.contains(v)));
+            let mut certain = left.certain.clone();
+            certain.extend(right.certain.iter().filter(|v| !left.certain.contains(v)));
+            super::exists::keyed_plan(ctx, e, &vars, &certain)
+        }
+        _ => None,
+    }
 }
 
 /// The estimated bytes of the largest operator output in `node`, as eager execution
@@ -1338,23 +1380,23 @@ pub(super) fn native(node: &Node) -> bool {
 const AUTO_EXISTS_DEPTH: usize = 4;
 
 /// Whether every operator of `node` has a cursor implementation, as [`native`] asks,
-/// where a FILTER whose conjuncts include `EXISTS { P }` or `NOT EXISTS { P }` also
-/// counts when the cursor can answer each of them from a key set and the plan of each
-/// `P` counts in turn. The key set is filled by a child cursor under the query's
-/// charges. An EXISTS anywhere else, such as in BIND, in an OPTIONAL condition or
-/// inside a larger expression, is evaluated once per distinct outer key. On Namespace
-/// at 10.5M quads that took 1.15 times as long in the cursor as in eager execution,
-/// while the key-set filters took 0.68 to 0.99 times as long, so such plans stay eager.
+/// where a FILTER conjunct or a BIND expression that is `EXISTS { P }` or
+/// `NOT EXISTS { P }` also counts when the cursor can answer it from a key set and the
+/// plan of `P` counts in turn. The key set is filled by a child cursor under the query's
+/// charges. An EXISTS inside a larger expression, such as IF or OR, is evaluated once
+/// per distinct outer key, which measured slower in the cursor than in eager execution,
+/// so such plans stay eager. So does an OPTIONAL whose condition is an EXISTS. The cursor
+/// answers it from the key set as well, but its conditional OPTIONAL took 3.5 to 4 times
+/// as long as the eager merge on Namespace at 10.5M quads, with any condition.
 /// The patterns are planned here only to read their operators. Planning interns their
 /// variables in `ctx` and runs no part of them.
 pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
     fn at(ctx: &Ctx, node: &Node, depth: usize) -> bool {
         let exists = match &node.kind {
-            Kind::Filter(exprs) => exprs.iter().all(|e| {
+            Kind::Filter(_) | Kind::Extend(..) => own_exprs(&node.kind).into_iter().all(|e| {
                 !e.has_exists()
                     || (depth < AUTO_EXISTS_DEPTH
-                        && node.children.len() == 1
-                        && super::exists::keyed_plan(ctx, e, &node.children[0])
+                        && keyed_exists(ctx, node, e)
                             .is_some_and(|planned| at(ctx, &planned, depth + 1)))
             }),
             kind => !own_exprs(kind).iter().any(|e| e.has_exists()),
@@ -4449,13 +4491,19 @@ mod tests {
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER NOT EXISTS {?s <urn:q> ?b . FILTER NOT EXISTS {?b <urn:p> ?s}}}",
                 true,
             ),
-            // an EXISTS evaluated per distinct key, in an OPTIONAL condition or BIND
+            // an EXISTS answered from a key set in BIND, and in an OPTIONAL condition,
+            // whose conditional OPTIONAL is slower in the cursor
+            (
+                "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(EXISTS {?s <urn:q> ?b} AS ?e)} GROUP BY ?e",
+                true,
+            ),
             (
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c}}}",
                 false,
             ),
+            // and one evaluated per distinct key inside a larger expression
             (
-                "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(EXISTS {?s <urn:q> ?b} AS ?e)} GROUP BY ?e",
+                "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(IF(EXISTS {?s <urn:q> ?b}, 1, 0) AS ?e)} GROUP BY ?e",
                 false,
             ),
             (
