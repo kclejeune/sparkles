@@ -204,7 +204,7 @@ implementation status.
 | [Explanations](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | Why, bounded why-not, entailment diffs and minimal supports are available. The reasoner can keep bounded witnesses per fact. Inferred visibility and review protections that read them remain planned. |
 | [Validation and forms](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | SHACL, ShEx, write guards and generated forms are available, including nested read models in the Rust library. Form checks use bounded shape-dependent targets and refuse incomplete discovery. Atomic nested editing, remaining editors and producer admission remain planned. |
 | [Schema discovery](reasoning/README.md#reasoning-validation-and-schema) | Complete within the documented discovery scope. | Class and predicate profiles, schema diffs and constrained shape drafts are available. Drafts retain the limits in the compatibility boundaries. |
-| [OWL 2 ontology API](reasoning/README.md#owl-2-ontologies) | Partially complete. | The OWL 2 axiom model, RDF mappings, profile checks, functional-style reader, axiom diffs, Rust handle, HTTP API, MCP tool and CLI are available. Bindings and other extensions remain in items 537, 539 to 541 and NEW-ITEM-1. |
+| [OWL 2 ontology API](reasoning/README.md#owl-2-ontologies) | Partially complete. | The OWL 2 axiom model, RDF mappings, profile checks, functional-style reader, axiom diffs, Rust handle, HTTP API, MCP tool and CLI are available. Bindings and other extensions remain in items 537, 539 to 541 and 559. |
 
 ### Server and security
 

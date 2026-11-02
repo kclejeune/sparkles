@@ -697,7 +697,7 @@ item 540 adds both.
 
 **Imports.** A read follows `owl:imports` only to graphs of the dataset that the caller
 can read. Fetching is refused, because a read route would otherwise make outbound
-requests. Roadmap item NEW-ITEM-1 adds fetching through the outbound policy.
+requests. Roadmap item 559 adds fetching through the outbound policy.
 
 **Caching.** The handle keeps the last four reads of up to two million triples each. An
 entry is keyed by commit, graphs, imports and mode, so any commit replaces it, and only

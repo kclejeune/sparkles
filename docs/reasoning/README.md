@@ -362,7 +362,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   materialized inferences and no warning when a reasoning run reads axioms outside RL.
   Roadmap item 537.
 * An ontology read does not fetch an `owl:imports` target that is not a graph of the
-  dataset. Roadmap item NEW-ITEM-1.
+  dataset. Roadmap item 559.
 * An ontology read has no size budget of its own beyond the query deadline, and its cost
   on large ontologies is not measured. Roadmap item 539.
 * The Rust ontology handle has no entity accessors such as the superclasses of a class
@@ -390,7 +390,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 537](../ROADMAP.md), [item NEW-ITEM-1](../ROADMAP.md), [item 539](../ROADMAP.md), [item 540](../ROADMAP.md), [item 541](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 537](../ROADMAP.md), [item 539](../ROADMAP.md), [item 540](../ROADMAP.md), [item 541](../ROADMAP.md), [item 559](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.
