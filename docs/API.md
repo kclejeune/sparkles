@@ -1858,6 +1858,42 @@ in functional-style syntax (`ofn`), with the dataset's prefixes, and in its JSON
 (`axiom`), with the graph it was read from. `format=ofn` answers one functional-style
 document of the page, as `text/owl-functional`.
 
+`GET /$/ontology/{ds}/entities` lists the entities the ontology declares or, in a lenient
+read, types by their use, as `{kind, iri}` in IRI order, 100 at a time by default and at
+most 10,000 (`limit`, `offset`, and `next` in the answer). `kind` keeps the kinds it
+lists, comma separated, such as `Class,ObjectProperty`.
+
+`GET /$/ontology/{ds}/entity?iri=IRI` answers what the ontology says about one entity.
+`kinds` lists the kinds the IRI has, and `labels` and `annotations` its `rdfs:label`
+literals and annotation assertions. Each kind adds a member. `class` has
+`superClasses`, `subClasses`, `equivalentClasses`, `disjointClasses`, `disjointUnions`,
+`keys` and `instances`. `objectProperty` has `domains`, `ranges`, `superProperties`,
+`subProperties`, `equivalentProperties`, `disjointProperties`, `inverseProperties` and
+`characteristics`. `dataProperty` has the domains, ranges and hierarchy and `functional`,
+`annotationProperty` the hierarchy, domains and ranges, `datatype` its `definitions`, and
+`namedIndividual` its `types`, `sameIndividuals`, `differentIndividuals` and
+`assertions`. Each expression is `{ofn, expression}`, its functional-style form and its
+JSON form. Without `assertions=true` the instances, types, equalities, inequalities and
+property assertions are those the read holds, such as annotated assertions and class
+assertions of class expressions. With it, they also stream from the store's assertions
+in the graphs read, at most `limit` of each list, 100 by default, and `truncated` says
+whether a list was cut. `kind` answers one kind only. An IRI that the ontology neither
+declares nor uses as an entity, or as that `kind`, is `404`. An entity that only the
+stored assertions use is found as the class of a class assertion, the property of a
+property assertion, or the subject of an assertion or object of an equality for an
+individual. With `inferences=true` the lists include the
+materialized closure, such as the inferred superclasses of a class.
+
+```json
+{ "dataset": "uni", "commit": 12, "iri": "http://ex.org/Professor", "kinds": ["Class"],
+  "labels": [{ "@value": "Professor" }], "annotations": [],
+  "class": { "superClasses": [{ "ofn": "ObjectSomeValuesFrom(:teaches :Course)",
+      "expression": { "type": "ObjectSomeValuesFrom", "property": "http://ex.org/teaches", "class": "http://ex.org/Course" } }],
+    "subClasses": [], "equivalentClasses": [], "disjointClasses": [], "disjointUnions": [],
+    "keys": [], "instances": [] },
+  "assertions": false, "truncated": false }
+```
+
 The JSON form of an axiom names its type and its operands. IRIs are strings, an
 anonymous individual is `_:label`, an inverse property is `{"inverseOf": IRI}` and a
 literal is `{"@value": …, "@type": …}` or `{"@value": …, "@language": …}`. A class
@@ -1878,7 +1914,11 @@ one report per profile. A report says whether the ontology conforms and lists at
 it breaks, such as `OWL 2 Profiles §2.2.3`, a message, and the axiom and graph when the
 violation is one axiom's. The EL, QL and RL reports also list the OWL 2 DL violations,
 since each profile is a subset of OWL 2 DL. With `assertions: false` the check covers
-the terminology alone, which is faster on a large data graph.
+the terminology alone, which is faster on a large data graph. The DL rules include the
+literal rules of the structural specification. A literal of a datatype in the OWL 2
+datatype map needs a lexical form of that datatype (§5.7), a datatype restriction needs
+facets and values from its datatype's facet space (§7.5), and a datatype that a datatype
+definition introduces cannot type a literal or be restricted (§9.4).
 
 `POST /$/ontology/{ds}/axioms` adds the axioms of `add` and removes those of `remove` in
 one commit. A removed axiom takes its triples with it, including the blank nodes of its
@@ -1916,15 +1956,58 @@ the `diff` endpoint. A commit that the dataset's history no longer keeps is `410
 
 The library's `sparkles::handles::ontology::wire::call` answers the same operations
 in the same JSON forms, and the bindings call it. Python's `Dataset.ontology` has
-`summary`, `axioms`, `check`, `edit`, `remove_entity` and `diff`, with the members as
-keyword arguments, and `Axiom` reads and writes one axiom with structural equality.
-Node.js's `dataset.ontology` has `summary`, `axiomPage`, `axioms` (an async iterable in
-batches), `check`, `edit`, `removeEntity` and `diff`. On the JVM,
-`DatasetGraphSparkles.ontology()` has the same operations, and `SparklesOnt.model`
-returns a `jena-ontapi` `OntModel` over a Sparkles graph
+`summary`, `axioms`, `entities`, `entity`, `check`, `edit`, `remove_entity` and `diff`,
+with the members as keyword arguments, and `Axiom` reads and writes one axiom with
+structural equality. Node.js's `dataset.ontology` has `summary`, `axiomPage`, `axioms`
+(an async iterable in batches), `entities`, `entity`, `check`, `edit`, `removeEntity`
+and `diff`. On the JVM, `DatasetGraphSparkles.ontology()` has the same operations,
+`SparklesOnt` has them over one graph, and `SparklesOnt.model` returns a `jena-ontapi`
+`OntModel` over a Sparkles graph
 ([integrations](integrations/README.md#libraries-and-bindings)). An axiom given to an
 edit is its JSON form or a string in functional-style syntax with the dataset's
 prefixes.
+
+Typed constructors build axioms without writing their syntax. Python's `sparkles.owl`
+and Node.js's `owl` namespace have one constructor per axiom type and per expression,
+named after its functional-style form and taking its operands in the same order, such as
+`SubClassOf(sub, sup)`, `ObjectSomeValuesFrom(property, class)` and
+`DatatypeRestriction(datatype, (facet, value))`. Entity constructors such as `Class(iri)`
+type an IRI, and `Declaration` takes one. A plain string is an IRI, except as a literal
+or an annotation value, where `IRI(iri)` marks an IRI. Python's constructors answer an
+`Axiom`, and an axiom the forward mapping cannot write, such as a `DisjointClasses` of
+one class, raises `ValueError`. Node.js's answer the JSON form, and the n-ary axioms take
+their operands as an array, followed by an options object with `annotations`.
+
+```python
+from sparkles import owl
+ds.ontology.edit("http://ex.org/onto", add=[
+    owl.SubClassOf(owl.Class("http://ex.org/Professor"),
+                   owl.ObjectSomeValuesFrom(owl.ObjectProperty("http://ex.org/teaches"),
+                                            owl.Class("http://ex.org/Course"))),
+])
+ds.ontology.entity("http://ex.org/Professor", "http://ex.org/onto")["class"]["superClasses"]
+```
+
+In Rust, `ds.ontology().graph(iri)` starts a scope over the request structures, with
+`imports`, `mode`, `at`, `inferences` and `options`, that ends in `open`, `check`,
+`diff`, `remove_entity` or `edit`. `edit` takes a closure that adds and removes axioms on
+an editor and commits once. The open ontology's `class(iri)` and the other lookups answer
+`NotFound` for an IRI that is not that kind of entity, its `ontology` member has the
+accessors such as `super_classes`, and `instances`, `types_of` and `property_assertions`
+stream assertions from the store.
+
+```rust
+let onto = ds.ontology().graph("http://ex.org/onto");
+onto.edit(|o| {
+    o.add(Axiom::sub_class_of(Class::new("http://ex.org/Professor"), Class::new("http://ex.org/Person")))?;
+    Ok(())
+})?;
+let o = onto.open()?;
+let prof = o.class("http://ex.org/Professor")?;
+for sup in o.ontology.super_classes(&prof) {
+    println!("{sup}");
+}
+```
 
 Graph Store writes and `/{ds}/upload` read an OWL 2 functional-style document sent as
 `text/owl-functional` or in a `.ofn` file. It is loaded as the triples its axioms map

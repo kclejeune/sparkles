@@ -473,6 +473,26 @@ fn entries() -> Vec<(&'static str, Entry)> {
                 o.assertions(&any(), |_, _, _| Ok(true));
             }
         }),
+        op_if!(
+            "ontology",
+            "listOntologyEntities",
+            "ontology.entities",
+            |ds| {
+                if let Ok(o) = ds.ontology().open(&any(), &any()) {
+                    o.ontology.entities(any());
+                }
+            }
+        ),
+        op_if!("ontology", "getOntologyEntity", "ontology.entity", |ds| {
+            if let Ok(o) = ds.ontology().open(&any(), &any()) {
+                o.entity(any(), "i", &any());
+                o.ontology.super_classes(sparkles::owl::Class::new("c"));
+                o.instances(&any(), &any(), |_, _| Ok(true));
+                o.types_of(&any(), &any(), |_, _| Ok(true));
+                o.equalities(&any(), &any(), |_, _| Ok(true));
+                o.property_assertions(&any(), &any(), |_, _| Ok(true));
+            }
+        }),
         op_if!("ontology", "checkOntology", "ontology.check", |ds| {
             ds.ontology().check(&any(), &any(), &any());
         }),
@@ -1075,6 +1095,7 @@ const EXTRA_KEYS: &[&str] = &[
     "dataset.branch",
     "dataset.run_mapping",
     "history.wait_for_commit",
+    "ontology.remove_entity",
     "history.prune",
     "history.tick",
     "indexes.vector.embed_until_idle",
@@ -1123,6 +1144,13 @@ fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
     ds.indexes()
         .vector()
         .embed_until_idle(std::time::Duration::ZERO);
+    #[cfg(feature = "ontology")]
+    {
+        ds.ontology().remove_entity(&any(), "i", &any());
+        let scope = ds.ontology().graph("default");
+        scope.open();
+        scope.edit(|e| e.add(any()).map(|_| ()));
+    }
     #[cfg(feature = "backup")]
     {
         let repos = cat.repositories().unwrap();

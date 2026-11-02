@@ -364,6 +364,18 @@ impl From<ObjectProperty> for ObjectPropertyExpression {
     }
 }
 
+impl From<&ObjectProperty> for ObjectPropertyExpression {
+    fn from(p: &ObjectProperty) -> ObjectPropertyExpression {
+        ObjectPropertyExpression::Property(p.clone())
+    }
+}
+
+impl From<&ObjectPropertyExpression> for ObjectPropertyExpression {
+    fn from(p: &ObjectPropertyExpression) -> ObjectPropertyExpression {
+        p.clone()
+    }
+}
+
 /// A facet restriction of a datatype restriction.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FacetRestriction {
@@ -470,6 +482,18 @@ impl ClassExpression {
 impl From<Class> for ClassExpression {
     fn from(c: Class) -> ClassExpression {
         ClassExpression::Class(c)
+    }
+}
+
+impl From<&Class> for ClassExpression {
+    fn from(c: &Class) -> ClassExpression {
+        ClassExpression::Class(c.clone())
+    }
+}
+
+impl From<&ClassExpression> for ClassExpression {
+    fn from(c: &ClassExpression) -> ClassExpression {
+        c.clone()
     }
 }
 

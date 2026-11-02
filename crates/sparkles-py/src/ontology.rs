@@ -1,5 +1,5 @@
 //! The OWL 2 ontology of a dataset's graphs (spec F21 Phase 2): its summary, axioms,
-//! profile checks, edits and diffs, and `Axiom`, a frozen axiom with structural equality
+//! entities, profile checks, edits and diffs, and `Axiom`, a frozen axiom with structural equality
 //! whose `str()` is functional-style syntax.
 //!
 //! The handle passes its arguments to the library's JSON operations
@@ -161,6 +161,21 @@ fn at_json(ob: Option<&Bound<'_, PyAny>>) -> PyResult<J> {
     Ok(J::String(s))
 }
 
+/// A list of names as one comma-separated string: a str, or an iterable of str.
+fn names_json(ob: Option<&Bound<'_, PyAny>>) -> PyResult<J> {
+    let Some(ob) = ob.filter(|o| !o.is_none()) else {
+        return Ok(J::Null);
+    };
+    if let Ok(s) = ob.cast::<PyString>() {
+        return Ok(J::String(s.to_str()?.to_string()));
+    }
+    let mut v = Vec::new();
+    for x in ob.try_iter()? {
+        v.push(x?.extract::<String>()?);
+    }
+    Ok(J::String(v.join(",")))
+}
+
 fn profiles_json(ob: Option<&Bound<'_, PyAny>>) -> PyResult<J> {
     let Some(ob) = ob.filter(|o| !o.is_none()) else {
         return Ok(J::Null);
@@ -307,6 +322,83 @@ impl PyOntologies {
         a.insert("offset".into(), json!(offset));
         let j = self.run(py, "axioms", a, cancel, timeout, false)?;
         answer(py, j, &["axioms"])
+    }
+
+    /// One page of the entities of the kinds in `kind` (all kinds by default), each a
+    /// dict with its `kind` and `iri`, as `GET /$/ontology/{ds}/entities` lists them.
+    #[pyo3(signature=(graph=None, *, kind=None, limit=100, offset=0, imports=true, mode="lenient", at=None, inferences=false, cancel=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn entities<'py>(
+        &self,
+        py: Python<'py>,
+        graph: Option<&Bound<'py, PyAny>>,
+        kind: Option<&Bound<'py, PyAny>>,
+        limit: usize,
+        offset: usize,
+        imports: bool,
+        mode: &str,
+        at: Option<&Bound<'py, PyAny>>,
+        inferences: bool,
+        cancel: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut a = base(graph, imports, mode, inferences)?;
+        a.insert("at".into(), at_json(at)?);
+        a.insert("kind".into(), names_json(kind)?);
+        a.insert("limit".into(), json!(limit));
+        a.insert("offset".into(), json!(offset));
+        let j = self.run(py, "entities", a, cancel, timeout, false)?;
+        answer(py, j, &[])
+    }
+
+    /// What the ontology says about the entity `iri`: its `kinds`, `labels` and
+    /// `annotations`, and for each kind a dict of its accessors, such as `superClasses`
+    /// under `class` or `domains` under `objectProperty`. Each expression is a dict with
+    /// its functional-style form `ofn` and its JSON form `expression`. With `assertions`,
+    /// the instances of a class and the types and property assertions of an individual
+    /// also come from the store, at most `limit` of each. An IRI the ontology does not
+    /// have as an entity, or as `kind`, raises `NotFoundError`.
+    #[pyo3(signature=(iri, graph=None, *, kind=None, assertions=false, limit=100, imports=true, mode="lenient", at=None, inferences=false, cancel=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn entity<'py>(
+        &self,
+        py: Python<'py>,
+        iri: &Bound<'py, PyAny>,
+        graph: Option<&Bound<'py, PyAny>>,
+        kind: Option<String>,
+        assertions: bool,
+        limit: usize,
+        imports: bool,
+        mode: &str,
+        at: Option<&Bound<'py, PyAny>>,
+        inferences: bool,
+        cancel: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut a = base(graph, imports, mode, inferences)?;
+        a.insert("at".into(), at_json(at)?);
+        a.insert(
+            "iri".into(),
+            J::String(crate::terms::iri_from_py(iri)?.into_string()),
+        );
+        a.insert("kind".into(), json!(kind));
+        a.insert("assertions".into(), json!(assertions));
+        a.insert("limit".into(), json!(limit));
+        let j = self.run(py, "entity", a, cancel, timeout, false)?;
+        let out = answer(py, j.clone(), &[])?;
+        // property assertions carry an `Axiom`, as listings do
+        if let Some(J::Array(list)) = j.pointer("/namedIndividual/assertions") {
+            let target = out.get_item("namedIndividual")?.get_item("assertions")?;
+            for (n, e) in list.iter().enumerate() {
+                let Some(v) = e.get("axiom") else { continue };
+                let ax = owl::json::read_axiom(v)
+                    .map_err(|e| PyValueError::new_err(format!("unreadable axiom: {e}")))?;
+                target
+                    .get_item(n)?
+                    .set_item("axiom", Bound::new(py, PyAxiom(ax))?)?;
+            }
+        }
+        Ok(out)
     }
 
     /// One report per profile (`el`, `ql`, `rl`, `dl`; `dl` by default), over the

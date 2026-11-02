@@ -62,7 +62,7 @@ use oxrdf::{NamedOrBlankNode, Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_owl::profiles::{CheckOptions, Checker, Profile, Report};
 use sparkles_owl::read::{self, Mode, ReadOptions};
-use sparkles_owl::{Axiom, AxiomType, Entity, EntityKind, vocab, write};
+use sparkles_owl::{Axiom, AxiomKind, AxiomType, Entity, EntityKind, Individual, vocab, write};
 use sparkles_reasoner::inputs::{GraphRef, Import, ImportMode, Inputs};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -264,50 +264,520 @@ impl Opened {
         mut f: impl FnMut(Option<Axiom>, &Triple, u32) -> Result<bool>,
     ) -> Result<()> {
         let opts = &*crate::overview::one_deadline(opts)?;
-        let snap = &self.snapshot;
-        let rdf_type = snap.lookup_iri(vocab::RDF_TYPE);
-        let mut n = 0usize;
-        let stopped = std::cell::Cell::new(false);
+        let mut stream = self.stream(opts);
         for (g, id) in self.inner.graph_ids.iter().enumerate() {
             let Some(id) = id else { continue };
-            let mut each = |q: &[Id; 4]| -> Result<bool> {
-                n += 1;
-                if n.is_multiple_of(4096) {
-                    check(opts)?;
-                }
-                if self.inner.terminological.contains(&q[1]) || self.inner.mains.contains(q) {
-                    return Ok(true);
-                }
-                let Some(t) = triple_of(snap, q) else {
-                    return Ok(true);
-                };
-                // class assertions with a structural type or a class expression were read
-                if Some(q[1]) == rdf_type && read::is_terminological(&t, &|_| false) {
-                    return Ok(true);
-                }
+            let more = stream.scan(Perm::Gspo, &[id.0], |t, _| {
                 let ax = self.ontology.map_assertion(&t);
-                let more = f(ax, &t, g as u32)?;
-                stopped.set(!more);
-                Ok(more)
-            };
-            snap.scan(Perm::Gspo, &[id.0], |c| {
-                match c {
-                    Chunk::Block(b, s, e) => {
-                        for i in s..e {
-                            if !each(&Perm::Gspo.to_quad(&b.key(i)))? {
-                                return Ok(false);
-                            }
-                        }
-                    }
-                    Chunk::Row(k) => return each(&Perm::Gspo.to_quad(&k)),
-                }
-                Ok(true)
+                f(ax, &t, g as u32)
             })?;
-            if stopped.get() {
+            if !more {
                 break;
             }
         }
         Ok(())
+    }
+
+    fn stream<'a>(&'a self, opts: &'a QueryOptions) -> Stream<'a> {
+        Stream {
+            o: self,
+            opts,
+            rdf_type: self.snapshot.lookup_iri(vocab::RDF_TYPE),
+            n: 0,
+        }
+    }
+
+    /// The graph index of the stored graph `id`, when the ontology read it.
+    fn graph_index(&self, id: Id) -> Option<u32> {
+        self.inner
+            .graph_ids
+            .iter()
+            .position(|g| *g == Some(id))
+            .map(|n| n as u32)
+    }
+
+    /// The store id of an individual, when the store holds it.
+    fn individual_id(&self, i: &Individual) -> Option<Id> {
+        match i {
+            Individual::Named(n) => self.snapshot.lookup_iri(n.as_str()),
+            Individual::Anonymous(a) => self
+                .snapshot
+                .lookup_term(&Term::BlankNode(oxrdf::BlankNode::new(a.label()).ok()?)),
+        }
+    }
+
+    // ------------------------------------------------------ entity accessors ------
+
+    /// The entity of kind `kind` that `iri` names (spec F21 §2.5): `NotFound` when the
+    /// ontology neither declares it nor, in a lenient read, uses it as that kind. The
+    /// accessors of [`read::Ontology`], such as
+    /// [`super_classes`](read::Ontology::super_classes), answer from the terminology.
+    ///
+    /// An entity that only the assertions left in the store use is found too, by the
+    /// probes of [`kinds`](Self::kinds) under the deadline of `opts`.
+    pub fn entity(&self, kind: EntityKind, iri: &str, opts: &QueryOptions) -> Result<Entity> {
+        if let Some(e) = self.ontology.entity(kind, iri) {
+            return Ok(e);
+        }
+        if self.stored_kinds(iri, &[kind], opts)?.contains(&kind) {
+            return Ok(entity_of(kind, iri));
+        }
+        Err(Error::NotFound(format!(
+            "the ontology neither declares nor uses <{iri}> as {}",
+            kind.name()
+        )))
+    }
+
+    /// The kinds of [`read::Ontology::kinds`], with the kinds that only the assertions
+    /// left in the store give `iri`. A class is found as the class of a stored class
+    /// assertion, a property as the property of a stored property or annotation
+    /// assertion, and a named individual as the subject of a stored assertion or the
+    /// object of a stored equality or inequality. Each probe stops at its first match,
+    /// runs only for a kind the read does not already give, and keeps the deadline and
+    /// cancellation of `opts`.
+    pub fn kinds(&self, iri: &str, opts: &QueryOptions) -> Result<Vec<EntityKind>> {
+        use EntityKind as K;
+        let mut kinds = self.ontology.kinds(iri);
+        let missing: Vec<EntityKind> = [
+            K::Class,
+            K::ObjectProperty,
+            K::DataProperty,
+            K::AnnotationProperty,
+            K::NamedIndividual,
+        ]
+        .into_iter()
+        .filter(|k| !kinds.contains(k))
+        .collect();
+        kinds.extend(self.stored_kinds(iri, &missing, opts)?);
+        kinds.sort();
+        kinds.dedup();
+        Ok(kinds)
+    }
+
+    /// The kinds among `wanted` that the assertions the store holds in the graphs read
+    /// give `iri` (see [`kinds`](Self::kinds)).
+    fn stored_kinds(
+        &self,
+        iri: &str,
+        wanted: &[EntityKind],
+        opts: &QueryOptions,
+    ) -> Result<Vec<EntityKind>> {
+        use AxiomKind as A;
+        use EntityKind as K;
+        let mut found = Vec::new();
+        let Some(id) = self.snapshot.lookup_iri(iri) else {
+            return Ok(found);
+        };
+        if vocab::is_reserved(iri) || wanted.is_empty() {
+            return Ok(found);
+        }
+        let opts = &*crate::overview::one_deadline(opts)?;
+        let mut stream = self.stream(opts);
+        let want = |k: &EntityKind| wanted.contains(k);
+        let read = |q: &[Id; 4]| self.graph_index(q[3]).is_some();
+        if want(&K::Class)
+            && let Some(t) = stream.rdf_type
+        {
+            stream.scan(Perm::Pos, &[t.0, id.0], |t, q| {
+                if read(q)
+                    && let Some(Axiom {
+                        kind: A::ClassAssertion(..),
+                        ..
+                    }) = self.ontology.map_assertion(&t)
+                {
+                    found.push(K::Class);
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+        }
+        if [K::ObjectProperty, K::DataProperty, K::AnnotationProperty]
+            .iter()
+            .any(want)
+        {
+            // the first assertion that maps decides the property's kind
+            stream.scan(Perm::Pso, &[id.0], |t, q| {
+                if !read(q) {
+                    return Ok(true);
+                }
+                let Some(ax) = self.ontology.map_assertion(&t) else {
+                    return Ok(true);
+                };
+                let kind = match ax.kind {
+                    A::ObjectPropertyAssertion(..) => K::ObjectProperty,
+                    A::DataPropertyAssertion(..) => K::DataProperty,
+                    A::AnnotationAssertion(..) => K::AnnotationProperty,
+                    _ => return Ok(false),
+                };
+                if want(&kind) {
+                    found.push(kind);
+                }
+                Ok(false)
+            })?;
+        }
+        if want(&K::NamedIndividual) {
+            let individual = |ax: &Axiom| !matches!(ax.kind, A::AnnotationAssertion(..));
+            let mut hit = false;
+            for g in self.inner.graph_ids.iter().flatten() {
+                stream.scan(Perm::Gspo, &[g.0, id.0], |t, _| {
+                    hit = self
+                        .ontology
+                        .map_assertion(&t)
+                        .is_some_and(|ax| individual(&ax));
+                    Ok(!hit)
+                })?;
+                if hit {
+                    break;
+                }
+            }
+            for p in [vocab::OWL_SAME_AS, vocab::OWL_DIFFERENT_FROM] {
+                let Some(pid) = self.snapshot.lookup_iri(p).filter(|_| !hit) else {
+                    continue;
+                };
+                stream.scan(Perm::Ops, &[id.0, pid.0], |t, q| {
+                    hit = read(q) && self.ontology.map_assertion(&t).is_some();
+                    Ok(!hit)
+                })?;
+            }
+            if hit {
+                found.push(K::NamedIndividual);
+            }
+        }
+        Ok(found)
+    }
+
+    /// The class `iri` names, or `NotFound`. This and the other typed lookups probe the
+    /// store without a deadline; [`entity`](Self::entity) takes one.
+    pub fn class(&self, iri: &str) -> Result<sparkles_owl::Class> {
+        self.entity(EntityKind::Class, iri, &QueryOptions::default())
+            .map(|_| sparkles_owl::Class::new(iri))
+    }
+
+    /// The object property `iri` names, or `NotFound`.
+    pub fn object_property(&self, iri: &str) -> Result<sparkles_owl::ObjectProperty> {
+        self.entity(EntityKind::ObjectProperty, iri, &QueryOptions::default())
+            .map(|_| sparkles_owl::ObjectProperty::new(iri))
+    }
+
+    /// The data property `iri` names, or `NotFound`.
+    pub fn data_property(&self, iri: &str) -> Result<sparkles_owl::DataProperty> {
+        self.entity(EntityKind::DataProperty, iri, &QueryOptions::default())
+            .map(|_| sparkles_owl::DataProperty::new(iri))
+    }
+
+    /// The annotation property `iri` names, or `NotFound`.
+    pub fn annotation_property(&self, iri: &str) -> Result<sparkles_owl::AnnotationProperty> {
+        self.entity(
+            EntityKind::AnnotationProperty,
+            iri,
+            &QueryOptions::default(),
+        )
+        .map(|_| sparkles_owl::AnnotationProperty::new(iri))
+    }
+
+    /// The datatype `iri` names, or `NotFound`.
+    pub fn datatype(&self, iri: &str) -> Result<sparkles_owl::Datatype> {
+        self.entity(EntityKind::Datatype, iri, &QueryOptions::default())
+            .map(|_| sparkles_owl::Datatype::new(iri))
+    }
+
+    /// The named individual `iri` names, or `NotFound`.
+    pub fn named_individual(&self, iri: &str) -> Result<sparkles_owl::NamedIndividual> {
+        self.entity(EntityKind::NamedIndividual, iri, &QueryOptions::default())
+            .map(|_| sparkles_owl::NamedIndividual::new(iri))
+    }
+
+    /// Stream the instances of the class `c` (spec F21 §4.5): the class assertions the
+    /// read holds, then those the store holds in the graphs read, which the store's
+    /// predicate-object index finds without reading the other assertions. `f` gets each
+    /// individual with its graph, once per graph that asserts it, and returns `false` to
+    /// stop.
+    pub fn instances(
+        &self,
+        c: &sparkles_owl::Class,
+        opts: &QueryOptions,
+        mut f: impl FnMut(Individual, u32) -> Result<bool>,
+    ) -> Result<()> {
+        let opts = &*crate::overview::one_deadline(opts)?;
+        let ce = sparkles_owl::ClassExpression::from(c);
+        for (ax, origins) in &self.ontology.axioms {
+            if let AxiomKind::ClassAssertion(x, i) = &ax.kind
+                && *x == ce
+            {
+                for g in origin_graphs(origins) {
+                    if !f(i.clone(), g)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let mut stream = self.stream(opts);
+        let (Some(t), Some(cid)) = (stream.rdf_type, self.snapshot.lookup_iri(c.as_str())) else {
+            return Ok(());
+        };
+        stream.scan(Perm::Pos, &[t.0, cid.0], |t, q| {
+            let Some(g) = self.graph_index(q[3]) else {
+                return Ok(true);
+            };
+            match self.ontology.map_assertion(&t) {
+                Some(Axiom {
+                    kind: AxiomKind::ClassAssertion(_, i),
+                    ..
+                }) => f(i, g),
+                _ => Ok(true),
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Stream the classes of the class assertions about `i`: those the read holds, then
+    /// those the store holds in the graphs read. `f` returns `false` to stop.
+    pub fn types_of(
+        &self,
+        i: &Individual,
+        opts: &QueryOptions,
+        mut f: impl FnMut(sparkles_owl::ClassExpression, u32) -> Result<bool>,
+    ) -> Result<()> {
+        let opts = &*crate::overview::one_deadline(opts)?;
+        for (ax, origins) in &self.ontology.axioms {
+            if let AxiomKind::ClassAssertion(c, x) = &ax.kind
+                && x == i
+            {
+                for g in origin_graphs(origins) {
+                    if !f(c.clone(), g)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let mut stream = self.stream(opts);
+        let (Some(t), Some(iid)) = (stream.rdf_type, self.individual_id(i)) else {
+            return Ok(());
+        };
+        for (g, id) in self.inner.graph_ids.iter().enumerate() {
+            let Some(id) = id else { continue };
+            let more = stream.scan(Perm::Gspo, &[id.0, iid.0, t.0], |t, _| {
+                match self.ontology.map_assertion(&t) {
+                    Some(Axiom {
+                        kind: AxiomKind::ClassAssertion(c, _),
+                        ..
+                    }) => f(c, g as u32),
+                    _ => Ok(true),
+                }
+            })?;
+            if !more {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream the object and data property assertions, positive and negative, whose
+    /// subject is `i`: those the read holds, then those the store holds in the graphs
+    /// read, which the store finds by subject. `f` returns `false` to stop.
+    pub fn property_assertions(
+        &self,
+        i: &Individual,
+        opts: &QueryOptions,
+        mut f: impl FnMut(Axiom, u32) -> Result<bool>,
+    ) -> Result<()> {
+        use AxiomKind as K;
+        let opts = &*crate::overview::one_deadline(opts)?;
+        let about = |ax: &Axiom| match &ax.kind {
+            K::ObjectPropertyAssertion(_, s, _)
+            | K::NegativeObjectPropertyAssertion(_, s, _)
+            | K::DataPropertyAssertion(_, s, _)
+            | K::NegativeDataPropertyAssertion(_, s, _) => s == i,
+            _ => false,
+        };
+        for (ax, origins) in &self.ontology.axioms {
+            if about(ax) {
+                for g in origin_graphs(origins) {
+                    if !f(ax.clone(), g)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let mut stream = self.stream(opts);
+        let Some(iid) = self.individual_id(i) else {
+            return Ok(());
+        };
+        for (g, id) in self.inner.graph_ids.iter().enumerate() {
+            let Some(id) = id else { continue };
+            let more = stream.scan(Perm::Gspo, &[id.0, iid.0], |t, _| {
+                match self.ontology.map_assertion(&t) {
+                    Some(ax) if about(&ax) => f(ax, g as u32),
+                    _ => Ok(true),
+                }
+            })?;
+            if !more {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Opened {
+    /// Stream the individual equalities and inequalities that name `i`: the
+    /// `SameIndividual` and `DifferentIndividuals` axioms the read holds, then the
+    /// `owl:sameAs` and `owl:differentFrom` assertions the store holds in the graphs read
+    /// with `i` as subject or object. `f` gets each axiom once per graph that holds it
+    /// and returns `false` to stop.
+    pub fn equalities(
+        &self,
+        i: &Individual,
+        opts: &QueryOptions,
+        mut f: impl FnMut(Axiom, u32) -> Result<bool>,
+    ) -> Result<()> {
+        use AxiomKind as K;
+        let opts = &*crate::overview::one_deadline(opts)?;
+        for (ax, origins) in &self.ontology.axioms {
+            if let K::SameIndividual(set) | K::DifferentIndividuals(set) = &ax.kind
+                && set.contains(i)
+            {
+                for g in origin_graphs(origins) {
+                    if !f(ax.clone(), g)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let Some(iid) = self.individual_id(i) else {
+            return Ok(());
+        };
+        let mut stream = self.stream(opts);
+        let preds: Vec<Id> = [vocab::OWL_SAME_AS, vocab::OWL_DIFFERENT_FROM]
+            .iter()
+            .filter_map(|p| self.snapshot.lookup_iri(p))
+            .collect();
+        for &p in &preds {
+            // the other individual and graph of each assertion streamed by subject, so
+            // that its reverse in the same graph, the same axiom, is not streamed again
+            let mut streamed: FxHashSet<(Id, Id)> = FxHashSet::default();
+            for (g, id) in self.inner.graph_ids.iter().enumerate() {
+                let Some(id) = id else { continue };
+                let more = stream.scan(Perm::Gspo, &[id.0, iid.0, p.0], |t, q| {
+                    match self.ontology.map_assertion(&t) {
+                        Some(ax) => {
+                            streamed.insert((q[2], q[3]));
+                            f(ax, g as u32)
+                        }
+                        None => Ok(true),
+                    }
+                })?;
+                if !more {
+                    return Ok(());
+                }
+            }
+            let more = stream.scan(Perm::Ops, &[iid.0, p.0], |t, q| {
+                // a reflexive assertion, or the reverse of one streamed by subject in
+                // the same graph, was streamed already
+                if q[0] == iid || streamed.contains(&(q[0], q[3])) {
+                    return Ok(true);
+                }
+                match (self.graph_index(q[3]), self.ontology.map_assertion(&t)) {
+                    (Some(g), Some(ax)) => f(ax, g),
+                    _ => Ok(true),
+                }
+            })?;
+            if !more {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The distinct graphs of an axiom's origins, or graph 0 for an axiom without one.
+fn origin_graphs(origins: &[read::Origin]) -> BTreeSet<u32> {
+    let mut graphs: BTreeSet<u32> = origins.iter().map(|o| o.graph).collect();
+    if graphs.is_empty() {
+        graphs.insert(0);
+    }
+    graphs
+}
+
+/// The entity of kind `kind` that `iri` names.
+fn entity_of(kind: EntityKind, iri: &str) -> Entity {
+    use sparkles_owl as o;
+    match kind {
+        EntityKind::Class => Entity::Class(o::Class::new(iri)),
+        EntityKind::Datatype => Entity::Datatype(o::Datatype::new(iri)),
+        EntityKind::ObjectProperty => Entity::ObjectProperty(o::ObjectProperty::new(iri)),
+        EntityKind::DataProperty => Entity::DataProperty(o::DataProperty::new(iri)),
+        EntityKind::AnnotationProperty => {
+            Entity::AnnotationProperty(o::AnnotationProperty::new(iri))
+        }
+        EntityKind::NamedIndividual => Entity::NamedIndividual(o::NamedIndividual::new(iri)),
+    }
+}
+
+/// A scan of the assertions an open read left in the store, with the filter that
+/// [`Opened::assertions`], [`Opened::instances`], [`Opened::types_of`] and
+/// [`Opened::property_assertions`] share, under one deadline.
+struct Stream<'a> {
+    o: &'a Opened,
+    opts: &'a QueryOptions,
+    rdf_type: Option<Id>,
+    n: usize,
+}
+
+impl Stream<'_> {
+    /// The triple of a stored quad when it is an assertion the read left in the store:
+    /// not terminological, not the main triple of an annotated axiom the read holds, and
+    /// not a class assertion of a structural type or a class expression.
+    fn assertion(o: &Opened, rdf_type: Option<Id>, q: &[Id; 4]) -> Option<Triple> {
+        let inner = &o.inner;
+        if inner.terminological.contains(&q[1]) || inner.mains.contains(q) {
+            return None;
+        }
+        let t = triple_of(&o.snapshot, q)?;
+        // class assertions with a structural type or a class expression were read
+        if Some(q[1]) == rdf_type && read::is_terminological(&t, &|_| false) {
+            return None;
+        }
+        Some(t)
+    }
+
+    /// Scan `perm` under `prefix`, calling `f` with each assertion and its quad until it
+    /// returns `false`; the answer is whether the scan ran to its end.
+    fn scan(
+        &mut self,
+        perm: Perm,
+        prefix: &[u64],
+        mut f: impl FnMut(Triple, &[Id; 4]) -> Result<bool>,
+    ) -> Result<bool> {
+        let stopped = std::cell::Cell::new(false);
+        let (o, opts, rdf_type) = (self.o, self.opts, self.rdf_type);
+        let n = &mut self.n;
+        let mut each = |q: &[Id; 4]| -> Result<bool> {
+            *n += 1;
+            if n.is_multiple_of(4096) {
+                check(opts)?;
+            }
+            let Some(t) = Self::assertion(o, rdf_type, q) else {
+                return Ok(true);
+            };
+            let more = f(t, q)?;
+            stopped.set(!more);
+            Ok(more)
+        };
+        o.snapshot.scan(perm, prefix, |c| {
+            match c {
+                Chunk::Block(b, s, e) => {
+                    for i in s..e {
+                        if !each(&perm.to_quad(&b.key(i)))? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                Chunk::Row(k) => return each(&perm.to_quad(&k)),
+            }
+            Ok(true)
+        })?;
+        Ok(!stopped.get())
     }
 }
 
@@ -374,6 +844,219 @@ impl Dataset {
     /// The OWL 2 ontology of this dataset's graphs (spec F21).
     pub fn ontology(&self) -> Ontologies {
         Ontologies { ds: self.clone() }
+    }
+}
+
+impl Ontologies {
+    /// A scope over one graph, `"default"` or an IRI, as spec F21 §2.1 writes it:
+    /// `ds.ontology().graph(iri).imports(true).open()`. An invalid IRI is reported by
+    /// the call that ends the scope.
+    pub fn graph(&self, graph: &str) -> OntologyScope {
+        self.graphs([graph])
+    }
+
+    /// A scope over several graphs; the first takes the axioms an edit adds.
+    pub fn graphs<S: AsRef<str>>(&self, graphs: impl IntoIterator<Item = S>) -> OntologyScope {
+        let mut error = None;
+        let mut list = Vec::new();
+        for g in graphs {
+            match GraphRef::parse(g.as_ref()) {
+                Ok(g) => list.push(g),
+                Err(e) => {
+                    error.get_or_insert(e);
+                }
+            }
+        }
+        let mut scope = self.scope(OntologyRequest::default());
+        if !list.is_empty() {
+            scope.req.graphs = list;
+        }
+        scope.error = error;
+        scope
+    }
+
+    /// A scope over the ontology a request names.
+    pub fn scope(&self, req: OntologyRequest) -> OntologyScope {
+        OntologyScope {
+            handle: self.clone(),
+            req,
+            opts: QueryOptions::default(),
+            error: None,
+        }
+    }
+}
+
+/// An ontology selected by [`Ontologies::graph`]: a builder over [`OntologyRequest`] and
+/// the [`QueryOptions`] of the calls that end it, which are the handle's calls with these
+/// arguments.
+///
+/// ```
+/// use sparkles::Dataset;
+/// use sparkles::owl::{Axiom, Class, ClassExpression, ObjectProperty};
+///
+/// let ds = Dataset::memory();
+/// let onto = ds.ontology().graph("http://ex.org/onto");
+/// let teaches = ClassExpression::some(
+///     ObjectProperty::new("http://ex.org/teaches"),
+///     Class::new("http://ex.org/Course"),
+/// );
+/// onto.edit(|o| {
+///     o.add(Axiom::sub_class_of(Class::new("http://ex.org/Professor"), teaches.clone()))?;
+///     Ok(())
+/// })?;
+/// let o = onto.open()?;
+/// let prof = o.class("http://ex.org/Professor")?;
+/// assert_eq!(o.ontology.super_classes(&prof), vec![teaches]);
+/// # Ok::<_, sparkles::Error>(())
+/// ```
+#[derive(Clone)]
+pub struct OntologyScope {
+    handle: Ontologies,
+    req: OntologyRequest,
+    opts: QueryOptions,
+    error: Option<String>,
+}
+
+impl OntologyScope {
+    /// Follow `owl:imports` to graphs of the dataset (the default) or not.
+    pub fn imports(mut self, follow: bool) -> Self {
+        self.req.imports = if follow {
+            ImportMode::Dataset
+        } else {
+            ImportMode::None
+        };
+        self
+    }
+
+    /// Read leniently (the default) or strictly.
+    pub fn mode(mut self, mode: Mode) -> Self {
+        self.req.mode = mode;
+        self
+    }
+
+    /// Read the state `at` names instead of the head.
+    pub fn at(mut self, at: At) -> Self {
+        self.req.at = Some(at);
+        self
+    }
+
+    /// Also read the materialized inferences ([`OntologyRequest::inferences`]).
+    pub fn inferences(mut self, read: bool) -> Self {
+        self.req.inferences = read;
+        self
+    }
+
+    /// The options of the calls: the caller's grants, the deadline and, for edits, the
+    /// commit's options in `opts.write`.
+    pub fn options(mut self, opts: QueryOptions) -> Self {
+        self.opts = opts;
+        self
+    }
+
+    /// The request the scope stands for.
+    pub fn request(&self) -> &OntologyRequest {
+        &self.req
+    }
+
+    fn ready(&self) -> Result<()> {
+        match &self.error {
+            Some(e) => Err(Error::invalid(e.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Ontologies::open`].
+    pub fn open(&self) -> Result<Opened> {
+        self.ready()?;
+        self.handle.open(&self.req, &self.opts)
+    }
+
+    /// [`Ontologies::check`] against `profiles`, with the other defaults of
+    /// [`CheckRequest`].
+    pub fn check(&self, profiles: &[Profile]) -> Result<Vec<Report>> {
+        self.check_with(&CheckRequest {
+            profiles: profiles.to_vec(),
+            ..Default::default()
+        })
+    }
+
+    /// [`Ontologies::check`].
+    pub fn check_with(&self, check: &CheckRequest) -> Result<Vec<Report>> {
+        self.ready()?;
+        self.handle.check(&self.req, check, &self.opts)
+    }
+
+    /// [`Ontologies::diff`].
+    pub fn diff(&self, from: &At, to: &At, assertions: bool) -> Result<OntologyDiff> {
+        self.ready()?;
+        self.handle
+            .diff(&self.req, from, to, assertions, &self.opts)
+    }
+
+    /// [`Ontologies::remove_entity`].
+    pub fn remove_entity(&self, iri: &str) -> Result<EditOutcome> {
+        self.ready()?;
+        self.handle.remove_entity(&self.req, iri, &self.opts)
+    }
+
+    /// Edit the ontology in one commit (spec F21 §2.1): `f` names the axioms to add and
+    /// remove on an [`Editor`], and [`Ontologies::edit`] then applies them under the
+    /// writer lock. `f` runs before the lock is taken, so it cannot see the head the
+    /// edit writes on; an error from it ends the edit before anything is written.
+    pub fn edit(&self, f: impl FnOnce(&mut Editor) -> Result<()>) -> Result<EditOutcome> {
+        self.ready()?;
+        let mut e = Editor::default();
+        f(&mut e)?;
+        self.handle.edit(&self.req, &e.req, &self.opts)
+    }
+}
+
+/// The additions and removals of an [`OntologyScope::edit`], collected into an
+/// [`EditRequest`].
+#[derive(Clone, Debug, Default)]
+pub struct Editor {
+    req: EditRequest,
+}
+
+impl Editor {
+    /// Add an axiom; one the forward mapping cannot write is `Invalid`.
+    pub fn add(&mut self, axiom: Axiom) -> Result<&mut Self> {
+        sparkles_owl::validate::axiom(&axiom).map_err(|e| Error::invalid(e.0))?;
+        self.req.add.push(axiom);
+        Ok(self)
+    }
+
+    /// Remove an axiom. Removing one the ontology does not hold is not an error; the
+    /// outcome lists it among the absent axioms.
+    pub fn remove(&mut self, axiom: &Axiom) -> Result<&mut Self> {
+        sparkles_owl::validate::axiom(axiom).map_err(|e| Error::invalid(e.0))?;
+        self.req.remove.push(axiom.clone());
+        Ok(self)
+    }
+
+    /// Also declare the entities that added axioms use and the ontology does not
+    /// declare (the default), or not.
+    pub fn declare(&mut self, declare: bool) -> &mut Self {
+        self.req.declare = Some(declare);
+        self
+    }
+
+    /// The graph that takes the added axioms, `"default"` or an IRI, instead of the
+    /// scope's first graph.
+    pub fn target(&mut self, graph: &str) -> Result<&mut Self> {
+        self.req.graph = Some(GraphRef::parse(graph).map_err(Error::invalid)?);
+        Ok(self)
+    }
+
+    /// The commit message.
+    pub fn message(&mut self, message: impl Into<String>) -> &mut Self {
+        self.req.message = Some(message.into());
+        self
+    }
+
+    /// The request collected so far.
+    pub fn request(&self) -> &EditRequest {
+        &self.req
     }
 }
 

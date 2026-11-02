@@ -77,9 +77,13 @@ def test_checks(ds: sparkles.Dataset) -> None:
 
 def test_edits_and_diffs(ds: sparkles.Dataset) -> None:
     head = ds.ontology.summary()["commit"]
-    done = ds.ontology.edit(remove=[sparkles.Axiom(A1)], add=f"SubClassOf(<{EX}Course> owl:Thing)")
+    done = ds.ontology.edit(
+        remove=[sparkles.Axiom(A1)], add=f"SubClassOf(<{EX}Course> owl:Thing)"
+    )
     assert done["removed"] == 1 and done["added"] == 1 and done["committed"]
-    assert sparkles.Axiom(A1) not in [e["axiom"] for e in ds.ontology.axioms()["axioms"]]
+    assert sparkles.Axiom(A1) not in [
+        e["axiom"] for e in ds.ontology.axioms()["axioms"]
+    ]
     d = ds.ontology.diff(head)
     assert d["addedCount"] == 1 and d["removedCount"] == 1
     assert d["removed"][0]["axiom"] == sparkles.Axiom(A1)
@@ -91,7 +95,9 @@ def test_edits_and_diffs(ds: sparkles.Dataset) -> None:
         ds.ontology.edit(add=[3])
 
 
-@pytest.mark.skipif("reasoning" not in sparkles.FEATURES, reason="built without reasoning")
+@pytest.mark.skipif(
+    "reasoning" not in sparkles.FEATURES, reason="built without reasoning"
+)
 def test_inferred_views() -> None:
     d = sparkles.Dataset()
     d.update(
@@ -103,6 +109,215 @@ def test_inferred_views() -> None:
     assert plain["inferences"] == {"included": False}
     d.reasoning.run(profile="rdfs")
     inferred = d.ontology.axioms(type="SubClassOf", inferences=True, limit=1000)
-    assert inferred["inferences"]["included"] and inferred["inferences"]["stale"] is False
+    assert (
+        inferred["inferences"]["included"] and inferred["inferences"]["stale"] is False
+    )
     assert a_c in [e["axiom"] for e in inferred["axioms"]]
-    assert a_c not in [e["axiom"] for e in d.ontology.axioms(type="SubClassOf")["axioms"]]
+    assert a_c not in [
+        e["axiom"] for e in d.ontology.axioms(type="SubClassOf")["axioms"]
+    ]
+
+
+# --------------------------------------------------- roadmap item 540: accessors ----
+
+
+def test_entities_and_entity_accessors(ds: sparkles.Dataset) -> None:
+    page = ds.ontology.entities(kind="Class")
+    assert {e["iri"] for e in page["entities"]} == {EX + "Professor", EX + "Course"}
+    assert page["total"] == 2 and page["next"] is None
+    both = ds.ontology.entities(kind=["Class", "ObjectProperty"], limit=1)
+    assert both["total"] == 3 and both["next"] == 1
+    prof = ds.ontology.entity(EX + "Professor")
+    assert prof["kinds"] == ["Class"]
+    (sup,) = prof["class"]["superClasses"]
+    assert sup["expression"]["type"] == "ObjectSomeValuesFrom"
+    assert prof["class"]["instances"] == []
+    # the class assertion of :ann stays in the store until assertions are asked for
+    streamed = ds.ontology.entity(sparkles.NamedNode(EX + "Professor"), assertions=True)
+    assert [i["expression"] for i in streamed["class"]["instances"]] == [EX + "ann"]
+    teaches = ds.ontology.entity(EX + "teaches", kind="ObjectProperty")
+    assert teaches["objectProperty"]["domains"] == []
+    with pytest.raises(sparkles.NotFoundError):
+        ds.ontology.entity(EX + "teaches", kind="Class")
+    with pytest.raises(sparkles.NotFoundError):
+        ds.ontology.entity(EX + "nothing")
+
+
+def test_individual_accessors_stream_assertions(ds: sparkles.Dataset) -> None:
+    ds.update(
+        f"{PREFIXES} INSERT DATA {{ :ann a owl:NamedIndividual ; :teaches :bob . }}"
+    )
+    ann = ds.ontology.entity(EX + "ann", assertions=True)
+    ind = ann["namedIndividual"]
+    assert [t["expression"] for t in ind["types"]] == [EX + "Professor"]
+    (pa,) = ind["assertions"]
+    assert isinstance(pa["axiom"], sparkles.Axiom)
+    assert pa["type"] == "ObjectPropertyAssertion"
+    assert ds.ontology.entity(EX + "ann")["namedIndividual"]["types"] == []
+
+
+# ------------------------------------------ roadmap item 540: typed constructors ----
+
+
+def test_numeric_literals_take_xml_schema_lexical_forms() -> None:
+    from sparkles import owl
+
+    xsd = "http://www.w3.org/2001/XMLSchema#"
+    assert owl.Literal(float("inf")) == {"@value": "INF", "@type": xsd + "double"}
+    assert owl.Literal(float("-inf"))["@value"] == "-INF"
+    assert owl.Literal(float("nan"))["@value"] == "NaN"
+    assert owl.Literal(10**21) == {"@value": "1" + "0" * 21, "@type": xsd + "integer"}
+    assert owl.Literal(float("inf"), datatype=xsd + "float")["@value"] == "INF"
+
+
+def test_typed_constructors_build_axioms() -> None:
+    from sparkles import owl
+
+    ax = owl.SubClassOf(
+        owl.Class(EX + "Professor"),
+        owl.ObjectSomeValuesFrom(
+            owl.ObjectProperty(EX + "teaches"), owl.Class(EX + "Course")
+        ),
+    )
+    assert ax == sparkles.Axiom(A1)
+    assert owl.Declaration(owl.Class(EX + "A")) == sparkles.Axiom(
+        f"Declaration(Class(<{EX}A>))"
+    )
+    labelled = owl.AnnotationAssertion(
+        "http://www.w3.org/2000/01/rdf-schema#label", sparkles.NamedNode(EX + "A"), "A"
+    )
+    assert str(labelled) == f'AnnotationAssertion(rdfs:label <{EX}A> "A")'
+    seen = owl.AnnotationAssertion(
+        "http://www.w3.org/2000/01/rdf-schema#seeAlso", EX + "A", owl.IRI(EX + "B")
+    )
+    assert str(seen) == f"AnnotationAssertion(rdfs:seeAlso <{EX}A> <{EX}B>)"
+    xsd = owl.XSD
+    cases = [
+        (
+            owl.EquivalentClasses(
+                EX + "A",
+                owl.ObjectIntersectionOf(EX + "B", owl.ObjectComplementOf(EX + "C")),
+            ),
+            f"EquivalentClasses(<{EX}A> ObjectIntersectionOf(<{EX}B> ObjectComplementOf(<{EX}C>)))",
+        ),
+        (
+            owl.DisjointUnion(EX + "A", EX + "B", EX + "C"),
+            f"DisjointUnion(<{EX}A> <{EX}B> <{EX}C>)",
+        ),
+        (
+            owl.SubObjectPropertyOf(
+                owl.ObjectPropertyChain(EX + "p", EX + "q"), EX + "r"
+            ),
+            f"SubObjectPropertyOf(ObjectPropertyChain(<{EX}p> <{EX}q>) <{EX}r>)",
+        ),
+        (
+            owl.InverseObjectProperties(EX + "p", owl.ObjectInverseOf(EX + "q")),
+            f"InverseObjectProperties(<{EX}p> ObjectInverseOf(<{EX}q>))",
+        ),
+        (owl.TransitiveObjectProperty(EX + "p"), f"TransitiveObjectProperty(<{EX}p>)"),
+        (
+            owl.DataPropertyRange(
+                EX + "d",
+                owl.DatatypeRestriction(xsd + "integer", (xsd + "minInclusive", 5)),
+            ),
+            f'DataPropertyRange(<{EX}d> DatatypeRestriction(xsd:integer xsd:minInclusive "5"^^xsd:integer))',
+        ),
+        (
+            owl.SubClassOf(EX + "A", owl.ObjectMaxCardinality(1, EX + "p", EX + "B")),
+            f"SubClassOf(<{EX}A> ObjectMaxCardinality(1 <{EX}p> <{EX}B>))",
+        ),
+        (
+            owl.SubClassOf(
+                EX + "A",
+                owl.DataSomeValuesFrom(EX + "d", owl.DataOneOf(True, 2.5, "x")),
+            ),
+            f'SubClassOf(<{EX}A> DataSomeValuesFrom(<{EX}d> DataOneOf("2.5"^^xsd:double "true"^^xsd:boolean "x")))',
+        ),
+        (
+            owl.HasKey(EX + "A", [EX + "p"], [EX + "d"]),
+            f"HasKey(<{EX}A> (<{EX}p>) (<{EX}d>))",
+        ),
+        (
+            owl.DataPropertyAssertion(
+                EX + "d", owl.AnonymousIndividual("x"), owl.Literal("chat", lang="fr")
+            ),
+            f'DataPropertyAssertion(<{EX}d> _:x "chat"@fr)',
+        ),
+        (
+            owl.NegativeObjectPropertyAssertion(EX + "p", EX + "a", EX + "b"),
+            f"NegativeObjectPropertyAssertion(<{EX}p> <{EX}a> <{EX}b>)",
+        ),
+    ]
+    for ax, ofn in cases:
+        assert ax == sparkles.Axiom(ofn), (str(ax), ofn)
+    annotated = owl.SubClassOf(
+        EX + "A",
+        EX + "B",
+        annotations=[
+            owl.Annotation(
+                owl.IRI("http://www.w3.org/2000/01/rdf-schema#comment"), "why"
+            )
+        ],
+    )
+    assert annotated.json()["annotations"][0]["value"] == {"@value": "why"}
+    with pytest.raises(ValueError):
+        owl.DisjointClasses(EX + "A")
+    with pytest.raises(TypeError):
+        owl.Declaration(EX + "A")
+
+
+def test_every_axiom_type_has_a_constructor() -> None:
+    from sparkles import owl
+
+    names = {
+        "Declaration",
+        "SubClassOf",
+        "EquivalentClasses",
+        "DisjointClasses",
+        "DisjointUnion",
+        "SubObjectPropertyOf",
+        "EquivalentObjectProperties",
+        "DisjointObjectProperties",
+        "InverseObjectProperties",
+        "ObjectPropertyDomain",
+        "ObjectPropertyRange",
+        "FunctionalObjectProperty",
+        "InverseFunctionalObjectProperty",
+        "ReflexiveObjectProperty",
+        "IrreflexiveObjectProperty",
+        "SymmetricObjectProperty",
+        "AsymmetricObjectProperty",
+        "TransitiveObjectProperty",
+        "SubDataPropertyOf",
+        "EquivalentDataProperties",
+        "DisjointDataProperties",
+        "DataPropertyDomain",
+        "DataPropertyRange",
+        "FunctionalDataProperty",
+        "DatatypeDefinition",
+        "HasKey",
+        "SameIndividual",
+        "DifferentIndividuals",
+        "ClassAssertion",
+        "ObjectPropertyAssertion",
+        "NegativeObjectPropertyAssertion",
+        "DataPropertyAssertion",
+        "NegativeDataPropertyAssertion",
+        "AnnotationAssertion",
+        "SubAnnotationPropertyOf",
+        "AnnotationPropertyDomain",
+        "AnnotationPropertyRange",
+    }
+    assert len(names) == 37
+    assert names <= set(owl.__all__)
+
+
+def test_an_edit_takes_constructed_axioms(ds: sparkles.Dataset) -> None:
+    from sparkles import owl
+
+    done = ds.ontology.edit(
+        add=[owl.SubClassOf(owl.Class(EX + "Course"), owl.Class(EX + "Event"))]
+    )
+    assert done["added"] >= 1
+    course = ds.ontology.entity(EX + "Course")
+    assert [c["expression"] for c in course["class"]["superClasses"]] == [EX + "Event"]

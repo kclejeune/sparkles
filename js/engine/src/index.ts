@@ -8,6 +8,7 @@ import {
   type CommitChanges,
 } from './admin.js';
 export * from './admin.js';
+export * as owl from './owl.js';
 export * from './utilities.js';
 export type { BackupPolicy, PolicyRun, RetentionReport, RetentionBackup } from './policy.js';
 import { policyResult, type BackupPolicy, type PolicyRun, type RetentionReport } from './policy.js';

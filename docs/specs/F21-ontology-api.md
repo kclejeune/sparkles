@@ -10,7 +10,8 @@
 > reads that include materialized inferences, the OWL 2 RL warning of reasoning runs and
 > the profile partition that F17's OWL 2 QL rewriting is to use. Phase 3 provides the
 > functional-style syntax reader, an MCP tool and ontology diffs between commits. Roadmap
-> items 539, 540, 541 and 559 extend the delivered phases.
+> items 540 and 541 added entity accessors, an edit builder, typed axiom constructors and
+> literal checks, and items 539 and 559 extend the delivered phases.
 >
 > **User docs:** [OWL 2 ontologies](../reasoning/README.md#owl-2-ontologies) and
 > [API: Ontology](../API.md#ontology).
@@ -755,6 +756,88 @@ have no RDF/XML form meet the DL species their cases state. Four profile members
 differ where the cases disagree with the Profiles grammars, also listed. Property tests
 write random axioms with the writer and read them back.
 
+### Entity accessors and the edit builder
+
+Roadmap item 540 adds the entity accessors and the edit builder of §2.1. The accessors
+are methods of `sparkles_owl::read::Ontology`, so they read files as well as datasets.
+`entities`, `classes`, `object_properties` and the other kinds list what the ontology
+declares or a lenient read types by use, and `class(iri)` and the other lookups find one
+entity. `labels`, `annotations`, `super_classes`, `sub_classes`, `equivalent_classes`,
+`disjoint_classes`, `keys`, the domains, ranges, hierarchy, inverses and characteristics
+of object and data properties, the hierarchy, domains and ranges of annotation
+properties, datatype definitions, and the types, equalities and property assertions of
+individuals answer from the axioms the read holds, sorted and each once. Each accessor
+goes over the axioms once per call, without an index by entity. With an inferred read,
+the answers include the materialized closure.
+
+The store keeps assertions out of the read (§4.5), so the open ontology adds streams for
+them. `Opened::instances` finds the class assertions of a class through the store's
+predicate-object index, and `Opened::types_of` and `Opened::property_assertions` find an
+individual's assertions by subject in each graph read. Each first answers the
+assertions the read holds, such as annotated ones, and then those the store holds,
+with the filter that `Opened::assertions` applies. `Opened::class` and the other
+lookups answer `NotFound` for an IRI that the ontology does not have as that kind, as
+§2.5 asks. An entity that only the stored assertions use is found by a probe of the
+graphs read that stops at its first match. A class is found as the class of a class
+assertion, a property as the property of a property or annotation assertion, and a named
+individual as the subject of an assertion or the object of an `owl:sameAs` or
+`owl:differentFrom` assertion. The probes keep the request's deadline and cancellation.
+
+`Ontologies::graph` and `Ontologies::graphs` start an `OntologyScope`, a builder over
+`OntologyRequest` and `QueryOptions` with `imports`, `mode`, `at`, `inferences` and
+`options`. It ends in `open`, `check`, `check_with`, `diff`, `remove_entity` or `edit`.
+`edit` takes a closure that names additions and removals on an `Editor`, and then makes
+one edit of the handle under the writer lock. The closure runs before the lock is taken,
+so it cannot read the head the edit writes on.
+
+The JSON operations add `entities` and `entity`, which `GET /$/ontology/{ds}/entities`
+and `GET /$/ontology/{ds}/entity` serve. `entity` answers an IRI's kinds, labels and
+annotations and, for each kind, the accessors of that kind, with each expression in
+functional-style syntax and in its JSON form. With `assertions`, it streams the
+instances of a class and the types, equalities, inequalities and property assertions of
+an individual from the store, at most `limit` of each. Each stream reports an assertion
+once for every graph that holds it. Python's `Dataset.ontology`, Node.js's `dataset.ontology`
+and the JVM's `SparklesOnt` and `DatasetGraphSparkles.ontology()` have both operations.
+The JVM's `SparklesOnt` also gains `removeEntity`, which the bindings table now lists.
+The CLI and the MCP tool do not have the two operations, roadmap item 578.
+
+Python's `sparkles.owl` and Node.js's `owl` namespace hold typed constructors named
+after the functional-style forms, one for each of the 37 axiom types and each class
+expression, data range and property expression. They build the JSON form, so Python's
+answer an `Axiom` and Node.js's answer plain objects that an edit takes. Entities are
+typed by their constructor, and a plain string is an IRI except where an annotation
+value or a literal is expected. The library tests cover the accessors, the streams, the
+builder and both operations. The binding tests cover both operations and the
+constructors, and a Python test checks that every axiom type has a constructor.
+
+### Literal checks
+
+Roadmap item 541 adds the literal rules of the structural specification to the OWL 2 DL
+check. The lexical form of each literal whose datatype is in the OWL 2 datatype map must
+be in that datatype's lexical space (§5.7). The lexical spaces follow XML Schema 1.1
+Part 2 for the `xsd:` datatypes, without trimming white space, with the ranges of the
+integer datatypes and the `xsd:language` pattern. `owl:rational` takes the forms of §4.1,
+`owl:real` has none, `rdf:PlainLiteral` is a string, `@` and an empty or well-formed
+language tag, and `rdf:XMLLiteral` is well-balanced XML content without namespace
+resolution, whose entity references are the five that XML predefines. Each pair of a datatype restriction must be in the facet space of its
+datatype (§7.5), so the facet must be one of the datatype's normative facets and its
+value must be in the value space the facet ranges over. The value is judged by its data
+value, so `"3.0"^^xsd:decimal` is a valid length and an `xsd:token` is a valid pattern.
+A pattern must parse as an XML Schema regular expression and a language range must
+follow the grammar of RFC 4647. A pattern whose groups or subtracted classes nest more
+than 250 deep is refused too, which bounds the check's recursion. A datatype that a datatype definition introduces
+occurs in no literal and no restriction (§9.4). The check covers the literals of
+annotations and of the headers of the ontology and its imports too, since §5.7 applies to every literal of the
+ontology, and it covers streamed assertions, as the other rules of one axiom do.
+
+The rules are part of OWL 2 DL, so every EL, QL and RL report lists their violations with
+the other DL violations. The profiles' own datatype lists are subsets of the OWL 2
+datatype map with the same lexical spaces, and their checks of which datatypes a profile
+allows are unchanged. A literal of a datatype outside the map has no known lexical space,
+and the datatype check reports the datatype instead. Edits still write ill-typed
+literals, since the forward mapping can write them, and a check reports them. The W3C
+OWL 2 test cases agree as before, and profile tests cover each datatype and facet rule.
+
 ### Decisions and departures from the design
 
 **Shared expressions in strict mode.** The first design made a blank node structure used
@@ -787,9 +870,9 @@ refused with code `invalid-axiom`.
 
 **The Rust API.** The handle takes request structures, `OntologyRequest`,
 `CheckRequest` and `EditRequest`, with `QueryOptions` for the caller's grants and
-deadline, instead of the builder and closure of §2.1. Entity accessors such as
-`super_classes` are not provided, and callers filter axioms by type and entity. Roadmap
-item 540 adds both.
+deadline. Roadmap item 540 adds the builder, the closure and the entity accessors of
+§2.1 over them, as the section [Entity accessors and the edit builder](#entity-accessors-and-the-edit-builder)
+describes.
 
 **Imports.** A read follows `owl:imports` only to graphs of the dataset that the caller
 can read. Fetching is refused, because a read route would otherwise make outbound
@@ -822,9 +905,7 @@ answers open question 3 for punned IRIs by removing both uses.
 **Commits.** The routes accept `at=` to read an earlier commit, which answers open
 question 5. An edit reads the ontology from the head it writes on, under the writer lock.
 
-**Unchecked.** The profile checks do not check literals' lexical forms against their
-datatypes, roadmap item 541. A8 is tested with graph views, not with C12b
-triple protections.
+**Unchecked.** A8 is tested with graph views, not with C12b triple protections.
 
 The parity test of the library administration API (P06) maps each route to its library
 call and to its Python, Node.js and JVM names.
@@ -836,8 +917,8 @@ members with each operation and answers in the routes' JSON forms. Python has on
 `Axiom` class, read from functional-style syntax or the JSON form, rather than a class
 per axiom type, so that an axiom is written as the recommendation writes it. Node.js
 axioms keep IRIs as strings in the JSON form rather than RDF/JS terms, so that they are
-the objects the HTTP client sends and receives. Typed axiom constructors in Python and
-Node.js come with the Rust edit builder of roadmap item 540.
+the objects the HTTP client sends and receives. Roadmap item 540 adds typed axiom
+constructors that build these forms.
 
 **The JVM model's copy.** The copy that `SparklesOnt.model` reads is filled once, so a
 commit made through another handle after the model is built is not seen by it, except

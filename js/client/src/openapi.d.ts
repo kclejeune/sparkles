@@ -2166,6 +2166,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ontology/{ds}/entities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Ontology entities
+         * @description The entities the ontology declares or, in a lenient read, types by their use, with their kinds, in IRI order and one page at a time.
+         */
+        get: operations["listOntologyEntities"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ontology/{ds}/entity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Ontology entity
+         * @description What the ontology says about one entity: its kinds, labels and annotations, and for each kind the superclasses, subclasses, equivalent and disjoint classes, keys and instances of a class, the domains, ranges, hierarchy, inverses and characteristics of a property, the definitions of a datatype, and the types, equalities and property assertions of an individual. Each expression comes in functional-style syntax and in its JSON form. With `assertions=true`, the instances of a class and the types and property assertions of an individual also come from the assertions the store holds, at most `limit` of each. An IRI that the ontology neither declares nor uses as an entity, or as the `kind` asked for, is `404`.
+         */
+        get: operations["getOntologyEntity"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/openapi.json": {
         parameters: {
             query?: never;
@@ -17032,6 +17072,100 @@ export interface operations {
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
             410: components["responses"]["Gone"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listOntologyEntities: {
+        parameters: {
+            query?: {
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description Also read the materialized inferences while the dataset has them. */
+                inferences?: boolean;
+                /** @description Entity kinds, comma separated, such as `Class,ObjectProperty` (all kinds by default). */
+                kind?: string;
+                /** @description The most entities listed, from 1 to 10,000 (100 by default). */
+                limit?: number;
+                /** @description The entities skipped. */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of entities. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getOntologyEntity: {
+        parameters: {
+            query?: {
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description Also read the materialized inferences while the dataset has them, so that the superclasses include the materialized closure. */
+                inferences?: boolean;
+                /** @description The entity's IRI. */
+                iri?: string;
+                /** @description The one entity kind answered, such as `Class` (every kind the IRI has by default). */
+                kind?: string;
+                /** @description Also read the instances, types and property assertions the store holds. */
+                assertions?: boolean;
+                /** @description The most entries of each streamed list, from 1 to 10,000 (100 by default). */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The entity. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
             default: components["responses"]["Error"];
         };
     };

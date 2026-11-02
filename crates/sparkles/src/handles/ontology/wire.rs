@@ -21,7 +21,10 @@ use crate::sparql::QueryOptions;
 use serde_json::{Map, Value as J, json};
 use sparkles_owl::ofn::Renderer;
 use sparkles_owl::profiles::{Profile, Report};
-use sparkles_owl::{Axiom, AxiomType, read};
+use sparkles_owl::{
+    Axiom, AxiomKind, AxiomType, ClassExpression, DataRange, Entity, EntityKind, Individual,
+    ObjectPropertyExpression, SubObjectPropertyExpression, read,
+};
 use sparkles_reasoner::inputs::{GraphRef, ImportMode};
 use std::collections::BTreeSet;
 
@@ -302,16 +305,343 @@ pub fn diff_lines(d: &OntologyDiff, limit: usize, r: &Renderer) -> String {
     s
 }
 
+// ------------------------------------------------------------- entities ------
+
+/// The entities of the kinds `kinds` (every kind when `None`), one page at a time.
+pub fn entities_body(
+    name: &str,
+    o: &Opened,
+    req: &OntologyRequest,
+    kinds: Option<&BTreeSet<EntityKind>>,
+    limit: usize,
+    offset: usize,
+) -> J {
+    let mut all: Vec<Entity> = Vec::new();
+    for k in EntityKind::ALL {
+        if kinds.is_none_or(|ks| ks.contains(&k)) {
+            all.extend(o.ontology.entities(k));
+        }
+    }
+    all.sort_by(|a, b| (a.iri(), a.kind()).cmp(&(b.iri(), b.kind())));
+    let total = all.len();
+    let list: Vec<J> = all
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|e| json!({ "kind": e.kind().name(), "iri": e.iri().as_str() }))
+        .collect();
+    let next = offset + list.len();
+    let mut j = opened_json(name, o, req);
+    j["entities"] = J::Array(list);
+    j["total"] = json!(total);
+    j["offset"] = json!(offset);
+    j["next"] = if next < total { json!(next) } else { J::Null };
+    j
+}
+
+/// Parse a comma-separated list of entity kinds, such as `Class,ObjectProperty`.
+pub fn parse_entity_kinds(s: &str) -> Result<BTreeSet<EntityKind>> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(|k| {
+            EntityKind::parse(k).ok_or_else(|| {
+                bad(format!(
+                    "unknown entity kind '{k}': {}",
+                    EntityKind::ALL.map(|k| k.name()).join(", ")
+                ))
+            })
+        })
+        .collect()
+}
+
+/// What an entity answer reads besides the terminology.
+#[derive(Clone, Debug)]
+pub struct EntityQuery {
+    pub iri: String,
+    /// the one kind answered (every kind the IRI has when `None`)
+    pub kind: Option<EntityKind>,
+    /// also stream the assertions the store holds: the instances of a class, and the
+    /// types and property assertions of an individual
+    pub assertions: bool,
+    /// the most entries each streamed list holds
+    pub limit: usize,
+}
+
+fn ce_json(c: &ClassExpression, r: &Renderer) -> J {
+    json!({ "ofn": r.class_expression(c), "expression": sparkles_owl::json::class_expression(c) })
+}
+
+fn ope_json(p: &ObjectPropertyExpression, r: &Renderer) -> J {
+    json!({ "ofn": r.ope(p), "expression": sparkles_owl::json::ope(p) })
+}
+
+fn dr_json(d: &DataRange, r: &Renderer) -> J {
+    json!({ "ofn": r.data_range(d), "expression": sparkles_owl::json::data_range(d) })
+}
+
+fn individual_json(i: &Individual, r: &Renderer) -> J {
+    json!({ "ofn": r.individual(i), "expression": sparkles_owl::json::individual(i) })
+}
+
+fn sub_ope_json(p: &SubObjectPropertyExpression, r: &Renderer) -> J {
+    match p {
+        SubObjectPropertyExpression::Expression(p) => ope_json(p, r),
+        SubObjectPropertyExpression::Chain(ps) => json!({
+            "ofn": format!(
+                "ObjectPropertyChain({})",
+                ps.iter().map(|p| r.ope(p)).collect::<Vec<_>>().join(" ")
+            ),
+            "expression": { "chain": ps.iter().map(sparkles_owl::json::ope).collect::<Vec<_>>() },
+        }),
+    }
+}
+
+/// The JSON of what the ontology says about one entity (spec F21 §2.1): its kinds,
+/// labels and annotations, and for each kind the accessors of that kind. A kind the
+/// IRI does not have, or an IRI with no kind, is `NotFound`.
+pub fn entity_body(
+    name: &str,
+    o: &Opened,
+    req: &OntologyRequest,
+    r: &Renderer,
+    q: &EntityQuery,
+    opts: &QueryOptions,
+) -> Result<J> {
+    let onto = &o.ontology;
+    let iri = q.iri.as_str();
+    let kinds: Vec<EntityKind> = match q.kind {
+        Some(k) => {
+            o.entity(k, iri, opts)?;
+            vec![k]
+        }
+        None => o.kinds(iri, opts)?,
+    };
+    if kinds.is_empty() {
+        return Err(Error::NotFound(format!(
+            "the ontology neither declares nor uses <{iri}> as an entity"
+        )));
+    }
+    let ces = |v: Vec<ClassExpression>| -> J { v.iter().map(|c| ce_json(c, r)).collect() };
+    let opes =
+        |v: Vec<ObjectPropertyExpression>| -> J { v.iter().map(|p| ope_json(p, r)).collect() };
+    let iris = |v: Vec<sparkles_owl::Iri>| -> J { v.iter().map(|i| J::from(i.as_str())).collect() };
+    let mut truncated = false;
+    let mut j = opened_json(name, o, req);
+    j["iri"] = json!(iri);
+    j["kinds"] = json!(kinds.iter().map(|k| k.name()).collect::<Vec<_>>());
+    j["labels"] = J::Array(
+        onto.labels(iri)
+            .iter()
+            .map(sparkles_owl::json::literal)
+            .collect(),
+    );
+    j["annotations"] = J::Array(
+        onto.annotations(iri)
+            .iter()
+            .map(|a| json!({ "ofn": r.annotation(a), "annotation": sparkles_owl::json::annotation(a) }))
+            .collect(),
+    );
+    for k in &kinds {
+        match k {
+            EntityKind::Class => {
+                let c = sparkles_owl::Class::new(iri);
+                let mut instances: Vec<J> = Vec::new();
+                let mut seen: BTreeSet<Individual> = BTreeSet::new();
+                let mut each = |i: Individual| {
+                    if seen.insert(i.clone()) {
+                        if instances.len() >= q.limit {
+                            truncated = true;
+                            return false;
+                        }
+                        instances.push(individual_json(&i, r));
+                    }
+                    true
+                };
+                if q.assertions {
+                    o.instances(&c, opts, |i, _| Ok(each(i)))?;
+                } else {
+                    for i in onto.instances(&c) {
+                        if !each(i) {
+                            break;
+                        }
+                    }
+                }
+                j["class"] = json!({
+                    "superClasses": ces(onto.super_classes(&c)),
+                    "subClasses": ces(onto.sub_classes(&c)),
+                    "equivalentClasses": ces(onto.equivalent_classes(&c)),
+                    "disjointClasses": ces(onto.disjoint_classes(&c)),
+                    "disjointUnions": onto.disjoint_unions(&c).into_iter().map(|cs| ces(cs.into_iter().collect())).collect::<Vec<_>>(),
+                    "keys": onto.keys(&c).into_iter().map(|(ps, ds)| json!({
+                        "objectProperties": opes(ps.into_iter().collect()),
+                        "dataProperties": ds.iter().map(|d| d.as_str()).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                    "instances": instances,
+                });
+            }
+            EntityKind::ObjectProperty => {
+                let p = sparkles_owl::ObjectProperty::new(iri);
+                j["objectProperty"] = json!({
+                    "domains": ces(onto.object_property_domains(&p)),
+                    "ranges": ces(onto.object_property_ranges(&p)),
+                    "superProperties": opes(onto.super_object_properties(&p)),
+                    "subProperties": onto.sub_object_properties(&p).iter().map(|x| sub_ope_json(x, r)).collect::<Vec<_>>(),
+                    "equivalentProperties": opes(onto.equivalent_object_properties(&p)),
+                    "disjointProperties": opes(onto.disjoint_object_properties(&p)),
+                    "inverseProperties": opes(onto.inverse_object_properties(&p)),
+                    "characteristics": onto.object_property_characteristics(&p).iter().map(|t| t.name()).collect::<Vec<_>>(),
+                });
+            }
+            EntityKind::DataProperty => {
+                let p = sparkles_owl::DataProperty::new(iri);
+                let dps = |v: Vec<sparkles_owl::DataProperty>| -> J {
+                    v.iter().map(|d| J::from(d.as_str())).collect()
+                };
+                j["dataProperty"] = json!({
+                    "domains": ces(onto.data_property_domains(&p)),
+                    "ranges": onto.data_property_ranges(&p).iter().map(|d| dr_json(d, r)).collect::<Vec<_>>(),
+                    "superProperties": dps(onto.super_data_properties(&p)),
+                    "subProperties": dps(onto.sub_data_properties(&p)),
+                    "equivalentProperties": dps(onto.equivalent_data_properties(&p)),
+                    "disjointProperties": dps(onto.disjoint_data_properties(&p)),
+                    "functional": onto.is_functional_data_property(&p),
+                });
+            }
+            EntityKind::AnnotationProperty => {
+                let p = sparkles_owl::AnnotationProperty::new(iri);
+                let aps = |v: Vec<sparkles_owl::AnnotationProperty>| -> J {
+                    v.iter().map(|d| J::from(d.as_str())).collect()
+                };
+                j["annotationProperty"] = json!({
+                    "superProperties": aps(onto.super_annotation_properties(&p)),
+                    "subProperties": aps(onto.sub_annotation_properties(&p)),
+                    "domains": iris(onto.annotation_property_domains(&p)),
+                    "ranges": iris(onto.annotation_property_ranges(&p)),
+                });
+            }
+            EntityKind::Datatype => {
+                let d = sparkles_owl::Datatype::new(iri);
+                j["datatype"] = json!({
+                    "definitions": onto.datatype_definitions(&d).iter().map(|x| dr_json(x, r)).collect::<Vec<_>>(),
+                });
+            }
+            EntityKind::NamedIndividual => {
+                let i = Individual::named(iri);
+                let mut types: Vec<J> = Vec::new();
+                let mut assertions: Vec<J> = Vec::new();
+                if q.assertions {
+                    let mut seen: BTreeSet<ClassExpression> = BTreeSet::new();
+                    o.types_of(&i, opts, |c, _| {
+                        if seen.insert(c.clone()) {
+                            if types.len() >= q.limit {
+                                truncated = true;
+                                return Ok(false);
+                            }
+                            types.push(ce_json(&c, r));
+                        }
+                        Ok(true)
+                    })?;
+                    o.property_assertions(&i, opts, |ax, g| {
+                        if assertions.len() >= q.limit {
+                            truncated = true;
+                            return Ok(false);
+                        }
+                        assertions.push(axiom_json(&ax, Some(o.graph_name(g)), r));
+                        Ok(true)
+                    })?;
+                } else {
+                    for c in onto.types(&i) {
+                        if types.len() >= q.limit {
+                            truncated = true;
+                            break;
+                        }
+                        types.push(ce_json(&c, r));
+                    }
+                    for ax in onto.property_assertions(&i) {
+                        if assertions.len() >= q.limit {
+                            truncated = true;
+                            break;
+                        }
+                        let g = onto
+                            .axioms
+                            .get(&ax)
+                            .and_then(|v| v.first())
+                            .map(|x| x.graph);
+                        assertions.push(axiom_json(&ax, g.map(|g| o.graph_name(g)), r));
+                    }
+                }
+                let (same, different) = if q.assertions {
+                    let mut same: BTreeSet<Individual> = BTreeSet::new();
+                    let mut different: BTreeSet<Individual> = BTreeSet::new();
+                    // each list fills to the limit on its own, and the stream stops
+                    // once both are cut
+                    let (mut same_cut, mut different_cut) = (false, false);
+                    o.equalities(&i, opts, |ax, _| {
+                        let (into, cut) = match &ax.kind {
+                            AxiomKind::SameIndividual(_) => (&mut same, &mut same_cut),
+                            AxiomKind::DifferentIndividuals(_) => {
+                                (&mut different, &mut different_cut)
+                            }
+                            _ => return Ok(true),
+                        };
+                        let (AxiomKind::SameIndividual(set) | AxiomKind::DifferentIndividuals(set)) =
+                            &ax.kind
+                        else {
+                            return Ok(true);
+                        };
+                        for x in set.iter().filter(|x| **x != i) {
+                            if into.contains(x) {
+                                continue;
+                            }
+                            if into.len() >= q.limit {
+                                *cut = true;
+                                truncated = true;
+                                break;
+                            }
+                            into.insert(x.clone());
+                        }
+                        Ok(!(same_cut && different_cut))
+                    })?;
+                    (same.into_iter().collect(), different.into_iter().collect())
+                } else {
+                    (onto.same_individuals(&i), onto.different_individuals(&i))
+                };
+                j["namedIndividual"] = json!({
+                    "types": types,
+                    "sameIndividuals": same.iter().map(|x| individual_json(x, r)).collect::<Vec<_>>(),
+                    "differentIndividuals": different.iter().map(|x| individual_json(x, r)).collect::<Vec<_>>(),
+                    "assertions": assertions,
+                });
+            }
+        }
+    }
+    j["assertions"] = json!(q.assertions);
+    j["truncated"] = json!(truncated);
+    Ok(j)
+}
+
 // ------------------------------------------------------------- requests ------
 
 /// The operations [`call`] answers, in the names of the bindings' surface keys.
-pub const OPERATIONS: [&str; 6] = ["summary", "axioms", "check", "edit", "removeEntity", "diff"];
+pub const OPERATIONS: [&str; 8] = [
+    "summary",
+    "axioms",
+    "entities",
+    "entity",
+    "check",
+    "edit",
+    "removeEntity",
+    "diff",
+];
 
 /// The members each operation reads besides those that name the ontology.
 fn members(op: &str) -> &'static [&'static str] {
     match op {
         "summary" => &[],
         "axioms" => &["type", "about", "assertions", "limit", "offset"],
+        "entities" => &["kind", "limit", "offset"],
+        "entity" => &["iri", "kind", "assertions", "limit"],
         "check" => &["profiles", "assertions", "maxViolations"],
         "edit" => &["add", "remove", "declare", "target", "message"],
         "removeEntity" => &["iri", "message"],
@@ -463,6 +793,10 @@ fn profiles_of(a: &Map<String, J>) -> Result<Vec<Profile>> {
 /// - `axioms`: a page of `GET /$/ontology/{ds}/axioms`, with `type` (a list such as
 ///   `SubClassOf,ClassAssertion`), `about` (an IRI), `assertions`, `limit` and
 ///   `offset`. `about` an IRI the ontology neither declares nor uses is `NotFound`.
+/// - `entities`: a page of `GET /$/ontology/{ds}/entities`, with `kind` (a list such as
+///   `Class,ObjectProperty`), `limit` and `offset`.
+/// - `entity`: what `GET /$/ontology/{ds}/entity` says about the entity `iri`, with
+///   `kind`, `assertions` and `limit`.
 /// - `check`: the reports of `POST /$/ontology/{ds}/check`, with `profiles`,
 ///   `assertions` and `maxViolations`.
 /// - `edit`: what `POST /$/ontology/{ds}/axioms` did, with `add`, `remove`, `declare`,
@@ -522,6 +856,39 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 )));
             }
             Ok(page_body(name, &o, &req, &r, &page))
+        }
+        "entities" => {
+            let kinds = string(a, "kind")?.map(parse_entity_kinds).transpose()?;
+            let limit = number(a, "limit", 1, MAX_LIMIT)?.unwrap_or(DEFAULT_LIMIT);
+            let offset = number(a, "offset", 0, usize::MAX)?.unwrap_or(0);
+            let opts = handle.anchored(opts)?;
+            let o = handle.open(&req, &opts)?;
+            Ok(entities_body(name, &o, &req, kinds.as_ref(), limit, offset))
+        }
+        "entity" => {
+            let iri = string(a, "iri")?
+                .ok_or_else(|| bad("iri names the entity"))?
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string();
+            let kind = match string(a, "kind")? {
+                None => None,
+                Some(k) => Some(EntityKind::parse(k).ok_or_else(|| {
+                    bad(format!(
+                        "unknown entity kind '{k}': {}",
+                        EntityKind::ALL.map(|k| k.name()).join(", ")
+                    ))
+                })?),
+            };
+            let q = EntityQuery {
+                iri,
+                kind,
+                assertions: boolean(a, "assertions")?.unwrap_or(false),
+                limit: number(a, "limit", 1, MAX_LIMIT)?.unwrap_or(DEFAULT_LIMIT),
+            };
+            let opts = handle.anchored(opts)?;
+            let o = handle.open(&req, &opts)?;
+            entity_body(name, &o, &req, &r, &q, &opts)
         }
         "check" => {
             let check = CheckRequest {

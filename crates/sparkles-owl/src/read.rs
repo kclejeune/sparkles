@@ -163,7 +163,8 @@ impl Typing {
         builtin_kind(iri) == Some(k) || self.declared.get(iri).is_some_and(|x| x.has(k))
     }
 
-    fn kinds(&self, iri: &str) -> Kinds {
+    /// The kinds `iri` is declared, built in or (lenient) typed as.
+    pub fn kinds(&self, iri: &str) -> Kinds {
         let mut out = self.declared.get(iri).copied().unwrap_or_default();
         if let Some(b) = builtin_kind(iri) {
             out.add(b);

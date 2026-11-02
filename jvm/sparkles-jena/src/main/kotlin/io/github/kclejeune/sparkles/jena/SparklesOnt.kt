@@ -83,6 +83,24 @@ public object SparklesOnt {
     public fun axioms(dataset: DatasetGraphSparkles, graphIri: String? = null, query: AxiomQuery = AxiomQuery()): JsonObject =
         dataset.ontology().axioms(OntologyRead(graph = graphIri), query)
 
+    /** One page of the entities of the graph, as [SparklesOntology.entities] answers it. */
+    @JvmStatic
+    @JvmOverloads
+    public fun entities(dataset: DatasetGraphSparkles, graphIri: String? = null, kinds: List<String> = emptyList(), limit: Int = 100, offset: Long = 0): JsonObject =
+        dataset.ontology().entities(OntologyRead(graph = graphIri), kinds, limit, offset)
+
+    /** What the ontology of the graph says about one entity, as [SparklesOntology.entity] answers it. */
+    @JvmStatic
+    @JvmOverloads
+    public fun entity(dataset: DatasetGraphSparkles, iri: String, graphIri: String? = null, kind: String? = null, assertions: Boolean = false): JsonObject =
+        dataset.ontology().entity(iri, OntologyRead(graph = graphIri), kind, assertions)
+
+    /** Remove an entity of the graph in one commit, as [SparklesOntology.removeEntity] does. */
+    @JvmStatic
+    @JvmOverloads
+    public fun removeEntity(dataset: DatasetGraphSparkles, iri: String, graphIri: String? = null): JsonObject =
+        dataset.ontology().removeEntity(iri, OntologyRead(graph = graphIri))
+
     /** Add and remove axioms of the graph in one commit, as [SparklesOntology.edit] does. */
     @JvmStatic
     @JvmOverloads
@@ -289,6 +307,36 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
     @JvmOverloads public fun axioms(read: OntologyRead = OntologyRead(), query: AxiomQuery = AxiomQuery()): JsonObject = SparklesOperation().use { axioms(read, query, it) }
     public fun axioms(read: OntologyRead, query: AxiomQuery, operation: SparklesOperation): JsonObject =
         call("axioms", read.value().also { query.into(it) }, operation, false)
+
+    /** One page of the entities of the kinds `kinds` (all kinds when empty), each with its kind and IRI. */
+    @JvmOverloads public fun entities(read: OntologyRead = OntologyRead(), kinds: List<String> = emptyList(), limit: Int = 100, offset: Long = 0): JsonObject =
+        SparklesOperation().use { entities(read, kinds, limit, offset, it) }
+    public fun entities(read: OntologyRead, kinds: List<String>, limit: Int, offset: Long, operation: SparklesOperation): JsonObject {
+        require(limit > 0 && offset >= 0)
+        val args = read.value()
+        if (kinds.isNotEmpty()) args.put("kind", kinds.joinToString(","))
+        args.put("limit", limit.toLong())
+        args.put("offset", offset)
+        return call("entities", args, operation, false)
+    }
+
+    /**
+     * What the ontology says about the entity `iri`: its kinds, labels and annotations, and
+     * for each kind its superclasses, domains, ranges, types and the other accessors. With
+     * `assertions`, the instances, types and property assertions the store holds too, at
+     * most `limit` of each.
+     */
+    @JvmOverloads public fun entity(iri: String, read: OntologyRead = OntologyRead(), kind: String? = null, assertions: Boolean = false, limit: Int = 100): JsonObject =
+        SparklesOperation().use { entity(iri, read, kind, assertions, limit, it) }
+    public fun entity(iri: String, read: OntologyRead, kind: String?, assertions: Boolean, limit: Int, operation: SparklesOperation): JsonObject {
+        require(limit > 0)
+        val args = read.value()
+        args.put("iri", iri)
+        kind?.let { args.put("kind", it) }
+        args.put("assertions", assertions)
+        args.put("limit", limit.toLong())
+        return call("entity", args, operation, false)
+    }
 
     /** One report per profile (`el`, `ql`, `rl`, `dl`), over the terminology and, unless `assertions` is false, the assertions. */
     @JvmOverloads public fun check(read: OntologyRead = OntologyRead(), profiles: List<String> = listOf("dl"), assertions: Boolean = true): JsonObject =

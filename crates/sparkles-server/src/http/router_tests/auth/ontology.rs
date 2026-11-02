@@ -130,6 +130,33 @@ async fn the_ontology_holds_only_what_the_caller_reads() {
     .await;
     assert_eq!(r.status, StatusCode::OK);
     assert!(!r.text().contains("Hidden"), "{}", r.text());
+    // the entity routes read through the same view
+    let a = format!("/$/ontology/ont/entity?{OPEN}&iri=http%3A%2F%2Fex%2FA");
+    let r = as_user(&app, "ofull", "GET", &a, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains("Hidden"), "{}", r.text());
+    let r = as_user(&app, "oopen", "GET", &a, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["class"]["superClasses"], json!([]), "{}", r.text());
+    let r = as_user(
+        &app,
+        "oopen",
+        "GET",
+        &format!("/$/ontology/ont/entity?{OPEN}&iri=http%3A%2F%2Fex%2FHidden"),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let r = as_user(
+        &app,
+        "oopen",
+        "GET",
+        &format!("/$/ontology/ont/entities?{OPEN}"),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(!r.text().contains("Hidden"), "{}", r.text());
 }
 
 #[tokio::test]

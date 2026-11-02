@@ -70,6 +70,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/schema/{ds}/diff", &["GET"]),
     ("/$/ontology/{ds}", &["GET"]),
     ("/$/ontology/{ds}/axioms", &["GET", "POST"]),
+    ("/$/ontology/{ds}/entities", &["GET"]),
+    ("/$/ontology/{ds}/entity", &["GET"]),
     ("/$/ontology/{ds}/check", &["POST"]),
     ("/$/ontology/{ds}/diff", &["GET"]),
     ("/$/graph/{ds}/groups", &["POST"]),
@@ -471,6 +473,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/schema/{ds}/profiles"
         | "/$/schema/{ds}/diff"
         | "/$/ontology/{ds}"
+        | "/$/ontology/{ds}/entities"
+        | "/$/ontology/{ds}/entity"
         | "/$/ontology/{ds}/check"
         | "/$/ontology/{ds}/diff"
         | "/$/graph/{ds}/groups"
@@ -652,7 +656,10 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/$/reason/{ds}/justify"
         | "/$/forms/{ds}" => Endpoint::Query,
         "/$/forms/{ds}/check" | "/$/forms/{ds}/save" => Endpoint::Update,
-        "/$/ontology/{ds}" | "/$/ontology/{ds}/check" => Endpoint::Query,
+        "/$/ontology/{ds}"
+        | "/$/ontology/{ds}/check"
+        | "/$/ontology/{ds}/entities"
+        | "/$/ontology/{ds}/entity" => Endpoint::Query,
         "/$/ontology/{ds}/axioms" if get => Endpoint::Query,
         "/$/ontology/{ds}/axioms" => Endpoint::Update,
         "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,

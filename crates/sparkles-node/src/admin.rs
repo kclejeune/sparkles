@@ -342,6 +342,8 @@ fn writes(op: &str) -> bool {
             | "validation.guard.get"
             | "ontology.summary"
             | "ontology.axioms"
+            | "ontology.entities"
+            | "ontology.entity"
             | "ontology.check"
             | "ontology.diff"
     )

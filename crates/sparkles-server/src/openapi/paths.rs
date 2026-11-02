@@ -731,6 +731,31 @@ fn ontology(p: &mut Paths) {
             .errors(&[400, 404, 408]),
     );
     p.add(
+        read(op(GET, "/$/ontology/{ds}/entities", "listOntologyEntities", "Ontology", "Ontology entities"))
+            .doc("The entities the ontology declares or, in a lenient read, types by their use, with their kinds, in IRI order and one page at a time.")
+            .see("ontology")
+            .param("at")
+            .query("inferences", boolean(), "Also read the materialized inferences while the dataset has them.")
+            .query("kind", s(), "Entity kinds, comma separated, such as `Class,ObjectProperty` (all kinds by default).")
+            .query("limit", int(), "The most entities listed, from 1 to 10,000 (100 by default).")
+            .query("offset", int(), "The entities skipped.")
+            .resp("200", "One page of entities.", Some(object.clone()))
+            .errors(&[400, 404, 408]),
+    );
+    p.add(
+        read(op(GET, "/$/ontology/{ds}/entity", "getOntologyEntity", "Ontology", "Ontology entity"))
+            .doc("What the ontology says about one entity: its kinds, labels and annotations, and for each kind the superclasses, subclasses, equivalent and disjoint classes, keys and instances of a class, the domains, ranges, hierarchy, inverses and characteristics of a property, the definitions of a datatype, and the types, equalities and property assertions of an individual. Each expression comes in functional-style syntax and in its JSON form. With `assertions=true`, the instances of a class and the types and property assertions of an individual also come from the assertions the store holds, at most `limit` of each. An IRI that the ontology neither declares nor uses as an entity, or as the `kind` asked for, is `404`.")
+            .see("ontology")
+            .param("at")
+            .query("inferences", boolean(), "Also read the materialized inferences while the dataset has them, so that the superclasses include the materialized closure.")
+            .query("iri", s(), "The entity's IRI.")
+            .query("kind", s(), "The one entity kind answered, such as `Class` (every kind the IRI has by default).")
+            .query("assertions", boolean(), "Also read the instances, types and property assertions the store holds.")
+            .query("limit", int(), "The most entries of each streamed list, from 1 to 10,000 (100 by default).")
+            .resp("200", "The entity.", Some(object.clone()))
+            .errors(&[400, 404, 408]),
+    );
+    p.add(
         op(POST, "/$/ontology/{ds}/check", "checkOntology", "Ontology", "Check OWL 2 profiles")
             .doc("One report per profile in `profiles` (`el`, `ql`, `rl`, `dl` or `all`; `dl` by default), over the terminology and, unless `assertions` is false, the assertions the store holds. Each report lists the violations with the rule of the OWL 2 Profiles or the structural specification that each breaks. The EL, QL and RL reports also list the OWL 2 DL violations.")
             .see("ontology")
