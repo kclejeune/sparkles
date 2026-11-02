@@ -1103,7 +1103,7 @@ conformance of the written records to the shapes, and the HTTP routes.
 4. **Withdrawal rights.** Any caller with the grants may withdraw a claim, as for every
    other typed operation. A withdrawal is final, and a new occurrence must be proposed.
 5. **Reconciliation.** A projection whose protections changed is refused rather than
-   repaired. Roadmap item NEW-ITEM-1 tracks an administered reconciliation.
+   repaired. Roadmap item 581 tracks an administered reconciliation.
 6. **Identity decisions.** Identity proposals need their own record input, a matching
    policy and resolution-map semantics, so they are a later step of this phase. The
    current review policy is specific to claims.
@@ -1111,7 +1111,7 @@ conformance of the written records to the shapes, and the HTTP routes.
    and the bindings for roadmap item 509.
 8. **Output visibility.** A review checks the reviewer's access, and the output graph is
    read under each reader's grants. The administrator must give the output's readers
-   the policy's boundary. Roadmap item NEW-ITEM-2 tracks support-aware visibility of
+   the policy's boundary. Roadmap item 582 tracks support-aware visibility of
    projections with F18.
 9. **Bounds.** One review reads at most 10,000 evidence records, and one triple's
    supports, one target's decisions and one decision's successors are each read up to
