@@ -58,6 +58,9 @@ pub struct Limits {
     pub max_memory: Option<usize>,
     /// polled during the run: true stops it as cancelled
     pub cancelled: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// told each growth of the estimated memory, in bytes: false stops the run as over
+    /// its memory budget, as a server's memory pool refuses a grant
+    pub charge: Option<std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync>>,
 }
 
 /// Why a run stopped. The classifier keeps its axioms, and its next run starts the
@@ -184,20 +187,19 @@ fn logical(ax: &AxiomKind) -> bool {
 }
 
 fn classes_of(ax: &AxiomKind) -> impl Iterator<Item = Class> {
-    Axiom::new(ax.clone())
-        .signature()
-        .into_iter()
-        .filter_map(|e| match e {
-            Entity::Class(c)
-                if !matches!(
-                    c.as_str(),
-                    crate::vocab::OWL_THING | crate::vocab::OWL_NOTHING
-                ) =>
-            {
-                Some(c)
-            }
-            _ => None,
-        })
+    let mut sig = crate::model::Signature::default();
+    sig.axiom(ax);
+    sig.0.into_iter().filter_map(|e| match e {
+        Entity::Class(c)
+            if !matches!(
+                c.as_str(),
+                crate::vocab::OWL_THING | crate::vocab::OWL_NOTHING
+            ) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    })
 }
 
 impl Classifier {
@@ -343,14 +345,11 @@ impl Classifier {
         let mut ax = Axioms::default();
         let mut partial = BTreeMap::new();
         let mut chains: Vec<&AxiomKind> = Vec::new();
-        let mut kinds: Vec<&AxiomKind> = self
+        let kinds = self
             .axioms
             .iter()
             .filter(|(_, h)| h.outside.is_none())
-            .map(|(k, _)| k)
-            .collect();
-        // a stable order keeps the interner's ids the same from run to run
-        kinds.sort_unstable();
+            .map(|(k, _)| k);
         for k in kinds {
             if matches!(
                 k,
@@ -452,20 +451,23 @@ impl Classifier {
         let cancel_fn = cancelled
             .as_deref()
             .map(|f| f as &(dyn Fn() -> bool + Sync));
+        let charge = limits.charge.clone();
+        let charge_fn = charge
+            .as_deref()
+            .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
         let bounds = Bounds {
             threads,
             deadline: limits.deadline,
             max_memory: limits.max_memory,
             cancelled: cancel_fn,
+            charge: charge_fn,
             base_memory: base,
         };
-        if let Some(m) = limits.max_memory
-            && base > m
-        {
+        if limits.max_memory.is_some_and(|m| base > m) || charge_fn.is_some_and(|f| !f(base)) {
             self.dirty = true;
             self.index = None;
             return Err(Error::Memory {
-                limit: m,
+                limit: limits.max_memory.unwrap_or(base),
                 used: base,
             });
         }

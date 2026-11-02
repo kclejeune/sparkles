@@ -121,6 +121,8 @@ pub struct Bounds<'a> {
     pub max_memory: Option<usize>,
     /// polled while the saturation runs: true asks it to stop as cancelled
     pub cancelled: Option<&'a (dyn Fn() -> bool + Sync)>,
+    /// told each growth of the estimated memory: false stops the run
+    pub charge: Option<&'a (dyn Fn(usize) -> bool + Sync)>,
     /// the bytes held before the saturation starts
     pub base_memory: usize,
 }
@@ -290,7 +292,9 @@ impl<'a> Run<'a> {
             return false;
         }
         let b = self.bounds;
-        if b.max_memory.is_some_and(|m| used > m) {
+        if b.max_memory.is_some_and(|m| used > m)
+            || b.charge.is_some_and(|f| bytes > 0 && !f(bytes))
+        {
             self.halt(STOP_MEMORY);
             return false;
         }

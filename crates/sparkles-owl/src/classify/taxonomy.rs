@@ -30,6 +30,8 @@ pub struct Taxonomy {
 }
 
 pub const TOP_NODE: usize = 0;
+/// The direct parents the greedy reduction finds before it marks instead.
+const GREEDY_MAX: usize = 32;
 pub const BOTTOM_NODE: usize = 1;
 
 impl Taxonomy {
@@ -280,12 +282,35 @@ pub(super) fn build(k: &Classifier, consistent: bool) -> Taxonomy {
         // more subsumers first, so that lower groups tend to come first
         cands.sort_by_key(|g| std::cmp::Reverse(subs.get(g).map_or(0, |s| s.len())));
         let mut direct: Vec<Ex> = Vec::new();
-        for g in cands {
+        for &g in &cands {
             if direct.iter().any(|&d| has(d, g)) {
                 continue;
             }
             direct.retain(|&d| !has(g, d));
             direct.push(g);
+            if direct.len() > GREEDY_MAX {
+                break;
+            }
+        }
+        if direct.len() > GREEDY_MAX {
+            // many direct parents: mark the groups above some candidate instead, which
+            // costs the candidates' subsumers rather than candidates times parents
+            let mut covered: rustc_hash::FxHashSet<Ex> = rustc_hash::FxHashSet::default();
+            for &d in &cands {
+                for b in &subs[&d] {
+                    if let Some(&kb) = key.get(b)
+                        && kb != d
+                        && kb != TOP
+                    {
+                        covered.insert(kb);
+                    }
+                }
+            }
+            direct = cands
+                .iter()
+                .copied()
+                .filter(|g| !covered.contains(g))
+                .collect();
         }
         let me = index[&r];
         let mut parents: Vec<usize> = if direct.is_empty() {
