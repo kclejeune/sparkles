@@ -102,11 +102,16 @@ def git(*args):
     return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
 
 
-def changed_files(base):
-    merge_base = git("merge-base", base, "HEAD").strip()
+def changed_files(base, rev=None):
+    """The files changed since the merge base of BASE and HEAD, with uncommitted and
+    untracked ones, or with REV the files that differ between that merge base and REV."""
+    merge_base = git("merge-base", base, rev or "HEAD").strip()
     # --no-renames reports both the old and the new path of a moved file
-    files = set(git("diff", "--name-only", "--no-renames", merge_base).split("\n"))
-    files |= set(git("ls-files", "--others", "--exclude-standard").split("\n"))
+    if rev:
+        files = set(git("diff", "--name-only", "--no-renames", merge_base, rev).split("\n"))
+    else:
+        files = set(git("diff", "--name-only", "--no-renames", merge_base).split("\n"))
+        files |= set(git("ls-files", "--others", "--exclude-standard").split("\n"))
     files.discard("")
     return sorted(files)
 
@@ -152,14 +157,16 @@ def matches(path, patterns):
     return any(fnmatch.fnmatchcase(path, pat) for pat in patterns)
 
 
-def choose(base):
+def choose(base, files=None):
+    """The packages that the change since BASE can affect, from the files that
+    changed_files lists or from FILES when given, with the reason for each."""
     packages = workspace()
     names = set(packages)
     # a cross read names a crate directory, which is the package's name in this workspace
     by_dir = {os.path.basename(rel): name for name, (rel, _) in packages.items()}
     packages = {n: (rel, {by_dir.get(d, d) for d in deps}) for n, (rel, deps) in packages.items()}
     chosen = {}
-    for f in changed_files(base):
+    for f in changed_files(base) if files is None else files:
         if matches(f, ALL):
             return "all", f"{f} is a shared root"
         owner = None
