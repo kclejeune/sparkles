@@ -257,10 +257,14 @@ and documentation through a form of the built-in SKOS shapes.
 The **Checks** tab runs the built-in SKOS shapes over the graph
 ([screenshot](../images/thesaurus-checks.png)), which check the integrity conditions of the
 SKOS Reference, and an administrator can install them as the dataset's write guard. The
-page shares the session model of the [ontology editor](#ontology-editor). Every edit is a
-dry run with `If-Match` before it commits, undo and redo revert commits, **Start session**
-creates a `skos.<user>.<date>` branch, another writer's commit reloads the page, and a
-protected branch is read-only. The [API reference](../API.md#skos-shapes) lists the shapes'
+page shares the session model of the [ontology editor](#ontology-editor). Every edit of
+the tree, labels and links is a dry run with `If-Match` before it commits, undo and redo
+revert commits, **Start session** creates a `skos.<user>.<date>` branch, another writer's
+commit reloads the page, and a protected branch is read-only. The page is also read-only
+when it cannot read the commit its graph is at. The notes and members forms save through
+the editing forms, which check the stored values of each field they change instead of the
+commit, and they are read-only when a value or their target is in another graph than the
+one the page edits. The [API reference](../API.md#skos-shapes) lists the shapes'
 conditions.
 
 ## Known gaps
@@ -324,7 +328,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   IRI, and the page lists only the mappings a concept states itself, NEW-ITEM-2.
   `skosxl:labelRelation` links between SKOS-XL labels are not edited, NEW-ITEM-3. The
   SKOS rules become a write guard only by replacing the dataset's guard, so a dataset
-  cannot keep its own shapes and the SKOS shapes together, NEW-ITEM-4.
+  cannot keep its own shapes and the SKOS shapes together, NEW-ITEM-4. Editing forms
+  read every graph and have no graph or commit precondition of a request's own, so the
+  thesaurus editor's notes and members forms edit the default graph's resources and their
+  saves do not name the commit the page shows, NEW-ITEM-5. Blank-node SKOS-XL labels of
+  one kind with the same literal form cannot be told apart by an update and are shown
+  without edit buttons.
 * The ontology editor decides whether the caller can write from the caller's level on the
   dataset, so a caller whose grants allow writes on a branch only sees the branch
   read-only, 611. Undo and redo revert commits, which needs write access to the

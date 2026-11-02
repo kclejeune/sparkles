@@ -213,14 +213,29 @@ S51, S52 and S58 of the SKOS-XL appendix. They live in the Rust library as
 tab runs them over the graph and installs them as the dataset's guard with grandfathered
 existing results. Each SPARQL constraint reads one property path or one basic graph
 pattern from the focus node, so a form check finds the resources an edit affects without
-validating the whole graph. Linked resources without their `rdf:type` are reported at
-`sh:Info` severity, since the Reference's own examples leave their resources untyped.
+validating the whole graph. The shapes graph does not hold the SKOS vocabulary, so the
+disjointness checks name the types the SKOS properties imply, ordered collections count
+as collections, the hierarchical and related mappings count for S27, and S46 follows the
+transitive closure of `skos:exactMatch`. Linked resources without their `rdf:type` are
+reported at `sh:Info` severity, since the Reference's own examples leave their resources
+untyped.
 
 **Sessions.** The page reuses the ontology editor's session through a shared module. Every
-edit is a dry run with `If-Match` and a commit with the same precondition, undo and redo
-revert commits, **Start session** creates a `skos.<user>.<date>` branch, the change feed
-reloads the page after another writer's commit, and a protected branch or a reader's
-access makes the page read-only. Commit messages that are not ASCII are sent percent-encoded
+edit of the tree, labels and links is a dry run with `If-Match` and a commit with the same
+precondition, undo and redo revert commits, **Start session** creates a
+`skos.<user>.<date>` branch, the change feed reloads the page after another writer's
+commit, and a protected branch or a reader's access makes the page read-only. The page
+reads its tag from the graph it edits and is read-only when it cannot, so no edit leaves
+without a precondition. The notes and members forms save through the forms of U02, whose
+saves check the stored values of the fields they change instead of the commit. The page
+locks them when a value or the form's target graph is outside the graph it edits.
+
+**Label edits.** A SKOS-XL label resource that another resource still refers to stays when
+one concept drops it or is deleted. Making a label preferred demotes the language's other
+preferred labels, plain or SKOS-XL, to alternative labels. A new SKOS-XL label's IRI is
+checked against the whole graph. Blank-node SKOS-XL labels of one kind with the same
+literal form are shown without edit buttons, since an update can find a blank node only
+by its triples. Commit messages that are not ASCII are sent percent-encoded
 as UTF-8, which also fixed the ontology editor's labels in other scripts.
 
 The Rust tests check every condition against the consistent and inconsistent examples of
@@ -233,5 +248,6 @@ which leave main and the unrelated triples unchanged.
 
 Roadmap item NEW-ITEM-1 covers paged trees and an indexed label search for large
 thesauri, NEW-ITEM-2 labels for mapping targets in other datasets and mappings stated by
-the other concept, NEW-ITEM-3 the editing of `skosxl:labelRelation`, and NEW-ITEM-4 a
-write guard that keeps a dataset's shapes beside the SKOS shapes.
+the other concept, NEW-ITEM-3 the editing of `skosxl:labelRelation`, NEW-ITEM-4 a write
+guard that keeps a dataset's shapes beside the SKOS shapes, and NEW-ITEM-5 forms that
+read and write one graph and name the commit a page shows.
