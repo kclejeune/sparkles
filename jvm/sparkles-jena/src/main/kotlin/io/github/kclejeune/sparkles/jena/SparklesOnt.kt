@@ -15,6 +15,7 @@ import org.apache.jena.graph.GraphMemFactory
 import org.apache.jena.ontapi.OntModelFactory
 import org.apache.jena.ontapi.OntSpecification
 import org.apache.jena.ontapi.model.OntModel
+import org.apache.jena.query.ReadWrite
 import org.apache.jena.sparql.core.Quad
 import org.apache.jena.sparql.graph.GraphWrapper
 
@@ -96,46 +97,45 @@ public object SparklesOnt {
 
 /**
  * A graph whose reads come from `copy` and whose writes go to `target` and to `copy`. The
- * changes a write transaction makes to the copy are kept until the transaction ends, and
- * undone when it does not commit, so that the copy keeps the state of the dataset. The
- * copy is shared by the threads that use the model, so another thread sees a
- * transaction's writes before it commits.
+ * triples a write transaction changes in the copy are noted until the transaction ends,
+ * and then set to what the dataset holds, so that the copy keeps the state of the dataset
+ * when the transaction aborts. Like Jena's in-memory graphs, the copy needs the caller's
+ * locking when threads use it at once, and another thread sees a transaction's writes
+ * before it commits.
  */
 private class ReadThroughGraph(
     private val copy: Graph,
     private val dataset: DatasetGraphSparkles,
     private val target: Graph,
 ) : GraphWrapper(copy) {
-    // the changes to the copy in the transaction `pending`, newest last: true for an addition
-    private val journal = ArrayList<Pair<Boolean, Triple>>()
+    // the triples the transaction `pending` changed in the copy
+    private val journal = LinkedHashSet<Triple>()
     private var pending: TxnState? = null
 
     /**
-     * Undo the changes of a transaction that ended without committing. A transaction
-     * that has not ended keeps its changes, unless `wait` asks to wait for its end: a
-     * write calls it so after its native write, which another transaction holds up only
-     * until that transaction releases the writer lock, just before it ends.
+     * Set the triples of an ended transaction to what the dataset holds. It waits for
+     * nothing: a transaction that is still open, or a read whose own transaction reads an
+     * older state, leaves them for later. After a write of the caller's, `written`, the
+     * transaction that held the writer lock before it has ended.
      */
     @Synchronized
-    private fun settle(wait: Boolean) {
+    private fun settle(written: Boolean) {
         val t = pending ?: return
-        if (t === dataset.txn()) return
-        if (wait) t.done.await() else if (t.done.count > 0) return
-        if (!t.committed) {
-            for (i in journal.indices.reversed()) {
-                val (added, triple) = journal[i]
-                if (added) copy.delete(triple) else copy.add(triple)
-            }
+        val own = dataset.txn()
+        if (t === own) return
+        if (!written && (t.active || (own != null && own.mode != ReadWrite.WRITE))) return
+        for (triple in journal) {
+            if (target.contains(triple)) copy.add(triple) else copy.delete(triple)
         }
         journal.clear()
         pending = null
     }
 
     /** Note a change to the copy; a change outside a transaction has committed already. */
-    private fun record(added: Boolean, t: Triple) {
+    private fun record(t: Triple) {
         val txn = dataset.txn() ?: return
         pending = txn
-        journal.add(added to t)
+        journal.add(t)
     }
 
     override fun get(): Graph {
@@ -143,16 +143,14 @@ private class ReadThroughGraph(
         return copy
     }
 
-    // the native write runs outside the monitor, since it may wait for another thread's
-    // transaction, which reads the model meanwhile; the copy changes once that
-    // transaction's changes are settled
+    // the native write runs outside the monitor, since it may wait for the writer lock
     override fun add(t: Triple) {
         target.add(t)
         synchronized(this) {
             settle(true)
             if (!copy.contains(t)) {
                 copy.add(t)
-                record(true, t)
+                record(t)
             }
         }
     }
@@ -163,7 +161,7 @@ private class ReadThroughGraph(
             settle(true)
             if (copy.contains(t)) {
                 copy.delete(t)
-                record(false, t)
+                record(t)
             }
         }
     }
@@ -173,14 +171,14 @@ private class ReadThroughGraph(
         synchronized(this) {
             settle(true)
             if (dataset.txn() == null) {
-                // the removal committed on its own, so nothing needs undoing
+                // the removal committed on its own, so nothing needs noting
                 copy.remove(s, p, o)
                 return
             }
             val gone = copy.find(s ?: Node.ANY, p ?: Node.ANY, o ?: Node.ANY).toList()
             for (t in gone) {
                 copy.delete(t)
-                record(false, t)
+                record(t)
             }
         }
     }

@@ -640,11 +640,12 @@ model reads an in-memory copy of the graph that one native call, `find_all`, fil
 the thread's transaction or the head, so the per-`find` cost that P04 §3.10 describes
 does not apply. A write to the model goes to the copy and to the Sparkles graph, in the
 thread's write transaction when there is one, so a transaction's edits make one commit.
-The copy keeps the changes of a transaction until it ends and undoes them when it does
-not commit, so an aborted transaction leaves the model as the dataset is. The copy is
-shared by the threads that use the model, so another thread sees a transaction's writes
-before it commits. `SparklesOnt`
-also runs the native operations over one graph, and
+The copy notes the triples a transaction changes and, once the transaction has ended,
+sets them to what the dataset holds, so an aborted transaction leaves the model as the
+dataset is. This settling waits for nothing, and a read whose own transaction reads an
+older state leaves it for later. Like Jena's in-memory models, the copy needs the
+caller's locking when threads use it at once, and another thread sees a transaction's
+writes before it commits. `SparklesOnt` also runs the native operations over one graph, and
 `DatasetGraphSparkles.ontology()` is the full handle with `summary`, `axioms`, `check`,
 `edit`, `removeEntity` and `diff`.
 
