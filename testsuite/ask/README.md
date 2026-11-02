@@ -336,7 +336,9 @@ ledger holds the rest with a cap of USD 49.1452. The two caps together equal the
 The Anthropic wallet of the same campaign was raised the same way from USD 50 to 95 with
 the approval of the person who pays, so that every model could run its baseline and its
 final build on the same three sets. Its first ledger closed with USD 30.7865 of upper
-liability, and the second has a cap of USD 64.2135.
+liability, and the second has a cap of USD 64.2135. The ledgers stay the record of
+Anthropic spend until the person who pays reconciles them against the Console's usage
+export, which stays outside the repository. Only the reconciled totals are recorded.
 
 ## A paid run
 
