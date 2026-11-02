@@ -25,7 +25,10 @@ owl:Nothing) for an unsatisfiable class and SubClassOf(owl:Thing owl:Nothing) al
 inconsistent ontology, so the classes are grouped by the cycles of the subclass graph. A
 class without a named superclass gets owl:Thing as its direct superclass. An inconsistent
 ontology gets one node of every class, owl:Thing and owl:Nothing, with the classes that
-INPUT declares when it is given, as the classifier of sparkles-owl writes it. --reduce
+INPUT declares when it is given, as the classifier of sparkles-owl writes it. A class that
+INPUT uses without declaring it is missing from that node, which changes the counts of
+classes and unsatisfiable classes but not the oracle's comparison over common classes.
+Relative IRIs in OWL/XML resolve against the document's xml:base. --reduce
 removes edges that other edges imply, for an output that is not the direct hierarchy.
 """
 
@@ -38,10 +41,12 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+from urllib.parse import urljoin
 
 THING = "http://www.w3.org/2002/07/owl#Thing"
 NOTHING = "http://www.w3.org/2002/07/owl#Nothing"
 OWL_NS = "http://www.w3.org/2002/07/owl#"
+XML_BASE = "{http://www.w3.org/XML/1998/namespace}base"
 TOKEN = re.compile(r"<([^>]*)>|([A-Za-z][\w.-]*)?:([\w.-]*)")
 
 
@@ -62,9 +67,11 @@ def read_owx(path):
     def local(tag):
         return tag.rsplit("}", 1)[-1]
 
+    base = [""]
+
     def iri(el):
         if "IRI" in el.attrib:
-            return el.attrib["IRI"]
+            return urljoin(base[0], el.attrib["IRI"]) if base[0] else el.attrib["IRI"]
         if "abbreviatedIRI" in el.attrib:
             p, _, n = el.attrib["abbreviatedIRI"].partition(":")
             return prefixes.get(p, "") + n
@@ -81,7 +88,11 @@ def read_owx(path):
             out.append(i)
         return out
 
-    for _, el in ET.iterparse(path, events=("end",)):
+    for event, el in ET.iterparse(path, events=("start", "end")):
+        if event == "start":
+            if local(el.tag) == "Ontology":
+                base[0] = el.attrib.get(XML_BASE, "")
+            continue
         tag = local(el.tag)
         if tag == "Prefix":
             prefixes[el.attrib.get("name", "")] = el.attrib.get("IRI", "")
@@ -199,16 +210,19 @@ def taxonomy(declared, subs, eqs, reduce=False, extra_classes=()):
         node(a)
         node(b)
         graph[a].add(b)
-        if a == THING:
-            # only a class equivalent to the top class is a superclass of it
-            graph[b].add(a)
-        if b == NOTHING:
-            graph[b].add(a)
     for e in eqs:
         for c in e:
             node(c)
         for x, y in zip(e, e[1:] + e[:1]):
             graph[x].add(y)
+    # Every class is a subclass of owl:Thing and a superclass of owl:Nothing, so a class
+    # that owl:Thing reaches joins its node, and so does one that reaches owl:Nothing.
+    # The edges into owl:Thing give a class without another superclass its direct one.
+    for c in graph:
+        if c != THING:
+            graph[c].add(THING)
+        if c != NOTHING:
+            graph[NOTHING].add(c)
     comps = sccs(graph)
     of = {}
     for i, comp in enumerate(comps):

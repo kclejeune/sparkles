@@ -50,6 +50,32 @@ let
         )
       );
 
+  # The licence texts installed with the packages, from the projects' release tags. Most
+  # of the dependency jars carry no notice of their own, so each Java package also lists
+  # its jars by Maven Central path in share/licenses/<name>/jars.tsv, whose POMs name
+  # their licences.
+  licence =
+    name: url: hash:
+    fetchurl { inherit name url hash; };
+  licences = {
+    elk =
+      licence "elk-LICENSE.txt"
+        "https://raw.githubusercontent.com/liveontologies/elk-reasoner/v0.6.0/LICENSE.txt"
+        "sha256-xx0jnfkXJvxRnG63LTGOxlggYnIysveWIZ6H3PNdCrQ=";
+    whelk =
+      licence "whelk-LICENSE.txt" "https://raw.githubusercontent.com/INCATools/whelk/v1.2.1/LICENSE.txt"
+        "sha256-0aBOv8RuV7h3Qw5j6WfUx/RC6Pzr10Jr2pCb9YDZhP0=";
+    robot =
+      licence "robot-LICENSE.txt" "https://raw.githubusercontent.com/ontodev/robot/v1.9.11/LICENSE.txt"
+        "sha256-yGLOMzatHsBDPkNnKDdfeoTkVRQ4jXyrB6KjmuxsFrI=";
+    lgpl3 =
+      licence "lgpl-3.0.txt" "https://www.gnu.org/licenses/lgpl-3.0.txt"
+        "sha256-46mU2C5kSwOnkqkw9XQAJlhBL2JAf1/uCD8lVcXyMRg=";
+    gpl3 =
+      licence "gpl-3.0.txt" "https://www.gnu.org/licenses/gpl-3.0.txt"
+        "sha256-OXLcl0T2SZ8Pmy2/dmlvKuetivmyPd5m1q+Gyd+zaYY=";
+  };
+
   # A reasoner reached through the OWL API, with ElkClassify compiled against its jars and a
   # `<name>-classify` wrapper that selects it.
   owlapiReasoner =
@@ -58,6 +84,8 @@ let
       version,
       reasoner,
       jars,
+      pins,
+      licenceFiles,
       meta,
     }:
     let
@@ -76,7 +104,13 @@ let
         // meta;
       }
       ''
-        mkdir -p $out/bin $out/share/java/${pname} $out/share/${pname}/classes
+        mkdir -p $out/bin $out/share/java/${pname} $out/share/${pname}/classes $out/share/licenses/${pname}
+        for f in ${lib.concatMapStringsSep " " toString licenceFiles}; do
+          cp "$f" "$out/share/licenses/${pname}/$(stripHash "$f")"
+        done
+        grep -hv '^#' ${
+          lib.concatMapStringsSep " " (p: "${p}") pins
+        } > $out/share/licenses/${pname}/jars.tsv
         for jar in ${lib.concatMapStringsSep " " toString jars}; do
           ln -s "$jar" "$out/share/java/${pname}/$(stripHash "$jar")"
         done
@@ -100,6 +134,12 @@ in
     version = "0.6.0";
     reasoner = "elk";
     jars = elkJars;
+    pins = [ ./elk.tsv ];
+    licenceFiles = with licences; [
+      elk
+      lgpl3
+      gpl3
+    ];
     meta = {
       description = "ELK, the OWL 2 EL reasoner, through the OWL API for the classification benchmark";
       homepage = "https://github.com/liveontologies/elk-reasoner";
@@ -116,6 +156,15 @@ in
     version = "1.4.5.519";
     reasoner = "hermit";
     jars = elkJars ++ pinned ./hermit.tsv;
+    pins = [
+      ./elk.tsv
+      ./hermit.tsv
+    ];
+    licenceFiles = with licences; [
+      elk
+      lgpl3
+      gpl3
+    ];
     meta = {
       description = "HermiT, the OWL 2 DL reasoner, through the OWL API for the classification benchmark";
       homepage = "http://www.hermit-reasoner.com/";
@@ -132,6 +181,12 @@ in
     version = "1.2.1";
     reasoner = "whelk";
     jars = pinned ./whelk.tsv;
+    pins = [ ./whelk.tsv ];
+    licenceFiles = with licences; [
+      whelk
+      lgpl3
+      gpl3
+    ];
     meta = {
       description = "Whelk, the OWL 2 EL reasoner in Scala, through the OWL API for the classification benchmark";
       homepage = "https://github.com/balhoff/whelk";
@@ -169,6 +224,7 @@ in
       }
       ''
         install -Dm644 ${jar} $out/share/java/robot/robot.jar
+        install -Dm644 ${licences.robot} $out/share/licenses/robot/LICENSE.txt
         mkdir -p $out/bin
         cat > $out/bin/robot <<EOF
         #!${stdenv.shell}

@@ -100,6 +100,38 @@ class KoncludeConvertTests(unittest.TestCase):
             [f"EquivalentClasses(<{EX}A> <{EX}B> <{konclude.NOTHING}> <{konclude.THING}>)"],
         )
 
+    def test_top_and_bottom_reach_through_chains(self):
+        text = "\n".join(
+            [
+                "Prefix(:=<http://example.org/>)",
+                "Ontology(",
+                "SubClassOf(owl:Thing :A)",
+                "SubClassOf(:A :B)",
+                "SubClassOf(:C :U)",
+                "SubClassOf(:U owl:Nothing)",
+                "SubClassOf(:D :B)",
+                ")",
+            ]
+        )
+        (consistent, _, unsat), got = self.convert(text, ".ofn")
+        self.assertTrue(consistent)
+        self.assertEqual(unsat, 2)
+        self.assertIn(f"EquivalentClasses(<{EX}A> <{EX}B> <{konclude.THING}>)", got)
+        self.assertIn(f"SubClassOf(<{EX}D> <{EX}A>)", got)
+        self.assertIn(f"EquivalentClasses(<{EX}C> <{EX}U> <{konclude.NOTHING}>)", got)
+        text = text.replace("SubClassOf(:D :B)", "SubClassOf(:B :U)")
+        (consistent, _, _), got = self.convert(text, ".ofn")
+        self.assertFalse(consistent)
+
+    def test_relative_iris_resolve_against_the_xml_base(self):
+        text = """<?xml version="1.0"?>
+<Ontology xmlns="http://www.w3.org/2002/07/owl#" xml:base="http://example.org/o">
+  <SubClassOf><Class IRI="#B"/><Class IRI="#A"/></SubClassOf>
+</Ontology>
+"""
+        _, got = self.convert(text, ".owx")
+        self.assertIn("SubClassOf(<http://example.org/o#B> <http://example.org/o#A>)", got)
+
     def test_the_oracle_reads_the_output(self):
         d = Path(tempfile.mkdtemp())
         (d / "raw.owx").write_text(OWX)
