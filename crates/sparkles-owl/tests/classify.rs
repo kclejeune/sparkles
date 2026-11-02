@@ -373,6 +373,135 @@ fn assertions_on_a_property_with_a_range_are_partial() {
     assert_eq!(partial, 2, "{:#?}", k.excluded());
 }
 
+// The four tests below state the classifier's behaviour today on ranges that meet
+// individuals, which ELK 0.6.0 shares. The calculus treats an individual as an atom and
+// gives each range of a property it fills a context of its own, so a range's conclusion
+// about the individual does not reach the individual's other contexts. Each missed
+// entailment is a known gap of roadmap item 587, which adds the nominal rules of EL++
+// and should turn these into positive tests. What they check now is that the classifier
+// reports the axioms it uses in part.
+
+fn ind(s: &str) -> Individual {
+    Individual::named(format!("http://ex.org/{s}"))
+}
+
+/// The axioms the classifier reports as used in part, by the reason it gives.
+fn partial_reasons(k: &Classifier) -> BTreeMap<&'static str, usize> {
+    let mut out = BTreeMap::new();
+    for e in k.excluded() {
+        if let Gap::Partial(why) = e.gap {
+            *out.entry(why).or_insert(0) += 1;
+        }
+    }
+    out
+}
+
+#[test]
+fn a_range_on_an_asserted_property_misses_a_subsumption_and_reports_it() {
+    // range(r) = C and r(a, b) put b in C, so Y ⊑ ∃s.{b} ⊑ ∃s.C ≡ X
+    let mut k = Classifier::of(&[
+        ax(AxiomKind::ObjectPropertyRange(ope("r"), ce("C"))),
+        ax(AxiomKind::ObjectPropertyAssertion(
+            ope("r"),
+            ind("a"),
+            ind("b"),
+        )),
+        Axiom::equivalent_classes([ce("X"), some("s", c("C"))]),
+        sub(c("Y"), ClassExpression::ObjectHasValue(ope("s"), ind("b"))),
+    ]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(out.consistent);
+    // known gap of item 587: Y ⊑ X is entailed
+    assert!(!out.taxonomy.is_subclass(&c("Y"), &c("X")));
+    let why = partial_reasons(&k);
+    assert_eq!(
+        why.get("individuals that fill a property with a range"),
+        Some(&1),
+        "{why:?}"
+    );
+    assert_eq!(why.get("individuals"), Some(&1), "{why:?}");
+}
+
+#[test]
+fn a_range_reached_through_has_value_misses_a_subsumption_and_reports_it() {
+    // Z(a) and Z ⊑ ∃r.{b} give r(a, b), so b is in range(r) = C and Y ⊑ ∃s.{b} ⊑ X
+    let mut k = Classifier::of(&[
+        ax(AxiomKind::ObjectPropertyRange(ope("r"), ce("C"))),
+        sub(c("Z"), ClassExpression::ObjectHasValue(ope("r"), ind("b"))),
+        ax(AxiomKind::ClassAssertion(ce("Z"), ind("a"))),
+        Axiom::equivalent_classes([ce("X"), some("s", c("C"))]),
+        sub(
+            c("Y"),
+            some(
+                "s",
+                ClassExpression::ObjectOneOf([ind("b")].into_iter().collect()),
+            ),
+        ),
+    ]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(out.consistent);
+    // known gap of item 587: Y ⊑ X is entailed
+    assert!(!out.taxonomy.is_subclass(&c("Y"), &c("X")));
+    let why = partial_reasons(&k);
+    assert_eq!(why.get("individuals"), Some(&2), "{why:?}");
+}
+
+#[test]
+fn two_disjoint_ranges_on_one_individual_miss_the_inconsistency_and_report_it() {
+    // r(a, b) and q(d, b) put b in C and in D, which are disjoint
+    let mut k = Classifier::of(&[
+        ax(AxiomKind::ObjectPropertyRange(ope("r"), ce("C"))),
+        ax(AxiomKind::ObjectPropertyRange(ope("q"), ce("D"))),
+        ax(AxiomKind::DisjointClasses(
+            [ce("C"), ce("D")].into_iter().collect(),
+        )),
+        ax(AxiomKind::ObjectPropertyAssertion(
+            ope("r"),
+            ind("a"),
+            ind("b"),
+        )),
+        ax(AxiomKind::ObjectPropertyAssertion(
+            ope("q"),
+            ind("d"),
+            ind("b"),
+        )),
+    ]);
+    let out = k.classify(&Limits::default()).unwrap();
+    // known gap of item 587: the ontology is inconsistent
+    assert!(out.consistent);
+    let why = partial_reasons(&k);
+    assert_eq!(
+        why.get("individuals that fill a property with a range"),
+        Some(&2),
+        "{why:?}"
+    );
+}
+
+#[test]
+fn one_range_that_clashes_with_an_assertion_is_inconsistent() {
+    // r(a, b) puts b in C, and D(b) with C and D disjoint makes the ontology inconsistent
+    let mut k = Classifier::of(&[
+        ax(AxiomKind::ObjectPropertyRange(ope("r"), ce("C"))),
+        ax(AxiomKind::DisjointClasses(
+            [ce("C"), ce("D")].into_iter().collect(),
+        )),
+        ax(AxiomKind::ClassAssertion(ce("D"), ind("b"))),
+        ax(AxiomKind::ObjectPropertyAssertion(
+            ope("r"),
+            ind("a"),
+            ind("b"),
+        )),
+    ]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.consistent);
+    let why = partial_reasons(&k);
+    assert_eq!(
+        why.get("individuals that fill a property with a range"),
+        Some(&1),
+        "{why:?}"
+    );
+}
+
 #[test]
 fn axioms_on_the_top_and_bottom_properties_are_partial() {
     let top = ObjectPropertyExpression::from(ObjectProperty::top());
