@@ -248,6 +248,40 @@ async fn check_query() {
     assert_eq!(e["code"], "bad-argument");
 }
 
+/// The class lookup still reports a class whose instances lack the predicate under a
+/// small memory budget, now that it names the class and the predicate in its query.
+/// The budget failure it avoids needs the estimates of a large store and does not
+/// occur on a fixture this size, so this test guards the report and not the failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn check_query_class_lookup_names_its_terms() {
+    let cfg = McpConfig::default();
+    let mut st = AppState::standalone(StoreOptions::default(), cfg.max_timeout);
+    st.read_only = true;
+    st.limits.query_memory_bytes = Some(64 << 10);
+    st.limits.max_result_bytes = None;
+    let st = Arc::new(st);
+    let ds = st.attach("big", DbType::Mem, None).unwrap();
+    let mut trig = String::from(
+        "@prefix ex: <http://example.org/> .\nex:r1 a ex:River ; ex:length 10 .\nex:r2 a ex:River ; ex:length 20 .\nex:c1 ex:location ex:China .\n",
+    );
+    for i in 0..20_000 {
+        trig.push_str(&format!("ex:f{i} ex:filler {i} .\n"));
+    }
+    load_trig(&ds, &trig);
+    let mut c = Client::start(McpServer::new(st, cfg));
+    let s = c
+        .structured(
+            "check_query",
+            json!({"query": "SELECT ?r WHERE { ?r a <http://example.org/River> ; <http://example.org/location> ?x }"}),
+        )
+        .await;
+    assert!(
+        issues(&s).contains(&("class-mismatch".into(), "warning".into())),
+        "{s}"
+    );
+    assert_eq!(s["ok"], true, "{s}");
+}
+
 /// The `mem` dataset of [`mem`] on a server whose tools read schema reports from the
 /// index statistics at any size (`--schema-statistics-above 0`), or never.
 fn mem_with_statistics(on: bool) -> McpServer {

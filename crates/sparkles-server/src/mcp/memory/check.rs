@@ -590,26 +590,32 @@ impl Tools<'_> {
                 continue;
             }
             lookups += 1;
-            let used = r
-                .ask(
-                    &format!(
-                        "ASK {{ {} {} }}",
-                        r.quads("?s a ?c", &[]),
-                        r.quads_in("?s ?pp ?o", &[], "h")
-                    ),
-                    vec![
-                        ("c".into(), c.clone().into()),
-                        ("pp".into(), p.clone().into()),
-                    ],
-                )
-                .map_err(|e| ctx.engine(e))?;
-            if used {
-                continue;
+            // The class and the predicate are written into the query. Passed as
+            // bindings, they left a large store's planner an estimate over every quad
+            // that passed the query memory budget, which failed the whole check of a
+            // draft that used a predicate its class lacks. The lookup is advice about
+            // the draft, so a lookup over its budget leaves the pattern unjudged.
+            let used = r.ask(
+                &format!(
+                    "ASK {{ {} {} }}",
+                    r.quads(&format!("?s a {c}"), &[]),
+                    r.quads_in(&format!("?s {p} ?o"), &[], "h")
+                ),
+                Vec::new(),
+            );
+            match used {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) if over_budget(&e) => continue,
+                Err(e) => return Err(ctx.engine(e)),
             }
             let (tc, tp) = (terms.iri(c.as_str()), terms.iri(p.as_str()));
-            let suggestions = self
-                .class_predicates(&r, c, max)
-                .map_err(|e| ctx.engine(e))?
+            let suggestions = match self.class_predicates(&r, c, max) {
+                Ok(s) => s,
+                Err(e) if over_budget(&e) => Vec::new(),
+                Err(e) => return Err(ctx.engine(e)),
+            };
+            let suggestions = suggestions
                 .into_iter()
                 .map(|(p, n)| json!({ "term": terms.iri(p.as_str()), "count": n, "why": "class-profile" }))
                 .collect();
@@ -882,10 +888,10 @@ impl Tools<'_> {
         }
         let q = format!(
             "SELECT ?p (COUNT(*) AS ?n) WHERE {{ {{ SELECT DISTINCT ?s WHERE {{ {} }} LIMIT {PROFILE_SAMPLE} }} {} FILTER(?p != <{RDF_TYPE}>) }} GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT {max}",
-            r.quads("?s a ?c", &[]),
+            r.quads(&format!("?s a {c}"), &[]),
             r.quads_in("?s ?p ?o", &[], "h"),
         );
-        Ok(r.rows(&q, vec![("c".into(), c.clone().into())])?
+        Ok(r.rows(&q, Vec::new())?
             .into_iter()
             .filter_map(|row| match row.as_slice() {
                 [Some(Term::NamedNode(p)), Some(Term::Literal(n))] => {
@@ -1080,4 +1086,18 @@ pub(super) fn literal_issue(
         at: None,
         suggestions,
     })
+}
+
+/// A lookup that passed one of its budgets, which a diagnostic treats as no answer.
+fn over_budget(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::BudgetExceeded(b) if matches!(
+            b.kind,
+            sparkles::BudgetKind::Memory
+                | sparkles::BudgetKind::ServerMemory
+                | sparkles::BudgetKind::Rows
+                | sparkles::BudgetKind::RowsProduced
+        )
+    )
 }
