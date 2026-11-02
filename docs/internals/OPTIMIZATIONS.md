@@ -51,7 +51,9 @@ operator or its cost model changes.
   decoded. The reads that visit index blocks in parallel, such as the runs of the count
   and filter operators below, copy each changed block with its delta keys merged in, so
   uncompacted commits keep those reads parallel. The copy holds only the columns that the
-  read asks for, and lives until the read's task for that block ends.
+  read asks for, and lives until the read's task for that block ends. These copies are
+  not charged to the query's memory budget, so a read whose ranges hold more than 65,536
+  delta keys merges them in order instead, as a scan does.
 * **Rebuilds in the background.** Like QLever's index rebuild, a compaction builds the
   new index from a snapshot while updates continue, then carries the updates made since
   the snapshot into the new index with their ids remapped. Sparkles carries each commit
@@ -117,18 +119,18 @@ implementation and always apply. EXPLAIN shows which ones ran.
   materialized. The index blocks are read in parallel, with the delta merged into the
   blocks it changes, and each block's vocabulary ids are tested on their keys as the
   block is read, in pieces of 8192 rows so that a short scan still uses every thread.
-  Union-graph dedup, which compares neighbouring rows, reads the runs in order. At 10.5M
-  triples,
-  counting the `foaf:name` values that contain "Ada" tests 1.02M names and takes about
-  4 ms in the server, against 14 ms when the name column is materialized first.
+  Union-graph dedup, which compares neighbouring rows, and a larger delta than the
+  parallel reads merge read the runs in order. At 10.5M triples, counting the
+  `foaf:name` values that contain "Ada" tests 1.02M names and takes about 4 ms in the
+  server, against 14 ms when the name column is materialized first.
 * **Filters on the runs of a scan** (`filter_scan_runs`). A FILTER directly over a scan
   sorted on a variable it tests evaluates the conjuncts that read only that variable once
   per value, then copies out of the index blocks only the rows of the values that pass,
   in parallel. The other conjuncts are applied to those rows. EXPLAIN notes
   `[runs of ?v: N values tested on vocabulary keys, M passed]`. Union-graph dedup, which
-  compares neighbouring rows, keeps the generic scan and filter. Under streaming
-  execution the filter reads its scan in morsels of whole blocks only when the snapshot
-  has no delta at all.
+  compares neighbouring rows, and a larger delta than the parallel reads merge keep the
+  generic scan and filter. Under streaming execution the filter reads its scan in morsels
+  of whole blocks only when the snapshot has no delta at all.
 * **Filter selectivity from samples** (`sampled_filters`). Without other knowledge the
   planner assumes that a FILTER conjunct keeps 30% of its input. A conjunct whose
   variables are all bound by one triple pattern is instead tested on a sample of that

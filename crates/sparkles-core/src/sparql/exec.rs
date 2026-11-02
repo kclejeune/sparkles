@@ -2097,6 +2097,9 @@ fn par_count_on_keys(
                 }
                 Ok(out)
             })?;
+    let Some(parts) = parts else {
+        return Ok(None);
+    };
     let mut all = KeyCount {
         ranges: ranges.len(),
         _cursor_charge: ctx.retained_charge(256)?,
@@ -2270,6 +2273,9 @@ fn filter_scan_runs(
                 ctx.check()?;
                 Ok(cols)
             })?;
+    let Some(parts) = parts else {
+        return Ok(None);
+    };
     let rows: usize = parts.iter().map(|p| p[0].len()).sum();
     ctx.check_output(rows, width)?;
     let mut table = Table::new(scan.vars.clone());
@@ -2324,7 +2330,8 @@ pub(super) type MorselPart = Vec<Vec<Id>>;
 /// on its vocabulary key and copies the rows of the runs that pass, so the morsel is read,
 /// tested and copied in one pass. Values outside the base vocabulary are tested as
 /// [`super::exprcache::filter_values`] tests them. Output column `i` is read from key
-/// column `cols[i]`. Returns the parts in key order and the rows read.
+/// column `cols[i]`. Returns the parts in key order and the rows read, or `None` when
+/// the delta has more keys in the ranges than a parallel read merges.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn filter_scan_morsel(
     ctx: &Ctx,
@@ -2335,7 +2342,7 @@ pub(super) fn filter_scan_morsel(
     kf: &super::keyfilter::KeyFilter,
     filters: &parking_lot::Mutex<Vec<super::keyfilter::KeyFilter>>,
     ranges: &[(Key, Key)],
-) -> Result<(Vec<MorselPart>, u64)> {
+) -> Result<Option<(Vec<MorselPart>, u64)>> {
     use crate::id::Tag;
     let kc = spec.cols[0].0;
     let vocab = &ctx.snap.generation.vocab;
@@ -2435,20 +2442,23 @@ pub(super) fn filter_scan_morsel(
                 ctx.check()?;
                 Ok((out, n as u64))
             })?;
-    let read = parts.iter().map(|p| p.1).sum();
-    Ok((
-        parts
-            .into_iter()
-            .filter(|p| p.0.first().is_some_and(|c| !c.is_empty()))
-            .map(|p| p.0)
-            .collect(),
-        read,
-    ))
+    Ok(parts.map(|parts| {
+        let read = parts.iter().map(|p| p.1).sum();
+        (
+            parts
+                .into_iter()
+                .filter(|p| p.0.first().is_some_and(|c| !c.is_empty()))
+                .map(|p| p.0)
+                .collect(),
+            read,
+        )
+    }))
 }
 
-/// [`key_runs`] with the index blocks read in parallel, merged with the snapshot's delta,
-/// when rows need no comparison with their neighbours (no union-graph dedup); `None`
-/// otherwise.
+/// [`key_runs`] with the index blocks read in parallel and the snapshot's delta merged in,
+/// when rows need no comparison with their neighbours (no union-graph dedup) and
+/// [`Snapshot::par_blocks_in_ranges`](crate::store::Snapshot::par_blocks_in_ranges) takes
+/// the delta in the scan's range; `None` otherwise.
 fn par_key_runs(
     ctx: &Ctx,
     spec: &ScanSpec,
@@ -2469,6 +2479,9 @@ fn par_key_runs(
                 ctx.check()?;
                 Ok((keys, counts))
             })?;
+    let Some(parts) = parts else {
+        return Ok(None);
+    };
     let total: usize = parts.iter().map(|p| p.0.len()).sum();
     // a key and a count per run
     ctx.check_output(total, 2)?;

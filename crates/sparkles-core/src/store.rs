@@ -624,6 +624,11 @@ impl TermKind {
     }
 }
 
+/// The most delta keys that [`Snapshot::par_blocks_in_ranges`] merges into the blocks of
+/// one read. At this bound the lists of keys per block take 2 MiB, and the copies of the
+/// changed blocks hold at most these rows beyond the rows of the blocks themselves.
+pub const MAX_PAR_DELTA_KEYS: usize = 1 << 16;
+
 /// The first row in `[s, e)` of a block with every column decoded whose key is not less
 /// than `k`.
 fn first_row_from(b: &Block, s: usize, e: usize, k: &Key) -> usize {
@@ -914,7 +919,11 @@ impl Snapshot {
     /// column and copied with the delta merged into it, into a block of its own that `f`
     /// reads, so `f` sees exactly the quads that
     /// [`scan_between_cols`](Self::scan_between_cols) visits, in the same order. Inserted
-    /// keys after the last block of a range form a block of their own.
+    /// keys after the last block of a range form a block of their own. `None` when the
+    /// delta has more than [`MAX_PAR_DELTA_KEYS`] keys in the ranges: the copies and the
+    /// lists of keys per block are not charged to a query's memory budget, so their size
+    /// stays bounded, and [`scan_between_cols`](Self::scan_between_cols) reads a larger
+    /// delta in order.
     pub fn par_blocks_in_ranges<T: Send>(
         &self,
         perm: Perm,
@@ -922,10 +931,31 @@ impl Snapshot {
         mask: crate::index::ColMask,
         piece: usize,
         f: impl Fn(&Block, usize, usize) -> Result<T> + Sync + Send,
-    ) -> Result<Vec<T>> {
+    ) -> Result<Option<Vec<T>>> {
+        self.par_blocks_merging(perm, ranges, mask, piece, MAX_PAR_DELTA_KEYS, f)
+    }
+
+    /// [`par_blocks_in_ranges`](Self::par_blocks_in_ranges) with at most `max_delta` delta
+    /// keys in the ranges.
+    fn par_blocks_merging<T: Send>(
+        &self,
+        perm: Perm,
+        ranges: &[(Key, Key)],
+        mask: crate::index::ColMask,
+        piece: usize,
+        max_delta: usize,
+        f: impl Fn(&Block, usize, usize) -> Result<T> + Sync + Send,
+    ) -> Result<Option<Vec<T>>> {
         use rayon::prelude::*;
         let pi = perm.index();
         let (ins_set, del_set) = (&self.delta.ins[pi], &self.delta.del[pi]);
+        let changes: usize = ranges
+            .iter()
+            .map(|(lo, hi)| ins_set.count_between(lo, hi) + del_set.count_between(lo, hi))
+            .sum();
+        if changes > max_delta {
+            return Ok(None);
+        }
         let base = self.perm(perm);
         let piece = piece.max(1);
         // one base block in one range, with the delta keys merged into its rows: those
@@ -1057,7 +1087,7 @@ impl Snapshot {
                     .collect::<Result<Vec<T>>>()
             })
             .collect::<Result<Vec<Vec<T>>>>()
-            .map(|parts| parts.into_iter().flatten().collect())
+            .map(|parts| Some(parts.into_iter().flatten().collect()))
     }
 
     /// Collect full keys for a prefix (convenience; engine uses [`scan`](Self::scan)).

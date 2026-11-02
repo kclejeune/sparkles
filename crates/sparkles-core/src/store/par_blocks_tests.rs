@@ -61,7 +61,8 @@ fn parallel(
         .par_blocks_in_ranges(perm, ranges, mask, piece, |b, s, e| {
             Ok((s..e).map(|i| b.key(i)).collect::<Vec<Key>>())
         })
-        .unwrap();
+        .unwrap()
+        .expect("the delta is small enough to merge");
     parts.concat()
 }
 
@@ -93,7 +94,11 @@ fn ranges(next: &mut impl FnMut() -> u64, keys: &[Key], n: usize) -> Vec<(Key, K
         .collect();
     ends.sort();
     ends.dedup();
-    ends.chunks_exact(2).map(|w| (w[0], w[1])).collect()
+    ends.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[a, b]| (a, b))
+        .collect()
 }
 
 fn check(snap: &Snapshot, seed: u64) {
@@ -193,6 +198,21 @@ fn parallel_block_reads_match_the_merged_scan() {
     tail[3] = tail[3].wrapping_add(1);
     assert!(between(tail, [u64::MAX; 4]));
     check(&after, 0xd1b5_4a32_d192_ed03);
+    // a read with more delta keys than the bound is left to the sequential merge
+    let whole = [([0; 4], [u64::MAX; 4])];
+    let changes = after.delta.ins[spo].len() + after.delta.del[spo].len();
+    let read = |max| {
+        after
+            .par_blocks_merging(Perm::Spo, &whole, ALL_COLS, 8192, max, |b, s, e| {
+                Ok((s..e).map(|i| b.key(i)).collect::<Vec<Key>>())
+            })
+            .unwrap()
+    };
+    assert!(read(changes - 1).is_none());
+    assert_eq!(
+        read(changes).unwrap().concat(),
+        merged(&after, Perm::Spo, &whole)
+    );
     // the snapshot before the update reads as it did
     check(&before, 0x8cb9_2ba7_2f3d_8dd7);
 }
