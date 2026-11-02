@@ -315,6 +315,19 @@ pub enum ManagedErrorKind {
     /// The caller's authority changed between authorization and publication, as when
     /// its credential was revoked or the access policy was reloaded.
     AuthorityChanged,
+    /// A review names another version of its policy than the settings record.
+    PolicyChanged,
+    /// A reviewed or withdrawn record's content digest differs from the request's.
+    TargetChanged,
+    /// A review's `supersedes` is not the current decision of its target.
+    DecisionSuperseded,
+    /// An acceptance names a claim occurrence that was withdrawn.
+    TargetWithdrawn,
+    /// An acceptance under a policy that refuses conflicts meets contrary evidence.
+    EvidenceConflict,
+    /// A policy's projection was written under protections that have since changed,
+    /// so its supports no longer authenticate and it must be reconciled first.
+    ProjectionUnavailable,
 }
 
 /// An error of the managed-graph boundary, with its stable code. Nothing was written.
@@ -326,7 +339,9 @@ pub struct ManagedError {
     /// resolution codes, `evidence-unavailable`, `incomplete-evidence`,
     /// `unanchored-evidence`, `span-mismatch`, `origin-not-reproduced` and
     /// `immutable-record-conflict`, and the typed-write codes `head-changed`,
-    /// `idempotency-conflict` and `authority-changed`
+    /// `idempotency-conflict` and `authority-changed`, and the review codes
+    /// `policy-changed`, `target-changed`, `decision-superseded`, `target-withdrawn`,
+    /// `evidence-conflict` and `projection-unavailable`
     pub code: &'static str,
     pub message: String,
 }
@@ -350,6 +365,12 @@ impl ManagedError {
             ManagedErrorKind::HeadChanged => "head-changed",
             ManagedErrorKind::IdempotencyConflict => "idempotency-conflict",
             ManagedErrorKind::AuthorityChanged => "authority-changed",
+            ManagedErrorKind::PolicyChanged => "policy-changed",
+            ManagedErrorKind::TargetChanged => "target-changed",
+            ManagedErrorKind::DecisionSuperseded => "decision-superseded",
+            ManagedErrorKind::TargetWithdrawn => "target-withdrawn",
+            ManagedErrorKind::EvidenceConflict => "evidence-conflict",
+            ManagedErrorKind::ProjectionUnavailable => "projection-unavailable",
         };
         Error::Managed(Box::new(ManagedError {
             kind,
@@ -374,8 +395,13 @@ impl ManagedError {
             | ManagedErrorKind::OriginNotReproduced => 422,
             ManagedErrorKind::ImmutableRecordConflict
             | ManagedErrorKind::HeadChanged
-            | ManagedErrorKind::IdempotencyConflict => 409,
-            ManagedErrorKind::AuthorityChanged => 503,
+            | ManagedErrorKind::IdempotencyConflict
+            | ManagedErrorKind::PolicyChanged
+            | ManagedErrorKind::TargetChanged
+            | ManagedErrorKind::DecisionSuperseded
+            | ManagedErrorKind::TargetWithdrawn
+            | ManagedErrorKind::EvidenceConflict => 409,
+            ManagedErrorKind::AuthorityChanged | ManagedErrorKind::ProjectionUnavailable => 503,
         }
     }
 }

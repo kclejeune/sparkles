@@ -290,7 +290,24 @@ idempotency key returns the first receipt, `ifHead` refuses a moved head, and a
 credential revoked before the commit publishes refuses it. Every graph has a protection
 nonce, which the operation records, so a record written while its graph was detached
 never authenticates. The Python, JVM and Node.js bindings and the MCP tools do not
-propose claims yet.
+propose claims.
+
+[Evidence reviews](../API.md#evidence-reviews) decide what a dataset accepts.
+`POST /{ds}/claims/review` and `sparkles::evidence::review` append immutable review
+decisions under a named policy, and a later decision supersedes an earlier one by name.
+An acceptance of a positive claim that the policy admits records an acceptance support
+and projects the claim's proposition into the policy's dedicated output graph, which is
+the only place the proposition is asserted. Each occurrence owns its own support, and a
+projected triple stays while one live support owns it. A reviewer must be able to read
+the claim's evidence and any negative claim of the same proposition, and a hidden one
+answers as an unavailable target. Contrary evidence refuses an acceptance or is admitted
+and labelled, as the policy says. `POST /{ds}/claims/withdraw` and
+`sparkles::evidence::withdraw` record that claim occurrences are withdrawn, which ends
+their supports without inventing a contrary claim. Both operations report the supports
+and projected triples they changed. A detach and new protection of a projection's graph
+makes later reviews under its policy refuse with `projection-unavailable`, because its
+supports no longer authenticate. Identity proposals and reviewed resolution maps are
+not available, and neither are reviews through the bindings or MCP.
 
 The Rust controlled permission helper can prepare graph, predicate and class masks
 and the built-in disclosure guard under one memory cap and `Control`. It explicitly

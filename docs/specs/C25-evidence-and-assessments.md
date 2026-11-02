@@ -1000,8 +1000,107 @@ reconciliation and a retry.
 5. **Bindings and MCP.** The route is HTTP, OpenAPI and Rust only. MCP waits for Phase 3
    and the bindings for roadmap item 509.
 
-Roadmap item 81 retains the rest of this contract. Phase 2 adds guarded metadata,
-review, support ownership, projections and reversible identity decisions. The shared
+Review decisions, accepted projections and withdrawals are the sixth Phase 2 step.
+`sparkles::evidence::review` and `POST /{ds}/claims/review` append one immutable
+`ev:ReviewDecision` per target under a named policy of the evidence settings, in the
+policy's decisions graph. A decision names its target, the target's `ev:recordDigest`,
+the policy as `urn:x-sparkles:evidence:policy:{name}`, the policy version, its
+disposition and the authenticated reviewer. When the target already has a current
+decision under the policy, the request must name it as `supersedes`, and the new
+decision then replaces it without editing it. A target answers `target-changed` for
+another digest, `decision-superseded` for a stale or missing `supersedes`, and the
+request answers `policy-changed` for another policy version. Decision identities are
+minted from the target, the policy and the operation, so a replayed key names the same
+decisions and a keyless retry finds the first decision current and is stale.
+
+An acceptance of a claim projects it when the claim is positive, its kind is admitted
+and it carries every required scope predicate. Other acceptances are recorded with a
+reason and no projection. A projecting acceptance records an `ev:AcceptanceSupport` in
+the policy's supports graph that names the claim, the decision, the policy, the output
+graph and the `ev:supportedTriple`, and inserts that triple into the output graph. No
+support is ever edited. A support is live while its decision is authenticated and no
+authenticated decision supersedes it, and while its claim has no authenticated
+`ev:Withdrawal`. After each operation, every triple it touched is in the output graph
+exactly when a live support owns it there, so duplicate occurrences each own one support
+and reversing or withdrawing one leaves the triple to the others.
+
+Contrary evidence is an authenticated `ev:Contradicts` link to the claim, or an
+authenticated negative claim of the same proposition in the policy's boundary that is
+not withdrawn and whose current decision is not a rejection, decided against the
+request's final decisions. A `refuse` policy answers `evidence-conflict`, and an
+`admitLabelled` policy records the contrary records as the support's
+`ev:conflictsWith`. Conflicts are decided only at admission. The first projecting
+review of a policy version writes an `ev:Projection` record, minted from the policy and
+version, with the output graph, the conflict mode and the protection nonces of the
+decisions, supports and output graphs. When a projection record of the policy carries
+other nonces than the current ones, because one of those graphs was detached and
+protected again, reviews and withdrawals under the policy answer
+`projection-unavailable`, since the output still holds triples whose supports no longer
+authenticate. A recorded projection whose output or conflict mode differs at the same
+version answers the same way.
+
+A review needs update and read grants on the policy's decisions, supports and output
+graphs, decided from the grants, and read access to each target, which must be in the
+policy's boundary. An acceptance also needs read access to every authenticated evidence
+link of the target in the boundary, the link's reference, the stored fact, revision,
+rendition and passage the reference names, and every negative claim of the same
+proposition there. Each is resolved through the L4 resolver under the caller's view in
+stream order, and any refusal answers as the `evidence-unavailable` answer of the
+decision's target, byte for byte. More than 10,000 such records answer
+`incomplete-evidence`. `ifHead` is required. The review reads the head only when it is
+`ifHead`, and the branch writer refuses the commit as `head-changed` unless its base is
+still that commit, so the reads and the commit see one state. The commit is made as a
+proposal's is, with the authority fence. A review records no new stored-fact reference
+and takes no source hold.
+
+`sparkles::evidence::withdraw` and `POST /{ds}/claims/withdraw` record an
+`ev:Withdrawal` of each named claim, with its digest, the caller and
+`prov:invalidatedAtTime`, the commit's time, in the claim's own graph. A withdrawal makes
+no contrary claim. Each projected triple left without a live support leaves its output
+graph. An already withdrawn claim is answered as `existing`, and the operation's
+description is still written to the claim's graph so that its key can be replayed. A
+withdrawal needs update grants on each claim's graph and on the output graph, and read
+grants on the decisions, supports and output graphs, of every policy whose boundary
+holds the claim's graph. Its `ifHead` is optional, and the head it read must still be the
+writer's base. Both operations answer `changed`, the supports added and ended and the
+triples inserted into and removed from output graphs, so that F22 can later find the
+dependent results. The vocabulary and shapes add `ev:supersedes`,
+`ev:AcceptanceSupport`, `ev:claim`, `ev:decision`, `ev:output`, `ev:supportedTriple`,
+`ev:conflictsWith`, `ev:Withdrawal`, `ev:Projection`, `ev:conflictMode`, `ev:Refuse`,
+`ev:AdmitLabelled` and the three protection properties. These are RDF records, so no
+file format or reader version changes.
+
+Tests state their expected accepted sets independently and cover duplicate occurrences
+that each own a support, reversal and withdrawal of one of them, a negative claim that
+is recorded and conflicts until it is rejected in either order of one request, a
+labelled policy, every stale precondition writing nothing, replays and keyless retries
+that add no support, hidden evidence compared with an unreadable target, direct SPARQL
+edits of the decisions, supports and output graphs, a changed protection, missing
+grants, kind and scope admission, dry runs, a review on a branch, a repeated withdrawal,
+conformance of the written records to the shapes, and the HTTP routes.
+
+#### Review decisions
+
+1. **Derived liveness.** Supports and decisions are never edited. A support's end is
+   derived from a superseding decision or a withdrawal, which each carry their own
+   receipt, so no unauthenticated triple can end or revive a support.
+2. **Conflicts.** The profile has no domain incompatibility rules, so only explicit
+   contradiction links and negative occurrences of the same proposition count. Domain
+   conflicts, such as two values of a functional property, remain application policy.
+3. **Policy versions.** Supports admitted under an earlier policy version stay live. A
+   version change records a new projection record and applies to later decisions only.
+4. **Withdrawal rights.** Any caller with the grants may withdraw a claim, as for every
+   other typed operation. A withdrawal is final, and a new occurrence must be proposed.
+5. **Reconciliation.** A projection whose protections changed is refused rather than
+   repaired. Roadmap item NEW-ITEM-1 tracks an administered reconciliation.
+6. **Identity decisions.** Identity proposals need their own record input, a matching
+   policy and resolution-map semantics, so they are a later step of this phase. The
+   current review policy is specific to claims.
+7. **Bindings and MCP.** The routes are HTTP, OpenAPI and Rust only. MCP waits for Phase 3
+   and the bindings for roadmap item 509.
+
+Roadmap item 81 retains the rest of this contract. Phase 2 still adds identity proposals
+with reviewed, reversible resolution maps. The shared
 managed-write and admission boundary described above is the one C26 reuses for its
 control graphs. Phase 3 integrates the new records with C17/C18, F22 and C22.
 The state-machine, authorization, direct-write, crash and retry acceptance cases remain

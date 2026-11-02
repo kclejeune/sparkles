@@ -38,8 +38,10 @@ sparkles query --data testsuite/evidence/v1/valid.ttl \
 
 Applications may load the vocabulary and their own profile records into graphs selected
 by their ordinary access policy. They may apply these shapes with the existing SHACL
-validation API or guard. No evidence setting, authenticated source registry, claims
-endpoint, review state machine or managed projection is enabled by these resources.
+validation API or guard. Loading these resources enables no evidence setting,
+authenticated source registry, claims endpoint, review operation or managed projection.
+Those are the runtime operations of the
+[evidence profile guide](../../../../../docs/ai/README.md#evidence-profile).
 The supplied fixture's availability receipt and commit references are demonstrations.
 They do not establish authenticated local availability or resolve a retained snapshot.
 
@@ -66,6 +68,17 @@ judgments. Derivation is not support, and a mention is not corroboration. Notes,
 decisions and tasks retain their separate types and relations. An identity proposal
 and a review decision can be represented as RDF, but loading them does not change
 identity resolution, admission, execution authority or asserted facts.
+
+The review operations write the remaining record types. An `ev:ReviewDecision` names
+its exact target, target digest, policy, policy version, disposition and, through
+`ev:supersedes`, the decision it replaces. An `ev:AcceptanceSupport` names the admitted
+claim, its decision, the policy, the output graph and the `ev:supportedTriple` it owns,
+and `ev:conflictsWith` names contrary records a labelled projection admitted it against.
+An `ev:Withdrawal` names a withdrawn claim and its `prov:invalidatedAtTime`. An
+`ev:Projection` names a policy version, its output graph, its `ev:conflictMode` of
+`ev:Refuse` or `ev:AdmitLabelled`, and the protection nonces of the decisions, supports
+and output graphs it was written under. Whether a support is live is derived from the
+decisions and withdrawals, so no record is edited.
 
 A revision's source key identifies an importer observation within its source. Its digest
 identifies the exact retained bytes. Renditions preserve that revision while recording

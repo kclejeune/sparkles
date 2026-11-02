@@ -280,6 +280,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/claims/resolve", &["POST"]),
     // authenticated claim proposals of the evidence profile (C25 §5 and §7)
     ("/{ds}/claims", &["POST"]),
+    // review decisions, accepted projections and withdrawals (C25 §5 and §6)
+    ("/{ds}/claims/review", &["POST"]),
+    ("/{ds}/claims/withdraw", &["POST"]),
     // `register_source` and `list_sources` over HTTP (C18 Phase 3m-b)
     ("/{ds}/sources", &["GET", "POST"]),
     ("/{ds}/text", &["GET", "POST"]),
@@ -595,6 +598,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/upload"
         | "/{ds}/facts"
         | "/{ds}/claims"
+        | "/{ds}/claims/review"
+        | "/{ds}/claims/withdraw"
         | "/{ds}/mappings/{name}/run" => Dataset(Write),
         "/{ds}/memory/brief" => Dataset(Read),
         "/{ds}/sources" if get => Dataset(Read),
@@ -656,7 +661,11 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         "/$/ontology/{ds}/axioms" if get => Endpoint::Query,
         "/$/ontology/{ds}/axioms" => Endpoint::Update,
         "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,
-        "/{ds}/update" | "/{ds}/facts" | "/{ds}/claims" => Endpoint::Update,
+        "/{ds}/update"
+        | "/{ds}/facts"
+        | "/{ds}/claims"
+        | "/{ds}/claims/review"
+        | "/{ds}/claims/withdraw" => Endpoint::Update,
         "/{ds}/sources" if get => Endpoint::Query,
         "/{ds}/sources" => Endpoint::Update,
         "/{ds}/get" => Endpoint::GspR,

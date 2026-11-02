@@ -91,11 +91,17 @@ pub fn profile(version: u32) -> Option<&'static Profile> {
 
 pub mod propose;
 pub mod resolve;
+pub mod review;
 
 pub use propose::{
     AuthorityFence, Options as ProposeOptions, Proposed, ProposedRecord, operation_recorded,
     propose, reconcile_operation_holds,
 };
+pub use review::{
+    Changed, Decided, Options as ReviewOptions, ProjectionChange, Reviewed, Withdrawn,
+    WithdrawnClaim, review, withdraw,
+};
+pub use sparkles_core::evidence::review::{DecisionInput, Disposition, WithdrawalInput};
 pub use sparkles_core::evidence::{
     AssessmentInput, ClaimInput, Confidence, ConfidenceFacets, EvidenceInput, EvidenceLinkInput,
     EvidenceRefInput, EvidenceRefTarget, EvidenceRelation, JSON_LEXICAL_UTF8_V1,

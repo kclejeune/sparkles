@@ -9,6 +9,7 @@ mod model;
 mod prepare;
 mod primitives;
 pub mod resolve;
+pub mod review;
 mod settings;
 mod structured;
 pub mod write;

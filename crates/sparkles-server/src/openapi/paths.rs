@@ -3172,6 +3172,22 @@ fn assist(p: &mut Paths) {
             .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
     );
     p.add(
+        op(POST, "/{ds}/claims/review", "reviewClaims", "SPARQL", "Review claims under a policy")
+            .doc("Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.")
+            .see("evidence-reviews")
+            .json_body(true, "EvidenceReview")
+            .json("200", "The operation and its decisions, published, replayed or previewed.", "EvidenceReviewResult")
+            .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
+    );
+    p.add(
+        op(POST, "/{ds}/claims/withdraw", "withdrawClaims", "SPARQL", "Withdraw claim occurrences")
+            .doc("Needs `write` on the dataset or branch through the update endpoint, update grants on each claim's graph, and update and read grants on the output graph and read grants on the decisions and supports graphs of every policy whose evidence boundary holds a claim's graph. Counts as an update. Records a withdrawal with `prov:invalidatedAtTime` in each claim's graph as one commit of the evidence owner, without making a contrary claim. The claims' supports stop being live, and each projected triple left without a live support leaves its output graph. A claim that is already withdrawn is answered as `existing`. Refusals write nothing: `400`, `403`, `409 head-changed`, `409 target-changed`, `409 idempotency-conflict`, `422 evidence-unavailable`, `503 projection-unavailable` and `503 authority-changed`.")
+            .see("evidence-reviews")
+            .json_body(true, "EvidenceWithdrawal")
+            .json("200", "The operation and its withdrawals, published, replayed or previewed.", "EvidenceWithdrawalResult")
+            .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
+    );
+    p.add(
         op(POST, "/{ds}/sources", "registerSource", "SPARQL", "Register a source document")
             .doc("The MCP tool `register_source` as the caller. Needs `write` on the graph and counts as an update. With `original` the file's bytes are kept beside the normalized text, `reanchor` moves the facts that cite the previous rendition to the new text, and `reanchorFrom` copies the facts of a renamed file's source. In a graph under the dataset's import base, a text that matches a secret pattern is refused with 422 `secret-detected`, the pattern's name and the offset. `sparkles memory import` calls it.")
             .see("importing-agent-memory")

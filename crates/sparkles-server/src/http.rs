@@ -4168,6 +4168,8 @@ async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<
                 "profiles": [1],
                 "propose": "/{ds}/claims",
                 "resolve": "/{ds}/claims/resolve",
+                "review": "/{ds}/claims/review",
+                "withdraw": "/{ds}/claims/withdraw",
             },
         },
     });

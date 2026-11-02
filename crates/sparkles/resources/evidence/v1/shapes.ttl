@@ -174,8 +174,43 @@ ev:ReviewDecisionShape a sh:NodeShape ;
   sh:property [ sh:path ev:reviewPolicy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
   sh:property [ sh:path ev:policyVersion ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
   sh:property [ sh:path ev:disposition ; sh:in (ev:Accepted ev:Rejected ev:NeedsEvidence) ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:supersedes ; sh:nodeKind sh:IRI ; sh:maxCount 1 ] ;
   sh:property [ sh:path prov:wasGeneratedBy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
   sh:property [ sh:path prov:wasAttributedTo ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:AcceptanceSupportShape a sh:NodeShape ;
+  sh:targetClass ev:AcceptanceSupport ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path ev:claim ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:decision ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:reviewPolicy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:output ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:supportedTriple ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:conflictsWith ; sh:nodeKind sh:IRI ] ;
+  sh:property [ sh:path prov:wasGeneratedBy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:WithdrawalShape a sh:NodeShape ;
+  sh:targetClass ev:Withdrawal ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path ev:target ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:targetDigest ; sh:datatype xsd:string ; sh:pattern "^sha256:[0-9a-f]{64}$" ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:invalidatedAtTime ; sh:datatype xsd:dateTime ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasGeneratedBy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasAttributedTo ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:message "Evidence profile version 1 requires the documented record structure." .
+
+ev:ProjectionShape a sh:NodeShape ;
+  sh:targetClass ev:Projection ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path ev:reviewPolicy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:policyVersion ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:output ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:conflictMode ; sh:in (ev:Refuse ev:AdmitLabelled) ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:decisionsProtection ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:supportsProtection ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:outputProtection ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
   sh:message "Evidence profile version 1 requires the documented record structure." .
 
 ev:IdentityProposalShape a sh:NodeShape ;

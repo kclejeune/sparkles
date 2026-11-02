@@ -868,3 +868,168 @@ async fn claims_are_proposed_over_http() {
     assert_eq!(server["capabilities"]["claims"]["profiles"], json!([1]));
     assert_eq!(server["capabilities"]["claims"]["propose"], "/{ds}/claims");
 }
+
+/// `POST /{ds}/claims/review` and `POST /{ds}/claims/withdraw` record decisions and
+/// withdrawals, project accepted claims into the policy's output graph and answer each
+/// refusal with its status and code, writing nothing.
+#[tokio::test]
+async fn claims_are_reviewed_and_withdrawn_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state.attach("d", DbType::Persistent, None).unwrap();
+    let app = router(state.clone());
+    let ds = state.get("d").unwrap();
+    let post = |path: &'static str, body: J| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                path,
+                Some("application/json"),
+                &body.to_string(),
+            )
+            .await
+        }
+    };
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &json!({"format": 1, "profile": 1, "enabled": true,
+                "sourceRecords": ["urn:ev:sources"], "proposals": ["urn:ev:claims"],
+                "decisions": ["urn:ev:decisions"], "supports": ["urn:ev:supports"],
+                "projections": ["urn:ev:accepted"],
+                "policies": {"main": {"version": 1, "admittedKinds": ["reported"],
+                    "requiredScope": [], "conflicts": "refuse",
+                    "boundary": ["urn:ev:sources", "urn:ev:claims"],
+                    "decisions": "urn:ev:decisions", "supports": "urn:ev:supports",
+                    "output": "urn:ev:accepted"}}})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let propose = |source: &str| {
+        json!({
+            "revisions": [{"key": "rev", "source": format!("urn:{source}"), "sourceKey": source,
+                           "content": {"digest": format!("sha256:{}", "0".repeat(64))}}],
+            "claims": [{"key": "claim", "occurrenceKey": "c", "revision": {"key": "rev"},
+                        "proposition": "<urn:release> <urn:affectedBy> <urn:cve>",
+                        "kind": "reported", "polarity": "positive", "author": "urn:publisher"}],
+        })
+    };
+    let (status, p) = post("/d/claims", propose("advisory")).await;
+    assert_eq!(status, StatusCode::OK, "{p}");
+    let claim = p["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "claim")
+        .unwrap()
+        .clone();
+    let head = ds.store.head_commit().seq;
+    let accept = |if_head: u64, supersedes: J| {
+        json!({"policy": "main", "policyVersion": 1, "ifHead": if_head,
+               "decisions": [{"key": "a", "target": claim["iri"], "targetDigest": claim["recordDigest"],
+                              "disposition": "accepted", "supersedes": supersedes}]})
+    };
+    // a dry run writes nothing
+    let mut dry = accept(head, J::Null);
+    dry["dryRun"] = true.into();
+    let (status, j) = post("/d/claims/review", dry).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["dryRun"]["wouldCommit"], true, "{j}");
+    assert_eq!(ds.store.head_commit().seq, head);
+    let (status, r) = post("/d/claims/review", accept(head, J::Null)).await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(r["committed"], true);
+    assert!(r["decisions"][0]["support"].is_string(), "{r}");
+    assert_eq!(r["changed"]["inserted"][0]["output"], "urn:ev:accepted");
+    let ask = |q: &str| ds.dataset.ask(q).unwrap();
+    assert!(ask(
+        "ASK { GRAPH <urn:ev:accepted> { <urn:release> <urn:affectedBy> <urn:cve> } }"
+    ));
+    // refusals write nothing
+    let head = ds.store.head_commit().seq;
+    let mut changed_digest = accept(head, r["decisions"][0]["iri"].clone());
+    changed_digest["decisions"][0]["targetDigest"] = format!("sha256:{}", "1".repeat(64)).into();
+    let mut version = accept(head, r["decisions"][0]["iri"].clone());
+    version["policyVersion"] = 2.into();
+    let mut unknown = accept(head, J::Null);
+    unknown["policy"] = "nope".into();
+    let mut disposition = accept(head, J::Null);
+    disposition["decisions"][0]["disposition"] = "maybe".into();
+    for (body, want, code) in [
+        (
+            accept(head - 1, J::Null),
+            StatusCode::CONFLICT,
+            "head-changed",
+        ),
+        (
+            accept(head, J::Null),
+            StatusCode::CONFLICT,
+            "decision-superseded",
+        ),
+        (changed_digest, StatusCode::CONFLICT, "target-changed"),
+        (version, StatusCode::CONFLICT, "policy-changed"),
+        (unknown, StatusCode::BAD_REQUEST, ""),
+        (disposition, StatusCode::BAD_REQUEST, "invalid-reference"),
+        (
+            json!({"policy": "main"}),
+            StatusCode::BAD_REQUEST,
+            "invalid-proposal",
+        ),
+    ] {
+        let (status, j) = post("/d/claims/review", body.clone()).await;
+        assert_eq!(status, want, "{body}: {j}");
+        if !code.is_empty() {
+            assert_eq!(j["code"], code, "{body}: {j}");
+        }
+        assert_eq!(ds.store.head_commit().seq, head, "{body}");
+    }
+    // a withdrawal removes the last live support's triple
+    let (status, w) = post(
+        "/d/claims/withdraw",
+        json!({"idempotencyKey": "w1", "withdrawals": [{"key": "w", "target": claim["iri"],
+               "targetDigest": claim["recordDigest"]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{w}");
+    assert_eq!(w["withdrawals"][0]["existing"], false);
+    assert_eq!(w["changed"]["removed"].as_array().unwrap().len(), 1, "{w}");
+    assert!(!ask(
+        "ASK { GRAPH ?g { <urn:release> <urn:affectedBy> <urn:cve> } }"
+    ));
+    let (status, again) = post(
+        "/d/claims/withdraw",
+        json!({"idempotencyKey": "w1", "withdrawals": [{"key": "w", "target": claim["iri"],
+               "targetDigest": claim["recordDigest"]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["replayed"], true);
+    // an acceptance of the withdrawn claim
+    let head = ds.store.head_commit().seq;
+    let (status, j) = post(
+        "/d/claims/review",
+        accept(head, r["decisions"][0]["iri"].clone()),
+    )
+    .await;
+    assert_eq!(
+        (status, j["code"].as_str()),
+        (StatusCode::CONFLICT, Some("target-withdrawn"))
+    );
+    // clients discover the operations
+    let (_, server) = call(&app, "GET", "/$/server", None, "").await;
+    assert_eq!(
+        server["capabilities"]["claims"]["review"],
+        "/{ds}/claims/review"
+    );
+    assert_eq!(
+        server["capabilities"]["claims"]["withdraw"],
+        "/{ds}/claims/withdraw"
+    );
+}

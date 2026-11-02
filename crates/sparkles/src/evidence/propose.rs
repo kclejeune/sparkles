@@ -43,7 +43,7 @@ use uuid::Uuid;
 pub use sparkles_core::evidence::write::{HeldCommit, operation_id, operation_iri};
 
 /// The memory allowance of the writer's own reads of its head.
-const READS_BYTES: u64 = 16 << 20;
+pub(super) const READS_BYTES: u64 = 16 << 20;
 
 /// A check of the caller's authority that a host runs right before the commit
 /// publishes, such as a server's check that the credential was not revoked.
@@ -64,7 +64,7 @@ thread_local! {
 
 /// Releases the authority guards a commit kept in this thread's slot, also when the
 /// commit unwinds, so that no guard outlives its commit.
-struct Release(usize);
+pub(super) struct Release(usize);
 
 impl Drop for Release {
     fn drop(&mut self) {
@@ -78,6 +78,29 @@ impl Drop for Release {
         });
         drop(released);
     }
+}
+
+/// The publish hook of a typed evidence commit: it runs `first` and then the caller's
+/// authority fence on the committing thread, inside the commit, and keeps the guards
+/// they return in this thread's slot until the returned [`Release`] is dropped once the
+/// commit has published or been refused.
+#[allow(clippy::type_complexity)]
+pub(super) fn publish_hook(
+    authority: Option<Arc<dyn AuthorityFence>>,
+    first: impl Fn() -> Result<Option<Box<dyn std::any::Any>>> + Send + Sync + 'static,
+) -> (Release, crate::guard::PublishHook) {
+    let release = Release(FENCES.with(|f| f.borrow().len()));
+    let hook = crate::guard::PublishHook::new(move || {
+        if let Some(guard) = first()? {
+            FENCES.with(|f| f.borrow_mut().push(guard));
+        }
+        if let Some(authority) = &authority {
+            let guard = authority.enter()?;
+            FENCES.with(|f| f.borrow_mut().push(guard));
+        }
+        Ok(())
+    });
+    (release, hook)
 }
 
 /// How [`propose`] publishes a batch.
@@ -165,12 +188,12 @@ pub struct Proposed {
     pub preview: Option<Box<crate::preview::Preview>>,
 }
 
-fn managed(kind: ManagedErrorKind, message: impl Into<String>) -> Error {
+pub(super) fn managed(kind: ManagedErrorKind, message: impl Into<String>) -> Error {
     ManagedError::error(kind, message)
 }
 
 /// The settings recorded in `main`, and their recorded bytes.
-fn settings_of(main: &Dataset) -> Result<(Settings, Arc<[u8]>)> {
+pub(super) fn settings_of(main: &Dataset) -> Result<(Settings, Arc<[u8]>)> {
     let Some(snapshot) = main.store().managed_snapshot()? else {
         return Err(managed(
             ManagedErrorKind::UnsupportedProfile,
@@ -190,7 +213,7 @@ fn settings_of(main: &Dataset) -> Result<(Settings, Arc<[u8]>)> {
 }
 
 /// The record-role graphs of `settings`, other than accepted projections.
-fn record_graphs(settings: &Settings) -> Vec<NamedNode> {
+pub(super) fn record_graphs(settings: &Settings) -> Vec<NamedNode> {
     let mut out: Vec<NamedNode> = settings
         .source_records
         .iter()
@@ -554,26 +577,21 @@ pub fn propose(
     }
     // The hook runs on this thread, inside the commit, and keeps the authority guard
     // in this thread's slot until the commit returns.
-    let release = Release(FENCES.with(|f| f.borrow().len()));
-    let before_publish = {
-        let authority = options.authority.clone();
+    let (release, before_publish) = {
         let held_by = main.clone();
         let dry_run = options.dry_run;
-        crate::guard::PublishHook::new(move || {
+        publish_hook(options.authority.clone(), move || {
             // An administrator's release leaves the references unheld: refuse rather
             // than record a hold that no longer protects them. The guard keeps every
             // release waiting until this commit has published or been refused.
-            if let Some(id) = hold.filter(|_| !dry_run) {
-                let guard = held_by
-                    .store()
-                    .hold_publication(OwnerKind::Evidence, id, &commits)?;
-                FENCES.with(|f| f.borrow_mut().push(Box::new(guard)));
+            match hold.filter(|_| !dry_run) {
+                Some(id) => Ok(Some(Box::new(held_by.store().hold_publication(
+                    OwnerKind::Evidence,
+                    id,
+                    &commits,
+                )?))),
+                None => Ok(None),
             }
-            if let Some(authority) = &authority {
-                let guard = authority.enter()?;
-                FENCES.with(|f| f.borrow_mut().push(guard));
-            }
-            Ok(())
         })
     };
     let opts = crate::guard::WriteOptions {

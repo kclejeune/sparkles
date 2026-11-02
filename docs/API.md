@@ -12373,6 +12373,95 @@ reference to it, and a commit whose hold was released before it published is a `
 hold-conflict`. Capability discovery is in `GET /$/server`, whose `capabilities.claims`
 lists the profile versions this build serves.
 
+### Evidence reviews
+
+`POST /{ds}/claims/review` appends review decisions under one named review policy of
+the [evidence settings](#evidence-settings), and `POST /{ds}/claims/withdraw` withdraws
+claim occurrences. Both need `write` on the dataset or branch through the update
+endpoint, count as updates and publish one commit of the evidence owner. Neither edits
+a record in place. The design is in
+[C25 §5 and §6](specs/C25-evidence-and-assessments.md#5-writes-review-and-accepted-projections).
+
+```json
+{
+  "policy": "advisories",
+  "policyVersion": 2,
+  "ifHead": 57,
+  "idempotencyKey": "review-2026-01-03",
+  "decisions": [{"key": "d1", "target": "urn:uuid:4f0b…",
+                 "targetDigest": "sha256:9c1e…", "disposition": "accepted"}]
+}
+```
+
+A decision names an exact claim or assessment and the `recordDigest` that the reviewer
+saw, and its disposition is `accepted`, `rejected` or `needsEvidence`. When the target
+already has a decision under the policy, the new decision names it as `supersedes`, and
+the new decision becomes the current one. `ifHead` is required, and every read of the
+review is made at that head. A request holds at most 1,000 decisions, one per target.
+The caller is the reviewer of record, and no client field can name another one.
+
+An acceptance projects a claim when the claim is positive, its kind is one of the
+policy's admitted kinds and it carries every required scope predicate. The server then
+records an `ev:AcceptanceSupport` in the policy's supports graph and inserts the claim's
+proposition into the policy's output graph. Other acceptances are recorded with a
+`notProjected` reason, and negative and uncertain claims never project. A support stays
+live while its decision is current and its claim is not withdrawn. A projected triple
+stays in the output graph while at least one live support owns it, so two occurrences
+of one proposition each own a support, and reversing or withdrawing one leaves the
+triple to the other.
+
+Contrary evidence is an `ev:Contradicts` link to the claim or a negative claim of the
+same proposition in the policy's evidence boundary whose current decision is not a
+rejection. A policy with `conflicts: "refuse"` refuses such an acceptance. A policy with
+`admitLabelled` admits it, lists the contrary records in the support's
+`ev:conflictsWith` and in the answer's `conflicts`, and its `ev:Projection` record names
+that mode. Conflicts are decided against the request's final decisions when it is
+admitted. Later contrary evidence does not relabel or remove a support.
+
+A review needs update and read grants on the policy's decisions, supports and output
+graphs and read access to each target. An acceptance also needs read access to every
+evidence link of the target in the policy's boundary, with the link's reference and the
+records and stored fact that the reference names, and to every negative claim of the
+same proposition there. When one of them is unreadable, the answer is the
+`evidence-unavailable` answer of an unreadable target, so it reveals nothing about the
+hidden record.
+
+A withdrawal names a claim and its record digest. The server records an `ev:Withdrawal`
+with `prov:invalidatedAtTime`, the commit's time, in the claim's own graph, and makes no
+contrary claim. The claim's supports stop being live, and each projected triple left
+without a live support leaves its output graph. A claim that is already withdrawn
+answers `existing: true`. A withdrawal needs update grants on each claim's graph and on
+the output graph, and read grants on the decisions, supports and output graphs, of every
+policy whose boundary holds that graph. `ifHead` is optional for a withdrawal. A
+withdrawn claim cannot be accepted again, and a new occurrence must be proposed instead.
+
+The review answer is `{operation, committed, replayed, commit, branchId, decisions,
+changed}`, and each decision is `{key, iri, target, disposition, supersedes, support,
+notProjected, conflicts}`. The withdrawal answer is `{operation, committed, replayed,
+commit, branchId, withdrawals, changed}`, and each withdrawal is `{key, iri, target,
+existing}`. `changed` lists `supportsAdded`, `supportsEnded`, and the `inserted` and
+`removed` projected triples with their output graphs, so that consumers can find the
+results that depend on them. A replay answers the first receipt with an empty
+`changed`.
+
+| Status and code | Meaning |
+|---|---|
+| `400 invalid-proposal`, `400 invalid-reference` | The body is malformed, a field is invalid, or the policy is unknown. The message names the field. |
+| `403` | The caller may not update or read a graph the operation needs. |
+| `409 policy-changed` | `policyVersion` is not the policy's version. |
+| `409 head-changed` | `ifHead` is not the branch head, or the head moved while the operation read it. |
+| `409 target-changed` | A target's record digest is not the one the request names. |
+| `409 decision-superseded` | `supersedes` is not the target's current decision under the policy. |
+| `409 target-withdrawn` | An acceptance names a withdrawn claim. |
+| `409 evidence-conflict` | An acceptance meets contrary evidence under a policy that refuses conflicts. |
+| `409 idempotency-conflict` | The key was used with a different payload. |
+| `422 evidence-unavailable` | A target, or evidence that an acceptance must read, is missing, unreadable or outside the policy's boundary. |
+| `422 incomplete-evidence` | The acceptances need more than 10,000 evidence records. |
+| `503 projection-unavailable` | A graph of the policy's projection was detached and protected again, so its supports no longer authenticate. |
+| `503 authority-changed` | The caller's credential or the access policy changed before the commit published. |
+
+A refusal writes nothing. `GET /$/server` lists both routes in `capabilities.claims`.
+
 ### Suggested examples
 
 A reader who finds a good question and query can suggest it as an example, and a

@@ -82,6 +82,19 @@ ev:recordDigest a rdf:Property ; rdfs:comment "The digest of a record's immutabl
 ev:retainedBytes a rdf:Property ; rdfs:comment "The retained bytes of a source revision or rendition, whose contentDigest they match." .
 ev:locator a rdf:Property ; rdfs:comment "A locator of a source revision; a locator is not its identity." .
 ev:reportedRights a rdf:Property ; rdfs:comment "Rights metadata reported for a source revision; it grants no permission." .
+ev:supersedes a rdf:Property ; rdfs:comment "The exact earlier review decision that a later decision replaces; neither is edited." .
+ev:AcceptanceSupport a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "One admitted claim occurrence that owns a projected triple while its decision is current and the claim is not withdrawn." .
+ev:claim a rdf:Property ; rdfs:comment "The admitted claim occurrence of an acceptance support." .
+ev:decision a rdf:Property ; rdfs:comment "The review decision that admitted an acceptance support." .
+ev:output a rdf:Property ; rdfs:comment "The projection graph a support or projection writes." .
+ev:supportedTriple a rdf:Property ; rdfs:comment "The projected triple an acceptance support owns." .
+ev:conflictsWith a rdf:Property ; rdfs:comment "A contrary link or claim that a labelled projection admitted its support against." .
+ev:Withdrawal a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "The withdrawal of a claim occurrence's admission; it makes no contrary claim." .
+ev:Projection a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "A review policy's projection under one policy version, with its conflict mode and the protections it was written under." .
+ev:conflictMode a rdf:Property ; rdfs:comment "Whether a projection refuses conflicts or admits them labelled; neither is a consistent logical closure." .
+ev:decisionsProtection a rdf:Property ; rdfs:comment "The protection nonce of the decisions graph when a projection was first written." .
+ev:supportsProtection a rdf:Property ; rdfs:comment "The protection nonce of the supports graph when a projection was first written." .
+ev:outputProtection a rdf:Property ; rdfs:comment "The protection nonce of the output graph when a projection was first written." .
 ev:Reported a rdfs:Resource ; rdfs:comment "The proposition was reported by its attributed source." .
 ev:Observation a rdfs:Resource ; rdfs:comment "The attributed author describes an observation." .
 ev:Hypothesis a rdfs:Resource ; rdfs:comment "The proposition is proposed for investigation." .
@@ -100,3 +113,5 @@ ev:Accepted a rdfs:Resource ; rdfs:comment "A review accepts the exact target un
 ev:Rejected a rdfs:Resource ; rdfs:comment "A review rejects the exact target under its policy." .
 ev:NeedsEvidence a rdfs:Resource ; rdfs:comment "A review asks for more evidence about the exact target." .
 ev:ZeroToOne a rdfs:Resource ; rdfs:comment "The declared finite decimal confidence scale from zero through one." .
+ev:Refuse a rdfs:Resource ; rdfs:comment "A projection that refuses an acceptance meeting contrary evidence." .
+ev:AdmitLabelled a rdfs:Resource ; rdfs:comment "A projection that admits contradicted claims and names what contradicts them." .
