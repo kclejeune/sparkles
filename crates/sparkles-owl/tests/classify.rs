@@ -465,28 +465,42 @@ fn chains_that_share_operands_are_charged_once_per_entry() {
 
 #[test]
 fn the_property_closure_polls_the_cancellation() {
-    let mut axioms = Vec::new();
-    for i in 0..3000 {
-        axioms.push(ax(AxiomKind::SubObjectPropertyOf(
-            SubObjectPropertyExpression::Expression(ope(&format!("r{i}"))),
-            ope(&format!("r{}", i + 1)),
-        )));
+    // 300 properties, each a subproperty of every later one, which is a closure of
+    // millions of steps over fewer rows than one poll interval of rows would be
+    let mut axioms = vec![sub(c("A"), c("B"))];
+    for i in 0..300 {
+        for j in i + 1..300 {
+            axioms.push(ax(AxiomKind::SubObjectPropertyOf(
+                SubObjectPropertyExpression::Expression(ope(&format!("r{i}"))),
+                ope(&format!("r{j}")),
+            )));
+        }
     }
-    // normalization polls once, then the closure is the next to poll
-    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let m = n.clone();
-    let limits = Limits {
-        cancelled: Some(Arc::new(move || m.fetch_add(1, Ordering::Relaxed) >= 1)),
-        ..Limits::default()
+    let counting = |stop_at: usize| {
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let m = n.clone();
+        let limits = Limits {
+            cancelled: Some(Arc::new(move || {
+                m.fetch_add(1, Ordering::Relaxed) + 1 >= stop_at
+            })),
+            ..Limits::default()
+        };
+        (n, limits)
     };
-    let start = std::time::Instant::now();
+    // a whole run polls the closure many times, more than its stages and
+    // normalization poll together
+    let (n, limits) = counting(usize::MAX);
+    Classifier::of(&axioms).classify(&limits).unwrap();
+    let polls = n.load(Ordering::Relaxed);
+    assert!(polls > 50, "{polls} polls");
+    // a cancellation in the middle of the closure stops the run there
+    let (n, limits) = counting(polls / 2);
     assert_eq!(
         Classifier::of(&axioms).classify(&limits).unwrap_err(),
         Error::Cancelled
     );
-    // the closure stopped at its first poll, not after its 4.5 million entries
-    assert!(n.load(Ordering::Relaxed) >= 2);
-    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    // one more poll tells the deadline from the cancellation
+    assert_eq!(n.load(Ordering::Relaxed), polls / 2 + 1);
 }
 
 #[test]

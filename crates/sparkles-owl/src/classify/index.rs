@@ -13,6 +13,7 @@
 use crate::model::*;
 use crate::vocab;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::Cell;
 use std::collections::BTreeSet;
 
 /// An interned class expression.
@@ -877,8 +878,9 @@ pub enum Halt {
     Stopped,
 }
 
-/// The roles between two polls of the run's deadline and cancellation.
-const POLL_ROLES: usize = 1024;
+/// The steps of the property closure between two polls of the run's deadline and
+/// cancellation, where a step visits one edge or one entry.
+const POLL_WORK: usize = 65_536;
 
 fn roles(
     ax: &Axioms,
@@ -886,15 +888,19 @@ fn roles(
     limit: Option<usize>,
     stop: &dyn Fn() -> bool,
 ) -> Result<Roles, Halt> {
-    let mut bytes = 0usize;
-    let mut steps = 0usize;
-    let mut grow = |b: usize| -> Result<(), Halt> {
-        bytes += b;
-        if limit.is_some_and(|l| bytes > l) {
-            return Err(Halt::Memory(bytes));
+    let bytes = Cell::new(0usize);
+    let grow = |b: usize| -> Result<(), Halt> {
+        bytes.set(bytes.get() + b);
+        if limit.is_some_and(|l| bytes.get() > l) {
+            return Err(Halt::Memory(bytes.get()));
         }
-        steps += 1;
-        if steps.is_multiple_of(POLL_ROLES) && stop() {
+        Ok(())
+    };
+    let work = Cell::new(0usize);
+    let tick = |w: usize| -> Result<(), Halt> {
+        let before = work.get();
+        work.set(before + w);
+        if before / POLL_WORK != (before + w) / POLL_WORK && stop() {
             return Err(Halt::Stopped);
         }
         Ok(())
@@ -938,6 +944,7 @@ fn roles(
         let mut seen: BTreeSet<Role> = BTreeSet::new();
         let mut stack = vec![r];
         while let Some(x) = stack.pop() {
+            tick(1)?;
             if seen.insert(x) {
                 stack.extend(direct[x as usize].iter().copied());
             }
@@ -948,6 +955,7 @@ fn roles(
     }
     let mut sub: Vec<Vec<Role>> = vec![Vec::new(); n];
     for (r, ss) in sup.iter().enumerate() {
+        tick(1 + ss.len())?;
         for &s in ss {
             sub[s as usize].push(r as Role);
         }
@@ -969,6 +977,7 @@ fn roles(
                 b += 4;
             }
             grow(b)?;
+            tick(1 + sub[s2 as usize].len())?;
         }
     }
     for v in comp.values_mut() {
@@ -977,6 +986,7 @@ fn roles(
     }
     let mut reflexive: BTreeSet<Role> = BTreeSet::new();
     for &r in &ax.reflexive {
+        tick(1 + sup[r as usize].len())?;
         reflexive.extend(sup[r as usize].iter().copied());
     }
     let mut direct_ranges: Vec<Vec<Ex>> = vec![Vec::new(); n];
@@ -985,6 +995,7 @@ fn roles(
     }
     let mut range = vec![None; n];
     for r in 0..n {
+        tick(1 + sup[r].len())?;
         let mut cs: Vec<Ex> = sup[r]
             .iter()
             .flat_map(|&s| direct_ranges[s as usize].iter().copied())
