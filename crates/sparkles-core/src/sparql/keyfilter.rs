@@ -7,7 +7,7 @@
 //! straight off the key are compiled; ids that are not stored terms (inline numbers and
 //! dates, blank nodes, unbound) are left to the general evaluator.
 
-use super::expr::{CmpOp, Expr, Func, compile_regex, lang_matches_bytes};
+use super::expr::{CmpOp, Expr, Func, lang_matches_bytes};
 use super::table::VarId;
 use super::value::Value;
 use crate::id::KEY_SEP;
@@ -38,13 +38,9 @@ enum Test {
     },
     Regex {
         arg: Arg,
-        re: regex::Regex,
+        /// the query's program, or `None` in a filter compiled only for its prefixes
+        re: Option<super::query_regex::RegexHandle>,
         /// the text every match starts with, for a pattern anchored at the start
-        prefix: Option<Arc<str>>,
-    },
-    CursorRegex {
-        arg: Arg,
-        re: super::cursor_regex::RegexHandle,
         prefix: Option<Arc<str>>,
     },
     /// `LANGMATCHES(LANG(?v), "range")`
@@ -83,6 +79,18 @@ fn length_test(e: &Expr, v: VarId) -> Option<Test> {
         op,
         bound: constant,
     })
+}
+
+/// Where a key filter's regular expressions come from.
+#[derive(Clone, Copy)]
+enum Programs<'a> {
+    /// the query's charged programs
+    Query(&'a super::ctx::Ctx),
+    /// uncharged programs of the filter's own, for the tests of the filter alone
+    #[cfg_attr(not(test), allow(dead_code))]
+    Own,
+    /// none, for a filter that only gives its prefixes
+    None,
 }
 
 /// A conjunction of key tests over one variable.
@@ -192,21 +200,25 @@ fn const_str(e: &Expr) -> Option<&str> {
 }
 
 impl KeyFilter {
-    /// Cursor fallbacks and planning use this admission too: otherwise an eager
-    /// subtree could compile an uncharged regex into the thread-local cache.
+    /// Compile filter conjuncts over `v` with the query's charged regular expressions,
+    /// in both accounting modes. `None` unless every conjunct is a supported test, or
+    /// when the filter's state does not fit the budget.
     pub(super) fn new_for(ctx: &super::ctx::Ctx, exprs: &[Expr], v: VarId) -> Option<Self> {
-        if !ctx.is_cursor() {
-            return Self::new(exprs, v);
-        }
         let bytes = Self::cursor_scratch_bytes(
             exprs,
             v,
             rayon::current_num_threads().saturating_mul(4096),
         )?;
         let charge = ctx.retained_charge(bytes).ok()?;
-        let mut filter = Self::compile(Some(ctx), exprs, v)?;
+        let mut filter = Self::compile(Programs::Query(ctx), exprs, v)?;
         filter.1 = charge.map(Arc::new);
         Some(filter)
+    }
+
+    /// [`KeyFilter::key_prefixes`] of the filter [`KeyFilter::new_for`] would compile,
+    /// without compiling its regular expressions, for the planner's estimates.
+    pub(super) fn plan_prefixes(exprs: &[Expr], v: VarId) -> Option<Vec<Vec<u8>>> {
+        Self::compile(Programs::None, exprs, v)?.key_prefixes()
     }
 
     /// Reserve cursor metadata before compiling key tests. Regex programs and
@@ -256,18 +268,15 @@ impl KeyFilter {
         Some(total.saturating_mul(rows.div_ceil(4096).saturating_add(1) as u64))
     }
 
-    /// Compile filter conjuncts over `v`; `None` unless every conjunct is a supported test.
+    /// Compile filter conjuncts over `v` with uncharged programs of their own; `None`
+    /// unless every conjunct is a supported test.
+    #[cfg(test)]
     pub fn new(exprs: &[Expr], v: VarId) -> Option<KeyFilter> {
-        Self::compile(None, exprs, v)
+        Self::compile(Programs::Own, exprs, v)
     }
 
-    fn compile(ctx: Option<&super::ctx::Ctx>, exprs: &[Expr], v: VarId) -> Option<KeyFilter> {
-        fn add(
-            ctx: Option<&super::ctx::Ctx>,
-            e: &Expr,
-            v: VarId,
-            out: &mut Vec<Test>,
-        ) -> Option<()> {
+    fn compile(ctx: Programs<'_>, exprs: &[Expr], v: VarId) -> Option<KeyFilter> {
+        fn add(ctx: Programs<'_>, e: &Expr, v: VarId, out: &mut Vec<Test>) -> Option<()> {
             if let Some(test) = length_test(e, v) {
                 out.push(test);
                 return Some(());
@@ -303,17 +312,19 @@ impl KeyFilter {
                         _ => "",
                     };
                     let pattern = const_str(p)?;
-                    match ctx {
-                        Some(ctx) => Test::CursorRegex {
-                            arg: Arg::of(a, v)?,
-                            re: ctx.cursor_regex(pattern, flags).ok()??.handle(),
-                            prefix: regex_prefix(pattern, flags).map(Into::into),
-                        },
-                        None => Test::Regex {
-                            arg: Arg::of(a, v)?,
-                            re: compile_regex(pattern, flags).ok()?,
-                            prefix: regex_prefix(pattern, flags).map(Into::into),
-                        },
+                    let arg = Arg::of(a, v)?;
+                    let re = match ctx {
+                        Programs::Query(ctx) => Some(ctx.regex(pattern, flags).ok()??.handle()),
+                        Programs::Own => Some(Arc::new(
+                            super::query_regex::RegexState::compile(None, pattern, flags).ok()??,
+                        )
+                        .handle()),
+                        Programs::None => None,
+                    };
+                    Test::Regex {
+                        arg,
+                        re,
+                        prefix: regex_prefix(pattern, flags).map(Into::into),
                     }
                 }
                 (Function::LangMatches, [Expr::Call(Func::Builtin(Function::Lang), l), r])
@@ -346,11 +357,6 @@ impl KeyFilter {
                     ..
                 } => (*arg, needle),
                 Test::Regex {
-                    arg,
-                    prefix: Some(p),
-                    ..
-                }
-                | Test::CursorRegex {
                     arg,
                     prefix: Some(p),
                     ..
@@ -404,14 +410,14 @@ impl KeyFilter {
                         _ => s.ends_with(needle.as_bytes()),
                     }
             }),
-            Test::Regex { arg, re, .. } => arg
-                .read(&key)
-                .and_then(|(s, _)| std::str::from_utf8(s).ok())
-                .is_some_and(|s| re.is_match(s)),
-            Test::CursorRegex { arg, re, .. } => arg
-                .read(&key)
-                .and_then(|(s, _)| std::str::from_utf8(s).ok())
-                .is_some_and(|s| re.is_match(s)),
+            Test::Regex { arg, re, .. } => {
+                let re = re
+                    .as_ref()
+                    .expect("a tested filter has compiled its regular expressions");
+                arg.read(&key)
+                    .and_then(|(s, _)| std::str::from_utf8(s).ok())
+                    .is_some_and(|s| re.is_match(s))
+            }
             Test::LangMatches(range) => match &key {
                 // Basic language filtering only compares bytes. The final validity
                 // check rejects malformed UTF-8 after all predicates pass.

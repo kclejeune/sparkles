@@ -131,3 +131,84 @@ fn a_refused_template_term_leaves_the_store_unchanged() {
         other => panic!("{other:?}"),
     }
 }
+
+/// A regular expression's program is charged in both accounting modes, so one that
+/// cannot fit a small budget fails the query instead of compiling outside it.
+#[test]
+fn a_regular_expression_beyond_the_budget_fails_the_query_in_both_modes() {
+    let s = store();
+    let q = r#"SELECT (REGEX("α", "\\w{20}") AS ?x) WHERE {}"#;
+    // the budgeted queries run first, since the result cache would answer them
+    match query(s.snapshot(), q, &budget(32 << 10)) {
+        Err(error) => assert!(is_memory(&error), "{error:?}"),
+        Ok(r) => panic!("eager answered {:?} within the budget", r.rows()),
+    }
+    let mut c = select_cursor(
+        s.snapshot(),
+        q,
+        &budget(32 << 10),
+        &CursorOptions::default(),
+    )
+    .unwrap();
+    match c.next_batch() {
+        Err(error) => assert!(is_memory(&error), "{error:?}"),
+        Ok(b) => panic!(
+            "the cursor answered {:?} within the budget",
+            b.map(|b| b.len())
+        ),
+    }
+    let rows = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0][0].is_some());
+}
+
+fn count(rows: &[Vec<Option<oxrdf::Term>>]) -> u64 {
+    match &rows[..] {
+        [row] => match &row[0] {
+            Some(oxrdf::Term::Literal(l)) => l.value().parse().unwrap(),
+            other => panic!("not a count: {other:?}"),
+        },
+        _ => panic!("{} rows", rows.len()),
+    }
+}
+
+/// Regular expressions on Rayon workers, each with its own search cache, give the
+/// counts that follow from the data, through the key filters on vocabulary keys and
+/// through `REGEX` and `REPLACE` on computed strings, in both accounting modes.
+#[test]
+fn regular_expressions_on_rayon_workers_count_what_the_data_holds() {
+    let s = store();
+    // the literals are "0" to "49999" and the subjects <urn:s0> to <urn:s49999>
+    let cases = [
+        (r#"FILTER(REGEX(STR(?s), "s1[0-9]{3}$"))"#, 1000),
+        (r#"FILTER(REGEX(?o, "^4[0-9]{4}$"))"#, 10_000),
+        (r#"FILTER(REGEX(?o, "^ab", "i") || REGEX(?o, "^7"))"#, 1111),
+        (r#"FILTER(REGEX(CONCAT("x", ?o), "^x7"))"#, 1111),
+        (r#"FILTER(REPLACE(?o, "([0-9])9$", "$1x") != ?o)"#, 4999),
+    ];
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap()
+        .install(|| {
+            for (filter, expected) in cases {
+                let q = format!("SELECT (COUNT(*) AS ?c) WHERE {{ ?s <urn:p> ?o {filter} }}");
+                let eager = query(s.snapshot(), &q, &Default::default()).unwrap().rows();
+                assert_eq!(count(&eager), expected, "eager {filter}");
+                let mut c = select_cursor(
+                    s.snapshot(),
+                    &q,
+                    &Default::default(),
+                    &CursorOptions::default(),
+                )
+                .unwrap();
+                let mut rows = Vec::new();
+                while let Some(b) = c.next_batch().unwrap() {
+                    for i in 0..b.len() {
+                        rows.push(b.row(i).unwrap());
+                    }
+                }
+                assert_eq!(count(&rows), expected, "cursor {filter}");
+            }
+        });
+}

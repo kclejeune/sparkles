@@ -676,6 +676,8 @@ pub struct Ctx {
     /// the context itself, once it is shared, which retained charges release through
     /// (see [`Ctx::attach_owner`])
     owner: parking_lot::Mutex<Weak<Ctx>>,
+    /// the query's compiled regular expressions, charged in both accounting modes
+    regex: super::query_regex::RegexCache,
     // Opt-in cursor accounting stays after the ordinary execution fields.
     cursor_memory: Option<Box<CursorMemory>>,
     // Data and weak retained caches drop before final ledger ownership.
@@ -788,10 +790,9 @@ struct DecodeEnvelope {
     reserved: AtomicU64,
 }
 
+/// The mark of a context in cursor accounting (see [`Ctx::accounting`]).
 #[derive(Default)]
-struct CursorMemory {
-    regex: super::cursor_regex::RegexCache,
-}
+struct CursorMemory;
 
 #[cfg(test)]
 thread_local! {
@@ -994,6 +995,7 @@ impl Ctx {
             decode: Default::default(),
             retained: Default::default(),
             owner: Default::default(),
+            regex: Default::default(),
             cursor_memory: None,
             fast: Default::default(),
             memory: Default::default(),
@@ -1386,16 +1388,26 @@ impl Ctx {
         Ok(Some(RetainedCharge { owner, id, bytes }))
     }
 
-    pub(super) fn cursor_regex(
+    /// The query's program of a regular expression, compiled and charged on first use.
+    /// `Ok(None)` for a pattern or flags that do not compile.
+    pub(super) fn regex(
         &self,
         pattern: &str,
         flags: &str,
-    ) -> Result<Option<Arc<super::cursor_regex::RegexState>>> {
-        self.cursor_memory
-            .as_ref()
-            .expect("cursor regex context")
-            .regex
-            .get(self, pattern, flags)
+    ) -> Result<Option<Arc<super::query_regex::RegexState>>> {
+        self.regex.get(self, pattern, flags)
+    }
+
+    /// Run `f` on the query's program of a regular expression without taking a
+    /// reference to it, which is the per-row path of `REGEX` and `REPLACE`.
+    #[inline]
+    pub(super) fn with_regex<R>(
+        &self,
+        pattern: &str,
+        flags: &str,
+        f: impl FnOnce(&super::query_regex::RegexState) -> R,
+    ) -> Result<Option<R>> {
+        self.regex.with(self, pattern, flags, f)
     }
 
     /// Give back `bytes` of estimated memory, and the pool's granules the query no
@@ -1440,11 +1452,9 @@ impl Ctx {
     }
 
     /// Release the state that only running work needs: the decode envelope and the
-    /// cursor's regular expressions. Execution ends with it in both accounting modes.
+    /// query's regular expressions. Execution ends with it in both accounting modes.
     pub(super) fn release_work(&self) {
-        if let Some(memory) = &self.cursor_memory {
-            memory.regex.clear();
-        }
+        self.regex.clear();
         self.release_decode_envelope();
     }
 

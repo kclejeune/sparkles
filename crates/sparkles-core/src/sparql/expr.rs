@@ -841,68 +841,31 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// A compiled pattern, shared by the calls of one thread: reusing the instance keeps its
-/// match cache (a clone of a `Regex` starts an empty one).
-type SharedRegex = std::rc::Rc<regex::Regex>;
-
-thread_local! {
-    static REGEX_CACHE: std::cell::RefCell<FxHashMap<(String, String), Option<SharedRegex>>> =
-        std::cell::RefCell::new(FxHashMap::default());
-    /// the last pattern looked up: a constant pattern is found without hashing or
-    /// allocating on every row
-    static LAST_REGEX: std::cell::RefCell<Option<(String, String, SharedRegex)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
+/// Compile an XPath pattern with SPARQL `REGEX` flags into a `regex::Regex`, for
+/// callers outside query evaluation, such as SHACL and ShEx shapes, which compile each
+/// pattern once. Query evaluation uses the query's own programs instead.
 pub fn compile_regex(pattern: &str, flags: &str) -> EvalResult<regex::Regex> {
-    shared_regex(pattern, flags).map(|r| (*r).clone())
-}
-
-/// The compiled pattern, from this thread's cache.
-fn shared_regex(pattern: &str, flags: &str) -> EvalResult<SharedRegex> {
-    if let Some(r) = LAST_REGEX.with(|l| {
-        l.borrow()
-            .as_ref()
-            .filter(|(p, f, _)| p == pattern && f == flags)
-            .map(|(_, _, r)| r.clone())
-    }) {
-        return Ok(r);
-    }
-    let r = REGEX_CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.len() > 1000 {
-            c.clear();
+    let mut b = String::new();
+    let mut literal = false;
+    for f in flags.chars() {
+        match f {
+            'i' => b.push_str("(?i)"),
+            's' => b.push_str("(?s)"),
+            'm' => b.push_str("(?m)"),
+            'x' => b.push_str("(?x)"),
+            'q' => literal = true,
+            _ => return Err(TypeError),
         }
-        c.entry((pattern.to_string(), flags.to_string()))
-            .or_insert_with(|| {
-                let mut b = String::new();
-                let mut literal = false;
-                for f in flags.chars() {
-                    match f {
-                        'i' => b.push_str("(?i)"),
-                        's' => b.push_str("(?s)"),
-                        'm' => b.push_str("(?m)"),
-                        'x' => b.push_str("(?x)"),
-                        'q' => literal = true,
-                        _ => return None,
-                    }
-                }
-                if literal {
-                    b.push_str(&regex::escape(pattern));
-                } else {
-                    b.push_str(pattern);
-                }
-                regex::RegexBuilder::new(&b)
-                    .size_limit(1 << 22)
-                    .build()
-                    .ok()
-                    .map(std::rc::Rc::new)
-            })
-            .clone()
-            .ok_or(TypeError)
-    })?;
-    LAST_REGEX.with(|l| *l.borrow_mut() = Some((pattern.into(), flags.into(), r.clone())));
-    Ok(r)
+    }
+    if literal {
+        b.push_str(&regex::escape(pattern));
+    } else {
+        b.push_str(pattern);
+    }
+    regex::RegexBuilder::new(&b)
+        .size_limit(1 << 22)
+        .build()
+        .map_err(|_| TypeError)
 }
 
 /// XPath replacement string → Rust regex replacement.
@@ -1203,33 +1166,22 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 .as_deref()
                 .map_or(Some(""), Value::as_str)
                 .ok_or(TypeError)?;
-            if ctx.is_cursor() {
-                let re = ctx
-                    .cursor_regex(p.as_str().ok_or(TypeError)?, flags)
-                    .map_err(|error| {
-                        ctx.fail_memory(&error);
-                        TypeError
-                    })?
-                    .ok_or(TypeError)?;
-                if re.is_match(ctx, "").map_err(|error| {
-                    ctx.fail_memory(&error);
-                    TypeError
-                })? {
-                    return Err(TypeError);
-                }
-                let rep = xpath_replacement(r.as_str().ok_or(TypeError)?)?;
-                let output = re.replace(ctx, st, &rep).map_err(|error| {
-                    ctx.fail_memory(&error);
-                    TypeError
-                })?;
-                return Ok(same_kind(l, output));
-            }
-            let re = shared_regex(p.as_str().ok_or(TypeError)?, flags)?;
-            if re.is_match("") {
-                return Err(TypeError);
-            }
             let rep = xpath_replacement(r.as_str().ok_or(TypeError)?)?;
-            same_kind(l, re.replace_all(st, rep.as_str()).into_owned())
+            let output = ctx
+                .with_regex(p.as_str().ok_or(TypeError)?, flags, |re| {
+                    if re.matches_empty() {
+                        return Ok(None);
+                    }
+                    re.replace(ctx, st, &rep).map(Some)
+                })
+                .and_then(|output| output.transpose())
+                .map_err(|error| {
+                    ctx.fail_memory(&error);
+                    TypeError
+                })?
+                .flatten()
+                .ok_or(TypeError)?;
+            same_kind(l, output)
         }
         F::UCase => {
             let v = a0()?;
@@ -1398,21 +1350,13 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 .as_deref()
                 .map_or(Some(""), Value::as_str)
                 .ok_or(TypeError)?;
-            if ctx.is_cursor() {
-                let re = ctx
-                    .cursor_regex(p.as_str().ok_or(TypeError)?, flags)
-                    .map_err(|error| {
-                        ctx.fail_memory(&error);
-                        TypeError
-                    })?
-                    .ok_or(TypeError)?;
-                b(re.is_match(ctx, st).map_err(|error| {
+            b(ctx
+                .with_regex(p.as_str().ok_or(TypeError)?, flags, |re| re.is_match(st))
+                .map_err(|error| {
                     ctx.fail_memory(&error);
                     TypeError
-                })?)
-            } else {
-                b(shared_regex(p.as_str().ok_or(TypeError)?, flags)?.is_match(st))
-            }
+                })?
+                .ok_or(TypeError)?)
         }
         F::Custom(iri) => return extension(iri.as_str(), args, row, ctx),
         // ---- SPARQL 1.2 -------------------------------------------------------------
