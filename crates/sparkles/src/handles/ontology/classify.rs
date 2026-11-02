@@ -186,7 +186,8 @@ impl Ontologies {
             let mut axioms = logical_axioms(&o.ontology);
             axioms.extend(assertions.iter().map(|a| &a.kind).filter(|k| logical(k)));
             let mut s = Saturation::new();
-            let out = run(&mut s, &axioms, None, c, &opts)?;
+            let par = admit(c, &opts)?;
+            let out = run(&mut s, &axioms, None, par, &opts)?;
             (Arc::new(out), Arc::new(s.excluded().to_vec()), false)
         };
         if let Some(about) = &c.about
@@ -251,6 +252,15 @@ impl Ontologies {
             *state.classify_cache.lock() = Some(e);
             return Ok(answer);
         }
+        // the threads come first: a wait that ends at the deadline leaves the kept state
+        // as it was
+        let par = match admit(c, opts) {
+            Ok(par) => par,
+            Err(err) => {
+                *state.classify_cache.lock() = Some(e);
+                return Err(err);
+            }
+        };
         // the axioms that changed since the ontology the saturation last read
         let before = e.ontology.take();
         let axioms = logical_axioms(&o.ontology);
@@ -271,7 +281,7 @@ impl Ontologies {
         });
         e.commit = commit;
         e.result = None;
-        let out = run(&mut e.saturation, &axioms, changes, c, opts);
+        let out = run(&mut e.saturation, &axioms, changes, par, opts);
         // the saturation reflects the new axioms whether the run ends or not
         e.ontology = Some(o.ontology.clone());
         let out = match out {
@@ -475,18 +485,33 @@ impl Ontologies {
     }
 }
 
-/// Runs a classification under the options' deadline, cancellation and memory budget,
-/// with threads from the algorithm pool.
+#[cfg(test)]
+thread_local! {
+    /// Makes the next admission on this thread time out, as a full pool would.
+    pub(super) static REFUSE_ADMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The threads of a classification, from the algorithm pool. A caller takes them before
+/// it changes any kept state, since the wait can end at the deadline or a cancellation.
+fn admit(c: &ClassifyRequest, opts: &QueryOptions) -> Result<Par> {
+    #[cfg(test)]
+    if REFUSE_ADMISSION.with(|r| r.replace(false)) {
+        return Err(Error::Timeout);
+    }
+    let flag = opts.cancel.clone().unwrap_or_default();
+    let ctl = Control::new(flag, opts.deadline, u64::MAX);
+    Par::acquire(c.threads, &ctl)
+}
+
+/// Runs a classification on the threads of `par` under the options' deadline,
+/// cancellation and memory budget.
 fn run(
     k: &mut Saturation,
     axioms: &[&AxiomKind],
     changes: Option<Changes<'_>>,
-    c: &ClassifyRequest,
+    par: Par,
     opts: &QueryOptions,
 ) -> Result<Classification> {
-    let flag = opts.cancel.clone().unwrap_or_default();
-    let ctl = Control::new(flag, opts.deadline, u64::MAX);
-    let par = Par::acquire(c.threads, &ctl)?;
     let cancel = opts.cancel.clone();
     let cancellation = opts.cancellation.clone();
     let grant = opts.grant.clone();
