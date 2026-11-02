@@ -957,6 +957,17 @@ mod random {
         fn json_then_read(ax in axiom()) {
             prop_assert_eq!(json::read_axiom(&json::axiom(&ax)).unwrap(), ax);
         }
+
+        /// The functional-style writer's document reads back as the same axioms.
+        #[test]
+        fn ofn_then_read(axioms in prop::collection::vec(axiom(), 1..6)) {
+            let r = sparkles_owl::ofn::Renderer::new([("ex", "http://example.org/")]);
+            let header = Header { iri: Some(iri(ex("onto"))), ..Default::default() };
+            let doc = sparkles_owl::ofn::document(&r, &header, &axioms);
+            let back = sparkles_owl::ofn_read::parse(&doc).unwrap();
+            prop_assert_eq!(back.header, header);
+            prop_assert_eq!(back.axioms, axioms);
+        }
     }
 }
 
@@ -1173,4 +1184,152 @@ fn a_failed_class_read_does_not_shorten_a_data_range() {
             if d.as_str() == format!("http://example.org/T{}", n - 1))),
         "the deepest definition is not read"
     );
+}
+
+// ---- the functional-style syntax reader -------------------------------------------
+
+#[test]
+fn ofn_reads_a_document() {
+    use sparkles_owl::ofn_read;
+    let doc = ofn_read::parse(
+        r#"Prefix(:=<http://example.org/>)
+# a comment
+Prefix(dc:=<http://purl.org/dc/elements/1.1/>)
+Ontology(<http://example.org/onto> <http://example.org/onto/1>
+  Import(<http://example.org/other>)
+  Annotation(dc:title "Uni"@en)
+  Declaration(Class(:Professor))
+  Declaration(ObjectProperty(:teaches))
+  SubClassOf(Annotation(rdfs:comment "says \"hi\" \\ there") :Professor ObjectSomeValuesFrom(:teaches :Course))
+  DataPropertyAssertion(:age _:x "41"^^xsd:integer)
+  AnnotationAssertion(rdfs:label :Professor "Prof@de"^^rdf:PlainLiteral)
+  AnnotationAssertion(rdfs:label :Course "Course@"^^rdf:PlainLiteral)
+  HasKey(:Professor () (:age))
+  DataSomeValuesFrom(:a :b xsd:string)
+)"#,
+    );
+    // the last line is a class expression, not an axiom
+    let e = doc.unwrap_err();
+    assert_eq!(e.line, 14, "{e}");
+    assert!(e.message.contains("not an axiom"), "{e}");
+    let doc = ofn_read::parse(
+        r#"Prefix(:=<http://example.org/>)
+Ontology(<http://example.org/onto> <http://example.org/onto/1>
+  Import(<http://example.org/other>)
+  Annotation(rdfs:comment "Uni"@en)
+  SubClassOf(Annotation(rdfs:comment "says \"hi\" \\ there") :Professor ObjectSomeValuesFrom(:teaches :Course))
+  DataPropertyAssertion(:age _:x "41"^^xsd:integer)
+  AnnotationAssertion(rdfs:label :Professor "Prof@de"^^rdf:PlainLiteral)
+  AnnotationAssertion(rdfs:label :Course "Course@"^^rdf:PlainLiteral)
+  SubClassOf(:A DataSomeValuesFrom(:d1 :d2 DatatypeRestriction(xsd:integer xsd:minInclusive "1"^^xsd:integer)))
+)"#,
+    )
+    .unwrap();
+    assert_eq!(doc.header.iri.as_ref().unwrap().as_str(), ex("onto"));
+    assert_eq!(
+        doc.header.version_iri.as_ref().unwrap().as_str(),
+        ex("onto/1")
+    );
+    assert_eq!(doc.header.imports.len(), 1);
+    assert_eq!(doc.prefixes, vec![(String::new(), ex(""))]);
+    let got: Vec<String> = doc.axioms.iter().map(|a| a.to_string()).collect();
+    assert_eq!(
+        got,
+        [
+            "SubClassOf(Annotation(rdfs:comment \"says \\\"hi\\\" \\\\ there\") <http://example.org/Professor> ObjectSomeValuesFrom(<http://example.org/teaches> <http://example.org/Course>))",
+            "DataPropertyAssertion(<http://example.org/age> _:x \"41\"^^xsd:integer)",
+            "AnnotationAssertion(rdfs:label <http://example.org/Professor> \"Prof\"@de)",
+            "AnnotationAssertion(rdfs:label <http://example.org/Course> \"Course\")",
+            "SubClassOf(<http://example.org/A> DataSomeValuesFrom(<http://example.org/d1> <http://example.org/d2> DatatypeRestriction(xsd:integer xsd:minInclusive \"1\"^^xsd:integer)))",
+        ]
+    );
+    // to triples, and read strictly with the declarations a strict read needs
+    let mut fresh = write::counter("f");
+    let o = read::read_graph(ofn_read::triples(&doc, &mut fresh), ReadOptions::default());
+    assert!(o.contains(&doc.axioms[0]));
+}
+
+#[test]
+fn ofn_reports_errors_with_positions() {
+    use sparkles_owl::ofn_read::parse;
+    let err = |text: &str| parse(text).unwrap_err();
+    let e = err("Ontology(\n  SubClassOf(ex:A ex:B))");
+    assert_eq!((e.line, e.column), (2, 14), "{e}");
+    assert!(e.message.contains("prefix 'ex:'"), "{e}");
+    assert!(
+        err("Ontology(SubClassOf(owl:Thing))")
+            .message
+            .contains("expected")
+    );
+    assert!(err("Ontology(").message.contains("not closed"));
+    assert!(err("Ontology() x").message.contains("end of the document"));
+    assert!(
+        err("Ontology(Declaration(Thing(owl:A)))")
+            .message
+            .contains("entity kind")
+    );
+    assert!(
+        err("Ontology(DisjointClasses(owl:Thing owl:Thing))")
+            .message
+            .contains("operands")
+    );
+    assert!(
+        err("Ontology(AnnotationAssertion(rdfs:label owl:Thing \"a\\n\"))")
+            .message
+            .contains("escape")
+    );
+    assert!(
+        err("Ontology(SubClassOf(owl:Thing ObjectMinCardinality(99999999999 owl:p)))")
+            .message
+            .contains("too large")
+    );
+    assert!(
+        err("Ontology(SubClassOf(<a b> owl:Thing))")
+            .message
+            .contains("IRI")
+    );
+    assert!(
+        err("Ontology(SubClassOf(<rel> owl:Thing))")
+            .message
+            .contains("IRI")
+    );
+    // a nesting deeper than the reader follows is an error, not a stack overflow
+    let mut deep = String::from("Ontology(SubClassOf(owl:Thing ");
+    for _ in 0..10_000 {
+        deep.push_str("ObjectComplementOf(");
+    }
+    deep.push_str("owl:Nothing");
+    deep.push_str(&")".repeat(10_000));
+    deep.push_str("))");
+    let e = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || parse(&deep).unwrap_err())
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(e.message.contains("nest"), "{e}");
+}
+
+#[test]
+fn ofn_reader_streams_axioms() {
+    let text = "Prefix(:=<http://example.org/>) Ontology(<http://example.org/o> SubClassOf(:A :B) SubClassOf(:B :C) SubClassOf(:C)";
+    let mut r = sparkles_owl::ofn_read::Reader::new(text).unwrap();
+    assert_eq!(r.header().iri.as_ref().unwrap().as_str(), ex("o"));
+    assert!(r.next().unwrap().is_ok());
+    assert!(r.next().unwrap().is_ok());
+    assert!(r.next().unwrap().is_err());
+    assert!(r.next().is_none());
+}
+
+#[test]
+fn ofn_reads_one_axiom_with_prefixes() {
+    use sparkles_owl::ofn_read::parse_axiom;
+    let p = vec![("ex".to_string(), ex(""))];
+    let ax = parse_axiom("SubClassOf(ex:A ObjectSomeValuesFrom(ex:p owl:Thing))", &p).unwrap();
+    assert_eq!(
+        ax,
+        Axiom::sub_class_of(class("A"), ClassExpression::some(op("p"), Class::thing()))
+    );
+    assert!(parse_axiom("SubClassOf(ex:A ex:B) SubClassOf(ex:B ex:C)", &p).is_err());
+    assert!(parse_axiom("SubClassOf(ex:A)", &p).is_err());
 }

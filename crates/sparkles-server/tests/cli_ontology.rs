@@ -146,3 +146,46 @@ fn check_a_file_offline() {
     assert_ne!(o.status.code(), Some(0));
     assert!(err(&o).contains("--loc"), "{}", err(&o));
 }
+
+const OFN: &str = "Prefix(:=<http://ex.org/>)
+Ontology(<http://ex.org/o>
+  Declaration(Class(:Professor))
+  Declaration(Class(:Course))
+  Declaration(ObjectProperty(:teaches))
+  SubClassOf(:Professor ObjectSomeValuesFrom(:teaches :Course))
+)
+";
+
+#[test]
+fn functional_syntax_files_check_and_load() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("onto.ofn"), OFN).unwrap();
+    let o = sparkles(
+        dir,
+        &["ontology", "check", "onto.ofn", "--profile", "el,dl"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}{}", out(&o), err(&o));
+    assert!(out(&o).contains("OWL 2 EL: conforms"), "{}", out(&o));
+    // the file loads as the triples of its axioms, which read back as the same axioms
+    let o = sparkles(dir, &["load", "--loc", "db", "onto.ofn"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = sparkles(
+        dir,
+        &["ontology", "axioms", "--loc", "db", "--type", "SubClassOf"],
+    );
+    assert!(
+        out(&o).contains("SubClassOf(:Professor ObjectSomeValuesFrom(:teaches :Course))"),
+        "{}",
+        out(&o)
+    );
+    // a syntax error names the file and the position
+    std::fs::write(dir.join("bad.ofn"), "Ontology(\n  SubClassOf(:A))").unwrap();
+    let o = sparkles(dir, &["ontology", "check", "bad.ofn"]);
+    assert_ne!(o.status.code(), Some(0));
+    assert!(
+        err(&o).contains("bad.ofn") && err(&o).contains("line 2"),
+        "{}",
+        err(&o)
+    );
+}

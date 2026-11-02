@@ -731,6 +731,11 @@ python = "planned: roadmap item 537, F21 Phase 2"
 jvm = "planned: roadmap item 537, through jena-ontapi in F21 Phase 2"
 node = "planned: roadmap item 537, F21 Phase 2"
 
+["ontology.diff"]
+python = "planned: roadmap item 537, F21 Phase 2"
+jvm = "planned: roadmap item 537, through jena-ontapi in F21 Phase 2"
+node = "planned: roadmap item 537, F21 Phase 2"
+
 ["ontology.edit"]
 python = "planned: roadmap item 537, F21 Phase 2"
 jvm = "planned: roadmap item 537, through jena-ontapi in F21 Phase 2"

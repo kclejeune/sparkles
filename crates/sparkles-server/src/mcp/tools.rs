@@ -174,6 +174,8 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "entailment_diff" => t.entailment_diff(args),
         "share_query" => t.share_query(args),
         "sparql_update" => t.sparql_update(args),
+        #[cfg(feature = "ontology")]
+        "ontology_axioms" => t.ontology_axioms(args),
         "assert_facts" => t.assert_facts(args),
         "register_source" => t.register_source(args),
         // `POST /$/ingest/{ds}`, never offered as a tool

@@ -32,3 +32,14 @@ owl2-rl-anonymous-individual:rl The owl:NamedIndividual typing of a blank node, 
 owl2-rl-valid-oneof:dl The ObjectOneOf node has no rdf:type owl:Class triple, which Table 13 requires; the lenient mode reads it.
 owl2-rl-valid-oneof:rl The missing owl:Class typing of the DL difference.
 somevaluesfrom2bnode:el OWL 2 Profiles §2.2 excludes anonymous individuals from OWL 2 EL.
+# The functional-style ontologies (test owl2_functional_syntax). Where a case's two forms
+# disagree, the difference is in the case's data, and the reader follows the text.
+New-Feature-Keys-007:ofn-fsNonConclusionOntology The RDF/XML form declares :Man and the functional-style form does not, so a strict read leaves the class assertion unmapped.
+New-Feature-Keys-007:ofn-fsPremiseOntology The functional-style form has SubClassOf(:Man :Person), which the RDF/XML form lacks.
+New-Feature-ObjectPropertyChain-001:ofn-fsConclusionOntology The RDF/XML conclusion does not declare :hasAunt, so its strict read leaves the assertion unmapped.
+New-Feature-Rational-002:ofn-fsPremiseOntology The RDF/XML form's enumeration is not a well-formed list, as for the RDF/XML DL difference above.
+New-Feature-Rational-003:ofn-fsPremiseOntology The RDF/XML form's enumeration is not a well-formed list, as for Rational-002.
+Plus and Minus Zero are Distinct:ofn-el The case lists EL, but OWL 2 Profiles §2.3 leaves xsd:float out of the OWL 2 EL datatypes.
+consistent-integer-filler:ofn-rl The case excludes RL, but DataHasValue and DataAllValuesFrom are superclass expressions of the OWL 2 RL grammar (Profiles §4.2).
+functionality-clash:ofn-el The case excludes EL, but FunctionalDataProperty and DataHasValue are in the OWL 2 EL grammar (Profiles §2.2).
+inconsistent-integer-filler:ofn-rl The case excludes RL, but the complement of a class is a superclass expression of the OWL 2 RL grammar (Profiles §4.2).

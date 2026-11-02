@@ -60,6 +60,8 @@ struct Case {
     species: BTreeSet<String>,
     profiles: BTreeSet<String>,
     not_profiles: BTreeSet<String>,
+    /// the functional-style ontologies, by their role
+    fs: Vec<(String, String)>,
 }
 
 fn cases(path: &str) -> Vec<Case> {
@@ -123,6 +125,7 @@ fn cases(path: &str) -> Vec<Case> {
             species: BTreeSet::new(),
             profiles: BTreeSet::new(),
             not_profiles: not.get(s).cloned().unwrap_or_default(),
+            fs: Vec::new(),
         };
         for x in ts {
             let p = x.predicate.as_str().strip_prefix(TEST).unwrap_or("");
@@ -133,6 +136,12 @@ fn cases(path: &str) -> Vec<Case> {
                 }
                 "rdfXmlConclusionOntology" | "rdfXmlNonConclusionOntology" => {
                     c.ontologies.push((p.to_string(), lit(x).unwrap()));
+                }
+                "fsPremiseOntology"
+                | "fsInputOntology"
+                | "fsConclusionOntology"
+                | "fsNonConclusionOntology" => {
+                    c.fs.push((p.to_string(), lit(x).unwrap()));
                 }
                 "species" => {
                     c.species.extend(local(x));
@@ -154,7 +163,7 @@ fn cases(path: &str) -> Vec<Case> {
                 _ => {}
             }
         }
-        if c.premise.is_some() {
+        if c.premise.is_some() || !c.fs.is_empty() {
             out.push(c);
         }
     }
@@ -248,26 +257,41 @@ fn round_trip(o: &read::Ontology) -> Result<(), String> {
     Ok(())
 }
 
+/// The known differences: each line is `<identifier>:<check> <reason>`, where the
+/// identifier may hold spaces and the key ends at the first space after its colon.
+fn known_differences() -> BTreeMap<String, String> {
+    include_str!("w3c_owl_known.txt")
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let colon = l.find(':')?;
+            let space = colon + l[colon..].find(' ')?;
+            Some((l[..space].to_string(), l[space..].trim().to_string()))
+        })
+        .collect()
+}
+
 #[test]
 fn owl2_test_cases() {
     let Ok(path) = std::env::var("SPARKLES_OWL2_TESTS") else {
         eprintln!("SPARKLES_OWL2_TESTS is not set: skipping the OWL 2 test cases");
         return;
     };
-    let known: BTreeMap<String, String> = include_str!("w3c_owl_known.txt")
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
-        .filter_map(|l| {
-            l.split_once(' ')
-                .map(|(a, b)| (a.to_string(), b.trim().to_string()))
-        })
+    let known: BTreeMap<String, String> = known_differences()
+        .into_iter()
+        .filter(|(k, _)| !k.contains(":ofn-"))
         .collect();
-    let cases = cases(&path);
+    let cases: Vec<Case> = cases(&path)
+        .into_iter()
+        .filter(|c| c.premise.is_some())
+        .collect();
     assert!(cases.len() > 300, "read only {} test cases", cases.len());
     let mut failures: BTreeMap<String, String> = BTreeMap::new();
     let mut stats: BTreeMap<&str, usize> = BTreeMap::new();
     for c in &cases {
-        let premise = c.premise.as_deref().unwrap();
+        let Some(premise) = c.premise.as_deref() else {
+            continue;
+        };
         let mut fail = |what: &str, why: String| {
             failures.entry(format!("{}:{what}", c.id)).or_insert(why);
         };
@@ -421,4 +445,171 @@ fn owl2_test_cases() {
         unexpected.is_empty() && fixed.is_empty(),
         "update tests/w3c_owl_known.txt"
     );
+}
+
+/// The axioms of a read as functional-style strings, with every anonymous individual
+/// written `_:x`, since each read labels them differently.
+fn rendered(o: &read::Ontology) -> BTreeSet<String> {
+    o.axiom_set()
+        .map(|a| {
+            let s = a.to_string();
+            let mut out = String::with_capacity(s.len());
+            let mut rest = s.as_str();
+            while let Some(i) = rest.find("_:") {
+                out.push_str(&rest[..i]);
+                out.push_str("_:x");
+                rest = &rest[i + 2..];
+                let end = rest.find([' ', ')']).unwrap_or(rest.len());
+                rest = &rest[end..];
+            }
+            out.push_str(rest);
+            out
+        })
+        .collect()
+}
+
+/// The functional-style ontologies of the OWL 2 test cases (spec F21 Phase 3). Each one
+/// parses; mapped to triples and read strictly, it gives the axioms of the case's RDF/XML
+/// form of the same role when the case has one; written with the functional-style
+/// writer and read again, it gives the same document; and a premise whose case has no
+/// RDF/XML form meets the case's species and profiles.
+#[test]
+fn owl2_functional_syntax() {
+    let Ok(path) = std::env::var("SPARKLES_OWL2_TESTS") else {
+        eprintln!("SPARKLES_OWL2_TESTS is not set: skipping the OWL 2 test cases");
+        return;
+    };
+    use sparkles_owl::ofn_read;
+    let known: BTreeMap<String, String> = known_differences()
+        .into_iter()
+        .filter(|(k, _)| k.contains(":ofn-"))
+        .collect();
+    let cases = cases(&path);
+    let mut failures: BTreeMap<String, String> = BTreeMap::new();
+    let mut stats: BTreeMap<&str, usize> = BTreeMap::new();
+    for c in cases.iter().filter(|c| !c.fs.is_empty()) {
+        let mut fail = |what: &str, why: String| {
+            failures
+                .entry(format!("{}:ofn-{what}", c.id))
+                .or_insert(why);
+        };
+        let imports = match load_imports(&c.imports) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("{}: an import does not parse: {e}", c.id);
+                continue;
+            }
+        };
+        for (role, text) in &c.fs {
+            *stats.entry("documents").or_default() += 1;
+            let doc = match ofn_read::parse(text) {
+                Ok(d) => d,
+                Err(e) => {
+                    fail(role, format!("does not parse: {e}"));
+                    continue;
+                }
+            };
+            *stats.entry("parsed").or_default() += 1;
+            // the writer's document reads back as the same document
+            let r = sparkles_owl::ofn::Renderer::new(doc.prefixes.clone());
+            let again = ofn_read::parse(&sparkles_owl::ofn::document(&r, &doc.header, &doc.axioms));
+            match again {
+                Ok(a) => {
+                    let x: BTreeSet<_> = doc.axioms.iter().collect();
+                    let y: BTreeSet<_> = a.axioms.iter().collect();
+                    if x != y || a.header != doc.header {
+                        fail(
+                            &format!("{role}-writer"),
+                            "the written document reads differently".into(),
+                        );
+                    } else {
+                        *stats.entry("writer round trips").or_default() += 1;
+                    }
+                }
+                Err(e) => fail(
+                    &format!("{role}-writer"),
+                    format!("the written document does not parse: {e}"),
+                ),
+            }
+            let mut fresh = write::counter("f");
+            let mut triples = ofn_read::triples(&doc, &mut fresh);
+            let mut graphs = vec![0u32; triples.len()];
+            triples.extend(imports.0.iter().cloned());
+            graphs.extend(imports.1.iter().map(|g| g + 1));
+            let strict = read::read(
+                triples,
+                graphs,
+                &[0],
+                ReadOptions {
+                    mode: Mode::Strict,
+                    ..Default::default()
+                },
+            );
+            let rdf_role = role.replacen("fs", "rdfXml", 1);
+            if let Some((_, xml)) = c.ontologies.iter().find(|(k, _)| *k == rdf_role) {
+                let Ok(l) = load(xml, &c.imports) else {
+                    continue;
+                };
+                let from_xml = read_loaded(&l, Mode::Strict);
+                let a = rendered(&strict);
+                let b = rendered(&from_xml);
+                if a != b {
+                    let lost: Vec<_> = b.difference(&a).take(2).collect();
+                    let gained: Vec<_> = a.difference(&b).take(2).collect();
+                    fail(
+                        role,
+                        format!("differs from the RDF/XML form: lacks {lost:?}, has {gained:?}"),
+                    );
+                } else {
+                    *stats.entry("agree with RDF/XML").or_default() += 1;
+                }
+            } else if role == "fsPremiseOntology" && c.premise.is_none() {
+                let in_dl = c.species.contains("DL");
+                let dl = profiles::check(&strict, &[Profile::Dl], Default::default())[0].conforms;
+                if in_dl != dl {
+                    fail("dl", format!("species DL {in_dl}, DL check {dl}"));
+                } else {
+                    *stats.entry("species agree").or_default() += 1;
+                }
+                for p in [Profile::El, Profile::Ql, Profile::Rl] {
+                    let name = p.as_str().to_ascii_uppercase();
+                    let ok = profiles::check(&strict, &[p], Default::default())[0].conforms;
+                    if c.profiles.contains(&name) && !ok || c.not_profiles.contains(&name) && ok {
+                        fail(
+                            p.as_str(),
+                            format!("listed {}, check {ok}", c.profiles.contains(&name)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let unexpected: Vec<_> = failures
+        .iter()
+        .filter(|(k, _)| !known.contains_key(*k))
+        .collect();
+    let fixed: Vec<_> = known
+        .keys()
+        .filter(|k| !failures.contains_key(*k))
+        .collect();
+    eprintln!("OWL 2 functional-syntax ontologies: {stats:?}");
+    for (k, v) in &unexpected {
+        eprintln!("  {k} {v}");
+    }
+    for k in &fixed {
+        eprintln!("  fixed: {k}");
+    }
+    assert!(stats.get("parsed").copied().unwrap_or(0) > 50);
+    assert!(
+        unexpected.is_empty() && fixed.is_empty(),
+        "update tests/w3c_owl_known.txt"
+    );
+}
+
+/// The triples of the imported ontologies, as [`load`] numbers their graphs from 0.
+fn load_imports(imports: &[String]) -> Result<(Vec<Triple>, Vec<u32>), String> {
+    let Some((first, rest)) = imports.split_first() else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    load(first, rest)
 }

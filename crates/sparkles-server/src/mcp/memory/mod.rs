@@ -14,6 +14,7 @@
 //! deadline, memory budget and row limit.
 
 mod assert;
+pub(crate) use assert::{date_time, now_ms, principal_iri};
 mod brief;
 mod check;
 mod communities;

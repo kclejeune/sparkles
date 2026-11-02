@@ -38,6 +38,17 @@ pub(crate) fn read_quads(
     use sparkles::io::RdfSyntax;
     match syntax {
         RdfSyntax::Jena(j) => sparkles::jena_formats::read_into(j, reader, base, "<input>", sink),
+        RdfSyntax::OwlFunctional => {
+            // a functional-style document is read whole, then axiom by axiom
+            let mut bytes = Vec::new();
+            let mut reader = reader;
+            reader
+                .read_to_end(&mut bytes)
+                .map_err(sparkles::codec::io_error)?;
+            let mut src = sparkles::io::Source::from_bytes(bytes, syntax, None);
+            src.name = "<input>".into();
+            sparkles::io::parse_source_into(&src, sink).map(|_| ())
+        }
         RdfSyntax::Rdf(f) => {
             let mut parser = RdfParser::from_format(f);
             if let Some(base) = base {

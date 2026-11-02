@@ -946,7 +946,7 @@ fn load(
                 "text/turtle, application/n-triples, application/n-quads, application/trig, \
                  application/rdf+xml, application/ld+json;q=0.9, application/trix+xml;q=0.8, \
                  application/rdf+thrift;q=0.8, application/rdf+protobuf;q=0.8, \
-                 application/rdf+json;q=0.8",
+                 application/rdf+json;q=0.8, text/owl-functional;q=0.7",
             )
         })
         .map_err(|f| {
@@ -962,6 +962,7 @@ fn load(
     let format = JenaFormat::from_media_type(&ct)
         .map(RdfSyntax::Jena)
         .or_else(|| crate::io::format_for_media_type(&ct).map(RdfSyntax::Rdf))
+        .or_else(|| RdfSyntax::from_name(&ct).filter(|s| *s == RdfSyntax::OwlFunctional))
         .or_else(|| RdfSyntax::from_path(url_path))
         .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))?;
     let mut body = resp.body;
@@ -1062,6 +1063,16 @@ fn insert_parsed(
                 }
                 insert(q)
             })?;
+        }
+        RdfSyntax::OwlFunctional => {
+            // a functional-style document is read whole, as the loader reads it
+            let mut bytes = Vec::new();
+            let mut r = r;
+            r.read_to_end(&mut bytes).map_err(crate::codec::io_error)?;
+            let mut src = crate::io::Source::from_bytes(bytes, syntax, into.graph.clone());
+            src.name = name.to_string();
+            src.max_decompressed = expansion_limit;
+            crate::io::parse_source_into(&src, &mut insert)?;
         }
     }
     for ids in held {

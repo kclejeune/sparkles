@@ -60,6 +60,7 @@ DEFERRED = {
     "evidence.settings",
     "ontology.axioms",
     "ontology.check",
+    "ontology.diff",
     "ontology.edit",
     "ontology.summary",
 }

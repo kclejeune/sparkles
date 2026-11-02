@@ -753,6 +753,25 @@ fn ontology(p: &mut Paths) {
             .errors(&[400, 404, 408]),
     );
     p.add(
+        read(op(GET, "/$/ontology/{ds}/diff", "diffOntology", "Ontology", "Diff the axioms of two commits"))
+            .doc("The axioms that differ between the commits `from` and `to` (the head by default), with the graph of each. The terminology of each state is read as the summary reads it, and the two sets of axioms are compared. With `assertions=true`, the assertions that the triples changed between the two commits carry are added and removed too. When no triple of the graphs read changed, the diff is empty. `format=text` answers `+ axiom` and `- axiom` lines in functional-style syntax. A caller whose grants limit endpoints needs the `diff` endpoint.")
+            .see("ontology")
+            .query("from", s(), "The earlier state: a commit number, a timestamp or a named snapshot, as `at` takes them.")
+            .query("to", s(), "The later state (the head by default).")
+            .query("assertions", boolean(), "Also diff the assertions that the changed triples carry.")
+            .query("format", json!({ "type": "string", "enum": ["json", "text"] }), "`json` (the default) or `text`.")
+            .query("limit", int(), "The most axioms listed on each side, from 1 to 10,000 (1,000 by default).")
+            .resp(
+                "200",
+                "The axioms added and removed.",
+                Some(json!({
+                    "application/json": { "schema": { "type": "object" } },
+                    "text/plain": { "schema": { "type": "string" } }
+                })),
+            )
+            .errors(&[400, 404, 408, 410]),
+    );
+    p.add(
         write_params(op(POST, "/$/ontology/{ds}/axioms", "editOntology", "Ontology", "Add and remove axioms"))
             .doc("Adds and removes axioms in their JSON form as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.")
             .see("ontology")

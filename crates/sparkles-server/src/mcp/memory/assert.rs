@@ -282,7 +282,7 @@ pub(super) fn literal(value: &str, datatype: &str) -> String {
 
 /// The IRI of a principal as `urn:x-sparkles:principal:<name>`, percent-encoding what
 /// an IRI may not hold.
-pub(super) fn principal_iri(name: &str) -> NamedNode {
+pub(crate) fn principal_iri(name: &str) -> NamedNode {
     let mut out = String::from("urn:x-sparkles:principal:");
     for b in name.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~:@!$&'()*+,;=".contains(&b) {
@@ -385,11 +385,11 @@ fn label_literal(s: &str, prefixes: &[(String, String)]) -> Result<Literal, Stri
 }
 
 /// The time of the call as `xsd:dateTime`.
-pub(super) fn date_time(ms: i64) -> String {
+pub(crate) fn date_time(ms: i64) -> String {
     sparkles::commit::rfc3339_ms(ms)
 }
 
-pub(super) fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)

@@ -55,8 +55,8 @@ pub enum OntologyCmd {
     },
     /// Check the OWL 2 profiles; exits with status 1 when the ontology is outside one
     Check {
-        /// An ontology file to check without a database (Turtle, RDF/XML, N-Triples,
-        /// TriG, JSON-LD, … by its extension)
+        /// An ontology file to check without a database (Turtle, RDF/XML, OWL
+        /// functional-style syntax, N-Triples, TriG, JSON-LD, … by its extension)
         file: Option<PathBuf>,
         #[command(flatten)]
         at: Target,

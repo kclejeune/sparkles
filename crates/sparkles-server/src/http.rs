@@ -83,6 +83,10 @@ mod ontology {
     pub(super) async fn edit() -> ApiResult {
         not_built()
     }
+
+    pub(super) async fn diff() -> ApiResult {
+        not_built()
+    }
 }
 mod patch;
 mod queries;
@@ -177,6 +181,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(ontology::axioms).post(ontology::edit),
         )
         .route("/$/ontology/{ds}/check", post(ontology::check))
+        .route("/$/ontology/{ds}/diff", get(ontology::diff))
         .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/graph/{ds}/facets", post(graph::facets))
         .route("/$/forms/{ds}", get(forms_model))
@@ -3456,6 +3461,11 @@ async fn gsp_on(
             let format: sparkles::io::RdfSyntax =
                 match jena_formats::JenaFormat::from_media_type(&ct) {
                     Some(j) => j.into(),
+                    // an OWL 2 functional-style document is read as the triples its
+                    // axioms map to
+                    None if ct == sparkles::io::OFN_MEDIA_TYPE => {
+                        sparkles::io::RdfSyntax::OwlFunctional
+                    }
                     None => sparkles::io::format_for_media_type(
                         headers
                             .get(header::CONTENT_TYPE)
@@ -3755,8 +3765,10 @@ async fn upload(
         // plain body: format from content type
         let jena = jena_formats::JenaFormat::from_media_type(&ct);
         let table = sparkles::tabular::tabular_media_type(&ct);
+        let ofn = ct == sparkles::io::OFN_MEDIA_TYPE;
         let format = match (jena, table) {
             (Some(_), _) | (_, Some(_)) => None,
+            _ if ofn => None,
             (None, None) => Some(
                 sparkles::io::format_for_media_type(
                     headers
@@ -3777,6 +3789,7 @@ async fn upload(
         let ext = match (jena, format) {
             _ if table == Some(sparkles::tabular::TabularKind::Csv) => "csv",
             _ if table == Some(sparkles::tabular::TabularKind::Tsv) => "tsv",
+            _ if ofn => "ofn",
             (Some(j), _) => j.file_extension(),
             (None, Some(RdfFormat::NTriples)) => "nt",
             (None, Some(RdfFormat::NQuads)) => "nq",

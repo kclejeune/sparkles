@@ -53,6 +53,9 @@ pub fn all_tools() -> Vec<&'static str> {
     if cfg!(feature = "graphql") {
         v.push("graphql_query");
     }
+    if cfg!(feature = "ontology") {
+        v.push("ontology_axioms");
+    }
     v.push("sparql_update");
     v.extend(super::branches::TOOLS_AFTER_UPDATE);
     v
@@ -148,6 +151,16 @@ fn max_results(cfg: &McpConfig) -> Value {
 
 pub(super) fn prefixes() -> Value {
     json!({"type":"object","additionalProperties":{"type":"string"},"description":"The dataset prefixes used in this result"})
+}
+
+#[cfg(feature = "ontology")]
+fn ontology_tool(cfg: &McpConfig) -> Option<ToolDef> {
+    Some(super::ontology::tool_def(cfg))
+}
+
+#[cfg(not(feature = "ontology"))]
+fn ontology_tool(_: &McpConfig) -> Option<ToolDef> {
+    None
 }
 
 pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
@@ -897,6 +910,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         },
     ]
     .into_iter()
+    .chain(ontology_tool(cfg))
     .chain(super::memory::assert_tool(cfg))
     .chain(super::memory::ingest_tools(cfg))
     .chain(super::branches::tool_defs(cfg))

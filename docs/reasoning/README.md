@@ -166,8 +166,17 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   expressions, data ranges, axioms, annotations and the ontology header. It reads the
   model from triples by the reverse mapping of the OWL 2 Mapping to RDF Graphs and writes
   it back by the forward mapping. Its functional-style writer renders axioms and
-  documents. The `ontology` cargo feature, which is on by default in the server, builds it
-  into the library and the server.
+  documents, and its functional-style reader reads them. The `ontology` cargo feature,
+  which is on by default in the server, builds it into the library and the server.
+* An OWL 2 functional-style document loads as the triples its axioms map to, one axiom
+  at a time. `sparkles load`, `sparkles ontology check FILE`, the library's and the
+  bindings' file loaders, SPARQL `LOAD` and the configuration's data files read a
+  `.ofn` file, compressed or not, and Graph Store writes and uploads read a body sent as
+  `text/owl-functional`. The predefined prefixes `owl:`, `rdf:`, `rdfs:` and `xsd:`
+  need no declaration, and a literal typed `rdf:PlainLiteral` reads as the plain or
+  language-tagged literal it stands for. A syntax error names the file, the line and the
+  column. The document is held in memory while it is read. Sparkles does not write the
+  syntax as a dataset dump, and the axiom listings render it.
 * A read takes the graphs a caller names, the default graph unless told otherwise, and
   follows `owl:imports` to graphs of the dataset that the caller can read. A strict read
   keeps every triple the mapping does not cover as unmapped and refuses shared list
@@ -192,8 +201,29 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   same for a database directory or a server, and `sparkles ontology check FILE` checks
   an ontology file without a database. The check exits with status 1 when the ontology
   is outside a profile it names.
+* `GET /$/ontology/{ds}/diff?from=&to=` lists the axioms that differ between two
+  commits, with the graph of each, as JSON or as `+` and `-` lines. The terminology of
+  each state is read as the summary reads it and the two axiom sets are compared. With
+  `assertions=true`, the assertions that the triples changed between the commits carry
+  are listed too, so an unchanged assertion costs nothing to diff. A diff of two states
+  whose graphs did not change opens neither. The diff needs the commits in the dataset's
+  retained history and the `diff` endpoint for a caller whose grants limit endpoints.
+* The MCP tool `ontology_axioms` lists axioms in functional-style syntax. On a server
+  that allows updates it also adds and removes axioms, given in functional-style syntax
+  or as JSON, with the preview, `ifHead` precondition and commit message of
+  `sparql_update`. Each added axiom is annotated with PROV-O provenance:
+  `prov:wasGeneratedBy` the call's activity, `prov:generatedAtTime` and
+  `prov:wasDerivedFrom` the source the call names. Annotation assertions describe the
+  activity, its principal, its message and the software agent. The PROV-O properties are
+  declared as annotation properties, so the ontology stays in OWL 2 DL, and an ontology
+  that types them as object or data properties refuses the provenance. Removals are
+  recorded by the activity and the commit, since an annotation cannot describe an axiom
+  that is gone.
 * The W3C OWL 2 test cases run as `mise run test:owl`, with the known differences and
-  their reasons in `crates/sparkles-owl/tests/w3c_owl_known.txt`.
+  their reasons in `crates/sparkles-owl/tests/w3c_owl_known.txt`. The 78
+  functional-style ontologies of the cases all parse, read back from the writer's
+  output unchanged, and give the axioms of the cases' RDF/XML forms apart from five
+  listed differences in the cases' data.
 
 ### Write-time validation
 
@@ -331,8 +361,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * The ontology API has no Python, Node.js or JVM surface, no views that include
   materialized inferences and no warning when a reasoning run reads axioms outside RL.
   Roadmap item 537.
-* The ontology API reads no functional-style syntax files, has no MCP tool and does not
-  diff axioms between commits. Roadmap item 538.
+* An ontology read does not fetch an `owl:imports` target that is not a graph of the
+  dataset. Roadmap item NEW-ITEM-1.
 * An ontology read has no size budget of its own beyond the query deadline, and its cost
   on large ontologies is not measured. Roadmap item 539.
 * The Rust ontology handle has no entity accessors such as the superclasses of a class
@@ -360,7 +390,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 537](../ROADMAP.md), [item 538](../ROADMAP.md), [item 539](../ROADMAP.md), [item 540](../ROADMAP.md), [item 541](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 537](../ROADMAP.md), [item NEW-ITEM-1](../ROADMAP.md), [item 539](../ROADMAP.md), [item 540](../ROADMAP.md), [item 541](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

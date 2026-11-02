@@ -286,10 +286,9 @@ fn charge_of(message: &Value) -> Charge {
     match m.get("method").and_then(Value::as_str) {
         Some("tools/call") => {
             let name = str_at(params, "name");
-            let class = if name
-                .as_deref()
-                .is_some_and(|n| super::branches::WRITE_TOOLS.contains(&n))
-            {
+            let class = if name.as_deref().is_some_and(|n| {
+                super::branches::call_writes(n, params.and_then(|p| p.get("arguments")))
+            }) {
                 Class::Update
             } else {
                 Class::Query
@@ -443,7 +442,8 @@ impl Endpoint {
         let tool = (method == "tools/call")
             .then(|| message.pointer("/params/name").and_then(Value::as_str))
             .flatten();
-        let need = if tool.is_some_and(|t| super::branches::WRITE_TOOLS.contains(&t)) {
+        let args = message.pointer("/params/arguments");
+        let need = if tool.is_some_and(|t| super::branches::call_writes(t, args)) {
             Level::Write
         } else {
             Level::Read
