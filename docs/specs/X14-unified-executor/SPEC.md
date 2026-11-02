@@ -444,9 +444,10 @@ templates decode through `batch_term`. A cursor's envelope is decode bytes on th
 ledger, as before, and its refusal fails the query. An eager envelope is a charge of its
 own that is taken when the budget has room and is never refused. A finished eager result
 is decoded through infallible readers after its last check, and an update applies its
-template after its WHERE clause, so a refusal there would read as an unbound value. The
-same holds for the plan text that the planner decodes. An update checks its context
-before it applies deletions and insertions.
+template after its WHERE clause, so a refusal there would read as an unbound value. Plan
+text, which no answer depends on, decodes through `Ctx::plan_term` without the envelope in
+both modes, so describing a substituted constant never fails a query. An update checks its
+context before it applies deletions and insertions.
 
 The terms that expressions compute, the blank nodes and callback terms they memoize and
 the parsed geometries of the geometry memo are charged in both modes through one step
