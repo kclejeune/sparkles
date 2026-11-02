@@ -4642,3 +4642,51 @@ fn arq_uuid_aliases_and_dynamic_calls_stay_volatile_across_cursor_morsels() {
         }
     }
 }
+
+/// The graph writers flush once after their first batch, with that batch's statements
+/// written and later batches not yet, so a writer that commits on a flush starts the
+/// response then. RDF/JSON groups by subject and writes everything at the end.
+#[test]
+fn graph_writers_flush_after_their_first_batch() {
+    use sparkles_core::jena_formats::JenaFormat;
+    use sparkles_core::sparql::{cursor::graph::write_cursor_graph, graph_cursor, results};
+    #[derive(Default)]
+    struct Probe {
+        written: usize,
+        first_flush: Option<usize>,
+    }
+    impl std::io::Write for Probe {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.written += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.first_flush.get_or_insert(self.written);
+            Ok(())
+        }
+    }
+    let s = store(1000);
+    let q = "CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }";
+    let check = |name: &str, probe: Probe| {
+        let at = probe
+            .first_flush
+            .unwrap_or_else(|| panic!("{name}: no flush"));
+        assert!(
+            at > 0 && at * 10 < probe.written,
+            "{name}: flushed at {at} of {}",
+            probe.written
+        );
+    };
+    for format in [RdfFormat::NTriples, RdfFormat::NQuads] {
+        let mut c = graph_cursor(s.snapshot(), q, &Default::default(), &options(10)).unwrap();
+        let mut probe = Probe::default();
+        write_cursor_graph(&mut c, format, &mut probe, None, &[]).unwrap();
+        check(&format!("{format:?}"), probe);
+    }
+    for format in [JenaFormat::Thrift, JenaFormat::Protobuf, JenaFormat::TriX] {
+        let mut c = graph_cursor(s.snapshot(), q, &Default::default(), &options(10)).unwrap();
+        let mut probe = Probe::default();
+        results::write_cursor_jena_graph(&mut c, format, &mut probe, None).unwrap();
+        check(&format!("{format:?}"), probe);
+    }
+}
