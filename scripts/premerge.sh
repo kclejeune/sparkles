@@ -14,18 +14,19 @@
 #                 DEFERRED set of crates/sparkles-py/tests/test_parity.py, every `skip:` entry
 #                 is one the test allows, and no DEFERRED key is stale
 #   doc-paths     cited source paths and documentation entry-page links (lint:doc-paths)
+#   licenses      the third-party licence files match the Cargo locks (licenses:check)
 #   bench-scripts the script unit tests, which include the CI task-profile test, and the
 #                 crash harness's tests (test:bench-scripts)
 #
 # Usage: scripts/premerge.sh [--fix] [check...]
-#   --fix   regenerate what can be regenerated (client:gen, client:types, py:lock, node:lock
-#           and jvm:lock) before checking, and list the files that changed, to commit
+#   --fix   regenerate what can be regenerated (client:gen, client:types, py:lock, node:lock,
+#           jvm:lock and licenses) before checking, and list the files that changed, to commit
 #   check   run only these checks
 set -euo pipefail
 
 main() {
   cd "$(dirname "$0")/.."
-  all=(client-ts client-rust lock-py lock-node lock-ffi py-parity doc-paths bench-scripts)
+  all=(client-ts client-rust lock-py lock-node lock-ffi py-parity doc-paths licenses bench-scripts)
   fix=
   checks=()
   while [ $# -gt 0 ]; do
@@ -58,7 +59,7 @@ main() {
 
   if [ -n "$fix" ]; then
     before=$(git status --porcelain)
-    for t in node:client:gen client:types py:lock node:lock jvm:lock; do
+    for t in node:client:gen client:types py:lock node:lock jvm:lock licenses; do
       echo "fix: mise run $t"
       mise run "$t" > "$out/fix-${t//:/_}.log" 2>&1 || echo "fix: $t failed, see $out/fix-${t//:/_}.log"
     done
@@ -103,6 +104,7 @@ hint() {
     lock-ffi) echo "run 'mise run jvm:lock' (or premerge.sh --fix) and commit crates/sparkles-ffi/Cargo.lock" ;;
     py-parity) echo "add the Python binding, or the key to DEFERRED in crates/sparkles-py/tests/test_parity.py with the reason in bindings.toml, or drop a stale DEFERRED key" ;;
     doc-paths) echo "fix the cited paths or links that the log names" ;;
+    licenses) echo "run 'mise run licenses' (or premerge.sh --fix) and commit the THIRD_PARTY_LICENSES.md files it changes" ;;
     bench-scripts) echo "fix the failing script test that the log names (scripts/bench-tests)" ;;
   esac
 }
@@ -156,6 +158,7 @@ PY
 }
 
 check_doc_paths() { mise run lint:doc-paths; }
+check_licenses() { python3 scripts/third-party-licenses.py --check; }
 check_bench_scripts() { mise run test:bench-scripts; }
 
 main "$@"
