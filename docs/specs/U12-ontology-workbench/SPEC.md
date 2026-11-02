@@ -1,7 +1,7 @@
 # U12: Ontology workbench
 
-> **Status:** partially complete. The ontology editor phase is built, and the SKOS editor,
-> the DL Query tab and the editable schema diagram are planned.
+> **Status:** partially complete. The ontology editor and thesaurus editor phases are built,
+> and the DL Query tab and the editable schema diagram are planned.
 >
 > **Roadmap:** [item 457](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
@@ -163,3 +163,75 @@ the dataset, so write grants on a branch alone leave the page read-only, roadmap
 ontologies, 608 Manchester input of class expressions, 609 inferred
 property trees and 610 an IRI policy kept on the server with the resource catalog
 of [C30](../C30-resource-catalog/README.md).
+
+### Thesaurus editor
+
+The SKOS and SKOS-XL thesaurus editor phase is built as the UI's **Thesaurus** page,
+`/ui/thesaurus`. It reads and writes one graph of a dataset with SPARQL queries and
+`DELETE DATA` and `INSERT DATA` updates, so it needs no routes of its own beyond the
+built-in shapes.
+
+**Schemes and the concept tree.** The page lists the graph's concept schemes, and the tree
+of the chosen scheme starts at its top concepts, from `skos:hasTopConcept` and
+`skos:topConceptOf`. Concepts of the scheme without a broader concept are roots too, marked
+when they are not top concepts. Each level is read when it opens, from `skos:broader` and
+`skos:narrower` in both directions, with the number of narrower and broader concepts of
+each child, so the tree reads one level of a large thesaurus at a time. A concept with
+several broader concepts sits under each of them. A level shows its first 2,000 concepts
+and the roots their first 5,000.
+
+**Moves.** Dragging a concept onto another removes its link to the old broader concept and
+adds the new one, writing `skos:broader` and `skos:narrower` together. Holding Ctrl or Alt
+keeps the old link, which builds a polyhierarchy, and the top zone makes a concept a top
+concept. A move under one of the concept's own narrower concepts is refused before the
+preview.
+
+**Labels.** The label table shows the preferred, alternative and hidden labels by language,
+with SKOS-XL labels marked. Adding or changing a label refuses a second preferred label in
+one language (S14) and a label that is already another kind of label (S13), counting the
+literal forms of SKOS-XL labels as S55 to S57 imply. A label converts between its plain
+and SKOS-XL forms, and a new SKOS-XL label gets an IRI minted from the resource's IRI.
+Deleting a SKOS-XL label removes its label resource.
+
+**Links.** The relations tab edits broader, narrower, related and the five mapping
+relations. Broader, narrower and related links are written in both directions, and a link
+stated in one direction only is marked with a repair that adds the other. The picker finds
+concepts by label in any scheme of the dataset or in another dataset the caller can read,
+or takes an IRI.
+
+**Collections, notes and search.** Collections and ordered collections list their members,
+and their members and `skos:memberList` are edited through the shape-driven form of
+[U02](../U02-shape-driven-forms/README.md) with its list editor. Notes and documentation
+are edited through the same form over the built-in SKOS shapes, grouped as notes and
+documentation. The search matches a substring of any label, SKOS-XL literal forms
+included, in all languages or one, and answers its first 100 matches.
+
+**Integrity shapes.** The built-in SKOS shapes, served by `GET /$/skos/shapes` and read by
+forms with `shapes=skos`, check S9, S13, S14, S27, S37 and S46 of the SKOS Reference with
+S51, S52 and S58 of the SKOS-XL appendix. They live in the Rust library as
+`sparkles::skos`, so a write guard enforces them like any shapes, and the page's checks
+tab runs them over the graph and installs them as the dataset's guard with grandfathered
+existing results. Each SPARQL constraint reads one property path or one basic graph
+pattern from the focus node, so a form check finds the resources an edit affects without
+validating the whole graph. Linked resources without their `rdf:type` are reported at
+`sh:Info` severity, since the Reference's own examples leave their resources untyped.
+
+**Sessions.** The page reuses the ontology editor's session through a shared module. Every
+edit is a dry run with `If-Match` and a commit with the same precondition, undo and redo
+revert commits, **Start session** creates a `skos.<user>.<date>` branch, the change feed
+reloads the page after another writer's commit, and a protected branch or a reader's
+access makes the page read-only. Commit messages that are not ASCII are sent percent-encoded
+as UTF-8, which also fixed the ontology editor's labels in other scripts.
+
+The Rust tests check every condition against the consistent and inconsistent examples of
+the SKOS Reference and its SKOS-XL appendix, the forms over the shapes, form checks of
+edits that break S13, S14, S27 and S46, and the HTTP route. The UI's unit tests cover the
+label rules, the queries and the updates against an in-browser store. Playwright covers
+the tree, search, labels, links, moves, collections, notes, undo, stale edits and live
+refresh against the mock backend, and edits on a session branch against a real server,
+which leave main and the unrelated triples unchanged.
+
+Roadmap item NEW-ITEM-1 covers paged trees and an indexed label search for large
+thesauri, NEW-ITEM-2 labels for mapping targets in other datasets and mappings stated by
+the other concept, NEW-ITEM-3 the editing of `skosxl:labelRelation`, and NEW-ITEM-4 a
+write guard that keeps a dataset's shapes beside the SKOS shapes.

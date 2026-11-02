@@ -223,6 +223,46 @@ committed with the commit it was previewed against
 branch that **Start session** creates. Undo and redo are previewed commits too, and
 another writer's commit reloads the page through the change feed.
 
+### Thesaurus editor
+
+The **Thesaurus** page, `/ui/thesaurus`, edits the SKOS concept schemes, concepts and
+collections of one graph, with their SKOS-XL labels
+([U12](../specs/U12-ontology-workbench/SPEC.md#thesaurus-editor),
+[screenshot](../images/thesaurus-editor.png)). The concept tree of the chosen scheme
+starts at its top concepts and reads one level of `skos:broader` and `skos:narrower` at a
+time, in both directions. A concept with several broader concepts appears under each of
+them with a count of its broader concepts, and a concept of the scheme without a broader
+one is marked when it is not a top concept. The search finds concepts by any preferred,
+alternative or hidden label, SKOS-XL labels included, in every language or in one, and the
+tree can show its labels in a chosen language.
+
+Dragging a concept onto another moves it there, and holding Ctrl or Alt adds the new
+broader concept and keeps the old one. Each move writes both directions of the hierarchy
+and is previewed as a commit before it is written
+([screenshot](../images/thesaurus-move.png)). Dropping a concept on the top zone makes it a
+top concept of the scheme. The page refuses a move under one of the concept's own
+narrower concepts.
+
+The **Labels** tab lists a resource's preferred, alternative and hidden labels by language,
+marks the SKOS-XL ones and converts a label between its plain and SKOS-XL forms. It
+refuses a second preferred label in one language and a label that is both preferred and
+alternative, and it lists the clashes the data already has. The **Relations** tab edits
+broader, narrower, related and mapping links, with a picker that searches concepts by
+label in another scheme or another dataset. A link written in one direction only is
+marked, and its repair adds the other direction. The **Members** tab edits a collection's members and an
+ordered collection's `skos:memberList` with the list editor of the
+[editing forms](#nested-forms-lists-and-alternatives), and the **Notes** tab edits notes
+and documentation through a form of the built-in SKOS shapes.
+
+The **Checks** tab runs the built-in SKOS shapes over the graph
+([screenshot](../images/thesaurus-checks.png)), which check the integrity conditions of the
+SKOS Reference, and an administrator can install them as the dataset's write guard. The
+page shares the session model of the [ontology editor](#ontology-editor). Every edit is a
+dry run with `If-Match` before it commits, undo and redo revert commits, **Start session**
+creates a `skos.<user>.<date>` branch, another writer's commit reloads the page, and a
+protected branch is read-only. The [API reference](../API.md#skos-shapes) lists the shapes'
+conditions.
+
 ## Known gaps
 
 These limits name the roadmap items that address them. Current priorities and
@@ -276,8 +316,15 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   syntax, since Manchester syntax is rendered but not parsed, 608. Only the class
   tree has an inferred view, 609, and the IRI policy is kept in the browser per
   dataset, 610. Rename covers the graph the page reads and not IRIs inside triple
-  terms, under item 457's refactoring phase. The SKOS editor, the DL Query tab and the
-  editable schema diagram are further U12 phases of item 457.
+  terms, under item 457's refactoring phase. The DL Query tab and the editable schema
+  diagram are further U12 phases of item 457.
+* The thesaurus editor reads at most 2,000 narrower concepts of a concept and 5,000 roots
+  of a scheme, and the label search scans the labels for a substring and answers
+  its first 100 matches, NEW-ITEM-1. A mapping's target in another dataset is named by its
+  IRI, and the page lists only the mappings a concept states itself, NEW-ITEM-2.
+  `skosxl:labelRelation` links between SKOS-XL labels are not edited, NEW-ITEM-3. The
+  SKOS rules become a write guard only by replacing the dataset's guard, so a dataset
+  cannot keep its own shapes and the SKOS shapes together, NEW-ITEM-4.
 * The ontology editor decides whether the caller can write from the caller's level on the
   dataset, so a caller whose grants allow writes on a branch only sees the branch
   read-only, 611. Undo and redo revert commits, which needs write access to the
