@@ -109,6 +109,15 @@ pub async fn track(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // Experiment (X07, item 4): `SPARKLES_PROBE_QUIET` leaves health checks out of the
+    // activity, so that a first query right after a readiness probe still runs in place.
+    static PROBE_QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let probe_quiet =
+        *PROBE_QUIET.get_or_init(|| std::env::var_os("SPARKLES_PROBE_QUIET").is_some());
+    let path = req.uri().path();
+    if probe_quiet && (path == "/$/ping" || path == "/$/ready" || path.starts_with("/$/ready/")) {
+        return next.run(req).await;
+    }
     let activity = Activity::start(&ACTIVE, &LAST_END_MS);
     DIRTY.store(true, Ordering::SeqCst);
     next.run(req).await.map(|inner| {
