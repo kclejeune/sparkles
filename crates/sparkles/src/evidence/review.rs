@@ -1068,14 +1068,16 @@ pub fn review(
     let branch = store.branch_id();
     let head = store.snapshot();
     let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
-    let masked = caller_view(access.as_ref(), &head, &preparation)?;
+    // The caller's masked view is prepared only after a replay was ruled out, under
+    // the resolver's allowance.
+    let mask_preparation =
+        crate::access::Preparation::new(control.clone(), super::resolve::MEMORY_BYTES)?;
+    let masked;
     // The preconditions read the stored decisions; this operation's supersessions
     // count once they have all been checked.
     let mut state = State {
         reads: Reads::new(&preparation, &head),
-        seen: masked
-            .as_ref()
-            .map(|v| Reads::new(&preparation, v.snapshot())),
+        seen: None,
         claim_graphs: claim_graphs(&settings, &capability),
         superseded: BTreeSet::new(),
         withdrawn: BTreeSet::new(),
@@ -1130,12 +1132,14 @@ pub fn review(
                         p.supports.0.as_str(),
                         MAX_EVIDENCE,
                     )?;
-                    v.into_iter()
-                        .filter_map(|t| match t {
-                            Term::NamedNode(n) => Some(n),
-                            _ => None,
-                        })
-                        .collect()
+                    canonical(
+                        v.into_iter()
+                            .filter_map(|t| match t {
+                                Term::NamedNode(n) => Some(n),
+                                _ => None,
+                            })
+                            .collect(),
+                    )
                 } else {
                     Vec::new()
                 };
@@ -1171,6 +1175,10 @@ pub fn review(
             ),
         ));
     }
+    masked = caller_view(access.as_ref(), &head, &mask_preparation)?;
+    state.seen = masked
+        .as_ref()
+        .map(|v| Reads::new(&mask_preparation, v.snapshot()));
     state.check_projection(&p, None)?;
     let mut resolution = Resolution::new(control.clone())?;
     let mut evidence = Evidence {
@@ -1354,7 +1362,7 @@ pub fn review(
                 ),
             ));
         }
-        conflicts.push(found);
+        conflicts.push(canonical(found));
     }
     // The records.
     let mut batch = Batch {
@@ -1482,6 +1490,14 @@ pub fn review(
         changed,
         preview: committed.preview,
     })
+}
+
+/// `conflicts` sorted by IRI without repeats, the order a recorded support's
+/// `ev:conflictsWith` is answered in.
+fn canonical(mut conflicts: Vec<NamedNode>) -> Vec<NamedNode> {
+    conflicts.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    conflicts.dedup();
+    conflicts
 }
 
 /// The reasons an acceptance does not project its claim, as `ev:projectionNote` records

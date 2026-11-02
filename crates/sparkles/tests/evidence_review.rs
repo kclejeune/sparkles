@@ -1002,3 +1002,84 @@ fn replays_keep_their_metadata_and_ended_supports_are_reported_once() {
     .unwrap();
     assert!(r.changed.supports_ended.is_empty(), "{:?}", r.changed);
 }
+
+/// A contradiction link from a passage of a new source, in the claims graph.
+fn contradicting_link(ds: &Dataset, target: &NamedNode) -> NamedNode {
+    let text = "Release 1.2 is not affected.";
+    let mut batch = EvidenceInput {
+        revisions: vec![revision("rebuttal")],
+        ..Default::default()
+    };
+    batch.renditions.push(evidence::RenditionInput {
+        version: RecordVersion::V1,
+        key: key("text"),
+        revision: RecordRef::Local(key("rev")),
+        occurrence_key: key("text"),
+        conversion: evidence::MethodRef {
+            method: iri("urn:method:identity"),
+            version: key("1"),
+        },
+        media_type: "text/plain".into(),
+        language: None,
+        content: evidence::RenditionContent::NormalizedText(text.into()),
+        expected_digest: None,
+    });
+    batch.passages.push(evidence::PassageInput {
+        version: RecordVersion::V1,
+        key: key("span"),
+        revision: RecordRef::Local(key("rev")),
+        rendition: RecordRef::Local(key("text")),
+        occurrence_key: key("span"),
+        start: 0,
+        end: 7,
+        text_digest: sha(&text[0..7]),
+        quote: None,
+    });
+    batch.references.push(EvidenceRefInput {
+        version: RecordVersion::V1,
+        key: key("ref"),
+        occurrence_key: key("ref"),
+        target: EvidenceRefTarget::Passage {
+            revision: RecordRef::Local(key("rev")),
+            rendition: RecordRef::Local(key("text")),
+            passage: RecordRef::Local(key("span")),
+        },
+    });
+    batch.links.push(EvidenceLinkInput {
+        version: RecordVersion::V1,
+        key: key("link"),
+        occurrence_key: key("link"),
+        target: RecordRef::Existing(target.clone()),
+        evidence: RecordRef::Local(key("ref")),
+        relation: EvidenceRelation::Contradicts,
+        attributed_author: iri("urn:importer"),
+    });
+    let p = propose(ds, &batch);
+    p.records
+        .iter()
+        .find(|r| r.key == "link")
+        .unwrap()
+        .iri
+        .clone()
+}
+
+/// A labelled acceptance against a negative claim and a later contradiction link
+/// answers its conflicts in one order, first and on replay.
+#[test]
+fn conflicts_are_answered_in_one_order_on_replay() {
+    let ds = configured(ConflictMode::AdmitLabelled);
+    let no = claim_of(&propose(&ds, &occurrence("vendor", Polarity::Negative)));
+    let yes = claim_of(&propose(&ds, &occurrence("advisory", Polarity::Positive)));
+    let link = contradicting_link(&ds, &yes.0);
+    let mut o = reviewer();
+    o.idempotency_key = Some("k".into());
+    o.if_head = Some(ds.store().head_commit().seq);
+    let d = [decision("y", &yes, Disposition::Accepted, None)];
+    let first = review_as(&ds, &d, &o, all()).unwrap();
+    let mut want = vec![no.0.clone(), link];
+    want.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assert_eq!(first.decisions[0].conflicts, want);
+    let again = review_as(&ds, &d, &o, all()).unwrap();
+    assert!(again.replayed);
+    assert_eq!(again.decisions, first.decisions);
+}
