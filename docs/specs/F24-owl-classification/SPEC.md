@@ -124,8 +124,8 @@ additions and removals gives the taxonomy of a full run.
 
 **Bounds.** A run stops at its deadline, at a cancellation and when the estimated memory
 passes the budget. The deadline and the cancellation are checked while the axioms are
-normalized, between the stages and while the taxonomy is built, as well as during the
-saturation. The estimate counts the classifier's copy of the axioms, the index with
+normalized, while the property closure is built, between the stages and while the
+taxonomy is built, as well as during the saturation. The estimate counts the classifier's copy of the axioms, the index with
 the property closure, which stops as soon as it passes the budget, the stored
 conclusions and the messages waiting in the contexts' to-do lists, and the memory
 pool is charged for the growth of its peak. A run that stops before its saturation ends

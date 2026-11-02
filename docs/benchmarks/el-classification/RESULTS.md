@@ -22,9 +22,9 @@ threads. `scripts/el-oracle.py --asserted` made both comparisons.
 All 298 ontologies of the ORE 2015 EL classification sample classify, with taxonomies
 that do not change between the builds of the record below and the build with the
 review fixes. One of them is inconsistent, four have unsatisfiable classes and 18 have
-axioms the classifier uses only in part. The largest has 981,151 classes and classifies
-in 13.6 s on four threads of a loaded laptop, which is a completion check and not a
-timing.
+axioms the classifier uses only in part. Each classifies within 21 s on four threads of
+a loaded laptop, the largest having 981,151 classes, which is a completion check and
+not a timing.
 
 The classifier has not been compared with ELK itself on these ontologies, and its time
 and memory have not been measured against ELK's. Roadmap item NEW-ITEM-6 covers both.

@@ -740,6 +740,9 @@ sparkles ontology axioms  --loc db --type SubClassOf --about http://ex.org/Perso
 sparkles ontology check   --loc db --profile el,rl   # OWL 2 profile checks (exit 1 when outside one)
 sparkles ontology check   onto.ttl --profile all     # check a file without a database
 sparkles ontology edit    --loc db --add new.json --remove old.json   # JSON axioms, in one commit
+sparkles ontology classify --loc db --format text   # OWL 2 EL taxonomy (exit 1 when unsatisfiable)
+sparkles ontology classify go.ofn > go-taxonomy.ofn  # classify a file without a database
+sparkles ontology classify --loc db --target http://ex.org/taxonomy   # write the taxonomy to a graph
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --language en|all,
                                               #   --language fr=french-light (a tag with an analyzer),
                                               #   --rebuild, --status, --disable, --text-dicts DIR

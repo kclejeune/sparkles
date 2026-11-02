@@ -245,7 +245,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   the contexts that those axioms can reach. A change to the property hierarchy, chains,
   reflexivity or ranges, or to an axiom with a data property or datatype, saturates
   everything again. A run stops at its deadline, its memory budget or a cancellation,
-  which it checks while it indexes, saturates and builds the taxonomy. On the benchmark
+  which it checks while it indexes, builds the property closure, saturates and builds
+  the taxonomy. On the benchmark
   host GO classifies in about 0.4 seconds and ChEBI lite in about 3 seconds on four
   threads. The classifier's direct hierarchy equals the hierarchy that GO's release
   publishes, and its taxonomy of ChEBI entails every subsumption ChEBI asserts and
