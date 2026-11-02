@@ -673,6 +673,9 @@ pub struct Ctx {
     decode: DecodeEnvelope,
     /// the charge of the query-local terms and memos
     retained: RetainedTerms,
+    /// the context itself, once it is shared, which retained charges release through
+    /// (see [`Ctx::attach_owner`])
+    owner: parking_lot::Mutex<Weak<Ctx>>,
     // Opt-in cursor accounting stays after the ordinary execution fields.
     cursor_memory: Option<Box<CursorMemory>>,
     // Data and weak retained caches drop before final ledger ownership.
@@ -787,7 +790,6 @@ struct DecodeEnvelope {
 
 #[derive(Default)]
 struct CursorMemory {
-    owner: parking_lot::Mutex<Weak<Ctx>>,
     regex: super::cursor_regex::RegexCache,
 }
 
@@ -991,6 +993,7 @@ impl Ctx {
             memory_failure: Default::default(),
             decode: Default::default(),
             retained: Default::default(),
+            owner: Default::default(),
             cursor_memory: None,
             fast: Default::default(),
             memory: Default::default(),
@@ -1345,29 +1348,40 @@ impl Ctx {
         self.accounting() == Accounting::Cursor
     }
 
-    pub(super) fn attach_cursor_owner(self: &Arc<Self>) {
-        if let Some(memory) = &self.cursor_memory {
-            *memory.owner.lock() = Arc::downgrade(self);
-        }
+    /// Let retained charges release through this shared context, in both accounting
+    /// modes. Query preparation attaches every context it shares.
+    pub(super) fn attach_owner(self: &Arc<Self>) {
+        *self.owner.lock() = Arc::downgrade(self);
+    }
+
+    /// Drop the context's weak reference to itself, which lets a test take the prepared
+    /// context back with `Arc::get_mut`.
+    #[cfg(test)]
+    pub(super) fn detach_owner_for_tests(&self) {
+        *self.owner.lock() = Weak::new();
     }
 
     /// The cursor's own context, for state that runs a cursor operator tree of its own
     /// (the key set of an EXISTS pattern). `None` in eager execution.
     pub(super) fn cursor_owner(&self) -> Option<Arc<Ctx>> {
-        self.cursor_memory.as_ref()?.owner.lock().upgrade()
+        self.cursor_memory.as_ref()?;
+        self.owner.lock().upgrade()
     }
 
-    /// A retained cache belongs to the plan, which may also occur in context
-    /// bookkeeping. Use a weak owner to avoid a plan/context reference cycle.
+    /// Charge `bytes` of state that outlives the call that builds it, such as a cache
+    /// that belongs to the plan, in both accounting modes. The charge holds a weak owner,
+    /// which avoids a plan and context reference cycle. A context that was never shared
+    /// has no owner to release through, so an eager one keeps such state uncharged, as
+    /// `None` says, while a cursor always has one.
     pub(super) fn retained_charge(&self, bytes: u64) -> Result<Option<RetainedCharge>> {
-        let Some(memory) = &self.cursor_memory else {
-            return Ok(None);
-        };
-        let charge = self.charge(bytes)?;
-        let owner = memory.owner.lock().clone();
+        let owner = self.owner.lock().clone();
         if owner.strong_count() == 0 {
+            if self.cursor_memory.is_none() {
+                return Ok(None);
+            }
             return Err(Error::invalid("cursor context owner has not been attached"));
         }
+        let charge = self.charge(bytes)?;
         let id = charge.disarm();
         Ok(Some(RetainedCharge { owner, id, bytes }))
     }
@@ -2584,13 +2598,15 @@ impl RetainedCharge {
             .upgrade()
             .ok_or_else(|| Error::invalid("cursor context was released"))?;
         if bytes > self.bytes {
-            let ledger = ctx.memory();
-            let owner = self
-                .id
-                .map(|id| ledger.owner_by_id(id))
-                .map_or_else(|| ledger.owner(ctx.grant.as_ref()), Ok)?;
-            ledger.reserve(&owner, ctx.mem_limit, bytes - self.bytes, false)?;
-            self.id = Some(owner.id);
+            // A charge on the same owner, which an eager context's lock-free account
+            // takes without the ledger.
+            let charge = Charge {
+                ctx: &ctx,
+                bytes: std::cell::Cell::new(0),
+                owner: std::cell::Cell::new(self.id),
+            };
+            charge.add(bytes - self.bytes)?;
+            self.id = charge.disarm();
         } else {
             ctx.release_live(self.id, self.bytes - bytes);
         }
@@ -2721,7 +2737,7 @@ mod charge_tests {
         let mut context = Ctx::new(store.snapshot());
         context.enable_cursor_accounting().unwrap();
         let context = Arc::new(context);
-        context.attach_cursor_owner();
+        context.attach_owner();
         let before = context.memory().live.load(Ordering::Relaxed);
         let mut retained = context.retained_charge(4096).unwrap().unwrap();
         assert_eq!(context.memory().live.load(Ordering::Relaxed), before + 4096);

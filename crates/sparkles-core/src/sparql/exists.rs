@@ -418,12 +418,13 @@ fn answers(
         decor.note(RISKY_BOUND);
         return Ok(None);
     }
-    // the key sets are alive while the rows are probed
-    let held = match ctx.charge(if ctx.is_cursor() {
-        // Retained key sets carry their own charges. Probe vectors are transient.
-        t.len() as u64 + (build.keys.len() + build.risky.len()) as u64 * 64 + 1024
+    // The probe vectors are transient. Retained key sets carry their own charges, and
+    // those of a context that was never shared are held while the rows are probed.
+    let probe = t.len() as u64 + (build.keys.len() + build.risky.len()) as u64 * 64 + 1024;
+    let held = match ctx.charge(if build._charge.is_some() {
+        probe
     } else {
-        build.bytes()
+        probe.saturating_add(build.bytes())
     }) {
         Ok(h) => h,
         Err(Error::BudgetExceeded(_)) => {
@@ -486,9 +487,7 @@ fn answers(
                     Some(build.full.contains(&key))
                 } else {
                     if let std::collections::hash_map::Entry::Vacant(entry) = sets.entry(mask) {
-                        if ctx.is_cursor() {
-                            held.add(128)?;
-                        }
+                        held.add(128)?;
                         entry.insert(partial(ctx, &build, mask, &held));
                     }
                     sets.get(&mask)
@@ -531,14 +530,17 @@ fn partial(ctx: &Ctx, build: &Build, mask: u64, held: &Charge<'_>) -> Option<Arc
     }
     let width = mask.count_ones() as usize;
     // reserve the estimate before building it (a projection has at most as many keys)
-    let charge = if ctx.is_cursor() {
-        ctx.retained_charge(build.full.len() as u64 * (width as u64 * 8 + 128) + 1024)
-            .ok()?
-    } else {
-        held.add(build.full.len() as u64 * (width as u64 * 8 + 16))
-            .ok()?;
-        None
-    };
+    let charge =
+        match ctx.retained_charge(build.full.len() as u64 * (width as u64 * 8 + 128) + 1024) {
+            Ok(Some(charge)) => Some(charge),
+            // A context that was never shared holds the set while its rows are probed.
+            Ok(None) => {
+                held.add(build.full.len() as u64 * (width as u64 * 8 + 16))
+                    .ok()?;
+                None
+            }
+            Err(_) => return None,
+        };
     let s = Arc::new(Partial {
         set: build.full.project(build.keys.len(), mask),
         _charge: charge,
@@ -717,8 +719,9 @@ fn build(ctx: &Ctx, node: &Node, keys: Vec<VarId>, risky: Vec<VarId>) -> Result<
         }
         KeySet::Many(s)
     };
-    // fails over budget (and so falls back) before the solutions are dropped
-    if !ctx.is_cursor() {
+    // A context that was never shared charges the set while the solutions are held, so
+    // that it fails over budget (and so falls back) before they are dropped.
+    if charge.is_none() {
         held.add(full.bytes(width))?;
     }
     Ok(Build {
@@ -829,7 +832,7 @@ fn admit(ctx: &Ctx, spec: &ExistsSpec) -> std::result::Result<Plan, String> {
             Ok(())
         }
     }
-    let charge = if ctx.is_cursor() {
+    let charge = {
         let mut size = Size(0);
         std::fmt::write(&mut size, format_args!("{}", spec.pattern)).map_err(|e| e.to_string())?;
         ctx.retained_charge(
@@ -838,8 +841,6 @@ fn admit(ctx: &Ctx, spec: &ExistsSpec) -> std::result::Result<Plan, String> {
                 .saturating_add(spec.vars.len() as u64 * 128 + 4096),
         )
         .map_err(|e| e.to_string())?
-    } else {
-        None
     };
     if let ActiveGraph::Var(_) = spec.graph {
         return Err("its active graph is a variable".into());

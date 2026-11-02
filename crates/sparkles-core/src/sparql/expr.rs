@@ -63,12 +63,16 @@ impl ExistsSpec {
         }
     }
 
-    /// Memoize the answer for `key` in a cursor, charging the entry first. The memo
-    /// takes at most an eighth of the query's memory budget and leaves the evaluation of
-    /// later rows room to run. An entry that does not fit is not kept, and that key is
-    /// evaluated again when it recurs. A pattern that calls a SERVICE keeps its entries
-    /// while the budget can charge them, even below the quarter it otherwise leaves free,
-    /// because a repeated evaluation is a repeated remote request.
+    /// Memoize the answer for `key`, charging the entry first, in both accounting modes.
+    /// The memo holds at most [`EXISTS_MEMO_ENTRIES`] entries and an eighth of the
+    /// query's memory budget, and leaves the evaluation of later rows room to run. An
+    /// entry that does not fit is not kept, and that key is evaluated again when it
+    /// recurs. A pattern that calls a SERVICE keeps its entries while the budget can
+    /// charge them, even below the quarter it otherwise leaves free, because a repeated
+    /// evaluation is a repeated remote request. A context that was never shared keeps
+    /// its entries uncharged (see [`Ctx::retained_charge`]).
+    ///
+    /// [`Ctx::retained_charge`]: super::ctx::Ctx::retained_charge
     fn remember(&self, ctx: &super::ctx::Ctx, key: Vec<Id>, found: bool) {
         // The key's heap allocation plus the map's slot, control byte and growth.
         let bytes = key.len() as u64 * 8 + 64;
@@ -79,18 +83,22 @@ impl ExistsSpec {
         {
             return;
         }
+        let mut memo = self.memo.lock();
+        if memo.len() >= EXISTS_MEMO_ENTRIES {
+            return;
+        }
         let charged = match charge.as_mut() {
             Some(charge) => charge.resize(charge.bytes().saturating_add(bytes)).is_ok(),
             None => match ctx.retained_charge(bytes) {
                 Ok(retained) => {
                     *charge = retained;
-                    charge.is_some()
+                    true
                 }
                 Err(_) => false,
             },
         };
         if charged {
-            self.memo.lock().insert(key, found);
+            memo.insert(key, found);
         }
     }
 
@@ -120,6 +128,9 @@ impl ExistsSpec {
             .map_or(Id::UNDEF, |b| b.1)
     }
 }
+
+/// The most entries the memo of one EXISTS keeps.
+const EXISTS_MEMO_ENTRIES: usize = 100_000;
 
 /// The deepest expression evaluated on rayon's threads (see [`Expr::parallel`]): their
 /// stack is 2 MiB unless the application sets another, and a debug build's evaluator
@@ -706,14 +717,7 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
             if unbound {
                 let _ = spec.unbound.set(r);
             } else if !ctx.calls_extensions {
-                if ctx.is_cursor() {
-                    spec.remember(ctx, key, r);
-                } else {
-                    let mut m = spec.memo.lock();
-                    if m.len() < 100_000 {
-                        m.insert(key, r);
-                    }
-                }
+                spec.remember(ctx, key, r);
             }
             Ok(b(r))
         }

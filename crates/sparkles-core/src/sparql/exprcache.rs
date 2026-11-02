@@ -1513,7 +1513,7 @@ mod tests {
         let var = ctx.var("key");
         ctx.enable_cursor_accounting().unwrap();
         let ctx = std::sync::Arc::new(ctx);
-        ctx.attach_cursor_owner();
+        ctx.attach_owner();
         let mut table = Table::new(vec![var]);
         table.cols[0] = vec![short; MIN_ROWS];
         table.cols[0][MIN_ROWS - 1] = long;

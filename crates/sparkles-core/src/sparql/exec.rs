@@ -37,10 +37,10 @@ pub(super) fn map_rows<T: Send>(
     par: bool,
     f: impl Fn(usize) -> T + Sync + Send,
 ) -> Result<Vec<T>> {
-    if par && ctx.is_cursor() {
-        // Submit one partitioned job and poll within each partition. Repeated
-        // 1024-row pool submissions cost more than cheap numeric predicates.
-        // Temporary collector capacity is optional and reserved before dispatch.
+    if par {
+        // Submit one partitioned job and poll within each partition. Repeated pool
+        // submissions cost more than cheap numeric predicates. Temporary collector
+        // capacity is optional and reserved before dispatch.
         let bytes = (n as u64)
             .saturating_mul(std::mem::size_of::<T>() as u64)
             .saturating_mul(2)
@@ -58,11 +58,9 @@ pub(super) fn map_rows<T: Send>(
                 .collect();
         }
     }
-    let chunk = if par && !ctx.is_cursor() {
-        1 << 16
-    } else {
-        1 << 10
-    };
+    // Without the collector's charge, a parallel map runs in pieces that each collect
+    // into the output.
+    let chunk = if par { 1 << 16 } else { 1 << 10 };
     let mut out = Vec::with_capacity(n);
     let mut start = 0;
     while start < n {
@@ -1946,22 +1944,13 @@ fn par_count_on_keys(
         return Ok(None);
     }
     let vocab = &ctx.snap.generation.vocab;
-    let piece = if ctx.is_cursor() {
-        PIECE.min(
-            (ctx.memory_remaining() / rayon::current_num_threads().max(1) as u64 / 128).max(1)
-                as usize,
-        )
-    } else {
-        PIECE
-    };
+    let piece = PIECE.min(
+        (ctx.memory_remaining() / rayon::current_num_threads().max(1) as u64 / 128).max(1) as usize,
+    );
     let parts =
         ctx.snap
             .par_blocks_in_ranges(spec.perm, ranges, run_mask(spec), piece, |b, s, e| {
-                let _scratch = if ctx.is_cursor() {
-                    Some(ctx.charge((e - s) as u64 * 48 + 1024)?)
-                } else {
-                    None
-                };
+                let _scratch = ctx.charge((e - s) as u64 * 48 + 1024)?;
                 let mut out = KeyCount {
                     _cursor_charge: ctx.retained_charge((e - s) as u64 * 32 + 256)?,
                     ..Default::default()
@@ -1985,31 +1974,27 @@ fn par_count_on_keys(
                     }
                     pass[j] = kf.test(key);
                 };
-                if ctx.is_cursor() {
-                    let scratch = ctx.charge(0)?;
-                    let mut reserved = 0;
-                    let mut tested = 0usize;
-                    vocab.get_sorted_checked(
-                        &ids,
-                        |need| {
+                let scratch = ctx.charge(0)?;
+                let mut reserved = 0;
+                let mut tested = 0usize;
+                vocab.get_sorted_checked(
+                    &ids,
+                    |need| {
+                        ctx.check()?;
+                        let bytes = (need as u64).saturating_mul(2);
+                        scratch.add(bytes.saturating_sub(reserved))?;
+                        reserved = bytes;
+                        Ok::<(), Error>(())
+                    },
+                    |p, key| {
+                        test(p, key);
+                        tested += 1;
+                        if tested.is_multiple_of(1024) {
                             ctx.check()?;
-                            let bytes = (need as u64).saturating_mul(2);
-                            scratch.add(bytes.saturating_sub(reserved))?;
-                            reserved = bytes;
-                            Ok::<(), Error>(())
-                        },
-                        |p, key| {
-                            test(p, key);
-                            tested += 1;
-                            if tested.is_multiple_of(1024) {
-                                ctx.check()?;
-                            }
-                            Ok::<(), Error>(())
-                        },
-                    )?;
-                } else {
-                    vocab.get_sorted(&ids, test);
-                }
+                        }
+                        Ok::<(), Error>(())
+                    },
+                )?;
                 for (h, n) in pass.iter().zip(&counts) {
                     if *h {
                         out.rows += n;

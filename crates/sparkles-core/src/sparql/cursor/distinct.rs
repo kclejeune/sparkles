@@ -597,7 +597,7 @@ mod tests {
         ctx.mem_limit = limit;
         ctx.enable_cursor_accounting().unwrap();
         let ctx = Arc::new(ctx);
-        ctx.attach_cursor_owner();
+        ctx.attach_owner();
         let baseline = ctx.live_bytes();
         let mut distinct = Distinct::new(&ctx, &[0, 1], &[], false, true).unwrap();
         let batch = |first: i64, len: usize| {
@@ -683,7 +683,7 @@ mod tests {
         }
         ctx.enable_cursor_accounting().unwrap();
         let ctx = Arc::new(ctx);
-        ctx.attach_cursor_owner();
+        ctx.attach_owner();
         let baseline = ctx.live_bytes();
         let mut distinct = Distinct::new(&ctx, &[0, 1], &[], false, numbered).unwrap();
         let batch = |first: i64, len: usize| {

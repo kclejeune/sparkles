@@ -823,7 +823,7 @@ fn prepare_query(
     }
     let mut ctx = Arc::new(ctx);
     if cursor_started.is_some() && automatic.is_none() {
-        ctx.attach_cursor_owner();
+        ctx.attach_owner();
     }
     crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
     // the keys are visited only when asking for their groups can do something
@@ -871,8 +871,11 @@ fn prepare_query(
             .ok_or_else(|| Error::invalid("automatic cursor context is shared"))?;
         mutable.enable_cursor_accounting()?;
         mutable.deadline = opts.effective_deadline(started)?;
-        ctx.attach_cursor_owner();
     }
+    // Retained charges release through the shared context in both accounting modes.
+    // An eager context is attached once the automatic choice no longer needs it alone,
+    // so its planning keeps what it retains uncharged, as before.
+    ctx.attach_owner();
     ctx.check()?;
     Ok(PreparedQuery {
         ctx,
