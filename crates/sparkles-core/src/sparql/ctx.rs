@@ -91,6 +91,90 @@ const VALUE_SHARDS: usize = 64;
 /// decoded values kept per shard before the shard is cleared
 const VALUE_SHARD_CAP: usize = 1 << 16;
 
+/// The most the decoded value cache of one query holds, before the memory budget's
+/// share (see [`ValueCache::cap`]).
+const VALUE_CACHE_BYTES: u64 = 64 << 20;
+
+/// The query's cache of decoded dictionary values, in shards that a hash of the id
+/// picks. It is charged to the query in both accounting modes: the cache reserves
+/// [`EAGER_STEP`]s from the query's account as its entries grow, and a value whose
+/// reservation is refused is returned without being cached. The cache holds at most
+/// [`VALUE_CACHE_BYTES`] or an eighth of the memory budget, whichever is smaller, and a
+/// shard that reaches its share of that is cleared. The reservation is kept until the
+/// context drops, so it also covers the slots that a cleared shard keeps allocated.
+pub(super) struct ValueCache {
+    shards: Box<[RwLock<ValueShard>]>,
+    /// the estimated bytes of the entries held now
+    used: AtomicU64,
+    /// the bytes charged for the cache, never fewer than `used`
+    reserved: AtomicU64,
+    /// serializes growth of `reserved`, with the owner its charges went to
+    grow: parking_lot::Mutex<Option<u64>>,
+}
+
+#[derive(Default)]
+struct ValueShard {
+    map: FxHashMap<Id, Value>,
+    /// the estimated bytes of `map`'s entries
+    bytes: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// growths of a value cache's reservation on this thread
+    static VALUE_GROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Default for ValueCache {
+    fn default() -> Self {
+        Self {
+            shards: (0..VALUE_SHARDS).map(|_| Default::default()).collect(),
+            used: AtomicU64::new(0),
+            reserved: AtomicU64::new(0),
+            grow: Default::default(),
+        }
+    }
+}
+
+impl ValueCache {
+    /// The estimated bytes one cached entry keeps: its slot, counted twice since a map
+    /// grows by doubling, and the heap storage of its text.
+    pub(super) fn entry_bytes(v: &Value) -> u64 {
+        fn text(s: &str) -> u64 {
+            s.len() as u64 + 16
+        }
+        let heap = match v {
+            Value::Iri(a) | Value::BNode(a) | Value::Str(a) => text(a),
+            Value::Lang(a, b) | Value::LangDir(a, b, _) => text(a) + text(b),
+            Value::Other { lex, dt } => text(lex) + text(dt),
+            Value::Triple(t) => 64 + t.to_string().len() as u64,
+            _ => 0,
+        };
+        2 * (std::mem::size_of::<(Id, Value)>() as u64 + 1) + heap
+    }
+
+    /// The most the cache holds under a memory budget of `mem_limit` bytes.
+    fn cap(mem_limit: u64) -> u64 {
+        VALUE_CACHE_BYTES.min(mem_limit / 8)
+    }
+
+    #[inline]
+    fn shard(&self, id: Id) -> &RwLock<ValueShard> {
+        &self.shards[(id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % VALUE_SHARDS]
+    }
+
+    #[inline]
+    fn get(&self, id: Id) -> Option<Value> {
+        self.shard(id).read().map.get(&id).cloned()
+    }
+
+    /// The bytes charged for the cache.
+    #[cfg(test)]
+    fn reserved(&self) -> u64 {
+        self.reserved.load(Ordering::Acquire)
+    }
+}
+
 /// Executor optimizations that can be switched off for diagnosis (every one of them has
 /// a generic fallback with the same results). `SPARKLES_DISABLE_OPTIMIZATIONS` holds a
 /// comma-separated list of names that are off by default in a process.
@@ -442,7 +526,7 @@ pub struct Ctx {
     pub(super) reasoning_memory: Vec<QueryMemoryLease>,
     pub snap: Arc<Snapshot>,
     local: RwLock<AppendVocab>,
-    values: Vec<RwLock<FxHashMap<Id, Value>>>,
+    values: ValueCache,
     next_bnode: AtomicU64,
     bnode_memo: parking_lot::Mutex<FxHashMap<(Vec<Id>, String), Id>>,
     /// blank nodes given to the query from outside (initial bindings) that are not
@@ -867,9 +951,7 @@ impl Ctx {
             memory: Default::default(),
             snap,
             local: RwLock::new(AppendVocab::default()),
-            values: (0..VALUE_SHARDS)
-                .map(|_| RwLock::new(FxHashMap::default()))
-                .collect(),
+            values: Default::default(),
             next_bnode: AtomicU64::new(0),
             bnode_memo: Default::default(),
             outside_bnodes: Default::default(),
@@ -1191,9 +1273,8 @@ impl Ctx {
 
     pub(super) fn enable_cursor_accounting(&mut self) -> Result<()> {
         self.memory().check_cursor_transition()?;
-        for shard in &self.values {
-            *shard.write() = FxHashMap::default();
-        }
+        // The decoded value cache is charged already, and the ledger carries its
+        // reservation over, so the cursor keeps it.
         let bytes = self.local.read().bytes() as u64;
         std::mem::forget(self.charge(bytes)?);
         self.memory().cursor_mode()?;
@@ -1560,36 +1641,18 @@ impl Ctx {
     }
 
     /// The bytes of the state an eager context keeps after execution without a charge:
-    /// the terms computed into its local vocabulary, its cached decoded values, its
+    /// the terms computed into its local vocabulary, its
     /// parsed geometries and the memos of its blank nodes and callback terms. A map
     /// counts the slots it has allocated, which clearing it keeps, and the heap storage
     /// of its live keys and values.
     fn retained_state_bytes(&self) -> u64 {
-        fn text(s: &str) -> u64 {
-            s.len() as u64 + 16
-        }
-        fn value(v: &Value) -> u64 {
-            match v {
-                Value::Iri(a) | Value::BNode(a) | Value::Str(a) => text(a),
-                Value::Lang(a, b) | Value::LangDir(a, b, _) => text(a) + text(b),
-                Value::Other { lex, dt } => text(lex) + text(dt),
-                Value::Triple(t) => 64 + t.to_string().len() as u64,
-                _ => 0,
-            }
-        }
         /// The slots of a hash map with `capacity` entries of type `T`, with one
         /// control byte each.
         fn slots<T>(capacity: usize) -> u64 {
             (capacity as u64).saturating_mul(std::mem::size_of::<T>() as u64 + 1)
         }
+        // The decoded value cache is charged, so its reservation is live already.
         let mut bytes = (self.local.read().bytes() as u64).saturating_add(self.geo.bytes() as u64);
-        for shard in &self.values {
-            let shard = shard.read();
-            bytes = bytes.saturating_add(slots::<(Id, Value)>(shard.capacity()));
-            for v in shard.values() {
-                bytes = bytes.saturating_add(value(v));
-            }
-        }
         {
             let memo = self.bnode_memo.lock();
             bytes = bytes.saturating_add(slots::<((Vec<Id>, String), Id)>(memo.capacity()));
@@ -2152,12 +2215,13 @@ impl Ctx {
                 {
                     return Some(v);
                 }
-                // Inline scalars need no retained cache or RDF round trip. Only
-                // dictionary/local values bypass the uncharged eager cache.
-                if self.is_cursor() {
+                if let Some(v) = self.values.get(id) {
+                    return Some(v);
+                }
+                let v = if self.is_cursor() {
                     let decode =
                         |key: &[u8]| self.cursor_decode(key.len()).then(|| Value::from_key(key));
-                    return match id.tag() {
+                    match id.tag() {
                         Tag::Vocab => match self.with_cursor_vocab_key(id.payload(), decode) {
                             Ok(value) => value.flatten(),
                             Err(error) => {
@@ -2172,41 +2236,91 @@ impl Ctx {
                             .with(|v| v.get(id.payload()).and_then(decode)),
                         Tag::Local => self.local.read().get(id.payload()).and_then(decode),
                         _ => unreachable!("dictionary value tag"),
-                    };
-                }
-                let shard = self.shard(id);
-                if let Some(v) = shard.read().get(&id) {
-                    return Some(v.clone());
-                }
-                // straight from the key: building an RDF term first cost two string
-                // allocations per value (lexical form and datatype IRI)
-                let v = match id.tag() {
-                    Tag::Vocab => self
-                        .snap
-                        .generation
-                        .vocab
-                        .get_with(id.payload(), Value::from_key)?,
-                    Tag::Delta => self
-                        .snap
-                        .generation
-                        .dvocab
-                        .with(|v| v.get(id.payload()).map(Value::from_key))?,
-                    Tag::Local => self.local.read().get(id.payload()).map(Value::from_key)?,
-                    _ => Value::from_term(&self.term(id)?),
-                };
-                let mut w = shard.write();
-                if w.len() > VALUE_SHARD_CAP {
-                    w.clear();
-                }
-                w.insert(id, v.clone());
+                    }
+                } else {
+                    // straight from the key: building an RDF term first cost two string
+                    // allocations per value (lexical form and datatype IRI)
+                    match id.tag() {
+                        Tag::Vocab => self
+                            .snap
+                            .generation
+                            .vocab
+                            .get_with(id.payload(), Value::from_key),
+                        Tag::Delta => self
+                            .snap
+                            .generation
+                            .dvocab
+                            .with(|v| v.get(id.payload()).map(Value::from_key)),
+                        Tag::Local => self.local.read().get(id.payload()).map(Value::from_key),
+                        _ => Some(Value::from_term(&self.term(id)?)),
+                    }
+                }?;
+                self.cache_value(id, &v);
                 Some(v)
             }
         }
     }
 
-    #[inline]
-    fn shard(&self, id: Id) -> &RwLock<FxHashMap<Id, Value>> {
-        &self.values[(id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % VALUE_SHARDS]
+    /// Keep `v` as the decoded value of `id`, when the cache's reservation can grow to
+    /// hold it (see [`ValueCache`]). A refused reservation leaves the value uncached and
+    /// records no failure, since the cache is optional.
+    fn cache_value(&self, id: Id, v: &Value) {
+        let cache = &self.values;
+        let cap = ValueCache::cap(self.mem_limit);
+        let share = cap / VALUE_SHARDS as u64;
+        let entry = ValueCache::entry_bytes(v);
+        if entry > share {
+            return;
+        }
+        let mut shard = cache.shard(id).write();
+        if shard.map.contains_key(&id) {
+            return;
+        }
+        if shard.bytes + entry > share || shard.map.len() > VALUE_SHARD_CAP {
+            // The slots stay allocated, and the reservation, which never shrinks
+            // before the context drops, keeps covering them.
+            cache.used.fetch_sub(shard.bytes, Ordering::AcqRel);
+            shard.bytes = 0;
+            shard.map.clear();
+        }
+        let used = cache.used.fetch_add(entry, Ordering::AcqRel) + entry;
+        if used > cache.reserved.load(Ordering::Acquire) && !self.grow_value_cache(used, cap) {
+            cache.used.fetch_sub(entry, Ordering::AcqRel);
+            return;
+        }
+        shard.bytes += entry;
+        shard.map.insert(id, v.clone());
+    }
+
+    /// Grow the value cache's reservation to cover `used` bytes of entries, a step ahead
+    /// within `cap`. Each shard holds at most its share of `cap`, so `used` never passes
+    /// it. `false` when the query's budget or the pool refuses the growth.
+    #[cold]
+    #[inline(never)]
+    fn grow_value_cache(&self, used: u64, cap: u64) -> bool {
+        #[cfg(test)]
+        VALUE_GROWS.with(|n| n.set(n.get() + 1));
+        let cache = &self.values;
+        let mut owner = cache.grow.lock();
+        let reserved = cache.reserved.load(Ordering::Acquire);
+        if used <= reserved {
+            return true;
+        }
+        let ahead = used.next_multiple_of(EAGER_STEP).min(cap).max(used);
+        let Ok(charge) = self.charge(ahead - reserved) else {
+            return false;
+        };
+        // The charge stays with the context until it drops, as its interned terms do.
+        let id = charge.disarm();
+        debug_assert!(
+            owner.is_none() || id.is_none() || *owner == id,
+            "one owner of the cache"
+        );
+        if owner.is_none() {
+            *owner = id;
+        }
+        cache.reserved.store(ahead, Ordering::Release);
+        true
     }
 
     /// Is the id an IRI / blank node / literal (without full decoding where possible)?
@@ -2722,25 +2836,111 @@ mod charge_tests {
         assert_eq!(grant.granted(), 16 * MIB);
     }
 
-    /// A value cache shard that overflowed is cleared without giving back its slots,
-    /// and a finished result keeps them counted (X08-P1-retained-results).
-    #[test]
-    fn retained_state_counts_the_slots_a_cleared_value_shard_keeps() {
-        let ctx = Ctx::new(Store::in_memory(StoreOptions::default()).snapshot());
-        let empty = ctx.retained_state_bytes();
-        {
-            let mut shard = ctx.values[0].write();
-            for i in 0..70_000u64 {
-                shard.insert(Id(i), Value::Bool(true));
-            }
-            shard.clear();
+    /// `n` distinct query-local simple literals and their texts.
+    fn local_literals(ctx: &Ctx, n: usize) -> Vec<(Id, String)> {
+        (0..n)
+            .map(|i| {
+                let text = format!("literal number {i}");
+                let term = Term::Literal(oxrdf::Literal::new_simple_literal(text.clone()));
+                let id = ctx.intern_term(&term);
+                assert_eq!(id.tag(), Tag::Local);
+                (id, text)
+            })
+            .collect()
+    }
+
+    fn assert_text(value: Option<Value>, text: &str) {
+        match value {
+            Some(Value::Str(s)) => assert_eq!(&*s, text),
+            other => panic!("{other:?} for {text:?}"),
         }
-        let slots = 70_000 * std::mem::size_of::<(Id, Value)>() as u64;
-        assert!(
-            ctx.retained_state_bytes() >= empty + slots,
-            "{} bytes for {slots} bytes of slots",
-            ctx.retained_state_bytes()
+    }
+
+    /// Cached values are charged to the query, and a finished eager result keeps
+    /// their reservation in its pool contribution.
+    #[test]
+    fn cached_values_are_charged_and_kept_by_a_finished_result() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(256 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let ctx = pooled(&store, &grant);
+        let literals = local_literals(&ctx, 2_000);
+        for (id, text) in &literals {
+            assert_text(ctx.value(*id), text);
+        }
+        let reserved = ctx.values.reserved();
+        assert!(reserved >= 2_000 * 40, "{reserved} bytes reserved");
+        assert!(ctx.live_bytes() >= reserved);
+        assert!(grant.used() >= reserved);
+        ctx.shrink_retained(0).unwrap();
+        assert!(grant.used() >= reserved, "{} of {reserved}", grant.used());
+        // a second read hits the cache and reserves nothing more
+        for (id, text) in &literals {
+            assert_text(ctx.value(*id), text);
+        }
+        assert_eq!(ctx.values.reserved(), reserved);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    /// A cursor keeps the values cached before its transition and the charge of
+    /// them, and caches repeated values with one reservation step per 64 KiB.
+    #[test]
+    fn a_cursor_caches_repeated_values_in_steps() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(256 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let mut ctx = pooled(&store, &grant);
+        ctx.mem_limit = 64 * MIB;
+        let literals = local_literals(&ctx, 1_000);
+        assert_text(ctx.value(literals[0].0), &literals[0].1);
+        let prepared = ctx.values.reserved();
+        assert!(prepared > 0);
+        ctx.enable_cursor_accounting().unwrap();
+        assert_eq!(
+            ctx.values.reserved(),
+            prepared,
+            "the transition keeps the cache"
         );
+        assert!(ctx.memory().live.load(Ordering::SeqCst) >= prepared);
+        let before = super::VALUE_GROWS.with(|n| n.get());
+        for i in 0..100_000 {
+            let (id, text) = &literals[i % literals.len()];
+            assert_text(ctx.value(*id), text);
+        }
+        let grows = super::VALUE_GROWS.with(|n| n.get()) - before;
+        let reserved = ctx.values.reserved();
+        assert!(
+            grows as u64 <= reserved / EAGER_STEP + 1,
+            "{grows} growths for {reserved} bytes"
+        );
+        assert!(reserved <= ValueCache::cap(ctx.mem_limit));
+        assert!(ctx.live_bytes() <= ctx.mem_limit);
+        assert!(ctx.check().is_ok());
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    /// A budget that cannot hold the cache's reservation leaves every value bound and
+    /// uncached, in both accounting modes, and records no failure.
+    #[test]
+    fn a_refused_cache_reservation_leaves_values_bound() {
+        let store = Store::in_memory(StoreOptions::default());
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = MIB;
+            let literals = local_literals(&ctx, 200);
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let held = ctx.charge(MIB - ctx.live_bytes() - 10_000).unwrap();
+            for (id, text) in &literals {
+                assert_text(ctx.value(*id), text);
+            }
+            assert_eq!(ctx.values.reserved(), 0, "cursor {cursor}");
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+            drop(held);
+        }
     }
 
     #[test]
