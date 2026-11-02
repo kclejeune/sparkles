@@ -42,9 +42,12 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/$/evidence/{ds}/holds/{id}", delete(release_hold))
         .route("/{ds}/claims/resolve", post(resolve))
         .route("/{ds}/claims", post(claims::propose))
+        .route("/{ds}/claims/review", post(review::review))
+        .route("/{ds}/claims/withdraw", post(review::withdraw))
 }
 
 mod claims;
+mod review;
 
 /// The response body: the canonical settings, their digest, the registry revision and
 /// the role graphs that are protected or detached.
@@ -413,6 +416,9 @@ fn record_kind(name: &str) -> Option<RecordKind> {
         Task,
         ReviewDecision,
         IdentityProposal,
+        AcceptanceSupport,
+        Withdrawal,
+        Projection,
     ]
     .into_iter()
     .find(|k| {

@@ -497,9 +497,171 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
             "evidence-proposals",
         ),
     );
+    let dry_run = || {
+        closed(
+            &["wouldCommit", "inserted", "deleted", "error"],
+            json!({
+                "wouldCommit": boolean(),
+                "inserted": int(),
+                "deleted": int(),
+                "error": or_null(string()),
+            }),
+        )
+    };
+    let changed = || {
+        let change = || {
+            array(closed(
+                &["output", "triple"],
+                json!({
+                    "output": iri("The output graph."),
+                    "triple": with_desc(string(), "The projected triple in N-Triples."),
+                }),
+            ))
+        };
+        with_desc(
+            closed(
+                &["supportsAdded", "supportsEnded", "inserted", "removed"],
+                json!({
+                    "supportsAdded": array(string()),
+                    "supportsEnded": array(string()),
+                    "inserted": change(),
+                    "removed": change(),
+                }),
+            ),
+            "The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay.",
+        )
+    };
+    put(
+        "EvidenceReview",
+        doc(
+            closed(
+                &["policy", "policyVersion", "ifHead", "decisions"],
+                json!({
+                    "policy": with_desc(string(), "The name of a review policy of the evidence settings."),
+                    "policyVersion": with_desc(int(), "The policy version the reviewer saw, else `409 policy-changed`."),
+                    "ifHead": commit("The branch head the review was prepared at, else `409 head-changed`. Every read is made at this head."),
+                    "idempotencyKey": key("Makes a retry with the same payload answer the first receipt."),
+                    "dryRun": with_desc(boolean(), "Check and preview the review without committing it."),
+                    "message": with_desc(string(), "The commit message."),
+                    "decisions": array(closed(
+                        &["key", "target", "targetDigest", "disposition"],
+                        json!({
+                            "key": key("The decision's key in this request."),
+                            "target": iri("The reviewed claim or assessment."),
+                            "targetDigest": digest("The target's record digest as the reviewer saw it, else `409 target-changed`."),
+                            "disposition": string_enum(&["accepted", "rejected", "needsEvidence"]),
+                            "supersedes": iri("The target's current decision under the policy, required when it has one, else `409 decision-superseded`."),
+                        }),
+                    )),
+                }),
+            ),
+            "Review decisions under one policy.",
+            "evidence-reviews",
+        ),
+    );
+    put(
+        "EvidenceReviewResult",
+        doc(
+            closed(
+                &[
+                    "operation",
+                    "committed",
+                    "replayed",
+                    "commit",
+                    "branchId",
+                    "decisions",
+                    "changed",
+                ],
+                json!({
+                    "operation": iri("The operation, every decision's availability receipt."),
+                    "committed": with_desc(boolean(), "Whether this request published a commit."),
+                    "replayed": with_desc(boolean(), "Whether the idempotency key had published the same payload, whose receipt this is."),
+                    "commit": commit("The publishing commit, the first one for a replay, or the head for a dry run."),
+                    "branchId": uuid("The branch the commit published on."),
+                    "decisions": array(closed(
+                        &["key", "iri", "target", "disposition", "supersedes", "support", "notProjected", "conflicts"],
+                        json!({
+                            "key": string(),
+                            "iri": string(),
+                            "target": string(),
+                            "disposition": string_enum(&["accepted", "rejected", "needsEvidence"]),
+                            "supersedes": or_null(string()),
+                            "support": with_desc(or_null(string()), "The acceptance support that owns the projected triple."),
+                            "notProjected": with_desc(or_null(string()), "Why an acceptance did not project its claim."),
+                            "conflicts": with_desc(array(string()), "The contrary links and claims an `admitLabelled` policy admitted the claim against."),
+                        }),
+                    )),
+                    "changed": changed(),
+                    "dryRun": dry_run(),
+                }),
+            ),
+            "The outcome of a review.",
+            "evidence-reviews",
+        ),
+    );
+    put(
+        "EvidenceWithdrawal",
+        doc(
+            closed(
+                &["withdrawals"],
+                json!({
+                    "ifHead": commit("Publish only while this commit is the branch head, else `409 head-changed`."),
+                    "idempotencyKey": key("Makes a retry with the same payload answer the first receipt."),
+                    "dryRun": with_desc(boolean(), "Check and preview the withdrawal without committing it."),
+                    "message": with_desc(string(), "The commit message."),
+                    "withdrawals": array(closed(
+                        &["key", "target", "targetDigest"],
+                        json!({
+                            "key": key("The withdrawal's key in this request."),
+                            "target": iri("The withdrawn claim occurrence."),
+                            "targetDigest": digest("The claim's record digest, else `409 target-changed`."),
+                        }),
+                    )),
+                }),
+            ),
+            "Claim occurrences to withdraw.",
+            "evidence-reviews",
+        ),
+    );
+    put(
+        "EvidenceWithdrawalResult",
+        doc(
+            closed(
+                &[
+                    "operation",
+                    "committed",
+                    "replayed",
+                    "commit",
+                    "branchId",
+                    "withdrawals",
+                    "changed",
+                ],
+                json!({
+                    "operation": iri("The operation, every withdrawal's availability receipt."),
+                    "committed": with_desc(boolean(), "Whether this request published a commit."),
+                    "replayed": with_desc(boolean(), "Whether the idempotency key had published the same payload."),
+                    "commit": commit("The publishing commit, the first one for a replay, or the head for a dry run."),
+                    "branchId": uuid("The branch the commit published on."),
+                    "withdrawals": array(closed(
+                        &["key", "iri", "target", "existing"],
+                        json!({
+                            "key": string(),
+                            "iri": with_desc(or_null(string()), "The withdrawal record, `null` when the claim was already withdrawn."),
+                            "target": string(),
+                            "existing": with_desc(boolean(), "An earlier withdrawal had already withdrawn the claim."),
+                        }),
+                    )),
+                    "changed": changed(),
+                    "dryRun": dry_run(),
+                }),
+            ),
+            "The outcome of a withdrawal.",
+            "evidence-reviews",
+        ),
+    );
 }
 
-const KINDS: [&str; 12] = [
+const KINDS: [&str; 15] = [
     "SourceRevision",
     "Rendition",
     "Passage",
@@ -512,6 +674,9 @@ const KINDS: [&str; 12] = [
     "Task",
     "ReviewDecision",
     "IdentityProposal",
+    "AcceptanceSupport",
+    "Withdrawal",
+    "Projection",
 ];
 
 fn explaining(put: &mut dyn FnMut(&str, J)) {

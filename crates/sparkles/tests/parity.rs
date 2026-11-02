@@ -439,6 +439,22 @@ fn entries() -> Vec<(&'static str, Entry)> {
             let _ =
                 sparkles::evidence::propose(None, ds, ds, &any(), &any(), &mut |_, _| None, &any());
         }),
+        op!("reviewClaims", "evidence.review", |ds| {
+            let _ = sparkles::evidence::review(
+                None,
+                ds,
+                ds,
+                "",
+                1,
+                &[],
+                &any(),
+                &mut |_, _| None,
+                &any(),
+            );
+        }),
+        op!("withdrawClaims", "evidence.withdraw", |ds| {
+            let _ = sparkles::evidence::withdraw(ds, ds, &[], &any(), &mut |_, _| None, &any());
+        }),
         op!("resolveEvidence", "evidence.resolve", |ds| {
             let _ = sparkles::evidence::resolve::Resolution::new(any())
                 .and_then(|mut r| r.all(None, ds, ds, &[], &mut |_, _| None));

@@ -57,7 +57,9 @@ DEFERRED = {
     "evidence.propose",
     "evidence.release_hold",
     "evidence.resolve",
+    "evidence.review",
     "evidence.settings",
+    "evidence.withdraw",
 }
 
 

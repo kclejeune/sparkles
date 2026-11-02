@@ -296,6 +296,22 @@ vocabulary adds `ev:Operation`, `ev:graphProtection`, `ev:payloadDigest`,
 `ev:idempotencyKey`, `ev:sourceHold`, `ev:recordDigest`, `ev:retainedBytes`,
 `ev:locator` and `ev:reportedRights`.
 
+`POST /{ds}/claims/review` and `sparkles::evidence::review` append immutable review
+decisions under a named policy of the evidence settings, and a decision supersedes the
+target's current decision by naming it. An acceptance of a positive claim of an admitted
+kind with the required scope records an `ev:AcceptanceSupport` and projects the claim's
+proposition into the policy's output graph. Each occurrence owns its own support, and a
+projected triple leaves the output graph when no live support owns it.
+`POST /{ds}/claims/withdraw` and `sparkles::evidence::withdraw` record an
+`ev:Withdrawal` of claim occurrences, which ends their supports. A reviewer must read
+an acceptance's evidence, and a hidden record answers as an unavailable target. Every
+read of a review is made at its required `ifHead`. The codes `409 policy-changed`,
+`409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`,
+`409 evidence-conflict` and `503 projection-unavailable` are new, and
+`capabilities.claims` lists both routes. The vocabulary and shapes add
+`ev:supersedes`, `ev:AcceptanceSupport`, `ev:Withdrawal`, `ev:Projection` and their
+properties (spec C25 Phase 2).
+
 Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
 and `owl:sameAs` with closure operators instead of joins, and derives the same facts.
 An operator condenses a relation's strongly connected components and computes each

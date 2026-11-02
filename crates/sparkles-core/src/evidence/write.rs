@@ -76,11 +76,11 @@ const LARGE: [&str; 2] = [
     "urn:x-sparkles:evidence:normalizedText",
 ];
 
-fn ev(local: &str) -> NamedNode {
+pub(super) fn ev(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{EV}{local}"))
 }
 
-fn prov(local: &str) -> NamedNode {
+pub(super) fn prov(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{PROV}{local}"))
 }
 
@@ -88,15 +88,15 @@ fn oa(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{OA}{local}"))
 }
 
-fn rdf_type() -> NamedNode {
+pub(super) fn rdf_type() -> NamedNode {
     NamedNode::new_unchecked(RDF_TYPE)
 }
 
-fn string(value: &str) -> Term {
+pub(super) fn string(value: &str) -> Term {
     Literal::new_simple_literal(value).into()
 }
 
-fn integer(value: u64) -> Term {
+pub(super) fn integer(value: u64) -> Term {
     Literal::new_typed_literal(
         value.to_string(),
         NamedNode::new_unchecked(format!("{XSD}integer")),
@@ -157,7 +157,7 @@ pub struct PlannedRecord {
     /// The digest of the record's immutable content.
     pub digest: Sha256Digest,
     /// The immutable content.
-    triples: Vec<Triple>,
+    pub(super) triples: Vec<Triple>,
 }
 
 /// A stored fact of the plan's dataset that the operation keeps readable.
@@ -217,7 +217,7 @@ fn choose(role: &str, configured: &[String], requested: Option<&NamedNode>) -> R
     }
 }
 
-fn no_blank(field: &str, term: &Term) -> Result<()> {
+pub(super) fn no_blank(field: &str, term: &Term) -> Result<()> {
     fn blank(term: &Term) -> bool {
         match term {
             Term::BlankNode(_) => true,
@@ -263,13 +263,13 @@ impl Builder<'_, '_> {
     }
 }
 
-struct Record {
-    subject: NamedNode,
-    triples: Vec<Triple>,
+pub(super) struct Record {
+    pub(super) subject: NamedNode,
+    pub(super) triples: Vec<Triple>,
 }
 
 impl Record {
-    fn new(subject: &NamedNode, kind: RecordKind) -> Record {
+    pub(super) fn new(subject: &NamedNode, kind: RecordKind) -> Record {
         let mut r = Record {
             subject: subject.clone(),
             triples: Vec::new(),
@@ -281,7 +281,7 @@ impl Record {
         r
     }
 
-    fn add(&mut self, p: NamedNode, o: impl Into<Term>) {
+    pub(super) fn add(&mut self, p: NamedNode, o: impl Into<Term>) {
         self.triples
             .push(Triple::new(self.subject.clone(), p, o.into()));
     }
@@ -326,7 +326,11 @@ impl Record {
 
 /// The digest of a record's immutable content: the sorted digests of its triples,
 /// framed under the record kind, without the large values listed in [`LARGE`].
-fn record_digest(kind: RecordKind, triples: &[Triple], control: &Control) -> Result<Sha256Digest> {
+pub(super) fn record_digest(
+    kind: RecordKind,
+    triples: &[Triple],
+    control: &Control,
+) -> Result<Sha256Digest> {
     let mut each = Vec::with_capacity(triples.len());
     for t in triples {
         if LARGE.contains(&t.predicate.as_str()) {
@@ -832,96 +836,151 @@ impl Plan {
         hold: Option<Uuid>,
         skip: &[bool],
     ) -> Result<Vec<Quad>> {
-        let op = &self.operation_iri;
-        let time = date_time(stamp.time_ms);
-        let mut out = Vec::new();
-        let mut quad = |s: &NamedNode, p: NamedNode, o: Term, g: &NamedNode| {
-            out.push(Quad::new(s.clone(), p, o, GraphName::NamedNode(g.clone())));
-        };
-        for g in &self.graphs {
-            let Some(nonce) = protection(g) else {
-                return Err(crate::managed::ManagedError::error(
-                    crate::managed::ManagedErrorKind::UnsupportedProfile,
-                    format!(
-                        "graph <{}> is not protected by the evidence profile; record the evidence settings again",
-                        g.as_str()
-                    ),
-                ));
-            };
-            quad(op, rdf_type(), ev("Operation").into(), g);
-            quad(op, rdf_type(), prov("Activity").into(), g);
-            quad(
-                op,
-                prov("wasAssociatedWith"),
-                self.principal.clone().into(),
-                g,
-            );
-            quad(op, prov("endedAtTime"), time.clone().into(), g);
-            quad(op, ev("datasetId"), string(&stamp.dataset.to_string()), g);
-            quad(op, ev("branchId"), string(&stamp.branch.to_string()), g);
-            quad(op, ev("commit"), integer(stamp.commit), g);
-            quad(
-                op,
-                ev("payloadDigest"),
-                string(&self.payload_digest.to_string()),
-                g,
-            );
-            quad(op, ev("graphProtection"), string(&nonce.to_string()), g);
-            if let Some(k) = &self.idempotency_key {
-                quad(op, ev("idempotencyKey"), string(k), g);
-            }
-            if let Some(h) = hold {
-                quad(op, ev("sourceHold"), string(&h.to_string()), g);
-            }
-        }
+        let mut out = publish_quads(
+            &Operation {
+                iri: &self.operation_iri,
+                principal: &self.principal,
+                payload_digest: self.payload_digest,
+                idempotency_key: self.idempotency_key.as_deref(),
+                hold,
+            },
+            &self.graphs,
+            &self.records,
+            stamp,
+            &protection,
+            skip,
+        )?;
         if let Some(g) = &self.source_graph {
             for s in &self.sources {
-                quad(s, rdf_type(), ev("Source").into(), g);
-            }
-        }
-        for (i, r) in self.records.iter().enumerate() {
-            if skip.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            for t in &r.triples {
-                let NamedOrBlankNode::NamedNode(s) = &t.subject else {
-                    unreachable!("record subjects are IRIs");
-                };
-                quad(s, t.predicate.clone(), t.object.clone(), &r.graph);
-            }
-            quad(
-                &r.iri,
-                ev("availabilityReceipt"),
-                op.clone().into(),
-                &r.graph,
-            );
-            quad(&r.iri, prov("wasGeneratedBy"), op.clone().into(), &r.graph);
-            // the record carries its graph's nonce itself, so that no record planted
-            // while the graph was detached can borrow a later operation's marker
-            let nonce = protection(&r.graph).expect("every written graph is protected");
-            quad(
-                &r.iri,
-                ev("graphProtection"),
-                string(&nonce.to_string()),
-                &r.graph,
-            );
-            quad(
-                &r.iri,
-                ev("recordDigest"),
-                string(&r.digest.to_string()),
-                &r.graph,
-            );
-            if r.kind == RecordKind::SourceRevision {
-                quad(
-                    &r.iri,
-                    ev("firstAvailableAt"),
-                    time.clone().into(),
-                    &r.graph,
-                );
+                out.push(Quad::new(
+                    s.clone(),
+                    rdf_type(),
+                    ev("Source"),
+                    GraphName::NamedNode(g.clone()),
+                ));
             }
         }
         Ok(out)
     }
+}
+
+/// The description of one typed operation.
+pub(super) struct Operation<'a> {
+    pub(super) iri: &'a NamedNode,
+    pub(super) principal: &'a NamedNode,
+    pub(super) payload_digest: Sha256Digest,
+    pub(super) idempotency_key: Option<&'a str>,
+    pub(super) hold: Option<Uuid>,
+}
+
+/// The operation's description in every graph of `graphs`, each with that graph's
+/// protection nonce, and every record of `records` not left out by `skip`, with its
+/// receipt, creation activity, nonce and record digest. A source revision's
+/// `ev:firstAvailableAt` and a withdrawal's `prov:invalidatedAtTime` are the commit's
+/// time. Every record graph must be among `graphs`.
+pub(super) fn publish_quads(
+    op: &Operation<'_>,
+    graphs: &[NamedNode],
+    records: &[PlannedRecord],
+    stamp: &Stamp,
+    protection: &dyn Fn(&NamedNode) -> Option<Uuid>,
+    skip: &[bool],
+) -> Result<Vec<Quad>> {
+    let time = date_time(stamp.time_ms);
+    let mut out = Vec::new();
+    let mut quad = |s: &NamedNode, p: NamedNode, o: Term, g: &NamedNode| {
+        out.push(Quad::new(s.clone(), p, o, GraphName::NamedNode(g.clone())));
+    };
+    let iri = op.iri;
+    for g in graphs {
+        let Some(nonce) = protection(g) else {
+            return Err(unprotected(g));
+        };
+        quad(iri, rdf_type(), ev("Operation").into(), g);
+        quad(iri, rdf_type(), prov("Activity").into(), g);
+        quad(
+            iri,
+            prov("wasAssociatedWith"),
+            op.principal.clone().into(),
+            g,
+        );
+        quad(iri, prov("endedAtTime"), time.clone().into(), g);
+        quad(iri, ev("datasetId"), string(&stamp.dataset.to_string()), g);
+        quad(iri, ev("branchId"), string(&stamp.branch.to_string()), g);
+        quad(iri, ev("commit"), integer(stamp.commit), g);
+        quad(
+            iri,
+            ev("payloadDigest"),
+            string(&op.payload_digest.to_string()),
+            g,
+        );
+        quad(iri, ev("graphProtection"), string(&nonce.to_string()), g);
+        if let Some(k) = op.idempotency_key {
+            quad(iri, ev("idempotencyKey"), string(k), g);
+        }
+        if let Some(h) = op.hold {
+            quad(iri, ev("sourceHold"), string(&h.to_string()), g);
+        }
+    }
+    for (i, r) in records.iter().enumerate() {
+        if skip.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        for t in &r.triples {
+            let NamedOrBlankNode::NamedNode(s) = &t.subject else {
+                unreachable!("record subjects are IRIs");
+            };
+            quad(s, t.predicate.clone(), t.object.clone(), &r.graph);
+        }
+        quad(
+            &r.iri,
+            ev("availabilityReceipt"),
+            iri.clone().into(),
+            &r.graph,
+        );
+        quad(&r.iri, prov("wasGeneratedBy"), iri.clone().into(), &r.graph);
+        // the record carries its graph's nonce itself, so that no record planted
+        // while the graph was detached can borrow a later operation's marker
+        let nonce = protection(&r.graph).ok_or_else(|| unprotected(&r.graph))?;
+        quad(
+            &r.iri,
+            ev("graphProtection"),
+            string(&nonce.to_string()),
+            &r.graph,
+        );
+        quad(
+            &r.iri,
+            ev("recordDigest"),
+            string(&r.digest.to_string()),
+            &r.graph,
+        );
+        match r.kind {
+            RecordKind::SourceRevision => quad(
+                &r.iri,
+                ev("firstAvailableAt"),
+                time.clone().into(),
+                &r.graph,
+            ),
+            RecordKind::Withdrawal => quad(
+                &r.iri,
+                prov("invalidatedAtTime"),
+                time.clone().into(),
+                &r.graph,
+            ),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+pub(super) fn unprotected(g: &NamedNode) -> Error {
+    crate::managed::ManagedError::error(
+        crate::managed::ManagedErrorKind::UnsupportedProfile,
+        format!(
+            "graph <{}> is not protected by the evidence profile; record the evidence settings again",
+            g.as_str()
+        ),
+    )
 }
 
 // ------------------------------------------------------- reads under the writer ---
@@ -1006,6 +1065,146 @@ impl<'a> Reads<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// The objects of `s p ?o` in `g`, at most `limit` of them, and whether more exist.
+    pub fn objects_up_to(
+        &mut self,
+        s: &str,
+        p: &str,
+        g: &str,
+        limit: usize,
+    ) -> Result<(Vec<Term>, bool)> {
+        let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
+            return Ok((Vec::new(), false));
+        };
+        let mut ids = Vec::new();
+        let mut more = false;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
+                if ids.len() == limit {
+                    more = true;
+                    return Ok(false);
+                }
+                ids.push(q[2]);
+                Ok(true)
+            })?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(t) = self
+                .preparation
+                .with_term(self.snap, id, |t| Ok(t.cloned()))?
+            {
+                out.push(t);
+            }
+        }
+        Ok((out, more))
+    }
+
+    /// The IRI subjects of `?s p o` in `g`, at most `limit` of them, and whether more
+    /// exist. `o` is a ground term.
+    pub fn subjects_up_to(
+        &mut self,
+        p: &str,
+        o: &Term,
+        g: &str,
+        limit: usize,
+    ) -> Result<(Vec<NamedNode>, bool)> {
+        let (Some(p), Some(g)) = (self.id(p)?, self.id(g)?) else {
+            return Ok((Vec::new(), false));
+        };
+        let o = match o {
+            Term::NamedNode(n) => self.id(n.as_str())?,
+            t => self.preparation.lookup_term(self.snap, t)?,
+        };
+        let Some(o) = o else {
+            return Ok((Vec::new(), false));
+        };
+        let mut ids = Vec::new();
+        let mut more = false;
+        self.preparation
+            .scan(self.snap, Perm::Pos, &[p.0, o.0], |q| {
+                if q[3] != g {
+                    return Ok(true);
+                }
+                if ids.len() == limit {
+                    more = true;
+                    return Ok(false);
+                }
+                ids.push(q[0]);
+                Ok(true)
+            })?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(Term::NamedNode(n)) = self
+                .preparation
+                .with_term(self.snap, id, |t| Ok(t.cloned()))?
+            {
+                out.push(n);
+            }
+        }
+        Ok((out, more))
+    }
+
+    /// The number of triples whose subject is `s` in `g`, counting at most `limit`.
+    pub fn subject_triples(&mut self, s: &str, g: &str, limit: usize) -> Result<usize> {
+        let (Some(s), Some(g)) = (self.id(s)?, self.id(g)?) else {
+            return Ok(0);
+        };
+        let mut n = 0;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[g.0, s.0], |_| {
+                n += 1;
+                Ok(n < limit)
+            })?;
+        Ok(n)
+    }
+
+    /// Whether `g` holds any quad.
+    pub fn graph_nonempty(&mut self, g: &str) -> Result<bool> {
+        let Some(g) = self.id(g)? else {
+            return Ok(false);
+        };
+        let mut found = false;
+        self.preparation.scan(self.snap, Perm::Gspo, &[g.0], |_| {
+            found = true;
+            Ok(false)
+        })?;
+        Ok(found)
+    }
+
+    /// Whether the quad `s p o g` is in the snapshot. `o` is a ground term.
+    pub fn contains(&mut self, s: &str, p: &str, o: &Term, g: &str) -> Result<bool> {
+        let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
+            return Ok(false);
+        };
+        let o = match o {
+            Term::NamedNode(n) => self.id(n.as_str())?,
+            t => self.preparation.lookup_term(self.snap, t)?,
+        };
+        let Some(o) = o else {
+            return Ok(false);
+        };
+        self.snap.contains(&[s, p, o, g])
+    }
+
+    /// Whether `s` is a typed operation's authenticated record in `g`: its single
+    /// receipt is an operation of `g` carrying `nonce`, and the record carries `nonce`.
+    pub fn authenticated(&mut self, s: &str, g: &str, nonce: Option<Uuid>) -> Result<bool> {
+        if nonce.is_none() {
+            return Ok(false);
+        }
+        Ok(match self.one(s, &format!("{EV}availabilityReceipt"), g)? {
+            Some(Term::NamedNode(op)) => {
+                self.marked(op.as_str(), g, nonce)? && self.nonce_of(s, g)? == nonce
+            }
+            _ => false,
+        })
+    }
+
+    /// The single object of `s p ?o` in `g`, `None` when it has none or several.
+    pub fn single(&mut self, s: &str, p: &str, g: &str) -> Result<Option<Term>> {
+        self.one(s, p, g)
     }
 
     fn one(&mut self, s: &str, p: &str, g: &str) -> Result<Option<Term>> {

@@ -114,10 +114,13 @@ pub fn kind_iri(kind: RecordKind) -> &'static str {
         RecordKind::Task => "urn:x-sparkles:evidence:Task",
         RecordKind::ReviewDecision => "urn:x-sparkles:evidence:ReviewDecision",
         RecordKind::IdentityProposal => "urn:x-sparkles:evidence:IdentityProposal",
+        RecordKind::AcceptanceSupport => "urn:x-sparkles:evidence:AcceptanceSupport",
+        RecordKind::Withdrawal => "urn:x-sparkles:evidence:Withdrawal",
+        RecordKind::Projection => "urn:x-sparkles:evidence:Projection",
     }
 }
 
-const KINDS: [RecordKind; 12] = [
+const KINDS: [RecordKind; 15] = [
     RecordKind::SourceRevision,
     RecordKind::Rendition,
     RecordKind::Passage,
@@ -130,6 +133,9 @@ const KINDS: [RecordKind; 12] = [
     RecordKind::Task,
     RecordKind::ReviewDecision,
     RecordKind::IdentityProposal,
+    RecordKind::AcceptanceSupport,
+    RecordKind::Withdrawal,
+    RecordKind::Projection,
 ];
 
 fn error(kind: ManagedErrorKind, message: String) -> Error {

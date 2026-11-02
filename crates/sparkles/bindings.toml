@@ -461,10 +461,20 @@ python = "planned: evidence resolution in the bindings with the typed evidence o
 jvm = "planned: evidence resolution in the bindings with the typed evidence operations"
 node = "planned: evidence resolution in the bindings with the typed evidence operations"
 
+["evidence.review"]
+python = "planned: evidence reviews in the bindings with the typed evidence operations"
+jvm = "planned: evidence reviews in the bindings with the typed evidence operations"
+node = "planned: evidence reviews in the bindings with the typed evidence operations"
+
 ["evidence.settings"]
 python = "planned: evidence settings in the bindings with the typed evidence operations"
 jvm = "planned: evidence settings in the bindings with the typed evidence operations"
 node = "planned: evidence settings in the bindings with the typed evidence operations"
+
+["evidence.withdraw"]
+python = "planned: evidence withdrawals in the bindings with the typed evidence operations"
+jvm = "planned: evidence withdrawals in the bindings with the typed evidence operations"
+node = "planned: evidence withdrawals in the bindings with the typed evidence operations"
 
 ["fmt.format"]
 python = "skip: formatter and linter remain CLI tools"

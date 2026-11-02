@@ -8416,7 +8416,10 @@
                     "Decision",
                     "Task",
                     "ReviewDecision",
-                    "IdentityProposal"
+                    "IdentityProposal",
+                    "AcceptanceSupport",
+                    "Withdrawal",
+                    "Projection"
                   ],
                   "type": "string"
                 },
@@ -8500,7 +8503,10 @@
                           "Decision",
                           "Task",
                           "ReviewDecision",
-                          "IdentityProposal"
+                          "IdentityProposal",
+                          "AcceptanceSupport",
+                          "Withdrawal",
+                          "Projection"
                         ],
                         "type": "string"
                       },
@@ -8627,7 +8633,10 @@
                         "Decision",
                         "Task",
                         "ReviewDecision",
-                        "IdentityProposal"
+                        "IdentityProposal",
+                        "AcceptanceSupport",
+                        "Withdrawal",
+                        "Projection"
                       ],
                       "type": "string"
                     },
@@ -8787,6 +8796,305 @@
         },
         "required": [
           "resolved"
+        ],
+        "type": "object"
+      },
+      "EvidenceReview": {
+        "additionalProperties": false,
+        "description": "Review decisions under one policy.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
+        },
+        "properties": {
+          "decisions": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "disposition": {
+                  "enum": [
+                    "accepted",
+                    "rejected",
+                    "needsEvidence"
+                  ],
+                  "type": "string"
+                },
+                "key": {
+                  "description": "The decision's key in this request.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "supersedes": {
+                  "description": "The target's current decision under the policy, required when it has one, else `409 decision-superseded`.",
+                  "type": "string"
+                },
+                "target": {
+                  "description": "The reviewed claim or assessment.",
+                  "type": "string"
+                },
+                "targetDigest": {
+                  "description": "The target's record digest as the reviewer saw it, else `409 target-changed`.",
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "target",
+                "targetDigest",
+                "disposition"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dryRun": {
+            "description": "Check and preview the review without committing it.",
+            "type": "boolean"
+          },
+          "idempotencyKey": {
+            "description": "Makes a retry with the same payload answer the first receipt.",
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "ifHead": {
+            "description": "The branch head the review was prepared at, else `409 head-changed`. Every read is made at this head.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "description": "The commit message.",
+            "type": "string"
+          },
+          "policy": {
+            "description": "The name of a review policy of the evidence settings.",
+            "type": "string"
+          },
+          "policyVersion": {
+            "description": "The policy version the reviewer saw, else `409 policy-changed`.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "policy",
+          "policyVersion",
+          "ifHead",
+          "decisions"
+        ],
+        "type": "object"
+      },
+      "EvidenceReviewResult": {
+        "additionalProperties": false,
+        "description": "The outcome of a review.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
+        },
+        "properties": {
+          "branchId": {
+            "description": "The branch the commit published on.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "changed": {
+            "additionalProperties": false,
+            "description": "The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay.",
+            "properties": {
+              "inserted": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "output": {
+                      "description": "The output graph.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The projected triple in N-Triples.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "output",
+                    "triple"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "removed": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "output": {
+                      "description": "The output graph.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The projected triple in N-Triples.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "output",
+                    "triple"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "supportsAdded": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "supportsEnded": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "supportsAdded",
+              "supportsEnded",
+              "inserted",
+              "removed"
+            ],
+            "type": "object"
+          },
+          "commit": {
+            "description": "The publishing commit, the first one for a replay, or the head for a dry run.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "committed": {
+            "description": "Whether this request published a commit.",
+            "type": "boolean"
+          },
+          "decisions": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "conflicts": {
+                  "description": "The contrary links and claims an `admitLabelled` policy admitted the claim against.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "disposition": {
+                  "enum": [
+                    "accepted",
+                    "rejected",
+                    "needsEvidence"
+                  ],
+                  "type": "string"
+                },
+                "iri": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                },
+                "notProjected": {
+                  "description": "Why an acceptance did not project its claim.",
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "supersedes": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "support": {
+                  "description": "The acceptance support that owns the projected triple.",
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "target": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "iri",
+                "target",
+                "disposition",
+                "supersedes",
+                "support",
+                "notProjected",
+                "conflicts"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dryRun": {
+            "additionalProperties": false,
+            "properties": {
+              "deleted": {
+                "type": "integer"
+              },
+              "error": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "inserted": {
+                "type": "integer"
+              },
+              "wouldCommit": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "wouldCommit",
+              "inserted",
+              "deleted",
+              "error"
+            ],
+            "type": "object"
+          },
+          "operation": {
+            "description": "The operation, every decision's availability receipt.",
+            "type": "string"
+          },
+          "replayed": {
+            "description": "Whether the idempotency key had published the same payload, whose receipt this is.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operation",
+          "committed",
+          "replayed",
+          "commit",
+          "branchId",
+          "decisions",
+          "changed"
         ],
         "type": "object"
       },
@@ -8978,6 +9286,242 @@
           "revision",
           "managed",
           "detached"
+        ],
+        "type": "object"
+      },
+      "EvidenceWithdrawal": {
+        "additionalProperties": false,
+        "description": "Claim occurrences to withdraw.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
+        },
+        "properties": {
+          "dryRun": {
+            "description": "Check and preview the withdrawal without committing it.",
+            "type": "boolean"
+          },
+          "idempotencyKey": {
+            "description": "Makes a retry with the same payload answer the first receipt.",
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "ifHead": {
+            "description": "Publish only while this commit is the branch head, else `409 head-changed`.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "description": "The commit message.",
+            "type": "string"
+          },
+          "withdrawals": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "description": "The withdrawal's key in this request.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "target": {
+                  "description": "The withdrawn claim occurrence.",
+                  "type": "string"
+                },
+                "targetDigest": {
+                  "description": "The claim's record digest, else `409 target-changed`.",
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "target",
+                "targetDigest"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "withdrawals"
+        ],
+        "type": "object"
+      },
+      "EvidenceWithdrawalResult": {
+        "additionalProperties": false,
+        "description": "The outcome of a withdrawal.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
+        },
+        "properties": {
+          "branchId": {
+            "description": "The branch the commit published on.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "changed": {
+            "additionalProperties": false,
+            "description": "The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay.",
+            "properties": {
+              "inserted": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "output": {
+                      "description": "The output graph.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The projected triple in N-Triples.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "output",
+                    "triple"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "removed": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "output": {
+                      "description": "The output graph.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The projected triple in N-Triples.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "output",
+                    "triple"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "supportsAdded": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "supportsEnded": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "supportsAdded",
+              "supportsEnded",
+              "inserted",
+              "removed"
+            ],
+            "type": "object"
+          },
+          "commit": {
+            "description": "The publishing commit, the first one for a replay, or the head for a dry run.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "committed": {
+            "description": "Whether this request published a commit.",
+            "type": "boolean"
+          },
+          "dryRun": {
+            "additionalProperties": false,
+            "properties": {
+              "deleted": {
+                "type": "integer"
+              },
+              "error": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "inserted": {
+                "type": "integer"
+              },
+              "wouldCommit": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "wouldCommit",
+              "inserted",
+              "deleted",
+              "error"
+            ],
+            "type": "object"
+          },
+          "operation": {
+            "description": "The operation, every withdrawal's availability receipt.",
+            "type": "string"
+          },
+          "replayed": {
+            "description": "Whether the idempotency key had published the same payload.",
+            "type": "boolean"
+          },
+          "withdrawals": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "existing": {
+                  "description": "An earlier withdrawal had already withdrawn the claim.",
+                  "type": "boolean"
+                },
+                "iri": {
+                  "description": "The withdrawal record, `null` when the claim was already withdrawn.",
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "key": {
+                  "type": "string"
+                },
+                "target": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "iri",
+                "target",
+                "existing"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "operation",
+          "committed",
+          "replayed",
+          "commit",
+          "branchId",
+          "withdrawals",
+          "changed"
         ],
         "type": "object"
       },
@@ -46125,6 +46669,186 @@
           "SPARQL"
         ],
         "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/claims/review": {
+      "post": {
+        "description": "Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
+        },
+        "operationId": "reviewClaims",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceReview"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceReviewResult"
+                }
+              }
+            },
+            "description": "The operation and its decisions, published, replayed or previewed."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Review claims under a policy",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "write"
+      }
+    },
+    "/{ds}/claims/withdraw": {
+      "post": {
+        "description": "Needs `write` on the dataset or branch through the update endpoint, update grants on each claim's graph, and update and read grants on the output graph and read grants on the decisions and supports graphs of every review policy. Counts as an update. Records a withdrawal with `prov:invalidatedAtTime` in each claim's graph as one commit of the evidence owner, without making a contrary claim. The claims' supports stop being live, and each projected triple left without a live support leaves its output graph. A claim that is already withdrawn is answered as `existing`. Refusals write nothing: `400`, `403`, `409 head-changed`, `409 target-changed`, `409 idempotency-conflict`, `422 evidence-unavailable`, `503 projection-unavailable` and `503 authority-changed`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
+        },
+        "operationId": "withdrawClaims",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceWithdrawal"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceWithdrawalResult"
+                }
+              }
+            },
+            "description": "The operation and its withdrawals, published, replayed or previewed."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Withdraw claim occurrences",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "write"
       }
     },
     "/{ds}/data": {
