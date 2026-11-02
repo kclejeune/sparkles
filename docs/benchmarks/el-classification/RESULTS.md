@@ -59,7 +59,8 @@ ELK 0.6.0 and the classifier of commit aa0a41a6 ran on forge, the benchmark host
 process at a time under the bench lock. Each process ran five classifications. Times are
 the median of the five in ms. ELK's classification excludes the OWL API's load of the
 file, which the load column gives, and its first run, which includes the compilation of
-the JVM's hot code, is listed apart. The classifier's read is its parse of the same file.
+the JVM's hot code, is listed apart. The classifier's read is its single parse of the same
+file in each process, so it is one measurement and not a median.
 Peak memory is each process's peak resident set in MiB, which for the classifier
 includes the axioms read and for ELK the OWL API ontology. ELK ran with a 4 GiB heap,
 and its live heap is the heap in use after a full collection with the reasoner open.

@@ -186,7 +186,7 @@ ELK's 553 ms on eight threads, and ChEBI lite in 4.0 s against 6.7 s on one thre
 1.16 times as fast on ChEBI lite on eight threads, 2.5 s against 3.0 s, because the
 classifier's indexing and taxonomy stages run on one thread. With the OWL API's load
 counted, ELK takes 1.3 s and 6.1 s on eight threads. The classifier's peak resident set is
-363 MiB and 1.6 GiB, and ELK's is 2.4 GiB and 4.4 GiB with a 4 GiB heap. The [benchmark
+363 MiB and 1.6 GiB, and ELK's is 2.4 GiB and 4.3 GiB with a 4 GiB heap. The [benchmark
 report](../../benchmarks/el-classification/RESULTS.md) has the numbers and the records.
 
 **Testing.** Tests in `crates/sparkles-owl/tests/classify.rs` cover worked examples of
