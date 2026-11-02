@@ -131,6 +131,8 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             .max_inferred
             .unwrap_or(sparkles_reasoner::DEFAULT_MAX_INFERRED),
         pool: super::reason_pool(),
+        // the input graphs' axioms outside OWL 2 RL, in the state the run reads
+        inspect: rl_inspector(store, req, ctl),
         ..Default::default()
     };
     let superseded = AtomicBool::new(false);
@@ -197,6 +199,31 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     state.set_reasoning(Some(record.clone()))?;
     ctl.progress.report(1.0, "materialized");
     Ok(ReasonOutcome { report, record })
+}
+
+/// The warnings of spec F21 §7 for an `owl-rl` run: the axioms of its inputs outside
+/// OWL 2 RL and those whose rules the rule subset lacks. Other profiles have none, and
+/// so does a library built without the `ontology` feature.
+fn rl_inspector(
+    store: &Store,
+    req: &ReasonRequest,
+    ctl: &Control,
+) -> Option<sparkles_reasoner::InspectFn> {
+    #[cfg(feature = "ontology")]
+    if req.profile == Profile::OwlRl {
+        let opts = QueryOptions {
+            cancel: Some(ctl.cancel.flag()),
+            deadline: ctl.deadline,
+            ..Default::default()
+        };
+        return Some(crate::handles::ontology::rl_inspector(
+            store,
+            &req.inputs,
+            opts,
+        ));
+    }
+    let _ = (store, req, ctl);
+    None
 }
 
 /// The record of a materialization.

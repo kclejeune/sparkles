@@ -722,29 +722,29 @@ jvm = "SparklesMappings.versions"
 node = "Dataset.mappings.versions"
 
 ["ontology.axioms"]
-python = "planned: roadmap item 537, F21 Phase 2"
-jvm = "planned: roadmap item 537, through jena-ontapi in F21 Phase 2"
-node = "planned: roadmap item 537, F21 Phase 2"
+python = "Dataset.ontology.axioms"
+jvm = "SparklesOnt.axioms"
+node = "Dataset.ontology.axioms"
 
 ["ontology.check"]
-python = "planned: roadmap item 537, F21 Phase 2"
-jvm = "planned: roadmap item 537, through jena-ontapi in F21 Phase 2"
-node = "planned: roadmap item 537, F21 Phase 2"
+python = "Dataset.ontology.check"
+jvm = "SparklesOnt.check"
+node = "Dataset.ontology.check"
 
 ["ontology.diff"]
-python = "planned: roadmap item 537, F21 Phase 2"
-jvm = "planned: roadmap item 537, through jena-ontapi in F21 Phase 2"
-node = "planned: roadmap item 537, F21 Phase 2"
+python = "Dataset.ontology.diff"
+jvm = "SparklesOnt.diff"
+node = "Dataset.ontology.diff"
 
 ["ontology.edit"]
-python = "planned: roadmap item 537, F21 Phase 2"
-jvm = "planned: roadmap item 537, through jena-ontapi in F21 Phase 2"
-node = "planned: roadmap item 537, F21 Phase 2"
+python = "Dataset.ontology.edit"
+jvm = "SparklesOnt.edit"
+node = "Dataset.ontology.edit"
 
 ["ontology.summary"]
-python = "planned: roadmap item 537, F21 Phase 2"
-jvm = "planned: roadmap item 537, through jena-ontapi in F21 Phase 2"
-node = "planned: roadmap item 537, F21 Phase 2"
+python = "Dataset.ontology.summary"
+jvm = "SparklesOnt.summary"
+node = "Dataset.ontology.summary"
 
 ["queries.delete"]
 python = "Dataset.queries.delete"

@@ -340,6 +340,10 @@ fn writes(op: &str) -> bool {
             | "indexes.geo.status"
             | "reasoning.status"
             | "validation.guard.get"
+            | "ontology.summary"
+            | "ontology.axioms"
+            | "ontology.check"
+            | "ontology.diff"
     )
 }
 #[napi]
@@ -680,6 +684,14 @@ fn run_admin(
             // Every overview query shares the administration operation's deadline.
             opts.deadline = ctl.deadline;
             ds.graph().groups(&req, &opts)?
+        }
+        // the OWL 2 ontology handle, in the JSON forms of its HTTP routes (spec F21)
+        #[cfg(feature = "ontology")]
+        op if op.starts_with("ontology.") => {
+            let mut opts = query_options(v, flag)?;
+            opts.deadline = ctl.deadline;
+            opts.write.deadline = ctl.deadline;
+            sparkles::handles::ontology::wire::call(ds, &op["ontology.".len()..], a, &opts)?
         }
         "mappings.list" => value(ds.mappings().list().into_iter().map(|(name, stored, last)| json!({"name": name, "kind": stored.definition.kind, "description": stored.definition.description, "version": stored.version, "lastRun": last})).collect::<Vec<_>>())?,
         "mappings.get" => value(ds.mappings().get(text(a, "name")?, optional_number(a, "version")?))?,

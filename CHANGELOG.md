@@ -24,6 +24,18 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
+`dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and
+axioms, check profiles, edit axioms, remove entities and diff commits in the JSON forms
+of the `/$/ontology` routes. Python adds `Axiom`, a frozen axiom with structural
+equality, and Node.js lists axioms as an async iterable in batches.
+`SparklesOnt.model` runs Jena's `jena-ontapi` over a Sparkles graph that one native read
+copies into memory, with writes sent to the graph in the caller's transaction, and
+programs that call it add `jena-ontapi`. A read with `inferences` includes the
+materialized inferences and says whether they are stale. A materialization under
+`owl-rl` warns about input axioms outside OWL 2 RL and about axioms whose rules the rule
+set covers only up to a size (spec F21 Phase 2).
+
 Sparkles reads the OWL 2 functional-style syntax. A `.ofn` file, or a body sent as
 `text/owl-functional`, loads as the triples its axioms map to, through `sparkles load`,
 `sparkles ontology check FILE`, the file loaders of the library and the bindings,

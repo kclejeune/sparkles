@@ -206,3 +206,8 @@ __all__ = [
 if "backup" in FEATURES:
     from sparkles._sparkles import Backup, BackupRepository, Backups, Repositories
     __all__ += ["Backup", "BackupRepository", "Backups", "Repositories"]
+
+# The OWL 2 ontology handle (spec F21).
+if "ontology" in FEATURES:
+    from sparkles._sparkles import Axiom, Ontologies
+    __all__ += ["Axiom", "Ontologies"]

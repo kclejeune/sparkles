@@ -132,6 +132,30 @@ unchanged. `RunOptions.check` remains a conversion-only callback and is also hon
 by the controlled variant. Use the structured write options for cancellation or a
 deadline that must reach the final writer wait.
 
+The OWL 2 ontology handle is Python's `Dataset.ontology`, Node.js's `dataset.ontology`
+and the JVM's `DatasetGraphSparkles.ontology()`. Each reads the summary and the axioms,
+checks the profiles, edits axioms, removes entities and diffs commits, and answers in the
+JSON forms of the `/$/ontology` routes ([API.md](../API.md#ontology)). Python's `Axiom`
+is a frozen axiom with structural equality and hashing, read from functional-style
+syntax or the JSON form, and the listings carry `Axiom` objects. Node.js's `axioms` is
+an async iterable that reads pages from the commit of the first page, and its `timeout`
+bounds the whole listing. Python takes
+`cancel` and `timeout`, Node.js the operation options, and the JVM a
+`SparklesOperation`.
+
+`SparklesOnt.model(dataset, graphIri, spec)` returns the `OntModel` that Jena's
+`OntModelFactory` builds over a Sparkles graph with an `OntSpecification`, so Jena
+programs use `jena-ontapi`'s own interfaces. One native call copies the graph into a
+Jena in-memory graph, from the thread's transaction or the head. Writes through the
+model go to the copy and to the Sparkles graph in the thread's write transaction, so a
+transaction's edits make one commit. A transaction that aborts undoes its writes in the
+copy too. A commit made through another handle later is not seen by the model, except
+for the triples a transaction of the model wrote, which are read back once it ends. Like
+Jena's in-memory models, the model needs the caller's locking when threads use it at
+once. `jena-ontapi` is not bundled, and a program that calls `model`
+adds `org.apache.jena:jena-ontapi` of its Jena version. `SparklesOnt.check` and the
+other `SparklesOnt` functions run the native operations over one graph.
+
 The [API compatibility policy](../DEVELOPMENT.md#api-compatibility) identifies the
 covered package roots and version rules. HTTP and standard CLI development-baseline
 checks are available. Public Rust and binding release comparisons remain under

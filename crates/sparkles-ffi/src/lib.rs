@@ -25,6 +25,8 @@ mod branches;
 mod catalog;
 mod documents;
 mod helpers;
+#[cfg(feature = "ontology")]
+mod ontology;
 pub use helpers::{
     DiagnosticsRequest, EmbeddingEnvironment, GeoFeaturesRequest, RecallRequest, TextSearchRequest,
     check_data, check_iri, check_langtag, convert_geometries, format_document, lint_document,
@@ -348,6 +350,13 @@ impl FfiDataset {
         self.reader(&snap, &labels).find(&pattern, first_rows)
     }
 
+    /// Every quad of a pattern on the head snapshot, in one batch.
+    pub fn find_all(&self, pattern: Vec<u8>) -> FfiResult<Vec<u8>> {
+        let snap = self.head();
+        let labels = self.inner.labels();
+        self.reader(&snap, &labels).find_all(&pattern)
+    }
+
     pub fn count(&self, pattern: Vec<u8>) -> FfiResult<u64> {
         let snap = self.head();
         let labels = self.inner.labels();
@@ -483,6 +492,12 @@ impl FfiReadTxn {
     pub fn find(&self, pattern: Vec<u8>, first_rows: u32) -> FfiResult<FindResult> {
         let labels = self.ds.labels();
         self.reader(&labels).find(&pattern, first_rows)
+    }
+
+    /// Every quad of a pattern in the transaction's snapshot, in one batch.
+    pub fn find_all(&self, pattern: Vec<u8>) -> FfiResult<Vec<u8>> {
+        let labels = self.ds.labels();
+        self.reader(&labels).find_all(&pattern)
     }
 
     pub fn count(&self, pattern: Vec<u8>) -> FfiResult<u64> {
@@ -739,6 +754,11 @@ impl FfiWriteTxn {
 
     pub fn find(&self, pattern: Vec<u8>, first_rows: u32) -> FfiResult<FindResult> {
         self.with_reader(|r| r.find(&pattern, first_rows))
+    }
+
+    /// Every quad of a pattern in the transaction's view, in one batch.
+    pub fn find_all(&self, pattern: Vec<u8>) -> FfiResult<Vec<u8>> {
+        self.with_reader(|r| r.find_all(&pattern))
     }
 
     pub fn count(&self, pattern: Vec<u8>) -> FfiResult<u64> {

@@ -29,6 +29,9 @@ internal sealed interface Source {
     fun graphNames(): ByteArray
     fun prepareQuery(text: String, opts: QueryOpts): FfiQuery
 
+    /** Every quad of a pattern in one batch, one native call however many there are. */
+    fun findAll(pattern: ByteArray): ByteArray
+
     /** The graph overview of what this source reads. A source other than the head ignores the request's `at`. */
     fun groups(request: ByteArray, opts: GroupsOpts, operation: FfiOperation): ByteArray
 
@@ -40,6 +43,7 @@ internal sealed interface Source {
         override fun count(pattern: ByteArray) = ffi { ds.count(pattern).toLong() }
         override fun contains(pattern: ByteArray) = ffi { SparklesJni.contains(ds, pattern) }
         override fun graphNames() = ffi { ds.graphNames() }
+        override fun findAll(pattern: ByteArray) = ffi { ds.findAll(pattern) }
         override fun prepareQuery(text: String, opts: QueryOpts) = ffi { SparklesJni.prepareQuery(ds, text, opts) }
         override fun groups(request: ByteArray, opts: GroupsOpts, operation: FfiOperation) = ffi { ds.graphGroups(request, opts, operation) }
         override fun algorithmStats(request: ByteArray, opts: AlgorithmOpts, operation: FfiOperation) = ffi { ds.algorithmStats(request, opts, operation) }
@@ -50,6 +54,7 @@ internal sealed interface Source {
         override fun count(pattern: ByteArray) = ffi { t.count(pattern).toLong() }
         override fun contains(pattern: ByteArray) = ffi { SparklesJni.contains(t, pattern) }
         override fun graphNames() = ffi { t.graphNames() }
+        override fun findAll(pattern: ByteArray) = ffi { t.findAll(pattern) }
         override fun prepareQuery(text: String, opts: QueryOpts) = ffi { SparklesJni.prepareQuery(t, text, opts) }
         override fun groups(request: ByteArray, opts: GroupsOpts, operation: FfiOperation) = ffi { t.graphGroups(request, opts, operation) }
         override fun algorithmStats(request: ByteArray, opts: AlgorithmOpts, operation: FfiOperation) = ffi { t.algorithmStats(request, opts, operation) }
@@ -60,6 +65,7 @@ internal sealed interface Source {
         override fun count(pattern: ByteArray) = ffi { t.count(pattern).toLong() }
         override fun contains(pattern: ByteArray) = ffi { t.contains(pattern) }
         override fun graphNames() = ffi { t.graphNames() }
+        override fun findAll(pattern: ByteArray) = ffi { t.findAll(pattern) }
         override fun prepareQuery(text: String, opts: QueryOpts) = ffi { t.prepareQuery(text, opts) }
         override fun groups(request: ByteArray, opts: GroupsOpts, operation: FfiOperation) = ffi { t.graphGroups(request, opts, operation) }
         override fun algorithmStats(request: ByteArray, opts: AlgorithmOpts, operation: FfiOperation) = ffi { t.algorithmStats(request, opts, operation) }
@@ -149,6 +155,16 @@ internal class TripleIter(private val quads: QuadIter) : ClosableIterator<Triple
     override fun next(): Triple = quads.next().asTriple()
     override fun remove() = throw UnsupportedOperationException("remove")
     override fun close() = quads.close()
+}
+
+/** The triples of a batch of quads (four columns, the graph first). */
+internal fun decodeTriples(bytes: ByteArray): List<Triple> {
+    val d = RowDecoder()
+    val b = d.decode(bytes)
+    return (0 until b.rows).map { r ->
+        val i = r * 4
+        Triple.create(d.node(b.cells[i + 1]), d.node(b.cells[i + 2]), d.node(b.cells[i + 3]))
+    }
 }
 
 /** The nodes of a batch of one column. */

@@ -3142,6 +3142,7 @@ dependencies = [
  "sparkles-core",
  "sparkles-fmt",
  "sparkles-graphql",
+ "sparkles-owl",
  "sparkles-reasoner",
  "sparkles-shacl",
  "sparkles-shex",

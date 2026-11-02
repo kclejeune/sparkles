@@ -16,6 +16,7 @@ jena-arq = { module = "org.apache.jena:jena-arq", version.ref = "jena" }
 jena-core = { module = "org.apache.jena:jena-core", version.ref = "jena" }
 jena-base = { module = "org.apache.jena:jena-base", version.ref = "jena" }
 jena-tdb2 = { module = "org.apache.jena:jena-tdb2", version.ref = "jena" }
+jena-ontapi = { module = "org.apache.jena:jena-ontapi", version.ref = "jena" }
 jena-rdfconnection = { module = "org.apache.jena:jena-rdfconnection", version.ref = "jena" }
 jena-fuseki-main = { module = "org.apache.jena:jena-fuseki-main", version.ref = "jena" }
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }

@@ -563,6 +563,10 @@
    "jar": "sha256-D/tjKnDsQXjXa8rlCOqWU9bxQRerLq6dLHByEyGnENA=",
    "pom": "sha256-Wc5xgWZORpdaTLDz7r4t3yFjdXdMEve78veod+N+2Uo="
   },
+  "org/apache/jena#jena-ontapi/5.6.0": {
+   "jar": "sha256-WxquVgGRIP9jL3w5BXZydJy4ejPUcf0L/LFJ9bWh5Gg=",
+   "pom": "sha256-JXfvpFOSHvXrp1zf+DLLLTawQOKoOeBEFyRn2Ufb59Y="
+  },
   "org/apache/jena#jena-rdfconnection/5.6.0": {
    "jar": "sha256-Wetg2M77g+JaFv8UCEpcLgyIzrV+fyKzx7lUuv4Yuzo=",
    "pom": "sha256-7dt5i3eBe2Ydz3NlHeX6aJuymZvls9U8sePaYVxnEYk="

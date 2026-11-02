@@ -36,8 +36,10 @@ napi-build = "2"
 
 [features]
 failpoints = ["sparkles/failpoints", "dep:nix"]
-default = ["reasoning", "shacl", "shex", "text", "geo", "backup", "graphql", "mimalloc"]
+default = ["reasoning", "ontology", "shacl", "shex", "text", "geo", "backup", "graphql", "mimalloc"]
 reasoning = ["sparkles/reasoning", "dep:sparkles-reasoner"]
+# the OWL 2 ontology handle (`dataset.ontology`, spec F21)
+ontology = ["reasoning", "sparkles/ontology"]
 shacl = ["sparkles/shacl", "dep:sparkles-shacl"]
 shex = ["sparkles/shex", "dep:sparkles-shex"]
 text = ["sparkles/text"]

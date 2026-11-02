@@ -35024,6 +35024,14 @@
             "$ref": "#/components/parameters/at"
           },
           {
+            "description": "Also read the materialized inferences while the dataset has them, so that the axioms include the materialized closure. The answer's `inferences` says whether they were read and whether they are stale.",
+            "in": "query",
+            "name": "inferences",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
             "$ref": "#/components/parameters/ifNoneMatch"
           }
         ],
@@ -35108,6 +35116,14 @@
           },
           {
             "$ref": "#/components/parameters/at"
+          },
+          {
+            "description": "Also read the materialized inferences while the dataset has them, so that the axioms include the materialized closure. The answer's `inferences` says whether they were read and whether they are stale.",
+            "in": "query",
+            "name": "inferences",
+            "schema": {
+              "type": "boolean"
+            }
           },
           {
             "description": "Axiom types, comma separated, such as `SubClassOf,EquivalentClasses`.",
@@ -35498,6 +35514,10 @@
                     "description": "A graph IRI or `default`, or a list of them."
                   },
                   "imports": {
+                    "type": "boolean"
+                  },
+                  "inferences": {
+                    "description": "Also read the materialized inferences while the dataset has them.",
                     "type": "boolean"
                   },
                   "maxViolations": {
