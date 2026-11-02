@@ -673,6 +673,9 @@ The `openai` provider preset starts with GPT-6 Luna in place of `gpt-5-mini`. In
 comparison of six Claude and OpenAI models on 150 held-out QALD-9-plus questions, Luna
 answers 106 at $0.0021 a question, within the noise of the best model's 113, and is the
 cheapest per correct answer. The `anthropic` preset keeps Sonnet 5.5 by the same rule.
+Both hosted presets give their model the settings the comparison used, a 200,000-token
+context and effort `medium` with its output limit, in the CLI and in the Add provider
+form.
 
 `scripts/eval-ask-paid`, which `scripts/eval-ask-anthropic` still runs, takes a run
 file's `provider`, so a paid run can ask OpenAI's GPT-6 Luna, GPT-6.1 Terra and GPT-6.1

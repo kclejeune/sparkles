@@ -5069,7 +5069,11 @@ The models of the two hosted presets come from the Ask comparison in the
 [natural-language benchmark](benchmarks/natural-language/RESULTS.md#ask-across-providers).
 Each is the cheapest model per correct answer whose score on 150 held-out questions is
 within the noise of its provider's best model. GPT-6 Luna is also the cheapest of all six
-models measured that meets that bar against the best of them.
+models measured that meets that bar against the best of them. The preset's entry for its
+model also sets the settings that the comparison used, a 200,000-token context, effort
+`medium` and an output limit of 4,096 tokens for Sonnet and 16,384 for Luna, whose
+reasoning counts toward it. Without a context size the server treats a model as a small
+one and trims Ask's grounding.
 
 The command refuses a provider name that is already in use. An OpenAI-compatible
 gateway, such as vLLM or LiteLLM, has no preset. Add it with the `openai` kind and its

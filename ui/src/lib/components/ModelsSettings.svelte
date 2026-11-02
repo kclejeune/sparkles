@@ -239,6 +239,7 @@
       endpoint: addEndpoint,
       secret: addSecret,
       model: addModel,
+      preset: addPreset,
     });
     if ('error' in r) {
       addError = r.error;

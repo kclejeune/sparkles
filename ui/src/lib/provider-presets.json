@@ -5,7 +5,12 @@
     "kind": "anthropic",
     "endpoint": "https://api.anthropic.com",
     "secret": "anthropic",
-    "model": "claude-sonnet-5-5"
+    "model": "claude-sonnet-5-5",
+    "modelOptions": {
+      "contextTokens": 200000,
+      "maxOutputTokens": 4096,
+      "reasoningEffort": "medium"
+    }
   },
   {
     "name": "openai",
@@ -13,7 +18,12 @@
     "kind": "openai",
     "endpoint": "https://api.openai.com/v1",
     "secret": "openai",
-    "model": "gpt-6-luna"
+    "model": "gpt-6-luna",
+    "modelOptions": {
+      "contextTokens": 200000,
+      "maxOutputTokens": 16384,
+      "reasoningEffort": "medium"
+    }
   },
   {
     "name": "ollama",
@@ -21,6 +31,7 @@
     "kind": "ollama",
     "endpoint": "http://127.0.0.1:11434",
     "secret": null,
-    "model": "qwen3:8b"
+    "model": "qwen3:8b",
+    "modelOptions": {}
   }
 ]

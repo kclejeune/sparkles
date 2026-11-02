@@ -17,6 +17,9 @@ pub struct Preset {
     pub secret: Option<&'static str>,
     /// a model to start with, as an entry of the provider's `models`
     pub model: &'static str,
+    /// the options of that model's entry, as JSON: the settings the Ask comparison
+    /// measured the model with, so that the preset reproduces them
+    pub model_options: &'static str,
 }
 
 /// The presets. Generic OpenAI-compatible gateways have none: they use the `openai` kind
@@ -28,6 +31,7 @@ pub const PRESETS: &[Preset] = &[
         endpoint: "https://api.anthropic.com",
         secret: Some("anthropic"),
         model: "claude-sonnet-5-5",
+        model_options: r#"{"contextTokens":200000,"maxOutputTokens":4096,"reasoningEffort":"medium"}"#,
     },
     Preset {
         name: "openai",
@@ -35,6 +39,7 @@ pub const PRESETS: &[Preset] = &[
         endpoint: "https://api.openai.com/v1",
         secret: Some("openai"),
         model: "gpt-6-luna",
+        model_options: r#"{"contextTokens":200000,"maxOutputTokens":16384,"reasoningEffort":"medium"}"#,
     },
     Preset {
         name: "ollama",
@@ -42,6 +47,7 @@ pub const PRESETS: &[Preset] = &[
         endpoint: "http://127.0.0.1:11434",
         secret: None,
         model: "qwen3:8b",
+        model_options: "{}",
     },
 ];
 
@@ -55,10 +61,17 @@ impl Preset {
     /// model's entry states the default `structuredOutput`, since the merge of the
     /// settings layers drops an empty object.
     pub fn provider(&self) -> Value {
+        let mut entry = json!({ "structuredOutput": "auto" });
+        if let (Some(e), Ok(Value::Object(o))) = (
+            entry.as_object_mut(),
+            serde_json::from_str::<Value>(self.model_options),
+        ) {
+            e.extend(o);
+        }
         let mut p = json!({
             "kind": self.kind,
             "endpoint": self.endpoint,
-            "models": { self.model: { "structuredOutput": "auto" } },
+            "models": { self.model: entry },
         });
         if let Some(s) = self.secret {
             p["apiKey"] = json!({ "secret": s });
@@ -87,6 +100,47 @@ mod tests {
         assert_eq!(preset("anthropic").unwrap().model, "claude-sonnet-5-5");
     }
 
+    /// A provider from a hosted preset asks its model the way the comparison did: Luna
+    /// as a reasoning model with `max_completion_tokens`, and each with the 200,000-token
+    /// context, so that Ask does not trim the grounding for a small model.
+    #[test]
+    fn hosted_presets_reproduce_the_measured_settings() {
+        use crate::models::client::{ChatRequest, Message, Part, build};
+        for name in ["openai", "anthropic"] {
+            let p = preset(name).unwrap();
+            let cfg =
+                ModelsConfig::from_value(&json!({ "providers": { name: p.provider() } })).unwrap();
+            let pc = &cfg.providers[name];
+            let m = pc.model(p.model);
+            assert_eq!(m.context_tokens, 200_000, "{name}");
+            assert_eq!(
+                m.reasoning_effort.map(|e| e.as_str()),
+                Some("medium"),
+                "{name}"
+            );
+            let req = ChatRequest {
+                model: p.model.into(),
+                system: vec![Part::cached("sys")],
+                messages: vec![Message::user("q")],
+                schema: None,
+                level: crate::models::Level::Text,
+                max_output_tokens: m.max_output_tokens,
+                temperature: m.temperature,
+                reasoning_effort: m.reasoning_effort,
+                num_ctx: None,
+                timeout: std::time::Duration::from_secs(1),
+            };
+            let (_, body) = build(pc, &req);
+            if name == "openai" {
+                assert_eq!(body["max_completion_tokens"], json!(16384));
+                assert_eq!(body["reasoning_effort"], json!("medium"));
+                assert!(body.get("max_tokens").is_none() && body.get("temperature").is_none());
+            } else {
+                assert_eq!(body["max_tokens"], json!(4096));
+            }
+        }
+    }
+
     /// The UI's table holds the same presets in the same order.
     #[test]
     fn the_ui_table_agrees() {
@@ -105,6 +159,8 @@ mod tests {
             assert_eq!(u["endpoint"], p.endpoint, "{}", p.name);
             assert_eq!(u["secret"].as_str(), p.secret, "{}", p.name);
             assert_eq!(u["model"], p.model, "{}", p.name);
+            let options: Value = serde_json::from_str(p.model_options).unwrap();
+            assert_eq!(u["modelOptions"], options, "{}", p.name);
         }
     }
 }
