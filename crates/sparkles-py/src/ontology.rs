@@ -299,7 +299,7 @@ impl PyOntologies {
         a.insert("type".into(), types);
         let about = match about.filter(|x| !x.is_none()) {
             None => J::Null,
-            Some(x) => J::String(crate::terms::named_node_from_py(x)?.into_string()),
+            Some(x) => J::String(crate::terms::iri_from_py(x)?.into_string()),
         };
         a.insert("about".into(), about);
         a.insert("assertions".into(), json!(assertions));
@@ -386,7 +386,7 @@ impl PyOntologies {
         a.remove("inferences");
         a.insert(
             "iri".into(),
-            J::String(crate::terms::named_node_from_py(iri)?.into_string()),
+            J::String(crate::terms::iri_from_py(iri)?.into_string()),
         );
         a.insert("message".into(), json!(message));
         let j = self.run(py, "removeEntity", a, cancel, timeout, true)?;
