@@ -12,8 +12,9 @@
 #
 # Results go to <main checkout>/.artifacts/gates/nightly/: one log per run, last-pass with
 # the last commit that passed and, after a failure, FAILED with the commit range between
-# the last pass and the failing commit and the steps that failed. A later pass removes
-# FAILED. The gate's own results are in .artifacts/gates/main-gate-<short>-nightly-<host>/.
+# the last pass and the failing commit and the steps that failed, or NOT-STARTED when the
+# gate could not start. A later pass removes both. The gate's own results are in
+# .artifacts/gates/main-gate-<short>-nightly-<host>/.
 # docs/DEVELOPMENT.md (Nightly gate) describes the bisect and fix-forward that a failure
 # starts.
 #
@@ -97,10 +98,17 @@ code=0
 "$here/gate.sh" --auto --full --tag nightly "$rev" > "$log" 2>&1 || code=$?
 if [ "$code" = 0 ]; then
   echo "$rev" > "$state/last-pass"
-  rm -f "$state/FAILED"
+  rm -f "$state/FAILED" "$state/NOT-STARTED"
   echo "nightly: $short passed, log $log"
   exit 0
 fi
+# A run that never started, such as one whose ssh agent was locked, is not a failure of
+# the commit.
+if ! grep -q "^gate-.* started" "$log"; then
+  echo "nightly gate on $rev could not start (exit $code) at $(date -u +%FT%TZ); log: $log" | tee "$state/NOT-STARTED"
+  exit "$code"
+fi
+rm -f "$state/NOT-STARTED"
 {
   echo "nightly gate failed on $rev (exit $code) at $(date -u +%FT%TZ)"
   echo "range: ${last:-<no earlier pass>}..$rev"

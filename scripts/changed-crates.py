@@ -13,7 +13,8 @@ normal, build and dev-dependencies, until nothing more is added.
 Some files are shared roots that change what every package builds or tests, such as
 Cargo.toml, Cargo.lock, rust-toolchain.toml, mise.toml, .config/, testsuite/, vendor/ and
 crates/sparkles-core. A change to one of them, or to any file the rules below do not
-cover, selects the whole workspace. The batch gate always runs the whole workspace.
+cover, selects the whole workspace. The batch gate makes the same selection for a
+batch through scripts/gate/select-checks.py, and the nightly gate runs the whole workspace.
 
 Usage:
   changed-crates.py BASE         print `all`, `none` or the chosen packages, one per line,

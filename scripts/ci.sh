@@ -22,7 +22,8 @@
 #                the merge base of BASE and HEAD can affect and the packages that depend on
 #                them (scripts/changed-crates.py). A change to a shared root, such as
 #                Cargo.lock or sparkles-core, keeps the whole workspace. The batch gate
-#                never uses it.
+#                passes it when its selection narrows the packages
+#                (scripts/gate/select-checks.py).
 #   --exhaustive-features
 #                also run optional-feature Clippy and the six stripped-server test sets
 #   --fail-fast  stop the remaining tasks after the first failure
