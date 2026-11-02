@@ -334,15 +334,22 @@ pub fn per_value<T: Send>(
     let held = (d.slot.as_ref().map_or(0, Vec::capacity) as u64)
         .saturating_mul(4)
         .saturating_add(d.values.mem_bytes());
-    let Ok(mut charge) = ctx.retained_charge(held) else {
+    let size = std::mem::size_of::<T>() as u64;
+    // Reuse is optional, so a charge that does not fit, before or after the evaluation,
+    // leaves the rows to the caller instead of failing the query.
+    let Ok(mut charge) =
+        ctx.retained_charge(held.saturating_add((d.values.len() as u64).saturating_mul(size)))
+    else {
         return Ok(None);
     };
     let vals = eval(&d.values)?;
     debug_assert_eq!(vals.len(), d.values.len());
-    if let Some(charge) = &mut charge {
-        charge.resize(held.saturating_add(
-            (vals.capacity() as u64).saturating_mul(std::mem::size_of::<T>() as u64),
-        ))?;
+    if let Some(charge) = &mut charge
+        && charge
+            .resize(held.saturating_add((vals.capacity() as u64).saturating_mul(size)))
+            .is_err()
+    {
+        return Ok(None);
     }
     ctx.check()?;
     Ok(Some(PerValue {

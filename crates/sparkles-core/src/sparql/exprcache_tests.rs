@@ -309,11 +309,19 @@ fn the_table_and_batch_algorithms_agree_with_rows_on_both_sides_of_the_threshold
     }
     assert!(cached > 0);
     // A pattern that does not compile fails the filter on every row in both modes,
-    // where the key tests decline it.
-    let q = "SELECT ?s WHERE { ?s ex:v ?v FILTER(REGEX(STR(?v), \"[\")) }";
-    assert!(show(&run_on(snap.clone(), q, Optimizations::ALL)).is_empty());
-    for batch_rows in [4096, super::exec::PAR_THRESHOLD + 4096] {
-        assert!(cursor_rows(&snap, q, Optimizations::ALL, batch_rows).is_empty());
+    // where the key tests decline it. The 2,000 rows of repeated values take the batch
+    // FILTER, which admits key tests by the shape of the conjunct.
+    let values: String = (0..2000).map(|i| format!("\"v{}\" ", i % 7)).collect();
+    for filter in ["REGEX(STR(?x), \"[\")", "REGEX(?x, \"[\")"] {
+        let q = format!("SELECT ?x WHERE {{ VALUES ?x {{ {values} }} FILTER({filter}) }}");
+        assert!(
+            show(&run_on(snap.clone(), &q, Optimizations::ALL)).is_empty(),
+            "{filter}"
+        );
+        assert!(
+            cursor_rows(&snap, &q, Optimizations::ALL, 4096).is_empty(),
+            "{filter}"
+        );
     }
 }
 
