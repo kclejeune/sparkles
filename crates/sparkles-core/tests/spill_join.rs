@@ -238,118 +238,150 @@ const INNER_UNORDERED: &str = "SELECT ?a ?v ?b ?k ?l { { ?a <urn:v> ?v . ?a <urn
                                UNION { ?a <urn:v> ?v . ?a <urn:p> ?k FILTER(?v = 3) } \
                                ?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l }";
 
-#[test]
-fn spilled_hash_joins_match_eager_at_every_batch_size() {
+/// The checks of one query of the spilled hash joins. Each query is its own test, with
+/// its own store and spill directory, so that the four run in parallel.
+fn spilled_hash_join_matches_eager_at_every_batch_size(q: &str) {
     let s = store(30_000, false);
     let tmp = tempfile::tempdir().unwrap();
     let spill = spill(tmp.path());
-    for q in [INNER_ORDERED, INNER_GROUPED, INNER, INNER_UNORDERED] {
-        let expected = eager(&s, q);
-        let memory = run(&s, q, 256 << 20, None, 4096).unwrap();
-        assert_eq!(sorted(memory.rows.clone()), expected, "{q}");
-        assert!(memory.plan.contains("HashJoin"), "{q}: {}", memory.plan);
-        // A8: the build input is several times the budget.
+    let expected = eager(&s, q);
+    let memory = run(&s, q, 256 << 20, None, 4096).unwrap();
+    assert_eq!(sorted(memory.rows.clone()), expected, "{q}");
+    assert!(memory.plan.contains("HashJoin"), "{q}: {}", memory.plan);
+    // A8: the build input is several times the budget.
+    assert!(
+        memory.peak > 4 * MEMORY,
+        "{q}: an unlimited join peaks at {} bytes",
+        memory.peak
+    );
+    match run(&s, q, MEMORY, None, 4096) {
+        Err(Error::BudgetExceeded(b)) => assert_eq!(b.kind, BudgetKind::Memory, "{q}"),
+        other => panic!(
+            "{q}: expected a memory budget error, got {:?}",
+            other.map(|r| r.rows.len())
+        ),
+    }
+    for batch in [1, 7, 4096] {
+        let spilled = run(&s, q, MEMORY, Some(spill.clone()), batch).unwrap();
+        assert!(spilled.peak <= MEMORY, "{q}: peak {}", spilled.peak);
         assert!(
-            memory.peak > 4 * MEMORY,
-            "{q}: an unlimited join peaks at {} bytes",
-            memory.peak
+            counter(&spilled.plan, "spillPartitions").is_some_and(|p| p >= 8),
+            "{q}: {}",
+            spilled.plan
         );
-        match run(&s, q, MEMORY, None, 4096) {
-            Err(Error::BudgetExceeded(b)) => assert_eq!(b.kind, BudgetKind::Memory, "{q}"),
-            other => panic!(
-                "{q}: expected a memory budget error, got {:?}",
-                other.map(|r| r.rows.len())
-            ),
+        assert!(counter(&spilled.plan, "spillLevels").is_some(), "{q}");
+        assert!(
+            counter(&spilled.plan, "spilledBytes").is_some_and(|b| b > 0),
+            "{q}"
+        );
+        if q == INNER_ORDERED {
+            // The grouping may rely on the probe input's order, so the spilled join
+            // merges its output back into that order. The unit tests of the join
+            // check the order itself.
+            assert!(spilled.plan.contains("spillMergePasses"), "{q}");
+        } else {
+            // Nothing relies on the order, so the join emits partition by partition.
+            assert!(!spilled.plan.contains("spillMergePasses"), "{q}");
         }
-        for batch in [1, 7, 4096] {
-            let spilled = run(&s, q, MEMORY, Some(spill.clone()), batch).unwrap();
-            assert!(spilled.peak <= MEMORY, "{q}: peak {}", spilled.peak);
+        // A grouping above the join groups many rows in each pass once the join
+        // and its scans have given their memory back (item 93). It used to take
+        // one group per pass.
+        if let Some(passes) = counter(&spilled.plan, "spillPasses") {
             assert!(
-                counter(&spilled.plan, "spillPartitions").is_some_and(|p| p >= 8),
-                "{q}: {}",
-                spilled.plan
+                passes as usize * 20 < expected.len(),
+                "{q}: {passes} passes for {} groups",
+                expected.len()
             );
-            assert!(counter(&spilled.plan, "spillLevels").is_some(), "{q}");
-            assert!(
-                counter(&spilled.plan, "spilledBytes").is_some_and(|b| b > 0),
-                "{q}"
-            );
-            if q == INNER_ORDERED {
-                // The grouping may rely on the probe input's order, so the spilled join
-                // merges its output back into that order. The unit tests of the join
-                // check the order itself.
-                assert!(spilled.plan.contains("spillMergePasses"), "{q}");
-            } else {
-                // Nothing relies on the order, so the join emits partition by partition.
-                assert!(!spilled.plan.contains("spillMergePasses"), "{q}");
-            }
-            // A grouping above the join groups many rows in each pass once the join
-            // and its scans have given their memory back (item 93). It used to take
-            // one group per pass.
-            if let Some(passes) = counter(&spilled.plan, "spillPasses") {
-                assert!(
-                    passes as usize * 20 < expected.len(),
-                    "{q}: {passes} passes for {} groups",
-                    expected.len()
-                );
-            }
-            assert_eq!(sorted(spilled.rows), expected, "{q} at batch size {batch}");
-            assert_eq!(spill.reserved_bytes(), 0, "{q}");
         }
+        assert_eq!(sorted(spilled.rows), expected, "{q} at batch size {batch}");
+        assert_eq!(spill.reserved_bytes(), 0, "{q}");
     }
     assert!(leftovers(tmp.path()).is_empty());
+}
+
+#[test]
+fn spilled_hash_joins_match_eager_at_every_batch_size_ordered() {
+    spilled_hash_join_matches_eager_at_every_batch_size(INNER_ORDERED);
+}
+
+#[test]
+fn spilled_hash_joins_match_eager_at_every_batch_size_grouped() {
+    spilled_hash_join_matches_eager_at_every_batch_size(INNER_GROUPED);
+}
+
+#[test]
+fn spilled_hash_joins_match_eager_at_every_batch_size_inner() {
+    spilled_hash_join_matches_eager_at_every_batch_size(INNER);
+}
+
+#[test]
+fn spilled_hash_joins_match_eager_at_every_batch_size_unordered() {
+    spilled_hash_join_matches_eager_at_every_batch_size(INNER_UNORDERED);
 }
 
 /// A9: OPTIONAL with a condition and MINUS, where one build row and one probe row in
 /// twenty leave the key unbound. Every probe row's unbound extension appears exactly when
 /// none of its candidates passes.
-#[test]
-fn spilled_optional_and_minus_handle_unbound_keys() {
+/// With `minus` false it checks the OPTIONAL query and with `minus` true the MINUS query.
+/// Each is its own test, with its own store and spill directory, so that the two run in
+/// parallel.
+fn spilled_optional_or_minus_handles_unbound_keys(minus: bool) {
     let s = store(6_000, false);
     let tmp = tempfile::tempdir().unwrap();
     let spill = spill(tmp.path());
     let left = "{ ?a <urn:v> ?v OPTIONAL { ?a <urn:p> ?k } }";
     let right = "?b <urn:w> ?w . ?b <urn:l> ?l . ?b <urn:x1> ?x1 . ?b <urn:x2> ?x2 . \
                  ?b <urn:x3> ?x3 OPTIONAL { ?b <urn:q> ?k }";
-    for q in [
+    let [optional_query, minus_query] = [
         format!(
             "SELECT ?a ?v ?k ?b ?w {{ {left} OPTIONAL {{ {right} FILTER(?w < 3 && ?v != 4) }} }}"
         ),
         format!("SELECT ?a ?v ?k {{ {left} MINUS {{ {right} FILTER(?w != 3) }} }}"),
-    ] {
-        let expected = eager(&s, &q);
-        let memory = run(&s, &q, 1 << 30, None, 4096).unwrap();
-        assert_eq!(sorted(memory.rows.clone()), expected, "{q}");
-        for (budget, batch) in [(768 << 10, 1000), (1 << 20, 7)] {
-            let spilled = match run(&s, &q, budget, Some(spill.clone()), batch) {
-                Ok(r) => r,
-                Err(e) => panic!("{q} under {budget}: {e}"),
-            };
-            assert_eq!(sorted(spilled.rows.clone()), expected, "{q} under {budget}");
-            if spilled.plan.contains("spillPartitions") && spilled.plan.contains("spillMergePasses")
-            {
-                assert_eq!(spilled.firsts, memory.firsts, "{q}: the order changed");
-            }
-            assert_eq!(spill.reserved_bytes(), 0, "{q}");
+    ];
+    let q = if minus { minus_query } else { optional_query };
+    let expected = eager(&s, &q);
+    let memory = run(&s, &q, 1 << 30, None, 4096).unwrap();
+    assert_eq!(sorted(memory.rows.clone()), expected, "{q}");
+    for (budget, batch) in [(768 << 10, 1000), (1 << 20, 7)] {
+        let spilled = match run(&s, &q, budget, Some(spill.clone()), batch) {
+            Ok(r) => r,
+            Err(e) => panic!("{q} under {budget}: {e}"),
+        };
+        assert_eq!(sorted(spilled.rows.clone()), expected, "{q} under {budget}");
+        if spilled.plan.contains("spillPartitions") && spilled.plan.contains("spillMergePasses") {
+            assert_eq!(spilled.firsts, memory.firsts, "{q}: the order changed");
         }
-        let spilled = run(&s, &q, 768 << 10, Some(spill.clone()), 1000).unwrap();
-        assert!(
-            spilled.plan.contains("spillPartitions"),
-            "{q}: {}",
-            spilled.plan
-        );
+        assert_eq!(spill.reserved_bytes(), 0, "{q}");
     }
+    let spilled = run(&s, &q, 768 << 10, Some(spill.clone()), 1000).unwrap();
+    assert!(
+        spilled.plan.contains("spillPartitions"),
+        "{q}: {}",
+        spilled.plan
+    );
     assert!(leftovers(tmp.path()).is_empty());
+}
+
+#[test]
+fn spilled_optional_and_minus_handle_unbound_keys_optional() {
+    spilled_optional_or_minus_handles_unbound_keys(false);
+}
+
+#[test]
+fn spilled_optional_and_minus_handle_unbound_keys_minus() {
+    spilled_optional_or_minus_handles_unbound_keys(true);
 }
 
 const HEAVY_MEMORY: u64 = 320 << 10;
 
 /// A10: a key that holds nine tenths of both inputs joins as a block nested loop within
-/// the budget.
-#[test]
-fn a_heavy_key_joins_as_a_block_nested_loop() {
+/// the budget. Part 0 checks the store and the join, part 1 the MINUS and part 2 the
+/// OPTIONAL. Each part is its own test, with its own store and spill directory, so that
+/// the three run in parallel.
+fn heavy_key_part(part: usize) {
     let s = store(3_000, true);
-    for property in ["p", "q"] {
+    let properties: &[&str] = if part == 0 { &["p", "q"] } else { &[] };
+    for property in properties {
         let all = format!("SELECT ?s {{ ?s <urn:{property}> ?k }}");
         let heavy = format!("SELECT ?s {{ ?s <urn:{property}> <urn:k:0> }}");
         assert_eq!(
@@ -370,24 +402,32 @@ fn a_heavy_key_joins_as_a_block_nested_loop() {
     // Wide build rows, so that a few thousand of them outgrow the budget.
     let right = "?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l . ?b <urn:x1> ?x1 . \
                  ?b <urn:x2> ?x2 . ?b <urn:x3> ?x3";
-    let q = format!("SELECT ?a ?b {{ ?a <urn:v> ?v . ?a <urn:p> ?k . {right} }}");
-    let expected = eager(&s, &q);
-    assert!(expected.len() > 4_000_000);
-    let spilled = run(&s, &q, HEAVY_MEMORY, Some(spill.clone()), 100).unwrap();
-    assert!(spilled.peak <= HEAVY_MEMORY, "peak {}", spilled.peak);
-    assert_eq!(sorted(spilled.rows), expected);
-    assert!(
-        counter(&spilled.plan, "spillChunks").is_some_and(|c| c > 1),
-        "{}",
-        spilled.plan
-    );
-    for q in [
+    if part == 0 {
+        let q = format!("SELECT ?a ?b {{ ?a <urn:v> ?v . ?a <urn:p> ?k . {right} }}");
+        let expected = eager(&s, &q);
+        assert!(expected.len() > 4_000_000);
+        let spilled = run(&s, &q, HEAVY_MEMORY, Some(spill.clone()), 100).unwrap();
+        assert!(spilled.peak <= HEAVY_MEMORY, "peak {}", spilled.peak);
+        assert_eq!(sorted(spilled.rows), expected);
+        assert!(
+            counter(&spilled.plan, "spillChunks").is_some_and(|c| c > 1),
+            "{}",
+            spilled.plan
+        );
+    }
+    for (i, q) in [
         format!("SELECT ?a ?k {{ ?a <urn:v> ?v . ?a <urn:p> ?k MINUS {{ {right} }} }}"),
         format!(
             "SELECT ?a ?k ?b {{ ?a <urn:v> ?v . ?a <urn:p> ?k OPTIONAL {{ {right} \
              FILTER(?w = 3 && ?v = 2) }} }}"
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if i + 1 != part {
+            continue;
+        }
         let q = q.as_str();
         let expected = eager(&s, q);
         let spilled = run(&s, q, HEAVY_MEMORY, Some(spill.clone()), 100).unwrap();
@@ -400,6 +440,21 @@ fn a_heavy_key_joins_as_a_block_nested_loop() {
     }
     assert_eq!(spill.reserved_bytes(), 0);
     assert!(leftovers(tmp.path()).is_empty());
+}
+
+#[test]
+fn a_heavy_key_joins_as_a_block_nested_loop() {
+    heavy_key_part(0);
+}
+
+#[test]
+fn a_heavy_key_joins_as_a_block_nested_loop_in_minus() {
+    heavy_key_part(1);
+}
+
+#[test]
+fn a_heavy_key_joins_as_a_block_nested_loop_in_optional() {
+    heavy_key_part(2);
 }
 
 #[test]

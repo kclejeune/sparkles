@@ -391,61 +391,70 @@ fn random_triple(r: &mut Rng, owl: bool) -> String {
 }
 
 /// F18 §11: every triple of the inferred graph has a demand tree, and every tree is well
-/// founded, with leaves the store asserts, for every profile on random data.
-#[test]
-fn every_inferred_triple_has_a_sound_demand_tree() {
-    for (p, owl) in [
-        (Profile::Rdfs, false),
-        (Profile::OwlRl, true),
-        (
-            Profile::Rules(
-                "@prefix ex: <http://ex.org/>.
-                 [a: (?x ex:p0 ?y), (?y ex:p0 ?z), notEqual(?x, ?z) -> (?x ex:p1 ?z)]
-                 [b: (?x ex:p1 ?y) -> (?y ex:p1 ?x)]
-                 [anc1: (?x ex:p0 ?y) -> (?x ex:anc ?y)]
-                 [anc2: (?x ex:p0 ?y), (?y ex:anc ?z) -> (?x ex:anc ?z)]
-                 [h: (?x rdf:type ex:C1), noValue(?x, ex:p0) -> (?x rdf:type ex:C2)]"
-                    .into(),
-            ),
-            false,
-        ),
-    ] {
-        for seed in 1..=3u64 {
-            let mut r = Rng(seed * 104_729 + 7);
-            let mut ttl = String::new();
-            for _ in 0..40 {
-                ttl.push_str(&format!("{} .\n", random_triple(&mut r, owl)));
-            }
-            let s = store(&ttl);
-            materialize(&s, &p, &ReasonOptions::default()).unwrap();
-            let all = graph_triples(&s, Some(INFERRED_GRAPH));
-            assert!(!all.is_empty());
-            // a sample, so that the test stays quick
-            let step = (all.len() / 40).max(1);
-            let qr = reasoner(&p);
-            for t in all.iter().step_by(step) {
-                let ask = format!("ASK {{ {} {} {} }}", t[0], t[1], t[2]);
-                let o = sparkles_core::sparql::QueryOptions {
-                    reasoning: Some(qr.provider()),
-                    ..Default::default()
-                };
-                let r = sparkles_core::sparql::query(s.snapshot(), &ask, &o).unwrap();
-                assert!(
-                    r.boolean,
-                    "{p} seed {seed}: demand misses materialized {t:?}\n{ttl}"
-                );
-                let e = demand(&s, &p, t.clone(), &ExplainOptions::default());
-                let Explained::Found { trees: ts, .. } = e else {
-                    panic!("{p} seed {seed}: {t:?} has no demand tree: {e:?}\n{ttl}");
-                };
-                for d in &ts {
-                    assert_eq!(&d.triple, t);
-                    sound(&s, d, &mut Vec::new());
-                    replay(d, &p.rules().unwrap());
-                }
+/// founded, with leaves the store asserts, for every profile on random data. Each profile
+/// is its own test below, with the same seeds, so that the three run in parallel.
+fn every_inferred_triple_has_a_sound_demand_tree(p: Profile, owl: bool) {
+    for seed in 1..=3u64 {
+        let mut r = Rng(seed * 104_729 + 7);
+        let mut ttl = String::new();
+        for _ in 0..40 {
+            ttl.push_str(&format!("{} .\n", random_triple(&mut r, owl)));
+        }
+        let s = store(&ttl);
+        materialize(&s, &p, &ReasonOptions::default()).unwrap();
+        let all = graph_triples(&s, Some(INFERRED_GRAPH));
+        assert!(!all.is_empty());
+        // a sample, so that the test stays quick
+        let step = (all.len() / 40).max(1);
+        let qr = reasoner(&p);
+        for t in all.iter().step_by(step) {
+            let ask = format!("ASK {{ {} {} {} }}", t[0], t[1], t[2]);
+            let o = sparkles_core::sparql::QueryOptions {
+                reasoning: Some(qr.provider()),
+                ..Default::default()
+            };
+            let r = sparkles_core::sparql::query(s.snapshot(), &ask, &o).unwrap();
+            assert!(
+                r.boolean,
+                "{p} seed {seed}: demand misses materialized {t:?}\n{ttl}"
+            );
+            let e = demand(&s, &p, t.clone(), &ExplainOptions::default());
+            let Explained::Found { trees: ts, .. } = e else {
+                panic!("{p} seed {seed}: {t:?} has no demand tree: {e:?}\n{ttl}");
+            };
+            for d in &ts {
+                assert_eq!(&d.triple, t);
+                sound(&s, d, &mut Vec::new());
+                replay(d, &p.rules().unwrap());
             }
         }
     }
+}
+
+#[test]
+fn every_inferred_triple_has_a_sound_demand_tree_rdfs() {
+    every_inferred_triple_has_a_sound_demand_tree(Profile::Rdfs, false);
+}
+
+#[test]
+fn every_inferred_triple_has_a_sound_demand_tree_owl_rl() {
+    every_inferred_triple_has_a_sound_demand_tree(Profile::OwlRl, true);
+}
+
+#[test]
+fn every_inferred_triple_has_a_sound_demand_tree_rules() {
+    every_inferred_triple_has_a_sound_demand_tree(
+        Profile::Rules(
+            "@prefix ex: <http://ex.org/>.
+             [a: (?x ex:p0 ?y), (?y ex:p0 ?z), notEqual(?x, ?z) -> (?x ex:p1 ?z)]
+             [b: (?x ex:p1 ?y) -> (?y ex:p1 ?x)]
+             [anc1: (?x ex:p0 ?y) -> (?x ex:anc ?y)]
+             [anc2: (?x ex:p0 ?y), (?y ex:anc ?z) -> (?x ex:anc ?z)]
+             [h: (?x rdf:type ex:C1), noValue(?x, ex:p0) -> (?x rdf:type ex:C2)]"
+                .into(),
+        ),
+        false,
+    );
 }
 
 fn whynot(s: &Store, p: &Profile, t: [Term; 3], opts: &WhyNotOptions) -> WhyNot {

@@ -197,40 +197,52 @@ fn forward(p: &Profile) -> Profile {
 }
 
 /// For random data and random queries of one or two patterns, the solutions under
-/// `demand` equal those over a full materialization, for every profile.
-#[test]
-fn demand_answers_like_materialization() {
-    let profiles = [
-        (Profile::Rdfs, false),
-        (Profile::RdfsSimple, false),
-        (Profile::OwlRl, true),
-        (rules_profile(), false),
-    ];
-    for (p, owl) in profiles {
-        for seed in 1..=6u64 {
-            let mut r = Rng(seed * 7919 + 13);
-            let mut ttl = String::new();
-            for _ in 0..50 {
-                ttl.push_str(&format!("{} .\n", random_triple(&mut r, owl)));
-            }
-            let s = store(&ttl);
-            materialize(&s, &forward(&p), &ReasonOptions::default())
-                .unwrap_or_else(|e| panic!("{p}: {e:#}"));
-            let qr = reasoner(&p);
-            for _ in 0..12 {
-                let one = random_pattern(&mut r, "a", "b");
-                let two = random_pattern(&mut r, "b", "c");
-                for q in [
-                    format!("SELECT DISTINCT * {{ {one} }}"),
-                    format!("SELECT DISTINCT * {{ {one} . {two} }}"),
-                ] {
-                    let want = rows(&run(&s, &q, &materialized()));
-                    let got = rows(&run(&s, &q, &demand(&qr)));
-                    assert_eq!(got, want, "{p} seed {seed}: {q}\n{ttl}");
-                }
+/// `demand` equal those over a full materialization, for every profile. Each profile is
+/// its own test below, with the same seeds, so that the four run in parallel.
+fn demand_answers_like_materialization(p: Profile, owl: bool) {
+    for seed in 1..=6u64 {
+        let mut r = Rng(seed * 7919 + 13);
+        let mut ttl = String::new();
+        for _ in 0..50 {
+            ttl.push_str(&format!("{} .\n", random_triple(&mut r, owl)));
+        }
+        let s = store(&ttl);
+        materialize(&s, &forward(&p), &ReasonOptions::default())
+            .unwrap_or_else(|e| panic!("{p}: {e:#}"));
+        let qr = reasoner(&p);
+        for _ in 0..12 {
+            let one = random_pattern(&mut r, "a", "b");
+            let two = random_pattern(&mut r, "b", "c");
+            for q in [
+                format!("SELECT DISTINCT * {{ {one} }}"),
+                format!("SELECT DISTINCT * {{ {one} . {two} }}"),
+            ] {
+                let want = rows(&run(&s, &q, &materialized()));
+                let got = rows(&run(&s, &q, &demand(&qr)));
+                assert_eq!(got, want, "{p} seed {seed}: {q}\n{ttl}");
             }
         }
     }
+}
+
+#[test]
+fn demand_answers_like_materialization_rdfs() {
+    demand_answers_like_materialization(Profile::Rdfs, false);
+}
+
+#[test]
+fn demand_answers_like_materialization_rdfs_simple() {
+    demand_answers_like_materialization(Profile::RdfsSimple, false);
+}
+
+#[test]
+fn demand_answers_like_materialization_owl_rl() {
+    demand_answers_like_materialization(Profile::OwlRl, true);
+}
+
+#[test]
+fn demand_answers_like_materialization_rules() {
+    demand_answers_like_materialization(rules_profile(), false);
 }
 
 /// A1: backward rules answer on demand and derive nothing outside the cone of the
