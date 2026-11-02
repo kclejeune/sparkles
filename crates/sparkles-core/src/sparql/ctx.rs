@@ -1432,26 +1432,19 @@ impl Ctx {
     }
 
     /// An operator finished with `rows` rows: count them as produced, and fail once the
-    /// total passes [`Ctx::max_rows_produced`]. One atomic add per operator.
+    /// total passes [`Ctx::max_rows_produced`]. One atomic update per operator, in both
+    /// accounting modes. The counter never wraps: a total past `u64::MAX` fails the
+    /// query and leaves the counter as it was.
     #[inline]
     pub fn produced(&self, rows: usize) -> Result<()> {
-        if self.is_cursor() {
-            let prior = self
-                .rows_produced
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    n.checked_add(rows as u64)
-                })
-                .map_err(|_| self.produced_exceeded(u64::MAX))?;
-            let total = prior + rows as u64;
-            if total > self.max_rows_produced {
-                return Err(self.produced_exceeded(total));
-            }
-            return Ok(());
-        }
-        let total = self
+        let rows = rows as u64;
+        let prior = self
             .rows_produced
-            .fetch_add(rows as u64, Ordering::Relaxed)
-            .saturating_add(rows as u64);
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                n.checked_add(rows)
+            })
+            .map_err(|_| self.produced_exceeded(u64::MAX))?;
+        let total = prior + rows;
         if total > self.max_rows_produced {
             return Err(self.produced_exceeded(total));
         }
