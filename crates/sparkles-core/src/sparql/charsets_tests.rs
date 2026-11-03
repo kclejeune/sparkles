@@ -434,18 +434,19 @@ fn correlations_of_another_version_are_refused() {
 
 /// The node pass counts each signature in one place, its set or the remainder, whichever
 /// thread meets its nodes: with fewer sets admitted than there are, every set kept holds
-/// all the nodes of its signature, as without a limit, and the remainder the others.
+/// all the nodes of its signature, as without a limit, and the remainder the others. The
+/// data spans several blocks of SPO and OPS, so the pass splits it into several ranges,
+/// and each range meets the 64 signatures in another order.
 #[test]
 fn node_sets_past_the_limit_keep_whole_signatures() {
     use crate::builder::correlations::node_sets_seen;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
-    // nodes with many distinct signatures: subject i has predicates p(j) for the bits j of
-    // i, so that signatures repeat across the id range the threads split
+    // subject i has the predicates p(j) for the bits j of i % 64, and ex:q
     let mut t = String::from("@prefix ex: <http://ex.org/> .\n");
-    for i in 0..4000u32 {
-        for j in 0..8 {
-            if (i % 97) >> j & 1 == 1 {
+    for i in 0..30_000u32 {
+        for j in 0..6 {
+            if (i % 64) >> j & 1 == 1 {
                 t.push_str(&format!("ex:s{i} ex:p{j} ex:o{} .\n", i % 13));
             }
         }
@@ -454,6 +455,7 @@ fn node_sets_past_the_limit_keep_whole_signatures() {
     let s = Store::open(&root, StoreOptions::default()).unwrap();
     s.load(&[Source::from_bytes(t.into_bytes(), RdfFormat::Turtle, None)])
         .unwrap();
+    assert!(s.snapshot().generation.stats.quads > 3 * 32_768);
     drop(s);
     // the data has no rdf:type, so no classes
     let rdf_type = None;
@@ -465,9 +467,8 @@ fn node_sets_past_the_limit_keep_whole_signatures() {
         .iter()
         .map(|c| (c.preds.clone(), (c.subjects, c.triples.clone())))
         .collect();
-    for seen in [3, 10, 40] {
+    for seen in [3, 10, 40, 60] {
         let (kept, rest) = node_sets_seen(&generation, rdf_type, 8, seen, &never).unwrap();
-        assert!(kept.len() <= seen);
         let mut nodes = rest.n;
         for c in &kept {
             assert_eq!(
@@ -479,5 +480,6 @@ fn node_sets_past_the_limit_keep_whole_signatures() {
         }
         let total: u64 = all.iter().map(|c| c.subjects).sum();
         assert_eq!(nodes, total, "seen {seen}");
+        assert!(kept.len() <= seen, "seen {seen}: {} sets kept", kept.len());
     }
 }

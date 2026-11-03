@@ -3750,13 +3750,20 @@ pub(super) fn keys_denom(
 }
 
 /// Whether one input of plan `n` that its joins do not split, a pattern or anything other
-/// than a join, binds every one of `keys`.
+/// than a join, binds every one of `keys`: one that [`input_vars`] lists.
 pub(super) fn one_input_binds(n: &Node, keys: &[VarId]) -> bool {
-    let mut found = false;
-    input_vars(n, &mut |vars| {
-        found |= keys.iter().all(|k| vars.contains(k));
-    });
-    found
+    match &n.kind {
+        Kind::Join { .. } | Kind::Filter(_) | Kind::Sort(_) => {
+            n.children.iter().any(|c| one_input_binds(c, keys))
+        }
+        Kind::IndexJoin(j) => {
+            j.probes
+                .iter()
+                .any(|p| keys.iter().all(|k| p.scan.cols.iter().any(|c| c.1 == *k)))
+                || one_input_binds(&n.children[0], keys)
+        }
+        _ => keys.iter().all(|k| n.vars.contains(k)),
+    }
 }
 
 /// Call `f` with the variables of each input of plan `n` that its joins do not split:

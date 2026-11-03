@@ -104,6 +104,8 @@ enum How {
 #[derive(Clone, Copy)]
 struct Shared {
     v: VarId,
+    /// its join variable index
+    j: u32,
     da: f64,
     db: f64,
     ca: bool,
@@ -341,9 +343,10 @@ struct Models {
     /// some input has a star mask or a side
     starred: bool,
     probed: bool,
-    /// per input, the variables, sorted, of each of its inputs that binds two or more,
-    /// when several keys back off (see [`plan::keys_denom`])
-    inputs: Vec<Vec<Vec<VarId>>>,
+    /// per input, the join variable indexes, sorted, of each of its inputs that binds two
+    /// or more, when several keys back off and two inputs could each bind several keys
+    /// (see [`plan::keys_denom`])
+    inputs: Vec<Vec<Vec<u32>>>,
 }
 
 /// What the inputs of one side of a join hold on a join variable: their star mask and
@@ -364,13 +367,13 @@ impl Held {
 }
 
 impl Models {
-    /// Whether one input of the inputs `ins` binds every one of `keys`, as
+    /// Whether one input of the inputs `ins` binds every key of `shared`, as
     /// [`plan::one_input_binds`] finds in the plan of them.
-    fn one_binds<I: Iterator<Item = usize>>(&self, mut ins: I, keys: &[VarId]) -> bool {
+    fn one_binds<I: Iterator<Item = usize>>(&self, mut ins: I, shared: &[Shared]) -> bool {
         ins.any(|i| {
             self.inputs.get(i).is_some_and(|xs| {
                 xs.iter()
-                    .any(|x| keys.iter().all(|k| x.binary_search(k).is_ok()))
+                    .any(|x| shared.iter().all(|s| x.binary_search(&s.j).is_ok()))
             })
         })
     }
@@ -561,17 +564,28 @@ impl Group {
                 }
             }
             models.sides.push(sides);
-            let mut inputs = Vec::new();
-            if ctx.opt.key_backoff {
-                plan::input_vars(&it[0], &mut |vars| {
-                    if vars.len() > 1 {
-                        let mut x = vars.to_vec();
+        }
+        // the inputs that bind several keys, needed only when two inputs could each bind
+        // several keys of one join
+        let several =
+            |iv: &Vec<u32>| iv.iter().filter(|&&l| join[l as usize] != u32::MAX).count() > 1;
+        if ctx.opt.key_backoff && item_vars.iter().filter(|iv| several(iv)).count() > 1 {
+            for it in items {
+                let mut inputs = Vec::new();
+                plan::input_vars(&it[0], &mut |vs| {
+                    let mut x: Vec<u32> = vs
+                        .iter()
+                        .filter_map(|v| idx.get(v).map(|&l| join[l as usize]))
+                        .filter(|&j| j != u32::MAX)
+                        .collect();
+                    if x.len() > 1 {
                         x.sort_unstable();
+                        x.dedup();
                         inputs.push(x);
                     }
                 });
+                models.inputs.push(inputs);
             }
-            models.inputs.push(inputs);
         }
         models.starred = models.stars.iter().any(|s| !s.is_empty());
         models.probed = models.sides.iter().any(|s| !s.is_empty());
@@ -958,6 +972,7 @@ impl Greedy {
                 let j = g.join[l as usize];
                 shared.push(Shared {
                     v: g.vars[l as usize],
+                    j,
                     da: ua.d(j),
                     db: ub.d(j),
                     ca: ua.certain.get(l),
@@ -974,11 +989,10 @@ impl Greedy {
             }
             _ => None,
         };
-        let capped = ctx.opt.key_backoff && shared.len() > 1 && {
-            let keys: Vec<VarId> = shared.iter().map(|s| s.v).collect();
-            g.models.one_binds(ua.inputs.ones(), &keys)
-                && g.models.one_binds(ub.inputs.ones(), &keys)
-        };
+        let capped = ctx.opt.key_backoff
+            && shared.len() > 1
+            && g.models.one_binds(ua.inputs.ones(), shared)
+            && g.models.one_binds(ub.inputs.ones(), shared);
         let est = pair_est(
             &ua.sum,
             &ub.sum,
@@ -1644,6 +1658,7 @@ impl Dp {
             bits &= bits - 1;
             sc.shared.push(Shared {
                 v: self.jvar[j as usize],
+                j,
                 da: 0.0,
                 db: 0.0,
                 ca: ca >> j & 1 == 1,
@@ -1672,10 +1687,10 @@ impl Dp {
                 sc.cached.push(v);
             }
         }
-        let capped = ctx.opt.key_backoff && sc.shared.len() > 1 && {
-            let keys: Vec<VarId> = sc.shared.iter().map(|s| s.v).collect();
-            self.models.one_binds(bits_of(ia), &keys) && self.models.one_binds(bits_of(ib), &keys)
-        };
+        let capped = ctx.opt.key_backoff
+            && sc.shared.len() > 1
+            && self.models.one_binds(bits_of(ia), &sc.shared)
+            && self.models.one_binds(bits_of(ib), &sc.shared);
         let Scratch {
             shared,
             pos,
