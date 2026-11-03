@@ -6,7 +6,8 @@
 // cannot make: sources kept as axiom annotations, the server's Manchester parser and
 // entity search, a stale tag after another writer's commit, and the grants.
 
-import { anonymous, expect, open, test, type Page } from './fixtures';
+import type { Page } from '@playwright/test';
+import { anonymous, expect, open, test } from './fixtures';
 import { BROWSE_TURTLE, CELLO } from '../browse-fixture';
 import { BROWSE_EDIT_AUTH, PASSWORD, READER } from './data';
 
