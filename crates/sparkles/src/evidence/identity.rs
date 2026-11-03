@@ -360,6 +360,13 @@ struct Clusters<'m> {
     key: String,
     /// The most proposals naming one entity that are read.
     candidates: usize,
+    /// Leave out a proposal, or a proposal whose current decision is a record, that the
+    /// caller's view hides any triple of, instead of refusing as an unavailable target.
+    /// A read sets it, since authentication reads only a record's receipt and
+    /// protection and would otherwise let a masked record join a cluster.
+    hide_masked: bool,
+    /// The most decisions of one proposal a read takes from the caller's view.
+    decision_limit: usize,
 }
 
 impl<'m> Clusters<'m> {
@@ -374,6 +381,8 @@ impl<'m> Clusters<'m> {
             limit: RETAINED_BYTES,
             key: String::new(),
             candidates: MAX_EVIDENCE,
+            hide_masked: false,
+            decision_limit: MAX_EVIDENCE,
         }
     }
 
@@ -407,13 +416,23 @@ impl<'m> Clusters<'m> {
     ) -> Result<Vec<NamedNode>> {
         let mut out = Vec::new();
         for g in self.m.proposals.clone() {
-            let (candidates, more) = state.reads.subjects_up_to(
-                &ev("entity"),
-                &Term::NamedNode(e.clone()),
-                g.0.as_str(),
-                self.candidates,
-            )?;
+            let o = Term::NamedNode(e.clone());
+            // A read takes its candidates from the caller's view, so its bound counts only
+            // triples the caller can read.
+            let (candidates, more) = match state.seen.as_mut().filter(|_| self.hide_masked) {
+                Some(seen) => {
+                    seen.subjects_up_to(&ev("entity"), &o, g.0.as_str(), self.candidates)?
+                }
+                None => {
+                    state
+                        .reads
+                        .subjects_up_to(&ev("entity"), &o, g.0.as_str(), self.candidates)?
+                }
+            };
             for p in candidates {
+                if self.hide_masked && state.masked(&p, &g.0)? {
+                    continue;
+                }
                 let known = self.facts.contains_key(&p);
                 if !known && !state.typed(&p, &g, RecordKind::IdentityProposal)? {
                     continue;
@@ -438,6 +457,9 @@ impl<'m> Clusters<'m> {
                 self.charge(when)?;
                 out.push(p);
             }
+            if more && self.hide_masked {
+                return Err(incomplete("the proposals of an entity"));
+            }
             if more {
                 // When the caller's view shows no more candidates than the bound, the
                 // excess is hidden from it, and a hidden one may be effective. The
@@ -460,6 +482,48 @@ impl<'m> Clusters<'m> {
         Ok(out)
     }
 
+    /// The current decisions of `p` under the policy that the caller's view shows in
+    /// full, for a read. Candidates come from the caller's view, so the bound counts
+    /// only decision triples the caller can read, and a decision the view hides any
+    /// triple of is left out. Authentication and supersession are read at the unmasked
+    /// head, so a hidden later decision still ends an earlier visible one.
+    fn visible_current(&mut self, state: &mut State<'_>, p: &NamedNode) -> Result<Vec<NamedNode>> {
+        let decisions = self.m.decisions.clone();
+        let o = Term::NamedNode(p.clone());
+        let (candidates, more) = match state.seen.as_mut() {
+            Some(seen) => {
+                seen.subjects_up_to(&ev("target"), &o, decisions.0.as_str(), self.decision_limit)?
+            }
+            None => state.reads.subjects_up_to(
+                &ev("target"),
+                &o,
+                decisions.0.as_str(),
+                self.decision_limit,
+            )?,
+        };
+        if more {
+            return Err(incomplete("decisions"));
+        }
+        let mut out = Vec::new();
+        for d in candidates {
+            if state.masked(&d, &decisions.0)? {
+                continue;
+            }
+            if state.typed(&d, &decisions, RecordKind::ReviewDecision)?
+                && state.reads.contains(
+                    d.as_str(),
+                    &ev("reviewPolicy"),
+                    &Term::NamedNode(self.m.policy_iri.clone()),
+                    decisions.0.as_str(),
+                )?
+                && !state.is_superseded(&d, &decisions)?
+            {
+                out.push(d);
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether `p`'s current decision under the policy accepts it, in `when`.
     fn is_effective(&mut self, state: &mut State<'_>, p: &NamedNode, when: When) -> Result<bool> {
         let k = (p.clone(), when == When::After);
@@ -473,7 +537,11 @@ impl<'m> Clusters<'m> {
                 // state before; after it, a proposal this operation does not decide has
                 // the same current decision
                 let superseded = std::mem::take(&mut state.superseded);
-                let current = state.current(p, &self.m.policy_iri, &self.m.decisions);
+                let current = if self.hide_masked {
+                    self.visible_current(state, p)
+                } else {
+                    state.current(p, &self.m.policy_iri, &self.m.decisions)
+                };
                 state.superseded = superseded;
                 let current = current?;
                 match current.as_slice() {
@@ -1055,6 +1123,28 @@ pub fn resolve(
     access: Option<Arc<GraphAccess>>,
     control: &Control,
 ) -> Result<EntityResolution> {
+    resolve_bounded(
+        main,
+        logical,
+        policy,
+        entities,
+        access,
+        control,
+        MAX_EVIDENCE,
+    )
+}
+
+/// [`resolve`] with at most `decision_limit` decisions of one proposal read from the
+/// caller's view, [`MAX_EVIDENCE`] outside tests.
+fn resolve_bounded(
+    main: &Dataset,
+    logical: &Dataset,
+    policy: &str,
+    entities: &[NamedNode],
+    access: Option<Arc<GraphAccess>>,
+    control: &Control,
+    decision_limit: usize,
+) -> Result<EntityResolution> {
     control.check()?;
     check_store(main, logical)?;
     if entities.is_empty() || entities.len() > MAX_RESOLVE {
@@ -1090,52 +1180,45 @@ pub fn resolve(
     let head = logical.store().snapshot();
     let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
     let view = caller_view(access.as_ref(), &head, &preparation)?;
-    let snap = view.as_ref().map_or(&*head, |v| v.snapshot());
-    // The map's consistency is checked at the unmasked head, so that a mask cannot hide
-    // the metadata that would refuse it, and a revision the caller's view masks is
-    // refused rather than read.
-    let latest = {
-        let mut full = State {
-            reads: Reads::new(&preparation, &head),
-            seen: view
-                .as_ref()
-                .map(|v| Reads::new(&preparation, v.snapshot())),
-            claim_graphs: Vec::new(),
-            superseded: BTreeSet::new(),
-            withdrawn: BTreeSet::new(),
-        };
-        let latest = latest(&mut full, main.dataset_id(), &m, control)?;
-        if let Some(l) = &latest
-            && full.masked(&l.iri, &m.maps.0)?
-        {
-            return Err(projection_unavailable(&m.name));
-        }
-        latest
-    };
+    // Records are read at the unmasked head with the caller's view beside it. The map's
+    // consistency is checked there, so that a mask cannot hide the metadata that would
+    // refuse it, and a revision the caller's view masks is refused rather than read. A
+    // proposal or decision the view hides any triple of takes no part in a cluster, and
+    // the output graph is read in the caller's view.
     let mut state = State {
-        reads: Reads::new(&preparation, snap),
-        seen: None,
+        reads: Reads::new(&preparation, &head),
+        seen: view
+            .as_ref()
+            .map(|v| Reads::new(&preparation, v.snapshot())),
         claim_graphs: Vec::new(),
         superseded: BTreeSet::new(),
         withdrawn: BTreeSet::new(),
     };
+    let latest = latest(&mut state, main.dataset_id(), &m, control)?;
+    if let Some(l) = &latest
+        && state.masked(&l.iri, &m.maps.0)?
+    {
+        return Err(projection_unavailable(&m.name));
+    }
     let mut clusters = Clusters::new(&m, BTreeMap::new());
+    clusters.hide_masked = true;
+    clusters.decision_limit = decision_limit;
     // The decisions of each component the caller's view traverses, kept for each of its
     // entities, so that a request answers each entity as a request of it alone does.
     let mut joined: BTreeMap<NamedNode, Arc<Vec<NamedNode>>> = BTreeMap::new();
     let mut out = Vec::with_capacity(entities.len());
     for e in entities {
         control.check()?;
-        let representative =
-            match state
-                .reads
-                .single(e.as_str(), RESOLVES_TO, m.output.0.as_str())?
-            {
-                Some(Term::NamedNode(r)) => r,
-                _ => e.clone(),
-            };
+        let seen = match state.seen.as_mut() {
+            Some(seen) => seen,
+            None => &mut state.reads,
+        };
+        let representative = match seen.single(e.as_str(), RESOLVES_TO, m.output.0.as_str())? {
+            Some(Term::NamedNode(r)) => r,
+            _ => e.clone(),
+        };
         let (members, complete) = if representative == *e
-            && !state.reads.contains(
+            && !seen.contains(
                 e.as_str(),
                 RESOLVES_TO,
                 &Term::NamedNode(e.clone()),
@@ -1143,7 +1226,7 @@ pub fn resolve(
             )? {
             (vec![e.clone()], true)
         } else {
-            let (mut v, more) = state.reads.subjects_up_to(
+            let (mut v, more) = seen.subjects_up_to(
                 RESOLVES_TO,
                 &Term::NamedNode(representative.clone()),
                 m.output.0.as_str(),
@@ -1160,7 +1243,7 @@ pub fn resolve(
                 let c = clusters.cluster(&mut state, e, When::Before, &mut |_, _, _| Ok(()))?;
                 let mut found = BTreeSet::new();
                 for p in &c.matches {
-                    let current = state.current(p, &m.policy_iri, &m.decisions)?;
+                    let current = clusters.visible_current(&mut state, p)?;
                     found.extend(current);
                 }
                 decisions = found.into_iter().collect();
@@ -1290,6 +1373,104 @@ mod tests {
                 limits: Limits::default(),
             },
         )))
+    }
+
+    /// A caller whose view hides `predicate` in `graph`.
+    fn hiding(predicate: &str, graph: &str) -> Option<Arc<GraphAccess>> {
+        Some(Arc::new(GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::All,
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "hidden".into(),
+                        predicates: Some(vec![predicate.to_string()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: Some(Graphs::Only(GraphRule::new([graph], &[]))),
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        )))
+    }
+
+    /// A decision about `target` under the matching policy.
+    fn decide(
+        ds: &Dataset,
+        target: &(NamedNode, sparkles_core::evidence::Sha256Digest),
+        disposition: Disposition,
+        supersedes: Option<&NamedNode>,
+    ) -> NamedNode {
+        let (settings, bytes) = settings_of(ds).unwrap();
+        let mut options = Options::new(n("urn:principal:reviewer"));
+        options.if_head = Some(ds.store().head_commit().seq);
+        review(
+            None,
+            ds,
+            ds,
+            Request {
+                name: "people",
+                policy: settings.matching_policies.get("people").unwrap(),
+                settings: &settings,
+                settings_bytes: &bytes,
+                version: 1,
+                if_head: ds.store().head_commit().seq,
+                candidates: MAX_EVIDENCE,
+            },
+            &[DecisionInput {
+                key: "x".into(),
+                target: target.0.clone(),
+                target_digest: target.1,
+                disposition,
+                supersedes: supersedes.cloned(),
+            }],
+            &options,
+            &mut |_, _| Some(Arc::new(GraphAccess::all())),
+            &Control::none(),
+        )
+        .unwrap()
+        .decisions[0]
+            .iri
+            .clone()
+    }
+
+    /// More decisions of a proposal than the read takes, all with their targets hidden
+    /// from the caller, are not counted: the read answers without them instead of
+    /// refusing with a bound that counts hidden triples. The same store read in full
+    /// reaches the bound. A lookup that enumerated decisions at the unmasked head would
+    /// refuse in both cases.
+    #[test]
+    fn hidden_decisions_beyond_the_bound_are_not_counted() {
+        let ds = configured();
+        let ab = propose(&ds, IDENTITY, "ab", &["urn:a", "urn:b"]);
+        let first = decide(&ds, &ab, Disposition::Accepted, None);
+        let second = decide(&ds, &ab, Disposition::Rejected, Some(&first));
+        decide(&ds, &ab, Disposition::Accepted, Some(&second));
+        let read = |access: Option<Arc<GraphAccess>>| {
+            resolve_bounded(
+                &ds,
+                &ds,
+                "people",
+                &[n("urn:b")],
+                access,
+                &Control::none(),
+                2,
+            )
+        };
+        let hidden = read(hiding(&ev("target"), "urn:ev:decisions")).unwrap();
+        assert!(hidden.entities[0].decisions.is_empty(), "{hidden:?}");
+        assert_eq!(hidden.entities[0].members.len(), 2);
+        assert_eq!(
+            read(Some(Arc::new(GraphAccess::all()))).unwrap_err().code(),
+            "incomplete-evidence"
+        );
     }
 
     /// The answer of an acceptance of `target` under a bound of `candidates`.

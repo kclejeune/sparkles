@@ -213,10 +213,11 @@ lists of names that open each entity's frame beside them, and the commit the pag
 runs the query again when it changes.
 
 Inside OWL 2 EL the EL classifier of [F24](../F24-owl-classification/SPEC.md#outcome)
-answers. The query adds `EquivalentClasses(urn:x-sparkles:dl-query C)` to the dataset's
-kept classifier, saturates without building a taxonomy, reads the answers from the
-saturated contexts and removes the axiom, so the ontology's classification is reused and
-left as it was. Outside EL the OWL 2 RL rules answer by demand reasoning over a copy in
+answers. The dataset's kept saturation reads `EquivalentClasses(urn:x-sparkles:dl-query C)`
+beside the ontology's axioms, which it reads in place, saturates again only what the
+axiom and any change since its last run reach, and gives the answers from the saturated
+contexts without building a taxonomy. The next run over the kept state lets the axiom go,
+so the ontology's classification is reused and its taxonomy left as it was. Outside EL the OWL 2 RL rules answer by demand reasoning over a copy in
 memory of the terminology, the defining axioms and the assertions. Automatic reasoning
 chooses EL when the expression and every logical axiom are inside it. Every answer
 carries its reasoning label, which names the engine and why it was chosen, says whether

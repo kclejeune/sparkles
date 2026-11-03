@@ -11,9 +11,14 @@
 //! classifier answers is entailed. It derives every entailed subsumption between named
 //! classes when no axiom is reported as partial or left out.
 //!
-//! [`Classifier`] holds the axioms and the saturated contexts between runs. A run after
-//! a change saturates again only the contexts that the changed axioms can reach, and a
-//! change to the role hierarchy, chains, reflexivity or ranges saturates everything.
+//! [`Saturation`] keeps the saturated contexts between runs over axioms that the caller
+//! keeps, such as those of an open ontology, and reads them in place on each run.
+//! [`Classifier`] holds its own copy of the axioms on top of one. A run after a change
+//! saturates again only the contexts that the changed axioms can reach, and a change to
+//! the role hierarchy, chains, reflexivity or ranges saturates everything.
+//!
+//! The profile check, the taxonomy and the saturation run on the threads of
+//! [`Limits`], and the answer is the same for every number of threads.
 //!
 //! ```
 //! use sparkles_owl::{classify::Classifier, model::*};
@@ -107,8 +112,13 @@ pub struct Stats {
     pub contexts: usize,
     /// the conclusions the rules applied, duplicates included
     pub conclusions: usize,
-    /// the estimated bytes of the index and the contexts
+    /// the estimated bytes the run keeps: the index, the contexts, the taxonomy and a
+    /// classifier's copy of the axioms
     pub memory: usize,
+    /// the most estimated bytes the run held at once, which a memory budget bounds:
+    /// [`memory`](Stats::memory) and, while the saturation ran, the messages waiting in
+    /// the contexts' to-do lists
+    pub peak_memory: usize,
     pub threads: usize,
     pub index: Duration,
     pub saturation: Duration,
@@ -116,9 +126,9 @@ pub struct Stats {
 }
 
 /// The result of a run that saturates without building a taxonomy
-/// ([`Classifier::saturate`]).
+/// ([`Saturation::saturate`]).
 #[derive(Clone, Debug)]
-pub struct Saturation {
+pub struct Saturated {
     /// false when the ontology has no model
     pub consistent: bool,
     pub stats: Stats,
@@ -140,40 +150,61 @@ pub struct Excluded {
     pub gap: Gap,
 }
 
-/// One axiom the classifier holds: how many times it was added and what of it the
-/// calculus uses.
+/// One axiom the classifier holds: how many times it is added now and was at the start
+/// of the last run.
 struct Held {
     count: u32,
-    /// the profile violation that leaves it out, if any
-    outside: Option<(String, String)>,
+    /// the count when the last run started, 0 for an axiom added since
+    ran: u32,
 }
 
-/// An incremental OWL 2 EL classifier. See the [module documentation](self).
+/// An incremental OWL 2 EL classifier that keeps its own copy of the axioms. See the
+/// [module documentation](self), and [`Saturation`] for a classifier over axioms that
+/// the caller keeps.
 pub struct Classifier {
+    /// the axioms held now or at the last run, an axiom held at neither being dropped
+    /// after the next run
     axioms: FxHashMap<AxiomKind, Held>,
+    /// the axioms held now
+    live: usize,
     /// the estimated bytes of the held axioms
     held_bytes: usize,
-    /// the classes of the axioms' signature, with the number of axioms naming each
-    classes: FxHashMap<Class, u32>,
-    /// changes since the last run, as signed counts
-    pending: FxHashMap<AxiomKind, i64>,
-    interner: Interner,
-    index: Option<Index>,
-    ctx: Contexts,
-    /// the partial axioms of the last normalization
-    partial: BTreeMap<AxiomKind, &'static str>,
-    /// chains left out by the range restriction of OWL 2 EL
-    chain_ranges: BTreeMap<AxiomKind, String>,
-    /// set when a run stopped part way, so that the next run starts again
-    dirty: bool,
-    /// whether the last run that ended found the ontology consistent
-    last_consistent: bool,
+    sat: Saturation,
 }
 
 impl Default for Classifier {
     fn default() -> Classifier {
         Classifier::new()
     }
+}
+
+/// The saturated contexts of a classification, kept between runs, over axioms that the
+/// caller keeps, such as those of an open ontology, and gives to each run. A caller that
+/// knows which axioms changed since the last run gives them too, and the run saturates
+/// again only what they can reach.
+pub struct Saturation {
+    interner: Interner,
+    index: Option<Index>,
+    ctx: Contexts,
+    /// what the last run left out or used only in part, sorted
+    excluded: Vec<Excluded>,
+    /// set when a run stopped part way, so that the next run starts again
+    dirty: bool,
+    /// whether the last run whose saturation ended found the ontology consistent
+    consistent: bool,
+}
+
+impl Default for Saturation {
+    fn default() -> Saturation {
+        Saturation::new()
+    }
+}
+
+/// The axioms added to an ontology and removed from it since a saturation's last run.
+#[derive(Clone, Copy, Default)]
+pub struct Changes<'a> {
+    pub added: &'a [&'a AxiomKind],
+    pub removed: &'a [&'a AxiomKind],
 }
 
 /// Whether a change to the axiom needs a run that starts again: one that changes the
@@ -205,7 +236,7 @@ fn role_axiom(ax: &AxiomKind) -> bool {
 }
 
 /// Whether the axiom has logical content for classification.
-fn logical(ax: &AxiomKind) -> bool {
+pub fn logical(ax: &AxiomKind) -> bool {
     !matches!(
         ax,
         AxiomKind::AnnotationAssertion(..)
@@ -215,42 +246,81 @@ fn logical(ax: &AxiomKind) -> bool {
     )
 }
 
-/// The classes of an axiom's signature, and the bytes the classifier's copy of the
-/// axiom takes, roughly: the axiom, its entry and each entity's IRI with the expression
-/// that holds it.
-fn signature_of(ax: &AxiomKind) -> (Vec<Class>, usize) {
+/// The bytes the classifier's copy of an axiom takes, roughly: the axiom, its entry and
+/// each entity's IRI with the expression that holds it.
+fn held_bytes_of(ax: &AxiomKind) -> usize {
     let mut sig = crate::model::Signature::default();
     sig.axiom(ax);
     let mut bytes = std::mem::size_of::<AxiomKind>() + std::mem::size_of::<Held>() + 16;
-    let mut classes = Vec::new();
-    for e in sig.0 {
+    for e in &sig.0 {
         bytes += e.iri().as_str().len() + 64;
-        if let Entity::Class(c) = e
-            && !matches!(
-                c.as_str(),
-                crate::vocab::OWL_THING | crate::vocab::OWL_NOTHING
-            )
-        {
-            classes.push(c);
-        }
     }
-    (classes, bytes)
+    bytes
+}
+
+/// The threads a run takes.
+fn threads_of(limits: &Limits) -> usize {
+    if limits.threads == 0 {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    } else {
+        limits.threads
+    }
+}
+
+/// The items below which a parallel step runs on one thread.
+const MIN_CHUNK: usize = 1024;
+
+/// Runs `f` on chunks of `items`, on up to `threads` scoped threads.
+pub(crate) fn par_chunks<T: Send>(items: &mut [T], threads: usize, f: impl Fn(&mut [T]) + Sync) {
+    let threads = threads.clamp(1, items.len().div_ceil(MIN_CHUNK).max(1));
+    if threads == 1 {
+        f(items);
+        return;
+    }
+    let size = items.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        for chunk in items.chunks_mut(size) {
+            let f = &f;
+            s.spawn(move || f(chunk));
+        }
+    });
+}
+
+/// The answers of `f` on chunks of `items`, in order, computed on up to `threads` scoped
+/// threads. `f` takes the offset of its chunk.
+pub(crate) fn par_map<T: Sync, R: Send>(
+    items: &[T],
+    threads: usize,
+    f: impl Fn(usize, &[T]) -> R + Sync,
+) -> Vec<R> {
+    let threads = threads.clamp(1, items.len().div_ceil(MIN_CHUNK).max(1));
+    if threads == 1 {
+        return vec![f(0, items)];
+    }
+    let size = items.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = items
+            .chunks(size)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let f = &f;
+                s.spawn(move || f(i * size, chunk))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    })
 }
 
 impl Classifier {
     pub fn new() -> Classifier {
         Classifier {
             axioms: FxHashMap::default(),
+            live: 0,
             held_bytes: 0,
-            classes: FxHashMap::default(),
-            pending: FxHashMap::default(),
-            interner: Interner::new(),
-            index: None,
-            ctx: Vec::new(),
-            partial: BTreeMap::new(),
-            chain_ranges: BTreeMap::new(),
-            dirty: true,
-            last_consistent: true,
+            sat: Saturation::new(),
         }
     }
 
@@ -264,9 +334,32 @@ impl Classifier {
     /// Adds axioms. Annotations are ignored, and an axiom added twice must be removed
     /// twice.
     pub fn add<'a>(&mut self, axioms: impl IntoIterator<Item = &'a Axiom>) {
+        self.add_kinds(axioms.into_iter().map(|a| &a.kind));
+    }
+
+    fn add_kinds<'a>(&mut self, axioms: impl IntoIterator<Item = &'a AxiomKind>) {
+        let axioms = axioms.into_iter();
+        // growing the table would hash every axiom it holds again
+        self.axioms.reserve(axioms.size_hint().0);
         for ax in axioms {
-            if logical(&ax.kind) {
-                *self.pending.entry(ax.kind.clone()).or_default() += 1;
+            self.add_kind(ax);
+        }
+    }
+
+    fn add_kind(&mut self, ax: &AxiomKind) {
+        if !logical(ax) {
+            return;
+        }
+        match self.axioms.get_mut(ax) {
+            Some(h) => {
+                if h.count == 0 {
+                    self.live += 1;
+                }
+                h.count += 1;
+            }
+            None => {
+                self.live += 1;
+                self.axioms.insert(ax.clone(), Held { count: 1, ran: 0 });
             }
         }
     }
@@ -275,29 +368,24 @@ impl Classifier {
     /// changes not yet classified, does nothing.
     pub fn remove<'a>(&mut self, axioms: impl IntoIterator<Item = &'a Axiom>) {
         for ax in axioms {
-            if !logical(&ax.kind) {
-                continue;
-            }
-            let have = self.axioms.get(&ax.kind).map_or(0, |h| h.count as i64);
-            let d = self.pending.get(&ax.kind).copied().unwrap_or(0);
-            if have + d > 0 {
-                *self.pending.entry(ax.kind.clone()).or_default() -= 1;
+            self.remove_kind(&ax.kind);
+        }
+    }
+
+    fn remove_kind(&mut self, ax: &AxiomKind) {
+        if let Some(h) = self.axioms.get_mut(ax)
+            && h.count > 0
+        {
+            h.count -= 1;
+            if h.count == 0 {
+                self.live -= 1;
             }
         }
     }
 
     /// The number of distinct axioms held, changes not yet classified included.
     pub fn len(&self) -> usize {
-        let mut n = self.axioms.len() as i64;
-        for (ax, d) in &self.pending {
-            let have = self.axioms.get(ax).map_or(0, |h| h.count as i64);
-            match (have > 0, have + d > 0) {
-                (false, true) => n += 1,
-                (true, false) => n -= 1,
-                _ => {}
-            }
-        }
-        n as usize
+        self.live
     }
 
     pub fn is_empty(&self) -> bool {
@@ -306,108 +394,183 @@ impl Classifier {
 
     /// The axioms of the last run that it left out or used only in part, in order.
     pub fn excluded(&self) -> Vec<Excluded> {
-        let mut out: Vec<Excluded> = Vec::new();
+        self.sat.excluded().to_vec()
+    }
+
+    /// Classifies the axioms held, saturating again only what changed since the last
+    /// run.
+    pub fn classify(&mut self, limits: &Limits) -> Result<Classification, Error> {
+        self.run_held(limits, true)
+            .map(|(consistent, taxonomy, stats)| Classification {
+                consistent,
+                taxonomy: taxonomy.expect("a taxonomy was asked for"),
+                stats,
+            })
+    }
+
+    /// Saturates the axioms held as [`classify`](Self::classify) does, again only what
+    /// changed since the last run, but builds no taxonomy. [`describe`](Self::describe)
+    /// then answers for one class from the saturated contexts.
+    pub fn saturate(&mut self, limits: &Limits) -> Result<Saturated, Error> {
+        self.run_held(limits, false)
+            .map(|(consistent, _, stats)| Saturated { consistent, stats })
+    }
+
+    /// What the last run says about the class `c` ([`Saturation::describe`]), or `None`
+    /// also when axioms were added or removed since.
+    pub fn describe(&self, c: &Class) -> Option<Description> {
+        if self.axioms.values().any(|h| h.ran != h.count) {
+            return None;
+        }
+        self.sat.describe(c)
+    }
+
+    fn run_held(
+        &mut self,
+        limits: &Limits,
+        with_taxonomy: bool,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        let threads = threads_of(limits);
+        let mut added: Vec<&AxiomKind> = Vec::new();
+        let mut removed: Vec<&AxiomKind> = Vec::new();
+        let mut held: Vec<&AxiomKind> = Vec::with_capacity(self.live);
         for (ax, h) in &self.axioms {
-            if let Some((rule, message)) = &h.outside {
-                out.push(Excluded {
-                    axiom: ax.clone(),
-                    gap: Gap::Outside {
-                        rule: rule.clone(),
-                        message: message.clone(),
-                    },
-                });
+            match (h.ran > 0, h.count > 0) {
+                (false, true) => added.push(ax),
+                (true, false) => removed.push(ax),
+                _ => {}
+            }
+            if h.count > 0 {
+                held.push(ax);
             }
         }
-        for (ax, message) in &self.chain_ranges {
-            out.push(Excluded {
-                axiom: ax.clone(),
-                gap: Gap::Outside {
-                    rule: "OWL 2 Profiles §2.2.6".to_string(),
-                    message: message.clone(),
-                },
-            });
+        // the sizes of the axioms that came and went, which depend on each alone
+        let size = |xs: &[&AxiomKind]| -> usize {
+            par_map(xs, threads, |_, c| {
+                c.iter().map(|a| held_bytes_of(a)).sum::<usize>()
+            })
+            .into_iter()
+            .sum()
+        };
+        let held_bytes = (self.held_bytes + size(&added)).saturating_sub(size(&removed));
+        let changes = Changes {
+            added: &added,
+            removed: &removed,
+        };
+        let r = self
+            .sat
+            .run_with(&held, Some(changes), held_bytes, limits, with_taxonomy);
+        drop((added, removed, held));
+        // the changes are applied whether the run ends or not
+        self.held_bytes = held_bytes;
+        if self.axioms.len() > self.live {
+            self.axioms.retain(|_, h| h.count > 0);
         }
-        for (ax, why) in &self.partial {
-            out.push(Excluded {
-                axiom: ax.clone(),
-                gap: Gap::Partial(why),
-            });
+        for h in self.axioms.values_mut() {
+            h.ran = h.count;
         }
-        out.sort();
-        out
+        r
+    }
+}
+
+impl Saturation {
+    pub fn new() -> Saturation {
+        Saturation {
+            interner: Interner::new(),
+            index: None,
+            ctx: Vec::new(),
+            excluded: Vec::new(),
+            dirty: true,
+            consistent: true,
+        }
     }
 
-    /// Applies the pending changes to the held axioms. The answer is the numbers of
-    /// axioms that came to be held and that stopped being held, and with `keep` the
-    /// axioms themselves, which only an incremental run needs.
-    fn apply_pending(&mut self, keep: bool) -> (usize, usize, Vec<AxiomKind>, Vec<AxiomKind>) {
-        let (mut n_added, mut n_removed) = (0, 0);
-        let mut added = Vec::new();
-        let mut removed = Vec::new();
-        for (ax, d) in std::mem::take(&mut self.pending) {
-            if d == 0 {
-                continue;
-            }
-            let have = self.axioms.get(&ax).map_or(0, |h| h.count as i64);
-            let now = (have + d).max(0);
-            if have == 0 && now > 0 {
-                let broken = profiles::el_axiom(&ax);
-                let outside = broken
-                    .into_iter()
-                    .next()
-                    .map(|b| (b.rule.to_string(), b.message));
-                let (classes, bytes) = signature_of(&ax);
-                for c in classes {
-                    *self.classes.entry(c).or_default() += 1;
-                }
-                self.held_bytes += bytes;
-                self.axioms.insert(
-                    ax.clone(),
-                    Held {
-                        count: now as u32,
-                        outside,
-                    },
-                );
-                n_added += 1;
-                if keep {
-                    added.push(ax);
-                }
-            } else if have > 0 && now == 0 {
-                self.axioms.remove(&ax);
-                let (classes, bytes) = signature_of(&ax);
-                self.held_bytes = self.held_bytes.saturating_sub(bytes);
-                for c in classes {
-                    if let Some(n) = self.classes.get_mut(&c) {
-                        *n -= 1;
-                        if *n == 0 {
-                            self.classes.remove(&c);
-                        }
-                    }
-                }
-                n_removed += 1;
-                if keep {
-                    removed.push(ax);
-                }
-            } else if let Some(h) = self.axioms.get_mut(&ax) {
-                h.count = now as u32;
-            }
-        }
-        (n_added, n_removed, added, removed)
+    /// The axioms of the last run that it left out or used only in part, in order.
+    pub fn excluded(&self) -> &[Excluded] {
+        &self.excluded
     }
 
-    /// Normalizes the held axioms inside OWL 2 EL and builds the index.
-    fn build(&mut self, limits: &Limits) -> Result<(Axioms, Index), Error> {
+    /// Classifies `axioms`, the logical axioms of an ontology, of which annotations are
+    /// passed over and repeats count once. `changes` are the axioms added and removed
+    /// since the last run, which then saturates again only what they can reach; without
+    /// them, and after a run that stopped before its saturation ended, the run starts
+    /// again.
+    pub fn classify(
+        &mut self,
+        axioms: &[&AxiomKind],
+        changes: Option<Changes<'_>>,
+        limits: &Limits,
+    ) -> Result<Classification, Error> {
+        self.run_with(axioms, changes, 0, limits, true)
+            .map(|(consistent, taxonomy, stats)| Classification {
+                consistent,
+                taxonomy: taxonomy.expect("a taxonomy was asked for"),
+                stats,
+            })
+    }
+
+    /// Saturates `axioms` as [`classify`](Saturation::classify) does, but builds no
+    /// taxonomy. [`describe`](Saturation::describe) then answers for one class from the
+    /// saturated contexts, which costs far less than a taxonomy of every class when
+    /// only a few classes are asked about.
+    pub fn saturate(
+        &mut self,
+        axioms: &[&AxiomKind],
+        changes: Option<Changes<'_>>,
+        limits: &Limits,
+    ) -> Result<Saturated, Error> {
+        self.run_with(axioms, changes, 0, limits, false)
+            .map(|(consistent, _, stats)| Saturated { consistent, stats })
+    }
+
+    /// [`classify`](Saturation::classify), with the bytes of the caller's copy of the
+    /// axioms, which the run counts as its own.
+    fn run_with(
+        &mut self,
+        axioms: &[&AxiomKind],
+        changes: Option<Changes<'_>>,
+        held_bytes: usize,
+        limits: &Limits,
+        with_taxonomy: bool,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        let r = self.run(axioms, changes, held_bytes, limits, with_taxonomy);
+        if r.is_err() && self.dirty {
+            // the next run starts again, so the state of this one is of no use
+            self.index = None;
+            self.interner = Interner::new();
+            self.ctx = Vec::new();
+        }
+        r
+    }
+
+    /// Normalizes the axioms inside OWL 2 EL and builds the index. `outside` names the
+    /// axioms the profile check leaves out.
+    fn build(
+        &mut self,
+        axioms: &[&AxiomKind],
+        outside: &[(usize, (String, String))],
+        limits: &Limits,
+    ) -> Result<(Axioms, Index), Error> {
         let mut ax = Axioms::default();
-        let mut partial = BTreeMap::new();
+        let mut partial: BTreeMap<&AxiomKind, &'static str> = BTreeMap::new();
         let mut chains: Vec<&AxiomKind> = Vec::new();
-        let kinds = self
-            .axioms
-            .iter()
-            .filter(|(_, h)| h.outside.is_none())
-            .map(|(k, _)| k);
-        for (i, k) in kinds.enumerate() {
+        let mut chain_ranges: Vec<(&AxiomKind, String)> = Vec::new();
+        let mut is_outside = vec![false; axioms.len()];
+        for &(i, _) in outside {
+            is_outside[i] = true;
+        }
+        // the classes the normalization meets are those of the signature
+        self.interner.clear_met();
+        for (i, &k) in axioms.iter().enumerate() {
             if i % POLL_AXIOMS == 0 {
                 poll(limits)?;
+            }
+            if !logical(k) {
+                continue;
+            }
+            if is_outside[i] {
+                index::intern_signature(k, &mut self.interner);
+                continue;
             }
             if matches!(
                 k,
@@ -417,14 +580,13 @@ impl Classifier {
                 continue;
             }
             if let Some(why) = index::normalize(k, &mut self.interner, &mut ax) {
-                partial.insert(k.clone(), why);
+                partial.insert(k, why);
             }
         }
         // the range restriction of OWL 2 EL (Profiles §2.2.6): a chain's superproperty
         // has no range that its last property lacks
-        self.chain_ranges.clear();
         if !chains.is_empty() {
-            let ranges = range_table(&self.axioms);
+            let ranges = range_table(axioms, &is_outside);
             for k in chains {
                 if let AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(ps), sup) =
                     k
@@ -435,26 +597,24 @@ impl Classifier {
                     if let Some(missing) =
                         want.and_then(|w| w.iter().find(|c| have.is_none_or(|h| !h.contains(*c))))
                     {
-                        self.chain_ranges.insert(
-                            k.clone(),
+                        index::intern_signature(k, &mut self.interner);
+                        chain_ranges.push((
+                            k,
                             format!(
                                 "the range {missing} of <{}> is not a range of the chain's last property <{}> in OWL 2 EL",
                                 sup.as_str(),
                                 last.named().as_str()
                             ),
-                        );
+                        ));
                         continue;
                     }
                 }
                 if let Some(why) = index::normalize(k, &mut self.interner, &mut ax) {
-                    partial.insert(k.clone(), why);
+                    partial.insert(k, why);
                 }
             }
         }
-        for c in self.classes.keys() {
-            let e = self.interner.class(c);
-            ax.classes.push(e);
-        }
+        ax.classes.extend(self.interner.met_classes());
         let stop = || poll(limits).is_err();
         let ix =
             Index::build(&ax, &mut self.interner, limits.max_memory, &stop).map_err(
@@ -468,89 +628,107 @@ impl Classifier {
             )?;
         // an individual that fills a property with a range has a context for each range,
         // which nominal reasoning would merge
-        for (k, h) in &self.axioms {
-            if let (
-                None,
-                AxiomKind::ObjectPropertyAssertion(ObjectPropertyExpression::Property(p), ..),
-            ) = (&h.outside, k)
+        for (i, &k) in axioms.iter().enumerate() {
+            if let AxiomKind::ObjectPropertyAssertion(ObjectPropertyExpression::Property(p), ..) = k
+                && !is_outside[i]
                 && let Some(r) = self.interner.role_id(&index::RoleName::Object(p.clone()))
                 && ix.roles.range.get(r as usize).is_some_and(|c| c.is_some())
             {
                 partial
-                    .entry(k.clone())
+                    .entry(k)
                     .or_insert("individuals that fill a property with a range");
             }
         }
-        self.partial = partial;
-        Ok((ax, ix))
-    }
-
-    /// Classifies the axioms held, saturating again only what changed since the last
-    /// run.
-    pub fn classify(&mut self, limits: &Limits) -> Result<Classification, Error> {
-        let r = self.run(limits, true);
-        self.after(r)
-            .map(|(consistent, taxonomy, stats)| Classification {
-                consistent,
-                taxonomy: taxonomy.expect("a taxonomy was asked for"),
-                stats,
-            })
-    }
-
-    /// Saturates the axioms held as [`classify`](Self::classify) does, again only what
-    /// changed since the last run, but builds no taxonomy. [`describe`](Self::describe)
-    /// then answers for one class from the saturated contexts, which costs far less than
-    /// a taxonomy of every class when only a few classes are asked about.
-    pub fn saturate(&mut self, limits: &Limits) -> Result<Saturation, Error> {
-        let r = self.run(limits, false);
-        self.after(r)
-            .map(|(consistent, _, stats)| Saturation { consistent, stats })
-    }
-
-    fn after<T>(&mut self, r: Result<T, Error>) -> Result<T, Error> {
-        if r.is_err() && self.dirty {
-            // the next run starts again, so the state of this one is of no use
-            self.index = None;
-            self.interner = Interner::new();
-            self.ctx = Vec::new();
+        let mut excluded: Vec<Excluded> = Vec::new();
+        for (i, (rule, message)) in outside {
+            excluded.push(Excluded {
+                axiom: axioms[*i].clone(),
+                gap: Gap::Outside {
+                    rule: rule.clone(),
+                    message: message.clone(),
+                },
+            });
         }
-        r
+        for (k, message) in chain_ranges {
+            excluded.push(Excluded {
+                axiom: k.clone(),
+                gap: Gap::Outside {
+                    rule: "OWL 2 Profiles §2.2.6".to_string(),
+                    message,
+                },
+            });
+        }
+        for (k, why) in partial {
+            excluded.push(Excluded {
+                axiom: k.clone(),
+                gap: Gap::Partial(why),
+            });
+        }
+        excluded.sort();
+        excluded.dedup();
+        self.excluded = excluded;
+        Ok((ax, ix))
     }
 
     fn run(
         &mut self,
+        axioms: &[&AxiomKind],
+        changes: Option<Changes<'_>>,
+        held_bytes: usize,
         limits: &Limits,
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
         let mut stats = Stats::default();
         let start = Instant::now();
-        // a run that starts again needs no copies of the changed axioms
+        let threads = threads_of(limits);
+        stats.threads = threads;
+        match changes {
+            Some(c) => {
+                stats.added = c.added.len();
+                stats.removed = c.removed.len();
+            }
+            None => stats.added = axioms.len(),
+        }
         let again = self.dirty || self.index.is_none();
-        let (n_added, n_removed, added, removed) = self.apply_pending(!again);
-        stats.added = n_added;
-        stats.removed = n_removed;
         // until the saturation ends, a stop leaves the state for a run that starts again
         self.dirty = true;
-        let full = again || added.iter().chain(&removed).any(needs_full_run);
+        let changes = changes.filter(|_| !again);
+        let full =
+            changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)));
         if full {
             self.interner = Interner::new();
             self.ctx = Vec::new();
         }
         // the premises of the changed axioms, read from the interner before the index of
         // the new axioms is built
-        let premises = if full {
-            None
-        } else {
-            let mut scratch = Axioms::default();
-            for k in added.iter().chain(&removed) {
-                index::normalize(k, &mut self.interner, &mut scratch);
+        let premises = match changes {
+            Some(c) if !full => {
+                let mut scratch = Axioms::default();
+                for &k in c.added.iter().chain(c.removed) {
+                    index::normalize(k, &mut self.interner, &mut scratch);
+                }
+                Some(scratch)
             }
-            Some(scratch)
+            _ => None,
         };
-        // the copies of the changed axioms are not needed past this point
-        drop(added);
-        drop(removed);
-        let (ax, ix) = self.build(limits)?;
+        // the profile check of each axiom, which depends on it alone
+        let outside: Vec<(usize, (String, String))> = par_map(axioms, threads, |at, chunk| {
+            let mut out = Vec::new();
+            for (i, k) in chunk.iter().enumerate() {
+                if logical(k)
+                    && let Some(b) = profiles::el_axiom(k).into_iter().next()
+                {
+                    out.push((at + i, (b.rule.to_string(), b.message)));
+                }
+            }
+            out
+        })
+        .into_iter()
+        .flatten()
+        .collect();
+        poll(limits)?;
+        let (ax, ix) = self.build(axioms, &outside, limits)?;
+        drop(outside);
         poll(limits)?;
         let n = self.interner.len();
         self.ctx.resize_with(n, OnceLock::new);
@@ -565,13 +743,13 @@ impl Classifier {
         roots.sort_unstable();
         roots.dedup();
         stats.index = start.elapsed();
-        let threads = if limits.threads == 0 {
-            std::thread::available_parallelism().map_or(1, |n| n.get())
-        } else {
-            limits.threads
-        };
-        stats.threads = threads;
-        let base = self.index_bytes(&ix) + self.context_bytes();
+        // the index, the caller's copy of the axioms, the normalized axioms and the roots,
+        // and the contexts kept from the last run
+        let base = self.index_bytes(&ix)
+            + held_bytes
+            + ax.bytes()
+            + roots.capacity() * 4
+            + self.context_bytes();
         let cancelled = limits.cancelled.clone();
         let cancel_fn = cancelled
             .as_deref()
@@ -595,7 +773,7 @@ impl Classifier {
             });
         }
         let t = Instant::now();
-        let totals = saturate::saturate(&ix, &self.interner.nodes, &self.ctx, &roots, &bounds);
+        let totals = saturate::saturate(&ix, &self.ctx, &roots, &bounds);
         stats.saturation = t.elapsed();
         let totals = match totals {
             Ok(t) => t,
@@ -611,26 +789,56 @@ impl Classifier {
             }
         };
         stats.conclusions = totals.conclusions;
-        stats.memory = totals.memory;
         // the saturated state is complete: a stop from here on keeps it for the next run
         self.dirty = false;
         self.index = Some(ix);
         let t = Instant::now();
         let consistent = self.consistent(&ax);
-        self.last_consistent = consistent;
-        let taxonomy = if with_taxonomy {
-            let stop = || poll(limits).is_err();
-            Some(
-                taxonomy::build(self, consistent, &stop)
-                    .ok_or_else(|| poll(limits).err().unwrap_or(Error::Cancelled))?,
-            )
-        } else {
-            None
+        self.consistent = consistent;
+        let held = totals.memory - ax.bytes();
+        drop(ax);
+        if !with_taxonomy {
+            stats.memory = held;
+            stats.peak_memory = totals.peak.max(held);
+            stats.contexts = self.ctx.iter().filter(|c| c.get().is_some()).count();
+            poll(limits)?;
+            return Ok((consistent, None, stats));
+        }
+        let stop = || poll(limits).is_err();
+        // the taxonomy's bytes join those held, and the budget and the pool's grant cover
+        // what passes the saturation's peak. The build asks again as its estimate grows,
+        // and the pool is charged only for the growth.
+        let charged = std::cell::Cell::new(0usize);
+        let budget = |bytes: usize| {
+            let used = held + bytes;
+            if limits.max_memory.is_some_and(|m| used > m) {
+                return false;
+            }
+            let over = used.saturating_sub(totals.peak);
+            let more = over.saturating_sub(charged.get());
+            if more == 0 {
+                return true;
+            }
+            let ok = charge_fn.is_none_or(|f| f(more));
+            if ok {
+                charged.set(over);
+            }
+            ok
         };
+        let (taxonomy, tax_bytes) = taxonomy::build(self, consistent, threads, &stop, &budget)
+            .map_err(|h| match h {
+                taxonomy::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
+                taxonomy::Halt::Memory(bytes) => Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used: held + bytes,
+                },
+            })?;
+        stats.memory = held + tax_bytes;
+        stats.peak_memory = totals.peak.max(stats.memory);
         stats.taxonomy = t.elapsed();
         stats.contexts = self.ctx.iter().filter(|c| c.get().is_some()).count();
         poll(limits)?;
-        Ok((consistent, taxonomy, stats))
+        Ok((consistent, Some(taxonomy), stats))
     }
 
     fn consistent(&self, ax: &Axioms) -> bool {
@@ -644,8 +852,6 @@ impl Classifier {
     }
 
     fn index_bytes(&self, ix: &Index) -> usize {
-        let vecs = |v: &Vec<Vec<Ex>>| v.iter().map(|x| 24 + x.len() * 4).sum::<usize>();
-        let pairs = |v: &Vec<Vec<(u32, u32)>>| v.iter().map(|x| 24 + x.len() * 8).sum::<usize>();
         let iris = |len: usize| len + 56;
         self.interner.len() * 40
             + self
@@ -654,26 +860,17 @@ impl Classifier {
                 .iter()
                 .map(|c| 2 * iris(c.as_str().len()))
                 .sum::<usize>()
-            + self
-                .classes
-                .keys()
-                .map(|c| iris(c.as_str().len()))
-                .sum::<usize>()
-            + vecs(&ix.told)
-            + pairs(&ix.conj)
-            + pairs(&ix.exist)
-            + ix.disjoint.iter().map(|x| 24 + x.len() * 4).sum::<usize>()
-            + ix.succ.len() * 12
-            + ix.roles.bytes()
-            + self.held_bytes
+            + ix.bytes()
     }
 
     fn context_bytes(&self) -> usize {
-        self.ctx
-            .iter()
-            .filter_map(|c| c.get())
-            .map(|c| 64 + c.st.lock().bytes())
-            .sum()
+        self.ctx.capacity() * std::mem::size_of::<std::sync::OnceLock<Box<saturate::Ctx>>>()
+            + self
+                .ctx
+                .iter()
+                .filter_map(|c| c.get())
+                .map(|c| std::mem::size_of::<saturate::Ctx>() + c.st.lock().bytes())
+                .sum::<usize>()
     }
 
     /// Clears the contexts that the changed axioms can affect: those that derived the
@@ -716,9 +913,9 @@ impl Classifier {
             }
             for &(s, f) in &links {
                 if st.subs.contains(&f) {
-                    for (&r, srcs) in &st.back {
-                        if ix.roles.sub(r, s) {
-                            affected.extend(srcs.iter().copied());
+                    for (r, srcs) in &st.back {
+                        if ix.roles.sub(*r, s) {
+                            affected.extend(srcs.list.iter().copied());
                         }
                     }
                 }
@@ -731,8 +928,8 @@ impl Classifier {
                 continue;
             };
             let st = c.st.lock();
-            for srcs in st.back.values() {
-                for &s in srcs {
+            for (_, srcs) in &st.back {
+                for &s in &srcs.list {
                     if affected.insert(s) {
                         queue.push(s);
                     }
@@ -774,12 +971,13 @@ impl Classifier {
 /// The ranges of each object property through its superproperties, as class expressions,
 /// for the range restriction on chains.
 fn range_table(
-    axioms: &FxHashMap<AxiomKind, Held>,
+    axioms: &[&AxiomKind],
+    outside: &[bool],
 ) -> FxHashMap<String, std::collections::BTreeSet<ClassExpression>> {
     let mut sup: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
     let mut direct: FxHashMap<&str, Vec<&ClassExpression>> = FxHashMap::default();
-    for (k, h) in axioms {
-        if h.outside.is_some() {
+    for (i, &k) in axioms.iter().enumerate() {
+        if outside[i] {
             continue;
         }
         match k {

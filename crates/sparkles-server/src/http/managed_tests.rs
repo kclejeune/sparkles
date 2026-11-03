@@ -1164,6 +1164,21 @@ async fn identities_are_proposed_reviewed_and_resolved_over_http() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // an analysis that used the map's revision
+    let (status, a) = post(
+        "/d/claims",
+        json!({"proposalGraph": "urn:ev:claims",
+               "assessments": [{"key": "a", "occurrenceKey": "a1", "target": {"iri": ab["iri"]},
+                                "conclusion": "<urn:conclusion:plausible>",
+                                "method": {"method": "urn:method:review", "version": "1"},
+                                "configurationDigest": format!("sha256:{}", "0".repeat(64)),
+                                "evaluatedAt": "2026-01-02T00:00:00Z",
+                                "evaluator": "urn:analyst",
+                                "inputs": [{"iri": r["mapRevision"]}]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{a}");
+    let analysis = a["records"][0]["iri"].clone();
     // a split reverses the match, and the map is empty again
     let (status, s) = post(
         "/d/claims/review",
@@ -1178,9 +1193,34 @@ async fn identities_are_proposed_reviewed_and_resolved_over_http() {
             .ask("ASK { GRAPH <urn:ev:map> { ?s ?p ?o } }")
             .unwrap()
     );
+    // the split's predecessor finds the analysis that used it
+    let (status, found) = post(
+        "/d/claims/dependents",
+        json!({"changed": [s["changed"]["map"]["previous"]], "transitive": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    assert_eq!(
+        found["dependents"],
+        json!([{"assessment": analysis, "graph": "urn:ev:claims",
+                "on": r["mapRevision"], "dependence": "used", "depth": 0}]),
+        "{found}"
+    );
+    for bad in [
+        json!({"changed": []}),
+        json!({"changed": ["not an iri"]}),
+        json!({"changed": ["urn:a"], "extra": 1}),
+    ] {
+        let (status, j) = post("/d/claims/dependents", bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{j}");
+    }
     let (_, server) = call(&app, "GET", "/$/server", None, "").await;
     assert_eq!(
         server["capabilities"]["claims"]["identities"],
         "/{ds}/claims/identities"
+    );
+    assert_eq!(
+        server["capabilities"]["claims"]["dependents"],
+        "/{ds}/claims/dependents"
     );
 }

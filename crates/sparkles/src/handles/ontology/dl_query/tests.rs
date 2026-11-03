@@ -2,6 +2,7 @@ use super::*;
 use crate::handles::ontology::classify::ClassifyRequest;
 use serde_json::json;
 use sparkles_owl::ObjectProperty;
+use sparkles_owl::classify::Classifier;
 use std::sync::Arc;
 
 fn ex(local: &str) -> String {

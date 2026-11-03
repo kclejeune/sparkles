@@ -4,9 +4,10 @@
 //!
 //! The query names a fresh class equivalent to the expression. Inside OWL 2 EL it is
 //! answered by the EL classifier of [`sparkles_owl::classify`]: the dataset's kept
-//! classifier takes the defining axiom, saturates again only what it reaches, gives the
-//! answer from its saturated contexts and lets the axiom go, so the ontology's own
-//! classification is not repeated. The class answers read the terminology, as the kept
+//! saturation reads the ontology's axioms in place with the defining axiom beside them,
+//! saturates again only what the axiom and any change since its last run reach, and
+//! gives the answer from its saturated contexts without building a taxonomy. The next run
+//! over it lets the axiom go, so the ontology's own classification is not repeated. The class answers read the terminology, as the kept
 //! classification does, and the instances come from a classification with the
 //! assertions, which the dataset does not keep. Outside OWL 2 EL the query is answered
 //! under the OWL 2 RL rules by demand reasoning, which derives only what the query's
@@ -40,14 +41,14 @@
 //! # Ok::<_, sparkles::Error>(())
 //! ```
 
-use super::classify::{CACHE_MAX_BYTES, saturate};
+use super::classify::{CACHE_MAX_BYTES, admit, logical_axioms, saturate};
 use super::{Ontologies, OntologyRequest, Opened};
 use crate::Dataset;
 use crate::error::{Error, Result};
 use crate::reasoning::{Demand, ReasoningMode};
 use crate::sparql::QueryOptions;
 use oxrdf::{GraphName, Quad, Term};
-use sparkles_owl::classify::{Classifier, Description, Excluded, Gap};
+use sparkles_owl::classify::{Changes, Description, Excluded, Gap, Saturation};
 use sparkles_owl::manchester::{self, Parsed, Vocabulary, What};
 use sparkles_owl::profiles::{self, Profile};
 use sparkles_owl::{Axiom, AxiomKind, Class, ClassExpression, EntityKind, Individual, write};
@@ -261,7 +262,7 @@ pub struct DlQueryAnswer {
     pub subclasses: Option<Vec<Class>>,
     pub direct_subclasses: Option<Vec<Class>>,
     pub instances: Option<Vec<Individual>>,
-    /// whether the dataset's kept classifier answered the class answers, saturating
+    /// whether the dataset's kept saturation answered the class answers, saturating
     /// again only what the query reaches
     pub incremental: bool,
     pub elapsed: Duration,
@@ -524,30 +525,41 @@ impl Ontologies {
             incremental: false,
             elapsed: Duration::ZERO,
         };
-        let describe = |k: &mut Classifier| -> Result<(bool, Description, Vec<Excluded>, u64)> {
-            k.add([ax]);
-            let r = saturate(k, q.threads, opts);
-            let out = r.and_then(|s| {
-                let d = k.describe(&qc).ok_or_else(|| {
-                    Error::invalid("the classifier holds no saturation of the query class")
-                })?;
-                Ok((s.consistent, d, k.excluded(), s.stats.memory as u64))
-            });
-            // the defining axiom goes, and the next run lets its consequences go
-            k.remove([ax]);
-            out
+        // saturates `axioms` with the defining axiom and describes the query class, on
+        // the threads of the request
+        let describe = |s: &mut Saturation,
+                        axioms: &[&AxiomKind],
+                        changes: Option<Changes<'_>>|
+         -> Result<(bool, Description, Vec<Excluded>, u64)> {
+            let par = admit(q.threads, opts)?;
+            let r = saturate(s, axioms, changes, par, opts)?;
+            let d = s.describe(&qc).ok_or_else(|| {
+                Error::invalid("the classifier holds no saturation of the query class")
+            })?;
+            Ok((
+                r.consistent,
+                d,
+                s.excluded().to_vec(),
+                r.stats.memory as u64,
+            ))
         };
         if q.answers.classes() {
             let keep = opts.graphs.is_none() && o.snapshot.cacheable;
             let (consistent, d, excluded) = if keep {
                 answer.incremental = true;
-                self.with_kept(o, req, opts, |e| {
-                    let (c, d, ex, memory) = describe(&mut e.classifier)?;
+                // the kept saturation reads the defining axiom beside the ontology's, and
+                // the next run over it lets the axiom go
+                self.with_kept(req, opts, |e| {
+                    let (c, d, ex, memory) =
+                        e.run_over(o, vec![ax.kind.clone()], |s, axioms, changes| {
+                            describe(s, axioms, changes)
+                        })?;
                     Ok(((c, d, ex), memory as usize <= CACHE_MAX_BYTES))
                 })?
             } else {
-                let mut k = Classifier::of(o.ontology.axioms.keys());
-                let (c, d, ex, _) = describe(&mut k)?;
+                let mut axioms = logical_axioms(&o.ontology);
+                axioms.push(&ax.kind);
+                let (c, d, ex, _) = describe(&mut Saturation::new(), &axioms, None)?;
                 (c, d, ex)
             };
             answer.consistent = Some(consistent);
@@ -571,10 +583,10 @@ impl Ontologies {
         if q.answers.instances {
             // the assertions take part in this classification only, which the dataset
             // does not keep
-            let mut k = Classifier::of(o.ontology.axioms.keys());
+            let mut assertions: Vec<Axiom> = Vec::new();
             o.assertions(opts, |a, _, _| {
                 if let Some(a) = a {
-                    k.add([&a]);
+                    assertions.push(a);
                 }
                 Ok(true)
             })?;
@@ -591,8 +603,16 @@ impl Ontologies {
                     _ => None,
                 })
                 .collect();
-            k.add(declared.iter());
-            let (consistent, d, excluded, _) = describe(&mut k)?;
+            let mut axioms = logical_axioms(&o.ontology);
+            axioms.extend(
+                assertions
+                    .iter()
+                    .chain(&declared)
+                    .map(|a| &a.kind)
+                    .filter(|k| sparkles_owl::classify::logical(k)),
+            );
+            axioms.push(&ax.kind);
+            let (consistent, d, excluded, _) = describe(&mut Saturation::new(), &axioms, None)?;
             answer.consistent = Some(consistent);
             if answer.satisfiable.is_none() {
                 answer.satisfiable = Some(d.satisfiable);

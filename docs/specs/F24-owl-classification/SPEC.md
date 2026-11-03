@@ -86,14 +86,29 @@ instance of its root expression and holds the root's subsumers, the backward lin
 contexts with an existential restriction it fills, the forward links that property
 chains need and the role loops of `ObjectHasSelf` and reflexive properties. Each rule
 reads the state of the context it runs in and sends conclusions to other contexts as
-messages. Worker threads take active contexts from a shared queue, and a context is
-processed by one worker at a time. Property chains are binarized, and transitivity is the
+messages. Each worker takes root contexts in chunks from a shared cursor, activates up
+to 1,024 of them in a round and then processes the contexts that its messages woke, in
+the order they woke, before it takes more roots. A context is processed by one worker at
+a time, and workers count their conclusions and memory locally and add them to the
+shared totals in batches. Property chains are binarized, and transitivity is the
 chain of a property with itself. A range is pushed into the filler of each existential
 restriction on the property, which is complete under the range restriction of OWL 2 EL
 (Profiles §2.2.6). A chain that breaks that restriction is left out. The taxonomy groups
 the classes by mutual subsumption and computes direct superclasses by transitive
 reduction, by greedy minimization or, for a class with more than 32 direct superclasses,
-by marking the classes above each candidate.
+by marking the classes above each candidate. The subsumers, the equivalence classes and
+the direct superclasses are computed in parallel chunks from the saturated contexts
+alone, with the classes numbered in IRI order, so the taxonomy is the same for every
+number of threads.
+
+`Saturation` keeps the contexts over axioms that the caller keeps, reads them in place
+on every run and takes the axioms added and removed since the last run. `Classifier`
+keeps a copy of the axioms on top of it, for callers that add and remove axioms one at a
+time. The classes of the signature come from the run's normalization, which marks each
+class it interns, and a signature walk covers only the axioms that the normalization
+leaves out. The index holds one record per expression, with the told subsumers, the
+conjunctions and the existential restrictions that use the expression as spans of flat
+arrays.
 
 **Scope of the reasoning.** The classifier covers `owl:Thing`, `owl:Nothing`,
 intersections, existential restrictions, equivalences, disjointness, the object and data
@@ -126,10 +141,13 @@ additions and removals gives the taxonomy of a full run.
 **Bounds.** A run stops at its deadline, at a cancellation and when the estimated memory
 passes the budget. The deadline and the cancellation are checked while the axioms are
 normalized, while the property closure is built, between the stages and while the
-taxonomy is built, as well as during the saturation. The estimate counts the classifier's copy of the axioms, the index with
-the property closure, which stops as soon as it passes the budget, the stored
-conclusions and the messages waiting in the contexts' to-do lists, and the memory
-pool is charged for the growth of its peak. A run that stops before its saturation ends
+taxonomy is built, as well as during the saturation. The estimate counts the classifier's copy of the axioms, the normalized axioms, the index with
+the property closure, which stops as soon as it passes the budget, the context slots and
+roots, the stored conclusions, the messages waiting in the contexts' to-do lists and
+the taxonomy with its links, which the budget checks before the taxonomy is built and
+again before the links are stored. The memory pool is charged for the growth of the peak.
+A counting allocator measured each run's peak heap within 14% of the estimate on GO,
+ChEBI lite and the largest ORE 2015 EL ontologies. A run that stops before its saturation ends
 drops its contexts, since the next run starts again. In the handle the threads come from the
 algorithm pool, the budget from the query's memory budget and the server's memory pool
 grant, and a run past the budget answers `507` with `budget: "memory"`.
@@ -142,9 +160,12 @@ keeps its last classification of an ontology for callers who read every graph, w
 assertions, keyed by the graphs, imports and mode. A classification at the same commit
 answers from it, and one at a later commit gives the kept classifier the axioms that
 changed. One kept classification runs at a time, and a second caller waits for it under
-its own deadline. The kept state is dropped after a run whose estimated size passes one
-gigabyte, and it costs memory while the dataset is open, about 115 MB estimated and
-190 MB resident for GO.
+its own deadline. The dataset keeps the saturation and the ontology it read, whose axioms
+the open ontology shares, and at the next commit it passes the saturation the axioms
+that differ between the two. The threads are taken before that, so a run that times out
+while it waits for them leaves the kept state as it was. The kept state is dropped after
+a run whose estimated size passes one gigabyte, and it costs memory while the dataset is
+open, about 74 MB estimated for GO.
 
 **Writing the taxonomy.** A run with `target` writes the taxonomy to a named graph that it
 does not read, through the handle's edit, in one commit. It adds the taxonomy's axioms
@@ -188,23 +209,33 @@ reasoners are packaged in `nix/reasoners` from checksum-pinned releases and run 
 606. SNOMED CT is not available to the project and was not used, so the acceptance
 gate's SNOMED CT comparison remains open.
 
-**Measurements.** On forge, GO classifies in 410 ms and ChEBI lite in 2.97 s on four
-threads, at peak resident sets of 438 MiB and 1.66 GiB that include the axioms read.
-Saturation scales with the threads, and indexing and the taxonomy, which run on one
-thread, take most of the time from four threads on. Keeping each worker's activations
-on a stack of its own instead of a shared queue took ChEBI on eight threads from 6.0 s
-to 2.8 s. Beside ELK 0.6.0 on forge, the classifier classifies GO in 354 ms against
-ELK's 553 ms on eight threads, and ChEBI lite in 4.0 s against 6.7 s on one thread. ELK is
-1.16 times as fast on ChEBI lite on eight threads, 2.5 s against 3.0 s, because the
-classifier's indexing and taxonomy stages run on one thread. With the OWL API's load
-counted, ELK takes 1.3 s and 6.1 s on eight threads. The classifier's peak resident set is
-363 MiB and 1.6 GiB, and ELK's is 2.4 GiB and 4.3 GiB with a 4 GiB heap. The [benchmark
+**Measurements.** On forge, beside ELK 0.6.0 and with the harness of item 591, the
+classifier classifies GO in 280 ms on one thread and 83 ms on eight, against ELK's
+1,216 and 608 ms, and ChEBI lite in 2.1 s and 0.84 s, against 6.7 s and 2.5 s. On the
+largest ORE 2015 EL ontologies it is 2.5 to 11.5 times as fast as ELK on one thread and
+5.1 to 13.3 times as fast on eight, and `ore_ont_868`, of 981,151 classes, classifies in
+1.9 s and 1.0 s against 11.7 s and 5.5 s. Its peak resident set is below ELK's on every
+run, 252 MiB for GO and 930 MiB for ChEBI lite on eight threads. Items 602 and 592 made
+these changes. Before them the classifier copied each axiom twice on the way in and once
+more for its signature, built the taxonomy on one thread with hash maps keyed by
+expression, sent every activation through a shared queue and left out the taxonomy from
+its estimate. An interleaved A/B on `atlas` against the build of commit aa0a41a6 took
+ChEBI lite on eight threads from 2,955 to 1,009 ms, `ore_ont_868` from 8,226 to 1,393 ms
+and `ore_ont_1559` from 8,099 to 781 ms, and the peak resident set from 1,337 to 804 MiB,
+3,514 to 1,686 MiB and 3,593 to 1,773 MiB. Normalization and interning still run on one
+thread and take most of a run on eight threads on the ORE ontologies, which item
+644 follows. The [benchmark
 report](../../benchmarks/el-classification/RESULTS.md) has the numbers and the records.
 
 **Testing.** Tests in `crates/sparkles-owl/tests/classify.rs` cover worked examples of
 each construct, the reports of excluded axioms, the bounds, incremental runs, a
 comparison with an independent naive completion procedure for EL++ on random ontologies
-of up to twenty axioms, and incremental against full runs on random changes. The library
+of up to twenty axioms, incremental against full runs on random changes for both
+`Classifier` and `Saturation`, the same taxonomy on one, two and eight threads for an
+ontology of 3,000 classes, and an estimate that bounds a run with its taxonomy. Unit
+tests of the taxonomy check that the estimate counts every link of a wide hierarchy,
+that an inconsistent ontology's taxonomy asks the budget and that every stage polls the
+deadline. The library
 tests cover the kept classification, the refusals, the taxonomy write with its
 provenance and its replacement, the budgets, assertions and the JSON operation. Route
 tests cover the answer, the functional-style form, dry runs and the caller's grants, a
@@ -217,6 +248,6 @@ are item 588. DL queries answer from the kept classifier through `Classifier::sa
 and `Classifier::describe`, as [U12's DL Query outcome](../U12-ontology-workbench/SPEC.md#dl-query)
 describes. Durable and automatic classification is item
 589, after item 339. A kept classification with assertions is item 590,
-the comparison and measurements against ELK were item 591, and a classifier that
-shares the ontology's axioms and builds its index and taxonomy in parallel is item
-592.
+the comparison and measurements against ELK were item 591, the speed and memory work
+against ELK were items 602 and 592, and normalization and interning on several threads
+are item 644.

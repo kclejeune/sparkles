@@ -3993,6 +3993,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/claims/dependents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Find the assessments that depend on changed records
+         * @description Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read.
+         */
+        post: operations["listEvidenceDependents"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/claims/identities": {
         parameters: {
             query?: never;
@@ -4004,7 +4024,7 @@ export interface paths {
         put?: never;
         /**
          * Resolve entities through a resolution map
-         * @description Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again.
+         * @description Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again or an identity graph the map was built from left the boundary.
          */
         post: operations["resolveIdentities"];
         delete?: never;
@@ -6498,6 +6518,30 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** @description Changed evidence records whose dependent assessments to find. */
+        EvidenceDependents: {
+            /** @description The record identities that changed, such as a withdrawn claim, an ended support or the revision a new map revision follows. */
+            changed: string[];
+            /** @description Also find the assessments that depend on a dependent. Defaults to `false`. */
+            transitive?: boolean;
+        };
+        /** @description The assessments that depend on the changed records, each once at its smallest depth. */
+        EvidenceDependentsResult: {
+            /** @description The commit the records were read at. */
+            commit: number;
+            dependents: {
+                /** @description An authenticated assessment. */
+                assessment: string;
+                /** @enum {string} */
+                dependence: "target" | "used";
+                /** @description How many assessments lie between it and a changed record, 0 for a direct dependent. */
+                depth: number;
+                /** @description Its proposal graph. */
+                graph: string;
+                /** @description The changed record it depends on, or for a transitive dependent the assessment it depends on. */
+                on: string;
+            }[];
+        };
         /** @description The graph to stop protecting. */
         EvidenceDetach: {
             /** @description A protected graph of the settings' roles. */
@@ -6619,6 +6663,13 @@ export interface components {
                 evaluatedAt: string;
                 /** @description The attributed evaluator. */
                 evaluator: string;
+                /** @description The records the evaluation consumed, each once, written as `prov:used`. */
+                inputs?: {
+                    /** @description An existing authenticated record, by its IRI. */
+                    iri?: string;
+                    /** @description A record of this batch, by its key. */
+                    key?: string;
+                }[];
                 /** @description The record's key in this batch. */
                 key: string;
                 method: {
@@ -22607,6 +22658,41 @@ export interface operations {
             413: components["responses"]["PayloadTooLarge"];
             422: components["responses"]["Unprocessable"];
             503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listEvidenceDependents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceDependents"];
+            };
+        };
+        responses: {
+            /** @description The dependent assessments. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceDependentsResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
             default: components["responses"]["Error"];
         };
     };

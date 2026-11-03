@@ -247,8 +247,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   everything again. A run stops at its deadline, its memory budget or a cancellation,
   which it checks while it indexes, builds the property closure, saturates and builds
   the taxonomy. On the benchmark
-  host GO classifies in about 0.4 seconds and ChEBI lite in about 3 seconds on four
-  threads. The classifier's direct hierarchy equals the hierarchy that GO's release
+  host GO classifies in 83 ms and ChEBI lite in 0.84 seconds on eight threads, and the
+  classifier is 2.5 to 13 times as fast as ELK on GO, ChEBI lite and the largest ORE
+  2015 EL ontologies on one and eight threads. The classifier's direct hierarchy equals the hierarchy that GO's release
   publishes, and its taxonomy of ChEBI entails every subsumption ChEBI asserts and
   gives no direct subsumption that ChEBI does not assert
   ([results](../benchmarks/el-classification/RESULTS.md)).
@@ -260,9 +261,10 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   taxonomy that graph held, and records PROV-O provenance on the graph's ontology
   header. The dataset keeps its last classification of an ontology for callers who read
   every graph, so a classification at the same commit answers at once and one at a
-  later commit is incremental. That kept state holds the classifier's contexts in memory
-  while the dataset is open, about 115 MB estimated and 190 MB resident for GO, which
-  trades memory for fast reclassification. `sparkles ontology classify FILE` classifies a file without a
+  later commit is incremental. That kept state holds the classifier's contexts, index
+  and taxonomy in memory while the dataset is open and reads the axioms of the open
+  ontology in place. It is about 74 MB for GO by the estimate, which a counted heap
+  matches, and it trades that memory for fast reclassification. `sparkles ontology classify FILE` classifies a file without a
   database and exits with status 1 when the ontology is inconsistent or has an
   unsatisfiable class.
 * The Rust handle `ds.ontology()` opens a snapshot's ontology, checks it and edits it,
@@ -511,10 +513,6 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   commits land. Roadmap item 589.
 * A classification with the assertions saturates everything on each run, since the
   dataset keeps only classifications of the terminology. Roadmap item 590.
-* The classifier keeps its own copy of the axioms, its peak resident memory is about 1.6
-  times the estimate that its memory budget uses, and its indexing and taxonomy stages
-  run on one thread, so ELK classifies ChEBI lite faster on eight threads. Roadmap item
-  592.
 
 ## Configuration and usage
 

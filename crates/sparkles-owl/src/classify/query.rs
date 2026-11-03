@@ -2,7 +2,7 @@
 //! superclasses and subclasses, direct and all, and its instances. A DL query asks this
 //! of a fresh class defined as equivalent to its class expression.
 
-use super::Classifier;
+use super::Saturation;
 use super::index::{BOTTOM, Ex, Node, TOP};
 use crate::model::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -27,20 +27,21 @@ pub struct Description {
     pub instances: Vec<NamedIndividual>,
 }
 
-impl Classifier {
+impl Saturation {
     /// What the last run says about the class `c`, from its saturated contexts and
-    /// without building a taxonomy. `None` when no run has saturated the axioms held,
-    /// as before the first run, after a run that stopped part way or with changes not
-    /// yet classified, and when `c` is not in the signature of the axioms held.
+    /// without building a taxonomy. `None` when no run has saturated its axioms, as
+    /// before the first run and after a run that stopped part way, and when `c` is not
+    /// in their signature. The answer is that of the axioms the last run read, which
+    /// the caller keeps unchanged until it asks.
     ///
     /// In an inconsistent ontology every class is unsatisfiable, so the answer is that
     /// of an unsatisfiable class, with every individual as an instance.
     pub fn describe(&self, c: &Class) -> Option<Description> {
-        if self.dirty || self.index.is_none() || !self.pending.is_empty() {
+        if self.dirty || self.index.is_none() {
             return None;
         }
         let q = self.interner.class_ex(c)?;
-        if q != TOP && q != BOTTOM && !self.classes.contains_key(c) {
+        if q != TOP && q != BOTTOM && !self.interner.in_signature(c) {
             return None;
         }
         let class_of = |e: Ex| -> Option<Class> {
@@ -58,9 +59,9 @@ impl Classifier {
         };
         // the named classes of the signature with their expressions
         let named: Vec<(Ex, Class)> = self
-            .classes
-            .keys()
-            .filter_map(|k| self.interner.class_ex(k).map(|e| (e, k.clone())))
+            .interner
+            .met_classes()
+            .filter_map(|e| class_of(e).map(|k| (e, k)))
             .collect();
         let individuals = || -> Vec<(Ex, NamedIndividual)> {
             self.interner
@@ -76,7 +77,7 @@ impl Classifier {
                 .collect()
         };
         let unsatisfiable = |e: Ex| self.named_subsumers(e).is_some_and(|(b, _)| b);
-        if !self.last_consistent {
+        if !self.consistent {
             let mut eq: Vec<Class> = named.iter().map(|(_, k)| k.clone()).collect();
             eq.push(Class::thing());
             eq.push(Class::nothing());

@@ -65,6 +65,9 @@ pub struct Interner {
     map: FxHashMap<Node, Ex>,
     pub classes: Vec<Class>,
     class_ids: FxHashMap<Class, u32>,
+    /// for each class, whether the run's normalization met it, which makes it a class of
+    /// the signature
+    pub met: Vec<bool>,
     pub individuals: Vec<NamedIndividual>,
     individual_ids: FxHashMap<NamedIndividual, u32>,
     pub data: Vec<DataAtom>,
@@ -117,13 +120,15 @@ impl Interner {
                 let id = self.classes.len() as u32;
                 self.classes.push(c.clone());
                 self.class_ids.insert(c.clone(), id);
+                self.met.push(false);
                 id
             }
         };
+        self.met[id as usize] = true;
         self.node(Node::Class(id))
     }
 
-    /// The expression of a named class, when it has been interned.
+    /// The expression of a class, if the interner has it.
     pub fn class_ex(&self, c: &Class) -> Option<Ex> {
         match c.as_str() {
             vocab::OWL_THING => Some(TOP),
@@ -133,6 +138,28 @@ impl Interner {
                 .get(c)
                 .and_then(|&id| self.get(&Node::Class(id))),
         }
+    }
+
+    /// Whether the run's normalization met the class `id`, which makes it a class of
+    /// the signature.
+    pub fn in_signature(&self, c: &Class) -> bool {
+        self.class_ids
+            .get(c)
+            .is_some_and(|&id| self.met[id as usize])
+    }
+
+    /// Forgets which classes the normalization met, before a run normalizes the axioms.
+    pub fn clear_met(&mut self) {
+        self.met.iter_mut().for_each(|m| *m = false);
+    }
+
+    /// The expressions of the classes the run's normalization met, by class id.
+    pub fn met_classes(&self) -> impl Iterator<Item = Ex> + '_ {
+        self.met
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| **m)
+            .filter_map(|(id, _)| self.get(&Node::Class(id as u32)))
     }
 
     pub fn nominal(&mut self, i: &NamedIndividual) -> Ex {
@@ -280,25 +307,68 @@ pub struct Axioms {
     pub classes: Vec<Ex>,
 }
 
+impl Axioms {
+    /// The bytes the normalized axioms take.
+    pub fn bytes(&self) -> usize {
+        self.subs.capacity() * 8
+            + self
+                .disjoint
+                .iter()
+                .map(|d| 24 + d.capacity() * 4)
+                .sum::<usize>()
+            + self.disjoint.capacity() * 24
+            + self.role_subs.capacity() * 8
+            + self
+                .chains
+                .iter()
+                .map(|(c, _)| 32 + c.capacity() * 4)
+                .sum::<usize>()
+            + self.reflexive.capacity() * 4
+            + self.ranges.capacity() * 8
+            + self.individuals.capacity() * 4
+            + self.classes.capacity() * 4
+    }
+}
+
 /// Maps one axiom's logical content into the interner. `out` collects what it means,
 /// and the answer says what of it the classifier may not fully take into account. An
 /// axiom with an expression the classifier cannot represent adds nothing to `out`.
+///
+/// Every class of the axiom's signature is interned, and so met for the run: those the
+/// normalization does not reach are interned from the signature.
 pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<&'static str> {
-    match normalize_axiom(ax, it, out) {
-        Ok(partial) => partial,
-        Err(why) => Some(why),
+    let (partial, whole) = match normalize_axiom(ax, it, out) {
+        Ok((partial, whole)) => (partial, whole),
+        Err(why) => (Some(why), false),
+    };
+    if !whole {
+        intern_signature(ax, it);
+    }
+    partial
+}
+
+/// Interns the classes of an axiom's signature.
+pub fn intern_signature(ax: &AxiomKind, it: &mut Interner) {
+    let mut sig = crate::model::Signature::default();
+    sig.axiom(ax);
+    for e in &sig.0 {
+        if let Entity::Class(c) = e {
+            it.class(c);
+        }
     }
 }
 
 /// [`normalize`], with an error for an axiom left out. Every branch interns all its
-/// expressions before it adds to `out`, so that an error leaves `out` as it was.
+/// expressions before it adds to `out`, so that an error leaves `out` as it was. The
+/// answer says, besides, whether the normalization interned every class of the axiom.
 fn normalize_axiom(
     ax: &AxiomKind,
     it: &mut Interner,
     out: &mut Axioms,
-) -> Result<Option<&'static str>, &'static str> {
+) -> Result<(Option<&'static str>, bool), &'static str> {
     use AxiomKind as K;
     let mut partial: Option<&'static str> = None;
+    let mut whole = true;
     fn ce(
         c: &ClassExpression,
         it: &mut Interner,
@@ -419,6 +489,8 @@ fn normalize_axiom(
                 let c = ce(c, it, &mut partial)?;
                 let e = it.node(Node::Exist(r, TOP));
                 out.subs.push((e, c));
+            } else {
+                whole = false;
             }
             if is_top_or_bottom_role(p) {
                 partial = Some(BUILTIN);
@@ -428,6 +500,8 @@ fn normalize_axiom(
             if let Some(r) = object_role(p, it) {
                 let c = ce(c, it, &mut partial)?;
                 out.ranges.push((r, c));
+            } else {
+                whole = false;
             }
             if is_top_or_bottom_role(p) {
                 partial = Some(BUILTIN);
@@ -530,7 +604,7 @@ fn normalize_axiom(
         | K::AnnotationPropertyDomain(..)
         | K::AnnotationPropertyRange(..) => {}
         // the profile check leaves the remaining types out of OWL 2 EL
-        _ => {}
+        _ => whole = false,
     }
     let data_builtin = match ax {
         K::SubDataPropertyOf(a, b) => is_builtin_data(a) || is_builtin_data(b),
@@ -541,7 +615,7 @@ fn normalize_axiom(
     if data_builtin {
         partial = Some(BUILTIN);
     }
-    Ok(partial)
+    Ok((partial, whole))
 }
 
 /// Whether a data property is the top or bottom one, which the classifier treats as an
@@ -698,37 +772,128 @@ fn data_range(r: &DataRange, it: &mut Interner) -> Ex {
     }
 }
 
+/// A slice of one of the index's flat arrays.
+#[derive(Clone, Copy, Default, Debug)]
+struct Span {
+    start: u32,
+    len: u32,
+}
+
+impl Span {
+    #[inline]
+    fn of<T>(self, v: &[T]) -> &[T] {
+        &v[self.start as usize..(self.start + self.len) as usize]
+    }
+}
+
+/// What a context needs when it derives an expression, in one record so that a new
+/// subsumer costs one lookup: the expression, the context of its filler when it is an
+/// existential restriction, and the spans of its rules in the flat arrays.
+#[derive(Clone, Copy, Debug)]
+pub struct Head {
+    pub node: Node,
+    /// for an existential restriction, the context of its filler, which includes the
+    /// role's range when the restriction occurs positively
+    pub succ: Ex,
+    told: Span,
+    conj: Span,
+    exist: Span,
+    disj: Span,
+}
+
 /// The rules each expression triggers.
 #[derive(Default)]
 pub struct Index {
+    /// by expression
+    heads: Vec<Head>,
     /// told superexpressions
-    pub told: Vec<Vec<Ex>>,
+    told: Vec<Ex>,
     /// for an operand, its partner and the negative intersection they form
-    pub conj: Vec<Vec<(Ex, Ex)>>,
+    conj: Vec<(Ex, Ex)>,
     /// for a filler, the role and the negative existential restriction
-    pub exist: Vec<Vec<(Role, Ex)>>,
+    exist: Vec<(Role, Ex)>,
     /// for a member, the disjointness sets it is in
-    pub disjoint: Vec<Vec<u32>>,
+    disjoint: Vec<u32>,
     /// negative `ObjectHasSelf` restrictions: the role and the expression
     pub selfs: Vec<(Role, Ex)>,
-    /// for an existential restriction that occurs positively, the context of its
-    /// filler, which includes the role's range
-    pub succ: FxHashMap<Ex, Ex>,
     pub roles: Roles,
 }
 
-impl Index {
-    pub fn told(&self, e: Ex) -> &[Ex] {
-        self.told.get(e as usize).map_or(&[], |v| v.as_slice())
+const NO_HEAD: Head = Head {
+    node: Node::Top,
+    succ: TOP,
+    told: Span { start: 0, len: 0 },
+    conj: Span { start: 0, len: 0 },
+    exist: Span { start: 0, len: 0 },
+    disj: Span { start: 0, len: 0 },
+};
+
+/// Groups `(key, value)` pairs by key into one flat array, in the order of the pairs
+/// within a key, and sets each key's span.
+fn group<T: Copy>(
+    pairs: &[(Ex, T)],
+    span: impl Fn(&mut Head) -> &mut Span,
+    heads: &mut [Head],
+) -> Vec<T> {
+    let Some(&(_, fill)) = pairs.first() else {
+        return Vec::new();
+    };
+    let mut next = vec![0u32; heads.len()];
+    for &(k, _) in pairs {
+        next[k as usize] += 1;
     }
-    pub fn conj(&self, e: Ex) -> &[(Ex, Ex)] {
-        self.conj.get(e as usize).map_or(&[], |v| v.as_slice())
+    let mut at = 0u32;
+    for (k, c) in next.iter_mut().enumerate() {
+        *span(&mut heads[k]) = Span { start: at, len: *c };
+        let start = at;
+        at += *c;
+        *c = start;
+    }
+    let mut out = vec![fill; pairs.len()];
+    for &(k, v) in pairs {
+        out[next[k as usize] as usize] = v;
+        next[k as usize] += 1;
+    }
+    out
+}
+
+impl Index {
+    #[inline]
+    pub fn head(&self, e: Ex) -> &Head {
+        self.heads.get(e as usize).unwrap_or(&NO_HEAD)
+    }
+    #[inline]
+    pub fn told_of(&self, h: &Head) -> &[Ex] {
+        h.told.of(&self.told)
+    }
+    #[inline]
+    pub fn conj_of(&self, h: &Head) -> &[(Ex, Ex)] {
+        h.conj.of(&self.conj)
+    }
+    #[inline]
+    pub fn exist_of(&self, h: &Head) -> &[(Role, Ex)] {
+        h.exist.of(&self.exist)
+    }
+    #[inline]
+    pub fn disjoint_of(&self, h: &Head) -> &[u32] {
+        h.disj.of(&self.disjoint)
     }
     pub fn exist(&self, e: Ex) -> &[(Role, Ex)] {
-        self.exist.get(e as usize).map_or(&[], |v| v.as_slice())
+        self.exist_of(self.head(e))
     }
     pub fn disjoint(&self, e: Ex) -> &[u32] {
-        self.disjoint.get(e as usize).map_or(&[], |v| v.as_slice())
+        self.disjoint_of(self.head(e))
+    }
+
+    /// The bytes the index takes, roughly, the role table included.
+    pub fn bytes(&self) -> usize {
+        self.heads.capacity() * std::mem::size_of::<Head>()
+            + self.told.capacity() * 4
+            + self.conj.capacity() * 8
+            + self.exist.capacity() * 8
+            + self.disjoint.capacity() * 4
+            + self.selfs.capacity() * 8
+            + self.roles.bytes()
     }
 
     /// Builds the index of normalized axioms. It may intern new expressions: the
@@ -746,14 +911,13 @@ impl Index {
             roles: roles(ax, it, limit, stop)?,
             ..Index::default()
         };
-        let mut neg_seen: FxHashSet<Ex> = FxHashSet::default();
-        let mut pos_seen: FxHashSet<Ex> = FxHashSet::default();
+        let mut b = Builder::default();
         let mut told: Vec<(Ex, Ex)> = Vec::with_capacity(ax.subs.len());
-        for &(a, b) in &ax.subs {
-            negative(a, it, &mut ix, &mut neg_seen);
-            positive(b, it, &mut ix, &mut pos_seen);
-            if a != b {
-                told.push((a, b));
+        for &(a, c) in &ax.subs {
+            b.negative(a, it);
+            b.positive(c, it, &ix.roles);
+            if a != c {
+                told.push((a, c));
             }
         }
         // a reflexive role links every individual to itself, so its range holds
@@ -765,7 +929,7 @@ impl Index {
             .filter_map(|&r| ix.roles.range[r as usize])
             .collect();
         for c in reflexive_ranges {
-            positive(c, it, &mut ix, &mut pos_seen);
+            b.positive(c, it, &ix.roles);
             told.push((TOP, c));
         }
         // a literal is in the range of its datatype, and every data range is in
@@ -787,83 +951,101 @@ impl Index {
                 told.push((e, d));
             }
         }
-        let n = it.len();
-        ix.told.resize_with(n, Vec::new);
-        for (a, b) in told {
-            ix.told[a as usize].push(b);
-        }
-        for v in &mut ix.told {
-            v.sort_unstable();
-            v.dedup();
-        }
-        ix.disjoint.resize_with(n, Vec::new);
+        let mut disj: Vec<(Ex, u32)> = Vec::new();
         for (s, set) in ax.disjoint.iter().enumerate() {
             for &e in set {
-                negative(e, it, &mut ix, &mut neg_seen);
-                ix.disjoint[e as usize].push(s as u32);
+                b.negative(e, it);
+                disj.push((e, s as u32));
             }
         }
-        let n = it.len();
-        ix.told.resize_with(n, Vec::new);
-        ix.disjoint.resize_with(n, Vec::new);
-        ix.conj.resize_with(n, Vec::new);
-        ix.exist.resize_with(n, Vec::new);
+        ix.heads = it
+            .nodes
+            .iter()
+            .map(|&node| Head {
+                node,
+                succ: match node {
+                    Node::Exist(_, f) => f,
+                    _ => TOP,
+                },
+                ..NO_HEAD
+            })
+            .collect();
+        for &(e, succ) in &b.succ {
+            ix.heads[e as usize].succ = succ;
+        }
+        // told superexpressions, sorted and without duplicates
+        told.sort_unstable();
+        told.dedup();
+        ix.told = group(&told, |h| &mut h.told, &mut ix.heads);
+        ix.conj = group(&b.conj, |h| &mut h.conj, &mut ix.heads);
+        ix.exist = group(&b.exist, |h| &mut h.exist, &mut ix.heads);
+        ix.disjoint = group(&disj, |h| &mut h.disj, &mut ix.heads);
+        ix.selfs = b.selfs;
         Ok(ix)
     }
 }
 
-fn grow<T: Default>(v: &mut Vec<T>, i: Ex) {
-    if v.len() <= i as usize {
-        v.resize_with(i as usize + 1, T::default);
-    }
+/// The occurrences an index build collects before it groups them by expression.
+#[derive(Default)]
+struct Builder {
+    neg_seen: FxHashSet<Ex>,
+    pos_seen: FxHashSet<Ex>,
+    conj: Vec<(Ex, (Ex, Ex))>,
+    exist: Vec<(Ex, (Role, Ex))>,
+    selfs: Vec<(Role, Ex)>,
+    succ: Vec<(Ex, Ex)>,
 }
 
-/// Registers a negative occurrence: the rules that build the expression from its parts.
-fn negative(e: Ex, it: &mut Interner, ix: &mut Index, seen: &mut FxHashSet<Ex>) {
-    if !seen.insert(e) {
-        return;
-    }
-    match it.nodes[e as usize] {
-        Node::Conj(a, b) => {
-            grow(&mut ix.conj, a.max(b));
-            ix.conj[a as usize].push((b, e));
-            ix.conj[b as usize].push((a, e));
-            negative(a, it, ix, seen);
-            negative(b, it, ix, seen);
-        }
-        Node::Exist(r, f) => {
-            grow(&mut ix.exist, f);
-            ix.exist[f as usize].push((r, e));
-            negative(f, it, ix, seen);
-        }
-        Node::SelfLoop(r) => ix.selfs.push((r, e)),
-        _ => {}
-    }
-}
-
-/// Registers a positive occurrence: the successor context of each existential
-/// restriction in it.
-fn positive(e: Ex, it: &mut Interner, ix: &mut Index, seen: &mut FxHashSet<Ex>) {
-    if !seen.insert(e) {
-        return;
-    }
-    match it.nodes[e as usize] {
-        Node::Conj(a, b) => {
-            positive(a, it, ix, seen);
-            positive(b, it, ix, seen);
-        }
-        Node::Exist(r, f) => {
-            positive(f, it, ix, seen);
-            let succ = match ix.roles.range.get(r as usize).copied().flatten() {
-                Some(range) => {
-                    positive(range, it, ix, seen);
-                    it.conj(f, range)
+impl Builder {
+    /// Registers a negative occurrence: the rules that build the expression from its
+    /// parts.
+    fn negative(&mut self, e: Ex, it: &Interner) {
+        let mut stack = vec![e];
+        while let Some(e) = stack.pop() {
+            if !self.neg_seen.insert(e) {
+                continue;
+            }
+            match it.nodes[e as usize] {
+                Node::Conj(a, b) => {
+                    self.conj.push((a, (b, e)));
+                    self.conj.push((b, (a, e)));
+                    stack.push(b);
+                    stack.push(a);
                 }
-                None => f,
-            };
-            ix.succ.insert(e, succ);
+                Node::Exist(r, f) => {
+                    self.exist.push((f, (r, e)));
+                    stack.push(f);
+                }
+                Node::SelfLoop(r) => self.selfs.push((r, e)),
+                _ => {}
+            }
         }
-        _ => {}
+    }
+
+    /// Registers a positive occurrence: the successor context of each existential
+    /// restriction in it.
+    fn positive(&mut self, e: Ex, it: &mut Interner, roles: &Roles) {
+        if !self.pos_seen.insert(e) {
+            return;
+        }
+        match it.nodes[e as usize] {
+            Node::Conj(a, b) => {
+                self.positive(a, it, roles);
+                self.positive(b, it, roles);
+            }
+            Node::Exist(r, f) => {
+                self.positive(f, it, roles);
+                let succ = match roles.range.get(r as usize).copied().flatten() {
+                    Some(range) => {
+                        self.positive(range, it, roles);
+                        it.conj(f, range)
+                    }
+                    None => f,
+                };
+                self.succ.push((e, succ));
+            }
+            _ => {}
+        }
     }
 }
 

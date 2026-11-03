@@ -347,6 +347,14 @@ cluster and the decisions that join it. Queries join the output graph explicitly
 never rewritten through a map. Reviews and resolutions are not available through the
 bindings or MCP.
 
+An assessment names the records it consumed in `inputs`, written as `prov:used`, and
+[evidence dependents](../API.md#evidence-dependents) find the assessments whose target or
+inputs changed. A review or withdrawal names what it changed, such as withdrawn claims,
+ended supports and the map revision a split follows, and `POST /{ds}/claims/dependents`
+or `sparkles::evidence::find_dependents` answers the authenticated assessments in the
+proposal graphs the caller can read that depend on them, optionally transitively. The
+answer marks nothing stale by itself. Maintained analyses that act on it are item 340.
+
 The Rust controlled permission helper can prepare graph, predicate and class masks
 and the built-in disclosure guard under one memory cap and `Control`. It explicitly
 refuses unsupported providers, unresolved providers nested in retained rules and
