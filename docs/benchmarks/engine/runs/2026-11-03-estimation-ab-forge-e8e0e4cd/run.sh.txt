@@ -1,0 +1,30 @@
+# Run on forge alone under ~/lanes/.bench.lock, as the systemd user unit est454-forge.
+# bin/sparkles-main is a release build of 125edd41 and bin/sparkles-final of e8e0e4cd, both
+# built on wally from `git archive` tarballs with scripts/nsc-build.sh, which runs
+# `mbx build --release -p sparkles-server` with MBX_LEARNED_INCREMENTAL=false, and copied
+# to forge. <w>/db-base holds each workload loaded by 62d9cb53, whose loader 125edd41
+# shares, and <w>/db-final the same data loaded by e8e0e4cd:
+#   sparkles load --loc <w>/db-<tag> <data>   (DBpedia with --lenient)
+systemd-run --user --unit est454-forge -p MemoryMax=12G --setenv=BT=final \
+  --setenv=A_BIN="$HOME/lanes/estimation-454/ab/bin/sparkles-main" \
+  --working-directory="$HOME/lanes/estimation-454/ab" \
+  flock "$HOME/lanes/.bench.lock" ./ab-all.sh "$HOME/lanes/estimation-454/ab/bin/sparkles-final" out-final 4 20
+
+# ab-all.sh, per workload (bsbm-bi runs its queries on the BSBM explore stores):
+python3 bin/abtime.py --a "$A_BIN" --a-loc "$PWD/$db/db-base" \
+  --b "$B" --b-loc "$PWD/$db/db-${BT}" --queries "queries-$name" --out "$OUT/$name" \
+  --rounds 4 --reps 20 --threads 12 --cpus 0-11 --port 29600
+
+# The flagged synthetic and DBpedia queries ran again in 8 rounds, in the same unit name
+# under the same lock, with --only naming them (rerun.sh):
+python3 bin/abtime.py --a "$A" --a-loc "$PWD/synthetic/db-base" --b "$B" \
+  --b-loc "$PWD/synthetic/db-final" --queries queries-synthetic --out out-rerun/synthetic \
+  --rounds 8 --reps 20 --threads 12 --cpus 0-11 --port 29600 --only "<flagged queries>"
+
+# abtime.py runs A, B, B, A per round, each a fresh `sparkles --result-cache-mb 0 serve`
+# under `taskset -c 0-11` with RAYON_NUM_THREADS=12, the client pinned to CPU 12 and an
+# idle-priority busy loop on CPUs 0-12. Each query gets 3 warm-ups and 20 timed requests
+# with ?nocache=true, and a request's time is meta.timing.planMs + execMs. The record
+# keeps the medians over every request and per round, and the answer digests. The plans
+# in the record come from scripts/bench-estimates/qerror.py runs of the base build
+# 62d9cb53 and of e8e0e4cd on the laptop, whose plans do not depend on the host.

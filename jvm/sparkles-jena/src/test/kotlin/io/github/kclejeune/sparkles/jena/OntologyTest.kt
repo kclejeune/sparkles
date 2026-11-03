@@ -245,7 +245,7 @@ class OntologyTest {
             val tree = onto.hierarchy("http://ex.org/Professor", read, ancestors = true)
             assertEquals("http://ex.org/Professor", tree.get("node").asObject.getString("iri"))
             val term = SparklesOnt.term(ds, "http://ex.org/Professor", "http://ex.org/onto")
-            assertEquals(listOf("class"), term.get("kinds").asArray.map { it.asString().value() })
+            assertEquals(listOf("class"), term.get("kinds").asArray.map { it.asString.value() })
             assertTrue(term.get("axioms").asArray.any { it.asObject.getString("type") == "SubClassOf" })
             val before = ds.headCommit().seq
             val done = SparklesOnt.edit(

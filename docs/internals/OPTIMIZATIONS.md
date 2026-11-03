@@ -158,17 +158,71 @@ implementation and always apply. EXPLAIN shows which ones ran.
   after Neumann and Moerkotte: each set of predicates some subject has exactly, with its
   subjects and the triples of each predicate. The classes a subject has by `rdf:type`
   count as predicates of their own, since a class usually decides which predicates its
-  instances have. The statistics keep the 10,000 sets with the most subjects. A join on a
+  instances have. The statistics keep the 32,768 sets with the most subjects. A join on a
   subject variable of patterns `?s p ?o` with a constant predicate, or `?s a <class>`, is
   then estimated from the sets that hold the predicates of both sides, including the
   number of triples per subject of each predicate within those sets. Whatever else
   restricts an input is taken to be independent of the predicates. Patterns with another
-  constant object, predicates that the kept sets cover poorly, and stores loaded before
-  this change keep the estimate from distinct values. The sets holding a predicate are
+  constant object and stores loaded before this change keep the estimate from distinct
+  values. The sets holding a predicate are
   found once per index generation, and the sums for a query's predicates are kept for
   later queries. On WatDiv at 1.1M triples, the joins of the C3 star are estimated
   exactly, and C3 runs in 0.65 ms instead of 1.48 ms. C2 runs in 0.03 ms instead of
   0.21 ms.
+* **The remainder of the sets** (`set_remainders`). The subjects whose sets are not kept
+  are counted as one remainder, with its number of subjects and, per predicate or class,
+  the remainder subjects that have it and its triples there. A star's rows and subjects
+  are the kept sets' sums plus the remainder's, in which the predicates are taken to be
+  independent of each other. Every triple is then accounted for, and a predicate that the
+  kept sets cover poorly is estimated from the sets too. Stores built before the
+  remainder existed use a predicate only when the kept sets hold 95% of its triples. At
+  the scale-100 WatDiv the 10,000 sets kept before held less than 95% of the triples of
+  68 of its 86 predicates, so its S3, S4 and S5 stars, which return no rows, were
+  estimated at 661 to 1,090 rows. With 32,768 sets all 24,037 are kept, the worst join
+  of S3 is estimated within a factor of 2 and that of S5 within 106 instead of 1,041.
+  DBpedia's 8.2M-triple slice has 64,814 sets, and the 32,768 kept hold 95% of its
+  subjects.
+* **Node characteristic sets** (`node_sets`). The subject sets say nothing about a join on
+  an object, such as `?a p ?v . ?b q ?v`, or on the link of a chain, such as
+  `?a p ?v . ?v q ?b`. A bulk load or compaction therefore also counts the sets of the
+  nodes over both directions: the predicates a node is the subject of, the predicates it
+  is the object of and its classes, with the nodes and triples of each, again 32,768 sets
+  and a remainder. A variable that is the object of a pattern `?x p ?v` with a constant
+  predicate is estimated from these node sets, for every join on it, so that the
+  estimates of the joins on one variable come from one family of sets. This is the
+  characteristic-pair idea of Gubichev and Neumann reduced to the join node: it captures
+  which objects of one predicate are subjects or objects of another, but not how the far
+  end of a link is restricted. When an input restricts the variable otherwise, such as a
+  pattern with a constant object, a subquery or a VALUES table, a join over its outgoing
+  items alone is estimated from the subject sets, which take the restriction to be
+  independent, and other joins on it keep the estimate from distinct values. The object
+  of `?x a ?c` keeps the subject sets, since what a class gains depends almost wholly on
+  what its instances are. The counts take one pass over the SPO and OPS
+  permutations after they are written, on the build's threads, and a partial compaction
+  updates them for the nodes its changes touch. The sets kept do not depend on the thread
+  count. Past 2^20 distinct node signatures, a count-min sketch filled by the first pass
+  ranks them by their nodes, with ties broken by a stable hash, and a second pass counts
+  the best-ranked ones exactly, so a load of data without blank nodes writes the same
+  `stats.json` at any thread count. On WatDiv the L1 chains were estimated 10
+  to 87 times too high and are now 2 to 11 times, and the C2 template's worst join goes
+  from 1,222 times too high to 30. DBpedia's join of two `birthPlace` patterns on their
+  object goes from 1,478 times too high to 8 times. The statistics trade memory for these
+  estimates. With the larger subject-set cap, `stats.json` grows from 5.0 MB to 44.3 MB on
+  that slice. On atlas, opening it takes 0.30 s instead of 0.07 s, and the server holds
+  214 MB instead of 133 MB once ready. Smaller caps cost less but give up much of the
+  gain, as the [engine results](../benchmarks/engine/RESULTS.md#cardinality-estimates)
+  show.
+* **Joins on several keys** (`key_backoff`). A join on several variables divided by the
+  largest distinct count of one key, as if the other keys added nothing. A cycle closed by
+  a join on two keys, such as the last edge of a triangle or LUBM `q9`'s
+  `?Y teacherOf ?Z`, keeps few of the pairs its input holds. The estimate now divides by
+  the distinct key tuples of the larger side, estimated from its counts sorted from the
+  largest with exponents 1, 1/2, 1/4 and 1/8. This exponential back-off lies between the
+  largest count and the product that independent keys would give. When each side has one
+  input that binds every key, such as two predicates between the same nodes or two
+  subqueries grouped by both keys, the keys depend on each other, so a side has at most
+  as many tuples as rows. LUBM `q9`'s closing join is estimated at 792 rows for 2,540
+  instead of 32,256, and `q2`'s at 115 for 28.
 * **Join estimates from probed values** (`probed_keys`). When one input of a group is
   small, a VALUES table or a pattern of at most 1,024 rows, the planner reads up to 32 of
   its values, spread over them in order, and counts the rows each has in every other
@@ -182,7 +236,12 @@ implementation and always apply. EXPLAIN shows which ones ran.
   and at most two blocks per group that the block cache does not hold. A small pattern
   whose blocks are not cached is left to a later query, after this one has read them. The
   counts are kept with the snapshot. At 10.5M triples, a star of three patterns over
-  30,000 VALUES keys is estimated at its 30,000 rows instead of 10,290.
+  30,000 VALUES keys is estimated at its 30,000 rows instead of 10,290. A sample that
+  finds no rows for any of its values, without having probed every distinct value of the
+  small input, is not taken as an empty join. Its share of values with rows is taken as
+  `1 / (k + 2)` of the `k` values probed, with the pattern's average rows per value. In
+  LUBM `q2`, 32 of the 1,000 universities find no departments, since only 10 have any,
+  and the join that returns 3,016 rows was estimated at one row.
 
   Joins that neither the characteristic sets nor probed values estimate keep QLever's
   0.7 correction. Measured over the two-input joins of every plan of `scripts/bench.sh`,

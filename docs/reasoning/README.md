@@ -242,8 +242,19 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   individual through a context that holds only where the class has an instance is
   classified again in a world of its own. An ontology where only an individual's own
   context derives the individual, and that has no keys or universal roles, skips that
-  step, and so does every ontology without individuals. An axiom outside OWL 2 EL is
-  left out and reported with its rule. An axiom with a literal or datatype that the
+  step, and so does every ontology without individuals. In an ontology without
+  individuals, functional data properties or top properties, the Horn rules of Kazakov's
+  calculus for Horn-SHIQ take the Horn axioms outside OWL 2 EL: inverse properties,
+  universal restrictions, at-most-one and at-least restrictions, functional and
+  inverse-functional properties, disjoint, asymmetric and irreflexive properties and
+  complements that move to the other side as their duals. Universal and at-most
+  restrictions create contexts for conjunctions of classes, which OWL 2 RL and QL
+  ontologies never need, so these stay polynomial. A run with the Horn rules has a
+  memory budget of 64 times its index and axioms, at least 1 GiB and no more than the
+  caller's. A run that passes it classifies again by the EL rules alone, leaves the Horn
+  axioms out and reports them, and sets `Stats::horn_over_budget`. Any other axiom
+  outside OWL 2 EL is left out and reported with its rule, and Horn reasoning with
+  individuals is item 692. An axiom with a literal or datatype that the
   classifier cannot compare, such as an XML literal, an ill-typed literal or a datatype
   outside the OWL 2 datatype map, or with a property chain through the top object
   property, is used as far as the calculus goes and reported as partial. Every answer is entailed, and it is complete for named classes
@@ -251,7 +262,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   after added or removed axioms saturates again only the contexts that those axioms can
   reach. A change to the property hierarchy, chains, reflexivity or ranges, to an axiom
   with an individual, a data property, a datatype or a key, and any change after a run
-  that took that step, saturates everything again. A run stops at its deadline, its
+  that took that step or an axiom outside OWL 2 EL, saturates everything again. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
   closure, saturates and builds the taxonomy. A run of 16,384 axioms or more on several
   threads normalizes chunks of the axioms in parallel, with the same ids and taxonomy as
@@ -259,10 +270,13 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   the memory budget, and a run whose chunks would pass it normalizes on one thread. This
   and the saturation's message buffers raise the peak resident set on eight threads by
   up to 13% on some ontologies in exchange for the speed. On the benchmark host GO
-  classifies in 77 ms and ChEBI lite in 0.39 seconds on eight threads, and the
+  classifies in 95 ms and ChEBI lite in 0.39 seconds on eight threads, and the
   classifier is 3.1 to 20 times as fast as ELK on GO, ChEBI lite and the largest ORE
-  2015 EL ontologies on one and eight threads. The classifier's direct hierarchy equals the hierarchy that GO's release
-  publishes, and its taxonomy of ChEBI entails every subsumption ChEBI asserts and
+  2015 EL ontologies on one and eight threads. GO's `InverseObjectProperties(part_of
+  has_part)` takes the Horn rules, which add the 14 subsumptions that Konclude and HermiT
+  entail and ELK misses and make GO 17 to 18% slower to classify than with the EL rules
+  alone, item 693. The classifier's direct hierarchy of GO is the one GO's release
+  publishes with those 7 direct edges added, and its taxonomy of ChEBI entails every subsumption ChEBI asserts and
   gives no direct subsumption that ChEBI does not assert
   ([results](../benchmarks/el-classification/RESULTS.md)).
 * `ds.ontology().classify()`, `POST /$/ontology/{ds}/classify`, `sparkles ontology
@@ -315,13 +329,19 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   `sparkles ontology reason --input x.owl relax reduce --output y.owl`. `classify` and
   `check` can join a chain to classify or check the ontology at that point, and a chain
   can start from `classify FILE` or `check FILE`, which answer as they do alone. A chain
-  from a database starts with `reason`, `reduce`, `relax` or `materialize` and `--loc`. The
-  classifier stands in for ELK, so `--reasoner` accepts ROBOT's other reasoners with a
-  warning, and the queries ELK does not answer, such as the disjoint classes and the
-  property hierarchy, add no axioms, as they add none in ROBOT. Errors and the exit
+  from a database starts with `reason`, `reduce`, `relax` or `materialize` and `--loc`.
+  Without `--reasoner`, `reason` and `reduce` also take the Horn axioms outside OWL 2 EL,
+  such as GO's inverse properties, so `reason` adds the subsumptions they entail.
+  `--reasoner ELK`, which `materialize` takes by default as ROBOT's does, and `emr`, which
+  ROBOT builds on ELK, run the OWL 2 EL rules alone and leave those axioms out, as ELK
+  does, so the output is ROBOT's with ELK. `hermit`, `jfact`, `whelk`
+  and `structural` run the default classifier with a warning. The library has the same
+  switch as `ClassifyRequest::el_only` and `Limits::el_only`. The queries ELK does not
+  answer, such as the disjoint classes and the property hierarchy, add no axioms, as they
+  add none in ROBOT. Errors and the exit
   status 1 follow ROBOT's, and a malformed command line exits with status 2, as every
-  `sparkles` command does. The outputs equal ROBOT's axiom for axiom on GO and ChEBI lite
-  ([ROBOT comparison](../benchmarks/el-classification/RESULTS.md#robot)). The commands
+  `sparkles` command does. With `--reasoner ELK` the outputs equal ROBOT's axiom for axiom
+  on GO and ChEBI lite ([ROBOT comparison](../benchmarks/el-classification/RESULTS.md#robot)). The commands
   read no `--server`, which item 685 follows, write no OWL/XML, Manchester, OBO
   or OBO Graphs JSON, item 686, and refuse `--prevent-invalid-references true`,
   item 687.
@@ -336,7 +356,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   direct in the taxonomy that has a class for each such restriction, so a superclass is
   left out when another superclass of the class, named or a restriction, lies below it.
   The command validates the ontology first, as `reason` does, and takes `--reasoner` as
-  `reduce` does. `--create-new-ontology true` adds nothing, because ROBOT's command saves
+  `reduce` does, with ELK by default, so it runs the OWL 2 EL rules alone unless another
+  reasoner is named. `--create-new-ontology true` adds nothing, because ROBOT's command saves
   the ontology without the axioms it found, and `--remove-redundant-subclass-axioms` and
   `--annotate-inferred-axioms` are accepted and ignored, as ROBOT ignores them. It runs
   from a file or a database and joins a chain, as in
@@ -576,6 +597,19 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   or a key saturates everything again, and so does any change after a run that merged
   a context with an individual.
   Roadmap item 664.
+* The classifier leaves out the Horn axioms outside OWL 2 EL in an ontology with
+  individuals, functional data properties or top properties. Roadmap item 692.
+* GO's inverse properties take the Horn rules, which classify it 17 to 18% slower than
+  the EL rules and raise its peak resident set. Two Uberon-based ontologies of the ORE
+  2015 DL sample pass the Horn rules' memory budget and get the EL answer in 4.2 seconds
+  instead of 0.8. Roadmap item 693.
+* The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
+  restrictions passes 10 GiB. Roadmap item 695.
+* The ELK mode, which classifies by the OWL 2 EL rules alone, is an option of the Rust
+  library and the ROBOT-compatible commands only, and HTTP, the other CLI commands and
+  the bindings always take the Horn axioms. Roadmap item 694.
+* Axioms outside OWL 2 EL that are not Horn are left out, and an external DL reasoner
+  bridge is planned. Roadmap item 603.
 * No MCP tool classifies, roadmap item 586, and the entity accessors and the
   inferred reads do not answer from a classification, nor does any surface answer the
   subclasses of a class expression, roadmap item 588.

@@ -3043,14 +3043,24 @@ impl<'a> Planner<'a> {
             super::sample::prepare(self.ctx, &leaves, &filters);
         }
         if self.ctx.opt.characteristic_sets {
-            let stars: Vec<(VarId, u64, Option<u64>)> = triples
-                .iter()
-                .filter_map(|t| match (t.t[0], t.t[1], t.t[2]) {
-                    (PT::V(v), PT::C(p), PT::V(_)) => Some((v, p.0, None)),
-                    (PT::V(v), PT::C(p), PT::C(o)) => Some((v, p.0, Some(o.0))),
-                    _ => None,
-                })
-                .collect();
+            use super::charsets::Term;
+            let rdf_type = super::charsets::rdf_type(self.ctx);
+            let incoming = super::charsets::incoming(self.ctx);
+            let term = |x: PT| match x {
+                PT::V(v) => Term::V(v),
+                PT::C(c) => Term::C(c.0),
+            };
+            let mut stars: Vec<(VarId, u64)> = Vec::new();
+            for t in &triples {
+                super::charsets::items_of(
+                    term(t.t[0]),
+                    term(t.t[1]),
+                    term(t.t[2]),
+                    rdf_type,
+                    incoming,
+                    &mut stars,
+                );
+            }
             super::charsets::register(self.ctx, &stars);
         }
         // searches that read the rest of the group are attached to it at the end
@@ -3682,14 +3692,107 @@ pub(super) fn merge_dist(
 }
 
 pub(super) fn join_est(a: &Node, b: &Node, keys: &[VarId]) -> f64 {
+    join_est_keys(a, b, keys, false)
+}
+
+/// [`join_est`], with the keys combined by [`keys_denom`]'s back-off when `backoff`.
+pub(super) fn join_est_keys(a: &Node, b: &Node, keys: &[VarId], backoff: bool) -> f64 {
     if keys.is_empty() {
         return a.est * b.est;
     }
-    let denom = keys
-        .iter()
-        .map(|v| a.d(*v).max(b.d(*v)))
-        .fold(1.0f64, f64::max);
+    let cap = (backoff && keys.len() > 1 && one_input_binds(a, keys) && one_input_binds(b, keys))
+        .then_some((a.est, b.est));
+    let denom = keys_denom(keys.iter().map(|v| (a.d(*v), b.d(*v))), backoff, cap);
     join_est_from(a.est, b.est, denom)
+}
+
+/// The denominator of a join on keys with the distinct counts `(da, db)` of each key on
+/// either side. One key divides by the larger count. Without `backoff`, several keys
+/// divide by the largest count alone, as if the other keys added nothing. With it, each
+/// side's distinct key tuples are estimated from its counts sorted from the largest with
+/// exponents 1, 1/2, 1/4 and 1/8 (exponential back-off, between the largest count and the
+/// product that independent keys would give), and the join divides by the larger side's.
+/// A cycle closed by a join on two keys, such as a triangle's last edge, keeps few of the
+/// pairs its input holds, which the largest count alone misses by orders of magnitude.
+///
+/// `cap` holds the rows of both sides when each has one input that binds every key, such
+/// as two predicates between the same nodes or two subqueries grouped by the keys. The
+/// keys then depend on each other, a side has no more tuples than rows, and the tuples of
+/// the side with fewer are taken to be among the other's, as for one key.
+pub(super) fn keys_denom(
+    m: impl Iterator<Item = (f64, f64)>,
+    backoff: bool,
+    cap: Option<(f64, f64)>,
+) -> f64 {
+    if !backoff {
+        return m.fold(1.0f64, |acc, (da, db)| acc.max(da).max(db));
+    }
+    // the four largest counts of each side, largest first
+    let mut top = [[1.0f64; 4]; 2];
+    let mut keys = 0;
+    for (da, db) in m {
+        keys += 1;
+        for (side, x) in top.iter_mut().zip([da, db]) {
+            let mut x = x.max(1.0);
+            for t in side.iter_mut() {
+                if x > *t {
+                    std::mem::swap(t, &mut x);
+                }
+            }
+        }
+    }
+    if keys < 2 {
+        return top[0][0].max(top[1][0]);
+    }
+    // roots by square roots, which the planner calls for every pair it costs
+    let tuples = |t: &[f64; 4]| {
+        let (r2, r4) = (t[2].sqrt(), t[3].sqrt().sqrt());
+        t[0] * t[1].sqrt() * r2.sqrt() * r4.sqrt()
+    };
+    let (ta, tb) = (tuples(&top[0]), tuples(&top[1]));
+    let (ta, tb) = match cap {
+        Some((ea, eb)) => (ta.min(ea.max(1.0)), tb.min(eb.max(1.0))),
+        None => (ta, tb),
+    };
+    // never below the largest count of one key
+    ta.max(tb).max(top[0][0]).max(top[1][0])
+}
+
+/// Whether one input of plan `n` that its joins do not split, a pattern or anything other
+/// than a join, binds every one of `keys`: one that [`input_vars`] lists.
+pub(super) fn one_input_binds(n: &Node, keys: &[VarId]) -> bool {
+    match &n.kind {
+        Kind::Join { .. } | Kind::Filter(_) | Kind::Sort(_) => {
+            n.children.iter().any(|c| one_input_binds(c, keys))
+        }
+        Kind::IndexJoin(j) => {
+            j.probes
+                .iter()
+                .any(|p| keys.iter().all(|k| p.scan.cols.iter().any(|c| c.1 == *k)))
+                || one_input_binds(&n.children[0], keys)
+        }
+        _ => keys.iter().all(|k| n.vars.contains(k)),
+    }
+}
+
+/// Call `f` with the variables of each input of plan `n` that its joins do not split:
+/// the patterns an index join probes and whatever is not a join, a filter or a sort.
+pub(super) fn input_vars(n: &Node, f: &mut dyn FnMut(&[VarId])) {
+    match &n.kind {
+        Kind::Join { .. } | Kind::Filter(_) | Kind::Sort(_) => {
+            for c in &n.children {
+                input_vars(c, f);
+            }
+        }
+        Kind::IndexJoin(j) => {
+            for p in &j.probes {
+                let vars: Vec<VarId> = p.scan.cols.iter().map(|c| c.1).collect();
+                f(&vars);
+            }
+            input_vars(&n.children[0], f);
+        }
+        _ => f(&n.vars),
+    }
 }
 
 /// The estimated rows of joining `a` and `b` on `keys`, and, when the join is on one
@@ -3705,7 +3808,7 @@ pub(super) fn join_est_with(
     ctx: &Ctx,
 ) -> (f64, Option<(VarId, JoinModel)>) {
     let [v] = keys else {
-        return (join_est(a, b, keys), None);
+        return (join_est_keys(a, b, keys, ctx.opt.key_backoff), None);
     };
     let probe = || {
         if !ctx.opt.probed_keys {

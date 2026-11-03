@@ -1,0 +1,5369 @@
+{
+ "host": {
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "kernel": "7.2.9",
+  "name": "forge"
+ },
+ "kind": "interleaved-ab",
+ "manifest": {
+  "base_commit": "125edd41",
+  "base_sha256": "edcffae2d2e0731d75d29167c13192e1fb754b10637c71ee74174f6ae54cce44",
+  "build": "scripts/nsc-build.sh (mbx build --release -p sparkles-server with MBX_LEARNED_INCREMENTAL=false) on wally from git archive tarballs of each commit",
+  "candidate_commit": "e8e0e4cd",
+  "candidate_sha256": "fa2fc2f8deaa63e57de6a7a7c1d87923530c1231051c75a98f255860d7efed8f",
+  "data": {
+   "bsbm/dataset.nt": {
+    "bytes": 2619263591,
+    "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be"
+   },
+   "dbpedia/anchor-text_lang=en.nt.zst": {
+    "bytes": 20412837,
+    "sha256": "f51eebf5ce775ab05e1816343281c87f633e6b724e90191f17f7bd72cef30e93"
+   },
+   "dbpedia/article-templates_lang=en.nt.zst": {
+    "bytes": 3998043,
+    "sha256": "d6894436ddf086aa03e3cc06e2b2617bc575b8f19a7e9ffc232f966355c2ef02"
+   },
+   "dbpedia/article-templates_lang=en_nested.nt.zst": {
+    "bytes": 864073,
+    "sha256": "4b12b3d03299556bd7a8dbada65c4acd90f3407384951ac26a448d8d7dfb3bdf"
+   },
+   "dbpedia/categories_lang=en_articles.nt.zst": {
+    "bytes": 3573932,
+    "sha256": "6fb62e42153b50604af22b7d3b7ab53b37eae1f40825cf324d066985aa20c672"
+   },
+   "dbpedia/categories_lang=en_labels.nt.zst": {
+    "bytes": 321875,
+    "sha256": "672b8b1e8b6f8c65192d1a5a8fc396fe83862beb229bea912a6b87e10b9cbf89"
+   },
+   "dbpedia/categories_lang=en_skos.nt.zst": {
+    "bytes": 905874,
+    "sha256": "e4c1a6bdef998b31e74480d6d59af14519bcdc1d78be1b2aa163917a0f53a85d"
+   },
+   "dbpedia/citations_lang=en_data.nt.zst": {
+    "bytes": 18377390,
+    "sha256": "8b2860eb62f9fb7e5b6a7f7017fa437cb53bd3aae7a52bdab4f32ea6a2cf695e"
+   },
+   "dbpedia/citations_lang=en_links.nt.zst": {
+    "bytes": 7046514,
+    "sha256": "0fb9a524658cc18f33eb233e6c34c0ebb7e963d690487f51c967ac99b3a76c02"
+   },
+   "dbpedia/commons-sameas-links_lang=en.nt.zst": {
+    "bytes": 8539,
+    "sha256": "8e6cf98679c076037cc23660678e66e8f1aa032020309b834d907364fceaf4d4"
+   },
+   "dbpedia/disambiguations_lang=en.nt.zst": {
+    "bytes": 176990,
+    "sha256": "a30c20b4da8908dba2d0ab37f497f008fddffb249defe43f81ebcbd66c7ede4b"
+   },
+   "dbpedia/external-links_lang=en.nt.zst": {
+    "bytes": 2153063,
+    "sha256": "eef08530ab650e09f2e01a2a9351bd1f1d3b9c7e8dab3ff2a5bca278b7ca027d"
+   },
+   "dbpedia/geo-coordinates-mappingbased_lang=en.nt.zst": {
+    "bytes": 268288,
+    "sha256": "5ea8c33c473f2120f46d73ca042990536a6978ecce9493b8ba224a60407de966"
+   },
+   "dbpedia/geo-coordinates_lang=en.nt.zst": {
+    "bytes": 508941,
+    "sha256": "69119e5a89d9b678fb2a9a0679372512b3856e0a59ed1626889d12ded72dfcce"
+   },
+   "dbpedia/homepages_lang=en.nt.zst": {
+    "bytes": 156741,
+    "sha256": "c43db6b4d034945cd507546fcf80a874f0b711325c38d9e8010fd6f138ea468c"
+   },
+   "dbpedia/images_lang=en.nt.zst": {
+    "bytes": 7204639,
+    "sha256": "7bfb8404cba90784fa36e82ecbf4694eb14b0cafbb4400641e441e392c646f14"
+   },
+   "dbpedia/infobox-properties_lang=en.nt.zst": {
+    "bytes": 11339691,
+    "sha256": "41ae553b78afe92edaad4ade64f212fcf8eadbe4579c00c440c1bf6be869b27a"
+   },
+   "dbpedia/infobox-property-definitions_lang=en.nt.zst": {
+    "bytes": 8652,
+    "sha256": "c570ed0b48897cba62b6c14926a32cf535cf2773b417d869a3c5fe87e073c885"
+   },
+   "dbpedia/instance-types_lang=en_specific.nt.zst": {
+    "bytes": 854148,
+    "sha256": "fcfcc151683c3642db649e9ac47bf5923c459f4654e12e296d871ebcc5f8c994"
+   },
+   "dbpedia/instance-types_lang=en_transitive.nt.zst": {
+    "bytes": 2486438,
+    "sha256": "3c74ad554199504897d2d1a74f29e99bee3151821fea31e966fa7e1818d0e7ba"
+   },
+   "dbpedia/interlanguage-links_lang=en.nt.zst": {
+    "bytes": 10176,
+    "sha256": "2963d4611a060842d7fab9ca15c25a7e0a24e5c0bc5a57c153f1c762da1899bb"
+   },
+   "dbpedia/labels_lang=en.nt.zst": {
+    "bytes": 2386511,
+    "sha256": "1b1cd3c468069be04769a1b95ad2d2c78306f7436585ed101999a579daa9cb5f"
+   },
+   "dbpedia/long-abstracts_lang=en.nt.zst": {
+    "bytes": 10067531,
+    "sha256": "b3b54fafdd0a961aaed90431db8679e28c342c266e1db7e4bad3a5eb90e095b4"
+   },
+   "dbpedia/mappingbased-literals_lang=en.nt.zst": {
+    "bytes": 2267693,
+    "sha256": "07675287ae08184364eee92694c283bb665c50a88946a5aa59eb28291aaf2767"
+   },
+   "dbpedia/mappingbased-objects_lang=en.nt.zst": {
+    "bytes": 2562003,
+    "sha256": "f7716156312d0576ea9022efa6a20a19000d07de6848b4c15eea2bb748d2c34d"
+   },
+   "dbpedia/mappingbased-objects_lang=en_disjointDomain.nt.zst": {
+    "bytes": 7684,
+    "sha256": "1ef8b71bd465f67dd7231eb31ed986cc62440e7d81d2d51e3ecd9132c6fa4731"
+   },
+   "dbpedia/mappingbased-objects_lang=en_disjointRange.nt.zst": {
+    "bytes": 12439,
+    "sha256": "7da5d478f4eae145f1580f72a8d269686529a0d3602753eda7b2f03eee9dfddc"
+   },
+   "dbpedia/ontology--DEV_type=parsed.nt.zst": {
+    "bytes": 6271,
+    "sha256": "f0a24c5e58e3ac48d015da98f5721b25baa7df50509286a041503a73f4f7f14a"
+   },
+   "dbpedia/page_lang=en_ids.nt.zst": {
+    "bytes": 2972184,
+    "sha256": "2b55d69fcdd5d14cc1cfea1f43880d1fc039e5c71f3fd91ed521cc7f106afa7d"
+   },
+   "dbpedia/page_lang=en_length.nt.zst": {
+    "bytes": 1945704,
+    "sha256": "07f9951c5715fdaf9641a96a871690e07d58916fbbf8f86b4e6a39ffbb995c60"
+   },
+   "dbpedia/persondata_lang=en.nt.zst": {
+    "bytes": 13,
+    "sha256": "f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c"
+   },
+   "dbpedia/redirects_lang=en.nt.zst": {
+    "bytes": 1673286,
+    "sha256": "d8fe88726218d11f006626cdbac5122ddd5e73bb677724634df93e90b0d34eea"
+   },
+   "dbpedia/redirects_lang=en_transitive.nt.zst": {
+    "bytes": 1673286,
+    "sha256": "d8fe88726218d11f006626cdbac5122ddd5e73bb677724634df93e90b0d34eea"
+   },
+   "dbpedia/revisions_lang=en_ids.nt.zst": {
+    "bytes": 3102833,
+    "sha256": "a436f35d6304db89a4b6bd863c41f691791e444cf5ce85b28899c6326f575f41"
+   },
+   "dbpedia/revisions_lang=en_uris.nt.zst": {
+    "bytes": 3804499,
+    "sha256": "0c3b6a4b109a563142fdc561fed88e4340f4ce1ff4f70351e7e456b1de850254"
+   },
+   "dbpedia/short-abstracts_lang=en.nt.zst": {
+    "bytes": 7181911,
+    "sha256": "20b0b12a1847e546692b1be0ea7cf9711b05cdd13766d49eeaa71be5eeb23a86"
+   },
+   "dbpedia/specific-mappingbased-properties_lang=en.nt.zst": {
+    "bytes": 143026,
+    "sha256": "f3ba3380edc1292062ec72374cb384586eb2f76ae70b2b14057300e3dc42c5a7"
+   },
+   "dbpedia/wikilinks_lang=en.nt.zst": {
+    "bytes": 23458564,
+    "sha256": "3413225ed3acb42184f16f32963f8f641636a138d222675c423b23d4bb5ffe7c"
+   },
+   "dbpedia/wikipedia-links_lang=en.nt.zst": {
+    "bytes": 5262221,
+    "sha256": "af1a6ccf677551ceb9745d909e02b553260a6d5805fce7b4eb5e0b00db6c92fa"
+   },
+   "lubm/owl-rl.nt": {
+    "bytes": 380128034,
+    "sha256": "6822f21549982a1db36f75955ee7290de565370f233bbcd198c8007b64743180"
+   },
+   "synthetic/people-100000.nt.zst": {
+    "bytes": 6223532,
+    "sha256": "befe6b2d417c379b1abf871abe95b8e8712637ad02f479c2aeffa735b188f4d3"
+   },
+   "watdiv/data.nt": {
+    "bytes": 1550231398,
+    "sha256": "980cee8905f8f3b982348df79d27fc21a800e7453971433d3fef51dc3d42b967"
+   }
+  },
+  "stores": "A on stores loaded by the lane's base build 62d9cb53, whose loader 125edd41 shares; B on stores loaded by the candidate"
+ },
+ "method": "abtime.py: per workload 4 rounds of A, B, B, A, each a fresh server pinned to CPUs 0-11 with RAYON_NUM_THREADS=12 and the result cache off, an idle-priority spinner on each server CPU and on the client CPU 12, 3 warm-ups and 20 timed requests per query and process; time is the server's planMs + execMs, medians over all requests and per round",
+ "reruns": [
+  {
+   "answers": "same",
+   "base_exec_ms": 0.0051,
+   "base_exec_ms_per_round": [
+    0.0052,
+    0.0051,
+    0.0049,
+    0.005,
+    0.0045,
+    0.0049,
+    0.0055,
+    0.0058
+   ],
+   "base_ms": 0.0205,
+   "base_plan_ms": 0.0153,
+   "candidate_exec_ms": 0.0053,
+   "candidate_exec_ms_per_round": [
+    0.0054,
+    0.0056,
+    0.0048,
+    0.0048,
+    0.0054,
+    0.0052,
+    0.0055,
+    0.0052
+   ],
+   "candidate_ms": 0.0226,
+   "candidate_plan_ms": 0.0171,
+   "per_round": [
+    1.069,
+    1.143,
+    1.062,
+    1.053,
+    1.271,
+    1.112,
+    1.066,
+    0.937
+   ],
+   "query": "count-all",
+   "ratio": 1.1036,
+   "rounds": 8,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_exec_ms": 0.0043,
+   "base_exec_ms_per_round": [
+    0.0043,
+    0.0042,
+    0.0042,
+    0.004,
+    0.0038,
+    0.0044,
+    0.0044,
+    0.0048
+   ],
+   "base_ms": 0.0223,
+   "base_plan_ms": 0.0181,
+   "candidate_exec_ms": 0.0043,
+   "candidate_exec_ms_per_round": [
+    0.0045,
+    0.0047,
+    0.0042,
+    0.0045,
+    0.0044,
+    0.004,
+    0.0046,
+    0.0041
+   ],
+   "candidate_ms": 0.0244,
+   "candidate_plan_ms": 0.0201,
+   "per_round": [
+    1.085,
+    1.163,
+    1.035,
+    1.183,
+    1.181,
+    0.961,
+    1.126,
+    0.933
+   ],
+   "query": "distinct-obj",
+   "ratio": 1.0921,
+   "rounds": 8,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_exec_ms": 0.034,
+   "base_exec_ms_per_round": [
+    0.0352,
+    0.0345,
+    0.0325,
+    0.0338,
+    0.0314,
+    0.0344,
+    0.0344,
+    0.0368
+   ],
+   "base_ms": 0.0842,
+   "base_plan_ms": 0.0502,
+   "candidate_exec_ms": 0.0351,
+   "candidate_exec_ms_per_round": [
+    0.0351,
+    0.0356,
+    0.0334,
+    0.0338,
+    0.035,
+    0.0345,
+    0.0355,
+    0.0367
+   ],
+   "candidate_ms": 0.0896,
+   "candidate_plan_ms": 0.0544,
+   "per_round": [
+    1.043,
+    1.075,
+    1.059,
+    1.024,
+    1.181,
+    1.033,
+    1.061,
+    1.024
+   ],
+   "query": "employee-docs",
+   "ratio": 1.0634,
+   "rounds": 8,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_exec_ms": 3.7259,
+   "base_exec_ms_per_round": [
+    3.3321,
+    3.6172,
+    3.5076,
+    4.7061,
+    4.0189,
+    3.3785,
+    2.8822,
+    4.7909
+   ],
+   "base_ms": 3.7831,
+   "base_plan_ms": 0.0574,
+   "candidate_exec_ms": 3.7001,
+   "candidate_exec_ms_per_round": [
+    3.3978,
+    2.8724,
+    3.9244,
+    3.7075,
+    4.6285,
+    3.3054,
+    3.4741,
+    4.7087
+   ],
+   "candidate_ms": 3.7585,
+   "candidate_plan_ms": 0.0601,
+   "per_round": [
+    1.019,
+    0.795,
+    1.115,
+    0.79,
+    1.159,
+    0.983,
+    1.203,
+    0.987
+   ],
+   "query": "expr-agg-arg",
+   "ratio": 0.9935,
+   "rounds": 8,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_exec_ms": 2.4127,
+   "base_exec_ms_per_round": [
+    1.8681,
+    1.7239,
+    2.8371,
+    2.7166,
+    3.1786,
+    1.7413,
+    2.9253,
+    1.753
+   ],
+   "base_ms": 2.5262,
+   "base_plan_ms": 0.1135,
+   "candidate_exec_ms": 2.6947,
+   "candidate_exec_ms_per_round": [
+    2.2593,
+    1.7872,
+    2.8013,
+    1.8392,
+    3.282,
+    2.2108,
+    1.8681,
+    1.8405
+   ],
+   "candidate_ms": 2.8064,
+   "candidate_plan_ms": 0.1157,
+   "per_round": [
+    1.203,
+    1.039,
+    0.984,
+    0.692,
+    1.035,
+    1.252,
+    0.653,
+    1.047
+   ],
+   "query": "f-expr-range-join",
+   "ratio": 1.1109,
+   "rounds": 8,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_exec_ms": 6.9229,
+   "base_exec_ms_per_round": [
+    6.7908,
+    7.1905,
+    6.3375,
+    6.8505,
+    7.2134,
+    6.5422,
+    7.1586,
+    7.211
+   ],
+   "base_ms": 7.0128,
+   "base_plan_ms": 0.0888,
+   "candidate_exec_ms": 7.329,
+   "candidate_exec_ms_per_round": [
+    7.3383,
+    7.3319,
+    6.8774,
+    6.3728,
+    6.9206,
+    7.0641,
+    7.6211,
+    7.6972
+   ],
+   "candidate_ms": 7.4201,
+   "candidate_plan_ms": 0.0898,
+   "per_round": [
+    1.081,
+    1.019,
+    1.084,
+    0.93,
+    0.96,
+    1.08,
+    1.066,
+    1.065
+   ],
+   "query": "f-regex-iri-join",
+   "ratio": 1.0581,
+   "rounds": 8,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_exec_ms": 0.0055,
+   "base_exec_ms_per_round": [
+    0.0051,
+    0.005,
+    0.0055,
+    0.0057,
+    0.0058,
+    0.0054,
+    0.0055,
+    0.0062
+   ],
+   "base_ms": 0.0263,
+   "base_plan_ms": 0.0208,
+   "candidate_exec_ms": 0.0055,
+   "candidate_exec_ms_per_round": [
+    0.0053,
+    0.0054,
+    0.0056,
+    0.0048,
+    0.0057,
+    0.0055,
+    0.0057,
+    0.0058
+   ],
+   "candidate_ms": 0.0269,
+   "candidate_plan_ms": 0.0215,
+   "per_round": [
+    1.047,
+    1.104,
+    1.022,
+    0.937,
+    1.01,
+    1.044,
+    1.069,
+    1.021
+   ],
+   "query": "predicate-counts",
+   "ratio": 1.0237,
+   "rounds": 8,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_exec_ms": 0.0075,
+   "base_exec_ms_per_round": [
+    0.0068,
+    0.0068,
+    0.0078,
+    0.0077,
+    0.0071,
+    0.0076,
+    0.0079,
+    0.0078
+   ],
+   "base_ms": 0.0173,
+   "base_plan_ms": 0.0099,
+   "candidate_exec_ms": 0.0075,
+   "candidate_exec_ms_per_round": [
+    0.0076,
+    0.0074,
+    0.007,
+    0.0068,
+    0.0073,
+    0.0078,
+    0.0075,
+    0.008
+   ],
+   "candidate_ms": 0.018,
+   "candidate_plan_ms": 0.0105,
+   "per_round": [
+    1.19,
+    1.098,
+    0.897,
+    0.892,
+    1.077,
+    1.084,
+    0.957,
+    1.082
+   ],
+   "query": "predicate-subjects",
+   "ratio": 1.0381,
+   "rounds": 8,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_exec_ms": 0.0533,
+   "base_exec_ms_per_round": [
+    0.0526,
+    0.0542,
+    0.0532,
+    0.0534,
+    0.0522,
+    0.0526,
+    0.0521,
+    0.0558
+   ],
+   "base_ms": 0.1288,
+   "base_plan_ms": 0.0761,
+   "candidate_exec_ms": 0.054,
+   "candidate_exec_ms_per_round": [
+    0.0533,
+    0.0536,
+    0.0534,
+    0.0532,
+    0.0532,
+    0.0527,
+    0.0544,
+    0.0593
+   ],
+   "candidate_ms": 0.1331,
+   "candidate_plan_ms": 0.0792,
+   "per_round": [
+    1.045,
+    1.024,
+    1.006,
+    1.007,
+    1.03,
+    1.033,
+    1.045,
+    1.069
+   ],
+   "query": "star-lookup",
+   "ratio": 1.0331,
+   "rounds": 8,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_exec_ms": 0.0247,
+   "base_exec_ms_per_round": [
+    0.0245,
+    0.0247,
+    0.0249,
+    0.0245,
+    0.0251,
+    0.025,
+    0.0248,
+    0.0235
+   ],
+   "base_ms": 0.0948,
+   "base_plan_ms": 0.0701,
+   "candidate_exec_ms": 0.0247,
+   "candidate_exec_ms_per_round": [
+    0.0249,
+    0.025,
+    0.0236,
+    0.0249,
+    0.0249,
+    0.025,
+    0.0243,
+    0.0244
+   ],
+   "candidate_ms": 0.0956,
+   "candidate_plan_ms": 0.0708,
+   "per_round": [
+    1.048,
+    1.019,
+    0.955,
+    1.03,
+    0.979,
+    1.006,
+    0.995,
+    1.041
+   ],
+   "query": "category-people-2",
+   "ratio": 1.008,
+   "rounds": 8,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_exec_ms": 0.0062,
+   "base_exec_ms_per_round": [
+    0.0059,
+    0.0063,
+    0.006,
+    0.0059,
+    0.0066,
+    0.0064,
+    0.0062,
+    0.0059
+   ],
+   "base_ms": 0.0234,
+   "base_plan_ms": 0.0172,
+   "candidate_exec_ms": 0.006,
+   "candidate_exec_ms_per_round": [
+    0.0062,
+    0.0065,
+    0.0058,
+    0.0057,
+    0.0064,
+    0.0063,
+    0.0059,
+    0.0053
+   ],
+   "candidate_ms": 0.0239,
+   "candidate_plan_ms": 0.0179,
+   "per_round": [
+    1.08,
+    1.029,
+    1.057,
+    1.04,
+    1.021,
+    1.012,
+    1.015,
+    0.947
+   ],
+   "query": "count-all",
+   "ratio": 1.0243,
+   "rounds": 8,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_exec_ms": 0.0283,
+   "base_exec_ms_per_round": [
+    0.0284,
+    0.029,
+    0.0286,
+    0.028,
+    0.0281,
+    0.0277,
+    0.0278,
+    0.029
+   ],
+   "base_ms": 0.0865,
+   "base_plan_ms": 0.0583,
+   "candidate_exec_ms": 0.0283,
+   "candidate_exec_ms_per_round": [
+    0.0295,
+    0.0284,
+    0.0283,
+    0.0277,
+    0.0284,
+    0.0284,
+    0.0278,
+    0.0278
+   ],
+   "candidate_ms": 0.0878,
+   "candidate_plan_ms": 0.0595,
+   "per_round": [
+    1.042,
+    0.974,
+    1.011,
+    1.009,
+    1.033,
+    1.046,
+    1.012,
+    0.976
+   ],
+   "query": "place-births-1",
+   "ratio": 1.0151,
+   "rounds": 8,
+   "workload": "dbpedia"
+  }
+ ],
+ "results": [
+  {
+   "answers": "same",
+   "base_ms": 1.5365,
+   "base_plan_ms": 0.0249,
+   "candidate_ms": 1.5403,
+   "candidate_plan_ms": 0.0262,
+   "per_round": [
+    0.997,
+    1.019,
+    0.997,
+    0.996
+   ],
+   "query": "class-predicate-list",
+   "ratio": 1.0025,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 1.5559,
+   "base_plan_ms": 0.0298,
+   "candidate_ms": 1.5687,
+   "candidate_plan_ms": 0.0301,
+   "per_round": [
+    1.008,
+    1.008,
+    1.013,
+    1.014
+   ],
+   "query": "class-predicates",
+   "ratio": 1.0083,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 2.9075,
+   "base_plan_ms": 0.0452,
+   "candidate_ms": 2.9007,
+   "candidate_plan_ms": 0.0466,
+   "per_round": [
+    0.999,
+    0.9,
+    1.002,
+    0.994
+   ],
+   "query": "contains",
+   "ratio": 0.9977,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0216,
+   "base_plan_ms": 0.0163,
+   "candidate_ms": 0.0238,
+   "candidate_plan_ms": 0.0183,
+   "per_round": [
+    1.014,
+    1.306,
+    0.982,
+    1.026
+   ],
+   "query": "count-all",
+   "ratio": 1.1033,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 4.8901,
+   "base_plan_ms": 0.0702,
+   "candidate_ms": 4.8726,
+   "candidate_plan_ms": 0.0755,
+   "per_round": [
+    1.004,
+    1.002,
+    0.995,
+    0.996
+   ],
+   "query": "distinct-join",
+   "ratio": 0.9964,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0245,
+   "base_plan_ms": 0.0199,
+   "candidate_ms": 0.0266,
+   "candidate_plan_ms": 0.0218,
+   "per_round": [
+    1.003,
+    1.25,
+    1.073,
+    1.045
+   ],
+   "query": "distinct-obj",
+   "ratio": 1.0855,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.094,
+   "base_plan_ms": 0.0556,
+   "candidate_ms": 0.0987,
+   "candidate_plan_ms": 0.0596,
+   "per_round": [
+    1.048,
+    1.087,
+    1.045,
+    1.042
+   ],
+   "query": "employee-docs",
+   "ratio": 1.0496,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 1.6081,
+   "base_plan_ms": 0.0571,
+   "candidate_ms": 1.6255,
+   "candidate_plan_ms": 0.0592,
+   "per_round": [
+    1.014,
+    1.022,
+    1.0,
+    1.005
+   ],
+   "query": "exists-join",
+   "ratio": 1.0108,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 4.0167,
+   "base_plan_ms": 0.0633,
+   "candidate_ms": 4.8063,
+   "candidate_plan_ms": 0.0674,
+   "per_round": [
+    1.33,
+    1.186,
+    1.496,
+    0.831
+   ],
+   "query": "expr-agg-arg",
+   "ratio": 1.1966,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 1.2969,
+   "base_plan_ms": 0.0356,
+   "candidate_ms": 1.2977,
+   "candidate_plan_ms": 0.0377,
+   "per_round": [
+    1.009,
+    1.626,
+    0.752,
+    1.006
+   ],
+   "query": "expr-bind-group",
+   "ratio": 1.0006,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 1.8719,
+   "base_plan_ms": 0.0292,
+   "candidate_ms": 1.9165,
+   "candidate_plan_ms": 0.0288,
+   "per_round": [
+    1.01,
+    1.024,
+    1.031,
+    1.022
+   ],
+   "query": "expr-order-key",
+   "ratio": 1.0238,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 10.5626,
+   "base_plan_ms": 0.1212,
+   "candidate_ms": 10.8164,
+   "candidate_plan_ms": 0.1273,
+   "per_round": [
+    1.039,
+    0.963,
+    0.99,
+    1.009
+   ],
+   "query": "f-contains-join",
+   "ratio": 1.024,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 8.9162,
+   "base_plan_ms": 0.1005,
+   "candidate_ms": 9.2147,
+   "candidate_plan_ms": 0.1027,
+   "per_round": [
+    0.986,
+    1.111,
+    1.059,
+    1.109
+   ],
+   "query": "f-contains-rare",
+   "ratio": 1.0335,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 2.536,
+   "base_plan_ms": 0.1177,
+   "candidate_ms": 3.2431,
+   "candidate_plan_ms": 0.1209,
+   "per_round": [
+    1.216,
+    2.221,
+    0.573,
+    1.233
+   ],
+   "query": "f-expr-range-join",
+   "ratio": 1.2788,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 12.0662,
+   "base_plan_ms": 0.145,
+   "candidate_ms": 12.4536,
+   "candidate_plan_ms": 0.1476,
+   "per_round": [
+    1.044,
+    1.028,
+    1.034,
+    1.067
+   ],
+   "query": "f-lang-join",
+   "ratio": 1.0321,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 5.6223,
+   "base_plan_ms": 0.1336,
+   "candidate_ms": 5.4923,
+   "candidate_plan_ms": 0.1405,
+   "per_round": [
+    0.943,
+    0.94,
+    1.023,
+    0.983
+   ],
+   "query": "f-neq-join",
+   "ratio": 0.9769,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 6.8446,
+   "base_plan_ms": 0.0965,
+   "candidate_ms": 7.4654,
+   "candidate_plan_ms": 0.0967,
+   "per_round": [
+    0.976,
+    1.004,
+    1.119,
+    1.088
+   ],
+   "query": "f-regex-iri-join",
+   "ratio": 1.0907,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 2.3108,
+   "base_plan_ms": 0.0833,
+   "candidate_ms": 2.3147,
+   "candidate_plan_ms": 0.0875,
+   "per_round": [
+    0.993,
+    1.023,
+    1.391,
+    1.374
+   ],
+   "query": "f-regex-join",
+   "ratio": 1.0017,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 16.3085,
+   "base_plan_ms": 0.113,
+   "candidate_ms": 16.1013,
+   "candidate_plan_ms": 0.1161,
+   "per_round": [
+    0.936,
+    0.975,
+    1.018,
+    1.022
+   ],
+   "query": "f-salary-expr",
+   "ratio": 0.9873,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.3404,
+   "base_plan_ms": 0.104,
+   "candidate_ms": 0.3553,
+   "candidate_plan_ms": 0.1115,
+   "per_round": [
+    1.042,
+    1.029,
+    1.06,
+    1.035
+   ],
+   "query": "f-str-eq-join",
+   "ratio": 1.0437,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 5.9062,
+   "base_plan_ms": 0.0774,
+   "candidate_ms": 5.9125,
+   "candidate_plan_ms": 0.0794,
+   "per_round": [
+    1.0,
+    1.032,
+    0.999,
+    1.002
+   ],
+   "query": "f-title-join",
+   "ratio": 1.0011,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 10.4229,
+   "base_plan_ms": 0.1342,
+   "candidate_ms": 10.3764,
+   "candidate_plan_ms": 0.1383,
+   "per_round": [
+    0.921,
+    0.939,
+    1.06,
+    1.032
+   ],
+   "query": "f-two-filters",
+   "ratio": 0.9955,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 1.9104,
+   "base_plan_ms": 0.0827,
+   "candidate_ms": 1.8516,
+   "candidate_plan_ms": 0.0849,
+   "per_round": [
+    0.928,
+    1.016,
+    0.954,
+    0.932
+   ],
+   "query": "f-year-docs",
+   "ratio": 0.9692,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 6.3918,
+   "base_plan_ms": 0.0613,
+   "candidate_ms": 6.4757,
+   "candidate_plan_ms": 0.0657,
+   "per_round": [
+    1.011,
+    0.974,
+    1.064,
+    0.964
+   ],
+   "query": "group-avg",
+   "ratio": 1.0131,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 14.7028,
+   "base_plan_ms": 0.0173,
+   "candidate_ms": 14.7068,
+   "candidate_plan_ms": 0.0175,
+   "per_round": [
+    1.011,
+    1.005,
+    1.001,
+    1.003
+   ],
+   "query": "knows-reach",
+   "ratio": 1.0003,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 2.8793,
+   "base_plan_ms": 0.0437,
+   "candidate_ms": 2.893,
+   "candidate_plan_ms": 0.0439,
+   "per_round": [
+    1.266,
+    1.001,
+    1.007,
+    1.003
+   ],
+   "query": "lang-filter",
+   "ratio": 1.0048,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.5426,
+   "base_plan_ms": 0.0344,
+   "candidate_ms": 0.5459,
+   "candidate_plan_ms": 0.0365,
+   "per_round": [
+    0.997,
+    1.02,
+    0.995,
+    1.022
+   ],
+   "query": "minus",
+   "ratio": 1.0061,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 1.2185,
+   "base_plan_ms": 0.0314,
+   "candidate_ms": 1.2292,
+   "candidate_plan_ms": 0.0319,
+   "per_round": [
+    0.981,
+    1.005,
+    1.004,
+    1.014
+   ],
+   "query": "not-exists",
+   "ratio": 1.0088,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 2.9384,
+   "base_plan_ms": 0.1063,
+   "candidate_ms": 2.9405,
+   "candidate_plan_ms": 0.1179,
+   "per_round": [
+    0.998,
+    1.006,
+    0.995,
+    1.009
+   ],
+   "query": "optional-chain",
+   "ratio": 1.0007,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.8151,
+   "base_plan_ms": 0.0384,
+   "candidate_ms": 0.8176,
+   "candidate_plan_ms": 0.0407,
+   "per_round": [
+    1.006,
+    1.009,
+    0.969,
+    0.999
+   ],
+   "query": "optional-count",
+   "ratio": 1.0031,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 40.7198,
+   "base_plan_ms": 0.0654,
+   "candidate_ms": 41.1975,
+   "candidate_plan_ms": 0.0668,
+   "per_round": [
+    1.02,
+    0.975,
+    0.989,
+    1.033
+   ],
+   "query": "order-by-full",
+   "ratio": 1.0117,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0304,
+   "base_plan_ms": 0.0173,
+   "candidate_ms": 0.0315,
+   "candidate_plan_ms": 0.0184,
+   "per_round": [
+    1.065,
+    1.013,
+    1.085,
+    1.039
+   ],
+   "query": "path-plus",
+   "ratio": 1.0368,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0276,
+   "base_plan_ms": 0.0218,
+   "candidate_ms": 0.029,
+   "candidate_plan_ms": 0.0231,
+   "per_round": [
+    1.0,
+    1.075,
+    1.076,
+    1.051
+   ],
+   "query": "predicate-counts",
+   "ratio": 1.0505,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0184,
+   "base_plan_ms": 0.0105,
+   "candidate_ms": 0.0193,
+   "candidate_plan_ms": 0.0113,
+   "per_round": [
+    1.018,
+    0.964,
+    1.098,
+    1.103
+   ],
+   "query": "predicate-subjects",
+   "ratio": 1.0501,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 1.0755,
+   "base_plan_ms": 0.164,
+   "candidate_ms": 1.0877,
+   "candidate_plan_ms": 0.1662,
+   "per_round": [
+    1.058,
+    1.001,
+    0.999,
+    1.01
+   ],
+   "query": "range-topk",
+   "ratio": 1.0113,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 3.6832,
+   "base_plan_ms": 0.0462,
+   "candidate_ms": 3.5877,
+   "candidate_plan_ms": 0.0474,
+   "per_round": [
+    0.948,
+    1.054,
+    0.985,
+    0.967
+   ],
+   "query": "regex-iri",
+   "ratio": 0.9741,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 3.9626,
+   "base_plan_ms": 0.1728,
+   "candidate_ms": 4.0135,
+   "candidate_plan_ms": 0.1814,
+   "per_round": [
+    1.008,
+    1.003,
+    1.029,
+    1.02
+   ],
+   "query": "star-join",
+   "ratio": 1.0129,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1416,
+   "base_plan_ms": 0.0872,
+   "candidate_ms": 0.1494,
+   "candidate_plan_ms": 0.093,
+   "per_round": [
+    1.075,
+    1.052,
+    1.037,
+    1.045
+   ],
+   "query": "star-lookup",
+   "ratio": 1.0546,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.9372,
+   "base_plan_ms": 0.0334,
+   "candidate_ms": 0.9393,
+   "candidate_plan_ms": 0.0341,
+   "per_round": [
+    0.993,
+    1.008,
+    1.004,
+    1.001
+   ],
+   "query": "subquery-agg",
+   "ratio": 1.0023,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 7.4691,
+   "base_plan_ms": 0.0671,
+   "candidate_ms": 7.3296,
+   "candidate_plan_ms": 0.0714,
+   "per_round": [
+    0.941,
+    1.144,
+    0.944,
+    1.003
+   ],
+   "query": "two-hop-count",
+   "ratio": 0.9813,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0365,
+   "base_plan_ms": 0.0264,
+   "candidate_ms": 0.0377,
+   "candidate_plan_ms": 0.0275,
+   "per_round": [
+    1.07,
+    1.049,
+    1.009,
+    1.051
+   ],
+   "query": "types-grouped",
+   "ratio": 1.0326,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 9.5376,
+   "base_plan_ms": 4.6477,
+   "candidate_ms": 9.7352,
+   "candidate_plan_ms": 4.7986,
+   "per_round": [
+    1.03,
+    1.022,
+    1.018,
+    0.99
+   ],
+   "query": "v-star3-10pct",
+   "ratio": 1.0207,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 1.2594,
+   "base_plan_ms": 0.6182,
+   "candidate_ms": 1.3028,
+   "candidate_plan_ms": 0.6352,
+   "per_round": [
+    1.059,
+    1.016,
+    1.057,
+    1.035
+   ],
+   "query": "v-star3-1pct",
+   "ratio": 1.0345,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 3.3762,
+   "base_plan_ms": 1.6416,
+   "candidate_ms": 3.4927,
+   "candidate_plan_ms": 1.6903,
+   "per_round": [
+    1.036,
+    1.025,
+    1.075,
+    1.025
+   ],
+   "query": "v-star3-3pct",
+   "ratio": 1.0345,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1011,
+   "base_plan_ms": 0.0821,
+   "candidate_ms": 0.1057,
+   "candidate_plan_ms": 0.0867,
+   "per_round": [
+    1.075,
+    1.056,
+    1.041,
+    1.018
+   ],
+   "query": "values-star",
+   "ratio": 1.0453,
+   "workload": "synthetic"
+  },
+  {
+   "answers": "same",
+   "base_ms": 3.0985,
+   "base_plan": [
+    "  MergeJoin on ?v7 est=4403.0",
+    "    HashJoin on ?v6 est=5525.0",
+    "      IndexJoin on ?v4 | PSO ?v4 <http://purl.org/stuff/rev#reviewer> ?v6 est=5566.0",
+    "        HashJoin on ?v0 est=5566.0",
+    "          MergeJoin on ?v0 est=1242.0",
+    "            MergeJoin on ?v0 est=1774.0",
+    "              IndexScan PSO ?v0 <http://schema.org/caption> ?v1 est=2534.0",
+    "              IndexScan PSO ?v0 <http://schema.org/text> ?v2 est=7554.0",
+    "            IndexScan PSO ?v0 <http://schema.org/contentRating> ?v3 est=7515.0",
+    "          MergeJoin on ?v4 est=31820.0",
+    "            IndexScan POS ?v0 <http://purl.org/stuff/rev#hasReview> ?v4 est=147647.0",
+    "            IndexScan PSO ?v4 <http://purl.org/stuff/rev#title> ?v5 est=45457.0",
+    "      IndexScan PSO ?v7 <http://schema.org/actor> ?v6 est=15669.0",
+    "    IndexScan PSO ?v7 <http://schema.org/language> ?v8 est=6267.0"
+   ],
+   "base_plan_ms": 0.2913,
+   "candidate_ms": 0.923,
+   "candidate_plan": [
+    "  IndexJoin on ?v7 | PSO ?v7 <http://schema.org/language> ?v8 est=16.0",
+    "    IndexJoin on ?v4 | PSO ?v4 <http://purl.org/stuff/rev#title> ?v5 est=26.0",
+    "      MergeJoin on ?v6 est=85.0",
+    "          IndexJoin on ?v4 | PSO ?v4 <http://purl.org/stuff/rev#reviewer> ?v6 est=1451.0",
+    "            IndexJoin on ?v0 | PSO ?v0 <http://purl.org/stuff/rev#hasReview> ?v4 est=1451.0",
+    "              MergeJoin on ?v0 est=229.0",
+    "                MergeJoin on ?v0 est=751.0",
+    "                  IndexScan PSO ?v0 <http://schema.org/caption> ?v1 est=2534.0",
+    "                  IndexScan PSO ?v0 <http://schema.org/text> ?v2 est=7554.0",
+    "                IndexScan PSO ?v0 <http://schema.org/contentRating> ?v3 est=7515.0",
+    "        IndexScan POS ?v7 <http://schema.org/actor> ?v6 est=15669.0"
+   ],
+   "candidate_plan_ms": 0.1654,
+   "per_round": [
+    0.3,
+    0.296,
+    0.297,
+    0.296
+   ],
+   "plan_changed": true,
+   "query": "C1-1",
+   "ratio": 0.2979,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 5.14,
+   "base_plan": [
+    "  HashJoin on ?v4 est=2444.0",
+    "    MergeJoin on ?v4 est=3491.0",
+    "      IndexScan PSO ?v4 <http://schema.org/jobTitle> ?v5 est=4987.0",
+    "      IndexScan PSO ?v4 <http://xmlns.com/foaf/homepage> ?v6 est=11187.0",
+    "    MergeJoin on ?v7 est=10630.0",
+    "      IndexScan POS ?v4 <http://db.uwaterloo.ca/~galuc/wsdbm/makesPurchase> ?v7 est=149998.0",
+    "      HashJoin on ?v3 est=15186.0",
+    "        IndexScan PSO ?v7 <http://db.uwaterloo.ca/~galuc/wsdbm/purchaseFor> ?v3 est=150000.0",
+    "        HashJoin on ?v2 est=2570.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/offers> ?v2 est=10931.0",
+    "            IndexScan PSO ?v0 <http://schema.org/legalName> ?v1 est=106.0",
+    "          HashJoin on ?v3 est=3672.0",
+    "            MergeJoin on ?v2 est=6364.0",
+    "              IndexScan POS ?v2 <http://schema.org/eligibleRegion> <http://db.uwaterloo.ca/~galuc/wsdbm/Country5> est=9091.0",
+    "              IndexScan PSO ?v2 <http://purl.org/goodrelations/includes> ?v3 est=90000.0",
+    "            IndexJoin on ?v8 | POS ?v3 <http://purl.org/stuff/rev#hasReview> ?v8 est=5246.0",
+    "              IndexScan PSO ?v8 <http://purl.org/stuff/rev#totalVotes> ?v9 est=7494.0"
+   ],
+   "base_plan_ms": 0.5221,
+   "candidate_ms": 1.0495,
+   "candidate_plan": [
+    "  MergeJoin on ?v8 est=36.0",
+    "      IndexJoin on ?v3 | PSO ?v3 <http://purl.org/stuff/rev#hasReview> ?v8 est=720.0",
+    "        IndexJoin on ?v2 | POS ?v2 <http://schema.org/eligibleRegion> <http://db.uwaterloo.ca/~galuc/wsdbm/Country5> est=91.0",
+    "          HashJoin on ?v0 est=130.0",
+    "            IndexScan PSO ?v0 <http://schema.org/legalName> ?v1 est=106.0",
+    "            IndexJoin on ?v2 | POS ?v0 <http://purl.org/goodrelations/offers> ?v2 est=1500.0",
+    "              IndexJoin on ?v3 | POS ?v2 <http://purl.org/goodrelations/includes> ?v3 est=1093.0",
+    "                IndexJoin on ?v7 | PSO ?v7 <http://db.uwaterloo.ca/~galuc/wsdbm/purchaseFor> ?v3 est=327.0",
+    "                  IndexJoin on ?v4 | PSO ?v4 <http://db.uwaterloo.ca/~galuc/wsdbm/makesPurchase> ?v7 est=327.0",
+    "                    MergeJoin on ?v4 est=245.0",
+    "                      IndexScan PSO ?v4 <http://schema.org/jobTitle> ?v5 est=4987.0",
+    "                      IndexScan PSO ?v4 <http://xmlns.com/foaf/homepage> ?v6 est=11187.0",
+    "    IndexScan PSO ?v8 <http://purl.org/stuff/rev#totalVotes> ?v9 est=7494.0"
+   ],
+   "candidate_plan_ms": 0.3157,
+   "per_round": [
+    0.208,
+    0.204,
+    0.204,
+    0.203
+   ],
+   "plan_changed": true,
+   "query": "C2-1",
+   "ratio": 0.2042,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 31.5864,
+   "base_plan": [
+    "  MergeJoin on ?v0 est=3567824.0",
+    "    IndexScan PSO ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/friendOf> ?v2 est=4493477.0",
+    "    MergeJoin on ?v0 est=45185.0",
+    "      IndexScan PSO ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/likes> ?v1 est=112183.0",
+    "      MergeJoin on ?v0 est=13763.0",
+    "        MergeJoin on ?v0 est=19661.0",
+    "          MergeJoin on ?v0 est=28087.0",
+    "            IndexScan PSO ?v0 <http://purl.org/dc/terms/Location> ?v3 est=40124.0",
+    "            IndexScan PSO ?v0 <http://xmlns.com/foaf/age> ?v4 est=49927.0",
+    "          IndexScan PSO ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/gender> ?v5 est=59897.0",
+    "        IndexScan PSO ?v0 <http://xmlns.com/foaf/givenName> ?v6 est=69986.0"
+   ],
+   "base_plan_ms": 0.2305,
+   "candidate_ms": 14.2797,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/friendOf> ?v2 est=422235.0",
+    "    MergeJoin on ?v0 est=9457.0",
+    "      IndexScan PSO ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/likes> ?v1 est=112183.0",
+    "      MergeJoin on ?v0 est=8470.0",
+    "        IndexScan PSO ?v0 <http://xmlns.com/foaf/givenName> ?v6 est=69986.0",
+    "        MergeJoin on ?v0 est=12028.0",
+    "          IndexScan PSO ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/gender> ?v5 est=59897.0",
+    "          MergeJoin on ?v0 est=20126.0",
+    "            IndexScan PSO ?v0 <http://purl.org/dc/terms/Location> ?v3 est=40124.0",
+    "            IndexScan PSO ?v0 <http://xmlns.com/foaf/age> ?v4 est=49927.0"
+   ],
+   "candidate_plan_ms": 0.2212,
+   "per_round": [
+    0.458,
+    0.44,
+    0.458,
+    0.475
+   ],
+   "plan_changed": true,
+   "query": "C3-1",
+   "ratio": 0.4521,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2219,
+   "base_plan_ms": 0.1347,
+   "candidate_ms": 0.2276,
+   "candidate_plan_ms": 0.1382,
+   "per_round": [
+    0.987,
+    1.042,
+    1.017,
+    1.034
+   ],
+   "query": "F1-1",
+   "ratio": 1.0258,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2983,
+   "base_plan_ms": 0.1807,
+   "candidate_ms": 0.2322,
+   "candidate_plan_ms": 0.1413,
+   "per_round": [
+    0.779,
+    0.776,
+    0.773,
+    0.782
+   ],
+   "query": "F1-2",
+   "ratio": 0.7785,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2232,
+   "base_plan_ms": 0.1345,
+   "candidate_ms": 0.2239,
+   "candidate_plan_ms": 0.1357,
+   "per_round": [
+    1.024,
+    1.011,
+    0.99,
+    0.996
+   ],
+   "query": "F1-3",
+   "ratio": 1.0031,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2883,
+   "base_plan_ms": 0.1802,
+   "candidate_ms": 0.2302,
+   "candidate_plan_ms": 0.141,
+   "per_round": [
+    0.8,
+    0.803,
+    0.788,
+    0.79
+   ],
+   "query": "F1-4",
+   "ratio": 0.7987,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2254,
+   "base_plan_ms": 0.1354,
+   "candidate_ms": 0.2279,
+   "candidate_plan_ms": 0.1373,
+   "per_round": [
+    1.002,
+    1.029,
+    0.998,
+    1.013
+   ],
+   "query": "F1-5",
+   "ratio": 1.0108,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2655,
+   "base_plan": [
+    "  StarJoin on ?v0 | <http://ogp.me/ns#title> ?v2 ; <http://schema.org/description> ?v5 ; rdf:type ?v3 est=4.0",
+    "    IndexJoin on ?v1 | PSO ?v1 <http://schema.org/url> ?v6 est=11.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://schema.org/caption> ?v4 est=11.0",
+    "        IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v7 est=15.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=22.0",
+    "            IndexScan POS ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> <http://db.uwaterloo.ca/~galuc/wsdbm/SubGenre138> est=31.0"
+   ],
+   "base_plan_ms": 0.2169,
+   "candidate_ms": 0.2674,
+   "candidate_plan": [
+    "  StarJoin on ?v0 | <http://ogp.me/ns#title> ?v2 ; rdf:type ?v3 est=1.0",
+    "    IndexJoin on ?v1 | PSO ?v1 <http://schema.org/url> ?v6 est=1.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v5 est=1.0",
+    "        IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v7 est=1.0",
+    "          StarJoin on ?v0 | <http://xmlns.com/foaf/homepage> ?v1 ; <http://schema.org/caption> ?v4 est=1.0",
+    "            IndexScan POS ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> <http://db.uwaterloo.ca/~galuc/wsdbm/SubGenre138> est=31.0"
+   ],
+   "candidate_plan_ms": 0.2195,
+   "per_round": [
+    1.006,
+    1.01,
+    1.0,
+    1.011
+   ],
+   "plan_changed": true,
+   "query": "F2-1",
+   "ratio": 1.0071,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.3983,
+   "base_plan": [
+    "  StarJoin on ?v0 | <http://schema.org/description> ?v5 ; rdf:type ?v3 est=85.0",
+    "    IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v7 est=160.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://ogp.me/ns#title> ?v2 est=160.0",
+    "        MergeJoin on ?v1 est=228.0",
+    "          IndexScan PSO ?v1 <http://schema.org/url> ?v6 est=5000.0",
+    "            IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=326.0",
+    "              MergeJoin on ?v0 est=465.0",
+    "                IndexScan PSO ?v0 <http://schema.org/caption> ?v4 est=2534.0",
+    "                IndexScan POS ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> <http://db.uwaterloo.ca/~galuc/wsdbm/SubGenre53> est=665.0"
+   ],
+   "base_plan_ms": 0.2866,
+   "candidate_ms": 0.4168,
+   "candidate_plan": [
+    "  StarJoin on ?v0 | <http://ogp.me/ns#title> ?v2 ; rdf:type ?v3 est=69.0",
+    "    IndexJoin on ?v1 | PSO ?v1 <http://schema.org/url> ?v6 est=69.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v5 est=69.0",
+    "        IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v7 est=116.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=116.0",
+    "            MergeJoin on ?v0 est=465.0",
+    "              IndexScan PSO ?v0 <http://schema.org/caption> ?v4 est=2534.0",
+    "              IndexScan POS ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> <http://db.uwaterloo.ca/~galuc/wsdbm/SubGenre53> est=665.0"
+   ],
+   "candidate_plan_ms": 0.3279,
+   "per_round": [
+    1.035,
+    1.053,
+    1.036,
+    1.046
+   ],
+   "plan_changed": true,
+   "query": "F2-2",
+   "ratio": 1.0465,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.3135,
+   "base_plan": [
+    "  StarJoin on ?v0 | <http://schema.org/description> ?v5 ; rdf:type ?v3 est=125.0",
+    "    MergeJoin on ?v1 est=235.0",
+    "      IndexScan PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v7 est=5000.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://ogp.me/ns#title> ?v2 est=235.0",
+    "        MergeJoin on ?v1 est=336.0",
+    "          IndexScan PSO ?v1 <http://schema.org/url> ?v6 est=5000.0",
+    "            MergeJoin on ?v0 est=480.0",
+    "              IndexScan PSO ?v0 <http://schema.org/caption> ?v4 est=2534.0",
+    "              MergeJoin on ?v0 est=686.0",
+    "                IndexScan PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=11187.0",
+    "                IndexScan POS ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> <http://db.uwaterloo.ca/~galuc/wsdbm/SubGenre69> est=980.0"
+   ],
+   "base_plan_ms": 0.2016,
+   "candidate_ms": 0.3156,
+   "candidate_plan": [
+    "  IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v7 est=23.0",
+    "    StarJoin on ?v0 | <http://ogp.me/ns#title> ?v2 ; rdf:type ?v3 est=23.0",
+    "      IndexJoin on ?v1 | PSO ?v1 <http://schema.org/url> ?v6 est=23.0",
+    "        IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v5 est=23.0",
+    "          MergeJoin on ?v0 est=39.0",
+    "            IndexScan PSO ?v0 <http://schema.org/caption> ?v4 est=2534.0",
+    "            MergeJoin on ?v0 est=686.0",
+    "              IndexScan PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=11187.0",
+    "              IndexScan POS ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> <http://db.uwaterloo.ca/~galuc/wsdbm/SubGenre69> est=980.0"
+   ],
+   "candidate_plan_ms": 0.2037,
+   "per_round": [
+    0.996,
+    1.017,
+    0.998,
+    1.0
+   ],
+   "plan_changed": true,
+   "query": "F2-3",
+   "ratio": 1.0068,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.3027,
+   "base_plan": [
+    "  StarJoin on ?v0 | <http://schema.org/description> ?v5 ; rdf:type ?v3 est=93.0",
+    "    IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v7 est=175.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://ogp.me/ns#title> ?v2 est=175.0",
+    "        MergeJoin on ?v1 est=250.0",
+    "          IndexScan PSO ?v1 <http://schema.org/url> ?v6 est=5000.0",
+    "            IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=357.0",
+    "              MergeJoin on ?v0 est=510.0",
+    "                IndexScan PSO ?v0 <http://schema.org/caption> ?v4 est=2534.0",
+    "                IndexScan POS ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> <http://db.uwaterloo.ca/~galuc/wsdbm/SubGenre91> est=729.0"
+   ],
+   "base_plan_ms": 0.2003,
+   "candidate_ms": 0.3027,
+   "candidate_plan": [
+    "  StarJoin on ?v0 | rdf:type ?v3 ; <http://ogp.me/ns#title> ?v2 est=76.0",
+    "    IndexJoin on ?v1 | PSO ?v1 <http://schema.org/url> ?v6 est=76.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v5 est=76.0",
+    "        IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v7 est=127.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=127.0",
+    "            MergeJoin on ?v0 est=510.0",
+    "              IndexScan PSO ?v0 <http://schema.org/caption> ?v4 est=2534.0",
+    "              IndexScan POS ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> <http://db.uwaterloo.ca/~galuc/wsdbm/SubGenre91> est=729.0"
+   ],
+   "candidate_plan_ms": 0.2003,
+   "per_round": [
+    0.996,
+    1.001,
+    1.002,
+    0.999
+   ],
+   "plan_changed": true,
+   "query": "F2-4",
+   "ratio": 1.0,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2582,
+   "base_plan": [
+    "  StarJoin on ?v0 | <http://schema.org/description> ?v5 ; rdf:type ?v3 est=22.0",
+    "    IndexJoin on ?v1 | PSO ?v1 <http://schema.org/url> ?v6 est=41.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://ogp.me/ns#title> ?v2 est=41.0",
+    "        IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v7 est=59.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=84.0",
+    "            MergeJoin on ?v0 est=120.0",
+    "              IndexScan PSO ?v0 <http://schema.org/caption> ?v4 est=2534.0",
+    "              IndexScan POS ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> <http://db.uwaterloo.ca/~galuc/wsdbm/SubGenre116> est=171.0"
+   ],
+   "base_plan_ms": 0.1963,
+   "candidate_ms": 0.2591,
+   "candidate_plan": [
+    "  StarJoin on ?v0 | <http://ogp.me/ns#title> ?v2 ; rdf:type ?v3 est=18.0",
+    "    IndexJoin on ?v1 | PSO ?v1 <http://schema.org/url> ?v6 est=18.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v5 est=18.0",
+    "        IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v7 est=30.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=30.0",
+    "            MergeJoin on ?v0 est=120.0",
+    "              IndexScan PSO ?v0 <http://schema.org/caption> ?v4 est=2534.0",
+    "              IndexScan POS ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> <http://db.uwaterloo.ca/~galuc/wsdbm/SubGenre116> est=171.0"
+   ],
+   "candidate_plan_ms": 0.1967,
+   "per_round": [
+    1.024,
+    1.002,
+    0.992,
+    0.989
+   ],
+   "plan_changed": true,
+   "query": "F2-5",
+   "ratio": 1.0037,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1796,
+   "base_plan_ms": 0.1452,
+   "candidate_ms": 0.1877,
+   "candidate_plan_ms": 0.153,
+   "per_round": [
+    1.061,
+    1.038,
+    1.045,
+    1.046
+   ],
+   "query": "F3-1",
+   "ratio": 1.0452,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1979,
+   "base_plan_ms": 0.1457,
+   "candidate_ms": 0.2052,
+   "candidate_plan_ms": 0.1544,
+   "per_round": [
+    1.015,
+    1.041,
+    1.024,
+    1.052
+   ],
+   "query": "F3-2",
+   "ratio": 1.0371,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.205,
+   "base_plan_ms": 0.1472,
+   "candidate_ms": 0.2119,
+   "candidate_plan_ms": 0.1545,
+   "per_round": [
+    1.058,
+    1.028,
+    1.019,
+    1.042
+   ],
+   "query": "F3-3",
+   "ratio": 1.0338,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2578,
+   "base_plan_ms": 0.1516,
+   "candidate_ms": 0.2693,
+   "candidate_plan_ms": 0.1612,
+   "per_round": [
+    1.048,
+    1.019,
+    1.063,
+    1.03
+   ],
+   "query": "F3-4",
+   "ratio": 1.0444,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2286,
+   "base_plan_ms": 0.147,
+   "candidate_ms": 0.2392,
+   "candidate_plan_ms": 0.1565,
+   "per_round": [
+    1.042,
+    1.054,
+    1.064,
+    1.032
+   ],
+   "query": "F3-5",
+   "ratio": 1.0464,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 1.0285,
+   "base_plan": [
+    "  IndexJoin on ?v0 | POS ?v2 <http://purl.org/goodrelations/includes> ?v0 est=38.0",
+    "    IndexJoin on ?v1 | PSO ?v1 <http://schema.org/url> ?v5 est=15.0",
+    "      IndexJoin on ?v0 | POS ?v7 <http://db.uwaterloo.ca/~galuc/wsdbm/likes> ?v0 est=15.0",
+    "        IndexJoin on ?v1 | POS ?v1 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=4.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v4 est=6.0",
+    "            IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v6 est=9.0",
+    "              IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=13.0",
+    "                MergeJoin on ?v0 est=69.0",
+    "                  IndexScan POS ?v0 <http://ogp.me/ns#tag> <http://db.uwaterloo.ca/~galuc/wsdbm/Topic238> est=551.0",
+    "                  IndexScan PSO ?v0 <http://schema.org/contentSize> ?v8 est=2549.0"
+   ],
+   "base_plan_ms": 0.9122,
+   "candidate_ms": 1.1082,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | POS ?v2 <http://purl.org/goodrelations/includes> ?v0 est=34.0",
+    "    IndexJoin on ?v0 | POS ?v7 <http://db.uwaterloo.ca/~galuc/wsdbm/likes> ?v0 est=10.0",
+    "      StarJoin on ?v1 | <http://schema.org/url> ?v5 ; <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v6 est=3.0",
+    "        IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v4 est=6.0",
+    "          IndexJoin on ?v1 | POS ?v1 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=9.0",
+    "            IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=13.0",
+    "              MergeJoin on ?v0 est=69.0",
+    "                IndexScan POS ?v0 <http://ogp.me/ns#tag> <http://db.uwaterloo.ca/~galuc/wsdbm/Topic238> est=551.0",
+    "                IndexScan PSO ?v0 <http://schema.org/contentSize> ?v8 est=2549.0"
+   ],
+   "candidate_plan_ms": 0.9969,
+   "per_round": [
+    1.071,
+    1.091,
+    1.069,
+    1.076
+   ],
+   "plan_changed": true,
+   "query": "F4-1",
+   "ratio": 1.0775,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.9958,
+   "base_plan": [
+    "  IndexJoin on ?v0 | POS ?v7 <http://db.uwaterloo.ca/~galuc/wsdbm/likes> ?v0 est=37.0",
+    "    IndexJoin on ?v1 | PSO ?v1 <http://schema.org/url> ?v5 est=9.0",
+    "      IndexJoin on ?v0 | POS ?v2 <http://purl.org/goodrelations/includes> ?v0 est=9.0",
+    "        IndexJoin on ?v1 | POS ?v1 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=3.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v4 est=5.0",
+    "            IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v6 est=9.0",
+    "              IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=13.0",
+    "                MergeJoin on ?v0 est=52.0",
+    "                  IndexScan POS ?v0 <http://ogp.me/ns#tag> <http://db.uwaterloo.ca/~galuc/wsdbm/Topic179> est=556.0",
+    "                  IndexScan PSO ?v0 <http://schema.org/contentSize> ?v8 est=2549.0"
+   ],
+   "base_plan_ms": 0.9012,
+   "candidate_ms": 1.068,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | POS ?v7 <http://db.uwaterloo.ca/~galuc/wsdbm/likes> ?v0 est=28.0",
+    "    IndexJoin on ?v0 | POS ?v2 <http://purl.org/goodrelations/includes> ?v0 est=8.0",
+    "      StarJoin on ?v1 | <http://schema.org/url> ?v5 ; <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v6 est=2.0",
+    "        IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v4 est=5.0",
+    "          IndexJoin on ?v1 | POS ?v1 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=9.0",
+    "            IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=13.0",
+    "              MergeJoin on ?v0 est=52.0",
+    "                IndexScan POS ?v0 <http://ogp.me/ns#tag> <http://db.uwaterloo.ca/~galuc/wsdbm/Topic179> est=556.0",
+    "                IndexScan PSO ?v0 <http://schema.org/contentSize> ?v8 est=2549.0"
+   ],
+   "candidate_plan_ms": 0.9853,
+   "per_round": [
+    1.055,
+    1.095,
+    1.07,
+    1.068
+   ],
+   "plan_changed": true,
+   "query": "F4-2",
+   "ratio": 1.0725,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.9957,
+   "base_plan": [
+    "  IndexJoin on ?v0 | POS ?v2 <http://purl.org/goodrelations/includes> ?v0 est=20.0",
+    "    IndexJoin on ?v1 | PSO ?v1 <http://schema.org/url> ?v5 est=8.0",
+    "      IndexJoin on ?v0 | POS ?v7 <http://db.uwaterloo.ca/~galuc/wsdbm/likes> ?v0 est=8.0",
+    "        IndexJoin on ?v1 | POS ?v1 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=3.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v4 est=4.0",
+    "            IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v6 est=7.0",
+    "              IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=10.0",
+    "                MergeJoin on ?v0 est=36.0",
+    "                  IndexScan POS ?v0 <http://ogp.me/ns#tag> <http://db.uwaterloo.ca/~galuc/wsdbm/Topic196> est=580.0",
+    "                  IndexScan PSO ?v0 <http://schema.org/contentSize> ?v8 est=2549.0"
+   ],
+   "base_plan_ms": 0.8942,
+   "candidate_ms": 1.0699,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | POS ?v2 <http://purl.org/goodrelations/includes> ?v0 est=26.0",
+    "    IndexJoin on ?v0 | POS ?v7 <http://db.uwaterloo.ca/~galuc/wsdbm/likes> ?v0 est=6.0",
+    "      StarJoin on ?v1 | <http://schema.org/url> ?v5 ; <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v6 est=2.0",
+    "        IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v4 est=4.0",
+    "          IndexJoin on ?v1 | POS ?v1 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=7.0",
+    "            IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=10.0",
+    "              MergeJoin on ?v0 est=36.0",
+    "                IndexScan POS ?v0 <http://ogp.me/ns#tag> <http://db.uwaterloo.ca/~galuc/wsdbm/Topic196> est=580.0",
+    "                IndexScan PSO ?v0 <http://schema.org/contentSize> ?v8 est=2549.0"
+   ],
+   "candidate_plan_ms": 0.9779,
+   "per_round": [
+    1.078,
+    1.08,
+    1.069,
+    1.066
+   ],
+   "plan_changed": true,
+   "query": "F4-3",
+   "ratio": 1.0746,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.8991,
+   "base_plan": [
+    "  IndexJoin on ?v0 | POS ?v7 <http://db.uwaterloo.ca/~galuc/wsdbm/likes> ?v0 est=907.0",
+    "    IndexJoin on ?v0 | POS ?v2 <http://purl.org/goodrelations/includes> ?v0 est=275.0",
+    "      IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v6 est=106.0",
+    "        IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v4 est=106.0",
+    "          MergeJoin on ?v1 est=152.0",
+    "            MergeJoin on ?v1 est=216.0",
+    "                IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=309.0",
+    "                  MergeJoin on ?v0 est=442.0",
+    "                    IndexScan POS ?v0 <http://ogp.me/ns#tag> <http://db.uwaterloo.ca/~galuc/wsdbm/Topic138> est=631.0",
+    "                    IndexScan PSO ?v0 <http://schema.org/contentSize> ?v8 est=2549.0",
+    "              IndexScan PSO ?v1 <http://schema.org/url> ?v5 est=5000.0",
+    "            IndexScan POS ?v1 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=1487.0"
+   ],
+   "base_plan_ms": 0.796,
+   "candidate_ms": 0.9653,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | POS ?v7 <http://db.uwaterloo.ca/~galuc/wsdbm/likes> ?v0 est=196.0",
+    "    IndexJoin on ?v0 | POS ?v2 <http://purl.org/goodrelations/includes> ?v0 est=59.0",
+    "      StarJoin on ?v1 | <http://schema.org/url> ?v5 ; <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v6 est=23.0",
+    "        IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v4 est=47.0",
+    "          MergeJoin on ?v1 est=79.0",
+    "              IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=113.0",
+    "                MergeJoin on ?v0 est=442.0",
+    "                  IndexScan POS ?v0 <http://ogp.me/ns#tag> <http://db.uwaterloo.ca/~galuc/wsdbm/Topic138> est=631.0",
+    "                  IndexScan PSO ?v0 <http://schema.org/contentSize> ?v8 est=2549.0",
+    "            IndexScan POS ?v1 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=1487.0"
+   ],
+   "candidate_plan_ms": 0.8862,
+   "per_round": [
+    1.069,
+    1.071,
+    1.077,
+    1.072
+   ],
+   "plan_changed": true,
+   "query": "F4-4",
+   "ratio": 1.0737,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.9873,
+   "base_plan": [
+    "  IndexJoin on ?v0 | POS ?v2 <http://purl.org/goodrelations/includes> ?v0 est=35.0",
+    "    IndexJoin on ?v1 | PSO ?v1 <http://schema.org/url> ?v5 est=13.0",
+    "      IndexJoin on ?v0 | POS ?v7 <http://db.uwaterloo.ca/~galuc/wsdbm/likes> ?v0 est=13.0",
+    "        IndexJoin on ?v1 | POS ?v1 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=4.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v4 est=6.0",
+    "            IndexJoin on ?v1 | PSO ?v1 <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v6 est=8.0",
+    "              IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=11.0",
+    "                MergeJoin on ?v0 est=71.0",
+    "                  IndexScan POS ?v0 <http://ogp.me/ns#tag> <http://db.uwaterloo.ca/~galuc/wsdbm/Topic200> est=565.0",
+    "                  IndexScan PSO ?v0 <http://schema.org/contentSize> ?v8 est=2549.0"
+   ],
+   "base_plan_ms": 0.8987,
+   "candidate_ms": 1.0571,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | POS ?v2 <http://purl.org/goodrelations/includes> ?v0 est=30.0",
+    "    IndexJoin on ?v0 | POS ?v7 <http://db.uwaterloo.ca/~galuc/wsdbm/likes> ?v0 est=9.0",
+    "      StarJoin on ?v1 | <http://schema.org/url> ?v5 ; <http://db.uwaterloo.ca/~galuc/wsdbm/hits> ?v6 est=3.0",
+    "        IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v4 est=6.0",
+    "          IndexJoin on ?v1 | POS ?v1 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=8.0",
+    "            IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/homepage> ?v1 est=11.0",
+    "              MergeJoin on ?v0 est=71.0",
+    "                IndexScan POS ?v0 <http://ogp.me/ns#tag> <http://db.uwaterloo.ca/~galuc/wsdbm/Topic200> est=565.0",
+    "                IndexScan PSO ?v0 <http://schema.org/contentSize> ?v8 est=2549.0"
+   ],
+   "candidate_plan_ms": 0.9759,
+   "per_round": [
+    1.066,
+    1.083,
+    1.07,
+    1.064
+   ],
+   "plan_changed": true,
+   "query": "F4-5",
+   "ratio": 1.0707,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2291,
+   "base_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/price> ?v3 est=11.0",
+    "    IndexJoin on ?v1 | PSO ?v1 rdf:type ?v6 est=11.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/validThrough> ?v4 est=14.0",
+    "        IndexJoin on ?v1 | PSO ?v1 <http://ogp.me/ns#title> ?v5 est=36.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/includes> ?v1 est=51.0",
+    "            IndexScan SPO <http://db.uwaterloo.ca/~galuc/wsdbm/Retailer1143> <http://purl.org/goodrelations/offers> ?v0 est=73.0"
+   ],
+   "base_plan_ms": 0.1195,
+   "candidate_ms": 0.2304,
+   "candidate_plan": [
+    "  IndexJoin on ?v1 | PSO ?v1 rdf:type ?v6 est=20.0",
+    "    IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/price> ?v3 est=20.0",
+    "      IndexJoin on ?v1 | PSO ?v1 <http://ogp.me/ns#title> ?v5 est=20.0",
+    "        StarJoin on ?v0 | <http://purl.org/goodrelations/includes> ?v1 ; <http://purl.org/goodrelations/validThrough> ?v4 est=21.0",
+    "          IndexScan SPO <http://db.uwaterloo.ca/~galuc/wsdbm/Retailer1143> <http://purl.org/goodrelations/offers> ?v0 est=73.0"
+   ],
+   "candidate_plan_ms": 0.1247,
+   "per_round": [
+    1.036,
+    1.014,
+    1.0,
+    0.997
+   ],
+   "plan_changed": true,
+   "query": "F5-1",
+   "ratio": 1.0056,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.3137,
+   "base_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/price> ?v3 est=26.0",
+    "    IndexJoin on ?v1 | PSO ?v1 rdf:type ?v6 est=26.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/validThrough> ?v4 est=34.0",
+    "        IndexJoin on ?v1 | PSO ?v1 <http://ogp.me/ns#title> ?v5 est=84.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/includes> ?v1 est=120.0",
+    "            IndexScan SPO <http://db.uwaterloo.ca/~galuc/wsdbm/Retailer1008> <http://purl.org/goodrelations/offers> ?v0 est=171.0"
+   ],
+   "base_plan_ms": 0.1243,
+   "candidate_ms": 0.3189,
+   "candidate_plan": [
+    "  IndexJoin on ?v1 | PSO ?v1 rdf:type ?v6 est=47.0",
+    "    IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/price> ?v3 est=47.0",
+    "      IndexJoin on ?v1 | PSO ?v1 <http://ogp.me/ns#title> ?v5 est=47.0",
+    "        StarJoin on ?v0 | <http://purl.org/goodrelations/includes> ?v1 ; <http://purl.org/goodrelations/validThrough> ?v4 est=48.0",
+    "          IndexScan SPO <http://db.uwaterloo.ca/~galuc/wsdbm/Retailer1008> <http://purl.org/goodrelations/offers> ?v0 est=171.0"
+   ],
+   "candidate_plan_ms": 0.132,
+   "per_round": [
+    1.033,
+    1.029,
+    1.012,
+    1.01
+   ],
+   "plan_changed": true,
+   "query": "F5-2",
+   "ratio": 1.0166,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2793,
+   "base_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/price> ?v3 est=19.0",
+    "    IndexJoin on ?v1 | PSO ?v1 rdf:type ?v6 est=19.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/validThrough> ?v4 est=25.0",
+    "        IndexJoin on ?v1 | PSO ?v1 <http://ogp.me/ns#title> ?v5 est=63.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/includes> ?v1 est=90.0",
+    "            IndexScan SPO <http://db.uwaterloo.ca/~galuc/wsdbm/Retailer170> <http://purl.org/goodrelations/offers> ?v0 est=128.0"
+   ],
+   "base_plan_ms": 0.1357,
+   "candidate_ms": 0.2842,
+   "candidate_plan": [
+    "  IndexJoin on ?v1 | PSO ?v1 rdf:type ?v6 est=35.0",
+    "    IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/price> ?v3 est=35.0",
+    "      IndexJoin on ?v1 | PSO ?v1 <http://ogp.me/ns#title> ?v5 est=35.0",
+    "        StarJoin on ?v0 | <http://purl.org/goodrelations/includes> ?v1 ; <http://purl.org/goodrelations/validThrough> ?v4 est=36.0",
+    "          IndexScan SPO <http://db.uwaterloo.ca/~galuc/wsdbm/Retailer170> <http://purl.org/goodrelations/offers> ?v0 est=128.0"
+   ],
+   "candidate_plan_ms": 0.1373,
+   "per_round": [
+    1.032,
+    1.022,
+    1.001,
+    1.021
+   ],
+   "plan_changed": true,
+   "query": "F5-3",
+   "ratio": 1.0176,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2913,
+   "base_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/price> ?v3 est=23.0",
+    "    IndexJoin on ?v1 | PSO ?v1 rdf:type ?v6 est=23.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/validThrough> ?v4 est=30.0",
+    "        IndexJoin on ?v1 | PSO ?v1 <http://ogp.me/ns#title> ?v5 est=75.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/includes> ?v1 est=108.0",
+    "            IndexScan SPO <http://db.uwaterloo.ca/~galuc/wsdbm/Retailer728> <http://purl.org/goodrelations/offers> ?v0 est=154.0"
+   ],
+   "base_plan_ms": 0.1228,
+   "candidate_ms": 0.2828,
+   "candidate_plan": [
+    "  IndexJoin on ?v1 | PSO ?v1 rdf:type ?v6 est=42.0",
+    "    IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/price> ?v3 est=42.0",
+    "      IndexJoin on ?v1 | PSO ?v1 <http://ogp.me/ns#title> ?v5 est=42.0",
+    "        StarJoin on ?v0 | <http://purl.org/goodrelations/includes> ?v1 ; <http://purl.org/goodrelations/validThrough> ?v4 est=43.0",
+    "          IndexScan SPO <http://db.uwaterloo.ca/~galuc/wsdbm/Retailer728> <http://purl.org/goodrelations/offers> ?v0 est=154.0"
+   ],
+   "candidate_plan_ms": 0.1287,
+   "per_round": [
+    0.977,
+    0.978,
+    0.97,
+    0.969
+   ],
+   "plan_changed": true,
+   "query": "F5-4",
+   "ratio": 0.9708,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2424,
+   "base_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/price> ?v3 est=13.0",
+    "    IndexJoin on ?v1 | PSO ?v1 rdf:type ?v6 est=13.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/validThrough> ?v4 est=17.0",
+    "        IndexJoin on ?v1 | PSO ?v1 <http://ogp.me/ns#title> ?v5 est=42.0",
+    "          IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/includes> ?v1 est=59.0",
+    "            IndexScan SPO <http://db.uwaterloo.ca/~galuc/wsdbm/Retailer402> <http://purl.org/goodrelations/offers> ?v0 est=85.0"
+   ],
+   "base_plan_ms": 0.1211,
+   "candidate_ms": 0.2377,
+   "candidate_plan": [
+    "  IndexJoin on ?v1 | PSO ?v1 rdf:type ?v6 est=23.0",
+    "    IndexJoin on ?v0 | PSO ?v0 <http://purl.org/goodrelations/price> ?v3 est=23.0",
+    "      IndexJoin on ?v1 | PSO ?v1 <http://ogp.me/ns#title> ?v5 est=23.0",
+    "        StarJoin on ?v0 | <http://purl.org/goodrelations/includes> ?v1 ; <http://purl.org/goodrelations/validThrough> ?v4 est=24.0",
+    "          IndexScan SPO <http://db.uwaterloo.ca/~galuc/wsdbm/Retailer402> <http://purl.org/goodrelations/offers> ?v0 est=85.0"
+   ],
+   "candidate_plan_ms": 0.1245,
+   "per_round": [
+    0.979,
+    0.978,
+    0.972,
+    0.985
+   ],
+   "plan_changed": true,
+   "query": "F5-5",
+   "ratio": 0.9808,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.092,
+   "base_plan_ms": 0.06,
+   "candidate_ms": 0.0943,
+   "candidate_plan_ms": 0.0623,
+   "per_round": [
+    1.016,
+    1.011,
+    1.033,
+    1.036
+   ],
+   "query": "L1-1",
+   "ratio": 1.025,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.106,
+   "base_plan_ms": 0.0615,
+   "candidate_ms": 0.1075,
+   "candidate_plan_ms": 0.0628,
+   "per_round": [
+    1.063,
+    1.002,
+    1.024,
+    0.984
+   ],
+   "query": "L1-2",
+   "ratio": 1.0138,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0943,
+   "base_plan_ms": 0.0594,
+   "candidate_ms": 0.0967,
+   "candidate_plan_ms": 0.0609,
+   "per_round": [
+    1.005,
+    1.011,
+    1.038,
+    1.037
+   ],
+   "query": "L1-3",
+   "ratio": 1.0258,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1069,
+   "base_plan_ms": 0.0655,
+   "candidate_ms": 0.1086,
+   "candidate_plan_ms": 0.0668,
+   "per_round": [
+    1.023,
+    0.999,
+    1.031,
+    1.014
+   ],
+   "query": "L1-4",
+   "ratio": 1.0154,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1105,
+   "base_plan_ms": 0.0652,
+   "candidate_ms": 0.1131,
+   "candidate_plan_ms": 0.0671,
+   "per_round": [
+    1.043,
+    1.022,
+    1.016,
+    1.016
+   ],
+   "query": "L1-5",
+   "ratio": 1.0232,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1116,
+   "base_plan_ms": 0.0538,
+   "candidate_ms": 0.1128,
+   "candidate_plan_ms": 0.0555,
+   "per_round": [
+    0.989,
+    1.025,
+    1.001,
+    1.019
+   ],
+   "query": "L2-1",
+   "ratio": 1.0106,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1214,
+   "base_plan_ms": 0.0529,
+   "candidate_ms": 0.1205,
+   "candidate_plan_ms": 0.0529,
+   "per_round": [
+    0.983,
+    0.992,
+    1.001,
+    1.002
+   ],
+   "query": "L2-2",
+   "ratio": 0.9929,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1541,
+   "base_plan_ms": 0.0539,
+   "candidate_ms": 0.1502,
+   "candidate_plan_ms": 0.0532,
+   "per_round": [
+    0.978,
+    0.971,
+    0.965,
+    0.997
+   ],
+   "query": "L2-3",
+   "ratio": 0.9749,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0862,
+   "base_plan_ms": 0.0583,
+   "candidate_ms": 0.0856,
+   "candidate_plan_ms": 0.0583,
+   "per_round": [
+    0.965,
+    0.992,
+    0.98,
+    1.015
+   ],
+   "query": "L2-4",
+   "ratio": 0.993,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1199,
+   "base_plan_ms": 0.0517,
+   "candidate_ms": 0.1196,
+   "candidate_plan_ms": 0.0523,
+   "per_round": [
+    0.996,
+    0.992,
+    1.014,
+    0.987
+   ],
+   "query": "L2-5",
+   "ratio": 0.9969,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0741,
+   "base_plan_ms": 0.0504,
+   "candidate_ms": 0.0738,
+   "candidate_plan_ms": 0.0502,
+   "per_round": [
+    0.998,
+    0.996,
+    0.975,
+    0.992
+   ],
+   "query": "L3-1",
+   "ratio": 0.996,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0798,
+   "base_plan_ms": 0.0508,
+   "candidate_ms": 0.0792,
+   "candidate_plan_ms": 0.0506,
+   "per_round": [
+    1.018,
+    0.972,
+    0.995,
+    0.988
+   ],
+   "query": "L3-2",
+   "ratio": 0.992,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0753,
+   "base_plan_ms": 0.0493,
+   "candidate_ms": 0.077,
+   "candidate_plan_ms": 0.05,
+   "per_round": [
+    1.02,
+    1.034,
+    0.979,
+    1.041
+   ],
+   "query": "L3-3",
+   "ratio": 1.0225,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0727,
+   "base_plan_ms": 0.0495,
+   "candidate_ms": 0.0727,
+   "candidate_plan_ms": 0.0494,
+   "per_round": [
+    1.034,
+    1.003,
+    0.987,
+    0.987
+   ],
+   "query": "L3-4",
+   "ratio": 0.9998,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0718,
+   "base_plan_ms": 0.049,
+   "candidate_ms": 0.0729,
+   "candidate_plan_ms": 0.0492,
+   "per_round": [
+    1.023,
+    1.013,
+    0.983,
+    1.054
+   ],
+   "query": "L3-5",
+   "ratio": 1.0162,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0836,
+   "base_plan_ms": 0.0537,
+   "candidate_ms": 0.0869,
+   "candidate_plan_ms": 0.0561,
+   "per_round": [
+    1.03,
+    1.032,
+    1.021,
+    1.055
+   ],
+   "query": "L4-1",
+   "ratio": 1.0395,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0852,
+   "base_plan_ms": 0.0541,
+   "candidate_ms": 0.0854,
+   "candidate_plan_ms": 0.055,
+   "per_round": [
+    1.0,
+    0.99,
+    0.976,
+    1.044
+   ],
+   "query": "L4-2",
+   "ratio": 1.0026,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0836,
+   "base_plan_ms": 0.0533,
+   "candidate_ms": 0.0855,
+   "candidate_plan_ms": 0.0553,
+   "per_round": [
+    1.015,
+    1.034,
+    1.028,
+    1.02
+   ],
+   "query": "L4-3",
+   "ratio": 1.0226,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0833,
+   "base_plan_ms": 0.0529,
+   "candidate_ms": 0.0849,
+   "candidate_plan_ms": 0.055,
+   "per_round": [
+    1.002,
+    1.038,
+    1.031,
+    1.01
+   ],
+   "query": "L4-4",
+   "ratio": 1.0202,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0826,
+   "base_plan_ms": 0.0532,
+   "candidate_ms": 0.083,
+   "candidate_plan_ms": 0.054,
+   "per_round": [
+    0.973,
+    1.058,
+    1.019,
+    1.007
+   ],
+   "query": "L4-5",
+   "ratio": 1.0043,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1196,
+   "base_plan_ms": 0.0556,
+   "candidate_ms": 0.1203,
+   "candidate_plan_ms": 0.0562,
+   "per_round": [
+    1.006,
+    1.027,
+    0.985,
+    0.992
+   ],
+   "query": "L5-1",
+   "ratio": 1.0055,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1324,
+   "base_plan_ms": 0.0557,
+   "candidate_ms": 0.1321,
+   "candidate_plan_ms": 0.0562,
+   "per_round": [
+    0.982,
+    1.003,
+    0.987,
+    0.999
+   ],
+   "query": "L5-2",
+   "ratio": 0.998,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1739,
+   "base_plan_ms": 0.0568,
+   "candidate_ms": 0.1716,
+   "candidate_plan_ms": 0.0573,
+   "per_round": [
+    0.981,
+    0.995,
+    0.996,
+    0.978
+   ],
+   "query": "L5-3",
+   "ratio": 0.9867,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.096,
+   "base_plan_ms": 0.0593,
+   "candidate_ms": 0.0998,
+   "candidate_plan_ms": 0.0617,
+   "per_round": [
+    1.066,
+    1.054,
+    0.997,
+    1.015
+   ],
+   "query": "L5-4",
+   "ratio": 1.039,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1304,
+   "base_plan_ms": 0.0545,
+   "candidate_ms": 0.1329,
+   "candidate_plan_ms": 0.0564,
+   "per_round": [
+    1.015,
+    1.018,
+    1.023,
+    1.011
+   ],
+   "query": "L5-5",
+   "ratio": 1.0195,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.6856,
+   "base_plan_ms": 0.5602,
+   "candidate_ms": 0.7105,
+   "candidate_plan_ms": 0.5843,
+   "per_round": [
+    1.039,
+    1.034,
+    1.038,
+    1.039
+   ],
+   "query": "S1-1",
+   "ratio": 1.0364,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.6187,
+   "base_plan_ms": 0.5077,
+   "candidate_ms": 0.6402,
+   "candidate_plan_ms": 0.5296,
+   "per_round": [
+    1.041,
+    1.031,
+    1.027,
+    1.034
+   ],
+   "query": "S1-2",
+   "ratio": 1.0347,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.7185,
+   "base_plan_ms": 0.5667,
+   "candidate_ms": 0.7402,
+   "candidate_plan_ms": 0.5881,
+   "per_round": [
+    1.034,
+    1.032,
+    1.034,
+    1.017
+   ],
+   "query": "S1-3",
+   "ratio": 1.0303,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.6597,
+   "base_plan_ms": 0.5585,
+   "candidate_ms": 0.6838,
+   "candidate_plan_ms": 0.582,
+   "per_round": [
+    1.031,
+    1.04,
+    1.041,
+    1.033
+   ],
+   "query": "S1-4",
+   "ratio": 1.0365,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.7611,
+   "base_plan_ms": 0.5668,
+   "candidate_ms": 0.7821,
+   "candidate_plan_ms": 0.5898,
+   "per_round": [
+    1.022,
+    1.039,
+    1.027,
+    1.024
+   ],
+   "query": "S1-5",
+   "ratio": 1.0275,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2606,
+   "base_plan_ms": 0.1041,
+   "candidate_ms": 0.2604,
+   "candidate_plan_ms": 0.1025,
+   "per_round": [
+    1.016,
+    0.987,
+    1.023,
+    1.004
+   ],
+   "query": "S2-1",
+   "ratio": 0.9993,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.3239,
+   "base_plan_ms": 0.1047,
+   "candidate_ms": 0.3272,
+   "candidate_plan_ms": 0.1059,
+   "per_round": [
+    1.003,
+    1.013,
+    1.021,
+    1.0
+   ],
+   "query": "S2-2",
+   "ratio": 1.0101,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2874,
+   "base_plan_ms": 0.1038,
+   "candidate_ms": 0.29,
+   "candidate_plan_ms": 0.1042,
+   "per_round": [
+    1.017,
+    1.007,
+    1.005,
+    1.01
+   ],
+   "query": "S2-3",
+   "ratio": 1.0093,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.3502,
+   "base_plan_ms": 0.1056,
+   "candidate_ms": 0.3556,
+   "candidate_plan_ms": 0.108,
+   "per_round": [
+    1.013,
+    1.015,
+    1.014,
+    1.024
+   ],
+   "query": "S2-4",
+   "ratio": 1.0154,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.4621,
+   "base_plan_ms": 0.1112,
+   "candidate_ms": 0.4657,
+   "candidate_plan_ms": 0.1102,
+   "per_round": [
+    1.004,
+    1.012,
+    1.003,
+    1.012
+   ],
+   "query": "S2-5",
+   "ratio": 1.0079,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.132,
+   "base_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> ?v3 est=1090.0",
+    "    MergeJoin on ?v0 est=661.0",
+    "      IndexScan PSO ?v0 <http://schema.org/caption> ?v2 est=2534.0",
+    "      MergeJoin on ?v0 est=944.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory14> est=2575.0",
+    "        IndexScan PSO ?v0 <http://schema.org/publisher> ?v4 est=1349.0"
+   ],
+   "base_plan_ms": 0.0762,
+   "candidate_ms": 0.1326,
+   "candidate_plan": [
+    "  StarJoin on ?v0 | <http://schema.org/caption> ?v2 ; <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> ?v3 est=2.0",
+    "    MergeJoin on ?v0 est=1.0",
+    "      IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory14> est=2575.0",
+    "      IndexScan PSO ?v0 <http://schema.org/publisher> ?v4 est=1349.0"
+   ],
+   "candidate_plan_ms": 0.0862,
+   "per_round": [
+    1.016,
+    1.013,
+    0.976,
+    1.006
+   ],
+   "plan_changed": true,
+   "query": "S3-1",
+   "ratio": 1.0049,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1246,
+   "base_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> ?v3 est=1090.0",
+    "    MergeJoin on ?v0 est=661.0",
+    "      IndexScan PSO ?v0 <http://schema.org/caption> ?v2 est=2534.0",
+    "      MergeJoin on ?v0 est=944.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory9> est=1627.0",
+    "        IndexScan PSO ?v0 <http://schema.org/publisher> ?v4 est=1349.0"
+   ],
+   "base_plan_ms": 0.0742,
+   "candidate_ms": 0.1229,
+   "candidate_plan": [
+    "  StarJoin on ?v0 | <http://schema.org/caption> ?v2 ; <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> ?v3 est=2.0",
+    "    MergeJoin on ?v0 est=1.0",
+    "      IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory9> est=1627.0",
+    "      IndexScan PSO ?v0 <http://schema.org/publisher> ?v4 est=1349.0"
+   ],
+   "candidate_plan_ms": 0.0831,
+   "per_round": [
+    1.005,
+    0.982,
+    0.972,
+    1.002
+   ],
+   "plan_changed": true,
+   "query": "S3-2",
+   "ratio": 0.9864,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1236,
+   "base_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> ?v3 est=1090.0",
+    "    MergeJoin on ?v0 est=661.0",
+    "      IndexScan PSO ?v0 <http://schema.org/caption> ?v2 est=2534.0",
+    "      MergeJoin on ?v0 est=944.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory12> est=1683.0",
+    "        IndexScan PSO ?v0 <http://schema.org/publisher> ?v4 est=1349.0"
+   ],
+   "base_plan_ms": 0.0736,
+   "candidate_ms": 0.1218,
+   "candidate_plan": [
+    "  StarJoin on ?v0 | <http://schema.org/caption> ?v2 ; <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> ?v3 est=2.0",
+    "    MergeJoin on ?v0 est=1.0",
+    "      IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory12> est=1683.0",
+    "      IndexScan PSO ?v0 <http://schema.org/publisher> ?v4 est=1349.0"
+   ],
+   "candidate_plan_ms": 0.0811,
+   "per_round": [
+    0.99,
+    0.996,
+    0.984,
+    0.959
+   ],
+   "plan_changed": true,
+   "query": "S3-3",
+   "ratio": 0.9852,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1223,
+   "base_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> ?v3 est=1090.0",
+    "    MergeJoin on ?v0 est=661.0",
+    "      IndexScan PSO ?v0 <http://schema.org/caption> ?v2 est=2534.0",
+    "      MergeJoin on ?v0 est=944.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory7> est=1635.0",
+    "        IndexScan PSO ?v0 <http://schema.org/publisher> ?v4 est=1349.0"
+   ],
+   "base_plan_ms": 0.0729,
+   "candidate_ms": 0.1222,
+   "candidate_plan": [
+    "  StarJoin on ?v0 | <http://schema.org/caption> ?v2 ; <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> ?v3 est=2.0",
+    "    MergeJoin on ?v0 est=1.0",
+    "      IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory7> est=1635.0",
+    "      IndexScan PSO ?v0 <http://schema.org/publisher> ?v4 est=1349.0"
+   ],
+   "candidate_plan_ms": 0.0819,
+   "per_round": [
+    1.01,
+    1.025,
+    0.986,
+    0.961
+   ],
+   "plan_changed": true,
+   "query": "S3-4",
+   "ratio": 0.9994,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2176,
+   "base_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> ?v3 est=1090.0",
+    "    MergeJoin on ?v0 est=661.0",
+    "      IndexScan PSO ?v0 <http://schema.org/caption> ?v2 est=2534.0",
+    "      MergeJoin on ?v0 est=944.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory4> est=1704.0",
+    "        IndexScan PSO ?v0 <http://schema.org/publisher> ?v4 est=1349.0"
+   ],
+   "base_plan_ms": 0.0871,
+   "candidate_ms": 0.2017,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://db.uwaterloo.ca/~galuc/wsdbm/hasGenre> ?v3 est=279.0",
+    "    MergeJoin on ?v0 est=122.0",
+    "      IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory4> est=1704.0",
+    "      MergeJoin on ?v0 est=122.0",
+    "        IndexScan PSO ?v0 <http://schema.org/caption> ?v2 est=2534.0",
+    "        IndexScan PSO ?v0 <http://schema.org/publisher> ?v4 est=1349.0"
+   ],
+   "candidate_plan_ms": 0.092,
+   "per_round": [
+    0.946,
+    0.929,
+    0.912,
+    0.923
+   ],
+   "plan_changed": true,
+   "query": "S3-5",
+   "ratio": 0.9267,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1197,
+   "base_plan_ms": 0.0798,
+   "candidate_ms": 0.1225,
+   "candidate_plan_ms": 0.0825,
+   "per_round": [
+    1.028,
+    1.022,
+    1.008,
+    1.033
+   ],
+   "query": "S4-1",
+   "ratio": 1.0237,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1667,
+   "base_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/familyName> ?v2 est=466.0",
+    "    MergeJoin on ?v0 est=666.0",
+    "      MergeJoin on ?v0 est=951.0",
+    "        IndexScan POS ?v0 <http://xmlns.com/foaf/age> <http://db.uwaterloo.ca/~galuc/wsdbm/AgeGroup5> est=12284.0",
+    "        IndexScan POS ?v3 <http://purl.org/ontology/mo/artist> ?v0 est=1359.0",
+    "      IndexScan POS ?v0 <http://schema.org/nationality> <http://db.uwaterloo.ca/~galuc/wsdbm/Country1> est=2575.0"
+   ],
+   "base_plan_ms": 0.0815,
+   "candidate_ms": 0.272,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | POS ?v0 <http://xmlns.com/foaf/age> <http://db.uwaterloo.ca/~galuc/wsdbm/AgeGroup5> est=446.0",
+    "    MergeJoin on ?v0 est=637.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/familyName> ?v2 est=909.0",
+    "        IndexScan POS ?v3 <http://purl.org/ontology/mo/artist> ?v0 est=1359.0",
+    "      IndexScan POS ?v0 <http://schema.org/nationality> <http://db.uwaterloo.ca/~galuc/wsdbm/Country1> est=2575.0"
+   ],
+   "candidate_plan_ms": 0.0906,
+   "per_round": [
+    1.641,
+    1.644,
+    1.618,
+    1.628
+   ],
+   "plan_changed": true,
+   "query": "S4-2",
+   "ratio": 1.6318,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1301,
+   "base_plan_ms": 0.0775,
+   "candidate_ms": 0.1347,
+   "candidate_plan_ms": 0.0814,
+   "per_round": [
+    1.067,
+    1.027,
+    1.036,
+    0.99
+   ],
+   "query": "S4-3",
+   "ratio": 1.0355,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1643,
+   "base_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/familyName> ?v2 est=466.0",
+    "    MergeJoin on ?v0 est=666.0",
+    "      MergeJoin on ?v0 est=951.0",
+    "        IndexScan POS ?v0 <http://xmlns.com/foaf/age> <http://db.uwaterloo.ca/~galuc/wsdbm/AgeGroup4> est=12245.0",
+    "        IndexScan POS ?v3 <http://purl.org/ontology/mo/artist> ?v0 est=1359.0",
+    "      IndexScan POS ?v0 <http://schema.org/nationality> <http://db.uwaterloo.ca/~galuc/wsdbm/Country1> est=2575.0"
+   ],
+   "base_plan_ms": 0.0792,
+   "candidate_ms": 0.2651,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | POS ?v0 <http://xmlns.com/foaf/age> <http://db.uwaterloo.ca/~galuc/wsdbm/AgeGroup4> est=446.0",
+    "    MergeJoin on ?v0 est=637.0",
+    "      IndexJoin on ?v0 | PSO ?v0 <http://xmlns.com/foaf/familyName> ?v2 est=909.0",
+    "        IndexScan POS ?v3 <http://purl.org/ontology/mo/artist> ?v0 est=1359.0",
+    "      IndexScan POS ?v0 <http://schema.org/nationality> <http://db.uwaterloo.ca/~galuc/wsdbm/Country1> est=2575.0"
+   ],
+   "candidate_plan_ms": 0.0866,
+   "per_round": [
+    1.637,
+    1.618,
+    1.627,
+    1.59
+   ],
+   "plan_changed": true,
+   "query": "S4-4",
+   "ratio": 1.6134,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.132,
+   "base_plan_ms": 0.0788,
+   "candidate_ms": 0.1341,
+   "candidate_plan_ms": 0.0811,
+   "per_round": [
+    1.002,
+    1.031,
+    1.042,
+    1.0
+   ],
+   "query": "S4-5",
+   "ratio": 1.0162,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1688,
+   "base_plan": [
+    "  MergeJoin on ?v0 est=510.0",
+    "    IndexScan PSO ?v0 <http://schema.org/keywords> ?v3 est=7391.0",
+    "    MergeJoin on ?v0 est=729.0",
+    "      IndexScan PSO ?v0 <http://schema.org/description> ?v2 est=15150.0",
+    "      MergeJoin on ?v0 est=1041.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory14> est=2575.0",
+    "        IndexScan POS ?v0 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=1487.0"
+   ],
+   "base_plan_ms": 0.0744,
+   "candidate_ms": 0.166,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://schema.org/keywords> ?v3 est=32.0",
+    "    MergeJoin on ?v0 est=106.0",
+    "      IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory14> est=2575.0",
+    "      MergeJoin on ?v0 est=1041.0",
+    "        IndexScan PSO ?v0 <http://schema.org/description> ?v2 est=15150.0",
+    "        IndexScan POS ?v0 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=1487.0"
+   ],
+   "candidate_plan_ms": 0.0812,
+   "per_round": [
+    1.016,
+    0.986,
+    0.968,
+    0.964
+   ],
+   "plan_changed": true,
+   "query": "S5-1",
+   "ratio": 0.9838,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1626,
+   "base_plan": [
+    "  MergeJoin on ?v0 est=510.0",
+    "    IndexScan PSO ?v0 <http://schema.org/keywords> ?v3 est=7391.0",
+    "    MergeJoin on ?v0 est=729.0",
+    "      IndexScan PSO ?v0 <http://schema.org/description> ?v2 est=15150.0",
+    "      MergeJoin on ?v0 est=1041.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory9> est=1627.0",
+    "        IndexScan POS ?v0 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=1487.0"
+   ],
+   "base_plan_ms": 0.0725,
+   "candidate_ms": 0.1681,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v2 est=195.0",
+    "    MergeJoin on ?v0 est=335.0",
+    "      MergeJoin on ?v0 est=478.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory9> est=1627.0",
+    "        IndexScan PSO ?v0 <http://schema.org/keywords> ?v3 est=7391.0",
+    "      IndexScan POS ?v0 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=1487.0"
+   ],
+   "candidate_plan_ms": 0.0803,
+   "per_round": [
+    1.041,
+    1.058,
+    1.025,
+    1.007
+   ],
+   "plan_changed": true,
+   "query": "S5-2",
+   "ratio": 1.0341,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1633,
+   "base_plan": [
+    "  MergeJoin on ?v0 est=510.0",
+    "    IndexScan PSO ?v0 <http://schema.org/keywords> ?v3 est=7391.0",
+    "    MergeJoin on ?v0 est=729.0",
+    "      IndexScan PSO ?v0 <http://schema.org/description> ?v2 est=15150.0",
+    "      MergeJoin on ?v0 est=1041.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory12> est=1683.0",
+    "        IndexScan POS ?v0 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=1487.0"
+   ],
+   "base_plan_ms": 0.0725,
+   "candidate_ms": 0.1689,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v2 est=225.0",
+    "    MergeJoin on ?v0 est=356.0",
+    "      MergeJoin on ?v0 est=509.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory12> est=1683.0",
+    "        IndexScan PSO ?v0 <http://schema.org/keywords> ?v3 est=7391.0",
+    "      IndexScan POS ?v0 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=1487.0"
+   ],
+   "candidate_plan_ms": 0.0796,
+   "per_round": [
+    1.022,
+    1.052,
+    1.047,
+    1.03
+   ],
+   "plan_changed": true,
+   "query": "S5-3",
+   "ratio": 1.0343,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1645,
+   "base_plan": [
+    "  MergeJoin on ?v0 est=510.0",
+    "    IndexScan PSO ?v0 <http://schema.org/keywords> ?v3 est=7391.0",
+    "    MergeJoin on ?v0 est=729.0",
+    "      IndexScan PSO ?v0 <http://schema.org/description> ?v2 est=15150.0",
+    "      MergeJoin on ?v0 est=1041.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory7> est=1635.0",
+    "        IndexScan POS ?v0 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=1487.0"
+   ],
+   "base_plan_ms": 0.0735,
+   "candidate_ms": 0.167,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v2 est=193.0",
+    "    MergeJoin on ?v0 est=320.0",
+    "      MergeJoin on ?v0 est=457.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory7> est=1635.0",
+    "        IndexScan PSO ?v0 <http://schema.org/keywords> ?v3 est=7391.0",
+    "      IndexScan POS ?v0 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=1487.0"
+   ],
+   "candidate_plan_ms": 0.0794,
+   "per_round": [
+    1.006,
+    1.029,
+    1.004,
+    1.023
+   ],
+   "plan_changed": true,
+   "query": "S5-4",
+   "ratio": 1.0155,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1629,
+   "base_plan": [
+    "  MergeJoin on ?v0 est=510.0",
+    "    IndexScan PSO ?v0 <http://schema.org/keywords> ?v3 est=7391.0",
+    "    MergeJoin on ?v0 est=729.0",
+    "      IndexScan PSO ?v0 <http://schema.org/description> ?v2 est=15150.0",
+    "      MergeJoin on ?v0 est=1041.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory4> est=1704.0",
+    "        IndexScan POS ?v0 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=1487.0"
+   ],
+   "base_plan_ms": 0.0724,
+   "candidate_ms": 0.1694,
+   "candidate_plan": [
+    "  IndexJoin on ?v0 | PSO ?v0 <http://schema.org/description> ?v2 est=226.0",
+    "    MergeJoin on ?v0 est=363.0",
+    "      MergeJoin on ?v0 est=519.0",
+    "        IndexScan POS ?v0 rdf:type <http://db.uwaterloo.ca/~galuc/wsdbm/ProductCategory4> est=1704.0",
+    "        IndexScan PSO ?v0 <http://schema.org/keywords> ?v3 est=7391.0",
+    "      IndexScan POS ?v0 <http://schema.org/language> <http://db.uwaterloo.ca/~galuc/wsdbm/Language0> est=1487.0"
+   ],
+   "candidate_plan_ms": 0.0801,
+   "per_round": [
+    1.075,
+    1.032,
+    1.021,
+    1.052
+   ],
+   "plan_changed": true,
+   "query": "S5-5",
+   "ratio": 1.0398,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0888,
+   "base_plan_ms": 0.0693,
+   "candidate_ms": 0.087,
+   "candidate_plan_ms": 0.067,
+   "per_round": [
+    0.992,
+    0.964,
+    0.988,
+    0.976
+   ],
+   "query": "S6-1",
+   "ratio": 0.9799,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1052,
+   "base_plan_ms": 0.0729,
+   "candidate_ms": 0.1026,
+   "candidate_plan_ms": 0.0704,
+   "per_round": [
+    1.008,
+    0.962,
+    0.972,
+    0.987
+   ],
+   "query": "S6-2",
+   "ratio": 0.975,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1045,
+   "base_plan_ms": 0.0724,
+   "candidate_ms": 0.1032,
+   "candidate_plan_ms": 0.0702,
+   "per_round": [
+    1.003,
+    0.987,
+    0.99,
+    0.976
+   ],
+   "query": "S6-3",
+   "ratio": 0.9869,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1036,
+   "base_plan_ms": 0.0731,
+   "candidate_ms": 0.1013,
+   "candidate_plan_ms": 0.0704,
+   "per_round": [
+    0.996,
+    0.966,
+    0.981,
+    0.956
+   ],
+   "query": "S6-4",
+   "ratio": 0.9778,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0882,
+   "base_plan_ms": 0.0688,
+   "candidate_ms": 0.0851,
+   "candidate_plan_ms": 0.0656,
+   "per_round": [
+    0.955,
+    0.96,
+    0.972,
+    0.964
+   ],
+   "query": "S6-5",
+   "ratio": 0.9645,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0393,
+   "base_plan_ms": 0.0364,
+   "candidate_ms": 0.0333,
+   "candidate_plan_ms": 0.0304,
+   "per_round": [
+    0.9,
+    0.807,
+    0.822,
+    0.883
+   ],
+   "query": "S7-1",
+   "ratio": 0.8454,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0383,
+   "base_plan_ms": 0.0355,
+   "candidate_ms": 0.0315,
+   "candidate_plan_ms": 0.0288,
+   "per_round": [
+    0.852,
+    0.846,
+    0.787,
+    0.788
+   ],
+   "query": "S7-2",
+   "ratio": 0.8222,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0375,
+   "base_plan_ms": 0.0347,
+   "candidate_ms": 0.0325,
+   "candidate_plan_ms": 0.0297,
+   "per_round": [
+    0.855,
+    0.901,
+    0.873,
+    0.855
+   ],
+   "query": "S7-3",
+   "ratio": 0.8678,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0374,
+   "base_plan_ms": 0.0346,
+   "candidate_ms": 0.0321,
+   "candidate_plan_ms": 0.0294,
+   "per_round": [
+    0.863,
+    0.87,
+    0.879,
+    0.843
+   ],
+   "query": "S7-4",
+   "ratio": 0.8594,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0379,
+   "base_plan_ms": 0.0352,
+   "candidate_ms": 0.0318,
+   "candidate_plan_ms": 0.029,
+   "per_round": [
+    0.825,
+    0.82,
+    0.886,
+    0.802
+   ],
+   "query": "S7-5",
+   "ratio": 0.838,
+   "workload": "watdiv"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.3126,
+   "base_plan_ms": 0.2557,
+   "candidate_ms": 0.307,
+   "candidate_plan_ms": 0.2499,
+   "per_round": [
+    0.999,
+    0.974,
+    0.974,
+    0.972
+   ],
+   "query": "explore-q1-1",
+   "ratio": 0.9821,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.3151,
+   "base_plan_ms": 0.258,
+   "candidate_ms": 0.3051,
+   "candidate_plan_ms": 0.2488,
+   "per_round": [
+    0.984,
+    0.964,
+    0.967,
+    0.962
+   ],
+   "query": "explore-q1-2",
+   "ratio": 0.9681,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2873,
+   "base_plan_ms": 0.2541,
+   "candidate_ms": 0.2816,
+   "candidate_plan_ms": 0.2482,
+   "per_round": [
+    0.983,
+    0.981,
+    0.978,
+    0.984
+   ],
+   "query": "explore-q1-3",
+   "ratio": 0.9802,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.4652,
+   "base_plan_ms": 0.3633,
+   "candidate_ms": 0.4729,
+   "candidate_plan_ms": 0.369,
+   "per_round": [
+    0.996,
+    1.027,
+    1.018,
+    1.009
+   ],
+   "query": "explore-q10-1",
+   "ratio": 1.0166,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.4533,
+   "base_plan_ms": 0.3607,
+   "candidate_ms": 0.459,
+   "candidate_plan_ms": 0.3652,
+   "per_round": [
+    1.0,
+    1.017,
+    1.01,
+    1.018
+   ],
+   "query": "explore-q10-2",
+   "ratio": 1.0125,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.4738,
+   "base_plan_ms": 0.3677,
+   "candidate_ms": 0.4802,
+   "candidate_plan_ms": 0.3724,
+   "per_round": [
+    1.006,
+    1.015,
+    1.021,
+    1.015
+   ],
+   "query": "explore-q10-3",
+   "ratio": 1.0136,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0325,
+   "base_plan_ms": 0.0263,
+   "candidate_ms": 0.0316,
+   "candidate_plan_ms": 0.0257,
+   "per_round": [
+    0.906,
+    1.024,
+    1.011,
+    0.967
+   ],
+   "query": "explore-q11-1",
+   "ratio": 0.971,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.031,
+   "base_plan_ms": 0.0253,
+   "candidate_ms": 0.0313,
+   "candidate_plan_ms": 0.0256,
+   "per_round": [
+    0.904,
+    1.038,
+    1.03,
+    1.042
+   ],
+   "query": "explore-q11-2",
+   "ratio": 1.0095,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0312,
+   "base_plan_ms": 0.0252,
+   "candidate_ms": 0.0306,
+   "candidate_plan_ms": 0.025,
+   "per_round": [
+    0.984,
+    1.01,
+    1.079,
+    0.913
+   ],
+   "query": "explore-q11-3",
+   "ratio": 0.98,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1145,
+   "base_plan_ms": 0.0751,
+   "candidate_ms": 0.1143,
+   "candidate_plan_ms": 0.0754,
+   "per_round": [
+    0.958,
+    1.038,
+    1.024,
+    0.998
+   ],
+   "query": "explore-q12-1",
+   "ratio": 0.9979,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1082,
+   "base_plan_ms": 0.0705,
+   "candidate_ms": 0.1102,
+   "candidate_plan_ms": 0.0722,
+   "per_round": [
+    1.025,
+    1.024,
+    1.026,
+    1.006
+   ],
+   "query": "explore-q12-2",
+   "ratio": 1.0179,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1092,
+   "base_plan_ms": 0.0708,
+   "candidate_ms": 0.1107,
+   "candidate_plan_ms": 0.0717,
+   "per_round": [
+    1.017,
+    1.029,
+    1.005,
+    0.992
+   ],
+   "query": "explore-q12-3",
+   "ratio": 1.0137,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2086,
+   "base_plan_ms": 0.1492,
+   "candidate_ms": 0.2077,
+   "candidate_plan_ms": 0.1479,
+   "per_round": [
+    1.002,
+    1.009,
+    0.999,
+    0.985
+   ],
+   "query": "explore-q2-1",
+   "ratio": 0.9957,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2168,
+   "base_plan_ms": 0.1547,
+   "candidate_ms": 0.2164,
+   "candidate_plan_ms": 0.1536,
+   "per_round": [
+    0.994,
+    1.005,
+    0.998,
+    0.992
+   ],
+   "query": "explore-q2-2",
+   "ratio": 0.9982,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2201,
+   "base_plan_ms": 0.1521,
+   "candidate_ms": 0.2164,
+   "candidate_plan_ms": 0.1488,
+   "per_round": [
+    0.99,
+    0.963,
+    0.987,
+    0.985
+   ],
+   "query": "explore-q2-3",
+   "ratio": 0.983,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.5381,
+   "base_plan_ms": 0.4337,
+   "candidate_ms": 0.5239,
+   "candidate_plan_ms": 0.4182,
+   "per_round": [
+    0.977,
+    0.976,
+    0.97,
+    0.968
+   ],
+   "query": "explore-q3-1",
+   "ratio": 0.9737,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.5201,
+   "base_plan_ms": 0.433,
+   "candidate_ms": 0.5113,
+   "candidate_plan_ms": 0.4232,
+   "per_round": [
+    0.98,
+    0.985,
+    0.979,
+    0.993
+   ],
+   "query": "explore-q3-2",
+   "ratio": 0.983,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.5728,
+   "base_plan_ms": 0.4492,
+   "candidate_ms": 0.5674,
+   "candidate_plan_ms": 0.442,
+   "per_round": [
+    0.996,
+    0.993,
+    0.992,
+    0.985
+   ],
+   "query": "explore-q3-3",
+   "ratio": 0.9906,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.6856,
+   "base_plan_ms": 0.5568,
+   "candidate_ms": 0.672,
+   "candidate_plan_ms": 0.5444,
+   "per_round": [
+    0.978,
+    0.977,
+    0.988,
+    0.974
+   ],
+   "query": "explore-q4-1",
+   "ratio": 0.9803,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.6613,
+   "base_plan_ms": 0.5509,
+   "candidate_ms": 0.6443,
+   "candidate_plan_ms": 0.5319,
+   "per_round": [
+    0.965,
+    0.969,
+    0.976,
+    0.982
+   ],
+   "query": "explore-q4-2",
+   "ratio": 0.9742,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.6108,
+   "base_plan_ms": 0.5595,
+   "candidate_ms": 0.5961,
+   "candidate_plan_ms": 0.5442,
+   "per_round": [
+    0.969,
+    0.977,
+    0.976,
+    0.98
+   ],
+   "query": "explore-q4-3",
+   "ratio": 0.9759,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 1.4277,
+   "base_plan_ms": 0.7097,
+   "candidate_ms": 1.4241,
+   "candidate_plan_ms": 0.7022,
+   "per_round": [
+    0.993,
+    1.006,
+    0.997,
+    0.983
+   ],
+   "query": "explore-q5-1",
+   "ratio": 0.9975,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 1.9532,
+   "base_plan_ms": 0.7317,
+   "candidate_ms": 1.9403,
+   "candidate_plan_ms": 0.7211,
+   "per_round": [
+    0.985,
+    1.003,
+    0.991,
+    0.988
+   ],
+   "query": "explore-q5-2",
+   "ratio": 0.9934,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 1.3481,
+   "base_plan_ms": 0.7093,
+   "candidate_ms": 1.3382,
+   "candidate_plan_ms": 0.6995,
+   "per_round": [
+    0.983,
+    1.002,
+    0.996,
+    0.991
+   ],
+   "query": "explore-q5-3",
+   "ratio": 0.9927,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.4248,
+   "base_plan_ms": 0.3389,
+   "candidate_ms": 0.4327,
+   "candidate_plan_ms": 0.3456,
+   "per_round": [
+    1.017,
+    1.018,
+    1.004,
+    1.025
+   ],
+   "query": "explore-q7-1",
+   "ratio": 1.0185,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.4175,
+   "base_plan": [
+    "  OptionalJoin on  est=1.0",
+    "    OptionalJoin filter (?date > \"2008-06-20T00:00:00\"^^<http://www.w3.org/2001/XMLSchema#dateTime>) est=1.0",
+    "      IndexScan SPO <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer508/Product24997> rdfs:label ?productLabel est=1.0",
+    "      IndexJoin on ?offer | PSO ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/validTo> ?date est=1.0",
+    "        IndexJoin on ?vendor | PSO ?vendor rdfs:label ?vendorTitle est=1.0",
+    "          IndexJoin on ?offer | PSO ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/price> ?price est=1.0",
+    "            IndexJoin on ?offer | PSO ?offer <http://purl.org/dc/elements/1.1/publisher> ?vendor est=1.0",
+    "              IndexJoin on ?vendor | POS ?vendor <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/country> <http://downlode.org/rdf/iso-3166/countries#DE> est=1.0",
+    "                IndexJoin on ?offer | PSO ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/vendor> ?vendor est=7.0",
+    "                  IndexScan POS ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/product> <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer508/Product24997> est=10.0",
+    "    OptionalJoin on ?review est=1.0",
+    "      OptionalJoin on ?review est=1.0",
+    "        IndexJoin on ?review | PSO ?review <http://purl.org/dc/elements/1.1/title> ?revTitle est=1.0",
+    "          IndexJoin on ?reviewer | PSO ?reviewer <http://xmlns.com/foaf/0.1/name> ?revName est=1.0",
+    "            IndexJoin on ?review | PSO ?review <http://purl.org/stuff/rev#reviewer> ?reviewer est=2.0",
+    "              IndexScan POS ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/reviewFor> <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer508/Product24997> est=2.0",
+    "        IndexScan PSO ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/rating1> ?rating1 est=198986.0",
+    "      IndexScan PSO ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/rating2> ?rating2 est=199692.0"
+   ],
+   "base_plan_ms": 0.3388,
+   "candidate_ms": 0.4278,
+   "candidate_plan": [
+    "  OptionalJoin on  est=1.0",
+    "    OptionalJoin filter (?date > \"2008-06-20T00:00:00\"^^<http://www.w3.org/2001/XMLSchema#dateTime>) est=1.0",
+    "      IndexScan SPO <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer508/Product24997> rdfs:label ?productLabel est=1.0",
+    "      IndexJoin on ?offer | PSO ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/validTo> ?date est=1.0",
+    "        IndexJoin on ?vendor | PSO ?vendor rdfs:label ?vendorTitle est=1.0",
+    "          IndexJoin on ?offer | PSO ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/price> ?price est=1.0",
+    "            IndexJoin on ?offer | PSO ?offer <http://purl.org/dc/elements/1.1/publisher> ?vendor est=1.0",
+    "              IndexJoin on ?vendor | POS ?vendor <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/country> <http://downlode.org/rdf/iso-3166/countries#DE> est=1.0",
+    "                IndexJoin on ?offer | PSO ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/vendor> ?vendor est=7.0",
+    "                  IndexScan POS ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/product> <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer508/Product24997> est=10.0",
+    "    OptionalJoin on ?review est=1.0",
+    "      OptionalJoin on ?review est=1.0",
+    "        IndexJoin on ?reviewer | PSO ?reviewer <http://xmlns.com/foaf/0.1/name> ?revName est=1.0",
+    "          StarJoin on ?review | <http://purl.org/dc/elements/1.1/title> ?revTitle ; <http://purl.org/stuff/rev#reviewer> ?reviewer est=1.0",
+    "            IndexScan POS ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/reviewFor> <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer508/Product24997> est=2.0",
+    "        IndexScan PSO ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/rating1> ?rating1 est=198986.0",
+    "      IndexScan PSO ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/rating2> ?rating2 est=199692.0"
+   ],
+   "candidate_plan_ms": 0.3494,
+   "per_round": [
+    1.023,
+    1.049,
+    1.015,
+    1.014
+   ],
+   "plan_changed": true,
+   "query": "explore-q7-2",
+   "ratio": 1.0247,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.4704,
+   "base_plan_ms": 0.3334,
+   "candidate_ms": 0.4838,
+   "candidate_plan_ms": 0.3465,
+   "per_round": [
+    1.022,
+    1.031,
+    1.028,
+    1.031
+   ],
+   "query": "explore-q7-3",
+   "ratio": 1.0285,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.3209,
+   "base_plan_ms": 0.2122,
+   "candidate_ms": 0.3287,
+   "candidate_plan_ms": 0.2194,
+   "per_round": [
+    1.025,
+    1.032,
+    1.01,
+    1.024
+   ],
+   "query": "explore-q8-1",
+   "ratio": 1.0243,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.3093,
+   "base_plan_ms": 0.2136,
+   "candidate_ms": 0.3171,
+   "candidate_plan_ms": 0.2215,
+   "per_round": [
+    1.033,
+    1.036,
+    1.011,
+    1.024
+   ],
+   "query": "explore-q8-2",
+   "ratio": 1.0253,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.2912,
+   "base_plan": [
+    "      OptionalJoin on ?review est=1.0",
+    "        OptionalJoin on ?review est=1.0",
+    "          OptionalJoin on ?review est=1.0",
+    "            OptionalJoin on ?review est=1.0",
+    "              StarJoin on ?review | <http://purl.org/stuff/rev#text> ?text ; <http://purl.org/dc/elements/1.1/title> ?title ; <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/reviewDate> ?reviewDate | LANGMATCHES(LANG(?text), \"EN\") est=1.0",
+    "                IndexJoin on ?reviewer | PSO ?reviewer <http://xmlns.com/foaf/0.1/name> ?reviewerName est=1.0",
+    "                  IndexJoin on ?review | PSO ?review <http://purl.org/stuff/rev#reviewer> ?reviewer est=2.0",
+    "                    IndexScan POS ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/reviewFor> <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer88/Product4228> est=2.0",
+    "              IndexScan PSO ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/rating1> ?rating1 est=198986.0",
+    "            IndexScan PSO ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/rating2> ?rating2 est=199692.0",
+    "          IndexScan PSO ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/rating3> ?rating3 est=199023.0",
+    "        IndexScan PSO ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/rating4> ?rating4 est=199514.0"
+   ],
+   "base_plan_ms": 0.2103,
+   "candidate_ms": 0.2949,
+   "candidate_plan": [
+    "      OptionalJoin on ?review est=1.0",
+    "        OptionalJoin on ?review est=1.0",
+    "          OptionalJoin on ?review est=1.0",
+    "            OptionalJoin on ?review est=1.0",
+    "              StarJoin on ?review | <http://purl.org/dc/elements/1.1/title> ?title ; <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/reviewDate> ?reviewDate est=1.0",
+    "                IndexJoin on ?reviewer | PSO ?reviewer <http://xmlns.com/foaf/0.1/name> ?reviewerName est=1.0",
+    "                  StarJoin on ?review | <http://purl.org/stuff/rev#text> ?text ; <http://purl.org/stuff/rev#reviewer> ?reviewer | LANGMATCHES(LANG(?text), \"EN\") est=1.0",
+    "                    IndexScan POS ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/reviewFor> <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/dataFromProducer88/Product4228> est=2.0",
+    "              IndexScan PSO ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/rating1> ?rating1 est=198986.0",
+    "            IndexScan PSO ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/rating2> ?rating2 est=199692.0",
+    "          IndexScan PSO ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/rating3> ?rating3 est=199023.0",
+    "        IndexScan PSO ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/rating4> ?rating4 est=199514.0"
+   ],
+   "candidate_plan_ms": 0.213,
+   "per_round": [
+    1.007,
+    1.028,
+    1.005,
+    1.017
+   ],
+   "plan_changed": true,
+   "query": "explore-q8-3",
+   "ratio": 1.0126,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0417,
+   "base_plan_ms": 0.0187,
+   "candidate_ms": 0.0432,
+   "candidate_plan_ms": 0.0195,
+   "per_round": [
+    1.023,
+    1.117,
+    1.015,
+    1.003
+   ],
+   "query": "explore-q9-1",
+   "ratio": 1.0345,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0395,
+   "base_plan_ms": 0.0181,
+   "candidate_ms": 0.04,
+   "candidate_plan_ms": 0.0183,
+   "per_round": [
+    0.979,
+    1.021,
+    1.057,
+    0.964
+   ],
+   "query": "explore-q9-2",
+   "ratio": 1.0131,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0402,
+   "base_plan_ms": 0.0179,
+   "candidate_ms": 0.0409,
+   "candidate_plan_ms": 0.0182,
+   "per_round": [
+    0.991,
+    1.051,
+    1.036,
+    1.017
+   ],
+   "query": "explore-q9-3",
+   "ratio": 1.0188,
+   "workload": "bsbm-explore"
+  },
+  {
+   "answers": "same",
+   "base_ms": 5.6365,
+   "base_plan_ms": 0.2412,
+   "candidate_ms": 5.739,
+   "candidate_plan_ms": 0.2424,
+   "per_round": [
+    1.017,
+    1.028,
+    1.014,
+    1.015
+   ],
+   "query": "bi-q1-1",
+   "ratio": 1.0182,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 6.9518,
+   "base_plan": [
+    "            HashJoin on ?productType est=35525.0",
+    "              IndexScan POS ?productType rdf:type <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/ProductType> est=585.0",
+    "              IndexJoin on ?product | PSO ?product rdf:type ?productType est=51444.0",
+    "                HashJoin on ?producer est=10289.0",
+    "                  IndexScan POS ?producer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/country> <http://downlode.org/rdf/iso-3166/countries#JP> est=1529.0",
+    "                  MergeJoin on ?product est=14698.0",
+    "                    IndexScan PSO ?product <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/producer> ?producer est=28480.0",
+    "                    HashJoin on ?review est=20998.0",
+    "                      IndexScan POS ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/reviewFor> ?product est=284800.0",
+    "                      IndexJoin on ?reviewer | POS ?review <http://purl.org/stuff/rev#reviewer> ?reviewer est=20998.0",
+    "                        IndexScan POS ?reviewer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/country> <http://downlode.org/rdf/iso-3166/countries#JP> est=1529.0"
+   ],
+   "base_plan_ms": 0.2414,
+   "candidate_ms": 6.1398,
+   "candidate_plan": [
+    "            HashJoin on ?productType est=50750.0",
+    "              IndexScan POS ?productType rdf:type <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/ProductType> est=585.0",
+    "              IndexJoin on ?product | PSO ?product rdf:type ?productType est=73491.0",
+    "                MergeJoin on ?product est=14698.0",
+    "                  HashJoin on ?producer est=19936.0",
+    "                    IndexScan PSO ?product <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/producer> ?producer est=28480.0",
+    "                    IndexScan POS ?producer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/country> <http://downlode.org/rdf/iso-3166/countries#JP> est=1529.0",
+    "                  HashJoin on ?review est=20998.0",
+    "                    IndexScan POS ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/reviewFor> ?product est=284800.0",
+    "                    IndexJoin on ?reviewer | POS ?review <http://purl.org/stuff/rev#reviewer> ?reviewer est=20998.0",
+    "                      IndexScan POS ?reviewer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/country> <http://downlode.org/rdf/iso-3166/countries#JP> est=1529.0"
+   ],
+   "candidate_plan_ms": 0.2305,
+   "per_round": [
+    0.889,
+    0.868,
+    0.884,
+    0.886
+   ],
+   "plan_changed": true,
+   "query": "bi-q1-2",
+   "ratio": 0.8832,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 86.6812,
+   "base_plan": [
+    "            HashJoin on ?reviewer est=4383.0",
+    "              IndexJoin on ?review | PSO ?review <http://purl.org/stuff/rev#reviewer> ?reviewer est=14950.0",
+    "                HashJoin on ?productType est=14950.0",
+    "                  IndexScan POS ?productType rdf:type <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/ProductType> est=585.0",
+    "                  MergeJoin on ?product est=21649.0",
+    "                    IndexJoin on ?producer | POS ?producer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/country> <http://downlode.org/rdf/iso-3166/countries#US> est=19936.0",
+    "                      IndexScan PSO ?product <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/producer> ?producer est=28480.0",
+    "                    IndexJoin on ?product | PSO ?product rdf:type ?productType est=224102.0",
+    "                      IndexScan POS ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/reviewFor> ?product est=284800.0",
+    "              IndexScan POS ?reviewer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/country> <http://downlode.org/rdf/iso-3166/countries#US> est=6080.0"
+   ],
+   "base_plan_ms": 0.3088,
+   "candidate_ms": 19.7252,
+   "candidate_plan": [
+    "            MergeJoin on ?product est=201805.0",
+    "              HashJoin on ?productType est=68835.0",
+    "                IndexScan POS ?productType rdf:type <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/ProductType> est=585.0",
+    "                IndexJoin on ?product | PSO ?product rdf:type ?productType est=99680.0",
+    "                  IndexJoin on ?producer | POS ?producer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/country> <http://downlode.org/rdf/iso-3166/countries#US> est=19936.0",
+    "                    IndexScan PSO ?product <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/producer> ?producer est=28480.0",
+    "                MergeJoin on ?review est=83496.0",
+    "                  IndexScan PSO ?review <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/reviewFor> ?product est=284800.0",
+    "                  HashJoin on ?reviewer est=83496.0",
+    "                    IndexScan PSO ?review <http://purl.org/stuff/rev#reviewer> ?reviewer est=284800.0",
+    "                    IndexScan POS ?reviewer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/country> <http://downlode.org/rdf/iso-3166/countries#US> est=6080.0"
+   ],
+   "candidate_plan_ms": 0.258,
+   "per_round": [
+    0.225,
+    0.216,
+    0.227,
+    0.234
+   ],
+   "plan_changed": true,
+   "query": "bi-q1-3",
+   "ratio": 0.2276,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 19.0961,
+   "base_plan_ms": 0.138,
+   "candidate_ms": 18.3312,
+   "candidate_plan_ms": 0.1225,
+   "per_round": [
+    1.008,
+    1.07,
+    0.949,
+    0.964
+   ],
+   "query": "bi-q2-1",
+   "ratio": 0.9599,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 15.2285,
+   "base_plan_ms": 0.128,
+   "candidate_ms": 15.1655,
+   "candidate_plan_ms": 0.1141,
+   "per_round": [
+    0.997,
+    1.009,
+    0.992,
+    0.993
+   ],
+   "query": "bi-q2-2",
+   "ratio": 0.9959,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 17.6993,
+   "base_plan_ms": 0.1287,
+   "candidate_ms": 17.7065,
+   "candidate_plan_ms": 0.1172,
+   "per_round": [
+    0.999,
+    1.005,
+    1.004,
+    0.993
+   ],
+   "query": "bi-q2-3",
+   "ratio": 1.0004,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 25.7187,
+   "base_plan_ms": 0.2308,
+   "candidate_ms": 25.1206,
+   "candidate_plan_ms": 0.2266,
+   "per_round": [
+    1.026,
+    0.934,
+    1.019,
+    0.98
+   ],
+   "query": "bi-q3-1",
+   "ratio": 0.9767,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 39.8225,
+   "base_plan_ms": 0.237,
+   "candidate_ms": 39.3972,
+   "candidate_plan_ms": 0.2299,
+   "per_round": [
+    1.005,
+    0.978,
+    0.991,
+    1.023
+   ],
+   "query": "bi-q3-2",
+   "ratio": 0.9893,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 45.623,
+   "base_plan_ms": 0.2385,
+   "candidate_ms": 45.5348,
+   "candidate_plan_ms": 0.2317,
+   "per_round": [
+    0.998,
+    1.0,
+    0.98,
+    0.98
+   ],
+   "query": "bi-q3-3",
+   "ratio": 0.9981,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 347.8562,
+   "base_plan_ms": 0.3064,
+   "candidate_ms": 317.7162,
+   "candidate_plan_ms": 0.2629,
+   "per_round": [
+    0.908,
+    0.92,
+    0.912,
+    0.913
+   ],
+   "query": "bi-q4-1",
+   "ratio": 0.9134,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 55.723,
+   "base_plan_ms": 0.3061,
+   "candidate_ms": 55.5252,
+   "candidate_plan_ms": 0.299,
+   "per_round": [
+    0.982,
+    0.97,
+    1.003,
+    1.016
+   ],
+   "query": "bi-q4-2",
+   "ratio": 0.9965,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 230.3624,
+   "base_plan": [
+    "        HashJoin on ?feature est=4164.0",
+    "                IndexJoin on ?product | PSO ?product <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/productFeature> ?feature est=130856.0",
+    "                  IndexJoin on ?offer | PSO ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/price> ?price est=6006.0",
+    "                    IndexJoin on ?product | POS ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/product> ?product est=6006.0",
+    "                      IndexScan POS ?product rdf:type <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductType54> est=273.0",
+    "                        IndexJoin on ?p | PSO ?p <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/productFeature> ?feature est=5948.0",
+    "                          IndexScan POS ?p rdf:type <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductType54> est=273.0",
+    "                    IndexJoin on ?offer | PSO ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/price> ?price est=6006.0",
+    "                      IndexJoin on ?product | POS ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/product> ?product est=6006.0",
+    "                        IndexScan POS ?product rdf:type <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductType54> est=273.0"
+   ],
+   "base_plan_ms": 0.3329,
+   "candidate_ms": 232.7375,
+   "candidate_plan": [
+    "        HashJoin on ?feature est=4164.0",
+    "                IndexJoin on ?product | PSO ?product <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/productFeature> ?feature est=116825.0",
+    "                  IndexJoin on ?offer | PSO ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/price> ?price est=5362.0",
+    "                    IndexJoin on ?product | POS ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/product> ?product est=5362.0",
+    "                      IndexScan POS ?product rdf:type <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductType54> est=273.0",
+    "                    IndexJoin on ?offer | PSO ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/price> ?price est=5362.0",
+    "                      IndexJoin on ?product | POS ?offer <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/product> ?product est=5362.0",
+    "                        IndexScan POS ?product rdf:type <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductType54> est=273.0",
+    "                        IndexJoin on ?p | PSO ?p <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/productFeature> ?feature est=5948.0",
+    "                          IndexScan POS ?p rdf:type <http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/ProductType54> est=273.0"
+   ],
+   "candidate_plan_ms": 0.3231,
+   "per_round": [
+    1.003,
+    1.007,
+    1.012,
+    1.02
+   ],
+   "plan_changed": true,
+   "query": "bi-q4-3",
+   "ratio": 1.0103,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 2.2544,
+   "base_plan_ms": 0.2481,
+   "candidate_ms": 2.2784,
+   "candidate_plan_ms": 0.2606,
+   "per_round": [
+    1.013,
+    1.005,
+    1.014,
+    1.011
+   ],
+   "query": "bi-q5-1",
+   "ratio": 1.0106,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 254.9591,
+   "base_plan_ms": 0.3145,
+   "candidate_ms": 255.0891,
+   "candidate_plan_ms": 0.331,
+   "per_round": [
+    0.991,
+    1.005,
+    1.009,
+    1.0
+   ],
+   "query": "bi-q5-2",
+   "ratio": 1.0005,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 25.3791,
+   "base_plan_ms": 0.3023,
+   "candidate_ms": 25.3745,
+   "candidate_plan_ms": 0.3133,
+   "per_round": [
+    0.999,
+    1.0,
+    0.999,
+    1.001
+   ],
+   "query": "bi-q5-3",
+   "ratio": 0.9998,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 17.2328,
+   "base_plan_ms": 0.2782,
+   "candidate_ms": 17.3515,
+   "candidate_plan_ms": 0.2865,
+   "per_round": [
+    1.027,
+    1.002,
+    1.001,
+    0.975
+   ],
+   "query": "bi-q6-1",
+   "ratio": 1.0069,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 17.9305,
+   "base_plan_ms": 0.2767,
+   "candidate_ms": 17.9682,
+   "candidate_plan_ms": 0.2875,
+   "per_round": [
+    1.019,
+    0.967,
+    1.011,
+    1.004
+   ],
+   "query": "bi-q6-2",
+   "ratio": 1.0021,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 16.3309,
+   "base_plan_ms": 0.273,
+   "candidate_ms": 16.4841,
+   "candidate_plan_ms": 0.2848,
+   "per_round": [
+    0.99,
+    0.967,
+    1.034,
+    1.005
+   ],
+   "query": "bi-q6-3",
+   "ratio": 1.0094,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 112.4713,
+   "base_plan_ms": 0.1763,
+   "candidate_ms": 113.5714,
+   "candidate_plan_ms": 0.1823,
+   "per_round": [
+    1.006,
+    1.012,
+    1.013,
+    1.005
+   ],
+   "query": "bi-q7-1",
+   "ratio": 1.0098,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 5.0309,
+   "base_plan_ms": 0.0752,
+   "candidate_ms": 5.1246,
+   "candidate_plan_ms": 0.0769,
+   "per_round": [
+    1.027,
+    1.017,
+    1.022,
+    1.012
+   ],
+   "query": "bi-q7-2",
+   "ratio": 1.0186,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 62.4698,
+   "base_plan_ms": 0.1508,
+   "candidate_ms": 63.9554,
+   "candidate_plan_ms": 0.1541,
+   "per_round": [
+    1.015,
+    1.027,
+    1.027,
+    1.017
+   ],
+   "query": "bi-q7-3",
+   "ratio": 1.0238,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 362.9891,
+   "base_plan_ms": 0.3446,
+   "candidate_ms": 365.4336,
+   "candidate_plan_ms": 0.355,
+   "per_round": [
+    1.01,
+    1.016,
+    0.989,
+    1.019
+   ],
+   "query": "bi-q8-1",
+   "ratio": 1.0067,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 28.9439,
+   "base_plan_ms": 0.3398,
+   "candidate_ms": 28.7652,
+   "candidate_plan_ms": 0.3508,
+   "per_round": [
+    1.0,
+    0.991,
+    1.001,
+    1.008
+   ],
+   "query": "bi-q8-2",
+   "ratio": 0.9938,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 2.4194,
+   "base_plan_ms": 0.2801,
+   "candidate_ms": 2.4298,
+   "candidate_plan_ms": 0.2869,
+   "per_round": [
+    0.996,
+    1.003,
+    1.011,
+    1.012
+   ],
+   "query": "bi-q8-3",
+   "ratio": 1.0043,
+   "workload": "bsbm-bi"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.06,
+   "base_plan_ms": 0.0474,
+   "candidate_ms": 0.06,
+   "candidate_plan_ms": 0.0475,
+   "per_round": [
+    0.94,
+    1.069,
+    1.019,
+    0.992
+   ],
+   "query": "q1",
+   "ratio": 1.0003,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0584,
+   "base_plan_ms": 0.0462,
+   "candidate_ms": 0.0602,
+   "candidate_plan_ms": 0.0482,
+   "per_round": [
+    0.956,
+    1.028,
+    1.083,
+    1.055
+   ],
+   "query": "q10",
+   "ratio": 1.0303,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.073,
+   "base_plan_ms": 0.0518,
+   "candidate_ms": 0.073,
+   "candidate_plan_ms": 0.0524,
+   "per_round": [
+    0.96,
+    1.017,
+    1.058,
+    0.992
+   ],
+   "query": "q11",
+   "ratio": 1.0008,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1364,
+   "base_plan": [
+    "  MergeJoin on ?Y est=93.0",
+    "    MergeJoin on ?Y est=132.0",
+    "      IndexScan POS ?Y rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#Department> est=189.0",
+    "        IndexJoin on ?X | PSO ?X <http://swat.cse.lehigh.edu/onto/univ-bench.owl#worksFor> ?Y est=189.0",
+    "          IndexScan POS ?X rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#Chair> est=189.0",
+    "    IndexScan POS ?Y <http://swat.cse.lehigh.edu/onto/univ-bench.owl#subOrganizationOf> <http://www.University0.edu> est=239.0"
+   ],
+   "base_plan_ms": 0.0892,
+   "candidate_ms": 0.1416,
+   "candidate_plan": [
+    "  MergeJoin on ?Y est=93.0",
+    "      IndexJoin on ?X | PSO ?X <http://swat.cse.lehigh.edu/onto/univ-bench.owl#worksFor> ?Y est=189.0",
+    "        IndexScan POS ?X rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#Chair> est=189.0",
+    "    MergeJoin on ?Y est=132.0",
+    "      IndexScan POS ?Y rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#Department> est=189.0",
+    "      IndexScan POS ?Y <http://swat.cse.lehigh.edu/onto/univ-bench.owl#subOrganizationOf> <http://www.University0.edu> est=239.0"
+   ],
+   "candidate_plan_ms": 0.0939,
+   "per_round": [
+    1.04,
+    1.047,
+    1.035,
+    1.036
+   ],
+   "plan_changed": true,
+   "query": "q12",
+   "ratio": 1.0379,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0751,
+   "base_plan_ms": 0.0481,
+   "candidate_ms": 0.0748,
+   "candidate_plan_ms": 0.0483,
+   "per_round": [
+    0.991,
+    1.008,
+    1.046,
+    0.994
+   ],
+   "query": "q13",
+   "ratio": 0.9965,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1303,
+   "base_plan_ms": 0.042,
+   "candidate_ms": 0.1351,
+   "candidate_plan_ms": 0.047,
+   "per_round": [
+    0.955,
+    1.155,
+    0.932,
+    1.012
+   ],
+   "query": "q14",
+   "ratio": 1.037,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 4.1355,
+   "base_plan": [
+    "  IndexJoin on ?X | POS ?X rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#GraduateStudent> est=1.0",
+    "    MergeJoin on ?Z est=1.0",
+    "      IndexScan POS ?Z rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#Department> est=189.0",
+    "        IndexJoin on ?X | PSO ?X <http://swat.cse.lehigh.edu/onto/univ-bench.owl#memberOf> ?Z est=22.0",
+    "          IndexJoin on ?Y | POS ?X <http://swat.cse.lehigh.edu/onto/univ-bench.owl#undergraduateDegreeFrom> ?Y est=31.0",
+    "            MergeJoin on ?Y est=1.0",
+    "              IndexScan POS ?Y rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#University> est=1000.0",
+    "              IndexScan POS ?Z <http://swat.cse.lehigh.edu/onto/univ-bench.owl#subOrganizationOf> ?Y est=5843.0"
+   ],
+   "base_plan_ms": 0.1737,
+   "candidate_ms": 2.0888,
+   "candidate_plan": [
+    "  IndexJoin on ?X | PSO ?X <http://swat.cse.lehigh.edu/onto/univ-bench.owl#memberOf> ?Z est=115.0",
+    "    MergeJoin on ?X est=2255.0",
+    "      IndexScan POS ?X rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#GraduateStudent> est=24019.0",
+    "        IndexJoin on ?Y | POS ?X <http://swat.cse.lehigh.edu/onto/univ-bench.owl#undergraduateDegreeFrom> ?Y est=2897.0",
+    "          MergeJoin on ?Y est=98.0",
+    "            IndexScan POS ?Y rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#University> est=1000.0",
+    "              IndexJoin on ?Z | PSO ?Z <http://swat.cse.lehigh.edu/onto/univ-bench.owl#subOrganizationOf> ?Y est=189.0",
+    "                IndexScan POS ?Z rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#Department> est=189.0"
+   ],
+   "candidate_plan_ms": 0.1845,
+   "per_round": [
+    0.509,
+    0.503,
+    0.506,
+    0.503
+   ],
+   "plan_changed": true,
+   "query": "q2",
+   "ratio": 0.5051,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0639,
+   "base_plan_ms": 0.05,
+   "candidate_ms": 0.064,
+   "candidate_plan_ms": 0.05,
+   "per_round": [
+    0.913,
+    1.025,
+    0.998,
+    1.107
+   ],
+   "query": "q3",
+   "ratio": 1.0014,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.166,
+   "base_plan_ms": 0.1211,
+   "candidate_ms": 0.1665,
+   "candidate_plan_ms": 0.1227,
+   "per_round": [
+    0.985,
+    1.031,
+    1.022,
+    1.01
+   ],
+   "query": "q4",
+   "ratio": 1.0029,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1196,
+   "base_plan_ms": 0.0485,
+   "candidate_ms": 0.1219,
+   "candidate_plan_ms": 0.0499,
+   "per_round": [
+    1.004,
+    1.033,
+    1.014,
+    1.023
+   ],
+   "query": "q5",
+   "ratio": 1.019,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1593,
+   "base_plan_ms": 0.045,
+   "candidate_ms": 0.1586,
+   "candidate_plan_ms": 0.0462,
+   "per_round": [
+    0.987,
+    1.033,
+    0.971,
+    1.017
+   ],
+   "query": "q6",
+   "ratio": 0.9952,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1263,
+   "base_plan_ms": 0.0907,
+   "candidate_ms": 0.1274,
+   "candidate_plan_ms": 0.0929,
+   "per_round": [
+    0.996,
+    1.038,
+    0.988,
+    1.023
+   ],
+   "query": "q7",
+   "ratio": 1.009,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 2.1469,
+   "base_plan_ms": 0.1622,
+   "candidate_ms": 2.1802,
+   "candidate_plan_ms": 0.1841,
+   "per_round": [
+    1.007,
+    1.009,
+    1.002,
+    1.029
+   ],
+   "query": "q8",
+   "ratio": 1.0155,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 6.3722,
+   "base_plan": [
+    "  HashJoin on ?Z ?Y est=32256.0",
+    "    MergeJoin on ?Z est=14330.0",
+    "      IndexScan POS ?Z rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#Course> est=20472.0",
+    "      IndexScan POS ?Y <http://swat.cse.lehigh.edu/onto/univ-bench.owl#teacherOf> ?Z est=20472.0",
+    "    MergeJoin on ?X est=65481.0",
+    "      MergeJoin on ?X est=27479.0",
+    "        IndexScan POS ?X rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#Student> est=99566.0",
+    "        HashJoin on ?Y est=27479.0",
+    "          IndexScan POS ?Y rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#Faculty> est=6843.0",
+    "          IndexScan PSO ?X <http://swat.cse.lehigh.edu/onto/univ-bench.owl#advisor> ?Y est=39255.0",
+    "      IndexScan PSO ?X <http://swat.cse.lehigh.edu/onto/univ-bench.owl#takesCourse> ?Z est=274699.0"
+   ],
+   "base_plan_ms": 0.2403,
+   "candidate_ms": 4.9836,
+   "candidate_plan": [
+    "  IndexJoin on ?Z | POS ?Z rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#Course> est=792.0",
+    "    MergeJoin on ?Y est=792.0",
+    "      IndexScan POS ?Y rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#Faculty> est=6843.0",
+    "        IndexJoin on ?X | POS ?X rdf:type <http://swat.cse.lehigh.edu/onto/univ-bench.owl#Student> est=792.0",
+    "          HashJoin on ?Y ?Z est=792.0",
+    "            IndexScan PSO ?Y <http://swat.cse.lehigh.edu/onto/univ-bench.owl#teacherOf> ?Z est=20472.0",
+    "            MergeJoin on ?X est=93545.0",
+    "              IndexScan PSO ?X <http://swat.cse.lehigh.edu/onto/univ-bench.owl#advisor> ?Y est=39255.0",
+    "              IndexScan PSO ?X <http://swat.cse.lehigh.edu/onto/univ-bench.owl#takesCourse> ?Z est=274699.0"
+   ],
+   "candidate_plan_ms": 0.2529,
+   "per_round": [
+    0.803,
+    0.77,
+    0.769,
+    0.812
+   ],
+   "plan_changed": true,
+   "query": "q9",
+   "ratio": 0.7821,
+   "workload": "lubm"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.5895,
+   "base_plan_ms": 0.0852,
+   "candidate_ms": 0.6,
+   "candidate_plan_ms": 0.0855,
+   "per_round": [
+    1.014,
+    1.018,
+    1.016,
+    1.017
+   ],
+   "query": "abstract-contains",
+   "ratio": 1.0179,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 3.7578,
+   "base_plan_ms": 0.0696,
+   "candidate_ms": 3.7478,
+   "candidate_plan_ms": 0.0711,
+   "per_round": [
+    0.792,
+    1.001,
+    1.027,
+    1.023
+   ],
+   "query": "births-by-decade",
+   "ratio": 0.9974,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0941,
+   "base_plan": [
+    "  StarJoin on ?p | rdf:type <http://dbpedia.org/ontology/Person> ; rdfs:label ?l est=3.0",
+    "    IndexScan POS ?p <http://purl.org/dc/terms/subject> <http://dbpedia.org/resource/Category:San_Diego_Padres_(minor_league)_players> est=6.0"
+   ],
+   "base_plan_ms": 0.0689,
+   "candidate_ms": 0.0957,
+   "candidate_plan": [
+    "  StarJoin on ?p | rdfs:label ?l ; rdf:type <http://dbpedia.org/ontology/Person> est=1.0",
+    "    IndexScan POS ?p <http://purl.org/dc/terms/subject> <http://dbpedia.org/resource/Category:San_Diego_Padres_(minor_league)_players> est=6.0"
+   ],
+   "candidate_plan_ms": 0.0708,
+   "per_round": [
+    1.013,
+    1.021,
+    1.008,
+    1.041
+   ],
+   "plan_changed": true,
+   "query": "category-people-1",
+   "ratio": 1.0167,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0884,
+   "base_plan": [
+    "  StarJoin on ?p | rdf:type <http://dbpedia.org/ontology/Person> ; rdfs:label ?l est=2.0",
+    "    IndexScan POS ?p <http://purl.org/dc/terms/subject> <http://dbpedia.org/resource/Category:Lyngby_Boldklub_players> est=5.0"
+   ],
+   "base_plan_ms": 0.0653,
+   "candidate_ms": 0.0933,
+   "candidate_plan": [
+    "  StarJoin on ?p | rdfs:label ?l ; rdf:type <http://dbpedia.org/ontology/Person> est=1.0",
+    "    IndexScan POS ?p <http://purl.org/dc/terms/subject> <http://dbpedia.org/resource/Category:Lyngby_Boldklub_players> est=5.0"
+   ],
+   "candidate_plan_ms": 0.0693,
+   "per_round": [
+    1.078,
+    1.048,
+    1.019,
+    1.071
+   ],
+   "plan_changed": true,
+   "query": "category-people-2",
+   "ratio": 1.0551,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0247,
+   "base_plan_ms": 0.0157,
+   "candidate_ms": 0.025,
+   "candidate_plan_ms": 0.016,
+   "per_round": [
+    1.034,
+    1.084,
+    0.984,
+    0.965
+   ],
+   "query": "category-tree",
+   "ratio": 1.0114,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1776,
+   "base_plan_ms": 0.0348,
+   "candidate_ms": 0.1779,
+   "candidate_plan_ms": 0.0318,
+   "per_round": [
+    1.009,
+    1.002,
+    0.996,
+    0.985
+   ],
+   "query": "class-counts",
+   "ratio": 1.002,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.3332,
+   "base_plan": [
+    "          MergeJoin on ?a est=1478.0",
+    "            IndexScan POS ?f <http://dbpedia.org/ontology/starring> ?a est=4036.0",
+    "            HashJoin on ?pl est=1952.0",
+    "              MergeJoin on ?d est=1348.0",
+    "                IndexScan POS ?f <http://dbpedia.org/ontology/director> ?d est=1208.0",
+    "                IndexScan PSO ?d <http://dbpedia.org/ontology/birthPlace> ?pl est=12347.0",
+    "              IndexScan PSO ?a <http://dbpedia.org/ontology/birthPlace> ?pl est=12347.0"
+   ],
+   "base_plan_ms": 0.0897,
+   "candidate_ms": 0.2102,
+   "candidate_plan": [
+    "          IndexJoin on ?f | PSO ?f <http://dbpedia.org/ontology/starring> ?a est=1.0",
+    "            IndexJoin on ?pl | POS ?a <http://dbpedia.org/ontology/birthPlace> ?pl est=16.0",
+    "              MergeJoin on ?d est=11.0",
+    "                IndexScan POS ?f <http://dbpedia.org/ontology/director> ?d est=1208.0",
+    "                IndexScan PSO ?d <http://dbpedia.org/ontology/birthPlace> ?pl est=12347.0"
+   ],
+   "candidate_plan_ms": 0.1005,
+   "per_round": [
+    0.622,
+    0.638,
+    0.632,
+    0.634
+   ],
+   "plan_changed": true,
+   "query": "costar-birthplace",
+   "ratio": 0.6309,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0221,
+   "base_plan_ms": 0.0164,
+   "candidate_ms": 0.0241,
+   "candidate_plan_ms": 0.018,
+   "per_round": [
+    1.052,
+    1.093,
+    1.011,
+    1.154
+   ],
+   "query": "count-all",
+   "ratio": 1.0876,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0845,
+   "base_plan_ms": 0.0514,
+   "candidate_ms": 0.0871,
+   "candidate_plan_ms": 0.0538,
+   "per_round": [
+    1.07,
+    1.039,
+    1.034,
+    0.998
+   ],
+   "query": "country-population",
+   "ratio": 1.0305,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0248,
+   "base_plan_ms": 0.0189,
+   "candidate_ms": 0.0251,
+   "candidate_plan_ms": 0.0194,
+   "per_round": [
+    0.982,
+    1.029,
+    1.006,
+    1.06
+   ],
+   "query": "entity-facts-1",
+   "ratio": 1.0132,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0254,
+   "base_plan_ms": 0.019,
+   "candidate_ms": 0.0262,
+   "candidate_plan_ms": 0.0199,
+   "per_round": [
+    1.051,
+    1.068,
+    1.068,
+    0.969
+   ],
+   "query": "entity-facts-2",
+   "ratio": 1.0314,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0539,
+   "base_plan_ms": 0.0389,
+   "candidate_ms": 0.0547,
+   "candidate_plan_ms": 0.0394,
+   "per_round": [
+    0.995,
+    1.026,
+    1.047,
+    1.014
+   ],
+   "query": "entity-summary-1",
+   "ratio": 1.0148,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0556,
+   "base_plan_ms": 0.0391,
+   "candidate_ms": 0.0543,
+   "candidate_plan_ms": 0.0382,
+   "per_round": [
+    0.951,
+    1.002,
+    0.976,
+    1.04
+   ],
+   "query": "entity-summary-2",
+   "ratio": 0.9765,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1418,
+   "base_plan_ms": 0.0647,
+   "candidate_ms": 0.1449,
+   "candidate_plan_ms": 0.0679,
+   "per_round": [
+    1.03,
+    1.035,
+    1.03,
+    0.997
+   ],
+   "query": "film-director-optional",
+   "ratio": 1.0213,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 1.7155,
+   "base_plan_ms": 0.633,
+   "candidate_ms": 1.7279,
+   "candidate_plan_ms": 0.6411,
+   "per_round": [
+    1.007,
+    1.012,
+    1.007,
+    1.007
+   ],
+   "query": "geo-box",
+   "ratio": 1.0073,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0363,
+   "base_plan_ms": 0.0217,
+   "candidate_ms": 0.0372,
+   "candidate_plan_ms": 0.0224,
+   "per_round": [
+    0.954,
+    1.079,
+    1.044,
+    0.992
+   ],
+   "query": "inlinks-count-1",
+   "ratio": 1.0233,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0351,
+   "base_plan_ms": 0.0218,
+   "candidate_ms": 0.034,
+   "candidate_plan_ms": 0.0211,
+   "per_round": [
+    0.914,
+    1.026,
+    0.943,
+    0.982
+   ],
+   "query": "inlinks-count-2",
+   "ratio": 0.9705,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 2.8913,
+   "base_plan_ms": 0.0986,
+   "candidate_ms": 2.8925,
+   "candidate_plan_ms": 0.0994,
+   "per_round": [
+    1.001,
+    1.0,
+    1.0,
+    1.001
+   ],
+   "query": "label-regex",
+   "ratio": 1.0004,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1525,
+   "base_plan_ms": 0.0661,
+   "candidate_ms": 0.1472,
+   "candidate_plan_ms": 0.0613,
+   "per_round": [
+    0.987,
+    0.951,
+    0.979,
+    0.954
+   ],
+   "query": "outlink-classes-1",
+   "ratio": 0.9653,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.1041,
+   "base_plan_ms": 0.0626,
+   "candidate_ms": 0.1011,
+   "candidate_plan_ms": 0.0594,
+   "per_round": [
+    0.991,
+    0.98,
+    0.974,
+    0.965
+   ],
+   "query": "outlink-classes-2",
+   "ratio": 0.9713,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.4508,
+   "base_plan_ms": 0.0303,
+   "candidate_ms": 0.4504,
+   "candidate_plan_ms": 0.0298,
+   "per_round": [
+    1.011,
+    1.011,
+    0.984,
+    1.005
+   ],
+   "query": "people-no-birthdate",
+   "ratio": 0.9992,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0833,
+   "base_plan_ms": 0.0568,
+   "candidate_ms": 0.0898,
+   "candidate_plan_ms": 0.0631,
+   "per_round": [
+    1.122,
+    1.073,
+    1.082,
+    1.036
+   ],
+   "query": "place-births-1",
+   "ratio": 1.0785,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.092,
+   "base_plan_ms": 0.061,
+   "candidate_ms": 0.0923,
+   "candidate_plan_ms": 0.0611,
+   "per_round": [
+    0.971,
+    1.027,
+    1.002,
+    0.997
+   ],
+   "query": "place-births-2",
+   "ratio": 1.0041,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0343,
+   "base_plan_ms": 0.0246,
+   "candidate_ms": 0.0345,
+   "candidate_plan_ms": 0.0248,
+   "per_round": [
+    0.961,
+    0.983,
+    1.056,
+    0.996
+   ],
+   "query": "place-union-1",
+   "ratio": 1.0045,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0331,
+   "base_plan_ms": 0.0236,
+   "candidate_ms": 0.0347,
+   "candidate_plan_ms": 0.0249,
+   "per_round": [
+    1.027,
+    1.072,
+    1.076,
+    1.034
+   ],
+   "query": "place-union-2",
+   "ratio": 1.0473,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.3535,
+   "base_plan_ms": 0.0458,
+   "candidate_ms": 0.3346,
+   "candidate_plan_ms": 0.0244,
+   "per_round": [
+    0.945,
+    0.948,
+    1.016,
+    0.935
+   ],
+   "query": "predicate-counts",
+   "ratio": 0.9464,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0453,
+   "base_plan_ms": 0.034,
+   "candidate_ms": 0.0447,
+   "candidate_plan_ms": 0.0336,
+   "per_round": [
+    1.052,
+    1.037,
+    0.889,
+    0.962
+   ],
+   "query": "redirect-target-1",
+   "ratio": 0.9875,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0434,
+   "base_plan_ms": 0.0327,
+   "candidate_ms": 0.0431,
+   "candidate_plan_ms": 0.0326,
+   "per_round": [
+    1.077,
+    0.977,
+    0.967,
+    0.969
+   ],
+   "query": "redirect-target-2",
+   "ratio": 0.9912,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 0.0265,
+   "base_plan_ms": 0.0217,
+   "candidate_ms": 0.0265,
+   "candidate_plan_ms": 0.0219,
+   "per_round": [
+    1.062,
+    0.961,
+    0.957,
+    1.027
+   ],
+   "query": "sameas-subjects",
+   "ratio": 0.9997,
+   "workload": "dbpedia"
+  },
+  {
+   "answers": "same",
+   "base_ms": 112.5458,
+   "base_plan_ms": 0.0721,
+   "candidate_ms": 111.9486,
+   "candidate_plan_ms": 0.0702,
+   "per_round": [
+    1.005,
+    0.982,
+    1.0,
+    1.002
+   ],
+   "query": "top-linked",
+   "ratio": 0.9947,
+   "workload": "dbpedia"
+  }
+ ],
+ "scale": "synthetic 1.05M, WatDiv 100, BSBM 10M explore and BI, LUBM(10) with OWL RL, DBpedia 8.2M-triple slice",
+ "settings": {
+  "client_cpu": 12,
+  "cpus": "0-11",
+  "reps": 20,
+  "rerun_rounds": 8,
+  "result_cache_mb": 0,
+  "rounds": 4,
+  "threads": 12,
+  "threshold": 1.05,
+  "warmup": 3
+ },
+ "suite": "estimation-ab",
+ "summary": {
+  "bsbm-bi": {
+   "answers_differ": [],
+   "at_least_5pct_slower": [],
+   "geomean": 0.933,
+   "queries": 24
+  },
+  "bsbm-explore": {
+   "answers_differ": [],
+   "at_least_5pct_slower": [],
+   "geomean": 0.9999,
+   "queries": 33
+  },
+  "dbpedia": {
+   "answers_differ": [],
+   "at_least_5pct_slower": [
+    "category-people-2",
+    "count-all",
+    "place-births-1"
+   ],
+   "geomean": 0.9931,
+   "queries": 30
+  },
+  "lubm": {
+   "answers_differ": [],
+   "at_least_5pct_slower": [],
+   "geomean": 0.9455,
+   "queries": 14
+  },
+  "synthetic": {
+   "answers_differ": [],
+   "at_least_5pct_slower": [
+    "count-all",
+    "distinct-obj",
+    "expr-agg-arg",
+    "f-expr-range-join",
+    "f-regex-iri-join",
+    "predicate-counts",
+    "predicate-subjects",
+    "star-lookup"
+   ],
+   "geomean": 1.0276,
+   "queries": 45
+  },
+  "watdiv": {
+   "answers_differ": [],
+   "at_least_5pct_slower": [
+    "F4-1",
+    "F4-2",
+    "F4-3",
+    "F4-4",
+    "F4-5",
+    "S4-2",
+    "S4-4"
+   ],
+   "geomean": 0.9677,
+   "queries": 88
+  }
+ }
+}

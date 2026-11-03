@@ -573,10 +573,17 @@ larger input only maps integers whose span is at most half its rows and at most 
 values to their slots directly, in parallel above 262,144 rows. From 1,024 rows, a
 variable's dictionary and query-local values can be decoded once per distinct term in
 key order, and the decoded column then keeps a charge for its slots, its distinct values
-and their payload rather than the reservation that built it. These paths are optional,
-and a refused reservation leaves the key to the paths below. Otherwise, up to 16,384 rows,
-keys are evaluated on the calling thread with each value admitted before the column keeps
-it. A larger input evaluates each distinct key once in parallel through the value cache,
+and their payload rather than the reservation that built it. From 4,096 distinct terms the
+decoding runs in one parallel pass over pieces of the sorted ids, in which each piece reads
+its numbers from the numeric column, admits each other value's payload before it builds the
+value and writes the value in place. A piece's charge outlives what it wrote, and the
+pass's charges join the column's charge when it ends. A column of more than 16,384 decoded
+values is freed on the pool after the sort, before its charge is released. These paths are
+optional, and a refused reservation leaves the key to the paths below. Otherwise, up to
+16,384 rows, keys are evaluated on the calling thread with each value admitted before the
+column keeps it. Both kinds of payload charge grow a step ahead, by the query's
+reservation step of at most 64 KiB, and take the exact amount when the step is refused, so
+a query at its budget fails where it failed before. A larger input evaluates each distinct key once in parallel through the value cache,
 and so does a large column of inline values, which the decoding would hold once per row,
 or one whose query-local payload the budget refuses. Its key column is charged for its
 slots before evaluation and for its values' payload after it, so a query over its budget
@@ -677,7 +684,8 @@ query above 0.3 ms that the kernels change within 1.019 of its time at 1.05M tri
 12 threads in both modes, and eager `order-by-full`, `range-topk` and `regex-iri` read
 0.921, 0.802 and 0.957. `types-grouped`, a GROUP BY of about 0.011 ms with an ORDER BY over
 its few groups, read 1.130 in eager execution and 1.053 when streamed, 1.4 and 1.0 µs more,
-which fails the D4 rule. Item 679 investigates it. At 10.5M triples in four rounds,
+which fails the D4 rule. The [per-query costs after stage 4](#per-query-costs-after-stage-4)
+removed it. At 10.5M triples in four rounds,
 every such query read within 1.024 except streamed `expr-order-key` at 1.045, 0.49 ms of
 10.8 ms, which item 680 investigates, and eager `order-by-full`, `range-topk` and
 `expr-order-key` read 0.797, 0.928 and 0.971.
@@ -704,8 +712,8 @@ thread at 1.05M triples, `regex-iri` read 0.990 in eager execution and
 0.978 when streamed. The latency harness ran on the merge before the unchecked rebuild and
 these two changes, which leave queries this short alone. It passed every query under 0.3 ms in both modes except
 `star-lookup`, which read 1.019 in eager execution and 1.017 when streamed, about 1.1 µs of
-59 µs, and eager `types-grouped` at 1.186. Items 681 and 679 investigate
-them. In twelve rounds of 200 requests, eager `subquery-agg` at 1.05M triples read 0.999
+59 µs, and eager `types-grouped` at 1.186, which the
+[per-query costs after stage 4](#per-query-costs-after-stage-4) follow up. In twelve rounds of 200 requests, eager `subquery-agg` at 1.05M triples read 0.999
 of main, and main read 0.981 of itself.
 
 The 12-thread matrix of 9d086646, the build with the mode-neutral kernels, returned the
@@ -716,3 +724,76 @@ flags of `regex-iri` and `subquery-agg` were the two costs it traced. Streamed
 responses still take about 0.27 ms more wall time than eager ones on the queries under
 1 ms, as they did before the stage, so chunked live reservations removed no measurable
 share of item 534's cost.
+
+### Per-query costs after stage 4
+
+The forge check after stage 4 merged found queries of a few microseconds slower with one
+thread than the main before it, 005df56d. `count-all`, `distinct-obj` and `types-grouped`
+read 1.135, 1.125 and 1.138, 0.6, 0.5 and 1.0 µs more, and eager `order-by-full` at 1.05M
+triples with 12 threads read 1.033. Counting user-space instructions per request of the
+server with `perf stat` on atlas, with one Rayon thread, put the whole request of these
+queries 2,800 to 6,400 instructions above 005df56d, and profiles of the plan's execution
+with LBR call stacks traced the share in the timed execution to five costs.
+
+- The query's regular-expression cache replaced its empty map when the query's context was
+  shared and again when its work ended. Each replacement of an `ArcSwap` pays the debts of
+  every thread that ever read the map, about 900 instructions. Freeing the context paid them
+  again, and the map and the 64 shards of the decoded value cache were allocated, set up and
+  freed for queries that never used them.
+- The expression cache of a BIND asked whether the expression was eligible, which walks it
+  and collects its variables, before it checked the input's size, so the one row of an
+  aggregate's BIND paid for the walk. FILTER and BIND inputs of up to 16,384 rows read the
+  clock and asked whether their expressions could run on the pool even when the batch was
+  too small to split, and ORDER BY keys called the per-value paths that decline fewer than
+  1,024 rows.
+- The key column of a small eager sort resized its retained charge on every row, which
+  upgrades the context's weak owner and releases nothing for a numeric key, about 1,000
+  instructions over the few groups of `types-grouped`.
+- The sort of `order-by-full`, 102,000 distinct names, decoded each key twice in parallel,
+  once to charge its payload and once to build it, and flattened the numbers, the values and
+  the pairs of ids and rows on the query's thread. Its serial part grew from 22.7 to 25.0
+  million cycles per request.
+- Freeing the 102,000 decoded keys after the sort ran on the query's thread, about 9.7
+  million cycles in both builds.
+
+The regular-expression map and the value cache's shards are now made on first use, so a
+query without patterns or decoded values neither builds nor frees them, and clearing an
+empty map keeps it. The BIND cache checks the input's size first, and small inputs skip the
+clock, the walk of their expressions and the per-value paths. A key column covers each
+value's payload a reservation step ahead, at most 64 KiB or a 64th of the budget, and
+takes the exact amount when the step is refused, so a query at its budget fails where it
+failed before and each column holds at most one step of charge above its values. From 4,096
+distinct terms the decoding runs in one parallel pass over pieces of the sorted ids, in
+which each piece reads its numbers from the numeric column, admits each value's payload
+before it builds the value and writes it in place. A piece's charge lives until what it
+wrote is cleared, and the pass's charges join the column's charge, less their step slack,
+when it ends. A sorted key column of more than 16,384 values is freed on the pool before
+its charge is released.
+
+On atlas, the whole request of `count-all`, `distinct-obj` and `path-plus` took about 800
+fewer instructions than on 005df56d after these changes, `predicate-counts` the same and
+`types-grouped` about 1,200 more, against 2,800 to 6,400 more before them. In the
+benchmark host's latency harness with one thread at 1.05M triples, in twelve rounds of 200
+requests in each order, the final build read `count-all` at 0.924 of 005df56d,
+`distinct-obj` at 0.948, `path-plus` at 0.941, `predicate-counts` at 0.978 and
+`predicate-subjects` at 0.967, and `types-grouped` at 1.054, 0.38 µs more, which passes the
+D4 rule. With 12 threads at 1.05M triples, eager `order-by-full` read 0.677 of 005df56d,
+13.1 ms against 8.9 ms, and both builds returned the same answers to all 30 queries.
+
+Against 62d9cb53, the build that merged stage 4, the final build ran the 30 queries at
+1.05M triples with 12 threads at a geometric mean of 0.959, with `order-by-full` at 0.643
+and the queries under 0.1 ms 2% to 21% faster. Every other query read within 1.02 of it except
+`distinct-join` at 1.036. Atlas put that 3.7% on the last change, against the build before
+it, and all of it in the hash join's pair loop, `join_pairs`, whose code is the same in
+both builds but starts 32 bytes later within its 64-byte line. Item 696 follows the
+loop's sensitivity to its alignment. `star-lookup`, which item 681 followed, read 0.964 of
+62d9cb53 and 0.996 of 005df56d with 12 threads in eager execution. With one thread the
+build after review read 0.988 of 005df56d, so the charged query state no longer adds to
+it, and the final build read 1.019 of 005df56d in two runs and 1.031 of the build after
+review, 1.1 to 1.8 µs more. Atlas put all of that on the binary search of the index join's
+galloping reads, `indexjoin::search`, which took 5,200 more cycles per request in the final
+build. Its code is the same in both builds but starts 16 bytes into its 64-byte line
+instead of at the line's start, so item 696 follows it with `join_pairs`.
+The eager costs of 1% to 4% that stage 4 added to filters and aggregates, such as
+`subquery-agg` at 1.040 of 005df56d at 10.5M triples and `contains` at 1.036 at 1.05M
+triples, are unchanged, and item 682 holds them.

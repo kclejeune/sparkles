@@ -23,6 +23,7 @@
 //!    in threads of their own. Statistics for the planner are gathered on the way.
 
 mod codec;
+pub mod correlations;
 mod hotkeys;
 mod iostat;
 mod runs;
@@ -73,6 +74,11 @@ pub struct BuildOptions {
     /// generation format 4. `None` is [`VocabCodec::default`] for a new database, and
     /// the codec of the generation it replaces for a compaction or a bulk commit.
     pub vocab_codec: Option<VocabCodec>,
+    /// Distinct node signatures the node-set pass counts exactly at most
+    /// ([`correlations::MAX_NODE_SETS_SEEN`] by default). With more in the data it keeps
+    /// the ones with the most nodes by a sketch, so the statistics stay the same at every
+    /// thread count.
+    pub node_sets_seen: usize,
 }
 
 impl Default for BuildOptions {
@@ -87,6 +93,7 @@ impl Default for BuildOptions {
             patterns: true,
             pattern_bytes: crate::patterns::DEFAULT_BUDGET,
             vocab_codec: None,
+            node_sets_seen: correlations::MAX_NODE_SETS_SEEN,
         }
     }
 }
@@ -118,6 +125,13 @@ pub struct Stats {
     /// [`MAX_CHARSETS`])
     #[serde(default)]
     pub charset_others: u64,
+    /// the remainders of the subject sets and the node sets, versioned on their own (see
+    /// [`correlations`])
+    #[serde(
+        default,
+        skip_serializing_if = "correlations::CorrelationSlot::is_unwritten"
+    )]
+    pub correlations: correlations::CorrelationSlot,
 }
 
 /// A characteristic set (Neumann and Moerkotte, ICDE 2011): a set of predicates, the
@@ -134,8 +148,9 @@ pub struct CharSet {
     pub triples: Vec<u64>,
 }
 
-/// Characteristic sets kept in the statistics at most, those of the most subjects.
-pub const MAX_CHARSETS: usize = 10_000;
+/// Characteristic sets kept in the statistics at most, those of the most subjects. The
+/// subjects of the others are counted in the remainder of [`Stats::correlations`].
+pub const MAX_CHARSETS: usize = 32_768;
 
 /// The item standing for class `class` (a base vocabulary id) in a characteristic set: its
 /// payload under a tag no term has, so that it sorts after every predicate.
@@ -153,6 +168,19 @@ pub fn item_class(item: u64) -> Option<u64> {
 const MAX_CHARSETS_SEEN: usize = 1 << 20;
 
 impl Stats {
+    /// Bytes the statistics hold beyond their own size.
+    pub fn heap_bytes(&self) -> u64 {
+        self.predicates.capacity() as u64 * std::mem::size_of::<PredicateStat>() as u64
+            + (self.graphs.capacity() + self.classes.capacity()) as u64 * 16
+            + self.charsets.capacity() as u64 * std::mem::size_of::<CharSet>() as u64
+            + self
+                .charsets
+                .iter()
+                .map(|s| (s.preds.capacity() + s.triples.capacity()) as u64 * 8)
+                .sum::<u64>()
+            + self.correlations.heap_bytes()
+    }
+
     pub fn predicate(&self, p: u64) -> Option<&PredicateStat> {
         self.predicates
             .binary_search_by_key(&p, |s| s.p)
@@ -722,6 +750,20 @@ impl Builder {
         }
         stats.quads = rows;
         stats.predicates.sort_by_key(|p| p.p);
+        if let Some(c) = stats.correlations.get_mut() {
+            self.interrupted()?;
+            self.report("counting node sets");
+            let (sets, rest) = correlations::node_sets_seen(
+                &self.dir,
+                rdf_type,
+                self.opts.threads,
+                self.opts.node_sets_seen,
+                &|| self.interrupted(),
+            )?;
+            c.node_sets = sets;
+            c.node_rest = rest;
+            self.phase_done("node sets");
+        }
         // the patterns are written before meta.json, which publishes the generation
         let patterns = match patterns {
             Some(p) => {
@@ -1583,6 +1625,8 @@ struct StatsCollector {
     cs_preds: Vec<u64>,
     charsets: FxHashMap<Box<[u64]>, (u64, Vec<u64>)>,
     cs_others: u64,
+    /// the subjects whose sets are not counted one by one, with their items
+    cs_rest: correlations::RestTally,
     /// the predicate patterns, collected from SPO when the build makes them
     patterns: Option<crate::patterns::PatternCollector>,
 }
@@ -1605,6 +1649,7 @@ impl StatsCollector {
             cs_preds: Vec::new(),
             charsets: FxHashMap::default(),
             cs_others: 0,
+            cs_rest: Default::default(),
             patterns: None,
         }
     }
@@ -1632,7 +1677,11 @@ impl StatsCollector {
                     (1, self.cs_cur.iter().map(|&(_, c)| c).collect()),
                 );
             }
-            None => self.cs_others += 1,
+            None => {
+                self.cs_others += 1;
+                let counts: Vec<u64> = self.cs_cur.iter().map(|&(_, c)| c).collect();
+                self.cs_rest.add(1, &self.cs_preds, &counts, 1);
+            }
         }
         self.cs_cur.clear();
     }
@@ -1711,23 +1760,21 @@ impl StatsCollector {
         match self.perm {
             Perm::Spo => {
                 stats.distinct_subjects = self.distinct0;
-                let mut sets: Vec<CharSet> = std::mem::take(&mut self.charsets)
-                    .into_iter()
-                    .map(|(preds, (subjects, triples))| CharSet {
-                        preds: preds.into_vec(),
-                        subjects,
-                        triples,
-                    })
-                    .collect();
-                sets.sort_unstable_by(|a, b| {
-                    b.subjects
-                        .cmp(&a.subjects)
-                        .then_with(|| a.preds.cmp(&b.preds))
-                });
-                let others: u64 = sets.iter().skip(MAX_CHARSETS).map(|c| c.subjects).sum();
-                sets.truncate(MAX_CHARSETS);
+                let mut rest = std::mem::take(&mut self.cs_rest);
+                let sets = correlations::keep_top(
+                    std::mem::take(&mut self.charsets),
+                    MAX_CHARSETS,
+                    &mut rest,
+                );
                 stats.charsets = sets;
-                stats.charset_others = self.cs_others + others;
+                stats.charset_others = rest.n as u64;
+                debug_assert!(rest.n as u64 >= self.cs_others);
+                stats.correlations =
+                    correlations::CorrelationSlot::Present(Box::new(correlations::Correlations {
+                        version: correlations::VERSION,
+                        subject_rest: rest.finish(),
+                        ..Default::default()
+                    }));
             }
             Perm::Osp => stats.distinct_objects = self.distinct0,
             Perm::Pso => {
@@ -1944,6 +1991,7 @@ mod tests {
             patterns: true,
             pattern_bytes: crate::patterns::DEFAULT_BUDGET,
             vocab_codec: None,
+            node_sets_seen: correlations::MAX_NODE_SETS_SEEN,
         });
         let no_hot = build(BuildOptions {
             batch_quads: 7,

@@ -320,8 +320,8 @@ another writer's commit reloads the page through the change feed.
 
 ### Ontology browser
 
-The **Browse** page, `/ui/browse`, is a read-only reference to the ontologies and thesauri
-of a dataset, with a page for each entity in the manner of the term pages of OLS and
+The **Browse** page, `/ui/browse`, is a reference to the ontologies and thesauri of a
+dataset, with a page for each entity in the manner of the term pages of OLS and
 Ontobee ([U12](../specs/U12-ontology-workbench/SPEC.md#ontology-browser),
 [screenshot](../images/browse-term.png)). The top bar's search opens an entity's page,
 and every name on a page links to the page of that entity. `/ui/browse?ds=NAME` is the
@@ -350,9 +350,34 @@ property, with their counts and further pages. **In other datasets** asks every 
 dataset the caller can read, up to 20, whether it mentions the IRI, and links its page
 there. The infobox lists the kind, status, identifiers, ontology, subsets and the counts
 of parents, children and instances, and downloads the entity in Turtle, RDF/XML, OWL
-functional syntax or JSON-LD. **Edit** opens the entity in the ontology or thesaurus
-editor. On a phone the page is one column with the header first, then the infobox, the
+functional syntax or JSON-LD. On a phone the page is one column with the header first, then the infobox, the
 hierarchy and the article ([screenshot](../images/browse-phone.png)).
+
+A caller who can write to the dataset gets an **Edit** button beside the title, and `E`
+or the palette's **Edit this page** does the same. Edit mode changes the page in place
+([screenshot](../images/browse-edit.png)). A bar under the top bar names the branch the
+edits go to and holds **Undo**, **Redo**, **Start session**, a link to the full ontology
+or thesaurus editor and **Done**. The definition becomes a text field with its language
+and its sources as chips, and each synonym, annotation and parent gets edit and remove
+buttons with an add row below them. On an OWL page the parents are picked through the
+entity search and the axioms are added in Manchester syntax with completion and the
+server's parse errors underlined. On a SKOS page the broader, narrower,
+related and mapping concepts are picked the same way, and the labels are edited by language.
+
+Each change is one commit through the editors' write path. It is previewed as a dry run
+against the commit the page shows ([screenshot](../images/browse-edit-preview.png)),
+and the preview names the axioms or triples it removes and adds. A definition or synonym
+keeps its sources and other axiom annotations through an edit. Undo and redo are
+previewed commits that share the editors' history for the dataset and graph. When the
+branch is protected the fields are disabled and **Start session** creates a session
+branch, as in the editors. A write the caller's grants refuse names the dataset and
+graph in the preview, and a commit by another writer makes the preview stale until
+**Reload** reads the page again. Statements that another graph states are shown without
+buttons. `Mod+S` previews the field that has focus, `Esc` leaves edit mode and asks
+first when a field holds an unsaved change, and `S`, `P` and `A` focus the add rows of
+synonyms, parents and axioms when focus is outside a text field. On a phone the bar
+moves to the bottom of the screen with **Undo**, **Redo**, a menu and **Done**, and the
+hierarchy comes before the article ([screenshot](../images/browse-edit-phone.png)).
 
 The landing page shows the ontology or scheme header with its title, version, license and
 description, a graph picker when named graphs hold ontologies or schemes, a search over
@@ -496,8 +521,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   read-only, 611. For the same reason the thesaurus editor's notes and members forms are
   read-only on branches other than main when authentication is on. Undo and redo revert commits, which needs write access to the
   whole branch, so a caller whose grants cover some graphs only can edit but not undo.
-* The ontology browser is read-only, and its edit mode is item 630. Its pages and
-  hierarchy show asserted axioms only, and inferred ones are item 622. Its search reads
+* The ontology browser's edit mode changes definitions, synonyms, annotations, parents,
+  axioms and SKOS labels and links. SKOS-XL labels and collection members are edited in
+  the thesaurus editor, and property assertions, keys and chains have no form of their
+  own and are added as an axiom, 706. Its first preview on a large
+  ontology waits for the axioms route to open the whole ontology, 707. Its
+  pages and hierarchy show asserted axioms only, and inferred ones are item 622. Its search reads
   the head of a branch, so a page at a past state has no search box, item 658. It shows
   entities by label with the reader's languages first, and a choice of label, prefixed
   name or IRI is item 625. Reuse is looked up in the other datasets of the same server,

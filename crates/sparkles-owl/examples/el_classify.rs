@@ -79,6 +79,7 @@ fn main() {
     let mut tax_out = None;
     let mut repeat = 1usize;
     let mut heap = false;
+    let mut el_only = false;
     let mut owned = false;
     let mut input = None;
     while let Some(a) = args.next() {
@@ -89,14 +90,19 @@ fn main() {
             "--repeat" => repeat = args.next().and_then(|v| v.parse().ok()).unwrap_or(1),
             "--heap" => heap = true,
             "--owned" => owned = true,
+            "--el-only" => el_only = true,
             _ => input = Some(a),
         }
     }
     let Some(input) = input else {
-        eprintln!("usage: el_classify [--threads N] [--ofn-out FILE] [--taxonomy FILE] INPUT");
+        eprintln!(
+            "usage: el_classify [--threads N] [--el-only] [--ofn-out FILE] [--taxonomy FILE] INPUT"
+        );
         std::process::exit(2);
     };
     let t = Instant::now();
+    // the SWRL rules the reader passes over, which the run leaves out
+    let mut rules = 0usize;
     let bytes = std::fs::read(&input).expect("read input");
     let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).to_string();
     let functional = input.ends_with(".ofn")
@@ -104,7 +110,9 @@ fn main() {
         || head.trim_start().starts_with("Ontology(");
     let (axioms, header): (Vec<Axiom>, sparkles_owl::Header) = if functional {
         let text = String::from_utf8(bytes).expect("UTF-8");
-        let doc = ofn_read::parse(&text).unwrap_or_else(|e| panic!("{input}: {e}"));
+        let doc = ofn_read::parse_with(&text, ofn_read::Options { skip_rules: true })
+            .unwrap_or_else(|e| panic!("{input}: {e}"));
+        rules = doc.rules;
         (doc.axioms, doc.header)
     } else {
         let format = if input.ends_with(".ttl") {
@@ -137,6 +145,7 @@ fn main() {
     let rss_read = peak_rss_kib();
     let limits = Limits {
         threads,
+        el_only,
         ..Limits::default()
     };
     let mut times = Vec::new();
@@ -233,11 +242,15 @@ fn main() {
             "nodes": out.taxonomy.nodes().len(),
             "unsatisfiable": out.taxonomy.unsatisfiable().count(),
             "consistent": out.consistent,
-            "outside": outside,
+            "outside": outside + rules,
+            "rules": rules,
             "tier": s.tier.as_str(),
             "outsideHorn": s.outside_el.horn,
             "outsideDisjunctive": s.outside_el.disjunctive,
             "outsideGlobal": s.outside_el.global,
+            "outsideTaken": s.outside_el.taken,
+            "conjunctions": s.conjunctions,
+            "hornOverBudget": s.horn_over_budget,
             "partial": partial,
             "threads": s.threads,
             "readMs": read_ms,

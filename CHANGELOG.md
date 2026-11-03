@@ -55,6 +55,15 @@ on the benchmark host it takes 3.31 s and 8.32 s, against 3.47 s and 8.77 s for 
 A term is kept only when it is a URN or a URL that OpenJDK 17's `java.net.URL` accepts, as
 ROBOT keeps it.
 
+The ontology browser has an edit mode (spec U12, roadmap item 630). A caller who can write
+to a dataset switches an entity's page into edit mode and changes its definition and
+sources, synonyms, annotations, parents and axioms in place, or a concept's labels,
+broader, narrower, related and mapping concepts. Each change is a previewed commit through
+the editors' write path, with their session branches, undo history and access checks, and
+a refused or stale write is explained in the preview. On a phone the edit bar sits at the
+bottom of the screen. A 403 in any editor's preview now names the dataset and graph that
+the caller can read but not write.
+
 The web UI has an ontology browser (spec U12, roadmap item 616). `/ui/browse` gives each
 entity of a dataset's ontologies and thesauri a read-only page with its label, short form,
 IRI, definition and sources, synonyms by kind, notes, SKOS labels by language,
@@ -199,6 +208,25 @@ lite and the ORE 2015 EL sample are unchanged. An incremental run after a change
 axiom with an individual or a key now saturates everything again, as one after a change
 to a data axiom already did.
 
+The classifier takes Horn axioms outside OWL 2 EL in ontologies without individuals
+(roadmap item 603), with Kazakov's consequence-based rules for Horn-SHIQ. It covers
+inverse properties, universal restrictions, at-most-one and at-least restrictions,
+functional and inverse-functional properties, self restrictions, disjoint, asymmetric
+and irreflexive properties and transitive properties and chains through automata, and
+creates contexts for the conjunctions that universal and at-most restrictions need.
+`Stats` reports the tier of rules a run needed, the axioms outside OWL 2 EL it took and
+the conjunctions it created. GO's taxonomy now has the 14 subsumptions that its inverse
+properties entail, as Konclude's does, and GO classifies 17 to 18% slower on the
+benchmark host. `sparkles ontology reason` and `reduce` with `--reasoner ELK`, and the
+library's `ClassifyRequest::el_only` and `Limits::el_only`, classify by the OWL 2 EL
+rules alone, as ELK does, so the ROBOT-compatible outputs equal ROBOT's with ELK. Without
+`--reasoner` they take the Horn axioms too. The functional-syntax reader can pass over SWRL rules and count them
+with `ofn_read::Options::skip_rules`, and refuses them otherwise as before. A run with
+the Horn rules has a memory budget of 64 times its index and axioms, at least 1 GiB, and
+one that passes it classifies again by the EL rules alone and sets
+`Stats::horn_over_budget`. Two Uberon-based ORE 2015 ontologies that ran out of memory
+now classify in 4.2 s with the EL answer.
+
 The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
 `dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and
 axioms, check profiles, edit axioms, remove entities and diff commits in the JSON forms
@@ -283,6 +311,26 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+The planner estimates more joins from statistics of how predicates occur together (spec
+X15, roadmap item 454). A bulk load or compaction keeps 32,768 subject characteristic sets
+instead of 10,000 and counts the subjects outside them as a remainder, so a star whose
+predicates the kept sets cover poorly is estimated from the sets too. It also counts the
+characteristic sets of nodes over both directions, which estimate joins on an object and
+the links of chains. A join on several keys divides by the key tuples of the larger side,
+with exponential back-off between the largest count and the product of the counts, and a
+key sample that finds no rows is no longer taken as an empty join. Over the join nodes of
+the recorded plans, the geometric mean of the q-error falls from 8.80 to 3.98 on WatDiv
+at scale 100, from 4.84 to 1.96 on an 8.2M-triple DBpedia slice and from 3.52 to 1.81
+on LUBM(10), and answers are unchanged. The switches are `set_remainders`, `node_sets` and
+`key_backoff`. The statistics grow `stats.json`, from 5.0 MB to 44.3 MB on the DBpedia
+slice, and the node pass adds about 0.2 s to a WatDiv load and 0.7 s to the DBpedia
+load. On atlas, opening the DBpedia slice takes 0.30 s instead of 0.07 s and the server
+holds 214 MB instead of 133 MB once ready. The node pass keeps the same sets at any
+thread count. On forge, WatDiv's `C` queries run 2.2 to 4.9 times as fast, BSBM BI
+`q1-3` 4.4 times and LUBM `q2` 2.0 times. WatDiv `S4-2` and `S4-4` take 1.6 times as long
+after a plan change, and planning takes 1 to 90 microseconds longer on short queries and
+WatDiv `F4`.
+
 `sparkles ontology classify FILE` and `sparkles ontology check FILE` read a file of one
 graph into memory without a store and give the answers that a store of the loaded file
 gives (spec F24, roadmap item 649). RDF/XML, Turtle, N-Triples and functional-style
@@ -354,6 +402,23 @@ stage 4). Per-value reuse in BIND and FILTER, ORDER BY keys, top k and the pre-d
 FILTER, BIND and ORDER BY columns choose their algorithms by the size of their input in
 both execution modes, so an eager table of up to 16,384 rows runs them as a cursor batch
 does, and an eager top-k scan reads its pieces in morsels into one heap.
+
+Short queries no longer pay the fixed costs that the charged query state added to every
+request (spec X14, roadmap items 679 and 681). A query makes its regular-expression map
+and the 64 shards of its value cache only when it uses them, so a query without patterns
+neither replaces nor frees a map, and FILTER, BIND and ORDER BY skip the checks of their
+larger-input paths on a few rows. A small sort's key column takes its payload charge a step
+of at most 64 KiB ahead, exactly when the step is refused, instead of once per row. The
+whole request of `count-all`, `distinct-obj` and `path-plus` now takes fewer instructions
+than before the charged query state, and `types-grouped` about 1,200 more. With one thread
+`star-lookup` runs 1.9% longer than before stage 4, since the build places the index join's
+unchanged search loop 16 bytes into its cache line, and roadmap item 696 follows the
+alignment of the join loops. A sort of more
+than 4,096 distinct dictionary terms decodes them in one parallel pass that admits each
+value before it builds it, and a large sorted key column is freed on the pool, which takes
+eager `order-by-full` at 1.05M triples with 12 threads from 13.1 ms to 8.9 ms on the
+benchmark host. Each decoding piece and each key column can hold up to one step of
+charged memory above its values until the sort ends.
 
 `sparkles ask` takes its question argument as optional, since `--questions FILE` reads
 questions from a batch file instead. A command line that passes a question parses and
@@ -1563,6 +1628,14 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+The planner statistics in `gen-*/stats.json` gain the member `correlations`, which
+carries its own version, 1, and is registered as the derived kind `planner-statistics`.
+It holds the remainder of the subject characteristic sets and the node characteristic
+sets with their remainder. A member of another version is refused with a recorded reason,
+`sparkles check` reports it, and the planner estimates as it did before. Releases without
+it ignore the member, and stores loaded before it keep their estimates until the next
+bulk load or full compaction.
 
 The resource catalog is the server file `resources.json`, format 1, registered as a
 server settings file. A file of another format, or one that does not parse or breaks the
