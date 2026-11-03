@@ -234,7 +234,7 @@ test('collections, notes, a new concept and a stale edit', async ({ page, reques
   await expect(tree(page).getByRole('button', { name: 'Reptiles', exact: true })).toBeVisible();
 
   // another writer commits while a preview is open: the commit is refused
-  await expect(page.locator('.live')).toContainText('Live');
+  await expect(page.getByText('Following changes')).toBeVisible();
   const add = page.getByRole('form', { name: 'Add a label' });
   await add.getByRole('textbox', { name: 'Label' }).fill('Reptilien');
   await add.getByRole('combobox', { name: 'Language' }).fill('de');

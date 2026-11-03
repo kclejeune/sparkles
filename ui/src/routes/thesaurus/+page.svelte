@@ -78,6 +78,7 @@
     type SearchHit,
   } from '$lib/skos';
   import Icon from '$components/Icon.svelte';
+  import FollowState from '$components/FollowState.svelte';
   import Modal from '$components/Modal.svelte';
   import OntoPreview from '$components/OntoPreview.svelte';
   import OntoTree, { TREE_DRAG } from '$components/OntoTree.svelte';
@@ -462,8 +463,11 @@
     }
   }
 
+  /** Bumped to follow the change feed again after it stopped. */
+  let followRun = $state(0);
   $effect(() => {
     const t = target;
+    void followRun;
     if (!name) return;
     return session.follow(
       t,
@@ -861,18 +865,7 @@
       </p>
     </div>
     <div class="page-actions">
-      <span
-        class="live"
-        class:on={session.live === 'on'}
-        title={session.live === 'on'
-          ? 'Following the change feed'
-          : 'Not following the change feed'}
-        ><span class="dot"></span>{session.live === 'on'
-          ? 'Live'
-          : session.live === 'stopped'
-            ? 'Live updates stopped'
-            : ''}</span
-      >
+      <FollowState live={session.live} onretry={() => followRun++} />
       <button
         class="btn ghost"
         disabled={!session.done.length || readonly}
@@ -1561,22 +1554,6 @@
     gap: 2px;
     font-size: var(--fs-xs);
     min-width: 0;
-  }
-  .live {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: var(--fs-xs);
-    color: var(--text-3);
-  }
-  .live .dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--border-strong);
-  }
-  .live.on .dot {
-    background: var(--ok);
   }
   .notice {
     display: flex;

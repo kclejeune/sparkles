@@ -219,7 +219,7 @@ test('a stale edit is refused and another writer’s commit refreshes the views'
   await expect(page.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
     timeout: 30_000,
   });
-  await expect(page.locator('.live')).toContainText('Live');
+  await expect(page.getByText('Following changes')).toBeVisible();
   await page.getByRole('button', { name: 'New', exact: true }).click();
   const create = page.getByRole('dialog', { name: 'New class' });
   await create.getByRole('textbox', { name: 'Label', exact: true }).fill('Lab');
@@ -261,7 +261,7 @@ test('a stale edit is refused and another writer’s commit refreshes the views'
   await choose('uni');
   // Course stays open from before
   await expect(page.getByRole('button', { name: 'Collapse Course' })).toBeVisible();
-  await expect(page.locator('.live')).toContainText('Live');
+  await expect(page.getByText('Following changes')).toBeVisible();
   const again = await request.post('/$/ontology/uni/axioms', {
     data: { add: [{ type: 'SubClassOf', subClass: `${UNI}Workshop`, superClass: `${UNI}Course` }] },
   });

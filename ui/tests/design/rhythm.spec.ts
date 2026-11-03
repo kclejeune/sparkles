@@ -208,3 +208,60 @@ test("Explore's graph tools stay inside a narrow canvas", async ({ browser }) =>
     await ctx.close();
   }
 });
+
+const STRIP_PAGES = [
+  ...PAGES,
+  '/ui/ontology?ds=go',
+  '/ui/thesaurus?ds=unesco',
+  '/ui/browse?ds=go',
+  `/ui/browse?ds=go&iri=${encodeURIComponent('http://purl.obolibrary.org/obo/GO_0005739')}`,
+];
+
+for (const [w, h] of WIDTHS) {
+  test(`tab strips keep one row and page actions one height at ${w} px`, async ({ browser }) => {
+    test.setTimeout(180_000);
+    const phone = w < 761;
+    const ctx = await browser.newContext({
+      viewport: { width: w, height: h },
+      isMobile: phone,
+      hasTouch: phone,
+    });
+    const page = await ctx.newPage();
+    for (const path of STRIP_PAGES) {
+      await load(page, path);
+      const m = await page.evaluate(() => {
+        const main = document.querySelector('main')!;
+        const wrapped = [...main.querySelectorAll<HTMLElement>('.tabs')]
+          .filter((t) => t.offsetParent)
+          .filter((t) => {
+            const tops = new Set(
+              [...t.querySelectorAll<HTMLElement>(':scope > [role="tab"], :scope > .tab')]
+                .filter((c) => c.offsetParent)
+                .map((c) => Math.round(c.getBoundingClientRect().top)),
+            );
+            return tops.size > 1;
+          })
+          .map((t) => t.getAttribute('aria-label') ?? t.className);
+        // the controls of a page's actions row, not its menus
+        const heights = [...main.querySelectorAll<HTMLElement>('.page-actions')]
+          .filter((a) => a.offsetParent)
+          .map((a) => [
+            ...new Set(
+              [...a.children]
+                .filter(
+                  (c) =>
+                    (c as HTMLElement).offsetParent &&
+                    c.matches('button, a.btn, .btn, select, span, label'),
+                )
+                .map((c) => Math.round(c.getBoundingClientRect().height)),
+            ),
+          ])
+          .filter((hs) => hs.length > 1);
+        return { wrapped, heights };
+      });
+      expect.soft(m.wrapped, `${path}: wrapped tab strips`).toEqual([]);
+      expect.soft(m.heights, `${path}: page action heights`).toEqual([]);
+    }
+    await ctx.close();
+  });
+}

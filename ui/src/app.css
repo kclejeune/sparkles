@@ -606,6 +606,10 @@ label.field {
 }
 /* The page's actions at the end of its head, level with the title. On a phone they take a
    row of their own under the title, from its start, so the title keeps the width. */
+/* a checkbox or a label in a page's actions stands as tall as the buttons beside it */
+.page-actions > .form-row {
+  min-height: var(--ctl-h);
+}
 .page-actions {
   display: flex;
   align-items: center;
@@ -1096,6 +1100,22 @@ table.data .num {
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
+}
+/* off-screen tabs fade out at the strip's edge (lib/tabstrip.ts sets the attributes) */
+.tabs[data-more-end] {
+  mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
+}
+.tabs[data-more-start] {
+  mask-image: linear-gradient(to left, #000 calc(100% - 32px), transparent);
+}
+.tabs[data-more-start][data-more-end] {
+  mask-image: linear-gradient(
+    to right,
+    transparent,
+    #000 32px,
+    #000 calc(100% - 32px),
+    transparent
+  );
 }
 .tab {
   display: inline-flex;

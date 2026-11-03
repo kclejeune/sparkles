@@ -76,6 +76,7 @@
     type Tree,
   } from '$lib/ontology';
   import Icon from '$components/Icon.svelte';
+  import FollowState from '$components/FollowState.svelte';
   import ManchesterEditor from '$components/ManchesterEditor.svelte';
   import type { NameOption } from '$lib/manchester-complete';
   import Modal from '$components/Modal.svelte';
@@ -795,8 +796,11 @@
   }
 
   // --- live refresh ---------------------------------------------------------------------------
+  /** Bumped to follow the change feed again after it stopped. */
+  let followRun = $state(0);
   $effect(() => {
     const t = target;
+    void followRun;
     if (!name) return;
     return session.follow(
       t,
@@ -905,18 +909,7 @@
       </p>
     </div>
     <div class="page-actions">
-      <span
-        class="live"
-        class:on={session.live === 'on'}
-        title={session.live === 'on'
-          ? 'Following the change feed'
-          : 'Not following the change feed'}
-        ><span class="dot"></span>{session.live === 'on'
-          ? 'Live'
-          : session.live === 'stopped'
-            ? 'Live updates stopped'
-            : ''}</span
-      >
+      <FollowState live={session.live} onretry={() => followRun++} />
       <button
         class="btn ghost"
         disabled={!session.done.length || readonly}
@@ -1627,25 +1620,6 @@
 {/snippet}
 
 <style>
-  .live {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: var(--fs-xs);
-    color: var(--text-3);
-  }
-  .live:empty {
-    display: none;
-  }
-  .live .dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--border-strong);
-  }
-  .live.on .dot {
-    background: var(--ok);
-  }
   .notice {
     display: flex;
     align-items: center;
@@ -1675,8 +1649,6 @@
     border-radius: var(--r-lg) var(--r-lg) 0 0;
   }
   .onto-tabs {
-    flex-wrap: wrap;
-    row-gap: 0;
     border-bottom: 1px solid var(--border);
   }
   .tab-sep {
