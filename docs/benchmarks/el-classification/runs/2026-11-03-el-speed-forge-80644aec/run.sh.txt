@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Measure el_classify and ELK on GO, ChEBI lite and the largest ORE 2015 EL ontologies on
+# the benchmark host, on one and eight threads. The script takes the bench lock and the
+# heavy lock once and holds them for every process, so no other job runs between them.
+# Usage: forge-measure.sh DIR   (DIR holds bin/el_classify, data/, scripts/elk-compare,
+#        scripts/el-oracle.py and elk-work for the fetched jars)
+set -euo pipefail
+D=$1
+cd "$D"
+if [ -z "${EL602_LOCKED:-}" ]; then
+  export EL602_LOCKED=1
+  exec 9> "$HOME/lanes/.bench.lock" 8> "$HOME/lanes/.heavy.lock"
+  flock 9
+  flock 8
+fi
+BIN=bin/el_classify
+OUT=out-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT"
+export ELK_WORK=$PWD/elk-work
+export JAVA=${JAVA:-$HOME/.local/share/mise/installs/java/temurin-17.0.20+8/bin/java}
+export PATH=$(dirname "$JAVA"):$PATH
+{
+  echo "host=$(hostname)"
+  echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')"
+  echo "cpus=$(nproc)"
+  echo "ram_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
+  echo "kernel=$(uname -r)"
+  echo "java=$("$JAVA" -version 2>&1 | tr '\n' ' ')"
+  echo "binary_sha256=$(sha256sum "$BIN" | cut -d' ' -f1)"
+  echo "harness_sha256=$(sha256sum scripts/elk-compare/ElkClassify.java | cut -d' ' -f1)"
+  echo "pins_sha256=$(sha256sum scripts/elk-compare/pins.tsv | cut -d' ' -f1)"
+  for f in data/*; do echo "data_sha256 $f=$(sha256sum "$f" | cut -d' ' -f1)"; done
+  echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$OUT/env.txt"
+scripts/elk-compare/elk.sh fetch
+
+locked() {
+  local label=$1
+  shift
+  echo "$label started=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$OUT/env.txt"
+  "$@"
+}
+
+# ontology, repeats, ELK heap
+while read -r f r heap; do
+  n=${f%.*}
+  for t in 1 8; do
+    locked "sparkles-$n-t$t" systemd-run --user --scope --quiet -p MemoryMax=13G -p MemorySwapMax=0 \
+      -p OOMPolicy=continue "$BIN" --threads "$t" --repeat "$r" --taxonomy "$OUT/$n.sparkles.t$t.txt" \
+      "data/$f" >> "$OUT/sparkles.jsonl" 2>> "$OUT/sparkles.err" ||
+      echo "{\"input\":\"data/$f\",\"threads\":$t,\"failed\":true}" >> "$OUT/sparkles.jsonl"
+    locked "elk-$n-t$t-$heap" env ELK_HEAP=$heap ELK_MEM_MAX=13G scripts/elk-compare/elk.sh run --threads "$t" \
+      --repeat "$r" --taxonomy "$OUT/$n.elk.t$t.ofn" "data/$f" >> "$OUT/elk.jsonl" 2>> "$OUT/elk.err" ||
+      echo "{\"input\":\"data/$f\",\"threads\":$t,\"failed\":true}" >> "$OUT/elk.jsonl"
+  done
+done << 'LIST'
+go.ofn 5 4g
+chebi_lite.ofn 5 4g
+ore_ont_13482.owl 3 4g
+ore_ont_3836.owl 3 7g
+ore_ont_3524.owl 3 6g
+ore_ont_15059.owl 3 10g
+ore_ont_1559.owl 3 7g
+ore_ont_868.owl 3 4g
+ore_ont_9674.owl 3 4g
+ore_ont_10689.owl 3 4g
+LIST
+echo "ended=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OUT/env.txt"
+sha256sum "$OUT"/*.t*.txt "$OUT"/*.t*.ofn > "$OUT/taxonomy.sha256"
+for t in "$OUT"/*.sparkles.t*.txt; do
+  b=${t%.sparkles.*}; th=${t##*.sparkles.}; th=${th%.txt}
+  [ -s "$b.elk.$th.ofn" ] && python3 scripts/el-oracle.py "$b.elk.$th.ofn" "$t" > "$b.$th.oracle.json" || true
+done
+echo "FORGE-DONE $OUT"

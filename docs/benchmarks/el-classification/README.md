@@ -1,7 +1,8 @@
 # OWL 2 EL classification
 
 These measurements cover the OWL 2 EL classifier of `sparkles-owl` on two large
-biomedical ontologies, the Gene Ontology and ChEBI, its agreement with the hierarchy
+biomedical ontologies, the Gene Ontology and ChEBI, and on the largest ontologies of the
+ORE 2015 EL classification sample, its agreement with the hierarchy
 those ontologies publish and with ELK, the Java EL reasoner, and its time and memory
 beside ELK's. The classifier and its limits are described in
 [F24](../../specs/F24-owl-classification/SPEC.md#outcome) and the
@@ -13,18 +14,22 @@ manual import of the retained run records.
 ## What is measured
 
 The harness is the example `crates/sparkles-owl/examples/el_classify.rs`, built with
-`mbx build --release -p sparkles-owl --example el_classify`. It reads an ontology file,
-classifies it with a fresh classifier `--repeat` times in one process and prints one JSON
-line. The line gives the counts of axioms, classes, nodes and unsatisfiable classes, the
+`mbx build --release -p sparkles-owl --example el_classify`, with the server's mimalloc
+allocator. It reads an ontology file, classifies it `--repeat` times in one process and
+prints one JSON line. Each classification is a fresh `Saturation` that reads the axioms
+in place, as the server's does from an open ontology, and `--owned` gives them instead
+to a `Classifier` that keeps its own copy. The line gives the counts of axioms, classes, nodes and unsatisfiable classes, the
 axioms outside OWL 2 EL and those used in part, the wall time of each classification, the
 median, the times of indexing, saturation and the taxonomy in the last run, the number of
-conclusions, the classifier's own memory estimate and the peak resident memory of the
-process after reading and at the end. `--taxonomy FILE` writes the direct taxonomy as
+conclusions, the classifier's own memory estimate and its peak, and the peak resident
+memory of the process after reading and at the end. `--heap` also counts the bytes that
+the last classification held at once beyond the axioms read, which slows the run and
+checks the estimate. `--taxonomy FILE` writes the direct taxonomy as
 sorted `EQ` and `SUB` lines, so that two runs or two reasoners can be compared.
 
 A classification time starts with the axioms in memory and ends with the taxonomy built.
-It includes normalization and indexing, saturation and the transitive reduction, and it
-excludes reading the file. The peak resident memory includes the axioms read, which the
+It includes the collection of the axioms' references, normalization and indexing,
+saturation and the transitive reduction, and it excludes reading the file. The peak resident memory includes the axioms read, which the
 caller holds in any case, and so it is an upper bound for the classifier.
 
 The inputs are functional-style files that `el_classify --ofn-out` wrote from each

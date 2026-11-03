@@ -3,7 +3,7 @@
 //! and the limits of a run.
 
 use proptest::prelude::*;
-use sparkles_owl::classify::{Classifier, Error, Gap, Limits};
+use sparkles_owl::classify::{Changes, Classifier, Error, Gap, Limits, Saturation};
 use sparkles_owl::model::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -536,6 +536,29 @@ fn the_property_closure_is_bounded_by_the_memory_limit() {
 }
 
 #[test]
+fn the_estimate_bounds_the_run_with_its_taxonomy() {
+    // the peak a run reports is the most it counted, the taxonomy included, so a budget
+    // of that much lets the same run end and one byte less stops it
+    let axioms = large_ontology(3000);
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let stats = Classifier::of(&axioms).classify(&limits).unwrap().stats;
+    assert!(stats.peak_memory >= stats.memory);
+    let used = stats.peak_memory;
+    let at = |max_memory| Limits {
+        max_memory: Some(max_memory),
+        ..limits.clone()
+    };
+    Classifier::of(&axioms).classify(&at(used)).unwrap();
+    match Classifier::of(&axioms).classify(&at(used - 1)).unwrap_err() {
+        Error::Memory { limit, used: u } => assert!(u > limit, "{u} <= {limit}"),
+        e => panic!("{e:?}"),
+    }
+}
+
+#[test]
 fn waiting_messages_count_against_the_memory_limit() {
     // every link from A to B through a subrole of s meets every rule at B, so A's
     // to-do list takes the square of n messages and stores only n of them
@@ -1027,6 +1050,84 @@ fn with_declarations(mut axioms: Vec<Axiom>) -> Vec<Axiom> {
     axioms
 }
 
+/// An ontology large enough that the stages split their work between threads: a
+/// hierarchy of `n` classes with up to three parents each, existential restrictions on
+/// a transitive property, definitions, equivalences, individuals and unsatisfiable
+/// classes, chosen by a fixed pseudo-random sequence.
+fn large_ontology(n: usize) -> Vec<Axiom> {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move |m: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % m as u64) as usize
+    };
+    let name = |i: usize| format!("K{i}");
+    let mut axioms = vec![ax(AxiomKind::TransitiveObjectProperty(ope("part")))];
+    for i in 1..n {
+        for _ in 0..1 + next(3) {
+            axioms.push(sub(c(&name(i)), c(&name(next(i)))));
+        }
+        if next(8) == 0 {
+            axioms.push(sub(c(&name(i)), some("part", c(&name(next(i))))));
+        }
+        if next(16) == 0 {
+            let (a, b) = (next(n), next(n));
+            axioms.push(sub(
+                and([ce(&name(a)), some("part", ce(&name(b)))]),
+                c(&name(i)),
+            ));
+        }
+        if next(64) == 0 {
+            axioms.push(Axiom::equivalent_classes([
+                ce(&name(i)),
+                ce(&name(next(n))),
+            ]));
+        }
+        if next(256) == 0 {
+            axioms.push(sub(c(&format!("U{i}")), c(&name(next(n)))));
+            axioms.push(sub(c(&format!("U{i}")), c("Empty")));
+        }
+        if next(32) == 0 {
+            axioms.push(ax(AxiomKind::ClassAssertion(
+                ce(&name(i)),
+                Individual::Named(NamedIndividual::new(format!("http://ex.org/i{i}"))),
+            )));
+        }
+    }
+    axioms.push(sub(c("Empty"), Class::nothing()));
+    axioms
+}
+
+#[test]
+fn the_taxonomy_is_the_same_for_every_number_of_threads() {
+    let axioms = large_ontology(3000);
+    let one = Classifier::of(&axioms)
+        .classify(&Limits {
+            threads: 1,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(one.consistent);
+    assert!(
+        one.taxonomy.nodes().len() > 1000,
+        "{}",
+        one.taxonomy.nodes().len()
+    );
+    assert!(one.taxonomy.unsatisfiable().count() > 0);
+    for threads in [2, 8] {
+        let limits = Limits {
+            threads,
+            ..Limits::default()
+        };
+        let many = Classifier::of(&axioms).classify(&limits).unwrap();
+        assert_eq!(one.taxonomy, many.taxonomy, "{threads} threads");
+        let kinds: Vec<&AxiomKind> = axioms.iter().map(|a| &a.kind).collect();
+        let shared = Saturation::new().classify(&kinds, None, &limits).unwrap();
+        assert_eq!(one.taxonomy, shared.taxonomy, "{threads} threads, in place");
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 300, ..ProptestConfig::default() })]
 
@@ -1065,6 +1166,42 @@ proptest! {
             let full = Classifier::of(&held).classify(&limits).unwrap();
             prop_assert_eq!(&inc.taxonomy, &full.taxonomy);
             prop_assert_eq!(inc.consistent, full.consistent);
+        }
+    }
+
+    #[test]
+    fn a_saturation_follows_the_changes_it_is_given(
+        base in prop::collection::vec(gen_axiom(), 0..12),
+        steps in prop::collection::vec((prop::collection::vec(gen_axiom(), 0..4), prop::collection::vec(any::<prop::sample::Index>(), 0..4)), 1..5),
+        threads in 1..4usize,
+    ) {
+        let limits = Limits { threads, ..Limits::default() };
+        let mut held = with_declarations(base);
+        let kinds = |xs: &[Axiom]| -> BTreeSet<AxiomKind> { xs.iter().map(|a| a.kind.clone()).collect() };
+        let mut sat = Saturation::new();
+        let mut before = kinds(&held);
+        let all: Vec<&AxiomKind> = before.iter().collect();
+        sat.classify(&all, None, &limits).unwrap();
+        for (adds, removes) in steps {
+            for i in removes {
+                if !held.is_empty() {
+                    held.remove(i.index(held.len()));
+                }
+            }
+            held.extend(adds);
+            let now = kinds(&held);
+            let added: Vec<&AxiomKind> = now.difference(&before).collect();
+            let removed: Vec<&AxiomKind> = before.difference(&now).collect();
+            let all: Vec<&AxiomKind> = now.iter().collect();
+            let inc = sat
+                .classify(&all, Some(Changes { added: &added, removed: &removed }), &limits)
+                .unwrap();
+            let mut k = Classifier::of(&held);
+            let full = k.classify(&limits).unwrap();
+            prop_assert_eq!(&inc.taxonomy, &full.taxonomy);
+            prop_assert_eq!(inc.consistent, full.consistent);
+            prop_assert_eq!(sat.excluded().to_vec(), k.excluded());
+            before = now;
         }
     }
 }

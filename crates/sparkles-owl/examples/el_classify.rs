@@ -2,7 +2,7 @@
 //! reference reasoner and the measurements of `docs/benchmarks/el-classification`.
 //!
 //! ```text
-//! el_classify [--threads N] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] INPUT
+//! el_classify [--threads N] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] [--heap] [--owned] INPUT
 //! ```
 //!
 //! INPUT is functional-style syntax (`.ofn`, or any file that starts with `Prefix(` or
@@ -12,13 +12,57 @@
 //! lines `EQ c1 c2 …` for each node of several classes and `SUB c d` for each direct
 //! subsumption between the first classes of two nodes, sorted. A JSON line on standard
 //! output gives the counts, the times of each step and the peak resident memory.
+//! The classification reads the axioms in place, as the server's does from an open
+//! ontology, and `--owned` gives them to a classifier that keeps its own copy instead.
+//! `--heap` also counts the bytes allocated, which slows the run, and reports the most
+//! that the last run's classification held at once beyond the axioms read, for the
+//! comparison with the classifier's estimate.
 
 use oxrdf::Triple;
 use oxrdfio::{RdfFormat, RdfParser};
-use sparkles_owl::classify::{Classifier, Gap, Limits};
+use sparkles_owl::classify::{Classifier, Gap, Limits, Saturation, logical};
 use sparkles_owl::{Axiom, ofn, ofn_read, read};
+use std::alloc::{GlobalAlloc, Layout};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::Instant;
+
+// the server's allocator, so that the times and the resident memory are the server's,
+// with a count of the bytes held that `--heap` turns on
+#[global_allocator]
+static GLOBAL: Counting = Counting;
+
+struct Counting;
+static COUNT: AtomicBool = AtomicBool::new(false);
+static HELD: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicIsize = AtomicIsize::new(0);
+
+fn count(n: isize) {
+    if COUNT.load(Ordering::Relaxed) {
+        let now = HELD.fetch_add(n, Ordering::Relaxed) + n;
+        PEAK.fetch_max(now, Ordering::Relaxed);
+    }
+}
+
+// SAFETY: every call goes to mimalloc unchanged; the count only reads the layouts.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        count(l.size() as isize);
+        unsafe { sparkles_alloc::Mimalloc.alloc(l) }
+    }
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        count(l.size() as isize);
+        unsafe { sparkles_alloc::Mimalloc.alloc_zeroed(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        count(-(l.size() as isize));
+        unsafe { sparkles_alloc::Mimalloc.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
+        count(size as isize - l.size() as isize);
+        unsafe { sparkles_alloc::Mimalloc.realloc(p, l, size) }
+    }
+}
 
 fn peak_rss_kib() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -34,6 +78,8 @@ fn main() {
     let mut ofn_out = None;
     let mut tax_out = None;
     let mut repeat = 1usize;
+    let mut heap = false;
+    let mut owned = false;
     let mut input = None;
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -41,6 +87,8 @@ fn main() {
             "--ofn-out" => ofn_out = args.next(),
             "--taxonomy" => tax_out = args.next(),
             "--repeat" => repeat = args.next().and_then(|v| v.parse().ok()).unwrap_or(1),
+            "--heap" => heap = true,
+            "--owned" => owned = true,
             _ => input = Some(a),
         }
     }
@@ -92,23 +140,50 @@ fn main() {
         ..Limits::default()
     };
     let mut times = Vec::new();
+    let mut add_times = Vec::new();
     let mut out = None;
-    let mut k = None;
+    let mut k: Option<Classifier> = None;
+    let mut sat: Option<Saturation> = None;
     for _ in 0..repeat {
         // the previous run's classifier and answer go first, so that the peak resident
         // memory is that of one run
         drop(out.take());
         drop(k.take());
+        drop(sat.take());
+        if heap {
+            HELD.store(0, Ordering::Relaxed);
+            PEAK.store(0, Ordering::Relaxed);
+            COUNT.store(true, Ordering::Relaxed);
+        }
         let t = Instant::now();
-        let mut c = Classifier::of(&axioms);
-        let o = c.classify(&limits).expect("classify");
+        let o = if owned {
+            let mut c = Classifier::of(&axioms);
+            add_times.push(t.elapsed().as_secs_f64() * 1000.0);
+            let o = c.classify(&limits).expect("classify");
+            k = Some(c);
+            o
+        } else {
+            let kinds: Vec<_> = axioms
+                .iter()
+                .map(|a| &a.kind)
+                .filter(|k| logical(k))
+                .collect();
+            add_times.push(t.elapsed().as_secs_f64() * 1000.0);
+            let mut s = Saturation::new();
+            let o = s.classify(&kinds, None, &limits).expect("classify");
+            sat = Some(s);
+            o
+        };
         times.push(t.elapsed().as_secs_f64() * 1000.0);
+        COUNT.store(false, Ordering::Relaxed);
         out = Some(o);
-        k = Some(c);
     }
     let out = out.expect("one run");
-    let k = k.expect("one run");
-    let excluded = k.excluded();
+    let excluded = match (&k, &sat) {
+        (Some(k), _) => k.excluded(),
+        (_, Some(s)) => s.excluded().to_vec(),
+        _ => Vec::new(),
+    };
     let outside = excluded
         .iter()
         .filter(|e| matches!(e.gap, Gap::Outside { .. }))
@@ -144,8 +219,8 @@ fn main() {
         }
     }
     let s = &out.stats;
-    let median = {
-        let mut v = times.clone();
+    let median = |times: &[f64]| {
+        let mut v = times.to_vec();
         v.sort_by(|a, b| a.total_cmp(b));
         v[v.len() / 2]
     };
@@ -163,15 +238,18 @@ fn main() {
             "threads": s.threads,
             "readMs": read_ms,
             "classifyMs": times,
-            "classifyMedianMs": median,
+            "classifyMedianMs": median(&times),
+            "addMs": median(&add_times),
             "indexMs": s.index.as_secs_f64() * 1000.0,
             "saturationMs": s.saturation.as_secs_f64() * 1000.0,
             "taxonomyMs": s.taxonomy.as_secs_f64() * 1000.0,
             "contexts": s.contexts,
             "conclusions": s.conclusions,
             "estimatedBytes": s.memory,
+            "peakEstimatedBytes": s.peak_memory,
             "peakRssKibAfterRead": rss_read,
             "peakRssKib": peak_rss_kib(),
+            "peakHeapBytes": heap.then(|| PEAK.load(Ordering::Relaxed)),
         })
     );
 }

@@ -13,5 +13,6 @@ parking_lot.workspace = true
 oxsdatatypes.workspace = true
 
 [dev-dependencies]
+sparkles-alloc.workspace = true
 oxrdfio.workspace = true
 proptest.workspace = true
