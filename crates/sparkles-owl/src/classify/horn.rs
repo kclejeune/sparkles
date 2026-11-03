@@ -201,11 +201,11 @@ impl Nfa {
 
 /// The role box of a Horn run: the closure of the role inclusions under inverses, the
 /// chains with their mirror images, which roles are simple and the automata.
-struct RoleBox {
+pub(super) struct RoleBox {
     sup: Vec<Vec<Role>>,
     chains: Vec<(Vec<Role>, Role)>,
     simple: Vec<bool>,
-    autos: FxHashMap<Role, Nfa>,
+    pub(super) autos: FxHashMap<Role, Nfa>,
     states: usize,
 }
 
@@ -222,14 +222,14 @@ impl RoleBox {
         self.sub(r, s) && self.sub(s, r)
     }
 
-    fn simple(&self, r: Role) -> bool {
+    pub(super) fn simple(&self, r: Role) -> bool {
         self.simple.get(r as usize).copied().unwrap_or(true)
     }
 
     /// The role box, or why it stopped: its closure passed `limit` bytes, or `stop`
     /// said the run's deadline or cancellation came, as the index's closure of the roles
     /// checks.
-    fn new(
+    pub(super) fn new(
         it: &Interner,
         role_subs: &[(Role, Role)],
         chains: &[(Vec<Role>, Role)],
@@ -295,7 +295,7 @@ impl RoleBox {
     /// The automaton of a role, whose words are the role paths that imply it, built as
     /// Horrocks, Kutz and Sattler do. `None` when the role inclusions are not regular or
     /// the automata pass [`MAX_STATES`].
-    fn auto(&mut self, r: Role, stack: &mut Vec<Role>) -> Option<Nfa> {
+    pub(super) fn auto(&mut self, r: Role, stack: &mut Vec<Role>) -> Option<Nfa> {
         if let Some(a) = self.autos.get(&r) {
             return Some(a.clone());
         }
