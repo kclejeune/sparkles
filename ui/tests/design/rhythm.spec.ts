@@ -149,10 +149,12 @@ test('Tab reaches the controls with a visible focus ring', async ({ browser }) =
         const ringed = (s: CSSStyleDeclaration) =>
           (s.boxShadow && s.boxShadow !== 'none') ||
           (s.outlineStyle !== 'none' && s.outlineWidth !== '0px');
-        const holder = a.closest<HTMLElement>('.field, .search, .box, label, .segmented');
+        const holders = [a.parentElement, a.parentElement?.parentElement].filter(
+          (e): e is HTMLElement => !!e,
+        );
         const ok =
           ringed(own) ||
-          (!!holder && ringed(getComputedStyle(holder))) ||
+          holders.some((h) => ringed(getComputedStyle(h))) ||
           a.closest('.cm-editor') != null;
         const label = `${a.tagName.toLowerCase()} ${a.getAttribute('aria-label') ?? a.textContent?.trim().slice(0, 30) ?? ''}`;
         return { ok, label };

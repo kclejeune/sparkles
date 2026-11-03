@@ -287,6 +287,10 @@
     width: 220px;
     box-shadow: none;
   }
+  .search:focus-within {
+    border-color: var(--iri);
+    box-shadow: var(--focus);
+  }
   .bar-end {
     display: flex;
     align-items: center;

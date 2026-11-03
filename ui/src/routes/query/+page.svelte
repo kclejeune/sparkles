@@ -4376,6 +4376,9 @@
   .qtab-x:focus-visible {
     opacity: 1;
   }
+  .qtab-x:focus-visible {
+    box-shadow: var(--focus);
+  }
   .qtab-x:hover {
     background: var(--active);
     color: var(--text);
@@ -5064,11 +5067,20 @@
       max-width: none;
     }
   }
-  /* below the large width the endpoint stays in the kind's tooltip, so the tools keep one row */
+  /* below the large width the endpoint stays in the kind's tooltip and History, Pattern and
+     Format keep their icons and tooltips, so the tools keep one row */
   @media (max-width: 1199px) {
     .target,
     .toolbar-group:first-child + .toolbar-sep {
       display: none;
+    }
+    .toolbar .lbl {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
     }
   }
   @media (max-width: 900px) {
