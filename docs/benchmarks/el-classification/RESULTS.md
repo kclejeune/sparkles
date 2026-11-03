@@ -95,7 +95,8 @@ counterpart of three of the commands. It cannot write the ontology back with the
 inferred axioms asserted and the redundant ones removed, as `reason` and `reduce` do,
 which roadmap item NEW-ITEM-1 covers. It has no `relax`, which item NEW-ITEM-2 covers, and
 it cannot materialize inferred existential restrictions, as `materialize` does, which item
-NEW-ITEM-3 covers. These times come from a loaded laptop, so they only show the scale. Each
+NEW-ITEM-3 covers. These times come from a loaded laptop, so they only show the scale and are not
+measurements. The benchmark host's times belong to roadmap items 604 and 606. Each
 is one end-to-end run in seconds, with the peak resident memory in MiB.
 
 | Run | GO time | GO peak RSS | ChEBI lite time | ChEBI lite peak RSS |
