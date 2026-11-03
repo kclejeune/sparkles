@@ -443,7 +443,10 @@ so far on every worker, charged once when it grows and released when the work en
 `Ctx::term`, `Ctx::value` and the comparison of simple literals have one path each, and
 templates decode through `batch_term`. A cursor's envelope is decode bytes on the
 ledger, as before, and its refusal fails the query. An eager envelope is a charge of its
-own that is taken when the budget has room and is never refused. A finished eager result
+own that is taken when the budget has room and is never refused, so an eager key is
+rebuilt on the vocabulary's unchecked path and the envelope grows to it afterwards.
+Checking the envelope before each step of the rebuild made an eager `term` about a
+quarter slower, and writing an answer of 500,000 rows term by term 1.25 times as slow. A finished eager result
 is decoded through infallible readers after its last check, and an update applies its
 template after its WHERE clause, so a refusal there would read as an unbound value. Plan
 text, which no answer depends on, decodes through `Ctx::plan_term` without the envelope in
@@ -500,7 +503,8 @@ entry in both modes. The key sets of a decorrelated EXISTS take one charge shape
 the probe vectors are transient and a key set is a retained charge, or part of the
 probe's charge in a context without an owner. The admission of the planned pattern is
 charged in both modes. `map_rows` takes its collector charge and runs one partitioned job
-in both modes, and the key count over front-coded blocks sizes its pieces by the budget
+in both modes, in pieces of at least the 1,024 rows between two polls of cancellation and
+the deadline, and the key count over front-coded blocks sizes its pieces by the budget
 and charges its scratch and decoding in both modes. A finished query drops its plan before
 its pool contribution shrinks, so the plan's retained
 charges leave the pool with them. `an_eager_exists_memo_is_charged` checks that 20,000
@@ -527,7 +531,12 @@ left `regex-iri` 4 to 6% slower at 1.05M triples with 12 threads on atlas, so wh
 query's work ends each worker's clone of a kept program waits in the table, keyed by the
 thread whose pool serves its cache, and the next query that searches the program on that
 thread takes it back warm and charges it again. Parked clones count their charged cache
-bounds against a second limit of 16 MiB. The table thus holds up to 32 MiB outside every
+bounds against a second limit of 16 MiB. Finding a worker's clone reads the thread's
+Rayon index, its number and the clone's slot, which took 13% of a filter over 314,000
+IRIs on one thread when it ran for every key, so the key kernels bind a filter once per
+piece of keys and find each clone at its first search there. The clone is found where an
+unbound search finds it, after the storage of the first key, so binding admits no cache
+before the work the query needs. The table thus holds up to 32 MiB outside every
 query's budget, which is the tradeoff that keeps a repeated pattern at the speed of the
 old cache. A key filter copy no longer forks a cache of its own. The per-row lookup of a
 pattern reads the query's map of programs without a lock, and the planner reads a
@@ -557,17 +566,19 @@ rows before spreading the rest over the pool in both modes.
 reuse with row-by-row evaluation over 32,768 rows in eager execution and in cursors with
 batches on both sides of the threshold.
 
-ORDER BY and its top k choose by input size in the same way. A numeric key over one
-variable is evaluated once per distinct input at any size. Up to 16,384 rows its distinct
-inputs come from a dense integer range or one sort, and a larger input maps integers that
-span at most 65,536 values to their slots directly, in parallel above 262,144 rows. A
-variable's dictionary and query-local values are decoded once per distinct term in key
-order at any size, and the decoded column then keeps a charge for its slots, its distinct
-values and their payload rather than the reservation that built it. Up to 16,384 rows,
-other keys are evaluated on the calling thread with each value admitted before the column
-keeps it. A larger input evaluates each distinct key once in parallel through the value
-cache, and so does a large column of inline values, which the decoding would hold once per
-row, or one whose query-local payload the budget refuses. Its key column is charged for its
+ORDER BY and its top k choose by input size in the same way. From 1,024 rows, a numeric
+key over one variable can be evaluated once per distinct input whatever the input's size.
+Up to 16,384 rows its distinct inputs come from a dense integer range or one sort, and a
+larger input only maps integers whose span is at most half its rows and at most 65,536
+values to their slots directly, in parallel above 262,144 rows. From 1,024 rows, a
+variable's dictionary and query-local values can be decoded once per distinct term in
+key order, and the decoded column then keeps a charge for its slots, its distinct values
+and their payload rather than the reservation that built it. These paths are optional,
+and a refused reservation leaves the key to the paths below. Otherwise, up to 16,384 rows,
+keys are evaluated on the calling thread with each value admitted before the column keeps
+it. A larger input evaluates each distinct key once in parallel through the value cache,
+and so does a large column of inline values, which the decoding would hold once per row,
+or one whose query-local payload the budget refuses. Its key column is charged for its
 slots before evaluation and for its values' payload after it, so a query over its budget
 fails after one column.
 The numeric prefilter of `ORDER BY ?v LIMIT k`, the total-order check of a top-k scan
@@ -651,13 +662,13 @@ A query that compiled each regular expression again made `regex-iri` 8 to 10% sl
 with cold search caches on every worker still read 1.069 in eager execution and 1.034
 when streamed. With the workers' clones parked between queries it read 1.010 and 1.015,
 and 1.011 and 1.004 at 10.5M triples. With one query thread it read 1.029 and 1.030,
-about 115 µs of 3.9 ms, which item NEW-ITEM-9 investigates.
+about 115 µs of 3.9 ms, until the key kernels found each clone once per piece.
 
 The first build of the size-chosen sort keys made streamed `expr-order-key` 1.20 times
 slower and `order-by-full` 1.06 times slower at 1.05M triples with 12 threads, because a
 cursor batch above 16,384 rows went to the hashed parallel distinct of per-value reuse
 and a variable key cloned a value per row. With dense integer slots and decoding per
-distinct term at any size they read 0.953, 0.917 and 0.819 for `expr-order-key`,
+distinct term above 16,384 rows too they read 0.953, 0.917 and 0.819 for `expr-order-key`,
 `order-by-full` and `range-topk` in eager execution and 0.999, 0.997 and 0.996 when
 streamed.
 
@@ -666,4 +677,41 @@ query above 0.3 ms that the kernels change within 1.019 of its time at 1.05M tri
 12 threads in both modes, and eager `order-by-full`, `range-topk` and `regex-iri` read
 0.921, 0.802 and 0.957. `types-grouped`, a GROUP BY of about 0.011 ms with an ORDER BY over
 its few groups, read 1.130 in eager execution and 1.053 when streamed, 1.4 and 1.0 µs more,
-which fails the D4 rule. Item NEW-ITEM-10 investigates it.
+which fails the D4 rule. Item NEW-ITEM-10 investigates it. At 10.5M triples in four rounds,
+every such query read within 1.024 except streamed `expr-order-key` at 1.045, 0.49 ms of
+10.8 ms, which item NEW-ITEM-11 investigates, and eager `order-by-full`, `range-topk` and
+`expr-order-key` read 0.797, 0.928 and 0.971.
+
+The whole stage was then compared with main at the commit it merged, 58bbfca5. Writing
+`export-500k` as `application/x-sparkles+json` in eager execution took 1.248 times as long,
+52 ms of 210 ms, with equal execution times, because that writer decodes each cell through
+`Ctx::term`, which checked the envelope before each step of a key's rebuild. With the
+unchecked rebuild described above it read 1.0085. The same comparison put eager
+`regex-iri` at 1.058 at 1.05M triples with 12 threads, about 60 µs of 0.95 ms, and eager
+`subquery-agg` at 1.12 at 10.5M triples, about 80 µs of 0.68 ms. Builds on either side of
+each step placed the first after the regular expressions became query-owned, where finding
+each thread's clone for every key cost the time described above, and the second at the
+step that charged retained scratch, whose parallel map took pieces of at least 4,096 rows
+in both modes. The 20,003 groups that `subquery-agg` filters at 10.5M triples then ran on
+at most five of twelve threads, and pieces of one poll's rows spread them over every
+thread again. With both changes, eager execution at 10.5M triples with 12 threads read
+1.029 of main for `subquery-agg`, 1.023 for `expr-bind-group`, 1.020 for `regex-iri`,
+1.011 for `lang-filter`, and 0.995 and 0.998 for `expr-agg-arg` and `group-avg`. The same
+queries read at most 1.011 when streamed at 10.5M triples, and with `star-join` at most
+1.02 in both modes at 1.05M triples, where eager `regex-iri` read 0.998. With one query
+thread at 1.05M triples, `regex-iri` read 0.990 in eager execution and
+0.978 when streamed. The latency harness ran on the merge before the unchecked rebuild and
+these two changes, which leave queries this short alone. It passed every query under 0.3 ms in both modes except
+`star-lookup`, which read 1.019 in eager execution and 1.017 when streamed, about 1.1 µs of
+59 µs, and eager `types-grouped` at 1.186. Items NEW-ITEM-12 and NEW-ITEM-10 investigate
+them. In twelve rounds of 200 requests, eager `subquery-agg` at 1.05M triples read 0.999
+of main, and main read 0.981 of itself.
+
+The 12-thread matrix of 9d086646, the build with the mode-neutral kernels, returned the
+same answers as the record of e52937ca in every cell. The execution times above 0.3 ms
+that it flagged against that record, eager `lang-filter`, `regex-iri`, `star-join` and
+`subquery-agg`, are among the queries that the comparison with main measured, and the
+flags of `regex-iri` and `subquery-agg` were the two costs it traced. Streamed
+responses still take about 0.27 ms more wall time than eager ones on the queries under
+1 ms, as they did before the stage, so chunked live reservations removed no measurable
+share of item 534's cost.
