@@ -75,6 +75,10 @@ The SvelteKit UI is embedded in the server binary.
   `.toolbar` row with the primary action at its end, and where the row does not fit the
   end group takes a row of its own, flush right. On a phone, buttons in a toolbar or a
   page head keep their icons and drop their labels, which stay their accessible names.
+  The Query toolbar does the same for **History**, **Pattern** and **Format** below
+  1,200 pixels, and Explore's graph tools do it whenever the canvas is narrower than
+  860 pixels, such as beside the details panel, where a still narrower canvas wraps
+  the tools to more rows.
   Panels side by side in a `.panel-grid` are as tall as the tallest in their row,
   headline numbers share one `.figures` grid, a choice of two to four values is one
   `.segmented` control, and the menus under a button share `.dropdown-menu`. At 760
@@ -89,7 +93,7 @@ The SvelteKit UI is embedded in the server binary.
   **Options**, then the pattern pane, **Format**, **Explain** and **Run** at its end.
   **Options** holds the branch, the past state to read, the history slider, the row
   limit and the inferences toggle, and its button names any of them that differ from
-  the default.
+  the default, including inferences left out on a dataset that reasons.
 * The **Saved** menu lists the dataset's stored queries, shows a form for a query's
   parameters and runs it. An admin can save the editor's query with parameters picked from
   its variables, or delete one.
