@@ -426,13 +426,22 @@
    */
   let dlRan = $state<{ text: string; commit: number | null; scope: string } | null>(null);
   let dlSeq = 0;
+  /** The run in flight: its scope and the query the address held when it started. */
+  let dlPending: { scope: string; url: string | null } | null = null;
   const dlScope = () => `${target}\u0000${JSON.stringify(sel)}`;
+  /** Forget the run in flight, whose answer no longer fits the page. */
+  function dropDl() {
+    dlSeq++;
+    dlPending = null;
+    dlBusy = false;
+  }
   async function runDl(text = dlText) {
     // the text is sent as it is, so that a problem's span fits the editor's text
     if (!text.trim()) return;
     const my = ++dlSeq;
     const scope = dlScope();
     const commit = summary?.commit ?? null;
+    dlPending = { scope, url: q.get('dl') };
     dlBusy = true;
     dlError = null;
     try {
@@ -441,7 +450,8 @@
         answers: dlAnswers,
         reasoning: dlReasoning,
       });
-      if (my !== dlSeq) return;
+      if (my !== dlSeq || dlScope() !== scope) return;
+      dlPending = null;
       if (r.ok) {
         dlResult = r.result;
         dlProblem = null;
@@ -464,6 +474,14 @@
     const text = q.get('dl');
     const commit = summary?.commit;
     const scope = dlScope();
+    untrack(() => {
+      // Back, another query in the address or another scope makes the run in flight moot
+      if (dlPending && (dlPending.scope !== scope || dlPending.url !== text)) dropDl();
+      if (dlRan && dlRan.scope !== scope) {
+        dlResult = null;
+        dlProblem = null;
+      }
+    });
     if (tab !== 'dlquery' || !text || commit == null) return;
     untrack(() => {
       if (dlRan && dlRan.text === text && dlRan.commit === commit && dlRan.scope === scope) return;
