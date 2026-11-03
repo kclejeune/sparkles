@@ -141,6 +141,8 @@ class LauncherState {
   /** Whether the results are showing (and, on a phone, the field is expanded). */
   open = $state(false);
   query = $state('');
+  /** The field's placeholder while a page names what its search finds, such as Explore's. */
+  hint = $state<string | null>(null);
   // raw: a deep proxy would wrap each provider and command, and an unregister compares
   // the caller's own object with what the list holds
   #providers = $state.raw<LauncherProvider[]>([]);
@@ -240,6 +242,17 @@ export function useCommands(cmds: () => LauncherCommand[]) {
 /** Registers a component's provider while it is mounted. */
 export function useProvider(p: LauncherProvider) {
   onMount(() => launcher.register(p));
+}
+
+/** Sets the top bar field's placeholder while a component is mounted. */
+export function useHint(hint: () => string | null) {
+  $effect(() => {
+    const h = hint();
+    launcher.hint = h;
+    return () => {
+      if (launcher.hint === h) launcher.hint = null;
+    };
+  });
 }
 
 /** Makes `/` focus a component's own search field while it is mounted. */

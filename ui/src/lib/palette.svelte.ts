@@ -78,6 +78,13 @@ export function pageProvider(base: string, backupsVisible: () => boolean): Launc
       href: navLink(base, n.href, ds),
     }));
     out.push({
+      id: '/embedding',
+      title: 'Embedding map',
+      icon: 'similar',
+      href: navLink(base, '/embedding', ds),
+      keywords: ['vectors', 'projection', 'umap'],
+    });
+    out.push({
       id: '/tokens',
       title: 'Access tokens',
       icon: 'key',

@@ -53,6 +53,10 @@
   /* the shell */
   --topbar-h: 48px;
   --rail-w: 208px;
+  /* the top bar's search field, centred in the viewport */
+  --search-w: 640px;
+  /* a workspace page's row of tools (Query, Explore) */
+  --toolbar-h: 44px;
   --panel-head-h: 44px;
   --row-h: 26px;
 
@@ -352,6 +356,12 @@ pre,
   color: var(--on-spark);
   font-weight: 600;
 }
+/* a primary action that cannot run yet is grey, not a faded amber that reads as busy */
+.btn.primary:disabled {
+  background: var(--surface-3);
+  color: var(--text-2);
+  opacity: 1;
+}
 .btn.primary:hover:not(:disabled) {
   background: var(--spark);
   filter: brightness(1.06);
@@ -480,6 +490,12 @@ label.field {
   color: var(--text-2);
   font-weight: 500;
 }
+/* a touch screen's 16 px controls keep their label in scale */
+@media (pointer: coarse) {
+  .form-row {
+    font-size: var(--fs);
+  }
+}
 .form-row > :is(.select, .input, select, input) {
   min-width: 0;
   color: var(--text);
@@ -569,9 +585,15 @@ label.field {
    of their own keep it, because this class has a distinct name. */
 .page-head {
   display: flex;
-  align-items: flex-end;
-  gap: 8px;
+  align-items: flex-start;
+  gap: var(--sp-2) var(--sp-4);
   flex-wrap: wrap;
+}
+/* the title block takes the row's room, so the actions sit at its end until they no
+   longer fit beside a readable title */
+.page-head > :first-child {
+  flex: 1 1 20rem;
+  min-width: 0;
 }
 .page-head p {
   margin-top: var(--sp-1);
@@ -582,13 +604,20 @@ label.field {
   color: var(--text-3);
   overflow-wrap: anywhere;
 }
-/* the page's actions at the end of its head */
+/* The page's actions at the end of its head, level with the title. On a phone they take a
+   row of their own under the title, from its start, so the title keeps the width. */
 .page-actions {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
   flex-wrap: wrap;
   margin-left: auto;
+}
+@media (max-width: 760px) {
+  .page-actions {
+    margin-left: 0;
+    width: 100%;
+  }
 }
 
 /* The row under a page's head with the controls that choose what the page shows, each a
@@ -655,6 +684,245 @@ label.field {
 .table-scroll {
   overflow-x: auto;
   max-width: 100%;
+}
+
+/* Panels side by side, as many columns as fit at --panel-min, each as tall as the tallest
+   in its row. */
+.panel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--panel-min, 320px)), 1fr));
+  gap: var(--gap);
+  align-items: stretch;
+}
+.panel-grid > * {
+  min-width: 0;
+}
+
+/* Headline figures: a row of label and value cells in one panel, split by rules, which
+   wraps into as many rows as it needs. */
+.figures {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 1px;
+  margin: 0;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+.figures > div {
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--surface);
+  min-width: 0;
+}
+.figures dt {
+  font-size: var(--fs-sm);
+  color: var(--text-2);
+}
+.figures dd {
+  margin: 2px 0 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* A workspace page's tools (Query, Explore): one row at --gutter, its groups split by
+   .toolbar-sep, and the .toolbar-end group with the primary action at the far end. Where the
+   row does not fit, the end group takes a row of its own under the rest, flush right, so the
+   primary action never strands in the middle. On a phone the label of any button that wraps
+   it in .lbl goes and its icon stays, with the label left as the accessible name. */
+.toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  min-height: var(--toolbar-h);
+  padding: var(--sp-2) var(--gutter);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+.toolbar-end {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-left: auto;
+  flex: none;
+}
+.toolbar-sep {
+  flex: none;
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+}
+.toolbar .note {
+  font-size: var(--fs-sm);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+@media (max-width: 760px) {
+  .toolbar-group {
+    flex-wrap: wrap;
+  }
+  .toolbar-end {
+    flex: 1 0 100%;
+    justify-content: flex-end;
+  }
+  .toolbar-sep {
+    display: none;
+  }
+  .btn .lbl {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+}
+
+/* One choice of two to four: buttons joined into one control, the chosen one marked
+   with aria-pressed (or aria-checked in a radiogroup). */
+.segmented {
+  display: inline-flex;
+  flex: none;
+  min-width: 0;
+}
+.segmented > :is(button, .btn, label) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: var(--ctl-h-sm);
+  padding: 0 var(--sp-2);
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--surface);
+  color: var(--text-2);
+  font: inherit;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+/* a finger needs the full control height, and on a phone a 44 px target */
+@media (pointer: coarse) {
+  .segmented > :is(button, .btn, label) {
+    height: var(--ctl-h);
+  }
+}
+@media (max-width: 760px) {
+  .segmented > :is(button, .btn, label) {
+    min-height: 44px;
+  }
+}
+.segmented.md > :is(button, .btn, label) {
+  height: var(--ctl-h);
+  padding: 0 var(--sp-3);
+  font-size: var(--fs);
+}
+.segmented > * + * {
+  margin-left: -1px;
+}
+.segmented > :first-child {
+  border-radius: var(--r) 0 0 var(--r);
+}
+.segmented > :last-child {
+  border-radius: 0 var(--r) var(--r) 0;
+}
+.segmented > :only-child {
+  border-radius: var(--r);
+}
+.segmented > :is(button, .btn, label):hover:not(:disabled) {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.segmented > :is([aria-pressed='true'], [aria-checked='true'], :has(input:checked)) {
+  position: relative;
+  z-index: 1;
+  background: color-mix(in srgb, var(--iri) 10%, var(--surface));
+  border-color: color-mix(in srgb, var(--iri) 45%, var(--border));
+  color: var(--iri);
+  font-weight: 600;
+}
+.segmented > :disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.segmented > :focus-visible,
+.segmented > label:focus-within {
+  z-index: 2;
+}
+.segmented > label {
+  position: relative;
+}
+.segmented > label:has(input:focus-visible) {
+  box-shadow: var(--focus);
+}
+.segmented input[type='radio'] {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+/* A menu under the button that opens it: commands, checks and short notes. The holder is
+   position: relative; .end aligns the menu with the holder's right edge. */
+.dropdown-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 30;
+  display: grid;
+  min-width: 220px;
+  max-width: min(340px, calc(100vw - 2 * var(--gutter)));
+  padding: var(--sp-1);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  box-shadow: var(--shadow-pop);
+}
+.dropdown-menu.end {
+  left: auto;
+  right: 0;
+}
+.dropdown-item {
+  all: unset;
+  box-sizing: border-box;
+  display: grid;
+  gap: 1px;
+  padding: 6px var(--sp-2);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  font-weight: 500;
+}
+.dropdown-item:hover,
+.dropdown-item:focus-visible {
+  background: var(--hover);
+}
+.dropdown-item:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.dropdown-item.check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.dropdown-item > span + span {
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  color: var(--text-3);
 }
 
 /* The buttons and links at the end of a table row, right-aligned on one line. A link
@@ -752,6 +1020,7 @@ table.data tbody tr:hover td {
 }
 table.data .num {
   text-align: right;
+  white-space: nowrap;
 }
 
 /* term styling shared across views */
