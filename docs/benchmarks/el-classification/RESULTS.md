@@ -154,6 +154,79 @@ memory in MiB.
 ROBOT ran with an 8 GiB heap. The materialized property was part of, `BFO:0000050`, for
 GO and has role, `RO:0000087`, for ChEBI lite.
 
+## File classification
+
+<a id="file-classification"></a>
+
+`sparkles ontology classify FILE` reads a file of one graph into memory without a store,
+and the taxonomy sorts its classes, builds its nodes and looks up a class's node on
+several threads. On forge, five interleaved rounds of the build of commit 62704d5b and of
+the build of commit c9b6ebff, which loads the file into a store first, classified GO and
+ChEBI lite from the release's RDF/XML file and from the functional-style file to a
+written taxonomy, on every core and on one thread. The table gives the median time in
+seconds from the start of the process to its end, and the median peak resident set in
+MiB. In the last round the two builds wrote byte-identical taxonomies of every file on
+every thread count.
+
+| File | Threads | Store path | File path | Store path peak RSS | File path peak RSS |
+|---|---:|---:|---:|---:|---:|
+| GO, functional-style | all | 0.91 | 0.25 | 657 | 286 |
+| | 1 | 1.09 | 0.40 | 600 | 281 |
+| GO, RDF/XML | all | 4.15 | 2.76 | 1,659 | 1,395 |
+| | 1 | 4.34 | 2.92 | 1,667 | 1,382 |
+| ChEBI lite, functional-style | all | 3.36 | 1.13 | 1,863 | 931 |
+| | 1 | 3.85 | 1.57 | 1,790 | 901 |
+| ChEBI lite, RDF/XML | all | 8.19 | 5.93 | 2,860 | 2,503 |
+| | 1 | 8.54 | 6.59 | 2,765 | 2,482 |
+
+ChEBI lite classifies from its functional-style file in 1.13 s, three times as fast as
+before. The read parses the document on several threads and keeps its axioms, so it maps
+nothing to triples and back. From RDF/XML the parse runs on several threads, and the
+reverse mapping of the triples, which runs on one, takes most of what remains. A
+phase-timed run on `atlas` gives 0.57 s for GO's parse and 1.4 s for its reverse
+mapping in a run of 2.9 s, and 0.81 s and 2.9 s in ChEBI lite's 5.7 s, which roadmap
+item 668 follows. The file path holds no store, so its peak resident set is
+lower on every file, by half from the functional-style files.
+
+`robot reason` took 14.0 s on GO and 30.6 s on ChEBI lite on the same host from the
+RDF/XML file, as [above](#robot), so the file path classifies the same files 5.1 and
+5.2 times as fast. ROBOT writes the whole ontology with the inferred axioms, while
+`sparkles ontology classify` writes only the taxonomy.
+
+`el_classify` measured the classification alone in the same rounds, with the axioms read,
+as the median of three classifications in each of five rounds, in ms. The rows give the
+classification and its taxonomy stage before and after the taxonomy's sort, nodes and
+lookup ran on several threads.
+
+| Ontology | Threads | Before | After | Taxonomy before | Taxonomy after |
+|---|---:|---:|---:|---:|---:|
+| GO | 8 | 85 | 82 | 14 | 11 |
+| ChEBI lite | 8 | 962 | 888 | 91 | 71 |
+| `ore_ont_868` | 8 | 992 | 878 | 372 | 249 |
+| `ore_ont_9674` | 8 | 989 | 883 | 369 | 252 |
+| `ore_ont_1559` | 8 | 778 | 744 | 88 | 60 |
+| `ore_ont_13482` | 8 | 517 | 511 | 17 | 14 |
+| `ore_ont_868` | 1 | 1,855 | 1,835 | 751 | 714 |
+
+On one thread every classification and its peak resident set are within 3% of before.
+On eight threads the peak resident set of `el_classify` is within 2% of before on every
+ontology but GO, where it rises from 242 to 256 MiB. An interleaved run of three rounds
+on `atlas` gives the same picture, with `ore_ont_868` at 990 and 861 ms and its taxonomy
+at 391 and 246 ms on eight threads.
+
+The taxonomies that `el_classify` writes were byte for byte the same in the build of
+commit c9b6ebff and the build of commit e196d28b, whose taxonomy stage is that of
+62704d5b, on GO, ChEBI lite and the 298 ORE ontologies on one and eight threads. The
+command line's taxonomies on one and eight threads, its JSON answers without the times
+and its `check --format json` answers were compared between the builds of 62704d5b and
+c9b6ebff on 904 files. These are GO, ChEBI lite and the 298 ORE ontologies, each in
+functional-style, RDF/XML and Turtle syntax, and four cut or malformed files, whose
+errors and exit codes must match. All 3,616 comparisons gave the same bytes. A file that
+ran out of memory with five comparisons at once on `atlas` was compared again alone with
+12 GiB. The
+[run record](runs/2026-11-03-file-classification-forge-62704d5b/record.json) holds every
+time, the binaries' hashes, the environment, the outputs' comparison and these checks.
+
 ## The reference reasoners on the benchmark host
 
 <a id="reference-reasoners"></a>
@@ -304,8 +377,9 @@ on `wally` on four threads.
 | | 8 | 576 | 70 | 84 | | |
 
 Normalization and interning run on one thread and take most of a run on eight threads
-on the ORE ontologies, which roadmap item 644 follows. On `ore_ont_868` the
-taxonomy's sort, node construction and lookup also run on one thread, item 646.
+on the ORE ontologies, which roadmap item 644 follows. The taxonomy's sort, node
+construction and lookup ran on one thread in this build, and the
+[file classification](#file-classification) section measures them on several.
 ChEBI lite's saturation scales least. A stage trace on `atlas` shows its workers
 spending 4.8 s in all on eight threads on the work that one thread does in 0.72 s, and
 one activation of a hub context taking 422 ms after the roots run out, which item

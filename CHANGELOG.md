@@ -207,6 +207,22 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+`sparkles ontology classify FILE` and `sparkles ontology check FILE` read a file of one
+graph into memory without a store and give the answers that a store of the loaded file
+gives (spec F24, roadmap item 649). RDF/XML, Turtle, N-Triples and functional-style
+documents parse on several threads, the last cut at its axioms and RDF/XML between the
+top-level elements of `rdf:RDF`. A file that holds named graphs, a strict read of a
+functional-style document, a file that fails to parse and a file whose answer only a
+store reproduces still go through a store in memory. On the benchmark host ChEBI lite
+classifies from its functional-style file in 1.13 s against 3.36 s and from RDF/XML in
+5.9 s against 8.2 s, GO in 0.25 s and 2.8 s, at a lower peak resident set, and the
+outputs are byte for byte the same. The EL taxonomy sorts its classes, builds its nodes
+and finds a class's node on several threads, with the same taxonomy on every thread
+count, which takes the taxonomy stage of `ore_ont_868` from 372 to 249 ms on eight
+threads (roadmap item 646). `sparkles_owl::read::Ontology::from_axioms` builds an open
+ontology from axioms, and the reverse mapping sorts annotation subjects without making
+their text again for each comparison.
+
 The OWL 2 EL classifier classifies GO, ChEBI lite and the largest ORE 2015 EL ontologies 2.5 to 13.3 times as fast as ELK 0.6.0 on forge on one and eight threads, where ELK had been faster on ChEBI lite on eight threads and on the ORE ontologies of a million classes (roadmap items 602 and 592). A
 `Saturation` reads the caller's axioms in place, so the dataset's kept classification
 shares the open ontology's axioms instead of copying them. The profile check and the

@@ -20,8 +20,8 @@ identify exceptions to the reference hardware, memory limits and request timing.
 | English DBpedia at 1.24B triples | Sparkles loads in 480 s, against QLever's 1,674 s and Fluree's 2,919 s. | [DBpedia](benchmarks/dbpedia/RESULTS.md) |
 | LUBM over a precomputed OWL 2 RL closure of 24.3M triples | Paired `q2` means are 26.8 ms for Sparkles and 60.6 ms for QLever. These are query times after materialization. | [Reasoning](benchmarks/reasoning/RESULTS.md) |
 | Serial literal inserts at 10.5M triples | Sparkles acknowledges synchronized commits in 1.167–1.254 ms, against 0.594–0.625 ms for unsynchronized Oxigraph commits. The durability contracts differ. | [Writes with reader work](benchmarks/writes/RESULTS.md#serial-writes-with-reader-work) |
-| OWL 2 EL classification of GO and ChEBI lite | On eight threads the classifier takes 354 ms on GO, against ELK 0.6.0's 553 ms. On one thread it takes 4.0 s on ChEBI lite, against 6.7 s. The taxonomies are the same. | [EL classification](benchmarks/el-classification/RESULTS.md#against-elk) |
-| OWL 2 EL classification against Konclude, Whelk and ROBOT | On one thread the classifier takes 0.58 s on GO and 8.3 s on a 981,151-class ORE 2015 ontology, against Konclude 0.7.0-1138's 1.3 s and 12.2 s. `sparkles ontology classify` runs 3.3 times as fast as `robot reason` on GO end to end. | [Reference reasoners](benchmarks/el-classification/RESULTS.md#reference-reasoners) |
+| OWL 2 EL classification of GO and ChEBI lite | On eight threads the classifier takes 83 ms on GO and 843 ms on ChEBI lite, against ELK 0.6.0's 608 ms and 2,540 ms, and it leads on every ORE 2015 ontology measured on one and eight threads. The taxonomies are the same. | [EL classification](benchmarks/el-classification/RESULTS.md#against-elk) |
+| OWL 2 EL classification against Konclude, Whelk and ROBOT | On one thread the classifier takes 0.58 s on GO and 8.3 s on a 981,151-class ORE 2015 ontology, against Konclude 0.7.0-1138's 1.3 s and 12.2 s. `sparkles ontology classify` runs 5.1 times as fast as `robot reason` on GO end to end from RDF/XML, and classifies ChEBI lite from its functional-style file in 1.13 s. | [Reference reasoners](benchmarks/el-classification/RESULTS.md#reference-reasoners) and [file classification](benchmarks/el-classification/RESULTS.md#file-classification) |
 
 ## Where Sparkles loses
 
@@ -40,7 +40,6 @@ where the two engines' means differed by less than an instance's variation betwe
 | DBpedia cold `outlink-classes-2` | QLever 1.25× | Sparkles wins 29 of 31 cold queries. |
 | Server RSS after the run, 1.05M | QLever 1.32× | Without its block cache, Sparkles holds 345 MiB. Sparkles has the lowest RSS after the run at 10.5M. |
 | Peak RSS under 16 readers | QLever 1.67× at 1.05M and 1.43× at 10.5M | Sparkles peaks at 567 and 1,339 MiB, against 339 and 939 MiB. |
-| EL classification of ChEBI lite on eight threads | ELK 0.6.0 1.16× | The classifier's indexing and taxonomy stages run on one thread. It is ahead on one thread and on GO, and ahead of ELK with the OWL API's load counted. |
 | Bulk load peak RSS | QLever 2.90× on the LUBM(100) closure and 1.23× on SP²Bench, Fluree 1.26× on SP²Bench | Sparkles has the lowest peak at 1.05M and on DBpedia, and is within 10% of QLever at 10.5M. |
 | DBpedia server RSS | QLever 3.14× | Sparkles maps its index, so touched file pages count toward its RSS. |
 | Text index size | QLever about 1.18× at 1.05M and 1.23× at 10.5M | The indexed predicates and features differ. |

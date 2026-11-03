@@ -1,0 +1,8 @@
+same out/main.chebi_lite.ofn.t1.ofn
+same out/main.chebi_lite.ofn.t8.ofn
+same out/main.chebi_lite.owl.t1.ofn
+same out/main.chebi_lite.owl.t8.ofn
+same out/main.go.ofn.t1.ofn
+same out/main.go.ofn.t8.ofn
+same out/main.go.owl.t1.ofn
+same out/main.go.owl.t8.ofn

@@ -1,0 +1,85 @@
+{
+ "checks": [
+  {
+   "detail": "The build of commit 62704d5b and the build of commit c9b6ebff wrote byte-identical taxonomies of GO and ChEBI lite from the functional-style and RDF/XML files on every core and one thread in the last round, which fab.sh.txt kept, on forge (cmp.txt) and on atlas (atlas-cmp.txt)",
+   "name": "outputs",
+   "ok": true
+  },
+  {
+   "detail": "el_classify's taxonomies of commit e196d28b, whose taxonomy and classifier code is that of 62704d5b, equal those of c9b6ebff byte for byte on GO, ChEBI lite and the 298 ORE 2015 EL ontologies on one and eight threads, 600 comparisons (taxonomy-compare.txt, taxeq.sh.txt)",
+   "name": "taxonomies",
+   "ok": true
+  },
+  {
+   "detail": "The CLI builds of 62704d5b and c9b6ebff gave the same bytes in all 3,616 comparisons on atlas: sparkles ontology classify --format ofn on one and eight threads, --format json on eight without the times, and sparkles ontology check --format json, each with its exit status and error output, on 904 files. These are GO, ChEBI lite and the 298 ORE 2015 EL ontologies in functional-style, RDF/XML and Turtle syntax, and four cut or malformed files (clieq.sh.txt). clieq-main-l4.results.txt holds 552 files and clieq-main-l4.rest.results.txt the other 352 (clieq-rest.sh.txt). With five files at once, 44 comparisons of 16 files differed where processes were killed at the 6 GiB cap. Those 16 files were compared again one at a time at 12 GiB, in the .rerun.txt files, and all 64 of their comparisons gave the same bytes.",
+   "name": "command-line",
+   "ok": true
+  },
+  {
+   "detail": "Every timed process exited with status 0 and none timed out",
+   "name": "status",
+   "ok": true
+  }
+ ],
+ "host": {
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "kernel": "7.2.9",
+  "name": "forge",
+  "ram_mib": 15620
+ },
+ "kind": "measurement",
+ "manifest": {
+  "base_commit": "c9b6ebff",
+  "binary": "The sparkles CLI and crates/sparkles-owl/examples/el_classify.rs, built with MBX_LEARNED_INCREMENTAL=false mbx build --release on atlas at commit 62704d5b (the file path, labelled l4) and at commit c9b6ebff (the store path, labelled main), and copied to the benchmark host",
+  "binary_sha256": {
+   "l4-el_classify": "0c50507d8c9ad64fcb18e433488f10712bcb7735856fa507fbcff85eab92346f",
+   "l4-sparkles": "5ae00aa0f634b52c0daed5ba3b3f81cce2899a6ba654e8a5e081d0e89dbeea98",
+   "main-el_classify": "0411a65e421f3e0b231e0cda0893ffdbb72425247fc1bd9fb3da2e8a51153130",
+   "main-sparkles": "760eb1bd19557cb02634497678a068ae4608dd9e79b22dbf8d644688dcdad13a"
+  },
+  "commit": "62704d5b",
+  "data": {
+   "chebi_lite": {
+    "ofn_sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4",
+    "rdfxml_sha256": "ebea75e0500818e319245a1bf605a684b2e22a2069680290b5dda638d5d25b16"
+   },
+   "go": {
+    "ofn_sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375",
+    "rdfxml_sha256": "653ce47cd7b02304e67eb67c54d3be02ec5b0ba5e00eb7384dfa0da00f9682ec"
+   },
+   "ore": "ore2015_sample.zip of Zenodo record 18578, pool_sample/el/classification, and env.txt gives the four timed files' SHA-256"
+  },
+  "ended": "2026-11-03T06:55:10Z",
+  "lock_note": "fab.sh.txt took ~/lanes/.bench.lock once for the whole run, and env.txt gives the time and the load average when it took it. Another lane's benchmark had just left the host, so the load average at the lock includes its tail, and the first round of the store path on ChEBI lite's functional-style file was slow. The tables use medians.",
+  "reference": {
+   "robot": "robot reason with ELK from runs/2026-11-03-reasoners-forge-ea96e8f5 on the same host and files, median of three, 14.04 s at 3,597 MiB on GO and 30.63 s at 8,287 MiB on ChEBI lite. ROBOT writes the whole ontology with the inferred axioms, while sparkles ontology classify writes only the taxonomy."
+  },
+  "started": "2026-11-03T06:42:25Z"
+ },
+ "method": "fab.sh.txt ran five interleaved rounds that alternate which build runs first. Each round timed sparkles ontology classify FILE --format ofn --allow-unsatisfiable with --threads 0 and 1 on GO and ChEBI lite from the functional-style and RDF/XML files through timed.py.txt, which records the wall time, the peak resident set and the exit status of each process in e2e.jsonl, and kept each output for cmp.txt. It then ran el_classify --repeat 3 on GO, ChEBI lite and four ORE ontologies on eight threads and one, whose JSON lines are in classify.jsonl. The atlas-* files are the interleaved A/B on atlas with atlas-run.sh.txt, atlas-ab.sh.txt and atlas-abtax.sh.txt, and atlas-phases.txt a phase-timed run of a build with timing points. taxeq.sh.txt compared el_classify's taxonomies, and clieq.sh.txt, clieq-one.sh.txt and clieq-rerun.sh.txt the command line's answers on atlas, with the results in clieq-*.",
+ "results": [],
+ "scale": "GO 2026-07-26, ChEBI lite 256 and the ORE 2015 EL ontologies ore_ont_868, ore_ont_9674, ore_ont_1559 and ore_ont_13482, with the 298 ORE 2015 EL ontologies for the checks",
+ "settings": {
+  "build": "MBX_LEARNED_INCREMENTAL=false, release profile",
+  "memory_cap": "none on forge; MemoryMax=6G per process for the parallel command-line comparison on atlas, and 12G for its rerun of the inputs that hit 6G",
+  "repeat": {
+   "el_classify": "5 rounds of --repeat 3",
+   "end_to_end": 5
+  },
+  "threads": {
+   "el_classify": [
+    8,
+    1
+   ],
+   "end_to_end": [
+    0,
+    1
+   ]
+  },
+  "timeout_s": {
+   "command_line_comparison": 900
+  }
+ },
+ "suite": "el-classification"
+}
