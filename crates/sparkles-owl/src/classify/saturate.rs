@@ -738,15 +738,8 @@ pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S)
                             out.send(e, Concl::Sub(BOTTOM));
                         }
                     }
-                    if let Some(x) = &st.extra {
-                        for &m in &x.members.list {
-                            out.send(m, Concl::Sub(BOTTOM));
-                        }
-                        if st.real {
-                            for &n in &x.noms {
-                                out.send(n, Concl::Sub(BOTTOM));
-                            }
-                        }
+                    if st.extra.is_some() {
+                        give(st, BOTTOM, out);
                     }
                     return true;
                 }
@@ -801,17 +794,8 @@ pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S)
                     }
                 }
             }
-            if let Some(x) = &st.extra {
-                // an individual's subsumers go to the contexts that stand for it, and a
-                // real context's to its individuals
-                for &m in &x.members.list {
-                    out.send(m, Concl::Sub(d));
-                }
-                if st.real {
-                    for &n in &x.noms {
-                        out.send(n, Concl::Sub(d));
-                    }
-                }
+            if st.extra.is_some() {
+                give(st, d, out);
             }
             true
         }
@@ -834,7 +818,7 @@ pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S)
                 }
             }
             if ix.nominal_selfs {
-                individuals(ix, me, st, |n| out.send(e, Concl::LinkTo(r, n)));
+                link_to(ix, me, st, e, r, out);
             }
             true
         }
@@ -879,58 +863,100 @@ pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S)
             }
             true
         }
-        Concl::Nom(k) => {
-            if k == me || !st.extra().members.insert(k) {
-                return false;
-            }
-            if st.bottom {
-                out.send(k, Concl::Sub(BOTTOM));
-            } else {
-                for &s in &st.subs {
-                    out.send(k, Concl::Sub(s));
-                }
-            }
-            true
-        }
-        Concl::Real => {
-            if st.real {
-                return false;
-            }
-            st.real = true;
-            if st.bottom {
-                if let Some(x) = &st.extra {
-                    for &n in &x.noms {
-                        out.send(n, Concl::Sub(BOTTOM));
-                    }
-                }
-                return true;
-            }
-            for &s in &st.subs {
-                if let Node::Exist(..) = ix.head(s).node {
-                    out.send(ix.head(s).succ, Concl::Real);
-                }
-            }
-            if let Some(x) = &st.extra {
-                for &n in &x.noms {
-                    for &s in &st.subs {
-                        out.send(n, Concl::Sub(s));
-                    }
-                }
-            }
-            true
-        }
-        Concl::LinkTo(r, n) => {
-            let x = st.extra();
-            if x.links.contains(&(r, n)) {
-                return false;
-            }
-            x.links.push((r, n));
-            if n == me || st.subs.contains(&n) {
-                out.me(Concl::Loop(r));
-            }
-            true
+        Concl::Nom(k) => apply_nom(me, st, k, out),
+        Concl::Real => apply_real(ix, st, out),
+        Concl::LinkTo(r, n) => apply_link_to(me, st, r, n, out),
+    }
+}
+
+/// A context registers as one that stands for its individual.
+#[cold]
+#[inline(never)]
+fn apply_nom<S: Sink>(me: Ex, st: &mut State, k: Ex, out: &mut S) -> bool {
+    if k == me || !st.extra().members.insert(k) {
+        return false;
+    }
+    if st.bottom {
+        out.send(k, Concl::Sub(BOTTOM));
+    } else {
+        for &s in &st.subs {
+            out.send(k, Concl::Sub(s));
         }
     }
+    true
+}
+
+/// A context becomes real: its successors do too, and it gives its individuals what it
+/// knows.
+#[cold]
+#[inline(never)]
+fn apply_real<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
+    if st.real {
+        return false;
+    }
+    st.real = true;
+    if st.bottom {
+        if let Some(x) = &st.extra {
+            for &n in &x.noms {
+                out.send(n, Concl::Sub(BOTTOM));
+            }
+        }
+        return true;
+    }
+    for &s in &st.subs {
+        if let Node::Exist(..) = ix.head(s).node {
+            out.send(ix.head(s).succ, Concl::Real);
+        }
+    }
+    if let Some(x) = &st.extra {
+        for &n in &x.noms {
+            for &s in &st.subs {
+                out.send(n, Concl::Sub(s));
+            }
+        }
+    }
+    true
+}
+
+/// An instance of the context has an individual as a successor, which closes a loop when
+/// the context stands for the individual.
+#[cold]
+#[inline(never)]
+fn apply_link_to<S: Sink>(me: Ex, st: &mut State, r: Role, n: Ex, out: &mut S) -> bool {
+    let x = st.extra();
+    if x.links.contains(&(r, n)) {
+        return false;
+    }
+    x.links.push((r, n));
+    if n == me || st.subs.contains(&n) {
+        out.me(Concl::Loop(r));
+    }
+    true
+}
+
+/// A new subsumer of a context with individuals: it goes to the contexts that stand for
+/// the context's individual, and from a real context to its individuals.
+#[cold]
+#[inline(never)]
+fn give<S: Sink>(st: &State, d: Ex, out: &mut S) {
+    let Some(x) = &st.extra else {
+        return;
+    };
+    for &m in &x.members.list {
+        out.send(m, Concl::Sub(d));
+    }
+    if st.real {
+        for &n in &x.noms {
+            out.send(n, Concl::Sub(d));
+        }
+    }
+}
+
+/// A backward link from `e` by `r` reaches the individuals the context stands for.
+#[cold]
+#[inline(never)]
+fn link_to<S: Sink>(ix: &Index, me: Ex, st: &State, e: Ex, r: Role, out: &mut S) {
+    individuals(ix, me, st, |n| out.send(e, Concl::LinkTo(r, n)));
 }
 
 /// The link of a chain: an instance of `e` has an instance of `f` as a `t`-successor.
@@ -947,6 +973,8 @@ fn compose<S: Sink>(roles: &super::index::Roles, e: Ex, t: Role, f: Ex, out: &mu
 
 /// A context derives the individual `n`: it registers with `n` to take its subsumers,
 /// gives `n` its own when it is real, and closes the loops of links to `n`.
+#[cold]
+#[inline(never)]
 fn nominal<S: Sink>(ix: &Index, me: Ex, st: &mut State, n: Ex, out: &mut S) {
     out.send(n, Concl::Nom(me));
     out.merged();
@@ -980,6 +1008,8 @@ fn nominal<S: Sink>(ix: &Index, me: Ex, st: &mut State, n: Ex, out: &mut S) {
 /// A context derives a data restriction by a role with functional superroles: its data
 /// successors by the roles under each of them are one value, in the intersection of
 /// their ranges.
+#[cold]
+#[inline(never)]
 fn functional<S: Sink>(ix: &Index, st: &mut State, r: Role, w: Ex, out: &mut S) {
     let fs = ix.roles.functional(r);
     let x = st.extra.get_or_insert_with(Box::default);
