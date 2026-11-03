@@ -826,35 +826,37 @@ impl Saturation {
             }
             _ => None,
         };
-        // the profile check of each axiom, which depends on it alone, and what each axiom
-        // outside OWL 2 EL needs (item 603)
-        let mut outside: Vec<(usize, (String, String))> = Vec::new();
-        for (part, counts) in par_map(axioms, threads, |at, chunk| {
+        // the profile check of each axiom, which depends on it alone
+        let outside: Vec<(usize, (String, String))> = par_map(axioms, threads, |at, chunk| {
             let mut out = Vec::new();
-            let mut counts = dl::OutsideEl::default();
             for (i, k) in chunk.iter().enumerate() {
                 if logical(k)
                     && let Some(b) = profiles::el_axiom(k).into_iter().next()
                 {
-                    counts.add(dl::shape(k));
                     out.push((at + i, (b.rule.to_string(), b.message)));
                 }
             }
-            (out, counts)
-        }) {
-            outside.extend(part);
-            stats.outside_el.merge(counts);
-        }
+            out
+        })
+        .into_iter()
+        .flatten()
+        .collect();
         poll(limits)?;
         let (ax, ix, normalized_peak) =
             self.build(axioms, &outside, threads, held_bytes, limits)?;
         drop(outside);
-        // a chain whose superproperty has a range its last property lacks is Horn
-        stats.outside_el.horn += self
-            .excluded
-            .iter()
-            .filter(|x| matches!(&x.gap, Gap::Outside { rule, .. } if rule == CHAIN_RANGE_RULE))
-            .count();
+        // what each axiom left out needs (item 603), counted once however often it
+        // occurs, as the excluded axioms are; a chain whose superproperty has a range its
+        // last property lacks is Horn
+        for x in &self.excluded {
+            if let Gap::Outside { rule, .. } = &x.gap {
+                if rule == CHAIN_RANGE_RULE {
+                    stats.outside_el.horn += 1;
+                } else {
+                    stats.outside_el.add(dl::shape(&x.axiom));
+                }
+            }
+        }
         stats.tier = stats.outside_el.tier();
         poll(limits)?;
         let n = self.interner.len();
@@ -1475,6 +1477,45 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn axioms_outside_el_count_once_however_often_they_occur() {
+        let c = |n: &str| ClassExpression::Class(Class::new(format!("http://ex.org/{n}")));
+        let or = AxiomKind::SubClassOf(
+            c("A"),
+            ClassExpression::ObjectUnionOf([c("B"), c("C")].into()),
+        );
+        let all = AxiomKind::SubClassOf(
+            c("A"),
+            ClassExpression::ObjectAllValuesFrom(
+                ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/r")),
+                Box::new(c("B")),
+            ),
+        );
+        let mut axioms = vec![&or; 3000];
+        axioms.extend(vec![&all; 3000]);
+        for threads in [1, 8] {
+            let out = Saturation::default()
+                .classify(
+                    &axioms,
+                    None,
+                    &Limits {
+                        threads,
+                        ..Limits::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                out.stats.outside_el,
+                OutsideEl {
+                    horn: 1,
+                    disjunctive: 1,
+                    global: 0
+                }
+            );
+            assert_eq!(out.stats.tier, Tier::Disjunctive);
+        }
+    }
 
     /// Random axioms over a few hundred classes, with intersections whose operands come
     /// in every order, so that chunks meet expressions in orders other than the run's.

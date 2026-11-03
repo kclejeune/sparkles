@@ -139,13 +139,13 @@ fn class(c: &ClassExpression) -> Pl {
     }
 }
 
-/// `≥n R.F`, F's counts being `f`: an existential in a positive position, and for n above
-/// one in a negative position the disjunct `≤n-1 R.F`.
+/// `≥n R.F`, F's counts being `f`: an existential in a positive position, and in a
+/// negative position the dual `≤n-1 R.F` in a positive one.
 fn at_least(n: u32, f: Pl) -> Pl {
     if n == 0 {
         return pl(0, 0);
     }
-    pl(f.pos.max(1), if n == 1 { f.neg } else { f.neg.max(1) })
+    pl(f.pos.max(1), at_most(n - 1, f).pos)
 }
 
 /// `≤n R.F`, the negation of `≥n+1 R.F`, whose filler keeps its position there: in a
@@ -203,18 +203,20 @@ fn bottom(c: &ClassExpression) -> bool {
         C::ObjectComplementOf(c) => top(c),
         // the individuals of the signature are not emptied
         C::ObjectOneOf(_) => false,
-        C::ObjectSomeValuesFrom(p, _) | C::ObjectHasValue(p, _) | C::ObjectHasSelf(p) => {
-            !is_top_role(p)
+        C::ObjectSomeValuesFrom(p, f) => !is_top_role(p) || bottom(f),
+        C::ObjectHasValue(p, _) | C::ObjectHasSelf(p) => !is_top_role(p),
+        C::ObjectMinCardinality(n, p, f) | C::ObjectExactCardinality(n, p, f) => {
+            *n > 0 && (!is_top_role(p) || f.as_deref().is_some_and(bottom))
         }
-        C::ObjectMinCardinality(n, p, _) | C::ObjectExactCardinality(n, p, _) => {
-            *n > 0 && !is_top_role(p)
-        }
+        // the top property relates every element to every other, so `∀U.F` is empty
+        // when F is
+        C::ObjectAllValuesFrom(p, f) => is_top_role(p) && bottom(f),
         C::DataSomeValuesFrom(ps, _) => ps.iter().all(|d| !is_top_data(d)),
         C::DataHasValue(d, _) => !is_top_data(d),
         C::DataMinCardinality(n, d, _) | C::DataExactCardinality(n, d, _) => {
             *n > 0 && !is_top_data(d)
         }
-        C::ObjectAllValuesFrom(..) | C::ObjectMaxCardinality(..) => false,
+        C::ObjectMaxCardinality(..) => false,
         C::DataAllValuesFrom(..) | C::DataMaxCardinality(..) => false,
     }
 }
@@ -227,8 +229,11 @@ fn top(c: &ClassExpression) -> bool {
         C::ObjectIntersectionOf(cs) => cs.iter().all(top),
         C::ObjectUnionOf(cs) => cs.iter().any(top),
         C::ObjectComplementOf(c) => bottom(c),
-        C::ObjectAllValuesFrom(p, _) | C::ObjectMaxCardinality(_, p, _) => !is_top_role(p),
-        C::ObjectExactCardinality(0, p, _) => !is_top_role(p),
+        C::ObjectAllValuesFrom(p, f) => !is_top_role(p) || top(f),
+        C::ObjectMaxCardinality(_, p, f) | C::ObjectExactCardinality(0, p, f) => {
+            !is_top_role(p) || f.as_deref().is_some_and(bottom)
+        }
+        C::ObjectMinCardinality(0, ..) | C::DataMinCardinality(0, ..) => true,
         C::DataAllValuesFrom(ps, _) => ps.iter().all(|d| !is_top_data(d)),
         C::DataMaxCardinality(_, d, _) | C::DataExactCardinality(0, d, _) => !is_top_data(d),
         _ => false,
@@ -254,56 +259,99 @@ fn clauses(ax: &AxiomKind) -> (u8, bool) {
         K::SubClassOf(c, d) => (sub(class(c), class(d)), !bottom(c) && !top(d)),
         K::EquivalentClasses(cs) => {
             let ps: Vec<Pl> = cs.iter().map(class).collect();
-            let mut most = 0;
-            for (i, a) in ps.iter().enumerate() {
-                for (j, b) in ps.iter().enumerate() {
-                    if i != j {
-                        most = most.max(sub(*a, *b));
-                    }
-                }
-            }
+            let most = cross(&ps);
             let global = !(cs.iter().all(bottom) || cs.iter().all(top));
             (most, global)
         }
-        K::DisjointClasses(cs) => {
-            let ps: Vec<Pl> = cs.iter().map(class).collect();
-            let mut most = 0;
-            for i in 0..ps.len() {
-                for j in i + 1..ps.len() {
-                    most = most.max(add(ps[i].neg, ps[j].neg));
-                }
-            }
-            (most, cs.iter().filter(|c| !bottom(c)).count() > 1)
-        }
+        K::DisjointClasses(cs) => (
+            pairs(cs.iter().map(|c| class(c).neg)),
+            cs.iter().filter(|c| !bottom(c)).count() > 1,
+        ),
         K::DisjointUnion(c, cs) => {
             let parts: Vec<Pl> = cs.iter().map(class).collect();
             let union = pl(
                 sum(parts.iter().map(|p| p.pos)),
                 parts.iter().map(|p| p.neg).max().unwrap_or(0),
             );
-            let named = class(&ClassExpression::Class(c.clone()));
-            let mut most = sub(named, union).max(sub(union, named));
-            for i in 0..parts.len() {
-                for j in i + 1..parts.len() {
-                    most = most.max(add(parts[i].neg, parts[j].neg));
-                }
-            }
-            // c ≡ ⊔cs is local when both sides are emptied, which a class other than
-            // owl:Thing is
-            let global = c.as_str() == vocab::OWL_THING || !cs.iter().all(bottom);
-            (most, global)
+            let named = ClassExpression::Class(c.clone());
+            let most = sub(class(&named), union)
+                .max(sub(union, class(&named)))
+                .max(pairs(parts.iter().map(|p| p.neg)));
+            // c ≡ ⊔cs is local when both sides are emptied or both are everything, and
+            // the disjointness of the parts when at most one of them is not emptied
+            let equal =
+                (bottom(&named) && cs.iter().all(bottom)) || (top(&named) && cs.iter().any(top));
+            let apart = cs.iter().filter(|c| !bottom(c)).count() <= 1;
+            (most, !(equal && apart))
         }
         K::ClassAssertion(c, _) => (class(c).pos, !top(c)),
         K::ObjectPropertyDomain(p, c) => (class(c).pos, is_top_role(p) && !top(c)),
-        K::ObjectPropertyRange(_, c) => (class(c).pos, false),
+        K::ObjectPropertyRange(p, c) => (class(c).pos, is_top_role(p) && !top(c)),
         K::DataPropertyDomain(d, c) => (class(c).pos, is_top_data(d) && !top(c)),
-        K::DataPropertyRange(_, r) => (data(r).pos, false),
+        // a data range is not emptied with the signature, so a range of the top data
+        // property is global unless it holds of every value
+        K::DataPropertyRange(d, r) => (data(r).pos, is_top_data(d) && !all_values(r)),
         K::DatatypeDefinition(_, r) => {
             let p = data(r);
             (p.pos.max(add(p.neg, 1)), false)
         }
-        K::HasKey(c, ..) => (class(c).neg, false),
+        // C(x) ∧ C(y) ∧ the key's values shared → x = y, an equality besides the two
+        // negative occurrences of C
+        K::HasKey(c, ..) => {
+            let n = class(c).neg;
+            (add(1, add(n, n)), false)
+        }
         _ => (0, false),
+    }
+}
+
+/// The most that two of the counts add up to, from the two largest, which is the largest
+/// clause of a set of pairwise disjointness conditions.
+fn pairs(ns: impl Iterator<Item = u8>) -> u8 {
+    let (mut a, mut b) = (0, 0);
+    for n in ns {
+        if n > a {
+            b = a;
+            a = n;
+        } else if n > b {
+            b = n;
+        }
+    }
+    add(a, b)
+}
+
+/// The largest clause of an equivalence: the negative count of one operand and the
+/// positive count of another, from the two largest positive counts.
+fn cross(ps: &[Pl]) -> u8 {
+    let mut best: [(u8, usize); 2] = [(0, usize::MAX); 2];
+    for (i, p) in ps.iter().enumerate() {
+        if best[0].1 == usize::MAX || p.pos > best[0].0 {
+            best = [(p.pos, i), best[0]];
+        } else if best[1].1 == usize::MAX || p.pos > best[1].0 {
+            best[1] = (p.pos, i);
+        }
+    }
+    ps.iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let other = if best[0].1 == i { best[1] } else { best[0] };
+            if other.1 == usize::MAX {
+                0
+            } else {
+                add(p.neg, other.0)
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether a data range holds of every data value.
+fn all_values(r: &DataRange) -> bool {
+    match r {
+        DataRange::Datatype(d) => d.as_str() == vocab::RDFS_LITERAL,
+        DataRange::UnionOf(rs) => rs.iter().any(all_values),
+        DataRange::IntersectionOf(rs) => rs.iter().all(all_values),
+        _ => false,
     }
 }
 
@@ -338,12 +386,6 @@ impl OutsideEl {
                 self.global += 1;
             }
         }
-    }
-
-    pub fn merge(&mut self, o: OutsideEl) {
-        self.horn += o.horn;
-        self.disjunctive += o.disjunctive;
-        self.global += o.global;
     }
 
     /// The tier these axioms need.
@@ -484,6 +526,58 @@ mod tests {
         assert!(!global("DisjointUnion(:A :B :C)"));
         // Horn axioms are never reported as global
         assert!(!global("SubClassOf(owl:Thing :A)"));
+        // the top properties are not emptied
+        assert!(global(
+            "ObjectPropertyRange(owl:topObjectProperty ObjectUnionOf(:A :B))"
+        ));
+        assert!(!global("ObjectPropertyRange(:r ObjectUnionOf(:A :B))"));
+        assert!(global(
+            "DataPropertyRange(owl:topDataProperty DataUnionOf(xsd:integer xsd:string))"
+        ));
+        // a restriction is emptied when its filler is
+        assert!(!global(
+            "SubClassOf(ObjectSomeValuesFrom(owl:topObjectProperty owl:Nothing) ObjectUnionOf(:A :B))"
+        ));
+        assert!(!global(
+            "SubClassOf(ObjectMinCardinality(2 owl:topObjectProperty owl:Nothing) ObjectUnionOf(:A :B))"
+        ));
+        assert!(!global(
+            "SubClassOf(owl:Thing ObjectUnionOf(:A ObjectAllValuesFrom(owl:topObjectProperty owl:Thing)))"
+        ));
+        assert!(!global(
+            "SubClassOf(owl:Thing ObjectUnionOf(:A ObjectMinCardinality(0 :r :B)))"
+        ));
+        // both sides of a disjoint union are everything and its parts but one are emptied
+        assert!(!global(
+            "DisjointUnion(owl:Thing ObjectComplementOf(:A) ObjectUnionOf(:B :C))"
+        ));
+    }
+
+    #[test]
+    fn minimums_in_a_negative_position_count_as_their_dual_maximum() {
+        assert!(!horn(
+            "SubClassOf(ObjectMinCardinality(3 :r :B) owl:Nothing)"
+        ));
+        assert!(!horn(
+            "SubClassOf(ObjectComplementOf(ObjectMaxCardinality(2 :r :B)) owl:Nothing)"
+        ));
+        // ≥2 r.B ⊑ C is ≤1 r.B ⊔ C, an equality and C
+        assert!(!horn("SubClassOf(ObjectMinCardinality(2 :r :B) :C)"));
+        assert!(horn(
+            "SubClassOf(ObjectMinCardinality(2 :r :B) owl:Nothing)"
+        ));
+        assert!(!horn(
+            "SubClassOf(ObjectMinCardinality(2 :r ObjectComplementOf(:B)) owl:Nothing)"
+        ));
+        assert!(horn(
+            "SubClassOf(ObjectMinCardinality(0 :r ObjectComplementOf(:B)) :C)"
+        ));
+    }
+
+    #[test]
+    fn a_key_concludes_an_equality() {
+        assert!(horn("HasKey(:A (:r) ())"));
+        assert!(!horn("HasKey(ObjectComplementOf(:A) (:r) ())"));
     }
 
     #[test]

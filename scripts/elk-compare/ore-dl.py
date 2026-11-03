@@ -138,6 +138,50 @@ def cap(n):
     return min(n, 2)
 
 
+def at_most_pos(k, n):
+    """The positive count of at most k fillers whose negative count is n: at most k is the
+    negation of at least k+1, whose filler keeps its position, so zero is a universal
+    restriction on the filler's complement, one adds an equality and more add several."""
+    return n if k == 0 else (cap(1 + n) if k == 1 else 2)
+
+
+def pairs(ns):
+    """The most that two of the counts add up to, from the two largest, which is the
+    largest clause of a set of pairwise disjointness conditions."""
+    a = b = 0
+    for n in ns:
+        if n > a:
+            a, b = n, a
+        elif n > b:
+            b = n
+    return a + b
+
+
+def cross(ps):
+    """The largest clause of an equivalence: the negative count of one operand and the
+    positive count of another."""
+    best = [(-1, None), (-1, None)]
+    for i, (p, _) in enumerate(ps):
+        if p > best[0][0]:
+            best = [(p, i), best[0]]
+        elif p > best[1][0]:
+            best[1] = (p, i)
+    return max(n + (best[0][0] if best[0][1] != i else best[1][0]) for i, (_, n) in enumerate(ps))
+
+
+def anonymous(tree):
+    """Whether an axiom names an anonymous individual, which OWL 2 EL does not allow."""
+    if isinstance(tree, list):
+        return any(anonymous(x) for x in tree)
+    return tree.startswith("_:")
+
+
+def literal(t, out):
+    """Records the datatype of a literal outside OWL 2 EL."""
+    if "^^" in t and short(t.rsplit("^^", 1)[1]) not in EL_TYPES:
+        out["f"].add("datatype_outside_el")
+
+
 class Scan:
     """What one ontology's axioms use, and which of them are Horn.
 
@@ -205,6 +249,7 @@ class Scan:
                   "DataMinCardinality", "DataMaxCardinality", "DataExactCardinality"):
             out["f"].add("data")
             if op == "DataHasValue":
+                literal(args[1], out)
                 return 1, 0
             card = op.startswith(("DataMin", "DataMax", "DataExact"))
             rest = args[2:] if card else args[1:]
@@ -227,11 +272,11 @@ class Scan:
             if prefix or k > 1:
                 out["f"].add(prefix + ("card" if prefix else "min_many"))
             pos = max(pos, max(1, p) if k > 0 else 0)
-            neg += n if k <= 1 else max(1, n)
+            # at least k in a negative position is at most k-1 in a positive one
+            neg += at_most_pos(k - 1, n) if k > 0 else 0
         if hi:
             out["f"].add(prefix + ("card" if prefix else "max"))
-            # at most k is the negation of at least k+1, whose filler keeps its position
-            pos = max(pos, n if k == 0 else (cap(1 + n) if k == 1 else 2))
+            pos = max(pos, at_most_pos(k, n))
             neg += max(1, p)
         return pos, cap(neg)
 
@@ -239,6 +284,7 @@ class Scan:
         """(positive, negative) counts of a data range."""
         if not isinstance(e, list):
             if e.startswith('"'):
+                literal(e, out)
                 return 1, 0
             if short(e) not in EL_TYPES:
                 out["f"].add("datatype_outside_el")
@@ -262,6 +308,9 @@ class Scan:
         if op == "DatatypeRestriction":
             out["f"].add("facets")
             self.data(args[0], out)
+            for a in args[1:]:
+                if isinstance(a, str) and a.startswith('"'):
+                    literal(a, out)
             return 1, 0
         raise Unknown(op)
 
@@ -272,6 +321,20 @@ class Scan:
             raise Unknown(str(r[0]))
         elif r in TOP_ROLE:
             out["f"].add("top_role")
+
+    def fact(self, ax):
+        """The features of an assertion between individuals, which is Horn."""
+        f = set()
+        if "ObjectInverseOf" in repr(ax):
+            f.add("inverse")
+        if anonymous(ax[1:]):
+            f.add("anonymous")
+        if ax[0] in ("DataPropertyAssertion", "NegativeDataPropertyAssertion"):
+            literal(ax[-1], {"f": f})
+        for x in f:
+            self.f[x] += 1
+        if f & NON_EL:
+            self.nonel += 1
 
     def axiom(self, ax):
         out = {"f": set(), "classes": set()}
@@ -290,12 +353,12 @@ class Scan:
                 rest = parts[1:]
                 union = (cap(sum(p for p, _ in rest)), max(n for _, n in rest))
                 parts = [parts[0], union]
-                clauses += [rest[i][1] + rest[j][1] for i in range(len(rest)) for j in range(i + 1, len(rest))]
-            clauses += [a[1] + b[0] for a in parts for b in parts if a is not b]
+                clauses.append(pairs(n for _, n in rest))
+            clauses.append(cross(parts))
         elif op == "DisjointClasses":
             out["f"].add("disjoint")
             parts = [self.pl(a, out) for a in args]
-            clauses += [parts[i][1] + parts[j][1] for i in range(len(parts)) for j in range(i + 1, len(parts))]
+            clauses.append(pairs(n for _, n in parts))
         elif op == "ClassAssertion":
             out["f"].add("abox")
             clauses.append(self.pl(args[0], out)[0])
@@ -349,11 +412,17 @@ class Scan:
             out["f"].add("role_disjoint")
         elif op == "HasKey":
             out["f"].add("key")
-            clauses.append(self.pl(args[0], out)[1])
+            # C(x) and C(y) with the key's values shared give x = y
+            clauses.append(1 + 2 * self.pl(args[0], out)[1])
+            if len(args) > 1 and isinstance(args[1], list):
+                for r in args[1][1:]:
+                    self.role(r, out)
         elif op == "DLSafeRule":
             out["f"].add("rule")
         else:
             raise Unknown(op)
+        if anonymous(ax):
+            out["f"].add("anonymous")
         for x in out["f"]:
             self.f[x] += 1
         if any(c > 1 for c in clauses):
@@ -368,7 +437,7 @@ NON_EL = {
     "union", "complement", "oneof_many", "forall", "qualified", "number", "max",
     "min_many", "inverse", "symmetric", "functional", "role_disjoint", "disjoint_union",
     "data_forall", "data_card", "data_union", "data_complement", "data_oneof_many",
-    "facets", "datatype_outside_el", "rule",
+    "facets", "datatype_outside_el", "rule", "anonymous",
 }
 # the heads of the axioms of functional-style syntax, for telling an axiom the scan
 # cannot read from the continuation line of a multi-line literal
@@ -438,10 +507,16 @@ def scan_one(job):
             if line.startswith(FACTS):
                 logical += 1
                 facts += 1
-                fingerprint = (fingerprint + line_hash(line)) % (1 << 64)
-                if "ObjectInverseOf" in line:
-                    s.f["inverse"] += 1
-                    s.nonel += 1
+                # the fingerprint of a fact is that of its tree without annotations, as
+                # for the other axioms, and that of its first line when a literal goes on
+                # over several lines
+                try:
+                    ax = parse(line)
+                except (ValueError, IndexError):
+                    fingerprint = (fingerprint + line_hash(line)) % (1 << 64)
+                    continue
+                fingerprint = (fingerprint + line_hash(repr(ax))) % (1 << 64)
+                s.fact(ax)
                 continue
             try:
                 ax = parse(line)
