@@ -172,8 +172,8 @@ co-editing (629) comes last.
 
 ### How the waves share capacity
 
-The waves run in parallel, and each has its own capacity. Wave B always has one stream
-of work reserved for it. When work competes for gate, review or benchmark time, the
+The waves run in parallel, and each has its own capacity. Waves A2 and C take the
+capacity first, and Wave B runs when a stream is free of them. When work competes for gate, review or benchmark time, the
 dependency order and how ready the work is decide which goes first, not the wave it
 belongs to. The goal at the start of this section states what Sparkles optimizes
 for, and it does not order the waves.
