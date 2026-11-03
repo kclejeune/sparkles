@@ -85,6 +85,30 @@ use std::time::{Duration, Instant};
 /// its last property lacks.
 const CHAIN_RANGE_RULE: &str = "OWL 2 Profiles §2.2.6";
 
+/// A pool's charge that takes `credit` bytes, which the pool has already admitted, before
+/// it asks the pool for more. A charge the pool refuses gives back the credit it took, as
+/// the refused growth is not the run's.
+fn drawing_on(
+    credit: usize,
+    charge: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync>,
+) -> std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> {
+    let credit = AtomicUsize::new(credit);
+    std::sync::Arc::new(move |bytes: usize| {
+        let had = credit
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                Some(c - c.min(bytes))
+            })
+            .unwrap_or(0);
+        let took = had.min(bytes);
+        let rest = bytes - took;
+        if rest == 0 || charge(rest) {
+            return true;
+        }
+        credit.fetch_add(took, Ordering::Relaxed);
+        false
+    })
+}
+
 /// The least memory budget, in estimated bytes, of a saturation with the Horn rules. The
 /// largest Horn run of the ORE 2015 DL sample's development set peaks at 666 MB, 139 times
 /// its index and axioms, on a small ontology.
@@ -648,22 +672,12 @@ impl Saturation {
             // draw first on what the pool admitted for the Horn run, which the grant
             // still holds.
             self.reset();
-            let credit = std::sync::Arc::new(AtomicUsize::new(admitted.load(Ordering::Relaxed)));
             let el = Limits {
                 el_only: true,
-                charge: limits.charge.clone().map(|f| {
-                    let charge: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
-                        std::sync::Arc::new(move |bytes: usize| {
-                            let had = credit
-                                .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                                    Some(c - c.min(bytes))
-                                })
-                                .unwrap_or(0);
-                            let rest = bytes - had.min(bytes);
-                            rest == 0 || f(rest)
-                        });
-                    charge
-                }),
+                charge: limits
+                    .charge
+                    .clone()
+                    .map(|f| drawing_on(admitted.load(Ordering::Relaxed), f)),
                 ..limits.clone()
             };
             r = self.run(axioms, None, held_bytes, &el, with_taxonomy).map(
@@ -1665,6 +1679,28 @@ fn poll(limits: &Limits) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refused_charge_gives_back_the_credit_it_took() {
+        // a pool with nothing left, and 100 bytes it admitted for an earlier run
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let a = asked.clone();
+        let charge = drawing_on(
+            100,
+            std::sync::Arc::new(move |bytes: usize| {
+                a.fetch_add(bytes, Ordering::Relaxed);
+                false
+            }),
+        );
+        assert!(charge(60));
+        assert_eq!(asked.load(Ordering::Relaxed), 0);
+        // 40 of credit and 60 the pool refuses: the charge fails and keeps the 40
+        assert!(!charge(100));
+        assert_eq!(asked.load(Ordering::Relaxed), 60);
+        assert!(charge(30));
+        assert!(charge(10));
+        assert!(!charge(1));
+    }
+
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
