@@ -1281,10 +1281,10 @@ about the assessments. F22's maintained analyses, roadmap item 340, consume it.
 
 The rest of Phase 3 is planned as separate roadmap items. Recall and Ask citations of
 reviewed claims under their review state, identity resolution and access are
-NEW-ITEM-1. Ingestion of extracted facts as claim proposals with their sources is
-NEW-ITEM-2. Reports and community summaries that draw on accepted evidence are
-NEW-ITEM-3. MCP tools for proposals, reviews, withdrawals, resolution, identities and
-dependents are NEW-ITEM-4. The bindings remain item 509.
+650. Ingestion of extracted facts as claim proposals with their sources is
+651. Reports and community summaries that draw on accepted evidence are
+652. MCP tools for proposals, reviews, withdrawals, resolution, identities and
+dependents are 653. The bindings remain item 509.
 
 Retained-reference resolution uses C29's bounded history and controlled permission
 preparation. Guarded Dataset queries and U02 readers still adopt them under item 395.
