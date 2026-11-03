@@ -1163,6 +1163,7 @@ impl<'a> Run<'a> {
 
     /// Activates a context: applies the rules to what waits in its to-do list until none
     /// is left, with the rules that `R` holds.
+    #[inline(always)]
     fn process<R: Rules>(
         &self,
         me: Ex,
