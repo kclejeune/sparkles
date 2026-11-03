@@ -348,16 +348,13 @@ fn deep_nesting_is_refused() {
 fn a_long_lookahead_costs_no_stack() {
     // the filler of a property of unknown kind is looked at before it is read, and a
     // recursive look at 100,000 `not`s overflowed the stack
-    for p in ["nobody", "teaches"] {
-        let text = format!("{p} some {}Person", "not ".repeat(100_000));
+    // an unknown prefixed name reads as a property of either kind, so its filler
+    // decides, and the reader then refuses the nesting
+    for opening in ["not ", "("] {
+        let text = format!("ex:nobody some {}Person", opening.repeat(100_000));
         let e = err(&text);
-        assert!(
-            e.message.contains("nests") || e.kind == ErrorKind::Unknown,
-            "{p}: {e}"
-        );
+        assert!(e.message.contains("nests"), "{opening}: {e}");
     }
-    let text = format!("nobody some {}Person", "(".repeat(100_000));
-    err(&text);
 }
 
 fn ax(text: &str) -> Axiom {

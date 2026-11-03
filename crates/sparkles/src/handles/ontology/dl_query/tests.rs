@@ -518,11 +518,17 @@ fn a_declared_individual_is_an_instance_of_what_holds_for_everything() {
 
 #[test]
 fn names_only_assertions_hold_are_read() {
+    // :k is a class and, through an assertion only, an individual too
     let ds = dataset(
-        "Declaration(Class(:C)) Declaration(ObjectProperty(:p))
-         ClassAssertion(:C :a) ObjectPropertyAssertion(:p :a :b)",
+        "Declaration(Class(:C)) Declaration(Class(:k)) Declaration(ObjectProperty(:p))
+         ClassAssertion(:C :a) ObjectPropertyAssertion(:p :a :b) ObjectPropertyAssertion(:p :b :k)",
     );
-    for text in ["p value a", "p value b"] {
+    for text in [
+        "p value a",
+        "p value b",
+        "p value b and p value k",
+        "k and p value k",
+    ] {
         let a = query_with(
             &ds,
             text,

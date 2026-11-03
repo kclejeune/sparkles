@@ -335,8 +335,11 @@ impl Ontologies {
     ///
     /// Individuals that only the store's assertions name, such as the objects of
     /// property assertions, are not entities of `o`. A name the vocabulary does not know
-    /// is therefore looked for again among the entities of the assertions the caller can
-    /// read, which streams them once, so that a text that reads costs no such pass.
+    /// or one known only as another kind is therefore looked for among the entities of
+    /// the assertions the caller can read,
+    /// which streams them once per such name, up to eight names. Only the entities the
+    /// name can mean are kept, so the vocabulary grows by a few entries, and a text that
+    /// reads costs no pass over the assertions.
     pub fn parse_manchester(
         &self,
         o: &Opened,
@@ -345,27 +348,47 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<Parsed> {
         let mut v = self.vocabulary(o);
-        match manchester::parse(text, what, &v) {
-            Ok(p) => Ok(p),
-            Err(e) if e.kind == manchester::ErrorKind::Unknown => {
-                let mut added = false;
-                o.assertions(opts, |a, _, _| {
-                    if let Some(a) = a {
-                        for ent in a.signature() {
-                            if !ent.is_builtin() && v.kinds(ent.iri().as_str()).is_empty() {
-                                v.add_entity(ent);
-                                added = true;
-                            }
+        let mut tries = 0;
+        loop {
+            let e = match manchester::parse(text, what, &v) {
+                Ok(p) => return Ok(p),
+                Err(e) => e,
+            };
+            // an unknown name, or a known one of another kind, such as an individual
+            // punned with a class
+            let retry = matches!(
+                e.kind,
+                manchester::ErrorKind::Unknown | manchester::ErrorKind::Kind
+            );
+            if !retry || tries == 8 {
+                return Err(manchester_error(e, text));
+            }
+            tries += 1;
+            let token = text.get(e.span.start..e.span.end).unwrap_or("");
+            let (iris, simple) = meant(&v, token);
+            let mut found = Vec::new();
+            o.assertions(opts, |a, _, _| {
+                if let Some(a) = a {
+                    for ent in a.signature() {
+                        let iri = ent.iri().as_str();
+                        if !ent.is_builtin()
+                            && (iris.contains(iri)
+                                || simple.as_deref() == Some(manchester::local_name(iri)))
+                            && !v.kinds(iri).contains(&ent.kind())
+                            && !found.contains(&ent)
+                        {
+                            found.push(ent);
                         }
                     }
-                    Ok(true)
-                })?;
-                if !added {
-                    return Err(manchester_error(e, text));
                 }
-                manchester::parse(text, what, &v).map_err(|e| manchester_error(e, text))
+                Ok(true)
+            })?;
+            if found.is_empty() {
+                return Err(manchester_error(e, text));
             }
-            Err(e) => Err(manchester_error(e, text)),
+            for ent in found {
+                v.add_entity(ent);
+            }
         }
     }
 
@@ -584,6 +607,28 @@ impl Ontologies {
         }
         Ok(answer)
     }
+}
+
+/// The IRIs a name token of Manchester text can mean, and the bare name for matching
+/// local names: an IRI in angle brackets means itself, a prefixed name its expansion,
+/// and a word or a quoted label the IRIs the vocabulary names by it.
+fn meant(v: &Vocabulary, token: &str) -> (std::collections::BTreeSet<String>, Option<String>) {
+    let mut iris = std::collections::BTreeSet::new();
+    if let Some(i) = token.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
+        iris.insert(i.to_string());
+        return (iris, None);
+    }
+    let simple = match token.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+        Some(q) => q.replace("\\'", "'").replace("\\\\", "\\"),
+        None => {
+            if let Some(i) = v.expand(token) {
+                iris.insert(i);
+            }
+            token.to_string()
+        }
+    };
+    iris.extend(v.named(&simple).map(str::to_string));
+    (iris, Some(simple))
 }
 
 /// Manchester text that does not parse, with the error: the source of the
