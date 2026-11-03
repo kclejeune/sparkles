@@ -479,6 +479,47 @@ impl<'m> Clusters<'m> {
         Ok(out)
     }
 
+    /// The current decisions of `p` under the policy that the caller's view shows in
+    /// full, for a read. Candidates come from the caller's view, so the bound counts
+    /// only decision triples the caller can read, and a decision the view hides any
+    /// triple of is left out. Authentication and supersession are read at the unmasked
+    /// head, so a hidden later decision still ends an earlier visible one.
+    fn visible_current(&mut self, state: &mut State<'_>, p: &NamedNode) -> Result<Vec<NamedNode>> {
+        let decisions = self.m.decisions.clone();
+        let o = Term::NamedNode(p.clone());
+        let (candidates, more) = match state.seen.as_mut() {
+            Some(seen) => {
+                seen.subjects_up_to(&ev("target"), &o, decisions.0.as_str(), MAX_EVIDENCE)?
+            }
+            None => {
+                state
+                    .reads
+                    .subjects_up_to(&ev("target"), &o, decisions.0.as_str(), MAX_EVIDENCE)?
+            }
+        };
+        if more {
+            return Err(incomplete("decisions"));
+        }
+        let mut out = Vec::new();
+        for d in candidates {
+            if state.masked(&d, &decisions.0)? {
+                continue;
+            }
+            if state.typed(&d, &decisions, RecordKind::ReviewDecision)?
+                && state.reads.contains(
+                    d.as_str(),
+                    &ev("reviewPolicy"),
+                    &Term::NamedNode(self.m.policy_iri.clone()),
+                    decisions.0.as_str(),
+                )?
+                && !state.is_superseded(&d, &decisions)?
+            {
+                out.push(d);
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether `p`'s current decision under the policy accepts it, in `when`.
     fn is_effective(&mut self, state: &mut State<'_>, p: &NamedNode, when: When) -> Result<bool> {
         let k = (p.clone(), when == When::After);
@@ -492,11 +533,14 @@ impl<'m> Clusters<'m> {
                 // state before; after it, a proposal this operation does not decide has
                 // the same current decision
                 let superseded = std::mem::take(&mut state.superseded);
-                let current = state.current(p, &self.m.policy_iri, &self.m.decisions);
+                let current = if self.hide_masked {
+                    self.visible_current(state, p)
+                } else {
+                    state.current(p, &self.m.policy_iri, &self.m.decisions)
+                };
                 state.superseded = superseded;
                 let current = current?;
                 match current.as_slice() {
-                    [one] if self.hide_masked && state.masked(one, &self.m.decisions.0)? => false,
                     [one] => {
                         state.disposition(one, &self.m.decisions)? == Some(Disposition::Accepted)
                     }
@@ -1172,7 +1216,7 @@ pub fn resolve(
                 let c = clusters.cluster(&mut state, e, When::Before, &mut |_, _, _| Ok(()))?;
                 let mut found = BTreeSet::new();
                 for p in &c.matches {
-                    let current = state.current(p, &m.policy_iri, &m.decisions)?;
+                    let current = clusters.visible_current(&mut state, p)?;
                     found.extend(current);
                 }
                 decisions = found.into_iter().collect();

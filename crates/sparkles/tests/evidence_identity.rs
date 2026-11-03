@@ -1345,4 +1345,8 @@ fn a_resolution_leaves_out_masked_proposals_and_decisions() {
     assert!(r[0].decisions.is_empty(), "{r:?}");
     // the map itself is read in the caller's view
     assert_eq!(r[0].representative, e("a"));
+    // decision targets the view hides are not counted, so they cannot reach a bound
+    let targets = masking(&format!("{EV}target"), DECISIONS);
+    let r = read(&["b"], targets);
+    assert!(r[0].decisions.is_empty(), "{r:?}");
 }
