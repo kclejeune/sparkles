@@ -226,7 +226,7 @@ and the reply writes a settle line with the cost from its usage. A request is re
 when the spent total plus its bound would pass `localCapNanodollars`. The spent total
 includes the carryover, so the cap covers the carryover as well, and new requests can
 spend the cap minus the carryover. The run file is also refused when the cap plus the
-carryover passes the hard cap of one ledger, USD 95 for Anthropic and USD 50 for OpenAI,
+carryover passes the hard cap of one ledger, USD 105 for Anthropic and USD 50 for OpenAI,
 which counts the carryover twice and keeps the run on the safe side. The person who pays sets each campaign's total, which can
 span several ledgers in separate directories. An error reply is free, a lost reply costs the bound, a reply without usage costs
 the bound, and any other fault of the request costs the bound. Replaying the ledger
@@ -336,7 +336,11 @@ ledger holds the rest with a cap of USD 49.1452. The two caps together equal the
 The Anthropic wallet of the same campaign was raised the same way from USD 50 to 95 with
 the approval of the person who pays, so that every model could run its baseline and its
 final build on the same three sets. Its first ledger closed with USD 30.7865 of upper
-liability, and the second has a cap of USD 64.2135. The ledgers stay the record of
+liability, and the second has a cap of USD 64.2135. The person who pays raised the
+wallet again to USD 105 on 2026-11-02, so that Opus 5.5 could answer the held-out set
+with the same final build as the cheaper models. The second ledger closed with
+USD 53.5667 of upper liability, USD 0.0632 of it one request held at its bound, and the
+third has a cap of USD 20.6468. The ledgers stay the record of
 Anthropic spend until the person who pays reconciles them against the Console's usage
 export, which stays outside the repository. Only the reconciled totals are recorded.
 
