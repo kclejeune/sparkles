@@ -11,7 +11,8 @@ one JSON line with the outcome:
 * `no-reference`: neither reasoner wrote a taxonomy
 * `equal`: the run left nothing out and its subsumptions are the reference's
 * `differs`: the run left nothing out and its subsumptions are not the reference's
-* `sound`: the run left axioms out, and every subsumption it answers is entailed
+* `sound`: the run left axioms out or used some in part, and every subsumption it
+  answers is entailed
 * `unsound`: some subsumption the run answers is not entailed
 
     ours-compare.py --status S --name N --hermit H --konclude K --report R --stderr E \
@@ -74,8 +75,9 @@ class Closure:
     def above(self, c):
         if c in self.memo:
             return self.memo[c]
+        # owl:Thing's superclasses and equivalents hold of every class
         seen = {c, THING}
-        stack = [c]
+        stack = [c, THING]
         while stack:
             x = stack.pop()
             for y in self.up.get(x, ()):
@@ -123,7 +125,7 @@ def main():
         print(json.dumps(out))
         return
     report = json.load(open(a.report))
-    for k in ["outside", "rules", "tier", "outsideTaken", "conjunctions", "classifyMedianMs", "classes"]:
+    for k in ["outside", "rules", "partial", "tier", "outsideTaken", "conjunctions", "classifyMedianMs", "classes"]:
         if k in report:
             out[k] = report[k]
     ref = a.hermit if nonempty(a.hermit) else a.konclude if nonempty(a.konclude) else None
@@ -139,7 +141,7 @@ def main():
     out["unentailedFirst"] = extra[:5]
     if extra:
         out["outcome"] = "unsound"
-    elif report.get("outside", 0) or report.get("rules", 0):
+    elif report.get("outside", 0) or report.get("rules", 0) or report.get("partial"):
         out["outcome"] = "sound"
     else:
         missing = unentailed(want, have)
