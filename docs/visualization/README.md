@@ -359,6 +359,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   read-only, 611. For the same reason the thesaurus editor's notes and members forms are
   read-only on branches other than main when authentication is on. Undo and redo revert commits, which needs write access to the
   whole branch, so a caller whose grants cover some graphs only can edit but not undo.
+* The ontology browser has no pages in the web UI. Its typo-tolerant typeahead runs on
+  the server as the [entity search](../search/README.md#entity-search), and the entity
+  pages, hierarchy and graph views and the browser's search box remain in item 616. The
+  ontology editor's tree filter matches the names it has loaded and does not call the
+  entity search, item 660.
 
 ## Configuration and usage
 
@@ -378,7 +383,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 612](../ROADMAP.md), [item 613](../ROADMAP.md), [item 614](../ROADMAP.md), [item 615](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
+The remaining work described above refers to [item 616](../ROADMAP.md), [item 612](../ROADMAP.md), [item 613](../ROADMAP.md), [item 614](../ROADMAP.md), [item 615](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

@@ -1,0 +1,26 @@
+#!/bin/sh
+# Benchmark the reviewed tip, then run ci.sh --fast, on atlas under the heavy-work lock.
+set -u
+L=$HOME/lanes/browser-search-616
+OUT=$L/out2
+mkdir -p "$OUT"
+cd "$L/wt"
+exec 9>"$HOME/lanes/.heavy.lock"
+echo "waiting for the heavy lock $(date -u +%FT%TZ)"
+flock 9
+echo "lock taken $(date -u +%FT%TZ)"
+git log --oneline -1 > "$OUT/commit.txt"
+systemd-run --user --scope -q -p MemoryMax=12G -p MemorySwapMax=2G -p OOMPolicy=continue -- \
+  mbx build --release -p sparkles --features ontology --example entity_search_bench -j 16 2>&1 | tail -3
+BIN=target/release/examples/entity_search_bench
+sha256sum "$BIN" > "$OUT/binary.sha256"
+{ echo "host: $(hostname)"; lscpu | grep -E "Model name|^CPU\(s\)"; free -m | head -2; uname -r; echo "load before: $(cat /proc/loadavg)"; } > "$OUT/env.txt"
+for o in chebi_lite go; do
+  echo "run $o $(date -u +%FT%TZ)"
+  date -u +%FT%TZ > "$OUT/$o.started"
+  systemd-run --user --scope -q -p MemoryMax=10G -p MemorySwapMax=0 -- \
+    "$BIN" "$L/data/$o.owl" --per-bucket 60 --rounds 5 --seed 1 --commits 50 > "$OUT/$o.json" 2> "$OUT/$o.err"
+  date -u +%FT%TZ > "$OUT/$o.ended"
+done
+echo "load after: $(cat /proc/loadavg)" >> "$OUT/env.txt"
+echo "BENCH DONE $(date -u +%FT%TZ)"

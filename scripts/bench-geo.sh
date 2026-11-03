@@ -35,6 +35,10 @@ SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 SPARKLES_ARGS=${SPARKLES_ARGS:-}
 mkdir -p "$WORK/results" "$WORK/queries"
 WORK=$(cd "$WORK" && pwd)
+# A binary in the managed target runs as a copy, which collection cannot remove.
+# shellcheck source=scripts/bench-tools.sh
+source "$ROOT/scripts/bench-tools.sh"
+SPARKLES=$(stage_binary "$SPARKLES")
 cd "$WORK"
 DB=$WORK/geo.db
 

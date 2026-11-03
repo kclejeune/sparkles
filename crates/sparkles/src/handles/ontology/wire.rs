@@ -12,6 +12,7 @@
 
 use super::classify::{Classified, ClassifyRequest};
 use super::dl_query::{DlAnswers, DlQueryAnswer, DlQueryRequest, DlReasoning};
+use super::search;
 use super::{
     CheckRequest, EditOutcome, EditRequest, OntologyDiff, OntologyRequest, Opened, check_opened,
     parse_axiom_types, parse_profiles, report_json,
@@ -637,7 +638,7 @@ pub fn entity_body(
 // ------------------------------------------------------------- requests ------
 
 /// The operations [`call`] answers, in the names of the bindings' surface keys.
-pub const OPERATIONS: [&str; 11] = [
+pub const OPERATIONS: [&str; 12] = [
     "summary",
     "axioms",
     "entities",
@@ -647,6 +648,7 @@ pub const OPERATIONS: [&str; 11] = [
     "removeEntity",
     "diff",
     "classify",
+    "search",
     "parse",
     "dlQuery",
 ];
@@ -662,6 +664,15 @@ fn members(op: &str) -> &'static [&'static str] {
         "edit" => &["add", "remove", "declare", "target", "message"],
         "removeEntity" => &["iri", "message"],
         "diff" => &["from", "to", "assertions", "limit"],
+        "search" => &[
+            "q",
+            "kind",
+            "lang",
+            "limit",
+            "offset",
+            "fuzzy",
+            "definitions",
+        ],
         "classify" => &[
             "assertions",
             "target",
@@ -840,6 +851,9 @@ fn profiles_of(a: &Map<String, J>) -> Result<Vec<Profile>> {
 /// - `removeEntity`: an edit that removes the entity `iri`.
 /// - `diff`: the diff of `GET /$/ontology/{ds}/diff`, with `from`, `to` (the head by
 ///   default), `assertions` and `limit`.
+/// - `search`: the entities of `GET /$/ontology/{ds}/search` that match `q`, with `kind`
+///   (a list such as `class,property`), `lang` (the caller's languages, most preferred
+///   first), `limit`, `offset`, `fuzzy` and `definitions`.
 /// - `classify`: the OWL 2 EL classification of `POST /$/ontology/{ds}/classify`, with
 ///   `assertions`, `target` and `message` (write the taxonomy to that graph), `about` (a
 ///   class to describe), `nodes` (list the taxonomy's nodes), `limit`, `offset` and
@@ -1046,8 +1060,131 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 limit,
             ))
         }
+        "search" => {
+            let s = search_request_of(a)?;
+            let found = handle.search(&req, &s, opts)?;
+            Ok(search_body(name, &s, &found))
+        }
         _ => unreachable!("checked above"),
     }
+}
+
+/// A comma-separated string or a list of strings, each trimmed, empty ones left out.
+fn list_of(a: &Map<String, J>, k: &str) -> Result<Vec<String>> {
+    let items: Vec<String> = match a.get(k) {
+        None | Some(J::Null) => Vec::new(),
+        Some(J::String(s)) => s.split(',').map(str::to_string).collect(),
+        Some(J::Array(v)) => v
+            .iter()
+            .map(|x| {
+                x.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| bad(format!("{k}: a string or a list of strings")))
+            })
+            .collect::<Result<_>>()?,
+        Some(_) => return Err(bad(format!("{k}: a string or a list of strings"))),
+    };
+    Ok(items
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// The kinds a comma-separated filter such as `class,property` names.
+pub fn parse_search_kinds(names: &[String]) -> Result<Vec<search::Kind>> {
+    let mut out: Vec<search::Kind> = Vec::new();
+    for n in names {
+        let ks = search::Kind::parse_filter(n).ok_or_else(|| {
+            bad(format!(
+                "unknown kind '{n}': {}",
+                search::Kind::ALL.map(|k| k.name()).join(", ")
+            ))
+        })?;
+        out.extend(ks);
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// The search a `search` request names.
+pub fn search_request_of(a: &Map<String, J>) -> Result<search::SearchRequest> {
+    let q = string(a, "q")?.ok_or_else(|| bad("q is the text searched for"))?;
+    let mut s = search::SearchRequest::new(q);
+    s.kinds = parse_search_kinds(&list_of(a, "kind")?)?;
+    s.languages = list_of(a, "lang")?;
+    for l in &s.languages {
+        if oxilangtag::LanguageTag::parse(l.as_str()).is_err() {
+            return Err(bad(format!("lang: '{l}' is not a BCP 47 language tag")));
+        }
+    }
+    s.limit = number(a, "limit", 1, search::MAX_LIMIT)?.unwrap_or(search::DEFAULT_LIMIT);
+    s.offset = number(a, "offset", 0, search::MAX_WINDOW)?.unwrap_or(0);
+    s.fuzzy = boolean(a, "fuzzy")?.unwrap_or(true);
+    s.definitions = boolean(a, "definitions")?.unwrap_or(true);
+    Ok(s)
+}
+
+/// The UTF-16 offset of byte `b` of `s`.
+fn utf16_at(s: &str, b: usize) -> usize {
+    s[..b.min(s.len())].encode_utf16().count()
+}
+
+/// The JSON of one entity a search found, which every list of search results shares:
+/// `type` is `entity`, so a list that mixes it with other kinds of result, such as the
+/// command palette's, tells them apart. The highlight ranges are `[start, end)` pairs in
+/// UTF-16 code units of `match.text`, the offsets of JavaScript and Java strings.
+pub fn search_hit(h: &search::SearchHit) -> J {
+    let m = &h.matched;
+    let highlight: Vec<J> = m
+        .highlight
+        .iter()
+        .map(|r| json!([utf16_at(&m.text, r.start), utf16_at(&m.text, r.end)]))
+        .collect();
+    json!({
+        "type": "entity",
+        "iri": h.iri,
+        "kinds": h.kinds.iter().map(|k| k.name()).collect::<Vec<_>>(),
+        "label": h.label,
+        "labelLang": h.label_lang,
+        "shortForm": h.short_form,
+        "deprecated": h.deprecated,
+        "match": {
+            "field": m.field.name(),
+            "property": m.property,
+            "text": m.text,
+            "lang": m.lang,
+            "kind": m.kind.name(),
+            "distance": m.distance,
+            "tier": m.tier,
+            "highlight": highlight,
+        },
+    })
+}
+
+/// The JSON of a search's answer, as `GET /$/ontology/{ds}/search` answers it.
+pub fn search_body(name: &str, s: &search::SearchRequest, r: &search::SearchResults) -> J {
+    let next = s.offset + r.hits.len();
+    json!({
+        "dataset": name,
+        "commit": r.commit,
+        "graphs": r.graphs.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
+        "imports": r.imports.iter().map(|i| json!({"iri": i.iri, "graph": i.graph})).collect::<Vec<_>>(),
+        "warnings": r.warnings,
+        "query": s.query,
+        "results": r.hits.iter().map(search_hit).collect::<Vec<_>>(),
+        "offset": s.offset,
+        "limit": s.limit,
+        "more": r.more,
+        // a page starts below the window's end
+        "next": if r.more && next < search::MAX_WINDOW { json!(next) } else { J::Null },
+        "index": match r.index {
+            search::IndexUse::Current => "current",
+            search::IndexUse::Updated => "updated",
+            search::IndexUse::Built => "built",
+        },
+    })
 }
 
 /// What the answer of a classification lists besides its counts.

@@ -6,13 +6,13 @@
 #
 # The benchmark is GPL-2.0-only. It is never part of this repository, its releases or its
 # CI: this developer tool clones it at a pinned commit into
-# target/geosparql-benchmark/ (git-ignored) when asked to, and only then. It loads the
+# .artifacts/geosparql-benchmark/ (git-ignored) when asked to, and only then. It loads the
 # benchmark's RDF/XML dataset into a fresh database with the spatial index enabled, runs
 # every query over HTTP, and compares each answer with the expected result files (any of a
 # query's alternatives): solutions as multisets, numbers within a relative 1e-6, geometry
 # literals by their coordinates (scripts/bench-answers.py's normalization). It prints the
 # correct answers and the score per requirement, and writes every answer and comparison
-# under target/geosparql-benchmark/results/.
+# under .artifacts/geosparql-benchmark/results/.
 #
 # Each requirement runs against the configuration of its conformance class. R25 to R30
 # (the RDFS entailment and query rewrite extensions) go to a second database with RDFS
@@ -31,7 +31,7 @@ set -euo pipefail
 if [ "${SPARKLES_ALLOW_GPL_BENCHMARK:-}" != 1 ]; then
   cat >&2 << 'EOF'
 The GeoSPARQL Compliance Benchmark is licensed under GPL-2.0-only. This script downloads
-it into target/geosparql-benchmark/ for a local run and never adds it to the repository.
+it into .artifacts/geosparql-benchmark/ for a local run and never adds it to the repository.
 Set SPARKLES_ALLOW_GPL_BENCHMARK=1 to proceed.
 EOF
   exit 2
@@ -42,10 +42,14 @@ SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 PORT=${PORT:-3942}
 GSB_URL=https://github.com/OpenLinkSoftware/GeoSPARQLBenchmark
 GSB_COMMIT=${GSB_COMMIT:-879e0746e74c1327f74e57366104bcf1a6d63fb1}
-WORK=$ROOT/target/geosparql-benchmark
+WORK=$ROOT/.artifacts/geosparql-benchmark
 SRC=$WORK/src
 RES=$SRC/src/main/resources
 mkdir -p "$WORK"
+# A binary in the managed target runs as a copy, which collection cannot remove.
+# shellcheck source=scripts/bench-tools.sh
+source "$ROOT/scripts/bench-tools.sh"
+SPARKLES=$(stage_binary "$SPARKLES")
 
 if [ ! -d "$SRC/.git" ]; then
   git clone --quiet --filter=blob:none --no-checkout "$GSB_URL" "$SRC"

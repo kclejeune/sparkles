@@ -545,6 +545,9 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op_if!("ontology", "dlQueryOntology", "ontology.dl_query", |ds| {
             let _ = ds.ontology().dl_query(&any(), &any(), &any());
         }),
+        op_if!("ontology", "searchOntology", "ontology.search", |ds| {
+            ds.ontology().search(&any(), &any(), &any());
+        }),
         op_if!("ontology", "diffOntology", "ontology.diff", |ds| {
             ds.ontology().diff(
                 &any(),

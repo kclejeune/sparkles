@@ -372,3 +372,30 @@ def test_manchester_and_dl_query(ds: sparkles.Dataset) -> None:
         answers=["subclasses"],
     )
     assert j["reasoning"]["engine"] == "rl"
+
+
+def test_search_ranks_entities_with_typos() -> None:
+    d = sparkles.Dataset()
+    d.update(
+        f"""{PREFIXES} PREFIX oio: <http://www.geneontology.org/formats/oboInOwl#>
+        INSERT DATA {{
+          :Glucose a owl:Class ; rdfs:label "glucose"@en , "Glukose"@de .
+          :G6P a owl:Class ; rdfs:label "glucose 6-phosphate" .
+          :Sugar a owl:Class ; rdfs:label "sugar" ; oio:hasExactSynonym "saccharide" .
+          :has a owl:ObjectProperty ; rdfs:label "has glucose part" .
+        }}"""
+    )
+    found = d.ontology.search("glucose")
+    assert [r["iri"] for r in found["results"]] == [EX + "Glucose", EX + "G6P", EX + "has"]
+    top = found["results"][0]
+    assert top["type"] == "entity" and top["kinds"] == ["class"]
+    assert top["match"]["kind"] == "exact" and top["match"]["highlight"] == [[0, 7]]
+    assert found["more"] is False
+    # one typo, the caller's language for the label, and a kind filter
+    found = d.ontology.search("glucsoe", kind="class", limit=1)
+    assert found["results"][0]["iri"] == EX + "Glucose"
+    assert found["results"][0]["match"]["distance"] == 1
+    assert found["more"] is True
+    assert d.ontology.search("glucose", lang="de")["results"][0]["label"] == "Glukose"
+    assert d.ontology.search("saccharide")["results"][0]["match"]["field"] == "synonym"
+    assert [r["iri"] for r in d.ontology.search("gluc", kind="property")["results"]] == [EX + "has"]

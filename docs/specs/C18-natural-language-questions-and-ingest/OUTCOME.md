@@ -1911,6 +1911,31 @@ run. The Anthropic spend of $51.72 and the OpenAI spend of $33.95 stand in the l
 OpenAI's reports match its ledger, and the Anthropic ledger awaits reconciliation
 against the Console's usage export.
 
+A further round aimed at Haiku 5.5 and GPT-6 Luna, the cheapest models. The draft
+check's class lookup now writes its terms into the ASK and skips a lookup over a memory
+or row budget, which had failed drafts on DBpedia. A draft gets declarations for
+well-known prefixes it uses without declaring, unless the dataset or query binds them.
+The check's class profile ranks predicates by sampled coverage and rarity, and the
+draft rules ask for only the variables that answer the question. Over three runs of 51
+validation questions the mean rose from 26.0 to 28.7 for Haiku and from 28.7 to 29.7
+for Luna, with no check failure on the memory estimate, no unparsed draft and far fewer
+extra columns. On the held-out set with build `ace00e4b` Opus answers 114, Terra 111,
+Sol 109, Haiku 102 and Luna 101. The cheap models are within the noise of Sol but not of
+Opus with the same build, and they fall short of the 105 that the round aimed for, so
+roadmap item 655 tracks that gap. A library of stored synthetic queries
+raised synthetic scores and lowered QALD ones, so it was not kept. The synthetic sets,
+with executed gold, are published in `testsuite/ask/synth`. The
+[results](../../benchmarks/natural-language/RESULTS.md#ask-on-the-cheapest-models) give
+every run and the [paid record](../../benchmarks/2026-11-02-ask-cheap-tier-paid.json)
+the per-case results and ledgers. The round spent $12.09 on Anthropic models and $9.35
+on OpenAI models. OpenAI's report matches its ledger for every day it had closed when
+it was read, its report for the last day lagged the Sol runs, and the Anthropic spend
+stands in the ledger.
+Effort `high` for Haiku and Luna, three runs each on the validation questions with the
+final build, scored 27.3 and 29.7 against 28.7 and 29.7 at `medium` for 12% to 15% more cost per
+run, so it was not confirmed on the held-out set and effort stays `medium`. The [effort
+record](../../benchmarks/2026-11-03-ask-effort-paid.json) holds the runs.
+
 ### Roadmap follow-ups
 
 #### Agent platform workstream

@@ -2455,6 +2455,7 @@ pub fn rl_inspector(
 
 pub mod classify;
 pub mod dl_query;
+pub mod search;
 pub mod wire;
 
 #[cfg(test)]

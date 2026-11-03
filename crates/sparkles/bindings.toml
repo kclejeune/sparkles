@@ -791,6 +791,11 @@ python = "Dataset.ontology.remove_entity"
 jvm = "SparklesOnt.removeEntity"
 node = "Dataset.ontology.removeEntity"
 
+["ontology.search"]
+python = "Dataset.ontology.search"
+jvm = "SparklesOnt.search"
+node = "Dataset.ontology.search"
+
 ["ontology.summary"]
 python = "Dataset.ontology.summary"
 jvm = "SparklesOnt.summary"

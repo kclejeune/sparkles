@@ -36,7 +36,7 @@ LEDGER_VERSION = 3
 # 50 to 95 and the OpenAI wallet from USD 40 to 50. A ledger's cap is fixed in its
 # header, so each raise closed a ledger and a second one holds what the first did not
 # spend.
-HARD_CAPS = {"anthropic": 95 * 10**9, "openai": 50 * 10**9}
+HARD_CAPS = {"anthropic": 105 * 10**9, "openai": 50 * 10**9}
 HARD_CAP = HARD_CAPS["anthropic"]
 MODELS = ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
 REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024

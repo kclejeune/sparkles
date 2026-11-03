@@ -1009,6 +1009,39 @@ test('the ontology handle lists entities and answers entity accessors', async (t
   await assert.rejects(onto.entity('http://ex.org/nothing'), NotFoundError);
 });
 
+test('the ontology handle searches entities with typos', async (t) => {
+  const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
+  await ds.update(`PREFIX : <http://ex.org/>
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+    INSERT DATA { :Glucose a owl:Class ; rdfs:label "glucose" .
+      :Galactose a owl:Class ; rdfs:label "galactose" .
+      :sweet a skos:Concept ; skos:prefLabel "sweet"@en ; skos:altLabel "sugary"@en . }`);
+  const onto = ds.ontology;
+  const prefix = await onto.search('gluc');
+  assert.equal(prefix.results[0].iri, 'http://ex.org/Glucose');
+  assert.equal(prefix.results[0].type, 'entity');
+  assert.equal(prefix.results[0].match.kind, 'prefix');
+  assert.deepEqual(prefix.results[0].match.highlight, [[0, 4]]);
+  // the commit and the next offset are bigints, the other numbers plain numbers
+  assert.equal(typeof prefix.commit, 'bigint');
+  assert.equal(typeof prefix.offset, 'number');
+  assert.equal(typeof prefix.limit, 'number');
+  assert.equal(typeof prefix.results[0].match.distance, 'number');
+  assert.equal(typeof prefix.results[0].match.tier, 'number');
+  const typo = await onto.search('glucoes');
+  assert.equal(typo.results[0].iri, 'http://ex.org/Glucose');
+  assert.equal(typo.results[0].match.kind, 'fuzzy');
+  const concepts = await onto.search('sugary', { kind: 'concept', lang: ['en'] });
+  assert.deepEqual(
+    concepts.results.map((h) => [h.iri, h.match.field]),
+    [['http://ex.org/sweet', 'synonym']],
+  );
+  const none = await onto.search('gluc', { kind: ['concept'] });
+  assert.deepEqual(none.results, []);
+});
+
 test('owl literals of numbers take XML Schema lexical forms', () => {
   const XSD = 'http://www.w3.org/2001/XMLSchema#';
   assert.deepEqual(owl.Literal(1e21), { '@value': '1' + '0'.repeat(21), '@type': XSD + 'integer' });

@@ -300,6 +300,46 @@ export interface OntologyEntityPage extends OntologyState {
   offset: number;
   next: bigint | null;
 }
+/** One entity an ontology search found, as `GET /$/ontology/{ds}/search` lists it. */
+export interface OntologySearchHit {
+  type: 'entity';
+  iri: string;
+  /** `class`, `objectProperty`, `concept` and the other kinds the search filters by */
+  kinds: string[];
+  label: string | null;
+  labelLang: string | null;
+  shortForm: string | null;
+  deprecated: boolean;
+  match: {
+    /** `label`, `synonym`, `shortForm` or `definition` */
+    field: string;
+    property: string | null;
+    text: string;
+    lang: string | null;
+    /** `exact`, `prefix`, `words` or `fuzzy` */
+    kind: string;
+    distance: number;
+    tier: number;
+    /** `[start, end)` ranges of `text` in UTF-16 code units */
+    highlight: [number, number][];
+  };
+}
+/** One page of an ontology search. */
+export interface OntologySearchPage {
+  dataset: string;
+  commit: bigint;
+  graphs: string[];
+  imports: { iri: string; graph: string | null }[];
+  warnings: string[];
+  query: string;
+  results: OntologySearchHit[];
+  offset: number;
+  limit: number;
+  more: boolean;
+  next: bigint | null;
+  /** `current`, `updated` or `built` */
+  index: string;
+}
 /** An expression of an entity answer: its functional-style form and its JSON form. */
 export interface OntologyExpression {
   ofn: string;
@@ -726,6 +766,40 @@ export class Administration {
             kind: o.kind,
             assertions: o.assertions,
             limit: o.limit,
+          },
+          o,
+          false,
+        ),
+      /**
+       * Search the entities by label, synonym, short form and definition, with typos
+       * tolerated, ranked as `GET /$/ontology/{ds}/search` ranks them. `lang` lists the
+       * preferred languages, most preferred first.
+       */
+      search: (
+        q: string,
+        o: Pick<OntologyRead, 'graph' | 'imports' | 'mode'> &
+          OperationOptions & {
+            kind?: string | string[];
+            lang?: string | string[];
+            limit?: number;
+            offset?: number;
+            fuzzy?: boolean;
+            definitions?: boolean;
+          } = {},
+      ) =>
+        call<OntologySearchPage>(
+          'ontology.search',
+          {
+            graph: o.graph,
+            imports: o.imports,
+            mode: o.mode,
+            q,
+            kind: Array.isArray(o.kind) ? o.kind.join(',') : o.kind,
+            lang: Array.isArray(o.lang) ? o.lang.join(',') : o.lang,
+            limit: o.limit,
+            offset: o.offset,
+            fuzzy: o.fuzzy,
+            definitions: o.definitions,
           },
           o,
           false,

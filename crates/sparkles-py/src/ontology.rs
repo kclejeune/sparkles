@@ -351,6 +351,41 @@ impl PyOntologies {
         answer(py, j, &[])
     }
 
+    /// The entities whose labels, synonyms, short forms, IRIs or definitions match `q`,
+    /// ranked for a typeahead with typo tolerance, as `GET /$/ontology/{ds}/search`
+    /// answers: a dict whose `results` each have the `iri`, `kinds`, `label`,
+    /// `shortForm`, `deprecated` and the `match` with its field, text and highlight, and
+    /// whose `more` says whether more follow. `kind` keeps some kinds, such as `class` or
+    /// `property`, and `lang` names the caller's languages, most preferred first.
+    #[pyo3(signature=(q, graph=None, *, kind=None, lang=None, limit=10, offset=0, fuzzy=true, definitions=true, imports=true, cancel=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn search<'py>(
+        &self,
+        py: Python<'py>,
+        q: &str,
+        graph: Option<&Bound<'py, PyAny>>,
+        kind: Option<&Bound<'py, PyAny>>,
+        lang: Option<&Bound<'py, PyAny>>,
+        limit: usize,
+        offset: usize,
+        fuzzy: bool,
+        definitions: bool,
+        imports: bool,
+        cancel: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut a = base(graph, imports, "lenient", false)?;
+        a.insert("q".into(), json!(q));
+        a.insert("kind".into(), names_json(kind)?);
+        a.insert("lang".into(), names_json(lang)?);
+        a.insert("limit".into(), json!(limit));
+        a.insert("offset".into(), json!(offset));
+        a.insert("fuzzy".into(), json!(fuzzy));
+        a.insert("definitions".into(), json!(definitions));
+        let j = self.run(py, "search", a, cancel, timeout, false)?;
+        answer(py, j, &[])
+    }
+
     /// What the ontology says about the entity `iri`: its `kinds`, `labels` and
     /// `annotations`, and for each kind a dict of its accessors, such as `superClasses`
     /// under `class` or `domains` under `objectProperty`. Each expression is a dict with

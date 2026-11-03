@@ -296,6 +296,10 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   iterable in batches. `SparklesOnt.model` runs Jena's `jena-ontapi` over a Sparkles
   graph that one native read copies into memory, with writes sent to the graph in the
   caller's transaction.
+* `GET /$/ontology/{ds}/search?q=` finds entities by label, synonym, short form and
+  definition with typos tolerated, ranked for a typeahead, and the bindings' ontology
+  handles call it as `search`. The [search guide](../search/README.md#entity-search)
+  describes its matching, ranking and index.
 * `GET /$/ontology/{ds}/diff?from=&to=` lists the axioms that differ between two
   commits, with the graph of each, as JSON or as `+` and `-` lines. The terminology of
   each state is read as the summary reads it and the two axiom sets are compared. With
