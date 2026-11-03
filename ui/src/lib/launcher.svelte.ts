@@ -5,7 +5,10 @@
 // This is the extension point of the command palette (ROADMAP item 631): a page or a
 // feature registers a provider for as long as it is mounted, and the bar shows its items
 // beside the others, in `order`. The shell registers one provider of its own, the entity
-// search of `GET /$/ontology/{ds}/search` (lib/entity-search.ts).
+// search of `GET /$/ontology/{ds}/search` (lib/entity-search.ts), and the palette's own
+// sources and commands (lib/palette.svelte.ts).
+
+import { onMount } from 'svelte';
 
 /** One row of the launcher's list. */
 export interface LauncherItem {
@@ -19,14 +22,64 @@ export interface LauncherItem {
   tag?: string;
   /** Where Enter or a click goes. */
   href?: string;
-  /** What Enter or a click does when there is no `href`. */
-  run?: () => void;
+  /**
+   * What Enter or a click does when there is no `href`. The focus goes back to where it was
+   * before the launcher opened, then `run` is called, so a dialog it opens takes the focus.
+   */
+  run?: () => void | Promise<void>;
+  /** What Enter or a click writes into the field instead, such as `#` to list datasets. */
+  query?: string;
+  /** A key the item answers to elsewhere, such as `Mod+Enter`; shown, not bound here. */
+  shortcut?: string;
+  /** An icon name of `Icon.svelte`, shown before the title. */
+  icon?: string;
+}
+
+/** The prefixes that show one kind of item only. */
+export type LauncherMode = '>' | '@' | '#' | '?';
+
+export const MODES: { mode: LauncherMode | null; label: string; title: string }[] = [
+  { mode: null, label: 'All', title: 'Everything' },
+  { mode: '>', label: 'Commands', title: 'Commands and pages' },
+  { mode: '@', label: 'Entities', title: 'Classes, properties, individuals and concepts' },
+  { mode: '#', label: 'Datasets', title: 'Datasets and branches' },
+  { mode: '?', label: 'Saved', title: 'Saved queries' },
+];
+
+/** The mode prefix of what was typed into the field, and the query after it. */
+export function parseMode(raw: string): { mode: LauncherMode | null; query: string } {
+  const t = raw.trimStart();
+  const c = t[0];
+  if (c === '>' || c === '@' || c === '#' || c === '?')
+    return { mode: c, query: t.slice(1).trim() };
+  return { mode: null, query: t.trim() };
+}
+
+/** A recent pick as it is remembered: enough to show it and to find it again. */
+export interface RecentEntry {
+  provider: string;
+  id: string;
+  title: string;
+  subtitle?: string;
+  tag?: string;
+  icon?: string;
+  href?: string;
+  /** The dataset that was open, for items that belong to one. */
+  ds: string | null;
+  at: number;
 }
 
 export interface LauncherContext {
   /** The dataset the UI has open, or null. */
   ds: string | null;
   signal: AbortSignal;
+  /**
+   * The mode the field is in. In a provider's own mode an empty query lists all of its items;
+   * outside it an empty query may answer suggestions or nothing.
+   */
+  mode?: LauncherMode | null;
+  /** The ids of this provider's recent picks, newest first, for a tie-break in ranking. */
+  recent?: ReadonlySet<string>;
 }
 
 export interface LauncherProvider {
@@ -39,6 +92,40 @@ export interface LauncherProvider {
   active?: (ctx: { ds: string | null }) => boolean;
   /** Items for `query`; an empty query may answer recent or suggested items. */
   search(query: string, ctx: LauncherContext): Promise<LauncherItem[]>;
+  /** The mode prefixes that show this provider; outside a mode, every provider shows. */
+  modes?: LauncherMode[];
+  /**
+   * Reads the state the provider's items come from, so that an open launcher asks again when
+   * it changes, such as a branch list that arrives after the launcher opened.
+   */
+  watch?: () => unknown;
+  /** Whether a pick is remembered among the recent items (default true). */
+  recent?: boolean;
+  /** Whether a recent pick belongs to the dataset open then (default true). */
+  perDataset?: boolean;
+  /**
+   * The item of a recent pick, or null when it no longer applies. Without this a pick with
+   * an `href` opens it again and any other is not shown.
+   */
+  revive?(entry: RecentEntry, ctx: { ds: string | null }): LauncherItem | null;
+}
+
+/** A command a page or the shell offers in the palette. */
+export interface LauncherCommand {
+  /** Stable across visits, such as `query.run`: recent picks find the command by it. */
+  id: string;
+  label: string;
+  /** "This page" for a page's commands, "Commands" for the shell's; default `page`. */
+  group?: 'page' | 'global';
+  icon?: string;
+  shortcut?: string;
+  /** More words the command answers to, matched at the start of a word. */
+  keywords?: string[];
+  subtitle?: string;
+  /** Whether the command applies now; read each time the palette searches. */
+  active?: () => boolean;
+  /** Runs the command. A string sets the field instead, such as `#` to list datasets. */
+  run: (() => void | Promise<void>) | { query: string };
 }
 
 export interface LauncherGroup {
@@ -46,6 +133,8 @@ export interface LauncherGroup {
   label: string;
   items: LauncherItem[];
   error?: string;
+  /** For the recent picks: the provider each item came from. */
+  from?: string[];
 }
 
 class LauncherState {
@@ -53,6 +142,8 @@ class LauncherState {
   open = $state(false);
   query = $state('');
   #providers = $state<LauncherProvider[]>([]);
+  #commands = $state<LauncherCommand[]>([]);
+  #pageSearch = $state<(() => boolean | void) | null>(null);
   #focus: (() => void) | null = null;
 
   get providers(): readonly LauncherProvider[] {
@@ -67,6 +158,55 @@ class LauncherState {
     return () => {
       this.#providers = this.#providers.filter((x) => x !== p);
     };
+  }
+
+  get commands(): readonly LauncherCommand[] {
+    return this.#commands;
+  }
+
+  /**
+   * Adds commands; the returned function removes them again. A command whose id is already
+   * registered replaces the earlier one, as a page that mounts again does.
+   */
+  command(cmds: LauncherCommand | LauncherCommand[]): () => void {
+    const list = Array.isArray(cmds) ? cmds : [cmds];
+    const ids = new Set(list.map((c) => c.id));
+    this.#commands = [...this.#commands.filter((c) => !ids.has(c.id)), ...list];
+    return () => {
+      this.#commands = this.#commands.filter((c) => !list.includes(c));
+    };
+  }
+
+  /** The commands that apply now, in the order they were registered. */
+  activeCommands(): LauncherCommand[] {
+    return this.#commands.filter((c) => {
+      try {
+        return !c.active || c.active();
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  /**
+   * A page's own search field, which `/` focuses instead of opening the launcher. `focus`
+   * returns false when the field is not showing, and `/` then opens the launcher. The
+   * returned function removes it again.
+   */
+  pageSearch(focus: () => boolean | void): () => void {
+    this.#pageSearch = focus;
+    return () => {
+      if (this.#pageSearch === focus) this.#pageSearch = null;
+    };
+  }
+
+  /** Focuses the page's own search; false when the page has none. */
+  focusPageSearch(): boolean {
+    return !!this.#pageSearch && this.#pageSearch() !== false;
+  }
+
+  get hasPageSearch(): boolean {
+    return this.#pageSearch != null;
   }
 
   /** The top bar binds the function that focuses its field. */
@@ -87,6 +227,40 @@ class LauncherState {
 
 export const launcher = new LauncherState();
 
+/**
+ * Registers a component's commands while it is mounted. Call it during the component's
+ * initialization; `active` predicates keep the commands current as the page's state changes.
+ */
+export function useCommands(cmds: () => LauncherCommand[]) {
+  onMount(() => launcher.command(cmds()));
+}
+
+/** Registers a component's provider while it is mounted. */
+export function useProvider(p: LauncherProvider) {
+  onMount(() => launcher.register(p));
+}
+
+/** Makes `/` focus a component's own search field while it is mounted. */
+export function usePageSearch(focus: () => boolean | void) {
+  onMount(() => launcher.pageSearch(focus));
+}
+
+const KEY_NAMES: Record<string, [mac: string, other: string]> = {
+  mod: ['⌘', 'Ctrl'],
+  ctrl: ['⌃', 'Ctrl'],
+  alt: ['⌥', 'Alt'],
+  shift: ['⇧', 'Shift'],
+  enter: ['↵', 'Enter'],
+};
+
+/** The keys of a shortcut such as `Shift+Alt+F` as the platform names them. */
+export function shortcutKeys(shortcut: string, mac: boolean): string[] {
+  return shortcut.split('+').map((k) => {
+    const n = KEY_NAMES[k.toLowerCase()];
+    return n ? n[mac ? 0 : 1] : k.length === 1 ? k.toUpperCase() : k;
+  });
+}
+
 /** Whether `e` happened in a place where `/` types a character. */
 export function isTypingTarget(target: EventTarget | null): boolean {
   const t = target as Partial<HTMLInputElement> | null;
@@ -106,7 +280,15 @@ type KeyLike = Pick<
   'key' | 'ctrlKey' | 'metaKey' | 'altKey' | 'shiftKey' | 'defaultPrevented' | 'target'
 >;
 
-/** Whether `e` is the launcher's key: Ctrl+K or Cmd+K, or `/` outside a text field. */
+/** Whether `e` is Ctrl+K or Cmd+K, which always opens the launcher. */
+export function isPaletteKey(e: KeyLike): boolean {
+  return (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'k';
+}
+
+/**
+ * Whether `e` is the launcher's key: Ctrl+K or Cmd+K, or `/` outside a text field. On a page
+ * with its own search (`launcher.pageSearch`), `/` focuses that one instead.
+ */
 export function isLauncherKey(e: KeyLike): boolean {
   if (e.defaultPrevented && e.key === '/') return false;
   if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'k')
