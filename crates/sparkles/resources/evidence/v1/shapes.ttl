@@ -227,6 +227,7 @@ ev:ResolutionMapShape a sh:NodeShape ;
   sh:property [ sh:path ev:decisionsProtection ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
   sh:property [ sh:path ev:mapsProtection ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
   sh:property [ sh:path ev:outputProtection ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ev:boundaryProtection ; sh:datatype xsd:string ; sh:pattern "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} [^ ]+$" ] ;
   sh:message "Evidence profile version 1 requires the documented record structure." .
 
 ev:IdentityProposalShape a sh:NodeShape ;

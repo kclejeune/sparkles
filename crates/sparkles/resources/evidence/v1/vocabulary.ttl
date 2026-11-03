@@ -104,6 +104,7 @@ ev:adds a rdf:Property ; rdfs:comment "An accepted identity decision that a reso
 ev:ends a rdf:Property ; rdfs:comment "An accepted identity decision whose effect a resolution map revision ends." .
 ev:resolvesTo a rdf:Property ; rdfs:comment "The entity a current resolution map selects for an entity; it is not owl:sameAs." .
 ev:mapsProtection a rdf:Property ; rdfs:comment "The protection nonce of the maps graph when a resolution map revision was written." .
+ev:boundaryProtection a rdf:Property ; rdfs:comment "The protection nonce and IRI of an identity graph of the boundary whose proposals a resolution map revision was built from." .
 ev:Reported a rdfs:Resource ; rdfs:comment "The proposition was reported by its attributed source." .
 ev:Observation a rdfs:Resource ; rdfs:comment "The attributed author describes an observation." .
 ev:Hypothesis a rdfs:Resource ; rdfs:comment "The proposition is proposed for investigation." .

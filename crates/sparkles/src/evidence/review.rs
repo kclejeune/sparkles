@@ -259,15 +259,20 @@ impl State<'_> {
     /// Refuse as `key`'s unavailable target unless every triple of `s` in `g` is in the
     /// caller's view, which hides none when its access has no triple protections.
     fn visible(&mut self, key: &str, s: &NamedNode, g: &NamedNode) -> Result<()> {
-        let Some(seen) = self.seen.as_mut() else {
-            return Ok(());
-        };
-        const LIMIT: usize = 1 << 20;
-        let all = self.reads.subject_triples(s.as_str(), g.as_str(), LIMIT)?;
-        if seen.subject_triples(s.as_str(), g.as_str(), LIMIT)? != all {
+        if self.masked(s, g)? {
             return Err(unavailable(key));
         }
         Ok(())
+    }
+
+    /// Whether the caller's view hides a triple of `s` in `g`.
+    fn masked(&mut self, s: &NamedNode, g: &NamedNode) -> Result<bool> {
+        let Some(seen) = self.seen.as_mut() else {
+            return Ok(false);
+        };
+        const LIMIT: usize = 1 << 20;
+        let all = self.reads.subject_triples(s.as_str(), g.as_str(), LIMIT)?;
+        Ok(seen.subject_triples(s.as_str(), g.as_str(), LIMIT)? != all)
     }
 
     fn iri(&mut self, s: &NamedNode, p: &str, g: &G) -> Result<Option<NamedNode>> {

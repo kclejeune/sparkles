@@ -385,9 +385,13 @@ decisions a map follows writes an immutable `ev:ResolutionMap` revision with the
 decisions it added and ended. The review answer adds `mapRevision` and `changed.map`
 with the entities whose selected entity changed. `POST /{ds}/claims/identities` and
 `sparkles::evidence::resolve_entities` read the current map, and `capabilities.claims`
-lists the route. Evidence links and assessments may target identity proposals. The
-vocabulary and shapes add `ev:preferredEntity`, `ev:ResolutionMap`, `ev:mapRevision`,
-`ev:adds`, `ev:ends`, `ev:resolvesTo` and `ev:mapsProtection`.
+lists the route. Evidence links and assessments may target identity proposals. A
+revision records the identity graphs of the boundary it was built from, and a map one of
+them has left, or whose graph was protected again, answers `projection-unavailable`.
+Identity reviews need read grants on every identity graph of the boundary, and one
+operation retains at most 64 MiB of entity identifiers. The vocabulary and shapes add
+`ev:preferredEntity`, `ev:ResolutionMap`, `ev:mapRevision`, `ev:adds`, `ev:ends`,
+`ev:resolvesTo`, `ev:mapsProtection` and `ev:boundaryProtection`.
 
 Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
 and `owl:sameAs` with closure operators instead of joins, and derives the same facts.

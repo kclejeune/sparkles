@@ -41,8 +41,8 @@ use crate::task::Control;
 use crate::{Catalog, Dataset, Error, Result};
 use oxrdf::{GraphName, NamedNode, Quad, Term, Triple};
 use sparkles_core::evidence::review::{
-    self as rv, Batch, DecisionInput, Disposition, MAP_NONCE_PREDICATES, MAX_DECISIONS,
-    MAX_EVIDENCE, MapNonces, MapRevision,
+    self as rv, BOUNDARY_PROTECTION, Batch, DecisionInput, Disposition, MAP_NONCE_PREDICATES,
+    MAX_DECISIONS, MAX_EVIDENCE, MapNonces, MapRevision,
 };
 use sparkles_core::evidence::write::{ExistingRecord, Reads, operation_iri};
 use sparkles_core::evidence::{IdentityRelation, MatchingPolicy, RecordKind, Settings};
@@ -61,6 +61,10 @@ pub const RESOLVES_TO: &str = "urn:x-sparkles:evidence:resolvesTo";
 pub const MAX_RESOLVE: usize = 100;
 /// The most members of one cluster a resolution read lists.
 pub const MAX_MEMBERS: usize = 1000;
+/// The most IRI bytes one operation retains for the proposals and clusters it reads.
+pub const RETAINED_BYTES: usize = 64 << 20;
+/// The most boundary protections a map revision records.
+const MAX_BOUNDARY: usize = 4096;
 
 /// One matching policy's graphs and their current nonces.
 pub(super) struct MapGraphs {
@@ -107,6 +111,17 @@ impl MapGraphs {
             boundary,
             proposals,
         })
+    }
+
+    /// The protected identity graphs of the boundary with their nonces, sorted.
+    fn boundary_protections(&self) -> Vec<(NamedNode, Uuid)> {
+        let mut out: Vec<(NamedNode, Uuid)> = self
+            .proposals
+            .iter()
+            .filter_map(|(g, n)| n.map(|n| (g.clone(), n)))
+            .collect();
+        out.sort();
+        out
     }
 
     fn nonces(&self) -> Option<MapNonces> {
@@ -203,6 +218,28 @@ fn latest(
     if !now.is_some_and(|n| recorded.iter().zip(n).all(|(a, b)| *a == Some(b))) {
         return Err(projection_unavailable(&m.name));
     }
+    // Every identity graph the map was built from must still be in the boundary under
+    // the same protection, or matches the map follows would no longer be read. A graph
+    // added to the boundary since holds no proposal the policy accepted.
+    let current: BTreeSet<String> = m
+        .boundary_protections()
+        .iter()
+        .map(|(g, n)| rv::boundary_protection(g, *n))
+        .collect();
+    let (built, more) = state.reads.objects_up_to(
+        lo_iri.as_str(),
+        BOUNDARY_PROTECTION,
+        m.maps.0.as_str(),
+        MAX_BOUNDARY,
+    )?;
+    if more
+        || !built.iter().all(|t| match t {
+            Term::Literal(l) => current.contains(l.value()),
+            _ => false,
+        })
+    {
+        return Err(projection_unavailable(&m.name));
+    }
     Ok(Some(Latest {
         iri: lo_iri,
         number: lo,
@@ -291,9 +328,33 @@ struct Clusters<'m> {
     /// Each proposal's effect in each state.
     effective: BTreeMap<(NamedNode, bool), bool>,
     visits: [usize; 2],
+    /// The IRI bytes retained for facts and clusters, at most `limit`.
+    bytes: usize,
+    limit: usize,
 }
 
-impl Clusters<'_> {
+impl<'m> Clusters<'m> {
+    fn new(m: &'m MapGraphs, batch: BTreeMap<NamedNode, Disposition>) -> Self {
+        Clusters {
+            m,
+            batch,
+            facts: BTreeMap::new(),
+            effective: BTreeMap::new(),
+            visits: [0, 0],
+            bytes: 0,
+            limit: RETAINED_BYTES,
+        }
+    }
+
+    /// Charge `n` retained bytes against the operation's allowance.
+    fn retain(&mut self, n: usize) -> Result<()> {
+        self.bytes = self.bytes.saturating_add(n);
+        if self.bytes > self.limit {
+            return Err(incomplete("the identifiers of the clusters"));
+        }
+        Ok(())
+    }
+
     fn charge(&mut self, when: When) -> Result<()> {
         let i = usize::from(when == When::After);
         self.visits[i] += 1;
@@ -303,30 +364,56 @@ impl Clusters<'_> {
         Ok(())
     }
 
-    /// The authenticated proposals that name `e`, with their graphs.
+    /// The effective proposals that name `e` in `when`, after `used` accepted each.
+    ///
+    /// Candidates are resolved in order before a bound is reported, so a record the
+    /// caller cannot read is refused, or left out, before any count that includes it.
+    /// A proposal the caller's view masks is left out without being charged when it is
+    /// not effective, and an effective one is refused by `used`. Only the facts of
+    /// effective proposals are kept.
     fn naming(
         &mut self,
         state: &mut State<'_>,
         e: &NamedNode,
         when: When,
+        used: &mut dyn FnMut(&mut State<'_>, &NamedNode, &G) -> Result<()>,
     ) -> Result<Vec<NamedNode>> {
         let mut out = Vec::new();
         for g in self.m.proposals.clone() {
             let (candidates, more) =
                 state.candidates(&ev("entity"), &Term::NamedNode(e.clone()), &g)?;
-            if more {
-                return Err(incomplete("the proposals of an entity"));
-            }
             for p in candidates {
-                self.charge(when)?;
-                if !self.facts.contains_key(&p) {
-                    if !state.typed(&p, &g, RecordKind::IdentityProposal)? {
+                let known = self.facts.contains_key(&p);
+                if !known && !state.typed(&p, &g, RecordKind::IdentityProposal)? {
+                    continue;
+                }
+                if !self.is_effective(state, &p, when)? {
+                    if !state.masked(&p, &g.0)? {
+                        self.charge(when)?;
+                    }
+                    continue;
+                }
+                if !known {
+                    let f = facts(state, &p, &g)?;
+                    if f.relation.is_none() {
                         continue;
                     }
-                    let f = facts(state, &p, &g)?;
+                    used(state, &p, &g)?;
+                    let n = f
+                        .entities
+                        .iter()
+                        .chain(&f.preferred)
+                        .map(|x| x.as_str().len());
+                    self.retain(n.sum())?;
                     self.facts.insert(p.clone(), (g.clone(), f));
+                } else {
+                    used(state, &p, &g)?;
                 }
+                self.charge(when)?;
                 out.push(p);
+            }
+            if more {
+                return Err(incomplete("the proposals of an entity"));
             }
         }
         Ok(out)
@@ -384,26 +471,24 @@ impl Clusters<'_> {
         let mut queue = VecDeque::from([seed.clone()]);
         while let Some(e) = queue.pop_front() {
             self.charge(when)?;
-            for p in self.naming(state, &e, when)? {
+            for p in self.naming(state, &e, when, used)? {
                 if c.matches.contains(&p) || c.distincts.contains(&p) {
                     continue;
                 }
-                let Some((g, f)) = self.facts.get(&p).cloned() else {
+                let Some((_, f)) = self.facts.get(&p).cloned() else {
                     continue;
                 };
                 let Some(relation) = f.relation else {
                     continue;
                 };
-                if !self.is_effective(state, &p, when)? {
-                    continue;
-                }
-                used(state, &p, &g)?;
                 match relation {
                     IdentityRelation::PossibleMatch => {
                         c.matches.insert(p);
                         c.preferred.extend(f.preferred.clone());
                         for x in f.entities {
-                            if c.entities.insert(x.clone()) {
+                            if !c.entities.contains(&x) {
+                                self.retain(x.as_str().len())?;
+                                c.entities.insert(x.clone());
                                 queue.push_back(x);
                             }
                         }
@@ -474,6 +559,11 @@ pub(super) fn review(
     }
     let capability = capability(logical, operation, r.settings_bytes)?;
     let m = MapGraphs::new(r.name, r.policy, r.settings, &|g| capability.protection(g))?;
+    // The clusters are read from every identity graph of the boundary, so the caller
+    // must be able to read each of them, as for the resolution read.
+    for (g, _) in &m.proposals {
+        readable(access.as_ref(), g)?;
+    }
     let nonces = m.protected()?;
     let store = logical.store();
     let branch = store.branch_id();
@@ -645,16 +735,13 @@ pub(super) fn review(
         .iter()
         .filter_map(|d| d.supersedes.clone())
         .collect();
-    let mut clusters = Clusters {
-        m: &m,
-        batch: decisions
+    let mut clusters = Clusters::new(
+        &m,
+        decisions
             .iter()
             .map(|d| (d.target.clone(), d.disposition))
             .collect(),
-        facts: BTreeMap::new(),
-        effective: BTreeMap::new(),
-        visits: [0, 0],
-    };
+    );
     let mut changes = Vec::new();
     let mut changed = Changed::default();
     if !adds.is_empty() || !ends.is_empty() {
@@ -799,6 +886,7 @@ pub(super) fn review(
                 adds: &adds,
                 ends: &ends,
                 nonces,
+                boundary: &m.boundary_protections(),
             },
             &m.maps.0,
             control,
@@ -962,13 +1050,9 @@ pub fn resolve(
         withdrawn: BTreeSet::new(),
     };
     let latest = latest(&mut state, main.dataset_id(), &m, control)?;
-    let mut clusters = Clusters {
-        m: &m,
-        batch: BTreeMap::new(),
-        facts: BTreeMap::new(),
-        effective: BTreeMap::new(),
-        visits: [0, 0],
-    };
+    let mut clusters = Clusters::new(&m, BTreeMap::new());
+    // The decisions of each cluster, read once for every requested member.
+    let mut joined: BTreeMap<NamedNode, Vec<NamedNode>> = BTreeMap::new();
     let mut out = Vec::with_capacity(entities.len());
     for e in entities {
         control.check()?;
@@ -998,12 +1082,19 @@ pub fn resolve(
             v.sort();
             (v, !more)
         };
-        let mut decisions = BTreeSet::new();
+        let mut decisions = Vec::new();
         if members.len() > 1 {
-            let c = clusters.cluster(&mut state, e, When::Before, &mut |_, _, _| Ok(()))?;
-            for p in &c.matches {
-                let current = state.current(p, &m.policy_iri, &m.decisions)?;
-                decisions.extend(current);
+            if let Some(d) = joined.get(&representative) {
+                decisions = d.clone();
+            } else {
+                let c = clusters.cluster(&mut state, e, When::Before, &mut |_, _, _| Ok(()))?;
+                let mut found = BTreeSet::new();
+                for p in &c.matches {
+                    let current = state.current(p, &m.policy_iri, &m.decisions)?;
+                    found.extend(current);
+                }
+                decisions = found.into_iter().collect();
+                joined.insert(representative.clone(), decisions.clone());
             }
         }
         out.push(ResolvedEntity {
@@ -1011,7 +1102,7 @@ pub fn resolve(
             representative,
             members,
             members_complete: complete,
-            decisions: decisions.into_iter().collect(),
+            decisions,
         });
     }
     Ok(EntityResolution {
@@ -1021,4 +1112,31 @@ pub fn resolve(
         commit: head.commit,
         entities: out,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_identifiers_are_bounded() {
+        let g = |s: &str| (NamedNode::new_unchecked(s), None);
+        let m = MapGraphs {
+            name: "people".into(),
+            policy_iri: rv::policy_iri("people"),
+            version: 1,
+            decisions: g("urn:d"),
+            maps: g("urn:m"),
+            output: g("urn:o"),
+            boundary: Vec::new(),
+            proposals: Vec::new(),
+        };
+        let mut c = Clusters::new(&m, BTreeMap::new());
+        assert_eq!(c.limit, RETAINED_BYTES);
+        c.limit = 100;
+        c.retain(60).unwrap();
+        c.retain(40).unwrap();
+        let e = c.retain(1).unwrap_err();
+        assert_eq!(e.code(), "incomplete-evidence");
+    }
 }

@@ -1157,11 +1157,18 @@ acceptance or supersedes one, it writes an immutable `ev:ResolutionMap` record i
 maps graph, minted in the policy's namespace from its number. The record names the
 policy, its version, `ev:mapRevision`, `prov:wasRevisionOf` the revision before it,
 the output graph, `ev:adds` for each acceptance that became effective, `ev:ends` for
-each accepted decision it superseded, and the protection nonces of the decisions, maps
-and output graphs. The latest revision is found by galloping and binary search over the
-minted identities. A revision that does not authenticate, a latest revision under other
-nonces than the current ones, and an output that holds triples while no revision exists
-answer `projection-unavailable`. A split is a superseding rejection, and accepting the
+each accepted decision it superseded, the protection nonces of the decisions, maps
+and output graphs, and an `ev:boundaryProtection` literal of nonce and IRI for each
+protected identity graph of the boundary. The latest revision is found by galloping and
+binary search over the minted identities. A revision that does not authenticate, a
+latest revision under other nonces than the current ones, a latest revision built from
+an identity graph that has left the boundary or carries another nonce, and an output
+that holds triples while no revision exists answer `projection-unavailable`. The
+clusters before an operation are recomputed from the boundary, so a map whose matches
+are no longer read would otherwise keep stale triples for entities the operation does
+not reach. A graph added to the boundary is accepted, since no proposal in it was
+accepted under the policy while the map was built. Rebuilding a map after a boundary
+change is roadmap item NEW-ITEM-1. A split is a superseding rejection, and accepting the
 match again restores the earlier map. Proposals, decisions and earlier revisions are
 never edited, and the output graph's history serves the map of any retained commit.
 `Changed::map` and the answer's `changed.map` name the policy, the new revision and its
@@ -1170,12 +1177,17 @@ changed, and `mapRevision` is answered on a replay as well. These are the change
 that F22 needs to find the consumers of the earlier revision.
 
 A review under a matching policy needs update and read grants on its decisions, maps
-and output graphs and read access to each target. An acceptance also needs read access
-to the target's evidence links in the boundary, as for claims, and every review that
-changes the map needs read access to each effective proposal of the clusters it reads
-in either state. A hidden one answers as the decision's target being unavailable, byte
-for byte. One operation visits at most 10,000 entities and proposals in each state,
-beyond which it answers `incomplete-evidence`.
+and output graphs, read grants on every identity graph of its boundary and read access
+to each target. An acceptance also needs read access to the target's evidence links in
+the boundary, as for claims, and every review that changes the map needs read access to
+each effective proposal of the clusters it reads in either state. One whose triples the
+caller's view hides answers as the decision's target being unavailable, byte for byte.
+Candidates are resolved in order before a bound is reported, and a hidden proposal that
+no decision accepts is left out without being counted, so a refusal never reports a
+count that includes a record the caller cannot read. One operation visits at most
+10,000 entities and proposals in each state and retains at most 64 MiB of their
+identifiers, beyond which it answers `incomplete-evidence`. A resolution read computes
+each cluster once, however many of its members the request names.
 
 `sparkles::evidence::resolve_entities` and `POST /{ds}/claims/identities` read the map
 at the head of a branch. They need read grants on the policy's decisions, maps and
@@ -1185,8 +1197,8 @@ through the query endpoint. Each of 1 to 100 entities answers its representative
 join its cluster. An entity the map does not name resolves to itself. Queries join the
 output graph explicitly and are never rewritten through a map, so the query path is
 unchanged. The vocabulary and shapes add `ev:preferredEntity`, `ev:ResolutionMap`,
-`ev:mapRevision`, `ev:adds`, `ev:ends`, `ev:resolvesTo` and `ev:mapsProtection`, and
-`GET /$/server` lists the route as `capabilities.claims.identities`.
+`ev:mapRevision`, `ev:adds`, `ev:ends`, `ev:resolvesTo`, `ev:mapsProtection` and
+`ev:boundaryProtection`, and `GET /$/server` lists the route as `capabilities.claims.identities`.
 
 Tests state the expected maps independently and cover merges, transitive merges, a
 split and the exact restoration of the earlier map, the revision chain, representatives

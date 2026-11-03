@@ -325,6 +325,16 @@ pub const NONCE_PREDICATES: [&str; 3] = [
     "urn:x-sparkles:evidence:outputProtection",
 ];
 
+/// The predicate of a resolution map revision's boundary protections. Each value is
+/// the literal `"<nonce> <graph IRI>"` of one protected identity graph of the policy's
+/// boundary when the revision was written.
+pub const BOUNDARY_PROTECTION: &str = "urn:x-sparkles:evidence:boundaryProtection";
+
+/// The value of [`BOUNDARY_PROTECTION`] for `graph` under `nonce`.
+pub fn boundary_protection(graph: &NamedNode, nonce: Uuid) -> String {
+    format!("{nonce} {}", graph.as_str())
+}
+
 /// The projection record of `policy` at `version` in its supports graph `graph`. Its
 /// identity is minted in the policy's own namespace from the version, so every
 /// reviewer of that version finds the same record.
@@ -422,6 +432,9 @@ pub struct MapRevision<'a> {
     /// operation supersedes them.
     pub ends: &'a [NamedNode],
     pub nonces: MapNonces,
+    /// The protected identity graphs of the policy's boundary and their nonces, whose
+    /// proposals the map was built from.
+    pub boundary: &'a [(NamedNode, Uuid)],
 }
 
 /// Revision `m.number` of a matching policy's resolution map, in its maps graph
@@ -454,6 +467,12 @@ pub fn map_record(
             .zip([m.nonces.decisions, m.nonces.maps, m.nonces.output])
     {
         r.add(NamedNode::new_unchecked(*p), string(&n.to_string()));
+    }
+    for (g, n) in m.boundary {
+        r.add(
+            NamedNode::new_unchecked(BOUNDARY_PROTECTION),
+            string(&boundary_protection(g, *n)),
+        );
     }
     planned("map", RecordKind::ResolutionMap, r, graph, control)
 }

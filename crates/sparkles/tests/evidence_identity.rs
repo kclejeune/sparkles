@@ -45,6 +45,10 @@ fn code<T: std::fmt::Debug>(r: sparkles::Result<T>) -> String {
 }
 
 fn settings(version: u32) -> Settings {
+    settings_with(version, &[IDENTITY, HIDDEN, SOURCES, CLAIMS])
+}
+
+fn settings_with(version: u32, boundary: &[&str]) -> Settings {
     Settings {
         enabled: true,
         source_records: vec![SOURCES.into()],
@@ -56,12 +60,7 @@ fn settings(version: u32) -> Settings {
             "people".to_string(),
             MatchingPolicy {
                 version,
-                boundary: vec![
-                    IDENTITY.into(),
-                    HIDDEN.into(),
-                    SOURCES.into(),
-                    CLAIMS.into(),
-                ],
+                boundary: boundary.iter().map(|g| g.to_string()).collect(),
                 decisions: DECISIONS.into(),
                 maps: MAPS.into(),
                 output: MAP.into(),
@@ -587,45 +586,113 @@ fn an_interrupted_review_publishes_nothing() {
     assert_eq!(map(&ds), pairs(&["a a", "b a"]));
 }
 
+/// A caller whose view hides the preferred entities of the restricted identity graph.
+fn masking_preferred_entities() -> Option<Arc<GraphAccess>> {
+    use sparkles::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+    Some(Arc::new(GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::All,
+        TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(Protection {
+                    name: "preferred".into(),
+                    predicates: Some(vec![format!("{EV}preferredEntity")]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: Some(Graphs::Only(GraphRule::new([HIDDEN], &[]))),
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Caller::default(),
+            limits: Limits::default(),
+        },
+    )))
+}
+
 /// A11: a reviewer who cannot read a proposal that its clusters depend on is refused
-/// exactly as for an unreadable target.
+/// exactly as for an unreadable target, and one who cannot read an identity graph of
+/// the boundary is refused before anything is read.
 #[test]
 fn hidden_proposals_answer_as_an_unavailable_target() {
     let ds = configured();
     let ab = propose_in(
         &ds,
         HIDDEN,
-        proposal("ab", IdentityRelation::PossibleMatch, &["a", "b"], None),
+        proposal(
+            "ab",
+            IdentityRelation::PossibleMatch,
+            &["a", "b"],
+            Some("a"),
+        ),
     );
     accept(&ds, "ab", &ab);
     let bc = matched(&ds, "bc", &["b", "c"], None);
-    let limited = Some(Arc::new(GraphAccess::graphs(
+    let head = ds.store().head_commit().seq;
+    let answer = |target: Target, access: Option<Arc<GraphAccess>>| {
+        let e = review_as(
+            &ds,
+            &[decision("x", &target, Disposition::Accepted, None)],
+            &reviewer(),
+            access,
+            1,
+        )
+        .unwrap_err();
+        (e.code().to_string(), e.to_string())
+    };
+    let missing_target = (iri("urn:uuid:00000000-0000-4000-8000-000000000000"), bc.1);
+    // an identity graph of the boundary the caller cannot read refuses every review
+    let without_graph = Some(Arc::new(GraphAccess::graphs(
         Graphs::Only(GraphRule::new(
             [SOURCES, CLAIMS, IDENTITY, MAPS, DECISIONS, MAP],
             &[],
         )),
         Graphs::All,
     )));
-    let head = ds.store().head_commit().seq;
-    let answer = |target: Target| {
-        let e = review_as(
-            &ds,
-            &[decision("x", &target, Disposition::Accepted, None)],
-            &reviewer(),
-            limited.clone(),
-            1,
-        )
-        .unwrap_err();
-        (e.code().to_string(), e.to_string())
-    };
-    let hidden = answer(bc.clone());
-    let missing = answer((iri("urn:uuid:00000000-0000-4000-8000-000000000000"), bc.1));
+    let hidden = answer(bc.clone(), without_graph.clone());
+    let missing = answer(missing_target.clone(), without_graph);
+    assert_eq!(hidden.0, "not-permitted", "{hidden:?}");
+    assert_eq!(hidden, missing);
+    // an effective proposal whose triples the caller's view masks
+    let hidden = answer(bc.clone(), masking_preferred_entities());
+    let missing = answer(missing_target, masking_preferred_entities());
     assert_eq!(hidden.0, "evidence-unavailable");
     assert_eq!(hidden, missing);
     assert_eq!(ds.store().head_commit().seq, head);
     // a reviewer who reads every identity graph accepts
     accept(&ds, "bc", &bc);
     assert_eq!(map(&ds), pairs(&["a a", "b a", "c a"]));
+}
+
+/// A masked proposal that no decision accepts takes no part in a cluster, so it
+/// neither refuses the review nor counts toward its bounds.
+#[test]
+fn a_masked_proposal_without_effect_is_left_out() {
+    let ds = configured();
+    let bd = propose_in(
+        &ds,
+        HIDDEN,
+        proposal(
+            "bd",
+            IdentityRelation::PossibleMatch,
+            &["b", "d"],
+            Some("d"),
+        ),
+    );
+    let bc = matched(&ds, "bc", &["b", "c"], None);
+    review_as(
+        &ds,
+        &[decision("bc", &bc, Disposition::Accepted, None)],
+        &reviewer(),
+        masking_preferred_entities(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(map(&ds), pairs(&["b b", "c b"]));
+    assert_ne!(bd.0, bc.0);
 }
 
 /// Grants: a reviewer needs update and read grants on the decisions, maps and output
@@ -950,4 +1017,130 @@ fn a_review_on_a_branch_changes_its_map_only() {
     let r = evidence::resolve_entities(&ds, &branch, "people", &[e("b")], all(), &Control::none())
         .unwrap();
     assert_eq!(r.entities[0].representative, e("a"));
+}
+
+/// A map is built from the identity graphs of its boundary. Removing one of them, or
+/// detaching and protecting it again, leaves the map following matches that are no
+/// longer read, so reviews and reads answer `projection-unavailable` and change
+/// nothing until the boundary is restored. A graph added to the boundary is accepted.
+#[test]
+fn a_changed_boundary_makes_the_map_unavailable() {
+    let ds = configured();
+    let ab = propose_in(
+        &ds,
+        HIDDEN,
+        proposal(
+            "ab",
+            IdentityRelation::PossibleMatch,
+            &["a", "b"],
+            Some("b"),
+        ),
+    );
+    accept(&ds, "ab", &ab);
+    let bc = matched(&ds, "bc", &["b", "c"], Some("c"));
+    assert_eq!(map(&ds), pairs(&["a b", "b b"]));
+    let refused = |ds: &Dataset| {
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(review(
+                ds,
+                &[decision("bc", &bc, Disposition::Accepted, None)]
+            )),
+            "projection-unavailable"
+        );
+        assert_eq!(
+            code(evidence::resolve_entities(
+                ds,
+                ds,
+                "people",
+                &[e("a")],
+                all(),
+                &Control::none()
+            )),
+            "projection-unavailable"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+        assert_eq!(map(ds), pairs(&["a b", "b b"]));
+    };
+    // removed from the boundary
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    refused(&ds);
+    // restored
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    // the smallest preferred entity of the restored cluster
+    accept(&ds, "bc", &bc);
+    assert_eq!(map(&ds), pairs(&["a b", "b b", "c b"]));
+
+    // detached and protected again, so its proposals no longer authenticate
+    let other = configured();
+    let ab = propose_in(
+        &other,
+        HIDDEN,
+        proposal(
+            "ab",
+            IdentityRelation::PossibleMatch,
+            &["a", "b"],
+            Some("b"),
+        ),
+    );
+    accept(&other, "ab", &ab);
+    let bc = matched(&other, "bc", &["b", "c"], Some("c"));
+    evidence::detach(&other, HIDDEN).unwrap();
+    evidence::configure(&other, &settings(1), &Control::none()).unwrap();
+    let head = other.store().head_commit().seq;
+    assert_eq!(
+        code(review(
+            &other,
+            &[decision("bc", &bc, Disposition::Accepted, None)]
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(other.store().head_commit().seq, head);
+    assert_eq!(map(&other), pairs(&["a b", "b b"]));
+
+    // a graph added to the boundary keeps the map available
+    let added = Dataset::memory();
+    evidence::configure(
+        &added,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    let ab = matched(&added, "ab", &["a", "b"], None);
+    accept(&added, "ab", &ab);
+    evidence::configure(&added, &settings(1), &Control::none()).unwrap();
+    let cd = propose_in(
+        &added,
+        HIDDEN,
+        proposal("cd", IdentityRelation::PossibleMatch, &["b", "d"], None),
+    );
+    accept(&added, "cd", &cd);
+    assert_eq!(map(&added), pairs(&["a a", "b a", "d a"]));
+}
+
+/// A resolution read of every member of one long cluster reads the cluster once.
+#[test]
+fn a_resolution_of_every_member_reads_its_cluster_once() {
+    let ds = configured();
+    let names: Vec<String> = (0..100).map(|i| format!("m{i:03}")).collect();
+    let mut decisions = Vec::new();
+    for (i, w) in names.windows(2).enumerate() {
+        let t = matched(&ds, &format!("chain{i}"), &[&w[0], &w[1]], None);
+        decisions.push(decision(&format!("d{i}"), &t, Disposition::Accepted, None));
+    }
+    review(&ds, &decisions).unwrap();
+    let entities: Vec<NamedNode> = names.iter().map(|n| e(n)).collect();
+    let r =
+        evidence::resolve_entities(&ds, &ds, "people", &entities, all(), &Control::none()).unwrap();
+    assert_eq!(r.entities.len(), 100);
+    for x in &r.entities {
+        assert_eq!(x.representative, e("m000"));
+        assert_eq!(x.members.len(), 100);
+        assert_eq!(x.decisions.len(), 99);
+    }
 }

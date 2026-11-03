@@ -12370,7 +12370,7 @@ in-memory dataset. The design is in
   "decisions": ["https://example.org/ev/decisions"],
   "supports": ["https://example.org/ev/supports"],
   "identity": ["https://example.org/ev/identity"],
-  "projections": ["https://example.org/ev/accepted"],
+  "projections": ["https://example.org/ev/accepted", "https://example.org/ev/people"],
   "policies": {
     "advisories": {
       "version": 1, "admittedKinds": ["reported", "observation"],
@@ -12393,8 +12393,8 @@ in-memory dataset. The design is in
 }
 ```
 
-The example's `projections` role lists both output graphs. Each role is a set of absolute graph IRIs, and the roles together name at most 1,024
-graphs. Enabled settings need `sourceRecords` and `proposals`. A graph may have several
+The `projections` role lists the output graphs of both policies. Each role is a set of
+absolute graph IRIs, and the roles together name at most 1,024 graphs. Enabled settings need `sourceRecords` and `proposals`. A graph may have several
 roles, except that a `projections` graph has no other role. The members after
 `proposals` may be left out and then default to empty. A policy name uses `a-z`, `0-9`
 and `-`, with at most 64 policies. A policy's `version` starts at 1, and
@@ -12788,7 +12788,9 @@ supersedes its acceptance, and may accept the separation in the same request.
 Every review that adds an acceptance or supersedes one writes an immutable
 `ev:ResolutionMap` revision in the policy's `maps` graph. It records its number, the
 revision it follows as `prov:wasRevisionOf`, the decisions it `ev:adds` and `ev:ends`,
-the output graph and the protection nonces of the policy's graphs. Accepting a reversed
+the output graph, the protection nonces of the policy's graphs and, as
+`ev:boundaryProtection`, the nonce and IRI of each identity graph of the boundary whose
+proposals the map was built from. Accepting a reversed
 match again restores the earlier map, and no proposal, decision or revision is edited.
 The review answer adds `mapRevision` and `changed.map`, which names the policy, the new
 revision and its predecessor, the decisions added and ended, and the entities whose
@@ -12796,11 +12798,21 @@ selected entity changed, so that consumers of the earlier revision can be found.
 resolvesTo triples written and removed are in `changed.inserted` and `changed.removed`.
 
 A review under a matching policy needs update and read grants on its decisions, maps and
-output graphs, read access to each target, and for an acceptance read access to the
-target's evidence links. It also needs read access to every accepted proposal of each
-cluster it reads, before and after its decisions, and an unreadable one answers as an
-unavailable target. One review reads at most 10,000 entities and proposals for its
-clusters in each state, beyond which it answers `422 incomplete-evidence`.
+output graphs, read grants on every identity graph of its boundary, read access to each
+target, and for an acceptance read access to the target's evidence links. It also needs
+read access to every accepted proposal of each cluster it reads, before and after its
+decisions, and one whose triples the caller's view hides answers as an unavailable
+target. A proposal no decision accepts takes no part in a cluster and is not counted
+when the caller cannot read it. One review reads at most 10,000 entities and proposals
+for its clusters in each state and retains at most 64 MiB of their identifiers, beyond
+which it answers `422 incomplete-evidence`.
+
+A map follows the matches of the identity graphs it was built from. When one of them
+leaves the boundary, or is detached and protected again so that its proposals no longer
+authenticate, reviews and reads under the policy answer `503 projection-unavailable`
+until the boundary is restored. A graph added to the boundary keeps the map available.
+No operation rebuilds a map from its decisions after such a change, so a new matching
+policy with its own maps and output graphs starts a new map.
 
 `POST /{ds}/claims/identities` with `{"policy", "entities"}` reads the current map. It
 needs `read` on the dataset or branch through the query endpoint and read grants on the
@@ -12817,7 +12829,7 @@ it.
 | `400` | The body is malformed or the policy is unknown. |
 | `403` | The caller may not read a graph of the policy. |
 | `422 incomplete-evidence` | A cluster's records exceed 10,000. |
-| `503 projection-unavailable` | A graph of the policy was detached and protected again, or the output holds a map without a revision. |
+| `503 projection-unavailable` | A graph of the policy was detached and protected again, an identity graph the map was built from left the boundary, or the output holds a map without a revision. |
 
 `GET /$/server` lists the route in `capabilities.claims.identities`.
 
