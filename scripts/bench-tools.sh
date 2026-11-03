@@ -114,11 +114,11 @@ gnu_time() {
 }
 
 # Print a path to run the binary $1 from for the rest of a run. A binary inside this
-# checkout's managed target is copied to $WORK/bin first, because Boxington can collect
+# checkout's managed target is copied under $WORK/bin first, because Boxington can collect
 # the whole target once the build that made it has exited, and a run that starts the binary
 # again later would then find nothing. Any other path is printed unchanged.
 stage_binary() {
-  local bin=$1 target abs real dest
+  local bin=$1 target abs real tmp hash dest
   [ -n "$bin" ] && [ -f "$bin" ] || {
     printf '%s\n' "$bin"
     return
@@ -133,9 +133,19 @@ stage_binary() {
     printf '%s\n' "$bin"
     return
   fi
-  dest=$WORK/bin/$(basename -- "$bin")
   mkdir -p "$WORK/bin" || return
-  # A private temporary name keeps two runs that share WORK from clobbering each other.
-  cp -- "$real" "$dest.tmp.$$" && mv -f -- "$dest.tmp.$$" "$dest" || return
+  # Once cp has opened the file, a collection that removes it cannot cut the copy short.
+  # A collection before that leaves nothing to copy, and the run stops here.
+  tmp=$WORK/bin/.staging.$$
+  cp -- "$real" "$tmp" || {
+    rm -f -- "$tmp"
+    echo "stage_binary: cannot copy $bin, which a collection of the managed target may have removed; build it again" >&2
+    return 1
+  }
+  # The copy's directory is named by its contents, so two runs that share WORK with
+  # different builds never run each other's binary.
+  hash=$(sha256sum -- "$tmp" | cut -c1-16) || return
+  dest=$WORK/bin/$hash/$(basename -- "$bin")
+  mkdir -p "$WORK/bin/$hash" && mv -f -- "$tmp" "$dest" || return
   printf '%s\n' "$dest"
 }

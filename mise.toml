@@ -536,7 +536,7 @@ run = [
   "python3 -m unittest discover -s scripts/bench-tests",
   # The test binary is scratch output outside the managed target, which Boxington can
   # collect between commands and leave as a dangling link.
-  'out={{config_root}}/.artifacts/crash-harness/crash-harness-test && mkdir -p "$(dirname "$out")" && rustc --edition 2024 --test -o "$out" scripts/crash-harness.rs && "$out"',
+  'out="{{config_root}}/.artifacts/crash-harness/crash-harness-test" && mkdir -p "$(dirname "$out")" && rustc --edition 2024 --test -o "$out" scripts/crash-harness.rs && "$out"',
 ]
 
 [tasks."test:jena-clients"]

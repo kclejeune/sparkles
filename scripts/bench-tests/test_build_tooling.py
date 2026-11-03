@@ -216,7 +216,9 @@ class BoxingtonContracts(unittest.TestCase):
         (self.workspace / "scripts").mkdir(exist_ok=True)
         shutil.copy2(ROOT / "scripts/crash-harness.rs", self.workspace / "scripts/crash-harness.rs")
         step = self.workspace / "crash-step.sh"
-        step.write_text("set -e\n" + command.replace("{{config_root}}", str(self.workspace)) + "\n")
+        # A checkout path with a space, which the command must quote.
+        self.config_root = self.root / "spaced checkout"
+        step.write_text("set -e\n" + command.replace("{{config_root}}", str(self.config_root)) + "\n")
         return step
 
     def test_crash_harness_step_survives_a_dangling_target(self):
@@ -227,7 +229,7 @@ class BoxingtonContracts(unittest.TestCase):
         result = subprocess.run(["bash", str(step)], cwd=self.workspace, env=self.env,
                                 capture_output=True, text=True, timeout=300)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue((self.workspace / ".artifacts/crash-harness/crash-harness-test").is_file())
+        self.assertTrue((self.config_root / ".artifacts/crash-harness/crash-harness-test").is_file())
 
     def test_premerge_repairs_a_dangling_target(self):
         step = self.crash_harness_step()
