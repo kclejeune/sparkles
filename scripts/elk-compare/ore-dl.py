@@ -176,9 +176,14 @@ def anonymous(tree):
     return tree.startswith("_:")
 
 
+# a literal's datatype, after the closing quote of its text
+TYPED = re.compile(r'^"(?:[^"\\]|\\.)*"\^\^(.+)$')
+
+
 def literal(t, out):
     """Records the datatype of a literal outside OWL 2 EL."""
-    if "^^" in t and short(t.rsplit("^^", 1)[1]) not in EL_TYPES:
+    m = TYPED.match(t)
+    if m and short(m.group(1)) not in EL_TYPES:
         out["f"].add("datatype_outside_el")
 
 
@@ -302,6 +307,8 @@ class Scan:
             p, n = self.data(args[0], out)
             return n, p
         if op == "DataOneOf":
+            for a in args:
+                literal(a, out)
             if len(args) > 1:
                 out["f"].add("data_oneof_many")
             return cap(len(args)), 0
