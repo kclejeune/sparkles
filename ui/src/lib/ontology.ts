@@ -1836,6 +1836,38 @@ export function changedAnything(a: OpAnswer): boolean {
   return a.inserted + a.deleted > 0;
 }
 
+/**
+ * An axiom as the preview lists it: Manchester-like text with the names `name` gives, and
+ * the number of its annotations. A string in functional-style syntax is shown as it is.
+ */
+export function describeAxiom(
+  a: AxiomInput,
+  name: (iri: string) => string,
+  prefixes: PrefixMap,
+): string {
+  if (typeof a === 'string') return a;
+  const sh = (x: unknown) => manchester(x, name, prefixes);
+  const anns = a.annotations?.length
+    ? ` [${a.annotations.length} annotation${a.annotations.length > 1 ? 's' : ''}]`
+    : '';
+  switch (a.type) {
+    case 'Declaration':
+      return `Declaration: ${KIND_SINGULAR[a.kind as EntityKind] ?? a.kind} ${sh(a.iri)}`;
+    case 'SubClassOf':
+      return `${sh(a.subClass)} SubClassOf ${sh(a.superClass)}${anns}`;
+    case 'AnnotationAssertion':
+      return `${sh(a.subject)} ${sh(a.property)} ${sh(a.value)}${anns}`;
+    case 'ClassAssertion':
+      return `${sh(a.individual)} Type ${sh(a.class)}${anns}`;
+    default: {
+      const parts = Object.entries(a)
+        .filter(([k]) => k !== 'type' && k !== 'annotations')
+        .map(([, v]) => (Array.isArray(v) ? v.map(sh).join(', ') : sh(v)));
+      return `${a.type}(${parts.join(' ')})${anns}`;
+    }
+  }
+}
+
 /** The axioms an operation adds and removes, for the preview's list. */
 export function opAxioms(op: Op): { add: AxiomInput[]; remove: AxiomInput[] } {
   return op.kind === 'axioms' ? { add: op.add, remove: op.remove } : { add: [], remove: [] };

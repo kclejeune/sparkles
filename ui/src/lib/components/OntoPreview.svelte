@@ -5,6 +5,7 @@
   // with the same precondition, so another writer's commit in between is refused. An undo or
   // a redo is a revert of one commit, which expects the head the editor shows instead.
   import { ApiError, errorMessage } from '$lib/api';
+  import { splitTarget } from '$lib/branches';
   import { fmtInt } from '$lib/format';
   import {
     isPreview,
@@ -63,6 +64,13 @@
   /** A refusal because another commit landed: `412`, or a revert's `409` `head-moved`. */
   const isStale = (e: unknown) =>
     e instanceof ApiError && (e.status === 412 || (e.status === 409 && e.code === 'head-moved'));
+  /** A refusal for want of access says so first, then gives the server's reason. */
+  const problemOf = (e: unknown) =>
+    e instanceof ApiError && e.status === 403
+      ? `You can read ${splitTarget(ranTarget || target).name} but not write to it${
+          ranSel.graph ? ` in the graph ${ranSel.graph}` : ''
+        }. ${errorMessage(e)}`
+      : errorMessage(e);
 
   $effect(() => {
     if (!open || !op || ran === op) return;
@@ -92,7 +100,7 @@
     } catch (e) {
       if (ran !== o) return;
       if (isStale(e)) movedOn = true;
-      else error = errorMessage(e);
+      else error = problemOf(e);
     } finally {
       if (ran === o) busy = false;
     }
@@ -120,7 +128,7 @@
       if (isStale(e)) {
         open = false;
         onstale();
-      } else error = errorMessage(e);
+      } else error = problemOf(e);
     } finally {
       busy = false;
     }

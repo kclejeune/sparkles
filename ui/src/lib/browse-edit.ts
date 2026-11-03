@@ -1,0 +1,334 @@
+// Edit mode on the ontology browser's pages (ROADMAP item 630, docs/specs/
+// U12-ontology-workbench/SPEC.md, "Ontology browser"): the pure functions that turn a form
+// of the page into one operation of the editors' write path. An OWL entity's edits are
+// `axioms` operations of annotation assertions and hierarchy axioms, as the ontology
+// editor sends them, and a SKOS resource's edits are `update` operations of ground
+// triples, as the thesaurus editor sends them. Both are previewed and committed by
+// OntoPreview, and nothing here writes.
+
+import { isLiteral, type Statement, type Value } from './browse';
+import {
+  annotationAssertion,
+  dataUpdate,
+  diffAxioms,
+  type Annotation,
+  type AnnValue,
+  type AxiomItem,
+  type AxiomJson,
+  type HeaderTriple,
+  type HeaderValue,
+  type Lit,
+  type Op,
+} from './ontology';
+import { WELL_KNOWN } from './rdf';
+
+const RDF = WELL_KNOWN.rdf;
+const RDFS = WELL_KNOWN.rdfs;
+const OWL = WELL_KNOWN.owl;
+const SKOS = WELL_KNOWN.skos;
+const OBO = 'http://purl.obolibrary.org/obo/';
+const OIO = 'http://www.geneontology.org/formats/oboInOwl#';
+const DC = 'http://purl.org/dc/elements/1.1/';
+const DCT = 'http://purl.org/dc/terms/';
+
+/** Whether a page's edits are OWL axioms or SKOS triples. */
+export type EditMode = 'owl' | 'skos';
+
+/** The property an edit mode writes a definition with. */
+export const definitionProperty = (mode: EditMode) =>
+  mode === 'skos' ? SKOS + 'definition' : OBO + 'IAO_0000115';
+
+/** The synonym kinds an OWL page adds, as the oboInOwl properties. */
+export const OWL_SYNONYMS: [string, string][] = [
+  [OIO + 'hasExactSynonym', 'Exact'],
+  [OIO + 'hasRelatedSynonym', 'Related'],
+  [OIO + 'hasBroadSynonym', 'Broad'],
+  [OIO + 'hasNarrowSynonym', 'Narrow'],
+];
+/** The property a new source of a definition or synonym is written with. */
+export const SOURCE_PROPERTY = OIO + 'hasDbXref';
+const SOURCE_PROPS = new Set([OIO + 'hasDbXref', DC + 'source', DCT + 'source', OIO + 'source']);
+
+/** The graph name a statement carries for a selection's graph (null: the default graph). */
+export const graphName = (graph: string | null) => graph ?? 'default';
+
+/** Whether a statement or axiom is in the graph the page edits, so the page may change it. */
+export const inGraph = (x: { graph?: string }, graph: string | null) =>
+  (x.graph ?? 'default') === graphName(graph);
+
+/** A value as an annotation's value: an IRI or a literal. */
+const annValue = (v: Value): AnnValue => v;
+
+/** The annotation assertion that states a statement, with the statement's annotations. */
+export function statementAxiom(
+  iri: string,
+  s: Pick<Statement, 'property' | 'value' | 'annotations'>,
+) {
+  const a = annotationAssertion(s.property, iri, annValue(s.value));
+  return s.annotations.length
+    ? { ...a, annotations: s.annotations.map((x) => ({ property: x.property, value: x.value })) }
+    : a;
+}
+
+const headerValue = (v: Value): HeaderValue => (isLiteral(v) ? (v as Lit) : { iri: v as string });
+
+/** A plain literal with a language tag, or none. */
+export function textLit(text: string, lang: string): Lit {
+  const l = lang.trim().toLowerCase();
+  return l ? { '@value': text, '@language': l } : { '@value': text };
+}
+
+/** The sources a statement's annotations name. */
+export const sourcesOf = (s: Pick<Statement, 'annotations'> | null) =>
+  (s?.annotations ?? [])
+    .filter((a) => SOURCE_PROPS.has(a.property))
+    .map((a) => (isLiteral(a.value) ? a.value['@value'] : a.value));
+
+/** A statement as a form edits it: a property, a value, and the sources of an OWL page. */
+export type Draft = { property: string; value: Value; sources: string[] };
+
+/**
+ * The annotations of a changed statement: the old ones that name no source, kept as they
+ * were, then the sources in the order the form lists them. A source the statement had keeps
+ * its property and value, and a new one is an `oboInOwl:hasDbXref` string.
+ */
+function annotationsFor(before: Statement | null, sources: string[]): Annotation[] {
+  const old = before?.annotations ?? [];
+  const keep = old
+    .filter((a) => !SOURCE_PROPS.has(a.property))
+    .map((a) => ({ property: a.property, value: a.value }));
+  const src = sources.map((text) => {
+    const was = old.find(
+      (a) =>
+        SOURCE_PROPS.has(a.property) && (isLiteral(a.value) ? a.value['@value'] : a.value) === text,
+    );
+    return was
+      ? { property: was.property, value: was.value }
+      : { property: SOURCE_PROPERTY, value: { '@value': text } as Lit };
+  });
+  return [...keep, ...src];
+}
+
+/**
+ * The operation that replaces the statement `before` with `after` about `iri` in `graph`:
+ * an addition when `before` is null and a removal when `after` is null. On an OWL page it
+ * removes and adds annotation assertions, which carry the sources as axiom annotations, and
+ * on a SKOS page it deletes and inserts the triples, which have no sources. Null when it
+ * would change nothing.
+ */
+export function statementOp(
+  mode: EditMode,
+  iri: string,
+  before: Statement | null,
+  after: Draft | null,
+  graph: string | null,
+): Op | null {
+  if (mode === 'skos') {
+    const remove: HeaderTriple[] = before
+      ? [{ s: iri, p: before.property, o: headerValue(before.value) }]
+      : [];
+    const add: HeaderTriple[] = after
+      ? [{ s: iri, p: after.property, o: headerValue(after.value) }]
+      : [];
+    if (sameTriples(remove, add)) return null;
+    return { kind: 'update', sparql: dataUpdate(remove, add, graph).sparql };
+  }
+  const remove = before ? [statementAxiom(iri, before)] : [];
+  const add: AxiomJson[] = after
+    ? [
+        statementAxiom(iri, {
+          property: after.property,
+          value: after.value,
+          annotations: annotationsFor(before, after.sources) as Statement['annotations'],
+        }),
+      ]
+    : [];
+  const d = diffAxioms(remove, add);
+  if (!d.add.length && !d.remove.length) return null;
+  return { kind: 'axioms', add: d.add, remove: d.remove };
+}
+
+const tripleKey = (t: HeaderTriple) => JSON.stringify([t.s, t.p, t.o]);
+const sameTriples = (a: HeaderTriple[], b: HeaderTriple[]) =>
+  a.length === b.length && a.every((t, i) => tripleKey(t) === tripleKey(b[i]));
+
+// --- annotations ------------------------------------------------------------------------
+
+/** Properties of the RDF, RDFS and OWL vocabularies that are annotations. */
+const BUILT_IN_ANNOTATIONS = new Set([
+  RDFS + 'label',
+  RDFS + 'comment',
+  RDFS + 'seeAlso',
+  RDFS + 'isDefinedBy',
+  OWL + 'deprecated',
+  OWL + 'versionInfo',
+  OWL + 'priorVersion',
+  OWL + 'backwardCompatibleWith',
+  OWL + 'incompatibleWith',
+]);
+
+/** SKOS properties that link resources or that other sections of a SKOS page edit. */
+const SKOS_STRUCTURE = new Set(
+  [
+    'prefLabel',
+    'altLabel',
+    'hiddenLabel',
+    'broader',
+    'narrower',
+    'related',
+    'broaderTransitive',
+    'narrowerTransitive',
+    'inScheme',
+    'topConceptOf',
+    'hasTopConcept',
+    'member',
+    'memberList',
+    'exactMatch',
+    'closeMatch',
+    'broadMatch',
+    'narrowMatch',
+    'relatedMatch',
+    'mappingRelation',
+    'semanticRelation',
+  ].map((l) => SKOS + l),
+);
+const SKOS_XL = 'http://www.w3.org/2008/05/skos-xl#';
+
+/**
+ * Whether a statement is an annotation the Annotations section edits: not an axiom of the
+ * RDF, RDFS or OWL vocabularies, not a fact of a declared object or data property, not a
+ * SKOS link or label, and not one of the properties in `owned`, which other sections edit.
+ */
+export function isAnnotation(
+  s: Pick<Statement, 'property' | 'value'>,
+  owned: ReadonlySet<string>,
+  kindsOf: (iri: string) => readonly string[] | undefined,
+): boolean {
+  const p = s.property;
+  if (owned.has(p)) return false;
+  if (p === RDF + 'type') return false;
+  if (!BUILT_IN_ANNOTATIONS.has(p) && [RDF, RDFS, OWL].some((ns) => p.startsWith(ns))) return false;
+  if (SKOS_STRUCTURE.has(p) || p.startsWith(SKOS_XL)) return false;
+  const k = kindsOf(p);
+  if (k?.some((x) => x === 'objectProperty' || x === 'dataProperty')) return false;
+  return true;
+}
+
+/** A statement as the editor's annotation rows show it. */
+export const toAnnotation = (s: Statement): Annotation => ({
+  property: s.property,
+  value: annValue(s.value),
+  ...(s.annotations.length
+    ? { annotations: s.annotations.map((a) => ({ property: a.property, value: a.value })) }
+    : {}),
+});
+
+/**
+ * The operation that turns the annotations `before` (statements of the edited graph) into
+ * the rows `next`, as the editor's annotation rows hand them back. Null when nothing changed.
+ */
+export function annotationsOp(
+  mode: EditMode,
+  iri: string,
+  before: Statement[],
+  next: Annotation[],
+  graph: string | null,
+): Op | null {
+  if (mode === 'skos') {
+    const t = (a: { property: string; value: AnnValue }): HeaderTriple => ({
+      s: iri,
+      p: a.property,
+      o: headerValue(a.value as Value),
+    });
+    const b = new Map(before.map((s) => [tripleKey(t(s)), t(s)]));
+    const n = new Map(next.map((a) => [tripleKey(t(a)), t(a)]));
+    const remove = [...b].filter(([k]) => !n.has(k)).map(([, x]) => x);
+    const add = [...n].filter(([k]) => !b.has(k)).map(([, x]) => x);
+    if (!remove.length && !add.length) return null;
+    return { kind: 'update', sparql: dataUpdate(remove, add, graph).sparql };
+  }
+  const d = diffAxioms(
+    before.map((s) => statementAxiom(iri, s)),
+    next.map((a) => ({
+      ...annotationAssertion(a.property, iri, a.value),
+      ...(a.annotations?.length ? { annotations: a.annotations } : {}),
+    })),
+  );
+  if (!d.add.length && !d.remove.length) return null;
+  return { kind: 'axioms', add: d.add, remove: d.remove };
+}
+
+// --- the hierarchy ----------------------------------------------------------------------
+
+/** The axiom type that makes one entity of a hierarchy's kind the child of another. */
+const PARENT_AXIOM: Record<string, [string, string, string]> = {
+  class: ['SubClassOf', 'subClass', 'superClass'],
+  objectProperty: ['SubObjectPropertyOf', 'subProperty', 'superProperty'],
+  dataProperty: ['SubDataPropertyOf', 'subProperty', 'superProperty'],
+  annotationProperty: ['SubAnnotationPropertyOf', 'subProperty', 'superProperty'],
+};
+
+/** Whether the browser's hierarchy of `kind` has parents an OWL page can edit. */
+export const parentsEditable = (kind: string | null) => !!kind && kind in PARENT_AXIOM;
+
+/** The axiom that states `parent` as a parent of `iri` in the hierarchy of `kind`. */
+export function parentAxiom(kind: string, iri: string, parent: string): AxiomJson | null {
+  const t = PARENT_AXIOM[kind];
+  return t ? { type: t[0], [t[1]]: iri, [t[2]]: parent } : null;
+}
+
+/** The asserted axiom of `axioms` that makes `parent` a parent of `iri`, if there is one. */
+export function findParentAxiom(
+  kind: string,
+  iri: string,
+  parent: string,
+  axioms: AxiomItem[],
+): AxiomItem | null {
+  const t = PARENT_AXIOM[kind];
+  if (!t) return null;
+  return (
+    axioms.find((a) => a.type === t[0] && a.axiom[t[1]] === iri && a.axiom[t[2]] === parent) ?? null
+  );
+}
+
+/**
+ * The parents of `iri` among the hierarchy's ancestors, each with the axiom of the edited
+ * graph that states it, or null when another graph states it, so the page cannot remove it.
+ */
+export function parentRows(
+  kind: string,
+  iri: string,
+  edges: readonly [string, string][],
+  axioms: AxiomItem[],
+  graph: string | null,
+): { iri: string; axiom: AxiomItem | null }[] {
+  const seen = new Set<string>();
+  const out: { iri: string; axiom: AxiomItem | null }[] = [];
+  for (const [c, p] of edges) {
+    if (c !== iri || seen.has(p)) continue;
+    seen.add(p);
+    const a = findParentAxiom(kind, iri, p, axioms);
+    out.push({ iri: p, axiom: a && inGraph(a, graph) ? a : null });
+  }
+  return out;
+}
+
+/** The operation that adds or removes one axiom, as written or as found. */
+export const axiomOp = (a: AxiomJson | string, remove: boolean): Op => ({
+  kind: 'axioms',
+  add: remove ? [] : [a],
+  remove: remove ? [a] : [],
+});
+
+/** How a form hands its change to the page, which previews it; `after` runs on commit. */
+export type OnEdit = (op: Op, label: string, after?: () => void) => void;
+
+/** A statement's identity across reloads: its graph, property, value and annotations. */
+export const statementKey = (s: Statement) =>
+  JSON.stringify([s.graph, s.property, s.value, s.annotations]);
+
+/** The text and language of a literal value, or the IRI of another. */
+export const valueParts = (v: Value): { text: string; lang: string } =>
+  isLiteral(v)
+    ? { text: v['@value'], lang: v['@language'] ?? '' }
+    : { text: v as string, lang: '' };

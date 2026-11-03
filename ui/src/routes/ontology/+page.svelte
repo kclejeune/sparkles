@@ -20,6 +20,7 @@
   import { branchProvider } from '$lib/palette.svelte';
   import {
     ancestorsOf,
+    describeAxiom,
     annotationAssertion,
     buildTree,
     classifyOntology,
@@ -565,30 +566,8 @@
     return m;
   });
 
-  const describe = (a: AxiomInput) => {
-    if (typeof a === 'string') return a;
-    const named = (iri: string) => entityName(iri, previewLabels, prefixes, langs);
-    const sh = (x: unknown) => manchester(x, named, prefixes);
-    const anns = a.annotations?.length
-      ? ` [${a.annotations.length} annotation${a.annotations.length > 1 ? 's' : ''}]`
-      : '';
-    switch (a.type) {
-      case 'Declaration':
-        return `Declaration: ${KIND_SINGULAR[a.kind as EntityKind] ?? a.kind} ${sh(a.iri)}`;
-      case 'SubClassOf':
-        return `${sh(a.subClass)} SubClassOf ${sh(a.superClass)}${anns}`;
-      case 'AnnotationAssertion':
-        return `${sh(a.subject)} ${sh(a.property)} ${sh(a.value)}${anns}`;
-      case 'ClassAssertion':
-        return `${sh(a.individual)} Type ${sh(a.class)}${anns}`;
-      default: {
-        const parts = Object.entries(a)
-          .filter(([k]) => k !== 'type' && k !== 'annotations')
-          .map(([, v]) => (Array.isArray(v) ? v.map(sh).join(', ') : sh(v)));
-        return `${a.type}(${parts.join(' ')})${anns}`;
-      }
-    }
-  };
+  const describe = (a: AxiomInput) =>
+    describeAxiom(a, (iri) => entityName(iri, previewLabels, prefixes, langs), prefixes);
 
   // --- create, rename, delete --------------------------------------------------------------
   let policy = $state<IriPolicy>(loadPolicy('', null));

@@ -91,6 +91,8 @@ export type TermPage = Name & {
   usage: Incoming | null;
   names: Record<string, Omit<Name, 'iri'>>;
   warnings?: string[];
+  /** The answer's entity tag, which an edit's `If-Match` names (set by {@link fetchTerm}). */
+  etag?: string | null;
 };
 
 /** What the browser reads: one graph (null for the default graph), its imports and a state. */
@@ -159,7 +161,7 @@ export async function fetchTerm(
     headers: { Accept: 'application/json' },
     signal,
   });
-  return (await res.json()) as TermPage;
+  return { ...((await res.json()) as TermPage), etag: res.headers.get('ETag') };
 }
 
 export const DOWNLOADS: { format: string; label: string }[] = [
