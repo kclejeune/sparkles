@@ -548,6 +548,27 @@ fn materialize_by_term_term_file_and_every_property() {
     );
     assert!(err(&o).contains("every object property"), "{}", err(&o));
     assert_eq!(added("b.ofn"), want);
+    // a full IRI that java.net.URL rejects, here for its port, is dropped as ROBOT drops it
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "materialize",
+            "-i",
+            "o.ofn",
+            "-t",
+            "http://ex.org:bad/partOf",
+            "-o",
+            "c.ofn",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        err(&o).contains("http://ex.org:bad/partOf is not a valid IRI."),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(added("c.ofn"), want);
     // an OBO CURIE expands, and a property the ontology lacks adds the named superclasses
     let o = sparkles(
         dir,

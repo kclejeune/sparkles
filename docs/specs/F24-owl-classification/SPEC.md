@@ -456,8 +456,10 @@ property p and filler B, each such class read back as its restriction. It leaves
 superclass with owl:Thing or the class itself in its signature and an axiom the ontology
 already holds without annotations, as ROBOT does, so it also asserts direct named
 superclasses that are not asserted. The properties come from `--term` and
-`--term-file`, read as ROBOT reads term lists, with full IRIs and the 282 prefixes of
-ROBOT's default JSON-LD context. When none is given, or none is an IRI, every object
+`--term-file`, read as ROBOT reads term lists, with the 282 prefixes of ROBOT's default
+JSON-LD context. An expanded term is kept when it is a URN or a URL that OpenJDK 17's
+`java.net.URL` parses, which ROBOT checks, so a full IRI with a malformed port or
+host is left out with ROBOT's warning. When none is given, or none is an IRI, every object
 property of the signature is taken. `--create-new-ontology true` adds nothing, since
 ROBOT's operation adds its axioms to a new ontology that the command never saves, and
 `-s` and `-a` are accepted and ignored. The saturation derives an existential

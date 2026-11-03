@@ -150,28 +150,309 @@ fn is_urn(s: &str) -> bool {
     true
 }
 
-/// Whether `java.net.URL` parses the string: a scheme of letters, digits, `+`, `-` and
-/// `.` that starts with a letter, whose protocol the JDK handles, and for `jar:` a
-/// `!/` separator.
-fn is_java_url(s: &str) -> bool {
-    let Some((scheme, rest)) = s.split_once(':') else {
+/// Whether `new java.net.URL(spec)` succeeds on OpenJDK 17, which ROBOT 1.9.11 runs on,
+/// with the handlers of `java.base` and none of ROBOT's own. It follows the JDK's
+/// `URL(URL, String, URLStreamHandler)`, `URLStreamHandler.parseURL` and `setURL`, and
+/// the `mailto` and `jar` handlers' `parseURL`. The check fails on an unknown protocol, a
+/// port that `Integer.parseInt` rejects or that is below -1, a bracketed host that is not
+/// an IPv6 literal, a host with a control character, an empty `mailto` address and a
+/// `jar` URL without `!/`, with an invalid inner URL or with a nested `jar:`.
+fn is_java_url(spec: &str) -> bool {
+    let b = spec.as_bytes();
+    let mut limit = b.len();
+    while limit > 0 && b[limit - 1] <= b' ' {
+        limit -= 1;
+    }
+    let mut start = 0;
+    while start < limit && b[start] <= b' ' {
+        start += 1;
+    }
+    if b.len() >= start + 4 && b[start..start + 4].eq_ignore_ascii_case(b"url:") {
+        start += 4;
+    }
+    // the protocol ends at the first `:` before any `/`, and a spec that starts with `#`
+    // has none
+    let mut protocol = None;
+    if b.get(start) != Some(&b'#') {
+        for i in start..limit {
+            match b[i] {
+                b'/' => break,
+                b':' => {
+                    protocol = Some(spec[start..i].to_lowercase());
+                    start = i + 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some(protocol) = protocol else {
         return false;
     };
-    let valid = scheme
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-    if !valid {
-        return false;
+    // the fragment
+    let hash = spec[start..].find('#').map(|i| start + i);
+    if let Some(i) = hash {
+        limit = i;
     }
-    match scheme.to_ascii_lowercase().as_str() {
-        "http" | "https" | "ftp" | "file" | "mailto" | "jrt" => true,
-        "jar" => rest.contains("!/"),
+    match protocol.as_str() {
+        "http" | "https" | "ftp" | "file" | "jrt" | "jmod" => default_parse_url(spec, start, limit),
+        "mailto" => spec[start..limit.max(start)]
+            .chars()
+            .any(|c| !is_java_whitespace(c)),
+        "jar" => {
+            let sub = &spec[start..limit.max(start)];
+            if sub.len() >= 4 && sub.as_bytes()[..4].eq_ignore_ascii_case(b"jar:") {
+                return false; // nested jar URLs are not supported
+            }
+            if b.len() >= 4 && b[..4].eq_ignore_ascii_case(b"jar:") {
+                // an absolute spec: the URL before its last `!/` must be one
+                sub.rfind("!/").is_some_and(|i| is_java_url(&sub[..i]))
+            } else {
+                // a spec relative to a context (after `url:`): without a context only a
+                // bare fragment parses
+                hash.is_some() && start == limit
+            }
+        }
         _ => false,
     }
+}
+
+/// `URLStreamHandler.parseURL` of OpenJDK 17 with no context URL, then `setURL`'s host
+/// check: whether the authority after `//` parses.
+fn default_parse_url(spec: &str, mut start: usize, mut limit: usize) -> bool {
+    let mut spec = spec;
+    if start < limit
+        && let Some(q) = spec.find('?')
+        && q < limit
+    {
+        limit = q;
+        spec = &spec[..q];
+    }
+    let b = spec.as_bytes();
+    let unc = start + 4 <= limit && &b[start..start + 4] == b"////";
+    let mut host = "";
+    if !unc && start + 2 <= limit && &b[start..start + 2] == b"//" {
+        start += 2;
+        let i = find_byte(b, b'/', start)
+            .filter(|&i| i <= limit)
+            .or_else(|| find_byte(b, b'?', start).filter(|&i| i <= limit))
+            .unwrap_or(limit);
+        let authority = &spec[start..i];
+        let server = match authority.find('@') {
+            Some(at) if authority.rfind('@') != Some(at) => None,
+            Some(at) => Some(&authority[at + 1..]),
+            None => Some(authority),
+        };
+        let mut port = -1;
+        if let Some(h) = server {
+            if h.starts_with('[') {
+                let Some(close) = h.find(']').filter(|&c| c > 2) else {
+                    return false;
+                };
+                if !is_ipv6_literal(&h[1..close]) {
+                    return false;
+                }
+                host = &h[..=close];
+                match h.as_bytes().get(close + 1) {
+                    None => {}
+                    Some(b':') if h.len() > close + 2 => match java_parse_int(&h[close + 2..]) {
+                        Some(p) => port = p,
+                        None => return false,
+                    },
+                    Some(b':') => {}
+                    Some(_) => return false,
+                }
+            } else if let Some(colon) = h.find(':') {
+                if h.len() > colon + 1 {
+                    match java_parse_int(&h[colon + 1..]) {
+                        Some(p) => port = p,
+                        None => return false,
+                    }
+                }
+                host = &h[..colon];
+            } else {
+                host = h;
+            }
+        }
+        if port < -1 {
+            return false;
+        }
+    }
+    // `IPAddressUtil.checkHostString`: no control character, `/`, or character that
+    // normalizes to a delimiter
+    const OTHERS: [u32; 17] = [
+        8263, 8264, 8265, 8448, 8449, 8453, 8454, 10868, 65109, 65110, 65119, 65131, 65283, 65295,
+        65306, 65311, 65312,
+    ];
+    !host
+        .chars()
+        .any(|c| c < ' ' || c == '\u{7f}' || c == '/' || OTHERS.contains(&(c as u32)))
+}
+
+fn find_byte(b: &[u8], x: u8, from: usize) -> Option<usize> {
+    b.get(from..)?
+        .iter()
+        .position(|&c| c == x)
+        .map(|i| from + i)
+}
+
+/// Java's `Integer.parseInt(s, 10)`: an optional sign and at least one decimal digit of
+/// any script, within `int`.
+fn java_parse_int(s: &str) -> Option<i64> {
+    let first = s.chars().next()?;
+    let (negative, digits) = match first {
+        '-' => (true, &s[1..]),
+        '+' => (false, &s[1..]),
+        c if c < '0' => return None,
+        _ => (false, s),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut v: i64 = 0;
+    for c in digits.chars() {
+        v = v * 10 + i64::from(java_decimal_digit(c)?);
+        if v > 1 << 31 {
+            return None;
+        }
+    }
+    if negative {
+        Some(-v)
+    } else {
+        (v < 1 << 31).then_some(v)
+    }
+}
+
+/// Java's `Character.digit(c, 10)` for a UTF-16 unit: the decimal digits of the Basic
+/// Multilingual Plane, in runs of ten from these zeros (Unicode 13, as in Java 17).
+fn java_decimal_digit(c: char) -> Option<u32> {
+    const ZEROS: [u32; 37] = [
+        0x0030, 0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66,
+        0x0CE6, 0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946,
+        0x19D0, 0x1A80, 0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0,
+        0xA9F0, 0xAA50, 0xABF0, 0xFF10,
+    ];
+    let c = c as u32;
+    ZEROS
+        .iter()
+        .find(|&&z| (z..z + 10).contains(&c))
+        .map(|&z| c - z)
+}
+
+/// Java's `Character.isWhitespace` for a UTF-16 unit.
+fn is_java_whitespace(c: char) -> bool {
+    matches!(c,
+        '\t'..='\r' | '\u{1c}'..=' ' | '\u{1680}' | '\u{2000}'..='\u{2006}'
+        | '\u{2008}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{205f}' | '\u{3000}')
+}
+
+/// `IPAddressUtil.isIPv6LiteralAddress` of OpenJDK 17: eight groups of hexadecimal digits
+/// with at most one `::`, an IPv4 address with three dots in place of the last two, and a
+/// scope after `%`.
+fn is_ipv6_literal(src: &str) -> bool {
+    let s: Vec<char> = src.chars().collect();
+    if s.len() < 2 {
+        return false;
+    }
+    let mut end = s.len();
+    if let Some(pc) = s.iter().position(|&c| c == '%') {
+        if pc == s.len() - 1 {
+            return false;
+        }
+        end = pc;
+    }
+    let (mut i, mut j) = (0, 0);
+    if s[0] == ':' {
+        i = 1;
+        if s[1] != ':' {
+            return false;
+        }
+    }
+    let mut colonp = None;
+    let mut curtok = i;
+    let mut saw_xdigit = false;
+    let mut val = 0u32;
+    while i < end {
+        let ch = s[i];
+        i += 1;
+        if let Some(d) = ch.to_digit(16) {
+            val = (val << 4) | d;
+            if val > 0xffff {
+                return false;
+            }
+            saw_xdigit = true;
+            continue;
+        }
+        if ch == ':' {
+            curtok = i;
+            if !saw_xdigit {
+                if colonp.is_some() {
+                    return false;
+                }
+                colonp = Some(j);
+                continue;
+            } else if i == end {
+                return false;
+            }
+            if j + 2 > 16 {
+                return false;
+            }
+            j += 2;
+            saw_xdigit = false;
+            val = 0;
+            continue;
+        }
+        if ch == '.' && j + 4 <= 16 {
+            let v4: String = s[curtok..end].iter().collect();
+            if v4.matches('.').count() != 3 || !is_ipv4_literal(&v4) {
+                return false;
+            }
+            j += 4;
+            saw_xdigit = false;
+            break;
+        }
+        return false;
+    }
+    if saw_xdigit {
+        if j + 2 > 16 {
+            return false;
+        }
+        j += 2;
+    }
+    if colonp.is_some() {
+        if j == 16 {
+            return false;
+        }
+        j = 16;
+    }
+    j == 16
+}
+
+/// `IPAddressUtil.textToNumericFormatV4` with ASCII digits, as OpenJDK 17 reads the
+/// IPv4 part of an IPv6 literal.
+fn is_ipv4_literal(s: &str) -> bool {
+    let n = s.chars().count();
+    if n == 0 || n > 15 {
+        return false;
+    }
+    let (mut v, mut octet, mut new_octet) = (0u64, 0, true);
+    for c in s.chars() {
+        if c == '.' {
+            if new_octet || v > 0xff || octet == 3 {
+                return false;
+            }
+            octet += 1;
+            v = 0;
+            new_octet = true;
+        } else {
+            let Some(d) = c.to_digit(10) else {
+                return false;
+            };
+            v = v * 10 + u64::from(d);
+            new_octet = false;
+        }
+    }
+    !new_octet && v < 1 << ((4 - octet) * 8)
 }
 
 #[cfg(test)]
@@ -214,6 +495,71 @@ mod tests {
                 "urn:-bad:p is not a valid IRI.",
             ]
         );
+    }
+
+    /// Each spec with whether `new java.net.URL(spec)` succeeds on OpenJDK 17.0.20, the
+    /// JDK of ROBOT 1.9.11's Nix package, as that JDK answered.
+    #[test]
+    fn urls_parse_as_openjdk_17_parses_them() {
+        let cases = [
+            ("http://ex.org:80/p", true),
+            ("http://ex.org:/p", true),
+            ("http://ex.org:+80/p", true),
+            ("http://ex.org:-1/p", true),
+            ("http://ex.org:\u{ff10}/p", true),
+            ("http://ex.org:99999/p", true),
+            ("http://a@b@c:bad/p", true),
+            ("http://u:pw@ex.org:12/p", true),
+            ("http://ex.org?x:bad", true),
+            ("http://ex.org/p#:bad", true),
+            ("http:ex.org:bad", true),
+            ("http:////ex.org:bad", true),
+            ("http:#x", true),
+            ("http://[::1]:80/p", true),
+            ("http://[fe80::1%eth0]/p", true),
+            ("http://[::ffff:1.2.3.4]/p", true),
+            ("http://[::01.2.3.4]/p", true),
+            ("http://[00000::1]/p", true),
+            ("http://ex.org/a b", true),
+            ("HTTP://ex.org/p", true),
+            ("url:http://ex.org/p", true),
+            ("jmod:x", true),
+            ("jrt:/java.base", true),
+            ("mailto:a@b", true),
+            ("jar:http://ex.org/a.jar!/p", true),
+            ("jar:http://ex.org/a.jar!/p!/q", true),
+            ("url:jar:#x", true),
+            ("http://ex.org:bad/p", false),
+            ("http://u@ex.org:bad/p", false),
+            ("http://ex.org:-2/p", false),
+            ("http://ex.org:2147483648/p", false),
+            ("http://ex.org:+/p", false),
+            ("http://ex.org:bad?q", false),
+            ("http://[::1]x/p", false),
+            ("http://[]/p", false),
+            ("http://[12]/p", false),
+            ("http://[::1/p", false),
+            ("http://[fe80::1%]/p", false),
+            ("http://[::1.2.3]/p", false),
+            ("http://[12345::1]/p", false),
+            ("http://[1::2::3]/p", false),
+            ("http://[::\u{661}]/p", false),
+            ("http://ex\u{2047}.org/p", false),
+            ("http://ex\torg/p", false),
+            ("mailto:", false),
+            ("mailto:#x", false),
+            ("mailto:\u{3000}", false),
+            ("jar:foo!/x", false),
+            ("jar:http://ex.org/a.jar", false),
+            ("jar:http://ex.org:x/a.jar!/p", false),
+            ("jar:jar:http://ex.org/a.jar!/b!/c", false),
+            ("url:jar:http://ex.org/a.jar!/p", false),
+            ("gopher://ex.org/p", false),
+            ("1http://ex.org", false),
+        ];
+        for (spec, ok) in cases {
+            assert_eq!(is_java_url(spec), ok, "{spec:?}");
+        }
     }
 
     #[test]
