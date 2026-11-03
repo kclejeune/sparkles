@@ -1,0 +1,1673 @@
+{
+ "schema": 1,
+ "measurement": "Ask effort trial on DBpedia 2022.12.01: Claude Haiku 5.5 and GPT-6 Luna at effort high against the medium runs of the cheap-tier round, build p2final-ace00e4b, 51 qald-validation-v2 questions, three runs per arm",
+ "host": "A development laptop with 16 cores and 30 GB of memory that was running other work. Binaries were built on atlas and copied back.",
+ "settings": {
+  "effort": "high",
+  "contextTokens": 200000,
+  "maxOutputTokens": 16384,
+  "requestTimeoutSecs": 180,
+  "askDeadlineSecs": 300,
+  "queryTimeoutSecs": 60,
+  "askTokenBudget": 100000,
+  "clarifications": "answer",
+  "haiku": {
+   "maxOutputTokens": 16384,
+   "requestTimeoutSecs": 180
+  },
+  "luna": {
+   "maxOutputTokens": 16384,
+   "requestTimeoutSecs": 180
+  }
+ },
+ "scoring": {
+  "headline": "rdf-term-set-projected-columns-v2, the strict score of record"
+ },
+ "medium": "The medium arms are p2-h-cf4-r1..r3 and p2-l-cf4-r1..r3 of 2026-11-02-ask-cheap-tier-paid.json, whose binary p2fix4-27459d58 builds the same code as ace00e4b.",
+ "rule": "An arm is confirmed on unseen-150 only when its mean gains beyond the spread of the three medium runs. Neither arm did, so no unseen-150 run was made.",
+ "comparison": {
+  "haiku": {
+   "medium": {
+    "runs": [
+     "p2-h-cf4-r1",
+     "p2-h-cf4-r2",
+     "p2-h-cf4-r3"
+    ],
+    "strict": [
+     29,
+     27,
+     30
+    ],
+    "mean": 28.67
+   },
+   "high": {
+    "runs": [
+     "p2-h-high-r1",
+     "p2-h-high-r2",
+     "p2-h-high-r3"
+    ],
+    "strict": [
+     26,
+     27,
+     29
+    ],
+    "mean": 27.33
+   }
+  },
+  "luna": {
+   "medium": {
+    "runs": [
+     "p2-l-cf4-r1",
+     "p2-l-cf4-r2",
+     "p2-l-cf4-r3"
+    ],
+    "strict": [
+     30,
+     29,
+     30
+    ],
+    "mean": 29.67
+   },
+   "high": {
+    "runs": [
+     "p2-l-high-r1",
+     "p2-l-high-r2",
+     "p2-l-high-r3"
+    ],
+    "strict": [
+     31,
+     28,
+     30
+    ],
+    "mean": 29.67
+   }
+  }
+ },
+ "budget": {
+  "anthropic": {
+   "walletNanodollars": 105000000000,
+   "ledger": {
+    "capNanodollars": 20646797280,
+    "settledNanodollars": 9596951230,
+    "unresolvedNanodollars": 0,
+    "requests": 1027
+   }
+  },
+  "openai": {
+   "walletNanodollars": 60000000000,
+   "walletHistory": "The person who pays raised the OpenAI wallet from USD 50 to 60 on 2026-11-02 for this trial. The second ledger closed at USD 43.6791 and the third holds a cap of USD 15.4660, so the three caps equal the wallet.",
+   "ledger": {
+    "capNanodollars": 15466028400,
+    "settledNanodollars": 217376590,
+    "unresolvedNanodollars": 0,
+    "requests": 361
+   }
+  }
+ },
+ "notes": [
+  "Haiku ran with 16,384 output tokens, as Luna does, and a 180-second request timeout, as Luna has, so that neither truncation nor a timeout could limit high effort. No reply in any run stopped on its token limit.",
+  "Every run asked eight questions at once in each Ask child. Haiku ran on db/dbpedia-b.db, a hardlinked copy of the campaign database that changes no file, so that the two providers could run at once.",
+  "An OpenAI run that starts while the prompt cache still holds the prompts of the run before reads most of its input from the cache, which explains the Luna runs that cost about USD 0.05."
+ ],
+ "runs": {
+  "p2-h-high-r1": {
+   "provider": "anthropic",
+   "model": "claude-haiku-5-5",
+   "effort": "high",
+   "askOptions": [],
+   "jobs": 8,
+   "binary": {
+    "name": "p2final-ace00e4b",
+    "commit": "ace00e4b",
+    "fix": null,
+    "sha256": "ee1d396a634f2b60f711d02cd108a9a9639d14f219f435ee11bbc5586da03773",
+    "builtOn": "atlas"
+   },
+   "costNanodollars": 123570105,
+   "requests": 123,
+   "tokens": {
+    "requests": 122,
+    "input": 79954,
+    "cacheWrite": 409231,
+    "cacheRead": 886293,
+    "output": 111066,
+    "cacheReadShare": 0.6444
+   },
+   "elapsedSeconds": 616.2763355020434,
+   "sets": {
+    "qald-val": {
+     "path": "sets/qald-validation-v2.json",
+     "setSha256": "bf936bd85526df5d5153b1f7272b1d96ed37a4d8f83aa1ed8e9b985b1f3e6227",
+     "database": "dbpedia-b.db",
+     "questions": 51,
+     "strict": 26,
+     "guarded": 26,
+     "macroF1": 0.5442035018254091,
+     "extraColumnAnswers": 2,
+     "complete": true,
+     "mechanisms": {
+      "checkError:unknown-predicate": 1,
+      "outcome:answered": 42,
+      "outcome:empty": 4,
+      "outcome:unanswerable": 5
+     },
+     "wallSecondsLoadedHost": {
+      "p50": 44.418,
+      "p95": 88.728
+     },
+     "cases": [
+      {
+       "id": "qald9p-84",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-64",
+       "strict": true
+      },
+      {
+       "id": "qald9p-49",
+       "strict": true
+      },
+      {
+       "id": "qald9p-44",
+       "strict": false
+      },
+      {
+       "id": "qald9p-42",
+       "strict": false
+      },
+      {
+       "id": "qald9p-23",
+       "strict": true
+      },
+      {
+       "id": "qald9p-68",
+       "strict": true
+      },
+      {
+       "id": "qald9p-196",
+       "strict": false
+      },
+      {
+       "id": "qald9p-160",
+       "strict": true
+      },
+      {
+       "id": "qald9p-25",
+       "strict": false
+      },
+      {
+       "id": "qald9p-125",
+       "strict": false
+      },
+      {
+       "id": "qald9p-124",
+       "strict": true
+      },
+      {
+       "id": "qald9p-123",
+       "strict": false
+      },
+      {
+       "id": "qald9p-111",
+       "strict": true
+      },
+      {
+       "id": "qald9p-117",
+       "strict": true
+      },
+      {
+       "id": "qald9p-113",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-7",
+       "strict": false
+      },
+      {
+       "id": "qald9p-50",
+       "strict": false
+      },
+      {
+       "id": "qald9p-83",
+       "strict": false
+      },
+      {
+       "id": "qald9p-105",
+       "strict": false
+      },
+      {
+       "id": "qald9p-52",
+       "strict": true
+      },
+      {
+       "id": "qald9p-102",
+       "strict": true
+      },
+      {
+       "id": "qald9p-34",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-198",
+       "strict": true
+      },
+      {
+       "id": "qald9p-162",
+       "strict": false
+      },
+      {
+       "id": "qald9p-79",
+       "strict": false
+      },
+      {
+       "id": "qald9p-88",
+       "strict": true
+      },
+      {
+       "id": "qald9p-24",
+       "strict": false
+      },
+      {
+       "id": "qald9p-103",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-15",
+       "strict": false
+      },
+      {
+       "id": "qald9p-114",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-175",
+       "strict": true
+      },
+      {
+       "id": "qald9p-26",
+       "strict": true
+      },
+      {
+       "id": "qald9p-115",
+       "strict": false,
+       "extraColumns": true
+      },
+      {
+       "id": "qald9p-14",
+       "strict": false
+      },
+      {
+       "id": "qald9p-141",
+       "strict": true
+      },
+      {
+       "id": "qald9p-171",
+       "strict": true
+      },
+      {
+       "id": "qald9p-32",
+       "strict": true
+      },
+      {
+       "id": "qald9p-128",
+       "strict": true
+      },
+      {
+       "id": "qald9p-143",
+       "strict": true
+      },
+      {
+       "id": "qald9p-87",
+       "strict": true,
+       "extraColumns": true
+      },
+      {
+       "id": "qald9p-177",
+       "strict": false
+      },
+      {
+       "id": "qald9p-134",
+       "strict": true
+      },
+      {
+       "id": "qald9p-188",
+       "strict": true
+      },
+      {
+       "id": "qald9p-101",
+       "strict": false
+      },
+      {
+       "id": "qald9p-156",
+       "strict": false
+      },
+      {
+       "id": "qald9p-27",
+       "strict": true
+      },
+      {
+       "id": "qald9p-45",
+       "strict": true
+      },
+      {
+       "id": "qald9p-66",
+       "strict": true
+      },
+      {
+       "id": "qald9p-131",
+       "strict": true
+      },
+      {
+       "id": "qald9p-73",
+       "strict": false
+      }
+     ]
+    }
+   }
+  },
+  "p2-h-high-r2": {
+   "provider": "anthropic",
+   "model": "claude-haiku-5-5",
+   "effort": "high",
+   "askOptions": [],
+   "jobs": 8,
+   "binary": {
+    "name": "p2final-ace00e4b",
+    "commit": "ace00e4b",
+    "fix": null,
+    "sha256": "ee1d396a634f2b60f711d02cd108a9a9639d14f219f435ee11bbc5586da03773",
+    "builtOn": "atlas"
+   },
+   "costNanodollars": 123902920,
+   "requests": 123,
+   "tokens": {
+    "requests": 122,
+    "input": 77623,
+    "cacheWrite": 407872,
+    "cacheRead": 852972,
+    "output": 113204,
+    "cacheReadShare": 0.6373
+   },
+   "elapsedSeconds": 621.4283738209633,
+   "sets": {
+    "qald-val": {
+     "path": "sets/qald-validation-v2.json",
+     "setSha256": "bf936bd85526df5d5153b1f7272b1d96ed37a4d8f83aa1ed8e9b985b1f3e6227",
+     "database": "dbpedia-b.db",
+     "questions": 51,
+     "strict": 27,
+     "guarded": 27,
+     "macroF1": 0.5585521941039945,
+     "extraColumnAnswers": 2,
+     "complete": true,
+     "mechanisms": {
+      "checkError:unknown-predicate": 2,
+      "outcome:answered": 44,
+      "outcome:empty": 5,
+      "outcome:unanswerable": 2
+     },
+     "wallSecondsLoadedHost": {
+      "p50": 45.8,
+      "p95": 84.627
+     },
+     "cases": [
+      {
+       "id": "qald9p-84",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-64",
+       "strict": true
+      },
+      {
+       "id": "qald9p-49",
+       "strict": true,
+       "extraColumns": true
+      },
+      {
+       "id": "qald9p-44",
+       "strict": false
+      },
+      {
+       "id": "qald9p-42",
+       "strict": false
+      },
+      {
+       "id": "qald9p-23",
+       "strict": true
+      },
+      {
+       "id": "qald9p-68",
+       "strict": true
+      },
+      {
+       "id": "qald9p-196",
+       "strict": false
+      },
+      {
+       "id": "qald9p-160",
+       "strict": true
+      },
+      {
+       "id": "qald9p-25",
+       "strict": false
+      },
+      {
+       "id": "qald9p-125",
+       "strict": false
+      },
+      {
+       "id": "qald9p-124",
+       "strict": true
+      },
+      {
+       "id": "qald9p-123",
+       "strict": false
+      },
+      {
+       "id": "qald9p-111",
+       "strict": true
+      },
+      {
+       "id": "qald9p-117",
+       "strict": true
+      },
+      {
+       "id": "qald9p-113",
+       "strict": false
+      },
+      {
+       "id": "qald9p-7",
+       "strict": false
+      },
+      {
+       "id": "qald9p-50",
+       "strict": false
+      },
+      {
+       "id": "qald9p-83",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-105",
+       "strict": false
+      },
+      {
+       "id": "qald9p-52",
+       "strict": true
+      },
+      {
+       "id": "qald9p-102",
+       "strict": true
+      },
+      {
+       "id": "qald9p-34",
+       "strict": false
+      },
+      {
+       "id": "qald9p-198",
+       "strict": true
+      },
+      {
+       "id": "qald9p-162",
+       "strict": false
+      },
+      {
+       "id": "qald9p-79",
+       "strict": false
+      },
+      {
+       "id": "qald9p-88",
+       "strict": true
+      },
+      {
+       "id": "qald9p-24",
+       "strict": false
+      },
+      {
+       "id": "qald9p-103",
+       "strict": true
+      },
+      {
+       "id": "qald9p-15",
+       "strict": false
+      },
+      {
+       "id": "qald9p-114",
+       "strict": false
+      },
+      {
+       "id": "qald9p-175",
+       "strict": true
+      },
+      {
+       "id": "qald9p-26",
+       "strict": true
+      },
+      {
+       "id": "qald9p-115",
+       "strict": false
+      },
+      {
+       "id": "qald9p-14",
+       "strict": false
+      },
+      {
+       "id": "qald9p-141",
+       "strict": true
+      },
+      {
+       "id": "qald9p-171",
+       "strict": true
+      },
+      {
+       "id": "qald9p-32",
+       "strict": true
+      },
+      {
+       "id": "qald9p-128",
+       "strict": true
+      },
+      {
+       "id": "qald9p-143",
+       "strict": true
+      },
+      {
+       "id": "qald9p-87",
+       "strict": true,
+       "extraColumns": true
+      },
+      {
+       "id": "qald9p-177",
+       "strict": false
+      },
+      {
+       "id": "qald9p-134",
+       "strict": true
+      },
+      {
+       "id": "qald9p-188",
+       "strict": true
+      },
+      {
+       "id": "qald9p-101",
+       "strict": false
+      },
+      {
+       "id": "qald9p-156",
+       "strict": false
+      },
+      {
+       "id": "qald9p-27",
+       "strict": true
+      },
+      {
+       "id": "qald9p-45",
+       "strict": true
+      },
+      {
+       "id": "qald9p-66",
+       "strict": true
+      },
+      {
+       "id": "qald9p-131",
+       "strict": true
+      },
+      {
+       "id": "qald9p-73",
+       "strict": false
+      }
+     ]
+    }
+   }
+  },
+  "p2-h-high-r3": {
+   "provider": "anthropic",
+   "model": "claude-haiku-5-5",
+   "effort": "high",
+   "askOptions": [],
+   "jobs": 8,
+   "binary": {
+    "name": "p2final-ace00e4b",
+    "commit": "ace00e4b",
+    "fix": null,
+    "sha256": "ee1d396a634f2b60f711d02cd108a9a9639d14f219f435ee11bbc5586da03773",
+    "builtOn": "atlas"
+   },
+   "costNanodollars": 122008510,
+   "requests": 123,
+   "tokens": {
+    "requests": 122,
+    "input": 79158,
+    "cacheWrite": 407864,
+    "cacheRead": 838681,
+    "output": 109396,
+    "cacheReadShare": 0.6326
+   },
+   "elapsedSeconds": 592.9899250379531,
+   "sets": {
+    "qald-val": {
+     "path": "sets/qald-validation-v2.json",
+     "setSha256": "bf936bd85526df5d5153b1f7272b1d96ed37a4d8f83aa1ed8e9b985b1f3e6227",
+     "database": "dbpedia-b.db",
+     "questions": 51,
+     "strict": 29,
+     "guarded": 29,
+     "macroF1": 0.610600167443528,
+     "extraColumnAnswers": 4,
+     "complete": true,
+     "mechanisms": {
+      "checkError:unknown-predicate": 1,
+      "outcome:answered": 45,
+      "outcome:empty": 2,
+      "outcome:unanswerable": 4
+     },
+     "wallSecondsLoadedHost": {
+      "p50": 48.497,
+      "p95": 84.85000000000001
+     },
+     "cases": [
+      {
+       "id": "qald9p-84",
+       "strict": false
+      },
+      {
+       "id": "qald9p-64",
+       "strict": true
+      },
+      {
+       "id": "qald9p-49",
+       "strict": true,
+       "extraColumns": true
+      },
+      {
+       "id": "qald9p-44",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-42",
+       "strict": false
+      },
+      {
+       "id": "qald9p-23",
+       "strict": true
+      },
+      {
+       "id": "qald9p-68",
+       "strict": true
+      },
+      {
+       "id": "qald9p-196",
+       "strict": false
+      },
+      {
+       "id": "qald9p-160",
+       "strict": true
+      },
+      {
+       "id": "qald9p-25",
+       "strict": false
+      },
+      {
+       "id": "qald9p-125",
+       "strict": false
+      },
+      {
+       "id": "qald9p-124",
+       "strict": true
+      },
+      {
+       "id": "qald9p-123",
+       "strict": false
+      },
+      {
+       "id": "qald9p-111",
+       "strict": true
+      },
+      {
+       "id": "qald9p-117",
+       "strict": true
+      },
+      {
+       "id": "qald9p-113",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-7",
+       "strict": false
+      },
+      {
+       "id": "qald9p-50",
+       "strict": false
+      },
+      {
+       "id": "qald9p-83",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-105",
+       "strict": false,
+       "extraColumns": true
+      },
+      {
+       "id": "qald9p-52",
+       "strict": true
+      },
+      {
+       "id": "qald9p-102",
+       "strict": true
+      },
+      {
+       "id": "qald9p-34",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-198",
+       "strict": true
+      },
+      {
+       "id": "qald9p-162",
+       "strict": false
+      },
+      {
+       "id": "qald9p-79",
+       "strict": false
+      },
+      {
+       "id": "qald9p-88",
+       "strict": true
+      },
+      {
+       "id": "qald9p-24",
+       "strict": false
+      },
+      {
+       "id": "qald9p-103",
+       "strict": false
+      },
+      {
+       "id": "qald9p-15",
+       "strict": false
+      },
+      {
+       "id": "qald9p-114",
+       "strict": true
+      },
+      {
+       "id": "qald9p-175",
+       "strict": true
+      },
+      {
+       "id": "qald9p-26",
+       "strict": true
+      },
+      {
+       "id": "qald9p-115",
+       "strict": false,
+       "extraColumns": true
+      },
+      {
+       "id": "qald9p-14",
+       "strict": false
+      },
+      {
+       "id": "qald9p-141",
+       "strict": true
+      },
+      {
+       "id": "qald9p-171",
+       "strict": true
+      },
+      {
+       "id": "qald9p-32",
+       "strict": true
+      },
+      {
+       "id": "qald9p-128",
+       "strict": true
+      },
+      {
+       "id": "qald9p-143",
+       "strict": true
+      },
+      {
+       "id": "qald9p-87",
+       "strict": true,
+       "extraColumns": true
+      },
+      {
+       "id": "qald9p-177",
+       "strict": false
+      },
+      {
+       "id": "qald9p-134",
+       "strict": true
+      },
+      {
+       "id": "qald9p-188",
+       "strict": true
+      },
+      {
+       "id": "qald9p-101",
+       "strict": true
+      },
+      {
+       "id": "qald9p-156",
+       "strict": false
+      },
+      {
+       "id": "qald9p-27",
+       "strict": true
+      },
+      {
+       "id": "qald9p-45",
+       "strict": true
+      },
+      {
+       "id": "qald9p-66",
+       "strict": true
+      },
+      {
+       "id": "qald9p-131",
+       "strict": true
+      },
+      {
+       "id": "qald9p-73",
+       "strict": true
+      }
+     ]
+    }
+   }
+  },
+  "p2-l-high-r1": {
+   "provider": "openai",
+   "model": "gpt-6-luna",
+   "effort": "high",
+   "askOptions": [],
+   "jobs": 8,
+   "binary": {
+    "name": "p2final-ace00e4b",
+    "commit": "ace00e4b",
+    "fix": null,
+    "sha256": "ee1d396a634f2b60f711d02cd108a9a9639d14f219f435ee11bbc5586da03773",
+    "builtOn": "atlas"
+   },
+   "costNanodollars": 116427130,
+   "requests": 121,
+   "tokens": {
+    "requests": 120,
+    "input": 14801,
+    "cacheWrite": 585428,
+    "cacheRead": 250393,
+    "output": 78511,
+    "reasoning": 63202,
+    "cacheReadShare": 0.2944
+   },
+   "elapsedSeconds": 1057.210619237041,
+   "sets": {
+    "qald-val": {
+     "path": "sets/qald-validation-v2.json",
+     "setSha256": "bf936bd85526df5d5153b1f7272b1d96ed37a4d8f83aa1ed8e9b985b1f3e6227",
+     "database": "dbpedia.db",
+     "questions": 51,
+     "strict": 31,
+     "guarded": 31,
+     "macroF1": 0.673136382446835,
+     "extraColumnAnswers": 1,
+     "complete": true,
+     "mechanisms": {
+      "checkError:syntax": 1,
+      "checkError:unknown-class": 1,
+      "checkError:unknown-predicate": 1,
+      "outcome:answered": 45,
+      "outcome:empty": 3,
+      "outcome:unanswerable": 3
+     },
+     "wallSecondsLoadedHost": {
+      "p50": 76.06200000000001,
+      "p95": 164.126
+     },
+     "cases": [
+      {
+       "id": "qald9p-84",
+       "strict": false
+      },
+      {
+       "id": "qald9p-64",
+       "strict": true
+      },
+      {
+       "id": "qald9p-49",
+       "strict": true
+      },
+      {
+       "id": "qald9p-44",
+       "strict": false
+      },
+      {
+       "id": "qald9p-42",
+       "strict": false
+      },
+      {
+       "id": "qald9p-23",
+       "strict": true
+      },
+      {
+       "id": "qald9p-68",
+       "strict": true
+      },
+      {
+       "id": "qald9p-196",
+       "strict": false
+      },
+      {
+       "id": "qald9p-160",
+       "strict": true
+      },
+      {
+       "id": "qald9p-25",
+       "strict": true
+      },
+      {
+       "id": "qald9p-125",
+       "strict": false
+      },
+      {
+       "id": "qald9p-124",
+       "strict": true
+      },
+      {
+       "id": "qald9p-123",
+       "strict": false
+      },
+      {
+       "id": "qald9p-111",
+       "strict": true
+      },
+      {
+       "id": "qald9p-117",
+       "strict": true
+      },
+      {
+       "id": "qald9p-113",
+       "strict": true
+      },
+      {
+       "id": "qald9p-7",
+       "strict": false
+      },
+      {
+       "id": "qald9p-50",
+       "strict": false
+      },
+      {
+       "id": "qald9p-83",
+       "strict": false
+      },
+      {
+       "id": "qald9p-105",
+       "strict": false
+      },
+      {
+       "id": "qald9p-52",
+       "strict": true
+      },
+      {
+       "id": "qald9p-102",
+       "strict": true
+      },
+      {
+       "id": "qald9p-34",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-198",
+       "strict": true
+      },
+      {
+       "id": "qald9p-162",
+       "strict": true
+      },
+      {
+       "id": "qald9p-79",
+       "strict": false
+      },
+      {
+       "id": "qald9p-88",
+       "strict": true
+      },
+      {
+       "id": "qald9p-24",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-103",
+       "strict": true
+      },
+      {
+       "id": "qald9p-15",
+       "strict": false,
+       "extraColumns": true
+      },
+      {
+       "id": "qald9p-114",
+       "strict": false
+      },
+      {
+       "id": "qald9p-175",
+       "strict": true
+      },
+      {
+       "id": "qald9p-26",
+       "strict": true
+      },
+      {
+       "id": "qald9p-115",
+       "strict": true
+      },
+      {
+       "id": "qald9p-14",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-141",
+       "strict": true
+      },
+      {
+       "id": "qald9p-171",
+       "strict": true
+      },
+      {
+       "id": "qald9p-32",
+       "strict": true
+      },
+      {
+       "id": "qald9p-128",
+       "strict": true
+      },
+      {
+       "id": "qald9p-143",
+       "strict": true
+      },
+      {
+       "id": "qald9p-87",
+       "strict": true
+      },
+      {
+       "id": "qald9p-177",
+       "strict": false
+      },
+      {
+       "id": "qald9p-134",
+       "strict": true
+      },
+      {
+       "id": "qald9p-188",
+       "strict": true
+      },
+      {
+       "id": "qald9p-101",
+       "strict": true
+      },
+      {
+       "id": "qald9p-156",
+       "strict": false
+      },
+      {
+       "id": "qald9p-27",
+       "strict": true
+      },
+      {
+       "id": "qald9p-45",
+       "strict": true
+      },
+      {
+       "id": "qald9p-66",
+       "strict": true
+      },
+      {
+       "id": "qald9p-131",
+       "strict": false
+      },
+      {
+       "id": "qald9p-73",
+       "strict": false
+      }
+     ]
+    }
+   }
+  },
+  "p2-l-high-r2": {
+   "provider": "openai",
+   "model": "gpt-6-luna",
+   "effort": "high",
+   "askOptions": [],
+   "jobs": 8,
+   "binary": {
+    "name": "p2final-ace00e4b",
+    "commit": "ace00e4b",
+    "fix": null,
+    "sha256": "ee1d396a634f2b60f711d02cd108a9a9639d14f219f435ee11bbc5586da03773",
+    "builtOn": "atlas"
+   },
+   "costNanodollars": 54253090,
+   "requests": 122,
+   "tokens": {
+    "requests": 121,
+    "input": 15443,
+    "cacheWrite": 25990,
+    "cacheRead": 815544,
+    "output": 82591,
+    "reasoning": 67374,
+    "cacheReadShare": 0.9517
+   },
+   "elapsedSeconds": 1162.005259432015,
+   "sets": {
+    "qald-val": {
+     "path": "sets/qald-validation-v2.json",
+     "setSha256": "bf936bd85526df5d5153b1f7272b1d96ed37a4d8f83aa1ed8e9b985b1f3e6227",
+     "database": "dbpedia.db",
+     "questions": 51,
+     "strict": 28,
+     "guarded": 29,
+     "macroF1": 0.6245089314664428,
+     "extraColumnAnswers": 1,
+     "complete": true,
+     "mechanisms": {
+      "outcome:answered": 45,
+      "outcome:empty": 3,
+      "outcome:unanswerable": 3
+     },
+     "wallSecondsLoadedHost": {
+      "p50": 83.017,
+      "p95": 191.782
+     },
+     "cases": [
+      {
+       "id": "qald9p-84",
+       "strict": false
+      },
+      {
+       "id": "qald9p-64",
+       "strict": true
+      },
+      {
+       "id": "qald9p-49",
+       "strict": true
+      },
+      {
+       "id": "qald9p-44",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-42",
+       "strict": false
+      },
+      {
+       "id": "qald9p-23",
+       "strict": true
+      },
+      {
+       "id": "qald9p-68",
+       "strict": true
+      },
+      {
+       "id": "qald9p-196",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-160",
+       "strict": true
+      },
+      {
+       "id": "qald9p-25",
+       "strict": true
+      },
+      {
+       "id": "qald9p-125",
+       "strict": false
+      },
+      {
+       "id": "qald9p-124",
+       "strict": true
+      },
+      {
+       "id": "qald9p-123",
+       "strict": false
+      },
+      {
+       "id": "qald9p-111",
+       "strict": true
+      },
+      {
+       "id": "qald9p-117",
+       "strict": true
+      },
+      {
+       "id": "qald9p-113",
+       "strict": false
+      },
+      {
+       "id": "qald9p-7",
+       "strict": false
+      },
+      {
+       "id": "qald9p-50",
+       "strict": false
+      },
+      {
+       "id": "qald9p-83",
+       "strict": false
+      },
+      {
+       "id": "qald9p-105",
+       "strict": false
+      },
+      {
+       "id": "qald9p-52",
+       "strict": true
+      },
+      {
+       "id": "qald9p-102",
+       "strict": true
+      },
+      {
+       "id": "qald9p-34",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-198",
+       "strict": false
+      },
+      {
+       "id": "qald9p-162",
+       "strict": true
+      },
+      {
+       "id": "qald9p-79",
+       "strict": false
+      },
+      {
+       "id": "qald9p-88",
+       "strict": true
+      },
+      {
+       "id": "qald9p-24",
+       "strict": false
+      },
+      {
+       "id": "qald9p-103",
+       "strict": true
+      },
+      {
+       "id": "qald9p-15",
+       "strict": false,
+       "extraColumns": true
+      },
+      {
+       "id": "qald9p-114",
+       "strict": false
+      },
+      {
+       "id": "qald9p-175",
+       "strict": true
+      },
+      {
+       "id": "qald9p-26",
+       "strict": true
+      },
+      {
+       "id": "qald9p-115",
+       "strict": true
+      },
+      {
+       "id": "qald9p-14",
+       "strict": false
+      },
+      {
+       "id": "qald9p-141",
+       "strict": true
+      },
+      {
+       "id": "qald9p-171",
+       "strict": true
+      },
+      {
+       "id": "qald9p-32",
+       "strict": true
+      },
+      {
+       "id": "qald9p-128",
+       "strict": true
+      },
+      {
+       "id": "qald9p-143",
+       "strict": true
+      },
+      {
+       "id": "qald9p-87",
+       "strict": true
+      },
+      {
+       "id": "qald9p-177",
+       "strict": false
+      },
+      {
+       "id": "qald9p-134",
+       "strict": true
+      },
+      {
+       "id": "qald9p-188",
+       "strict": true
+      },
+      {
+       "id": "qald9p-101",
+       "strict": false
+      },
+      {
+       "id": "qald9p-156",
+       "strict": false
+      },
+      {
+       "id": "qald9p-27",
+       "strict": true
+      },
+      {
+       "id": "qald9p-45",
+       "strict": true
+      },
+      {
+       "id": "qald9p-66",
+       "strict": true
+      },
+      {
+       "id": "qald9p-131",
+       "strict": false
+      },
+      {
+       "id": "qald9p-73",
+       "strict": false
+      }
+     ]
+    }
+   }
+  },
+  "p2-l-high-r3": {
+   "provider": "openai",
+   "model": "gpt-6-luna",
+   "effort": "high",
+   "askOptions": [],
+   "jobs": 8,
+   "binary": {
+    "name": "p2final-ace00e4b",
+    "commit": "ace00e4b",
+    "fix": null,
+    "sha256": "ee1d396a634f2b60f711d02cd108a9a9639d14f219f435ee11bbc5586da03773",
+    "builtOn": "atlas"
+   },
+   "costNanodollars": 46696370,
+   "requests": 118,
+   "tokens": {
+    "requests": 117,
+    "input": 15417,
+    "cacheWrite": 12574,
+    "cacheRead": 785732,
+    "output": 71433,
+    "reasoning": 57444,
+    "cacheReadShare": 0.9656
+   },
+   "elapsedSeconds": 973.7545119920978,
+   "sets": {
+    "qald-val": {
+     "path": "sets/qald-validation-v2.json",
+     "setSha256": "bf936bd85526df5d5153b1f7272b1d96ed37a4d8f83aa1ed8e9b985b1f3e6227",
+     "database": "dbpedia.db",
+     "questions": 51,
+     "strict": 30,
+     "guarded": 30,
+     "macroF1": 0.6602387789609963,
+     "extraColumnAnswers": 0,
+     "complete": true,
+     "mechanisms": {
+      "checkError:unknown-class": 1,
+      "outcome:answered": 45,
+      "outcome:empty": 2,
+      "outcome:unanswerable": 4
+     },
+     "wallSecondsLoadedHost": {
+      "p50": 77.608,
+      "p95": 150.992
+     },
+     "cases": [
+      {
+       "id": "qald9p-84",
+       "strict": false
+      },
+      {
+       "id": "qald9p-64",
+       "strict": true
+      },
+      {
+       "id": "qald9p-49",
+       "strict": true
+      },
+      {
+       "id": "qald9p-44",
+       "strict": false
+      },
+      {
+       "id": "qald9p-42",
+       "strict": false
+      },
+      {
+       "id": "qald9p-23",
+       "strict": true
+      },
+      {
+       "id": "qald9p-68",
+       "strict": true
+      },
+      {
+       "id": "qald9p-196",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-160",
+       "strict": true
+      },
+      {
+       "id": "qald9p-25",
+       "strict": true
+      },
+      {
+       "id": "qald9p-125",
+       "strict": false
+      },
+      {
+       "id": "qald9p-124",
+       "strict": true
+      },
+      {
+       "id": "qald9p-123",
+       "strict": false
+      },
+      {
+       "id": "qald9p-111",
+       "strict": true
+      },
+      {
+       "id": "qald9p-117",
+       "strict": true
+      },
+      {
+       "id": "qald9p-113",
+       "strict": false
+      },
+      {
+       "id": "qald9p-7",
+       "strict": false
+      },
+      {
+       "id": "qald9p-50",
+       "strict": false
+      },
+      {
+       "id": "qald9p-83",
+       "strict": false
+      },
+      {
+       "id": "qald9p-105",
+       "strict": false
+      },
+      {
+       "id": "qald9p-52",
+       "strict": true
+      },
+      {
+       "id": "qald9p-102",
+       "strict": true
+      },
+      {
+       "id": "qald9p-34",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-198",
+       "strict": false
+      },
+      {
+       "id": "qald9p-162",
+       "strict": true
+      },
+      {
+       "id": "qald9p-79",
+       "strict": false
+      },
+      {
+       "id": "qald9p-88",
+       "strict": true
+      },
+      {
+       "id": "qald9p-24",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-103",
+       "strict": true
+      },
+      {
+       "id": "qald9p-15",
+       "strict": false
+      },
+      {
+       "id": "qald9p-114",
+       "strict": true
+      },
+      {
+       "id": "qald9p-175",
+       "strict": true
+      },
+      {
+       "id": "qald9p-26",
+       "strict": true
+      },
+      {
+       "id": "qald9p-115",
+       "strict": true
+      },
+      {
+       "id": "qald9p-14",
+       "strict": false,
+       "status": "pipeline_unanswerable"
+      },
+      {
+       "id": "qald9p-141",
+       "strict": true
+      },
+      {
+       "id": "qald9p-171",
+       "strict": true
+      },
+      {
+       "id": "qald9p-32",
+       "strict": true
+      },
+      {
+       "id": "qald9p-128",
+       "strict": true
+      },
+      {
+       "id": "qald9p-143",
+       "strict": true
+      },
+      {
+       "id": "qald9p-87",
+       "strict": true
+      },
+      {
+       "id": "qald9p-177",
+       "strict": false
+      },
+      {
+       "id": "qald9p-134",
+       "strict": true
+      },
+      {
+       "id": "qald9p-188",
+       "strict": true
+      },
+      {
+       "id": "qald9p-101",
+       "strict": true
+      },
+      {
+       "id": "qald9p-156",
+       "strict": false
+      },
+      {
+       "id": "qald9p-27",
+       "strict": true
+      },
+      {
+       "id": "qald9p-45",
+       "strict": true
+      },
+      {
+       "id": "qald9p-66",
+       "strict": true
+      },
+      {
+       "id": "qald9p-131",
+       "strict": false
+      },
+      {
+       "id": "qald9p-73",
+       "strict": false
+      }
+     ]
+    }
+   }
+  }
+ }
+}
