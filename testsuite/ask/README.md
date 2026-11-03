@@ -369,7 +369,10 @@ liability, and the second has a cap of USD 64.2135. The person who pays raised t
 wallet again to USD 105 on 2026-11-02, so that Opus 5.5 could answer the held-out set
 with the same final build as the cheaper models. The second ledger closed with
 USD 53.5667 of upper liability, USD 0.0632 of it one request held at its bound, and the
-third has a cap of USD 20.6468. The ledgers stay the record of
+third has a cap of USD 20.6468. On the same day the person who pays raised the OpenAI
+wallet from USD 50 to 60 for an effort trial of the cheapest models. The second OpenAI
+ledger closed with USD 43.6791 settled and nothing unresolved, and the third has a cap of
+USD 15.4660, so the three OpenAI caps again equal the wallet. The ledgers stay the record of
 Anthropic spend until the person who pays reconciles them against the Console's usage
 export, which stays outside the repository. Only the reconciled totals are recorded.
 
