@@ -39,7 +39,7 @@ async function open(page: Page, phone: boolean, text = '') {
   else await page.keyboard.press('ControlOrMeta+k');
   await expect(search(page)).toBeFocused();
   if (text) await page.keyboard.type(text);
-  await expect(list(page).getByRole('option').first()).toBeVisible({ timeout: 15_000 });
+  await expect(list(page).getByRole('option').first()).toBeVisible({ timeout: 90_000 });
 }
 
 test.describe.configure({ mode: 'serial' });
@@ -84,7 +84,9 @@ test('each source answers on real data', async ({ browser }) => {
   const page = await ctx.newPage();
   const shot = (name: string) => page.screenshot({ path: join(OUT, `source-${name}.png`) });
 
-  // GO's classes through the server's typo-tolerant ranking
+  // GO's classes through the server's typo-tolerant ranking; the first search builds the
+  // index, which takes a while on a debug build
+  await page.request.get(`${BASE}/$/ontology/go/search?q=mito&limit=1`, { timeout: 120_000 });
   await page.goto(`${BASE}/ui/ontology?ds=go`);
   await expect(page.locator('main h1')).toBeAttached({ timeout: 60_000 });
   await open(page, false, '@mitochondrion inher');
@@ -117,6 +119,8 @@ test('each source answers on real data', async ({ browser }) => {
   await open(page, false, '?');
   await expect(list(page).getByRole('option', { name: /^people-by-city/ })).toBeVisible();
   await shot('saved-demo');
+  // the first Escape leaves the `?` mode, the second closes the palette
+  await page.keyboard.press('Escape');
   await page.keyboard.press('Escape');
   await open(page, false, '#');
   await expect(list(page).getByRole('group', { name: 'Branches of demo' })).toBeVisible();
