@@ -138,7 +138,9 @@ const VALUE_CACHE_BYTES: u64 = 64 << 20;
 /// shard that reaches its share of that is cleared and freed. The reservation is kept
 /// until the context drops.
 pub(super) struct ValueCache {
-    shards: Box<[RwLock<ValueShard>]>,
+    /// Made on the first value cached or looked up. Most short queries decode nothing
+    /// through the cache and skip the 64 shards' allocation, setup and drop.
+    shards: std::sync::OnceLock<Box<[RwLock<ValueShard>]>>,
     /// the estimated bytes of the entries held now
     used: AtomicU64,
     /// the bytes charged for the cache, never fewer than `used`
@@ -161,7 +163,7 @@ thread_local! {
 impl Default for ValueCache {
     fn default() -> Self {
         Self {
-            shards: (0..VALUE_SHARDS).map(|_| Default::default()).collect(),
+            shards: std::sync::OnceLock::new(),
             used: AtomicU64::new(0),
             charge: Default::default(),
         }
@@ -191,13 +193,22 @@ impl ValueCache {
     }
 
     #[inline]
+    fn index(id: Id) -> usize {
+        (id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % VALUE_SHARDS
+    }
+
+    #[inline]
     fn shard(&self, id: Id) -> &RwLock<ValueShard> {
-        &self.shards[(id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % VALUE_SHARDS]
+        let shards = self
+            .shards
+            .get_or_init(|| (0..VALUE_SHARDS).map(|_| Default::default()).collect());
+        &shards[Self::index(id)]
     }
 
     #[inline]
     fn get(&self, id: Id) -> Option<Value> {
-        self.shard(id).read().map.get(&id).cloned()
+        let shards = self.shards.get()?;
+        shards[Self::index(id)].read().map.get(&id).cloned()
     }
 
     /// The bytes charged for the cache.

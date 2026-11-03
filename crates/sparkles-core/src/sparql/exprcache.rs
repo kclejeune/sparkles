@@ -1918,8 +1918,10 @@ mod tests {
         let (store, col) = vocabulary_column(2 * DECODE_PIECE);
         let (ctx, _) = owned(&store, 1 << 30, &[]);
         let (t, _) = column(&ctx, col);
+        // The room the pieces take depends on how their steps interleave, by up to a
+        // step per piece, so half of the least room seen is below what any order needs.
         let peak = least_room(&ctx, &t);
-        let storage = ctx.charge(ctx.memory_room() - (peak - 1)).unwrap();
+        let storage = ctx.charge(ctx.memory_room() - peak / 2).unwrap();
         let before = ctx.live_bytes();
         let refused = cursor_variable_values(&ctx, &t, &Expr::Var(t.vars[0]));
         assert!(

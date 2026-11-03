@@ -477,6 +477,7 @@ impl Val {
             Val::V(v) | Val::Dec(_, v) => Ok(v),
         }
     }
+    #[inline]
     pub fn into_id(self, ctx: &Ctx) -> Id {
         match self {
             Val::Id(id) | Val::Dec(id, _) => id,
