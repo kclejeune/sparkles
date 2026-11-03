@@ -3132,6 +3132,7 @@ dependencies = [
 name = "sparkles-owl"
 version = "0.1.0"
 dependencies = [
+ "hashbrown 0.16.1",
  "oxrdf",
  "oxsdatatypes",
  "parking_lot",

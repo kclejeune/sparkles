@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Time the classifier of the lane and of its base beside ELK 0.6.0 and Konclude 0.7.0-1138
+# on forge, the benchmark host, for roadmap items 645, 648, 644, 647 and 665. The script
+# takes ~/lanes/.bench.lock and ~/lanes/.heavy.lock once for the whole run.
+#
+# Usage: forge-measure.sh DIR
+#   DIR holds bin/{base,lane}-el_classify, data/{go,chebi_lite}.ofn, data/ore/*.owl,
+#   scripts/elk-compare, scripts/el-oracle.py and paths.env, which names ELK_CLASSIFY and
+#   KONCLUDE as store paths on forge. Nothing is built here.
+#
+# GO and ChEBI lite run on 1 and 8 threads with 5 classifications per process, and the
+# ORE 2015 EL ontologies with 3. Each process of the classifier writes its taxonomy, which
+# the base and the lane must give byte for byte, and el-oracle.py compares ELK's and
+# Konclude's taxonomies with the lane's on one thread.
+set -uo pipefail
+D=$(cd "$1" && pwd) || exit 1
+cd "$D" || exit 1
+# shellcheck source=/dev/null
+. ./paths.env
+export ELK_CLASSIFY KONCLUDE
+export ELK_WORK=$D/elk-work
+MEM=${MEM:-12G}
+OUT=$D/out-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT"
+ELK=scripts/elk-compare/elk.sh
+exec 9> "$HOME/lanes/.bench.lock"
+flock 9
+exec 8> "$HOME/lanes/.heavy.lock"
+flock 8
+{
+  echo "host=$(hostname)"
+  echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')"
+  echo "cpus=$(nproc)"
+  echo "ram_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
+  echo "kernel=$(uname -r)"
+  for b in base lane; do echo "${b}_sha256=$(sha256sum bin/$b-el_classify | cut -d' ' -f1)"; done
+  echo "harness_sha256=$(sha256sum scripts/elk-compare/ElkClassify.java | cut -d' ' -f1)"
+  echo "konclude_py_sha256=$(sha256sum scripts/elk-compare/konclude.py | cut -d' ' -f1)"
+  cat paths.env
+  for f in data/*.ofn data/ore/*.owl; do echo "data_sha256 $f=$(sha256sum "$f" | cut -d' ' -f1)"; done
+  echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)"
+} > "$OUT/env.txt"
+
+# one NAME INPUT WHICH THREADS REPEAT HEAP TIMEOUT: a run, appended to WHICH's log
+one() {
+  local name=$1 input=$2 which=$3 t=$4 repeat=$5 heap=$6 limit=$7 line s tax
+  echo "$which-$name-t$t at=$(date -u +%H:%M:%S) load=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$OUT/env.txt"
+  case $which in
+    base | lane)
+      tax=$OUT/$name.$which.t$t.txt
+      line=$(timeout "$limit" systemd-run --user --scope --quiet -p "MemoryMax=$MEM" -p MemorySwapMax=0 \
+        -p OOMPolicy=continue bin/$which-el_classify --threads "$t" --repeat "$repeat" --taxonomy "$tax" \
+        "$input" 2>> "$OUT/$which.err")
+      ;;
+    *)
+      tax=$OUT/$name.$which.t$t.ofn
+      line=$(env ELK_HEAP="$heap" ELK_MEM_MAX="$MEM" timeout "$limit" "$ELK" run --reasoner "$which" \
+        --threads "$t" --repeat "$repeat" --taxonomy "$tax" "$input" 2>> "$OUT/$which.err")
+      ;;
+  esac
+  s=$?
+  if [ $s = 0 ]; then
+    echo "$line" >> "$OUT/$which.jsonl"
+  else
+    echo "{\"input\":\"$input\",\"reasoner\":\"$which\",\"threads\":$t,\"failed\":$s}" >> "$OUT/$which.jsonl"
+  fi
+}
+
+ORE=${ORE:-"ore_ont_13482 ore_ont_868 ore_ont_9674 ore_ont_10689 ore_ont_8486 ore_ont_14459 ore_ont_16008 ore_ont_14042 ore_ont_11395 ore_ont_1559 ore_ont_15059 ore_ont_3524 ore_ont_3836"}
+for o in go chebi_lite; do
+  for t in 1 8; do
+    one "$o" "data/$o.ofn" base "$t" 5 - 1800
+    one "$o" "data/$o.ofn" lane "$t" 5 - 1800
+    one "$o" "data/$o.ofn" elk "$t" 5 4g 1800
+    one "$o" "data/$o.ofn" konclude "$t" 5 - 3600
+  done
+done
+for n in $ORE; do
+  f=data/ore/$n.owl
+  for t in 1 8; do
+    one "$n" "$f" base "$t" 3 - 1800
+    one "$n" "$f" lane "$t" 3 - 1800
+    one "$n" "$f" elk "$t" 3 10g 1800
+    one "$n" "$f" konclude "$t" 3 - 3600
+  done
+  rm -f "$OUT/$n".konclude.t*.ofn.konclude.owx
+done
+echo "ended=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OUT/env.txt"
+flock -u 8
+flock -u 9
+
+# the lane's taxonomy is the base's, on both thread counts, and the same on both
+for f in "$OUT"/*.lane.t*.txt; do
+  b=${f/.lane./.base.}
+  cmp -s "$f" "$b" && echo "$(basename "$f") same-as-base" >> "$OUT/checks.txt" || echo "$(basename "$f") DIFFERS-FROM-BASE" >> "$OUT/checks.txt"
+done
+for f in "$OUT"/*.lane.t8.txt; do
+  cmp -s "$f" "${f/.t8./.t1.}" && echo "$(basename "$f") same-as-t1" >> "$OUT/checks.txt" || echo "$(basename "$f") DIFFERS-FROM-T1" >> "$OUT/checks.txt"
+done
+# ELK's and Konclude's taxonomies against the lane's on one thread
+for f in "$OUT"/*.elk.t[18].ofn "$OUT"/*.konclude.t[18].ofn; do
+  [ -s "$f" ] || continue
+  b=$(basename "$f")
+  n=${b%%.*}
+  python3 scripts/el-oracle.py "$f" "$OUT/$n.lane.t1.txt" > "$OUT/${b%.ofn}.oracle.json" || true
+done
+sha256sum "$OUT"/*.t*.txt "$OUT"/*.t*.ofn > "$OUT/taxonomy.sha256" 2>/dev/null
+echo "FORGE-DONE $OUT"

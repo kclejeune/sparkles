@@ -237,6 +237,22 @@ threads (roadmap item 646). `sparkles_owl::read::Ontology::from_axioms` builds a
 ontology from axioms, and the reverse mapping sorts annotation subjects without making
 their text again for each comparison.
 
+The OWL 2 EL classifier normalizes large ontologies on several threads and scales its
+saturation on ChEBI lite (spec F24, roadmap items 644, 645, 648 and 665). Chunks of the
+axioms normalize in parallel and merge in order, so every thread count gives the ids
+and taxonomy of one thread, and each IRI is hashed and held once. Saturation workers
+deliver their messages in batches grouped by destination, share the contexts that a
+long activation wakes and count pending work without a shared counter per context.
+Small contexts keep their subsumers in lists, and ontologies without individuals run
+the rules without their checks. On forge on eight threads ChEBI lite classifies in
+393 ms against 912 ms, `ore_ont_868` in 599 ms against 862 ms, `ore_ont_13482` in
+368 ms against 588 ms and GO in 77 ms against 88 ms, and GO takes 279 ms against 288 ms
+on one thread. The chunks of a parallel normalization count against the memory budget
+and the pool, and a run whose chunks would pass the budget normalizes on one thread.
+They hold the names they meet until the merge, and the outboxes hold up to 4,096
+messages per worker, which raises ChEBI lite's peak resident set on eight threads from
+911 to 988 MiB, while the ORE ontologies' falls.
+
 The OWL 2 EL classifier classifies GO, ChEBI lite and the largest ORE 2015 EL ontologies 2.5 to 13.3 times as fast as ELK 0.6.0 on forge on one and eight threads, where ELK had been faster on ChEBI lite on eight threads and on the ORE ontologies of a million classes (roadmap items 602 and 592). A
 `Saturation` reads the caller's axioms in place, so the dataset's kept classification
 shares the open ontology's axioms instead of copying them. The profile check and the
