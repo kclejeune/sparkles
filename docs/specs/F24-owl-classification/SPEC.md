@@ -184,8 +184,12 @@ ontologies and is incomplete on one. ROBOT 1.9.11's `reason`, `reduce`, `relax` 
 items NEW-ITEM-1 to NEW-ITEM-4 add ROBOT-compatible `sparkles ontology` commands for the
 outputs that Sparkles does not write. The
 reasoners are packaged in `nix/reasoners` from checksum-pinned releases and run through
-`scripts/elk-compare/elk.sh`. Their times on the benchmark host belong to items 604 and
-606. SNOMED CT is not available to the project and was not used, so the acceptance
+`scripts/elk-compare/elk.sh`. On the benchmark host the classifier classifies GO, ChEBI
+lite and the 8 largest ORE ontologies faster than Konclude and Whelk, and HermiT confirms
+the 7 GO edges that come from the inverse property. Konclude takes 1.3 s on GO, 4.2 s on
+ChEBI lite and 12.2 s on the largest ORE ontology, and `sparkles ontology classify` runs
+3.1 to 3.3 times as fast as `robot reason` end to end
+([results](../../benchmarks/el-classification/RESULTS.md#reference-reasoners)). SNOMED CT is not available to the project and was not used, so the acceptance
 gate's SNOMED CT comparison remains open.
 
 **Measurements.** On forge, GO classifies in 410 ms and ChEBI lite in 2.97 s on four
