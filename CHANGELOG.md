@@ -60,8 +60,6 @@ and `GET /$/ontology/{ds}/term` answers an entity's statements, axioms, mentions
 incoming statements and the names of every IRI it uses, or a download with `format=`.
 The Rust library, the wire dispatcher and the ontology handles of Python, Node.js and
 the JVM call them as `hierarchy` and `term`.
-The two calls of an entity page took 6.6 ms on GO and 8.9 ms on ChEBI lite at the 95th
-percentile over 500 random classes each.
 
 The web UI has one app shell and design system (roadmap item 632). A top bar on every
 page holds the dataset switcher and a search of the open dataset's entities through

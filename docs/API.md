@@ -1964,8 +1964,10 @@ literal, each with its `property`, `value`, `graph` and the `annotations` that a
 reification of the triple (`owl:Axiom` with `owl:annotatedSource`) gives it, such as the
 sources of a definition. `xlLabels` gives the `skosxl:literalForm` of each SKOS-XL label
 the entity has, with the label's property and graph. `statementsTruncated` says whether a
-property had more than 500 values, or the entity's triples or the blank nodes they reach
-more than 20,000, so that the page and the downloads hold only the first ones. `axioms`
+property had more than 500 values or more than 500 SKOS-XL labels, so that `statements`
+and `xlLabels` hold the first 500, or whether the reading stopped at its limits of 20,000
+triples about the entity and 40,000 triples with the blank nodes they reach, which also
+cut the axioms and the downloads. `axioms`
 are the axioms that the entity's triples, the blank nodes they reach and those
 reifications map to by the reverse mapping in the request's `mode`, in the forms the
 axiom listing uses. The types of the IRIs they use are read too, so the mapping types
@@ -1987,8 +1989,9 @@ link them without more requests. The answer also has the entity's own name membe
 `jsonld` give the triples about the entity, the blank nodes they reach and the
 reifications of its annotated triples, and `ofn` gives its axioms in functional-style
 syntax. An IRI that the graphs read do not mention is `404`. The route takes `graph`,
-`imports`, `mode`, `branch`, `at` and `lang`, answers with the commit as its entity tag,
-and refuses `inferences`.
+`imports`, `mode`, `branch`, `at` and `lang`, and refuses `inferences`. A JSON answer
+carries the commit as its entity tag and answers `If-None-Match` and `If-Match`, and a
+download carries the commit in its headers without an entity tag.
 
 `GET /$/ontology/{ds}/entity?iri=IRI` answers what the ontology says about one entity.
 `kinds` lists the kinds the IRI has, and `labels` and `annotations` its `rdfs:label`

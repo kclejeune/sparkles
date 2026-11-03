@@ -341,9 +341,7 @@ parent otherwise.
 
 The pages read two routes of the [API reference](../API.md#ontology), `hierarchy` and
 `term`, which read the store's indexes around one entity, so a page costs the same on
-GO or ChEBI as on a small ontology. An entity page waits for one `term` and one
-`hierarchy` call, which together took under 10 ms at the 95th percentile over 500 random
-classes of GO and of ChEBI lite on a release build. The landing page search takes `/`,
+GO or ChEBI as on a small ontology. The landing page search takes `/`,
 which opens the command palette on the other browser pages. The components of the page
 live in `ui/src/lib/components/browse` and take their data as properties, so other pages
 can reuse them.

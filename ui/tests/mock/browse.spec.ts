@@ -254,3 +254,11 @@ test('`/` focuses the landing page search and opens the palette on an entity pag
   await page.keyboard.press('/');
   await expect(page.getByRole('listbox')).toBeVisible();
 });
+
+test('a landing page at a past state has no search box', async ({ page }) => {
+  await page.goto('/ui/browse?ds=uni&at=1');
+  await expect(page.getByRole('heading', { level: 1, name: 'University ontology' })).toBeVisible({
+    timeout: 30_000,
+  });
+  await expect(page.locator('main').getByRole('searchbox')).toHaveCount(0);
+});

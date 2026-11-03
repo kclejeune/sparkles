@@ -732,15 +732,18 @@
           {landingError}
         </div>
       {/if}
-      <EntitySearchList
-        {target}
-        {graph}
-        href={(i) => hrefOf(i)}
-        {chips}
-        placeholder={entityTotal
-          ? `Search ${entityTotal.toLocaleString('en-US')} entities by label, synonym, ID or definition`
-          : 'Search by label, synonym, ID or definition'}
-      />
+      <!-- the entity search reads a branch head, so a past state has no search box (item 658) -->
+      {#if !at}
+        <EntitySearchList
+          {target}
+          {graph}
+          href={(i) => hrefOf(i)}
+          {chips}
+          placeholder={entityTotal
+            ? `Search ${entityTotal.toLocaleString('en-US')} entities by label, synonym, ID or definition`
+            : 'Search by label, synonym, ID or definition'}
+        />
+      {/if}
       <div class="cols">
         {#if roots}
           <TopTerms
