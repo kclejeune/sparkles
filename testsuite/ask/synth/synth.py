@@ -53,15 +53,25 @@ def label(iri):
     return re.sub(r'\s*\([^)]*\)', '', b[0]['l']['value']).strip() or None
 
 
+# A prefixed DBpedia resource name: letters of any script, digits, `_`, `-`, `.`, `%`
+# escapes and backslash escapes such as `\(`, ending on anything but a `.`.
+PREFIXED = re.compile(r"(?<![\w:])(?:res|dbr):((?:[\w\-.%]|\\.)*(?:[\w\-%]|\\.))")
+
+
+def gold_resources(g):
+    """The DBpedia resource IRIs that one gold query names, written in full or with the
+    `res:` or `dbr:` prefix."""
+    out = set(re.findall(r'<(http://dbpedia\.org/resource/[^>]+)>', g))
+    out.update('http://dbpedia.org/resource/' + re.sub(r'\\(.)', r'\1', m) for m in PREFIXED.findall(g))
+    return out
+
+
 def test_resources():
     """Every DBpedia resource that a gold query of the evaluation sets names."""
     out = set()
     for f in EXCLUDE:
         for q in json.loads(f.read_text()).get('questions', []):
-            g = q.get('gold') or ''
-            out.update(re.findall(r'<(http://dbpedia\.org/resource/[^>]+)>', g))
-            for pfx in ('res', 'dbr'):
-                out.update('http://dbpedia.org/resource/' + m for m in re.findall(pfx + r':([A-Za-z0-9_%().,\'-]+[A-Za-z0-9_%)])', g))
+            out |= gold_resources(q.get('gold') or '')
     return out
 
 
