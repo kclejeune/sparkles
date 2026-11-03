@@ -188,9 +188,9 @@
    "metadata_note": "A manual measurement record of el_classify and ELK 0.6.0 on GO and ChEBI lite on the benchmark host. Read the record for its method, results and checks."
   },
   {
-   "run_id": "sha256-03508b91a353709d1347404fb8c6f1dd26422783f9b0a1588a0006dde5b80577",
+   "run_id": "sha256-e9b51a1640397f8486c3a682dffd9425cbf9e909dfb2116338495cfc42e31ff4",
    "path": "runs/2026-11-02-reasoners-agreement-91a7b160/record.json",
-   "sha256": "03508b91a353709d1347404fb8c6f1dd26422783f9b0a1588a0006dde5b80577",
+   "sha256": "e9b51a1640397f8486c3a682dffd9425cbf9e909dfb2116338495cfc42e31ff4",
    "format": "legacy-assessment",
    "context": {
     "suite": "el-classification",
@@ -243,7 +243,7 @@
       "name": "stanley",
       "role": "laptop, loaded by other work, so the times are a rough screen and not measurements"
      },
-     "method": "run.sh.txt ran each reasoner once per input and compared its taxonomy with the classifier's (gen-ours.sh.txt wrote those) and, for the range cases, with HermiT's, through scripts/el-oracle.py. The first range and big pass of Whelk failed in the harness, which commit 91a7b160 fixed, and the batch then ran Whelk again with ONLY=whelk, so env.txt lists three starts. The robot stage timed each ROBOT command with timed.py.txt from the release's RDF/XML file, or from the functional-style file for the -ofn rows, to the written functional-style output, and checked each output's asserted named hierarchy with el-oracle.py --asserted against the classifier's taxonomy. The batch's sparkles runs failed because the release binary had been removed from the build directory, so the four sparkles-classify rows of robot/runs.jsonl after the failed ones ran afterwards with the same binary under the same cap.",
+     "method": "run.sh.txt ran each reasoner once per input and compared its taxonomy with the classifier's (gen-ours.sh.txt wrote those) and, for the range cases, with HermiT's, through scripts/el-oracle.py. The first range and big pass of Whelk failed in the harness, which commit 91a7b160 fixed, and the batch then ran Whelk again with ONLY=whelk, so env.txt lists three starts. The robot stage timed each ROBOT command with timed.py.txt from the release's RDF/XML file, or from the functional-style file for the -ofn rows, to the written functional-style output, and checked each output's asserted named hierarchy with el-oracle.py --asserted against the classifier's taxonomy. The batch's sparkles runs failed because the release binary had been removed from the build directory, so the four sparkles-classify rows of robot/runs.jsonl after the failed ones ran afterwards with the same binary under the same cap. closure.py.txt counts the subsumptions between named classes that two taxonomies entail, with each class's equivalent classes and the classes above its node, after el-oracle.py's normalization. The Whelk package of these runs is the build of commit 91a7b160 that env.txt names. Commit ea96e8f5 later made the harness treat an unsatisfiable owl:Thing as inconsistent, which changes none of these results, since Whelk reported the inconsistent ontologies here as inconsistent itself.",
      "kind": "agreement"
     }
    },

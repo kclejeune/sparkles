@@ -6,7 +6,7 @@
    "ok": true
   },
   {
-   "detail": "296 of 298. ore_ont_412, a BioTop ontology with 18 two-property chains and no axiom outside OWL 2 EL, gives Whelk 11,456 entailed subsumptions against 18,937 for the classifier, which ELK and Konclude also give. ore_ont_3524 ended Whelk at the 12G memory cap",
+   "detail": "296 of 298. ore_ont_412, a BioTop ontology with 18 two-property chains and no axiom outside OWL 2 EL, gives Whelk 20,401 entailed subsumptions between named classes against 20,802 for the classifier, which ELK and Konclude also give, and none of its own (ore412-whelk-closure.json, closure.py.txt). ore_ont_3524 ended Whelk at the 12G memory cap",
    "name": "whelk/ore-agrees-with-classifier",
    "ok": false
   },
@@ -16,7 +16,7 @@
    "ok": true
   },
   {
-   "detail": "Konclude entails 7 subsumptions on GO that the classifier and ELK do not, all through the InverseObjectProperties axiom that both leave out (go-konclude-extra.json)",
+   "detail": "Konclude's GO taxonomy has 7 direct edges that the classifier's and ELK's do not and entails 14 subsumptions between named classes that they do not (go-konclude-closure.json), all through the InverseObjectProperties axiom that both leave out (go-konclude-extra.json)",
    "name": "big/konclude-go",
    "ok": true
   },
@@ -66,7 +66,7 @@
    "whelk": "Whelk 1.2.1 on OWL API 4.5.22, the flake's .#whelk /nix/store/3d5mrs612arm3p4ky514b5s5qgvf714a-whelk-1.2.1 (ElkClassify of commit 91a7b160), OpenJDK 17.0.20.1"
   }
  },
- "method": "run.sh.txt ran each reasoner once per input and compared its taxonomy with the classifier's (gen-ours.sh.txt wrote those) and, for the range cases, with HermiT's, through scripts/el-oracle.py. The first range and big pass of Whelk failed in the harness, which commit 91a7b160 fixed, and the batch then ran Whelk again with ONLY=whelk, so env.txt lists three starts. The robot stage timed each ROBOT command with timed.py.txt from the release's RDF/XML file, or from the functional-style file for the -ofn rows, to the written functional-style output, and checked each output's asserted named hierarchy with el-oracle.py --asserted against the classifier's taxonomy. The batch's sparkles runs failed because the release binary had been removed from the build directory, so the four sparkles-classify rows of robot/runs.jsonl after the failed ones ran afterwards with the same binary under the same cap.",
+ "method": "run.sh.txt ran each reasoner once per input and compared its taxonomy with the classifier's (gen-ours.sh.txt wrote those) and, for the range cases, with HermiT's, through scripts/el-oracle.py. The first range and big pass of Whelk failed in the harness, which commit 91a7b160 fixed, and the batch then ran Whelk again with ONLY=whelk, so env.txt lists three starts. The robot stage timed each ROBOT command with timed.py.txt from the release's RDF/XML file, or from the functional-style file for the -ofn rows, to the written functional-style output, and checked each output's asserted named hierarchy with el-oracle.py --asserted against the classifier's taxonomy. The batch's sparkles runs failed because the release binary had been removed from the build directory, so the four sparkles-classify rows of robot/runs.jsonl after the failed ones ran afterwards with the same binary under the same cap. closure.py.txt counts the subsumptions between named classes that two taxonomies entail, with each class's equivalent classes and the classes above its node, after el-oracle.py's normalization. The Whelk package of these runs is the build of commit 91a7b160 that env.txt names. Commit ea96e8f5 later made the harness treat an unsatisfiable owl:Thing as inconsistent, which changes none of these results, since Whelk reported the inconsistent ontologies here as inconsistent itself.",
  "results": [],
  "scale": "Four range test ontologies, GO 2026-07-26, ChEBI lite 256 and the 298 ORE 2015 EL classification ontologies",
  "settings": {

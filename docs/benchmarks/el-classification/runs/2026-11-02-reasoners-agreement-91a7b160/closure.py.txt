@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Count the subsumptions between named classes that two taxonomies entail, and those that
+only one entails, after el-oracle.py's normalization into nodes and direct edges.
+
+    python3 closure.py.txt A B   (each in either of el-oracle.py's two forms)
+"""
+import importlib.util, json, sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("oracle", Path(sys.argv[3] if len(sys.argv) > 3 else "scripts/el-oracle.py"))
+o = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(o)
+
+
+def pairs(path):
+    node, edges = o.normalize(*o.read_second(path))
+    up = {}
+    for a, b in edges:
+        up.setdefault(a, set()).add(b)
+    memo = {}
+
+    def anc(n):
+        if n not in memo:
+            out, stack = set(), list(up.get(n, ()))
+            while stack:
+                x = stack.pop()
+                if x not in out:
+                    out.add(x)
+                    stack.extend(up.get(x, ()))
+            memo[n] = out
+        return memo[n]
+
+    out = set()
+    for c, n in node.items():
+        if c in (o.THING, o.NOTHING) or o.NOTHING in n:
+            continue
+        for m in n:
+            if m != c and m != o.THING:
+                out.add((c, m))
+        for a in anc(n):
+            for d in a:
+                if d != o.THING:
+                    out.add((c, d))
+    return out
+
+
+a, b = pairs(sys.argv[1]), pairs(sys.argv[2])
+print(json.dumps({"first": len(a), "second": len(b), "onlyFirst": len(a - b), "onlySecond": len(b - a),
+                  "examplesOnlyFirst": sorted(a - b)[:20]}))

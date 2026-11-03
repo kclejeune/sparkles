@@ -55,9 +55,10 @@ SNOMED CT is not available to the project and was not used.
 
 Konclude 0.7.0-1138, a complete OWL 2 DL reasoner, gives the classifier's taxonomy on all
 298 ORE ontologies and on ChEBI lite, and finds `ore_ont_6720` inconsistent as the
-classifier does. On the Gene Ontology it entails 7 subsumptions that the classifier and
-ELK do not, such as filopodium membrane `GO_0031527` under organelle membrane
-`GO_0031090`. All 7 follow from `InverseObjectProperties(part_of has_part)`, the one GO
+classifier does. On the Gene Ontology its taxonomy has 7 direct edges that the
+classifier's and ELK's do not, such as filopodium membrane `GO_0031527` under organelle
+membrane `GO_0031090`, and it entails 14 subsumptions between named classes that they do
+not. All 14 follow from `InverseObjectProperties(part_of has_part)`, the one GO
 axiom outside OWL 2 EL, which both EL reasoners leave out and report. Part of is
 transitive, and a membrane-bounded organelle is defined as an organelle that has a
 membrane as a part. A filopodium membrane is part of a filopodium, which is part of the
@@ -70,11 +71,13 @@ classifier miss.
 
 Whelk, a second OWL 2 EL reasoner, gives the classifier's taxonomy on GO, ChEBI lite and
 296 of the ORE ontologies. On `ore_ont_412`, a BioTop ontology with 18 two-property chains
-and no axiom outside OWL 2 EL, Whelk entails 11,456 subsumptions between named classes
-where the classifier, ELK and Konclude entail 18,937, so Whelk is incomplete there. Whelk
+and no axiom outside OWL 2 EL, Whelk entails 20,401 subsumptions between named classes
+where the classifier, ELK and Konclude entail 20,802, and none that they do not, so Whelk
+misses 401 there. Whelk
 exceeded the 12 GiB memory cap of the laptop run on `ore_ont_3524`. The
 [agreement record](runs/2026-11-02-reasoners-agreement-91a7b160/record.json) keeps every
-comparison and the trace of the GO subsumptions.
+comparison, the trace of the GO subsumptions and the script that counts entailed
+subsumptions.
 
 ## ROBOT workflows
 
@@ -91,11 +94,10 @@ and the 296,173 of ChEBI lite between named classes, which `scripts/el-oracle.py
 
 `sparkles ontology classify FILE --format ofn` writes the taxonomy without the rest of
 the ontology, and its output equals `el_classify`'s on both files. Sparkles has no
-counterpart of three of the commands. It cannot write the ontology back with the
-inferred axioms asserted and the redundant ones removed, as `reason` and `reduce` do,
-which roadmap item NEW-ITEM-1 covers. It has no `relax`, which item NEW-ITEM-2 covers, and
-it cannot materialize inferred existential restrictions, as `materialize` does, which item
-NEW-ITEM-3 covers. These times come from a loaded laptop, so they only show the scale and are not
+counterpart of the other commands. Roadmap items NEW-ITEM-1 to NEW-ITEM-3 add
+`sparkles ontology reason`, `reduce`, `relax` and `materialize` with ROBOT's options,
+item NEW-ITEM-4 chains them in one process, and this comparison checks their output.
+These times come from a loaded laptop, so they only show the scale and are not
 measurements. The benchmark host's times belong to roadmap items 604 and 606. Each
 is one end-to-end run in seconds, with the peak resident memory in MiB.
 

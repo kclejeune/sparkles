@@ -273,6 +273,19 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   same for a database directory or a server, and `sparkles ontology check FILE` checks
   an ontology file without a database. The check exits with status 1 when the ontology
   is outside a profile it names.
+* The ontology commands cover part of what ROBOT does in OBO release pipelines.
+  `sparkles ontology classify FILE` writes the inferred class hierarchy, the taxonomy that
+  `robot reason` adds to an ontology, without the rest of the ontology.
+  `sparkles ontology check FILE` reports the profile and the axioms outside it. Both
+  work on a file with no database or server, and on a database with `--loc` or
+  `--server`. `sparkles ontology axioms` lists the axioms of a database or a server. The planned
+  `sparkles ontology reason`, `reduce`, `relax` and `materialize` take ROBOT's options
+  of the same names and write the whole ontology with its inferred, reduced, relaxed or
+  materialized axioms. They chain in one process as ROBOT's commands do, and they too
+  run standalone from `--input` and `--output` files, with the database and server modes
+  on top. Roadmap items NEW-ITEM-1 to NEW-ITEM-4 cover them, and the
+  [ROBOT comparison](../benchmarks/el-classification/RESULTS.md#robot) checks their
+  output against ROBOT's.
 * Python's `Dataset.ontology`, Node.js's `dataset.ontology` and the JVM's
   `DatasetGraphSparkles.ontology()` and `SparklesOnt` run the summary, listing, check,
   edit, entity removal and diff in the JSON forms of the routes
