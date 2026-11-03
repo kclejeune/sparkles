@@ -621,8 +621,10 @@ impl Saturation {
                 r.clone()?;
             }
             if !parts.iter().any(|(_, it, _)| it.chunk_has_data()) {
-                for (_, it, out) in parts {
-                    let (nodes, roles) = self.interner.merge(it);
+                let (its, outs): (Vec<Interner>, Vec<Normalized>) =
+                    parts.into_iter().map(|(_, it, out)| (it, out)).unzip();
+                let maps = self.interner.merge(its, threads);
+                for ((nodes, roles), out) in maps.into_iter().zip(outs) {
                     ax.append_mapped(out.ax, &nodes, &roles);
                     partial.extend(out.partial);
                     chains.extend(out.chains);
@@ -1398,6 +1400,50 @@ mod tests {
             out.push(k);
         }
         out
+    }
+
+    #[test]
+    fn an_incremental_parallel_normalization_keeps_the_ids_of_one_thread() {
+        // without individuals a change keeps the interner, so the merge meets names and
+        // expressions the interner already has
+        let axioms: Vec<AxiomKind> = mixed_axioms(4000, 645)
+            .into_iter()
+            .filter(|k| {
+                !matches!(
+                    k,
+                    AxiomKind::ClassAssertion(..) | AxiomKind::ObjectPropertyAssertion(..)
+                )
+            })
+            .collect();
+        let (before, added) = axioms.split_at(axioms.len() * 2 / 3);
+        let added: Vec<&AxiomKind> = added.iter().filter(|k| !needs_full_run(k)).collect();
+        let first: Vec<&AxiomKind> = before.iter().collect();
+        let all: Vec<&AxiomKind> = first.iter().copied().chain(added.iter().copied()).collect();
+        let run = |threads: usize| {
+            let limits = Limits {
+                threads,
+                ..Limits::default()
+            };
+            let mut s = Saturation::new();
+            s.classify(&first, None, &limits).unwrap();
+            let changes = Changes {
+                added: &added,
+                removed: &[],
+            };
+            let out = s.classify(&all, Some(changes), &limits).unwrap();
+            assert!(out.stats.incremental);
+            (s, out)
+        };
+        let (one, a) = run(1);
+        let (many, b) = run(8);
+        assert_eq!(one.interner.nodes, many.interner.nodes);
+        assert_eq!(one.interner.classes[..], many.interner.classes[..]);
+        assert_eq!(one.interner.met, many.interner.met);
+        assert_eq!(a.taxonomy, b.taxonomy);
+        let fresh = Saturation::new()
+            .classify(&all, None, &Limits::default())
+            .unwrap();
+        assert_eq!(a.taxonomy, fresh.taxonomy);
     }
 
     #[test]

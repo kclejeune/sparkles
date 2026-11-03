@@ -129,7 +129,7 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
 }
 
 /// The members a context's subsumers keep in a list before they become a hash set.
-const SUBS_LIST: usize = 32;
+const SUBS_LIST: usize = 12;
 
 /// A context's subsumers: a list while they are few, which most contexts' are, so that
 /// a small context takes one allocation and no rehashing as it grows, and a hash set
@@ -153,7 +153,7 @@ impl Subs {
         match self {
             Subs::Set(set) => set.insert(x),
             Subs::List(list) => {
-                if list.contains(&x) {
+                if has(list, x) {
                     return false;
                 }
                 if list.len() < SUBS_LIST {
@@ -163,7 +163,7 @@ impl Subs {
                     list.push(x);
                 } else {
                     let mut set: FxHashSet<Ex> =
-                        FxHashSet::with_capacity_and_hasher(4 * SUBS_LIST, Default::default());
+                        FxHashSet::with_capacity_and_hasher(2 * SUBS_LIST, Default::default());
                     set.extend(list.iter().copied());
                     set.insert(x);
                     *self = Subs::Set(set);
@@ -177,7 +177,7 @@ impl Subs {
     pub fn contains(&self, x: &Ex) -> bool {
         match self {
             Subs::Set(set) => set.contains(x),
-            Subs::List(list) => list.contains(x),
+            Subs::List(list) => has(list, *x),
         }
     }
 
@@ -206,6 +206,19 @@ impl Subs {
             Subs::List(list) => list.capacity() * 4,
         }
     }
+}
+
+/// Whether a list holds `x`, comparing eight members at a time without a branch, which
+/// the compiler can do in vector registers.
+#[inline]
+fn has(list: &[Ex], x: Ex) -> bool {
+    let mut chunks = list.chunks_exact(8);
+    for c in &mut chunks {
+        if c.iter().fold(false, |a, &y| a | (y == x)) {
+            return true;
+        }
+    }
+    chunks.remainder().contains(&x)
 }
 
 /// The members of a [`Subs`], in no particular order.
@@ -555,11 +568,64 @@ struct Out<'r, 'a> {
     /// the contexts this worker activated
     woke: &'r mut VecDeque<Ex>,
     /// the messages for other contexts that wait to be delivered
-    outbox: &'r mut Vec<(Ex, Concl)>,
+    outbox: &'r mut Outbox,
     /// the messages sent to other contexts since the last check
     sent: usize,
-    /// the duplicate messages the outbox dropped since the last check
-    dropped: usize,
+}
+
+/// A worker's messages for other contexts, which it delivers by destination, with the
+/// buffers that group them.
+#[derive(Default)]
+struct Outbox {
+    msgs: Vec<(Ex, Concl)>,
+    tmp: Vec<(Ex, Concl)>,
+    counts: Vec<u32>,
+}
+
+/// The bits of a destination that one pass of the outbox's radix sort reads.
+const RADIX_BITS: u32 = 11;
+/// The messages below which an outbox sorts by comparison instead.
+const RADIX_MIN: usize = 512;
+
+impl Outbox {
+    fn is_empty(&self) -> bool {
+        self.msgs.is_empty()
+    }
+
+    /// Orders the messages by destination, keeping the order of each destination's.
+    fn group(&mut self) {
+        let n = self.msgs.len();
+        if n < RADIX_MIN {
+            self.msgs.sort_by_key(|m| m.0);
+            return;
+        }
+        let max = self.msgs.iter().map(|m| m.0).max().unwrap_or(0);
+        let buckets = 1usize << RADIX_BITS;
+        let mask = (buckets - 1) as u32;
+        let mut shift = 0u32;
+        self.tmp.clear();
+        self.tmp.resize(n, (0, Concl::Real));
+        while shift == 0 || (shift < 32 && max >> shift != 0) {
+            self.counts.clear();
+            self.counts.resize(buckets, 0);
+            for m in &self.msgs {
+                self.counts[((m.0 >> shift) & mask) as usize] += 1;
+            }
+            let mut at = 0u32;
+            for c in self.counts.iter_mut() {
+                let k = *c;
+                *c = at;
+                at += k;
+            }
+            for &m in &self.msgs {
+                let d = ((m.0 >> shift) & mask) as usize;
+                self.tmp[self.counts[d] as usize] = m;
+                self.counts[d] += 1;
+            }
+            std::mem::swap(&mut self.msgs, &mut self.tmp);
+            shift += RADIX_BITS;
+        }
+    }
 }
 
 /// Where the rules of a context send their conclusions.
@@ -587,10 +653,10 @@ impl Sink for Out<'_, '_> {
                 self.woke.push_back(to);
             }
         } else {
-            self.outbox.push((to, c));
+            self.outbox.msgs.push((to, c));
             self.sent += 1;
-            if self.outbox.len() >= OUTBOX {
-                self.dropped += self.run.deliver(self.outbox, self.woke);
+            if self.outbox.msgs.len() >= OUTBOX {
+                self.run.deliver(self.outbox, self.woke);
             }
         }
     }
@@ -622,19 +688,15 @@ impl<'a> Run<'a> {
         !(c.active.load(Ordering::SeqCst) || c.active.swap(true, Ordering::SeqCst))
     }
 
-    /// Delivers a worker's outbox: the messages sorted by destination and without
-    /// duplicates, each destination's to-do list taken once, and the contexts they
-    /// activate added to the worker's queue. The answer is the number of duplicates
-    /// dropped. A duplicate is a conclusion the destination would find it holds, so
-    /// dropping it changes nothing the saturation derives.
-    fn deliver(&self, outbox: &mut Vec<(Ex, Concl)>, mine: &mut VecDeque<Ex>) -> usize {
+    /// Delivers a worker's outbox: the messages grouped by destination, each
+    /// destination's to-do list taken once, and the contexts they activate added to the
+    /// worker's queue.
+    fn deliver(&self, outbox: &mut Outbox, mine: &mut VecDeque<Ex>) {
         if outbox.is_empty() {
-            return 0;
+            return;
         }
-        outbox.sort_unstable();
-        let before = outbox.len();
-        outbox.dedup();
-        let dropped = before - outbox.len();
+        outbox.group();
+        let outbox = &mut outbox.msgs;
         let mut at = 0;
         while at < outbox.len() {
             let to = outbox[at].0;
@@ -649,7 +711,6 @@ impl<'a> Run<'a> {
             at = end;
         }
         outbox.clear();
-        dropped
     }
 
     /// Moves half of a worker's queue to the shared queue when a worker waits for it.
@@ -717,7 +778,7 @@ impl<'a> Run<'a> {
         let mut tally = Tally::default();
         // the buffer of a context's conclusions, kept across contexts
         let mut local: Vec<Concl> = Vec::new();
-        let mut outbox: Vec<(Ex, Concl)> = Vec::new();
+        let mut outbox = Outbox::default();
         loop {
             if round >= ROOTS_PER_ROUND && mine.is_empty() {
                 round = 0;
@@ -734,14 +795,15 @@ impl<'a> Run<'a> {
                 e
             } else if !outbox.is_empty() {
                 // the messages the worker holds go out before it looks for more work
-                let dropped = self.deliver(&mut outbox, &mut mine);
-                tally.queued -= dropped as isize;
+                self.deliver(&mut outbox, &mut mine);
                 continue;
             } else {
                 // no roots are left: what the worker counted goes to the totals before
                 // it waits for the others
                 round = 0;
-                self.flush(&mut tally);
+                if tally.applied > 0 || tally.stored > 0 || tally.queued != 0 {
+                    self.flush(&mut tally);
+                }
                 // the worker goes idle; the last to do so with the queue empty ends the
                 // saturation
                 if self.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
@@ -771,10 +833,13 @@ impl<'a> Run<'a> {
                 self.flush(&mut tally);
                 return;
             }
-            self.process(next, &mut mine, &mut tally, &mut local, &mut outbox);
+            if self.plain {
+                self.process::<false>(next, &mut mine, &mut tally, &mut local, &mut outbox);
+            } else {
+                self.process::<true>(next, &mut mine, &mut tally, &mut local, &mut outbox);
+            }
             if !outbox.is_empty() && self.idle.load(Ordering::Relaxed) > 0 {
-                let dropped = self.deliver(&mut outbox, &mut mine);
-                tally.queued -= dropped as isize;
+                self.deliver(&mut outbox, &mut mine);
             }
             self.share(&mut mine);
         }
@@ -818,13 +883,15 @@ impl<'a> Run<'a> {
         ok
     }
 
-    fn process(
+    /// Activates a context: applies the rules to what waits in its to-do list until none
+    /// is left, with the rules of individuals when `FULL` is set.
+    fn process<const FULL: bool>(
         &self,
         me: Ex,
         mine: &mut VecDeque<Ex>,
         tally: &mut Tally,
         local: &mut Vec<Concl>,
-        outbox: &mut Vec<(Ex, Concl)>,
+        outbox: &mut Outbox,
     ) {
         let ctx = self.get(me);
         let mut st = ctx.st.lock();
@@ -836,7 +903,6 @@ impl<'a> Run<'a> {
             woke: mine,
             outbox,
             sent: 0,
-            dropped: 0,
         };
         if !st.init {
             tally.stored += CONTEXT_BYTES / CONCLUSION_BYTES;
@@ -845,25 +911,19 @@ impl<'a> Run<'a> {
         }
         'outer: loop {
             while let Some(c) = out.local.pop() {
-                let new = if self.plain {
-                    apply_rules::<_, false>(self.ix, me, &mut st, c, &mut out)
-                } else {
-                    apply_rules::<_, true>(self.ix, me, &mut st, c, &mut out)
-                };
-                if new {
+                if apply_rules::<_, FULL>(self.ix, me, &mut st, c, &mut out) {
                     tally.stored += 1;
                 }
                 tally.applied += 1;
                 if tally.applied >= CHECK_EVERY || out.sent >= SEND_EVERY {
-                    tally.queued += out.sent as isize - out.dropped as isize;
+                    tally.queued += out.sent as isize;
                     out.sent = 0;
-                    out.dropped = 0;
                     if !self.flush(tally) {
                         break 'outer;
                     }
                     // a long activation gives idle workers what it woke as it goes
                     if self.idle.load(Ordering::Relaxed) > 0 {
-                        out.dropped += self.deliver(out.outbox, out.woke);
+                        self.deliver(out.outbox, out.woke);
                         self.share(out.woke);
                     }
                 }
@@ -882,7 +942,7 @@ impl<'a> Run<'a> {
             batch.reverse();
             out.local.append(&mut batch);
         }
-        tally.queued += out.sent as isize - out.dropped as isize;
+        tally.queued += out.sent as isize;
         drop(st);
         ctx.active.store(false, Ordering::SeqCst);
         if !self.stopped() && !ctx.todo.lock().is_empty() && self.mark(ctx) {

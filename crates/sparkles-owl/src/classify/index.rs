@@ -50,16 +50,6 @@ pub enum Node {
     And(u32),
 }
 
-/// An entity a merge moves into a [`Names`] table.
-pub struct Owned<T>(pub T);
-
-impl<T> std::ops::Deref for Owned<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.0
-    }
-}
-
 /// Entities named by an IRI, which a [`Names`] table keys by the IRI.
 pub trait Named: Clone + Eq {
     fn name(&self) -> &str;
@@ -91,7 +81,19 @@ pub fn name_hash(s: &str) -> u64 {
 pub struct Names<T> {
     items: Vec<T>,
     hashes: Vec<u64>,
-    table: hashbrown::HashTable<u32>,
+    /// the ids by hash, in [`SHARDS`] tables by [`shard`], so that a merge can fill
+    /// them on several threads
+    tables: Vec<hashbrown::HashTable<u32>>,
+}
+
+/// The tables of a [`Names`].
+const SHARDS: usize = 64;
+
+/// The table of a [`Names`] that holds a hash: bits that neither the slot nor the tag
+/// of a hashbrown table of fewer than 2^32 entries reads.
+#[inline]
+fn shard(h: u64) -> usize {
+    ((h >> 40) as usize) % SHARDS
 }
 
 impl<T> Default for Names<T> {
@@ -99,7 +101,7 @@ impl<T> Default for Names<T> {
         Names {
             items: Vec::new(),
             hashes: Vec::new(),
-            table: hashbrown::HashTable::new(),
+            tables: (0..SHARDS).map(|_| hashbrown::HashTable::new()).collect(),
         }
     }
 }
@@ -111,32 +113,34 @@ impl<T> std::ops::Deref for Names<T> {
     }
 }
 
+/// What the merge of chunks' names found for a name of a chunk.
+#[derive(Clone, Copy)]
+enum Found {
+    /// the table had it, with this id
+    Held(u32),
+    /// it is the first occurrence among the chunks
+    First,
+    /// an earlier chunk, or earlier in this one, has it at (chunk, index)
+    Again(u32, u32),
+}
+
 impl<T: Named> Names<T> {
     pub fn get(&self, x: &T) -> Option<u32> {
         let h = name_hash(x.name());
-        self.table
+        self.tables[shard(h)]
             .find(h, |&i| self.items[i as usize].name() == x.name())
             .copied()
     }
 
     /// The id of an entity, which is added when it is new.
     pub fn id(&mut self, x: &T) -> u32 {
-        self.id_hashed(name_hash(x.name()), x, |x| x.clone())
-    }
-
-    /// The id of an entity whose hash the caller has, taking it with `take` when it is
-    /// new.
-    #[inline]
-    pub fn id_hashed<X>(&mut self, h: u64, x: X, take: impl FnOnce(X) -> T) -> u32
-    where
-        X: std::ops::Deref<Target = T>,
-    {
+        let h = name_hash(x.name());
         let Names {
             items,
             hashes,
-            table,
+            tables,
         } = self;
-        match table.entry(
+        match tables[shard(h)].entry(
             h,
             |&i| items[i as usize].name() == x.name(),
             |&i| hashes[i as usize],
@@ -145,7 +149,7 @@ impl<T: Named> Names<T> {
             hashbrown::hash_table::Entry::Vacant(v) => {
                 let id = items.len() as u32;
                 v.insert(id);
-                items.push(take(x));
+                items.push(x.clone());
                 hashes.push(h);
                 id
             }
@@ -156,22 +160,164 @@ impl<T: Named> Names<T> {
     pub fn bytes(&self) -> usize {
         self.items.capacity() * std::mem::size_of::<T>()
             + self.hashes.capacity() * 8
-            + self.table.capacity() * 5
+            + self.tables.iter().map(|t| t.capacity() * 5).sum::<usize>()
     }
 
-    /// Makes room for `n` more entities.
-    pub fn reserve(&mut self, n: usize) {
-        let hashes = &self.hashes;
-        self.table.reserve(n, |&i| hashes[i as usize]);
-        self.items.reserve(n);
-        self.hashes.reserve(n);
+    /// Takes the entities and their hashes out, leaving the table empty.
+    pub fn take(&mut self) -> (Vec<T>, Vec<u64>) {
+        for t in &mut self.tables {
+            t.clear();
+        }
+        (
+            std::mem::take(&mut self.items),
+            std::mem::take(&mut self.hashes),
+        )
     }
 
-    /// Takes the entities out, leaving the table empty.
-    pub fn take_items(&mut self) -> Vec<T> {
-        self.table.clear();
-        self.hashes.clear();
-        std::mem::take(&mut self.items)
+    /// Adds the names of chunks, each a list of distinct names with their hashes, and
+    /// answers each chunk's ids. The ids are those that adding the names one at a time,
+    /// in order, would give, and the tables fill on up to `threads` threads, each
+    /// taking whole tables.
+    pub fn merge_chunks(&mut self, chunks: Vec<(Vec<T>, Vec<u64>)>, threads: usize) -> Vec<Vec<u32>>
+    where
+        T: Send + Sync,
+    {
+        let threads = threads.clamp(1, SHARDS);
+        // each chunk's names by table, in their order
+        let buckets: Vec<Vec<Vec<u32>>> = super::par_map(&chunks, threads, |_, cs| {
+            cs.iter()
+                .map(|(_, hs)| {
+                    let mut b: Vec<Vec<u32>> = vec![Vec::new(); SHARDS];
+                    for (k, &h) in hs.iter().enumerate() {
+                        b[shard(h)].push(k as u32);
+                    }
+                    b
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect();
+        // what each name is, found table by table on the threads
+        let found: Vec<Vec<std::sync::atomic::AtomicU64>> = chunks
+            .iter()
+            .map(|(_, hs)| {
+                (0..hs.len())
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect()
+            })
+            .collect();
+        let encode = |f: Found| -> u64 {
+            match f {
+                Found::Held(id) => (1 << 62) | id as u64,
+                Found::First => 2 << 62,
+                Found::Again(c, k) => (3 << 62) | ((c as u64) << 31) | k as u64,
+            }
+        };
+        let decode = |x: u64| -> Found {
+            match x >> 62 {
+                1 => Found::Held(x as u32),
+                2 => Found::First,
+                _ => Found::Again(((x >> 31) & 0x7fff_ffff) as u32, (x & 0x7fff_ffff) as u32),
+            }
+        };
+        {
+            let shards: Vec<usize> = (0..SHARDS).collect();
+            let this = &*self;
+            let chunks = &chunks;
+            let buckets = &buckets;
+            let found = &found;
+            super::par_map(&shards, threads, |_, ss| {
+                for &s in ss {
+                    let mut seen: hashbrown::HashTable<(u32, u32)> = hashbrown::HashTable::new();
+                    for (c, b) in buckets.iter().enumerate() {
+                        let (items, hs) = &chunks[c];
+                        for &k in &b[s] {
+                            let x = &items[k as usize];
+                            let h = hs[k as usize];
+                            let f = if let Some(&id) = this.tables[s]
+                                .find(h, |&i| this.items[i as usize].name() == x.name())
+                            {
+                                Found::Held(id)
+                            } else if let Some(&(c2, k2)) = seen.find(h, |&(c2, k2)| {
+                                chunks[c2 as usize].0[k2 as usize].name() == x.name()
+                            }) {
+                                Found::Again(c2, k2)
+                            } else {
+                                seen.insert_unique(h, (c as u32, k), |&(c2, k2)| {
+                                    chunks[c2 as usize].1[k2 as usize]
+                                });
+                                Found::First
+                            };
+                            found[c][k as usize]
+                                .store(encode(f), std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+        }
+        // the ids, in the order of the chunks
+        let mut ids: Vec<Vec<u32>> = Vec::with_capacity(chunks.len());
+        let added: usize = found
+            .iter()
+            .flatten()
+            .filter(|f| {
+                matches!(
+                    decode(f.load(std::sync::atomic::Ordering::Relaxed)),
+                    Found::First
+                )
+            })
+            .count();
+        self.items.reserve(added);
+        self.hashes.reserve(added);
+        for (c, (items, hs)) in chunks.into_iter().enumerate() {
+            let mut out = Vec::with_capacity(items.len());
+            for (k, (x, h)) in items.into_iter().zip(hs).enumerate() {
+                let id = match decode(found[c][k].load(std::sync::atomic::Ordering::Relaxed)) {
+                    Found::Held(id) => id,
+                    Found::First => {
+                        let id = self.items.len() as u32;
+                        self.items.push(x);
+                        self.hashes.push(h);
+                        id
+                    }
+                    Found::Again(c2, k2) => ids[c2 as usize][k2 as usize],
+                };
+                out.push(id);
+            }
+            ids.push(out);
+        }
+        // the new names join the tables, table by table on the threads
+        {
+            let hashes = &self.hashes;
+            let first = self.items.len() - added;
+            let mut tables: Vec<(usize, &mut hashbrown::HashTable<u32>)> =
+                self.tables.iter_mut().enumerate().collect();
+            let per = SHARDS.div_ceil(threads);
+            let mut counts = [0usize; SHARDS];
+            for &h in &hashes[first..] {
+                counts[shard(h)] += 1;
+            }
+            let counts = &counts;
+            std::thread::scope(|sc| {
+                for part in tables.chunks_mut(per) {
+                    sc.spawn(move || {
+                        let s0 = part[0].0;
+                        for (s, t) in part.iter_mut() {
+                            t.reserve(counts[*s], |&i| hashes[i as usize]);
+                        }
+                        for (i, &h) in hashes.iter().enumerate().skip(first) {
+                            if let Some((_, t)) =
+                                shard(h).checked_sub(s0).and_then(|j| part.get_mut(j))
+                            {
+                                t.insert_unique(h, i as u32, |&j| hashes[j as usize]);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        ids
     }
 }
 
@@ -266,62 +412,63 @@ impl Interner {
         acc
     }
 
-    /// Takes in a chunk's interner, which normalized a run of axioms that follows those
-    /// this interner has met, and answers the ids here of the chunk's expressions and
-    /// roles. Each name and expression gets the id the chunk's first occurrence would
-    /// have given it in a normalization on one thread: the chunk lists them in the order
-    /// it met them, and those this interner has keep their ids.
-    pub fn merge(&mut self, mut chunk: Interner) -> (Vec<Ex>, Vec<Role>) {
-        debug_assert!(!chunk.chunk_has_data() && chunk.fresh == 0);
-        let roles: Vec<Role> = chunk.roles.iter().map(|r| self.role(r.clone())).collect();
-        let hashes = std::mem::take(&mut chunk.classes.hashes);
-        self.classes.reserve(hashes.len());
-        let classes: Vec<u32> = chunk
-            .classes
-            .take_items()
-            .into_iter()
-            .zip(hashes)
-            .map(|(c, h)| {
-                let id = self.classes.id_hashed(h, Owned(c), |c| c.0);
+    /// Takes in the interners of chunks, which normalized consecutive runs of axioms
+    /// that follow those this interner has met, and answers the ids here of each
+    /// chunk's expressions and roles. Each name and expression gets the id the chunk's
+    /// first occurrence would have given it in a normalization on one thread: a chunk
+    /// lists them in the order it met them, and those this interner has keep their ids.
+    /// The names of classes and individuals merge on up to `threads` threads.
+    pub fn merge(
+        &mut self,
+        mut chunks: Vec<Interner>,
+        threads: usize,
+    ) -> Vec<(Vec<Ex>, Vec<Role>)> {
+        debug_assert!(chunks.iter().all(|c| !c.chunk_has_data() && c.fresh == 0));
+        let classes = self.classes.merge_chunks(
+            chunks.iter_mut().map(|c| c.classes.take()).collect(),
+            threads,
+        );
+        for ids in &classes {
+            for &id in ids {
                 self.mark_met(id);
-                id
-            })
-            .collect();
-        let hashes = std::mem::take(&mut chunk.individuals.hashes);
-        let individuals: Vec<u32> = chunk
-            .individuals
-            .take_items()
-            .into_iter()
-            .zip(hashes)
-            .map(|(i, h)| self.individuals.id_hashed(h, Owned(i), |i| i.0))
-            .collect();
-        self.map.reserve(chunk.map.len());
-        let mut map: Vec<Ex> = Vec::with_capacity(chunk.nodes.len());
-        let mut ops: Vec<Ex> = Vec::new();
-        for n in &chunk.nodes {
-            let e = match *n {
-                Node::Top => TOP,
-                Node::Bottom => BOTTOM,
-                Node::Class(k) => self.node(Node::Class(classes[k as usize])),
-                Node::Nominal(k) => self.node(Node::Nominal(individuals[k as usize])),
-                Node::Conj(a, b) => self.conj(map[a as usize], map[b as usize]),
-                Node::Exist(r, f) => self.node(Node::Exist(roles[r as usize], map[f as usize])),
-                Node::SelfLoop(r) => self.node(Node::SelfLoop(roles[r as usize])),
-                Node::DataSome(..) => unreachable!("a chunk with data merges on one thread"),
-                Node::And(j) => {
-                    let (xs, binary) = &chunk.ands[j as usize];
-                    ops.clear();
-                    ops.extend(xs.iter().map(|&x| map[x as usize]));
-                    if *binary {
-                        self.conj(ops[0], ops[1])
-                    } else {
-                        self.fold_conj(&mut ops)
-                    }
-                }
-            };
-            map.push(e);
+            }
         }
-        (map, roles)
+        let individuals = self.individuals.merge_chunks(
+            chunks.iter_mut().map(|c| c.individuals.take()).collect(),
+            threads,
+        );
+        let mut out = Vec::with_capacity(chunks.len());
+        for ((chunk, classes), individuals) in chunks.into_iter().zip(classes).zip(individuals) {
+            let roles: Vec<Role> = chunk.roles.iter().map(|r| self.role(r.clone())).collect();
+            self.map.reserve(chunk.map.len());
+            let mut map: Vec<Ex> = Vec::with_capacity(chunk.nodes.len());
+            let mut ops: Vec<Ex> = Vec::new();
+            for n in &chunk.nodes {
+                let e = match *n {
+                    Node::Top => TOP,
+                    Node::Bottom => BOTTOM,
+                    Node::Class(k) => self.node(Node::Class(classes[k as usize])),
+                    Node::Nominal(k) => self.node(Node::Nominal(individuals[k as usize])),
+                    Node::Conj(a, b) => self.conj(map[a as usize], map[b as usize]),
+                    Node::Exist(r, f) => self.node(Node::Exist(roles[r as usize], map[f as usize])),
+                    Node::SelfLoop(r) => self.node(Node::SelfLoop(roles[r as usize])),
+                    Node::DataSome(..) => unreachable!("a chunk with data merges on one thread"),
+                    Node::And(j) => {
+                        let (xs, binary) = &chunk.ands[j as usize];
+                        ops.clear();
+                        ops.extend(xs.iter().map(|&x| map[x as usize]));
+                        if *binary {
+                            self.conj(ops[0], ops[1])
+                        } else {
+                            self.fold_conj(&mut ops)
+                        }
+                    }
+                };
+                map.push(e);
+            }
+            out.push((map, roles));
+        }
+        out
     }
 
     /// The id of a class, which the run's normalization meets.
@@ -1466,11 +1613,27 @@ impl Index {
     }
 }
 
+/// A set of expressions, as a flag for each.
+#[derive(Default)]
+struct Seen(Vec<bool>);
+
+impl Seen {
+    /// Adds an expression, and says whether it is new.
+    #[inline]
+    fn insert(&mut self, e: Ex) -> bool {
+        let i = e as usize;
+        if self.0.len() <= i {
+            self.0.resize((i + 1).max(2 * self.0.len()), false);
+        }
+        !std::mem::replace(&mut self.0[i], true)
+    }
+}
+
 /// The occurrences an index build collects before it groups them by expression.
 #[derive(Default)]
 struct Builder {
-    neg_seen: FxHashSet<Ex>,
-    pos_seen: FxHashSet<Ex>,
+    neg_seen: Seen,
+    pos_seen: Seen,
     conj: Vec<(Ex, (Ex, Ex))>,
     exist: Vec<(Ex, (Role, Ex))>,
     selfs: Vec<(Role, Ex)>,

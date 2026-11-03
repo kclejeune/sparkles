@@ -921,11 +921,9 @@ fn the_estimate_bounds_the_run_with_its_taxonomy() {
 
 #[test]
 fn waiting_messages_count_against_the_memory_limit() {
-    // every link from A to B through a subrole of s meets every rule at B, so B sends A
-    // the square of n messages, of which A stores only n. A worker's outbox drops the
-    // duplicates within each delivery, so A's to-do list still takes about n messages
-    // for each delivery, n * n / 4096 deliveries
-    let n = 1000;
+    // every link from A to B through a subrole of s meets every rule at B, so A's
+    // to-do list takes the square of n messages and stores only n of them
+    let n = 300;
     let mut axioms = Vec::new();
     for i in 0..n {
         let r = format!("r{i}");
