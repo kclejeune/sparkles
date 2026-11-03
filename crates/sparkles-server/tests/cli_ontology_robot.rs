@@ -233,11 +233,11 @@ fn classify_and_check_in_a_chain() {
     let alone = sparkles(dir, &["ontology", "check", "o.ofn", "--profile", "el"]);
     assert_eq!(out(&o), out(&alone));
     assert_eq!(axioms(&dir.join("c.ofn")), axioms(&dir.join("o.ofn")));
-    // a chain from a database starts with reason, reduce or relax
+    // a chain from a database starts with reason, reduce, relax or materialize
     let o = sparkles(dir, &["ontology", "classify", "--loc", "db", "relax"]);
     assert_eq!(o.status.code(), Some(1), "{}", err(&o));
     assert!(
-        err(&o).contains("starts with reason, reduce or relax"),
+        err(&o).contains("starts with reason, reduce, relax or materialize"),
         "{}",
         err(&o)
     );
@@ -460,4 +460,242 @@ SubClassOf(Annotation(rdfs:comment "x") :A :D)
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     let g = axioms(&dir.join("g.ofn"));
     assert!(!g.iter().any(|l| l.starts_with("SubClassOf")), "{g:?}");
+}
+
+/// What `materialize --term partOf` adds to `o.ofn`: the direct superclasses of the two
+/// defined classes, of which `∃partOf.Brain` is not direct for CerebellarNeuron through
+/// the transitive partOf, and nothing for Cerebellum, whose existential is asserted, or
+/// for Neuron, Brain and Obsolete, which have no class axiom.
+const MATERIALIZED: [&str; 4] = [
+    "SubClassOf(:CerebellarNeuron :HindbrainNeuron)",
+    "SubClassOf(:CerebellarNeuron ObjectSomeValuesFrom(:partOf :Cerebellum))",
+    "SubClassOf(:HindbrainNeuron :Neuron)",
+    "SubClassOf(:HindbrainNeuron ObjectSomeValuesFrom(:partOf :Brain))",
+];
+
+#[test]
+fn materialize_by_term_term_file_and_every_property() {
+    let d = setup();
+    let dir = d.path();
+    let input = axioms(&dir.join("o.ofn"));
+    let added = |file: &str| -> BTreeSet<String> {
+        axioms(&dir.join(file))
+            .difference(&input)
+            .cloned()
+            .collect()
+    };
+    let want: BTreeSet<String> = MATERIALIZED.iter().map(|s| s.to_string()).collect();
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "materialize",
+            "--input",
+            "o.ofn",
+            "--term",
+            "http://ex.org/partOf",
+            "--output",
+            "m.ofn",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(added("m.ofn"), want);
+    std::fs::write(
+        dir.join("terms.txt"),
+        "# the properties\nhttp://ex.org/partOf # part of\n\n",
+    )
+    .unwrap();
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "materialize",
+            "-i",
+            "o.ofn",
+            "-T",
+            "terms.txt",
+            "-o",
+            "t.ofn",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(added("t.ofn"), want);
+    // no term, or none that is an IRI, takes every object property, as ROBOT does
+    let o = sparkles(
+        dir,
+        &["ontology", "materialize", "-i", "o.ofn", "-o", "a.ofn"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(added("a.ofn"), want);
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "materialize",
+            "-i",
+            "o.ofn",
+            "-t",
+            "ex:partOf",
+            "-o",
+            "b.ofn",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        err(&o).contains("ex:partOf is not a valid IRI."),
+        "{}",
+        err(&o)
+    );
+    assert!(err(&o).contains("every object property"), "{}", err(&o));
+    assert_eq!(added("b.ofn"), want);
+    // an OBO CURIE expands, and a property the ontology lacks adds the named superclasses
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "materialize",
+            "-i",
+            "o.ofn",
+            "-t",
+            "BFO:0000050",
+            "-r",
+            "HermiT",
+            "-s",
+            "false",
+            "-a",
+            "true",
+            "-o",
+            "c.ofn",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        err(&o).contains("--reasoner HermiT is ignored"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(
+        added("c.ofn"),
+        want.iter()
+            .filter(|s| !s.contains("ObjectSomeValuesFrom"))
+            .cloned()
+            .collect()
+    );
+    // --create-new-ontology true saves the ontology without them, as ROBOT does
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "materialize",
+            "-i",
+            "o.ofn",
+            "-n",
+            "TRUE",
+            "-o",
+            "n.ofn",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(added("n.ofn").is_empty());
+}
+
+#[test]
+fn materialize_in_a_chain_from_a_file_and_a_database() {
+    let d = setup();
+    let dir = d.path();
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "reason",
+            "--input",
+            "o.ofn",
+            "materialize",
+            "--term",
+            "http://ex.org/partOf",
+            "reduce",
+            "--output",
+            "chain.ofn",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    for (cmd, from, to) in [
+        ("reason", "o.ofn", "1.ofn"),
+        ("materialize", "1.ofn", "2.ofn"),
+        ("reduce", "2.ofn", "3.ofn"),
+    ] {
+        let mut args = vec!["ontology", cmd, "--input", from, "--output", to];
+        if cmd == "materialize" {
+            args.extend(["--term", "http://ex.org/partOf"]);
+        }
+        let o = sparkles(dir, &args);
+        assert_eq!(o.status.code(), Some(0), "{cmd}: {}", err(&o));
+    }
+    let chain = axioms(&dir.join("chain.ofn"));
+    assert_eq!(chain, axioms(&dir.join("3.ofn")));
+    assert!(
+        chain.contains("SubClassOf(:CerebellarNeuron ObjectSomeValuesFrom(:partOf :Cerebellum))"),
+        "{chain:?}"
+    );
+    // from a database
+    let o = sparkles(dir, &["load", "--loc", "db", "o.ofn"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "materialize",
+            "--loc",
+            "db",
+            "-t",
+            "http://ex.org/partOf",
+            "-o",
+            "db.ofn",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let a = axioms(&dir.join("db.ofn"));
+    assert!(
+        a.iter().any(|l| l.starts_with("SubClassOf(")
+            && l.contains("CerebellarNeuron")
+            && l.contains("ObjectSomeValuesFrom(")
+            && l.contains("Cerebellum))")),
+        "{a:?}"
+    );
+}
+
+#[test]
+fn materialize_errors_and_exit_statuses() {
+    let d = setup();
+    let dir = d.path();
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["materialize", "-i", "unsat.ofn", "-o", "y.ofn"],
+            "unsatisfiable: http://ex.org/A",
+        ),
+        (
+            &["materialize", "-i", "o.ofn", "-r", "emr"],
+            "INVALID REASONER ERROR",
+        ),
+        (
+            &["materialize", "-i", "o.ofn", "-r", "nonsense"],
+            "INVALID REASONER ERROR",
+        ),
+        (
+            &["materialize", "-i", "o.ofn", "-T", "missing.txt"],
+            "cannot read the term file",
+        ),
+        (
+            &["materialize", "-i", "abox.ofn", "-o", "y.ofn"],
+            "INCONSISTENT ONTOLOGY ERROR",
+        ),
+    ];
+    for (args, message) in cases {
+        let mut a = vec!["ontology"];
+        a.extend_from_slice(args);
+        let o = sparkles(dir, &a);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", err(&o));
+        assert!(err(&o).contains(message), "{args:?}: {}", err(&o));
+    }
+    assert!(!dir.join("y.ofn").exists());
 }
