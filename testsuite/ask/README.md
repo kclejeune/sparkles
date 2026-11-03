@@ -55,6 +55,17 @@ of the committed questions returns nothing. No question comes from a QALD-9-plus
 Text2SPARQL'25 question, and with `--exclude` no resource that a gold query of those
 sets names becomes a question's subject.
 
+The paid runs read copies of these files whose `description` named the campaign's path
+to the generator. The questions are identical, and the evaluated copies have the SHA-256
+digests `d471fd79d0b933e41aac0dd0879c3d41707fe32846dfee7ac9a3592342aae3c2` for train,
+`e698843f2d61435ed93ca32e07c1cee903ad9bd71374b48cef39b473852792a8` for validation and
+`829647ae2073ced7e823494cf04432a215463a34263da96f0b294aa0a283fb5a` for test, the digests
+that the [paid record](../../docs/benchmarks/2026-11-02-ask-cheap-tier-paid.json) gives.
+The generator read resource names with ASCII letters only when the sets were made, so
+three excluded resources with other letters, such as `dbr:Düsseldorf_Airport`, were read
+cut short. None of them is the subject of a committed question, and the generator now
+reads names in any script and with escapes.
+
 The synthetic questions are easier than the public sets. On the validation split Haiku
 5.5 answers about 82% and GPT-6 Luna about 88%, against 45% to 63% on 51 QALD-9-plus
 validation questions, so a gain on them is a coarse guide. A gain must also hold on the

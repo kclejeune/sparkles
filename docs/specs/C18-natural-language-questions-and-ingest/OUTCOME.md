@@ -1928,8 +1928,9 @@ with executed gold, are published in `testsuite/ask/synth`. The
 [results](../../benchmarks/natural-language/RESULTS.md#ask-on-the-cheapest-models) give
 every run and the [paid record](../../benchmarks/2026-11-02-ask-cheap-tier-paid.json)
 the per-case results and ledgers. The round spent $12.09 on Anthropic models and $9.35
-on OpenAI models. OpenAI's report matches its ledger, and the Anthropic spend stands in
-the ledger.
+on OpenAI models. OpenAI's report matches its ledger for every day it had closed when
+it was read, its report for the last day lagged the Sol runs, and the Anthropic spend
+stands in the ledger.
 
 ### Roadmap follow-ups
 

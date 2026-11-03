@@ -196,7 +196,8 @@
   "anthropic": "Not reconciled for Phase 2, since no Anthropic Admin API key or Console export was available. The ledger holds each request at its settled cost."
  },
  "notes": [
-  "qald-val is qald-validation-v2, 51 questions. synth-val is the synthetic validation split; synth/v3 holds the same sets as testsuite/ask/synth/v3.",
+  "The synth/v3 digests under sets are those of the evaluated files. testsuite/ask/synth/v3 publishes the same questions with a description that names the published generator path, so its files have other digests, and its README gives these.",
+  "qald-val is qald-validation-v2, 51 questions. synth-val is the synthetic validation split; synth/v3 holds the same questions as testsuite/ask/synth/v3.",
   "The library runs used db/dbpedia-ex.db, a hardlinked clone of the campaign database with 99 stored queries added; its superlative template was removed before p2-l-lib-r2. Every other run used the campaign database or db/dbpedia-b.db, a hardlinked clone with no change, which let the two provider streams of the finals run at once.",
   "p2-h-lib-r2 was stopped by a timeout during its qald-val set, so only its synthetic set is complete. One request it held stays at its bound in the second Anthropic ledger.",
   "Admission refused Sol and Opus finals as one block of 150, so p2-final-sol-parts and p2-final-anth-opus ran unseen-150 as sets unseen-a, -b and -c of 50 questions each.",
