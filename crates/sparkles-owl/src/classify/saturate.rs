@@ -837,9 +837,9 @@ impl<'a> Run<'a> {
                 return;
             }
             if self.plain {
-                self.process::<false>(next, &mut mine, &mut tally, &mut local, &mut outbox);
+                self.process::<Plain>(next, &mut mine, &mut tally, &mut local, &mut outbox);
             } else {
-                self.process::<true>(next, &mut mine, &mut tally, &mut local, &mut outbox);
+                self.process::<Full>(next, &mut mine, &mut tally, &mut local, &mut outbox);
             }
             if !outbox.is_empty() && self.idle.load(Ordering::Relaxed) > 0 {
                 self.deliver(&mut outbox, &mut mine);
@@ -887,8 +887,8 @@ impl<'a> Run<'a> {
     }
 
     /// Activates a context: applies the rules to what waits in its to-do list until none
-    /// is left, with the rules of individuals when `FULL` is set.
-    fn process<const FULL: bool>(
+    /// is left, with the rules that `R` holds.
+    fn process<R: Rules>(
         &self,
         me: Ex,
         mine: &mut VecDeque<Ex>,
@@ -914,7 +914,7 @@ impl<'a> Run<'a> {
         }
         'outer: loop {
             while let Some(c) = out.local.pop() {
-                if apply_rules::<_, FULL>(self.ix, me, &mut st, c, &mut out) {
+                if apply_rules::<_, R>(self.ix, me, &mut st, c, &mut out) {
                     tally.stored += 1;
                 }
                 tally.applied += 1;
@@ -983,7 +983,7 @@ fn individuals(ix: &Index, me: Ex, st: &State, mut f: impl FnMut(Ex)) {
 
 /// Applies the rules to one conclusion. The answer says whether it was new.
 pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S) -> bool {
-    apply_rules::<S, true>(ix, me, st, c, out)
+    apply_rules::<S, Full>(ix, me, st, c, out)
 }
 
 /// Whether the rules of individuals and functional data roles can apply to the index:
@@ -994,10 +994,30 @@ pub fn plain(ix: &Index) -> bool {
     !ix.has_individuals() && !ix.nominal_selfs && ix.roles.functional.iter().all(|f| f.is_empty())
 }
 
-/// [`apply`], with the rules of individuals and functional data roles left out when
-/// `FULL` is false, which [`plain`] allows.
+/// The rules a saturation runs, as constants that the compiler folds, so that each set
+/// is its own instantiation of [`apply_rules`] and a rule left out costs no check.
+trait Rules {
+    /// the rules of individuals and functional data roles, which [`plain`] leaves out
+    const FULL: bool;
+}
+
+/// The rules of an index without individuals, universal roles or functional data roles.
+struct Plain;
+
+/// Every rule of the EL calculus.
+struct Full;
+
+impl Rules for Plain {
+    const FULL: bool = false;
+}
+
+impl Rules for Full {
+    const FULL: bool = true;
+}
+
+/// [`apply`], with the rules that `R` holds.
 #[inline(always)]
-fn apply_rules<S: Sink, const FULL: bool>(
+fn apply_rules<S: Sink, R: Rules>(
     ix: &Index,
     me: Ex,
     st: &mut State,
@@ -1019,7 +1039,7 @@ fn apply_rules<S: Sink, const FULL: bool>(
                             out.send(e, Concl::Sub(BOTTOM));
                         }
                     }
-                    if FULL && st.extra.is_some() {
+                    if R::FULL && st.extra.is_some() {
                         give(st, BOTTOM, out);
                     }
                     return true;
@@ -1034,13 +1054,13 @@ fn apply_rules<S: Sink, const FULL: bool>(
                     if roles.keeps_forward(r) {
                         out.me(Concl::Fwd(r, succ));
                     }
-                    if FULL && st.real {
+                    if R::FULL && st.real {
                         out.send(succ, Concl::Real);
                     }
                 }
                 Node::SelfLoop(r) => out.me(Concl::Loop(r)),
-                Node::Nominal(_) if FULL && d != me => nominal(ix, me, st, d, out),
-                Node::DataSome(r, _) if FULL && !roles.functional(r).is_empty() => {
+                Node::Nominal(_) if R::FULL && d != me => nominal(ix, me, st, d, out),
+                Node::DataSome(r, _) if R::FULL && !roles.functional(r).is_empty() => {
                     functional(ix, st, r, h.succ, out)
                 }
                 _ => {}
@@ -1075,7 +1095,7 @@ fn apply_rules<S: Sink, const FULL: bool>(
                     }
                 }
             }
-            if FULL && st.extra.is_some() {
+            if R::FULL && st.extra.is_some() {
                 give(st, d, out);
             }
             true
@@ -1098,7 +1118,7 @@ fn apply_rules<S: Sink, const FULL: bool>(
                     compose(roles, e, t, f, out);
                 }
             }
-            if FULL && ix.nominal_selfs {
+            if R::FULL && ix.nominal_selfs {
                 link_to(ix, me, st, e, r, out);
             }
             true
@@ -1144,9 +1164,9 @@ fn apply_rules<S: Sink, const FULL: bool>(
             }
             true
         }
-        Concl::Nom(k) if FULL => apply_nom(me, st, k, out),
-        Concl::Real if FULL => apply_real(ix, st, out),
-        Concl::LinkTo(r, n) if FULL => apply_link_to(me, st, r, n, out),
+        Concl::Nom(k) if R::FULL => apply_nom(me, st, k, out),
+        Concl::Real if R::FULL => apply_real(ix, st, out),
+        Concl::LinkTo(r, n) if R::FULL => apply_link_to(me, st, r, n, out),
         Concl::Nom(_) | Concl::Real | Concl::LinkTo(..) => {
             unreachable!("a conclusion of individuals in a saturation without them")
         }

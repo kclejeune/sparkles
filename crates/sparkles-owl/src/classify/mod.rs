@@ -10,7 +10,9 @@
 //! top and bottom properties. A class whose instances reach an individual through a
 //! context that holds only where the class has an instance is classified again in a
 //! world of its own. An axiom outside OWL 2 EL is left out and reported, with
-//! the rule of the OWL 2 Profiles recommendation it breaks. An axiom with a literal or a
+//! the rule of the OWL 2 Profiles recommendation it breaks, and the run's [`Stats`] count
+//! these axioms by whether they are Horn and give the [`Tier`] of rules the ontology
+//! needs. An axiom with a literal or a
 //! datatype that the classifier cannot compare, or with a property chain through the top
 //! property, is used as far as the calculus goes and reported as partial. Every
 //! subsumption the classifier answers is entailed. It derives every entailed subsumption
@@ -44,12 +46,14 @@
 //! ```
 
 mod data;
+mod dl;
 mod index;
 mod query;
 mod saturate;
 mod taxonomy;
 mod world;
 
+pub use dl::{OutsideEl, Tier};
 pub use index::Gap;
 pub use query::Description;
 pub use taxonomy::{Node as TaxonomyNode, Taxonomy};
@@ -63,6 +67,10 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// The rule of the EL profile that a chain breaks when its superproperty has a range that
+/// its last property lacks.
+const CHAIN_RANGE_RULE: &str = "OWL 2 Profiles §2.2.6";
 
 /// What bounds a run: the worker threads, a deadline, a memory budget and a cancellation
 /// check.
@@ -136,6 +144,11 @@ pub struct Stats {
     pub index: Duration,
     pub saturation: Duration,
     pub taxonomy: Duration,
+    /// the axioms outside OWL 2 EL, by what classifying them needs, which the run leaves
+    /// out until roadmap item 603's rules take them
+    pub outside_el: OutsideEl,
+    /// the rules the run's axioms need
+    pub tier: Tier,
 }
 
 /// The result of a run that saturates without building a taxonomy
@@ -754,7 +767,7 @@ impl Saturation {
             excluded.push(Excluded {
                 axiom: k.clone(),
                 gap: Gap::Outside {
-                    rule: "OWL 2 Profiles §2.2.6".to_string(),
+                    rule: CHAIN_RANGE_RULE.to_string(),
                     message,
                 },
             });
@@ -832,6 +845,19 @@ impl Saturation {
         let (ax, ix, normalized_peak) =
             self.build(axioms, &outside, threads, held_bytes, limits)?;
         drop(outside);
+        // what each axiom left out needs (item 603), counted once however often it
+        // occurs, as the excluded axioms are; a chain whose superproperty has a range its
+        // last property lacks is Horn
+        for x in &self.excluded {
+            if let Gap::Outside { rule, .. } = &x.gap {
+                if rule == CHAIN_RANGE_RULE {
+                    stats.outside_el.horn += 1;
+                } else {
+                    stats.outside_el.add(dl::shape(&x.axiom));
+                }
+            }
+        }
+        stats.tier = stats.outside_el.tier();
         poll(limits)?;
         let n = self.interner.len();
         self.ctx.resize_with(n, OnceLock::new);
@@ -1451,6 +1477,45 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn axioms_outside_el_count_once_however_often_they_occur() {
+        let c = |n: &str| ClassExpression::Class(Class::new(format!("http://ex.org/{n}")));
+        let or = AxiomKind::SubClassOf(
+            c("A"),
+            ClassExpression::ObjectUnionOf([c("B"), c("C")].into()),
+        );
+        let all = AxiomKind::SubClassOf(
+            c("A"),
+            ClassExpression::ObjectAllValuesFrom(
+                ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/r")),
+                Box::new(c("B")),
+            ),
+        );
+        let mut axioms = vec![&or; 3000];
+        axioms.extend(vec![&all; 3000]);
+        for threads in [1, 8] {
+            let out = Saturation::default()
+                .classify(
+                    &axioms,
+                    None,
+                    &Limits {
+                        threads,
+                        ..Limits::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                out.stats.outside_el,
+                OutsideEl {
+                    horn: 1,
+                    disjunctive: 1,
+                    global: 0
+                }
+            );
+            assert_eq!(out.stats.tier, Tier::Disjunctive);
+        }
+    }
 
     /// Random axioms over a few hundred classes, with intersections whose operands come
     /// in every order, so that chunks meet expressions in orders other than the run's.
