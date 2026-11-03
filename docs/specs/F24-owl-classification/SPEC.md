@@ -74,8 +74,9 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-The OWL 2 EL classifier is delivered as roadmap item 580 and covers all of OWL 2 EL
-since item 587. The other phases remain under [item 457](../../ROADMAP.md).
+The OWL 2 EL classifier is delivered as roadmap item 580 and covers OWL 2 EL, apart
+from the literals and the chains that item NEW-ITEM-1 follows, since item 587. The other
+phases remain under [item 457](../../ROADMAP.md).
 
 ### The OWL 2 EL classifier
 
@@ -110,7 +111,8 @@ leaves out. The index holds one record per expression, with the told subsumers, 
 conjunctions and the existential restrictions that use the expression as spans of flat
 arrays.
 
-**Scope of the reasoning.** The classifier covers all of OWL 2 EL. Besides `owl:Thing`,
+**Scope of the reasoning.** The classifier covers OWL 2 EL, apart from the literals,
+datatypes and chains this paragraph names last. Besides `owl:Thing`,
 `owl:Nothing`, intersections, existential restrictions, equivalences, disjointness, the
 object and data property hierarchies, chains, transitive and reflexive properties,
 domains, ranges and `ObjectHasSelf`, it reasons with individuals in class expressions

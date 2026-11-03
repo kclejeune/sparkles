@@ -79,7 +79,7 @@ the 36 ORE ontologies with individuals (roadmap item 591). `scripts/elk-compare/
 runs ELK or HermiT through the OWL API from pinned Maven Central jars, and the EL
 classification report gives times and memory beside ELK's on the benchmark host.
 
-The OWL 2 EL classifier covers all of OWL 2 EL (roadmap items 587 and 605). It reasons
+The OWL 2 EL classifier covers OWL 2 EL (roadmap items 587 and 605). It reasons
 with individuals in class expressions and assertions, ranges that meet them, the
 datatypes, literals and data ranges of the profile, functional data properties, data
 property ranges, datatype definitions, keys, negative property assertions and the top

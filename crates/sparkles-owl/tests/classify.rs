@@ -1775,3 +1775,40 @@ fn worlds_count_against_the_memory_limit() {
         e => panic!("{e:?}"),
     }
 }
+
+#[test]
+fn messages_a_world_sends_count_against_the_memory_limit() {
+    // in A's world B is real, so the individual a, which B is, takes every G_j, and F,
+    // which is a too, takes them from a. Each G_j at F sends H_j back over the n links
+    // from A, so F sends the square of n messages to A, which stores only n of them.
+    let n = 400;
+    let mut axioms = vec![
+        sub(c("A"), some("t", c("B"))),
+        sub(c("B"), one("a")),
+        sub(c("F"), one("a")),
+    ];
+    for i in 0..n {
+        let r = format!("r{i}");
+        axioms.push(ax(AxiomKind::SubObjectPropertyOf(
+            SubObjectPropertyExpression::Expression(ope(&r)),
+            ope("s"),
+        )));
+        axioms.push(sub(c("A"), some(&r, c("F"))));
+        axioms.push(sub(c("B"), c(&format!("G{i}"))));
+        axioms.push(sub(some("s", c(&format!("G{i}"))), c(&format!("H{i}"))));
+    }
+    let full = Classifier::of(&axioms)
+        .classify(&Limits::default())
+        .unwrap();
+    assert!(full.taxonomy.is_subclass(&c("A"), &c("H7")));
+    assert!(!full.taxonomy.is_subclass(&c("F"), &c("G7")));
+    let limit = Limits {
+        threads: 1,
+        max_memory: Some(full.stats.memory + 1_000_000),
+        ..Limits::default()
+    };
+    match Classifier::of(&axioms).classify(&limit).unwrap_err() {
+        Error::Memory { limit, used } => assert!(used > limit, "{used} <= {limit}"),
+        e => panic!("{e:?}"),
+    }
+}

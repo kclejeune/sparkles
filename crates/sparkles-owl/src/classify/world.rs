@@ -398,10 +398,11 @@ impl<'a> World<'a> {
     }
 
     /// Tells the bound what the world holds now, its waiting messages included, and
-    /// stops the world when the bound refuses.
-    fn checkpoint(&mut self) {
-        let used =
-            self.held + (self.waiting + self.pending.len()) * std::mem::size_of::<(Ex, Concl)>();
+    /// stops the world when the bound refuses. `busy` counts the messages in the buffers
+    /// of the context being processed.
+    fn checkpoint(&mut self, busy: usize) {
+        let used = self.held
+            + (self.waiting + self.pending.len() + busy) * std::mem::size_of::<(Ex, Concl)>();
         let delta = used as isize - self.reported as isize;
         self.reported = used;
         if !(self.bound)(delta) {
@@ -526,7 +527,7 @@ impl<'a> World<'a> {
                     // the world made it real from the global state already
                     st.real |= real && st.init;
                     self.held += CONTEXT_BYTES + st.bytes();
-                    self.checkpoint();
+                    self.checkpoint(todo.len());
                     st
                 }
             };
@@ -555,7 +556,7 @@ impl<'a> World<'a> {
                     }
                     self.applied += 1;
                     if self.applied.is_multiple_of(CHECK_EVERY) {
-                        self.checkpoint();
+                        self.checkpoint(sink.local.len() + sink.out.len());
                         if self.halted {
                             break;
                         }
@@ -564,6 +565,9 @@ impl<'a> World<'a> {
             }
             let slot = self.slots.get_mut(&e).expect("slot");
             slot.st = Some(st);
+            // the messages the context sent count until they are delivered, and once
+            // they wait in their contexts' to-do lists
+            self.checkpoint(out.len());
             self.pending.extend(out);
             self.deliver();
         }
@@ -576,7 +580,7 @@ impl<'a> World<'a> {
         self.pending.push((class, Concl::Real));
         loop {
             self.drain();
-            self.checkpoint();
+            self.checkpoint(0);
             if self.halted {
                 (self.bound)(-(self.reported as isize));
                 return None;

@@ -3,7 +3,7 @@
 //! calculus in the style of ELK (Kazakov, Krötzsch and Simančík, *The Incredible ELK*,
 //! JAR 2014), and kept up to date incrementally as axioms are added and removed.
 //!
-//! The classifier reads the F21 axiom model only. It covers all of OWL 2 EL with the
+//! The classifier reads the F21 axiom model only. It covers OWL 2 EL with the
 //! rules of EL++ (Baader, Brandt and Lutz, IJCAI 2005 and OWLED 2008): individuals in
 //! class expressions and assertions, ranges, the datatypes, literals and data ranges of
 //! the profile, functional data properties, keys, negative property assertions and the
@@ -812,37 +812,16 @@ impl Saturation {
                 // the worlds running and the subsumers of those done count against the
                 // budget beside the saturated state, and the pool is charged for what
                 // passes the peak
-                let held = AtomicIsize::new(0);
-                let peak = AtomicUsize::new(totals.peak);
-                let halt = AtomicU8::new(0);
-                let halted_at = AtomicUsize::new(0);
-                let base = totals.memory;
-                let bound = |delta: isize| -> bool {
-                    let now = held.fetch_add(delta, Ordering::Relaxed) + delta;
-                    if halt.load(Ordering::Relaxed) != 0 {
-                        return false;
-                    }
-                    if delta <= 0 {
-                        return true;
-                    }
-                    let used = base + now.max(0) as usize;
-                    let before = peak.fetch_max(used, Ordering::Relaxed);
-                    let grown = used.saturating_sub(before);
-                    let why = if limits.max_memory.is_some_and(|m| used > m)
-                        || charge_fn.is_some_and(|f| grown > 0 && !f(grown))
-                    {
-                        halted_at.store(used, Ordering::Relaxed);
-                        WORLD_MEMORY
-                    } else if limits.deadline.is_some_and(|d| Instant::now() >= d) {
-                        WORLD_TIMEOUT
-                    } else if limits.cancelled.as_ref().is_some_and(|f| f()) {
-                        WORLD_CANCEL
-                    } else {
-                        return true;
-                    };
-                    halt.store(why, Ordering::Relaxed);
-                    false
+                let budget = WorldBudget {
+                    limits,
+                    charge: charge_fn,
+                    base: totals.memory,
+                    held: AtomicIsize::new(0),
+                    peak: AtomicUsize::new(totals.peak),
+                    halt: AtomicU8::new(0),
+                    halted_at: AtomicUsize::new(0),
                 };
+                let bound = |delta: isize| budget.tell(delta);
                 let found = par_map(&classes, threads, |_, chunk| {
                     let mut out = Vec::with_capacity(chunk.len());
                     for &d in chunk {
@@ -858,18 +837,8 @@ impl Saturation {
                     }
                     out
                 });
-                match halt.load(Ordering::Relaxed) {
-                    WORLD_MEMORY => {
-                        return Err(Error::Memory {
-                            limit: limits.max_memory.unwrap_or(usize::MAX),
-                            used: halted_at.load(Ordering::Relaxed),
-                        });
-                    }
-                    WORLD_TIMEOUT => return Err(Error::Timeout),
-                    WORLD_CANCEL => return Err(Error::Cancelled),
-                    _ => {}
-                }
-                totals.peak = peak.load(Ordering::Relaxed);
+                budget.stopped()?;
+                totals.peak = budget.peak.load(Ordering::Relaxed);
                 for (d, f, kept) in found.into_iter().flatten() {
                     world_bytes += kept;
                     self.worlds.insert(d, (f.bottom, f.subs));
@@ -1134,6 +1103,70 @@ const WORLD_MEMORY: u8 = 1;
 const WORLD_TIMEOUT: u8 = 2;
 const WORLD_CANCEL: u8 = 3;
 
+/// The bound the worlds of a run share: what they hold counts against the memory budget
+/// beside the saturated state, the pool is charged for what passes the run's peak, and
+/// every report polls the deadline and the cancellation.
+struct WorldBudget<'a> {
+    limits: &'a Limits,
+    charge: Option<&'a (dyn Fn(usize) -> bool + Sync)>,
+    /// the bytes of the saturated state
+    base: usize,
+    /// the bytes the worlds hold now
+    held: AtomicIsize,
+    peak: AtomicUsize,
+    halt: AtomicU8,
+    halted_at: AtomicUsize,
+}
+
+impl WorldBudget<'_> {
+    /// Takes a change of what a world holds, and answers whether the worlds go on.
+    fn tell(&self, delta: isize) -> bool {
+        let now = self.held.fetch_add(delta, Ordering::Relaxed) + delta;
+        if self.halt.load(Ordering::Relaxed) != 0 {
+            return false;
+        }
+        let limits = self.limits;
+        let mut over = false;
+        if delta > 0 {
+            let used = self.base + now.max(0) as usize;
+            let before = self.peak.fetch_max(used, Ordering::Relaxed);
+            let grown = used.saturating_sub(before);
+            over = limits.max_memory.is_some_and(|m| used > m)
+                || self.charge.is_some_and(|f| grown > 0 && !f(grown));
+            if over {
+                self.halted_at.store(used, Ordering::Relaxed);
+            }
+        }
+        let why = if over {
+            WORLD_MEMORY
+        } else if limits.deadline.is_some_and(|d| Instant::now() >= d) {
+            WORLD_TIMEOUT
+        } else if limits.cancelled.as_ref().is_some_and(|f| f()) {
+            WORLD_CANCEL
+        } else {
+            return true;
+        };
+        // the first reason stays
+        let _ = self
+            .halt
+            .compare_exchange(0, why, Ordering::Relaxed, Ordering::Relaxed);
+        false
+    }
+
+    /// The error of the worlds' stop, if they stopped.
+    fn stopped(&self) -> Result<(), Error> {
+        match self.halt.load(Ordering::Relaxed) {
+            WORLD_MEMORY => Err(Error::Memory {
+                limit: self.limits.max_memory.unwrap_or(usize::MAX),
+                used: self.halted_at.load(Ordering::Relaxed),
+            }),
+            WORLD_TIMEOUT => Err(Error::Timeout),
+            WORLD_CANCEL => Err(Error::Cancelled),
+            _ => Ok(()),
+        }
+    }
+}
+
 fn poll(limits: &Limits) -> Result<(), Error> {
     if limits.deadline.is_some_and(|d| Instant::now() >= d) {
         return Err(Error::Timeout);
@@ -1142,4 +1175,66 @@ fn poll(limits: &Limits) -> Result<(), Error> {
         return Err(Error::Cancelled);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn the_world_budget_polls_the_cancellation_when_nothing_grows() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let seen = flag.clone();
+        let limits = Limits {
+            cancelled: Some(Arc::new(move || seen.load(Ordering::Relaxed))),
+            ..Limits::default()
+        };
+        let budget = WorldBudget {
+            limits: &limits,
+            charge: None,
+            base: 0,
+            held: AtomicIsize::new(0),
+            peak: AtomicUsize::new(0),
+            halt: AtomicU8::new(0),
+            halted_at: AtomicUsize::new(0),
+        };
+        assert!(budget.tell(100));
+        assert!(budget.tell(0));
+        flag.store(true, Ordering::Relaxed);
+        // a world whose working set stays flat or shrinks still sees the cancellation
+        assert!(!budget.tell(0));
+        assert!(!budget.tell(-50));
+        assert_eq!(budget.stopped(), Err(Error::Cancelled));
+        assert_eq!(budget.held.load(Ordering::Relaxed), 50);
+    }
+
+    #[test]
+    fn the_world_budget_stops_at_the_memory_limit_and_keeps_the_first_reason() {
+        let limits = Limits {
+            max_memory: Some(1_000),
+            deadline: Some(Instant::now() + Duration::from_secs(3600)),
+            ..Limits::default()
+        };
+        let budget = WorldBudget {
+            limits: &limits,
+            charge: None,
+            base: 600,
+            held: AtomicIsize::new(0),
+            peak: AtomicUsize::new(600),
+            halt: AtomicU8::new(0),
+            halted_at: AtomicUsize::new(0),
+        };
+        assert!(budget.tell(300));
+        assert!(!budget.tell(200));
+        assert!(!budget.tell(-500));
+        assert_eq!(
+            budget.stopped(),
+            Err(Error::Memory {
+                limit: 1_000,
+                used: 1_100
+            })
+        );
+    }
 }

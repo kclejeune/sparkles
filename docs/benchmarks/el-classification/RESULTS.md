@@ -42,8 +42,9 @@ range clashes with a class assertion, is inconsistent for all of them. The tests
 
 <a id="complete-el"></a>
 
-The classifier covers all of OWL 2 EL and reports no axiom of the 298 ORE ontologies
-as used in part. Its taxonomies of GO, ChEBI lite and the 298 ORE ontologies are byte
+The classifier covers OWL 2 EL apart from literals it cannot compare and property chains
+through the top object property, which it uses in part and reports, and it reports no
+axiom of the 298 ORE ontologies as used in part. Its taxonomies of GO, ChEBI lite and the 298 ORE ontologies are byte
 for byte those of the build before, which equal ELK's, and they equal Konclude's on
 all but GO, whose difference the next section explains. Before, it used axioms with
 individuals, data ranges or literals in part on 18 ORE ontologies, and HermiT's

@@ -233,7 +233,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   calculus in the manner of ELK. It reads the axiom model only, saturates its contexts
   on several threads and computes the class taxonomy: the classes grouped into
   equivalence classes, their direct superclasses and the unsatisfiable classes. It
-  covers all of OWL 2 EL, with intersections, existential restrictions, `owl:Thing` and
+  covers OWL 2 EL, with intersections, existential restrictions, `owl:Thing` and
   `owl:Nothing`, individuals in class expressions and assertions, the property
   hierarchy with the top and bottom properties, property chains, transitive and
   reflexive properties, domains, ranges, disjointness, `ObjectHasSelf`, the datatypes,
