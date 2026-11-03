@@ -1,0 +1,72 @@
+{
+ "ontology": "GO 2026-07-26",
+ "konclude_subsumptions_not_in_classifier": 7,
+ "classifier_direct_edges_not_direct_in_konclude": 2,
+ "examples": {
+  "onlyReference": [],
+  "onlyOurs": [],
+  "nodes": [],
+  "missing": [
+   [
+    [
+     "http://purl.obolibrary.org/obo/GO_0031527"
+    ],
+    [
+     "http://purl.obolibrary.org/obo/GO_0031090"
+    ]
+   ],
+   [
+    [
+     "http://purl.obolibrary.org/obo/GO_0031528"
+    ],
+    [
+     "http://purl.obolibrary.org/obo/GO_0031090"
+    ]
+   ],
+   [
+    [
+     "http://purl.obolibrary.org/obo/GO_0034357"
+    ],
+    [
+     "http://purl.obolibrary.org/obo/GO_0031090"
+    ]
+   ],
+   [
+    [
+     "http://purl.obolibrary.org/obo/GO_0035448"
+    ],
+    [
+     "http://purl.obolibrary.org/obo/GO_0031312"
+    ]
+   ],
+   [
+    [
+     "http://purl.obolibrary.org/obo/GO_0060171"
+    ],
+    [
+     "http://purl.obolibrary.org/obo/GO_0031090"
+    ]
+   ]
+  ],
+  "extra": [
+   [
+    [
+     "http://purl.obolibrary.org/obo/GO_0034357"
+    ],
+    [
+     "http://purl.obolibrary.org/obo/GO_0016020"
+    ]
+   ],
+   [
+    [
+     "http://purl.obolibrary.org/obo/GO_0035448"
+    ],
+    [
+     "http://purl.obolibrary.org/obo/GO_0019898"
+    ]
+   ]
+  ]
+ },
+ "explanation": "Every extra subsumption follows from InverseObjectProperties(BFO_0000050 part_of, BFO_0000051 has_part), the one GO axiom outside OWL 2 EL, which the classifier and ELK leave out and report, with TransitiveObjectProperty(part_of), GO_0043227 membrane-bounded organelle EquivalentTo organelle and has_part some membrane, and GO_0031090 organelle membrane EquivalentTo membrane and part_of some GO_0043227. For GO_0031527 filopodium membrane: it is a membrane and part_of some GO_0030175 filopodium, which is part_of some GO_0015629 actin cytoskeleton, an organelle. By transitivity the membrane is part of an actin cytoskeleton, by the inverse that cytoskeleton has the membrane as a part, so it is a membrane-bounded organelle and the membrane an organelle membrane. GO_0031528 and GO_0060171 follow the same path through GO_0015629, GO_0034357 and GO_0035448 through GO_0009579 thylakoid, and GO_0035448 then falls under GO_0031312. The two other differences are direct edges of the classifier that these subsumptions make indirect.",
+ "traced_by": "named superclasses from the classifier's taxonomy and the part_of restrictions of go.ofn, followed by hand; HermiT on forge checks the same taxonomy"
+}
