@@ -144,7 +144,9 @@ stage_binary() {
   }
   # The copy's directory is named by its contents, so two runs that share WORK with
   # different builds never run each other's binary.
-  hash=$(sha256sum -- "$tmp" | cut -c1-16) || return
+  # sha256sum, or shasum on macOS.
+  hash=$(sha256sum -- "$tmp" 2> /dev/null || shasum -a 256 -- "$tmp") || return
+  hash=${hash:0:16}
   dest=$WORK/bin/$hash/$(basename -- "$bin")
   mkdir -p "$WORK/bin/$hash" && mv -f -- "$tmp" "$dest" || return
   printf '%s\n' "$dest"
