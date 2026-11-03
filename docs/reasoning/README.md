@@ -330,9 +330,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   of `--term` and `--term-file`, together with the direct named superclasses that are not
   asserted, and with no term it takes every object property of the ontology. A term is a
   full IRI or a CURIE with one of the OBO prefixes of ROBOT's default context, such as
-  `BFO:0000050`, and a term file holds one a line with `#` comments. A term that Java's
-  URL parser rejects, such as an IRI with a malformed port, is left out with a warning,
-  as ROBOT leaves it out. A superclass is
+  `BFO:0000050`, and a term file holds one a line with `#` comments. A term that is
+  neither a URN nor a URL that Java's URL parser accepts, such as an IRI with a malformed
+  port, is left out with a warning, as ROBOT leaves it out. A superclass is
   direct in the taxonomy that has a class for each such restriction, so a superclass is
   left out when another superclass of the class, named or a restriction, lies below it.
   The command validates the ontology first, as `reason` does, and takes `--reasoner` as
