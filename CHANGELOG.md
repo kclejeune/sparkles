@@ -118,6 +118,17 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+Ask's draft rules tell the model to select only the variables that answer the question,
+without label, predicate or helper columns unless the question asks for them, and never
+to add a variable only to fill the draft's `graph` member. Over three runs of 51
+QALD-9-plus validation questions the mean strict score rose from 27.0 to 28.7 with Haiku
+5.5 and from 29.0 to 29.7 with GPT-6 Luna, and answers with columns beyond the gold's
+fell from 8 to 1 and from 22 to 4 in a run.
+
+Ask declares the well-known vocabulary prefixes that a draft uses without declaring,
+such as `dbo` and `dbr`, before the check, unless the query or the dataset defines them.
+A draft that used one of them failed the check with a syntax error and needed a repair.
+
 `sparkles ask` takes its question argument as optional, since `--questions FILE` reads
 questions from a batch file instead. A command line that passes a question parses and
 behaves as before, and one that gives neither a question nor `--questions` is refused.
@@ -1119,6 +1130,16 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 (X14, item 478).
 
 ### Fixed
+
+`check_query` no longer fails with `budget-memory` when a draft uses a predicate that no
+instance of its typed variable's class has. On the DBpedia 2022.12.01 database the
+class lookup's estimate passed the 2 GiB query memory budget, which failed the whole
+check, so Ask lost the draft instead of repairing it. The lookup now writes its terms
+into the query and leaves the pattern unjudged when a lookup still passes the budget.
+Its suggestions profile a sample of the class through the index and rank the sample's
+predicates by their share of it and their rarity in the dataset, with the namespace of
+the draft's predicate first, so that a link every page has ranks below a predicate of
+the class.
 
 A rename or delete of a persistent dataset no longer fails with `409` and "still has
 live handles" because the dataset's own views worker started a round at the wrong

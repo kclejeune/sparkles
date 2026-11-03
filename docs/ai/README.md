@@ -116,6 +116,10 @@ build community reports.
   stayed within the baseline's spread, and type hints lowered it to 22.7. Voting costs
   63% more per question. The
   [results](../benchmarks/natural-language/RESULTS.md#ask-repair-options) give each run.
+* The draft rules ask for only the variables that answer the question, without label,
+  predicate or helper columns unless the question asks for them. With them, answers
+  with columns beyond the gold's fell from 8 to 1 for Haiku 5.5 and from 22 to 4 for
+  GPT-6 Luna in a run of 51 validation questions.
 * A draft often uses a common vocabulary prefix without declaring it. Before the check,
   Ask declares each of these that the query uses and neither the query nor the dataset
   defines: `dbo`, `dbr`, `dbp` and `dbc` for DBpedia's ontology, resources, properties
@@ -126,7 +130,9 @@ build community reports.
 * The check of a draft reports a typed variable whose class has no instance with the
   predicate the draft uses. That lookup names the class and the predicate in its query,
   and a lookup that passes the query memory budget leaves the pattern unjudged instead
-  of failing the check.
+  of failing the check. Its suggestions are the predicates that a sample of 200
+  instances uses, those in the namespace of the draft's predicate first, ranked by
+  their share of the sample and how rare they are in the dataset.
 * The extra kind preference recognizes the English words film, movie, book, novel,
   song, album, city, town, country, river and person through supported DBpedia,
   schema.org and FOAF class IRIs. Unknown class namespaces and incomplete or competing
