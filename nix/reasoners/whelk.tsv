@@ -1,0 +1,65 @@
+# The jars of Whelk 1.2.1's OWL API binding and their runtime dependencies, which Maven
+# resolved for org.geneontology:whelk-owlapi_2.13:1.2.1 (OWL API 4.5.22 and Scala 2.13.14),
+# with slf4j-simple 1.7.36 to print warnings. The aggregate owlapi-distribution jar is left
+# out, since its modules are listed one by one. nix/reasoners/default.nix fetches each from
+# Maven Central under this path and checks it against its SHA-256 here, which was checked
+# against Maven Central's SHA-1 when it was pinned. Whelk is licensed under BSD-3-Clause,
+# Scala under Apache-2.0 and the OWL API under LGPL-3.0 or Apache-2.0.
+# path	sha256
+com/fasterxml/jackson/core/jackson-annotations/2.9.10/jackson-annotations-2.9.10.jar	c876f2e85d0f108a34cdd11ccc9d8d7875697367efc75bf10a89c2c26aee994c
+com/fasterxml/jackson/core/jackson-core/2.9.10/jackson-core-2.9.10.jar	65fe26d7554a4409652c86ee38f2e94bc42934326d88b3c78c61f66ff2222c53
+com/fasterxml/jackson/core/jackson-databind/2.9.10.8/jackson-databind-2.9.10.8.jar	8fd3467359648c1ad89e91f2b8bb8ba75460b0b1fbff8ac4a3308af8b27501b6
+com/github/ben-manes/caffeine/caffeine/2.8.6/caffeine-2.8.6.jar	230af102f4b41ca93b84447fcb6d105b7d736290a6142a99bcddcf3ca402fdbf
+com/github/jsonld-java/jsonld-java/0.12.0/jsonld-java-0.12.0.jar	57e60ed820590a43670898222ef4b6c711732b5060d9b060726b3b1e6d08181c
+com/github/vsonnier/hppcrt/0.7.5/hppcrt-0.7.5.jar	f3cfbd511d0bd5a29b72bcca97fcaa81889cf6698f045c5f658744829c8784b9
+com/google/code/findbugs/jsr305/3.0.1/jsr305-3.0.1.jar	c885ce34249682bc0236b4a7d56efcc12048e6135a5baf7a9cde8ad8cda13fcd
+com/google/errorprone/error_prone_annotations/2.4.0/error_prone_annotations-2.4.0.jar	5f2a0648230a662e8be049df308d583d7369f13af683e44ddf5829b6d741a228
+com/google/guava/guava/18.0/guava-18.0.jar	d664fbfc03d2e5ce9cab2a44fb01f1d0bf9dfebeccc1a473b1f9ea31f79f6f99
+com/lihaoyi/fastparse_2.13/2.3.1/fastparse_2.13-2.3.1.jar	5e0894c0cc8600f2dfae75d9947c2aa2cd7fc9d6928d612a80a9a717d9850ae3
+com/lihaoyi/geny_2.13/0.6.5/geny_2.13-0.6.5.jar	ca3857a3f95266e0d87e1a1f26c8592c53c12ac7203f911759415f6c8a43df7d
+com/lihaoyi/sourcecode_2.13/0.2.3/sourcecode_2.13-0.2.3.jar	0794fc106107d34d71101ead0b31b2c48273737d89197bbf9b1bac6ff32ab576
+commons-codec/commons-codec/1.10/commons-codec-1.10.jar	4241dfa94e711d435f29a4604a3e2de5c4aa3c165e23bd066be6fc1fc4309569
+commons-io/commons-io/2.5/commons-io-2.5.jar	a10418348d234968600ccb1d988efcbbd08716e1d96936ccc1880e7d22513474
+javax/inject/javax.inject/1/javax.inject-1.jar	91c77044a50c481636c32d916fd89c9118a72195390452c81065080f957de7ff
+net/sourceforge/owlapi/owlapi-api/4.5.22/owlapi-api-4.5.22.jar	7ebc45163bcd45da6b6c91add407e648335405b65d4af6b927c6bd7826116a08
+net/sourceforge/owlapi/owlapi-apibinding/4.5.22/owlapi-apibinding-4.5.22.jar	cc815fd23699a9bd7d30da7f54820d2df0898883c0ef853687e053b474a29cf9
+net/sourceforge/owlapi/owlapi-compatibility/4.5.22/owlapi-compatibility-4.5.22.jar	c106ef4384b6dcb5dc6dd2c0ba1c203c091a83140537e55e66b4fea667a17f1c
+net/sourceforge/owlapi/owlapi-fixers/4.5.22/owlapi-fixers-4.5.22.jar	9b4e86d65738a32841c6cf57f9723247c8384ab932e9ffeb8b59e953dc071f4f
+net/sourceforge/owlapi/owlapi-impl/4.5.22/owlapi-impl-4.5.22.jar	077b860004e954284a0813311ddb5a49e61250b3b13c5b2a17d5459c353641fd
+net/sourceforge/owlapi/owlapi-oboformat/4.5.22/owlapi-oboformat-4.5.22.jar	5a32396e7c3d8acfd5f9160263db4b7c5edce736a0c76f8f48698fd402e0f242
+net/sourceforge/owlapi/owlapi-parsers/4.5.22/owlapi-parsers-4.5.22.jar	3c5fdfa3a8ce753fcb7e5d98ccca231f7240675c5e601e38e530bcd2c08ad5fe
+net/sourceforge/owlapi/owlapi-rio/4.5.22/owlapi-rio-4.5.22.jar	be73ffa227b9dc84298a091ac4950b9c5e99450dced1231887b30427ec8a7151
+net/sourceforge/owlapi/owlapi-tools/4.5.22/owlapi-tools-4.5.22.jar	af0a96488127917a1c82d08a4db9265491d97e9fa87e5238e5c025cd03ef6d5b
+org/apache/httpcomponents/fluent-hc/4.5.5/fluent-hc-4.5.5.jar	497a7a52e3293bba775ab151f0e0e2bc387eaf16cdaa15fdd8622deb2cb85a77
+org/apache/httpcomponents/httpclient/4.5.5/httpclient-4.5.5.jar	7e97724443ad2a25ad8c73183431d47cc7946271bcbbdfa91a8a17522a566573
+org/apache/httpcomponents/httpclient-cache/4.5.5/httpclient-cache-4.5.5.jar	7808e829b158e5ba09d94476f3726cfe4539722c452453251427f1eec27b8e15
+org/apache/httpcomponents/httpclient-osgi/4.5.5/httpclient-osgi-4.5.5.jar	ba76819cc553111347f4a58ae82b83cf4f2b74aff46a2fa3b080d44ccbd93ab8
+org/apache/httpcomponents/httpcore/4.4.9/httpcore-4.4.9.jar	1b4a1c0b9b4222eda70108d3c6e2befd4a6be3d9f78ff53dd7a94966fdf51fc5
+org/apache/httpcomponents/httpcore-nio/4.4.9/httpcore-nio-4.4.9.jar	366c7def45fb27816bb2d1ec4017fb1a5855940669123177234c4091ee269fdb
+org/apache/httpcomponents/httpcore-osgi/4.4.9/httpcore-osgi-4.4.9.jar	38b93bf15d43efe65ad5ceffd672b9077dfab205c41314af09e6d911423351f2
+org/apache/httpcomponents/httpmime/4.5.5/httpmime-4.5.5.jar	e46206931b7426102e658f086f74ee582761264a8f9977fba02c1e200c51a9c5
+org/checkerframework/checker-qual/3.7.0/checker-qual-3.7.0.jar	be2039732159d13f3f00867f22223992178a3b28b8a143724eba4206a8fdfff3
+org/eclipse/rdf4j/rdf4j-model/2.4.2/rdf4j-model-2.4.2.jar	ed4f7b62431bf153b48c6d843f39ed0dab33e5d2df01a8183fc028123f53857e
+org/eclipse/rdf4j/rdf4j-rio-api/2.4.2/rdf4j-rio-api-2.4.2.jar	7bc7851488d8c3561059de03f36fea65d7b968f19eb687c7acb01513dc383311
+org/eclipse/rdf4j/rdf4j-rio-binary/2.4.2/rdf4j-rio-binary-2.4.2.jar	da317ccb481479584baec59c5d7968629ff905733cd2cb1b70dd66d414eb9419
+org/eclipse/rdf4j/rdf4j-rio-datatypes/2.4.2/rdf4j-rio-datatypes-2.4.2.jar	df1c19b767beb299b75ec686a6dc047569acd40ac52e56cc794619e43e491113
+org/eclipse/rdf4j/rdf4j-rio-jsonld/2.4.2/rdf4j-rio-jsonld-2.4.2.jar	1f60eb5d94532daf44a70734cc8489063dbba445819118abf556668ee6591193
+org/eclipse/rdf4j/rdf4j-rio-languages/2.4.2/rdf4j-rio-languages-2.4.2.jar	6746717188a87adaca9d50a6b5bc3c093e29138205ecdc07142a159cc6c17e73
+org/eclipse/rdf4j/rdf4j-rio-n3/2.4.2/rdf4j-rio-n3-2.4.2.jar	51dbc2ea76a94c6088bda9e41732de45a787f6f987c50bc04ad1043339c5f9ba
+org/eclipse/rdf4j/rdf4j-rio-nquads/2.4.2/rdf4j-rio-nquads-2.4.2.jar	c5e6e5bc7cf19640e956eb8c5f3f19f099694736e9e450984e70b3e58e8f98e8
+org/eclipse/rdf4j/rdf4j-rio-ntriples/2.4.2/rdf4j-rio-ntriples-2.4.2.jar	e15979f9a04fd0fa7e5692e3083161d6c7fdfb9db2c50441b98d60efb7eaa369
+org/eclipse/rdf4j/rdf4j-rio-rdfjson/2.4.2/rdf4j-rio-rdfjson-2.4.2.jar	1c1619424e8da6a46eae818eaf296589d15e6e1489fac732f053f158c78a9a2c
+org/eclipse/rdf4j/rdf4j-rio-rdfxml/2.4.2/rdf4j-rio-rdfxml-2.4.2.jar	641cfd32ca1242850f9ca2ac403796dea4af6c5619aa9c68fc998e71039216b3
+org/eclipse/rdf4j/rdf4j-rio-trig/2.4.2/rdf4j-rio-trig-2.4.2.jar	e6a479c823c2dd13cb6ec053fac52d43ad48e813238324fc23158df23fec3ac5
+org/eclipse/rdf4j/rdf4j-rio-trix/2.4.2/rdf4j-rio-trix-2.4.2.jar	715fc1af71c9f6b4497c679952d7e6980afd1f8f2ccf5580637ceca8cb5cb301
+org/eclipse/rdf4j/rdf4j-rio-turtle/2.4.2/rdf4j-rio-turtle-2.4.2.jar	a08dbc1ebf6f3db0adbc7ee7bb3726a55c8d7b6cd5a5d03f52048eceba379b65
+org/eclipse/rdf4j/rdf4j-util/2.4.2/rdf4j-util-2.4.2.jar	80c85df21e5915cf418d42b622753e40ab9ed0a457504b3c6a2190fb60eb6b0f
+org/geneontology/archimedes_2.13/0.1.1/archimedes_2.13-0.1.1.jar	3c4c14a36a0941254f86930d41c91b8844654420cef2bcef6d66506bbebc0c34
+org/geneontology/whelk_2.13/1.2.1/whelk_2.13-1.2.1.jar	d98f294635de34af08f6256c021237b0678a38af18e0c39312cda3e91426d079
+org/geneontology/whelk-owlapi_2.13/1.2.1/whelk-owlapi_2.13-1.2.1.jar	df9ace9a966ae548b6e4194731bbf624fb3fb23fbebddc016205d37a4f5e66ed
+org/phenoscape/scowl_2.13/1.4.1/scowl_2.13-1.4.1.jar	20a4808f9a614924cbc8fcc77ab3c16d84ff116eb6b27bd0aa586af5f530fa03
+org/scala-lang/scala-library/2.13.14/scala-library-2.13.14.jar	43e0ca1583df1966eaf02f0fbddcfb3784b995dd06bfc907209347758ce4b7e3
+org/slf4j/jcl-over-slf4j/1.7.22/jcl-over-slf4j-1.7.22.jar	e1ab57ae2e46a4a0dcbbd15b329187600b76ce54882834b4681b24f0c083cee0
+org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar	d3ef575e3e4979678dc01bf1dcce51021493b4d11fb7f1be8ad982877c16a1c0
+org/slf4j/slf4j-simple/1.7.36/slf4j-simple-1.7.36.jar	2f39bed943d624dfa8f4102d0571283a10870b6aa36f197a8a506f147010c10f
+org/tukaani/xz/1.6/xz-1.6.jar	a594643d73cc01928cf6ca5ce100e094ea9d73af760a5d4fb6b75fa673ecec96
