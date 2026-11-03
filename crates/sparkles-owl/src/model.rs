@@ -863,9 +863,9 @@ impl Axiom {
         s.0
     }
 
-    /// The entities of the axiom's signature, as [`Axiom::signature`] gives them, and
-    /// whether the axiom has an `ObjectInverseOf` anywhere.
-    pub fn signature_and_inverses(&self) -> (BTreeSet<Entity>, bool) {
+    /// The entities of the axiom's signature, as [`Axiom::signature`] gives them, and the
+    /// axiom's [`Shape`].
+    pub fn signature_and_shape(&self) -> (BTreeSet<Entity>, Shape) {
         let mut s = Signature::default();
         s.axiom(&self.kind);
         for a in &self.annotations {
@@ -942,17 +942,38 @@ impl Axiom {
     }
 }
 
-/// The signature of a structure, collected by walking it, and whether the structure has
-/// an `ObjectInverseOf`.
+/// The signature of a structure, collected by walking it, and its [`Shape`].
 #[derive(Default)]
-pub(crate) struct Signature(pub(crate) BTreeSet<Entity>, pub(crate) bool);
+pub(crate) struct Signature(pub(crate) BTreeSet<Entity>, pub(crate) Shape);
+
+/// What a walk of a structure found besides its signature.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Shape {
+    /// an `ObjectInverseOf` anywhere
+    pub inverses: bool,
+    /// a facet of a datatype restriction that is not one of the OWL 2 facets
+    pub other_facets: bool,
+    /// the deepest nesting of class expressions and data ranges, 1 for a class
+    pub depth: usize,
+    /// the deepest nesting of annotations, 1 for an annotation without annotations
+    pub annotation_depth: usize,
+    /// the nesting at the point of the walk
+    at: usize,
+}
+
+impl Shape {
+    fn enter(&mut self) {
+        self.at += 1;
+        self.depth = self.depth.max(self.at);
+    }
+}
 
 impl Signature {
     fn class(&mut self, c: &Class) {
         self.0.insert(Entity::Class(c.clone()));
     }
     fn ope(&mut self, p: &ObjectPropertyExpression) {
-        self.1 |= matches!(p, ObjectPropertyExpression::InverseOf(_));
+        self.1.inverses |= matches!(p, ObjectPropertyExpression::InverseOf(_));
         self.0.insert(Entity::ObjectProperty(p.named().clone()));
     }
     fn dp(&mut self, p: &DataProperty) {
@@ -971,6 +992,12 @@ impl Signature {
     }
 
     pub(crate) fn ce(&mut self, c: &ClassExpression) {
+        self.1.enter();
+        self.ce_inner(c);
+        self.1.at -= 1;
+    }
+
+    fn ce_inner(&mut self, c: &ClassExpression) {
         use ClassExpression as C;
         match c {
             C::Class(c) => self.class(c),
@@ -1016,6 +1043,12 @@ impl Signature {
     }
 
     pub(crate) fn dr(&mut self, r: &DataRange) {
+        self.1.enter();
+        self.dr_inner(r);
+        self.1.at -= 1;
+    }
+
+    fn dr_inner(&mut self, r: &DataRange) {
         match r {
             DataRange::Datatype(d) => {
                 self.0.insert(Entity::Datatype(d.clone()));
@@ -1027,19 +1060,27 @@ impl Signature {
             DataRange::OneOf(ls) => ls.iter().for_each(|l| self.lit(l)),
             DataRange::DatatypeRestriction(d, fs) => {
                 self.0.insert(Entity::Datatype(d.clone()));
-                fs.iter().for_each(|f| self.lit(&f.value));
+                for f in fs {
+                    self.1.other_facets |= !crate::vocab::FACETS.contains(&f.facet.as_str());
+                    self.lit(&f.value);
+                }
             }
         }
     }
 
     fn annotation(&mut self, a: &Annotation) {
+        self.annotation_at(a, 1);
+    }
+
+    fn annotation_at(&mut self, a: &Annotation, depth: usize) {
+        self.1.annotation_depth = self.1.annotation_depth.max(depth);
         self.0
             .insert(Entity::AnnotationProperty(a.property.clone()));
         if let AnnotationValue::Literal(l) = &a.value {
             self.lit(l);
         }
         for a in &a.annotations {
-            self.annotation(a);
+            self.annotation_at(a, depth + 1);
         }
     }
 

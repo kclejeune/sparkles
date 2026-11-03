@@ -757,7 +757,8 @@ fn from_document(
 /// IRI declared both as two kinds of property or as a class and a datatype, no entity of
 /// the reserved vocabulary that is not built in, no mention of the ontology's IRI or
 /// version IRI in an axiom, no `ObjectInverseOf` but in a property assertion without
-/// annotations, no two annotations of one subject with the same property and value, and
+/// annotations, no two annotations of one subject with the same property and value, no
+/// facet outside OWL 2's or nesting near the reader's limits ([`readable`]), and
 /// every n-ary axiom with at least two operands, an equivalence of three or more with
 /// named operands only. The header's annotations are held to the same rules.
 fn round_trips(doc: &sparkles_owl::ofn_read::Document) -> bool {
@@ -826,21 +827,30 @@ fn round_trips(doc: &sparkles_owl::ofn_read::Document) -> bool {
         sparkles_owl::Class::new(vocab::OWL_THING),
     )));
     header_signature.annotations = doc.header.annotations.clone();
-    if collapses(&doc.header.annotations) || !header_signature.signature().iter().all(typed) {
+    let (signature, shape) = header_signature.signature_and_shape();
+    if collapses(&doc.header.annotations) || !readable(&shape) || !signature.iter().all(typed) {
         return false;
     }
     doc.axioms.par_iter().with_min_len(4096).all(|a| {
-        let (signature, inverses) = a.signature_and_inverses();
+        let (signature, shape) = a.signature_and_shape();
         // an inverse property only in a plain property assertion, which maps to the
         // triple of the named property
         let plain_assertion =
             a.annotations.is_empty() && matches!(a.kind, AxiomKind::ObjectPropertyAssertion(..));
         operands(&a.kind)
-            && (!inverses || plain_assertion)
+            && (!shape.inverses || plain_assertion)
+            && readable(&shape)
             && !collapses(&a.annotations)
             && !header.iter().any(|i| a.mentions(i))
             && signature.iter().all(typed)
     })
+}
+
+/// Whether the reverse mapping reads a structure of this shape whole: only OWL 2 facets,
+/// expressions nested at most half as deep as [`read::MAX_NESTING`] and annotations
+/// nested at most 16 deep, well within the reader's limits.
+fn readable(shape: &sparkles_owl::Shape) -> bool {
+    !shape.other_facets && shape.depth <= read::MAX_NESTING / 2 && shape.annotation_depth <= 16
 }
 
 /// Whether two of the annotations, or two annotations of one of them, at any depth, have

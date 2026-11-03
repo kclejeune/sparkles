@@ -443,6 +443,17 @@ fn what_the_triples_could_read_otherwise_is_left_to_the_store() {
         format!(
             "{OFN_HEAD}{declared} SubClassOf(Annotation(rdfs:comment \"x\") Annotation(Annotation(rdfs:label \"nested\") rdfs:comment \"x\") :A ObjectUnionOf(:B :C))\n)\n"
         ),
+        // annotations nested deeper than the reader follows
+        format!(
+            "{OFN_HEAD}{declared} SubClassOf({} :A :B)\n)\n",
+            (0..34).fold(String::new(), |inner, i| format!(
+                "Annotation({inner} rdfs:comment \"{i}\")"
+            ))
+        ),
+        // a facet that is not an OWL 2 facet
+        format!(
+            "{OFN_HEAD}{declared} Declaration(DataProperty(:dp))\n DataPropertyRange(:dp DatatypeRestriction(xsd:integer :custom \"1\"^^xsd:integer))\n)\n"
+        ),
         // inverse properties with an inverse, whose blank subject the mapping refuses
         format!(
             "{OFN_HEAD}{declared} Declaration(ObjectProperty(:p))\n Declaration(ObjectProperty(:q))\n InverseObjectProperties(ObjectInverseOf(:p) :q)\n)\n"
