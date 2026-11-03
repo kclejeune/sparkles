@@ -1215,6 +1215,16 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+`scripts/premerge.sh` and the development tasks no longer fail when Boxington has
+collected a checkout's managed target and left `target` as a dangling link. Premerge now
+places a fresh target with `mbx sparkles-task` before its checks, with a one-line
+message. The crash harness's test binary, the feature-test logs, the fetched test
+suites, the GeoSPARQL benchmark checkout, the Graphalytics results and the JVM Nix
+dependency script now live under `.artifacts`, where collection does not reach them.
+`mise run ui:wasm` runs inside a target lease, so the module that wasm-bindgen reads
+cannot be collected after the build. The benchmark and probe scripts copy a binary that
+lies in the managed target to their work directory before they start it.
+
 A rename or delete of a persistent dataset no longer fails with `409` and "still has
 live handles" because the dataset's own views worker started a round at the wrong
 moment. Each open dataset runs a views worker, and a round of that worker holds the

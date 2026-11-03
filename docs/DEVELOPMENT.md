@@ -113,6 +113,18 @@ lease, low-disk collection cannot reclaim the run's own target and evicts shared
 objects instead, so a host whose disk is nearly full can still run out of space during a
 gate.
 
+Scripts follow two rules that keep a collection from breaking them. Scratch output that
+no compiler produces, such as logs, downloaded suites, test binaries built with plain
+`rustc` and benchmark results, goes under `.artifacts` and never under `target`. A script
+that runs a built binary after the build command has exited either runs inside
+`mbx sparkles-task` or copies the binary out of the target first. The benchmark and probe
+scripts do the second through `stage_binary` in `scripts/bench-tools.sh`, which copies a
+binary that lies in the managed target to the run's work directory, as the Namespace
+screens stage theirs. A collection can also leave `target` as a link to a directory that
+no longer exists, and a command that writes there then fails with "File exists" or "Not a
+directory". Any `mbx` build places a fresh target, and so does `mbx sparkles-task -- true`.
+`scripts/premerge.sh` runs that repair before its checks.
+
 Each machine has its own cache.
 GitHub Actions cache restoration is configured separately. See the
 [Boxington setup guide](https://mr-boxington.jdx.dev/setup) for editor integration.
@@ -361,7 +373,7 @@ repository, or at `SPARKLES_W3C_DIR`. The SHACL suites come from the same checko
 `SPARKLES_SHACL_TESTS`. Without the checkout, the suites are skipped.
 `scripts/fetch-test-suites.sh DIR` fetches every suite the tests read, at the commits CI
 pins, as shallow sparse checkouts of about 35 MB, and prints the variables that point the
-tests at them (`export $(scripts/fetch-test-suites.sh target/test-suites)`).
+tests at them (`export $(scripts/fetch-test-suites.sh .artifacts/test-suites)`).
 `mise run test:w3c` runs each suite and each cursor batch size as its own test, and the
 tests run in parallel, since each keeps its own state and prints its summary as one line.
 On a 20-core gate host that took the suite from 433 to 82 seconds, and the plain spill
@@ -415,7 +427,7 @@ This task is the test counterpart of `lint:features`. The script runs every set 
 after one fails, prints a line for each with its result and time, and exits non-zero if
 any set failed. Names on the command line choose the sets, and a set with several
 features is a comma-separated list, as in `scripts/test-features.sh none mcp,shacl`.
-Each set writes its output to `target/test-features/<set>.log`. The sets share the
+Each set writes its output to `.artifacts/test-features/<set>.log`. The sets share the
 workspace target directory, so the dependencies compile once, and `CARGO_BUILD_JOBS`
 limits the compile jobs as it does for any mbx run. A test of a route that exists only
 with a feature carries a `#[cfg(feature = "...")]` gate for that feature, and a test

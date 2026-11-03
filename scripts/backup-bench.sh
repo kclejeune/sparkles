@@ -28,6 +28,10 @@ SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 DB=$(cd "$DB" && pwd)
 mkdir -p "$WORK/results"
 WORK=$(cd "$WORK" && pwd)
+# A binary in the managed target runs as a copy, which collection cannot remove.
+# shellcheck source=scripts/bench-tools.sh
+source "$ROOT/scripts/bench-tools.sh"
+SPARKLES=$(stage_binary "$SPARKLES")
 cd "$WORK"
 # the CLI's manifest cache, per work directory
 export XDG_CACHE_HOME=$WORK/cache

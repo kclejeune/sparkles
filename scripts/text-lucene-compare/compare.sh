@@ -27,6 +27,8 @@ FPORT=$((PORT_BASE + 1))
 SPORT=$((PORT_BASE + 2))
 # shellcheck source=scripts/bench-tools.sh
 source "$ROOT/scripts/bench-tools.sh"
+# A binary in the managed target runs as a copy, which collection cannot remove.
+SPARKLES=$(stage_binary "$SPARKLES")
 has() { [ "$1" = jena ]; }
 resolve_tools
 

@@ -112,3 +112,30 @@ gnu_time() {
   [ -x "$system" ] && echo "$system" && return
   nixexe time time
 }
+
+# Print a path to run the binary $1 from for the rest of a run. A binary inside this
+# checkout's managed target is copied to $WORK/bin first, because Boxington can collect
+# the whole target once the build that made it has exited, and a run that starts the binary
+# again later would then find nothing. Any other path is printed unchanged.
+stage_binary() {
+  local bin=$1 target abs real dest
+  [ -n "$bin" ] && [ -f "$bin" ] || {
+    printf '%s\n' "$bin"
+    return
+  }
+  target=$ROOT/target
+  case $bin in
+    /*) abs=$bin ;;
+    *) abs=$PWD/$bin ;;
+  esac
+  real=$(readlink -f -- "$bin")
+  if [[ $abs != "$target"/* ]] && { [ ! -e "$target" ] || [[ $real != "$(readlink -f -- "$target")"/* ]]; }; then
+    printf '%s\n' "$bin"
+    return
+  fi
+  dest=$WORK/bin/$(basename -- "$bin")
+  mkdir -p "$WORK/bin" || return
+  # A private temporary name keeps two runs that share WORK from clobbering each other.
+  cp -- "$real" "$dest.tmp.$$" && mv -f -- "$dest.tmp.$$" "$dest" || return
+  printf '%s\n' "$dest"
+}

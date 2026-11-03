@@ -2,14 +2,14 @@
 # Run the Graphalytics BFS, WCC and PageRank examples natively against a Sparkles binary
 # and compare every vertex with the pinned reference outputs. The binary defaults to
 # target/debug/sparkles. Results go to a new directory given as the second argument
-# (default: a fresh directory under target/graphalytics-native). Exit status is nonzero
+# (default: a fresh directory under .artifacts/graphalytics-native). Exit status is nonzero
 # when any engine run or comparison fails. See testsuite/graphalytics/README.md.
 # Usage: scripts/graphalytics-native.sh [binary] [output-directory]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 bin=${1:-target/debug/sparkles}
-out=${2:-target/graphalytics-native/$(date +%Y%m%dT%H%M%S)}
+out=${2:-.artifacts/graphalytics-native/$(date +%Y%m%dT%H%M%S)}
 [ -x "$bin" ] || {
   echo "no executable at $bin" >&2
   exit 2
@@ -20,6 +20,10 @@ mkdir "$out" 2> /dev/null || {
   echo "output directory $out already exists" >&2
   exit 2
 }
+# A binary in the managed target runs as a copy, which collection cannot remove.
+# shellcheck source=scripts/bench-tools.sh
+source scripts/bench-tools.sh
+bin=$(ROOT=$PWD WORK=$out stage_binary "$bin")
 echo "binary $bin sha256 $(sha256sum "$bin" | cut -d' ' -f1)" | tee "$out/summary.txt"
 echo "revision $(git rev-parse HEAD)" | tee -a "$out/summary.txt"
 

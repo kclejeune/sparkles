@@ -139,6 +139,41 @@ for output in outputs:
         self.assertEqual(p.returncode, 42)
         self.assertEqual(p.stdout, "")
 
+    def test_binary_in_the_managed_target_is_staged_out_of_it(self):
+        # The checkout's target is a link into Boxington's cache, as a managed target is.
+        checkout = self.work / "checkout"
+        view = self.work / "cache view"
+        (view / "release").mkdir(parents=True)
+        built = view / "release" / "sparkles"
+        built.write_text("#!/bin/sh\necho built\n")
+        built.chmod(0o755)
+        checkout.mkdir()
+        (checkout / "target").symlink_to(view)
+        other = self.work / "elsewhere" / "sparkles"
+        other.parent.mkdir()
+        other.write_text("#!/bin/sh\n")
+        run = self.work / "run"
+        cases = [
+            (str(checkout / "target/release/sparkles"), str(run / "bin/sparkles")),
+            ("target/release/sparkles", str(run / "bin/sparkles")),
+            (str(built), str(run / "bin/sparkles")),
+            (str(other), str(other)),
+            (str(checkout / "target/release/missing"), str(checkout / "target/release/missing")),
+        ]
+        for given, expected in cases:
+            with self.subTest(given=given):
+                p = subprocess.run(["bash", "-euc", 'source "$1"; cd "$ROOT"; stage_binary "$2"', "bash",
+                                    str(TOOLS), given], env=self.env | {"ROOT": str(checkout), "WORK": str(run)},
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(p.stdout.strip(), expected)
+        staged = run / "bin" / "sparkles"
+        self.assertEqual(staged.read_text(), built.read_text())
+        self.assertTrue(os.access(staged, os.X_OK))
+        # The copy outlives the collection of the target.
+        shutil.rmtree(view)
+        self.assertEqual(subprocess.run([str(staged)], capture_output=True, text=True).stdout, "built\n")
+
     def test_missing_binary_is_an_error(self):
         p = self.shell("nixbin qlever qlever-server", MISSING_BIN="1")
         self.assertNotEqual(p.returncode, 0)
