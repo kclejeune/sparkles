@@ -37,6 +37,35 @@ one the query does not use. The set keeps the source query as `sourceGold` and l
 rewrites. The DBpedia sets run with `--loc` against a database of the release their gold
 answers were recomputed on.
 
+## Synthetic DBpedia sets
+
+`synth/v3` holds 461 synthetic questions over DBpedia 2022.12.01, in a train split of
+186, a validation split of 134 and a test split of 141. `synth/synth.py` writes them
+from six templates over well-known instances of eleven DBpedia classes: the value of a
+relation, the instances that share a value, their count, a yes or no question, the
+instance with the largest value of a number, and two hops through a value. Each relation
+has its phrasings written by hand in `synth/phrases.py`. A subject whose page title needs
+a parenthesized qualifier is left out, since the question would name it ambiguously. A
+list or count is kept only when instances of the class reach the value through the
+relation and at most half again as many reach it through any other property. The SHA-256
+of each question's ID chooses its split, so the splits are fixed before any run. The
+generator executes every gold query and keeps a question only when the answer is bounded
+and not empty. `synth/check.py` runs every gold again and writes `check.json`, and none
+of the committed questions returns nothing. No question comes from a QALD-9-plus or
+Text2SPARQL'25 question, and with `--exclude` no resource that a gold query of those
+sets names becomes a question's subject.
+
+The synthetic questions are easier than the public sets. On the validation split Haiku
+5.5 answers about 82% and GPT-6 Luna about 88%, against 45% to 63% on 51 QALD-9-plus
+validation questions, so a gain on them is a coarse guide. A gain must also hold on the
+public sets. The generator needs a DBpedia database:
+
+```
+python3 testsuite/ask/synth/synth.py --bin target/release/sparkles --loc DBPEDIA_DB \
+  --exclude QALD_TEST.json --exclude QALD_TRAIN.json --exclude DB25.json testsuite/ask/synth/v3 4
+python3 testsuite/ask/synth/check.py --bin target/release/sparkles --loc DBPEDIA_DB testsuite/ask/synth/v3
+```
+
 ## What is scored
 
 Every pair of a provider and a model is one whole pipeline, which supplies the draft,
