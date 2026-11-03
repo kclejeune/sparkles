@@ -13,6 +13,7 @@ import {
   labelsQuery,
   withMissingLabels,
   localFromLabel,
+  manchesterTokens,
   litText,
   manchester,
   manchesterName,
@@ -165,6 +166,62 @@ describe('labels', () => {
       }),
     ]);
     expect(m.get(EX + 'A')!.map((l) => l['@value'])).toEqual(['label', 'pref']);
+  });
+});
+
+describe('Manchester tokens', () => {
+  const name = (i: string) =>
+    i === EX + 'pc' ? 'part of' : i === EX + 'and' ? 'and' : i.replace(EX, '');
+  const join = (e: unknown) =>
+    manchesterTokens(e, name, {})
+      .map((t) => t.text)
+      .join('');
+  const samples: unknown[] = [
+    EX + 'A',
+    { type: 'ObjectSomeValuesFrom', property: EX + 'pc', class: EX + 'Cell' },
+    {
+      type: 'ObjectIntersectionOf',
+      classes: [
+        EX + 'and',
+        {
+          type: 'ObjectAllValuesFrom',
+          property: EX + 'p',
+          class: { type: 'ObjectComplementOf', class: EX + 'B' },
+        },
+      ],
+    },
+    { type: 'ObjectUnionOf', classes: [EX + 'A', EX + 'B', EX + 'C'] },
+    { type: 'ObjectOneOf', individuals: [EX + 'a', EX + 'b'] },
+    { type: 'ObjectHasValue', property: { inverseOf: EX + 'p' }, individual: EX + 'a' },
+    { type: 'ObjectHasSelf', property: EX + 'p' },
+    { type: 'ObjectExactCardinality', property: EX + 'p', cardinality: 1, class: EX + 'A' },
+    {
+      type: 'DataSomeValuesFrom',
+      property: EX + 'd',
+      range: 'http://www.w3.org/2001/XMLSchema#string',
+    },
+    { '@value': "it's", '@language': 'en' },
+    { '@value': '3', '@type': 'http://www.w3.org/2001/XMLSchema#integer' },
+    { type: 'Chain', chain: [EX + 'p', EX + 'q'] },
+  ];
+  it('join to the text of manchester()', () => {
+    for (const e of samples) expect(join(e)).toBe(manchester(e, name, {}));
+  });
+  it('mark names with their IRIs, keywords and literals', () => {
+    const t = manchesterTokens(samples[1], name, {});
+    expect(t.filter((x) => x.role === 'name').map((x) => [x.text, x.iri])).toEqual([
+      ["'part of'", EX + 'pc'],
+      ['Cell', EX + 'Cell'],
+    ]);
+    expect(t.filter((x) => x.role === 'kw').map((x) => x.text)).toEqual(['some']);
+    const lit = manchesterTokens(samples[9], name, {});
+    expect(lit.map((x) => x.role)).toEqual(['lit']);
+  });
+  it('quote a label that is a keyword and parenthesize nested expressions', () => {
+    const t = manchesterTokens(samples[2], name, {});
+    expect(t.find((x) => x.iri === EX + 'and')?.text).toBe("'and'");
+    expect(t.some((x) => x.role === 'punct' && x.text === '(')).toBe(true);
+    expect(join(samples[2])).toBe("'and' and (p only not B)");
   });
 });
 

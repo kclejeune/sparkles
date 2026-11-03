@@ -293,7 +293,7 @@ test.describe('at 390 pixels', () => {
       .getByRole('option', { name: /Person/ })
       .first()
       .click();
-    await expect(page).toHaveURL(/\/ui\/ontology\?ds=uni&iri=/);
+    await expect(page).toHaveURL(/\/ui\/browse\?ds=uni&iri=/);
     await expect(search(page)).toBeHidden();
   });
 
@@ -314,6 +314,7 @@ test.describe('at 390 pixels', () => {
     for (const name of [
       'Query',
       'Explore',
+      'Browse',
       'Ontology',
       'Thesaurus',
       'Similar',
@@ -335,6 +336,8 @@ test.describe('at 390 pixels', () => {
 const PAGES = [
   '/ui/query',
   '/ui/explore?ds=foaf',
+  '/ui/browse?ds=uni',
+  '/ui/browse?ds=uni&iri=http%3A%2F%2Fexample.org%2Funi%23Professor',
   '/ui/ontology?ds=uni',
   '/ui/thesaurus?ds=uni',
   '/ui/similar?ds=foaf',
