@@ -365,6 +365,8 @@ struct Clusters<'m> {
     /// A read sets it, since authentication reads only a record's receipt and
     /// protection and would otherwise let a masked record join a cluster.
     hide_masked: bool,
+    /// The most decisions of one proposal a read takes from the caller's view.
+    decision_limit: usize,
 }
 
 impl<'m> Clusters<'m> {
@@ -380,6 +382,7 @@ impl<'m> Clusters<'m> {
             key: String::new(),
             candidates: MAX_EVIDENCE,
             hide_masked: false,
+            decision_limit: MAX_EVIDENCE,
         }
     }
 
@@ -489,13 +492,14 @@ impl<'m> Clusters<'m> {
         let o = Term::NamedNode(p.clone());
         let (candidates, more) = match state.seen.as_mut() {
             Some(seen) => {
-                seen.subjects_up_to(&ev("target"), &o, decisions.0.as_str(), MAX_EVIDENCE)?
+                seen.subjects_up_to(&ev("target"), &o, decisions.0.as_str(), self.decision_limit)?
             }
-            None => {
-                state
-                    .reads
-                    .subjects_up_to(&ev("target"), &o, decisions.0.as_str(), MAX_EVIDENCE)?
-            }
+            None => state.reads.subjects_up_to(
+                &ev("target"),
+                &o,
+                decisions.0.as_str(),
+                self.decision_limit,
+            )?,
         };
         if more {
             return Err(incomplete("decisions"));
@@ -1119,6 +1123,28 @@ pub fn resolve(
     access: Option<Arc<GraphAccess>>,
     control: &Control,
 ) -> Result<EntityResolution> {
+    resolve_bounded(
+        main,
+        logical,
+        policy,
+        entities,
+        access,
+        control,
+        MAX_EVIDENCE,
+    )
+}
+
+/// [`resolve`] with at most `decision_limit` decisions of one proposal read from the
+/// caller's view, [`MAX_EVIDENCE`] outside tests.
+fn resolve_bounded(
+    main: &Dataset,
+    logical: &Dataset,
+    policy: &str,
+    entities: &[NamedNode],
+    access: Option<Arc<GraphAccess>>,
+    control: &Control,
+    decision_limit: usize,
+) -> Result<EntityResolution> {
     control.check()?;
     check_store(main, logical)?;
     if entities.is_empty() || entities.len() > MAX_RESOLVE {
@@ -1176,6 +1202,7 @@ pub fn resolve(
     }
     let mut clusters = Clusters::new(&m, BTreeMap::new());
     clusters.hide_masked = true;
+    clusters.decision_limit = decision_limit;
     // The decisions of each component the caller's view traverses, kept for each of its
     // entities, so that a request answers each entity as a request of it alone does.
     let mut joined: BTreeMap<NamedNode, Arc<Vec<NamedNode>>> = BTreeMap::new();
@@ -1346,6 +1373,104 @@ mod tests {
                 limits: Limits::default(),
             },
         )))
+    }
+
+    /// A caller whose view hides `predicate` in `graph`.
+    fn hiding(predicate: &str, graph: &str) -> Option<Arc<GraphAccess>> {
+        Some(Arc::new(GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::All,
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "hidden".into(),
+                        predicates: Some(vec![predicate.to_string()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: Some(Graphs::Only(GraphRule::new([graph], &[]))),
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        )))
+    }
+
+    /// A decision about `target` under the matching policy.
+    fn decide(
+        ds: &Dataset,
+        target: &(NamedNode, sparkles_core::evidence::Sha256Digest),
+        disposition: Disposition,
+        supersedes: Option<&NamedNode>,
+    ) -> NamedNode {
+        let (settings, bytes) = settings_of(ds).unwrap();
+        let mut options = Options::new(n("urn:principal:reviewer"));
+        options.if_head = Some(ds.store().head_commit().seq);
+        review(
+            None,
+            ds,
+            ds,
+            Request {
+                name: "people",
+                policy: settings.matching_policies.get("people").unwrap(),
+                settings: &settings,
+                settings_bytes: &bytes,
+                version: 1,
+                if_head: ds.store().head_commit().seq,
+                candidates: MAX_EVIDENCE,
+            },
+            &[DecisionInput {
+                key: "x".into(),
+                target: target.0.clone(),
+                target_digest: target.1,
+                disposition,
+                supersedes: supersedes.cloned(),
+            }],
+            &options,
+            &mut |_, _| Some(Arc::new(GraphAccess::all())),
+            &Control::none(),
+        )
+        .unwrap()
+        .decisions[0]
+            .iri
+            .clone()
+    }
+
+    /// More decisions of a proposal than the read takes, all with their targets hidden
+    /// from the caller, are not counted: the read answers without them instead of
+    /// refusing with a bound that counts hidden triples. The same store read in full
+    /// reaches the bound. A lookup that enumerated decisions at the unmasked head would
+    /// refuse in both cases.
+    #[test]
+    fn hidden_decisions_beyond_the_bound_are_not_counted() {
+        let ds = configured();
+        let ab = propose(&ds, IDENTITY, "ab", &["urn:a", "urn:b"]);
+        let first = decide(&ds, &ab, Disposition::Accepted, None);
+        let second = decide(&ds, &ab, Disposition::Rejected, Some(&first));
+        decide(&ds, &ab, Disposition::Accepted, Some(&second));
+        let read = |access: Option<Arc<GraphAccess>>| {
+            resolve_bounded(
+                &ds,
+                &ds,
+                "people",
+                &[n("urn:b")],
+                access,
+                &Control::none(),
+                2,
+            )
+        };
+        let hidden = read(hiding(&ev("target"), "urn:ev:decisions")).unwrap();
+        assert!(hidden.entities[0].decisions.is_empty(), "{hidden:?}");
+        assert_eq!(hidden.entities[0].members.len(), 2);
+        assert_eq!(
+            read(Some(Arc::new(GraphAccess::all()))).unwrap_err().code(),
+            "incomplete-evidence"
+        );
     }
 
     /// The answer of an acceptance of `target` under a bound of `candidates`.
