@@ -807,6 +807,19 @@ impl Checker<'_> {
                             .file(&stats_file),
                         );
                     }
+                    if let Some(why) = s.correlations.refusal() {
+                        run.add(Issue::warning(why).file(&stats_file));
+                    }
+                    if let Some(c) = s.correlations.get()
+                        && let Some(why) = crate::builder::correlations::check(&s, c)
+                    {
+                        run.add(
+                            Issue::warning(format!(
+                                "correlations: {why}: planner statistics are off"
+                            ))
+                            .file(&stats_file),
+                        );
+                    }
                 }
             },
         }

@@ -470,18 +470,8 @@ impl super::Generation {
         if let Some(why) = meta.patterns.as_ref().and_then(|p| p.skipped.as_ref()) {
             budget.charge(why.capacity() as u64)?;
         }
-        let stats = &self.stats;
-        budget.charge(
-            stats.predicates.capacity() as u64
-                * std::mem::size_of::<crate::builder::PredicateStat>() as u64
-                + (stats.graphs.capacity() + stats.classes.capacity()) as u64 * 16
-                + stats.charsets.capacity() as u64
-                    * std::mem::size_of::<crate::builder::CharSet>() as u64,
-        )?;
-        for set in &stats.charsets {
-            budget.check()?;
-            budget.charge((set.preds.capacity() as u64 + set.triples.capacity() as u64) * 8)?;
-        }
+        budget.check()?;
+        budget.charge(self.stats.heap_bytes())?;
         budget.charge(if self.patterns.file.is_some() {
             std::mem::size_of::<crate::patterns::PatternFile>() as u64 + 64
         } else {
@@ -675,17 +665,8 @@ fn retain_stats(
     loaded: Loaded<crate::builder::Stats>,
     budget: &mut ColdBudget<'_>,
 ) -> Result<crate::builder::Stats> {
-    let stats = &loaded.value;
-    let mut retained = stats.predicates.capacity() as u64
-        * std::mem::size_of::<crate::builder::PredicateStat>() as u64
-        + (stats.graphs.capacity() + stats.classes.capacity()) as u64 * 16
-        + stats.charsets.capacity() as u64 * std::mem::size_of::<crate::builder::CharSet>() as u64;
-    for set in &stats.charsets {
-        budget.check()?;
-        retained = retained
-            .checked_add((set.preds.capacity() as u64 + set.triples.capacity() as u64) * 8)
-            .ok_or_else(|| budget.exhausted())?;
-    }
+    budget.check()?;
+    let retained = loaded.value.heap_bytes();
     retain_parse(loaded, retained, budget)
 }
 

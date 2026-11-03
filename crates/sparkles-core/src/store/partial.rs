@@ -15,6 +15,7 @@
 //! The C13 spec (Phase 2) has the design and the cost model.
 
 use super::*;
+use crate::builder::correlations::{self, Rest, RestTally};
 use crate::builder::{CharSet, MAX_CHARSETS, PredicateStat, class_item};
 use crate::index::{BLOCK_ROWS, BlockMeta, PermWriter};
 use rayon::prelude::*;
@@ -616,82 +617,286 @@ fn update_charsets(
 ) -> Result<()> {
     let d = &snap.delta;
     let (ins, del) = (&d.ins[Perm::Spo.index()], &d.del[Perm::Spo.index()]);
-    if ins.is_empty() && del.is_empty() {
-        return Ok(());
+    if !(ins.is_empty() && del.is_empty()) {
+        update_subject_sets(snap, cache, rdf_type, st)?;
     }
-    let mut sets: FxHashMap<Vec<u64>, (u64, Vec<u64>)> = std::mem::take(&mut st.charsets)
-        .into_iter()
-        .map(|c| (c.preds, (c.subjects, c.triples)))
-        .collect();
-    let mut others = st.charset_others;
-    let spo = snap.generation.perm(Perm::Spo);
-    let mut rows: Vec<Key> = Vec::new();
-    let mut merged: Vec<Key> = Vec::new();
-    for s in groups(ins, del, 1).into_keys() {
-        rows.clear();
-        spo.for_each_range(cache, &[s[0]], |b, lo, hi| {
+    update_node_sets(snap, cache, rdf_type, st)
+}
+
+/// How a partial compaction places a holder whose set is not kept. While the remainder
+/// is empty, a new set joins the kept ones, as a full build would count it. Once the
+/// remainder holds anything, the kept sets stay as they are until the next full build,
+/// and the holder joins the remainder. A holder is then kept exactly when its set is, so
+/// taking out its old set is exact either way.
+struct Placing {
+    sets: FxHashMap<Box<[u64]>, (u64, Vec<u64>)>,
+    rest: Option<RestTally>,
+    frozen: bool,
+    /// subjects outside the kept sets, for statistics without a remainder
+    others: u64,
+}
+
+impl Placing {
+    fn new(sets: Vec<CharSet>, rest: Option<&Rest>, others: u64) -> Placing {
+        let rest = rest.map(RestTally::of);
+        Placing {
+            frozen: rest.as_ref().is_some_and(|r| r.n > 0),
+            sets: sets
+                .into_iter()
+                .map(|c| (c.preds.into_boxed_slice(), (c.subjects, c.triples)))
+                .collect(),
+            rest,
+            others,
+        }
+    }
+
+    fn remove(&mut self, items: &[u64], counts: &[u64]) {
+        if items.is_empty() {
+            return;
+        }
+        match self.sets.get_mut(items) {
+            Some((n, t)) => {
+                *n -= 1;
+                for (x, c) in t.iter_mut().zip(counts) {
+                    *x = x.saturating_sub(*c);
+                }
+                if *n == 0 {
+                    self.sets.remove(items);
+                }
+            }
+            None => match &mut self.rest {
+                Some(r) => r.add(1, items, counts, -1),
+                None => self.others = self.others.saturating_sub(1),
+            },
+        }
+    }
+
+    fn add(&mut self, items: &[u64], counts: &[u64]) {
+        if items.is_empty() {
+            return;
+        }
+        match self.sets.get_mut(items) {
+            Some((n, t)) => {
+                *n += 1;
+                for (x, c) in t.iter_mut().zip(counts) {
+                    *x += c;
+                }
+            }
+            None if self.frozen => {
+                if let Some(r) = &mut self.rest {
+                    r.add(1, items, counts, 1);
+                }
+            }
+            None => {
+                self.sets
+                    .insert(items.to_vec().into_boxed_slice(), (1, counts.to_vec()));
+            }
+        }
+    }
+
+    /// The kept sets, the remainder (when there is one) and the holders outside the kept
+    /// sets.
+    fn finish(self, cap: usize) -> (Vec<CharSet>, Option<Rest>, u64) {
+        match self.rest {
+            Some(mut r) => {
+                let kept = correlations::keep_top(self.sets, cap, &mut r);
+                let r = r.finish();
+                let n = r.n;
+                (kept, Some(r), n)
+            }
+            None => {
+                let mut v: Vec<CharSet> = self
+                    .sets
+                    .into_iter()
+                    .map(|(preds, (subjects, triples))| CharSet {
+                        preds: preds.into_vec(),
+                        subjects,
+                        triples,
+                    })
+                    .collect();
+                v.sort_unstable_by(|a, b| {
+                    b.subjects
+                        .cmp(&a.subjects)
+                        .then_with(|| a.preds.cmp(&b.preds))
+                });
+                let others = self.others + v.iter().skip(cap).map(|c| c.subjects).sum::<u64>();
+                v.truncate(cap);
+                (v, None, others)
+            }
+        }
+    }
+}
+
+/// The rows of `perm`'s base with prefix `[x]`, and the same rows with the delta merged.
+fn rows_before_after(
+    snap: &Snapshot,
+    cache: &BlockCache,
+    perm: Perm,
+    x: u64,
+    rows: &mut Vec<Key>,
+    merged: &mut Vec<Key>,
+) -> Result<()> {
+    let d = &snap.delta;
+    let (ins, del) = (&d.ins[perm.index()], &d.del[perm.index()]);
+    rows.clear();
+    snap.generation
+        .perm(perm)
+        .for_each_range(cache, &[x], |b, lo, hi| {
             rows.extend((lo..hi).map(|i| b.key(i)));
             Ok(())
         })?;
-        let (preds, counts) = charset_of(&rows, rdf_type);
-        if !preds.is_empty() {
-            match sets.get_mut(&preds) {
-                Some((n, t)) => {
-                    *n -= 1;
-                    for (x, c) in t.iter_mut().zip(&counts) {
-                        *x = x.saturating_sub(*c);
-                    }
-                    if *n == 0 {
-                        sets.remove(&preds);
-                    }
-                }
-                None => others = others.saturating_sub(1),
-            }
+    merged.clear();
+    let mut add = Delta::range(ins, &[x]).peekable();
+    let mut gone = Delta::range(del, &[x]).peekable();
+    for k in rows.iter() {
+        while let Some(n) = add.next_if(|n| *n < k) {
+            merged.push(*n);
         }
-        merged.clear();
-        let mut add = Delta::range(ins, &[s[0]]).peekable();
-        let mut gone = Delta::range(del, &[s[0]]).peekable();
-        for k in &rows {
-            while let Some(n) = add.next_if(|n| *n < k) {
-                merged.push(*n);
-            }
-            if gone.next_if(|x| *x == k).is_none() {
-                merged.push(*k);
-            }
-        }
-        merged.extend(add.copied());
-        let (preds, counts) = charset_of(&merged, rdf_type);
-        if !preds.is_empty() {
-            match sets.get_mut(&preds) {
-                Some((n, t)) => {
-                    *n += 1;
-                    for (x, c) in t.iter_mut().zip(&counts) {
-                        *x += c;
-                    }
-                }
-                None => {
-                    sets.insert(preds, (1, counts));
-                }
-            }
+        if gone.next_if(|g| *g == k).is_none() {
+            merged.push(*k);
         }
     }
-    let mut v: Vec<CharSet> = sets
-        .into_iter()
-        .map(|(preds, (subjects, triples))| CharSet {
-            preds,
-            subjects,
-            triples,
-        })
-        .collect();
-    v.sort_unstable_by(|a, b| {
-        b.subjects
-            .cmp(&a.subjects)
-            .then_with(|| a.preds.cmp(&b.preds))
-    });
-    others += v.iter().skip(MAX_CHARSETS).map(|c| c.subjects).sum::<u64>();
-    v.truncate(MAX_CHARSETS);
-    st.charsets = v;
+    merged.extend(add.copied());
+    Ok(())
+}
+
+fn update_subject_sets(
+    snap: &Snapshot,
+    cache: &BlockCache,
+    rdf_type: Option<u64>,
+    st: &mut Stats,
+) -> Result<()> {
+    let d = &snap.delta;
+    let (ins, del) = (&d.ins[Perm::Spo.index()], &d.del[Perm::Spo.index()]);
+    let mut place = Placing::new(
+        std::mem::take(&mut st.charsets),
+        st.correlations.get().map(|c| &c.subject_rest),
+        st.charset_others,
+    );
+    let mut rows: Vec<Key> = Vec::new();
+    let mut merged: Vec<Key> = Vec::new();
+    for s in groups(ins, del, 1).into_keys() {
+        rows_before_after(snap, cache, Perm::Spo, s[0], &mut rows, &mut merged)?;
+        let (preds, counts) = charset_of(&rows, rdf_type);
+        place.remove(&preds, &counts);
+        let (preds, counts) = charset_of(&merged, rdf_type);
+        place.add(&preds, &counts);
+    }
+    let (kept, rest, others) = place.finish(MAX_CHARSETS);
+    st.charsets = kept;
     st.charset_others = others;
+    if let (Some(c), Some(r)) = (st.correlations.get_mut(), rest) {
+        c.subject_rest = r;
+    }
+    Ok(())
+}
+
+/// The node set of `x` from its SPO rows `out` and the predicates of its OPS rows with
+/// their counts `inn`.
+fn node_set_of(out: &[Key], inn: &[(u64, u64)], rdf_type: Option<u64>) -> (Vec<u64>, Vec<u64>) {
+    let (mut items, mut counts) = (Vec::new(), Vec::new());
+    correlations::node_set(
+        out.iter().map(|k| (k[1], k[2])),
+        inn.iter().copied(),
+        rdf_type,
+        &mut items,
+        &mut counts,
+    );
+    (items, counts)
+}
+
+/// The predicates of the quads with object `x`, with the count of each, before and after
+/// the delta. Each predicate costs a seek and a count, so an object that many quads point
+/// at, such as a class, is not read row by row.
+fn in_counts(
+    snap: &Snapshot,
+    cache: &BlockCache,
+    x: u64,
+    before: &mut Vec<(u64, u64)>,
+    after: &mut Vec<(u64, u64)>,
+) -> Result<()> {
+    let ops = snap.generation.perm(Perm::Ops);
+    before.clear();
+    let mut p = 0u64;
+    loop {
+        let mut next = None;
+        ops.for_each_key_range_until(
+            cache,
+            &[x, p, 0, 0],
+            &[x, u64::MAX, u64::MAX, u64::MAX],
+            |b, s, _| {
+                next = Some(b.key(s)[1]);
+                Ok(false)
+            },
+        )?;
+        let Some(q) = next else { break };
+        before.push((q, ops.count(cache, &[x, q])?));
+        match q.checked_add(1) {
+            Some(n) => p = n,
+            None => break,
+        }
+    }
+    let d = &snap.delta;
+    let (ins, del) = (&d.ins[Perm::Ops.index()], &d.del[Perm::Ops.index()]);
+    let mut m: BTreeMap<u64, i64> = before.iter().map(|&(p, n)| (p, n as i64)).collect();
+    for k in Delta::range(ins, &[x]) {
+        *m.entry(k[1]).or_default() += 1;
+    }
+    for k in Delta::range(del, &[x]) {
+        *m.entry(k[1]).or_default() -= 1;
+    }
+    after.clear();
+    after.extend(
+        m.into_iter()
+            .filter(|&(_, n)| n > 0)
+            .map(|(p, n)| (p, n as u64)),
+    );
+    Ok(())
+}
+
+/// Update the node sets for the nodes whose quads the delta changes: the subjects of its
+/// SPO keys and the objects of its OPS keys, each read in both directions before and
+/// after the delta.
+fn update_node_sets(
+    snap: &Snapshot,
+    cache: &BlockCache,
+    rdf_type: Option<u64>,
+    st: &mut Stats,
+) -> Result<()> {
+    let Some(c) = st.correlations.get_mut() else {
+        return Ok(());
+    };
+    let d = &snap.delta;
+    let mut nodes: Vec<u64> = Vec::new();
+    for p in [Perm::Spo, Perm::Ops] {
+        let (ins, del) = (&d.ins[p.index()], &d.del[p.index()]);
+        nodes.extend(groups(ins, del, 1).into_keys().map(|k| k[0]));
+    }
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    nodes.sort_unstable();
+    nodes.dedup();
+    let mut place = Placing::new(
+        std::mem::take(&mut c.node_sets),
+        Some(&c.node_rest),
+        c.node_rest.n,
+    );
+    let (mut out, mut out_new, mut inn, mut inn_new) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for x in nodes {
+        rows_before_after(snap, cache, Perm::Spo, x, &mut out, &mut out_new)?;
+        in_counts(snap, cache, x, &mut inn, &mut inn_new)?;
+        let (items, counts) = node_set_of(&out, &inn, rdf_type);
+        place.remove(&items, &counts);
+        let (items, counts) = node_set_of(&out_new, &inn_new, rdf_type);
+        place.add(&items, &counts);
+    }
+    let (kept, rest, _) = place.finish(correlations::MAX_NODE_SETS);
+    c.node_sets = kept;
+    if let Some(r) = rest {
+        c.node_rest = r;
+    }
     Ok(())
 }
 

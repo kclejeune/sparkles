@@ -984,14 +984,40 @@ fn stats_terms(s: &Store) -> serde_json::Value {
     let snap = s.snapshot();
     let st = &snap.generation.stats;
     let t = |id: u64| {
-        let id = if Id(id).tag() as u8 == 0xF {
-            Id::vocab(id & crate::id::PAYLOAD_MASK)
-        } else {
-            Id(id)
+        let (kind, id) = match Id(id).tag() as u8 {
+            0xF => ("class", Id::vocab(id & crate::id::PAYLOAD_MASK)),
+            0xE => ("incoming", Id::vocab(id & crate::id::PAYLOAD_MASK)),
+            _ => ("term", Id(id)),
         };
         snap.term(id)
-            .map_or_else(|| format!("{id:?}"), |t| format!("class or term {t}"))
+            .map_or_else(|| format!("{id:?}"), |t| format!("{kind} {t}"))
     };
+    let sets = |v: &[crate::builder::CharSet]| {
+        let mut v: Vec<_> = v
+            .iter()
+            .map(|c| {
+                (
+                    c.preds.iter().map(|p| t(*p)).collect::<Vec<_>>(),
+                    c.subjects,
+                    c.triples.clone(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let rest = |r: &crate::builder::correlations::Rest| {
+        let mut v: Vec<_> = r.items.iter().map(|&(i, h, n)| (t(i), h, n)).collect();
+        v.sort();
+        (r.n, v)
+    };
+    let correlations = st.correlations.get().map(|c| {
+        serde_json::json!({
+            "subjectRest": rest(&c.subject_rest),
+            "nodeSets": sets(&c.node_sets),
+            "nodeRest": rest(&c.node_rest),
+        })
+    });
     serde_json::json!({
         "quads": st.quads,
         "subjects": st.distinct_subjects,
@@ -1002,6 +1028,7 @@ fn stats_terms(s: &Store) -> serde_json::Value {
         "classes": st.classes.iter().map(|(c, n)| (t(*c), *n)).collect::<Vec<_>>(),
         "charsets": st.charsets.iter().map(|c| (c.preds.iter().map(|p| t(*p)).collect::<Vec<_>>(), c.subjects, c.triples.clone())).collect::<Vec<_>>(),
         "charsetOthers": st.charset_others,
+        "correlations": correlations,
     })
 }
 

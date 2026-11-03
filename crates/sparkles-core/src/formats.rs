@@ -232,6 +232,20 @@ pub const PATTERNS: FileKind = FileKind {
     reads: &[1],
 };
 
+/// The planner's correlation statistics of a generation: the remainders of its subject
+/// sets and its node sets (see [`crate::builder::correlations`]). They are the member
+/// `correlations` of `stats.json`, whose version is read before the rest of it. A version
+/// this build does not read is not used, the planner estimates as without them, and the
+/// next full compaction writes the current version. Releases before them ignore the member.
+pub const PLANNER_STATISTICS: FileKind = FileKind {
+    id: "planner-statistics",
+    files: "gen-*/stats.json, its member correlations",
+    marker: "`version` of the member `correlations`; another version is not used and is rebuilt at the next full compaction",
+    class: Class::Derived,
+    writes: crate::builder::correlations::VERSION,
+    reads: &[1],
+};
+
 /// The terms added since a generation was built.
 pub const DELTA_VOCAB: FileKind = FileKind {
     id: "delta-vocab",
@@ -582,6 +596,7 @@ pub const KINDS: &[&FileKind] = &[
     &VOCAB_FSST,
     &NUMERIC_COLUMN,
     &PATTERNS,
+    &PLANNER_STATISTICS,
     &DELTA_VOCAB,
     &WAL,
     &COMMITS,
@@ -1058,6 +1073,11 @@ mod tests {
         assert!(INDEX.reads(crate::builder::FORMAT_VERSION));
         assert_eq!(DELTA_VOCAB.writes, crate::vocab::delta::VERSION);
         assert_eq!(PATTERNS.writes, crate::patterns::VERSION);
+        assert_eq!(
+            PLANNER_STATISTICS.writes,
+            crate::builder::correlations::VERSION
+        );
+        assert!(PLANNER_STATISTICS.reads(crate::builder::correlations::VERSION));
         assert_eq!(VOCAB_FSST.writes, crate::vocab::fsst::VERSION);
         assert_eq!(DATASET.writes, crate::commit::DATASET_READER);
         assert_eq!(
