@@ -385,6 +385,109 @@ gaps are outside the noise, so a dataset like the tuning sets gains more from a 
 model. The [paid record](../2026-11-02-ask-fair-matrix-paid.json) holds every run, the
 per-case results, the bootstrap intervals and the ledgers.
 
+#### Ask on the cheapest models
+
+A second round aimed at the cheapest tier, GPT-6 Luna and Claude Haiku 5.5 at about
+$0.002 per question. Its bar was that the better of the two answers at least 105 of the
+150 unseen questions strictly, and that its paired bootstrap 95% interval against Sol, the
+strongest model of the provider comparison, contains zero. Every change was generic to
+any dataset and was judged on both models by the mean of three runs on the 51 validation
+questions. The two robustness fixes were kept unless they clearly hurt a model, and the
+other changes were kept only when they gained.
+
+| Measurement context | |
+|---|---|
+| Date and host | 2026-11-02 on a development laptop that was running other work, with binaries built on atlas |
+| Builds | `27459d58` as the base, the same commit with each change applied for the trials, and `ace00e4b` for the finals |
+| Settings | Effort `medium`, a 200,000-token context and answered clarifications, as in the provider comparison. The finals and the later trials asked eight questions at once in each Ask child, and the earlier trials one. |
+| Data | The DBpedia 2022.12.01 database of the provider comparison. The finals of the two providers ran at once, the Claude models on a hardlinked copy of the database that changes no file. |
+| Cost | $9.23 for the Claude finals, $7.73 for the OpenAI finals and $4.48 for the trials |
+
+The changes are these, in the order they were added.
+
+- The draft check's lookup of whether a class has a predicate now writes the two terms
+  into its ASK. Passed as bindings, the same lookup exceeded the 2 GiB query memory
+  estimate on DBpedia for a class such as `dbo:River`, and the check then failed the
+  draft. A lookup that still exceeds a memory or row budget is now skipped.
+- A draft that uses a well-known prefix such as `dbo:` or `geo:` without declaring it
+  gets the declaration added, unless the dataset or the query binds that prefix itself.
+- The class profile that the check suggests ranks a class's predicates by how many
+  sampled instances use them and how rare they are in the whole store, with the draft's
+  own namespace first.
+- The draft prompt asks for only the variables that answer the question, with no label,
+  predicate or helper column unless the question asks for one.
+
+Strict answers on the 51 validation questions, three runs per arm unless shown
+
+| Arm | Haiku 5.5 | Mean | GPT-6 Luna | Mean |
+|---|---|---|---|---|
+| Base | 28, 27, 23 | 26.0 | 29, 29, 28 | 28.7 |
+| Check lookup fix, two runs | 27, 26 | 26.5 | 31, 31 | 31.0 |
+| Plus prefix completion and the ranked profile | 26, 26, 29 | 27.0 | 27, 32, 28 | 29.0 |
+| Plus the projection rule, the final build | 29, 27, 30 | 28.7 | 30, 29, 30 | 29.7 |
+
+The mechanism counts carry more signal than the scores, whose spread across three runs
+of one arm reaches 5 questions. Across three base runs, 7 Haiku drafts and 10 Luna drafts
+failed the check on the memory estimate, and none did after the lookup fix. Drafts that
+failed to parse fell from 9 and 6 to none once prefix completion was added. Answers with
+columns the gold lacks fell from 27 to 8 for Haiku and from 59 to 10 for Luna with the
+projection rule. The cost per question stayed between $0.0020 and $0.0023, apart from a
+few Luna runs that cost less than half as much because they started while OpenAI's
+prompt cache still held the prompts of the run before.
+
+Unseen, 150 QALD-9-plus training questions, final build
+
+| Model | Strict | Without the 7 overlapping questions | Before this round | Cost | Cost per correct answer |
+|---|---|---|---|---|---|
+| GPT-6 Luna | 101 (67%) | 96 of 143 | 106 | $0.29 | $0.0028 |
+| Claude Haiku 5.5 | 102 (68%) | 97 of 143 | 95 | $0.29 | $0.0029 |
+| GPT-6.1 Terra | 111 (74%) | 106 of 143 | 108 | $2.51 | $0.0227 |
+| GPT-6.1 Sol | 109 (73%) | 104 of 143 | 113 | $4.93 | $0.0452 |
+| Claude Opus 5.5 | 114 (76%) | 110 of 143 | 111 | $8.93 | $0.0784 |
+
+The overlapping questions are the 7 unseen questions whose wording shares at least half
+its tokens with a synthetic training question, so the synthetic sets could have taught
+them. The column before this round gives the final build of the provider comparison.
+
+The bar is not met. Haiku is the better cheap model with 102, three short of 105. Its
+interval against Sol runs from 2.0 points below to 11.3 points above, and Luna's from 0.7
+below to 11.3 above, so both are within the noise of Sol. Against Opus with the same
+build, Haiku's interval runs from 2.0 to 14.0 points and Luna's from 2.0 to 15.3 points,
+so neither is. Against the Opus run of the provider comparison, Haiku's interval runs from
+0.7 points below to 12.7 above and Luna's from 0.0 to 13.3, which both contain zero.
+Without the overlapping questions the conclusions are the same, except that Luna's
+interval against that earlier Opus run, from 0.7 to 14.7 points, no longer contains zero.
+
+The changes did not move the held-out scores beyond the noise. Haiku gained 7 questions,
+Terra and Opus 3 each, Sol lost 4 and Luna lost 5, a net gain of 4 over the five models,
+and each model's paired interval against its earlier run contains zero. The robustness
+fixes stay because they remove failures of the check and the parser. Luna stays the
+model of the `openai` preset, since one run per model moved none of them beyond the noise
+of the provider comparison on which the preset was chosen.
+
+##### Synthetic questions
+
+The synthetic DBpedia sets in `testsuite/ask/synth` have gold queries that were executed
+when they were generated, but they are far easier than QALD. Haiku answers 109 and 110 of
+the 134 synthetic validation questions, about 82%, against 30 and 26 of the 51 QALD
+validation questions, about 55%, with the same build. Luna answers 118, about 88%,
+against 27, about 53%. The synthetic sets therefore only rank changes coarsely, and item
+595 tracks harder ones.
+
+##### Experiments not kept
+
+A library of 99 stored queries, written from the templates of the synthetic training
+split and kept in a copy of the database, gave the draft model worked examples of the
+data's shapes. Its superlative template was removed after the first runs. Haiku rose
+from 110 and 109 to 121 and 119 of the 134 synthetic validation questions but fell to 25
+of the 51 QALD questions, against 30 and 26 without it. Luna answered 29 of 51 against 27
+and 119 synthetic questions against 118, inside its spread. The library teaches the shape
+of the synthetic questions rather than the data. Its stored query for the languages of a
+country reads `dbo:language`, which reaches 1 of the 11 languages that the QALD gold
+lists for its question, and drafts copied that shape. The library was not kept. The
+[paid record](../2026-11-02-ask-cheap-tier-paid.json) holds every run of this round, the
+per-case results, the mechanism counts, the intervals and the ledgers.
+
 ### Global answering
 
 Sonnet 5.5 answered 30 generated questions about the whole demo organisation graph four

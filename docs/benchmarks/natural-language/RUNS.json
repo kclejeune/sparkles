@@ -236,6 +236,33 @@
           "schema": 1
         }
       }
+    },
+    {
+      "run_id": "sha256-2849faf1d84210bea40219f5dc28d872fdb015cdf47db2809ceb6de4e89b4c5f",
+      "path": "../2026-11-02-ask-cheap-tier-paid.json",
+      "sha256": "2849faf1d84210bea40219f5dc28d872fdb015cdf47db2809ceb6de4e89b4c5f",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": {
+          "effort": "medium",
+          "contextTokens": 200000,
+          "maxOutputTokens": 16384,
+          "requestTimeoutSecs": 180,
+          "askDeadlineSecs": 300,
+          "queryTimeoutSecs": 60,
+          "askTokenBudget": 100000,
+          "clarifications": "answer"
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": "A development laptop with 16 cores and 30 GB of memory that was running other work. Binaries were built on atlas and copied back.",
+          "measurement": "Ask cheap-tier hill-climb on DBpedia 2022.12.01, Phase 2: robustness fixes of the draft check, well-known prefix completion, a ranked class profile and an answer-projection prompt rule, judged on Claude Haiku 5.5 and OpenAI GPT-6 Luna over qald-validation-v2, with finals on unseen-150 for Luna, Haiku, GPT-6.1 Terra, GPT-6.1 Sol and Claude Opus 5.5",
+          "schema": 1
+        }
+      }
     }
   ]
 }

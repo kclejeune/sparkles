@@ -118,8 +118,8 @@ build community reports.
   [results](../benchmarks/natural-language/RESULTS.md#ask-repair-options) give each run.
 * The draft rules ask for only the variables that answer the question, without label,
   predicate or helper columns unless the question asks for them. With them, answers
-  with columns beyond the gold's fell from 8 to 1 for Haiku 5.5 and from 22 to 4 for
-  GPT-6 Luna in a run of 51 validation questions.
+  with columns beyond the gold's fell from 27 to 8 for Haiku 5.5 and from 59 to 10 for
+  GPT-6 Luna over three runs of 51 validation questions.
 * A draft often uses a common vocabulary prefix without declaring it. Before the check,
   Ask declares each of these that the query uses and neither the query nor the dataset
   defines: `dbo`, `dbr`, `dbp` and `dbc` for DBpedia's ontology, resources, properties
@@ -519,15 +519,19 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   ([C18](../specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12),
   [BENCHMARKS.md](../benchmarks/natural-language/RESULTS.md#ask-grounding-from-predicate-use)).
   With the current build, on 150 held-out QALD-9-plus training questions that no tuning
-  step read, GPT-6.1 Sol answers 113, Opus 5.5 111, GPT-6.1 Terra 108, GPT-6 Luna and
-  Sonnet 5.5 106 and Haiku 5.5 95 under projected-column scoring, against 41 to 72 for
-  the build before predicate-use grounding. Luna costs $0.0021 per question, Sonnet
-  $0.029 and Opus $0.062. On the 107 retained QALD-9-plus test questions, which Ask
+  step read, Opus 5.5 answers 114, GPT-6.1 Terra 111, GPT-6.1 Sol 109, Haiku 5.5 102
+  and GPT-6 Luna 101 under projected-column scoring, against 41 to 72 for the build
+  before predicate-use grounding. Sonnet 5.5 answered 106 with the build before the check
+  fixes and the projection rule. Luna and Haiku are within the noise of Sol but not of
+  Opus ([results](../benchmarks/natural-language/RESULTS.md#ask-on-the-cheapest-models)).
+  Luna costs $0.0019 per question, Sonnet $0.029 and Opus $0.060. With the earlier
+  build, on the 107 retained QALD-9-plus test questions, which Ask
   grounding was tuned on, Opus answers 60, Sonnet 55 and Luna 47, and on the 74 retained
   Text2SPARQL'25 DBpedia questions 46, 45 and 40
   ([results](../benchmarks/natural-language/RESULTS.md#ask-across-providers)). The
   `openai` provider preset starts with Luna and the `anthropic` preset with Sonnet, the
-  cheapest models per correct answer within the noise of the best one. A gold resource
+  cheapest models per correct answer within the noise of the best one in the provider
+  comparison. A gold resource
   missing from the prompt causes about half of the wrong answers, and wrong query shape
   most of the rest. Property path evaluation runs within Ask's query memory budget and
   timeout, so a generated query with a property path fails with the usual error rather

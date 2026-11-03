@@ -123,7 +123,9 @@ without label, predicate or helper columns unless the question asks for them, an
 to add a variable only to fill the draft's `graph` member. Over three runs of 51
 QALD-9-plus validation questions the mean strict score rose from 27.0 to 28.7 with Haiku
 5.5 and from 29.0 to 29.7 with GPT-6 Luna, and answers with columns beyond the gold's
-fell from 8 to 1 and from 22 to 4 in a run.
+fell from 27 to 8 and from 59 to 10 over the three runs. On 150 held-out QALD-9-plus
+questions Haiku answers 102 and Luna 101, within the noise of GPT-6.1 Sol and short of
+70%, and no model moved beyond the noise of its run with the earlier build.
 
 Ask declares the well-known vocabulary prefixes that a draft uses without declaring,
 such as `dbo` and `dbr`, before the check, unless the query or the dataset defines them.
