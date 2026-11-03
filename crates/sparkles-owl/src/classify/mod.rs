@@ -60,6 +60,7 @@ mod data;
 mod dl;
 mod dl_clause;
 mod dl_norm;
+mod dl_rules;
 mod horn;
 mod horn_rules;
 mod index;
@@ -1091,6 +1092,7 @@ impl Saturation {
             base_memory: base,
             peak_memory: normalized_peak,
             dynamic: dynamic.as_ref(),
+            dl: None,
         };
         // the pool has been charged for the peak of a parallel normalization
         let more = base.saturating_sub(normalized_peak);
