@@ -3571,9 +3571,14 @@
   .gtools.narrow {
     /* and a very narrow one, such as with Facets open as well, wraps its tools to more
        rows rather than clipping them */
-    & .toolbar-group {
+    & .toolbar-group,
+    & .toolbar-end {
       flex-wrap: wrap;
       min-width: 0;
+    }
+    & .toolbar-end {
+      flex-shrink: 1;
+      justify-content: flex-end;
     }
     & .lbl {
       position: absolute;

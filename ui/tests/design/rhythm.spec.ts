@@ -189,7 +189,8 @@ test('Tab reaches the controls with a visible focus ring', async ({ browser }) =
 });
 
 test("Explore's graph tools stay inside a narrow canvas", async ({ browser }) => {
-  for (const width of [1100, 1440]) {
+  // 1001 px is just above the width where the details panel stacks under the canvas
+  for (const width of [1001, 1100, 1440]) {
     const ctx = await browser.newContext({ viewport: { width, height: 800 } });
     const page = await ctx.newPage();
     await load(page, `/ui/explore?ds=demo&iri=${encodeURIComponent('http://example.org/ns#City')}`);
