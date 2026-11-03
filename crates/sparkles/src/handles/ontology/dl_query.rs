@@ -371,6 +371,9 @@ impl Ontologies {
             o.assertions(opts, |a, _, _| {
                 if let Some(a) = a {
                     for ent in a.signature() {
+                        if found.len() == RETRY_ENTITIES {
+                            break;
+                        }
                         let iri = ent.iri().as_str();
                         if !ent.is_builtin()
                             && meant.matches(iri)

@@ -522,7 +522,8 @@ fn names_only_assertions_hold_are_read() {
     let ds = dataset(
         "Declaration(Class(:C)) Declaration(Class(:k)) Declaration(ObjectProperty(:p))
          ClassAssertion(:C :a) ObjectPropertyAssertion(:p :a :b) ObjectPropertyAssertion(:p :b :k)
-         AnnotationAssertion(rdfs:label :b \"Ada Lovelace\")",
+         AnnotationAssertion(rdfs:label :b \"Ada Lovelace\")
+         ObjectPropertyAssertion(:p :a <http://ex.org/ΟΣ>)",
     );
     for text in [
         "p value a",
@@ -533,6 +534,9 @@ fn names_only_assertions_hold_are_read() {
         "p value B",
         "p value 'Ada Lovelace'",
         "p value 'Ada\\u0020Lovelace'",
+        // a final sigma lowers differently from the letter alone
+        "p value ΟΣ",
+        "p value ος",
     ] {
         let a = query_with(
             &ds,
@@ -558,11 +562,19 @@ fn names_only_assertions_hold_are_read() {
 
 #[test]
 fn a_name_many_assertions_share_reads_as_ambiguous_within_a_bound() {
-    let members: String = (0..400)
-        .map(|n| format!("ClassAssertion(:C <http://ex.org/g/{n}/member>) "))
+    // one entity, then two per assertion, so the bound falls inside an assertion
+    let members: String = (0..200)
+        .map(|n| {
+            format!(
+                "ObjectPropertyAssertion(:q <http://ex.org/g/{}/member> <http://ex.org/g/{}/member>) ",
+                2 * n,
+                2 * n + 1
+            )
+        })
         .collect();
     let ds = dataset(&format!(
-        "Declaration(Class(:C)) Declaration(ObjectProperty(:p)) {members}"
+        "Declaration(Class(:C)) Declaration(ObjectProperty(:p)) Declaration(ObjectProperty(:q))
+         ClassAssertion(:C <http://ex.org/g/x/member>) {members}"
     ));
     let h = ds.ontology();
     let opts = h.anchored(&Default::default()).unwrap();
@@ -570,7 +582,7 @@ fn a_name_many_assertions_share_reads_as_ambiguous_within_a_bound() {
     let Err(Error::Component(c)) =
         h.parse_manchester(&o, "p value member", What::ClassExpression, &opts)
     else {
-        panic!("a name 400 individuals share read");
+        panic!("a name 401 individuals share read");
     };
     let j = c
         .source

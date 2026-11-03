@@ -350,6 +350,7 @@ impl Vocabulary {
         let named = self.names.get(simple).into_iter().flatten();
         let named = named.chain(self.folded.get(&folded).into_iter().flatten());
         m.iris.extend(named.cloned());
+        m.simple = Some(simple.to_string());
         m.folded = Some(folded);
         m
     }
@@ -488,18 +489,34 @@ impl Vocabulary {
 #[derive(Clone, Debug, Default)]
 pub struct Meant {
     iris: BTreeSet<String>,
-    /// the simple name in lower case, which the local names of IRIs are matched against
+    /// the simple name, which the local names of IRIs are matched against
+    simple: Option<String>,
+    /// the same in lower case, as the vocabulary folds names
     folded: Option<String>,
 }
 
 impl Meant {
     /// Whether the name may stand for the entity `iri`.
     pub fn matches(&self, iri: &str) -> bool {
-        self.iris.contains(iri)
-            || self.folded.as_deref().is_some_and(|f| {
-                let local = local_name(iri);
-                !local.is_empty() && local.chars().flat_map(char::to_lowercase).eq(f.chars())
-            })
+        if self.iris.contains(iri) {
+            return true;
+        }
+        let (Some(simple), Some(folded)) = (&self.simple, &self.folded) else {
+            return false;
+        };
+        let local = local_name(iri);
+        if local.is_empty() {
+            return false;
+        }
+        if local == simple {
+            return true;
+        }
+        if local.is_ascii() && folded.is_ascii() {
+            return local.eq_ignore_ascii_case(folded);
+        }
+        // the string's own lower case, as `Vocabulary` folds names, since a final sigma
+        // lowers differently from the letter alone
+        local.to_lowercase() == *folded
     }
 }
 
