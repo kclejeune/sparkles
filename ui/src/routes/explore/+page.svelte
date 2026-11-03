@@ -2055,9 +2055,13 @@
   // Focus only after initial time controls have reconciled, preserving a past-state URL.
   $effect(() => {
     const iri = page.url.searchParams.get('iri');
+    const urlTab = page.url.searchParams.get('tab');
     void page.url.searchParams.get('ds');
     untrack(() => {
-      if (iri && (!focusId || nodes[focusId]?.iri !== iri)) void focusOn(iri, undefined, true);
+      if (!iri || (focusId && nodes[focusId]?.iri === iri)) return;
+      // a link to a resource, such as a top bar search hit, shows it in the graph
+      if (!urlTab) tab = 'graph';
+      void focusOn(iri, undefined, true);
     });
   });
 

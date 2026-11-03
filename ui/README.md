@@ -35,15 +35,16 @@ bar. `lib/launcher.svelte.ts` keeps the launcher's providers. A page registers o
 registers the entity search of `lib/entity-search.ts`. The command palette of ROADMAP item
 631 adds its commands, pages and saved queries the same way.
 
-`src/app.css` defines the tokens for the light theme and both dark ones (by
-`prefers-color-scheme` and by `data-theme`), which must stay equal, as `lib/tokens.test.ts`
-checks together with WCAG AA contrast for every text colour. The breakpoints are 1200 px,
+`src/app.css` defines the tokens for the light theme and for two dark blocks, one chosen
+by `prefers-color-scheme` and one by `data-theme`. The two dark blocks must stay equal, and
+`lib/tokens.test.ts` checks that together with WCAG AA contrast for every text colour. The breakpoints are 1200 px,
 where the rail narrows to icons and `--gutter` drops from 24 to 20 px, and 760 px, where
-the rail becomes the drawer and the gutter drops to 16 px. Use the spacing (`--sp-*`), control height
-(`--ctl-h`, `--ctl-h-sm`), radius and shadow tokens instead of literal values, and the
-shared classes for page heads (`.page-head`, `.page-actions`, `.page-context` with
-`.form-row`), panels, `.count-badge`, `table.data` in `.table-scroll`, and a list beside its
-detail (`.page-container.fill` with `.split-view`).
+the rail becomes the drawer and the gutter drops to 16 px. Pages use the `--sp-*` spacing,
+`--ctl-h` and `--ctl-h-sm` control heights, radius and shadow tokens instead of literal
+values. A page head is `.page-head` with `.page-actions` and a `.page-context` row of
+`.form-row` controls. Tables are `table.data` in `.table-scroll`, counts are
+`.count-badge`, and a list beside its detail is a `.split-view` in a
+`.page-container.fill`.
 
 `node scripts/seed-design.mjs` serves realistic data for layout work: the Gene Ontology,
 the UNESCO Thesaurus and the demo dataset with stored queries and branches, downloaded

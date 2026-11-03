@@ -27,8 +27,12 @@
   let root: HTMLDivElement | undefined = $state();
   let opener: HTMLButtonElement | undefined = $state();
   let groups = $state<LauncherGroup[]>([]);
+  /** The dataset and query that `groups` answer. */
+  let groupsFor = $state('');
   let active = $state(0);
   let busy = $state(false);
+  /** Enter was pressed before the results of the current query arrived. */
+  let pickPending = false;
   /** Where the focus was before the keys opened the launcher. */
   let returnTo: HTMLElement | null = null;
   const mac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
@@ -36,6 +40,10 @@
   const base = resolve('/').replace(/\/$/, '');
   const ds = $derived(app.current);
   const items = $derived(groups.flatMap((g) => g.items));
+  const searchKey = $derived(`${ds ?? ''}\u0000${launcher.query.trim()}`);
+  /** Whether the rows shown answer what the field now says; Enter waits until they do. */
+  const fresh = $derived(groupsFor === searchKey);
+  const showResults = $derived(launcher.open && (!!launcher.query.trim() || items.length > 0));
   const placeholder = $derived(
     ds ? 'Search classes, properties and concepts' : 'Open a dataset to search it',
   );
@@ -81,38 +89,49 @@
     else input?.blur();
   }
 
-  // the search: debounced, the previous request aborted
+  // the search: debounced, the previous request aborted. Every provider answers, an empty
+  // query included, since a provider may suggest items before anything is typed.
   $effect(() => {
-    const q = launcher.query;
+    const q = launcher.query.trim();
     const d = ds;
+    const key = searchKey;
     const providers = launcher.providers.filter((p) => !p.active || p.active({ ds: d }));
-    if (!q.trim()) {
+    if (!launcher.open && !q) {
       groups = [];
+      groupsFor = key;
       busy = false;
       return;
     }
     const ctrl = new AbortController();
     busy = true;
-    const timer = setTimeout(async () => {
-      const out = await Promise.all(
-        providers.map(async (p): Promise<LauncherGroup> => {
-          const label = typeof p.label === 'function' ? p.label({ ds: d }) : p.label;
-          try {
-            return {
-              provider: p.id,
-              label,
-              items: await p.search(q, { ds: d, signal: ctrl.signal }),
-            };
-          } catch (e) {
-            return { provider: p.id, label, items: [], error: errorMessage(e) };
-          }
-        }),
-      );
-      if (ctrl.signal.aborted) return;
-      groups = out.filter((g) => g.items.length || g.error);
-      active = 0;
-      busy = false;
-    }, 140);
+    const timer = setTimeout(
+      async () => {
+        const out = await Promise.all(
+          providers.map(async (p): Promise<LauncherGroup> => {
+            const label = typeof p.label === 'function' ? p.label({ ds: d }) : p.label;
+            try {
+              return {
+                provider: p.id,
+                label,
+                items: await p.search(q, { ds: d, signal: ctrl.signal }),
+              };
+            } catch (e) {
+              return { provider: p.id, label, items: [], error: errorMessage(e) };
+            }
+          }),
+        );
+        if (ctrl.signal.aborted) return;
+        groups = out.filter((g) => g.items.length || g.error);
+        groupsFor = key;
+        active = 0;
+        busy = false;
+        if (pickPending) {
+          pickPending = false;
+          pick(groups.flatMap((g) => g.items)[0]);
+        }
+      },
+      q ? 140 : 0,
+    );
     return () => {
       clearTimeout(timer);
       ctrl.abort();
@@ -138,13 +157,22 @@
       if (items.length) active = (active - 1 + items.length) % items.length;
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      pick(items[active]);
+      // rows of an earlier query or dataset are not picked; the first row of this one is
+      if (fresh) pick(items[active]);
+      else if (launcher.query.trim()) pickPending = true;
     } else if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
+      pickPending = false;
       void close();
     }
   }
+
+  // the active row stays in view as the arrow keys move it
+  $effect(() => {
+    if (!showResults || !items.length) return;
+    document.getElementById(optionId(active))?.scrollIntoView({ block: 'nearest' });
+  });
 
   $effect(() => {
     if (!launcher.open) return;
@@ -193,7 +221,7 @@
         bind:value={launcher.query}
         type="search"
         role="combobox"
-        aria-expanded={launcher.open && !!launcher.query.trim()}
+        aria-expanded={showResults}
         aria-controls={listId}
         aria-autocomplete="list"
         aria-activedescendant={launcher.open && items.length ? optionId(active) : undefined}
@@ -208,8 +236,8 @@
     </label>
   </div>
 
-  {#if launcher.open && launcher.query.trim()}
-    <div class="results">
+  {#if showResults}
+    <div class="results" class:stale={!fresh}>
       <div id={listId} role="listbox" aria-label="Search results">
         {#each groups as g, gi (g.provider)}
           <div role="group" aria-labelledby="{listId}-g{gi}">
@@ -316,6 +344,9 @@
   }
   .query input:focus-visible {
     box-shadow: none;
+  }
+  .results.stale .hit {
+    opacity: 0.6;
   }
   .results {
     position: absolute;

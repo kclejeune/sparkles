@@ -77,6 +77,13 @@ const FIELD_NAME: Record<string, string> = {
   definition: 'definition',
 };
 
+/** The ontology editor's tree tab of each property kind. */
+const PROPERTY_TAB: Record<string, string> = {
+  objectProperty: 'ObjectProperty',
+  dataProperty: 'DataProperty',
+  annotationProperty: 'AnnotationProperty',
+};
+
 /**
  * Where a hit opens: a concept, scheme or collection in the thesaurus editor, a class or
  * property in the ontology editor, and anything else in Explore. Item 616's browser pages
@@ -87,8 +94,9 @@ export function entityHref(base: string, ds: string, hit: Pick<EntityHit, 'iri' 
   const k = hit.kinds;
   if (k.some((x) => x === 'concept' || x === 'conceptScheme' || x === 'collection'))
     return `${base}/thesaurus${q}`;
-  if (k.some((x) => x === 'class' || x.endsWith('Property') || x === 'datatype'))
-    return `${base}/ontology${q}`;
+  if (k.some((x) => x === 'class' || x === 'datatype')) return `${base}/ontology${q}`;
+  const prop = k.find((x) => x in PROPERTY_TAB);
+  if (prop) return `${base}/ontology${q}&tab=${PROPERTY_TAB[prop]}`;
   return `${base}/explore${q}`;
 }
 

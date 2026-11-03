@@ -6,15 +6,22 @@ import { expect, test } from './fixtures';
 import { expectNoSidewaysScroll } from '../phone';
 import { DATASET, EX } from './data';
 
-const search = (page: import('@playwright/test').Page) =>
-  page.getByRole('combobox', { name: /^Search/ });
+type Page = import('@playwright/test').Page;
+
+const search = (page: Page) => page.getByRole('combobox', { name: /^Search/ });
+
+/** Opens `url` and waits for the app to start, so that its keys answer. */
+async function visit(page: Page, url: string) {
+  await page.goto(url);
+  await expect(page.locator('main h1')).toBeAttached();
+}
 
 test.describe('at 1440 pixels', () => {
   test.use({ viewport: { width: 1440, height: 900 } });
 
   test('Ctrl+K searches the entities of the open dataset', async ({ page }) => {
     await page.addInitScript((d) => localStorage.setItem('sparkles.dataset', d), DATASET);
-    await page.goto('/ui/datasets');
+    await visit(page, '/ui/datasets');
     await page.keyboard.press('ControlOrMeta+k');
     await expect(search(page)).toBeFocused();
     await page.keyboard.type('pers');
@@ -30,7 +37,7 @@ test.describe('at 1440 pixels', () => {
   });
 
   test('/ focuses the search and Escape gives the focus back', async ({ page }) => {
-    await page.goto('/ui/server');
+    await visit(page, '/ui/server');
     const refresh = page.getByRole('button', { name: 'Refresh' });
     await refresh.focus();
     await page.keyboard.press('/');
@@ -45,7 +52,7 @@ test.describe('at 390 pixels', () => {
 
   test('the search expands over the bar and the drawer holds the pages', async ({ page }) => {
     await page.addInitScript((d) => localStorage.setItem('sparkles.dataset', d), DATASET);
-    await page.goto('/ui/datasets');
+    await visit(page, '/ui/datasets');
     await expect(search(page)).toBeHidden();
     await page.getByRole('button', { name: 'Open search' }).click();
     await expect(search(page)).toBeFocused();

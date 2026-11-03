@@ -237,11 +237,17 @@ export async function ontologyAxioms(
   }
 }
 
-/** The SPARQL of every label in the graph that `sel` reads: `rdfs:label`, then `skos:prefLabel`. */
+/** Jena's name for the stored default graph, which a query reads even under a union default. */
+const DEFAULT_GRAPH_IRI = 'urn:x-arq:DefaultGraph';
+
+/**
+ * The SPARQL of every label in the graph that `sel` reads: `rdfs:label`, then
+ * `skos:prefLabel`. With no graph selected it names the stored default graph, as the ontology
+ * routes read it, so a server with `--union-default-graph` does not add other graphs' labels.
+ */
 export function labelsQuery(sel: Selection): string {
   const pattern = `VALUES ?p { ${sparqlIri(RDFS_LABEL)} ${sparqlIri(SKOS_PREF_LABEL)} } ?s ?p ?l FILTER(isIRI(?s) && isLiteral(?l))`;
-  const where = sel.graph ? `GRAPH ${sparqlIri(sel.graph)} { ${pattern} }` : pattern;
-  return `SELECT ?s ?p ?l WHERE { ${where} }`;
+  return `SELECT ?s ?p ?l WHERE { GRAPH ${sparqlIri(sel.graph ?? DEFAULT_GRAPH_IRI)} { ${pattern} } }`;
 }
 
 type SparqlBinding = Record<string, { type: string; value: string; 'xml:lang'?: string }>;

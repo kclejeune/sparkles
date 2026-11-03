@@ -38,6 +38,8 @@
 
   function onkeydown(e: KeyboardEvent) {
     if (e.key === 'Escape' && open) {
+      // preventDefault too: in the phone drawer, Escape would otherwise also close the dialog
+      e.preventDefault();
       e.stopPropagation();
       open = false;
       button?.focus();

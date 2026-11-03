@@ -79,6 +79,71 @@ test.describe('at 1440 pixels', () => {
     await expect(search(page)).not.toBeFocused();
   });
 
+  test('Enter waits for the results of what the field now says', async ({ page }) => {
+    await onDataset(page, 'uni');
+    await visit(page, '/ui/datasets');
+    await page.keyboard.press('Control+k');
+    await page.keyboard.type('pers');
+    await expect(page.getByRole('option', { name: /Person/ }).first()).toBeVisible();
+    // the next answer is slow, so the rows of `pers` are still shown when Enter is pressed
+    await page.route('**/$/ontology/uni/search?*', async (r) => {
+      await new Promise((f) => setTimeout(f, 1200));
+      await r.continue();
+    });
+    await search(page).fill('stud');
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(
+      new RegExp(`/ui/ontology\\?ds=uni&iri=${encodeURIComponent(`${UNI}Student`)}`),
+    );
+  });
+
+  test('the arrow keys keep the active result in view', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 340 });
+    await onDataset(page, 'uni');
+    await visit(page, '/ui/datasets');
+    await page.keyboard.press('Control+k');
+    await page.keyboard.type('a');
+    const options = page.getByRole('listbox', { name: 'Search results' }).getByRole('option');
+    await expect(options).toHaveCount(8);
+    for (let i = 0; i < 7; i++) await page.keyboard.press('ArrowDown');
+    await expect(options.nth(7)).toHaveAttribute('aria-selected', 'true');
+    await expect(options.nth(7)).toBeInViewport({ ratio: 1 });
+  });
+
+  test('a provider can suggest items before anything is typed', async ({ page }) => {
+    await visit(page, '/ui/server');
+    // the mock runs under Vite, which serves the app's own instance of the module
+    await page.evaluate(async () => {
+      const path = '/ui/src/lib/launcher.svelte.ts';
+      const { launcher } = await import(/* @vite-ignore */ path);
+      launcher.register({
+        id: 'recent',
+        label: 'Recent',
+        order: 0,
+        search: async (q: string) =>
+          q ? [] : [{ id: 'r1', title: 'Datasets', href: '/ui/datasets' }],
+      });
+    });
+    await page.keyboard.press('Control+k');
+    const list = page.getByRole('listbox', { name: 'Search results' });
+    await expect(list.getByRole('group', { name: 'Recent' })).toBeVisible();
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(/\/ui\/datasets$/);
+  });
+
+  test("a hit opened from Explore's Schema tab shows in the graph", async ({ page }) => {
+    await visit(page, '/ui/explore?ds=uni&tab=schema');
+    await expect(page.getByRole('tab', { name: /Schema/ })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    await page.keyboard.press('Control+k');
+    await page.keyboard.type('ada love');
+    await page.getByRole('option', { name: /^Ada Lovelace/ }).click();
+    await expect(page).toHaveURL(/\/ui\/explore\?ds=uni&iri=/);
+    await expect(page.getByRole('tab', { name: /Graph/ })).toHaveAttribute('aria-selected', 'true');
+  });
+
   test('Ctrl+K reaches the search from the query editor', async ({ page }) => {
     await visit(page, '/ui/query');
     await page.locator('.cm-content').click();
@@ -205,7 +270,11 @@ test.describe('at 390 pixels', () => {
     await expectNoSidewaysScroll(page, 'the drawer');
     await drawer.locator('.ds-button').click();
     await expect(drawer.getByRole('listbox', { name: 'Datasets' })).toBeVisible();
-    await drawer.locator('.ds-button').click();
+    // the first Escape closes the switcher's list, the drawer stays open
+    await page.keyboard.press('Escape');
+    await expect(drawer.getByRole('listbox', { name: 'Datasets' })).toBeHidden();
+    await expect(drawer).toBeVisible();
+    await expect(drawer.locator('.ds-button')).toBeFocused();
     for (const name of [
       'Query',
       'Explore',

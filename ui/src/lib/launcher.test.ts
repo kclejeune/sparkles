@@ -99,6 +99,13 @@ describe('entity hits', () => {
     );
     expect(entityHref('/ui', 'th', hit({ kinds: ['concept'] }))).toMatch(/^\/ui\/thesaurus\?/);
     expect(entityHref('/ui', 'd', hit({ kinds: ['individual'] }))).toMatch(/^\/ui\/explore\?/);
+    // a property opens on its own tree's tab
+    expect(entityHref('/ui', 'go', hit({ kinds: ['objectProperty'] }))).toMatch(
+      /^\/ui\/ontology\?ds=go&iri=[^&]+&tab=ObjectProperty$/,
+    );
+    expect(entityHref('/ui', 'go', hit({ kinds: ['annotationProperty'] }))).toMatch(
+      /&tab=AnnotationProperty$/,
+    );
   });
 
   it('highlight a label match and name any other field', () => {

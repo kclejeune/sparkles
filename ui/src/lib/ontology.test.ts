@@ -549,7 +549,8 @@ describe('the labels a capped listing leaves out', () => {
     const q = labelsQuery({ graph: null, imports: true });
     expect(q).toContain('<http://www.w3.org/2000/01/rdf-schema#label>');
     expect(q).toContain('<http://www.w3.org/2004/02/skos/core#prefLabel>');
-    expect(q).not.toContain('GRAPH');
+    // the stored default graph, not the union a server may read as its default
+    expect(q).toContain('GRAPH <urn:x-arq:DefaultGraph> {');
     expect(labelsQuery({ graph: 'http://ex.org/g', imports: true })).toContain(
       'GRAPH <http://ex.org/g> {',
     );
