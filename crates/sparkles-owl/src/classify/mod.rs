@@ -616,19 +616,61 @@ impl Saturation {
         limits: &Limits,
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
-        let mut r = self.run(axioms, changes, held_bytes, limits, with_taxonomy);
-        if matches!(r, Err(Error::Memory { .. })) && self.horn_tried && !limits.el_only {
+        // what a pool admitted for a run that may fall back, so that the EL run charges
+        // only what it needs beyond that
+        let admitted = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted;
+        let first = match &limits.charge {
+            Some(f) if !limits.el_only => {
+                let (f, a) = (f.clone(), admitted.clone());
+                counted = Limits {
+                    charge: Some(std::sync::Arc::new(move |bytes: usize| {
+                        let ok = f(bytes);
+                        if ok {
+                            a.fetch_add(bytes, Ordering::Relaxed);
+                        }
+                        ok
+                    })),
+                    ..limits.clone()
+                };
+                &counted
+            }
+            _ => limits,
+        };
+        let mut r = self.run(axioms, changes, held_bytes, first, with_taxonomy);
+        if let Err(Error::Memory { used, .. }) = r
+            && self.horn_tried
+            && !limits.el_only
+        {
             // The Horn rules passed their budget or the caller's: the run starts again by
             // the EL rules alone, which leave the axioms outside OWL 2 EL out, as the
-            // classifier did before the Horn rules and as the ELK mode does.
+            // classifier did before the Horn rules and as the ELK mode does. Its charges
+            // draw first on what the pool admitted for the Horn run, which the grant
+            // still holds.
             self.reset();
+            let credit = std::sync::Arc::new(AtomicUsize::new(admitted.load(Ordering::Relaxed)));
             let el = Limits {
                 el_only: true,
+                charge: limits.charge.clone().map(|f| {
+                    let charge: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
+                        std::sync::Arc::new(move |bytes: usize| {
+                            let had = credit
+                                .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                                    Some(c - c.min(bytes))
+                                })
+                                .unwrap_or(0);
+                            let rest = bytes - had.min(bytes);
+                            rest == 0 || f(rest)
+                        });
+                    charge
+                }),
                 ..limits.clone()
             };
             r = self.run(axioms, None, held_bytes, &el, with_taxonomy).map(
                 |(consistent, taxonomy, mut stats)| {
                     stats.horn_over_budget = true;
+                    // the Horn run's high-water mark, which the run reached first
+                    stats.peak_memory = stats.peak_memory.max(used);
                     (consistent, taxonomy, stats)
                 },
             );

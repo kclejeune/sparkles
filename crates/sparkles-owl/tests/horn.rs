@@ -777,6 +777,7 @@ fn a_run_whose_horn_rules_pass_the_budget_classifies_by_the_el_rules() {
         .unwrap();
     assert!(out.stats.horn_over_budget);
     assert_eq!(out.stats.conjunctions, 0);
+    assert!(out.stats.peak_memory > el.stats.peak_memory);
     assert_eq!(k.excluded(), el_ex);
     assert!(
         !out.taxonomy
@@ -794,5 +795,59 @@ fn a_run_whose_horn_rules_pass_the_budget_classifies_by_the_el_rules() {
     assert!(
         k.classify(&limits(false, Some(el.stats.peak_memory / 2)))
             .is_err()
+    );
+}
+
+#[test]
+fn the_el_run_after_the_horn_budget_draws_on_what_the_pool_admitted() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let body = "TransitiveObjectProperty(:part_of)
+         InverseObjectProperties(:part_of :has_part)
+         SubClassOf(:FilopodiumMembrane :Membrane)
+         SubClassOf(:FilopodiumMembrane ObjectSomeValuesFrom(:part_of :Filopodium))
+         SubClassOf(:Filopodium ObjectSomeValuesFrom(:part_of :Cytoskeleton))
+         SubClassOf(:Cytoskeleton :Organelle)
+         EquivalentClasses(:MembraneBounded ObjectIntersectionOf(:Organelle ObjectSomeValuesFrom(:has_part :Membrane)))
+         EquivalentClasses(:OrganelleMembrane ObjectIntersectionOf(:Membrane ObjectSomeValuesFrom(:part_of :MembraneBounded)))";
+    let ax = axioms(body);
+    // a pool that admits charges up to `cap` and keeps them, as a server's grant does
+    let pool = |cap: usize| {
+        let held = Arc::new(AtomicUsize::new(0));
+        let h = held.clone();
+        let charge: Arc<dyn Fn(usize) -> bool + Send + Sync> = Arc::new(move |bytes: usize| {
+            h.try_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+                (x + bytes <= cap).then_some(x + bytes)
+            })
+            .is_ok()
+        });
+        (held, charge)
+    };
+    let limits = |el_only: bool, charge| Limits {
+        threads: 1,
+        el_only,
+        charge: Some(charge),
+        ..Limits::default()
+    };
+    let (el_held, charge) = pool(usize::MAX);
+    Classifier::of(&ax).classify(&limits(true, charge)).unwrap();
+    let el_need = el_held.load(Ordering::Relaxed);
+    let (horn_held, charge) = pool(usize::MAX);
+    let horn = Classifier::of(&ax)
+        .classify(&limits(false, charge))
+        .unwrap();
+    assert!(!horn.stats.horn_over_budget);
+    assert!(horn_held.load(Ordering::Relaxed) > el_need);
+    // a pool the EL run fits in: the Horn run passes it, and the EL run charges only
+    // what it needs beyond what the pool admitted for the Horn run
+    let (held, charge) = pool(el_need);
+    let out = Classifier::of(&ax)
+        .classify(&limits(false, charge))
+        .unwrap();
+    assert!(out.stats.horn_over_budget);
+    assert!(held.load(Ordering::Relaxed) <= el_need);
+    assert!(
+        !out.taxonomy
+            .is_subclass(&c("FilopodiumMembrane"), &c("OrganelleMembrane"))
     );
 }
