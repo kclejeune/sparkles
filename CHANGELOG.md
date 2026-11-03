@@ -203,6 +203,20 @@ one that passes it classifies again by the EL rules alone and sets
 `Stats::horn_over_budget`. Two Uberon-based ORE 2015 ontologies that ran out of memory
 now classify in 4.2 s with the EL answer.
 
+The classifier takes axioms that need case analysis in ALCHI ontologies without
+individuals or data properties (roadmap item 603), with the consequence-based calculus of
+Bate, Motik, Cuenca Grau, Tena Cucala, Simančík and Horrocks. It covers unions,
+complements and universal restrictions in every position with inverse properties,
+property hierarchies, transitive properties and chains, and tests the named subsumers
+that its clauses leave open in contexts of their own. `Limits::expansion` chooses the
+cautious or the eager successor strategy. `Limits::partial` makes such a run that its
+deadline, cancellation or memory budget stops return the subsumptions it proved, and
+`Classification` gains `complete`, `incomplete` and `consistency` to say what the answer
+leaves open. `Stats` counts the clauses, the contexts that held them, the stored clauses
+and the subsumer tests, and `Stats::dl_over_budget` says a run passed the shared memory
+budget and classified again by the Horn rules. The taxonomies of the ORE 2015 EL sample,
+GO and ChEBI lite are unchanged.
+
 The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
 `dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and
 axioms, check profiles, edit axioms, remove entities and diff commits in the JSON forms

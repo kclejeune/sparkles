@@ -61,9 +61,10 @@ representation.
 
 ## Non-goals
 
-* A native reasoner for OWL 2 DL in the phases above. DL reasoning goes through the
-  external bridge until roadmap item 603 adds native DL classification on top of the EL
-  classifier.
+* A native reasoner for OWL 2 DL in the phases above. Roadmap item 603 adds native DL
+  classification on top of the EL classifier, which covers Horn ontologies and ALCHI
+  without individuals, and the rest of OWL 2 DL goes through the external bridge until its
+  later phases.
 
 ## Design constraints
 
@@ -79,7 +80,8 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 The OWL 2 EL classifier is delivered as roadmap item 580 and covers OWL 2 EL, apart
 from the literals and the chains that item 663 follows, since item 587. Item 603 extends
 it to Horn ontologies without individuals, as [the Horn rules](#the-horn-rules)
-describe. The export of inferred axioms and the removal of redundant ones are delivered
+describe, and to ALCHI ontologies without individuals that need case analysis, as
+[the disjunctive rules](#the-disjunctive-rules) describe. The export of inferred axioms and the removal of redundant ones are delivered
 as the ROBOT-compatible commands of items 634, 635 and 637, and the existential
 superclasses as `materialize`, item 636. The other phases remain under
 [item 457](../../ROADMAP.md).
@@ -498,6 +500,92 @@ second equivalence follows from the first, so Konclude's answer stands for both.
 The functional-syntax reader refuses a document with a SWRL rule. A read with
 `ofn_read::Options::skip_rules` passes over the rules and counts them, which the
 classification comparison uses to report them as left out.
+
+### The disjunctive rules
+
+Item 603 classifies ontologies whose axioms outside OWL 2 EL need case analysis with the
+consequence-based calculus of Bate, Motik, Cuenca Grau, Tena Cucala, Simančík and
+Horrocks (*Consequence-Based Reasoning for Description Logics with Disjunctions and Number
+Restrictions*, JAIR 2018), written from the paper over the EL classifier's contexts. It
+covers ALCHI, which adds unions, complements and universal restrictions in every position
+to the EL classifier's language, with inverse properties and property hierarchies.
+Transitive properties and chains are taken through the automata of Horrocks, Kutz and
+Sattler, which unfold the universal restrictions, negative existential restrictions and
+ranges on the properties they reach. An at-least restriction in a positive position and an
+at-most restriction in a negative one are read as the existential restriction they
+imply, which keeps ALCHI's models. The rules run when an axiom needs case analysis and the
+ontology has no individuals, data properties, self restrictions, reflexive properties or
+top and bottom properties. Otherwise the Horn rules take what they can, and the axioms
+that need case analysis stay left out and reported, as do counting, nominals and property
+hierarchies that are not regular. `Stats::tier` is `Disjunctive` for such a run, and
+`Stats::clauses`, `dl_contexts`, `dl_stored`, `dl_tests` and `dl_testing` count its
+clauses, the contexts that held them, the clauses they stored, the candidate subsumers it
+tested and the time the tests took.
+
+The axioms with two or more disjuncts become clauses, and the others stay told subsumers
+of the EL index, so the EL rules still derive every unit. Each context keeps its clauses in
+a store with indexes by maximal literal, and a new clause that a stored one subsumes is
+dropped, while the stored clauses it subsumes are deleted. A marker `A → A` stays, since it
+records a hypothesis a predecessor sent. All contexts share one total order on literals,
+with fresh classes first, then named classes, then other atoms, and the literals over a
+successor above those over the context's own element. Under a total order a context decides
+its units and its satisfiability, and a named subsumer that only a case analysis gives
+stays inside a clause. The run therefore takes the canonical model of each class's
+context, built from its clauses with an empty body in the order of the literals, and tests
+each named class that model makes true and that is not a unit. A test is a context whose
+core is the class with the candidate's complement. All of a class's candidates are tested in
+one context first, and when that context is unsatisfiable each is tested alone, since most
+fail. A test that holds adds the subsumer to the class's units, and the saturation goes on
+until no class has a new candidate. An earlier order kept the named classes incomparable,
+so that every context answered for them at once, but on ore_ont_5438 it let clauses keep
+many maximal literals and the run did not end within 300 s.
+
+The Succ rule takes the cautious strategy of the paper by default. A unit existential
+restriction uses the EL rules' successor, and a conditional one uses a hypothetical
+successor of its own, whose core is empty and which takes the hypotheses as markers.
+`Limits::expansion` set to `Expansion::Eager` makes the successor's core everything that
+holds of it for certain, with a context of that conjunction when it is more than the EL
+successor's core. Both strategies give the same answers on the fixtures and the random
+tests.
+
+`Limits::partial` makes a run of the disjunctive rules that its deadline, its cancellation
+or its memory budget stops answer with what it proved instead of failing. The answer's
+`Classification::complete` is false, `incomplete` lists the classes whose subsumers it may
+miss, and `consistency` is `Consistent`, `Inconsistent` or `Unknown`. A stopped worker gives
+back the conclusions it did not apply and delivers the messages it holds, and an inference
+the stop cut off marks its context, so that every context with work left shows as open. A
+class is complete when every context it reaches is closed, none of its candidates is left
+untested and the ontology is consistent. Consistency is decided when `owl:Thing`'s context
+is unsatisfiable, or when it and every context it reaches are closed, and when it is unknown
+no class is complete. The taxonomy of a partial answer is built from its proved subsumptions
+closed transitively, after the clause stores are freed. A partial answer that passes the
+budget fails with the memory error, and the next run starts again. Runs of the other tiers
+ignore the flag and fail on a stop as before, item NEW-ITEM-3.
+
+A run of the disjunctive rules has the Horn rules' memory budget, 64 times the estimated
+bytes of its index and axioms, at least 1 GiB, and no more than the caller's. The clause
+stores and the table of clauses that contexts send each other count against it, and the
+case analysis of one inference derives its choices one at a time and checks the bounds as
+it goes. A run without the partial flag that passes the budget classifies again with the
+Horn rules, leaves the axioms that need case analysis out and reports them, and sets
+`Stats::dl_over_budget`. ore_ont_3215 of the ORE 2015 DL sample, with 18,323 unions over a
+transitive property, needs this, item NEW-ITEM-2.
+
+The classifier's answers equal HermiT 1.4.5.519's on the generated and hand-written
+`alc`, `alch` and `shi` fixtures that the rules take whole, and are the same on one and
+four threads and under both strategies. A random test of 20,000 small Horn ontologies with
+inverses, chains and transitive properties gives the disjunctive rules' answer and the Horn
+rules' the same taxonomy, and a random test of ALCHI ontologies stops each run at every
+point of its cancellation and checks that each partial answer is part of the full one and
+whole for every class it reports complete. On the development set of the ORE 2015 DL
+sample, the disjunctive rules take nine files of the `dl` and `dl-i` strata whole, and
+their taxonomies equal the reference on all nine. Eight files of the strata have
+individuals or data properties and stay sound, and ore_ont_3215 passes the budget. Of the 13
+development files that classify slower than Konclude without them, the disjunctive rules
+take only ore_ont_5940, whose taxonomy is now complete and faster than Konclude's. ore_ont_12141, BioTop,
+classifies slower than Konclude, item NEW-ITEM-1. The taxonomies of the 298 ORE 2015 EL
+ontologies, GO, ChEBI lite and every development file that the disjunctive rules do not
+take are byte for byte those of the Horn tier on one and eight threads.
 
 ### ROBOT-compatible commands
 

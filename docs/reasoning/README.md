@@ -252,9 +252,23 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   ontologies never need, so these stay polynomial. A run with the Horn rules has a
   memory budget of 64 times its index and axioms, at least 1 GiB and no more than the
   caller's. A run that passes it classifies again by the EL rules alone, leaves the Horn
-  axioms out and reports them, and sets `Stats::horn_over_budget`. Any other axiom
-  outside OWL 2 EL is left out and reported with its rule, and Horn reasoning with
-  individuals is item 692. An axiom with a literal or datatype that the
+  axioms out and reports them, and sets `Stats::horn_over_budget`. In an ontology
+  without individuals, data properties, self restrictions, reflexive properties or top
+  properties, axioms that need case analysis, such as unions, complements and universal
+  restrictions on the left, take the disjunctive rules of the consequence-based calculus
+  for ALCHI, with transitive properties and chains through the same automata. Each
+  context keeps clauses under one total order of literals, and a named subsumer that only
+  a case analysis gives is found by a test context for the class with the candidate's
+  complement. `Limits::expansion` chooses the cautious or the eager successor strategy,
+  which give the same answers. These runs share the Horn rules' memory budget, and a run
+  that passes it classifies again by the Horn rules, leaves the disjunctive axioms out and
+  reports them, and sets `Stats::dl_over_budget`. With `Limits::partial`, a run of the
+  disjunctive rules that its deadline, cancellation or memory budget stops returns the
+  subsumptions it proved, with `Classification::complete` false, the classes it may have
+  left incomplete in `incomplete`, and a consistency of consistent, inconsistent or
+  unknown, which leaves every class incomplete when unknown. Any other axiom outside OWL 2
+  EL, such as counting and nominals, is left out and reported with its rule, and Horn
+  reasoning with individuals is item 692. An axiom with a literal or datatype that the
   classifier cannot compare, such as an XML literal, an ill-typed literal or a datatype
   outside the OWL 2 datatype map, or with a property chain through the top object
   property, is used as far as the calculus goes and reported as partial. Every answer is entailed, and it is complete for named classes
@@ -608,8 +622,16 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * The ELK mode, which classifies by the OWL 2 EL rules alone, is an option of the Rust
   library and the ROBOT-compatible commands only, and HTTP, the other CLI commands and
   the bindings always take the Horn axioms. Roadmap item 694.
-* Axioms outside OWL 2 EL that are not Horn are left out, and an external DL reasoner
-  bridge is planned. Roadmap item 603.
+* Axioms outside OWL 2 EL that need counting or nominals, and axioms that need case
+  analysis in an ontology with individuals or data properties, are left out, and an
+  external DL reasoner bridge is planned. Roadmap item 603.
+* BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies slower with the
+  disjunctive rules than with Konclude, since each of its contexts derives the same
+  global case analysis again. Roadmap item NEW-ITEM-1.
+* ore_ont_3215 of the ORE 2015 DL sample passes the disjunctive rules' memory budget and
+  gets the Horn rules' answer without its 18,323 unions. Roadmap item NEW-ITEM-2.
+* `Limits::partial` applies only to runs of the disjunctive rules, and runs of the EL and
+  Horn rules still fail at a deadline. Roadmap item NEW-ITEM-3.
 * No MCP tool classifies, roadmap item 586, and the entity accessors and the
   inferred reads do not answer from a classification, nor does any surface answer the
   subclasses of a class expression, roadmap item 588.
