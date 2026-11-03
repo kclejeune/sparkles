@@ -261,7 +261,6 @@ impl Ontology {
         axioms: impl IntoIterator<Item = Axiom>,
         mode: Mode,
     ) -> Ontology {
-        let mut map: BTreeMap<Axiom, Vec<Origin>> = BTreeMap::new();
         let origin = || Origin {
             graph: 0,
             triples: Vec::new(),
@@ -272,6 +271,7 @@ impl Ontology {
             ..Typing::default()
         };
         let mut implied: Vec<ObjectProperty> = Vec::new();
+        let mut all = Vec::new();
         for ax in axioms {
             match &ax.kind {
                 AxiomKind::Declaration(e) => typing
@@ -286,8 +286,10 @@ impl Ontology {
                 )) => implied.push(p.clone()),
                 _ => {}
             }
-            map.entry(ax).or_insert_with(|| vec![origin()]);
+            all.push((ax, vec![origin()]));
         }
+        // a bulk build, which sorts the axioms once and keeps one of each
+        let mut map: BTreeMap<Axiom, Vec<Origin>> = all.into_iter().collect();
         for p in implied {
             let declared = typing
                 .declared
