@@ -1651,7 +1651,6 @@ impl Index {
 /// the universals that the negative existential restrictions stand for where links run
 /// against them, the negative existentials that the ranges stand for, the automata of the
 /// universals on roles that chains reach, and the fillers of the at-most restrictions.
-#[inline(never)]
 fn horn_index(
     ax: &Axioms,
     h: &super::horn::HornAx,
@@ -1871,7 +1870,6 @@ struct Selection {
 /// stays on composed links when every chain of its closure has two operands, and the
 /// others are unfolded as every negative existential over a role that chains reach is.
 /// The run composes the chains of the closures and no others.
-#[inline(never)]
 fn select_chains(roles: &Roles, told: &[(Vec<Role>, Role)], seeds: &[Role]) -> Selection {
     let n = roles.sup.len();
     let mut chains: Vec<(Vec<Role>, Role)> = Vec::with_capacity(2 * told.len());
@@ -2085,32 +2083,6 @@ pub enum Halt {
 /// cancellation, where a step visits one edge or one entry.
 pub(super) const POLL_WORK: usize = 65_536;
 
-/// With the Horn rules, the mirror images of the told chains that are not told
-/// themselves, `r_n⁻ ∘ … ∘ r_1⁻ ⊑ s⁻` for `r_1 ∘ … ∘ r_n ⊑ s`, sorted.
-#[inline(never)]
-fn mirror_chains(ax: &Axioms, it: &Interner) -> Vec<(Vec<Role>, Role)> {
-    match &ax.horn {
-        Some(_) => {
-            let told: FxHashSet<&(Vec<Role>, Role)> = ax.chains.iter().collect();
-            let inv = super::horn::inverses(it);
-            let inv = |r: Role| Some(inv[r as usize]).filter(|&i| i != NO_ROLE);
-            let mut m: Vec<(Vec<Role>, Role)> = ax
-                .chains
-                .iter()
-                .filter_map(|(rs, s)| {
-                    let m: Option<Vec<Role>> = rs.iter().rev().map(|&r| inv(r)).collect();
-                    Some((m?, inv(*s)?))
-                })
-                .filter(|c| !told.contains(c))
-                .collect();
-            m.sort();
-            m.dedup();
-            m
-        }
-        None => Vec::new(),
-    }
-}
-
 fn roles(
     ax: &Axioms,
     it: &mut Interner,
@@ -2139,7 +2111,26 @@ fn roles(
     let mut prefixes: FxHashMap<(Role, Role), Role> = FxHashMap::default();
     // with the Horn rules, a chain holds in its mirror image too, r1⁻ ∘ … ∘ rn⁻ ⊑ s⁻ for
     // r1 ∘ … ∘ rn ⊑ s reversed, which composes the links a told chain over inverses gives
-    let mirrors = mirror_chains(ax, it);
+    let mirrors: Vec<(Vec<Role>, Role)> = match &ax.horn {
+        Some(_) => {
+            let told: FxHashSet<&(Vec<Role>, Role)> = ax.chains.iter().collect();
+            let inv = super::horn::inverses(it);
+            let inv = |r: Role| Some(inv[r as usize]).filter(|&i| i != NO_ROLE);
+            let mut m: Vec<(Vec<Role>, Role)> = ax
+                .chains
+                .iter()
+                .filter_map(|(rs, s)| {
+                    let m: Option<Vec<Role>> = rs.iter().rev().map(|&r| inv(r)).collect();
+                    Some((m?, inv(*s)?))
+                })
+                .filter(|c| !told.contains(c))
+                .collect();
+            m.sort();
+            m.dedup();
+            m
+        }
+        None => Vec::new(),
+    };
     for (rs, s) in ax.chains.iter().chain(&mirrors) {
         let mut left = rs[0];
         for (k, &r) in rs.iter().enumerate().skip(1) {
