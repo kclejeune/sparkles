@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# atlas-ab.sh: the interleaved A/B of main and l4 on atlas, end to end (ab.sh, 5 rounds)
+# and the classification alone (abtax.sh, 3 rounds), then one phase-timed run of each file
+set -uo pipefail
+cd ~/lanes/el-perf-649
+{ date -u +%FT%TZ; uptime; free -g; nproc; lscpu | sed -n 1,16p; sha256sum bin/main-* bin/l4-*; } > evidence/atlas-env.txt
+bash ab.sh 5 main l4
+bash abtax.sh 3 main l4
+for f in go.ofn chebi_lite.ofn go.owl chebi_lite.owl; do
+  echo "== $f"; /usr/bin/time -f "wall %e user %U sys %S rss %M" bin/l4-prof-sparkles ontology classify data/$f --format ofn --allow-unsatisfiable > /dev/null
+done > evidence/atlas-phases.txt 2>&1
+for f in out/main.*.ofn; do g=${f/main./l4.}; cmp -s $f $g && echo "same $f" || echo "DIFF $f"; done > evidence/atlas-ab-cmp.txt
+echo "ATLAS-AB-DONE"

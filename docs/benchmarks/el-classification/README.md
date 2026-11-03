@@ -37,6 +37,15 @@ release's RDF/XML file, with the annotation assertions left out. The classifier 
 annotations, so both reasoners read the same logical axioms from a smaller file. The
 records give each file's SHA-256.
 
+An end-to-end time is the wall time of one `sparkles ontology classify FILE --format ofn`
+process from its start to its exit, with the taxonomy written to a file, and its peak
+resident memory is the process's. It includes reading the file, the selection of the
+terminology, the classification and the output. A file classification compares two
+builds in interleaved rounds that alternate which build runs first, through
+`timed.py`, which records the wall time, the peak resident set and the exit status of
+each process. The record keeps the outputs' comparison, which must find them byte for
+byte equal.
+
 ## The reference reasoners
 
 `scripts/elk-compare/elk.sh` runs the reference reasoners that `nix/reasoners` packages

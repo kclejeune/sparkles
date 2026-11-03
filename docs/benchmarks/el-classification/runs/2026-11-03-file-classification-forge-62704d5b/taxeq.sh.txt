@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# taxeq.sh A B: el_classify taxonomies of bin/A and bin/B on GO, ChEBI lite and the ORE
+# ontologies at 1 and 8 threads, compared byte for byte; mismatches to taxeq-A-B.txt
+set -uo pipefail
+cd ~/lanes/el-perf-649
+A=$1; B=$2
+W=work/taxeq-$A-$B; mkdir -p $W
+R=taxeq-$A-$B.txt; : > $R
+n=0; bad=0
+for f in data/go.ofn data/chebi_lite.ofn data/ore/*.owl; do
+  b=$(basename $f); b=${b%.*}
+  for t in 1 8; do
+    for L in $A $B; do
+      timeout 600 systemd-run --user --scope -q -p MemoryMax=10G -p MemorySwapMax=0 -p OOMPolicy=continue \
+        bin/$L-el_classify --threads $t --taxonomy $W/$b.$L.t$t.txt $f > $W/$b.$L.t$t.json 2>/dev/null || echo "FAILED $L $b t$t" >> $R
+    done
+    n=$((n+1))
+    if ! cmp -s $W/$b.$A.t$t.txt $W/$b.$B.t$t.txt; then echo "DIFF $b t$t" >> $R; bad=$((bad+1)); fi
+    rm -f $W/$b.$A.t$t.txt
+  done
+done
+echo "compared=$n differing=$bad" >> $R
+echo "TAXEQ-DONE $(tail -1 $R)"

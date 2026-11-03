@@ -1,0 +1,1 @@
+compared=600 differing=0

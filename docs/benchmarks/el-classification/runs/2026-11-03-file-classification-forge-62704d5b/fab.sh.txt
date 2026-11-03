@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# fab.sh ROUNDS A B: interleaved runs of bin/A-* and bin/B-* under ~/lanes/.bench.lock,
+# held once for the whole run. End to end: `sparkles ontology classify FILE --format ofn`
+# on GO and ChEBI lite from OFN and RDF/XML, on every core (--threads 0) and one thread.
+# Classification alone: `el_classify --repeat 3` on GO, ChEBI lite and four large ORE
+# ontologies on eight threads and one. The order of A and B alternates by round.
+# Results go to runs-<stamp>/: e2e.jsonl, classify.jsonl, env.txt and cmp.txt.
+set -uo pipefail
+cd ~/lanes/el-perf-649
+R=$1 A=$2 B=$3
+OUT=runs-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p $OUT/out
+exec 9> ~/lanes/.bench.lock
+flock 9
+echo "lock $(date -u +%FT%TZ)"
+{ date -u +%FT%TZ; uname -a; nproc; lscpu | sed -n 1,20p; free -g; uptime; sha256sum bin/$A-* bin/$B-* data/*.o* data/ore/*; } > $OUT/env.txt
+for r in $(seq 1 "$R"); do
+  if [ $((r % 2)) = 1 ]; then order="$A $B"; else order="$B $A"; fi
+  for f in go.ofn chebi_lite.ofn go.owl chebi_lite.owl; do
+    for th in 0 1; do
+      for L in $order; do
+        python3 timed.py $OUT/e2e.jsonl "$L $f t$th r$r" --stdout $OUT/out/$L.$f.t$th.ofn -- \
+          bin/$L-sparkles ontology classify data/$f --format ofn --threads $th --allow-unsatisfiable
+      done
+    done
+  done
+  for f in go.ofn chebi_lite.ofn ore/ore_ont_868.owl ore/ore_ont_9674.owl ore/ore_ont_1559.owl ore/ore_ont_13482.owl; do
+    for t in 8 1; do
+      for L in $order; do
+        j=$(bin/$L-el_classify --threads $t --repeat 3 data/$f 2>/dev/null)
+        echo "{\"label\":\"$L\",\"round\":$r,\"run\":$j}" >> $OUT/classify.jsonl
+      done
+    done
+  done
+done
+flock -u 9
+for f in go.ofn chebi_lite.ofn go.owl chebi_lite.owl; do
+  for th in 0 1; do
+    cmp -s $OUT/out/$A.$f.t$th.ofn $OUT/out/$B.$f.t$th.ofn && echo "same $f t$th" || echo "DIFF $f t$th"
+  done
+done > $OUT/cmp.txt
+echo "FAB-DONE $OUT $(grep -c DIFF $OUT/cmp.txt) differing"

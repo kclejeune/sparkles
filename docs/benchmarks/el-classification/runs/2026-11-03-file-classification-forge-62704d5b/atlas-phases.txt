@@ -1,0 +1,40 @@
+== go.ofn
+T ofn-parsed 43.356419ms
+T round-trips-checked 55.868537ms
+T partitioned 63.093867ms
+T assertions-sorted 63.108278ms
+T axioms-gathered 93.352509ms
+T classified 209.556233ms
+wall 0.29 user 0.66 sys 0.29 rss 337928
+== chebi_lite.ofn
+T ofn-parsed 104.731115ms
+T round-trips-checked 143.272801ms
+T partitioned 174.442264ms
+T assertions-sorted 174.458294ms
+T axioms-gathered 299.02476ms
+T classified 967.050692ms
+wall 1.13 user 3.31 sys 0.42 rss 952796
+== go.owl
+T parsed 572.757547ms
+T nested-checked 577.262927ms
+T distinct 622.105932ms
+T imports 629.056714ms
+T selected 736.269186ms
+T sorted 977.892909ms
+T relabeled 1.13143976s
+T reverse-mapped 2.551760392s
+T axioms-gathered 2.563719562s
+T classified 2.687460343s
+wall 2.86 user 7.20 sys 0.61 rss 1405876
+== chebi_lite.owl
+T parsed 810.740045ms
+T nested-checked 816.615129ms
+T distinct 877.571181ms
+T imports 887.412048ms
+T selected 977.29151ms
+T sorted 1.41258659s
+T relabeled 1.574627444s
+T reverse-mapped 4.428510641s
+T axioms-gathered 4.455620915s
+T classified 5.24729517s
+wall 5.68 user 13.65 sys 2.05 rss 2712460

@@ -6,7 +6,7 @@ use super::Saturation;
 use super::index::{Ex, Node as Ix, TOP};
 use crate::model::*;
 use crate::vocab;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -27,7 +27,9 @@ pub struct Node {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Taxonomy {
     nodes: Vec<Node>,
-    of: FxHashMap<Class, usize>,
+    /// the node and the place in it of each class of the signature, in the order of
+    /// their IRIs, which [`Taxonomy::node_of`] searches by the names the nodes hold
+    at: Vec<(u32, u32)>,
 }
 
 pub const TOP_NODE: usize = 0;
@@ -60,7 +62,13 @@ impl Taxonomy {
             vocab::OWL_THING if self.nodes[TOP_NODE].classes.is_empty() => Some(BOTTOM_NODE),
             vocab::OWL_THING => Some(TOP_NODE),
             vocab::OWL_NOTHING => Some(BOTTOM_NODE),
-            _ => self.of.get(c).copied(),
+            iri => self
+                .at
+                .binary_search_by(|&(n, k)| {
+                    self.nodes[n as usize].classes[k as usize].as_str().cmp(iri)
+                })
+                .ok()
+                .map(|i| self.at[i].0 as usize),
         }
     }
 
@@ -156,14 +164,6 @@ impl Taxonomy {
     }
 }
 
-/// The node of `owl:Thing` or `owl:Nothing` first, then the classes by IRI.
-fn sort_classes(cs: &mut [Class]) {
-    cs.sort_by(|a, b| {
-        let builtin = |c: &Class| !matches!(c.as_str(), vocab::OWL_THING | vocab::OWL_NOTHING);
-        (builtin(a), a.as_str()).cmp(&(builtin(b), b.as_str()))
-    });
-}
-
 /// Why building the taxonomy stopped.
 #[derive(Debug)]
 pub(super) enum Halt {
@@ -189,35 +189,39 @@ pub(super) fn build(
     stop: &(dyn Fn() -> bool + Sync),
     budget: &dyn Fn(usize) -> bool,
 ) -> Result<(Taxonomy, usize), Halt> {
-    let mut classes: Vec<(&Class, Ex)> = k
-        .interner
-        .met_classes()
-        .map(|e| match k.interner.nodes[e as usize] {
-            Ix::Class(id) => (&k.interner.classes[id as usize], e),
-            _ => unreachable!("a class's expression"),
-        })
-        .collect();
-    classes.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
-    let mut top = vec![Class::thing()];
-    let mut bottom = vec![Class::nothing()];
+    // the classes the normalization met, by class id in parallel chunks
+    let met = &k.interner.met;
+    let found = super::par_map(met, threads, |at, chunk| {
+        let mut out = Vec::new();
+        for (j, &m) in chunk.iter().enumerate() {
+            let id = (at + j) as u32;
+            if m && let Some(e) = k.interner.get(&Ix::Class(id)) {
+                out.push((&k.interner.classes[id as usize], e));
+            }
+        }
+        out
+    });
+    let classes: Vec<(&Class, Ex)> = sort_by_iri(joined(found), threads);
     if !consistent {
         // every class in the bottom node and the lookup
         let bytes = classes.len()
-            * (2 * std::mem::size_of::<Class>() + std::mem::size_of::<(Class, usize)>() * 8 / 7)
-            + classes
-                .iter()
-                .map(|(c, _)| 2 * c.as_str().len())
-                .sum::<usize>();
+            * (std::mem::size_of::<Class>() + std::mem::size_of::<(u32, u32)>())
+            + classes.iter().map(|(c, _)| c.as_str().len()).sum::<usize>();
         if !budget(bytes) {
             return Err(Halt::Memory(bytes));
         }
-        bottom.push(Class::thing());
-        bottom.extend(classes.into_iter().map(|(c, _)| c.clone()));
-        sort_classes(&mut bottom);
-        let mut of = FxHashMap::default();
-        for c in &bottom[2..] {
-            of.insert(c.clone(), BOTTOM_NODE);
-        }
+        // owl:Nothing and owl:Thing first, then the classes, which are in IRI order
+        let mut bottom = vec![Class::nothing(), Class::thing()];
+        bottom.extend(
+            super::par_map(&classes, threads, |_, chunk| {
+                chunk.iter().map(|(c, _)| (*c).clone()).collect::<Vec<_>>()
+            })
+            .into_iter()
+            .flatten(),
+        );
+        let at = (0..classes.len() as u32)
+            .map(|i| (BOTTOM_NODE as u32, i + 2))
+            .collect();
         return Ok((
             Taxonomy {
                 nodes: vec![
@@ -232,7 +236,7 @@ pub(super) fn build(
                         children: Vec::new(),
                     },
                 ],
-                of,
+                at,
             },
             bytes,
         ));
@@ -320,41 +324,64 @@ pub(super) fn build(
     if stopped.load(Ordering::Relaxed) {
         return Err(Halt::Stopped);
     }
-    // the nodes, in the order of their first classes
+    // the nodes, in the order of their first classes: number them and place each class
+    // in its node, after owl:Thing in the top node and owl:Nothing in the bottom node, on
+    // one pass of integers, then copy the names into the nodes in parallel chunks
     let mut node_of: Vec<u32> = vec![NONE; n];
-    let mut nodes = vec![
-        Node {
-            classes: Vec::new(),
-            parents: Vec::new(),
-            children: Vec::new(),
-        },
-        Node {
-            classes: Vec::new(),
-            parents: Vec::new(),
-            children: Vec::new(),
-        },
-    ];
+    let mut at: Vec<(u32, u32)> = vec![(0, 0); n];
+    let mut size: Vec<u32> = vec![1, 1];
     let mut reps: Vec<u32> = Vec::new();
     for i in 0..n {
-        let (c, _) = classes[i];
-        if subs[i].0 {
-            bottom.push(c.clone());
+        let node = if subs[i].0 {
+            BOTTOM_NODE as u32
         } else if at_top[i] {
-            top.push(c.clone());
+            TOP_NODE as u32
         } else if key[i] == i as u32 {
-            node_of[i] = nodes.len() as u32;
             reps.push(i as u32);
-            nodes.push(Node {
-                classes: vec![c.clone()],
+            size.push(0);
+            node_of[i] = (size.len() - 1) as u32;
+            node_of[i]
+        } else {
+            node_of[i] = node_of[key[i] as usize];
+            node_of[i]
+        };
+        at[i] = (node, size[node as usize]);
+        size[node as usize] += 1;
+    }
+    // the classes of each node, as positions, in its order
+    let mut start: Vec<usize> = Vec::with_capacity(size.len() + 1);
+    let mut sum = 0usize;
+    for &z in &size {
+        start.push(sum);
+        sum += z as usize;
+    }
+    start.push(sum);
+    let mut members: Vec<u32> = vec![NONE; sum];
+    members[start[TOP_NODE]] = THING;
+    members[start[BOTTOM_NODE]] = NOTHING;
+    for (i, &(node, slot)) in at.iter().enumerate() {
+        members[start[node as usize] + slot as usize] = i as u32;
+    }
+    let ids: Vec<usize> = (0..size.len()).collect();
+    let nodes = super::par_map(&ids, threads, |_, chunk| {
+        chunk
+            .iter()
+            .map(|&j| Node {
+                classes: members[start[j]..start[j + 1]]
+                    .iter()
+                    .map(|&i| match i {
+                        THING => Class::thing(),
+                        NOTHING => Class::nothing(),
+                        i => classes[i as usize].0.clone(),
+                    })
+                    .collect(),
                 parents: Vec::new(),
                 children: Vec::new(),
-            });
-        } else {
-            let at = node_of[key[i] as usize];
-            node_of[i] = at;
-            nodes[at as usize].classes.push(c.clone());
-        }
-    }
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut nodes: Vec<Node> = joined(nodes);
+    drop(members);
     // the direct superclasses of each node: the minimal nodes among its subsumers
     let mut parents: Vec<Vec<usize>> = vec![Vec::new(); reps.len()];
     let mut work: Vec<(u32, &mut Vec<usize>)> =
@@ -393,31 +420,88 @@ pub(super) fn build(
         }
         nodes[j + 2].parents = ps;
     }
-    sort_classes(&mut top);
-    sort_classes(&mut bottom);
-    nodes[TOP_NODE].classes = top;
-    nodes[BOTTOM_NODE].classes = bottom;
-    let mut of = FxHashMap::with_capacity_and_hasher(n, Default::default());
-    for (i, node) in nodes.iter().enumerate() {
-        for c in &node.classes {
-            of.insert(c.clone(), i);
-        }
-    }
-    Ok((Taxonomy { nodes, of }, bytes))
+    Ok((Taxonomy { nodes, at }, bytes))
 }
 
+/// The classes sorted by IRI on up to `threads` threads: a sample sort, whose buckets
+/// are ranges of IRIs sorted in parallel and joined in order. The IRIs are distinct, so
+/// the order is the one a sequential sort gives.
+fn sort_by_iri(mut v: Vec<(&Class, Ex)>, threads: usize) -> Vec<(&Class, Ex)> {
+    let cmp = |a: &(&Class, Ex), b: &(&Class, Ex)| a.0.as_str().cmp(b.0.as_str());
+    let buckets = threads.clamp(1, v.len().div_ceil(SORT_MIN).max(1));
+    if buckets == 1 {
+        v.sort_unstable_by(cmp);
+        return v;
+    }
+    // splitters from an evenly spaced sample
+    let step = (v.len() / (buckets * 32)).max(1);
+    let mut sample: Vec<&str> = v.iter().step_by(step).map(|(c, _)| c.as_str()).collect();
+    sample.sort_unstable();
+    let splitters: Vec<&str> = (1..buckets)
+        .map(|b| sample[b * sample.len() / buckets])
+        .collect();
+    let bucket = |c: &Class| splitters.partition_point(|s| *s <= c.as_str());
+    // each chunk's classes by bucket, then each bucket joined from the chunks and sorted
+    let parts: Vec<Vec<Vec<(&Class, Ex)>>> = super::par_map(&v, threads, |_, chunk| {
+        let mut out: Vec<Vec<(&Class, Ex)>> = vec![Vec::new(); buckets];
+        for &x in chunk {
+            out[bucket(x.0)].push(x);
+        }
+        out
+    });
+    drop(v);
+    let sorted: Vec<Vec<(&Class, Ex)>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..buckets)
+            .map(|b| {
+                let parts = &parts;
+                s.spawn(move || {
+                    let mut all: Vec<(&Class, Ex)> =
+                        parts.iter().flat_map(|p| p[b].iter().copied()).collect();
+                    all.sort_unstable_by(cmp);
+                    all
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    });
+    joined(sorted)
+}
+
+/// The vectors joined in order, by moving their items.
+fn joined<T>(parts: Vec<Vec<T>>) -> Vec<T> {
+    let mut out = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for p in parts {
+        out.extend(p);
+    }
+    out
+}
+
+/// The fewest classes a bucket of the parallel sort takes; fewer in tests, so that small
+/// ontologies take the parallel path.
+const SORT_MIN: usize = if cfg!(test) { 256 } else { 16 * 1024 };
+
+/// The places of `owl:Thing` and `owl:Nothing` among a node's classes.
+const THING: u32 = u32::MAX - 1;
+const NOTHING: u32 = u32::MAX - 2;
+
 /// The estimated bytes of a taxonomy and of what building it holds before its links: the
-/// subsumers read, the tables by class and by expression, and for each class its two
-/// copies in the nodes and the lookup. The build adds the links once it has them.
+/// subsumers read, the tables by class and by expression, the tables that place the
+/// classes in their nodes, and for each class its node, its copy in the node and its
+/// entry in the lookup. The build adds the links once it has them.
 fn bytes_of(classes: &[(&Class, Ex)], subs: &[(bool, Vec<u32>)], exprs: usize) -> usize {
     let per_class = std::mem::size_of::<(&Class, Ex)>()
         + std::mem::size_of::<(bool, Vec<u32>)>()
         + 3 * 4
         + 1
+        + 2 * 4
+        + std::mem::size_of::<usize>()
         + std::mem::size_of::<Node>()
-        + 2 * std::mem::size_of::<Class>()
-        + std::mem::size_of::<(Class, usize)>() * 8 / 7;
-    let iris: usize = classes.iter().map(|(c, _)| 2 * c.as_str().len()).sum();
+        + std::mem::size_of::<Class>()
+        + std::mem::size_of::<(u32, u32)>();
+    let iris: usize = classes.iter().map(|(c, _)| c.as_str().len()).sum();
     let read: usize = subs.iter().map(|(_, v)| v.capacity() * 4).sum();
     classes.len() * per_class + iris + read + exprs * 4
 }
@@ -542,7 +626,7 @@ mod tests {
         let k = saturated(&axioms);
         let (t, bytes) = build(&k, false, 1, &|| false, &|_| true).unwrap();
         assert!(t.bottom().classes.len() > 1000);
-        assert!(bytes >= 1000 * 2 * std::mem::size_of::<Class>(), "{bytes}");
+        assert!(bytes >= 1000 * std::mem::size_of::<Class>(), "{bytes}");
         assert!(matches!(
             build(&k, false, 1, &|| false, &|b| b < bytes),
             Err(Halt::Memory(_))
@@ -583,5 +667,84 @@ mod tests {
             build(&k, true, 1, &stop, &|_| true),
             Err(Halt::Stopped)
         ));
+    }
+
+    #[test]
+    fn the_parallel_sort_gives_the_sequential_order() {
+        // IRIs that share long prefixes and differ in their middle or end
+        let classes: Vec<Class> = (0..20_000u64)
+            .map(|i| {
+                let x = i.wrapping_mul(0x9e37_79b9_7f4a_7c15) % 1_000_003;
+                c(&format!("{}/{x:07}/{}", x % 7, i % 13))
+            })
+            .collect();
+        let v: Vec<(&Class, Ex)> = classes.iter().zip(0..).collect();
+        let mut want = v.clone();
+        want.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        for threads in [1, 2, 3, 8, 64] {
+            assert_eq!(sort_by_iri(v.clone(), threads), want, "{threads} threads");
+        }
+    }
+
+    #[test]
+    fn a_large_taxonomy_is_the_same_on_every_number_of_threads() {
+        // enough classes for the parallel sort and the parallel nodes: a forest of
+        // chains with equivalent pairs, classes equivalent to owl:Thing and
+        // unsatisfiable classes
+        let n = 6_000;
+        let mut axioms = Vec::new();
+        for i in 0..n {
+            let a = c(&format!("C{:06}", (i * 7919) % n));
+            if i % 50 == 0 {
+                axioms.push(Axiom::sub_class_of(Class::thing(), a));
+            } else if i % 97 == 0 {
+                axioms.push(Axiom::sub_class_of(a, Class::nothing()));
+            } else if i % 3 == 0 {
+                axioms.push(Axiom::equivalent_classes([
+                    a.into(),
+                    c(&format!("C{:06}", (i * 7919 + 1) % n)).into(),
+                ]));
+            } else {
+                axioms.push(Axiom::sub_class_of(
+                    a,
+                    c(&format!("C{:06}", (i * 7919 + 13) % n)),
+                ));
+            }
+        }
+        let k = saturated(&axioms);
+        let (one, _) = build(&k, true, 1, &|| false, &|_| true).unwrap();
+        for threads in [2, 8] {
+            let (t, _) = build(&k, true, threads, &|| false, &|_| true).unwrap();
+            assert!(t == one, "{threads} threads");
+        }
+        // every class's lookup finds the node that holds it
+        let mut seen = 0;
+        for (i, node) in one.nodes().iter().enumerate() {
+            for class in &node.classes {
+                let want = match class.as_str() {
+                    vocab::OWL_THING => TOP_NODE,
+                    vocab::OWL_NOTHING => BOTTOM_NODE,
+                    _ => i,
+                };
+                assert_eq!(one.node_of(class), Some(want), "{class:?}");
+                seen += 1;
+            }
+            assert!(
+                node.classes
+                    .windows(2)
+                    .all(|w| w[0].as_str() < w[1].as_str()
+                        || matches!(w[0].as_str(), vocab::OWL_THING | vocab::OWL_NOTHING))
+            );
+        }
+        assert!(seen >= n);
+        assert!(one.bottom().classes.len() > 1 && one.top().classes.len() > 1);
+        assert_eq!(one.node_of(&c("absent")), None);
+        // an inconsistent ontology puts every class in the bottom node on any number of
+        // threads
+        let (bad, _) = build(&k, false, 8, &|| false, &|_| true).unwrap();
+        let (bad1, _) = build(&k, false, 1, &|| false, &|_| true).unwrap();
+        assert!(bad == bad1);
+        assert_eq!(bad.node_of(&c("C000001")), Some(BOTTOM_NODE));
+        assert_eq!(bad.node_of(&Class::thing()), Some(BOTTOM_NODE));
     }
 }

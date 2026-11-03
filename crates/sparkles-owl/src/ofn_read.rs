@@ -4,8 +4,9 @@
 //! [`Reader`] reads an ontology document one axiom at a time: [`Reader::new`] reads the
 //! prefix declarations and the ontology header, and the reader is then an iterator over
 //! the axioms, so a caller that maps each axiom to triples holds one axiom at a time.
-//! [`parse`] collects a whole [`Document`]. [`triples`] maps a document to RDF with the
-//! forward mapping of [`crate::write`].
+//! [`parse`] collects a whole [`Document`], and [`parse_parallel`] collects it on several
+//! threads with the same answer. [`triples`] maps a document to RDF with the forward
+//! mapping of [`crate::write`].
 //!
 //! The prefixes `owl:`, `rdf:`, `rdfs:` and `xsd:` are predefined, and a document may
 //! declare them again. A literal typed `rdf:PlainLiteral` is read as the plain or
@@ -61,6 +62,98 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
         header: r.header,
         axioms,
     })
+}
+
+/// The fewest bytes a document needs before [`parse_parallel`] cuts it, and the fewest
+/// each chunk takes.
+const PARALLEL_MIN_CHUNK: usize = if cfg!(test) { 64 } else { 256 * 1024 };
+
+/// Read a whole document on up to `threads` threads, with the answer of [`parse`],
+/// errors included. After the header the text is cut into chunks at lines that begin
+/// with a letter, as an axiom's keyword does, and each chunk is read on a thread of its
+/// own with the header's prefixes. A chunk must end right after an axiom, and the last
+/// one after the ontology's closing `)`. The axioms of the chunks are joined in order.
+///
+/// A cut inside a string that spans lines leaves the chunk before it ending inside the
+/// string, which is an error. Whenever a chunk fails, the document is read again by
+/// [`parse`], whose answer or error is returned, so a cut never changes the answer.
+pub fn parse_parallel(text: &str, threads: usize) -> Result<Document, ParseError> {
+    match chunked(text, threads) {
+        Some(d) => Ok(d),
+        None => parse(text),
+    }
+}
+
+/// The document read in chunks on up to `threads` threads, or `None` when it has fewer
+/// than two chunks or a chunk fails.
+fn chunked(text: &str, threads: usize) -> Option<Document> {
+    let chunks = threads.min(text.len() / PARALLEL_MIN_CHUNK);
+    if chunks <= 1 {
+        return None;
+    }
+    let mut r = Reader::new(text).ok()?;
+    // the start of the first axiom, which the preamble may have read ahead
+    let body = match &r.peeked {
+        Some((_, at)) => *at,
+        None => r.pos,
+    };
+    let full = r.text;
+    let mut bounds = vec![body];
+    for k in 1..chunks {
+        let target = (body + (full.len() - body) * k / chunks).max(*bounds.last().unwrap_or(&0));
+        let Some(cut) = line_start(full, target) else {
+            break;
+        };
+        if cut > *bounds.last().unwrap_or(&0) {
+            bounds.push(cut);
+        }
+    }
+    bounds.push(full.len());
+    if bounds.len() <= 2 {
+        return None;
+    }
+    let parts: Vec<Option<Vec<Axiom>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = bounds
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| {
+                let (start, end, last) = (w[0], w[1], i + 2 == bounds.len());
+                let r = &r;
+                s.spawn(move || r.chunk(start, end, last))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    });
+    let mut axioms = Vec::new();
+    for p in parts {
+        axioms.extend(p?);
+    }
+    Some(Document {
+        prefixes: std::mem::take(&mut r.prefixes),
+        header: std::mem::take(&mut r.header),
+        axioms,
+    })
+}
+
+/// The first position at or after `at` that starts a line beginning with an ASCII
+/// letter.
+fn line_start(text: &str, at: usize) -> Option<usize> {
+    let b = text.as_bytes();
+    let mut i = at;
+    while let Some(n) = b
+        .get(i..)
+        .and_then(|rest| rest.iter().position(|&c| c == b'\n'))
+    {
+        let next = i + n + 1;
+        if b.get(next).is_some_and(u8::is_ascii_alphabetic) {
+            return Some(next);
+        }
+        i = next;
+    }
+    None
 }
 
 /// Read one axiom, such as `SubClassOf(ex:A ex:B)`, with `prefixes` and the predefined
@@ -195,6 +288,39 @@ impl<'a> Reader<'a> {
         };
         r.preamble()?;
         Ok(r)
+    }
+
+    /// The axioms of `text[start..end]`, read with this reader's prefixes, or `None` when
+    /// the chunk does not end right after an axiom (after the ontology's end when `last`)
+    /// or holds an error.
+    fn chunk(&self, start: usize, end: usize, last: bool) -> Option<Vec<Axiom>> {
+        let mut c = Reader {
+            text: &self.text[..end],
+            pos: start,
+            peeked: None,
+            last: start,
+            names: self.names.clone(),
+            prefixes: Vec::new(),
+            header: Header::default(),
+            depth: 0,
+            done: false,
+        };
+        let mut out = Vec::new();
+        if last {
+            for ax in c.by_ref() {
+                out.push(ax.ok()?);
+            }
+            return Some(out);
+        }
+        loop {
+            match c.peek().ok()? {
+                Tok::End => return Some(out),
+                Tok::Close => return None,
+                _ => {}
+            }
+            c.depth = 0;
+            out.push(c.axiom().ok()?);
+        }
     }
 
     /// The prefix declarations, in document order.
@@ -1032,4 +1158,86 @@ impl Iterator for Reader<'_> {
 /// `fresh`. An anonymous individual is the blank node its label names.
 pub fn triples(doc: &Document, fresh: &mut dyn FnMut() -> oxrdf::BlankNode) -> Vec<oxrdf::Triple> {
     crate::write::ontology_triples(&doc.header, doc.axioms.iter(), fresh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A document whose axioms include strings that span lines, lines inside strings
+    /// that begin like axioms, comments, full IRIs with parentheses and anonymous
+    /// individuals.
+    fn document(n: usize) -> String {
+        let mut d = String::from(
+            "Prefix(:=<http://ex.org/>)\nPrefix(ex:=<http://ex.org/x#>)\nOntology(<http://ex.org/o>\nImport(<http://ex.org/i>)\nAnnotation(rdfs:label \"o\")\n",
+        );
+        for i in 0..n {
+            match i % 6 {
+                0 => d.push_str(&format!("Declaration(Class(:C{i}))\n")),
+                1 => d.push_str(&format!(
+                    "AnnotationAssertion(rdfs:comment :C{i} \"two lines\nSubClassOf(:X{i} :Y)\nand \\\"more\\\"\")\n"
+                )),
+                2 => d.push_str(&format!("# a comment\nSubClassOf(:C{i} <http://ex.org/(p){i}>)\n")),
+                3 => d.push_str(&format!(
+                    "SubClassOf(Annotation(rdfs:label \"a\") ex:D{i}\n  ObjectSomeValuesFrom(:r ObjectOneOf(_:a{i})))\n"
+                )),
+                4 => d.push_str(&format!("EquivalentClasses(:C{i} :E{i} :F{i})\n")),
+                _ => d.push_str(&format!("ClassAssertion(:C{i} :i{i})\n")),
+            }
+        }
+        d.push_str(")\n");
+        d
+    }
+
+    #[test]
+    fn a_parallel_read_gives_the_sequential_answer() {
+        for n in [0, 1, 7, 60, 400] {
+            let d = document(n);
+            let want = parse(&d).unwrap();
+            assert_eq!(want.axioms.len(), n);
+            for threads in [1, 2, 3, 8, 32] {
+                assert_eq!(parse_parallel(&d, threads).unwrap(), want, "{n} {threads}");
+            }
+        }
+        // without strings that span lines every cut holds, so the chunks answer
+        let d = document(600)
+            .replace("two lines\n", "two lines ")
+            .replace("\nand", " and");
+        let want = parse(&d).unwrap();
+        for threads in [2, 8] {
+            assert_eq!(chunked(&d, threads), Some(want.clone()), "{threads}");
+        }
+        // a cut inside such a string fails its chunk, and the sequential read answers
+        let d = document(600);
+        let want = parse(&d).unwrap();
+        assert!((2..40).any(|threads| chunked(&d, threads).is_none()));
+        assert_eq!(parse_parallel(&d, 8).unwrap(), want);
+    }
+
+    #[test]
+    fn a_parallel_read_gives_the_sequential_error() {
+        let d = document(300);
+        let lines: Vec<&str> = d.lines().collect();
+        let broken = [
+            // an axiom cut off, a stray closing parenthesis, an unknown prefix, an
+            // unclosed string, text after the ontology and an ontology not closed
+            d.replacen("SubClassOf(:C2 <http://ex.org/(p)2>)", "SubClassOf(:C2", 1),
+            d.replacen("Declaration(Class(:C150))", "Declaration(Class(:C150)))", 1),
+            d.replacen(":C206 <", "nope:C206 <", 1),
+            d.replacen(
+                "\"two lines\nSubClassOf(:X241",
+                "\"two lines\nSubClassOf(:X241\"\"",
+                1,
+            ),
+            format!("{d}Declaration(Class(:Late))\n"),
+            lines[..lines.len() - 1].join("\n"),
+        ];
+        for b in &broken {
+            assert_ne!(b, &d);
+            let want = parse(b).unwrap_err();
+            for threads in [2, 8] {
+                assert_eq!(parse_parallel(b, threads).unwrap_err(), want, "{want}");
+            }
+        }
+    }
 }

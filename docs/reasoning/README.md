@@ -274,6 +274,20 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   matches, and it trades that memory for fast reclassification. `sparkles ontology classify FILE` classifies a file without a
   database and exits with status 1 when the ontology is inconsistent or has an
   unsatisfiable class.
+* `sparkles ontology classify FILE` and `sparkles ontology check FILE` read a file of one
+  graph straight into memory, with no store, and give the answers of a store that loaded
+  the file. RDF/XML, Turtle, N-Triples and N3 parse on several threads, and so does a
+  functional-style document, whose axioms the read keeps as written. A file that holds
+  named graphs, a strict read of a functional-style document and a file whose answer
+  depends on what only a store reproduces, such as its own blank node labels, go through
+  a store in memory, and so does a file that fails to parse, with the loader's
+  error. A functional-style document goes through the store when it has an anonymous
+  individual, an undeclared entity or an `ObjectInverseOf` outside a plain property
+  assertion, among the other cases that the
+  [F24 Outcome](../specs/F24-owl-classification/SPEC.md#outcome) lists. ChEBI lite
+  classifies from its functional-style file in 1.13 s on the benchmark host, and the
+  reverse mapping of the triples bounds a read of RDF/XML
+  ([results](../benchmarks/el-classification/RESULTS.md#file-classification)).
 * The Rust handle `ds.ontology()` opens a snapshot's ontology, checks it and edits it,
   and keeps the last four reads of up to two million triples each, keyed by commit, for
   callers who read every graph. `/$/ontology/{ds}` serves the summary, the axioms, the

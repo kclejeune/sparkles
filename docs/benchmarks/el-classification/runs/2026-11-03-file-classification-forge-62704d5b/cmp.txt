@@ -1,0 +1,8 @@
+same go.ofn t0
+same go.ofn t1
+same chebi_lite.ofn t0
+same chebi_lite.ofn t1
+same go.owl t0
+same go.owl t1
+same chebi_lite.owl t0
+same chebi_lite.owl t1
