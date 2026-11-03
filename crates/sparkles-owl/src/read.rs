@@ -250,6 +250,70 @@ pub struct Ontology {
 }
 
 impl Ontology {
+    /// The ontology of axioms that a structural syntax gives, as the functional-style
+    /// syntax does, read as one graph: the header in graph 0, each axiom once with an
+    /// origin that names no triple, and the declared typing. A read of the same axioms
+    /// as triples adds the declaration of an object property that Table 6 implies for a
+    /// transitive, symmetric or inverse-functional property, so this does too. Each use
+    /// of an entity names its kind, so no kind is inferred from the uses.
+    pub fn from_axioms(
+        header: Header,
+        axioms: impl IntoIterator<Item = Axiom>,
+        mode: Mode,
+    ) -> Ontology {
+        let mut map: BTreeMap<Axiom, Vec<Origin>> = BTreeMap::new();
+        let origin = || Origin {
+            graph: 0,
+            triples: Vec::new(),
+            main: None,
+        };
+        let mut typing = Typing {
+            mode,
+            ..Typing::default()
+        };
+        let mut implied: Vec<ObjectProperty> = Vec::new();
+        for ax in axioms {
+            match &ax.kind {
+                AxiomKind::Declaration(e) => typing
+                    .declared
+                    .entry(e.iri().as_str().to_string())
+                    .or_default()
+                    .add(e.kind()),
+                AxiomKind::TransitiveObjectProperty(ObjectPropertyExpression::Property(p))
+                | AxiomKind::SymmetricObjectProperty(ObjectPropertyExpression::Property(p))
+                | AxiomKind::InverseFunctionalObjectProperty(ObjectPropertyExpression::Property(
+                    p,
+                )) => implied.push(p.clone()),
+                _ => {}
+            }
+            map.entry(ax).or_insert_with(|| vec![origin()]);
+        }
+        for p in implied {
+            let declared = typing
+                .declared
+                .get(p.as_str())
+                .is_some_and(|k| k.has(EntityKind::ObjectProperty));
+            if !declared {
+                typing
+                    .declared
+                    .entry(p.as_str().to_string())
+                    .or_default()
+                    .add(EntityKind::ObjectProperty);
+                map.entry(Axiom::declaration(Entity::ObjectProperty(p)))
+                    .or_insert_with(|| vec![origin()]);
+            }
+        }
+        Ontology {
+            header,
+            header_graph: Some(0),
+            axioms: map,
+            typing,
+            mode,
+            terminology_only: true,
+            ..Ontology::default()
+        }
+    }
+
     /// The axioms, in order.
     pub fn axiom_set(&self) -> impl Iterator<Item = &Axiom> {
         self.axioms.keys()
