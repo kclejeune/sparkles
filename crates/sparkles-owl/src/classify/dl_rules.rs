@@ -430,25 +430,71 @@ fn partners_rf(ix: &Index, st: &State, t: Role) -> Vec<(Ex, Side)> {
     out
 }
 
-/// Each choice of one premise from every list, merged with `base`.
-fn products(lists: &[Vec<Side>], base: Side, found: &mut Vec<Side>) {
-    fn go(lists: &[Vec<Side>], acc: &Side, found: &mut Vec<Side>) {
-        match lists.split_first() {
-            None => found.push(acc.clone()),
-            Some((first, rest)) => {
-                for (b, h) in first {
-                    let mut next = acc.clone();
-                    next.0.extend_from_slice(b);
-                    next.1.extend_from_slice(h);
-                    go(rest, &next, found);
+/// What the rules on one clause or unit give: single conclusions, and choices of one
+/// premise from every list of a product, which [`drain`] derives one at a time so that a
+/// wide case analysis is never held whole.
+#[derive(Default)]
+struct Found {
+    one: Vec<Side>,
+    prods: Vec<(Vec<Vec<Side>>, Side)>,
+}
+
+impl Found {
+    fn push(&mut self, s: Side) {
+        self.one.push(s);
+    }
+    /// Each choice of one premise from every list, merged with `base`.
+    fn products(&mut self, lists: Vec<Vec<Side>>, base: Side) {
+        if lists.iter().any(|l| l.is_empty()) {
+            return;
+        }
+        self.prods.push((lists, base));
+    }
+}
+
+/// The choices of a product between two checks of the run's bounds.
+const PRODUCT_POLL: usize = 256;
+
+/// Derives what the rules found: the single conclusions, then each product's choices in
+/// the order of their lists, the last list fastest. The run's bounds are checked every
+/// [`PRODUCT_POLL`] choices, and when the run stops, the rest of the inference is left
+/// undone and the store is marked interrupted, so that the dependency record of a partial
+/// answer counts the context as open.
+fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
+    for c in found.one {
+        derive(ix, st, c, out);
+    }
+    let mut n = 0usize;
+    for (lists, base) in found.prods {
+        let mut at = vec![0usize; lists.len()];
+        'choices: loop {
+            let mut s = base.clone();
+            for (l, &i) in lists.iter().zip(&at) {
+                s.0.extend_from_slice(&l[i].0);
+                s.1.extend_from_slice(&l[i].1);
+            }
+            derive(ix, st, s, out);
+            n += 1;
+            if n.is_multiple_of(PRODUCT_POLL) && !out.go_on() {
+                if let Some(x) = st.extra.as_mut().and_then(|x| x.dl.as_deref_mut()) {
+                    x.store.interrupted = true;
                 }
+                return;
+            }
+            let mut k = lists.len();
+            loop {
+                if k == 0 {
+                    break 'choices;
+                }
+                k -= 1;
+                at[k] += 1;
+                if at[k] < lists[k].len() {
+                    break;
+                }
+                at[k] = 0;
             }
         }
     }
-    if lists.iter().any(|l| l.is_empty()) {
-        return;
-    }
-    go(lists, &base, found);
 }
 
 /// Two premises merged.
@@ -550,7 +596,7 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
 
 /// Hyper with a clause of case analysis, `id`, with `prem` as the premise of its body atom
 /// `d`: the other atoms' premises, and the head as literals over x.
-fn hyper_clause(ix: &Index, st: &State, id: u32, d: Ex, prem: &Side, found: &mut Vec<Side>) {
+fn hyper_clause(ix: &Index, st: &State, id: u32, d: Ex, prem: &Side, found: &mut Found) {
     let (body, head) = &dix(ix).clauses[id as usize];
     let lists: Vec<Vec<Side>> = body
         .iter()
@@ -563,12 +609,12 @@ fn hyper_clause(ix: &Index, st: &State, id: u32, d: Ex, prem: &Side, found: &mut
         })
         .collect();
     let base: Side = (Vec::new(), head.iter().map(|&h| Lit::x(h)).collect());
-    products(&lists, base, found);
+    found.products(lists, base);
 }
 
 /// The universals of the holders over the successor by e: the units' through the
 /// propagations, and the stored holders', each with `prem`, the premise of `RF(e)`.
-fn univ_over(ix: &Index, st: &State, e: Ex, r: Role, prem: &Side, found: &mut Vec<Side>) {
+fn univ_over(ix: &Index, st: &State, e: Ex, r: Role, prem: &Side, found: &mut Found) {
     let roles = &ix.roles;
     let dx = dix(ix);
     for &(s, x) in &st.props {
@@ -608,7 +654,7 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
     }
     let dx = dix(ix);
     let roles = &ix.roles;
-    let mut found: Vec<Side> = Vec::new();
+    let mut found = Found::default();
     let unit: Side = (Vec::new(), Vec::new());
     if let Some(ids) = dx.by_body.get(&d) {
         for &id in ids {
@@ -628,7 +674,7 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
         for &set in ix.disjoint_of(h) {
             for &m in &dx.sets[set as usize] {
                 if m != d && !st.subs.contains(&m) {
-                    found.extend(partners_x(st, m));
+                    found.one.extend(partners_x(st, m));
                 }
             }
         }
@@ -677,9 +723,7 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
     if let Node::Exist(r, _) = h.node {
         univ_over(ix, st, d, r, &unit, &mut found);
     }
-    for c in found {
-        derive(ix, st, c, out);
-    }
+    drain(ix, st, found, out);
 }
 
 /// The context became unsatisfiable: its registered predecessors learn it.
@@ -834,13 +878,11 @@ pub fn pred_c<S: Sink>(ix: &Index, st: &mut State, v: Ex, cid: u32, out: &mut S)
     let c = out.dl().table.get(cid).clone();
     let mut es = Vec::new();
     reaching(dix(ix), st, v, &mut es);
-    let mut found = Vec::new();
+    let mut found = Found::default();
     for e in es {
         pred(ix, st, e, &c, None, &mut found);
     }
-    for c in found {
-        derive(ix, st, c, out);
-    }
+    drain(ix, st, found, out);
     true
 }
 
@@ -848,14 +890,7 @@ pub fn pred_c<S: Sink>(ix: &Index, st: &mut State, v: Ex, cid: u32, out: &mut S)
 /// whose maximal literal is `F(e, A)`, the role atoms one whose maximal literal is
 /// `RF(e)`, and the head's atoms over y become atoms over x. `fixed` is the premise that a
 /// new clause gives for one of these literals, which the inference must use.
-fn pred(
-    ix: &Index,
-    st: &State,
-    e: Ex,
-    c: &Clause,
-    fixed: Option<(Lit, &Side)>,
-    found: &mut Vec<Side>,
-) {
+fn pred(ix: &Index, st: &State, e: Ex, c: &Clause, fixed: Option<(Lit, &Side)>, found: &mut Found) {
     let Some(r) = role_of(ix, e) else { return };
     if !meets(ix, c, r) {
         return;
@@ -890,7 +925,7 @@ fn pred(
         Vec::new(),
         c.head().iter().map(|l| Lit::x(l.atom())).collect(),
     );
-    products(&lists, base, found);
+    found.products(lists, base);
 }
 
 /// Runs the rules on up to `budget` clauses waiting in the store, and stops early once
@@ -951,7 +986,7 @@ fn process<S: Sink>(
         }
         return;
     }
-    let mut found: Vec<Side> = Vec::new();
+    let mut found = Found::default();
     let mut ps: Vec<(Role, Ex)> = Vec::new();
     let mut es: Vec<Ex> = Vec::new();
     for &l in max {
@@ -1039,9 +1074,7 @@ fn process<S: Sink>(
             _ => {}
         }
     }
-    for c in found {
-        derive(ix, st, c, out);
-    }
+    drain(ix, st, found, out);
 }
 
 /// Sends the successor `v` the marker of `a`, unless the successor's core has it.

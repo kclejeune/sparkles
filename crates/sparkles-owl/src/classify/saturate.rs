@@ -557,6 +557,22 @@ pub fn saturate(
     universal: &[Ex],
     bounds: &Bounds<'_>,
 ) -> Result<Totals, Stop> {
+    match saturate_counted(ix, ctx, roots, seeds, universal, bounds) {
+        (t, None) => Ok(t),
+        (_, Some(s)) => Err(s),
+    }
+}
+
+/// Saturates as [`saturate`] does, and gives the totals of the work done with the reason
+/// the run stopped, for a partial answer.
+pub fn saturate_counted(
+    ix: &Index,
+    ctx: &Contexts,
+    roots: &[Ex],
+    seeds: &[Ex],
+    universal: &[Ex],
+    bounds: &Bounds<'_>,
+) -> (Totals, Option<Stop>) {
     let run = Run {
         ix,
         ctx,
@@ -600,20 +616,21 @@ pub fn saturate(
         });
     }
     let memory = run.memory.load(Ordering::Relaxed);
-    match run.stop.load(Ordering::SeqCst) {
-        STOP_CANCEL => Err(Stop::Cancelled),
-        STOP_TIMEOUT => Err(Stop::Timeout),
+    let peak = run.peak.load(Ordering::Relaxed).max(memory);
+    let totals = Totals {
+        conclusions: run.applied.load(Ordering::Relaxed),
+        memory,
+        peak,
+        merged: run.merged.load(Ordering::Relaxed),
+    };
+    let stop = match run.stop.load(Ordering::SeqCst) {
+        STOP_CANCEL => Some(Stop::Cancelled),
+        STOP_TIMEOUT => Some(Stop::Timeout),
         // the most counted, waiting messages included, which is what passed the limit
-        STOP_MEMORY => Err(Stop::Memory {
-            used: run.peak.load(Ordering::Relaxed).max(memory),
-        }),
-        _ => Ok(Totals {
-            conclusions: run.applied.load(Ordering::Relaxed),
-            memory,
-            peak: run.peak.load(Ordering::Relaxed).max(memory),
-            merged: run.merged.load(Ordering::Relaxed),
-        }),
-    }
+        STOP_MEMORY => Some(Stop::Memory { used: peak }),
+        _ => None,
+    };
+    (totals, stop)
 }
 
 /// Where a context's rules send their conclusions: to itself, applied in the same pass,
@@ -713,6 +730,11 @@ pub trait Sink {
     fn busy(&self) -> bool {
         false
     }
+    /// whether the run goes on, after a check of its bounds, for rules whose one
+    /// inference can make many conclusions
+    fn go_on(&self) -> bool {
+        true
+    }
 }
 
 impl Sink for Out<'_, '_> {
@@ -772,6 +794,10 @@ impl Sink for Out<'_, '_> {
     #[inline]
     fn busy(&self) -> bool {
         !self.local.is_empty()
+    }
+
+    fn go_on(&self) -> bool {
+        self.run.check(0, 0, 0)
     }
 }
 

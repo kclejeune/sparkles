@@ -270,6 +270,9 @@ pub struct Store {
     /// the clauses with an empty head
     empty: Vec<u32>,
     bytes: usize,
+    /// whether a stop of the run cut off an inference of the rules, whose conclusions the
+    /// store may lack
+    pub interrupted: bool,
 }
 
 impl Store {
@@ -283,7 +286,7 @@ impl Store {
     }
 
     pub fn is_idle(&self) -> bool {
-        self.queue.is_empty()
+        self.queue.is_empty() && !self.interrupted
     }
 
     /// Whether a clause of the store that is not dead subsumes `c`, whose signature is

@@ -382,6 +382,9 @@ pub struct Saturation {
     dl_tried: bool,
     /// set while a run classifies again without Tier D, past Tier D's memory budget
     skip_dl: bool,
+    /// set when a partial answer of Tier D passed the budget, so that the run fails with
+    /// the error instead of classifying again without Tier D
+    partial_over: bool,
     /// what the last run's partial answer leaves open: the classes not complete and the
     /// consistency
     partial: Option<(Vec<Class>, Consistency)>,
@@ -686,6 +689,7 @@ impl Saturation {
             horn_tried: false,
             dl_tried: false,
             skip_dl: false,
+            partial_over: false,
             partial: None,
         }
     }
@@ -763,6 +767,7 @@ impl Saturation {
         if let Err(Error::Memory { used, .. }) = r
             && self.dl_tried
             && !limits.el_only
+            && !self.partial_over
         {
             // Tier D passed its budget or the caller's: the run starts again with the Horn
             // rules, which leave the disjunctive axioms out. Its charges draw first on
@@ -797,6 +802,7 @@ impl Saturation {
         if let Err(Error::Memory { used, .. }) = r
             && self.horn_tried
             && !limits.el_only
+            && !self.partial_over
         {
             // The Horn rules passed their budget or the caller's: the run starts again by
             // the EL rules alone, which leave the axioms outside OWL 2 EL out, as the
@@ -1149,6 +1155,7 @@ impl Saturation {
         self.dirty = true;
         self.horn_tried = false;
         self.dl_tried = false;
+        self.partial_over = false;
         let changes = changes.filter(|_| !again);
         let full = self.entangled
             || changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)));
@@ -1296,17 +1303,14 @@ impl Saturation {
         // a run that answers in part keeps the reason it stopped and goes on to the answer
         let mut halted: Option<Error> = None;
         let partial = bounds.partial;
-        let mut totals = match saturate::saturate(&ix, &self.ctx, &roots, &[], &[], &bounds) {
-            Ok(t) => t,
-            Err(s) if partial => {
+        let mut totals = match saturate::saturate_counted(&ix, &self.ctx, &roots, &[], &[], &bounds)
+        {
+            (t, None) => t,
+            (t, Some(s)) if partial => {
                 halted = Some(stopped(s));
-                saturate::Totals {
-                    memory: base,
-                    peak: base,
-                    ..Default::default()
-                }
+                t
             }
-            Err(s) => return Err(stopped(s)),
+            (_, Some(s)) => return Err(stopped(s)),
         };
         // the candidates whose tests ended without a contradiction
         let mut refuted: FxHashSet<(Ex, Ex)> = FxHashSet::default();
@@ -1329,15 +1333,15 @@ impl Saturation {
                     peak_memory: totals.peak,
                     ..bounds
                 };
-                let more =
-                    saturate::saturate(&ix, &self.ctx, tests, seeds, &[], &b).map_err(stopped)?;
+                let (more, stop) =
+                    saturate::saturate_counted(&ix, &self.ctx, tests, seeds, &[], &b);
                 *totals = saturate::Totals {
                     conclusions: totals.conclusions + more.conclusions,
                     memory: more.memory,
                     peak: totals.peak.max(more.peak),
                     merged: false,
                 };
-                Ok::<(), Error>(())
+                stop.map_or(Ok(()), |s| Err(stopped(s)))
             };
             loop {
                 if let Err(e) = poll(limits) {
@@ -1527,13 +1531,33 @@ impl Saturation {
         // again
         self.entangled |= horn || disj;
         if let Some(d) = &dl_run {
-            totals.memory += d.bytes();
-            totals.peak = totals.peak.max(totals.memory);
             for c in self.ctx.iter().filter_map(|c| c.get()) {
                 if let Some(n) = c.st.lock().extra.as_ref().and_then(|x| x.dl.as_ref()) {
                     stats.dl_contexts += 1;
                     stats.dl_stored += n.store.clauses.len();
                 }
+            }
+            if open.is_some() {
+                // A partial answer has taken its record, and the next run starts again,
+                // so the clause stores and the clause table go before its taxonomy.
+                totals.peak = totals.peak.max(totals.memory + d.bytes());
+                let base = self.ctx.len() as Ex;
+                let dynamic_ctx = dynamic
+                    .iter()
+                    .flat_map(|dy| (0..dy.len() as Ex).map(move |i| dy.ctx(base + i)));
+                for c in self
+                    .ctx
+                    .iter()
+                    .filter_map(|c| c.get().map(|c| &**c))
+                    .chain(dynamic_ctx)
+                {
+                    if let Some(x) = c.st.lock().extra.as_mut() {
+                        x.dl = None;
+                    }
+                }
+            } else {
+                totals.memory += d.bytes();
+                totals.peak = totals.peak.max(totals.memory);
             }
         }
         drop(dl_run);
@@ -1593,14 +1617,18 @@ impl Saturation {
             }
             ok
         };
-        let (taxonomy, tax_bytes) = taxonomy::build(self, consistent, threads, &stop, &budget)
-            .map_err(|h| match h {
-                taxonomy::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
-                taxonomy::Halt::Memory(bytes) => Error::Memory {
+        let built = taxonomy::build(self, consistent, threads, open.is_some(), &stop, &budget);
+        let (taxonomy, tax_bytes) = built.map_err(|h| match h {
+            taxonomy::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
+            taxonomy::Halt::Memory(bytes) => {
+                // a partial answer that does not fit is not a reason for another tier
+                self.partial_over = open.is_some();
+                Error::Memory {
                     limit: limits.max_memory.unwrap_or(usize::MAX),
                     used: held + bytes,
-                },
-            })?;
+                }
+            }
+        })?;
         stats.memory = held + tax_bytes;
         stats.taxonomy_memory = tax_bytes;
         stats.peak_memory = totals.peak.max(stats.memory);

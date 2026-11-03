@@ -182,10 +182,15 @@ pub(super) enum Halt {
 /// equivalence class and, for the first class of each, the direct superclasses are
 /// computed from the saturated contexts alone, so the answer is the same for every
 /// number of threads.
+///
+/// `close` is set for a partial answer, whose contexts did not all saturate: the rows of
+/// subsumers are closed first, as [`close_rows`] says, since the rest of the build needs
+/// the closed rows that a whole saturation gives.
 pub(super) fn build(
     k: &Saturation,
     consistent: bool,
     threads: usize,
+    close: bool,
     stop: &(dyn Fn() -> bool + Sync),
     budget: &dyn Fn(usize) -> bool,
 ) -> Result<(Taxonomy, usize), Halt> {
@@ -280,20 +285,26 @@ pub(super) fn build(
     if stopped.load(Ordering::Relaxed) {
         return Err(Halt::Stopped);
     }
+    // the named subsumers of owl:Thing, as positions
+    let mut top: Vec<u32> = k
+        .named_subsumers(TOP)
+        .map(|(_, s)| {
+            s.into_iter()
+                .filter_map(|x| pos.get(x as usize).copied().filter(|&p| p != NONE))
+                .collect()
+        })
+        .unwrap_or_default();
+    if close {
+        top = close_rows(&mut subs, &top, budget)?;
+    }
     let bytes = bytes_of(&classes, &subs, pos.len());
     if !budget(bytes) {
         return Err(Halt::Memory(bytes));
     }
     // the classes equivalent to owl:Thing
     let mut at_top = vec![false; n];
-    if let Some((_, s)) = k.named_subsumers(TOP) {
-        for x in s {
-            if let Some(&p) = pos.get(x as usize)
-                && p != NONE
-            {
-                at_top[p as usize] = true;
-            }
-        }
+    for p in top {
+        at_top[p as usize] = true;
     }
     let has = |a: u32, b: u32| a == b || subs[a as usize].1.binary_search(&b).is_ok();
     // each satisfiable class's equivalence class, by its first class in IRI order;
@@ -509,6 +520,126 @@ fn bytes_of(classes: &[(&Class, Ex)], subs: &[(bool, Vec<u32>)], exprs: usize) -
 /// No position or node.
 const NONE: u32 = u32::MAX;
 
+/// Closes the rows of a partial answer, whose subsumers are each entailed but whose
+/// contexts did not all saturate. Each row takes the rows of the classes in it, through
+/// the components of the graph of rows in the order that Tarjan's algorithm closes them,
+/// so that the classes a row reaches are in it and each class of a cycle has the same
+/// row. A row that reaches an unsatisfiable class is unsatisfiable. The closed row of
+/// owl:Thing, `top`, joins every row, and the answer is that closed row. The rows grow
+/// only by entailed subsumers, and a row that was saturated is closed already. The bytes
+/// of the closed rows are asked of `budget` as they grow.
+fn close_rows(
+    subs: &mut [(bool, Vec<u32>)],
+    top: &[u32],
+    budget: &dyn Fn(usize) -> bool,
+) -> Result<Vec<u32>, Halt> {
+    let n = subs.len();
+    // Tarjan's algorithm without recursion: the components, each after those it reaches
+    let mut index = vec![NONE; n];
+    let mut low = vec![0u32; n];
+    let mut on = vec![false; n];
+    let mut comp = vec![NONE; n];
+    let mut comps: Vec<Vec<u32>> = Vec::new();
+    let mut stack: Vec<u32> = Vec::new();
+    let mut next = 0u32;
+    for root in 0..n {
+        if index[root] != NONE {
+            continue;
+        }
+        // (node, the next edge to follow)
+        let mut calls: Vec<(u32, usize)> = vec![(root as u32, 0)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root as u32);
+        on[root] = true;
+        while let Some(&mut (v, ref mut e)) = calls.last_mut() {
+            let vu = v as usize;
+            if let Some(&w) = subs[vu].1.get(*e) {
+                *e += 1;
+                let wu = w as usize;
+                if index[wu] == NONE {
+                    index[wu] = next;
+                    low[wu] = next;
+                    next += 1;
+                    stack.push(w);
+                    on[wu] = true;
+                    calls.push((w, 0));
+                } else if on[wu] {
+                    low[vu] = low[vu].min(index[wu]);
+                }
+                continue;
+            }
+            calls.pop();
+            if let Some(&(p, _)) = calls.last() {
+                low[p as usize] = low[p as usize].min(low[vu]);
+            }
+            if low[vu] == index[vu] {
+                let id = comps.len() as u32;
+                let mut members = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on[w as usize] = false;
+                    comp[w as usize] = id;
+                    members.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                comps.push(members);
+            }
+        }
+    }
+    // each component's closed row, with whether it is unsatisfiable, in the order made,
+    // which has every component it reaches made before it
+    let mut rows: Vec<(bool, Vec<u32>)> = Vec::with_capacity(comps.len());
+    let mut bytes = 0usize;
+    let mut asked = 0usize;
+    for members in &comps {
+        let id = rows.len() as u32;
+        let mut unsat = false;
+        let mut row: Vec<u32> = members.clone();
+        for &m in members {
+            unsat |= subs[m as usize].0;
+            for &w in &subs[m as usize].1 {
+                let c = comp[w as usize];
+                if c != id {
+                    unsat |= rows[c as usize].0;
+                    row.extend_from_slice(&rows[c as usize].1);
+                }
+            }
+        }
+        row.sort_unstable();
+        row.dedup();
+        bytes += row.len() * 4 + 32;
+        if bytes > asked + (1 << 20) {
+            if !budget(bytes) {
+                return Err(Halt::Memory(bytes));
+            }
+            asked = bytes;
+        }
+        rows.push((unsat, row));
+    }
+    // the closed row of owl:Thing joins every row
+    let mut t: Vec<u32> = top.to_vec();
+    let mut t_unsat = false;
+    for &p in top {
+        let (u, r) = &rows[comp[p as usize] as usize];
+        t_unsat |= *u;
+        t.extend_from_slice(r);
+    }
+    t.sort_unstable();
+    t.dedup();
+    for (i, slot) in subs.iter_mut().enumerate() {
+        let (u, r) = &rows[comp[i] as usize];
+        let mut row = r.clone();
+        row.extend_from_slice(&t);
+        row.sort_unstable();
+        row.dedup();
+        *slot = (*u || t_unsat, row);
+    }
+    Ok(t)
+}
+
 /// The direct superclasses of the node whose first class is `r`, as node indices,
 /// sorted: the minimal nodes among the subsumers of `r`.
 fn direct_parents(
@@ -598,7 +729,7 @@ mod tests {
             axioms.push(Axiom::sub_class_of(via.clone(), c(&format!("U{i}"))));
         }
         let k = saturated(&axioms);
-        let (t, bytes) = build(&k, true, 1, &|| false, &|_| true).unwrap();
+        let (t, bytes) = build(&k, true, 1, false, &|| false, &|_| true).unwrap();
         let links: usize = t
             .nodes()
             .iter()
@@ -612,7 +743,7 @@ mod tests {
         // a budget that does not cover the links stops the build
         let below = bytes - 1;
         assert!(matches!(
-            build(&k, true, 1, &|| false, &|b| b <= below),
+            build(&k, true, 1, false, &|| false, &|b| b <= below),
             Err(Halt::Memory(_))
         ));
     }
@@ -624,11 +755,11 @@ mod tests {
             axioms.push(Axiom::sub_class_of(c(&format!("A{i}")), c("B")));
         }
         let k = saturated(&axioms);
-        let (t, bytes) = build(&k, false, 1, &|| false, &|_| true).unwrap();
+        let (t, bytes) = build(&k, false, 1, false, &|| false, &|_| true).unwrap();
         assert!(t.bottom().classes.len() > 1000);
         assert!(bytes >= 1000 * std::mem::size_of::<Class>(), "{bytes}");
         assert!(matches!(
-            build(&k, false, 1, &|| false, &|b| b < bytes),
+            build(&k, false, 1, false, &|| false, &|b| b < bytes),
             Err(Halt::Memory(_))
         ));
     }
@@ -650,6 +781,7 @@ mod tests {
             &k,
             true,
             1,
+            false,
             &|| {
                 polls.fetch_add(1, Ordering::Relaxed);
                 false
@@ -664,7 +796,7 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let stop = || calls.fetch_add(1, Ordering::Relaxed) + 1 >= 3;
         assert!(matches!(
-            build(&k, true, 1, &stop, &|_| true),
+            build(&k, true, 1, false, &stop, &|_| true),
             Err(Halt::Stopped)
         ));
     }
@@ -712,9 +844,9 @@ mod tests {
             }
         }
         let k = saturated(&axioms);
-        let (one, _) = build(&k, true, 1, &|| false, &|_| true).unwrap();
+        let (one, _) = build(&k, true, 1, false, &|| false, &|_| true).unwrap();
         for threads in [2, 8] {
-            let (t, _) = build(&k, true, threads, &|| false, &|_| true).unwrap();
+            let (t, _) = build(&k, true, threads, false, &|| false, &|_| true).unwrap();
             assert!(t == one, "{threads} threads");
         }
         // every class's lookup finds the node that holds it
@@ -741,8 +873,8 @@ mod tests {
         assert_eq!(one.node_of(&c("absent")), None);
         // an inconsistent ontology puts every class in the bottom node on any number of
         // threads
-        let (bad, _) = build(&k, false, 8, &|| false, &|_| true).unwrap();
-        let (bad1, _) = build(&k, false, 1, &|| false, &|_| true).unwrap();
+        let (bad, _) = build(&k, false, 8, false, &|| false, &|_| true).unwrap();
+        let (bad1, _) = build(&k, false, 1, false, &|| false, &|_| true).unwrap();
         assert!(bad == bad1);
         assert_eq!(bad.node_of(&c("C000001")), Some(BOTTOM_NODE));
         assert_eq!(bad.node_of(&Class::thing()), Some(BOTTOM_NODE));

@@ -587,3 +587,194 @@ fn tier_d_answers_horn_ontologies_as_the_horn_rules_do() {
         "only {compared} cases were taken whole"
     );
 }
+
+/// A random ALCHI ontology: a random Horn one with a few unions in the heads.
+fn random_dl(seed: u64) -> String {
+    let (mut s, _) = random_horn(seed);
+    let mut x = seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1;
+    let mut next = |m: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x % m
+    };
+    for _ in 0..1 + next(3) {
+        let a = next(6);
+        let b = (a + 1 + next(5)) % 6;
+        let c = (0..6).map(|k| (b + 1 + k) % 6).find(|&k| k != a).unwrap();
+        s.push_str(&match next(3) {
+            0 => format!("SubClassOf(:A{a} ObjectUnionOf(:A{b} :A{c}))\n"),
+            1 => format!(
+                "SubClassOf(:A{a} ObjectSomeValuesFrom(:r{} ObjectUnionOf(:A{b} :A{c})))\n",
+                next(3)
+            ),
+            _ => format!("EquivalentClasses(:A{a} ObjectUnionOf(:A{b} :A{c}))\n"),
+        });
+    }
+    s
+}
+
+/// The polls of the cancellation in a whole run.
+fn polls_of(ax: &[Axiom], threads: usize) -> usize {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let p = polls.clone();
+    Classifier::of(ax)
+        .classify(&Limits {
+            threads,
+            cancelled: Some(Arc::new(move || {
+                p.fetch_add(1, Ordering::Relaxed);
+                false
+            })),
+            ..Limits::default()
+        })
+        .unwrap();
+    polls.load(Ordering::Relaxed)
+}
+
+#[test]
+fn partial_answers_of_random_ontologies_are_sound_and_complete_where_they_say() {
+    let seeds = if cfg!(debug_assertions) { 60 } else { 300 };
+    let mut partial = 0;
+    for seed in 0..seeds {
+        let body = random_dl(seed);
+        let ax = axioms(&body);
+        let cs = classes(&ax);
+        let mut k = Classifier::of(&ax);
+        let full = k.classify(&Limits::default()).unwrap();
+        if !k.excluded().is_empty() || full.stats.clauses == 0 {
+            continue;
+        }
+        for threads in [1, 8] {
+            let total = polls_of(&ax, threads);
+            for stop in 0..total {
+                let Ok(out) =
+                    Classifier::of(&ax).classify(&cancelled_at(stop, threads, Expansion::Cautious))
+                else {
+                    continue;
+                };
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    check_partial(&out, &full, &cs)
+                }));
+                assert!(
+                    r.is_ok(),
+                    "seed {seed}, stop {stop}, {threads} threads\n{body}"
+                );
+                partial += !out.complete as usize;
+            }
+        }
+    }
+    assert!(partial > 0);
+}
+
+#[test]
+fn a_memory_stop_answers_in_part() {
+    let ax = axioms(&many(if cfg!(debug_assertions) { 40 } else { 120 }, false));
+    let cs = classes(&ax);
+    let full = Classifier::of(&ax).classify(&Limits::default()).unwrap();
+    let peak = full.stats.peak_memory;
+    let mut answered = 0;
+    for f in 1..20 {
+        let cap = peak * f / 20;
+        let out = Classifier::of(&ax).classify(&Limits {
+            partial: true,
+            max_memory: Some(cap),
+            ..Limits::default()
+        });
+        match out {
+            Err(sparkles_owl::classify::Error::Memory { .. }) => {}
+            Err(e) => panic!("cap {cap}: {e:?}"),
+            Ok(out) => {
+                assert!(
+                    !out.stats.dl_over_budget,
+                    "cap {cap} fell back to the Horn tier"
+                );
+                assert_eq!(out.stats.tier, Tier::Disjunctive);
+                check_partial(&out, &full, &cs);
+                if !out.complete {
+                    answered += 1;
+                    assert!(
+                        out.stats.conclusions > 0,
+                        "cap {cap}: no conclusions counted"
+                    );
+                    // a memory stop is the only one in this run, and its peak passed the cap
+                    assert!(
+                        out.stats.peak_memory > cap,
+                        "cap {cap}: a peak of {}",
+                        out.stats.peak_memory
+                    );
+                }
+            }
+        }
+    }
+    assert!(answered > 0, "no cap gave a partial answer");
+}
+
+/// An intersection of `n` classes Z below a union, each of which holds of A in two cases,
+/// so that Hyper has 2^n choices of premises. The other cases' classes come first, so that
+/// they rank below the Z classes.
+fn wide(n: usize) -> Vec<Axiom> {
+    let mut s = String::new();
+    for p in ["P", "Q", "Z"] {
+        for i in 0..n {
+            s.push_str(&format!("Declaration(Class(:{p}{i:02}))\n"));
+        }
+    }
+    for p in ["P", "Q"] {
+        for i in 0..n {
+            s.push_str(&format!(
+                "SubClassOf(:A ObjectUnionOf(:{p}{i:02} :Z{i:02}))\n"
+            ));
+        }
+    }
+    s.push_str("SubClassOf(ObjectIntersectionOf(");
+    for i in 0..n {
+        s.push_str(&format!(":Z{i:02} "));
+    }
+    s.push_str(") ObjectUnionOf(:D :E))\n");
+    axioms(&s)
+}
+
+/// Classifies in the order of the axioms, which fixes the order of their classes.
+fn in_order(
+    ax: &[Axiom],
+    limits: &Limits,
+) -> Result<Classification, sparkles_owl::classify::Error> {
+    let refs: Vec<&AxiomKind> = ax.iter().map(|a| &a.kind).collect();
+    sparkles_owl::classify::Saturation::new().classify(&refs, None, limits)
+}
+
+#[test]
+fn a_wide_case_analysis_stays_within_the_memory_budget() {
+    let ax = wide(14);
+    let cap = 500_000;
+    let out = in_order(
+        &ax,
+        &Limits {
+            max_memory: Some(cap),
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    assert!(out.stats.dl_over_budget);
+    assert!(
+        out.stats.peak_memory <= 2 * cap,
+        "a peak of {} under a cap of {cap}",
+        out.stats.peak_memory
+    );
+    let out = in_order(
+        &ax,
+        &Limits {
+            partial: true,
+            max_memory: Some(cap),
+            ..Limits::default()
+        },
+    );
+    // with the flag, the run answers by Tier D, in part or whole
+    let full = in_order(&ax, &Limits::default()).unwrap();
+    let cs = classes(&ax);
+    if let Ok(out) = out {
+        assert!(!out.stats.dl_over_budget);
+        assert!(out.stats.peak_memory <= 2 * cap);
+        check_partial(&out, &full, &cs);
+    }
+}
