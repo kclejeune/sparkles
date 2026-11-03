@@ -3,19 +3,26 @@
 //! calculus in the style of ELK (Kazakov, Krötzsch and Simančík, *The Incredible ELK*,
 //! JAR 2014), and kept up to date incrementally as axioms are added and removed.
 //!
-//! The classifier reads the F21 axiom model only. An axiom outside OWL 2 EL is left out
-//! and reported, with the rule of the OWL 2 Profiles recommendation it breaks. An axiom
-//! inside the profile whose consequences the calculus may not all derive, such as one with
-//! an individual in a class expression, a data range or a negative property assertion,
-//! is used as far as the calculus goes and reported as partial. Every subsumption the
-//! classifier answers is entailed. It derives every entailed subsumption between named
-//! classes when no axiom is reported as partial or left out.
+//! The classifier reads the F21 axiom model only. It covers OWL 2 EL with the
+//! rules of EL++ (Baader, Brandt and Lutz, IJCAI 2005 and OWLED 2008): individuals in
+//! class expressions and assertions, ranges, the datatypes, literals and data ranges of
+//! the profile, functional data properties, keys, negative property assertions and the
+//! top and bottom properties. A class whose instances reach an individual through a
+//! context that holds only where the class has an instance is classified again in a
+//! world of its own. An axiom outside OWL 2 EL is left out and reported, with
+//! the rule of the OWL 2 Profiles recommendation it breaks. An axiom with a literal or a
+//! datatype that the classifier cannot compare, or with a property chain through the top
+//! property, is used as far as the calculus goes and reported as partial. Every
+//! subsumption the classifier answers is entailed. It derives every entailed subsumption
+//! between named classes when no axiom is reported as partial or left out.
 //!
 //! [`Saturation`] keeps the saturated contexts between runs over axioms that the caller
 //! keeps, such as those of an open ontology, and reads them in place on each run.
 //! [`Classifier`] holds its own copy of the axioms on top of one. A run after a change
 //! saturates again only the contexts that the changed axioms can reach, and a change to
-//! the role hierarchy, chains, reflexivity or ranges saturates everything.
+//! the role hierarchy, chains, reflexivity or ranges, to an axiom with an individual, a
+//! data property, a datatype or a key, and any change after a run that merged a context
+//! with an individual saturates everything.
 //!
 //! The profile check, the taxonomy and the saturation run on the threads of
 //! [`Limits`], and the answer is the same for every number of threads.
@@ -36,11 +43,15 @@
 //! assert!(out.taxonomy.is_subclass(&c("Nucleus"), &c("CellPart")));
 //! ```
 
+mod data;
 mod index;
+mod query;
 mod saturate;
 mod taxonomy;
+mod world;
 
 pub use index::Gap;
+pub use query::Description;
 pub use taxonomy::{Node as TaxonomyNode, Taxonomy};
 
 use crate::model::*;
@@ -50,6 +61,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use saturate::{Bounds, Contexts, Stop};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// What bounds a run: the worker threads, a deadline, a memory budget and a cancellation
@@ -113,6 +125,9 @@ pub struct Stats {
     /// the estimated bytes the run keeps: the index, the contexts, the taxonomy and a
     /// classifier's copy of the axioms
     pub memory: usize,
+    /// the part of [`memory`](Stats::memory) that the taxonomy takes, 0 for a run
+    /// without one
+    pub taxonomy_memory: usize,
     /// the most estimated bytes the run held at once, which a memory budget bounds:
     /// [`memory`](Stats::memory) and, while the saturation ran, the messages waiting in
     /// the contexts' to-do lists
@@ -121,6 +136,15 @@ pub struct Stats {
     pub index: Duration,
     pub saturation: Duration,
     pub taxonomy: Duration,
+}
+
+/// The result of a run that saturates without building a taxonomy
+/// ([`Saturation::saturate`]).
+#[derive(Clone, Debug)]
+pub struct Saturated {
+    /// false when the ontology has no model
+    pub consistent: bool,
+    pub stats: Stats,
 }
 
 /// The result of a run.
@@ -179,6 +203,15 @@ pub struct Saturation {
     excluded: Vec<Excluded>,
     /// set when a run stopped part way, so that the next run starts again
     dirty: bool,
+    /// the subsumers of the classes that the last run classified in worlds of their own,
+    /// with whether each is unsatisfiable
+    worlds: FxHashMap<Ex, (bool, Vec<Ex>)>,
+    /// whether the last run's contexts depend on one another through individuals in ways
+    /// the invalidation does not follow: a context merged with an individual, a world, a
+    /// key or a fact of a universal role
+    entangled: bool,
+    /// whether the last run whose saturation ended found the ontology consistent
+    consistent: bool,
 }
 
 impl Default for Saturation {
@@ -195,17 +228,21 @@ pub struct Changes<'a> {
 }
 
 /// Whether a change to the axiom needs a run that starts again: one that changes the
-/// role table, which a run builds once, or one with data, whose generated rules for
-/// literals and data ranges the invalidation does not follow.
+/// role table, which a run builds once, one with data, whose told subsumers the index
+/// derives from every data axiom at once, a key, or one with an individual, whose
+/// merges the invalidation does not follow.
 fn needs_full_run(ax: &AxiomKind) -> bool {
-    if role_axiom(ax) {
+    if role_axiom(ax) || matches!(ax, AxiomKind::HasKey(..)) {
         return true;
     }
     let mut sig = crate::model::Signature::default();
     sig.axiom(ax);
-    sig.0
-        .iter()
-        .any(|e| matches!(e, Entity::DataProperty(_) | Entity::Datatype(_)))
+    sig.0.iter().any(|e| {
+        matches!(
+            e,
+            Entity::DataProperty(_) | Entity::Datatype(_) | Entity::NamedIndividual(_)
+        )
+    })
 }
 
 /// Whether a change to the axiom affects the role table, which a run builds once.
@@ -219,6 +256,8 @@ fn role_axiom(ax: &AxiomKind) -> bool {
             | AxiomKind::ObjectPropertyRange(..)
             | AxiomKind::SubDataPropertyOf(..)
             | AxiomKind::EquivalentDataProperties(_)
+            | AxiomKind::DataPropertyRange(..)
+            | AxiomKind::FunctionalDataProperty(_)
     )
 }
 
@@ -387,6 +426,36 @@ impl Classifier {
     /// Classifies the axioms held, saturating again only what changed since the last
     /// run.
     pub fn classify(&mut self, limits: &Limits) -> Result<Classification, Error> {
+        self.run_held(limits, true)
+            .map(|(consistent, taxonomy, stats)| Classification {
+                consistent,
+                taxonomy: taxonomy.expect("a taxonomy was asked for"),
+                stats,
+            })
+    }
+
+    /// Saturates the axioms held as [`classify`](Self::classify) does, again only what
+    /// changed since the last run, but builds no taxonomy. [`describe`](Self::describe)
+    /// then answers for one class from the saturated contexts.
+    pub fn saturate(&mut self, limits: &Limits) -> Result<Saturated, Error> {
+        self.run_held(limits, false)
+            .map(|(consistent, _, stats)| Saturated { consistent, stats })
+    }
+
+    /// What the last run says about the class `c` ([`Saturation::describe`]), or `None`
+    /// also when axioms were added or removed since.
+    pub fn describe(&self, c: &Class) -> Option<Description> {
+        if self.axioms.values().any(|h| h.ran != h.count) {
+            return None;
+        }
+        self.sat.describe(c)
+    }
+
+    fn run_held(
+        &mut self,
+        limits: &Limits,
+        with_taxonomy: bool,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
         let threads = threads_of(limits);
         let mut added: Vec<&AxiomKind> = Vec::new();
         let mut removed: Vec<&AxiomKind> = Vec::new();
@@ -414,7 +483,9 @@ impl Classifier {
             added: &added,
             removed: &removed,
         };
-        let r = self.sat.run_with(&held, Some(changes), held_bytes, limits);
+        let r = self
+            .sat
+            .run_with(&held, Some(changes), held_bytes, limits, with_taxonomy);
         drop((added, removed, held));
         // the changes are applied whether the run ends or not
         self.held_bytes = held_bytes;
@@ -436,6 +507,9 @@ impl Saturation {
             ctx: Vec::new(),
             excluded: Vec::new(),
             dirty: true,
+            worlds: FxHashMap::default(),
+            entangled: false,
+            consistent: true,
         }
     }
 
@@ -455,7 +529,26 @@ impl Saturation {
         changes: Option<Changes<'_>>,
         limits: &Limits,
     ) -> Result<Classification, Error> {
-        self.run_with(axioms, changes, 0, limits)
+        self.run_with(axioms, changes, 0, limits, true)
+            .map(|(consistent, taxonomy, stats)| Classification {
+                consistent,
+                taxonomy: taxonomy.expect("a taxonomy was asked for"),
+                stats,
+            })
+    }
+
+    /// Saturates `axioms` as [`classify`](Saturation::classify) does, but builds no
+    /// taxonomy. [`describe`](Saturation::describe) then answers for one class from the
+    /// saturated contexts, which costs far less than a taxonomy of every class when
+    /// only a few classes are asked about.
+    pub fn saturate(
+        &mut self,
+        axioms: &[&AxiomKind],
+        changes: Option<Changes<'_>>,
+        limits: &Limits,
+    ) -> Result<Saturated, Error> {
+        self.run_with(axioms, changes, 0, limits, false)
+            .map(|(consistent, _, stats)| Saturated { consistent, stats })
     }
 
     /// [`classify`](Saturation::classify), with the bytes of the caller's copy of the
@@ -466,8 +559,9 @@ impl Saturation {
         changes: Option<Changes<'_>>,
         held_bytes: usize,
         limits: &Limits,
-    ) -> Result<Classification, Error> {
-        let r = self.run(axioms, changes, held_bytes, limits);
+        with_taxonomy: bool,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        let r = self.run(axioms, changes, held_bytes, limits, with_taxonomy);
         if r.is_err() && self.dirty {
             // the next run starts again, so the state of this one is of no use
             self.index = None;
@@ -495,6 +589,18 @@ impl Saturation {
         }
         // the classes the normalization meets are those of the signature
         self.interner.clear_met();
+        // the datatype definitions, which the data ranges that name them stand for
+        self.interner.ranges.definitions.clear();
+        for (i, &k) in axioms.iter().enumerate() {
+            if let AxiomKind::DatatypeDefinition(d, r) = k
+                && !is_outside[i]
+            {
+                self.interner
+                    .ranges
+                    .definitions
+                    .insert(d.clone(), r.clone());
+            }
+        }
         for (i, &k) in axioms.iter().enumerate() {
             if i % POLL_AXIOMS == 0 {
                 poll(limits)?;
@@ -560,19 +666,6 @@ impl Saturation {
                     index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
                 },
             )?;
-        // an individual that fills a property with a range has a context for each range,
-        // which nominal reasoning would merge
-        for (i, &k) in axioms.iter().enumerate() {
-            if let AxiomKind::ObjectPropertyAssertion(ObjectPropertyExpression::Property(p), ..) = k
-                && !is_outside[i]
-                && let Some(r) = self.interner.role_id(&index::RoleName::Object(p.clone()))
-                && ix.roles.range.get(r as usize).is_some_and(|c| c.is_some())
-            {
-                partial
-                    .entry(k)
-                    .or_insert("individuals that fill a property with a range");
-            }
-        }
         let mut excluded: Vec<Excluded> = Vec::new();
         for (i, (rule, message)) in outside {
             excluded.push(Excluded {
@@ -610,7 +703,8 @@ impl Saturation {
         changes: Option<Changes<'_>>,
         held_bytes: usize,
         limits: &Limits,
-    ) -> Result<Classification, Error> {
+        with_taxonomy: bool,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
         let mut stats = Stats::default();
         let start = Instant::now();
         let threads = threads_of(limits);
@@ -626,8 +720,9 @@ impl Saturation {
         // until the saturation ends, a stop leaves the state for a run that starts again
         self.dirty = true;
         let changes = changes.filter(|_| !again);
-        let full =
-            changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)));
+        let full = self.entangled
+            || changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)));
+        self.worlds.clear();
         if full {
             self.interner = Interner::new();
             self.ctx = Vec::new();
@@ -672,7 +767,10 @@ impl Saturation {
         }
         let mut roots: Vec<Ex> = ax.classes.clone();
         roots.push(TOP);
+        // every individual has an instance, whether an assertion or a class expression
+        // names it
         roots.extend(ax.individuals.iter().copied());
+        roots.extend(ix.nominals.iter().copied());
         roots.sort_unstable();
         roots.dedup();
         stats.index = start.elapsed();
@@ -706,29 +804,140 @@ impl Saturation {
             });
         }
         let t = Instant::now();
-        let totals = saturate::saturate(&ix, &self.ctx, &roots, &bounds);
-        stats.saturation = t.elapsed();
-        let totals = match totals {
-            Ok(t) => t,
-            Err(stop) => {
-                return Err(match stop {
-                    Stop::Cancelled => Error::Cancelled,
-                    Stop::Timeout => Error::Timeout,
-                    Stop::Memory { used } => Error::Memory {
-                        limit: limits.max_memory.unwrap_or(usize::MAX),
-                        used,
-                    },
-                });
-            }
+        let stopped = |stop: Stop| match stop {
+            Stop::Cancelled => Error::Cancelled,
+            Stop::Timeout => Error::Timeout,
+            Stop::Memory { used } => Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used,
+            },
         };
+        let mut totals =
+            saturate::saturate(&ix, &self.ctx, &roots, &[], &[], &bounds).map_err(stopped)?;
+        // Which contexts are real matters only when a context derived an individual, for
+        // keys and for universal roles. Then owl:Thing and the individuals become real,
+        // and so does what they reach, between rounds of the saturation, with the facts
+        // of universal roles and the merges of keys, until none is new.
+        let mut universal: Vec<Ex> = Vec::new();
+        let entangled = ix.has_individuals()
+            && (totals.merged || !ix.universal.is_empty() || !ix.keys.is_empty());
+        if entangled {
+            let mut seeds: Vec<(Ex, saturate::Concl)> = std::iter::once(TOP)
+                .chain(ix.nominals.iter().copied())
+                .map(|e| (e, saturate::Concl::Real))
+                .collect();
+            loop {
+                poll(limits)?;
+                let mut woken: Vec<Ex> = Vec::with_capacity(seeds.len());
+                for (e, c) in seeds.drain(..) {
+                    if let Some(x) = self.ctx.get(e as usize).and_then(|x| x.get()) {
+                        x.todo.lock().push(c);
+                        woken.push(e);
+                    }
+                }
+                woken.sort_unstable();
+                woken.dedup();
+                let round = Bounds {
+                    base_memory: totals.memory,
+                    ..bounds
+                };
+                let more = saturate::saturate(&ix, &self.ctx, &[], &woken, &universal, &round)
+                    .map_err(stopped)?;
+                totals = saturate::Totals {
+                    conclusions: totals.conclusions + more.conclusions,
+                    memory: more.memory,
+                    peak: totals.peak.max(more.peak),
+                    merged: totals.merged || more.merged,
+                };
+                let view = world::Global(&self.ctx);
+                let facts = world::universal_facts(&ix, &view, &universal);
+                let merges = world::key_merges(&ix, &view);
+                if facts.is_empty() && merges.is_empty() {
+                    break;
+                }
+                if !facts.is_empty() {
+                    for (e, c) in self.ctx.iter().enumerate() {
+                        if c.get().is_some_and(|c| c.st.lock().init) {
+                            seeds.extend(facts.iter().map(|&x| (e as Ex, saturate::Concl::Sub(x))));
+                        }
+                    }
+                }
+                universal.extend_from_slice(&facts);
+                for (a, b) in merges {
+                    seeds.push((a, saturate::Concl::Sub(b)));
+                    seeds.push((b, saturate::Concl::Sub(a)));
+                }
+            }
+        }
+        // the classes whose instances reach an individual through a context that is not
+        // real, each in a world of its own
+        let mut world_bytes = 0usize;
+        if entangled {
+            let witnesses = world::witnesses(&ix, &self.ctx, &universal);
+            if !witnesses.is_empty() {
+                let classes = world::reaching(&ix, &self.ctx, &witnesses);
+                let real: Vec<Ex> = (0..self.ctx.len() as Ex)
+                    .filter(|&e| self.ctx[e as usize].get().is_some_and(|c| c.st.lock().real))
+                    .collect();
+                // the worlds running and the subsumers of those done count against the
+                // budget beside the saturated state, and the pool is charged for what
+                // passes the peak
+                let budget = WorldBudget {
+                    limits,
+                    charge: charge_fn,
+                    base: totals.memory,
+                    held: AtomicIsize::new(0),
+                    peak: AtomicUsize::new(totals.peak),
+                    halt: AtomicU8::new(0),
+                    halted_at: AtomicUsize::new(0),
+                };
+                let bound = |delta: isize| budget.tell(delta);
+                let found = par_map(&classes, threads, |_, chunk| {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for &d in chunk {
+                        let w = world::World::new(&ix, &self.ctx, &universal, &real, &bound);
+                        let Some(f) = w.classify(d) else {
+                            break;
+                        };
+                        let kept = 48 + f.subs.len() * 4;
+                        if !bound(kept as isize) {
+                            break;
+                        }
+                        out.push((d, f, kept));
+                    }
+                    out
+                });
+                budget.stopped()?;
+                totals.peak = budget.peak.load(Ordering::Relaxed);
+                for (d, f, kept) in found.into_iter().flatten() {
+                    world_bytes += kept;
+                    self.worlds.insert(d, (f.bottom, f.subs));
+                }
+            }
+            self.entangled = entangled;
+        } else {
+            self.entangled = false;
+        }
+        stats.saturation = t.elapsed();
         stats.conclusions = totals.conclusions;
+        totals.memory += world_bytes;
+        totals.peak = totals.peak.max(totals.memory);
         // the saturated state is complete: a stop from here on keeps it for the next run
         self.dirty = false;
+        let ix_nominals = ix.nominals.clone();
         self.index = Some(ix);
         let t = Instant::now();
-        let consistent = self.consistent(&ax);
+        let consistent = self.consistent(&ax, &ix_nominals);
+        self.consistent = consistent;
         let held = totals.memory - ax.bytes();
         drop(ax);
+        if !with_taxonomy {
+            stats.memory = held;
+            stats.peak_memory = totals.peak.max(held);
+            stats.contexts = self.ctx.iter().filter(|c| c.get().is_some()).count();
+            poll(limits)?;
+            return Ok((consistent, None, stats));
+        }
         let stop = || poll(limits).is_err();
         // the taxonomy's bytes join those held, and the budget and the pool's grant cover
         // what passes the saturation's peak. The build asks again as its estimate grows,
@@ -759,25 +968,24 @@ impl Saturation {
                 },
             })?;
         stats.memory = held + tax_bytes;
+        stats.taxonomy_memory = tax_bytes;
         stats.peak_memory = totals.peak.max(stats.memory);
         stats.taxonomy = t.elapsed();
         stats.contexts = self.ctx.iter().filter(|c| c.get().is_some()).count();
         poll(limits)?;
-        Ok(Classification {
-            consistent,
-            taxonomy,
-            stats,
-        })
+        Ok((consistent, Some(taxonomy), stats))
     }
 
-    fn consistent(&self, ax: &Axioms) -> bool {
+    fn consistent(&self, ax: &Axioms, nominals: &[Ex]) -> bool {
         let bottom = |e: Ex| {
             self.ctx
                 .get(e as usize)
                 .and_then(|c| c.get())
                 .is_some_and(|c| c.st.lock().bottom)
         };
-        !bottom(TOP) && !ax.individuals.iter().any(|&i| bottom(i))
+        !bottom(TOP)
+            && !ax.individuals.iter().any(|&i| bottom(i))
+            && !nominals.iter().any(|&i| bottom(i))
     }
 
     fn index_bytes(&self, ix: &Index) -> usize {
@@ -885,6 +1093,14 @@ impl Saturation {
     /// The subsumers of a saturated context that are named classes, with their
     /// expressions.
     fn named_subsumers(&self, e: Ex) -> Option<(bool, Vec<Ex>)> {
+        if let Some((bottom, subs)) = self.worlds.get(&e) {
+            let named = subs
+                .iter()
+                .copied()
+                .filter(|&s| matches!(self.interner.nodes[s as usize], Node::Class(_) | Node::Top))
+                .collect();
+            return Some((*bottom, named));
+        }
         let c = self.ctx.get(e as usize)?.get()?;
         let st = c.st.lock();
         let named = st
@@ -957,6 +1173,75 @@ fn range_table(
 const POLL_AXIOMS: usize = 65_536;
 
 /// The run's deadline and cancellation, as an error when either has come.
+/// Why the worlds stopped.
+const WORLD_MEMORY: u8 = 1;
+const WORLD_TIMEOUT: u8 = 2;
+const WORLD_CANCEL: u8 = 3;
+
+/// The bound the worlds of a run share: what they hold counts against the memory budget
+/// beside the saturated state, the pool is charged for what passes the run's peak, and
+/// every report polls the deadline and the cancellation.
+struct WorldBudget<'a> {
+    limits: &'a Limits,
+    charge: Option<&'a (dyn Fn(usize) -> bool + Sync)>,
+    /// the bytes of the saturated state
+    base: usize,
+    /// the bytes the worlds hold now
+    held: AtomicIsize,
+    peak: AtomicUsize,
+    halt: AtomicU8,
+    halted_at: AtomicUsize,
+}
+
+impl WorldBudget<'_> {
+    /// Takes a change of what a world holds, and answers whether the worlds go on.
+    fn tell(&self, delta: isize) -> bool {
+        let now = self.held.fetch_add(delta, Ordering::Relaxed) + delta;
+        if self.halt.load(Ordering::Relaxed) != 0 {
+            return false;
+        }
+        let limits = self.limits;
+        let mut over = false;
+        if delta > 0 {
+            let used = self.base + now.max(0) as usize;
+            let before = self.peak.fetch_max(used, Ordering::Relaxed);
+            let grown = used.saturating_sub(before);
+            over = limits.max_memory.is_some_and(|m| used > m)
+                || self.charge.is_some_and(|f| grown > 0 && !f(grown));
+            if over {
+                self.halted_at.store(used, Ordering::Relaxed);
+            }
+        }
+        let why = if over {
+            WORLD_MEMORY
+        } else if limits.deadline.is_some_and(|d| Instant::now() >= d) {
+            WORLD_TIMEOUT
+        } else if limits.cancelled.as_ref().is_some_and(|f| f()) {
+            WORLD_CANCEL
+        } else {
+            return true;
+        };
+        // the first reason stays
+        let _ = self
+            .halt
+            .compare_exchange(0, why, Ordering::Relaxed, Ordering::Relaxed);
+        false
+    }
+
+    /// The error of the worlds' stop, if they stopped.
+    fn stopped(&self) -> Result<(), Error> {
+        match self.halt.load(Ordering::Relaxed) {
+            WORLD_MEMORY => Err(Error::Memory {
+                limit: self.limits.max_memory.unwrap_or(usize::MAX),
+                used: self.halted_at.load(Ordering::Relaxed),
+            }),
+            WORLD_TIMEOUT => Err(Error::Timeout),
+            WORLD_CANCEL => Err(Error::Cancelled),
+            _ => Ok(()),
+        }
+    }
+}
+
 fn poll(limits: &Limits) -> Result<(), Error> {
     if limits.deadline.is_some_and(|d| Instant::now() >= d) {
         return Err(Error::Timeout);
@@ -965,4 +1250,66 @@ fn poll(limits: &Limits) -> Result<(), Error> {
         return Err(Error::Cancelled);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn the_world_budget_polls_the_cancellation_when_nothing_grows() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let seen = flag.clone();
+        let limits = Limits {
+            cancelled: Some(Arc::new(move || seen.load(Ordering::Relaxed))),
+            ..Limits::default()
+        };
+        let budget = WorldBudget {
+            limits: &limits,
+            charge: None,
+            base: 0,
+            held: AtomicIsize::new(0),
+            peak: AtomicUsize::new(0),
+            halt: AtomicU8::new(0),
+            halted_at: AtomicUsize::new(0),
+        };
+        assert!(budget.tell(100));
+        assert!(budget.tell(0));
+        flag.store(true, Ordering::Relaxed);
+        // a world whose working set stays flat or shrinks still sees the cancellation
+        assert!(!budget.tell(0));
+        assert!(!budget.tell(-50));
+        assert_eq!(budget.stopped(), Err(Error::Cancelled));
+        assert_eq!(budget.held.load(Ordering::Relaxed), 50);
+    }
+
+    #[test]
+    fn the_world_budget_stops_at_the_memory_limit_and_keeps_the_first_reason() {
+        let limits = Limits {
+            max_memory: Some(1_000),
+            deadline: Some(Instant::now() + Duration::from_secs(3600)),
+            ..Limits::default()
+        };
+        let budget = WorldBudget {
+            limits: &limits,
+            charge: None,
+            base: 600,
+            held: AtomicIsize::new(0),
+            peak: AtomicUsize::new(600),
+            halt: AtomicU8::new(0),
+            halted_at: AtomicUsize::new(0),
+        };
+        assert!(budget.tell(300));
+        assert!(!budget.tell(200));
+        assert!(!budget.tell(-500));
+        assert_eq!(
+            budget.stopped(),
+            Err(Error::Memory {
+                limit: 1_000,
+                used: 1_100
+            })
+        );
+    }
 }

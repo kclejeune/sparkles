@@ -1098,6 +1098,317 @@ function classify(o) {
   return { nodes, classes: classes.size };
 }
 
+// --- Manchester syntax and the DL query --------------------------------------------------
+
+const DL_QUERY = 'urn:x-sparkles:dl-query';
+
+class ManchesterError extends Error {
+  constructor(reason, message, start, end, candidates = []) {
+    super(message);
+    this.reason = reason;
+    this.start = start;
+    this.end = end;
+    this.candidates = candidates;
+  }
+  json() {
+    return {
+      error: this.message,
+      code: 'invalid-manchester',
+      reason: this.reason,
+      start: this.start,
+      end: this.end,
+      candidates: this.candidates,
+    };
+  }
+}
+
+/** The names of the ontology: labels, local names and prefixed names, each to its IRIs. */
+function vocabulary(o, prefixes) {
+  const names = new Map();
+  const add = (n, iri) => {
+    const k = n.toLowerCase();
+    if (!names.has(k)) names.set(k, new Set());
+    names.get(k).add(iri);
+  };
+  const label = new Map();
+  for (const [iri] of o.kinds) {
+    const local = iri.replace(/^.*[#/]/, '');
+    if (local) add(local, iri);
+  }
+  for (const a of o.axioms)
+    if (
+      a.json.type === 'AnnotationAssertion' &&
+      a.json.property === RDFS + 'label' &&
+      typeof a.json.subject === 'string' &&
+      isLit(a.json.value)
+    ) {
+      add(a.json.value['@value'], a.json.subject);
+      // the label a name shows: an English one before the others
+      const en = /^en\b/i.test(a.json.value['@language'] ?? '');
+      if (!label.has(a.json.subject) || (en && !label.get(a.json.subject).en))
+        label.set(a.json.subject, { text: a.json.value['@value'], en });
+    }
+  const expand = (n) => {
+    const i = n.indexOf(':');
+    if (i < 0) return null;
+    const ns = prefixes[n.slice(0, i)];
+    return ns === undefined ? null : ns + n.slice(i + 1);
+  };
+  return {
+    names,
+    label: new Map([...label].map(([k, l]) => [k, l.text])),
+    expand,
+    kinds: o.kinds,
+  };
+}
+
+/** Manchester tokens with their spans: names, quoted names, IRIs and punctuation. */
+function mTokens(text) {
+  const out = [];
+  const re = /\s+|<[^>\s]*>|'(?:[^'\\]|\\.)*'?|[(){},]|[^\s(){},'<>]+/gy;
+  let at = 0;
+  while (at < text.length) {
+    re.lastIndex = at;
+    const m = re.exec(text);
+    if (!m) throw new ManchesterError('syntax', 'unexpected character', at, at + 1);
+    const t = m[0];
+    at = m.index + t.length;
+    if (/^\s/.test(t)) continue;
+    if (t.startsWith("'") && (t.length < 2 || !t.endsWith("'")))
+      throw new ManchesterError('syntax', 'a quoted name is not closed', m.index, text.length);
+    out.push({ t, start: m.index, end: at });
+  }
+  return out;
+}
+
+const M_KEYWORDS = new Set(['and', 'or', 'not', 'that', 'some', 'only', 'value']);
+const AXIOM_WORDS = { SubClassOf: 1, EquivalentTo: 1, DisjointWith: 1 };
+
+/** A reader of the class expressions and class axioms the mock understands. */
+function manchesterReader(text, v) {
+  const toks = mTokens(text);
+  let i = 0;
+  const peek = () => toks[i];
+  const end = () => (toks.length ? toks[toks.length - 1].end : 0);
+  const want = (what) => {
+    const t = toks[i];
+    if (!t) throw new ManchesterError('syntax', `expected ${what} at the end`, end(), end());
+    return t;
+  };
+  const resolve = (tok, kind) => {
+    const raw = tok.t;
+    let iris;
+    if (raw.startsWith('<')) iris = [raw.slice(1, -1)];
+    else {
+      const name = raw.startsWith("'") ? raw.slice(1, -1).replace(/\\(.)/g, '$1') : raw;
+      const ex = raw.startsWith("'") ? null : v.expand(name);
+      iris = ex && v.kinds.has(ex) ? [ex] : [...(v.names.get(name.toLowerCase()) ?? [])];
+      iris = iris.filter((x) => v.kinds.get(x)?.has(kind));
+      if (!iris.length)
+        throw new ManchesterError(
+          'unknown',
+          `no ${kind === 'Class' ? 'class' : 'object property'} is named ${raw}`,
+          tok.start,
+          tok.end,
+        );
+      if (iris.length > 1)
+        throw new ManchesterError(
+          'ambiguous',
+          `${raw} names ${iris.length} entities`,
+          tok.start,
+          tok.end,
+          iris.map((x) => ({ iri: x, kind, label: v.label.get(x) ?? null })),
+        );
+    }
+    return iris[0];
+  };
+  const primary = () => {
+    const t = want('a class expression');
+    if (t.t === 'not') {
+      i++;
+      return { type: 'ObjectComplementOf', class: primary() };
+    }
+    if (t.t === '(') {
+      i++;
+      const e = union();
+      const c = want('a closing bracket');
+      if (c.t !== ')') throw new ManchesterError('syntax', 'expected )', c.start, c.end);
+      i++;
+      return e;
+    }
+    if (M_KEYWORDS.has(t.t) || '(){},'.includes(t.t) || t.t in AXIOM_WORDS)
+      throw new ManchesterError(
+        'syntax',
+        `expected a class expression, not ${t.t}`,
+        t.start,
+        t.end,
+      );
+    i++;
+    const next = peek();
+    if (next && (next.t === 'some' || next.t === 'only' || next.t === 'value')) {
+      const property = resolve(t, 'ObjectProperty');
+      i++;
+      if (next.t === 'value') {
+        const ind = want('an individual');
+        i++;
+        return { type: 'ObjectHasValue', property, individual: resolve(ind, 'NamedIndividual') };
+      }
+      return {
+        type: next.t === 'some' ? 'ObjectSomeValuesFrom' : 'ObjectAllValuesFrom',
+        property,
+        class: primary(),
+      };
+    }
+    return resolve(t, 'Class');
+  };
+  const conj = () => {
+    const parts = [primary()];
+    while (peek() && (peek().t === 'and' || peek().t === 'that')) {
+      i++;
+      parts.push(primary());
+    }
+    return parts.length > 1 ? { type: 'ObjectIntersectionOf', classes: parts } : parts[0];
+  };
+  const union = () => {
+    const parts = [conj()];
+    while (peek()?.t === 'or') {
+      i++;
+      parts.push(conj());
+    }
+    return parts.length > 1 ? { type: 'ObjectUnionOf', classes: parts } : parts[0];
+  };
+  const done = () => {
+    const t = peek();
+    if (t) throw new ManchesterError('syntax', `unexpected ${t.t}`, t.start, t.end);
+  };
+  return {
+    classExpression() {
+      const e = union();
+      done();
+      return e;
+    },
+    axiom() {
+      const left = union();
+      const k = want('SubClassOf, EquivalentTo or DisjointWith');
+      if (!(k.t in AXIOM_WORDS))
+        throw new ManchesterError(
+          'syntax',
+          `expected an axiom keyword, not ${k.t}`,
+          k.start,
+          k.end,
+        );
+      i++;
+      const right = union();
+      done();
+      if (k.t === 'SubClassOf') return { type: 'SubClassOf', subClass: left, superClass: right };
+      return {
+        type: k.t === 'EquivalentTo' ? 'EquivalentClasses' : 'DisjointClasses',
+        classes: [left, right],
+      };
+    },
+  };
+}
+
+/** A class expression in Manchester syntax, with labels where they name one entity. */
+function manchesterOf(x, v, r) {
+  const name = (iri) => {
+    const l = v.label.get(iri);
+    if (l && v.names.get(l.toLowerCase())?.size === 1)
+      return /^[A-Za-z_][\w-]*$/.test(l) && !M_KEYWORDS.has(l) ? l : `'${l.replace(/'/g, "\\'")}'`;
+    return r.iri(iri);
+  };
+  const go = (e, top) => {
+    if (typeof e === 'string') return name(e);
+    const wrap = (s) => (top ? s : `(${s})`);
+    switch (e.type) {
+      case 'ObjectIntersectionOf':
+        return wrap(e.classes.map((c) => go(c, false)).join(' and '));
+      case 'ObjectUnionOf':
+        return wrap(e.classes.map((c) => go(c, false)).join(' or '));
+      case 'ObjectComplementOf':
+        return `not ${go(e.class, false)}`;
+      case 'ObjectSomeValuesFrom':
+        return wrap(`${name(e.property)} some ${go(e.class, false)}`);
+      case 'ObjectAllValuesFrom':
+        return wrap(`${name(e.property)} only ${go(e.class, false)}`);
+      case 'ObjectHasValue':
+        return wrap(`${name(e.property)} value ${name(e.individual)}`);
+      default:
+        return r.val(e);
+    }
+  };
+  return go(x, true);
+}
+
+/** The mock's DL query: the expression classified as a fresh class with the told axioms. */
+function dlQueryOf(o, expr, answers) {
+  const kinds = new Map(o.kinds);
+  kinds.set(DL_QUERY, new Set(['Class']));
+  const parts = expr.type === 'ObjectIntersectionOf' ? expr.classes : [expr];
+  const extra = [
+    {
+      json: {
+        type: 'EquivalentClasses',
+        classes: [DL_QUERY, { type: 'ObjectIntersectionOf', classes: parts }],
+      },
+    },
+    ...parts.map((p) => ({ json: { type: 'SubClassOf', subClass: DL_QUERY, superClass: p } })),
+  ];
+  // the mock's classifier reads no superclasses from a definition, so its parts are added
+  for (const a of o.axioms)
+    if (a.json.type === 'EquivalentClasses')
+      for (const d of a.json.classes.filter((x) => typeof x === 'string'))
+        for (const x of a.json.classes)
+          if (x?.type === 'ObjectIntersectionOf')
+            for (const p of x.classes)
+              extra.push({ json: { type: 'SubClassOf', subClass: d, superClass: p } });
+  if (typeof expr === 'string')
+    extra.push({ json: { type: 'EquivalentClasses', classes: [DL_QUERY, expr] } });
+  const c = classify({ kinds, axioms: [...o.axioms, ...extra] });
+  const nodes = c.nodes;
+  const at = nodes.findIndex((n) => n.classes.includes(DL_QUERY));
+  const named = (ns) =>
+    [...new Set(ns.flatMap((n) => nodes[n].classes))].filter((x) => x !== DL_QUERY).sort();
+  const up = (n, seen = new Set()) => {
+    for (const p of nodes[n].parents)
+      if (!seen.has(p)) {
+        seen.add(p);
+        up(p, seen);
+      }
+    return seen;
+  };
+  const below = (n) => nodes.map((m) => m.node).filter((m) => m > 1 && up(m).has(n));
+  const subs = below(at);
+  const directSubs = subs.filter((m) => nodes[m].parents.includes(at));
+  const sups = [...up(at)];
+  const out = {
+    equivalents: named([at]),
+    directSuperclasses: named(nodes[at].parents),
+    superclasses: named(sups),
+    // as the server's answers, these leave out owl:Nothing
+    directSubclasses: named(directSubs),
+    subclasses: named(subs),
+  };
+  const classesOf = new Set([at, ...subs].flatMap((n) => nodes[n].classes));
+  out.instances = o.axioms
+    .filter(
+      (a) =>
+        a.json.type === 'ClassAssertion' &&
+        typeof a.json.class === 'string' &&
+        classesOf.has(a.json.class),
+    )
+    .map((a) => a.json.individual)
+    .filter((x, k, all) => all.indexOf(x) === k)
+    .sort();
+  const body = { counts: {} };
+  for (const k of answers)
+    if (out[k]) {
+      body[k] = out[k];
+      body.counts[k] = out[k].length;
+    }
+  return body;
+}
+
 // --- the routes ------------------------------------------------------------------------
 
 const etag = (ds, seq) => `W/"${ds.branchId ?? ds.id}:${seq}:owl"`;
@@ -1242,6 +1553,80 @@ export async function handleOntology(req, res, url, seg, ctx) {
       annotations: [],
       assertions: false,
       truncated: false,
+    });
+    return true;
+  }
+  if (req.method === 'POST' && (sub === 'parse' || sub === 'dl-query')) {
+    let body;
+    try {
+      body = JSON.parse((await readBody(req)) || '{}');
+    } catch {
+      return (fail(res, 400, 'invalid JSON'), true);
+    }
+    const o = readOntology(ds, body.graph ?? graph);
+    const v = vocabulary(o, ds.prefixes ?? {});
+    const text = sub === 'parse' ? (body.text ?? '') : (body.expression ?? '');
+    const as = sub === 'parse' ? (body.as ?? 'classExpression') : 'classExpression';
+    let value;
+    try {
+      if (as !== 'classExpression' && as !== 'axiom')
+        throw new ManchesterError('syntax', `the mock reads no ${as}`, 0, text.length);
+      value = manchesterReader(text, v)[as]();
+    } catch (e) {
+      if (e instanceof ManchesterError) return (send(res, 400, e.json()), true);
+      throw e;
+    }
+    if (sub === 'parse') {
+      const manchester = as === 'axiom' ? null : manchesterOf(value, v, r);
+      send(res, 200, {
+        ...opened(o),
+        as,
+        value,
+        ofn: as === 'axiom' ? r.axiom(value) : r.val(value),
+        manchester,
+      });
+      return true;
+    }
+    const t0 = performance.now();
+    const answers = body.answers ?? [
+      'equivalents',
+      'directSuperclasses',
+      'superclasses',
+      'directSubclasses',
+      'subclasses',
+    ];
+    const el = body.reasoning !== 'rl';
+    send(res, 200, {
+      ...opened(o),
+      expression: { manchester: manchesterOf(value, v, r), ofn: r.val(value), json: value },
+      reasoning: el
+        ? {
+            engine: 'el',
+            title: 'OWL 2 EL classifier',
+            why: 'the expression and the ontology are inside OWL 2 EL',
+            complete: true,
+            instancesComplete: true,
+            gapCount: 0,
+            gaps: [],
+            notes: [],
+          }
+        : {
+            engine: 'rl',
+            title: 'OWL 2 RL rules by demand reasoning',
+            why: 'the caller asked for the OWL 2 RL rules',
+            complete: false,
+            instancesComplete: true,
+            gapCount: 0,
+            gaps: [],
+            notes: [
+              'the OWL 2 RL rules derive subsumptions between classes only in part, so the class answers can miss entailed ones',
+            ],
+          },
+      satisfiable: true,
+      consistent: true,
+      incremental: el,
+      elapsedMs: Math.max(0.1, performance.now() - t0),
+      ...dlQueryOf(o, value, answers),
     });
     return true;
   }

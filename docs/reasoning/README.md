@@ -233,20 +233,27 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   calculus in the manner of ELK. It reads the axiom model only, saturates its contexts
   on several threads and computes the class taxonomy: the classes grouped into
   equivalence classes, their direct superclasses and the unsatisfiable classes. It
-  covers intersections, existential restrictions, `owl:Thing` and `owl:Nothing`, the
-  property hierarchy, property chains, transitive and reflexive properties, domains,
-  ranges, disjointness and `ObjectHasSelf`. An axiom outside OWL 2 EL is left out and
-  reported with its rule. An axiom with an individual in a class expression, a data
-  range or a data value, or a key, a negative property assertion or a functional data
-  property, is used as far as the calculus goes and reported as partial, since the
-  classifier treats individuals and data ranges as atoms. Every answer is entailed, and
-  it is complete for named classes when nothing is reported. The classifier keeps its
-  contexts between runs, and a run after added or removed axioms saturates again only
-  the contexts that those axioms can reach. A change to the property hierarchy, chains,
-  reflexivity or ranges, or to an axiom with a data property or datatype, saturates
-  everything again. A run stops at its deadline, its memory budget or a cancellation,
-  which it checks while it indexes, builds the property closure, saturates and builds
-  the taxonomy. On the benchmark
+  covers OWL 2 EL, with intersections, existential restrictions, `owl:Thing` and
+  `owl:Nothing`, individuals in class expressions and assertions, the property
+  hierarchy with the top and bottom properties, property chains, transitive and
+  reflexive properties, domains, ranges, disjointness, `ObjectHasSelf`, the datatypes,
+  literals and data ranges of the profile, functional data properties, datatype
+  definitions, keys and negative property assertions. A class whose instances reach an
+  individual through a context that holds only where the class has an instance is
+  classified again in a world of its own. An ontology where only an individual's own
+  context derives the individual, and that has no keys or universal roles, skips that
+  step, and so does every ontology without individuals. An axiom outside OWL 2 EL is
+  left out and reported with its rule. An axiom with a literal or datatype that the
+  classifier cannot compare, such as an XML literal, an ill-typed literal or a datatype
+  outside the OWL 2 datatype map, or with a property chain through the top object
+  property, is used as far as the calculus goes and reported as partial. Every answer is entailed, and it is complete for named classes
+  when nothing is reported. The classifier keeps its contexts between runs, and a run
+  after added or removed axioms saturates again only the contexts that those axioms can
+  reach. A change to the property hierarchy, chains, reflexivity or ranges, to an axiom
+  with an individual, a data property, a datatype or a key, and any change after a run
+  that took that step, saturates everything again. A run stops at its deadline, its
+  memory budget or a cancellation, which it checks while it indexes, builds the property
+  closure, saturates and builds the taxonomy. On the benchmark
   host GO classifies in 83 ms and ChEBI lite in 0.84 seconds on eight threads, and the
   classifier is 2.5 to 13 times as fast as ELK on GO, ChEBI lite and the largest ORE
   2015 EL ontologies on one and eight threads. The classifier's direct hierarchy equals the hierarchy that GO's release
@@ -332,6 +339,23 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   that types them as object or data properties refuses the provenance. Removals are
   recorded by the activity and the commit, since an annotation cannot describe an axiom
   that is gone.
+* `sparkles_owl::manchester` reads OWL 2 Manchester syntax against an ontology's
+  prefixes, local names and labels. `POST /$/ontology/{ds}/parse` and the bindings'
+  `parse` read a class expression, data range, individual, literal or one-line axiom
+  with the caller's grants, and a name that several entities share is an error that
+  lists them, with the span of the name ([API.md](../API.md#ontology)).
+* A DL query answers a class expression's equivalent classes, direct and inferred
+  superclasses and subclasses, and instances, as Protégé's DL Query tab does.
+  `ds.ontology().dl_query()`, `POST /$/ontology/{ds}/dl-query` and the bindings'
+  `dl_query` or `dlQuery` run it. Inside OWL 2 EL it adds the expression as a fresh
+  class to the dataset's kept classification, saturates only what that class reaches and
+  removes it again, so the answers are complete and the kept taxonomy is unchanged.
+  Outside EL the OWL 2 RL rules answer it by demand reasoning over a copy of the
+  ontology in memory. Their instances are complete for an ontology in OWL 2 RL, and
+  their class answers can miss entailed subsumptions. Every answer names the engine,
+  why it was chosen, whether it is complete and the axioms outside the profile. The
+  instances come from a classification with the assertions, which the dataset does not
+  keep, so an instance query classifies the ontology again.
 * The web UI's **Ontology** page, `/ui/ontology`, edits an ontology graph over these
   routes ([U12](../specs/U12-ontology-workbench/SPEC.md#outcome)). It has trees of
   classes, object, data and annotation properties and individuals, an entity frame with
@@ -343,9 +367,13 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   commit by another writer in between refuses the edit. **Start session** edits on a
   branch of its own, an undo stack for the browser session undoes and redoes commits by
   reverting them, which restores exactly the triples each commit changed, and the change
-  feed reloads the views after another writer's commit.
+  feed reloads the views after another writer's commit. The frame's add fields take
+  Manchester syntax with completion of names and labels, and the **DL Query** tab runs
+  DL queries with the reasoning label beside the answers.
 
   ![The ontology editor with the class tree and the frame of Professor](../images/ontology-editor.png)
+
+  ![The DL Query tab with the answers of a class expression and the frame of a subclass](../images/ontology-dl-query.png)
 
   ![The asserted and inferred class trees side by side](../images/ontology-inferred.png)
 
@@ -499,10 +527,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   report. Roadmap item 578.
 * An ontology read has no size budget of its own beyond the query deadline, and its cost
   on large ontologies is not measured. Roadmap item 539.
-* The EL classifier treats individuals in class expressions, data ranges and data values
-  as atoms, so axioms that use them may lose consequences, and keys, negative property
-  assertions, functional data properties and data property ranges take no part.
-  Roadmap item 587.
+* The EL classifier uses literals and datatypes it cannot compare, which are XML
+  literals, ill-typed literals, datatypes outside the OWL 2 datatype map and numbers
+  past 128 bits, and property chains through the top object property only in part.
+  Roadmap item 663.
+* An EL classification after a change to an axiom with an individual, a data property
+  or a key saturates everything again, and so does any change after a run that merged
+  a context with an individual.
+  Roadmap item 664.
 * No MCP tool classifies, roadmap item 586, and the entity accessors and the
   inferred reads do not answer from a classification, nor does any surface answer the
   subclasses of a class expression, roadmap item 588.

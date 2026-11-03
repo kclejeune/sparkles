@@ -10,6 +10,7 @@
 //! linear in their number, while the interner keeps its ids across runs so that an
 //! incremental run can keep the contexts it does not touch.
 
+use super::data::{DataVal, Ranges};
 use crate::model::*;
 use crate::vocab;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -34,11 +35,13 @@ pub enum Node {
     Class(u32),
     /// `ObjectOneOf(a)`, by the individual's index
     Nominal(u32),
-    /// a data range or a literal, by its index in [`Interner::data`], used as an atom
-    Data(u32),
     Conj(Ex, Ex),
     Exist(Role, Ex),
     SelfLoop(Role),
+    /// `DataSomeValuesFrom(d E)`, by the data role and the index of the data range in
+    /// [`Interner::vals`]. A data value has no successors, so it needs no context: the
+    /// index gives a positive restriction its consequences as told subsumers.
+    DataSome(Role, u32),
 }
 
 /// The name of a role.
@@ -48,13 +51,6 @@ pub enum RoleName {
     Data(DataProperty),
     /// a role the binarization of a property chain introduces
     Fresh(u32),
-}
-
-/// The atom a data range stands for: a range, or one literal of `DataHasValue`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum DataAtom {
-    Range(DataRange),
-    Value(Literal),
 }
 
 /// The interned expressions and the names they use. Ids are never reused, so an
@@ -70,8 +66,11 @@ pub struct Interner {
     pub met: Vec<bool>,
     pub individuals: Vec<NamedIndividual>,
     individual_ids: FxHashMap<NamedIndividual, u32>,
-    pub data: Vec<DataAtom>,
-    data_ids: FxHashMap<DataAtom, u32>,
+    /// the data ranges, as lattice elements
+    pub vals: Vec<DataVal>,
+    val_ids: FxHashMap<DataVal, u32>,
+    /// the opaque data atoms and the datatype definitions of the run
+    pub ranges: Ranges,
     pub roles: Vec<RoleName>,
     role_ids: FxHashMap<RoleName, Role>,
     fresh: u32,
@@ -128,6 +127,26 @@ impl Interner {
         self.node(Node::Class(id))
     }
 
+    /// The expression of a class, if the interner has it.
+    pub fn class_ex(&self, c: &Class) -> Option<Ex> {
+        match c.as_str() {
+            vocab::OWL_THING => Some(TOP),
+            vocab::OWL_NOTHING => Some(BOTTOM),
+            _ => self
+                .class_ids
+                .get(c)
+                .and_then(|&id| self.get(&Node::Class(id))),
+        }
+    }
+
+    /// Whether the run's normalization met the class `id`, which makes it a class of
+    /// the signature.
+    pub fn in_signature(&self, c: &Class) -> bool {
+        self.class_ids
+            .get(c)
+            .is_some_and(|&id| self.met[id as usize])
+    }
+
     /// Forgets which classes the normalization met, before a run normalizes the axioms.
     pub fn clear_met(&mut self) {
         self.met.iter_mut().for_each(|m| *m = false);
@@ -155,23 +174,22 @@ impl Interner {
         self.node(Node::Nominal(id))
     }
 
-    pub fn data(&mut self, d: DataAtom) -> Ex {
-        let id = match self.data_ids.get(&d) {
+    /// The id of a data range.
+    pub fn val(&mut self, v: DataVal) -> u32 {
+        match self.val_ids.get(&v) {
             Some(&id) => id,
             None => {
-                let id = self.data.len() as u32;
-                self.data.push(d.clone());
-                self.data_ids.insert(d, id);
+                let id = self.vals.len() as u32;
+                self.vals.push(v.clone());
+                self.val_ids.insert(v, id);
                 id
             }
-        };
-        self.node(Node::Data(id))
+        }
     }
 
-    pub fn data_ex(&self, d: &DataAtom) -> Option<Ex> {
-        self.data_ids
-            .get(d)
-            .and_then(|&id| self.get(&Node::Data(id)))
+    /// The expressions of the individuals.
+    pub fn nominals(&self) -> impl Iterator<Item = Ex> + '_ {
+        (0..self.individuals.len() as u32).filter_map(|i| self.get(&Node::Nominal(i)))
     }
 
     pub fn role(&mut self, r: RoleName) -> Role {
@@ -215,6 +233,15 @@ pub struct Roles {
     pub reflexive: Vec<Role>,
     /// for each role, the intersection of its ranges and those of its superroles
     pub range: Vec<Option<Ex>>,
+    /// for each data role, the intersection of its data ranges and those of its
+    /// superroles, by index in [`Interner::vals`]
+    pub data_range: Vec<Option<u32>>,
+    /// for each data role, its functional superroles, itself included
+    pub functional: Vec<Vec<Role>>,
+    /// roles under the bottom object or data property, which relate nothing
+    pub empty: Vec<bool>,
+    /// whether any role is empty
+    pub any_empty: bool,
 }
 
 impl Roles {
@@ -233,6 +260,26 @@ impl Roles {
             + self.left.len()
             + self.reflexive.len() * 4
             + self.range.len() * 8
+            + self.data_range.len() * 8
+            + self
+                .functional
+                .iter()
+                .map(|v| 24 + v.capacity() * 4)
+                .sum::<usize>()
+            + self.empty.len()
+    }
+
+    /// The functional superroles of a data role, itself included.
+    #[inline]
+    pub fn functional(&self, r: Role) -> &[Role] {
+        self.functional
+            .get(r as usize)
+            .map_or(&[], |v| v.as_slice())
+    }
+
+    #[inline]
+    pub fn is_empty_role(&self, r: Role) -> bool {
+        self.any_empty && self.empty.get(r as usize).copied().unwrap_or(false)
     }
 
     /// Whether `r` is a subrole of `s`, itself included.
@@ -267,6 +314,16 @@ pub enum Gap {
     Partial(&'static str),
 }
 
+/// A key: the named instances of the class that share a named individual for every
+/// object role and a data value for every data role are one individual (Structural
+/// Specification §9.5, Direct Semantics Table 9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Key {
+    pub class: Ex,
+    pub objects: Vec<Role>,
+    pub data: Vec<Role>,
+}
+
 /// The normalized logical content of the EL axioms.
 #[derive(Default)]
 pub struct Axioms {
@@ -281,6 +338,12 @@ pub struct Axioms {
     pub reflexive: Vec<Role>,
     /// `range(r) = c`
     pub ranges: Vec<(Role, Ex)>,
+    /// `range(d) = v`, for a data role and a data range
+    pub data_ranges: Vec<(Role, u32)>,
+    /// the functional data roles
+    pub functional: Vec<Role>,
+    /// `HasKey(c (p…) (d…))`
+    pub keys: Vec<Key>,
     /// the individuals of assertions, which classification checks for consistency
     pub individuals: Vec<Ex>,
     /// the classes of the signature
@@ -305,6 +368,13 @@ impl Axioms {
                 .sum::<usize>()
             + self.reflexive.capacity() * 4
             + self.ranges.capacity() * 8
+            + self.data_ranges.capacity() * 8
+            + self.functional.capacity() * 4
+            + self
+                .keys
+                .iter()
+                .map(|k| 56 + (k.objects.len() + k.data.len()) * 4)
+                .sum::<usize>()
             + self.individuals.capacity() * 4
             + self.classes.capacity() * 4
     }
@@ -360,7 +430,6 @@ fn normalize_axiom(
         }
         Ok(e)
     }
-    const BUILTIN: &str = "the top and bottom object and data properties";
     match ax {
         K::Declaration(Entity::Class(c)) => {
             let e = it.class(c);
@@ -425,15 +494,22 @@ fn normalize_axiom(
                         };
                         rs.push(r);
                     }
+                    // every chain is a subproperty of the top property
+                    let trivial = sup.named().as_str() == vocab::OWL_TOP_OBJECT_PROPERTY;
+                    if !trivial
+                        && ps
+                            .iter()
+                            .any(|p| p.named().as_str() == vocab::OWL_TOP_OBJECT_PROPERTY)
+                    {
+                        partial = Some(TOP_CHAIN);
+                    }
                     match rs.len() {
                         0 => {}
                         1 => out.role_subs.push((rs[0], s)),
+                        _ if trivial => {}
                         _ => out.chains.push((rs, s)),
                     }
                 }
-            }
-            if is_top_or_bottom_role(sup) || is_top_or_bottom_sub(sub) {
-                partial = Some(BUILTIN);
             }
         }
         K::EquivalentObjectProperties(ps) => {
@@ -444,24 +520,17 @@ fn normalize_axiom(
                     out.role_subs.push((rs[w], next));
                 }
             }
-            if ps.iter().any(is_top_or_bottom_role) {
-                partial = Some(BUILTIN);
-            }
         }
         K::TransitiveObjectProperty(p) => {
-            if let Some(r) = object_role(p, it) {
+            if let Some(r) = object_role(p, it)
+                && p.named().as_str() != vocab::OWL_TOP_OBJECT_PROPERTY
+            {
                 out.chains.push((vec![r, r], r));
-            }
-            if is_top_or_bottom_role(p) {
-                partial = Some(BUILTIN);
             }
         }
         K::ReflexiveObjectProperty(p) => {
             if let Some(r) = object_role(p, it) {
                 out.reflexive.push(r);
-            }
-            if is_top_or_bottom_role(p) {
-                partial = Some(BUILTIN);
             }
         }
         K::ObjectPropertyDomain(p, c) => {
@@ -472,9 +541,6 @@ fn normalize_axiom(
             } else {
                 whole = false;
             }
-            if is_top_or_bottom_role(p) {
-                partial = Some(BUILTIN);
-            }
         }
         K::ObjectPropertyRange(p, c) => {
             if let Some(r) = object_role(p, it) {
@@ -482,9 +548,6 @@ fn normalize_axiom(
                 out.ranges.push((r, c));
             } else {
                 whole = false;
-            }
-            if is_top_or_bottom_role(p) {
-                partial = Some(BUILTIN);
             }
         }
         K::SubDataPropertyOf(a, b) => {
@@ -507,9 +570,48 @@ fn normalize_axiom(
         K::DataPropertyDomain(d, c) => {
             let c = ce(c, it, &mut partial)?;
             let r = it.role(RoleName::Data(d.clone()));
-            let top = it.data(DataAtom::Range(DataRange::Datatype(Datatype::literal())));
-            let e = it.node(Node::Exist(r, top));
+            let top = it.val(DataVal::TOP);
+            let e = it.node(Node::DataSome(r, top));
             out.subs.push((e, c));
+        }
+        K::DataPropertyRange(d, range) => {
+            let r = it.role(RoleName::Data(d.clone()));
+            let (v, opaque) = it.ranges.range(range);
+            if opaque {
+                partial = Some(OPAQUE);
+            }
+            let v = it.val(v);
+            out.data_ranges.push((r, v));
+        }
+        K::FunctionalDataProperty(d) => {
+            let r = it.role(RoleName::Data(d.clone()));
+            out.functional.push(r);
+        }
+        // the definitions are read before the axioms, and the data ranges that name a
+        // defined datatype stand for its definition
+        K::DatatypeDefinition(_, range) => {
+            if it.ranges.range(range).1 {
+                partial = Some(OPAQUE);
+            }
+        }
+        K::HasKey(c, ops, dps) => {
+            let class = ce(c, it, &mut partial)?;
+            let mut objects = Vec::with_capacity(ops.len());
+            for p in ops {
+                let Some(r) = object_role(p, it) else {
+                    return Err("inverse properties");
+                };
+                objects.push(r);
+            }
+            let data = dps
+                .iter()
+                .map(|d| it.role(RoleName::Data(d.clone())))
+                .collect();
+            out.keys.push(Key {
+                class,
+                objects,
+                data,
+            });
         }
         K::ClassAssertion(c, Individual::Named(i)) => {
             let c = ce(c, it, &mut partial)?;
@@ -526,18 +628,44 @@ fn normalize_axiom(
                 out.individuals.push(b);
                 out.subs.push((a, e));
             }
-            if is_top_or_bottom_role(p) {
-                partial = Some(BUILTIN);
-            }
+        }
+        // ¬p(a, b) is {a} ⊓ ∃p.{b} ⊑ ⊥
+        K::NegativeObjectPropertyAssertion(p, Individual::Named(a), Individual::Named(b)) => {
+            let Some(r) = object_role(p, it) else {
+                return Err("inverse properties");
+            };
+            let a = it.nominal(a);
+            let b = it.nominal(b);
+            let e = it.node(Node::Exist(r, b));
+            let both = it.conj(a, e);
+            out.individuals.push(a);
+            out.individuals.push(b);
+            out.subs.push((both, BOTTOM));
         }
         K::DataPropertyAssertion(d, Individual::Named(a), v) => {
             let r = it.role(RoleName::Data(d.clone()));
             let a = it.nominal(a);
-            let v = it.data(DataAtom::Value(v.clone()));
-            let e = it.node(Node::Exist(r, v));
+            let (v, opaque) = it.ranges.literal(v);
+            if opaque {
+                partial = Some(OPAQUE);
+            }
+            let v = it.val(v);
+            let e = it.node(Node::DataSome(r, v));
             out.individuals.push(a);
             out.subs.push((a, e));
-            partial = Some("data values");
+        }
+        K::NegativeDataPropertyAssertion(d, Individual::Named(a), v) => {
+            let r = it.role(RoleName::Data(d.clone()));
+            let a = it.nominal(a);
+            let (v, opaque) = it.ranges.literal(v);
+            if opaque {
+                partial = Some(OPAQUE);
+            }
+            let v = it.val(v);
+            let e = it.node(Node::DataSome(r, v));
+            let both = it.conj(a, e);
+            out.individuals.push(a);
+            out.subs.push((both, BOTTOM));
         }
         K::SameIndividual(is) => {
             let es: Vec<Ex> = is
@@ -554,7 +682,6 @@ fn normalize_axiom(
                     out.subs.push((es[w], next));
                 }
             }
-            partial = Some("individuals");
         }
         K::DifferentIndividuals(is) => {
             let mut es: Vec<Ex> = is
@@ -571,55 +698,24 @@ fn normalize_axiom(
                 out.disjoint.push(es);
             }
         }
-        K::NegativeObjectPropertyAssertion(..) | K::NegativeDataPropertyAssertion(..) => {
-            return Err("negative property assertions");
-        }
-        K::HasKey(..) => return Err("keys"),
-        K::FunctionalDataProperty(_) => return Err("functional data properties"),
-        K::DataPropertyRange(..) => return Err("data property ranges"),
-        K::DatatypeDefinition(..) => return Err("datatype definitions"),
         // annotations carry no logical content
         K::AnnotationAssertion(..)
         | K::SubAnnotationPropertyOf(..)
         | K::AnnotationPropertyDomain(..)
         | K::AnnotationPropertyRange(..) => {}
-        // the profile check leaves the remaining types out of OWL 2 EL
+        // the profile check leaves the remaining types out of OWL 2 EL, anonymous
+        // individuals among them
         _ => whole = false,
-    }
-    let data_builtin = match ax {
-        K::SubDataPropertyOf(a, b) => is_builtin_data(a) || is_builtin_data(b),
-        K::EquivalentDataProperties(ps) => ps.iter().any(is_builtin_data),
-        K::DataPropertyDomain(d, _) | K::DataPropertyAssertion(d, ..) => is_builtin_data(d),
-        _ => false,
-    };
-    if data_builtin {
-        partial = Some(BUILTIN);
     }
     Ok((partial, whole))
 }
 
-/// Whether a data property is the top or bottom one, which the classifier treats as an
-/// ordinary property.
-fn is_builtin_data(p: &DataProperty) -> bool {
-    matches!(
-        p.as_str(),
-        vocab::OWL_TOP_DATA_PROPERTY | vocab::OWL_BOTTOM_DATA_PROPERTY
-    )
-}
-
-fn is_top_or_bottom_role(p: &ObjectPropertyExpression) -> bool {
-    matches!(
-        p.named().as_str(),
-        vocab::OWL_TOP_OBJECT_PROPERTY | vocab::OWL_BOTTOM_OBJECT_PROPERTY
-    )
-}
-
-fn is_top_or_bottom_sub(s: &SubObjectPropertyExpression) -> bool {
-    match s {
-        SubObjectPropertyExpression::Expression(p) => is_top_or_bottom_role(p),
-        SubObjectPropertyExpression::Chain(ps) => ps.iter().any(is_top_or_bottom_role),
-    }
-}
+/// Why an axiom with a chain through the top object property is used in part: the
+/// classifier composes links, and the top property links every pair.
+const TOP_CHAIN: &str = "property chains through the top object property";
+/// Why an axiom with a literal or a datatype that the classifier cannot compare is used
+/// in part: it is an atom that only equals itself.
+pub const OPAQUE: &str = "literals and datatypes without values the classifier compares";
 
 fn object_role(p: &ObjectPropertyExpression, it: &mut Interner) -> Option<Role> {
     match p {
@@ -656,7 +752,7 @@ pub fn class_expression(
                     partial = partial.or(p);
                     Ok(e)
                 })
-                .collect::<Result<_, _>>()?;
+                .collect::<Result<_, &'static str>>()?;
             es.sort_unstable();
             es.dedup();
             es.retain(|&e| e != TOP);
@@ -682,11 +778,6 @@ pub fn class_expression(
                 }
                 ObjectPropertyExpression::Property(p) => {
                     let r = it.role(RoleName::Object(p.clone()));
-                    let partial = if p.as_str() == vocab::OWL_TOP_OBJECT_PROPERTY {
-                        Some("the top and bottom object and data properties")
-                    } else {
-                        partial
-                    };
                     if f == BOTTOM {
                         return Ok((BOTTOM, partial));
                     }
@@ -703,53 +794,34 @@ pub fn class_expression(
             match p {
                 ObjectPropertyExpression::Property(p) => {
                     let r = it.role(RoleName::Object(p.clone()));
-                    (it.node(Node::Exist(r, f)), Some("individuals"))
+                    (it.node(Node::Exist(r, f)), None)
                 }
                 ObjectPropertyExpression::InverseOf(_) => return Err("inverse properties"),
             }
         }
         C::ObjectOneOf(is) if is.len() == 1 => match is.iter().next() {
-            Some(Individual::Named(i)) => (it.nominal(i), Some("individuals")),
+            Some(Individual::Named(i)) => (it.nominal(i), None),
             _ => return Err("anonymous individuals"),
         },
         C::ObjectHasSelf(ObjectPropertyExpression::Property(p)) => {
             let r = it.role(RoleName::Object(p.clone()));
-            (it.node(Node::SelfLoop(r)), Some("ObjectHasSelf"))
+            (it.node(Node::SelfLoop(r)), None)
         }
         C::DataSomeValuesFrom(ps, r) if ps.len() == 1 => {
             let role = it.role(RoleName::Data(ps[0].clone()));
-            let atom = data_range(r, it);
-            let partial = match r {
-                _ if is_builtin_data(&ps[0]) => {
-                    Some("the top and bottom object and data properties")
-                }
-                DataRange::Datatype(d) if d.as_str() == vocab::RDFS_LITERAL => None,
-                _ => Some("data ranges"),
-            };
-            (it.node(Node::Exist(role, atom)), partial)
+            let (v, opaque) = it.ranges.range(r);
+            let v = it.val(v);
+            (it.node(Node::DataSome(role, v)), opaque.then_some(OPAQUE))
         }
-        C::DataHasValue(d, v) => {
+        C::DataHasValue(d, l) => {
             let role = it.role(RoleName::Data(d.clone()));
-            let atom = it.data(DataAtom::Value(v.clone()));
-            (it.node(Node::Exist(role, atom)), Some("data values"))
+            let (v, opaque) = it.ranges.literal(l);
+            let v = it.val(v);
+            (it.node(Node::DataSome(role, v)), opaque.then_some(OPAQUE))
         }
         // outside OWL 2 EL: the profile check has already left the axiom out
         _ => return Err("a class expression outside OWL 2 EL"),
     })
-}
-
-fn data_range(r: &DataRange, it: &mut Interner) -> Ex {
-    match r {
-        DataRange::OneOf(ls) if ls.len() == 1 => {
-            let l = ls
-                .iter()
-                .next()
-                .cloned()
-                .unwrap_or_else(|| Literal::simple(""));
-            it.data(DataAtom::Value(l))
-        }
-        r => it.data(DataAtom::Range(r.clone())),
-    }
 }
 
 /// A slice of one of the index's flat arrays.
@@ -773,7 +845,8 @@ impl Span {
 pub struct Head {
     pub node: Node,
     /// for an existential restriction, the context of its filler, which includes the
-    /// role's range when the restriction occurs positively
+    /// role's range when the restriction occurs positively; for a data restriction, the
+    /// index in [`Index::vals`] of its range met with the role's data range
     pub succ: Ex,
     told: Span,
     conj: Span,
@@ -797,6 +870,28 @@ pub struct Index {
     /// negative `ObjectHasSelf` restrictions: the role and the expression
     pub selfs: Vec<(Role, Ex)>,
     pub roles: Roles,
+    /// the data ranges, by index
+    pub vals: Vec<DataVal>,
+    /// the negative data restrictions by role: the range and the expression
+    pub neg_data: FxHashMap<Role, Vec<(u32, Ex)>>,
+    /// the negative existential restrictions on a universal role, which hold everywhere
+    /// once their filler has an instance: the filler and the expression
+    pub universal: Vec<(Ex, Ex)>,
+    pub keys: Vec<Key>,
+    /// the expressions of the individuals
+    pub nominals: Vec<Ex>,
+    /// whether a link to an individual can close a loop that a negative `ObjectHasSelf`
+    /// reads
+    pub nominal_selfs: bool,
+    /// the top object and data roles, when the axioms use them
+    pub tops: [Option<Role>; 2],
+}
+
+impl Index {
+    /// Whether `r` is above a top role, so that it relates every pair of elements.
+    pub fn is_universal(&self, r: Role) -> bool {
+        self.tops.iter().flatten().any(|&t| self.roles.sub(t, r))
+    }
 }
 
 const NO_HEAD: Head = Head {
@@ -865,6 +960,31 @@ impl Index {
         self.disjoint_of(self.head(e))
     }
 
+    /// Whether the index has individuals or universal roles, which the run's later steps
+    /// look at: the merges of contexts with individuals, the conditional worlds and the
+    /// keys.
+    pub fn has_individuals(&self) -> bool {
+        !self.nominals.is_empty() || !self.universal.is_empty()
+    }
+
+    /// The negative data restrictions that a data value in `v` by a role under `r` meets.
+    pub fn data_matches(&self, r: Role, v: &DataVal, mut f: impl FnMut(Ex)) {
+        for &g in self
+            .roles
+            .sup
+            .get(r as usize)
+            .map_or(&[][..], |v| v.as_slice())
+        {
+            if let Some(ns) = self.neg_data.get(&g) {
+                for &(w, x) in ns {
+                    if v.within(&self.vals[w as usize]) {
+                        f(x);
+                    }
+                }
+            }
+        }
+    }
+
     /// The bytes the index takes, roughly, the role table included.
     pub fn bytes(&self) -> usize {
         self.heads.capacity() * std::mem::size_of::<Head>()
@@ -873,6 +993,14 @@ impl Index {
             + self.exist.capacity() * 8
             + self.disjoint.capacity() * 4
             + self.selfs.capacity() * 8
+            + self.vals.capacity() * std::mem::size_of::<DataVal>()
+            + self
+                .neg_data
+                .values()
+                .map(|v| 48 + v.capacity() * 8)
+                .sum::<usize>()
+            + self.universal.capacity() * 8
+            + self.nominals.capacity() * 4
             + self.roles.bytes()
     }
 
@@ -893,49 +1021,113 @@ impl Index {
         };
         let mut b = Builder::default();
         let mut told: Vec<(Ex, Ex)> = Vec::with_capacity(ax.subs.len());
-        for &(a, c) in &ax.subs {
+        // the negative occurrences first, so that the data restrictions that occur
+        // positively find every negative one they meet
+        for &(a, _) in &ax.subs {
             b.negative(a, it);
-            b.positive(c, it, &ix.roles);
-            if a != c {
-                told.push((a, c));
-            }
-        }
-        // a reflexive role links every individual to itself, so its range holds
-        // everywhere
-        let reflexive_ranges: Vec<Ex> = ix
-            .roles
-            .reflexive
-            .iter()
-            .filter_map(|&r| ix.roles.range[r as usize])
-            .collect();
-        for c in reflexive_ranges {
-            b.positive(c, it, &ix.roles);
-            told.push((TOP, c));
-        }
-        // a literal is in the range of its datatype, and every data range is in
-        // rdfs:Literal
-        let literal = it.data_ex(&DataAtom::Range(DataRange::Datatype(Datatype::literal())));
-        for (e, n) in it.nodes.iter().enumerate() {
-            let Node::Data(id) = *n else { continue };
-            let e = e as Ex;
-            if let Some(l) = literal
-                && l != e
-            {
-                told.push((e, l));
-            }
-            if let DataAtom::Value(v) = &it.data[id as usize]
-                && let Some(d) = it.data_ex(&DataAtom::Range(DataRange::Datatype(Datatype::new(
-                    v.datatype(),
-                ))))
-            {
-                told.push((e, d));
-            }
         }
         let mut disj: Vec<(Ex, u32)> = Vec::new();
         for (s, set) in ax.disjoint.iter().enumerate() {
             for &e in set {
                 b.negative(e, it);
                 disj.push((e, s as u32));
+            }
+        }
+        for k in &ax.keys {
+            b.negative(k.class, it);
+        }
+        for &(r, w, x) in &b.neg_data {
+            ix.neg_data.entry(r).or_default().push((w, x));
+        }
+        ix.vals = it.vals.clone();
+        for &(a, c) in &ax.subs {
+            b.positive(c, it, &mut ix);
+            if a != c {
+                told.push((a, c));
+            }
+        }
+        // a reflexive role links every individual to itself, and a universal role every
+        // individual to every one, so their ranges hold everywhere
+        let mut everywhere: Vec<Ex> = ix
+            .roles
+            .reflexive
+            .iter()
+            .filter_map(|&r| ix.roles.range[r as usize])
+            .collect();
+        let top = it.role_id(&RoleName::Object(ObjectProperty::top()));
+        if let Some(t) = top
+            && let Some(c) = ix.roles.range[t as usize]
+        {
+            everywhere.push(c);
+        }
+        for c in everywhere {
+            b.positive(c, it, &mut ix);
+            told.push((TOP, c));
+        }
+        // the domain is never empty, so a universal role under the bottom role relates
+        // what it cannot
+        let top_data = it.role_id(&RoleName::Data(DataProperty::top()));
+        if top
+            .iter()
+            .chain(&top_data)
+            .any(|&t| ix.roles.is_empty_role(t))
+        {
+            told.push((TOP, BOTTOM));
+        }
+        ix.tops = [top, top_data];
+        // every element is its own successor by a universal role
+        for &(r, x) in &b.selfs {
+            if top.is_some_and(|t| ix.roles.sub(t, r)) {
+                told.push((TOP, x));
+            }
+        }
+        // the negative restrictions on a universal role
+        for &(f, (r, x)) in &b.exist {
+            if top.is_some_and(|t| ix.roles.sub(t, r)) {
+                ix.universal.push((f, x));
+            }
+        }
+        ix.universal.sort_unstable();
+        ix.universal.dedup();
+        // the data value of a data restriction is in its range and the role's
+        let datas: Vec<(Ex, Role, u32)> = it
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(e, n)| match *n {
+                Node::DataSome(r, w) => Some((e as Ex, r, w)),
+                _ => None,
+            })
+            .collect();
+        let mut data_succ = Vec::with_capacity(datas.len());
+        for (e, r, w) in datas {
+            let mut v = it.vals[w as usize].clone();
+            if let Some(d) = ix.roles.data_range.get(r as usize).copied().flatten() {
+                v = v.meet(&it.vals[d as usize]);
+            }
+            data_succ.push((e, it.val(v)));
+        }
+        // every individual is linked to every literal by a universal data role
+        if let Some(td) = top_data {
+            for (&g, ns) in &ix.neg_data {
+                if ix.roles.sub(td, g) {
+                    for &(w, x) in ns {
+                        if !ix.vals[w as usize].is_empty() {
+                            told.push((TOP, x));
+                        }
+                    }
+                }
+            }
+            // every literal is in the data ranges of a universal data role, and none has
+            // one value by it
+            if let Some(w) = ix.roles.data_range[td as usize] {
+                let v = &ix.vals[w as usize];
+                if v.known != super::data::Known::Top {
+                    told.push((TOP, BOTTOM));
+                }
+            }
+            if !ix.roles.functional(td).is_empty() {
+                told.push((TOP, BOTTOM));
             }
         }
         ix.heads = it
@@ -950,9 +1142,10 @@ impl Index {
                 ..NO_HEAD
             })
             .collect();
-        for &(e, succ) in &b.succ {
+        for &(e, succ) in b.succ.iter().chain(&data_succ) {
             ix.heads[e as usize].succ = succ;
         }
+        told.extend(b.told.iter().copied());
         // told superexpressions, sorted and without duplicates
         told.sort_unstable();
         told.dedup();
@@ -960,7 +1153,11 @@ impl Index {
         ix.conj = group(&b.conj, |h| &mut h.conj, &mut ix.heads);
         ix.exist = group(&b.exist, |h| &mut h.exist, &mut ix.heads);
         ix.disjoint = group(&disj, |h| &mut h.disj, &mut ix.heads);
+        ix.nominal_selfs = !b.selfs.is_empty() && !it.individuals.is_empty();
         ix.selfs = b.selfs;
+        ix.keys = ax.keys.clone();
+        ix.nominals = it.nominals().collect();
+        ix.vals = it.vals.clone();
         Ok(ix)
     }
 }
@@ -973,7 +1170,11 @@ struct Builder {
     conj: Vec<(Ex, (Ex, Ex))>,
     exist: Vec<(Ex, (Role, Ex))>,
     selfs: Vec<(Role, Ex)>,
+    /// negative data restrictions: the role, the range and the expression
+    neg_data: Vec<(Role, u32, Ex)>,
     succ: Vec<(Ex, Ex)>,
+    /// the told subsumers of positive data restrictions and empty roles
+    told: Vec<(Ex, Ex)>,
 }
 
 impl Builder {
@@ -997,32 +1198,59 @@ impl Builder {
                     stack.push(f);
                 }
                 Node::SelfLoop(r) => self.selfs.push((r, e)),
+                Node::DataSome(r, v) => self.neg_data.push((r, v, e)),
                 _ => {}
             }
         }
     }
 
     /// Registers a positive occurrence: the successor context of each existential
-    /// restriction in it.
-    fn positive(&mut self, e: Ex, it: &mut Interner, roles: &Roles) {
+    /// restriction in it, and the consequences of each data restriction.
+    fn positive(&mut self, e: Ex, it: &mut Interner, ix: &mut Index) {
         if !self.pos_seen.insert(e) {
             return;
         }
         match it.nodes[e as usize] {
             Node::Conj(a, b) => {
-                self.positive(a, it, roles);
-                self.positive(b, it, roles);
+                self.positive(a, it, ix);
+                self.positive(b, it, ix);
             }
             Node::Exist(r, f) => {
-                self.positive(f, it, roles);
-                let succ = match roles.range.get(r as usize).copied().flatten() {
+                self.positive(f, it, ix);
+                if ix.roles.is_empty_role(r) {
+                    self.told.push((e, BOTTOM));
+                }
+                let succ = match ix.roles.range.get(r as usize).copied().flatten() {
                     Some(range) => {
-                        self.positive(range, it, roles);
+                        self.positive(range, it, ix);
                         it.conj(f, range)
                     }
                     None => f,
                 };
                 self.succ.push((e, succ));
+            }
+            Node::SelfLoop(r) => {
+                if ix.roles.is_empty_role(r) {
+                    self.told.push((e, BOTTOM));
+                }
+            }
+            Node::DataSome(r, w) => {
+                // the one data value of the restriction is in its range and the role's
+                let mut v = it.vals[w as usize].clone();
+                if let Some(d) = ix.roles.data_range.get(r as usize).copied().flatten() {
+                    v = v.meet(&it.vals[d as usize]);
+                }
+                if v.is_empty() || ix.roles.is_empty_role(r) {
+                    self.told.push((e, BOTTOM));
+                } else {
+                    let mut found = Vec::new();
+                    ix.data_matches(r, &v, |x| found.push(x));
+                    for x in found {
+                        if x != e {
+                            self.told.push((e, x));
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -1093,10 +1321,18 @@ fn roles(
     for &(r, s) in &ax.role_subs {
         direct[r as usize].push(s);
     }
-    // every object property is a subproperty of the top object property
+    // every object property is a subproperty of the top object property, and every
+    // data property of the top data property
     if let Some(&top) = it.role_ids.get(&RoleName::Object(ObjectProperty::top())) {
         for (r, name) in it.roles.iter().enumerate() {
             if matches!(name, RoleName::Object(_)) && r as Role != top {
+                direct[r].push(top);
+            }
+        }
+    }
+    if let Some(&top) = it.role_ids.get(&RoleName::Data(DataProperty::top())) {
+        for (r, name) in it.roles.iter().enumerate() {
+            if matches!(name, RoleName::Data(_)) && r as Role != top {
                 direct[r].push(top);
             }
         }
@@ -1173,6 +1409,52 @@ fn roles(
             range[r] = Some(acc);
         }
     }
+    let mut direct_data: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for &(r, v) in &ax.data_ranges {
+        direct_data[r as usize].push(v);
+    }
+    let mut data_range = vec![None; n];
+    let mut is_functional = vec![false; n];
+    for &r in &ax.functional {
+        is_functional[r as usize] = true;
+    }
+    let mut functional: Vec<Vec<Role>> = vec![Vec::new(); n];
+    for r in 0..n {
+        if !matches!(it.roles[r], RoleName::Data(_)) {
+            continue;
+        }
+        tick(1 + sup[r].len())?;
+        let mut acc: Option<DataVal> = None;
+        for &s in &sup[r] {
+            for &w in &direct_data[s as usize] {
+                let v = &it.vals[w as usize];
+                acc = Some(match acc {
+                    None => v.clone(),
+                    Some(a) => a.meet(v),
+                });
+            }
+            if is_functional[s as usize] {
+                functional[r].push(s);
+            }
+        }
+        if let Some(v) = acc {
+            data_range[r] = Some(it.val(v));
+        }
+    }
+    // a role under the bottom property relates nothing
+    let mut empty = vec![false; n];
+    for bottom in [
+        RoleName::Object(ObjectProperty::bottom()),
+        RoleName::Data(DataProperty::bottom()),
+    ] {
+        if let Some(&b) = it.role_ids.get(&bottom) {
+            for (r, ss) in sup.iter().enumerate() {
+                if ss.binary_search(&b).is_ok() {
+                    empty[r] = true;
+                }
+            }
+        }
+    }
     Ok(Roles {
         sup,
         comp,
@@ -1180,5 +1462,9 @@ fn roles(
         left,
         reflexive: reflexive.into_iter().collect(),
         range,
+        data_range,
+        functional,
+        any_empty: empty.contains(&true),
+        empty,
     })
 }

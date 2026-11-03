@@ -348,6 +348,8 @@ fn writes(op: &str) -> bool {
             | "ontology.check"
             | "ontology.diff"
             | "ontology.classify"
+            | "ontology.parse"
+            | "ontology.dlQuery"
     )
 }
 #[napi]

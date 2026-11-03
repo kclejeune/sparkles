@@ -159,28 +159,53 @@ fn line_start(text: &str, at: usize) -> Option<usize> {
 /// Read one axiom, such as `SubClassOf(ex:A ex:B)`, with `prefixes` and the predefined
 /// ones (a prefix of `prefixes` wins over a predefined one of the same name).
 pub fn parse_axiom(text: &str, prefixes: &[(String, String)]) -> Result<Axiom, ParseError> {
-    let mut r = Reader {
-        text,
-        pos: 0,
-        peeked: None,
-        last: 0,
-        names: crate::ofn::STANDARD_PREFIXES
-            .iter()
-            .map(|(p, n)| (p.to_string(), n.to_string()))
-            .chain(prefixes.iter().cloned())
-            .collect(),
-        prefixes: Vec::new(),
-        header: Header::default(),
-        depth: 0,
-        done: false,
-    };
+    let mut r = Reader::one(text, prefixes);
     let ax = r.axiom()?;
-    match Reader::take(&mut r)? {
-        Tok::End => Ok(ax),
-        t => Err(r.error(format!(
-            "expected the end of the axiom, found {}",
-            t.describe()
-        ))),
+    r.end("axiom")?;
+    Ok(ax)
+}
+
+/// Read one class expression, such as `ObjectSomeValuesFrom(ex:p ex:A)`, with
+/// `prefixes` as [`parse_axiom`] reads them.
+pub fn parse_class_expression(
+    text: &str,
+    prefixes: &[(String, String)],
+) -> Result<ClassExpression, ParseError> {
+    let mut r = Reader::one(text, prefixes);
+    let c = r.class_expression()?;
+    r.end("class expression")?;
+    Ok(c)
+}
+
+impl<'a> Reader<'a> {
+    /// A reader of one value of `text` with `prefixes` and the predefined ones.
+    fn one(text: &'a str, prefixes: &[(String, String)]) -> Reader<'a> {
+        Reader {
+            text,
+            pos: 0,
+            peeked: None,
+            last: 0,
+            names: crate::ofn::STANDARD_PREFIXES
+                .iter()
+                .map(|(p, n)| (p.to_string(), n.to_string()))
+                .chain(prefixes.iter().cloned())
+                .collect(),
+            prefixes: Vec::new(),
+            header: Header::default(),
+            depth: 0,
+            done: false,
+        }
+    }
+
+    /// The end of the text, after one value.
+    fn end(&mut self, what: &str) -> Result<(), ParseError> {
+        match Reader::take(self)? {
+            Tok::End => Ok(()),
+            t => Err(self.error(format!(
+                "expected the end of the {what}, found {}",
+                t.describe()
+            ))),
+        }
     }
 }
 

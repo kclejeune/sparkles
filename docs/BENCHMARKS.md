@@ -41,7 +41,6 @@ where the two engines' means differed by less than an instance's variation betwe
 | Server RSS after the run, 1.05M | QLever 1.32× | Without its block cache, Sparkles holds 345 MiB. Sparkles has the lowest RSS after the run at 10.5M. |
 | Peak RSS under 16 readers | QLever 1.67× at 1.05M and 1.43× at 10.5M | Sparkles peaks at 567 and 1,339 MiB, against 339 and 939 MiB. |
 | EL classification of ChEBI lite on eight threads | ELK 0.6.0 1.16× | The classifier's normalization and indexing run on one thread. It is ahead on one thread and on GO, and ahead of ELK with the OWL API's load counted. |
-| EL classification of the largest ORE 2015 ontologies on eight threads | ELK 0.6.0 1.25–1.44× | The classifier is ahead of ELK on one thread and of Konclude, Whelk and HermiT everywhere. Roadmap item 602 follows. |
 | Bulk load peak RSS | QLever 2.90× on the LUBM(100) closure and 1.23× on SP²Bench, Fluree 1.26× on SP²Bench | Sparkles has the lowest peak at 1.05M and on DBpedia, and is within 10% of QLever at 10.5M. |
 | DBpedia server RSS | QLever 3.14× | Sparkles maps its index, so touched file pages count toward its RSS. |
 | Text index size | QLever about 1.18× at 1.05M and 1.23× at 10.5M | The indexed predicates and features differ. |
@@ -66,7 +65,7 @@ partially complete and planned implementation scope.
 | Query, load and write comparisons | Measured with partial coverage | Published tables cover their named data, engines and timing contracts. Larger suites, sustained workloads and broader hardware remain open. |
 | Bindings and model-assisted workflows | Partial coverage | The listed APIs, models and question sets have measurements. Selected API controls and internal A/B runs do not replace a complete peer-suite refresh. |
 | Spatial and query-time reasoning comparisons | Unmeasured against peers | Conformance and internal measurements do not establish comparative performance. |
-| OWL 2 EL classification | Measured against ELK, Konclude, Whelk, HermiT and ROBOT | [Times and memory beside ELK 0.6.0](benchmarks/el-classification/RESULTS.md#against-elk) and [beside the other reference reasoners](benchmarks/el-classification/RESULTS.md#reference-reasoners) on GO, ChEBI lite and the largest ORE 2015 EL ontologies are published. ELK is faster on eight threads on ChEBI lite and the largest ORE ontologies, which roadmap items 592 and 602 follow. |
+| OWL 2 EL classification | Measured against ELK, Konclude, Whelk, HermiT and ROBOT | [Times and memory beside ELK 0.6.0](benchmarks/el-classification/RESULTS.md#against-elk) and [beside the other reference reasoners](benchmarks/el-classification/RESULTS.md#reference-reasoners) on GO, ChEBI lite and the largest ORE 2015 EL ontologies are published. The reference reasoners ran against a classifier built before item 602, and the current classifier is ahead of ELK on one and eight threads. |
 | Evidence and maintained analysis | Unmeasured | C25 provides authenticated evidence proposals and resolution, and C27 supplies temporal profile resources and queries. Review-controlled projections and the managed analysis work in C26, F22 and C22b remain planned. |
 
 ## Reading the comparisons

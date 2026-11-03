@@ -316,6 +316,31 @@ pub fn partition(ontology: &Ontology, profile: Profile) -> Partition {
     out
 }
 
+/// The rules of the EL, QL or RL grammar that one axiom breaks, each as its rule and
+/// message, as [`partition`] finds them. The global restrictions, such as the range
+/// restriction on property chains in OWL 2 EL, are left out, and OWL 2 DL, whose
+/// restrictions need the whole ontology, answers nothing.
+pub fn axiom_violations(ax: &Axiom, profile: Profile) -> Vec<(String, String)> {
+    let broken = match profile {
+        Profile::El => el::axiom(ax),
+        Profile::Ql => ql::axiom(ax),
+        Profile::Rl => rl::axiom(ax),
+        Profile::Dl => Vec::new(),
+    };
+    let title = profile.title();
+    broken
+        .into_iter()
+        .map(|b| {
+            let message = if b.rule.starts_with("OWL 2 Profiles") {
+                format!("{} in {title}", b.message)
+            } else {
+                b.message
+            };
+            (b.rule.to_string(), message)
+        })
+        .collect()
+}
+
 /// Check every axiom of an ontology against `profiles`.
 pub fn check(ontology: &Ontology, profiles: &[Profile], opts: CheckOptions) -> Vec<Report> {
     let mut c = Checker::new(ontology, profiles, opts);

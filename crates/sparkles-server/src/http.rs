@@ -187,6 +187,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/$/ontology/{ds}/check", post(ontology::check))
         .route("/$/ontology/{ds}/classify", post(ontology::classify))
+        .route("/$/ontology/{ds}/parse", post(ontology::parse))
+        .route("/$/ontology/{ds}/dl-query", post(ontology::dl_query))
         .route("/$/ontology/{ds}/diff", get(ontology::diff))
         .route("/$/ontology/{ds}/search", get(ontology::search))
         .route("/$/graph/{ds}/groups", post(graph::groups))
@@ -891,6 +893,8 @@ impl From<Error> for ApiError {
                 StatusCode::from_u16(m.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
             }
             Error::Component(c) if c.component == "views" => views::status(&c.code),
+            // Manchester text that does not parse
+            Error::Component(c) if c.component == "owl" => StatusCode::BAD_REQUEST,
             // query-time reasoning past a limit, or with rules it cannot evaluate
             Error::Component(c)
                 if c.component == "reasoner"
@@ -926,6 +930,14 @@ impl From<Error> for ApiError {
             Error::Component(c) if c.component == "reasoner" => {
                 json!({ "error": msg, "code": c.code })
             }
+            Error::Component(c) if c.component == "owl" => c
+                .source
+                .as_ref()
+                .and_then(|s| {
+                    s.downcast_ref::<sparkles::handles::ontology::dl_query::ManchesterFailure>()
+                })
+                .map(|f| f.json())
+                .unwrap_or_else(|| json!({ "error": msg, "code": c.code })),
             _ => json!({ "error": msg }),
         };
         ApiError(status, body)

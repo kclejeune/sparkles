@@ -29,6 +29,28 @@ pub fn engine(py: Python<'_>, e: sparkles::Error) -> PyErr {
     use sparkles::Error as E;
     let msg = e.to_string();
     let code = e.code().to_owned();
+    // Manchester text that does not read is invalid input, with the reason, the span in
+    // UTF-16 code units and the candidates of an ambiguous name as attributes
+    #[cfg(feature = "ontology")]
+    if let E::Component(c) = &e
+        && c.code == "invalid-manchester"
+    {
+        let err = new_err(py, "InvalidInputError", msg);
+        let _ = err.value(py).setattr("code", code);
+        if let Some(f) = c.source.as_ref().and_then(|s| {
+            s.downcast_ref::<sparkles::handles::ontology::dl_query::ManchesterFailure>()
+        }) {
+            let j = f.json();
+            let v = err.value(py);
+            let _ = v.setattr("reason", j["reason"].as_str().unwrap_or(""));
+            let _ = v.setattr("start", j["start"].as_u64().unwrap_or(0));
+            let _ = v.setattr("end", j["end"].as_u64().unwrap_or(0));
+            if let Ok(cands) = crate::admin::to_py(py, &j["candidates"]) {
+                let _ = v.setattr("candidates", cands);
+            }
+        }
+        return err;
+    }
     if matches!(&e, E::Component(c) if c.component == "backup") {
         let err = new_err(py, "BackupError", msg);
         let _ = err.value(py).setattr("code", code);
