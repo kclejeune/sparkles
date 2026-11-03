@@ -469,6 +469,79 @@ for Konclude 0.7.0. Item 693 follows this cost with GO's. The largest Horn run o
 the development set below, ore_ont_9855, peaks at 666 MB, and GO at 74 MB, so neither
 reaches the budget.
 
+A run with the Horn rules composes only the property chains that some negative existential
+restriction needs, and carries every other property inclusion by the automata (item 693).
+Two definitions are used here, both over the role hierarchy closed under inverses and the
+told chains together with their mirror images, `r_n⁻ ∘ … ∘ r_1⁻ ⊑ s⁻` for
+`r_1 ∘ … ∘ r_n ⊑ s`. A chain `s_1 ∘ s_2 ⊑ v` is left-linear when `v` is under `s_1`. A
+property `s` is letter-closed when every chain whose result is under `s` has all its
+operands under `s`, so that every path that implies `s` is a path of links by properties
+under `s`.
+
+A negative existential restriction `∃t.F ⊑ G` stays on composed links when the automaton
+of `t⁻` has no transition by a property that a link runs under, which phase 3 calls not
+linked. Its closure starts with `t`, and each chain whose result is under a property of
+the closure adds the chain's left operand. It adds the right operand too, unless the chain
+is left-linear and the right operand is letter-closed. The restriction is kept when every
+chain of its closure has two operands. Every other negative existential restriction over a
+property that chains reach becomes `F ⊑ ∀t⁻.G` and is unfolded by the automaton, as the
+universal restrictions are. The run composes the chains of the kept closures and no
+others.
+
+- **Uberon.** The composition of the parthood chains, which the conjunction contexts
+  repeated, is gone.
+- **GO.** The regulation properties stay composed. Their automata would spread a state down
+  every descendant of each regulated process.
+
+The argument for completeness has three steps.
+
+1. **The translation.** Replace every universal restriction and every negative existential
+   restriction over a property that chains reach by the residual states of its automaton,
+   and drop the chains. This preserves named subsumption.
+   - A model of the ontology gives each state the elements whose accepted paths end in the
+     filler.
+   - A model of the translation, with its properties closed under the chains, satisfies
+     each restriction by induction along the path that gave an added edge.
+   - Simple properties gain no edge, so the at-most, self, disjointness, asymmetry and
+     irreflexivity axioms, which take simple properties only, still hold.
+2. **The calculus without composition is complete for the translation,** which has no
+   chains left.
+3. **Every conclusion of the run without composition is also derived with chain
+   selection.**
+   - A kept restriction's residual states move only backwards along links, by the rule for
+     a universal restriction on an inverse. No link runs under their transitions, so the
+     rule for a successor never applies to them.
+   - Those states reach a context `P` only along a path of links from `P` to a context that
+     holds `F`, whose properties spell a word that implies `t`.
+   - By induction on how the word implies `t`, the kept chains compose a link from `P` to
+     that context by a property under `t`. A left operand's links are complete, which the
+     closure ensures. A letter-closed right operand contributes its links one at a time,
+     each joined to the link built so far, which the chain being left-linear keeps under
+     `s_1`.
+   - The restriction's own EL rule then gives `G` at `P`.
+
+Composed links are entailed and are never successors of the Horn rules. A restriction kept
+on composed links and one unfolded by its automaton can share properties, and neither
+takes a premise from the other. Two kinds of run compose every told chain and its mirror
+image, and unfold only the linked restrictions, as phase 3 did:
+
+- a run with a property under the bottom property, since closing the properties of a
+  model could give that property an edge;
+- a run with a negative existential restriction over a property that chains reach and
+  whose inverse the run lacks, since that restriction cannot be unfolded.
+
+Three further changes cut the cost of the Horn rules.
+
+- **Merging by at-most restrictions.** At the end of its activation, a context merges
+  every successor that an at-most restriction counts into one conjunction of their
+  classes. Merging pairs created a context for each subset on the way.
+- **Fillers no rule reads.** The rule for a successor passes over a filler that no rule
+  takes as a premise and whose told subsumers every context holds. The rule for a
+  universal restriction on an inverse still takes such a filler to the predecessors.
+- **Mirror images of chains.** A run with the Horn rules composes the mirror image of
+  every chain. A told chain written over an inverse otherwise left its mirror image's
+  links out.
+
 The development set of the ORE 2015 DL sample was compared on the laptop with four
 threads and a 10 GiB cap, as an unpublished measurement. The classifier's taxonomy
 equals the reference on 62 of the 206 files, 37 by the EL rules and 25 by the Horn rules.

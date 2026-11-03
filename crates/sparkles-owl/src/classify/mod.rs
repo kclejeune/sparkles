@@ -1745,6 +1745,74 @@ mod tests {
         }
     }
 
+    /// The run's index after classifying a functional-syntax body with the prefix `:`
+    /// for `http://ex.org/`, and the entailment of `A ⊑ C`.
+    fn horn_run(body: &str) -> (Index, bool) {
+        let doc = crate::ofn_read::parse(&format!(
+            "Prefix(:=<http://ex.org/>)\nOntology(\nSubClassOf(:X ObjectAllValuesFrom(:u :Y))\n{body}\n)"
+        ))
+        .unwrap();
+        let axioms: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let mut s = Saturation::default();
+        let out = s.classify(&axioms, None, &Limits::default()).unwrap();
+        assert_eq!(out.stats.tier, Tier::Horn);
+        let c = |n: &str| Class::new(format!("http://ex.org/{n}"));
+        let yes = out.taxonomy.is_subclass(&c("A"), &c("C"));
+        (s.index.take().unwrap(), yes)
+    }
+
+    #[test]
+    fn a_left_linear_chain_stays_composed_with_direct_right_operands() {
+        // regulates ∘ part of ⊑ regulates, with part of transitive: the negative
+        // existential over regulates stays on composed links, and part of's own chain
+        // is not composed, since the links of regulates take part of one link at a time
+        let (ix, yes) = horn_run(
+            "TransitiveObjectProperty(:part_of)
+             SubObjectPropertyOf(ObjectPropertyChain(:regulates :part_of) :regulates)
+             SubClassOf(:A ObjectSomeValuesFrom(:regulates ObjectSomeValuesFrom(:part_of ObjectSomeValuesFrom(:part_of :B))))
+             EquivalentClasses(:C ObjectSomeValuesFrom(:regulates :B))",
+        );
+        assert!(yes);
+        // one chain is composed, over the subroles of its operands
+        let results: std::collections::BTreeSet<index::Role> =
+            ix.roles.comp.values().flatten().copied().collect();
+        assert_eq!(results.len(), 1, "{:?}", ix.roles.comp);
+        let &(left, right) = ix.roles.comp.keys().next().unwrap();
+        // part of is a right operand, but no chain composes part of links
+        assert!(ix.roles.keeps_forward(right));
+        assert!(!results.contains(&right));
+        assert!(results.contains(&left));
+    }
+
+    #[test]
+    fn a_chain_of_three_falls_back_to_unfolding() {
+        let (ix, yes) = horn_run(
+            "SubObjectPropertyOf(ObjectPropertyChain(:p :q :s) :t)
+             SubClassOf(:A ObjectSomeValuesFrom(:p ObjectSomeValuesFrom(:q ObjectSomeValuesFrom(:s :B))))
+             EquivalentClasses(:C ObjectSomeValuesFrom(:t :B))",
+        );
+        assert!(yes);
+        assert!(ix.roles.comp.is_empty(), "{:?}", ix.roles.comp);
+        assert!(ix.roles.right.iter().all(|&r| !r));
+    }
+
+    #[test]
+    fn a_chain_that_is_not_left_linear_composes_its_right_operand_too() {
+        // negatively regulates ∘ negatively regulates ⊑ positively regulates: the right
+        // operand's links must be complete, so its own chain is composed as well
+        let (ix, yes) = horn_run(
+            "SubObjectPropertyOf(ObjectPropertyChain(:neg :neg) :C_pos)
+             SubObjectPropertyOf(ObjectPropertyChain(:neg :part_of) :neg)
+             TransitiveObjectProperty(:part_of)
+             SubClassOf(:A ObjectSomeValuesFrom(:neg ObjectSomeValuesFrom(:part_of ObjectSomeValuesFrom(:neg :B))))
+             EquivalentClasses(:C ObjectSomeValuesFrom(:C_pos :B))",
+        );
+        assert!(yes);
+        let results: std::collections::BTreeSet<index::Role> =
+            ix.roles.comp.values().flatten().copied().collect();
+        assert_eq!(results.len(), 2, "{:?}", ix.roles.comp);
+    }
+
     /// Random axioms over a few hundred classes, with intersections whose operands come
     /// in every order, so that chunks meet expressions in orders other than the run's.
     fn mixed_axioms(n: usize, seed: u64) -> Vec<AxiomKind> {
