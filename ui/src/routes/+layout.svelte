@@ -11,6 +11,7 @@
   import NavLinks from '$components/NavLinks.svelte';
   import Toasts from '$components/Toasts.svelte';
   import TopBar from '$components/TopBar.svelte';
+  import AskDrawer from '$components/ask/AskDrawer.svelte';
 
   let { children } = $props();
 
@@ -56,6 +57,7 @@
     <main id="main" tabindex="-1">
       {@render children()}
     </main>
+    <AskDrawer />
   </div>
 {/if}
 
@@ -67,10 +69,11 @@
      bar's menu opens the pages in a drawer. */
   .shell {
     display: grid;
+    /* the Ask drawer docks in the last column, which is empty while it is closed */
     grid-template-areas:
-      'top top'
-      'rail main';
-    grid-template-columns: var(--rail-w) minmax(0, 1fr);
+      'top top top'
+      'rail main ask';
+    grid-template-columns: var(--rail-w) minmax(0, 1fr) auto;
     grid-template-rows: var(--topbar-h) minmax(0, 1fr);
     height: 100vh;
     height: 100dvh;

@@ -11,6 +11,7 @@ export interface NavItem {
 
 /** The pages whose link carries the open dataset as `?ds=`. */
 const CARRIES_DATASET = new Set([
+  '/ask',
   '/explore',
   '/browse',
   '/ontology',
@@ -22,6 +23,7 @@ const CARRIES_DATASET = new Set([
 export function navItems(backupsVisible: boolean): NavItem[] {
   return [
     { href: '/query', label: 'Query', icon: 'query', group: 'work' },
+    { href: '/ask', label: 'Ask', icon: 'sparkle', group: 'work' },
     { href: '/explore', label: 'Explore', icon: 'explore', group: 'work' },
     { href: '/browse', label: 'Browse', icon: 'book', group: 'work' },
     { href: '/ontology', label: 'Ontology', icon: 'tree', group: 'work' },
