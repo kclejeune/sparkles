@@ -124,6 +124,16 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+The OWL 2 EL classifier classifies GO, ChEBI lite and the largest ORE 2015 EL ontologies 2.5 to 13.3 times as fast as ELK 0.6.0 on forge on one and eight threads, where ELK had been faster on ChEBI lite on eight threads and on the ORE ontologies of a million classes (roadmap items 602 and 592). A
+`Saturation` reads the caller's axioms in place, so the dataset's kept classification
+shares the open ontology's axioms instead of copying them. The profile check and the
+taxonomy run on several threads and give the same taxonomy for every thread count, the
+index keeps one record per expression in flat arrays, and saturation workers take roots
+in rounds from a shared cursor and batch their shared counters. The memory estimate now
+counts the taxonomy and its links and comes within 14% of a counted peak heap, and
+`Stats::peak_memory` gives the peak. `el_classify` uses the server's mimalloc allocator,
+reads the axioms in place unless `--owned` is given and counts the heap with `--heap`.
+
 `sparkles ask` takes its question argument as optional, since `--questions FILE` reads
 questions from a batch file instead. A command line that passes a question parses and
 behaves as before, and one that gives neither a question nor `--questions` is refused.

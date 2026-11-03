@@ -23,7 +23,9 @@ and ELK reported possible incompleteness in 31, from object property ranges, nom
 in both groups. The taxonomies agree on these ontologies too, so the axioms that each
 reasoner leaves out or uses in part do not separate the two on this sample. GO and ChEBI
 lite each have one `InverseObjectProperties` axiom, which both reasoners leave out and
-report. The classifier's taxonomy is the same on one and eight threads.
+report. The classifier's taxonomy is the same on one and eight threads. The build of commit
+80644aec gives taxonomies byte for byte equal to those of commit aa0a41a6 on GO, ChEBI
+lite and the 298 ORE ontologies on four threads, and the same ones on one thread.
 
 <a id="complete-reasoner"></a>
 
@@ -55,98 +57,96 @@ SNOMED CT is not available to the project and was not used.
 
 <a id="against-elk"></a>
 
-ELK 0.6.0 and the classifier of commit aa0a41a6 ran on forge, the benchmark host, one
-process at a time under the bench lock. Each process ran five classifications. Times are
-the median of the five in ms. ELK's classification excludes the OWL API's load of the
-file, which the load column gives, and its first run, which includes the compilation of
-the JVM's hot code, is listed apart. The classifier's read is its single parse of the same
-file in each process, so it is one measurement and not a median.
-Peak memory is each process's peak resident set in MiB, which for the classifier
-includes the axioms read and for ELK the OWL API ontology. ELK ran with a 4 GiB heap,
-and its live heap is the heap in use after a full collection with the reasoner open.
+ELK 0.6.0 and the classifier of commit 80644aec ran on forge, the benchmark host, which
+the script held under the bench lock for the whole run, so nothing else ran beside it.
+Each process classified GO and ChEBI lite five times and each ORE ontology three times.
+Times are the median classification time in ms. The classifier's time starts with the
+axioms read and ends with the taxonomy built. ELK's starts at the creation of the
+reasoner over the OWL API ontology and ends with its class hierarchy, so it leaves out
+the OWL API's load of the file, as the classifier's leaves out its parse. Peak memory is
+each process's peak resident set in MiB, which for the classifier includes the axioms
+read and for ELK the OWL API ontology. ELK ran with a fixed heap of 4 GiB, or of 6 to
+10 GiB for the ORE ontologies that need more. The ORE ontologies are the largest of the
+ORE 2015 EL sample by classification time, and `ore_ont_868`, `ore_ont_9674` and
+`ore_ont_10689` are versions of one ontology.
 
-| Ontology | Threads | Classifier | Read | Peak RSS | ELK | ELK first run | OWL API load | ELK with load | ELK peak RSS | ELK live heap |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| GO 2026-07-26 | 1 | 577 | 103 | 350 | 1,210 | 1,674 | 758 | 2,054 | 2,449 | 150 |
-| | 8 | 354 | 105 | 363 | 553 | 1,061 | 741 | 1,281 | 2,429 | 150 |
-| ChEBI lite 256 | 1 | 4,023 | 453 | 1,403 | 6,694 | 7,202 | 3,551 | 10,245 | 4,414 | 688 |
-| | 8 | 2,967 | 445 | 1,643 | 2,548 | 2,969 | 3,549 | 6,138 | 4,369 | 688 |
+| Ontology | Classes | Threads | Classifier | Peak RSS | ELK | ELK peak RSS | ELK time over the classifier's |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GO 2026-07-26 | 51,986 | 1 | 280 | 211 | 1,216 | 2,393 | 4.3 |
+| | | 8 | 83 | 252 | 608 | 2,444 | 7.3 |
+| ChEBI lite 256 | 238,150 | 1 | 2,112 | 670 | 6,694 | 4,406 | 3.2 |
+| | | 8 | 843 | 930 | 2,540 | 4,517 | 3.0 |
+| `ore_ont_13482` | 58,376 | 1 | 1,100 | 1,346 | 2,746 | 4,294 | 2.5 |
+| | | 8 | 516 | 1,538 | 2,616 | 4,265 | 5.1 |
+| `ore_ont_868` | 981,151 | 1 | 1,866 | 1,735 | 11,743 | 4,552 | 6.3 |
+| | | 8 | 1,004 | 1,729 | 5,505 | 4,551 | 5.5 |
+| `ore_ont_9674` | 981,148 | 1 | 1,867 | 1,735 | 11,782 | 4,562 | 6.3 |
+| | | 8 | 987 | 1,728 | 5,404 | 4,584 | 5.5 |
+| `ore_ont_10689` | 981,148 | 1 | 1,858 | 1,735 | 11,798 | 4,596 | 6.4 |
+| | | 8 | 999 | 1,750 | 5,449 | 4,542 | 5.5 |
+| `ore_ont_1559` | 264,022 | 1 | 1,214 | 1,775 | 8,870 | 7,694 | 7.3 |
+| | | 8 | 764 | 1,803 | 7,317 | 7,729 | 9.6 |
+| `ore_ont_15059` | 142,884 | 1 | 1,299 | 2,176 | 8,982 | 7,574 | 6.9 |
+| | | 8 | 873 | 2,207 | 8,811 | 9,017 | 10.1 |
+| `ore_ont_3524` | 123,311 | 1 | 634 | 1,419 | 7,258 | 5,689 | 11.5 |
+| | | 8 | 375 | 1,492 | 4,975 | 5,925 | 13.3 |
+| `ore_ont_3836` | 58,887 | 1 | 596 | 1,187 | 4,744 | 4,154 | 8.0 |
+| | | 8 | 362 | 1,193 | 4,339 | 4,822 | 12.0 |
 
-The classifier classifies GO 2.1 times as fast as ELK on one thread and 1.6 times as fast
-on eight, and ChEBI lite 1.7 times as fast on one thread. On eight threads ELK classifies
-ChEBI lite in 2,548 ms against the classifier's 2,967, so ELK is 1.16 times as fast. The
-classifier's saturation scales as ELK's does, but its indexing and its taxonomy, about
-1.8 s of the 3 s, run on one thread, which roadmap item 592 follows. With the reading of
-the file counted on both sides, the classifier takes 459 ms on GO and 3.4 s on ChEBI
-lite on eight threads, against ELK's 1.3 s and 6.1 s.
+The classifier is at least 2.5 times as fast as ELK on every ontology and thread count,
+and the closest case is `ore_ont_13482` on one thread, an ontology of 58,376 classes
+whose 689,540 axioms give 659,619 small contexts. On eight threads it is 3.0 times
+as fast on ChEBI lite and 5.1 to 13.3 times as fast on the ORE ontologies. Its peak
+resident set is below ELK's on every run. ChEBI lite on one thread took 2.1 s on forge
+against 1.1 s on `atlas`, a host of the same model, in five runs in one process each,
+while the other ontologies took the same time on both hosts. The cause is not known,
+and the table gives the forge figure. The taxonomies of both reasoners agree on every ontology and thread count, and
+each reasoner gives the same taxonomy on one and eight threads.
 
-ELK's resident memory follows its heap setting. With a 1 GiB heap for GO and 2 GiB for
-ChEBI lite on eight threads, ELK classified in 539 ms and 3.0 s at peak resident sets of
-1,271 MiB and 2,426 MiB. The classifier's peak is 363 MiB on GO and 1,643 MiB on ChEBI
-lite, which includes its own copy of the axioms, as the section below describes. Both
-reasoners give the same taxonomy on one and eight threads, and the ELK taxonomies of the
-run agree with the classifier's.
+ELK's resident memory follows its heap setting more than its live data, as the
+[earlier ELK record](runs/2026-11-02-elk-forge-aa0a41a6/record.json) shows with smaller
+heaps. Its live heap after a full collection is 150 MiB for GO and 688 MiB for ChEBI
+lite there.
 
 ## Classification time and memory
 
-The run on forge, the benchmark host, took the bench lock and classified each ontology
-five times in one process for each thread count. Times are the median of the five
-classifications in ms, with the stages of the last one. Peak memory is the process's
-peak resident set in MiB and includes the axioms read, which the next column gives.
-The build is commit 8e73284a.
+The stages of the last classification in the same forge run, in ms, are the
+normalization and indexing, the saturation and the taxonomy. The memory estimate is the
+classifier's own peak estimate in MiB, and the counted heap is the most that a
+classification held at once beyond the axioms read, measured with `el_classify --heap`
+on `wally` on four threads.
 
-| Ontology | Threads | Classify | Index | Saturation | Taxonomy | Peak RSS | After read |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| GO 2026-07-26, 51,986 classes, 135,031 axioms | 1 | 583 | 159 | 280 | 90 | 428 | 77 |
-| | 4 | 410 | 166 | 94 | 90 | 438 | 77 |
-| | 8 | 377 | 160 | 68 | 94 | 436 | 77 |
-| ChEBI lite 256, 238,150 classes, 647,721 axioms | 1 | 3,912 | 913 | 1,742 | 916 | 1,561 | 269 |
-| | 4 | 2,966 | 924 | 809 | 827 | 1,660 | 269 |
-| | 8 | 2,840 | 858 | 739 | 868 | 1,803 | 269 |
+| Ontology | Threads | Index | Saturation | Taxonomy | Estimate | Counted heap |
+|---|---:|---:|---:|---:|---:|---:|
+| GO | 1 | 32 | 218 | 28 | 71 | 70 |
+| | 8 | 27 | 39 | 15 | | |
+| ChEBI lite | 1 | 288 | 1,347 | 441 | 461 | 411 |
+| | 8 | 134 | 499 | 94 | | |
+| `ore_ont_13482` | 1 | 393 | 601 | 29 | 566 | 612 |
+| | 8 | 314 | 133 | 17 | | |
+| `ore_ont_868` | 1 | 574 | 509 | 757 | 1,265 | 1,111 |
+| | 8 | 507 | 116 | 371 | | |
+| `ore_ont_1559` | 1 | 785 | 269 | 139 | 388 | 422 |
+| | 8 | 576 | 70 | 84 | | |
 
-Saturation scales with the threads. Indexing and the taxonomy run on one thread and
-take most of the time on four threads or more, which roadmap item 592 follows.
-The classifier holds a copy of the axioms of its own, so its share of the peak is about
-350 MiB on GO and 1.3 to 1.5 GiB on ChEBI. That copy is what lets a kept classifier
-reclassify incrementally after a change, which trades memory for fast
-reclassification. The memory estimate that this build reported was 52 MiB on GO and
-357 MiB on ChEBI. Commit 552fdbdd counts the copy of the axioms too, so the estimate
-that the budget and the dataset's kept classification use is closer to the resident
-memory, and later builds drop a transient copy of the changed axioms on a full run.
-Reading the functional-style files took 100 to 111 ms for GO and 429 to 489 ms for
-ChEBI, outside the classification times.
-
-### Saturation scheduling
-
-Before commit 8e73284a every activation of a context took the shared queue's lock and
-woke a waiting worker. The same ontologies on forge with the previous build, 6aff910a,
-gave these medians in ms.
-
-| Ontology | Threads | 6aff910a | 8e73284a |
-|---|---:|---:|---:|
-| GO | 1 | 604 | 583 |
-| | 4 | 504 | 410 |
-| | 8 | 466 | 377 |
-| ChEBI lite | 1 | 4,234 | 3,912 |
-| | 4 | 4,157 | 2,966 |
-| | 8 | 6,005 | 2,840 |
-
-ChEBI saturated in 3,871 ms on eight threads with the previous build and in 739 ms with
-the new one. An A/B on atlas measured 6.2 million voluntary context switches and 12.8 s
-of system time on eight threads before the change and 0.7 million and 3.2 s after it.
-The previous build's harness kept two classifiers alive at once, so its peak memory is
-not comparable and is left out.
+Saturation and the taxonomy scale with the threads. Normalization and interning run on
+one thread and take most of a run on eight threads on the ORE ontologies, which roadmap
+item NEW-ITEM-1 follows. The estimate comes within 14% of the counted heap on each
+ontology, so a memory budget bounds what it states. The classifier reads the axioms in
+place, as the server's kept classification reads those of the open ontology, so the
+peak resident set above holds one copy of the axioms.
 
 ## Records
 
-The [run record](runs/2026-11-02-go-chebi-forge-8e73284a/record.json) holds the host,
-the binary and data hashes, the settings, every classification time, the taxonomy
-hashes and the agreement checks. Its directory keeps the raw metrics, the environment
-and the script that ran.
+The [run record](runs/2026-11-03-el-speed-forge-80644aec/record.json) holds the host,
+the binary, harness and data hashes, the settings, every classification time of both
+tools, the taxonomy hashes and the agreement checks of the tables above. Its directory
+keeps both tools' output lines, ELK's warnings, the oracle's reports, the environment
+with the load when each process started, and the script that ran.
 
-The [ELK run record](runs/2026-11-02-elk-forge-aa0a41a6/record.json) holds the same for
-the comparison with ELK on forge, with both tools' output lines, ELK's warnings and the
-oracle's reports. The [ORE agreement record](runs/2026-11-02-ore-elk-agreement-aa0a41a6/record.json)
+The [record of commit 8e73284a](runs/2026-11-02-go-chebi-forge-8e73284a/record.json) and
+the [ELK record of commit aa0a41a6](runs/2026-11-02-elk-forge-aa0a41a6/record.json) hold
+the measurements of earlier builds on GO and ChEBI lite. The [ORE agreement record](runs/2026-11-02-ore-elk-agreement-aa0a41a6/record.json)
 and the [HermiT agreement record](runs/2026-11-02-hermit-agreement-aa0a41a6/record.json)
 hold the comparisons on the ORE 2015 sample and the range test ontologies. Their times
 come from a loaded laptop and are not measurements.

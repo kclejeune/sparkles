@@ -64,7 +64,7 @@ partially complete and planned implementation scope.
 | Query, load and write comparisons | Measured with partial coverage | Published tables cover their named data, engines and timing contracts. Larger suites, sustained workloads and broader hardware remain open. |
 | Bindings and model-assisted workflows | Partial coverage | The listed APIs, models and question sets have measurements. Selected API controls and internal A/B runs do not replace a complete peer-suite refresh. |
 | Spatial and query-time reasoning comparisons | Unmeasured against peers | Conformance and internal measurements do not establish comparative performance. |
-| OWL 2 EL classification | Measured against ELK | [Times and memory beside ELK 0.6.0](benchmarks/el-classification/RESULTS.md#against-elk) on GO and ChEBI lite are published, with taxonomies equal to ELK's there and on the 298 ORE 2015 EL ontologies. ELK is faster on ChEBI lite on eight threads, which roadmap item 592 follows. |
+| OWL 2 EL classification | Measured against ELK | [Times and memory beside ELK 0.6.0](benchmarks/el-classification/RESULTS.md#against-elk) on GO, ChEBI lite and the largest ORE 2015 EL ontologies are published, with taxonomies equal to ELK's there and on all 298 ORE 2015 EL ontologies. The classifier is 2.5 to 13.3 times as fast as ELK on one and eight threads. |
 | Evidence and maintained analysis | Unmeasured | C25 provides authenticated evidence proposals and resolution, and C27 supplies temporal profile resources and queries. Review-controlled projections and the managed analysis work in C26, F22 and C22b remain planned. |
 
 ## Reading the comparisons
