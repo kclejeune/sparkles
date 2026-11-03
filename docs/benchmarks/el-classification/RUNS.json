@@ -645,6 +645,59 @@
     }
    },
    "metadata_note": "A manual measurement record of sparkles ontology classify from a file without a store beside the build that loads a store, and of the parallel taxonomy, on the benchmark host. Read the method with each time."
+  },
+  {
+   "run_id": "sha256-4b302e2701c2766b2c0f1e869ea325b7c02b207d3e251ac6a08bac86e3022305",
+   "path": "runs/2026-11-03-robot-commands-forge-71fcf893/record.json",
+   "sha256": "4b302e2701c2766b2c0f1e869ea325b7c02b207d3e251ac6a08bac86e3022305",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26 and ChEBI lite 256, RDF/XML releases",
+    "manifest": {
+     "binary": "The sparkles CLI built with mbx build --release -p sparkles-server on stanley at commit 71fcf893 and copied to the benchmark host",
+     "binary_sha256": {
+      "sparkles": "899b4b2054e93106a80a9a8f7d73f18c9a1bf74c38d4179416dd54fc9fbf3548"
+     },
+     "commit": "71fcf893",
+     "data": {
+      "chebi_lite": {
+       "rdfxml_sha256": "ebea75e0500818e319245a1bf605a684b2e22a2069680290b5dda638d5d25b16"
+      },
+      "go": {
+       "rdfxml_sha256": "653ce47cd7b02304e67eb67c54d3be02ec5b0ba5e00eb7384dfa0da00f9682ec"
+      }
+     },
+     "ended": "2026-11-03T13:50:19Z",
+     "host_load_after": "1.52 2.76 2.53",
+     "host_load_before": "3.86 3.70 2.72",
+     "lock_note": "The lock passed from the post-push benchmark check, so the first round includes that run's tail and is the slowest in every row. The tables use medians.",
+     "reference": {
+      "robot": "robot reason with ELK from runs/2026-11-03-reasoners-forge-ea96e8f5 on the same host and files, median of three, 14.04 s at 3,597 MiB on GO and 30.63 s at 8,287 MiB on ChEBI lite. ROBOT's reduce, relax and chain have no figures from this host."
+     },
+     "started": "2026-11-03T13:47:18Z"
+    },
+    "settings": {
+     "build": "release profile",
+     "memory_cap": "MemoryMax=12G, MemorySwapMax=0 per process",
+     "repeat": 3,
+     "threads": "0 (the classifier's default)",
+     "timeout_s": 1800
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "kernel": "7.2.9",
+      "name": "forge",
+      "ram_mib": 15620
+     },
+     "method": "forge-sparkles.sh.txt took ~/lanes/.bench.lock once and ran three interleaved rounds. Each round timed, on GO and ChEBI lite from the release's RDF/XML file, sparkles ontology reason, reduce and relax with --input and --output to a functional-style file, the chain reason --input FILE relax reduce --output FILE, and sparkles ontology classify FILE --format ofn --allow-unsatisfiable, each through timed.py.txt, which records the wall time, the peak resident set and the exit status in runs.jsonl. robot-compare.txt is scripts/elk-compare/ofn-axioms.py --all between lane 604's ROBOT 1.9.11 outputs with ELK 0.6.0 and the same build's outputs on stanley, and outputs-sha256.txt shows the forge outputs are byte-identical to those.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual measurement record of sparkles ontology reason, reduce, relax, their chain and classify on the benchmark host, with the axiom comparison against ROBOT 1.9.11's outputs."
   }
  ]
 }

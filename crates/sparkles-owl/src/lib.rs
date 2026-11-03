@@ -51,6 +51,7 @@ pub mod ofn;
 pub mod ofn_read;
 pub mod profiles;
 pub mod read;
+pub mod transform;
 pub mod validate;
 pub mod vocab;
 pub mod write;
