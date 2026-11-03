@@ -1005,16 +1005,20 @@ export const builtIn = (iri: string) => BUILT_IN.some((ns) => iri.startsWith(ns)
 const inGraph = (graph: string | null, body: string) =>
   graph ? `GRAPH <${graph}> { ${body} }` : body;
 
-/** A pattern over the graphs a term answer names, where `default` is the default graph. */
+/**
+ * A pattern over the graphs a term answer names, where `default` is the stored default
+ * graph. It names that graph as Jena does, so a server with a union default graph still
+ * reads the graphs the term route read.
+ */
 function overGraphs(graphs: readonly string[], body: string) {
   const named = graphs.filter((g) => g !== 'default');
   const parts = [
-    ...(graphs.includes('default') ? [`{ ${body} }`] : []),
+    ...(graphs.includes('default') ? [`{ GRAPH <urn:x-arq:DefaultGraph> { ${body} } }`] : []),
     ...(named.length
       ? [`{ VALUES ?g { ${named.map((g) => `<${g}>`).join(' ')} } GRAPH ?g { ${body} } }`]
       : []),
   ];
-  return parts.length ? parts.join(' UNION ') : `{ ${body} }`;
+  return parts.length ? parts.join(' UNION ') : `{ GRAPH <urn:x-arq:DefaultGraph> { ${body} } }`;
 }
 
 /** Where a page of named subjects continues: the page size of `incomingQuery` and `usageQuery`. */

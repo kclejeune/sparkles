@@ -70,6 +70,10 @@ pub const DEFAULT_INCOMING: usize = 20;
 pub const MAX_INCOMING: usize = 200;
 /// The values listed per property of the entity.
 pub const MAX_VALUES: usize = 500;
+
+/// The most reifications of one axiom target that the term route reads to find the
+/// annotations of the axioms that mention an entity.
+const MAX_REIFIERS: usize = 20 * MAX_VALUES;
 /// The most IRIs an answer names with their labels.
 pub const MAX_NAMES: usize = 4000;
 
@@ -649,8 +653,12 @@ impl Ontologies {
         if let Some(form) = s.id(SKOSXL_LITERAL_FORM) {
             let props: Vec<Id> = SKOSXL_LABELS.iter().filter_map(|p| s.id(p)).collect();
             for q in &own {
-                if !props.contains(&q[1]) || xl_labels.len() >= MAX_VALUES {
+                if !props.contains(&q[1]) {
                     continue;
+                }
+                if xl_labels.len() >= MAX_VALUES {
+                    truncated = true;
+                    break;
                 }
                 for f in s.objects(q[2], form, 4)? {
                     if let Some(value @ Value::Literal(_)) = s.value(f) {
@@ -680,7 +688,9 @@ impl Ontologies {
                     mentions_cut |= !s.closure(&mut mention, [q[2]])?;
                     // the axiom's annotations, reified with the same source, property
                     // and target
-                    for r in s.reifiers_of(q[0], q[1], q[2])? {
+                    let (reifiers, complete) = s.reifiers_of(q[0], q[1], q[2])?;
+                    mentions_cut |= !complete;
+                    for r in reifiers {
                         let qs = s.quads(Perm::Spo, &[r.0], MAX_ABOUT_QUADS)?;
                         mention.add_all(&qs);
                         mentions_cut |= !s.closure(&mut mention, qs.iter().map(|q| q[2]))?;
@@ -1184,17 +1194,21 @@ impl Scope {
         Ok(true)
     }
 
-    /// The `owl:Axiom` nodes that reify the triple `s p o`.
-    fn reifiers_of(&mut self, s: Id, p: Id, o: Id) -> Result<Vec<Id>> {
+    /// The `owl:Axiom` nodes that reify the triple `s p o`, and whether the scan saw every
+    /// reification of the target `o`. A blank-node target that many axioms share has one
+    /// reification for each of them, so the scan reads up to [`MAX_REIFIERS`] of them.
+    fn reifiers_of(&mut self, s: Id, p: Id, o: Id) -> Result<(Vec<Id>, bool)> {
         let (Some(src), Some(prop), Some(tgt)) = (
             self.id(OWL_ANNOTATED_SOURCE),
             self.id(OWL_ANNOTATED_PROPERTY),
             self.id(OWL_ANNOTATED_TARGET),
         ) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), true));
         };
         let mut out = Vec::new();
-        for q in self.quads(Perm::Pos, &[tgt.0, o.0], MAX_VALUES)? {
+        let found = self.quads(Perm::Pos, &[tgt.0, o.0], MAX_REIFIERS + 1)?;
+        let complete = found.len() <= MAX_REIFIERS;
+        for q in found.into_iter().take(MAX_REIFIERS) {
             let r = q[0];
             if self.snap.term_kind(r) == TermKind::Iri || out.contains(&r) {
                 continue;
@@ -1203,7 +1217,7 @@ impl Scope {
                 out.push(r);
             }
         }
-        Ok(out)
+        Ok((out, complete))
     }
 
     /// The annotations of the reified triples of `reifiers`, by their property and

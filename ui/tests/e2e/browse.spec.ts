@@ -165,3 +165,40 @@ open('a cycle in the hierarchy stops at the class it returns to', async ({ page,
   await expect(tree.getByRole('button', { name: 'Open alpha' })).toHaveCount(0);
   await expect(tree.getByRole('link', { name: /^alpha/ })).toHaveCount(2);
 });
+
+open('Show more pages instances and users past the first ones', async ({ page, request }) => {
+  const ds = 'browse-e2e-more';
+  const ex = 'http://example.org/more#';
+  expect((await request.post('/$/datasets', { data: { dbName: ds, dbType: 'mem' } })).ok()).toBe(
+    true,
+  );
+  const many = Array.from(
+    { length: 75 },
+    (_, n) => `:i${String(n).padStart(3, '0')} a :K ; :p :o .`,
+  );
+  const loaded = await request.post(`/${ds}/data`, {
+    headers: { 'Content-Type': 'text/turtle' },
+    data: `@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix : <${ex}> .
+:K a owl:Class ; rdfs:label "kind" .
+:p a owl:ObjectProperty ; rdfs:label "points at" .
+${many.join('\n')}`,
+  });
+  expect(loaded.ok(), await loaded.text()).toBe(true);
+  for (const [local, heading] of [
+    ['K', 'Instances'],
+    ['p', 'Used by'],
+  ]) {
+    await page.goto(`/ui/browse?ds=${ds}&iri=${encodeURIComponent(ex + local)}`);
+    const usage = page.getByRole('region', { name: /What links here/ });
+    const grp = usage.locator('.grp', { has: page.getByRole('heading', { name: heading }) });
+    await expect(grp.getByRole('link')).toHaveCount(20);
+    await grp.getByRole('button', { name: /Show more/ }).click();
+    // the next page starts again in IRI order and skips the subjects already shown
+    await expect(grp.getByRole('link')).toHaveCount(50);
+    await grp.getByRole('button', { name: /Show more/ }).click();
+    await expect(grp.getByRole('link')).toHaveCount(75);
+    await expect(grp.getByRole('button', { name: /Show more/ })).toHaveCount(0);
+  }
+});

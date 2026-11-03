@@ -69,10 +69,11 @@
         done = got.length < PAGE;
         for (const s of got) if (!seen.has(s)) (seen.add(s), items.push(s));
       }
+      // a count the server stopped at is a lower bound, so only a short page ends the list
       extra[key] = {
         items,
         offset,
-        done: done || i.subjects.length + items.length >= i.count,
+        done: done || (!i.more && i.subjects.length + items.length >= i.count),
         busy: false,
       };
     } catch {
@@ -99,14 +100,17 @@
 
 {#snippet incomingList(i: Incoming, kind: 'incoming' | 'usage', h: string)}
   {@const ex = extra[keyOf(kind, i)]}
+  {@const left = i.count - i.subjects.length - (ex?.items.length ?? 0)}
   <div class="grp" data-property={i.property}>
     <h3>{h} <span class="count-badge">{i.count.toLocaleString('en-US')}</span></h3>
     {@render subjectList([...i.subjects, ...(ex?.items ?? [])])}
-    {#if more && i.count > i.subjects.length + (ex?.items.length ?? 0) && !ex?.done}
+    {#if more && (i.more || left > 0) && !ex?.done}
       <button class="more-btn" type="button" disabled={ex?.busy} onclick={() => readMore(kind, i)}
         >{ex?.busy
           ? 'Reading…'
-          : `Show more (${(i.count - i.subjects.length - (ex?.items.length ?? 0)).toLocaleString('en-US')} left)`}</button
+          : left > 0 && !i.more
+            ? `Show more (${left.toLocaleString('en-US')} left)`
+            : 'Show more'}</button
       >
     {/if}
   </div>

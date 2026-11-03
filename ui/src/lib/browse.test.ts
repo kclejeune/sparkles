@@ -513,10 +513,12 @@ describe('SPARQL of the landing page and the further reads', () => {
     );
     // the default graph and the imported graphs the term answer names
     const q = incomingQuery(EX + 'a', RDF + 'type', ['default', 'urn:g', 'urn:imp'], 0);
-    expect(q).toContain(`{ ?s <${RDF}type> <${EX}a> FILTER(isIRI(?s)) } UNION`);
+    expect(q).toContain(
+      `{ GRAPH <urn:x-arq:DefaultGraph> { ?s <${RDF}type> <${EX}a> FILTER(isIRI(?s)) } } UNION`,
+    );
     expect(q).toContain('VALUES ?g { <urn:g> <urn:imp> }');
     expect(usageQuery(EX + 'p', ['default'], 50)).toBe(
-      `SELECT DISTINCT ?s WHERE { { ?s <${EX}p> ?o FILTER(isIRI(?s)) } } ORDER BY ?s LIMIT 50 OFFSET 50`,
+      `SELECT DISTINCT ?s WHERE { { GRAPH <urn:x-arq:DefaultGraph> { ?s <${EX}p> ?o FILTER(isIRI(?s)) } } } ORDER BY ?s LIMIT 50 OFFSET 50`,
     );
   });
 });

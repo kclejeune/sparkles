@@ -613,3 +613,43 @@ fn the_term_read_takes_the_requested_mode() {
     assert!(sub(Mode::Lenient));
     assert!(!sub(Mode::Strict));
 }
+
+#[test]
+fn every_axiom_on_a_shared_target_keeps_its_annotations() {
+    let mut body = String::from(
+        ":p a owl:ObjectProperty . :C a owl:Class . _:r a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :C .",
+    );
+    for n in 0..600 {
+        body.push_str(&format!(
+            " :S{n} a owl:Class ; rdfs:subClassOf _:r .
+              [ a owl:Axiom ; owl:annotatedSource :S{n} ; owl:annotatedProperty rdfs:subClassOf ;
+                owl:annotatedTarget _:r ; rdfs:comment \"n{n}\" ] ."
+        ));
+    }
+    let ds = dataset(&body);
+    let r = TermRequest {
+        mentions: 1000,
+        ..TermRequest::new(ex("C"))
+    };
+    let t = ds.ontology().term(&req(), &r, &Default::default()).unwrap();
+    assert_eq!(t.mentions.len(), 600);
+    assert!(!t.mentions_truncated);
+    assert!(
+        t.mentions.iter().all(|(a, _)| a.annotations.len() == 1),
+        "an axiom lost its annotation"
+    );
+}
+
+#[test]
+fn many_skos_xl_labels_report_the_cut() {
+    let mut body = String::from(":c a skos:Concept .");
+    for n in 0..(MAX_VALUES + 1) {
+        body.push_str(&format!(
+            " :c skosxl:altLabel [ skosxl:literalForm \"l{n}\"@en ] ."
+        ));
+    }
+    let ds = dataset(&body);
+    let t = term(&ds, &ex("c"));
+    assert_eq!(t.xl_labels.len(), MAX_VALUES);
+    assert!(t.statements_truncated);
+}
