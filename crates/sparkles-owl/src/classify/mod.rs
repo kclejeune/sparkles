@@ -1039,8 +1039,19 @@ impl Saturation {
         };
         self.ctx.resize_with(n, OnceLock::new);
         if ix.horn.is_some() {
-            horn::absorb(&mut ix, &|| poll(limits).is_err());
-            poll(limits)?;
+            // the stop the pass saw, which a cancellation polled once does not repeat
+            let stopped = std::cell::RefCell::new(None);
+            horn::absorb(&mut ix, &|| {
+                let r = poll(limits);
+                let stop = r.is_err();
+                if let Err(e) = r {
+                    *stopped.borrow_mut() = Some(e);
+                }
+                stop
+            });
+            if let Some(e) = stopped.into_inner() {
+                return Err(e);
+            }
         }
         let dynamic = ix.horn.as_ref().map(|h| {
             debug_assert_eq!(h.base as usize, n);

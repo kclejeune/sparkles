@@ -1107,3 +1107,38 @@ fn r5_over_successors_that_hold_only_the_top_class() {
         &[("B", "A")],
     );
 }
+
+#[test]
+fn a_cancellation_polled_once_stops_a_horn_run_wherever_it_comes() {
+    // 40,000 classes no rule reads under one superclass: enough work for the absorbed
+    // fillers' pass to poll, with a saturation that stays linear
+    let mut body = String::from("SubClassOf(:X ObjectAllValuesFrom(:u :Y))\n");
+    for i in 0..40_000 {
+        body.push_str(&format!("SubClassOf(:C{i} :D)\n"));
+    }
+    let ax = axioms(&body);
+    let counting = |stop_at: usize| {
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let m = n.clone();
+        let limits = Limits {
+            threads: 1,
+            cancelled: Some(std::sync::Arc::new(move || {
+                m.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 == stop_at
+            })),
+            ..Limits::default()
+        };
+        (n, limits)
+    };
+    let (n, limits) = counting(0);
+    let out = Classifier::of(&ax).classify(&limits).unwrap();
+    assert_eq!(out.stats.tier, Tier::Horn);
+    let polls = n.load(std::sync::atomic::Ordering::Relaxed);
+    for k in 1..=polls {
+        let (_, limits) = counting(k);
+        let r = Classifier::of(&ax).classify(&limits);
+        assert!(
+            matches!(r, Err(sparkles_owl::classify::Error::Cancelled)),
+            "poll {k} of {polls}"
+        );
+    }
+}
