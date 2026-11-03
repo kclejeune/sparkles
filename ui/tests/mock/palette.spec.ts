@@ -274,6 +274,24 @@ test.describe('at 1440 pixels', () => {
     await expect(page).toHaveURL(/\/ui\/thesaurus/);
   });
 
+  test('an item stored twice shows once among the recent picks', async ({ page }) => {
+    await onDataset(page, 'uni');
+    // a page picked once with a dataset recorded and once without
+    await page.addInitScript(() => {
+      const pick = { provider: 'pages', id: '/server', title: 'Server', href: '/ui/server' };
+      localStorage.setItem(
+        'sparkles.launcher.recent',
+        JSON.stringify([
+          { ...pick, ds: null, at: 2 },
+          { ...pick, ds: 'uni', at: 1 },
+        ]),
+      );
+    });
+    await visit(page, '/ui/datasets');
+    await palette(page);
+    await expect(titles(page, group(page, 'Recent'))).toHaveText(['Server']);
+  });
+
   test('works when the browser blocks storage', async ({ page }) => {
     await page.addInitScript(() => {
       const fail = () => {

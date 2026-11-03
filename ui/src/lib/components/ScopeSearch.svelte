@@ -164,6 +164,8 @@
       const p = providers.find((x) => x.id === e.provider);
       if (!p || p.recent === false) continue;
       if (p.perDataset !== false && e.ds !== d) continue;
+      // one row per item, also for picks stored with a dataset before they had none
+      if (out.items.some((it, i) => out.from[i] === p.id && it.id === e.id)) continue;
       const it = p.revive
         ? p.revive(e, { ds: d })
         : e.href
