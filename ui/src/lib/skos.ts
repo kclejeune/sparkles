@@ -548,9 +548,11 @@ export function labelEdit(
 }
 
 /**
- * Make an entry the preferred label of its language: it stops being alternative or hidden,
- * and the preferred labels it replaces become alternative labels, plain or SKOS-XL as they
- * were. A SKOS-XL entry keeps its label resource and changes the property that links it.
+ * Make an entry's literal the preferred label of its language. Every alternative and
+ * hidden representation of that literal becomes preferred, plain or SKOS-XL as it was, so
+ * the literal is left in one kind, and the language's other preferred labels become
+ * alternative labels in their own form. A SKOS-XL label keeps its resource and changes
+ * the property that links it.
  */
 export function makePreferredEdit(
   r: string,
@@ -558,28 +560,33 @@ export function makePreferredEdit(
   entries: LabelEntry[],
   graph: string | null,
 ): string {
-  const old = entries.filter(
-    (e) => e.kind === 'pref' && e.label.lang === entry.label.lang && !sameEntry(e, entry),
-  );
   const parts: string[] = [];
   const plainDel: { kind: LabelKind; label: Label }[] = [];
   const plainAdd: { kind: LabelKind; label: Label }[] = [];
-  if (entry.xl) parts.push(xlKindEdit(r, entry.kind, 'pref', entry.xl, entry.label, graph));
-  else {
-    plainDel.push({ kind: entry.kind, label: entry.label });
-    plainAdd.push({ kind: 'pref', label: entry.label });
-  }
-  for (const e of old) {
-    // a preferred label with the same literal form is the same label in another form
-    if (sameLabel(e.label, entry.label)) continue;
-    if (e.xl) parts.push(xlKindEdit(r, 'pref', 'alt', e.xl, e.label, graph));
+  for (const e of entries) {
+    const promote = sameLabel(e.label, entry.label) && e.kind !== 'pref';
+    const demote =
+      e.kind === 'pref' && e.label.lang === entry.label.lang && !sameLabel(e.label, entry.label);
+    if (!promote && !demote) continue;
+    const to: LabelKind = promote ? 'pref' : 'alt';
+    if (e.xl) parts.push(xlKindEdit(r, e.kind, to, e.xl, e.label, graph));
     else {
-      plainDel.push({ kind: 'pref', label: e.label });
-      plainAdd.push({ kind: 'alt', label: e.label });
+      plainDel.push({ kind: e.kind, label: e.label });
+      plainAdd.push({ kind: to, label: e.label });
     }
   }
-  if (plainDel.length || plainAdd.length) parts.unshift(labelEdit(r, plainDel, plainAdd, graph));
+  if (plainDel.length) parts.unshift(labelEdit(r, plainDel, plainAdd, graph));
   return parts.join(' ;\n');
+}
+
+/** The labels after {@link makePreferredEdit}, to check them before the edit is offered. */
+export function preferredResult(entry: LabelEntry, entries: LabelEntry[]): LabelEntry[] {
+  return entries.map((e) => {
+    if (sameLabel(e.label, entry.label) && e.kind !== 'pref') return { ...e, kind: 'pref' };
+    if (e.kind === 'pref' && e.label.lang === entry.label.lang && !sameLabel(e.label, entry.label))
+      return { ...e, kind: 'alt' };
+    return e;
+  });
 }
 
 /** Two entries are the same representation: one kind, one literal and one XL resource. */
@@ -852,6 +859,13 @@ export async function readHead(
     etag: res.headers.get('ETag'),
     commit: Number(res.headers.get('Sparkles-Commit') ?? 0),
   };
+}
+
+/** Whether a dataset holds any triple outside `graph` (`null`: the default graph). */
+export function otherGraphsQuery(graph: string | null): string {
+  return graph
+    ? `ASK { { GRAPH ?g { ?s ?p ?o } FILTER(?g != ${iri(graph)}) } UNION { ?s ?p ?o } }`
+    : 'ASK { GRAPH ?g { ?s ?p ?o } }';
 }
 
 /** Any graph of a dataset whose graphs the editor does not know: for the picker. */

@@ -4,6 +4,7 @@
   // alternative and hidden labels by language, plain and SKOS-XL, with the S13 and S14
   // clashes among them. Each change is an edit the page previews: add, change and remove a
   // label, make one preferred, and convert between a plain label and a SKOS-XL label.
+  import { onDestroy } from 'svelte';
   import type { Term } from '$lib/api';
   import { validLang } from '$lib/ontology';
   import {
@@ -16,6 +17,7 @@
     labelProblems,
     makePreferredEdit,
     normLang,
+    preferredResult,
     sameEntry,
     sameLabel,
     toXlEdit,
@@ -36,6 +38,7 @@
     readonly,
     onedit,
     isUsed = async () => false,
+    scope = '',
   }: {
     iri: string;
     /** The resource's name, for the edits' labels. */
@@ -48,7 +51,16 @@
     onedit: (sparql: string, label: string) => void;
     /** Whether the graph already uses an IRI, so a minted SKOS-XL label IRI is new. */
     isUsed?: (iri: string) => Promise<boolean>;
+    /** What the page edits (target and graph): an edit read for another one is dropped. */
+    scope?: string;
   } = $props();
+
+  // a conversion that waits for the graph's answer opens its edit only if the component
+  // still shows the resource it started on, in the same target and graph
+  let alive = true;
+  onDestroy(() => (alive = false));
+  const still = (at: { iri: string; scope: string }) =>
+    alive && at.iri === iri && at.scope === scope;
 
   const problems = $derived(labelProblems(entries));
   const clashing = (e: LabelEntry) =>
@@ -199,7 +211,9 @@
   }
 
   async function toXl(e: LabelEntry) {
+    const at = { iri, scope };
     const node = await mint(e, new Set(xlTaken));
+    if (!still(at)) return;
     onedit(
       toXlEdit(iri, e.kind, e.label, node, graph),
       `Make ${shown(e.label)} a SKOS-XL label of ${name}`,
@@ -216,6 +230,7 @@
   async function allToXl() {
     const plain = entries.filter((e) => !e.xl);
     if (!plain.length) return;
+    const at = { iri, scope };
     const taken = new Set(xlTaken);
     const parts: string[] = [];
     for (const e of plain) {
@@ -223,6 +238,7 @@
       taken.add(node);
       parts.push(toXlEdit(iri, e.kind, e.label, node, graph));
     }
+    if (!still(at)) return;
     onedit(parts.join(' ;\n'), `Make the ${plain.length} plain labels of ${name} SKOS-XL labels`);
   }
 </script>
@@ -294,7 +310,8 @@
                               title="Make preferred"
                               aria-label="Make {e.label.value} preferred"
                               onclick={() => makePreferred(e)}
-                              ><Icon name="check" size={11} /></button
+                              disabled={labelProblems(preferredResult(e, entries)).length >
+                                problems.length}><Icon name="check" size={11} /></button
                             >
                           {/if}
                           {#if e.xl}

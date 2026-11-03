@@ -22,7 +22,9 @@ import {
   linkEdit,
   makePreferredEdit,
   moveEdit,
+  otherGraphsQuery,
   parseDetails,
+  preferredResult,
   rootsQuery,
   schemesQuery,
   searchHits,
@@ -392,10 +394,41 @@ describe('label edits keep what other resources and labels need', () => {
     ]);
   });
 
+  it('promotes every representation of the chosen literal', () => {
+    const s = store(`ex:c skos:prefLabel "cat"@en ; skos:altLabel "feline"@en ;
+      skosxl:altLabel ex:feline . ex:feline a skosxl:Label ; skosxl:literalForm "feline"@en .`);
+    const d = parseDetails(EX + 'c', select(s, detailsQuery(EX + 'c', null)));
+    const xlFeline = d.labels.find((l) => l.label.value === 'feline' && l.xl)!;
+    const after = preferredResult(xlFeline, d.labels);
+    expect(labelProblems(after)).toEqual([]);
+    s.update(makePreferredEdit(EX + 'c', xlFeline, d.labels, null));
+    const e = parseDetails(EX + 'c', select(s, detailsQuery(EX + 'c', null)));
+    expect(e.labels.map((l) => [l.kind, l.label.value, !!l.xl]).sort()).toEqual([
+      ['alt', 'cat', false],
+      ['pref', 'feline', false],
+      ['pref', 'feline', true],
+    ]);
+    expect(labelProblems(e.labels)).toEqual([]);
+  });
+
   it('checks an edit without the unedited twin of the label', () => {
     const es = [plain('pref', 'cat'), xl('pref', 'cat', EX + 'cat')];
     const rest = es.filter((e) => !sameEntry(e, es[0]));
     expect(addProblem(rest, 'pref', { value: 'feline', lang: 'en' })).toMatch(/S14/);
+  });
+});
+
+describe('the graphs outside the editor', () => {
+  it('are found in named graphs and, for a named graph, in the default graph', () => {
+    const s = new ox.Store();
+    s.load(PREFIXES + 'ex:a a skos:Concept .', {
+      format: 'text/turtle',
+      to_graph_name: ox.namedNode('urn:g'),
+    });
+    expect(ask(s, otherGraphsQuery('urn:g'))).toBe(false);
+    expect(ask(s, otherGraphsQuery(null))).toBe(true);
+    s.load(PREFIXES + 'ex:b a skos:Concept .', { format: 'text/turtle' });
+    expect(ask(s, otherGraphsQuery('urn:g'))).toBe(true);
   });
 });
 

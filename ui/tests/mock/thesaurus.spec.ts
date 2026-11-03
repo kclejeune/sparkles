@@ -210,6 +210,10 @@ test('collections, notes, a new concept and a stale edit', async ({ page, reques
   await page.getByRole('tab', { name: /Members/ }).click();
   const form = page.locator('.detail form').first();
   await expect(form).toContainText('Ordered members');
+  // the dataset keeps no other graph, so the list's cells can be edited
+  await expect(
+    form.getByRole('button', { name: 'Move Ordered members member 2 up' }),
+  ).toBeEnabled();
 
   // the notes form of a concept, from the built-in SKOS shapes
   await page.getByRole('tab', { name: 'Concepts' }).click();
@@ -274,4 +278,47 @@ test('without the head tag the page cannot guard its edits and is read-only', as
     page.getByRole('status').filter({ hasText: 'cannot guard its edits' }),
   ).toBeVisible();
   await expect(page.getByRole('form', { name: 'Add a label' })).toHaveCount(0);
+});
+
+test('a list is read-only while the dataset keeps another graph', async ({ page, request }) => {
+  const other = `GRAPH <urn:other> { <urn:x> <urn:y> "z" }`;
+  const up = (u: string) =>
+    request.post('/thes/update', {
+      headers: { 'Content-Type': 'application/sparql-update' },
+      data: u,
+    });
+  expect((await up(`INSERT DATA { ${other} }`)).ok()).toBe(true);
+  try {
+    await open(page, `&iri=${encodeURIComponent(TH + 'bySize')}&view=members`);
+    const details = page.getByRole('region', { name: 'Details' });
+    await expect(details.getByRole('status')).toContainText("a list's cells could sit there");
+    await expect(
+      details.getByRole('button', { name: 'Move Ordered members member 2 up' }),
+    ).toBeDisabled();
+  } finally {
+    await up(`DELETE DATA { ${other} }`);
+  }
+});
+
+test('undo waits for the head tag', async ({ page }) => {
+  await page.addInitScript(() =>
+    sessionStorage.setItem(
+      'sparkles.skos.undo.thes|',
+      JSON.stringify({ done: [{ commit: 1, label: 'An earlier edit' }], undone: [] }),
+    ),
+  );
+  let release = () => {};
+  const held = new Promise<void>((r) => (release = r));
+  await page.route('**/thes/data?default', async (route) => {
+    if (route.request().method() !== 'HEAD') return route.fallback();
+    await held;
+    await route.fallback();
+  });
+  await page.goto('/ui/thesaurus?ds=thes');
+  const undo = page.getByRole('button', { name: /^Undo/ });
+  await expect(undo).toHaveText(/Undo \(1\)/);
+  await expect(undo).toBeDisabled();
+  release();
+  await expect(node(page, 'Vertebrates')).toBeVisible({ timeout: 30_000 });
+  await expect(undo).toBeEnabled();
 });

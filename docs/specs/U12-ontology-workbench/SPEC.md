@@ -228,11 +228,16 @@ commit, and a protected branch or a reader's access makes the page read-only. Th
 reads its tag from the graph it edits and is read-only when it cannot, so no edit leaves
 without a precondition. The notes and members forms save through the forms of U02, whose
 saves check the stored values of the fields they change instead of the commit. The page
-locks them when a value or the form's target graph is outside the graph it edits.
+locks them when a value, a nested node or the form's target graph is outside the graph it
+edits, and locks a list while the dataset keeps any other graph, since a form names the
+graph of a list's members but not of its cells. Until the head and its tag are read, the
+page and its undo and redo are read-only.
 
 **Label edits.** A SKOS-XL label resource that another resource still refers to stays when
-one concept drops it or is deleted. Making a label preferred demotes the language's other
-preferred labels, plain or SKOS-XL, to alternative labels. A new SKOS-XL label's IRI is
+one concept drops it or is deleted. Making a label preferred moves every alternative and
+hidden representation of that literal to preferred and demotes the language's other
+preferred labels, plain or SKOS-XL, to alternative labels. A conversion that waits for the
+graph's answer is dropped when the page has moved to another resource, graph or dataset. A new SKOS-XL label's IRI is
 checked against the whole graph. Blank-node SKOS-XL labels of one kind with the same
 literal form are shown without edit buttons, since an update can find a blank node only
 by its triples. Commit messages that are not ASCII are sent percent-encoded
