@@ -1575,6 +1575,13 @@ impl Ctx {
         self.grow_decode(need)
     }
 
+    /// Whether the decode envelope can refuse a key before it is rebuilt. A cursor's
+    /// callers report a refusal through the next check, and eager callers cannot.
+    #[inline]
+    fn envelope_refuses(&self) -> bool {
+        self.streams()
+    }
+
     #[cold]
     #[inline(never)]
     fn grow_decode(&self, need: u64) -> Result<()> {
@@ -1584,7 +1591,7 @@ impl Ctx {
         if need > *peak {
             // A cursor's callers of `term` and `value` report a refusal through the
             // next check, so its envelope reserves on the ledger and can fail.
-            if self.streams() {
+            if self.envelope_refuses() {
                 let ledger = self.memory();
                 let account = ledger.owner(self.grant.as_ref())?;
                 ledger.reserve(&account, self.mem_limit, need - *peak, true)?;
@@ -1627,6 +1634,18 @@ impl Ctx {
     /// decoding inside the envelope. A refusal records a failure and gives `None`.
     #[inline]
     fn with_vocab_key<T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
+        if !self.envelope_refuses() {
+            // An envelope that never refuses is charged after the key is rebuilt, on the
+            // vocabulary's unchecked path. Checking it before each step of the rebuild
+            // made an eager `term` about a quarter slower, which writing a large answer
+            // term by term pays for every cell.
+            return self
+                .snap
+                .generation
+                .vocab
+                .get_with(id, |key| self.reserve_decode(key.len()).then(|| f(key)))
+                .flatten();
+        }
         match self.snap.generation.vocab.get_with_checked(
             id,
             |need| self.reserve_decode_checked(need),
