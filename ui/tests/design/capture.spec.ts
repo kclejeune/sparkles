@@ -39,10 +39,22 @@ export const PAGES: { name: string; path: string; ready?: string }[] = [
     name: 'browse-go-deprecated',
     path: '/ui/browse?ds=go&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FGO_0000005',
   },
+  {
+    name: 'browse-go-term-edit',
+    path: '/ui/browse?ds=go&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FGO_0005739&edit=1',
+  },
+  {
+    name: 'browse-go-property-edit',
+    path: '/ui/browse?ds=go&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FBFO_0000050&edit=1',
+  },
   { name: 'browse-unesco', path: '/ui/browse?ds=unesco' },
   {
     name: 'browse-unesco-concept',
     path: '/ui/browse?ds=unesco&iri=http%3A%2F%2Fvocabularies.unesco.org%2Fthesaurus%2Fconcept4011',
+  },
+  {
+    name: 'browse-unesco-concept-edit',
+    path: '/ui/browse?ds=unesco&iri=http%3A%2F%2Fvocabularies.unesco.org%2Fthesaurus%2Fconcept4011&edit=1',
   },
   {
     name: 'browse-unesco-scheme',
