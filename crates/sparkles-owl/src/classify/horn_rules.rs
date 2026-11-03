@@ -241,15 +241,32 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
     h.dirty = false;
     // the fillers of the universals that apply to each role of the successors
     let roles = &ix.roles;
-    let mut fillers: FxHashMap<Role, Vec<Ex>> = FxHashMap::default();
+    // a short list for the few roles of most contexts, and a map beyond them
+    let mut few: Vec<(Role, Vec<Ex>)> = Vec::new();
+    let mut many: FxHashMap<Role, Vec<Ex>> = FxHashMap::default();
+    let of = |r: Role| -> Vec<Ex> {
+        h.alls
+            .iter()
+            .filter(|&&(s, _)| roles.sub(r, s))
+            .map(|&(_, a)| a)
+            .collect()
+    };
     for (r, n) in todo {
-        let fs = fillers.entry(r).or_insert_with(|| {
-            h.alls
-                .iter()
-                .filter(|&&(s, _)| roles.sub(r, s))
-                .map(|&(_, a)| a)
-                .collect()
-        });
+        let fs = if many.is_empty() {
+            match few.iter().position(|(x, _)| *x == r) {
+                Some(at) => &few[at].1,
+                None if few.len() < 8 => {
+                    few.push((r, of(r)));
+                    &few[few.len() - 1].1
+                }
+                None => {
+                    many.extend(few.drain(..));
+                    many.entry(r).or_insert_with(|| of(r))
+                }
+            }
+        } else {
+            many.entry(r).or_insert_with(|| of(r))
+        };
         sent |= extend(ix, fs, n, r, out);
     }
     sent
