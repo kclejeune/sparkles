@@ -28,6 +28,10 @@ pub(super) const PAR_THRESHOLD: usize = 16_384;
 /// than the work, and a short request would wait for threads on idle cores to wake.
 pub(super) const PAR_MIN_LEN: usize = 4096;
 
+/// Rows that the partitioned job of [`map_rows`] maps between two polls of cancellation
+/// and the deadline.
+const MAP_POLL_ROWS: usize = 1024;
+
 /// Map `f` over rows `0..n` (in parallel when `par`) in chunks, checking cancellation and
 /// the deadline between chunks: one clock read per chunk rather than per row, while an
 /// expensive expression still stops within one chunk of the deadline.
@@ -40,7 +44,11 @@ pub(super) fn map_rows<T: Send>(
     if par {
         // Submit one partitioned job and poll within each partition. Repeated pool
         // submissions cost more than cheap numeric predicates. Temporary collector
-        // capacity is optional and reserved before dispatch.
+        // capacity is optional and reserved before dispatch. A piece holds at least
+        // one poll's rows, and no more, so that a table just above `PAR_THRESHOLD`
+        // still spreads over every thread: pieces of `PAR_MIN_LEN` rows left the
+        // 20,000 groups of `subquery-agg` at 10.5M triples on four of twelve threads,
+        // which made its eager FILTER about 12% slower.
         let bytes = (n as u64)
             .saturating_mul(std::mem::size_of::<T>() as u64)
             .saturating_mul(2)
@@ -48,9 +56,9 @@ pub(super) fn map_rows<T: Send>(
         if let Ok(_scratch) = ctx.charge(bytes) {
             return (0..n)
                 .into_par_iter()
-                .with_min_len(PAR_MIN_LEN)
+                .with_min_len(MAP_POLL_ROWS)
                 .map(|i| {
-                    if i.is_multiple_of(1024) {
+                    if i.is_multiple_of(MAP_POLL_ROWS) {
                         ctx.check()?;
                     }
                     Ok(f(i))
