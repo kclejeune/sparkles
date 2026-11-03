@@ -549,11 +549,11 @@ peak resident set of 1.0 GiB on one thread and 0.89 s with 1.4 GiB on eight, and
 set comparison of [F24](../../specs/F24-owl-classification/SPEC.md#the-horn-rules). The
 current taxonomies miss 33 and 27 of Konclude's subsumptions, which follow from axioms
 that are not Horn and stay left out, and give none that Konclude does not entail. Both
-files still cost several times the EL rules' time, since their conjunction contexts
-derive 52 million conclusions on one thread where the EL rules derive 18.5 million, and
-item 693 follows this too. `ore_ont_9855`, the slowest Horn file of the development
-set, classifies 2.9 times as fast as with the base's rules on one and eight threads,
-with the same taxonomy.
+files still cost several times the EL rules' time. On one thread the Horn rules derive
+52.0 million conclusions on `ore_ont_9663` and 29.4 million on `ore_ont_14817`, where
+the EL rules derive 18.5 and 20.8 million, and item 693 follows this too.
+`ore_ont_9855`, the slowest Horn file of the development set, classifies 2.9 times as
+fast as with the base's rules on one and eight threads, with the same taxonomy.
 
 The OWL 2 EL files and ChEBI lite take the EL rules on every side and give the same
 taxonomies. `ore_ont_3836`'s index stage takes 434 ms against 398 ms on one thread,

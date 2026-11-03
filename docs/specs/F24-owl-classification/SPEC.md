@@ -476,12 +476,13 @@ on eight, and ore_ont_14817 takes 2.2 s and 0.7 GiB and 0.46 s and 1.0 GiB. The 
 alone take 0.77 and 0.68 s on one thread, and Konclude 0.7.0 took 8.9 to 9.7 s and 3.5
 to 4.2 GB on four threads on the laptop. The two taxonomies miss 33 and 27 of Konclude's
 subsumptions, which follow from axioms that are not Horn, and give none that Konclude
-does not entail. Their contexts of conjunctions still derive 52 million conclusions on
-one thread where the EL rules derive 18.5 million, which item 693 follows. No file of
-the development set below and no case of the differential test reaches the budget with
-item 693's rules, and the budget stays as a safety net. The largest Horn run of the
-development set, ore_ont_9855, classifies in 1.5 s on one thread on the benchmark host
-against 4.4 s with the rules of phase 3, with a peak resident set of 359 MiB.
+does not entail. On one thread the Horn rules still derive 52.0 million conclusions on
+ore_ont_9663 and 29.4 million on ore_ont_14817, where the EL rules derive 18.5 and 20.8
+million, which item 693 follows. No file of the development set below and no case of the
+differential test reaches the budget with item 693's rules, and the budget stays as a
+safety net. The largest Horn run of the development set, ore_ont_9855, classifies in 1.5
+s on one thread on the benchmark host against 4.4 s with the rules of phase 3, with a
+peak resident set of 359 MiB.
 
 A run with the Horn rules composes only the property chains that some negative existential
 restriction needs, and carries every other property inclusion by the automata (item 693).
