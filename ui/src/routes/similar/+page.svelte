@@ -509,19 +509,17 @@
           </p>
         {/if}
 
-        <div class="seg" role="radiogroup" aria-label="Search from">
+        <div class="segmented" role="radiogroup" aria-label="Search from">
           <button
             type="button"
             role="radio"
             aria-checked={mode === 'entity'}
-            class:on={mode === 'entity'}
             onclick={() => (mode = 'entity')}>Entity</button
           >
           <button
             type="button"
             role="radio"
             aria-checked={mode === 'vector'}
-            class:on={mode === 'vector'}
             onclick={() => (mode = 'vector')}>Vector</button
           >
         </div>
@@ -580,17 +578,16 @@
         {/if}
 
         <div class="controls">
-          <label class="ctl">
-            <span class="faint">top</span>
-            <select class="select sm" bind:value={k} aria-label="Results">
+          <label class="form-row">
+            Results
+            <select class="select sm" bind:value={k}>
               {#each KS as n (n)}<option value={n}>{n}</option>{/each}
             </select>
           </label>
-          <div class="seg" role="radiogroup" aria-label="Metric">
+          <div class="segmented" role="radiogroup" aria-label="Metric">
             {#each METRICS as m (m)}
               <button
                 type="button"
-                class:on={usedMetric === m}
                 role="radio"
                 aria-checked={usedMetric === m}
                 title="{metricInfo(m).label}: {metricInfo(m).better} is closer{chosenIndex &&
@@ -602,8 +599,8 @@
             {/each}
           </div>
           {#if hnsw}
-            <label class="ctl" title="HNSW candidates. More raise recall and latency.">
-              <span class="faint">ef</span>
+            <label class="form-row" title="HNSW candidates. More raise recall and latency.">
+              ef
               <input
                 class="input sm ef"
                 inputmode="numeric"
@@ -615,7 +612,7 @@
               />
             </label>
             <label class="check" title="Search all vectors instead of the graph">
-              <input type="checkbox" bind:checked={exact} /> exact
+              <input type="checkbox" bind:checked={exact} /> Exact
             </label>
           {/if}
         </div>
@@ -635,7 +632,7 @@
     <section class="panel results" aria-label="Similar results">
       <div class="panel-head">
         <h2>Results</h2>
-        {#if result}<span class="faint">{result.hits.length}</span>{/if}
+        {#if result}<span class="count-badge">{result.hits.length}</span>{/if}
         <span class="spacer"></span>
         {#if result || ran}
           <button class="btn sm" onclick={openInQuery} title="Open the SPARQL of this search"
@@ -750,11 +747,12 @@
 </div>
 
 <style>
+  /* the query beside its results, both as tall as the taller */
   .layout {
     display: grid;
     grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
-    gap: 18px;
-    align-items: start;
+    gap: var(--gap);
+    align-items: stretch;
   }
   .form {
     display: grid;
@@ -794,46 +792,14 @@
     background: color-mix(in srgb, var(--warn) 14%, transparent);
     color: var(--warn);
   }
-  .seg {
-    display: inline-flex;
+  .form > .segmented {
     justify-self: start;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    overflow: hidden;
-  }
-  .seg button {
-    all: unset;
-    padding: 3px 10px;
-    font-size: var(--fs-sm);
-    cursor: pointer;
-    color: var(--text-2);
-  }
-  .seg button + button {
-    border-left: 1px solid var(--border);
-  }
-  .seg button.on {
-    background: color-mix(in srgb, var(--iri) 12%, transparent);
-    color: var(--iri);
-    font-weight: 600;
-  }
-  .seg button:focus-visible {
-    box-shadow: var(--focus);
   }
   .controls {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     gap: 8px 12px;
-  }
-  .ctl {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-  }
-  .select.sm,
-  .input.sm {
-    height: 26px;
-    font-size: var(--fs-sm);
   }
   .ef {
     width: 64px;

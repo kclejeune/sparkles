@@ -131,13 +131,21 @@
 </dialog>
 
 <style>
+  /* Three columns: the brand, the search and the end. The two outer columns share the
+     free space equally, so the search sits in the middle of the viewport; a side that needs
+     more room than its share (a long user name at medium width) pushes the search over
+     rather than crowding it. */
   .topbar {
     grid-area: top;
-    display: flex;
+    display: grid;
+    grid-template-columns:
+      minmax(max-content, 1fr) minmax(0, var(--search-w))
+      minmax(max-content, 1fr);
     align-items: center;
-    gap: var(--gutter);
+    column-gap: var(--gutter);
     height: var(--topbar-h);
-    padding: 0 var(--sp-3) 0 0;
+    /* the same inset on both sides, so the middle column is the viewport's middle */
+    padding: 0 var(--sp-3);
     background: var(--surface);
     border-bottom: 1px solid var(--border);
     min-width: 0;
@@ -148,7 +156,7 @@
     gap: var(--sp-2);
     flex: none;
     width: calc(var(--rail-w) - var(--sp-4));
-    margin-left: var(--sp-4);
+    margin-left: calc(var(--sp-4) - var(--sp-3));
     padding: var(--sp-1) 0;
     color: var(--text);
     font-weight: 650;
@@ -194,21 +202,32 @@
     .brand {
       justify-content: center;
       width: var(--rail-w);
-      margin-left: 0;
+      margin-left: calc(-1 * var(--sp-3));
     }
     .brand .name {
       display: none;
     }
   }
   @media (max-width: 760px) {
+    /* a phone: the brand, then the search and menu buttons together at the end */
     .topbar {
-      gap: var(--sp-2);
+      display: flex;
+      gap: var(--sp-1);
       padding: 0 var(--sp-2) 0 0;
+    }
+    .topbar > :global(.scope-search) {
+      margin-left: auto;
+    }
+    .end {
+      margin-left: 0;
     }
     .brand {
       width: auto;
       margin-left: var(--sp-4);
       justify-content: flex-start;
+    }
+    .topbar {
+      padding-left: 0;
     }
     .brand .name {
       display: inline;

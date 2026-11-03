@@ -645,22 +645,6 @@ ex:PersonShape a sh:NodeShape ;
     <div class="title">
       <div class="name row">
         <h1 class="mono">{name}</h1>
-        {#if hasBranches && branchList}
-          <label class="branch-pick" title="The branch this page shows">
-            <Icon name="branch" size={14} />
-            <select
-              class="select sm mono"
-              aria-label="Branch"
-              value={branch ?? MAIN}
-              onchange={(e) => selectBranch(e.currentTarget.value)}
-            >
-              {#each branchList as b (b.name)}
-                <option value={b.name}>{branchOption(b)}</option>
-              {/each}
-              {#if !shown}<option value={branch}>{branch}</option>{/if}
-            </select>
-          </label>
-        {/if}
       </div>
       <div class="row meta">
         {#if info}<span class="badge">{info.type === 'mem' ? 'in-memory' : 'persistent'}</span>{/if}
@@ -725,31 +709,94 @@ ex:PersonShape a sh:NodeShape ;
       {/if}
     </div>
     <div class="page-actions">
-      <button class="btn" onclick={refreshAll} disabled={loading}>
-        {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={14} />{/if} Refresh
+      <button class="btn" onclick={refreshAll} disabled={loading} aria-label="Refresh">
+        {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={14} />{/if}<span
+          class="lbl">Refresh</span
+        >
       </button>
       <button class="btn" onclick={openQuery}><Icon name="query" size={14} /> Query</button>
       <a class="btn" href={explore('')}><Icon name="explore" size={14} /> Explore</a>
       {#if auth.can(name, 'admin')}
         <button
           class="btn"
+          aria-label="Clone"
           onclick={() => (cloneOpen = true)}
           disabled={readOnly || !info}
           title={readOnly
             ? 'The server is read-only'
             : 'Copy this dataset into a new, independent dataset'}
-          ><Icon name="copy" size={14} /> Clone</button
+          ><Icon name="copy" size={14} /><span class="lbl">Clone</span></button
         >
         <button
           class="btn danger"
+          aria-label="Delete"
           onclick={() => (deleteTarget = name)}
           disabled={info?.declared === true}
           title={info?.declared ? api.DECLARED_TEXT : 'Delete this dataset and its files'}
-          ><Icon name="trash" size={14} /> Delete</button
+          ><Icon name="trash" size={14} /><span class="lbl">Delete</span></button
         >
       {/if}
     </div>
   </header>
+
+  <!-- the state the page shows: a branch, and a past state of the figures -->
+  {#if (hasBranches && branchList) || (tab === 'overview' && stats)}
+    <div class="page-context">
+      {#if hasBranches && branchList}
+        <label class="form-row" title="The branch this page shows">
+          Branch
+          <select
+            class="select mono"
+            value={branch ?? MAIN}
+            onchange={(e) => selectBranch(e.currentTarget.value)}
+          >
+            {#each branchList as b (b.name)}
+              <option value={b.name}>{branchOption(b)}</option>
+            {/each}
+            {#if !shown}<option value={branch}>{branch}</option>{/if}
+          </select>
+        </label>
+      {/if}
+      {#if tab === 'overview' && stats}
+        <!-- the state the figures describe -->
+        <form
+          class="stats-at"
+          onsubmit={(e) => {
+            e.preventDefault();
+            void loadStats();
+          }}
+        >
+          <label
+            class="form-row"
+            title="Show the figures of a past state: a commit number, commit:N, time:<RFC 3339> or snapshot:NAME"
+          >
+            State at
+            <input
+              class="input mono"
+              class:invalid={!statsAtOk}
+              placeholder="head"
+              size="12"
+              bind:value={statsAt}
+            />
+          </label>
+          <button class="btn" disabled={!statsAtOk || loading}>Show</button>
+          {#if stats.at}
+            <span class="badge past" title="These figures describe a past state ({stats.at})"
+              >commit {stats.commit}</span
+            >
+            <button
+              type="button"
+              class="btn ghost sm"
+              onclick={() => {
+                statsAt = '';
+                void loadStats();
+              }}>Back to head</button
+            >
+          {/if}
+        </form>
+      {/if}
+    </div>
+  {/if}
 
   {#if cloned}
     <div class="cloned row">
@@ -824,44 +871,8 @@ ex:PersonShape a sh:NodeShape ;
       />
     </div>
   {:else if stats}
-    <!-- the state the figures describe -->
-    <form
-      class="stats-at page-context"
-      onsubmit={(e) => {
-        e.preventDefault();
-        void loadStats();
-      }}
-    >
-      <label
-        class="form-row"
-        title="Show the figures of a past state: a commit number, commit:N, time:<RFC 3339> or snapshot:NAME"
-      >
-        State at
-        <input
-          class="input mono"
-          class:invalid={!statsAtOk}
-          placeholder="head"
-          size="12"
-          bind:value={statsAt}
-        />
-      </label>
-      <button class="btn" disabled={!statsAtOk || loading}>Show</button>
-      {#if stats.at}
-        <span class="badge past" title="These figures describe a past state ({stats.at})"
-          >commit {stats.commit}</span
-        >
-        <button
-          type="button"
-          class="btn ghost sm"
-          onclick={() => {
-            statsAt = '';
-            void loadStats();
-          }}>Back to head</button
-        >
-      {/if}
-    </form>
     <!-- headline numbers -->
-    <dl class="figures panel">
+    <dl class="figures">
       <div>
         <dt>Quads</dt>
         <dd>{fmtInt(stats.quads)}</dd>
@@ -1710,18 +1721,6 @@ ex:PersonShape a sh:NodeShape ;
     flex-wrap: wrap;
     gap: 6px 12px;
   }
-  .branch-pick {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-    max-width: 100%;
-    color: var(--text-2);
-  }
-  .branch-pick .select {
-    min-width: 0;
-    max-width: 260px;
-  }
   .meta {
     flex-wrap: wrap;
   }
@@ -1740,18 +1739,6 @@ ex:PersonShape a sh:NodeShape ;
   }
   a.btn {
     text-decoration: none;
-  }
-  .figures {
-    display: grid;
-    grid-template-columns: repeat(6, 1fr);
-    margin: 0;
-  }
-  .figures > div {
-    padding: 12px 16px;
-    border-right: 1px solid var(--border);
-  }
-  .figures > div:last-child {
-    border-right: 0;
   }
   dt {
     font-size: var(--fs-sm);
@@ -2057,35 +2044,14 @@ ex:PersonShape a sh:NodeShape ;
     .cols {
       grid-template-columns: minmax(0, 1fr);
     }
-    .figures {
-      grid-template-columns: repeat(3, 1fr);
-    }
-    .figures > div:nth-child(3) {
-      border-right: 0;
-    }
-    .figures > div:nth-child(-n + 3) {
-      border-bottom: 1px solid var(--border);
-    }
-  }
-  @media (max-width: 760px) {
-    .figures {
-      grid-template-columns: repeat(2, 1fr);
-    }
-    .figures > div {
-      border-right: 0;
-      border-bottom: 1px solid var(--border);
-    }
-    .figures > div:nth-child(odd) {
-      border-right: 1px solid var(--border);
-    }
-    .figures > div:nth-last-child(-n + 2) {
-      border-bottom: 0;
-    }
   }
   .page-tabs {
     border-bottom: 1px solid var(--border);
   }
   .stats-at {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     gap: var(--sp-2);
   }
   .stats-at input.invalid {

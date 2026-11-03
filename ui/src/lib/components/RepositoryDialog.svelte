@@ -172,9 +172,9 @@
     <form id="repo-form" class="form" onsubmit={submit}>
       <fieldset class="types" disabled={isEdit}>
         <legend>Type</legend>
-        <div class="seg" role="radiogroup" aria-label="Repository type">
+        <div class="segmented" role="radiogroup" aria-label="Repository type">
           {#each [['fs', 'Filesystem'], ['s3', 'S3'], ['gcs', 'GCS'], ['azure', 'Azure']].filter(([v]) => v === 'fs' || v === 's3' || v === type) as [v, label] (v)}
-            <label class:sel={type === v}>
+            <label>
               <input type="radio" bind:group={type} value={v} />{label}
             </label>
           {/each}
@@ -436,27 +436,6 @@
     border: 1px solid var(--border);
     border-radius: var(--r);
   }
-  .seg {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-  }
-  .seg label {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    height: 28px;
-    padding: 0 9px;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    font-size: var(--fs-sm);
-    cursor: pointer;
-  }
-  .seg label.sel {
-    border-color: var(--iri);
-    background: color-mix(in srgb, var(--iri) 8%, transparent);
-  }
-  .seg input,
   .check input,
   .checks input {
     margin: 0;

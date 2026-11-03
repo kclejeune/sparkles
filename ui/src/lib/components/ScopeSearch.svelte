@@ -76,7 +76,8 @@
     launcher.open && (!!launcher.query.trim() || items.length > 0 || busy),
   );
   const placeholder = $derived(
-    ds ? 'Search or type > for commands' : 'Search pages, or type > for commands',
+    launcher.hint ??
+      (ds ? 'Search or type > for commands' : 'Search pages, or type > for commands'),
   );
 
   const backupsVisible = () =>
@@ -518,9 +519,8 @@
 <style>
   .scope-search {
     position: relative;
-    flex: 1;
     min-width: 0;
-    max-width: 640px;
+    width: 100%;
     display: flex;
   }
   .opener,
@@ -736,8 +736,7 @@
   @media (max-width: 760px) {
     .scope-search {
       flex: none;
-      max-width: none;
-      margin-left: auto;
+      width: auto;
     }
     .opener {
       display: inline-flex;

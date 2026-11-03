@@ -147,7 +147,7 @@
                         onclick={() => {
                           app.setDataset(d.name);
                           goto(resolve('/query'));
-                        }}><Icon name="query" size={13} /> Query</button
+                        }}><Icon name="query" size={13} /><span class="lbl">Query</span></button
                       >
                       <a class="btn sm" href={detail(d.name)}>Details</a>
                       {#if auth.can(d.name, 'admin')}
@@ -205,6 +205,8 @@
   @media (max-width: 760px) {
     table.data th:nth-child(5),
     table.data td:nth-child(5),
+    table.data th:nth-child(2),
+    table.data td:nth-child(2),
     table.data th:nth-child(4),
     table.data td:nth-child(4) {
       display: none;

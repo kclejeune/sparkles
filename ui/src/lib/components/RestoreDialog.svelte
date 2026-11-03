@@ -316,11 +316,9 @@
       </fieldset>
       <fieldset class="inline">
         <legend>Check after restoring</legend>
-        <div class="seg" role="radiogroup" aria-label="Check after restoring">
+        <div class="segmented" role="radiogroup" aria-label="Check after restoring">
           {#each [['quick', 'Quick'], ['full', 'Full'], ['none', 'Skip']] as [v, label] (v)}
-            <label class:sel={check === v}
-              ><input type="radio" bind:group={check} value={v} />{label}</label
-            >
+            <label><input type="radio" bind:group={check} value={v} />{label}</label>
           {/each}
         </div>
         <span class="hint"
@@ -490,29 +488,9 @@
     font-size: var(--fs-sm);
   }
   .opt input,
-  .check input,
-  .seg input {
+  .check input {
     margin: 2px 0 0;
     accent-color: var(--iri);
-  }
-  .seg {
-    display: flex;
-    gap: 4px;
-  }
-  .seg label {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    height: 28px;
-    padding: 0 10px;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    font-size: var(--fs-sm);
-    cursor: pointer;
-  }
-  .seg label.sel {
-    border-color: var(--iri);
-    background: color-mix(in srgb, var(--iri) 8%, transparent);
   }
   .hint {
     font-weight: 400;

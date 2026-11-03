@@ -74,6 +74,7 @@
   import ValidationSource from '$components/ValidationSource.svelte';
   import { type Badge, type GuardProbe, type VResult } from '$lib/validation-overlay';
   import { load as loadPref, save as savePref } from '$lib/storage';
+  import { useHint, usePageSearch, useProvider, type LauncherItem } from '$lib/launcher.svelte';
 
   type ENode = {
     id: string;
@@ -109,8 +110,8 @@
   });
 
   /** Take the search text to the query page's Ask bar. */
-  function askInQuery() {
-    app.pendingQuery = { query: '', ask: query.trim() };
+  function askInQuery(text: string) {
+    app.pendingQuery = { query: '', ask: text.trim() };
     goto(resolve('/query'));
   }
 
@@ -129,6 +130,8 @@
   );
   /** The facet panel beside the canvas (`&facets=1`, Shift+F, U11 section 2.3). */
   let facetsOpen = $state(page.url.searchParams.get('facets') === '1');
+  /** The graph toolbar's View menu: literals and rdf:type edges. */
+  let viewOpen = $state(false);
   /** The set the facets count: `class:` and a class IRI, or `drawn`; empty for the default. */
   let facetSetKey = $state('');
 
@@ -256,6 +259,7 @@
   }
   let graphView: GraphView | undefined = $state();
   let graphToolbar: HTMLDivElement | undefined = $state();
+  let gtoolsWidth = $state(0);
 
   // --- the validation overlay (docs/specs/U07-data-quality-and-schema-diagram.md §11) ---
   /**
@@ -1695,79 +1699,80 @@
 
   // --- search -------------------------------------------------------------------
 
-  let query = $state('');
-  let hits = $state<ex.SearchHit[]>([]);
-  let searching = $state(false);
-  let searchOpen = $state(false);
-  let searchErr = $state<string | null>(null);
-  let active = $state(0);
-  let searchCtl: AbortController | null = null;
-  let debounce: ReturnType<typeof setTimeout> | undefined;
-
-  const directIri = $derived.by(() => {
-    const q = query.trim();
-    if (!q) return null;
+  /** The IRI that a search text names: `<…>`, an absolute IRI or a known prefixed name. */
+  function directIriOf(q: string): string | null {
     const m = /^<(.+)>$/.exec(q);
     if (m) return m[1];
     if (/^(https?|urn|mailto|file):/i.test(q)) return q;
     const pn = /^([A-Za-z][\w.-]*)?:(\S*)$/.exec(q);
     if (pn && prefixes[pn[1] ?? ''] != null) return prefixes[pn[1] ?? ''] + pn[2];
     return null;
-  });
-  const options = $derived<{ iri: string; label?: string; direct?: boolean }[]>([
-    ...(directIri ? [{ iri: directIri, direct: true }] : []),
-    ...hits.filter((h) => h.iri !== directIri),
-  ]);
+  }
 
-  function onSearchInput() {
-    clearTimeout(debounce);
-    searchOpen = true;
-    active = 0;
-    const q = query.trim();
-    if (q.length < 2 || !ds) {
-      hits = [];
-      searching = false;
-      return;
-    }
-    // Show the spinner (not "Nothing matches") while the debounce is pending.
-    searching = true;
-    debounce = setTimeout(async () => {
-      searchCtl?.abort();
-      const ctl = (searchCtl = new AbortController());
-      searching = true;
-      searchErr = null;
+  // The resource finder lives in the top bar's launcher: while Explore is open its hits come
+  // first, each focusing the resource in the graph, with "Open <IRI>" for a typed IRI and
+  // "Ask a question…" when the dataset answers questions.
+  useProvider({
+    id: 'resources',
+    label: ({ ds: name }) => (name ? `Resources in ${name}` : 'Resources'),
+    order: 1,
+    modes: ['@'],
+    recent: false,
+    active: ({ ds: name }) => !!name,
+    // the Open row needs the prefixes and the Ask row the assistant's settings, which can
+    // arrive after the launcher asked
+    watch: () => [Object.keys(prefixes).length, canAsk],
+    async search(raw, { ds: name, signal }) {
+      const q = raw.trim();
+      if (!name || q.length < 2) return [];
+      const direct = directIriOf(q);
+      const out: LauncherItem[] = [];
+      if (direct)
+        out.push({
+          id: `!${direct}`,
+          title: `Open ${displayIri(direct, prefixes)}`,
+          icon: 'target',
+          run: () => void focusOn(direct),
+        });
+      // a failed label search leaves the Open and Ask rows, which need no answer
+      let hits: Awaited<ReturnType<typeof ex.search>> = [];
       try {
-        hits = await ex.search(ds!, q, ctl.signal);
+        hits = await ex.search(name, q, signal);
       } catch (e) {
-        if (!(e instanceof DOMException && e.name === 'AbortError'))
-          searchErr = api.errorMessage(e);
-      } finally {
-        if (searchCtl === ctl) searching = false;
+        if (signal.aborted || (e instanceof DOMException && e.name === 'AbortError')) throw e;
       }
-    }, 250);
-  }
-
-  function pick(o: { iri: string; label?: string }) {
-    searchOpen = false;
-    query = '';
-    hits = [];
-    void focusOn(o.iri, o.label);
-  }
-
-  function onSearchKey(e: KeyboardEvent) {
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      active = Math.min(active + 1, options.length - 1);
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      active = Math.max(active - 1, 0);
-    } else if (e.key === 'Enter' && options[active]) {
-      e.preventDefault();
-      pick(options[active]);
-    } else if (e.key === 'Escape') {
-      searchOpen = false;
-    }
-  }
+      for (const h of hits)
+        if (h.iri !== direct)
+          out.push({
+            id: h.iri,
+            title: h.label ?? shortLabel(h.iri, prefixes),
+            subtitle: displayIri(h.iri, prefixes),
+            icon: 'explore',
+            run: () => void focusOn(h.iri, h.label),
+          });
+      if (canAsk)
+        out.push({
+          id: '?ask',
+          title: 'Ask a question…',
+          subtitle: `“${q}”`,
+          icon: 'sparkle',
+          run: () => askInQuery(q),
+        });
+      return out;
+    },
+  });
+  useHint(() =>
+    ds && tab === 'graph'
+      ? `Find a resource in ${ds} by label or IRI${canAsk ? ', or ask a question' : ''}`
+      : null,
+  );
+  // `/` focuses the text-search tab's own field there, and opens the top bar elsewhere
+  usePageSearch(() => {
+    if (tab !== 'search') return false;
+    const el = document.querySelector<HTMLInputElement>('.text-search-field');
+    el?.focus();
+    return !!el;
+  });
 
   // --- starting points ------------------------------------------------------------
 
@@ -2114,7 +2119,7 @@
 
   onMount(() => {
     const onDoc = (e: MouseEvent) => {
-      if (searchOpen && !(e.target as HTMLElement).closest('.search')) searchOpen = false;
+      if (viewOpen && !(e.target as HTMLElement).closest('.view-menu')) viewOpen = false;
     };
     // H opens and closes the History strip of the selected resource, Shift+H the one over the graph
     const onKey = (e: KeyboardEvent) => {
@@ -2196,63 +2201,6 @@
 <h1 class="sr-only">Explore</h1>
 <div class="page">
   <header class="bar">
-    <div class="search">
-      <Icon name="search" size={15} />
-      <input
-        class="search-input"
-        placeholder={ds
-          ? `Find a resource in ${ds} by label or IRI${canAsk ? ', or ask a question' : ''}`
-          : 'Choose a dataset first'}
-        bind:value={query}
-        oninput={onSearchInput}
-        onfocus={() => (searchOpen = true)}
-        onkeydown={onSearchKey}
-        disabled={!ds}
-        role="combobox"
-        aria-expanded={searchOpen && options.length > 0}
-        aria-controls="search-results"
-        aria-autocomplete="list"
-      />
-      {#if searching}<span class="spinner"></span>{/if}
-      {#if searchOpen && query.trim().length >= 2}
-        <div class="results" id="search-results" role="listbox">
-          {#each options as o, i (o.iri + (o.direct ? '!' : ''))}
-            <button
-              role="option"
-              aria-selected={i === active}
-              class="hit"
-              class:active={i === active}
-              onmouseenter={() => (active = i)}
-              onclick={() => pick(o)}
-            >
-              {#if o.direct}
-                <Icon name="target" size={14} />
-                <span>Open <span class="mono t-iri">{displayIri(o.iri, prefixes)}</span></span>
-              {:else}
-                <span class="hit-label">{o.label ?? shortLabel(o.iri, prefixes)}</span>
-                <span class="hit-iri mono">{displayIri(o.iri, prefixes)}</span>
-              {/if}
-            </button>
-          {:else}
-            {#if !searching}
-              <div class="hit none">{searchErr ?? `Nothing matches “${query.trim()}”.`}</div>
-            {/if}
-          {/each}
-          {#if canAsk}
-            <button
-              role="option"
-              aria-selected="false"
-              class="hit ask-hint"
-              onclick={askInQuery}
-              title="Open the query page with this as a question"
-            >
-              <Icon name="sparkle" size={14} />
-              <span>Ask a question… <span class="faint">“{query.trim()}”</span></span>
-            </button>
-          {/if}
-        </div>
-      {/if}
-    </div>
     <div class="tabs" role="tablist">
       <button class="tab" role="tab" aria-selected={tab === 'graph'} onclick={() => setTab('graph')}
         ><Icon name="graph" size={14} /> Graph</button
@@ -2320,66 +2268,107 @@
     >
       <div class="canvas">
         {#if nodeCount > 0 || graphTimeOpen || pathsOpen}
-          <div class="gtools" bind:this={graphToolbar}>
-            <label class="row check"
-              ><input type="checkbox" bind:checked={showLiterals} /> Literals</label
-            >
-            <label class="row check"
-              ><input type="checkbox" bind:checked={hideTypes} /> Hide rdf:type</label
-            >
-            <span class="spacer"></span>
-            <span class="faint">{gNodes.length} nodes, {gEdges.length} edges</span>
-            <button
-              class="btn sm"
-              aria-pressed={pathsOpen}
-              title="Find the paths between two entities (Shift+P)"
-              onclick={() => (pathsOpen ? closePaths() : openPaths())}
-              ><Icon name="route" size={13} /> Paths</button
-            >
-            {#if nodeCount}
-              <div class="seg" role="group" aria-label="Show the graph as">
+          <div
+            class="toolbar gtools"
+            class:narrow={gtoolsWidth > 0 && gtoolsWidth < 860}
+            bind:this={graphToolbar}
+            bind:clientWidth={gtoolsWidth}
+          >
+            <div class="toolbar-group">
+              <button
+                class="btn sm"
+                aria-pressed={pathsOpen}
+                aria-label="Paths"
+                title="Find the paths between two entities (Shift+P)"
+                onclick={() => (pathsOpen ? closePaths() : openPaths())}
+                ><Icon name="route" size={13} /><span class="lbl">Paths</span></button
+              >
+              {#if nodeCount}
+                <div class="segmented" role="group" aria-label="Show the graph as">
+                  <button
+                    aria-pressed={canvasMode === 'graph'}
+                    onclick={() => setCanvasMode('graph')}>Graph</button
+                  >
+                  <button
+                    aria-pressed={canvasMode === 'map'}
+                    disabled={pathsOpen}
+                    title={pathsOpen
+                      ? 'Close the path finder to show the graph on a map'
+                      : 'Show the drawn entities on a map, with arcs for their relations (Shift+M)'}
+                    onclick={() => setCanvasMode('map')}><Icon name="map" size={13} /> Map</button
+                  >
+                </div>
+                {#if mapIndex && ds}
+                  <a
+                    class="btn sm"
+                    title="The entities of the vector index {mapIndex} projected to two dimensions"
+                    href="{resolve('/embedding')}?ds={encodeURIComponent(
+                      ds,
+                    )}&index={encodeURIComponent(mapIndex)}">Embedding map</a
+                  >
+                {/if}
+                {#if canvasMode === 'graph'}
+                  <LensMenu
+                    {lenses}
+                    anchor={graphToolbar}
+                    short={(iri) => shortLabel(iri, prefixes)}
+                    keys={tab === 'graph' && canvasMode === 'graph'}
+                  >
+                    {#snippet extra()}
+                      {#if vOn && vProbe}
+                        <ValidationSource
+                          probe={vProbe}
+                          editor={vHasEditor}
+                          bind:kind={vSource}
+                          bind:graphIri={vGraphIri}
+                        />
+                      {/if}
+                    {/snippet}
+                  </LensMenu>
+                {/if}
                 <button
                   class="btn sm"
-                  aria-pressed={canvasMode === 'graph'}
-                  onclick={() => setCanvasMode('graph')}>Graph</button
+                  aria-pressed={facetsOpen}
+                  aria-label="Facets"
+                  title="Histograms of the properties of the entities, which brush the graph (Shift+F)"
+                  onclick={toggleFacets}
+                  ><Icon name="filter" size={13} /><span class="lbl">Facets</span></button
                 >
                 <button
                   class="btn sm"
-                  aria-pressed={canvasMode === 'map'}
-                  disabled={pathsOpen}
-                  title={pathsOpen
-                    ? 'Close the path finder to show the graph on a map'
-                    : 'Show the drawn entities on a map, with arcs for their relations (Shift+M)'}
-                  onclick={() => setCanvasMode('map')}><Icon name="map" size={13} /> Map</button
-                >
-              </div>
-              {#if mapIndex && ds}
-                <a
-                  class="btn sm"
-                  title="The entities of the vector index {mapIndex} projected to two dimensions"
-                  href="{resolve('/embedding')}?ds={encodeURIComponent(
-                    ds,
-                  )}&index={encodeURIComponent(mapIndex)}">Embedding map</a
+                  aria-pressed={graphTimeOpen}
+                  aria-label="Graph history"
+                  title="Move the whole graph through the commits (Shift+H)"
+                  onclick={() => (graphTimeOpen ? closeGraphTime() : openGraphTime())}
+                  ><Icon name="clock" size={13} /><span class="lbl">History</span></button
                 >
               {/if}
-              {#if canvasMode === 'graph'}
-                <LensMenu
-                  {lenses}
-                  anchor={graphToolbar}
-                  short={(iri) => shortLabel(iri, prefixes)}
-                  keys={tab === 'graph' && canvasMode === 'graph'}
+              <div class="view-menu">
+                <button
+                  class="btn sm"
+                  aria-haspopup="true"
+                  aria-expanded={viewOpen}
+                  aria-label="View"
+                  title="What the graph draws"
+                  onclick={() => (viewOpen = !viewOpen)}
+                  ><Icon name="eye" size={13} /><span class="lbl">View</span>
+                  <Icon name="chevronDown" size={13} /></button
                 >
-                  {#snippet extra()}
-                    {#if vOn && vProbe}
-                      <ValidationSource
-                        probe={vProbe}
-                        editor={vHasEditor}
-                        bind:kind={vSource}
-                        bind:graphIri={vGraphIri}
-                      />
-                    {/if}
-                  {/snippet}
-                </LensMenu>
+                {#if viewOpen}
+                  <div class="dropdown-menu">
+                    <label class="dropdown-item check"
+                      ><input type="checkbox" bind:checked={showLiterals} /> Literals</label
+                    >
+                    <label class="dropdown-item check"
+                      ><input type="checkbox" bind:checked={hideTypes} /> Hide rdf:type</label
+                    >
+                  </div>
+                {/if}
+              </div>
+            </div>
+            <div class="toolbar-end">
+              <span class="note">{gNodes.length} nodes, {gEdges.length} edges</span>
+              {#if nodeCount && canvasMode === 'graph'}
                 {#if !listView}
                   <button
                     class="btn sm icon graph-control"
@@ -2397,29 +2386,22 @@
                 <button
                   class="btn sm"
                   aria-pressed={listView}
+                  aria-label="List"
                   title="The drawn nodes as a list, with a column per lens"
                   onclick={() => (listView = !listView)}
-                  ><Icon name="table" size={13} /> List</button
+                  ><Icon name="table" size={13} /><span class="lbl">List</span></button
                 >
               {/if}
-              <button
-                class="btn sm"
-                aria-pressed={facetsOpen}
-                title="Histograms of the properties of the entities, which brush the graph (Shift+F)"
-                onclick={toggleFacets}><Icon name="filter" size={13} /> Facets</button
-              >
-              <button
-                class="btn sm"
-                aria-pressed={graphTimeOpen}
-                aria-label="Graph history"
-                title="Move the whole graph through the commits (Shift+H)"
-                onclick={() => (graphTimeOpen ? closeGraphTime() : openGraphTime())}
-                ><Icon name="clock" size={13} /> History</button
-              >
-              <button class="btn sm ghost" onclick={clearGraph}
-                ><Icon name="trash" size={13} /> Clear</button
-              >
-            {/if}
+              {#if nodeCount}
+                <button
+                  class="btn sm ghost"
+                  aria-label="Clear"
+                  title="Clear the graph"
+                  onclick={clearGraph}
+                  ><Icon name="trash" size={13} /><span class="lbl">Clear</span></button
+                >
+              {/if}
+            </div>
           </div>
           <SelectionBar onopengraph={openSelectionAsGraph} onuse={useSelection} />
           {#if ds && vItems.length}
@@ -2622,9 +2604,10 @@
           >
             {#snippet header()}
               {#if facetSets.length > 1}
-                <label class="row facet-set"
+                <label class="row facet-set form-row"
                   >Count
                   <select
+                    class="select sm"
                     value={facetSet?.key ?? ''}
                     onchange={(e) => (facetSetKey = (e.currentTarget as HTMLSelectElement).value)}
                   >
@@ -2675,17 +2658,29 @@
           {:else if selected}
             {@const n = selected}
             <div class="side-head">
-              <div class="side-title">
-                <h2 title={labelFor(n.term, n.label)}>{labelFor(n.term, n.label)}</h2>
+              <div class="side-title-row">
+                <div class="side-title">
+                  <h2 title={labelFor(n.term, n.label)}>{labelFor(n.term, n.label)}</h2>
+                  {#if n.term.type === 'uri'}
+                    <button class="iri-line mono" onclick={() => copy(n.iri)} title="Copy IRI">
+                      {n.iri}
+                      <Icon name="copy" size={12} />
+                    </button>
+                  {:else}
+                    <div class="mono faint">
+                      {n.term.type === 'literal' ? 'literal' : n.term.type}
+                    </div>
+                  {/if}
+                </div>
                 {#if n.term.type === 'uri'}
-                  <button class="iri-line mono" onclick={() => copy(n.iri)} title="Copy IRI">
-                    {n.iri}
-                    <Icon name="copy" size={12} />
+                  <button
+                    class="btn sm ghost icon"
+                    title="Remove from graph"
+                    aria-label="Remove from graph"
+                    onclick={() => removeNode(n.id)}
+                  >
+                    <Icon name="x" size={14} />
                   </button>
-                {:else}
-                  <div class="mono faint">
-                    {n.term.type === 'literal' ? 'literal' : n.term.type}
-                  </div>
                 {/if}
               </div>
               {#if types.length}
@@ -2741,7 +2736,7 @@
                     ><Icon name="route" size={13} /> Paths from here</button
                   >
                   <button class="btn sm" onclick={() => openPaths({ to: n.id })}
-                    >Paths to here</button
+                    ><Icon name="route" size={13} /> Paths to here</button
                   >
                   <button
                     class="btn sm"
@@ -2750,14 +2745,6 @@
                     onclick={() => (stripOpen ? closeStrip() : (stripOpen = true))}
                     ><Icon name="clock" size={13} /> History</button
                   >
-                  <button
-                    class="btn sm ghost icon"
-                    title="Remove from graph"
-                    aria-label="Remove from graph"
-                    onclick={() => removeNode(n.id)}
-                  >
-                    <Icon name="x" size={13} />
-                  </button>
                 </div>
                 <div class="tabs side-tabs" role="tablist" aria-label="Resource views">
                   <button
@@ -2894,7 +2881,9 @@
                     {/if}
                   </section>
                 {/if}
-                <h3 class="sub">Properties <span class="faint">{detail.props.length}</span></h3>
+                <h3 class="sub">
+                  Properties <span class="count-badge">{fmtInt(detail.props.length)}</span>
+                </h3>
                 {#if grouped.length === 0}
                   <p class="faint">No outgoing triples. This IRI is only used as an object.</p>
                 {/if}
@@ -2955,7 +2944,7 @@
                 {/key}
 
                 <h3 class="sub">
-                  Referenced by <span class="faint">{fmtInt(detail.incomingTotal)}</span>
+                  Referenced by <span class="count-badge">{fmtInt(detail.incomingTotal)}</span>
                 </h3>
                 {#if detail.incoming.length === 0}
                   <p class="faint">Nothing points to this resource.</p>
@@ -3538,84 +3527,10 @@
   }
   .bar {
     display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 8px 12px 0;
+    align-items: flex-end;
+    padding: var(--sp-1) var(--gutter) 0;
     border-bottom: 1px solid var(--border);
     background: var(--surface);
-  }
-  .search {
-    position: relative;
-    flex: 1;
-    min-width: 0;
-    max-width: 620px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    height: 32px;
-    padding: 0 10px;
-    margin-bottom: 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    background: var(--bg);
-    color: var(--text-3);
-  }
-  .search:focus-within {
-    border-color: var(--iri);
-    box-shadow: 0 0 0 3px rgba(36, 89, 199, 0.15);
-  }
-  .search-input {
-    flex: 1;
-    border: 0;
-    outline: 0;
-    background: transparent;
-    color: var(--text);
-    font: inherit;
-    min-width: 0;
-  }
-  .results {
-    position: absolute;
-    left: -1px;
-    right: -1px;
-    top: calc(100% + 4px);
-    z-index: 40;
-    max-height: 380px;
-    overflow: auto;
-    padding: 4px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    box-shadow: var(--shadow-pop);
-  }
-  .hit {
-    all: unset;
-    box-sizing: border-box;
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-    width: 100%;
-    padding: 6px 8px;
-    border-radius: 4px;
-    cursor: pointer;
-    color: var(--text);
-  }
-  .hit.active {
-    background: color-mix(in srgb, var(--iri) 12%, transparent);
-  }
-  .hit.none {
-    cursor: default;
-    color: var(--text-2);
-  }
-  .hit-label {
-    font-weight: 500;
-    white-space: nowrap;
-  }
-  .hit-iri {
-    font-size: 11px;
-    color: var(--text-3);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
   .diff-host {
     flex: 1;
@@ -3646,14 +3561,48 @@
     overflow: hidden;
   }
   .gtools {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px 14px;
-    padding: 6px 12px;
-    border-bottom: 1px solid var(--border);
-    background: var(--surface);
-    font-size: var(--fs-sm);
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+  /* a narrow canvas, such as beside the details panel on a laptop: every tool keeps its
+     icon and tooltip, so the tools stay on one row and the canvas keeps its height. A
+     measured width rather than a container query, since a container's layout containment
+     would hold the toolbar's fixed popovers */
+  .gtools.narrow {
+    /* and a very narrow one, such as with Facets open as well, wraps its tools to more
+       rows rather than clipping them */
+    & .toolbar-group,
+    & .toolbar-end {
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+    & .toolbar-end {
+      flex-shrink: 1;
+      justify-content: flex-end;
+    }
+    & .lbl {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+    }
+  }
+  .view-menu {
+    position: relative;
+  }
+  /* beside the details panel the canvas is narrow: the end group's buttons keep their icons
+     and tooltips, so the tools stay on one row */
+  @media (max-width: 1599px) {
+    .gtools .toolbar-end .lbl {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+    }
   }
   .check {
     gap: 5px;
@@ -3664,19 +3613,6 @@
     min-height: 0;
     /* the lens legend docks in its corner */
     position: relative;
-  }
-  .seg {
-    display: inline-flex;
-    gap: 0;
-  }
-  .seg .btn:first-child {
-    border-top-right-radius: 0;
-    border-bottom-right-radius: 0;
-  }
-  .seg .btn:last-child {
-    border-top-left-radius: 0;
-    border-bottom-left-radius: 0;
-    margin-left: -1px;
   }
   .ov-host {
     flex: 1;
@@ -3807,6 +3743,15 @@
     grid-template-columns: minmax(0, 1fr);
     gap: 8px;
   }
+  .side-title-row {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--sp-2);
+  }
+  .side-title {
+    flex: 1;
+    min-width: 0;
+  }
   .side-title h2 {
     font-size: var(--fs-lg);
     overflow: hidden;
@@ -3845,7 +3790,7 @@
   .side-actions {
     display: flex;
     flex-wrap: wrap;
-    gap: 4px;
+    gap: var(--sp-1);
   }
   .side-tabs {
     margin-top: 8px;
@@ -3905,6 +3850,9 @@
     text-align: center;
   }
   .sub {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     margin: 14px 0 6px;
     font-size: var(--fs-sm);
     font-weight: 600;
@@ -4163,16 +4111,7 @@
     font-size: 12px;
     border-bottom: 1px solid var(--border);
   }
-  .bar > .tabs {
-    flex-shrink: 0;
-  }
   @media (max-width: 1000px) {
-    .bar {
-      gap: 8px;
-    }
-    .bar > .tabs {
-      flex-shrink: 1;
-    }
     .split,
     .split.faceted {
       grid-template-columns: minmax(0, 1fr);
@@ -4213,24 +4152,14 @@
       grid-template-rows: minmax(min(480px, 62vh), 1fr) auto;
     }
   }
-  /* a phone: the search box on a row of its own, the tabs under it */
   @media (max-width: 760px) {
-    .bar {
-      flex-wrap: wrap;
+    .gtools .note {
+      margin-right: auto;
     }
-    .search {
-      flex-basis: 100%;
-      max-width: none;
-    }
-    /* taps need 44 px targets: the switch between the graph and the map */
-    .gtools .seg .btn,
+    /* taps need 44 px targets */
     .graph-control {
       min-height: 44px;
       min-width: 44px;
-    }
-    .gtools {
-      flex-wrap: wrap;
-      gap: 6px 12px;
     }
     /* the path finder is a sheet over the graph, which folds to its first path */
     .split {

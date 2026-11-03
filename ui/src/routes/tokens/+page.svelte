@@ -100,20 +100,21 @@
         more access than you do, even if your access changes later.
       </p>
     </div>
-    <span class="spacer"></span>
-    {#if admin}
-      <label class="check small">
-        <input type="checkbox" bind:checked={showAll} onchange={refresh} /> All tokens
-      </label>
-    {/if}
-    <button class="btn" onclick={refresh} disabled={loading}>
-      <Icon name="refresh" size={14} /> Refresh
-    </button>
-    {#if auth.who?.canMintTokens}
-      <button class="btn primary" onclick={() => (createOpen = true)}>
-        <Icon name="plus" size={14} /> New token
+    <div class="page-actions">
+      {#if admin}
+        <label class="form-row">
+          <input type="checkbox" bind:checked={showAll} onchange={refresh} /> All tokens
+        </label>
+      {/if}
+      <button class="btn" onclick={refresh} disabled={loading}>
+        <Icon name="refresh" size={14} /> Refresh
       </button>
-    {/if}
+      {#if auth.who?.canMintTokens}
+        <button class="btn primary" onclick={() => (createOpen = true)}>
+          <Icon name="plus" size={14} /> New token
+        </button>
+      {/if}
+    </div>
   </header>
 
   {#if !auth.enabled && auth.loaded}
@@ -203,12 +204,6 @@
 </Modal>
 
 <style>
-  .check {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    height: 28px;
-  }
   .small {
     font-size: var(--fs-sm);
   }

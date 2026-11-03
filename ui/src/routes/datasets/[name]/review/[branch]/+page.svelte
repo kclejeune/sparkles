@@ -24,6 +24,7 @@
     signalClass,
     signalText,
   } from '$lib/review';
+  import { fmtInt } from '$lib/format';
   import { LatestRun } from '$lib/supersede';
   import Icon from '$components/Icon.svelte';
   import EntailmentComparison from '$components/EntailmentComparison.svelte';
@@ -194,7 +195,7 @@
         <section class="panel" aria-label="Proposed facts">
           <div class="panel-head">
             <h2>Proposed facts</h2>
-            <span class="faint small">{data.facts.length}</span>
+            <span class="count-badge">{fmtInt(data.facts.length)}</span>
           </div>
           <ul class="facts panel-body">
             {#each data.facts as f, i (factKey(f))}

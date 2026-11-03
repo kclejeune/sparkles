@@ -424,7 +424,7 @@
       <label><input type="radio" bind:group={mode} value="kShortest" /> k shortest</label>
       {#if mode === 'kShortest'}
         <label class="k"
-          >k <select bind:value={k} aria-label="Paths to find">
+          >k <select class="select sm" bind:value={k} aria-label="Paths to find">
             {#each Array.from({ length: 19 }, (_, i) => i + 2) as n (n)}<option value={n}
                 >{n}</option
               >{/each}
@@ -437,6 +437,7 @@
       <div class="frow">
         <label
           >Length {#if mode === 'kShortest'}<select
+              class="select sm"
               bind:value={minLength}
               aria-label="Fewest edges"
             >
@@ -444,14 +445,14 @@
                   value={n}>{n}</option
                 >{/each}
             </select> to{:else}up to{/if}
-          <select bind:value={maxLength} aria-label="Most edges">
+          <select class="select sm" bind:value={maxLength} aria-label="Most edges">
             {#each Array.from({ length: pf.MAX_LENGTH }, (_, i) => i + 1) as n (n)}<option value={n}
                 >{n}</option
               >{/each}
           </select> edges</label
         >
         <label
-          >Direction <select bind:value={direction}>
+          >Direction <select class="select sm" bind:value={direction}>
             <option value="both">both</option>
             <option value="forward">forward</option>
             <option value="backward">backward</option>
@@ -459,6 +460,7 @@
         >
         <label title={phase1 ? 'Paths do not pass through a node with more edges' : ''}
           >Skip hubs over <select
+            class="select sm"
             bind:value={maxDegree}
             disabled={!phase1}
             aria-describedby={phase1 ? undefined : 'path-phase1'}
@@ -469,6 +471,7 @@
         <label
           title="Add up a numeric annotation on each edge instead of counting edges. An edge without one weighs 1."
           >Weight <select
+            class="select sm"
             bind:value={weight}
             aria-describedby="path-weight-note"
             onfocus={loadWeights}

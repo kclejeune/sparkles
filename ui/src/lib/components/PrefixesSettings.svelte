@@ -266,7 +266,7 @@
           {#if addError}<p class="bad small add-error">{addError}</p>{/if}
         </form>
       {/if}
-      <div class="scroll-x">
+      <div class="table-scroll">
         <table class="data" aria-label="Prefixes">
           <thead>
             <tr><th>Prefix</th><th>IRI</th><th>Source</th><th></th></tr>

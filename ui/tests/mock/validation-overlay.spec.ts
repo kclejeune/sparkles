@@ -236,9 +236,13 @@ test('item 120 review: a guard default does not follow the person to a dataset w
     .getByRole('listbox', { name: 'Datasets' })
     .getByRole('option', { name: /quality2/ })
     .click();
-  const search = page.getByRole('combobox', { name: /Find a resource/ });
+  const search = page.getByPlaceholder(/^Find a resource/);
   await search.fill('Quinn');
-  await page.locator('#search-results').getByRole('option', { name: /Quinn/ }).first().click();
+  await page
+    .getByRole('listbox', { name: 'Search results' })
+    .getByRole('option', { name: /Quinn/ })
+    .first()
+    .click();
   await expect(page.locator('.wrap[data-graph]')).toBeVisible({ timeout: 15_000 });
   await page.waitForTimeout(800);
   await page.getByRole('button', { name: /^Lenses/ }).click();

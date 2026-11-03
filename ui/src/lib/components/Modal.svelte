@@ -52,21 +52,31 @@
 </dialog>
 
 <style>
+  /* A centred card; on a phone (760 px and narrower) a sheet docked at the bottom of the
+     screen, full width, whose body scrolls under a fixed head and footer, so the actions stay
+     within reach of a thumb and above the on-screen keyboard. */
   dialog {
-    max-width: calc(100vw - 32px);
+    max-width: calc(100vw - 2 * var(--sp-4));
+    max-height: calc(100dvh - 2 * var(--sp-6));
     padding: 0;
     border: 1px solid var(--border);
     border-radius: var(--r-lg);
     background: var(--surface);
     color: var(--text);
-    box-shadow: var(--shadow-pop);
+    box-shadow: var(--shadow-overlay);
+    flex-direction: column;
   }
   dialog[open] {
-    animation: pop 0.14s ease-out;
+    display: flex;
   }
   dialog::backdrop {
-    background: rgba(10, 12, 18, 0.45);
+    background: var(--scrim);
     backdrop-filter: blur(2px);
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    dialog[open] {
+      animation: pop 0.14s ease-out;
+    }
   }
   @keyframes pop {
     from {
@@ -74,28 +84,64 @@
       transform: translateY(6px) scale(0.985);
     }
   }
+  @keyframes rise {
+    from {
+      transform: translateY(24px);
+      opacity: 0.6;
+    }
+  }
   .head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 14px 16px 6px;
+    gap: var(--sp-2);
+    flex: none;
+    padding: 14px var(--sp-4) 6px;
   }
   .head h2 {
     font-size: var(--fs-md);
   }
   .body {
-    padding: 8px 16px 16px;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    padding: var(--sp-2) var(--sp-4) var(--sp-4);
     display: grid;
     grid-template-columns: minmax(0, 1fr);
-    gap: 12px;
+    align-content: start;
+    gap: var(--sp-3);
   }
   .actions {
     display: flex;
     justify-content: flex-end;
-    gap: 8px;
-    padding: 12px 16px;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    flex: none;
+    padding: var(--sp-3) var(--sp-4);
     border-top: 1px solid var(--border);
     background: var(--surface-2);
     border-radius: 0 0 var(--r-lg) var(--r-lg);
+  }
+  @media (max-width: 760px) {
+    dialog {
+      width: 100% !important;
+      max-width: none;
+      max-height: 90dvh;
+      margin: auto 0 0;
+      border-width: 1px 0 0;
+      border-radius: var(--r-lg) var(--r-lg) 0 0;
+    }
+    @media (prefers-reduced-motion: no-preference) {
+      dialog[open] {
+        animation: rise 0.18s ease-out;
+      }
+    }
+    .head {
+      padding-top: var(--sp-4);
+    }
+    .actions {
+      padding-bottom: calc(var(--sp-3) + env(safe-area-inset-bottom));
+      border-radius: 0;
+    }
   }
 </style>

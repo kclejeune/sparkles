@@ -810,7 +810,7 @@
 <svelte:window onkeydown={onKey} />
 
 <div class="ov" bind:this={wrap} data-testid="overview" data-mode={mode}>
-  <div class="ov-bar">
+  <div class="toolbar ov-bar">
     <nav class="crumbs" aria-label="Overview levels">
       <button
         class="crumb"
@@ -832,89 +832,91 @@
       {/each}
       {#if opening}<span class="spinner" aria-label="Opening"></span>{/if}
     </nav>
-    <span class="spacer"></span>
-    <label class="by faint small">
-      <span class="hide-xs">Group by</span>
-      <select
-        class="select sm"
-        value={pickerValue}
-        onchange={(e) => regroup((e.currentTarget as HTMLSelectElement).value)}
-        aria-label="Group by"
-      >
-        {#if !current}
-          <option value="mode:classes">Classes</option>
-          <option value="mode:communities">GraphRAG communities</option>
-        {:else if communities}
-          <option value="auto">Sub-communities</option>
-          <option value="members">Members</option>
-          <option value="mode:classes">Classes</option>
-        {:else}
-          <option value="auto">Automatic</option>
-          <option value="members">Members</option>
-          {#if current?.answer.communities && current.answer.grouping.predicate}
-            <option value={`community:${current.answer.grouping.predicate}`}>Communities</option>
+    <div class="toolbar-end">
+      <label class="form-row by">
+        <span class="lbl">Group by</span>
+        <select
+          class="select sm"
+          value={pickerValue}
+          onchange={(e) => regroup((e.currentTarget as HTMLSelectElement).value)}
+          aria-label="Group by"
+        >
+          {#if !current}
+            <option value="mode:classes">Classes</option>
+            <option value="mode:communities">GraphRAG communities</option>
+          {:else if communities}
+            <option value="auto">Sub-communities</option>
+            <option value="members">Members</option>
+            <option value="mode:classes">Classes</option>
+          {:else}
+            <option value="auto">Automatic</option>
+            <option value="members">Members</option>
+            {#if current?.answer.communities && current.answer.grouping.predicate}
+              <option value={`community:${current.answer.grouping.predicate}`}>Communities</option>
+            {/if}
+            {#each groupChoices as g (g.value)}
+              <option value={g.value}>{g.label}</option>
+            {/each}
+            <option value="mode:communities">GraphRAG communities</option>
           {/if}
-          {#each groupChoices as g (g.value)}
-            <option value={g.value}>{g.label}</option>
-          {/each}
-          <option value="mode:communities">GraphRAG communities</option>
-        {/if}
-      </select>
-    </label>
-    {#if communities && reportsReady}
-      <label class="by faint small">
-        <span class="hide-xs">Colour</span>
-        <select class="select sm" bind:value={colorBy} aria-label="Colour by">
-          <option value="status">Report status</option>
-          <option value="community">Community</option>
         </select>
       </label>
-      {#if !path.length && shownLevels.length > 1}
-        <label class="by faint small">
-          <span class="hide-xs">Level</span>
-          <select
-            class="select sm"
-            value={String(startLevel)}
-            onchange={(e) => loadCommunities(Number((e.currentTarget as HTMLSelectElement).value))}
-            aria-label="Level"
-          >
-            {#each shownLevels as l (l.level)}
-              <option value={String(l.level)}>{l.level}</option>
-            {/each}
+      {#if communities && reportsReady}
+        <label class="form-row by">
+          <span class="lbl">Colour</span>
+          <select class="select sm" bind:value={colorBy} aria-label="Colour by">
+            <option value="status">Report status</option>
+            <option value="community">Community</option>
           </select>
         </label>
+        {#if !path.length && shownLevels.length > 1}
+          <label class="form-row by">
+            <span class="lbl">Level</span>
+            <select
+              class="select sm"
+              value={String(startLevel)}
+              onchange={(e) =>
+                loadCommunities(Number((e.currentTarget as HTMLSelectElement).value))}
+              aria-label="Level"
+            >
+              {#each shownLevels as l (l.level)}
+                <option value={String(l.level)}>{l.level}</option>
+              {/each}
+            </select>
+          </label>
+        {/if}
       {/if}
-    {/if}
-    {#if !communities && !path.length && profiles?.some((c) => c.builtin && c.instances > 0)}
-      <label class="row check small"
-        ><input type="checkbox" bind:checked={builtins} /> Built-in</label
-      >
-    {/if}
-    {#if !communities}
+      {#if !communities && !path.length && profiles?.some((c) => c.builtin && c.instances > 0)}
+        <label class="form-row check"
+          ><input type="checkbox" bind:checked={builtins} /> Built-in</label
+        >
+      {/if}
+      {#if !communities}
+        <button
+          class="btn sm"
+          aria-pressed={timeOpen}
+          aria-label="Overview history"
+          title="Move the overview through the commits (Shift+H)"
+          onclick={() => (timeOpen ? closeTime() : ((timeKey = '|'), (timeOpen = true)))}
+          ><Icon name="clock" size={13} /><span class="lbl">History</span></button
+        >
+      {/if}
       <button
         class="btn sm"
-        aria-pressed={timeOpen}
-        aria-label="Overview history"
-        title="Move the overview through the commits (Shift+H)"
-        onclick={() => (timeOpen ? closeTime() : ((timeKey = '|'), (timeOpen = true)))}
-        ><Icon name="clock" size={13} /> <span class="hide-xs">History</span></button
+        aria-pressed={listView}
+        onclick={() => (listView = !listView)}
+        title="List view (L)"
+        aria-label="List"><Icon name="table" size={13} /><span class="lbl">List</span></button
       >
-    {/if}
-    <button
-      class="btn sm"
-      aria-pressed={listView}
-      onclick={() => (listView = !listView)}
-      title="List view (L)"
-      ><Icon name="table" size={13} /> <span class="hide-xs">List</span></button
-    >
-    {#if !listView && webgl && !failReason}
-      <button
-        class="btn sm ghost icon"
-        onclick={() => large?.fit()}
-        title="Fit (0)"
-        aria-label="Fit"><Icon name="fit" size={13} /></button
-      >
-    {/if}
+      {#if !listView && webgl && !failReason}
+        <button
+          class="btn sm ghost icon"
+          onclick={() => large?.fit()}
+          title="Fit (0)"
+          aria-label="Fit"><Icon name="fit" size={13} /></button
+        >
+      {/if}
+    </div>
   </div>
   {#if timeOpen}
     <div class="ov-time">
@@ -1121,13 +1123,8 @@
     min-width: 0;
   }
   .ov-bar {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex-wrap: wrap;
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--border);
-    min-height: 38px;
+    padding-top: 6px;
+    padding-bottom: 6px;
   }
   .crumbs {
     display: flex;
@@ -1165,9 +1162,6 @@
   .sep {
     color: var(--text-3);
   }
-  .spacer {
-    flex: 1;
-  }
   .by {
     display: inline-flex;
     gap: 4px;
@@ -1178,7 +1172,7 @@
     max-width: 24ch;
   }
   .ov-notes {
-    padding: 4px 12px;
+    padding: 4px var(--gutter);
     border-bottom: 1px solid var(--border);
   }
   .ov-notes p {
@@ -1251,7 +1245,7 @@
     flex: none;
   }
   .ov-foot {
-    padding: 4px 12px;
+    padding: 4px var(--gutter);
     border-top: 1px solid var(--border);
   }
   .link {
@@ -1271,9 +1265,6 @@
     white-space: nowrap;
   }
   @media (max-width: 480px) {
-    .hide-xs {
-      display: none;
-    }
     .by select {
       max-width: 13ch;
     }

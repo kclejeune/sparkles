@@ -51,6 +51,7 @@ open(
     // the query page writes to and reads from the branch
     await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'branchy'));
     await page.goto('/ui/query');
+    await page.getByRole('button', { name: /^Options/ }).click();
     await page.getByRole('combobox', { name: 'Branch', exact: true }).selectOption('feature');
     const editor = page.locator('.cm-content');
     await editor.click();
@@ -176,6 +177,7 @@ open(
     expect((await ask.json()).boolean).toBe(false);
     await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'branchy-memory'));
     await page.goto('/ui/query');
+    await page.getByRole('button', { name: /^Options/ }).click();
     await page.getByRole('combobox', { name: 'Branch', exact: true }).selectOption('renamed');
     await page.locator('.cm-content').click();
     await page.keyboard.press('ControlOrMeta+a');

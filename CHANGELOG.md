@@ -94,6 +94,21 @@ to a row under the title, the query page's branch, state, history and row limit 
 behind an Options button on a phone, and the ontology editor's trees show labels on
 ontologies larger than the 50,000 axioms it lists, such as the Gene Ontology.
 
+The web UI's pages follow one layout after a design review (roadmap item 633). The top
+bar's search sits in the middle of the viewport, and on Explore it is also the resource
+finder that Explore's own search field was, with its Open and Ask rows. Every page starts
+at the gutter, the Query and Explore toolbars keep one row with the run and clear actions
+at their end, Explore's graph tools keep their icons beside the details panel, and the
+Query page's branch, state, history, row limit and inferences sit
+behind **Options** at every width, whose button names what differs from the defaults.
+Every control shows a focus ring that differs from its unfocused look, which a design
+check walks with Tab on every page.
+Panels side by side end on the same line, counts use one chip, two to four choices use
+one segmented control, the Server page shows its uptime and version once, and the dataset
+page's branch and past-state choices share one row under the title. On a phone, dialogs
+dock at the bottom of the screen as sheets, toolbar and page-head buttons keep their icons,
+and the dataset settings and branch review pages no longer scroll sideways.
+
 Ontologies and thesauri have a typo-tolerant entity search for typeahead (spec U12,
 roadmap item 616). `GET /$/ontology/{ds}/search?q=` matches the labels, synonyms, short
 forms and definitions of OWL, RDFS and SKOS entities in any language, with up to two

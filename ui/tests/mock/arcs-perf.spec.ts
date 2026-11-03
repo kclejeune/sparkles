@@ -78,6 +78,7 @@ test('20,000 arcs: the caps hold, and the frame times of a pan are recorded', as
   await editor.click();
   await page.keyboard.press('ControlOrMeta+a');
   await page.keyboard.insertText(QUERY);
+  await page.getByRole('button', { name: /^Options/ }).click();
   await page.locator('label.limit select').selectOption({ index: 2 });
   await page.getByRole('button', { name: /^Run\b/ }).click();
   const results = page.getByRole('region', { name: 'Results' });
@@ -137,6 +138,7 @@ test('more than 20,000 rows draw the first 20,000 and say so', async ({ page }) 
   // 100 x 250 rows: the first 20,000 are read
   const C = Array.from({ length: 250 }, (_, i) => i + 1).join(' ');
   await page.keyboard.insertText(QUERY.replace(`VALUES ?b { ${B} }`, `VALUES ?b { ${C} }`));
+  await page.getByRole('button', { name: /^Options/ }).click();
   await page.locator('label.limit select').selectOption({ index: 2 });
   await page.getByRole('button', { name: /^Run\b/ }).click();
   const results = page.getByRole('region', { name: 'Results' });

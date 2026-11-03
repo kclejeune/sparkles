@@ -189,6 +189,7 @@ test('the History graph draws every branch with its forks and merges', async ({
   await expect(detail.getByLabel('Changes')).toContainText('+ <urn:f> <urn:p> "1"^^');
   await detail.getByRole('link', { name: /^Query at commit/ }).click();
   await expect(page).toHaveURL(/\/ui\/query$/);
+  await page.getByRole('button', { name: /^Options/ }).click();
   await expect(page.getByRole('combobox', { name: 'Branch' })).toHaveValue('fix');
 
   // the choice of view is kept
