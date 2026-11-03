@@ -418,7 +418,7 @@ live in the browser's local storage, and the palette works without it. The comma
 and its behaviour are described in the [visualization guide](../../visualization/README.md#app-shell).
 
 **Remaining work.** The browser pages of item 616 register their search, which `/`
-focuses, and gain their commands with edit mode (item 630), which adds them the same way. Item 633's design
+focuses, and their edit mode commands of item 630. Item 633's design
 review adds commands to the pages that have none, such as Explore, Similar, Memory and
 Embedding, under 689. The shortcuts the palette shows are written beside each
 command and not read from the keymaps that bind them, which 690 unifies.
@@ -474,7 +474,7 @@ datasets, the graph view and the downloads. The prose comes from `manchesterToke
 which `manchester()` now joins, so the editor's text and the browser's links come from
 one renderer. The landing page reads the header, the counts by kind and the graphs that
 hold an ontology or scheme by SPARQL, and its search is the entity search. The edit
-button opens the ontology or thesaurus editor until item 630's edit mode replaces it.
+button switches the page into the edit mode of item 630, described below.
 
 **Measurements.** A script timed the two calls an entity page waits for, `term` and then
 `hierarchy` with its ancestors, for 500 random classes of each ontology, one after the
@@ -488,6 +488,64 @@ roots, which ChEBI lite does not name and the route finds by one scan of the par
 took 183 ms on the first call and 97 ms after it, for 19,430 roots. Every page stays far
 under the 300 ms target.
 
-**Remaining work.** Edit mode is item 630, inferred axioms and hierarchies item 622,
-search at a past state item 658, rendering preferences item 625, metrics item 621 and
-other servers' term pages item 461.
+**Remaining work.** Inferred axioms and hierarchies are item 622, search at a past
+state item 658, rendering preferences item 625, metrics item 621 and other servers' term
+pages item 461.
+
+### Ontology browser edit mode
+
+Item 630 lets a caller who can write to a dataset change a browser page in place. The
+page offers edit mode when the caller has write access, the page reads the head of a
+branch and not a past commit, the term route answered an entity tag, and the entity is a
+SKOS concept or an OWL entity other than a datatype. `&edit=1` in the address opens it,
+and the address drops it for a caller who may not edit. The **Edit** button, `E` and the
+palette's **Edit this page** enter it, and the button hides while the edit bar is shown,
+so the bar is the one sign of the mode.
+
+**One write path.** Each change is one operation of the editors' `EditSession`, previewed
+by `OntoPreview` as a dry run with `If-Match` on the term route's entity tag and committed
+with the same tag. The term route's tag names the commit it read, so the axioms and
+update routes accept it without a server change. OWL pages write `axioms` operations of
+annotation assertions and hierarchy axioms, and SKOS pages write SPARQL updates built by
+the thesaurus editor's functions. Undo and redo use the editors' history keys for the
+dataset and graph, so a change made on a browser page can be undone in the editor and
+the other way round. A protected branch disables the fields and offers **Start session**,
+which creates the same session branch as the editors and moves the page onto it.
+
+**What changes.** The definition is a text field with its language and its sources as
+chips. A definition or synonym edit removes the old annotation assertion and adds the new
+one with the axiom annotations that are not sources kept as they were, so a change of
+kind or text never loses a cross-reference. Synonyms, annotations and parents get edit
+and remove buttons with an add row. Parents are picked through the entity search and
+written as `SubClassOf`, `SubObjectPropertyOf`, `SubDataPropertyOf` or
+`SubAnnotationPropertyOf`. Axioms are added in the frame's sections with the Manchester
+editor's completion and parsed by the server, whose errors underline the text. A SKOS
+page reuses the thesaurus editor's label table and concept pickers for labels, broader,
+narrower, related and mapping concepts. Statements of other graphs than the edited one
+are shown without buttons. The ontology editor's `describe` moved to `describeAxiom` in
+`ontology.ts`, so the preview names the axioms in the same words.
+
+**Errors.** A 403 from a write names the dataset and graph the caller can read but not
+write, and a stale tag offers **Reload**, which reads the term and hierarchy again and
+keeps the open forms' text. `Esc` and **Done** ask before leaving a field with an unsaved
+change, and so does navigating away.
+
+**Keyboard and phone.** `Mod+S` previews the field with focus and prevents the browser's
+save. `E`, `S`, `P` and `A` fire only when focus is outside text fields, contenteditable
+elements and CodeMirror and no palette or dialog is open. Below 760 px the bar moves to
+the bottom of the screen with **Undo**, **Redo**, a menu and **Done**, the hierarchy comes
+before the article, and the thesaurus label table scrolls inside its section.
+
+**Checks.** Playwright runs edit mode against the mock for each edit kind, undo and redo,
+a session branch from a protected main, a reader, a refused and a stale write, keyboard
+use, the palette and the phone, and against a real server for sources kept through an
+edit, the Manchester parser, a stale tag after another writer's commit, a session branch
+and a grant that leaves out the ontology's graph. The design captures of GO and UNESCO
+pages in edit mode at 1440, 900 and 390 px in both themes show no sideways scroll. The
+first preview on GO took about 5 s on a debug build because the axioms route opens the
+whole ontology, and later previews took 0.16 to 0.4 s.
+
+**Remaining work.** SKOS-XL labels and collection members are edited in the thesaurus
+editor, and property assertions, keys and chains have no form of their own, NEW-ITEM-1.
+The first preview's wait on a large ontology is NEW-ITEM-2. Phone dialogs as bottom
+sheets belong to the design review of item 633.

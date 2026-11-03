@@ -151,8 +151,10 @@ The [thesaurus editor](visualization/README.md#thesaurus-editor) edits SKOS conc
 schemes, concepts, collections and SKOS-XL labels in a concept tree, and checks them
 against the integrity conditions of the SKOS Reference. The
 [ontology browser](visualization/README.md#ontology-browser) gives every entity of an
-ontology or thesaurus a read-only page with its definition, synonyms, hierarchy, axioms
-as linked prose and what links here, and the top bar's search opens it.
+ontology or thesaurus a page with its definition, synonyms, hierarchy, axioms as linked
+prose and what links here, and the top bar's search opens it. A caller who can write
+switches a page into edit mode and changes its definition, synonyms, annotations,
+parents and axioms in place as previewed commits.
 
 Every page shares one [app shell](visualization/README.md#app-shell), with a top bar
 whose search is a command palette, a rail of pages that narrows to icons at medium width
@@ -169,6 +171,8 @@ datasets and saved queries alone.
 ![The top bar's search listing the demo dataset's classes and properties that match org, with the matched text highlighted](images/shell-search.png)
 
 ![The ontology browser's page of mitochondrion with its lineage tree, definition, synonyms, axioms and infobox](images/browse-term.png)
+
+![The ontology browser's page of mitochondrion in edit mode, with the edit bar, the definition as a text field with its sources, and edit and remove buttons on the synonyms, parents and axioms](images/browse-edit.png)
 
 ![The ontology editor with the class tree and the frame of Professor](images/ontology-editor.png)
 
@@ -249,7 +253,7 @@ implementation status.
 | [OWL 2 EL classification](reasoning/README.md#owl-2-ontologies) | Partially complete. | An incremental, concurrent EL classifier computes the inferred class hierarchy and the unsatisfiable classes in Rust, Python, Node.js, the JVM, HTTP and the CLI, which reads a file without a store, and can write the taxonomy to a graph with provenance. It covers OWL 2 EL with individuals, datatypes, keys and negative assertions, and uses only literals it cannot compare and chains through the top property in part, item 663. Its taxonomies equal ELK's on GO and ELK's and Konclude's on ChEBI lite and the ORE 2015 EL sample, and it classifies them 3.1 to 20 times as fast as ELK on one and eight threads and faster than Konclude on the benchmark host. DL queries reuse the kept classification incrementally in the same languages over HTTP and the bindings, and over MCP and the CLI in item 661. `sparkles ontology reason`, `reduce`, `relax` and `materialize` take ROBOT's options, chain in one process and equal ROBOT's outputs on GO and ChEBI lite. An MCP tool, reads with the classification, durable runs and the remaining ROBOT inputs and outputs remain in items 586, 588 to 590 and 685 to 687. |
 | [Ontology editor](visualization/README.md#ontology-editor) | Partially complete. | The web UI edits classes, properties, individuals, annotations and the ontology header as previewed commits in Manchester or functional-style syntax, on session branches with undo, beside the asserted and inferred class trees. Its DL Query tab answers class expressions through the EL classifier or the OWL 2 RL rules and labels each answer with the reasoning used. The editable schema diagram remains in item 457, and trees on the browser's hierarchy route, inferred property trees, a server-side IRI policy and branch write grants in items 607 and 609 to 611. |
 | [Thesaurus editor](visualization/README.md#thesaurus-editor) | Complete. | The web UI edits SKOS concept schemes, concepts, collections, multilingual and SKOS-XL labels, hierarchy and mapping links as previewed commits, with drag to re-parent. Built-in SKOS shapes check the SKOS Reference's integrity conditions and can guard writes. Larger trees and search, foreign mapping labels, label relations, combined guards and graph-scoped forms are items 638 to 642. |
-| [Ontology browser](visualization/README.md#ontology-browser) | Partially complete. | The web UI's Browse page gives every entity a read-only page with its definition, synonyms, cross-references, infobox, lineage tree or graph view, axioms as linked prose, what links here and downloads, and each ontology a landing page. Its typo-tolerant [entity search](search/README.md#entity-search) answers typeahead on ChEBI lite within 8.3 ms at the 99th percentile. Edit mode and inferred axioms remain in items 630 and 622. |
+| [Ontology browser](visualization/README.md#ontology-browser) | Partially complete. | The web UI's Browse page gives every entity a page with its definition, synonyms, cross-references, infobox, lineage tree or graph view, axioms as linked prose, what links here and downloads, and each ontology a landing page. Its typo-tolerant [entity search](search/README.md#entity-search) answers typeahead on ChEBI lite within 8.3 ms at the 99th percentile. Its edit mode changes a page in place through the editors' previewed commits, session branches and undo. Inferred axioms remain in item 622. |
 
 ### Server and security
 

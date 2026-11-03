@@ -272,6 +272,14 @@ editor and browser and the app shell. The collapsed panel below it has more work
     <td>An ontology's landing page with its search and top classes</td>
   </tr>
   <tr>
+    <td><img src="docs/images/browse-edit.png" alt="The ontology browser's page of mitochondrion in edit mode, with a bar naming the branch and holding undo, redo, start session, the ontology editor link and done, the definition as a text field with its language and its sources as chips, and edit and remove buttons on each synonym, parent and axiom with an add row below them"></td>
+    <td><img src="docs/images/browse-edit-preview.png" alt="The preview of a definition edit in the ontology browser's edit mode, listing the definition it removes and the one it adds, each with its one source annotation, the dry run's six triples removed and six added, and a button that commits it"></td>
+  </tr>
+  <tr>
+    <td>Edit mode on a browser page, with the editors' previewed commits and undo</td>
+    <td>Each change in edit mode previewed as a dry run before it commits</td>
+  </tr>
+  <tr>
     <td><img src="docs/images/thesaurus-editor.png" alt="The thesaurus editor with the concept tree of an animals scheme, where Whales and Penguins appear under both Mammals and Marine animals marked 2 broader, and the label table of Whales with its English and French preferred labels and an English alternative label, each with buttons that edit it, remove it or turn it into a SKOS-XL label"></td>
     <td><img src="docs/images/thesaurus-checks.png" alt="The checks of the thesaurus editor, listing the concept Owls as breaking S13 because one label is both preferred and alternative, with a button that enforces the SKOS rules on writes"></td>
   </tr>
