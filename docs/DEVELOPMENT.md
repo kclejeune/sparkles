@@ -321,6 +321,11 @@ chosen packages that have a library. The chosen packages are part of the task ca
 so a narrowed pass never stands in for a full one. The batch gate uses the same
 selection for the packages of a batch, as [Batch gate](#batch-gate) describes.
 
+A lane runs these checks on an ephemeral Namespace instance by default, created with
+`nsc create --bare --duration …` and destroyed when the run ends, or through
+`mise run test:partitioned` over `nsc:16x32` shares. The shared build hosts stay free for
+batch gates and benchmark comparisons.
+
 ### Known flaky tests
 
 nextest retries a test only when `.config/nextest.toml` lists it by name as flaky, and
