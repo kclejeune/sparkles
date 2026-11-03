@@ -2493,6 +2493,7 @@ pub fn rl_inspector(
     Arc::new(move |snap| Ok(rl_warnings(snap, &prefixes, &inputs, &opts)?))
 }
 
+pub mod browse;
 pub mod classify;
 pub mod dl_query;
 pub mod file;

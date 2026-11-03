@@ -934,6 +934,230 @@ pub(super) async fn search(
     .await
 }
 
+/// The members of a browser request that the query parameters give, with the caller's
+/// languages from `lang` or `Accept-Language`.
+fn browse_args(
+    params: &Params,
+    headers: &HeaderMap,
+    keys: &[&str],
+    flags: &[&str],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut a = serde_json::Map::new();
+    for k in keys {
+        if let Some(v) = params.get(k) {
+            a.insert((*k).into(), json!(v));
+        }
+    }
+    for k in flags {
+        if let Some(v) = params.get(k) {
+            a.insert((*k).into(), json!(truthy(v)));
+        }
+    }
+    match params.get("lang") {
+        Some(l) => a.insert("lang".into(), json!(l)),
+        None => a.insert("lang".into(), json!(accept_languages(headers))),
+    };
+    a
+}
+
+/// Parse the numbers of a browser request, which the library reads as JSON numbers.
+fn numbers(a: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> ApiResult<()> {
+    for k in keys {
+        if let Some(serde_json::Value::String(v)) = a.get(*k) {
+            let n: u64 = v
+                .parse()
+                .map_err(|_| bad(format!("{k} must be a non-negative integer, not '{v}'")))?;
+            a.insert((*k).into(), json!(n));
+        }
+    }
+    Ok(())
+}
+
+/// A JSON answer with the commit it read as its entity tag, or `304` when the caller
+/// already has it.
+fn tagged(
+    ds: &Dataset,
+    headers: &HeaderMap,
+    seq: u64,
+    ext: &str,
+    j: serde_json::Value,
+) -> ApiResult {
+    let tag = conditional::etag(ds.store.dataset_id(), seq, ext);
+    let resp = match conditional::check_read(headers, ds.store.dataset_id(), seq, &tag)? {
+        conditional::ReadOutcome::NotModified => conditional::not_modified(&tag),
+        conditional::ReadOutcome::Send => {
+            conditional::with_etag(Json(j).into_response(), &tag, false)
+        }
+    };
+    Ok(with_commit(resp, ds, seq))
+}
+
+/// `GET /$/ontology/{ds}/hierarchy`: one level of the class, property or concept
+/// hierarchy (item 607): the children of `iri`, or the roots, a page at a time
+/// (`limit`, `offset`), with their own numbers of children and parents, and the
+/// ancestors of `iri` with `ancestors=true`. `kind`, `scheme`, `deprecated` and `lang`
+/// or `Accept-Language` refine it.
+pub(super) async fn hierarchy(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let req = request_of(&params)?;
+    let mut a = browse_args(
+        &params,
+        &headers,
+        &["kind", "iri", "scheme", "limit", "offset"],
+        &["ancestors", "deprecated"],
+    );
+    numbers(&mut a, &["limit", "offset"])?;
+    let h = onto::wire::hierarchy_request_of(&a).map_err(|e| bad(e.to_string()))?;
+    let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+    blocking(move || {
+        let found = ds
+            .dataset
+            .ontology()
+            .hierarchy(&req, &h, &opts)
+            .map_err(ontology_error)?;
+        let j = onto::wire::hierarchy_body(&ds.name, &h, &found);
+        tagged(&ds, &headers, found.commit, "owl-tree", j)
+    })
+    .await
+}
+
+/// The download formats of `GET /$/ontology/{ds}/term`.
+fn term_format(f: &str) -> ApiResult<Option<(oxrdfio::RdfFormat, &'static str, &'static str)>> {
+    use oxrdfio::RdfFormat;
+    Ok(Some(match f {
+        "json" => return Ok(None),
+        "ttl" | "turtle" => (RdfFormat::Turtle, "text/turtle; charset=utf-8", "ttl"),
+        "nt" | "ntriples" => (
+            RdfFormat::NTriples,
+            "application/n-triples; charset=utf-8",
+            "nt",
+        ),
+        "rdfxml" | "owl" => (
+            RdfFormat::RdfXml,
+            "application/rdf+xml; charset=utf-8",
+            "rdf",
+        ),
+        "jsonld" => (
+            RdfFormat::JsonLd {
+                profile: oxrdfio::JsonLdProfileSet::empty(),
+            },
+            "application/ld+json; charset=utf-8",
+            "jsonld",
+        ),
+        "ofn" => (
+            RdfFormat::NTriples,
+            "text/owl-functional; charset=utf-8",
+            "ofn",
+        ),
+        f => {
+            return Err(bad(format!(
+                "format must be json, ttl, nt, rdfxml, jsonld or ofn, not '{f}'"
+            )));
+        }
+    }))
+}
+
+/// A file name for an entity's download: its short form or local name, made safe.
+fn download_name(t: &onto::browse::TermPage, ext: &str) -> String {
+    let base = t.name.short_form.clone().unwrap_or_else(|| {
+        t.name
+            .iri
+            .rsplit(['/', '#'])
+            .next()
+            .unwrap_or("term")
+            .to_string()
+    });
+    let safe: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!(
+        "{}.{ext}",
+        if safe.is_empty() { "term".into() } else { safe }
+    )
+}
+
+/// `GET /$/ontology/{ds}/term?iri=IRI`: what the graphs read say about one entity
+/// without reading the whole ontology: its statements with their annotations, the
+/// axioms they map to, the axioms of other entities that mention it, the statements
+/// that point at it, and the labels of every IRI used. `format` downloads the triples
+/// about it in Turtle, N-Triples, RDF/XML or JSON-LD, or its axioms in functional-style
+/// syntax.
+pub(super) async fn term(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let req = request_of(&params)?;
+    let mut a = browse_args(&params, &headers, &["iri", "mentions", "incoming"], &[]);
+    numbers(&mut a, &["mentions", "incoming"])?;
+    let t = onto::wire::term_request_of(&a).map_err(|e| bad(e.to_string()))?;
+    let format = term_format(params.get("format").unwrap_or("json"))?;
+    let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+    blocking(move || {
+        let page = ds
+            .dataset
+            .ontology()
+            .term(&req, &t, &opts)
+            .map_err(ontology_error)?;
+        let r = renderer(&ds);
+        let Some((fmt, mime, ext)) = format else {
+            let j = onto::wire::term_body(&ds.name, &page, &r);
+            return tagged(&ds, &headers, page.commit, "owl-term", j);
+        };
+        let body: Vec<u8> = if ext == "ofn" {
+            let header = owl::Header::default();
+            owl::ofn::document(&r, &header, page.axioms.iter().map(|(a, _)| a)).into_bytes()
+        } else {
+            let mut ser = sparkles::io::with_prefixes(
+                oxrdfio::RdfSerializer::from_format(fmt),
+                ds.store.prefixes(),
+            )
+            .for_writer(Vec::new());
+            for q in &page.quads {
+                ser.serialize_triple(oxrdf::TripleRef::new(
+                    q.subject.as_ref(),
+                    q.predicate.as_ref(),
+                    q.object.as_ref(),
+                ))
+                .map_err(|e| ApiError::from(sparkles::Error::from(e)))?;
+            }
+            ser.finish()
+                .map_err(|e| ApiError::from(sparkles::Error::from(e)))?
+        };
+        let resp = (
+            [
+                (header::CONTENT_TYPE, mime.to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", download_name(&page, ext)),
+                ),
+            ],
+            body,
+        )
+            .into_response();
+        Ok(with_commit(resp, &ds, page.commit))
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests;
 
