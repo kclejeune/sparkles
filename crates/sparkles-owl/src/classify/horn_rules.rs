@@ -32,6 +32,7 @@
 use super::horn::HornIx;
 use super::index::{BOTTOM, Ex, Index, Role, TOP};
 use super::saturate::{Concl, Sink, Small, State};
+use rustc_hash::FxHashMap;
 
 /// What a context keeps for the Horn rules.
 #[derive(Default, Clone)]
@@ -240,22 +241,16 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
     h.dirty = false;
     // the fillers of the universals that apply to each role of the successors
     let roles = &ix.roles;
-    let mut fillers: Vec<(Role, Vec<Ex>)> = Vec::new();
+    let mut fillers: FxHashMap<Role, Vec<Ex>> = FxHashMap::default();
     for (r, n) in todo {
-        let at = match fillers.iter().position(|(x, _)| *x == r) {
-            Some(at) => at,
-            None => {
-                let fs: Vec<Ex> = h
-                    .alls
-                    .iter()
-                    .filter(|&&(s, _)| roles.sub(r, s))
-                    .map(|&(_, a)| a)
-                    .collect();
-                fillers.push((r, fs));
-                fillers.len() - 1
-            }
-        };
-        sent |= extend(ix, &fillers[at].1, n, r, out);
+        let fs = fillers.entry(r).or_insert_with(|| {
+            h.alls
+                .iter()
+                .filter(|&&(s, _)| roles.sub(r, s))
+                .map(|&(_, a)| a)
+                .collect()
+        });
+        sent |= extend(ix, fs, n, r, out);
     }
     sent
 }
@@ -369,6 +364,10 @@ fn merge_all<S: Sink>(ix: &Index, st: &mut State, s: Role, b: Ex, out: &mut S) -
     }
     u.sort_unstable();
     u.dedup();
+    // every member already holds the union, which may be empty when they hold only ⊤
+    if cores.iter().all(|c| *c == u) {
+        return false;
+    }
     let m = if u.len() == 1 { u[0] } else { out.intern(&u) };
     let mut sent = false;
     for (&(r, _), c) in links.iter().zip(&cores) {

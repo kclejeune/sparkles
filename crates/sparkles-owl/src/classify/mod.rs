@@ -1039,7 +1039,8 @@ impl Saturation {
         };
         self.ctx.resize_with(n, OnceLock::new);
         if ix.horn.is_some() {
-            horn::absorb(&mut ix);
+            horn::absorb(&mut ix, &|| poll(limits).is_err());
+            poll(limits)?;
         }
         let dynamic = ix.horn.as_ref().map(|h| {
             debug_assert_eq!(h.base as usize, n);
@@ -1814,6 +1815,62 @@ mod tests {
         let results: std::collections::BTreeSet<index::Role> =
             ix.roles.comp.values().flatten().copied().collect();
         assert_eq!(results.len(), 2, "{:?}", ix.roles.comp);
+    }
+
+    /// The index of a Horn run over a functional-syntax body, before the saturation.
+    fn horn_index_of(body: &str) -> Index {
+        let doc =
+            crate::ofn_read::parse(&format!("Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n)"))
+                .unwrap();
+        let axioms: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let outside: Vec<(usize, (String, String))> = axioms
+            .iter()
+            .enumerate()
+            .filter_map(|(i, k)| {
+                let b = profiles::el_axiom(k).into_iter().next()?;
+                Some((i, (b.rule.to_string(), b.message)))
+            })
+            .collect();
+        let mut s = Saturation::default();
+        let (_, ix, _, _) = s
+            .build(&axioms, &outside, 1, 0, &Limits::default())
+            .unwrap();
+        assert!(ix.horn.is_some());
+        ix
+    }
+
+    #[test]
+    fn absorbed_fillers_take_linear_work_and_stop_when_asked() {
+        // C0 ⊑ C1 ⊑ … ⊑ Cn: every class is absorbed, unless Cn holds a universal, which
+        // rejects them all, one after another down the chain
+        let n = 50_000;
+        let chain: String = (0..n)
+            .map(|i| format!("SubClassOf(:C{i:05} :C{:05})\n", i + 1))
+            .collect();
+        let absorbed = |ix: &Index| {
+            let h = ix.horn.as_ref().unwrap();
+            (0..h.flags.len() as Ex)
+                .filter(|&e| h.is(e, horn::HornIx::ABSORBED))
+                .count()
+        };
+        let free = format!("{chain}SubClassOf(:X ObjectAllValuesFrom(:u :Y))");
+        let mut ix = horn_index_of(&free);
+        horn::absorb(&mut ix, &|| true);
+        assert_eq!(absorbed(&ix), 0, "a stopped pass marks nothing");
+        let mut ix = horn_index_of(&free);
+        horn::absorb(&mut ix, &|| false);
+        assert!(absorbed(&ix) > n, "{}", absorbed(&ix));
+        let held = format!("{chain}SubClassOf(:C{n:05} ObjectAllValuesFrom(:u :Y))");
+        let mut ix = horn_index_of(&held);
+        let polls = std::cell::Cell::new(0usize);
+        horn::absorb(&mut ix, &|| {
+            polls.set(polls.get() + 1);
+            false
+        });
+        // the universal's filler Y alone
+        assert_eq!(absorbed(&ix), 1);
+        // a pass per rejected class would poll thousands of times
+        assert!(polls.get() <= 16, "{}", polls.get());
     }
 
     /// Random axioms over a few hundred classes, with intersections whose operands come

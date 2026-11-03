@@ -1093,3 +1093,17 @@ fn mirror_images_of_longer_chains_told_mirrors_and_superroles() {
     check(told, &[("A", "C"), ("D", "F")], &[("A", "F"), ("D", "C")]);
     chain_free(told, &[("A", "C"), ("D", "F")], &[("A", "F"), ("D", "C")]);
 }
+
+#[test]
+fn r5_over_successors_that_hold_only_the_top_class() {
+    // both successors' cores are empty, so their merge changes nothing
+    check(
+        "SubObjectPropertyOf(:r :s)
+         SubObjectPropertyOf(:q :s)
+         FunctionalObjectProperty(:s)
+         SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:r owl:Thing) ObjectSomeValuesFrom(:q owl:Thing)))
+         SubClassOf(ObjectSomeValuesFrom(:s owl:Thing) :B)",
+        &[("A", "B")],
+        &[("B", "A")],
+    );
+}

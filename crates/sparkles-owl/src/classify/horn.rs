@@ -97,19 +97,31 @@ impl HornIx {
 }
 
 /// Marks the expressions that [`HornIx::ABSORBED`] describes, as the greatest set
-/// closed under its definition.
-pub fn absorb(ix: &mut super::index::Index) {
+/// closed under its definition, or marks none when `stop` says the run's deadline or
+/// cancellation came. The work is linear in the told subsumptions: a rejected candidate
+/// rejects the candidates whose told subsumers it is.
+pub fn absorb(ix: &mut super::index::Index, stop: &dyn Fn() -> bool) {
     let n = ix
         .horn
         .as_ref()
         .expect("a run with the Horn rules")
         .flags
         .len();
+    let mut work = 0usize;
+    let mut tick = |w: usize| {
+        let before = work;
+        work += w;
+        before / POLL_WORK != work / POLL_WORK && stop()
+    };
     let mut global = vec![false; n];
     let mut stack = vec![TOP];
     while let Some(x) = stack.pop() {
         if !std::mem::replace(&mut global[x as usize], true) {
-            stack.extend(ix.told_of(ix.head(x)).iter().copied());
+            let told = ix.told_of(ix.head(x));
+            if tick(1 + told.len()) {
+                return;
+            }
+            stack.extend(told.iter().copied());
         }
     }
     let flags = &ix.horn.as_ref().expect("a run with the Horn rules").flags;
@@ -124,25 +136,42 @@ pub fn absorb(ix: &mut super::index::Index) {
                 .is_none_or(|&f| f & HornIx::FILLER == 0)
     };
     let mut cand: Vec<bool> = (0..n as Ex).map(|e| e != TOP && inert(e)).collect();
-    loop {
-        let mut changed = false;
-        for e in 0..n {
-            if !cand[e] {
-                continue;
-            }
-            // a universal among them is not absorbed, since R4 takes its filler back to
-            // the predecessor that gave the successor the class
-            let ok = ix
-                .told_of(ix.head(e as Ex))
-                .iter()
-                .all(|&t| global[t as usize] || cand[t as usize]);
-            if !ok {
-                cand[e] = false;
-                changed = true;
+    // the candidates each expression is a told subsumer of, and the candidates with a
+    // told subsumer that is neither held by ⊤ nor a candidate; a universal among the
+    // told subsumers is never absorbed, since R4 takes its filler back to the
+    // predecessor that gave the successor the class
+    let mut below: Vec<Vec<Ex>> = vec![Vec::new(); n];
+    let mut out: Vec<Ex> = Vec::new();
+    for e in 0..n {
+        if !cand[e] {
+            continue;
+        }
+        let told = ix.told_of(ix.head(e as Ex));
+        if tick(1 + told.len()) {
+            return;
+        }
+        let mut ok = true;
+        for &t in told {
+            if !global[t as usize] {
+                below[t as usize].push(e as Ex);
+                ok &= cand[t as usize];
             }
         }
-        if !changed {
-            break;
+        if !ok {
+            out.push(e as Ex);
+        }
+    }
+    for &e in &out {
+        cand[e as usize] = false;
+    }
+    while let Some(x) = out.pop() {
+        if tick(1 + below[x as usize].len()) {
+            return;
+        }
+        for &e in &below[x as usize] {
+            if std::mem::replace(&mut cand[e as usize], false) {
+                out.push(e);
+            }
         }
     }
     let flags = &mut ix.horn.as_mut().expect("a run with the Horn rules").flags;
