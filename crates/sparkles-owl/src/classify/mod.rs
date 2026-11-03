@@ -623,7 +623,7 @@ impl Saturation {
             if !parts.iter().any(|(_, it, _)| it.chunk_has_data()) {
                 let (its, outs): (Vec<Interner>, Vec<Normalized>) =
                     parts.into_iter().map(|(_, it, out)| (it, out)).unzip();
-                let maps = self.interner.merge(its, threads);
+                let maps = self.interner.merge(its);
                 for ((nodes, roles), out) in maps.into_iter().zip(outs) {
                     ax.append_mapped(out.ax, &nodes, &roles);
                     partial.extend(out.partial);

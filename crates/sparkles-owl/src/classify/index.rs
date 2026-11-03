@@ -81,19 +81,7 @@ pub fn name_hash(s: &str) -> u64 {
 pub struct Names<T> {
     items: Vec<T>,
     hashes: Vec<u64>,
-    /// the ids by hash, in [`SHARDS`] tables by [`shard`], so that a merge can fill
-    /// them on several threads
-    tables: Vec<hashbrown::HashTable<u32>>,
-}
-
-/// The tables of a [`Names`].
-const SHARDS: usize = 64;
-
-/// The table of a [`Names`] that holds a hash: bits that neither the slot nor the tag
-/// of a hashbrown table of fewer than 2^32 entries reads.
-#[inline]
-fn shard(h: u64) -> usize {
-    ((h >> 40) as usize) % SHARDS
+    table: hashbrown::HashTable<u32>,
 }
 
 impl<T> Default for Names<T> {
@@ -101,7 +89,7 @@ impl<T> Default for Names<T> {
         Names {
             items: Vec::new(),
             hashes: Vec::new(),
-            tables: (0..SHARDS).map(|_| hashbrown::HashTable::new()).collect(),
+            table: hashbrown::HashTable::new(),
         }
     }
 }
@@ -113,21 +101,10 @@ impl<T> std::ops::Deref for Names<T> {
     }
 }
 
-/// What the merge of chunks' names found for a name of a chunk.
-#[derive(Clone, Copy)]
-enum Found {
-    /// the table had it, with this id
-    Held(u32),
-    /// it is the first occurrence among the chunks
-    First,
-    /// an earlier chunk, or earlier in this one, has it at (chunk, index)
-    Again(u32, u32),
-}
-
 impl<T: Named> Names<T> {
     pub fn get(&self, x: &T) -> Option<u32> {
         let h = name_hash(x.name());
-        self.tables[shard(h)]
+        self.table
             .find(h, |&i| self.items[i as usize].name() == x.name())
             .copied()
     }
@@ -135,189 +112,73 @@ impl<T: Named> Names<T> {
     /// The id of an entity, which is added when it is new.
     pub fn id(&mut self, x: &T) -> u32 {
         let h = name_hash(x.name());
-        let Names {
-            items,
-            hashes,
-            tables,
-        } = self;
-        match tables[shard(h)].entry(
-            h,
-            |&i| items[i as usize].name() == x.name(),
-            |&i| hashes[i as usize],
-        ) {
-            hashbrown::hash_table::Entry::Occupied(o) => *o.get(),
-            hashbrown::hash_table::Entry::Vacant(v) => {
-                let id = items.len() as u32;
-                v.insert(id);
-                items.push(x.clone());
-                hashes.push(h);
-                id
-            }
+        match self.find(h, x) {
+            Ok(id) => id,
+            Err(()) => self.push(h, x.clone()),
         }
+    }
+
+    /// The id of an entity whose hash the caller has, which moves in when it is new.
+    #[inline]
+    fn id_hashed(&mut self, h: u64, x: T) -> u32 {
+        match self.find(h, &x) {
+            Ok(id) => id,
+            Err(()) => self.push(h, x),
+        }
+    }
+
+    #[inline]
+    fn find(&self, h: u64, x: &T) -> Result<u32, ()> {
+        self.table
+            .find(h, |&i| self.items[i as usize].name() == x.name())
+            .copied()
+            .ok_or(())
+    }
+
+    #[inline]
+    fn push(&mut self, h: u64, x: T) -> u32 {
+        let id = self.items.len() as u32;
+        let hashes = &self.hashes;
+        self.table.insert_unique(h, id, |&i| hashes[i as usize]);
+        self.items.push(x);
+        self.hashes.push(h);
+        id
     }
 
     /// The bytes the table takes beyond the entities, roughly.
     pub fn bytes(&self) -> usize {
         self.items.capacity() * std::mem::size_of::<T>()
             + self.hashes.capacity() * 8
-            + self.tables.iter().map(|t| t.capacity() * 5).sum::<usize>()
+            + self.table.capacity() * 5
     }
 
     /// Takes the entities and their hashes out, leaving the table empty.
     pub fn take(&mut self) -> (Vec<T>, Vec<u64>) {
-        for t in &mut self.tables {
-            t.clear();
-        }
+        self.table.clear();
         (
             std::mem::take(&mut self.items),
             std::mem::take(&mut self.hashes),
         )
     }
 
-    /// Adds the names of chunks, each a list of distinct names with their hashes, and
-    /// answers each chunk's ids. The ids are those that adding the names one at a time,
-    /// in order, would give, and the tables fill on up to `threads` threads, each
-    /// taking whole tables.
-    pub fn merge_chunks(&mut self, chunks: Vec<(Vec<T>, Vec<u64>)>, threads: usize) -> Vec<Vec<u32>>
-    where
-        T: Send + Sync,
-    {
-        let threads = threads.clamp(1, SHARDS);
-        // each chunk's names by table, in their order
-        let buckets: Vec<Vec<Vec<u32>>> = super::par_map(&chunks, threads, |_, cs| {
-            cs.iter()
-                .map(|(_, hs)| {
-                    let mut b: Vec<Vec<u32>> = vec![Vec::new(); SHARDS];
-                    for (k, &h) in hs.iter().enumerate() {
-                        b[shard(h)].push(k as u32);
-                    }
-                    b
-                })
-                .collect::<Vec<_>>()
-        })
-        .into_iter()
-        .flatten()
-        .collect();
-        // what each name is, found table by table on the threads
-        let found: Vec<Vec<std::sync::atomic::AtomicU64>> = chunks
-            .iter()
-            .map(|(_, hs)| {
-                (0..hs.len())
-                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+    /// Adds the names of chunks, each a list of distinct names with their hashes, in
+    /// order, and answers each chunk's ids, which are those that adding the names one
+    /// at a time would give.
+    pub fn merge_chunks(&mut self, chunks: Vec<(Vec<T>, Vec<u64>)>) -> Vec<Vec<u32>> {
+        let n: usize = chunks.iter().map(|(xs, _)| xs.len()).sum();
+        let hashes = &self.hashes;
+        self.table.reserve(n, |&i| hashes[i as usize]);
+        self.items.reserve(n);
+        self.hashes.reserve(n);
+        chunks
+            .into_iter()
+            .map(|(xs, hs)| {
+                xs.into_iter()
+                    .zip(hs)
+                    .map(|(x, h)| self.id_hashed(h, x))
                     .collect()
             })
-            .collect();
-        let encode = |f: Found| -> u64 {
-            match f {
-                Found::Held(id) => (1 << 62) | id as u64,
-                Found::First => 2 << 62,
-                Found::Again(c, k) => (3 << 62) | ((c as u64) << 31) | k as u64,
-            }
-        };
-        let decode = |x: u64| -> Found {
-            match x >> 62 {
-                1 => Found::Held(x as u32),
-                2 => Found::First,
-                _ => Found::Again(((x >> 31) & 0x7fff_ffff) as u32, (x & 0x7fff_ffff) as u32),
-            }
-        };
-        {
-            let shards: Vec<usize> = (0..SHARDS).collect();
-            let this = &*self;
-            let chunks = &chunks;
-            let buckets = &buckets;
-            let found = &found;
-            super::par_map(&shards, threads, |_, ss| {
-                for &s in ss {
-                    let mut seen: hashbrown::HashTable<(u32, u32)> = hashbrown::HashTable::new();
-                    for (c, b) in buckets.iter().enumerate() {
-                        let (items, hs) = &chunks[c];
-                        for &k in &b[s] {
-                            let x = &items[k as usize];
-                            let h = hs[k as usize];
-                            let f = if let Some(&id) = this.tables[s]
-                                .find(h, |&i| this.items[i as usize].name() == x.name())
-                            {
-                                Found::Held(id)
-                            } else if let Some(&(c2, k2)) = seen.find(h, |&(c2, k2)| {
-                                chunks[c2 as usize].0[k2 as usize].name() == x.name()
-                            }) {
-                                Found::Again(c2, k2)
-                            } else {
-                                seen.insert_unique(h, (c as u32, k), |&(c2, k2)| {
-                                    chunks[c2 as usize].1[k2 as usize]
-                                });
-                                Found::First
-                            };
-                            found[c][k as usize]
-                                .store(encode(f), std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                }
-            });
-        }
-        // the ids, in the order of the chunks
-        let mut ids: Vec<Vec<u32>> = Vec::with_capacity(chunks.len());
-        let added: usize = found
-            .iter()
-            .flatten()
-            .filter(|f| {
-                matches!(
-                    decode(f.load(std::sync::atomic::Ordering::Relaxed)),
-                    Found::First
-                )
-            })
-            .count();
-        self.items.reserve(added);
-        self.hashes.reserve(added);
-        for (c, (items, hs)) in chunks.into_iter().enumerate() {
-            let mut out = Vec::with_capacity(items.len());
-            for (k, (x, h)) in items.into_iter().zip(hs).enumerate() {
-                let id = match decode(found[c][k].load(std::sync::atomic::Ordering::Relaxed)) {
-                    Found::Held(id) => id,
-                    Found::First => {
-                        let id = self.items.len() as u32;
-                        self.items.push(x);
-                        self.hashes.push(h);
-                        id
-                    }
-                    Found::Again(c2, k2) => ids[c2 as usize][k2 as usize],
-                };
-                out.push(id);
-            }
-            ids.push(out);
-        }
-        // the new names join the tables, table by table on the threads
-        {
-            let hashes = &self.hashes;
-            let first = self.items.len() - added;
-            let mut tables: Vec<(usize, &mut hashbrown::HashTable<u32>)> =
-                self.tables.iter_mut().enumerate().collect();
-            let per = SHARDS.div_ceil(threads);
-            let mut counts = [0usize; SHARDS];
-            for &h in &hashes[first..] {
-                counts[shard(h)] += 1;
-            }
-            let counts = &counts;
-            std::thread::scope(|sc| {
-                for part in tables.chunks_mut(per) {
-                    sc.spawn(move || {
-                        let s0 = part[0].0;
-                        for (s, t) in part.iter_mut() {
-                            t.reserve(counts[*s], |&i| hashes[i as usize]);
-                        }
-                        for (i, &h) in hashes.iter().enumerate().skip(first) {
-                            if let Some((_, t)) =
-                                shard(h).checked_sub(s0).and_then(|j| part.get_mut(j))
-                            {
-                                t.insert_unique(h, i as u32, |&j| hashes[j as usize]);
-                            }
-                        }
-                    });
-                }
-            });
-        }
-        ids
+            .collect()
     }
 }
 
@@ -417,26 +278,19 @@ impl Interner {
     /// chunk's expressions and roles. Each name and expression gets the id the chunk's
     /// first occurrence would have given it in a normalization on one thread: a chunk
     /// lists them in the order it met them, and those this interner has keep their ids.
-    /// The names of classes and individuals merge on up to `threads` threads.
-    pub fn merge(
-        &mut self,
-        mut chunks: Vec<Interner>,
-        threads: usize,
-    ) -> Vec<(Vec<Ex>, Vec<Role>)> {
+    pub fn merge(&mut self, mut chunks: Vec<Interner>) -> Vec<(Vec<Ex>, Vec<Role>)> {
         debug_assert!(chunks.iter().all(|c| !c.chunk_has_data() && c.fresh == 0));
-        let classes = self.classes.merge_chunks(
-            chunks.iter_mut().map(|c| c.classes.take()).collect(),
-            threads,
-        );
+        let classes = self
+            .classes
+            .merge_chunks(chunks.iter_mut().map(|c| c.classes.take()).collect());
         for ids in &classes {
             for &id in ids {
                 self.mark_met(id);
             }
         }
-        let individuals = self.individuals.merge_chunks(
-            chunks.iter_mut().map(|c| c.individuals.take()).collect(),
-            threads,
-        );
+        let individuals = self
+            .individuals
+            .merge_chunks(chunks.iter_mut().map(|c| c.individuals.take()).collect());
         let mut out = Vec::with_capacity(chunks.len());
         for ((chunk, classes), individuals) in chunks.into_iter().zip(classes).zip(individuals) {
             let roles: Vec<Role> = chunk.roles.iter().map(|r| self.role(r.clone())).collect();
