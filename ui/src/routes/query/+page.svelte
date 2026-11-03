@@ -5,6 +5,8 @@
   import { onDestroy, onMount, tick, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
+  import { useCommands, useProvider } from '$lib/launcher.svelte';
+  import { branchProvider } from '$lib/palette.svelte';
   import { auth } from '$lib/auth.svelte';
   import { branchOption, branchParam, MAIN, onBranch, onBranchLabel } from '$lib/branches';
   import { receiptSummary } from '$lib/commits';
@@ -2482,6 +2484,86 @@
     if (outcome?.status !== 'running') return;
     const t = setInterval(() => (now = performance.now()), 100);
     return () => clearInterval(t);
+  });
+
+  // the command palette (ROADMAP item 631): this page's commands and branches
+  useCommands(() => [
+    {
+      id: 'query.run',
+      label: 'Run query',
+      icon: 'play',
+      shortcut: 'Mod+Enter',
+      keywords: ['execute'],
+      active: () => !!ds && !!active.query.trim(),
+      run: () => (activeStored ? runSaved() : void run()),
+    },
+    {
+      id: 'query.format',
+      label: 'Format query',
+      icon: 'wand',
+      shortcut: 'Shift+Alt+F',
+      keywords: ['pretty print', 'indent', 'tidy'],
+      active: () => !!active.query.trim(),
+      run: () => formatQuery(),
+    },
+    {
+      id: 'query.explain',
+      label: 'Explain query',
+      icon: 'plan',
+      keywords: ['plan', 'algebra'],
+      active: () => !!ds && !!active.query.trim() && kind !== 'UPDATE',
+      run: () => runExplain(),
+    },
+    { id: 'query.tab', label: 'New query tab', icon: 'plus', run: () => addTab() },
+    {
+      id: 'query.save',
+      label: 'Save query…',
+      icon: 'download',
+      keywords: ['stored query'],
+      active: () => canAdmin && !!active.query.trim(),
+      run: openSave,
+    },
+    {
+      id: 'query.history',
+      label: 'Show or hide history',
+      icon: 'clock',
+      shortcut: 'H',
+      keywords: ['time slider', 'commits'],
+      active: () => !!ds,
+      run: toggleTime,
+    },
+    {
+      id: 'query.pattern',
+      label: 'Show or hide the pattern pane',
+      icon: 'graph',
+      shortcut: 'Alt+P',
+      keywords: ['visual query'],
+      run: () => (patternOpen ? void (patternOpen = false) : togglePattern('page')),
+    },
+  ]);
+  useProvider(
+    branchProvider({
+      list: () => (branchList ?? []).map((b) => b.name),
+      current: () => branch ?? MAIN,
+      choose: (n) => (app.queryBranch = n === MAIN ? '' : n),
+    }),
+  );
+  // `?saved=NAME` (the palette's saved queries) opens that stored query once
+  $effect(() => {
+    const name = page.url.searchParams.get('saved');
+    if (!name) return;
+    untrack(() => {
+      const urlDs = page.url.searchParams.get('ds');
+      if (urlDs && urlDs !== app.current) app.setDataset(urlDs);
+      const url = new URL(page.url);
+      url.searchParams.delete('saved');
+      try {
+        replaceState(url, page.state);
+      } catch {
+        history.replaceState(history.state, '', url);
+      }
+      void openSaved({ name } as api.StoredQuery);
+    });
   });
 
   onMount(() => {

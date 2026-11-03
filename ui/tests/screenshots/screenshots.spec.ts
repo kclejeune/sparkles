@@ -265,6 +265,45 @@ test('shell-search', async ({ page }) => {
   await shoot(page, 'shell-search', { focus: true });
 });
 
+// The command palette (item 631): its commands with nothing typed on the Query page, the
+// `>` mode, and the phone's full-width sheet.
+test('palette', async ({ page }) => {
+  await page.goto('/ui/query');
+  await expect(page.locator('.cm-content')).toBeVisible();
+  await page.locator('.cm-content').click();
+  await page.keyboard.press('ControlOrMeta+k');
+  const list = page.getByRole('listbox', { name: 'Search results' });
+  await expect(list.getByRole('group', { name: 'This page' })).toBeVisible();
+  await shoot(page, 'palette', { focus: true });
+  await page.keyboard.type('>form');
+  await expect(list.getByRole('option', { name: /^Format query/ })).toBeVisible();
+  await shoot(page, 'palette-commands', { focus: true });
+});
+
+test('palette-phone', async ({ browser }) => {
+  const ctx = await browser.newContext({
+    viewport: { width: 390, height: 844 },
+    deviceScaleFactor: 2,
+    isMobile: true,
+    hasTouch: true,
+    colorScheme: 'dark',
+    baseURL: process.env.SPARKLES_SCREENSHOTS_URL,
+  });
+  await ctx.addInitScript((ds) => {
+    localStorage.setItem('sparkles.theme', 'dark');
+    localStorage.setItem('sparkles.dataset', ds);
+  }, DATASET);
+  const page = await ctx.newPage();
+  await page.goto(`/ui/ontology?ds=${DATASET}`);
+  await expect(page.getByRole('heading', { name: 'Ontology', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Open search' }).click();
+  await expect(
+    page.getByRole('listbox', { name: 'Search results' }).getByRole('group', { name: 'This page' }),
+  ).toBeVisible();
+  await shoot(page, 'palette-phone');
+  await ctx.close();
+});
+
 test('shell-medium', async ({ page }) => {
   await page.setViewportSize({ width: 900, height: 900 });
   await page.goto(

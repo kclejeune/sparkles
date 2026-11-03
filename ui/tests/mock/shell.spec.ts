@@ -50,7 +50,7 @@ test.describe('at 1440 pixels', () => {
     await search(page).click();
     await page.keyboard.type('zzzzqqq');
     await expect(page.getByRole('listbox', { name: 'Search results' })).toContainText(
-      'No entity in uni matches',
+      'Nothing in uni matches “zzzzqqq”.',
     );
   });
 
@@ -129,7 +129,8 @@ test.describe('at 1440 pixels', () => {
     await onDataset(page, 'uni');
     await visit(page, '/ui/datasets');
     await page.keyboard.press('Control+k');
-    await page.keyboard.type('a');
+    // entities only, eight of them
+    await page.keyboard.type('@a');
     const options = page.getByRole('listbox', { name: 'Search results' }).getByRole('option');
     await expect(options).toHaveCount(8);
     for (let i = 0; i < 7; i++) await page.keyboard.press('ArrowDown');
