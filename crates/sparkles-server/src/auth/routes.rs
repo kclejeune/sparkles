@@ -76,6 +76,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ontology/{ds}/check", &["POST"]),
     ("/$/ontology/{ds}/classify", &["POST"]),
     ("/$/ontology/{ds}/diff", &["GET"]),
+    ("/$/ontology/{ds}/search", &["GET"]),
     ("/$/graph/{ds}/groups", &["POST"]),
     ("/$/graph/{ds}/facets", &["POST"]),
     // editing forms (U02): the check and the save check write on the branch they name
@@ -491,6 +492,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // a run that writes its taxonomy checks write in the handler
         | "/$/ontology/{ds}/classify"
         | "/$/ontology/{ds}/diff"
+        | "/$/ontology/{ds}/search"
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
         | "/$/forms/{ds}"
@@ -681,6 +683,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/$/ontology/{ds}/check"
         | "/$/ontology/{ds}/classify"
         | "/$/ontology/{ds}/entities"
+        | "/$/ontology/{ds}/search"
         | "/$/ontology/{ds}/entity" => Endpoint::Query,
         "/$/ontology/{ds}/axioms" if get => Endpoint::Query,
         "/$/ontology/{ds}/axioms" => Endpoint::Update,

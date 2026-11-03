@@ -247,3 +247,36 @@ async fn classify_reads_the_callers_view_and_writes_need_write() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["written"]["committed"], true, "{}", r.text());
 }
+
+#[tokio::test]
+async fn the_entity_search_holds_only_what_the_caller_reads() {
+    let (_dir, app) = server();
+    let uri = format!("/$/ontology/ont/search?{OPEN}&q=hidd");
+    let r = as_user(&app, "ofull", "GET", &uri, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        r.json()["results"][0]["iri"],
+        "http://ex/Hidden",
+        "{}",
+        r.text()
+    );
+    // the import the caller cannot read is not searched
+    let r = as_user(&app, "oopen", "GET", &uri, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["results"], json!([]), "{}", r.text());
+    assert!(!r.text().contains("Hidden"), "{}", r.text());
+    let r = as_user(
+        &app,
+        "oopen",
+        "GET",
+        &format!("/$/ontology/ont/search?{OPEN}&q=A"),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(r.json()["results"][0]["iri"], "http://ex/A", "{}", r.text());
+    // a reader may search, and a caller without credentials may not
+    let r = as_user(&app, "oread", "GET", &uri, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = call(&app, "GET", &uri, &[], "").await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+}

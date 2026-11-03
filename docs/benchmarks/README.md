@@ -16,6 +16,7 @@ The summary also records measurement coverage and the full loss table. The
 | DBpedia | [Read](dbpedia/README.md) | [Read](dbpedia/RESULTS.md) |
 | BSBM | [Read](bsbm/README.md) | [Read](bsbm/RESULTS.md) |
 | Full-text search | [Read](full-text/README.md) | [Read](full-text/RESULTS.md) |
+| Ontology entity search | [Read](entity-search/README.md) | [Read](entity-search/RESULTS.md) |
 | Vector search | [Read](vector/README.md) | [Read](vector/RESULTS.md) |
 | Spatial queries | [Read](spatial/README.md) | [Read](spatial/RESULTS.md) |
 | Paths and graph algorithms | [Read](graph/README.md) | [Read](graph/RESULTS.md) |
