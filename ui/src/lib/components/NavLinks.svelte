@@ -211,6 +211,10 @@
   .drawer .row a.parent.active::before {
     display: none;
   }
+  .rail .row a.parent:focus-visible,
+  .drawer .row a.parent:focus-visible {
+    box-shadow: var(--focus);
+  }
   .chev {
     position: absolute;
     right: 4px;

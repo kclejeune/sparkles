@@ -8,6 +8,7 @@
   import { fmtBytes, fmtRelative, fmtTime } from '$lib/format';
   import { LatestRun } from '$lib/supersede';
   import BackupDialogs from './BackupDialogs.svelte';
+  import FilterGroup from './FilterGroup.svelte';
   import Icon from './Icon.svelte';
 
   let {
@@ -141,20 +142,22 @@
       aria-label="Search backups"
     />
   </label>
-  <select class="select" bind:value={repo} aria-label="Repository">
-    <option value="">All repositories</option>
-    {#each repoNames as r (r)}<option value={r}>{r}</option>{/each}
-  </select>
-  <select class="select" bind:value={dataset} aria-label="Dataset">
-    <option value="">All datasets</option>
-    {#each dsNames as d (d)}<option value={d}>{d}</option>{/each}
-    {#if dataset && !dsNames.includes(dataset)}<option value={dataset}>{dataset}</option>{/if}
-  </select>
-  <select class="select" bind:value={policy} aria-label="Policy">
-    <option value="">Any origin</option>
-    <option value="-">Made by hand</option>
-    {#each policies as p (p)}<option value={p}>Policy {p}</option>{/each}
-  </select>
+  <FilterGroup active={[repo, dataset, policy].filter(Boolean).length}>
+    <select class="select" bind:value={repo} aria-label="Repository">
+      <option value="">All repositories</option>
+      {#each repoNames as r (r)}<option value={r}>{r}</option>{/each}
+    </select>
+    <select class="select" bind:value={dataset} aria-label="Dataset">
+      <option value="">All datasets</option>
+      {#each dsNames as d (d)}<option value={d}>{d}</option>{/each}
+      {#if dataset && !dsNames.includes(dataset)}<option value={dataset}>{dataset}</option>{/if}
+    </select>
+    <select class="select" bind:value={policy} aria-label="Policy">
+      <option value="">Any origin</option>
+      <option value="-">Made by hand</option>
+      {#each policies as p (p)}<option value={p}>Policy {p}</option>{/each}
+    </select>
+  </FilterGroup>
   <span class="bar-end">
     <span class="faint small">{filtered.length} of {backups.length}</span>
     <button class="btn ghost icon sm" onclick={load} disabled={loading} aria-label="Reload backups">
@@ -298,14 +301,11 @@
     gap: var(--sp-2);
     margin-left: auto;
   }
-  /* a phone: the search across, the filters two to a row */
+  /* a phone: the search takes the row beside the Filter button */
   @media (max-width: 760px) {
-    .bar {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
     .search {
-      grid-column: 1 / -1;
+      flex: 1 1 10rem;
+      min-width: 0;
     }
     .search input {
       flex: 1;

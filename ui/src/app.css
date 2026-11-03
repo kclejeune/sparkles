@@ -1027,6 +1027,93 @@ table.data .num {
   white-space: nowrap;
 }
 
+/* a table wider than its box keeps its actions column pinned to the box's right edge
+   (src/lib/tables.ts marks the box) */
+[data-clipped] > table.data tr > .actions:last-child,
+[data-clipped] > table.data:has(td.actions:last-child) thead tr > th:last-child {
+  position: sticky;
+  right: 0;
+  z-index: 1;
+  background: var(--surface);
+  box-shadow: inset 1px 0 0 var(--border);
+}
+[data-clipped] > table.data:has(td.actions:last-child) thead tr > th:last-child {
+  z-index: 3;
+}
+[data-clipped] > table.data tbody tr:hover > .actions:last-child {
+  background: linear-gradient(var(--hover), var(--hover)), var(--surface);
+}
+
+/* on a phone a table too wide for its box is one card a row (src/lib/tables.ts sets
+   data-stack and each cell's column name) */
+table.data[data-stack],
+table.data[data-stack] tbody,
+table.data[data-stack] tr,
+table.data[data-stack] td {
+  display: block;
+  width: auto;
+}
+table.data[data-stack] thead {
+  display: none;
+}
+table.data[data-stack] tr {
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--border);
+}
+table.data[data-stack] tr:last-child {
+  border-bottom: 0;
+}
+table.data[data-stack] td {
+  position: relative;
+  min-width: 0;
+  max-width: none;
+  padding: 2px var(--sp-3) 2px calc(var(--sp-3) + 8.5rem);
+  border: 0;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+table.data[data-stack] td::before {
+  content: attr(data-label);
+  position: absolute;
+  left: var(--sp-3);
+  width: 8rem;
+  color: var(--text-3);
+  font-size: var(--fs-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+table.data[data-stack] td:first-child,
+table.data[data-stack] td.actions,
+table.data[data-stack] td:not([data-label]) {
+  padding-left: var(--sp-3);
+}
+table.data[data-stack] td:first-child {
+  padding-bottom: var(--sp-1);
+  font-weight: 600;
+}
+table.data[data-stack] td:first-child::before,
+table.data[data-stack] td.actions::before {
+  display: none;
+}
+table.data[data-stack] td:empty {
+  display: none;
+}
+table.data[data-stack] td.actions {
+  padding-top: var(--sp-2);
+}
+table.data[data-stack] td.actions > div,
+table.data[data-stack] td.actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: var(--sp-2);
+}
+table.data[data-stack] tbody tr:hover td {
+  background: none;
+}
+
 /* term styling shared across views */
 .t-iri {
   color: var(--iri);

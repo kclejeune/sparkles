@@ -4,6 +4,7 @@
   import '../app.css';
   import { page } from '$app/state';
   import { onMount } from 'svelte';
+  import { watchTables } from '$lib/tables';
   import { watchTabStrips } from '$lib/tabstrip';
   import { app } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
@@ -27,6 +28,7 @@
   });
 
   onMount(() => watchTabStrips());
+  onMount(() => watchTables());
 
   onMount(() => {
     void auth.ensure().then(() => auth.guard());

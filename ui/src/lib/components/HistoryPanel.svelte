@@ -402,7 +402,7 @@
                   {/if}
                 </td>
                 <td class="num">{fmtInt(c.quads)}</td>
-                <td class="row-actions">
+                <td class="actions">
                   <div class="cell-actions">
                     <button
                       class="btn ghost sm"
@@ -689,7 +689,7 @@
   .inherited {
     font-family: var(--font-mono);
   }
-  .row-actions {
+  .actions {
     text-align: right;
     width: 1%;
   }

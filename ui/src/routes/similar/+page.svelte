@@ -662,7 +662,7 @@
                     >{info.score} {info.better === 'lower' ? '↓' : '↑'}</th
                   >
                   <th class="vec">Matched vector</th>
-                  <th class="acts"><span class="sr">Actions</span></th>
+                  <th class="actions"><span class="sr">Actions</span></th>
                 </tr>
               </thead>
               <tbody>
@@ -691,7 +691,7 @@
                       title={h.vector?.type === 'literal' ? h.vector.value : undefined}
                       >{vectorLabel(h.vector)}</td
                     >
-                    <td class="acts">
+                    <td class="actions">
                       <div class="cell-actions">
                         {#if h.term.type === 'uri'}
                           {@const iri = h.term.value}
@@ -844,7 +844,7 @@
   .hits th.vec {
     width: 30%;
   }
-  .hits th.acts {
+  .hits th.actions {
     width: 64px;
   }
   .ent {
@@ -886,7 +886,7 @@
     background: var(--literal);
     opacity: 0.7;
   }
-  td.acts {
+  td.actions {
     white-space: nowrap;
     text-align: right;
   }

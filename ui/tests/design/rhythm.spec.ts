@@ -215,6 +215,10 @@ const STRIP_PAGES = [
   '/ui/thesaurus?ds=unesco',
   '/ui/browse?ds=go',
   `/ui/browse?ds=go&iri=${encodeURIComponent('http://purl.obolibrary.org/obo/GO_0005739')}`,
+  `/ui/ontology?ds=go&iri=${encodeURIComponent('http://purl.obolibrary.org/obo/GO_0005739')}`,
+  `/ui/explore?ds=demo&iri=${encodeURIComponent('http://example.org/ns#City')}`,
+  '/ui/memory?ds=demo&tab=inbox',
+  '/ui/similar/map?ds=demo',
 ];
 
 for (const [w, h] of WIDTHS) {
@@ -257,10 +261,74 @@ for (const [w, h] of WIDTHS) {
             ),
           ])
           .filter((hs) => hs.length > 1);
-        return { wrapped, heights };
+        // a page has at most one tab row; a further level is a control (ROADMAP item 633)
+        const strips = [...main.querySelectorAll<HTMLElement>('.tabs, [role="tablist"]')].filter(
+          (t, i, all) => t.offsetParent && !all.slice(0, i).some((o) => o.contains(t)),
+        );
+        return {
+          wrapped,
+          heights,
+          strips: strips.map((t) => t.getAttribute('aria-label') ?? t.className),
+        };
       });
       expect.soft(m.wrapped, `${path}: wrapped tab strips`).toEqual([]);
       expect.soft(m.heights, `${path}: page action heights`).toEqual([]);
+    }
+    await ctx.close();
+  });
+}
+
+// pages with data tables: their actions stay in view, and on a phone no table scrolls sideways
+const TABLE_PAGES = [
+  '/ui/admin/backups',
+  '/ui/admin/backups?tab=repositories',
+  '/ui/admin/backups?tab=policies',
+  '/ui/admin/backups?tab=activity',
+  '/ui/admin/server',
+  '/ui/admin/tokens',
+  '/ui/datasets',
+  '/ui/datasets/demo',
+  '/ui/datasets/demo?tab=history',
+  '/ui/datasets/demo?tab=branches',
+  '/ui/memory?ds=demo',
+  '/ui/similar?ds=demo&q=city',
+];
+
+for (const [w, h] of [
+  [900, 1000],
+  [390, 844],
+] as const) {
+  test(`data tables keep their actions in view and fit a phone at ${w} px`, async ({ browser }) => {
+    test.setTimeout(180_000);
+    const phone = w < 761;
+    const ctx = await browser.newContext({
+      viewport: { width: w, height: h },
+      isMobile: phone,
+      hasTouch: phone,
+    });
+    const page = await ctx.newPage();
+    for (const path of TABLE_PAGES) {
+      await load(page, path);
+      const m = await page.evaluate(() => {
+        const tables = [...document.querySelectorAll<HTMLTableElement>('main table.data')].filter(
+          (t) => t.offsetParent,
+        );
+        // an action button cut off by its table's box or the viewport
+        const clipped = tables.flatMap((t) => {
+          const box = t.parentElement!.getBoundingClientRect();
+          const right = Math.min(box.right, window.innerWidth);
+          return [...t.querySelectorAll<HTMLElement>('td.actions button, td.actions a')]
+            .filter((b) => b.offsetParent)
+            .filter((b) => b.getBoundingClientRect().right > right + 1)
+            .map((b) => b.getAttribute('aria-label') ?? b.textContent?.trim() ?? '?');
+        });
+        const scrolls = tables
+          .filter((t) => t.parentElement!.scrollWidth > t.parentElement!.clientWidth + 1)
+          .map((t) => t.tHead?.textContent?.trim().slice(0, 40) ?? t.className);
+        return { clipped: [...new Set(clipped)], scrolls };
+      });
+      expect.soft(m.clipped, `${path}: clipped table actions`).toEqual([]);
+      if (phone) expect.soft(m.scrolls, `${path}: tables that scroll sideways`).toEqual([]);
     }
     await ctx.close();
   });
