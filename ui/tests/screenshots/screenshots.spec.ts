@@ -259,7 +259,7 @@ test('shell-search', async ({ page }) => {
   await page.keyboard.press('ControlOrMeta+k');
   await page.keyboard.type('org');
   await expect(
-    page.getByRole('listbox', { name: 'Search results' }).getByRole('option').nth(2),
+    page.getByRole('listbox', { name: 'Search results' }).getByRole('option', { name: /^Organi/ }),
   ).toBeVisible();
   await shoot(page, 'shell-search', { focus: true });
 });

@@ -24,5 +24,8 @@ test('the GO class tree shows labels', async ({ page }) => {
     )
     .toEqual([]);
   await page.getByRole('searchbox', { name: 'Filter' }).fill('mitochondrion inheritance');
-  await expect(tree.getByRole('button', { name: 'mitochondrion inheritance' })).toBeVisible();
+  // a class with several parents shows under each of them
+  await expect(
+    tree.getByRole('button', { name: 'mitochondrion inheritance' }).first(),
+  ).toBeVisible();
 });
