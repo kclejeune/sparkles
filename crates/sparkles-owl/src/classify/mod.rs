@@ -577,6 +577,7 @@ impl Saturation {
         &mut self,
         axioms: &[&AxiomKind],
         outside: &[(usize, (String, String))],
+        threads: usize,
         limits: &Limits,
     ) -> Result<(Axioms, Index), Error> {
         let mut ax = Axioms::default();
@@ -601,28 +602,45 @@ impl Saturation {
                     .insert(d.clone(), r.clone());
             }
         }
-        for (i, &k) in axioms.iter().enumerate() {
-            if i % POLL_AXIOMS == 0 {
-                poll(limits)?;
+        // Chunks of the axioms normalize on the run's threads into interners of their
+        // own, which merge in order into the run's, so that every id is the one a
+        // normalization on one thread gives. Data ranges and literals have ids inside
+        // their values, which the merge does not map, so a run that has them normalizes
+        // on one thread.
+        let mut merged = false;
+        if threads > 1 && axioms.len() >= PARALLEL_AXIOMS {
+            let definitions = &self.interner.ranges.definitions;
+            let is_outside = &is_outside;
+            let parts = par_map(axioms, threads, |at, chunk| {
+                let mut it = Interner::chunk(definitions);
+                let mut out = Normalized::default();
+                let r = normalize_axioms(chunk, at, is_outside, &mut it, &mut out, limits);
+                (r, it, out)
+            });
+            for (r, _, _) in &parts {
+                r.clone()?;
             }
-            if !logical(k) {
-                continue;
-            }
-            if is_outside[i] {
-                index::intern_signature(k, &mut self.interner);
-                continue;
-            }
-            if matches!(
-                k,
-                AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
-            ) {
-                chains.push(k);
-                continue;
-            }
-            if let Some(why) = index::normalize(k, &mut self.interner, &mut ax) {
-                partial.insert(k, why);
+            if !parts.iter().any(|(_, it, _)| it.chunk_has_data()) {
+                for (_, it, out) in parts {
+                    let (nodes, roles) = self.interner.merge(it);
+                    ax.append_mapped(out.ax, &nodes, &roles);
+                    partial.extend(out.partial);
+                    chains.extend(out.chains);
+                }
+                merged = true;
             }
         }
+        if !merged {
+            let mut out = Normalized {
+                ax,
+                ..Normalized::default()
+            };
+            normalize_axioms(axioms, 0, &is_outside, &mut self.interner, &mut out, limits)?;
+            ax = out.ax;
+            partial.extend(out.partial);
+            chains.extend(out.chains);
+        }
+        poll(limits)?;
         // the range restriction of OWL 2 EL (Profiles §2.2.6): a chain's superproperty
         // has no range that its last property lacks
         if !chains.is_empty() {
@@ -755,7 +773,7 @@ impl Saturation {
         .flatten()
         .collect();
         poll(limits)?;
-        let (ax, ix) = self.build(axioms, &outside, limits)?;
+        let (ax, ix) = self.build(axioms, &outside, threads, limits)?;
         drop(outside);
         poll(limits)?;
         let n = self.interner.len();
@@ -989,13 +1007,14 @@ impl Saturation {
     }
 
     fn index_bytes(&self, ix: &Index) -> usize {
-        let iris = |len: usize| len + 56;
+        // each class's IRI is held once, beside its hash and its entry in the table
         self.interner.len() * 40
+            + self.interner.classes.bytes()
             + self
                 .interner
                 .classes
                 .iter()
-                .map(|c| 2 * iris(c.as_str().len()))
+                .map(|c| c.as_str().len() + 16)
                 .sum::<usize>()
             + ix.bytes()
     }
@@ -1112,6 +1131,53 @@ impl Saturation {
             .collect();
         Some((st.bottom, named))
     }
+}
+
+/// The axioms below which a run normalizes on one thread.
+const PARALLEL_AXIOMS: usize = if cfg!(test) { 64 } else { 16_384 };
+
+/// What the normalization of a run of axioms gives: the normalized axioms, the axioms used
+/// in part, and the chains, which the range restriction checks once every axiom is read.
+#[derive(Default)]
+struct Normalized<'k> {
+    ax: Axioms,
+    partial: BTreeMap<&'k AxiomKind, &'static str>,
+    chains: Vec<&'k AxiomKind>,
+}
+
+/// Normalizes a run of axioms that starts at `at` in the run's axioms into `it`. Axioms
+/// outside OWL 2 EL give only their classes, and chains wait in `out.chains`.
+fn normalize_axioms<'k>(
+    axioms: &[&'k AxiomKind],
+    at: usize,
+    is_outside: &[bool],
+    it: &mut Interner,
+    out: &mut Normalized<'k>,
+    limits: &Limits,
+) -> Result<(), Error> {
+    for (i, &k) in axioms.iter().enumerate() {
+        if (at + i).is_multiple_of(POLL_AXIOMS) {
+            poll(limits)?;
+        }
+        if !logical(k) {
+            continue;
+        }
+        if is_outside[at + i] {
+            index::intern_signature(k, it);
+            continue;
+        }
+        if matches!(
+            k,
+            AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
+        ) {
+            out.chains.push(k);
+            continue;
+        }
+        if let Some(why) = index::normalize(k, it, &mut out.ax) {
+            out.partial.insert(k, why);
+        }
+    }
+    Ok(())
 }
 
 /// The ranges of each object property through its superproperties, as class expressions,
@@ -1258,6 +1324,118 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+
+    /// Random axioms over a few hundred classes, with intersections whose operands come
+    /// in every order, so that chunks meet expressions in orders other than the run's.
+    fn mixed_axioms(n: usize, seed: u64) -> Vec<AxiomKind> {
+        let mut seed = seed;
+        let mut next = move |m: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % m as u64) as usize
+        };
+        let c = |i: usize| ClassExpression::Class(Class::new(format!("http://ex.org/C{i}")));
+        let p = |i: usize| ObjectProperty::new(format!("http://ex.org/p{i}"));
+        let ind = |i: usize| Individual::Named(NamedIndividual::new(format!("http://ex.org/i{i}")));
+        let mut out = vec![
+            AxiomKind::TransitiveObjectProperty(ObjectPropertyExpression::Property(p(0))),
+            AxiomKind::SubObjectPropertyOf(
+                SubObjectPropertyExpression::Chain(vec![
+                    ObjectPropertyExpression::Property(p(1)),
+                    ObjectPropertyExpression::Property(p(2)),
+                ]),
+                ObjectPropertyExpression::Property(p(1)),
+            ),
+        ];
+        let classes = 300;
+        for _ in 0..n {
+            let expr = |next: &mut dyn FnMut(usize) -> usize| -> ClassExpression {
+                match next(4) {
+                    0 => c(next(classes)),
+                    1 => ClassExpression::some(p(next(4)), c(next(classes))),
+                    2 => ClassExpression::ObjectIntersectionOf(
+                        (0..2 + next(3)).map(|_| c(next(classes))).collect(),
+                    ),
+                    _ => ClassExpression::some(
+                        p(next(4)),
+                        ClassExpression::ObjectIntersectionOf(
+                            [
+                                c(next(classes)),
+                                ClassExpression::some(p(next(4)), c(next(classes))),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        ),
+                    ),
+                }
+            };
+            let k = match next(10) {
+                0 => AxiomKind::EquivalentClasses(
+                    [expr(&mut next), c(next(classes))].into_iter().collect(),
+                ),
+                1 => AxiomKind::DisjointClasses(
+                    [c(next(classes)), c(next(classes))].into_iter().collect(),
+                ),
+                2 => AxiomKind::ClassAssertion(c(next(classes)), ind(next(40))),
+                3 => AxiomKind::ObjectPropertyAssertion(
+                    ObjectPropertyExpression::Property(p(next(4))),
+                    ind(next(40)),
+                    ind(next(40)),
+                ),
+                4 => AxiomKind::SubObjectPropertyOf(
+                    SubObjectPropertyExpression::Expression(ObjectPropertyExpression::Property(p(
+                        4 + next(4),
+                    ))),
+                    ObjectPropertyExpression::Property(p(next(4))),
+                ),
+                5 => AxiomKind::Declaration(Entity::Class(Class::new(format!(
+                    "http://ex.org/D{}",
+                    next(classes)
+                )))),
+                _ => AxiomKind::SubClassOf(expr(&mut next), expr(&mut next)),
+            };
+            out.push(k);
+        }
+        out
+    }
+
+    #[test]
+    fn a_parallel_normalization_gives_the_ids_of_one_thread() {
+        for seed in [1u64, 0x9e37_79b9_7f4a_7c15, 587] {
+            let axioms = mixed_axioms(3000, seed);
+            let kinds: Vec<&AxiomKind> = axioms.iter().collect();
+            let run = |threads: usize| {
+                let mut s = Saturation::new();
+                let out = s
+                    .classify(
+                        &kinds,
+                        None,
+                        &Limits {
+                            threads,
+                            ..Limits::default()
+                        },
+                    )
+                    .unwrap();
+                (s, out)
+            };
+            let (one, a) = run(1);
+            for threads in [2, 3, 8] {
+                let (many, b) = run(threads);
+                assert_eq!(
+                    one.interner.nodes, many.interner.nodes,
+                    "seed {seed}, {threads} threads"
+                );
+                assert_eq!(one.interner.classes[..], many.interner.classes[..]);
+                assert_eq!(one.interner.roles, many.interner.roles);
+                assert_eq!(one.interner.individuals[..], many.interner.individuals[..]);
+                assert_eq!(one.interner.met, many.interner.met);
+                assert_eq!(one.excluded, many.excluded);
+                assert_eq!(a.taxonomy, b.taxonomy);
+                assert_eq!(a.consistent, b.consistent);
+            }
+        }
+    }
 
     #[test]
     fn the_world_budget_polls_the_cancellation_when_nothing_grows() {
