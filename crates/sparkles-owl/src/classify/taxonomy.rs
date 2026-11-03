@@ -520,6 +520,32 @@ fn bytes_of(classes: &[(&Class, Ex)], subs: &[(bool, Vec<u32>)], exprs: usize) -
 /// No position or node.
 const NONE: u32 = u32::MAX;
 
+/// Writes the sorted union of sorted `a` and `b`, each without repeats, to `out`.
+fn merge_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    out.clear();
+    out.reserve(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => {
+                out.push(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(b[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+}
+
 /// Closes the rows of a partial answer, whose subsumers are each entailed but whose
 /// contexts did not all saturate. Each row takes the rows of the classes in it, through
 /// the components of the graph of rows in the order that Tarjan's algorithm closes them,
@@ -590,51 +616,72 @@ fn close_rows(
         }
     }
     // each component's closed row, with whether it is unsatisfiable, in the order made,
-    // which has every component it reaches made before it
+    // which has every component it reaches made before it. A row grows by sorted merges
+    // with the rows of the distinct components it reaches, and the bytes held, the
+    // scratch row included, are asked of `budget` before each merge that passes the last
+    // grant by a mebibyte.
     let mut rows: Vec<(bool, Vec<u32>)> = Vec::with_capacity(comps.len());
-    let mut bytes = 0usize;
+    let mut held = 0usize;
     let mut asked = 0usize;
+    let ask = |bytes: usize, asked: &mut usize| -> Result<(), Halt> {
+        if bytes > *asked + (1 << 20) {
+            if !budget(bytes) {
+                return Err(Halt::Memory(bytes));
+            }
+            *asked = bytes;
+        }
+        Ok(())
+    };
+    let mut seen = vec![NONE; comps.len()];
+    let mut scratch: Vec<u32> = Vec::new();
     for members in &comps {
         let id = rows.len() as u32;
         let mut unsat = false;
         let mut row: Vec<u32> = members.clone();
+        row.sort_unstable();
         for &m in members {
             unsat |= subs[m as usize].0;
             for &w in &subs[m as usize].1 {
                 let c = comp[w as usize];
-                if c != id {
-                    unsat |= rows[c as usize].0;
-                    row.extend_from_slice(&rows[c as usize].1);
+                if c == id || seen[c as usize] == id {
+                    continue;
                 }
+                seen[c as usize] = id;
+                let (u, other) = &rows[c as usize];
+                unsat |= *u;
+                ask(held + (row.len() + other.len()) * 4 * 2, &mut asked)?;
+                merge_into(&row, other, &mut scratch);
+                std::mem::swap(&mut row, &mut scratch);
             }
         }
-        row.sort_unstable();
-        row.dedup();
-        bytes += row.len() * 4 + 32;
-        if bytes > asked + (1 << 20) {
-            if !budget(bytes) {
-                return Err(Halt::Memory(bytes));
-            }
-            asked = bytes;
-        }
+        row.shrink_to_fit();
+        held += row.len() * 4 + 32;
         rows.push((unsat, row));
     }
+    drop(scratch);
     // the closed row of owl:Thing joins every row
     let mut t: Vec<u32> = top.to_vec();
+    t.sort_unstable();
+    t.dedup();
     let mut t_unsat = false;
+    let mut scratch: Vec<u32> = Vec::new();
     for &p in top {
         let (u, r) = &rows[comp[p as usize] as usize];
         t_unsat |= *u;
-        t.extend_from_slice(r);
+        ask(held + (t.len() + r.len()) * 4 * 2, &mut asked)?;
+        merge_into(&t, r, &mut scratch);
+        std::mem::swap(&mut t, &mut scratch);
     }
-    t.sort_unstable();
-    t.dedup();
+    drop(scratch);
+    t.shrink_to_fit();
+    // the rows replace the read ones, which are freed as they go
     for (i, slot) in subs.iter_mut().enumerate() {
         let (u, r) = &rows[comp[i] as usize];
-        let mut row = r.clone();
-        row.extend_from_slice(&t);
-        row.sort_unstable();
-        row.dedup();
+        let mut row = Vec::new();
+        merge_into(r, &t, &mut row);
+        row.shrink_to_fit();
+        held += row.len() * 4;
+        ask(held, &mut asked)?;
         *slot = (*u || t_unsat, row);
     }
     Ok(t)
@@ -878,5 +925,42 @@ mod tests {
         assert!(bad == bad1);
         assert_eq!(bad.node_of(&c("C000001")), Some(BOTTOM_NODE));
         assert_eq!(bad.node_of(&Class::thing()), Some(BOTTOM_NODE));
+    }
+
+    #[test]
+    fn closing_dense_rows_asks_the_budget() {
+        // rows that are closed already, each class below every later one
+        let n = 512u32;
+        let rows =
+            || -> Vec<(bool, Vec<u32>)> { (0..n).map(|i| (false, (i..n).collect())).collect() };
+        let out_bytes = (n as usize * (n as usize + 1) / 2) * 4;
+        let most = std::cell::Cell::new(0usize);
+        let mut subs = rows();
+        let top = close_rows(&mut subs, &[], &|b| {
+            most.set(most.get().max(b));
+            true
+        })
+        .unwrap();
+        assert!(top.is_empty());
+        for (i, (u, r)) in subs.iter().enumerate() {
+            assert!(!u);
+            assert_eq!(r.len(), n as usize - i);
+        }
+        assert!(
+            most.get() >= out_bytes / 2,
+            "asked for {} bytes",
+            most.get()
+        );
+        assert!(
+            most.get() <= 4 * out_bytes,
+            "asked for {} bytes",
+            most.get()
+        );
+        // a budget below the closed rows stops the closure
+        let mut subs = rows();
+        assert!(matches!(
+            close_rows(&mut subs, &[], &|b| b <= out_bytes / 4),
+            Err(Halt::Memory(_))
+        ));
     }
 }

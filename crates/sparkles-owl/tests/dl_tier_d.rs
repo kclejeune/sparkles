@@ -778,3 +778,94 @@ fn a_wide_case_analysis_stays_within_the_memory_budget() {
         check_partial(&out, &full, &cs);
     }
 }
+
+/// A ⊑ B, B ⊑ A ⊔ Cᵢ for 300 classes, and B ⊑ D ⊔ E with D and E below F: A's context
+/// goes through the choices that are redundant, since A holds, before the one that gives F.
+fn redundant_choices() -> Vec<Axiom> {
+    let mut s = String::from("SubClassOf(:A :B)\n");
+    for i in 0..300 {
+        s.push_str(&format!("SubClassOf(:B ObjectUnionOf(:A :C{i:03}))\n"));
+    }
+    s.push_str("SubClassOf(:B ObjectUnionOf(:D :E))\nSubClassOf(:D :F)\nSubClassOf(:E :F)\n");
+    s.push_str("Declaration(Class(:A))\nDeclaration(Class(:F))\n");
+    axioms(&s)
+}
+
+#[test]
+fn a_stop_among_redundant_choices_leaves_the_context_open() {
+    let ax = redundant_choices();
+    let cs = classes(&ax);
+    let full = in_order(&ax, &Limits::default()).unwrap();
+    assert!(full.taxonomy.is_subclass(&c("A"), &c("F")));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let p = polls.clone();
+    in_order(
+        &ax,
+        &Limits {
+            cancelled: Some(Arc::new(move || {
+                p.fetch_add(1, Ordering::Relaxed);
+                false
+            })),
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    for stop in 0..polls.load(Ordering::Relaxed) {
+        if let Ok(out) = in_order(&ax, &cancelled_at(stop, 1, Expansion::Cautious)) {
+            check_partial(&out, &full, &cs);
+        }
+    }
+}
+
+/// `m` intersections of `n` classes below unions, each class holding of A in two cases.
+fn wide_many(m: usize, n: usize) -> Vec<Axiom> {
+    let mut s = String::new();
+    for p in ["P", "Q", "Z"] {
+        for k in 0..m {
+            for i in 0..n {
+                s.push_str(&format!("Declaration(Class(:{p}{k}_{i:02}))\n"));
+            }
+        }
+    }
+    for p in ["P", "Q"] {
+        for k in 0..m {
+            for i in 0..n {
+                s.push_str(&format!(
+                    "SubClassOf(:A ObjectUnionOf(:{p}{k}_{i:02} :Z{k}_{i:02}))\n"
+                ));
+            }
+        }
+    }
+    for k in 0..m {
+        s.push_str("SubClassOf(ObjectIntersectionOf(");
+        for i in 0..n {
+            s.push_str(&format!(":Z{k}_{i:02} "));
+        }
+        s.push_str(&format!(") ObjectUnionOf(:D{k} :E{k}))\n"));
+    }
+    axioms(&s)
+}
+
+#[test]
+fn a_stop_ends_every_waiting_case_analysis() {
+    let ax = wide_many(6, 12);
+    let cap = 400_000;
+    for partial in [false, true] {
+        let out = in_order(
+            &ax,
+            &Limits {
+                partial,
+                max_memory: Some(cap),
+                ..Limits::default()
+            },
+        );
+        if let Ok(out) = out {
+            assert!(
+                out.stats.peak_memory <= 2 * cap,
+                "a peak of {} under a cap of {cap}",
+                out.stats.peak_memory
+            );
+            assert_eq!(out.stats.dl_over_budget, !partial);
+        }
+    }
+}

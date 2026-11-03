@@ -735,6 +735,10 @@ pub trait Sink {
     fn go_on(&self) -> bool {
         true
     }
+    /// whether the run has stopped, without a check of its bounds
+    fn stopped(&self) -> bool {
+        false
+    }
 }
 
 impl Sink for Out<'_, '_> {
@@ -798,6 +802,11 @@ impl Sink for Out<'_, '_> {
 
     fn go_on(&self) -> bool {
         self.run.check(0, 0, 0)
+    }
+
+    #[inline]
+    fn stopped(&self) -> bool {
+        self.run.stopped()
     }
 }
 

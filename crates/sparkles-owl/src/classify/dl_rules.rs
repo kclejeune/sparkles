@@ -457,9 +457,10 @@ const PRODUCT_POLL: usize = 256;
 
 /// Derives what the rules found: the single conclusions, then each product's choices in
 /// the order of their lists, the last list fastest. The run's bounds are checked every
-/// [`PRODUCT_POLL`] choices, and when the run stops, the rest of the inference is left
-/// undone and the store is marked interrupted, so that the dependency record of a partial
-/// answer counts the context as open.
+/// [`PRODUCT_POLL`] choices, and a stop of the run, found there or made by another worker,
+/// leaves the rest of the inference undone and marks the context's store interrupted, a
+/// store made for the mark if the context has none, so that the dependency record of a
+/// partial answer counts the context as open.
 fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
     for c in found.one {
         derive(ix, st, c, out);
@@ -468,6 +469,10 @@ fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
     for (lists, base) in found.prods {
         let mut at = vec![0usize; lists.len()];
         'choices: loop {
+            if out.stopped() || (n > 0 && n.is_multiple_of(PRODUCT_POLL) && !out.go_on()) {
+                ds(st).store.interrupted = true;
+                return;
+            }
             let mut s = base.clone();
             for (l, &i) in lists.iter().zip(&at) {
                 s.0.extend_from_slice(&l[i].0);
@@ -475,12 +480,6 @@ fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
             }
             derive(ix, st, s, out);
             n += 1;
-            if n.is_multiple_of(PRODUCT_POLL) && !out.go_on() {
-                if let Some(x) = st.extra.as_mut().and_then(|x| x.dl.as_deref_mut()) {
-                    x.store.interrupted = true;
-                }
-                return;
-            }
             let mut k = lists.len();
             loop {
                 if k == 0 {
@@ -947,7 +946,8 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
         n += 1;
         let c = x.store.clauses[id as usize].c.clone();
         process(ix, me, st, id, &c, &max, out);
-        if out.busy() {
+        // the units go to the EL rules first, and a stopped run leaves the rest queued
+        if out.busy() || out.stopped() {
             break;
         }
     }
