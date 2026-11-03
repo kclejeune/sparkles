@@ -458,6 +458,9 @@ pub struct Bounds<'a> {
     pub dynamic: Option<&'a Dynamic>,
     /// what the contexts of Tier D share, in a run with it
     pub dl: Option<&'a super::dl_rules::DlRun>,
+    /// whether a stop leaves every context's unapplied conclusions in its to-do list, for
+    /// a partial answer
+    pub partial: bool,
 }
 
 const STOP_NONE: u8 = 0;
@@ -1060,6 +1063,11 @@ impl<'a> Run<'a> {
             };
             if self.stopped() {
                 self.flush(&mut tally);
+                // the messages the worker holds reach their contexts' to-do lists, which
+                // then show the work left for a partial answer
+                if self.bounds.partial {
+                    self.deliver(&mut outbox, &mut mine);
+                }
                 return;
             }
             if self.horn {
@@ -1215,6 +1223,11 @@ impl<'a> Run<'a> {
             out.local.append(&mut batch);
         }
         tally.queued += out.sent as isize;
+        // A run that answers in part when it stops gives back the conclusions it did not
+        // apply, so that the context shows as not closed (roadmap item 603).
+        if self.bounds.partial && !out.local.is_empty() {
+            ctx.todo.lock().append(out.local);
+        }
         drop(st);
         ctx.active.store(false, Ordering::SeqCst);
         if !self.stopped() && !ctx.todo.lock().is_empty() && self.mark(ctx) {

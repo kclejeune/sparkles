@@ -42,9 +42,6 @@ pub struct DlAx {
     /// for each existential restriction, the fresh class whose context is its
     /// hypothetical successor, with the empty core
     pub hyp: FxHashMap<Ex, Ex>,
-    /// the axioms outside OWL 2 EL the run takes, and how many of them need case analysis
-    pub taken: usize,
-    pub disjunctive: usize,
 }
 
 impl DlAx {
@@ -677,8 +674,6 @@ pub fn normalize(
     unfold(it, ax, &all.clauses, &mut rb);
     let mut dl = DlAx {
         clauses: all.clauses,
-        taken: taken.iter().filter(|t| **t).count(),
-        disjunctive,
         ..DlAx::default()
     };
     // the hypothetical successor of each existential restriction

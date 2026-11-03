@@ -96,12 +96,6 @@ pub fn rank(ix: &Index, a: Ex) -> (u8, Ex) {
     (r, a)
 }
 
-/// Whether an expression is a named class, whose atom over x is a query atom.
-#[inline]
-pub fn named(ix: &Index, a: Ex) -> bool {
-    matches!(ix.head(a).node, Node::Class(_))
-}
-
 /// A context clause: its body, then its head, each sorted.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Clause {
@@ -168,10 +162,6 @@ impl Clause {
             out.push(m);
         }
     }
-    /// Whether the head is over y alone, so that the clause goes to the predecessors.
-    pub fn to_predecessor(&self) -> bool {
-        self.head().iter().all(|l| l.kind() == Y)
-    }
 }
 
 /// Whether sorted `a` is a subset of sorted `b`.
@@ -192,11 +182,14 @@ fn subset(a: &[Lit], b: &[Lit]) -> bool {
     true
 }
 
+/// One segment of a [`Table`], made on first use.
+type Segment = OnceLock<Box<[OnceLock<Clause>]>>;
+
 /// The clauses that contexts send one another, by id: an append-only table whose entries
 /// never move, so that a worker reads one without a lock.
 pub struct Table {
     next: AtomicU32,
-    segs: Box<[OnceLock<Box<[OnceLock<Clause>]>>]>,
+    segs: Box<[Segment]>,
     bytes: AtomicUsize,
 }
 
@@ -241,10 +234,6 @@ impl Table {
 
     pub fn bytes(&self) -> usize {
         self.bytes.load(Ordering::Relaxed)
-    }
-
-    pub fn len(&self) -> usize {
-        self.next.load(Ordering::Relaxed) as usize
     }
 }
 
@@ -402,6 +391,16 @@ impl Store {
     pub fn with_x(&self, a: Ex) -> impl Iterator<Item = u32> + '_ {
         self.by_x
             .get(&a)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&i| !self.clauses[i as usize].dead)
+    }
+
+    /// The processed clauses that are not dead whose maximal literal is over `f_e(x)`.
+    pub fn with_succ_fun(&self, e: Ex) -> impl Iterator<Item = u32> + '_ {
+        self.by_f
+            .get(&e)
             .into_iter()
             .flatten()
             .copied()

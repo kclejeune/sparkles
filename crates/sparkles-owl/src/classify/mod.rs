@@ -142,6 +142,26 @@ pub struct Limits {
     /// told each growth of the estimated memory, in bytes: false stops the run as over
     /// its memory budget, as a server's memory pool refuses a grant
     pub charge: Option<std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync>>,
+    /// a run with Tier D (roadmap item 603) that its deadline, cancellation or memory
+    /// budget stops answers with what it proved, in a [`Classification`] whose
+    /// [`complete`](Classification::complete) is false, instead of failing. Runs of the
+    /// other tiers fail as before.
+    pub partial: bool,
+    /// the expansion strategy of Tier D's Succ rule
+    pub expansion: Expansion,
+}
+
+/// Which context the Succ rule of Tier D (roadmap item 603) gives a successor. Both
+/// strategies give the same answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Expansion {
+    /// the context of the existential restriction's filler with the role's range when
+    /// the restriction holds, and else a context with the empty core for each
+    /// restriction, as Sequoia's cautious strategy
+    #[default]
+    Cautious,
+    /// the context of what holds of the successor for certain, as the eager strategy
+    Eager,
 }
 
 /// Why a run stopped. The classifier keeps its axioms, and its next run starts the
@@ -215,6 +235,8 @@ pub struct Stats {
     pub clauses: usize,
     /// the contexts that held clauses of Tier D
     pub dl_contexts: usize,
+    /// the clauses that the contexts of Tier D stored, those deleted as subsumed included
+    pub dl_stored: usize,
     /// the candidate subsumers that Tier D tested in contexts of their own
     pub dl_tests: usize,
     /// the tested candidates that hold
@@ -242,6 +264,56 @@ pub struct Classification {
     pub consistent: bool,
     pub taxonomy: Taxonomy,
     pub stats: Stats,
+    /// false for the partial answer of a run that stopped ([`Limits::partial`]): its
+    /// subsumptions are entailed, and those of the classes not in
+    /// [`incomplete`](Classification::incomplete) are all that hold
+    pub complete: bool,
+    /// the classes whose subsumers a partial answer may miss, in IRI order
+    pub incomplete: Vec<Class>,
+    /// whether the ontology has a model, as far as the run knows: a partial answer can
+    /// leave it unknown, and then no class is complete
+    pub consistency: Consistency,
+}
+
+/// Whether the ontology has a model, as far as a run knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Consistency {
+    Consistent,
+    Inconsistent,
+    /// a partial answer that did not decide it
+    Unknown,
+}
+
+impl Consistency {
+    fn of(consistent: bool) -> Consistency {
+        if consistent {
+            Consistency::Consistent
+        } else {
+            Consistency::Inconsistent
+        }
+    }
+}
+
+impl Classification {
+    fn new(
+        consistent: bool,
+        taxonomy: Option<Taxonomy>,
+        stats: Stats,
+        partial: Option<(Vec<Class>, Consistency)>,
+    ) -> Classification {
+        let (complete, incomplete, consistency) = match partial {
+            Some((incomplete, consistency)) => (false, incomplete, consistency),
+            None => (true, Vec::new(), Consistency::of(consistent)),
+        };
+        Classification {
+            consistent,
+            taxonomy: taxonomy.expect("a taxonomy was asked for"),
+            stats,
+            complete,
+            incomplete,
+            consistency,
+        }
+    }
 }
 
 /// An axiom the classifier leaves out or uses only in part, and why.
@@ -310,6 +382,9 @@ pub struct Saturation {
     dl_tried: bool,
     /// set while a run classifies again without Tier D, past Tier D's memory budget
     skip_dl: bool,
+    /// what the last run's partial answer leaves open: the classes not complete and the
+    /// consistency
+    partial: Option<(Vec<Class>, Consistency)>,
 }
 
 impl Default for Saturation {
@@ -524,12 +599,11 @@ impl Classifier {
     /// Classifies the axioms held, saturating again only what changed since the last
     /// run.
     pub fn classify(&mut self, limits: &Limits) -> Result<Classification, Error> {
-        self.run_held(limits, true)
-            .map(|(consistent, taxonomy, stats)| Classification {
-                consistent,
-                taxonomy: taxonomy.expect("a taxonomy was asked for"),
-                stats,
-            })
+        let r = self.run_held(limits, true);
+        let partial = self.sat.partial.take();
+        r.map(|(consistent, taxonomy, stats)| {
+            Classification::new(consistent, taxonomy, stats, partial)
+        })
     }
 
     /// Saturates the axioms held as [`classify`](Self::classify) does, again only what
@@ -612,6 +686,7 @@ impl Saturation {
             horn_tried: false,
             dl_tried: false,
             skip_dl: false,
+            partial: None,
         }
     }
 
@@ -631,12 +706,11 @@ impl Saturation {
         changes: Option<Changes<'_>>,
         limits: &Limits,
     ) -> Result<Classification, Error> {
-        self.run_with(axioms, changes, 0, limits, true)
-            .map(|(consistent, taxonomy, stats)| Classification {
-                consistent,
-                taxonomy: taxonomy.expect("a taxonomy was asked for"),
-                stats,
-            })
+        let r = self.run_with(axioms, changes, 0, limits, true);
+        let partial = self.partial.take();
+        r.map(|(consistent, taxonomy, stats)| {
+            Classification::new(consistent, taxonomy, stats, partial)
+        })
     }
 
     /// Saturates `axioms` as [`classify`](Saturation::classify) does, but builds no
@@ -1146,7 +1220,10 @@ impl Saturation {
             None if disj => Some(saturate::Dynamic::new(n as Ex)),
             None => None,
         };
-        let dl_run = ix.dl.as_ref().map(|_| dl_rules::DlRun::default());
+        let dl_run = ix
+            .dl
+            .as_ref()
+            .map(|_| dl_rules::DlRun::new(limits.expansion == Expansion::Eager));
         if let Some(scratch) = premises {
             stats.incremental = true;
             stats.cleared = self.invalidate(&scratch, &ix);
@@ -1195,6 +1272,7 @@ impl Saturation {
             peak_memory: normalized_peak,
             dynamic: dynamic.as_ref(),
             dl: dl_run.as_ref(),
+            partial: limits.partial && disj && with_taxonomy,
         };
         // the pool has been charged for the peak of a parallel normalization
         let more = base.saturating_sub(normalized_peak);
@@ -1215,13 +1293,28 @@ impl Saturation {
                 used,
             },
         };
-        let mut totals =
-            saturate::saturate(&ix, &self.ctx, &roots, &[], &[], &bounds).map_err(stopped)?;
+        // a run that answers in part keeps the reason it stopped and goes on to the answer
+        let mut halted: Option<Error> = None;
+        let partial = bounds.partial;
+        let mut totals = match saturate::saturate(&ix, &self.ctx, &roots, &[], &[], &bounds) {
+            Ok(t) => t,
+            Err(s) if partial => {
+                halted = Some(stopped(s));
+                saturate::Totals {
+                    memory: base,
+                    peak: base,
+                    ..Default::default()
+                }
+            }
+            Err(s) => return Err(stopped(s)),
+        };
+        // the candidates whose tests ended without a contradiction
+        let mut refuted: FxHashSet<(Ex, Ex)> = FxHashSet::default();
         // Tier D orders the atoms totally, which leaves the subsumers that only a case
-        // analysis gives as clauses: each named class in the head of a class's clause is
-        // tested in a context of its own, and those that hold join the class's subsumers,
-        // until no class has a new candidate.
-        if disj {
+        // analysis gives as clauses: each named class that the canonical model of a
+        // class's context makes true is tested in a context of its own, and those that
+        // hold join the class's subsumers, until no class has a new candidate.
+        if disj && halted.is_none() {
             let tests_start = Instant::now();
             let d = dynamic
                 .as_ref()
@@ -1229,8 +1322,28 @@ impl Saturation {
             let mut tested: FxHashSet<(Ex, Ex)> = FxHashSet::default();
             // the candidates of a group test that failed, each tested alone next
             let mut singles: Vec<(Ex, Ex)> = Vec::new();
+            // one round of the saturation, which records a stop for a partial answer
+            let round = |seeds: &[Ex], tests: &[Ex], totals: &mut saturate::Totals| {
+                let b = Bounds {
+                    base_memory: totals.memory,
+                    peak_memory: totals.peak,
+                    ..bounds
+                };
+                let more =
+                    saturate::saturate(&ix, &self.ctx, tests, seeds, &[], &b).map_err(stopped)?;
+                *totals = saturate::Totals {
+                    conclusions: totals.conclusions + more.conclusions,
+                    memory: more.memory,
+                    peak: totals.peak.max(more.peak),
+                    merged: false,
+                };
+                Ok::<(), Error>(())
+            };
             loop {
-                poll(limits)?;
+                if let Err(e) = poll(limits) {
+                    halted = Some(e);
+                    break;
+                }
                 let found = dl_rules::candidates(&ix, &self.ctx, &roots, &tested);
                 tested.extend(found.iter().copied());
                 // A class's candidates are tested together first, since most fail: a
@@ -1250,22 +1363,14 @@ impl Saturation {
                     .iter()
                     .map(|(x, bs)| dl_rules::test(d, *x, bs))
                     .collect();
-                let round = Bounds {
-                    base_memory: totals.memory,
-                    peak_memory: totals.peak,
-                    ..bounds
-                };
-                let more =
-                    saturate::saturate(&ix, &self.ctx, &ids, &[], &[], &round).map_err(stopped)?;
-                totals = saturate::Totals {
-                    conclusions: totals.conclusions + more.conclusions,
-                    memory: more.memory,
-                    peak: totals.peak.max(more.peak),
-                    merged: false,
-                };
+                if let Err(e) = round(&[], &ids, &mut totals) {
+                    halted = Some(e);
+                    break;
+                }
                 let mut seeds: Vec<Ex> = Vec::new();
                 for ((x, bs), &id) in tests.iter().zip(&ids) {
                     if !d.ctx(id).st.lock().bottom {
+                        refuted.extend(bs.iter().map(|&b| (*x, b)));
                         continue;
                     }
                     if let [b] = bs.as_slice() {
@@ -1284,22 +1389,34 @@ impl Saturation {
                 }
                 seeds.sort_unstable();
                 seeds.dedup();
-                let round = Bounds {
-                    base_memory: totals.memory,
-                    peak_memory: totals.peak,
-                    ..bounds
-                };
-                let more = saturate::saturate(&ix, &self.ctx, &[], &seeds, &[], &round)
-                    .map_err(stopped)?;
-                totals = saturate::Totals {
-                    conclusions: totals.conclusions + more.conclusions,
-                    memory: more.memory,
-                    peak: totals.peak.max(more.peak),
-                    merged: false,
-                };
+                if let Err(e) = round(&seeds, &[], &mut totals) {
+                    halted = Some(e);
+                    break;
+                }
             }
             stats.dl_testing = tests_start.elapsed();
         }
+        if !partial && let Some(h) = halted.take() {
+            return Err(h);
+        }
+        // the dependency record of a partial answer: the classes it leaves open and the
+        // consistency
+        let open = halted.as_ref().map(|_| {
+            let (complete, known) =
+                dl_rules::record(&ix, &self.ctx, dynamic.as_ref(), &roots, &refuted);
+            let incomplete: Vec<Ex> = roots
+                .iter()
+                .zip(complete)
+                .filter(|&(&r, c)| !c && r != TOP)
+                .map(|(&r, _)| r)
+                .collect();
+            let consistency = match known {
+                dl_rules::Known::Consistent => Consistency::Consistent,
+                dl_rules::Known::Inconsistent => Consistency::Inconsistent,
+                dl_rules::Known::Unknown => Consistency::Unknown,
+            };
+            (incomplete, consistency)
+        });
         // Which contexts are real matters only when a context derived an individual, for
         // keys and for universal roles. Then owl:Thing and the individuals become real,
         // and so does what they reach, between rounds of the saturation, with the facts
@@ -1412,12 +1529,12 @@ impl Saturation {
         if let Some(d) = &dl_run {
             totals.memory += d.bytes();
             totals.peak = totals.peak.max(totals.memory);
-            stats.dl_contexts = self
-                .ctx
-                .iter()
-                .filter_map(|c| c.get())
-                .filter(|c| c.st.lock().extra.as_ref().is_some_and(|x| x.dl.is_some()))
-                .count();
+            for c in self.ctx.iter().filter_map(|c| c.get()) {
+                if let Some(n) = c.st.lock().extra.as_ref().and_then(|x| x.dl.as_ref()) {
+                    stats.dl_contexts += 1;
+                    stats.dl_stored += n.store.clauses.len();
+                }
+            }
         }
         drop(dl_run);
         if let Some(d) = &dynamic {
@@ -1432,14 +1549,20 @@ impl Saturation {
         stats.conclusions = totals.conclusions;
         totals.memory += world_bytes;
         totals.peak = totals.peak.max(totals.memory);
-        // the saturated state is complete: a stop from here on keeps it for the next run
-        self.dirty = false;
+        // the saturated state is complete: a stop from here on keeps it for the next run. A
+        // partial answer's is not, and the next run starts again.
+        self.dirty = open.is_some();
         let ix_nominals = ix.nominals.clone();
         self.index = Some(ix);
         let t = Instant::now();
-        let consistent = self.consistent(&ax, &ix_nominals);
-        self.consistent = consistent;
-        let held = totals.memory - ax.bytes();
+        let consistent = match &open {
+            Some((_, c)) => *c != Consistency::Inconsistent,
+            None => self.consistent(&ax, &ix_nominals),
+        };
+        if open.is_none() {
+            self.consistent = consistent;
+        }
+        let held = totals.memory.saturating_sub(ax.bytes());
         drop(ax);
         if !with_taxonomy {
             stats.memory = held;
@@ -1448,7 +1571,8 @@ impl Saturation {
             poll(limits)?;
             return Ok((consistent, None, stats));
         }
-        let stop = || poll(limits).is_err();
+        // a partial answer builds its taxonomy past the deadline that stopped it
+        let stop = || open.is_none() && poll(limits).is_err();
         // the taxonomy's bytes join those held, and the budget and the pool's grant cover
         // what passes the saturation's peak. The build asks again as its estimate grows,
         // and the pool is charged only for the growth.
@@ -1482,6 +1606,18 @@ impl Saturation {
         stats.peak_memory = totals.peak.max(stats.memory);
         stats.taxonomy = t.elapsed();
         stats.contexts = self.context_count();
+        if let Some((incomplete, consistency)) = open {
+            let mut classes: Vec<Class> = incomplete
+                .into_iter()
+                .filter_map(|e| match self.interner.nodes[e as usize] {
+                    Node::Class(id) => Some(self.interner.classes[id as usize].clone()),
+                    _ => None,
+                })
+                .collect();
+            classes.sort();
+            self.partial = Some((classes, consistency));
+            return Ok((consistent, Some(taxonomy), stats));
+        }
         poll(limits)?;
         Ok((consistent, Some(taxonomy), stats))
     }

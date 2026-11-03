@@ -261,6 +261,7 @@ fn main() {
             "dlContexts": s.dl_contexts,
             "dlOverBudget": s.dl_over_budget,
             "dlTests": s.dl_tests,
+            "dlStored": s.dl_stored,
             "dlTestsHeld": s.dl_tests_held,
             "dlTestingMs": s.dl_testing.as_secs_f64() * 1000.0,
             "partial": partial,

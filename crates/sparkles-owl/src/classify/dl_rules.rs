@@ -34,12 +34,16 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// A clause of the axioms with two or more disjuncts: its body, where an empty one is
+/// `owl:Thing`, and its head.
+pub type AxClause = (Box<[Ex]>, Box<[Ex]>);
+
 /// What Tier D reads in the index.
 #[derive(Default)]
 pub struct DlIx {
     /// the clauses with two or more disjuncts, by id: the body, where an empty one is
     /// `owl:Thing`, and the head
-    pub clauses: Vec<(Box<[Ex]>, Box<[Ex]>)>,
+    pub clauses: Vec<AxClause>,
     /// for each body atom, the clauses whose body has it
     pub by_body: FxHashMap<Ex, Vec<u32>>,
     /// the disjointness sets, by the index's numbering
@@ -159,12 +163,20 @@ impl DlIx {
 #[derive(Default)]
 pub struct DlRun {
     pub table: Table,
+    /// whether the Succ rule takes the eager strategy instead of the cautious one
+    pub eager: bool,
     stores: AtomicUsize,
     /// the clause with an empty body and head, which an unsatisfiable context sends
     empty: OnceLock<u32>,
 }
 
 impl DlRun {
+    pub fn new(eager: bool) -> DlRun {
+        DlRun {
+            eager,
+            ..DlRun::default()
+        }
+    }
     pub fn bytes(&self) -> usize {
         self.table.bytes() + self.stores.load(Ordering::Relaxed)
     }
@@ -188,9 +200,10 @@ pub struct DlSt {
     /// the predecessors that registered, with the existential restriction they reach this
     /// context by
     pub dpreds: Vec<(Ex, Ex)>,
-    /// the existential restrictions whose hypothetical successor this context registered
-    /// with
-    pub dedges: Vec<Ex>,
+    /// the successors this context registered with, by existential restriction: the
+    /// hypothetical successor, or under the eager strategy the context of what holds of
+    /// the successor for certain
+    pub edges: Vec<(Ex, Ex)>,
     /// the markers this context holds
     hyps: FxHashSet<Ex>,
     /// the markers sent, by target
@@ -213,7 +226,7 @@ impl DlSt {
                 .sum::<usize>()
             + table_bytes(self.pred_seen.capacity(), 8)
             + self.dpreds.capacity() * 8
-            + self.dedges.capacity() * 4
+            + self.edges.capacity() * 8
             + table_bytes(self.hyps.capacity(), 4)
             + table_bytes(self.sent.capacity(), 8)
             + table_bytes(self.props.capacity(), 12)
@@ -796,10 +809,10 @@ pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mu
 /// context registered with it.
 fn reaching(dx: &DlIx, st: &State, v: Ex, out: &mut Vec<Ex>) {
     out.clear();
-    if let Some(&e) = dx.of_hyp.get(&v) {
-        if dl(st).is_some_and(|x| x.dedges.contains(&e)) {
-            out.push(e);
-        }
+    if let Some(x) = dl(st) {
+        out.extend(x.edges.iter().filter(|&&(_, w)| w == v).map(|&(e, _)| e));
+    }
+    if dx.of_hyp.contains_key(&v) {
         return;
     }
     if let Some(es) = dx.by_succ.get(&v) {
@@ -999,19 +1012,17 @@ fn process<S: Sink>(
                 // Succ: the successor takes the marker
                 let v = target(ix, me, st, e, out);
                 if l.kind() == F {
-                    send_hyp(dx, st, e, v, l.atom(), out);
+                    send_hyp(ix, st, v, l.atom(), out);
                 } else if let Some(r) = role_of(ix, e) {
                     univ_over(ix, st, e, r, &prem, &mut found);
                 }
-                // Pred with the clauses the successors of e sent: the hypothetical one once
-                // registered with, and the EL one when e is a unit
+                // Pred with the clauses the successors of e sent: the one registered with,
+                // and the EL one when e is a unit
                 es.clear();
-                if dl(st).is_some_and(|x| x.dedges.contains(&e))
-                    && let Some(&h) = dx.hyp.get(&e)
-                {
-                    es.push(h);
+                if let Some(&(_, w)) = dl(st).and_then(|x| x.edges.iter().find(|&&(f, _)| f == e)) {
+                    es.push(w);
                 }
-                if st.subs.contains(&e) {
+                if st.subs.contains(&e) && !es.contains(&ix.head(e).succ) {
                     es.push(ix.head(e).succ);
                 }
                 for &v in &es {
@@ -1033,37 +1044,186 @@ fn process<S: Sink>(
     }
 }
 
-/// Sends the successor `v` by e the marker of `a`, unless the successor's core has it.
-fn send_hyp<S: Sink>(dx: &DlIx, st: &mut State, e: Ex, v: Ex, a: Ex, out: &mut S) {
-    if a == TOP || (dx.of_hyp.get(&v).is_none() && dx.in_core(e, a)) {
+/// Sends the successor `v` the marker of `a`, unless the successor's core has it.
+fn send_hyp<S: Sink>(ix: &Index, st: &mut State, v: Ex, a: Ex, out: &mut S) {
+    if a == TOP || ds(st).sent.contains(&(v, a)) {
         return;
     }
-    if ds(st).sent.insert((v, a)) {
+    let mut core = Vec::new();
+    if !dix(ix).of_hyp.contains_key(&v) {
+        out.core(ix, v, &mut core);
+    }
+    if core.binary_search(&a).is_err() {
+        ds(st).sent.insert((v, a));
         out.send(v, Concl::Hyp(a));
     }
 }
 
-/// The successor that e's literals go to, by the cautious strategy: the hypothetical
-/// successor once the context has registered with it, else the EL successor when e is a
-/// unit, else the hypothetical successor, which the context registers with and gives the
-/// markers of the EL successor's core.
+/// The successor that e's literals go to. The context keeps the one it registered with.
+/// Otherwise the cautious strategy takes the EL successor when e is a unit, whose core is
+/// e's filler with the role's range, and else the hypothetical successor, with the empty
+/// core. The eager strategy takes the context whose core is what holds of the successor
+/// for certain: the EL successor when that is all, and else the hypothetical successor
+/// for nothing, the context of the one atom, or that of the conjunction. A successor the
+/// context registers with takes the markers of the EL core's atoms it lacks.
 fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Ex {
     let dx = dix(ix);
     let unit = st.subs.contains(&e);
     let h = dx.hyp.get(&e).copied().unwrap_or(TOP);
-    let x = ds(st);
-    if x.dedges.contains(&e) {
-        return h;
+    let succ = ix.head(e).succ;
+    if let Some(&(_, v)) = dl(st).and_then(|x| x.edges.iter().find(|&&(f, _)| f == e)) {
+        return v;
     }
-    if unit {
-        return ix.head(e).succ;
-    }
-    x.dedges.push(e);
-    out.send(h, Concl::DEdge(me, e));
+    let v = if out.dl().eager {
+        let mut k1: Vec<Ex> = Vec::new();
+        if unit {
+            k1.extend(dx.cores.get(&e).into_iter().flat_map(|c| c.iter().copied()));
+        }
+        if let Some(x) = dl(st) {
+            for i in x.store.with_succ_fun(e) {
+                let c = &x.store.clauses[i as usize].c;
+                if let ([], [l]) = (c.body(), c.head())
+                    && l.kind() == F
+                {
+                    k1.push(l.atom());
+                }
+            }
+        }
+        k1.retain(|&a| a != TOP);
+        k1.sort_unstable();
+        k1.dedup();
+        if unit && dx.cores.get(&e).is_some_and(|c| **c == *k1) {
+            return succ;
+        }
+        match k1.as_slice() {
+            [] => h,
+            [a] => *a,
+            _ => out.intern(&k1),
+        }
+    } else {
+        if unit {
+            return succ;
+        }
+        h
+    };
+    ds(st).edges.push((e, v));
+    out.send(v, Concl::DEdge(me, e));
     if let Some(core) = dx.cores.get(&e) {
         for &a in core.iter() {
-            send_hyp(dx, st, e, h, a, out);
+            send_hyp(ix, st, v, a, out);
         }
     }
-    h
+    v
+}
+
+/// Whether the ontology has a model, as far as a stopped run of Tier D knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Known {
+    Consistent,
+    Inconsistent,
+    Unknown,
+}
+
+/// The dependency record of a run of Tier D that stopped: which roots have their whole
+/// answer, and whether the ontology's consistency is decided.
+///
+/// A context's units and unsatisfiability depend only on the contexts it reaches forward:
+/// the successors of its existential restrictions, the hypothetical successors it
+/// registered with and the targets of its forward links. A predecessor's later markers
+/// make clauses whose bodies only that predecessor resolves. A context is closed when it
+/// has started and its to-do list and clause queue are empty, which a stopped worker's
+/// returned conclusions and delivered outbox make false where work was left. A root is
+/// complete when every context it reaches is closed, no candidate of its tests is left
+/// untested, and the ontology is consistent. The ontology is consistent when `owl:Thing`'s
+/// context and every context it reaches are closed and it is satisfiable, and
+/// inconsistent when that context is unsatisfiable, whatever else is open.
+pub fn record(
+    ix: &Index,
+    ctx: &super::saturate::Contexts,
+    dynamic: Option<&super::saturate::Dynamic>,
+    roots: &[Ex],
+    refuted: &FxHashSet<(Ex, Ex)>,
+) -> (Vec<bool>, Known) {
+    let n = ctx.len() as Ex;
+    let get = |e: Ex| -> Option<&super::saturate::Ctx> {
+        if e < n {
+            ctx[e as usize].get().map(|c| &**c)
+        } else {
+            dynamic.map(|d| d.ctx(e))
+        }
+    };
+    let all: Vec<Ex> = (0..n)
+        .chain(dynamic.map_or(0..0, |d| n..n + d.len() as Ex))
+        .collect();
+    // the contexts that are not closed, and the reverse of the forward edges
+    let mut open: FxHashSet<Ex> = FxHashSet::default();
+    let mut rev: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
+    let mut reached: Vec<Ex> = Vec::new();
+    for &e in &all {
+        let Some(c) = get(e) else { continue };
+        let st = c.st.lock();
+        let started = c.started.load(Ordering::Acquire) && st.init;
+        let idle = dl(&st).is_none_or(|d| d.is_idle());
+        if !started || !idle || !c.todo.lock().is_empty() {
+            open.insert(e);
+        }
+        let mut edge = |to: Ex| {
+            rev.entry(to).or_default().push(e);
+            reached.push(to);
+        };
+        for &d in &st.subs {
+            if let Node::Exist(..) = ix.head(d).node {
+                edge(ix.head(d).succ);
+            }
+        }
+        if let Some(d) = dl(&st) {
+            for &(_, v) in &d.edges {
+                edge(v);
+            }
+        }
+        for &(_, f) in &st.fwd.list {
+            edge(f);
+        }
+    }
+    // a context reached but never made has not started either
+    for e in reached {
+        if get(e).is_none() {
+            open.insert(e);
+        }
+    }
+    // the contexts that reach an open one
+    let mut bad = open.clone();
+    let mut stack: Vec<Ex> = open.into_iter().collect();
+    while let Some(e) = stack.pop() {
+        for &p in rev.get(&e).into_iter().flatten() {
+            if bad.insert(p) {
+                stack.push(p);
+            }
+        }
+    }
+    let unsat = |e: Ex| {
+        ctx.get(e as usize)
+            .and_then(|c| c.get())
+            .is_some_and(|c| c.st.lock().bottom)
+    };
+    let known = if unsat(TOP) {
+        Known::Inconsistent
+    } else if !bad.contains(&TOP) {
+        Known::Consistent
+    } else {
+        Known::Unknown
+    };
+    let pending: FxHashSet<Ex> = candidates(ix, ctx, roots, refuted)
+        .into_iter()
+        .map(|(x, _)| x)
+        .collect();
+    let complete = roots
+        .iter()
+        .map(|&r| match known {
+            Known::Inconsistent => true,
+            Known::Unknown => false,
+            Known::Consistent => !bad.contains(&r) && !pending.contains(&r),
+        })
+        .collect();
+    (complete, known)
 }

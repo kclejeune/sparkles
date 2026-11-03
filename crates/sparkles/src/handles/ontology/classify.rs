@@ -623,6 +623,8 @@ fn bounded<T>(
             Arc::new(move |bytes: usize| g.charge(bytes as u64).is_ok())
                 as Arc<dyn Fn(usize) -> bool + Send + Sync>
         }),
+        partial: false,
+        expansion: Default::default(),
     };
     let out = f(&limits);
     drop(par);
