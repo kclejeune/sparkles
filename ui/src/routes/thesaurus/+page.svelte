@@ -19,6 +19,8 @@
   import { getForm, type FormSaveAnswer } from '$lib/forms-api';
   import type { FormModel } from '$lib/forms';
   import { fmtInt } from '$lib/format';
+  import { useCommands, usePageSearch, useProvider } from '$lib/launcher.svelte';
+  import { branchProvider } from '$lib/palette.svelte';
   import {
     iriName,
     loadPolicy,
@@ -470,6 +472,78 @@
     );
   });
   onMount(() => session.keys(() => readonly));
+
+  // the command palette (ROADMAP item 631): `/` searches the labels, and this page's commands
+  let searchInput: HTMLInputElement | undefined = $state();
+  usePageSearch(() => {
+    if (!searchInput) return false;
+    searchInput.focus();
+    searchInput.select();
+  });
+  useCommands(() => [
+    {
+      id: 'thesaurus.session',
+      label: 'Start session',
+      icon: 'branch',
+      keywords: ['edit', 'branch'],
+      subtitle: 'Edit on a branch of your own, then merge it',
+      active: () => !!name && canWrite && !branch,
+      run: startSession,
+    },
+    {
+      id: 'thesaurus.new.concept',
+      label: 'New concept…',
+      icon: 'plus',
+      keywords: ['create', 'add', 'entity'],
+      active: () => !!name && !readonly,
+      run: () => openCreate('concept'),
+    },
+    {
+      id: 'thesaurus.new.scheme',
+      label: 'New concept scheme…',
+      icon: 'plus',
+      keywords: ['create', 'add'],
+      active: () => !!name && !readonly,
+      run: () => openCreate('scheme'),
+    },
+    {
+      id: 'thesaurus.new.collection',
+      label: 'New collection…',
+      icon: 'plus',
+      keywords: ['create', 'add'],
+      active: () => !!name && !readonly,
+      run: () => openCreate('collection'),
+    },
+    {
+      id: 'thesaurus.checks',
+      label: 'Run checks',
+      icon: 'check',
+      keywords: ['validate', 'quality'],
+      active: () => !!name,
+      run: () => (tab === 'checks' ? runChecks() : void nav({ tab: 'checks' })),
+    },
+    {
+      id: 'thesaurus.undo',
+      label: 'Undo',
+      icon: 'stepBack',
+      active: () => !readonly && session.done.length > 0,
+      run: () => void session.undoLast(),
+    },
+    {
+      id: 'thesaurus.redo',
+      label: 'Redo',
+      icon: 'stepForward',
+      active: () => !readonly && session.undone.length > 0,
+      run: () => void session.redoLast(),
+    },
+  ]);
+  useProvider(
+    branchProvider({
+      list: () => branchList.map((b) => b.name),
+      current: () => branch ?? MAIN,
+      choose: (n) => void nav({ branch: n === MAIN ? null : n }),
+    }),
+  );
 
   const edit = (sparql: string, label: string, after?: () => void) =>
     session.edit({ kind: 'update', sparql }, label, after);
@@ -939,6 +1013,7 @@
             type="search"
             placeholder="Search labels in any language"
             aria-label="Search labels"
+            bind:this={searchInput}
             bind:value={search}
           />
           <select class="select sm" bind:value={searchLang} aria-label="Search language">

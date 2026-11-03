@@ -1,0 +1,24 @@
+== go reason
+logical {'a': 96847, 'b': 96847, 'common': 96847, 'onlyA': 0, 'onlyB': 0}
+all {'a': 622357, 'b': 622357, 'common': 622357, 'onlyA': 0, 'onlyB': 0}
+== go reduce
+logical {'a': 82950, 'b': 82950, 'common': 82950, 'onlyA': 0, 'onlyB': 0}
+all {'a': 608460, 'b': 608460, 'common': 608460, 'onlyA': 0, 'onlyB': 0}
+== go relax
+logical {'a': 91704, 'b': 91704, 'common': 91704, 'onlyA': 0, 'onlyB': 0}
+all {'a': 617214, 'b': 617214, 'common': 617214, 'onlyA': 0, 'onlyB': 0}
+== go pipeline
+logical {'a': 96847, 'b': 96847, 'common': 96847, 'onlyA': 0, 'onlyB': 0}
+all {'a': 622357, 'b': 622357, 'common': 622357, 'onlyA': 0, 'onlyB': 0}
+== chebi_lite reason
+logical {'a': 424904, 'b': 424904, 'common': 424904, 'onlyA': 0, 'onlyB': 0}
+all {'a': 1682146, 'b': 1682146, 'common': 1682146, 'onlyA': 0, 'onlyB': 0}
+== chebi_lite reduce
+logical {'a': 400901, 'b': 400901, 'common': 400901, 'onlyA': 0, 'onlyB': 0}
+all {'a': 1658143, 'b': 1658143, 'common': 1658143, 'onlyA': 0, 'onlyB': 0}
+== chebi_lite relax
+logical {'a': 409525, 'b': 409525, 'common': 409525, 'onlyA': 0, 'onlyB': 0}
+all {'a': 1666767, 'b': 1666767, 'common': 1666767, 'onlyA': 0, 'onlyB': 0}
+== chebi_lite pipeline
+logical {'a': 420331, 'b': 420331, 'common': 420331, 'onlyA': 0, 'onlyB': 0}
+all {'a': 1677573, 'b': 1677573, 'common': 1677573, 'onlyA': 0, 'onlyB': 0}

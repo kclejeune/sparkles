@@ -61,6 +61,8 @@ mod notify;
 mod notify_cmd;
 mod obs;
 #[cfg(feature = "ontology")]
+mod ontology_chain;
+#[cfg(feature = "ontology")]
 mod ontology_cmd;
 mod openapi;
 mod otel;

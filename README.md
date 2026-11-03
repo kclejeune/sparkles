@@ -280,11 +280,11 @@ editor and the app shell. The collapsed panel below it has more workflows and de
     <td>An ordered list editor and a choice among sh:or alternatives</td>
   </tr>
   <tr>
-    <td><img src="docs/images/shell-search.png" alt="The top bar's search listing the demo dataset's classes and properties that match org, with the matched text highlighted and the kind of each entity"></td>
+    <td><img src="docs/images/palette.png" alt="The command palette on the Query page with nothing typed, listing the page's commands with their shortcuts and the pages of the shell"></td>
     <td><img src="docs/images/shell-phone.png" alt="The web UI on a phone, with the drawer open over a dataset page, holding the dataset switcher, the pages, the connection status and the theme"></td>
   </tr>
   <tr>
-    <td>One top bar on every page: Ctrl+K or / searches the open dataset's entities</td>
+    <td>Ctrl+K opens a command palette of the page's commands, entities, datasets and saved queries</td>
     <td>On a phone the pages move into a drawer and the search expands over the bar</td>
   </tr>
 </table>

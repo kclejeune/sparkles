@@ -312,19 +312,32 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   same for a database directory or a server, and `sparkles ontology check FILE` checks
   an ontology file without a database. The check exits with status 1 when the ontology
   is outside a profile it names.
-* The ontology commands cover part of what ROBOT does in OBO release pipelines.
-  `sparkles ontology classify FILE` writes the inferred class hierarchy, the taxonomy that
-  `robot reason` adds to an ontology, without the rest of the ontology.
-  `sparkles ontology check FILE` reports the profile and the axioms outside it. Both
-  work on a file with no database or server, and on a database with `--loc` or
-  `--server`. `sparkles ontology axioms` lists the axioms of a database or a server. The planned
-  `sparkles ontology reason`, `reduce`, `relax` and `materialize` take ROBOT's options
-  of the same names and write the whole ontology with its inferred, reduced, relaxed or
-  materialized axioms. They chain in one process as ROBOT's commands do, and they too
-  run standalone from `--input` and `--output` files, with the database and server modes
-  on top. Roadmap items 634 to 637 cover them, and the
-  [ROBOT comparison](../benchmarks/el-classification/RESULTS.md#robot) checks their
-  output against ROBOT's.
+* `sparkles ontology reason`, `reduce` and `relax` do what ROBOT 1.9.11's commands of the
+  same names do in OBO release pipelines, with ROBOT's options, values and defaults.
+  `reason` writes the whole ontology with the inferred axioms and, by default, without
+  the asserted subclass axioms that are not direct. `reduce` removes the subclass axioms
+  that other subclass axioms entail, between named classes and existential restrictions
+  alike, and `relax` adds the subclass axioms that equivalences with intersections and
+  existential restrictions imply. They read a file with `--input` and no database, as
+  `sparkles ontology classify FILE` does, or a database with `--loc`, and write the
+  ontology with `--output` as functional-style syntax (`.ofn`), RDF/XML (`.owl`), Turtle
+  (`.ttl`) or N-Triples (`.nt`), each optionally gzipped. They chain in one process as
+  ROBOT's commands do, as in
+  `sparkles ontology reason --input x.owl relax reduce --output y.owl`. `classify` and
+  `check` can join a chain to classify or check the ontology at that point, and a chain
+  can start from `classify FILE` or `check FILE`, which answer as they do alone. A chain
+  from a database starts with `reason`, `reduce` or `relax` and `--loc`. The
+  classifier stands in for ELK, so `--reasoner` accepts ROBOT's other reasoners with a
+  warning, and the queries ELK does not answer, such as the disjoint classes and the
+  property hierarchy, add no axioms, as they add none in ROBOT. Errors and the exit
+  status 1 follow ROBOT's, and a malformed command line exits with status 2, as every
+  `sparkles` command does. The outputs equal ROBOT's axiom for axiom on GO and ChEBI lite
+  ([ROBOT comparison](../benchmarks/el-classification/RESULTS.md#robot)). The commands
+  read no `--server`, which item 685 follows, write no OWL/XML, Manchester, OBO
+  or OBO Graphs JSON, item 686, and refuse `--prevent-invalid-references true`,
+  item 687. `robot materialize` is item 636.
+* `sparkles ontology check FILE` reports the profile and the axioms outside it, and
+  `sparkles ontology axioms` lists the axioms of a database or a server.
 * Python's `Dataset.ontology`, Node.js's `dataset.ontology` and the JVM's
   `DatasetGraphSparkles.ontology()` and `SparklesOnt` run the summary, listing, check,
   edit, entity removal and diff in the JSON forms of the routes

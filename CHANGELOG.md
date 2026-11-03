@@ -24,6 +24,27 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+`sparkles ontology reason`, `reduce` and `relax` do what ROBOT 1.9.11's commands of the
+same names do, with ROBOT's options, defaults, errors and exit statuses (roadmap items
+634 and 635). They read a file without a database or a database with `--loc`, write
+functional-style syntax, RDF/XML, Turtle or N-Triples, and chain in one process with
+`classify` and `check`, as in `sparkles ontology reason --input x.owl relax reduce
+--output y.owl` (item 637). On GO and ChEBI lite their outputs and the chain's equal
+ROBOT's with ELK axiom for axiom.
+
+The web UI's top-bar search is a command palette (roadmap item 631). `Ctrl+K` or
+`Cmd+K` opens it anywhere, and with nothing typed it lists the viewer's recent picks,
+kept in the browser, the open page's commands and the pages. A query searches entities
+through the server's typo-tolerant ranking and ranks commands, pages, datasets, branches
+and saved queries in the browser, and the prefixes `>`, `@`, `#` and `?`, or the chips
+above the results, show one kind alone. Pages register their commands while mounted
+through `useCommands`, so the Query page runs, formats, explains and saves queries, the
+Ontology and Thesaurus pages start sessions, create entities, undo and redo, and the
+shell switches the dataset or branch, sets the theme and opens the settings and server
+pages. `/` focuses a page's own search where it has one, such as the ontology editor's
+tree filter, and opens the palette elsewhere. The Query page opens a saved query from
+`?saved=NAME`.
+
 The web UI has one app shell and design system (roadmap item 632). A top bar on every
 page holds the dataset switcher and a search of the open dataset's entities through
 `GET /$/ontology/{ds}/search`, which `Ctrl+K`, `Cmd+K` and `/` focus, and the pages sit

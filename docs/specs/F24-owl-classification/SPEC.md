@@ -37,7 +37,7 @@ representation.
 
 **External OWL DL reasoner bridge.** Run HermiT, Openllet or Konclude as a sandboxed child process or through the P04 JVM binding on an exported ontology, and write back inferred axioms and unsatisfiable classes with provenance. It gives DL classification and consistency without building a tableau reasoner, as Protégé's reasoner plug-ins do. It depends on items 71 and 339.
 
-**Inferred-axiom export and redundancy removal.** Export inferred subclass and equivalence axioms only, annotated as inferred, and remove redundant asserted subclass axioms. Every OBO release uses these ROBOT reason options.
+**Inferred-axiom export and redundancy removal (items 634, 635 and 637, delivered).** Export inferred subclass and equivalence axioms only, annotated as inferred, and remove redundant asserted subclass axioms. Every OBO release uses these ROBOT reason options.
 
 **Justifications for any entailed axiom.** Compute minimal and laconic justifications for entailed axioms, not only for findings and unsatisfiable classes, rendered in Manchester syntax. Sparkles' explanations are strong but limited to facts and RL findings. It depends on item 18.
 
@@ -77,7 +77,9 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 The OWL 2 EL classifier is delivered as roadmap item 580 and covers OWL 2 EL, apart
 from the literals and the chains that item 663 follows, since item 587. Item 603 extends
 it to Horn ontologies without individuals, as [the Horn rules](#the-horn-rules)
-describe. The other phases remain under [item 457](../../ROADMAP.md).
+describe. The export of inferred axioms and the removal of redundant ones are delivered
+as the ROBOT-compatible commands of items 634, 635 and 637. The other phases remain under
+[item 457](../../ROADMAP.md).
 
 ### The OWL 2 EL classifier
 
@@ -285,8 +287,8 @@ functional-style files and on every case that goes to the store, and the
 [file classification results](../../benchmarks/el-classification/RESULTS.md#file-classification)
 compare the command line's answers on GO, ChEBI lite and the ORE 2015 sample.
 `OntologyFile` holds the terminology, the assertions, the imports and the prefixes in
-memory, so the ROBOT-style commands of items 634 to 637 can read their input through it,
-and `read::Ontology::from_axioms` makes a command's output the next command's input
+memory, so the ROBOT-compatible commands read their input through it, and
+`read::Ontology::from_axioms` makes a command's output the next command's input
 without a file.
 
 **Writing the taxonomy.** A run with `target` writes the taxonomy to a named graph that it
@@ -326,8 +328,8 @@ subsumptions, so its taxonomy of GO equals Konclude's and has 7 direct edges tha
 and GO's release do not. Whelk 1.2.1 agrees on GO, ChEBI lite and 296 ORE
 ontologies and is incomplete on one. ROBOT 1.9.11's `reason`, `reduce`, `relax` and
 `materialize` with ELK assert the classifier's direct hierarchy on GO and ChEBI lite, and
-items 634 to 637 add ROBOT-compatible `sparkles ontology` commands for the
-outputs that Sparkles does not write. The
+`sparkles ontology reason`, `reduce` and `relax` write the same outputs, as the
+section below describes. The
 reasoners are packaged in `nix/reasoners` from checksum-pinned releases and run through
 `scripts/elk-compare/elk.sh`. On the benchmark host the classifier classifies GO, ChEBI
 lite and the 8 largest ORE ontologies faster than Konclude and Whelk, and HermiT confirms
@@ -449,3 +451,76 @@ ChEBI lite are byte for byte those of the EL rules on one and eight threads.
 The functional-syntax reader refuses a document with a SWRL rule. A read with
 `ofn_read::Options::skip_rules` passes over the rules and counts them, which the
 classification comparison uses to report them as left out.
+
+### ROBOT-compatible commands
+
+**The commands.** `sparkles ontology reason`, `reduce` and `relax` (items 634 and 635)
+follow ROBOT 1.9.11's `ReasonOperation`, `ReduceOperation` and `RelaxOperation` as their
+source is written, with the inferred axiom generators of OWL API 4.5.29 that ROBOT calls,
+so that a release pipeline gets the same axioms. The options take ROBOT's names, short
+names, values and defaults. `reason` and `reduce` read a boolean as ROBOT's
+`OptionsHelper` does, where `true` or `yes` in any case is true and any other value is
+false, and `relax` takes exactly `true` or `false`, as ROBOT's `getBooleanValue` does.
+ROBOT's error messages and its exit status 1 are kept. The transformations live in
+`sparkles_owl::transform` and work on a `Document` of a header and a set of axioms, with
+the classification passed in as a function, so they use the classifier without changing
+it. `sparkles::handles::ontology::transform::WorkingOntology` reads a file through
+`OntologyFile` or a database with `--loc`, runs the classifier with the caller's
+threads, deadline and budgets, and writes functional-style syntax, RDF/XML, Turtle and
+N-Triples, gzipped when the name ends in `.gz`.
+
+**What each command does.** `reason` validates as ROBOT's `ReasonerHelper.validate` does.
+An inconsistent ontology, an unsatisfiable class or an unsatisfiable object property
+fails, and the last is found with ROBOT's probe for ELK, a fresh class under
+`ObjectSomeValuesFrom(p owl:Thing)` for each property, added to the same classification
+and left out of every answer. `--dump-unsatisfiable` writes the syntactic bottom-locality
+module of the unsatisfiable classes, which holds every justification, as ROBOT's `BOT`
+extraction does. The subclass, equivalence and class assertion generators work over the
+classes and individuals of the ontology's signature. A class the taxonomy does not hold,
+such as a declared obsolete class, is a direct subclass of `owl:Thing`, as ELK answers,
+and class assertions come from a second classification with a fresh class equivalent to
+`ObjectOneOf(a)` for each individual. The generators whose queries ELK does not answer
+add nothing and log a warning, as in ROBOT. The duplicate, `owl:Thing`, external-entity
+and tautology exclusions, the `is_inferred` annotation, the new ontology modes and the
+removal of redundant subclass axioms follow ROBOT, which removes only the unannotated
+form of an axiom. For the axioms between named entities that the generators write, the
+axioms the empty ontology entails are exactly ROBOT's structural tautologies, so
+`--exclude-tautologies all` needs no other reasoner. `reduce` by default classifies the
+subclass axioms and the property characteristics alone, with each anonymous class
+expression of a subclass axiom named by a fresh class equivalent to it, as ROBOT does,
+so it removes redundant existential axioms with the classifier's taxonomy of named
+classes and needs none of the existential subsumers that item 636 exposes.
+`--named-classes-only` keeps the subclass axioms between named classes that are direct
+edges of the whole ontology's taxonomy. `relax` adds the subclass axioms for the
+existential restrictions, cardinality restrictions above zero and named conjuncts of
+equivalences, and of complex superclasses with `--include-subclass-of`.
+
+**Chains.** Each command ends in a hidden list of the arguments that follow it, which is
+parsed again as the next command, so that `sparkles ontology reason --input x.owl relax
+reduce --output y.owl` runs in one process with the ontology in memory (item 637).
+`classify` and `check` can join a chain and end it with status 1 where they would exit
+with it alone. A chain can also start from `classify FILE` or `check FILE`, which answer
+from the file as they do alone before the rest of the chain reads it. FILE is their
+first positional argument and the next command is the second, so the options after the
+next command belong to it. A chain from a database starts with `reason`, `reduce` or
+`relax` and `--loc`. `--input` on a later command is ROBOT's chained input error, and
+`--output` on any command writes the ontology after it. A malformed command line exits
+with status 2, as every `sparkles` command does, where ROBOT documents only a non-zero
+status.
+
+**Comparison with ROBOT.** `scripts/elk-compare/ofn-axioms.py` compares two
+functional-style files after expanding prefixes and sorting the operands of n-ary
+constructors. On GO and ChEBI lite the outputs of `reason`, `reduce`, `relax` and the
+chain `reason relax reduce` equal ROBOT 1.9.11's with ELK 0.6.0 axiom for axiom,
+annotations included: 622,357 axioms of GO's reasoned ontology and 1,682,146 of ChEBI
+lite's, of which 96,847 and 424,904 are logical. On the benchmark host `reason` took 3.45 s
+on GO and 7.74 s on ChEBI lite from the RDF/XML release, against `robot reason`'s 14.04 s
+and 30.63 s, and the chain took 3.87 s and 10.27 s. The run record of the
+[ROBOT comparison](../../benchmarks/el-classification/RESULTS.md#robot) keeps the
+comparison and the timings.
+
+**Limits.** The commands read no dataset on a server (item 685), write no OWL/XML,
+Manchester, OBO or OBO Graphs JSON (item 686), and refuse
+`--prevent-invalid-references true` (item 687). `reason --reasoner emr` asserts
+named superclasses only, as ELK does, not the class expressions that ROBOT's expression
+materializing reasoner adds. `robot materialize` is item 636.
