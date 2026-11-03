@@ -328,10 +328,12 @@
     overflow-x: auto;
   }
   .name {
+    min-width: 12rem;
     max-width: 280px;
   }
+  /* a backup's name stays on one line; a narrow table scrolls inside its box instead */
   .name .linkish {
-    overflow-wrap: anywhere;
+    white-space: nowrap;
     text-align: left;
   }
   .linkish {
