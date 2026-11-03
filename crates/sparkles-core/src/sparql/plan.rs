@@ -3729,7 +3729,9 @@ pub(super) fn keys_denom(
     }
     // the four largest counts of each side, largest first
     let mut top = [[1.0f64; 4]; 2];
+    let mut keys = 0;
     for (da, db) in m {
+        keys += 1;
         for (side, x) in top.iter_mut().zip([da, db]) {
             let mut x = x.max(1.0);
             for t in side.iter_mut() {
@@ -3739,7 +3741,14 @@ pub(super) fn keys_denom(
             }
         }
     }
-    let tuples = |t: &[f64; 4]| t[0] * t[1].sqrt() * t[2].powf(0.25) * t[3].powf(0.125);
+    if keys < 2 {
+        return top[0][0].max(top[1][0]);
+    }
+    // roots by square roots, which the planner calls for every pair it costs
+    let tuples = |t: &[f64; 4]| {
+        let (r2, r4) = (t[2].sqrt(), t[3].sqrt().sqrt());
+        t[0] * t[1].sqrt() * r2.sqrt() * r4.sqrt()
+    };
     let (ta, tb) = (tuples(&top[0]), tuples(&top[1]));
     let (ta, tb) = match cap {
         Some((ea, eb)) => (ta.min(ea.max(1.0)), tb.min(eb.max(1.0))),
