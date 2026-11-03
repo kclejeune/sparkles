@@ -82,6 +82,8 @@ pub struct Names<T> {
     items: Vec<T>,
     hashes: Vec<u64>,
     table: hashbrown::HashTable<u32>,
+    /// the bytes of the IRIs, each counted with a pointer and a length
+    name_bytes: usize,
 }
 
 impl<T> Default for Names<T> {
@@ -90,6 +92,7 @@ impl<T> Default for Names<T> {
             items: Vec::new(),
             hashes: Vec::new(),
             table: hashbrown::HashTable::new(),
+            name_bytes: 0,
         }
     }
 }
@@ -140,9 +143,15 @@ impl<T: Named> Names<T> {
         let id = self.items.len() as u32;
         let hashes = &self.hashes;
         self.table.insert_unique(h, id, |&i| hashes[i as usize]);
+        self.name_bytes += x.name().len() + 16;
         self.items.push(x);
         self.hashes.push(h);
         id
+    }
+
+    /// The bytes of the IRIs, each counted with a pointer and a length.
+    pub fn name_bytes(&self) -> usize {
+        self.name_bytes
     }
 
     /// The bytes the table takes beyond the entities, roughly.
@@ -155,6 +164,7 @@ impl<T: Named> Names<T> {
     /// Takes the entities and their hashes out, leaving the table empty.
     pub fn take(&mut self) -> (Vec<T>, Vec<u64>) {
         self.table.clear();
+        self.name_bytes = 0;
         (
             std::mem::take(&mut self.items),
             std::mem::take(&mut self.hashes),
@@ -163,24 +173,40 @@ impl<T: Named> Names<T> {
 
     /// Adds the names of chunks, each a list of distinct names with their hashes, in
     /// order, and answers each chunk's ids, which are those that adding the names one
-    /// at a time would give.
-    pub fn merge_chunks(&mut self, chunks: Vec<(Vec<T>, Vec<u64>)>) -> Vec<Vec<u32>> {
+    /// at a time would give. `poll` is called every [`POLL_MERGE`] names and stops the
+    /// merge with its error.
+    pub fn merge_chunks<E>(
+        &mut self,
+        chunks: Vec<(Vec<T>, Vec<u64>)>,
+        poll: &mut dyn FnMut() -> Result<(), E>,
+    ) -> Result<Vec<Vec<u32>>, E> {
         let n: usize = chunks.iter().map(|(xs, _)| xs.len()).sum();
         let hashes = &self.hashes;
         self.table.reserve(n, |&i| hashes[i as usize]);
         self.items.reserve(n);
         self.hashes.reserve(n);
-        chunks
-            .into_iter()
-            .map(|(xs, hs)| {
-                xs.into_iter()
-                    .zip(hs)
-                    .map(|(x, h)| self.id_hashed(h, x))
-                    .collect()
-            })
-            .collect()
+        let mut done = 0usize;
+        let mut out = Vec::with_capacity(chunks.len());
+        for (xs, hs) in chunks {
+            let mut ids = Vec::with_capacity(xs.len());
+            for (x, h) in xs.into_iter().zip(hs) {
+                done += 1;
+                if done.is_multiple_of(POLL_MERGE) {
+                    poll()?;
+                }
+                ids.push(self.id_hashed(h, x));
+            }
+            out.push(ids);
+        }
+        Ok(out)
     }
 }
+
+/// A chunk's expressions and roles by their ids in the merged interner.
+pub type Mapped = (Vec<Ex>, Vec<Role>);
+
+/// The names and expressions a merge of chunks takes between two calls of its poll.
+pub const POLL_MERGE: usize = if cfg!(test) { 64 } else { 65_536 };
 
 /// The name of a role.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -241,6 +267,21 @@ impl Interner {
         i
     }
 
+    /// The bytes the interner takes, roughly: each expression with its entry in the
+    /// table, the names with their IRIs, and a chunk's intersections.
+    pub fn bytes(&self) -> usize {
+        self.nodes.capacity() * 40
+            + self.classes.bytes()
+            + self.classes.name_bytes()
+            + self.met.capacity()
+            + self.class_nodes.capacity() * 4
+            + self.individuals.bytes()
+            + self.individuals.name_bytes()
+            + self.individual_nodes.capacity() * 4
+            + self.roles.capacity() * 48
+            + self.ands.len() * 80
+    }
+
     /// Whether a chunk met data ranges or literals, whose ids its merge does not map, so
     /// that the run normalizes on one thread instead.
     pub fn chunk_has_data(&self) -> bool {
@@ -278,26 +319,36 @@ impl Interner {
     /// chunk's expressions and roles. Each name and expression gets the id the chunk's
     /// first occurrence would have given it in a normalization on one thread: a chunk
     /// lists them in the order it met them, and those this interner has keep their ids.
-    pub fn merge(&mut self, mut chunks: Vec<Interner>) -> Vec<(Vec<Ex>, Vec<Role>)> {
+    /// `poll` is called every [`POLL_MERGE`] names and expressions and stops the merge
+    /// with its error.
+    pub fn merge<E>(
+        &mut self,
+        mut chunks: Vec<Interner>,
+        poll: &mut dyn FnMut() -> Result<(), E>,
+    ) -> Result<Vec<Mapped>, E> {
         debug_assert!(chunks.iter().all(|c| !c.chunk_has_data() && c.fresh == 0));
         let classes = self
             .classes
-            .merge_chunks(chunks.iter_mut().map(|c| c.classes.take()).collect());
+            .merge_chunks(chunks.iter_mut().map(|c| c.classes.take()).collect(), poll)?;
         for ids in &classes {
             for &id in ids {
                 self.mark_met(id);
             }
         }
-        let individuals = self
-            .individuals
-            .merge_chunks(chunks.iter_mut().map(|c| c.individuals.take()).collect());
+        let individuals = self.individuals.merge_chunks(
+            chunks.iter_mut().map(|c| c.individuals.take()).collect(),
+            poll,
+        )?;
         let mut out = Vec::with_capacity(chunks.len());
         for ((chunk, classes), individuals) in chunks.into_iter().zip(classes).zip(individuals) {
             let roles: Vec<Role> = chunk.roles.iter().map(|r| self.role(r.clone())).collect();
             self.map.reserve(chunk.map.len());
             let mut map: Vec<Ex> = Vec::with_capacity(chunk.nodes.len());
             let mut ops: Vec<Ex> = Vec::new();
-            for n in &chunk.nodes {
+            for (k, n) in chunk.nodes.iter().enumerate() {
+                if (k + 1).is_multiple_of(POLL_MERGE) {
+                    poll()?;
+                }
                 let e = match *n {
                     Node::Top => TOP,
                     Node::Bottom => BOTTOM,
@@ -311,10 +362,14 @@ impl Interner {
                         let (xs, binary) = &chunk.ands[j as usize];
                         ops.clear();
                         ops.extend(xs.iter().map(|&x| map[x as usize]));
-                        if *binary {
-                            self.conj(ops[0], ops[1])
-                        } else {
-                            self.fold_conj(&mut ops)
+                        // operands that the chunk kept apart can be one expression here,
+                        // and the normalization on one thread takes each once
+                        ops.sort_unstable();
+                        ops.dedup();
+                        match ops.len() {
+                            1 => ops[0],
+                            _ if *binary => self.conj(ops[0], ops[1]),
+                            _ => self.fold_conj(&mut ops),
                         }
                     }
                 };
@@ -322,7 +377,7 @@ impl Interner {
             }
             out.push((map, roles));
         }
-        out
+        Ok(out)
     }
 
     /// The id of a class, which the run's normalization meets.
@@ -626,17 +681,26 @@ impl Axioms {
     pub fn append_mapped(&mut self, chunk: Axioms, nodes: &[Ex], roles: &[Role]) {
         let n = |e: Ex| nodes[e as usize];
         let r = |x: Role| roles[x as usize];
-        debug_assert!(chunk.data_ranges.is_empty() && chunk.functional.is_empty());
+        debug_assert!(chunk.data_ranges.is_empty());
         self.subs
             .extend(chunk.subs.into_iter().map(|(a, b)| (n(a), n(b))));
-        self.disjoint
-            .extend(chunk.disjoint.into_iter().map(|mut d| {
-                for e in &mut d {
-                    *e = n(*e);
+        for mut d in chunk.disjoint {
+            for e in &mut d {
+                *e = n(*e);
+            }
+            d.sort_unstable();
+            // two operands that the chunk kept apart and that are one expression here
+            // make it unsatisfiable, as the normalization on one thread finds
+            for w in d.windows(2) {
+                if w[0] == w[1] {
+                    self.subs.push((w[0], BOTTOM));
                 }
-                d.sort_unstable();
-                d
-            }));
+            }
+            d.dedup();
+            if d.len() >= 2 {
+                self.disjoint.push(d);
+            }
+        }
         self.role_subs
             .extend(chunk.role_subs.into_iter().map(|(a, b)| (r(a), r(b))));
         self.chains.extend(
@@ -646,6 +710,7 @@ impl Axioms {
                 .map(|(rs, s)| (rs.into_iter().map(r).collect(), r(s))),
         );
         self.reflexive.extend(chunk.reflexive.into_iter().map(r));
+        self.functional.extend(chunk.functional.into_iter().map(r));
         self.ranges
             .extend(chunk.ranges.into_iter().map(|(x, c)| (r(x), n(c))));
         self.keys.extend(chunk.keys.into_iter().map(|k| Key {
@@ -656,6 +721,22 @@ impl Axioms {
         self.individuals
             .extend(chunk.individuals.into_iter().map(n));
         self.classes.extend(chunk.classes.into_iter().map(n));
+    }
+
+    /// The bytes the normalized axioms take, roughly, from the lengths of the lists
+    /// alone, so that a normalization can ask often.
+    pub fn rough_bytes(&self) -> usize {
+        self.subs.capacity() * 8
+            + self.disjoint.capacity() * 40
+            + self.role_subs.capacity() * 8
+            + self.chains.capacity() * 48
+            + self.reflexive.capacity() * 4
+            + self.ranges.capacity() * 8
+            + self.data_ranges.capacity() * 8
+            + self.functional.capacity() * 4
+            + self.keys.capacity() * 72
+            + self.individuals.capacity() * 4
+            + self.classes.capacity() * 4
     }
 
     /// The bytes the normalized axioms take.

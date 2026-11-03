@@ -212,13 +212,13 @@ impl Subs {
 /// the compiler can do in vector registers.
 #[inline]
 fn has(list: &[Ex], x: Ex) -> bool {
-    let mut chunks = list.chunks_exact(8);
-    for c in &mut chunks {
+    let (chunks, rest) = list.as_chunks::<8>();
+    for c in chunks {
         if c.iter().fold(false, |a, &y| a | (y == x)) {
             return true;
         }
     }
-    chunks.remainder().contains(&x)
+    rest.contains(&x)
 }
 
 /// The members of a [`Subs`], in no particular order.
@@ -414,6 +414,9 @@ pub struct Bounds<'a> {
     pub charge: Option<&'a (dyn Fn(usize) -> bool + Sync)>,
     /// the bytes held before the saturation starts
     pub base_memory: usize,
+    /// the peak the run reached before the saturation, which the pool has been charged
+    /// for, so that only growth past it is charged
+    pub peak_memory: usize,
 }
 
 const STOP_NONE: u8 = 0;
@@ -516,7 +519,7 @@ pub fn saturate(
         stop: AtomicU8::new(STOP_NONE),
         memory: AtomicUsize::new(bounds.base_memory),
         queued: AtomicIsize::new(0),
-        peak: AtomicUsize::new(bounds.base_memory),
+        peak: AtomicUsize::new(bounds.base_memory.max(bounds.peak_memory)),
         applied: AtomicUsize::new(0),
         merged: AtomicBool::new(false),
         batch: bounds.threads > 1,
