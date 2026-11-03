@@ -250,6 +250,7 @@ fn main() {
             "outsideGlobal": s.outside_el.global,
             "outsideTaken": s.outside_el.taken,
             "conjunctions": s.conjunctions,
+            "hornOverBudget": s.horn_over_budget,
             "partial": partial,
             "threads": s.threads,
             "readMs": read_ms,

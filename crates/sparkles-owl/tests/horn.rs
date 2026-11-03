@@ -739,3 +739,60 @@ fn the_el_only_mode_gives_the_el_answer_and_the_default_the_horn_one() {
             .is_subclass(&c("FilopodiumMembrane"), &c("OrganelleMembrane"))
     );
 }
+
+#[test]
+fn a_run_whose_horn_rules_pass_the_budget_classifies_by_the_el_rules() {
+    // GO's pattern, whose Horn run needs more memory than its EL run
+    let body = "TransitiveObjectProperty(:part_of)
+         InverseObjectProperties(:part_of :has_part)
+         SubClassOf(:FilopodiumMembrane :Membrane)
+         SubClassOf(:FilopodiumMembrane ObjectSomeValuesFrom(:part_of :Filopodium))
+         SubClassOf(:Filopodium ObjectSomeValuesFrom(:part_of :Cytoskeleton))
+         SubClassOf(:Cytoskeleton :Organelle)
+         EquivalentClasses(:MembraneBounded ObjectIntersectionOf(:Organelle ObjectSomeValuesFrom(:has_part :Membrane)))
+         EquivalentClasses(:OrganelleMembrane ObjectIntersectionOf(:Membrane ObjectSomeValuesFrom(:part_of :MembraneBounded)))";
+    let ax = axioms(body);
+    let limits = |el_only: bool, max_memory: Option<usize>| Limits {
+        threads: 1,
+        el_only,
+        max_memory,
+        ..Limits::default()
+    };
+    let mut k = Classifier::of(&ax);
+    let el = k.classify(&limits(true, None)).unwrap();
+    let el_ex = k.excluded();
+    let mut k = Classifier::of(&ax);
+    let horn = k.classify(&limits(false, None)).unwrap();
+    assert!(!horn.stats.horn_over_budget);
+    assert!(
+        horn.stats.peak_memory > el.stats.peak_memory,
+        "{} {}",
+        horn.stats.peak_memory,
+        el.stats.peak_memory
+    );
+    // a budget the EL run fits in and the Horn run does not
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&limits(false, Some(el.stats.peak_memory)))
+        .unwrap();
+    assert!(out.stats.horn_over_budget);
+    assert_eq!(out.stats.conjunctions, 0);
+    assert_eq!(k.excluded(), el_ex);
+    assert!(
+        !out.taxonomy
+            .is_subclass(&c("FilopodiumMembrane"), &c("OrganelleMembrane"))
+    );
+    // the classifier is whole again: a run without the budget takes the Horn rules
+    let out = k.classify(&limits(false, None)).unwrap();
+    assert!(!out.stats.horn_over_budget);
+    assert!(
+        out.taxonomy
+            .is_subclass(&c("FilopodiumMembrane"), &c("OrganelleMembrane"))
+    );
+    // a budget the EL run does not fit in either is an error
+    let mut k = Classifier::of(&ax);
+    assert!(
+        k.classify(&limits(false, Some(el.stats.peak_memory / 2)))
+            .is_err()
+    );
+}

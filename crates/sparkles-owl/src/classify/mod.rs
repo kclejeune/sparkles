@@ -85,6 +85,18 @@ use std::time::{Duration, Instant};
 /// its last property lacks.
 const CHAIN_RANGE_RULE: &str = "OWL 2 Profiles §2.2.6";
 
+/// The least memory budget, in estimated bytes, of a saturation with the Horn rules. The
+/// largest Horn run of the ORE 2015 DL sample's development set peaks at 666 MB, 139 times
+/// its index and axioms, on a small ontology.
+const HORN_MEMORY_FLOOR: usize = 1 << 30;
+
+/// The memory budget of a saturation with the Horn rules as a multiple of the bytes of its
+/// index and axioms, above the floor. Larger ontologies of the development set peak at up
+/// to 35 times them with the Horn rules and GO at 4, while two Uberon-based ontologies
+/// grow past 10 GiB from 24 MB, their contexts of conjunctions composing the chains of
+/// transitive parthood again (roadmap NEW-ITEM-2).
+const HORN_MEMORY_FACTOR: usize = 64;
+
 /// What bounds a run: the worker threads, a deadline, a memory budget and a cancellation
 /// check, and the rules it may use.
 #[derive(Clone, Default)]
@@ -169,6 +181,9 @@ pub struct Stats {
     /// the contexts of conjunctions that the Horn rules created, which
     /// [`contexts`](Stats::contexts) includes
     pub conjunctions: usize,
+    /// the Horn rules passed their memory budget, so the run classified by the OWL 2 EL
+    /// rules alone, as [`Limits::el_only`] does, and left the axioms outside OWL 2 EL out
+    pub horn_over_budget: bool,
 }
 
 /// The result of a run that saturates without building a taxonomy
@@ -247,6 +262,9 @@ pub struct Saturation {
     consistent: bool,
     /// the contexts of conjunctions that the last run's Horn rules created
     dynamic: Option<saturate::Dynamic>,
+    /// whether the current run's axioms went to the Horn normalization, from its start
+    /// until the normalization took none
+    horn_tried: bool,
 }
 
 impl Default for Saturation {
@@ -546,6 +564,7 @@ impl Saturation {
             entangled: false,
             consistent: true,
             dynamic: None,
+            horn_tried: false,
         }
     }
 
@@ -597,14 +616,35 @@ impl Saturation {
         limits: &Limits,
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
-        let r = self.run(axioms, changes, held_bytes, limits, with_taxonomy);
+        let mut r = self.run(axioms, changes, held_bytes, limits, with_taxonomy);
+        if matches!(r, Err(Error::Memory { .. })) && self.horn_tried && !limits.el_only {
+            // The Horn rules passed their budget or the caller's: the run starts again by
+            // the EL rules alone, which leave the axioms outside OWL 2 EL out, as the
+            // classifier did before the Horn rules and as the ELK mode does.
+            self.reset();
+            let el = Limits {
+                el_only: true,
+                ..limits.clone()
+            };
+            r = self.run(axioms, None, held_bytes, &el, with_taxonomy).map(
+                |(consistent, taxonomy, mut stats)| {
+                    stats.horn_over_budget = true;
+                    (consistent, taxonomy, stats)
+                },
+            );
+        }
         if r.is_err() && self.dirty {
-            // the next run starts again, so the state of this one is of no use
-            self.index = None;
-            self.interner = Interner::new();
-            self.ctx = Vec::new();
+            self.reset();
         }
         r
+    }
+
+    /// Drops the state of a run that stopped part way, since the next run starts again.
+    fn reset(&mut self) {
+        self.index = None;
+        self.interner = Interner::new();
+        self.ctx = Vec::new();
+        self.dynamic = None;
     }
 
     /// Normalizes the axioms inside OWL 2 EL and builds the index. `outside` names the
@@ -790,6 +830,7 @@ impl Saturation {
             index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
         };
         if !candidates.is_empty() && !limits.el_only && self.horn_allowed(&ax) {
+            self.horn_tried = true;
             let flags = horn::normalize(
                 &candidates,
                 &mut self.interner,
@@ -883,6 +924,7 @@ impl Saturation {
         let again = self.dirty || self.index.is_none();
         // until the saturation ends, a stop leaves the state for a run that starts again
         self.dirty = true;
+        self.horn_tried = false;
         let changes = changes.filter(|_| !again);
         let full = self.entangled
             || changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)));
@@ -931,6 +973,7 @@ impl Saturation {
         // normalization, and the conjunctions of the Horn rules get contexts above the
         // index's
         let horn = ax.horn.is_some();
+        self.horn_tried = horn;
         self.dynamic = None;
         let premises = if horn {
             self.ctx = Vec::new();
@@ -972,10 +1015,19 @@ impl Saturation {
         let charge_fn = charge
             .as_deref()
             .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
+        // The Horn rules' contexts of conjunctions can need far more memory than the EL
+        // rules on the same ontology, so a run with them has a budget of its own, past
+        // which it classifies by the EL rules alone (run_with).
+        let max_memory = if horn {
+            let own = HORN_MEMORY_FLOOR.max(base.saturating_mul(HORN_MEMORY_FACTOR));
+            Some(limits.max_memory.map_or(own, |m| m.min(own)))
+        } else {
+            limits.max_memory
+        };
         let bounds = Bounds {
             threads,
             deadline: limits.deadline,
-            max_memory: limits.max_memory,
+            max_memory,
             cancelled: cancel_fn,
             charge: charge_fn,
             base_memory: base,
