@@ -12860,9 +12860,11 @@ policy's decisions, maps and output graphs and on the identity graphs of its bou
 and counts as a query. The answer is `{policy, revision, number, commit, entities}`, and
 each entity is `{entity, representative, members, membersComplete, decisions}`, with at
 most 1,000 members and the current accepted decisions that join the cluster as far as
-the caller's view reaches from the entity, whatever else the request names. The map's
-latest revision is checked against the store as written, and a caller whose view hides
-part of it is refused with `503 projection-unavailable`. An entity
+the caller's view reaches from the entity, whatever else the request names. A proposal
+or decision whose triples the caller's view hides in part takes no part in the cluster
+the read traverses and is not reported. The map's latest revision is checked against
+the store as written, and a caller whose view hides part of it is refused with `503
+projection-unavailable`. An entity
 the map does not name resolves to itself. A request names 1 to 100 entities. Queries
 read the map by joining the output graph explicitly, and no query is rewritten through
 it.

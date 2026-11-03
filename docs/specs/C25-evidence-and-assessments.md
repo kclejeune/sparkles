@@ -1193,6 +1193,10 @@ read checks the latest revision at the unmasked head and refuses a caller whose 
 hides part of it, so a mask cannot hide the boundary that would refuse the map. It
 traverses each component the caller's view reaches once and answers each requested
 entity with the decisions of its own component, whatever else the request names.
+Authentication reads only a record's receipt and protection, so the read takes its
+candidates from the caller's view and leaves out a proposal, or a proposal whose current
+decision is a record, that the view hides any triple of. Such a proposal neither joins a
+cluster nor reveals its decision, and the output graph is read in the caller's view.
 
 `sparkles::evidence::resolve_entities` and `POST /{ds}/claims/identities` read the map
 at the head of a branch. They need read grants on the policy's decisions, maps and

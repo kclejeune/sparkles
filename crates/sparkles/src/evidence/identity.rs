@@ -360,6 +360,11 @@ struct Clusters<'m> {
     key: String,
     /// The most proposals naming one entity that are read.
     candidates: usize,
+    /// Leave out a proposal, or a proposal whose current decision is a record, that the
+    /// caller's view hides any triple of, instead of refusing as an unavailable target.
+    /// A read sets it, since authentication reads only a record's receipt and
+    /// protection and would otherwise let a masked record join a cluster.
+    hide_masked: bool,
 }
 
 impl<'m> Clusters<'m> {
@@ -374,6 +379,7 @@ impl<'m> Clusters<'m> {
             limit: RETAINED_BYTES,
             key: String::new(),
             candidates: MAX_EVIDENCE,
+            hide_masked: false,
         }
     }
 
@@ -407,13 +413,23 @@ impl<'m> Clusters<'m> {
     ) -> Result<Vec<NamedNode>> {
         let mut out = Vec::new();
         for g in self.m.proposals.clone() {
-            let (candidates, more) = state.reads.subjects_up_to(
-                &ev("entity"),
-                &Term::NamedNode(e.clone()),
-                g.0.as_str(),
-                self.candidates,
-            )?;
+            let o = Term::NamedNode(e.clone());
+            // A read takes its candidates from the caller's view, so its bound counts only
+            // triples the caller can read.
+            let (candidates, more) = match state.seen.as_mut().filter(|_| self.hide_masked) {
+                Some(seen) => {
+                    seen.subjects_up_to(&ev("entity"), &o, g.0.as_str(), self.candidates)?
+                }
+                None => {
+                    state
+                        .reads
+                        .subjects_up_to(&ev("entity"), &o, g.0.as_str(), self.candidates)?
+                }
+            };
             for p in candidates {
+                if self.hide_masked && state.masked(&p, &g.0)? {
+                    continue;
+                }
                 let known = self.facts.contains_key(&p);
                 if !known && !state.typed(&p, &g, RecordKind::IdentityProposal)? {
                     continue;
@@ -437,6 +453,9 @@ impl<'m> Clusters<'m> {
                 }
                 self.charge(when)?;
                 out.push(p);
+            }
+            if more && self.hide_masked {
+                return Err(incomplete("the proposals of an entity"));
             }
             if more {
                 // When the caller's view shows no more candidates than the bound, the
@@ -477,6 +496,7 @@ impl<'m> Clusters<'m> {
                 state.superseded = superseded;
                 let current = current?;
                 match current.as_slice() {
+                    [one] if self.hide_masked && state.masked(one, &self.m.decisions.0)? => false,
                     [one] => {
                         state.disposition(one, &self.m.decisions)? == Some(Disposition::Accepted)
                     }
@@ -1090,52 +1110,44 @@ pub fn resolve(
     let head = logical.store().snapshot();
     let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
     let view = caller_view(access.as_ref(), &head, &preparation)?;
-    let snap = view.as_ref().map_or(&*head, |v| v.snapshot());
-    // The map's consistency is checked at the unmasked head, so that a mask cannot hide
-    // the metadata that would refuse it, and a revision the caller's view masks is
-    // refused rather than read.
-    let latest = {
-        let mut full = State {
-            reads: Reads::new(&preparation, &head),
-            seen: view
-                .as_ref()
-                .map(|v| Reads::new(&preparation, v.snapshot())),
-            claim_graphs: Vec::new(),
-            superseded: BTreeSet::new(),
-            withdrawn: BTreeSet::new(),
-        };
-        let latest = latest(&mut full, main.dataset_id(), &m, control)?;
-        if let Some(l) = &latest
-            && full.masked(&l.iri, &m.maps.0)?
-        {
-            return Err(projection_unavailable(&m.name));
-        }
-        latest
-    };
+    // Records are read at the unmasked head with the caller's view beside it. The map's
+    // consistency is checked there, so that a mask cannot hide the metadata that would
+    // refuse it, and a revision the caller's view masks is refused rather than read. A
+    // proposal or decision the view hides any triple of takes no part in a cluster, and
+    // the output graph is read in the caller's view.
     let mut state = State {
-        reads: Reads::new(&preparation, snap),
-        seen: None,
+        reads: Reads::new(&preparation, &head),
+        seen: view
+            .as_ref()
+            .map(|v| Reads::new(&preparation, v.snapshot())),
         claim_graphs: Vec::new(),
         superseded: BTreeSet::new(),
         withdrawn: BTreeSet::new(),
     };
+    let latest = latest(&mut state, main.dataset_id(), &m, control)?;
+    if let Some(l) = &latest
+        && state.masked(&l.iri, &m.maps.0)?
+    {
+        return Err(projection_unavailable(&m.name));
+    }
     let mut clusters = Clusters::new(&m, BTreeMap::new());
+    clusters.hide_masked = true;
     // The decisions of each component the caller's view traverses, kept for each of its
     // entities, so that a request answers each entity as a request of it alone does.
     let mut joined: BTreeMap<NamedNode, Arc<Vec<NamedNode>>> = BTreeMap::new();
     let mut out = Vec::with_capacity(entities.len());
     for e in entities {
         control.check()?;
-        let representative =
-            match state
-                .reads
-                .single(e.as_str(), RESOLVES_TO, m.output.0.as_str())?
-            {
-                Some(Term::NamedNode(r)) => r,
-                _ => e.clone(),
-            };
+        let seen = match state.seen.as_mut() {
+            Some(seen) => seen,
+            None => &mut state.reads,
+        };
+        let representative = match seen.single(e.as_str(), RESOLVES_TO, m.output.0.as_str())? {
+            Some(Term::NamedNode(r)) => r,
+            _ => e.clone(),
+        };
         let (members, complete) = if representative == *e
-            && !state.reads.contains(
+            && !seen.contains(
                 e.as_str(),
                 RESOLVES_TO,
                 &Term::NamedNode(e.clone()),
@@ -1143,7 +1155,7 @@ pub fn resolve(
             )? {
             (vec![e.clone()], true)
         } else {
-            let (mut v, more) = state.reads.subjects_up_to(
+            let (mut v, more) = seen.subjects_up_to(
                 RESOLVES_TO,
                 &Term::NamedNode(representative.clone()),
                 m.output.0.as_str(),

@@ -411,7 +411,9 @@ lists the route. Evidence links and assessments may target identity proposals. A
 revision records the identity graphs of the boundary it was built from, and a map one of
 them has left, or whose graph was protected again, answers `projection-unavailable`.
 Identity reviews need read grants on every identity graph of the boundary, and one
-operation retains at most 64 MiB of entity identifiers. The vocabulary and shapes add
+operation retains at most 64 MiB of entity identifiers. The resolution read leaves out
+a proposal or decision whose triples the caller's view hides in part, so it neither joins
+a cluster nor reveals its decision. The vocabulary and shapes add
 `ev:preferredEntity`, `ev:ResolutionMap`, `ev:mapRevision`, `ev:adds`, `ev:ends`,
 `ev:resolvesTo`, `ev:mapsProtection` and `ev:boundaryProtection`.
 
