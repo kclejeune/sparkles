@@ -358,6 +358,8 @@ struct Clusters<'m> {
     limit: usize,
     /// The key of the decision whose clusters are read, which a refusal names.
     key: String,
+    /// The most proposals naming one entity that are read.
+    candidates: usize,
 }
 
 impl<'m> Clusters<'m> {
@@ -371,6 +373,7 @@ impl<'m> Clusters<'m> {
             bytes: 0,
             limit: RETAINED_BYTES,
             key: String::new(),
+            candidates: MAX_EVIDENCE,
         }
     }
 
@@ -404,8 +407,12 @@ impl<'m> Clusters<'m> {
     ) -> Result<Vec<NamedNode>> {
         let mut out = Vec::new();
         for g in self.m.proposals.clone() {
-            let (candidates, more) =
-                state.candidates(&ev("entity"), &Term::NamedNode(e.clone()), &g)?;
+            let (candidates, more) = state.reads.subjects_up_to(
+                &ev("entity"),
+                &Term::NamedNode(e.clone()),
+                g.0.as_str(),
+                self.candidates,
+            )?;
             for p in candidates {
                 let known = self.facts.contains_key(&p);
                 if !known && !state.typed(&p, &g, RecordKind::IdentityProposal)? {
@@ -441,7 +448,7 @@ impl<'m> Clusters<'m> {
                         &ev("entity"),
                         &Term::NamedNode(e.clone()),
                         g.0.as_str(),
-                        MAX_EVIDENCE,
+                        self.candidates,
                     )?;
                     if !visible_more {
                         return Err(unavailable(&self.key));
@@ -545,6 +552,9 @@ pub(super) struct Request<'a> {
     pub(super) settings_bytes: &'a [u8],
     pub(super) version: u32,
     pub(super) if_head: u64,
+    /// The most proposals naming one entity that the review reads, [`MAX_EVIDENCE`]
+    /// outside tests.
+    pub(super) candidates: usize,
 }
 
 /// One target of a review, between its checks and its records.
@@ -779,6 +789,7 @@ pub(super) fn review(
             .collect(),
     );
     clusters.bytes = retained;
+    clusters.candidates = r.candidates;
     let mut changes = Vec::new();
     let mut changed = Changed::default();
     if !adds.is_empty() || !ends.is_empty() {
@@ -1179,6 +1190,176 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+    use crate::access::{GraphRule, Graphs};
+    use crate::evidence::{
+        EvidenceInput, IdentityInput, MethodRef, ProposeOptions, RecordKey, RecordVersion,
+    };
+
+    const IDENTITY: &str = "urn:ev:identity";
+    const HIDDEN: &str = "urn:ev:identity-restricted";
+
+    fn n(s: &str) -> NamedNode {
+        NamedNode::new_unchecked(s)
+    }
+
+    fn configured() -> Dataset {
+        let ds = Dataset::memory();
+        let settings = Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".into()],
+            proposals: vec!["urn:ev:claims".into()],
+            decisions: vec!["urn:ev:decisions".into()],
+            identity: vec![IDENTITY.into(), HIDDEN.into(), "urn:ev:maps".into()],
+            projections: vec!["urn:ev:map".into()],
+            matching_policies: [(
+                "people".to_string(),
+                MatchingPolicy {
+                    version: 1,
+                    boundary: vec![IDENTITY.into(), HIDDEN.into()],
+                    decisions: "urn:ev:decisions".into(),
+                    maps: "urn:ev:maps".into(),
+                    output: "urn:ev:map".into(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Settings::default()
+        };
+        crate::evidence::configure(&ds, &settings, &Control::none()).unwrap();
+        ds
+    }
+
+    fn propose(
+        ds: &Dataset,
+        graph: &str,
+        occurrence: &str,
+        entities: &[&str],
+    ) -> (NamedNode, sparkles_core::evidence::Sha256Digest) {
+        let mut o = ProposeOptions::new(n("urn:principal:matcher"));
+        o.identity_graph = Some(n(graph));
+        let p = crate::evidence::propose(
+            None,
+            ds,
+            ds,
+            &EvidenceInput {
+                identities: vec![IdentityInput {
+                    version: RecordVersion::V1,
+                    key: RecordKey::new("p").unwrap(),
+                    occurrence_key: RecordKey::new(occurrence).unwrap(),
+                    entities: entities.iter().map(|e| n(e)).collect(),
+                    relation: IdentityRelation::PossibleMatch,
+                    preferred: None,
+                    attributed_author: n("urn:matcher"),
+                    method: Some(MethodRef {
+                        method: n("urn:method"),
+                        version: RecordKey::new("1").unwrap(),
+                    }),
+                }],
+                ..Default::default()
+            },
+            &o,
+            &mut |_, _| Some(Arc::new(GraphAccess::all())),
+            &Control::none(),
+        )
+        .unwrap();
+        (p.records[0].iri.clone(), p.records[0].digest)
+    }
+
+    /// The caller's view hides which entities the restricted graph's proposals name.
+    fn masked() -> Option<Arc<GraphAccess>> {
+        Some(Arc::new(GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::All,
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "entities".into(),
+                        predicates: Some(vec![ev("entity")]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: Some(Graphs::Only(GraphRule::new([HIDDEN], &[]))),
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        )))
+    }
+
+    /// The answer of an acceptance of `target` under a bound of `candidates`.
+    fn answer(
+        ds: &Dataset,
+        target: &(NamedNode, sparkles_core::evidence::Sha256Digest),
+        candidates: usize,
+        access: Option<Arc<GraphAccess>>,
+    ) -> Result<Reviewed> {
+        let (settings, bytes) = settings_of(ds)?;
+        let mut options = Options::new(n("urn:principal:reviewer"));
+        options.if_head = Some(ds.store().head_commit().seq);
+        review(
+            None,
+            ds,
+            ds,
+            Request {
+                name: "people",
+                policy: settings.matching_policies.get("people").unwrap(),
+                settings: &settings,
+                settings_bytes: &bytes,
+                version: 1,
+                if_head: ds.store().head_commit().seq,
+                candidates,
+            },
+            &[DecisionInput {
+                key: "x".into(),
+                target: target.0.clone(),
+                target_digest: target.1,
+                disposition: Disposition::Accepted,
+                supersedes: None,
+            }],
+            &options,
+            &mut |_, _| access.clone(),
+            &Control::none(),
+        )
+    }
+
+    /// More proposals naming an entity than the bound, hidden from the caller, answer
+    /// exactly as an unavailable target, and the same store read in full answers
+    /// `incomplete-evidence`. Without the recount in the caller's view the masked review
+    /// would answer `incomplete-evidence` too and disclose the hidden count.
+    #[test]
+    fn hidden_candidates_beyond_the_bound_answer_as_an_unavailable_target() {
+        let ds = configured();
+        for i in 0..3 {
+            propose(
+                &ds,
+                HIDDEN,
+                &format!("h{i}"),
+                &["urn:b", &format!("urn:h{i}")],
+            );
+        }
+        let bc = propose(&ds, IDENTITY, "bc", &["urn:b", "urn:c"]);
+        let missing = (n("urn:uuid:00000000-0000-4000-8000-000000000000"), bc.1);
+        let pair = |r: Result<Reviewed>| {
+            let e = r.unwrap_err();
+            (e.code().to_string(), e.to_string())
+        };
+        let hidden = pair(answer(&ds, &bc, 2, masked()));
+        assert_eq!(hidden.0, "evidence-unavailable", "{hidden:?}");
+        assert_eq!(hidden, pair(answer(&ds, &missing, 2, masked())));
+        let all = Some(Arc::new(GraphAccess::all()));
+        assert_eq!(
+            pair(answer(&ds, &bc, 2, all.clone())).0,
+            "incomplete-evidence"
+        );
+        // within the bound the masked proposals have no effect and are left out
+        assert!(answer(&ds, &bc, 10, masked()).unwrap().committed);
+    }
 
     #[test]
     fn retained_identifiers_are_bounded() {

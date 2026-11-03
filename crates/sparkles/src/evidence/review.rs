@@ -1079,6 +1079,7 @@ pub fn review(
                 settings_bytes: &settings_bytes,
                 version: policy_version,
                 if_head,
+                candidates: MAX_EVIDENCE,
             },
             decisions,
             options,
