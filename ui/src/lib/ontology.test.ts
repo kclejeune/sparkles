@@ -9,6 +9,9 @@ import {
   filterTree,
   hierarchyEdges,
   labelsOf,
+  labelsOfBindings,
+  labelsQuery,
+  withMissingLabels,
   localFromLabel,
   litText,
   manchester,
@@ -538,5 +541,48 @@ describe('names in the add fields', () => {
     expect(resolveName('ex:p some ex:A', opts, prefixes)).toBeNull();
     expect(resolveName('not ex:A', opts, prefixes)).toBeNull();
     expect(resolveName('{ex:a}', opts, prefixes)).toBeNull();
+  });
+});
+
+describe('the labels a capped listing leaves out', () => {
+  it('are read from the selected graph in one query', () => {
+    const q = labelsQuery({ graph: null, imports: true });
+    expect(q).toContain('<http://www.w3.org/2000/01/rdf-schema#label>');
+    expect(q).toContain('<http://www.w3.org/2004/02/skos/core#prefLabel>');
+    expect(q).not.toContain('GRAPH');
+    expect(labelsQuery({ graph: 'http://ex.org/g', imports: true })).toContain(
+      'GRAPH <http://ex.org/g> {',
+    );
+  });
+
+  it('put rdfs:label before skos:prefLabel and keep languages', () => {
+    const m = labelsOfBindings([
+      {
+        s: { type: 'uri', value: 'http://ex.org/a' },
+        p: { type: 'uri', value: 'http://www.w3.org/2004/02/skos/core#prefLabel' },
+        l: { type: 'literal', value: 'pref', 'xml:lang': 'en' },
+      },
+      {
+        s: { type: 'uri', value: 'http://ex.org/a' },
+        p: { type: 'uri', value: 'http://www.w3.org/2000/01/rdf-schema#label' },
+        l: { type: 'literal', value: 'label' },
+      },
+    ]);
+    expect(m.get('http://ex.org/a')).toEqual([
+      { '@value': 'label' },
+      { '@value': 'pref', '@language': 'en' },
+    ]);
+  });
+
+  it('fill only the subjects without a label', () => {
+    const have = new Map([['a', [{ '@value': 'A' }]]]);
+    const more = new Map([
+      ['a', [{ '@value': 'other' }]],
+      ['b', [{ '@value': 'B' }]],
+    ]);
+    const out = withMissingLabels(have, more);
+    expect(out.get('a')).toEqual([{ '@value': 'A' }]);
+    expect(out.get('b')).toEqual([{ '@value': 'B' }]);
+    expect(have.has('b')).toBe(false);
   });
 });
