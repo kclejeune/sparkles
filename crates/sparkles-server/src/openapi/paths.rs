@@ -1047,6 +1047,11 @@ fn ontology(p: &mut Paths) {
                                 "annotations": { "type": "array", "items": { "type": "object", "properties": { "property": { "type": "string" }, "value": {} } } }
                             } } },
                             "statementsTruncated": { "type": "boolean" },
+                            "xlLabels": { "type": "array", "description": "The literal forms of the entity's SKOS-XL labels, with the label property and the graph.", "items": { "type": "object", "properties": {
+                                "property": { "type": "string" },
+                                "value": { "description": "A literal as `{\"@value\", \"@language\"?, \"@type\"?}`." },
+                                "graph": { "type": "string" }
+                            } } },
                             "axioms": { "type": "array", "items": { "type": "object", "description": "An axiom with `type`, `ofn`, `axiom` (its JSON form) and `graph`." } },
                             "mentions": { "type": "object", "properties": {
                                 "axioms": { "type": "array", "items": { "type": "object" } },

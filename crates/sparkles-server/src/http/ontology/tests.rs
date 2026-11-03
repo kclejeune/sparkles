@@ -1253,6 +1253,18 @@ async fn the_hierarchy_answers_one_level_at_a_time() {
     )
     .await;
     assert_eq!(r.status, StatusCode::NOT_MODIFIED);
+    // each route's own tag is a valid precondition of a read
+    for uri in [
+        "/$/ontology/t/hierarchy".to_string(),
+        format!("/$/ontology/t/term?iri={}", enc("http://ex.org/Person")),
+    ] {
+        let tag = get(&s.app, &uri).await.headers[header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let r = send(&s.app, "GET", &uri, &[("if-match", &tag)], "").await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+    }
     let j = get(
         &s.app,
         &format!(

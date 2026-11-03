@@ -39086,6 +39086,24 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "xlLabels": {
+                      "description": "The literal forms of the entity's SKOS-XL labels, with the label property and the graph.",
+                      "items": {
+                        "properties": {
+                          "graph": {
+                            "type": "string"
+                          },
+                          "property": {
+                            "type": "string"
+                          },
+                          "value": {
+                            "description": "A literal as `{\"@value\", \"@language\"?, \"@type\"?}`."
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
                     }
                   },
                   "type": "object"

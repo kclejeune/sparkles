@@ -255,21 +255,30 @@ fn full(ds: &Dataset, iri: &str) -> BTreeSet<Axiom> {
 fn the_fragment_maps_to_the_axioms_of_a_full_read() {
     let body = format!(
         "{ONTO}
-         :a a owl:NamedIndividual, :A ; :p :b . :b a owl:NamedIndividual .
+         :a a owl:NamedIndividual, :A ; :p :b . :b a owl:NamedIndividual, :C .
+         :p a owl:TransitiveProperty .
          [ a owl:Class ; owl:intersectionOf ( :B :C ) ] rdfs:subClassOf :D .
          [ a owl:Axiom ; owl:annotatedSource :B ; owl:annotatedProperty rdfs:label ;
-           owl:annotatedTarget \"bird\" ; rdfs:comment \"from a book\" ] ."
+           owl:annotatedTarget \"bird\" ; rdfs:comment \"from a book\" ] .
+         :V a owl:Class ; rdfs:subClassOf _:r .
+         _:r a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :C .
+         [ a owl:Axiom ; owl:annotatedSource :V ; owl:annotatedProperty rdfs:subClassOf ;
+           owl:annotatedTarget _:r ; rdfs:comment \"annotated restriction\" ] ."
     );
     let ds = dataset(&body);
-    for e in ["A", "B", "C", "D", "W", "X", "p", "a", "b", "Z"] {
+    for e in ["A", "B", "C", "D", "V", "W", "X", "p", "a", "b", "Z"] {
         let iri = ex(e);
         let t = term(&ds, &iri);
+        // every axiom of the answer mentions the entity: the types of the other IRIs
+        // that the fragment reads to type them add none of their own
+        for (a, _) in t.axioms.iter().chain(&t.mentions) {
+            assert!(a.mentions(&iri), "{e}: {a:?} does not mention {iri}");
+        }
         let got: BTreeSet<Axiom> = t
             .axioms
             .iter()
             .chain(&t.mentions)
             .map(|(a, _)| a.clone())
-            .filter(|a| a.mentions(&iri))
             .collect();
         let want = full(&ds, &iri);
         assert!(
@@ -412,6 +421,17 @@ fn grants_hide_graphs_and_triples() {
         .unwrap();
     assert!(!t.statements.iter().any(|s| s.property.ends_with("comment")));
     assert!(t.incoming.is_empty());
+    // a scheme that only the hidden graph mentions is unknown, like any other IRI
+    let r = ds.ontology().hierarchy(
+        &both,
+        &HierarchyRequest {
+            kind: TreeKind::Concept,
+            scheme: Some(ex("B")),
+            ..Default::default()
+        },
+        &only_default,
+    );
+    assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
     // a hidden predicate
     let hiding =
         crate::handles::ontology::tests::hiding("http://www.w3.org/2000/01/rdf-schema#comment");
@@ -469,4 +489,127 @@ fn history_branches_and_inferences() {
             .hierarchy(&inf, &HierarchyRequest::default(), &Default::default())
             .is_err()
     );
+}
+
+#[test]
+fn a_mention_keeps_the_annotations_of_its_axiom() {
+    let ds = dataset(
+        ":p a owl:ObjectProperty . :C a owl:Class .
+         :V a owl:Class ; rdfs:subClassOf _:r .
+         _:r a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :C .
+         [ a owl:Axiom ; owl:annotatedSource :V ; owl:annotatedProperty rdfs:subClassOf ;
+           owl:annotatedTarget _:r ; rdfs:comment \"annotated\" ] .",
+    );
+    let t = term(&ds, &ex("C"));
+    assert_eq!(t.mentions.len(), 1, "{:?}", t.mentions);
+    assert_eq!(t.mentions[0].0.annotations.len(), 1, "{:?}", t.mentions);
+    assert!(full(&ds, &ex("C")).contains(&t.mentions[0].0));
+}
+
+#[test]
+fn many_axioms_that_share_one_restriction_are_all_found() {
+    let mut body = String::from(
+        ":p a owl:ObjectProperty . :C a owl:Class . _:r a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :C .",
+    );
+    for n in 0..70 {
+        body.push_str(&format!(" :S{n} a owl:Class ; rdfs:subClassOf _:r ."));
+    }
+    let ds = dataset(&body);
+    let t = term(&ds, &ex("C"));
+    assert_eq!(t.mentions_total, 70);
+    assert_eq!(t.mentions.len(), 70);
+    assert!(!t.mentions_truncated);
+}
+
+#[test]
+fn skos_xl_labels_and_distinct_users() {
+    let ds = dataset(
+        ":c a skos:Concept ; skosxl:prefLabel :l1 ; skosxl:altLabel [ skosxl:literalForm \"other\"@en ] .
+         :l1 a skosxl:Label ; skosxl:literalForm \"concept\"@en .
+         :q a owl:ObjectProperty .
+         :s1 :q :o1, :o2 . :s2 :q :o1 .",
+    );
+    let t = term(&ds, &ex("c"));
+    let forms: Vec<String> = t
+        .xl_labels
+        .iter()
+        .map(|s| format!("{} {:?}", s.property.rsplit('#').next().unwrap(), s.value))
+        .collect();
+    assert_eq!(forms.len(), 2, "{forms:?}");
+    assert!(
+        forms
+            .iter()
+            .any(|f| f.starts_with("prefLabel") && f.contains("concept"))
+    );
+    assert!(
+        forms
+            .iter()
+            .any(|f| f.starts_with("altLabel") && f.contains("other"))
+    );
+    let u = term(&ds, &ex("q")).usage.unwrap();
+    assert_eq!(u.count, 2);
+    assert_eq!(u.subjects.len(), 2);
+}
+
+#[test]
+fn a_scheme_root_ignores_broader_concepts_of_other_schemes() {
+    let ds = dataset(
+        ":s a skos:ConceptScheme . :t a skos:ConceptScheme .
+         :a a skos:Concept ; skos:inScheme :s ; skos:broader :b .
+         :b a skos:Concept ; skos:inScheme :t .",
+    );
+    let h = tree(
+        &ds,
+        HierarchyRequest {
+            kind: TreeKind::Concept,
+            scheme: Some(ex("s")),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        h.children.iter().map(|n| n.iri.clone()).collect::<Vec<_>>(),
+        [ex("a")]
+    );
+}
+
+#[test]
+fn a_wide_level_comes_in_iri_order() {
+    let mut body = String::from(":R a owl:Class .");
+    // inserted in reverse, so the ids run against the IRIs
+    for n in (0..20_005).rev() {
+        body.push_str(&format!(" :K{n:05} a owl:Class ; rdfs:subClassOf :R ."));
+    }
+    let ds = dataset(&body);
+    let h = tree(
+        &ds,
+        HierarchyRequest {
+            iri: Some(ex("R")),
+            limit: 3,
+            ..Default::default()
+        },
+    );
+    assert!(!h.sorted);
+    assert_eq!(
+        h.children.iter().map(|n| n.iri.clone()).collect::<Vec<_>>(),
+        [ex("K00000"), ex("K00001"), ex("K00002")]
+    );
+}
+
+#[test]
+fn the_term_read_takes_the_requested_mode() {
+    let ds = dataset(":A rdfs:subClassOf :B .");
+    let sub = |mode: Mode| {
+        let r = OntologyRequest {
+            mode,
+            ..Default::default()
+        };
+        ds.ontology()
+            .term(&r, &TermRequest::new(ex("A")), &Default::default())
+            .unwrap()
+            .axioms
+            .iter()
+            .any(|(a, _)| matches!(a.kind, sparkles_owl::AxiomKind::SubClassOf(..)))
+    };
+    assert!(sub(Mode::Lenient));
+    assert!(!sub(Mode::Strict));
 }

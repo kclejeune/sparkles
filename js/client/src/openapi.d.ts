@@ -18402,6 +18402,13 @@ export interface operations {
                             property?: string;
                             subjects?: string[];
                         } | null;
+                        /** @description The literal forms of the entity's SKOS-XL labels, with the label property and the graph. */
+                        xlLabels?: {
+                            graph?: string;
+                            property?: string;
+                            /** @description A literal as `{"@value", "@language"?, "@type"?}`. */
+                            value?: unknown;
+                        }[];
                     };
                     "application/ld+json": Record<string, never>;
                     "application/n-triples": string;

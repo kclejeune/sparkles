@@ -405,6 +405,8 @@ export interface OntologyTerm extends OntologyName {
     annotations: { property: string; value: string | Configuration }[];
   }[];
   statementsTruncated: boolean;
+  /** the literal forms of the entity's SKOS-XL labels */
+  xlLabels: { property: string; value: Configuration; graph: string }[];
   axioms: OntologyAxiom[];
   mentions: { axioms: OntologyAxiom[]; total: number; truncated: boolean };
   incoming: OntologyIncoming[];

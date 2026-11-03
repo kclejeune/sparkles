@@ -1323,6 +1323,18 @@ pub fn term_body(name: &str, t: &browse::TermPage, r: &Renderer) -> J {
             .collect(),
     );
     j["statementsTruncated"] = json!(t.statements_truncated);
+    j["xlLabels"] = J::Array(
+        t.xl_labels
+            .iter()
+            .map(|s| {
+                json!({
+                    "property": s.property,
+                    "value": value_json(&s.value),
+                    "graph": t.graph_name(s.graph),
+                })
+            })
+            .collect(),
+    );
     j["axioms"] = J::Array(axioms(&t.axioms));
     j["mentions"] = json!({
         "axioms": axioms(&t.mentions),

@@ -41,7 +41,7 @@ use crate::store::{Chunk, Snapshot, TermKind};
 use oxrdf::{NamedOrBlankNode, Quad, Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_owl::Axiom;
-use sparkles_owl::read::{self, ReadOptions};
+use sparkles_owl::read::{self, Mode, ReadOptions};
 use sparkles_reasoner::inputs::{GraphRef, Import, Inputs};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -330,8 +330,13 @@ pub struct TermPage {
     /// the IRI's types in the graphs read
     pub types: Vec<String>,
     pub statements: Vec<Statement>,
-    /// whether a property had more values than [`MAX_VALUES`]
+    /// whether a property had more values than [`MAX_VALUES`], or the triples about the
+    /// entity or the blank nodes they reach passed [`MAX_ABOUT_QUADS`]
     pub statements_truncated: bool,
+    /// the literal forms of the entity's SKOS-XL labels: `property` is
+    /// `skosxl:prefLabel`, `altLabel` or `hiddenLabel` and `value` the label's
+    /// `skosxl:literalForm`
+    pub xl_labels: Vec<Statement>,
     /// the axioms the triples about the entity map to, with their graphs
     pub axioms: Vec<(Axiom, u32)>,
     /// the axioms of other entities that mention it, with their graphs
@@ -374,6 +379,8 @@ pub(super) struct Scope {
     prefixes: BTreeMap<String, String>,
     ids: FxHashMap<&'static str, Option<Id>>,
     opts: QueryOptions,
+    /// how the reverse mapping reads the fragments
+    mode: Mode,
 }
 
 impl Ontologies {
@@ -419,6 +426,7 @@ impl Ontologies {
             prefixes: self.ds.prefixes(),
             ids: FxHashMap::default(),
             opts,
+            mode: req.mode,
         })
     }
 
@@ -439,9 +447,15 @@ impl Ontologies {
         let mut s = self.browse_scope(req, &h.languages, opts)?;
         let scheme = match &h.scheme {
             None => None,
-            Some(iri) => Some(s.snap.lookup_iri(iri).ok_or_else(|| {
-                Error::NotFound(format!("the graphs read do not mention the scheme <{iri}>"))
-            })?),
+            Some(iri) => Some(
+                s.lookup(iri)
+                    .filter(|id| s.mentioned(*id).unwrap_or(false))
+                    .ok_or_else(|| {
+                        Error::NotFound(format!(
+                            "the graphs read do not mention the scheme <{iri}>"
+                        ))
+                    })?,
+            ),
         };
         let tree = Tree {
             kind: h.kind,
@@ -484,6 +498,18 @@ impl Ontologies {
                 let dep = s.deprecated(id)?;
                 let label = s.label(id)?.map(|(l, _)| l.to_lowercase());
                 keyed.push(((dep, label.is_none(), label, s.iri(id)), id));
+            }
+            keyed.sort();
+            members = keyed.into_iter().map(|(_, id)| id).collect();
+        } else {
+            // too many to label: IRI order, which does not depend on the ids a
+            // compaction may renumber
+            let mut keyed = Vec::with_capacity(members.len());
+            for (n, id) in members.into_iter().enumerate() {
+                if n.is_multiple_of(4096) {
+                    check(&s.opts)?;
+                }
+                keyed.push((s.iri(id), id));
             }
             keyed.sort();
             members = keyed.into_iter().map(|(_, id)| id).collect();
@@ -554,7 +580,7 @@ impl Ontologies {
         for q in &own {
             about.add(*q);
         }
-        s.closure(&mut about, own.iter().map(|q| q[2]))?;
+        let mut complete = s.closure(&mut about, own.iter().map(|q| q[2]))?;
         let mut reifiers = Vec::new();
         if let Some(src) = s.id(OWL_ANNOTATED_SOURCE) {
             for q in s.quads(Perm::Pos, &[src.0, x.0], MAX_ABOUT_QUADS)? {
@@ -566,7 +592,10 @@ impl Ontologies {
             for q in &qs {
                 about.add(*q);
             }
-            s.closure(&mut about, qs.iter().map(|q| q[2]))?;
+            complete &= s.closure(&mut about, qs.iter().map(|q| q[2]))?;
+        }
+        if !complete {
+            truncated = true;
         }
 
         // statements: the entity's triples with a named or literal object, and the
@@ -615,27 +644,56 @@ impl Ontologies {
         types.sort();
         types.dedup();
 
+        // the literal forms of its SKOS-XL labels, which are resources of their own
+        let mut xl_labels = Vec::new();
+        if let Some(form) = s.id(SKOSXL_LITERAL_FORM) {
+            let props: Vec<Id> = SKOSXL_LABELS.iter().filter_map(|p| s.id(p)).collect();
+            for q in &own {
+                if !props.contains(&q[1]) || xl_labels.len() >= MAX_VALUES {
+                    continue;
+                }
+                for f in s.objects(q[2], form, 4)? {
+                    if let Some(value @ Value::Literal(_)) = s.value(f) {
+                        names.insert(q[1]);
+                        xl_labels.push(Statement {
+                            property: s.iri(q[1]),
+                            value,
+                            graph: s.graphs[&q[3]],
+                            annotations: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
         // the axioms of other entities that mention it: walk up from the blank nodes
         // that hold it to the named subject or the root of each axiom
         check(&s.opts)?;
         let (roots, mentions_total, mentions_truncated) = s.mention_roots(x, t.mentions)?;
         let mut mention = Collector::default();
+        let mut mentions_cut = false;
         for root in &roots {
             match root {
                 Root::Named(q) => {
                     let q: [Id; 4] = q.clone();
                     mention.add(q);
-                    s.closure(&mut mention, [q[2]])?;
+                    mentions_cut |= !s.closure(&mut mention, [q[2]])?;
+                    // the axiom's annotations, reified with the same source, property
+                    // and target
+                    for r in s.reifiers_of(q[0], q[1], q[2])? {
+                        let qs = s.quads(Perm::Spo, &[r.0], MAX_ABOUT_QUADS)?;
+                        mention.add_all(&qs);
+                        mentions_cut |= !s.closure(&mut mention, qs.iter().map(|q| q[2]))?;
+                    }
                 }
                 Root::Blank(b) => {
                     let qs = s.quads(Perm::Spo, &[b.0], MAX_ABOUT_QUADS)?;
-                    for q in &qs {
-                        mention.add(*q);
-                    }
-                    s.closure(&mut mention, qs.iter().map(|q| q[2]))?;
+                    mention.add_all(&qs);
+                    mentions_cut |= !s.closure(&mut mention, qs.iter().map(|q| q[2]))?;
                 }
             }
         }
+        let mentions_truncated = mentions_truncated || mentions_cut;
 
         // incoming statements from named subjects, by predicate
         check(&s.opts)?;
@@ -654,12 +712,14 @@ impl Ontologies {
         // statements that use it as their predicate
         let used = s.quads(Perm::Pso, &[x.0], MAX_INCOMING_COUNT + 1)?;
         let usage = (!used.is_empty()).then(|| {
+            // the distinct named subjects, in index order, of the statements counted
+            let mut distinct: FxHashSet<Id> = FxHashSet::default();
             let mut subjects: Vec<Id> = Vec::new();
-            for q in &used {
-                if subjects.len() >= t.incoming {
-                    break;
-                }
-                if s.snap.term_kind(q[0]) == TermKind::Iri && !subjects.contains(&q[0]) {
+            for q in used.iter().take(MAX_INCOMING_COUNT) {
+                if s.snap.term_kind(q[0]) == TermKind::Iri
+                    && distinct.insert(q[0])
+                    && subjects.len() < t.incoming
+                {
                     subjects.push(q[0]);
                 }
             }
@@ -668,7 +728,7 @@ impl Ontologies {
             }
             Incoming {
                 property: iri.to_string(),
-                count: used.len().min(MAX_INCOMING_COUNT),
+                count: distinct.len(),
                 more: used.len() > MAX_INCOMING_COUNT,
                 subjects: subjects.iter().map(|id| s.iri(*id)).collect(),
             }
@@ -724,6 +784,7 @@ impl Ontologies {
             types,
             statements,
             statements_truncated: truncated,
+            xl_labels,
             axioms,
             mentions,
             mentions_total,
@@ -741,6 +802,12 @@ impl Ontologies {
 }
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const SKOSXL_LITERAL_FORM: &str = "http://www.w3.org/2008/05/skos-xl#literalForm";
+const SKOSXL_LABELS: [&str; 3] = [
+    "http://www.w3.org/2008/05/skos-xl#prefLabel",
+    "http://www.w3.org/2008/05/skos-xl#altLabel",
+    "http://www.w3.org/2008/05/skos-xl#hiddenLabel",
+];
 const OWL_ANNOTATED_SOURCE: &str = "http://www.w3.org/2002/07/owl#annotatedSource";
 const OWL_ANNOTATED_PROPERTY: &str = "http://www.w3.org/2002/07/owl#annotatedProperty";
 const OWL_ANNOTATED_TARGET: &str = "http://www.w3.org/2002/07/owl#annotatedTarget";
@@ -766,6 +833,12 @@ impl Collector {
     fn add(&mut self, q: [Id; 4]) {
         if self.seen.insert(q) {
             self.quads.push(q);
+        }
+    }
+
+    fn add_all(&mut self, qs: &[[Id; 4]]) {
+        for q in qs {
+            self.add(*q);
         }
     }
 }
@@ -891,7 +964,13 @@ impl Tree {
         }
         // a computed root has no parent; scan the parent links once instead of asking
         // per candidate when that is cheaper
-        let with_parent = self.with_parents(s)?;
+        // in a scheme, a parent counts only when it is in the scheme, which the bulk scan
+        // cannot tell, so each candidate of the scheme is asked
+        let with_parent = if self.scheme.is_some() {
+            FxHashSet::default()
+        } else {
+            self.with_parents(s)?
+        };
         let ignored: Vec<&str> = self.kind.ignored().to_vec();
         for c in candidates {
             if s.snap.term_kind(c) != TermKind::Iri || out.contains(&c) {
@@ -903,7 +982,8 @@ impl Tree {
             if with_parent.contains(&c) {
                 continue;
             }
-            if self.scheme.is_some() && !self.in_scheme(s, c)? {
+            if self.scheme.is_some() && (!self.in_scheme(s, c)? || !self.parents(s, c)?.is_empty())
+            {
                 continue;
             }
             out.insert(c);
@@ -1077,8 +1157,9 @@ impl Scope {
             .collect())
     }
 
-    /// Add the blank nodes `from` reaches, with their triples, to `c`.
-    fn closure(&self, c: &mut Collector, from: impl IntoIterator<Item = Id>) -> Result<()> {
+    /// Add the blank nodes `from` reaches, with their triples, to `c`. Returns false
+    /// when the collector reached its cap before the closure was complete.
+    fn closure(&self, c: &mut Collector, from: impl IntoIterator<Item = Id>) -> Result<bool> {
         let mut stack: Vec<Id> = from
             .into_iter()
             .filter(|o| self.snap.term_kind(*o) == TermKind::BNode)
@@ -1086,16 +1167,43 @@ impl Scope {
         let mut seen: FxHashSet<Id> = stack.iter().copied().collect();
         while let Some(b) = stack.pop() {
             if c.quads.len() >= MAX_ABOUT_QUADS * 2 {
-                break;
+                return Ok(false);
             }
-            for q in self.quads(Perm::Spo, &[b.0], MAX_ABOUT_QUADS)? {
+            let qs = self.quads(Perm::Spo, &[b.0], MAX_ABOUT_QUADS)?;
+            if qs.len() >= MAX_ABOUT_QUADS {
+                c.add_all(&qs);
+                return Ok(false);
+            }
+            for q in qs {
                 c.add(q);
                 if self.snap.term_kind(q[2]) == TermKind::BNode && seen.insert(q[2]) {
                     stack.push(q[2]);
                 }
             }
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// The `owl:Axiom` nodes that reify the triple `s p o`.
+    fn reifiers_of(&mut self, s: Id, p: Id, o: Id) -> Result<Vec<Id>> {
+        let (Some(src), Some(prop), Some(tgt)) = (
+            self.id(OWL_ANNOTATED_SOURCE),
+            self.id(OWL_ANNOTATED_PROPERTY),
+            self.id(OWL_ANNOTATED_TARGET),
+        ) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for q in self.quads(Perm::Pos, &[tgt.0, o.0], MAX_VALUES)? {
+            let r = q[0];
+            if self.snap.term_kind(r) == TermKind::Iri || out.contains(&r) {
+                continue;
+            }
+            if self.exists(&[r, src, s])? && self.exists(&[r, prop, p])? {
+                out.push(r);
+            }
+        }
+        Ok(out)
     }
 
     /// The annotations of the reified triples of `reifiers`, by their property and
@@ -1171,7 +1279,10 @@ impl Scope {
             {
                 continue;
             }
-            let parents = self.quads(Perm::Osp, &[b.0], 64)?;
+            let parents = self.quads(Perm::Osp, &[b.0], MAX_COUNTED * 20)?;
+            if parents.len() >= MAX_COUNTED * 20 {
+                truncated = true;
+            }
             if parents.is_empty() {
                 if blanks.insert(b) {
                     total += 1;
@@ -1239,7 +1350,7 @@ impl Scope {
                         return false;
                     }
                     count += 1;
-                    if subjects.len() < listed {
+                    if subjects.len() < listed && !subjects.contains(&q[0]) {
                         subjects.push(q[0]);
                     }
                     true
@@ -1290,6 +1401,8 @@ impl Scope {
         for q in quads {
             all.add(*q);
         }
+        // the quads after these are context: the types of the IRIs the fragment uses
+        let fragment = all.quads.len();
         if let Some(t) = self.id(RDF_TYPE) {
             let used: BTreeSet<Id> = quads
                 .iter()
@@ -1304,10 +1417,12 @@ impl Scope {
         }
         let mut triples = Vec::with_capacity(all.quads.len());
         let mut graph_of = Vec::with_capacity(all.quads.len());
-        for q in &all.quads {
+        let mut context = Vec::with_capacity(all.quads.len());
+        for (n, q) in all.quads.iter().enumerate() {
             if let Some(t) = triple_of(&self.snap, q) {
                 triples.push(t);
                 graph_of.push(self.graphs[&q[3]]);
+                context.push(n >= fragment);
             }
         }
         let primary: Vec<u32> = (0..self.refs.len().max(1) as u32).collect();
@@ -1316,26 +1431,38 @@ impl Scope {
             graph_of,
             &primary,
             ReadOptions {
-                mode: read::Mode::Lenient,
+                mode: self.mode,
                 terminology_only: false,
                 max_diagnostics: 0,
             },
         );
-        // the declarations the type triples of other IRIs add are not part of the
-        // fragment's axioms
+        // An axiom belongs to the fragment when its main triple does, or one of its
+        // triples when it has no main triple. The context's type triples only type the
+        // fragment's IRIs, so the axioms they alone give, such as another IRI's class
+        // assertion or a property characteristic, are left out. A declaration that the
+        // mapping implies has no triples and is kept for the fragment's own subjects.
         let own: FxHashSet<Id> = quads.iter().map(|q| q[0]).collect();
         let own_iris: FxHashSet<String> = own
             .iter()
             .filter(|id| self.snap.term_kind(**id) == TermKind::Iri)
             .map(|id| self.iri(*id))
             .collect();
+        let in_fragment = |o: &read::Origin| match o.main {
+            Some(m) => !context[m],
+            None => o.triples.iter().any(|t| !context[*t]),
+        };
         Ok(o.axioms
             .into_iter()
-            .filter(|(a, _)| match &a.kind {
-                sparkles_owl::AxiomKind::Declaration(entity) => {
-                    own_iris.contains(entity.iri().as_str())
+            .filter(|(a, origins)| {
+                if origins.iter().any(|o| !o.triples.is_empty()) {
+                    return origins.iter().any(in_fragment);
                 }
-                _ => true,
+                match &a.kind {
+                    sparkles_owl::AxiomKind::Declaration(entity) => {
+                        own_iris.contains(entity.iri().as_str())
+                    }
+                    _ => true,
+                }
             })
             .map(|(a, origins)| {
                 let g = origins.first().map_or(0, |o| o.graph);
