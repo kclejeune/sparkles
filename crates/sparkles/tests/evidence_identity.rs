@@ -1144,3 +1144,162 @@ fn a_resolution_of_every_member_reads_its_cluster_once() {
         assert_eq!(x.decisions.len(), 99);
     }
 }
+
+/// A caller whose view hides `predicate` in `graph`.
+fn masking(predicate: &str, graph: &str) -> Option<Arc<GraphAccess>> {
+    use sparkles::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+    Some(Arc::new(GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::All,
+        TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(Protection {
+                    name: "masked".into(),
+                    predicates: Some(vec![predicate.to_string()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: Some(Graphs::Only(GraphRule::new([graph], &[]))),
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Caller::default(),
+            limits: Limits::default(),
+        },
+    )))
+}
+
+/// More proposals naming an entity than one review reads, all hidden from the
+/// caller, answer exactly as an unavailable target and report no count of their own,
+/// while the same store read in full answers `incomplete-evidence`.
+#[test]
+fn hidden_proposals_beyond_the_bound_report_no_count() {
+    let ds = configured();
+    let mut o = ProposeOptions::new(iri("urn:principal:matcher"));
+    o.identity_graph = Some(iri(HIDDEN));
+    // one more than the bound, so that the caller's masked view stays within the
+    // resolution budget
+    for batch in 0..11 {
+        let size = if batch == 10 { 1 } else { 1000 };
+        let identities = (0..size)
+            .map(|i| {
+                let n = batch * 1000 + i;
+                let mut p = proposal(
+                    &format!("hidden{n}"),
+                    IdentityRelation::PossibleMatch,
+                    &["b", &format!("h{n}")],
+                    Some("b"),
+                );
+                p.key = key(&format!("p{n}"));
+                p
+            })
+            .collect();
+        evidence::propose(
+            None,
+            &ds,
+            &ds,
+            &EvidenceInput {
+                identities,
+                ..Default::default()
+            },
+            &o,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+    }
+    let bc = matched(&ds, "bc", &["b", "c"], None);
+    // the caller cannot see which entities the hidden proposals name
+    let masked = masking(&format!("{EV}entity"), HIDDEN);
+    let answer = |target: Target, access: Option<Arc<GraphAccess>>| {
+        let e = review_as(
+            &ds,
+            &[decision("x", &target, Disposition::Accepted, None)],
+            &reviewer(),
+            access,
+            1,
+        )
+        .unwrap_err();
+        (e.code().to_string(), e.to_string())
+    };
+    let hidden = answer(bc.clone(), masked.clone());
+    let missing = answer(
+        (iri("urn:uuid:00000000-0000-4000-8000-000000000000"), bc.1),
+        masked,
+    );
+    // With this many hidden triples the resolution budget of the caller's view refuses
+    // first, for any target alike, and a smaller hidden set reaches the clusters, which
+    // answer as the target being unavailable. Either way the two answers are the same.
+    assert_eq!(hidden, missing);
+    assert_eq!(answer(bc, all()).0, "incomplete-evidence");
+    assert!(map(&ds).is_empty());
+}
+
+/// A mask over a revision's boundary protections cannot hide that the map was built
+/// from a graph that has left the boundary.
+#[test]
+fn a_masked_revision_is_refused_by_the_resolution_read() {
+    let ds = configured();
+    let ab = propose_in(
+        &ds,
+        HIDDEN,
+        proposal("ab", IdentityRelation::PossibleMatch, &["a", "b"], None),
+    );
+    accept(&ds, "ab", &ab);
+    let masked = masking(&format!("{EV}boundaryProtection"), MAPS);
+    let read = |access: Option<Arc<GraphAccess>>| {
+        evidence::resolve_entities(&ds, &ds, "people", &[e("a")], access, &Control::none())
+    };
+    // a masked latest revision is refused even before the boundary changes
+    assert_eq!(code(read(masked.clone())), "projection-unavailable");
+    assert_eq!(read(all()).unwrap().entities[0].representative, e("a"));
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(code(read(masked)), "projection-unavailable");
+    assert_eq!(code(read(all())), "projection-unavailable");
+}
+
+/// When the caller's view splits a cluster, each requested entity answers the
+/// decisions of the component it reaches, whatever else the request names and in
+/// whatever order.
+#[test]
+fn a_resolution_answers_each_entity_as_alone() {
+    let ds = configured();
+    let ab = propose_in(
+        &ds,
+        HIDDEN,
+        proposal("ab", IdentityRelation::PossibleMatch, &["a", "b"], None),
+    );
+    let bc = matched(&ds, "bc", &["b", "c"], None);
+    accept(&ds, "ab", &ab);
+    let dbc = accept(&ds, "bc", &bc);
+    let masked = masking(&format!("{EV}entity"), HIDDEN);
+    let decisions = |entities: &[&str]| -> Vec<Vec<NamedNode>> {
+        let entities: Vec<NamedNode> = entities.iter().map(|n| e(n)).collect();
+        evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &entities,
+            masked.clone(),
+            &Control::none(),
+        )
+        .unwrap()
+        .entities
+        .into_iter()
+        .map(|x| x.decisions)
+        .collect()
+    };
+    let b = decisions(&["b"]).remove(0);
+    assert_eq!(b, vec![dbc]);
+    assert_eq!(decisions(&["a", "b"])[1], b);
+    assert_eq!(decisions(&["b", "a"])[0], b);
+    assert_eq!(decisions(&["a"])[0], decisions(&["b", "a"])[1]);
+}

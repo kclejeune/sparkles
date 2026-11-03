@@ -1183,11 +1183,16 @@ the boundary, as for claims, and every review that changes the map needs read ac
 each effective proposal of the clusters it reads in either state. One whose triples the
 caller's view hides answers as the decision's target being unavailable, byte for byte.
 Candidates are resolved in order before a bound is reported, and a hidden proposal that
-no decision accepts is left out without being counted, so a refusal never reports a
-count that includes a record the caller cannot read. One operation visits at most
-10,000 entities and proposals in each state and retains at most 64 MiB of their
-identifiers, beyond which it answers `incomplete-evidence`. A resolution read computes
-each cluster once, however many of its members the request names.
+no decision accepts is left out without being counted. More than 10,000 proposals naming
+one entity answer `incomplete-evidence` when the caller's view shows that many, and
+otherwise answer as the target being unavailable, so a refusal never reports a count
+that includes a record the caller cannot read. One operation visits at most 10,000
+entities and proposals in each state and retains at most 64 MiB of the identifiers of
+its targets and clusters, beyond which it answers `incomplete-evidence`. A resolution
+read checks the latest revision at the unmasked head and refuses a caller whose view
+hides part of it, so a mask cannot hide the boundary that would refuse the map. It
+traverses each component the caller's view reaches once and answers each requested
+entity with the decisions of its own component, whatever else the request names.
 
 `sparkles::evidence::resolve_entities` and `POST /{ds}/claims/identities` read the map
 at the head of a branch. They need read grants on the policy's decisions, maps and

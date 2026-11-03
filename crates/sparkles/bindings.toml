@@ -461,6 +461,11 @@ python = "planned: evidence resolution in the bindings with the typed evidence o
 jvm = "planned: evidence resolution in the bindings with the typed evidence operations"
 node = "planned: evidence resolution in the bindings with the typed evidence operations"
 
+["evidence.resolve_entities"]
+python = "planned: identity resolution in the bindings with the typed evidence operations"
+jvm = "planned: identity resolution in the bindings with the typed evidence operations"
+node = "planned: identity resolution in the bindings with the typed evidence operations"
+
 ["evidence.review"]
 python = "planned: evidence reviews in the bindings with the typed evidence operations"
 jvm = "planned: evidence reviews in the bindings with the typed evidence operations"

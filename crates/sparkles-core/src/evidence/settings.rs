@@ -1000,7 +1000,15 @@ mod tests {
             "sha256:603171de274f97d4af635aeb6b7f6ddcd170aafde6dbffa0c6d1bb56b9642303"
         );
         let decoded = Settings::from_slice(canonical.bytes(), &Control::none()).unwrap();
-        assert_eq!(decoded, settings);
+        assert_eq!(
+            decoded.canonical(&Control::none()).unwrap().bytes(),
+            canonical.bytes()
+        );
+        assert_eq!(decoded.matching_policies, {
+            let mut m = settings.matching_policies.clone();
+            m.get_mut("people").unwrap().boundary.sort();
+            m
+        });
         let text = std::str::from_utf8(canonical.bytes()).unwrap();
         for (from, to) in [
             (

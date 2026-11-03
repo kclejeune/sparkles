@@ -63,6 +63,30 @@ pub const MAX_RESOLVE: usize = 100;
 pub const MAX_MEMBERS: usize = 1000;
 /// The most IRI bytes one operation retains for the proposals and clusters it reads.
 pub const RETAINED_BYTES: usize = 64 << 20;
+/// Charge `n` bytes to `bytes`, refusing as `incomplete-evidence` beyond `limit`.
+fn retain(bytes: &mut usize, limit: usize, n: usize) -> Result<()> {
+    *bytes = bytes.saturating_add(n);
+    if *bytes > limit {
+        return Err(managed(
+            ManagedErrorKind::IncompleteEvidence,
+            format!(
+                "the identifiers of the targets and clusters exceed {} MiB, so nothing was written",
+                limit >> 20
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The IRI bytes a proposal's facts retain.
+fn fact_bytes(f: &Facts) -> usize {
+    f.entities
+        .iter()
+        .chain(&f.preferred)
+        .map(|x| x.as_str().len())
+        .sum()
+}
+
 /// The most boundary protections a map revision records.
 const MAX_BOUNDARY: usize = 4096;
 
@@ -328,9 +352,12 @@ struct Clusters<'m> {
     /// Each proposal's effect in each state.
     effective: BTreeMap<(NamedNode, bool), bool>,
     visits: [usize; 2],
-    /// The IRI bytes retained for facts and clusters, at most `limit`.
+    /// The IRI bytes retained for the operation's targets, facts and clusters, at most
+    /// `limit`.
     bytes: usize,
     limit: usize,
+    /// The key of the decision whose clusters are read, which a refusal names.
+    key: String,
 }
 
 impl<'m> Clusters<'m> {
@@ -343,16 +370,13 @@ impl<'m> Clusters<'m> {
             visits: [0, 0],
             bytes: 0,
             limit: RETAINED_BYTES,
+            key: String::new(),
         }
     }
 
     /// Charge `n` retained bytes against the operation's allowance.
     fn retain(&mut self, n: usize) -> Result<()> {
-        self.bytes = self.bytes.saturating_add(n);
-        if self.bytes > self.limit {
-            return Err(incomplete("the identifiers of the clusters"));
-        }
-        Ok(())
+        retain(&mut self.bytes, self.limit, n)
     }
 
     fn charge(&mut self, when: When) -> Result<()> {
@@ -399,12 +423,7 @@ impl<'m> Clusters<'m> {
                         continue;
                     }
                     used(state, &p, &g)?;
-                    let n = f
-                        .entities
-                        .iter()
-                        .chain(&f.preferred)
-                        .map(|x| x.as_str().len());
-                    self.retain(n.sum())?;
+                    self.retain(fact_bytes(&f))?;
                     self.facts.insert(p.clone(), (g.clone(), f));
                 } else {
                     used(state, &p, &g)?;
@@ -413,6 +432,21 @@ impl<'m> Clusters<'m> {
                 out.push(p);
             }
             if more {
+                // When the caller's view shows no more candidates than the bound, the
+                // excess is hidden from it, and a hidden one may be effective. The
+                // review then answers as its target being unavailable, so the refusal
+                // reports no count that includes a hidden record.
+                if let Some(seen) = state.seen.as_mut() {
+                    let (_, visible_more) = seen.subjects_up_to(
+                        &ev("entity"),
+                        &Term::NamedNode(e.clone()),
+                        g.0.as_str(),
+                        MAX_EVIDENCE,
+                    )?;
+                    if !visible_more {
+                        return Err(unavailable(&self.key));
+                    }
+                }
                 return Err(incomplete("the proposals of an entity"));
             }
         }
@@ -670,6 +704,7 @@ pub(super) fn review(
         count: 0,
     };
     let mut pending = Vec::with_capacity(decisions.len());
+    let mut retained = 0usize;
     for d in decisions {
         control.check()?;
         let target = evidence.record(&d.key, &d.target, &[RecordKind::IdentityProposal])?;
@@ -712,6 +747,7 @@ pub(super) fn review(
             state.visible(&d.key, &d.target, &tg.0)?;
             evidence.links(&mut state, &d.key, &d.target, &m.boundary)?;
         }
+        retain(&mut retained, RETAINED_BYTES, fact_bytes(&facts))?;
         pending.push(Pending { facts });
     }
     // The decisions the map follows change when an acceptance is added or an accepted
@@ -742,6 +778,7 @@ pub(super) fn review(
             .map(|d| (d.target.clone(), d.disposition))
             .collect(),
     );
+    clusters.bytes = retained;
     let mut changes = Vec::new();
     let mut changed = Changed::default();
     if !adds.is_empty() || !ends.is_empty() {
@@ -760,6 +797,7 @@ pub(super) fn review(
                 }
                 Ok(())
             };
+            clusters.key = d.key.clone();
             for e in &item.facts.entities {
                 control.check()?;
                 for (when, out) in [(When::Before, &mut before), (When::After, &mut after)] {
@@ -1042,6 +1080,27 @@ pub fn resolve(
     let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
     let view = caller_view(access.as_ref(), &head, &preparation)?;
     let snap = view.as_ref().map_or(&*head, |v| v.snapshot());
+    // The map's consistency is checked at the unmasked head, so that a mask cannot hide
+    // the metadata that would refuse it, and a revision the caller's view masks is
+    // refused rather than read.
+    let latest = {
+        let mut full = State {
+            reads: Reads::new(&preparation, &head),
+            seen: view
+                .as_ref()
+                .map(|v| Reads::new(&preparation, v.snapshot())),
+            claim_graphs: Vec::new(),
+            superseded: BTreeSet::new(),
+            withdrawn: BTreeSet::new(),
+        };
+        let latest = latest(&mut full, main.dataset_id(), &m, control)?;
+        if let Some(l) = &latest
+            && full.masked(&l.iri, &m.maps.0)?
+        {
+            return Err(projection_unavailable(&m.name));
+        }
+        latest
+    };
     let mut state = State {
         reads: Reads::new(&preparation, snap),
         seen: None,
@@ -1049,10 +1108,10 @@ pub fn resolve(
         superseded: BTreeSet::new(),
         withdrawn: BTreeSet::new(),
     };
-    let latest = latest(&mut state, main.dataset_id(), &m, control)?;
     let mut clusters = Clusters::new(&m, BTreeMap::new());
-    // The decisions of each cluster, read once for every requested member.
-    let mut joined: BTreeMap<NamedNode, Vec<NamedNode>> = BTreeMap::new();
+    // The decisions of each component the caller's view traverses, kept for each of its
+    // entities, so that a request answers each entity as a request of it alone does.
+    let mut joined: BTreeMap<NamedNode, Arc<Vec<NamedNode>>> = BTreeMap::new();
     let mut out = Vec::with_capacity(entities.len());
     for e in entities {
         control.check()?;
@@ -1084,8 +1143,8 @@ pub fn resolve(
         };
         let mut decisions = Vec::new();
         if members.len() > 1 {
-            if let Some(d) = joined.get(&representative) {
-                decisions = d.clone();
+            if let Some(d) = joined.get(e) {
+                decisions = d.as_ref().clone();
             } else {
                 let c = clusters.cluster(&mut state, e, When::Before, &mut |_, _, _| Ok(()))?;
                 let mut found = BTreeSet::new();
@@ -1094,7 +1153,10 @@ pub fn resolve(
                     found.extend(current);
                 }
                 decisions = found.into_iter().collect();
-                joined.insert(representative.clone(), decisions.clone());
+                let shared = Arc::new(decisions.clone());
+                for x in c.entities {
+                    joined.insert(x, shared.clone());
+                }
             }
         }
         out.push(ResolvedEntity {
@@ -1138,5 +1200,21 @@ mod tests {
         c.retain(40).unwrap();
         let e = c.retain(1).unwrap_err();
         assert_eq!(e.code(), "incomplete-evidence");
+        // the targets' facts are charged to the same allowance before the clusters
+        let mut bytes = 0;
+        retain(&mut bytes, 10, 10).unwrap();
+        assert_eq!(
+            retain(&mut bytes, 10, 1).unwrap_err().code(),
+            "incomplete-evidence"
+        );
+        let f = Facts {
+            relation: Some(IdentityRelation::PossibleMatch),
+            entities: vec![
+                NamedNode::new_unchecked("urn:a"),
+                NamedNode::new_unchecked("urn:bb"),
+            ],
+            preferred: Some(NamedNode::new_unchecked("urn:a")),
+        };
+        assert_eq!(fact_bytes(&f), 5 + 6 + 5);
     }
 }

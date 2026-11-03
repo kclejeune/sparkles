@@ -12803,9 +12803,12 @@ target, and for an acceptance read access to the target's evidence links. It als
 read access to every accepted proposal of each cluster it reads, before and after its
 decisions, and one whose triples the caller's view hides answers as an unavailable
 target. A proposal no decision accepts takes no part in a cluster and is not counted
-when the caller cannot read it. One review reads at most 10,000 entities and proposals
-for its clusters in each state and retains at most 64 MiB of their identifiers, beyond
-which it answers `422 incomplete-evidence`.
+when the caller cannot read it. More than 10,000 proposals naming one entity answer
+`422 incomplete-evidence` when the caller's view shows that many, and otherwise answer
+as an unavailable target, so no refusal reports a count that includes a hidden record.
+One review reads at most 10,000 entities and proposals for its clusters in each state
+and retains at most 64 MiB of the identifiers of its targets and clusters, beyond which
+it answers `422 incomplete-evidence`.
 
 A map follows the matches of the identity graphs it was built from. When one of them
 leaves the boundary, or is detached and protected again so that its proposals no longer
@@ -12819,7 +12822,10 @@ needs `read` on the dataset or branch through the query endpoint and read grants
 policy's decisions, maps and output graphs and on the identity graphs of its boundary,
 and counts as a query. The answer is `{policy, revision, number, commit, entities}`, and
 each entity is `{entity, representative, members, membersComplete, decisions}`, with at
-most 1,000 members and the current accepted decisions that join the cluster. An entity
+most 1,000 members and the current accepted decisions that join the cluster as far as
+the caller's view reaches from the entity, whatever else the request names. The map's
+latest revision is checked against the store as written, and a caller whose view hides
+part of it is refused with `503 projection-unavailable`. An entity
 the map does not name resolves to itself. A request names 1 to 100 entities. Queries
 read the map by joining the output graph explicitly, and no query is rewritten through
 it.
