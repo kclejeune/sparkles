@@ -15,6 +15,8 @@ use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod rdfxml_split;
+
 /// Minimum bytes per chunk before splitting a document for parallel parsing.
 const PARALLEL_MIN_CHUNK: usize = 8 << 20;
 
@@ -845,6 +847,141 @@ impl<R: Read> Read for PrefixReader<R> {
         }
         self.reader.read(buf)
     }
+}
+
+/// The triples of a source in a W3C syntax of one graph (Turtle, N-Triples, RDF/XML or
+/// N3), in document order, and the prefixes it declares, for a reader that keeps the
+/// triples in memory instead of loading them. A source in another syntax is refused.
+///
+/// The document is held in memory, mapped for a plain file. Turtle and N-Triples are cut
+/// into chunks as the loader cuts them. An RDF/XML document whose root is `rdf:RDF` is cut
+/// between its top-level elements (see `rdfxml_split`), and when a piece fails to parse
+/// the whole document is parsed as one, whose triples or error are the answer. The
+/// chunks are parsed on up to `parallelism` threads and joined in order. An error names
+/// the source as the loader's do, but its text can differ from the loader's for the same
+/// input, and so a caller that must report the loader's error asks the loader for it.
+pub fn parse_triples(
+    src: &Source,
+    parallelism: usize,
+) -> Result<(Vec<oxrdf::Triple>, BTreeMap<String, String>)> {
+    let format = src.format.rdf().filter(|f| !f.supports_datasets());
+    let Some(format) = format else {
+        return Err(Error::Unsupported(format!(
+            "{}: {} is not a syntax of one graph",
+            src.name,
+            src.format.name()
+        )));
+    };
+    let bytes = load_bytes(src)?;
+    let slice = bytes.as_ref();
+    crate::nesting::check(format, slice, &src.name)?;
+    let parser = source_parser(src)?;
+    let err = |e: &dyn std::fmt::Display| Error::RdfParse(format!("{}: {e}", src.name));
+    let triple = |q: Quad| oxrdf::Triple::new(q.subject, q.predicate, q.object);
+    let whole = |parser: RdfParser| -> Result<(Vec<oxrdf::Triple>, BTreeMap<String, String>)> {
+        let mut p = parser.for_slice(slice);
+        let mut out = Vec::new();
+        for q in p.by_ref() {
+            out.push(triple(q.map_err(|e| err(&e))?));
+        }
+        let prefixes = p
+            .prefixes()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Ok((out, prefixes))
+    };
+    let n = (slice.len() / TRIPLES_MIN_CHUNK).clamp(1, parallelism.max(1));
+    if n == 1 {
+        return whole(parser);
+    }
+    // the triples of a chunk and the prefixes it ends with
+    type Part = (Vec<oxrdf::Triple>, Vec<(String, String)>);
+    match format {
+        RdfFormat::NTriples | RdfFormat::Turtle => {
+            let parts: Vec<Part> = parser
+                .split_slice_for_parallel_parsing(slice, n)
+                .into_par_iter()
+                .map(|mut p| -> Result<_> {
+                    let mut out = Vec::new();
+                    for q in p.by_ref() {
+                        out.push(triple(q.map_err(|e| err(&e))?));
+                    }
+                    let prefixes = p
+                        .prefixes()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    Ok((out, prefixes))
+                })
+                .collect::<Result<_>>()?;
+            let mut prefixes = BTreeMap::new();
+            let mut triples = Vec::with_capacity(parts.iter().map(|p| p.0.len()).sum());
+            for (t, p) in parts {
+                triples.extend(t);
+                prefixes.extend(p);
+            }
+            Ok((triples, prefixes))
+        }
+        RdfFormat::RdfXml => {
+            let Some(split) = rdfxml_split::split(slice, n) else {
+                return whole(parser);
+            };
+            let pieces = split.pieces(slice);
+            let last = pieces.len() - 1;
+            let parts: Vec<Option<Part>> = pieces
+                .par_iter()
+                .enumerate()
+                .map(|(i, piece)| {
+                    let mut p = parser.clone().for_slice(piece);
+                    let mut out = Vec::new();
+                    for q in p.by_ref() {
+                        out.push(triple(q.ok()?));
+                    }
+                    // the last piece ends as the document does, so its prefixes are the
+                    // ones a parse of the whole document ends with
+                    let prefixes = if i == last {
+                        p.prefixes()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    Some((out, prefixes))
+                })
+                .collect();
+            if parts.iter().any(Option::is_none) {
+                return whole(parser);
+            }
+            let mut prefixes = BTreeMap::new();
+            let mut triples = Vec::new();
+            for (t, p) in parts.into_iter().flatten() {
+                triples.extend(t);
+                prefixes.extend(p);
+            }
+            Ok((triples, prefixes))
+        }
+        _ => whole(parser),
+    }
+}
+
+/// The fewest bytes of a chunk of [`parse_triples`]: the loader's, and fewer in tests so
+/// that small documents are cut.
+const TRIPLES_MIN_CHUNK: usize = if cfg!(test) { 512 } else { PARALLEL_MIN_CHUNK };
+
+/// The functional-style document of a source, read on up to `threads` threads, with the
+/// errors the loader reports for it, and whether its text has `_:`, which every anonymous
+/// individual is written with.
+pub fn read_ofn(src: &Source, threads: usize) -> Result<(sparkles_owl::ofn_read::Document, bool)> {
+    let bytes = load_bytes(src)?;
+    let text = std::str::from_utf8(bytes.as_ref()).map_err(|e| {
+        Error::RdfParse(format!(
+            "{}: the functional-style document is not UTF-8: {e}",
+            src.name
+        ))
+    })?;
+    let blank = memchr::memmem::find(text.as_bytes(), b"_:").is_some();
+    let doc = sparkles_owl::ofn_read::parse_parallel(text, threads)
+        .map_err(|e| Error::RdfParse(format!("{}: OWL functional-style syntax, {e}", src.name)))?;
+    Ok((doc, blank))
 }
 
 /// Parse one source into a synchronous callback, without collecting its quads.
