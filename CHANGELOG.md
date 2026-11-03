@@ -32,6 +32,13 @@ functional-style syntax, RDF/XML, Turtle or N-Triples, and chain in one process 
 --output y.owl` (item 637). On GO and ChEBI lite their outputs and the chain's equal
 ROBOT's with ELK axiom for axiom.
 
+`sparkles ontology materialize` does what ROBOT 1.9.11's `materialize` does (roadmap item
+636). It asserts each class's direct superclasses of the form `ObjectSomeValuesFrom(p C)`
+for the properties of `--term` and `--term-file`, which take full IRIs and the OBO
+prefixes of ROBOT's default context, or for every property when none is given. It runs
+from a file or a database and joins chains such as `reason materialize reduce`. On GO
+with part of and ChEBI lite with has role its output equals ROBOT's axiom for axiom.
+
 The web UI has one app shell and design system (roadmap item 632). A top bar on every
 page holds the dataset switcher and a search of the open dataset's entities through
 `GET /$/ontology/{ds}/search`, which `Ctrl+K`, `Cmd+K` and `/` focus, and the pages sit
