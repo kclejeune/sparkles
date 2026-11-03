@@ -9,6 +9,7 @@
 import { isLiteral, type Statement, type Value } from './browse';
 import {
   annotationAssertion,
+  axiomKey,
   dataUpdate,
   diffAxioms,
   type Annotation,
@@ -59,6 +60,64 @@ export const inGraph = (x: { graph?: string }, graph: string | null) =>
 /** A value as an annotation's value: an IRI or a literal. */
 const annValue = (v: Value): AnnValue => v;
 
+/**
+ * A statement of a page with the annotation assertions that state it, as the term route
+ * maps them. The statement's own annotations merge those of every reification of its
+ * triple and leave out nested ones, so an edit removes these axioms as the store keeps
+ * them and not one rebuilt from the merged list.
+ */
+export type Stated = Statement & { asserted?: AxiomJson[] };
+
+const bareKey = (a: AxiomJson) => {
+  const { annotations: _, ...bare } = a;
+  return axiomKey(bare);
+};
+
+/** The annotation assertions of `axioms` in `graph` that state `s` about `iri`. */
+export function assertionsOf(
+  iri: string,
+  s: Pick<Statement, 'property' | 'value'>,
+  axioms: readonly AxiomItem[],
+  graph: string | null,
+): AxiomJson[] {
+  const k = bareKey(annotationAssertion(s.property, iri, annValue(s.value)));
+  return axioms
+    .filter((a) => a.type === 'AnnotationAssertion' && inGraph(a, graph) && bareKey(a.axiom) === k)
+    .map((a) => a.axiom);
+}
+
+/** The statements with the assertions that state them in `graph`. */
+export const withAssertions = (
+  iri: string,
+  statements: readonly Statement[],
+  axioms: readonly AxiomItem[],
+  graph: string | null,
+): Stated[] =>
+  statements.map((s) =>
+    inGraph(s, graph) ? { ...s, asserted: assertionsOf(iri, s, axioms, graph) } : s,
+  );
+
+/** The axioms that state `s`: those the store keeps, or one rebuilt from the statement. */
+const removalsOf = (iri: string, s: Stated): AxiomJson[] =>
+  s.asserted?.length ? s.asserted : [statementAxiom(iri, s)];
+
+/** The annotations of every axiom that states `s`, nested ones kept, each once. */
+function annotationsOf(s: Stated): Annotation[] {
+  if (!s.asserted?.length)
+    return s.annotations.map((a) => ({ property: a.property, value: a.value }));
+  const seen = new Set<string>();
+  const out: Annotation[] = [];
+  for (const a of s.asserted)
+    for (const x of a.annotations ?? []) {
+      const k = axiomKey({ type: 'a', annotations: [x] });
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(x);
+      }
+    }
+  return out;
+}
+
 /** The annotation assertion that states a statement, with the statement's annotations. */
 export function statementAxiom(
   iri: string,
@@ -78,11 +137,22 @@ export function textLit(text: string, lang: string): Lit {
   return l ? { '@value': text, '@language': l } : { '@value': text };
 }
 
-/** The sources a statement's annotations name. */
-export const sourcesOf = (s: Pick<Statement, 'annotations'> | null) =>
-  (s?.annotations ?? [])
-    .filter((a) => SOURCE_PROPS.has(a.property))
-    .map((a) => (isLiteral(a.value) ? a.value['@value'] : a.value));
+const sourceText = (v: AnnValue) => (isLiteral(v as Value) ? (v as Lit)['@value'] : (v as string));
+
+/** The sources a statement's annotations name, each text once. */
+export const sourcesOf = (s: Pick<Statement, 'annotations'> | null) => [
+  ...new Set(
+    (s?.annotations ?? [])
+      .filter((a) => SOURCE_PROPS.has(a.property))
+      .map((a) => sourceText(a.value)),
+  ),
+];
+
+/** The sources of a form with the text typed in its add field and not added yet. */
+export const withPending = (sources: string[], pending: string) => {
+  const p = pending.trim();
+  return p && !sources.includes(p) ? [...sources, p] : sources;
+};
 
 /** A statement as a form edits it: a property, a value, and the sources of an OWL page. */
 export type Draft = { property: string; value: Value; sources: string[] };
@@ -92,19 +162,13 @@ export type Draft = { property: string; value: Value; sources: string[] };
  * were, then the sources in the order the form lists them. A source the statement had keeps
  * its property and value, and a new one is an `oboInOwl:hasDbXref` string.
  */
-function annotationsFor(before: Statement | null, sources: string[]): Annotation[] {
-  const old = before?.annotations ?? [];
-  const keep = old
-    .filter((a) => !SOURCE_PROPS.has(a.property))
-    .map((a) => ({ property: a.property, value: a.value }));
-  const src = sources.map((text) => {
-    const was = old.find(
-      (a) =>
-        SOURCE_PROPS.has(a.property) && (isLiteral(a.value) ? a.value['@value'] : a.value) === text,
-    );
-    return was
-      ? { property: was.property, value: was.value }
-      : { property: SOURCE_PROPERTY, value: { '@value': text } as Lit };
+function annotationsFor(before: Stated | null, sources: string[]): Annotation[] {
+  const old = before ? annotationsOf(before) : [];
+  const keep = old.filter((a) => !SOURCE_PROPS.has(a.property));
+  const src = sources.flatMap((text) => {
+    // every source annotation with this text, so `hasDbXref "X"` and `dc:source "X"` both stay
+    const was = old.filter((a) => SOURCE_PROPS.has(a.property) && sourceText(a.value) === text);
+    return was.length ? was : [{ property: SOURCE_PROPERTY, value: { '@value': text } as Lit }];
   });
   return [...keep, ...src];
 }
@@ -119,11 +183,13 @@ function annotationsFor(before: Statement | null, sources: string[]): Annotation
 export function statementOp(
   mode: EditMode,
   iri: string,
-  before: Statement | null,
+  before: Stated | null,
   after: Draft | null,
   graph: string | null,
 ): Op | null {
-  if (mode === 'skos') {
+  // a SKOS statement with axiom annotations, such as a definition's sources, is changed as
+  // an annotation assertion, so its reification follows the new value
+  if (mode === 'skos' && !before?.annotations.length) {
     const remove: HeaderTriple[] = before
       ? [{ s: iri, p: before.property, o: headerValue(before.value) }]
       : [];
@@ -133,14 +199,14 @@ export function statementOp(
     if (sameTriples(remove, add)) return null;
     return { kind: 'update', sparql: dataUpdate(remove, add, graph).sparql };
   }
-  const remove = before ? [statementAxiom(iri, before)] : [];
+  const remove = before ? removalsOf(iri, before) : [];
+  const anns = after ? annotationsFor(before, after.sources) : [];
   const add: AxiomJson[] = after
     ? [
-        statementAxiom(iri, {
-          property: after.property,
-          value: after.value,
-          annotations: annotationsFor(before, after.sources) as Statement['annotations'],
-        }),
+        {
+          ...annotationAssertion(after.property, iri, annValue(after.value)),
+          ...(anns.length ? { annotations: anns } : {}),
+        },
       ]
     : [];
   const d = diffAxioms(remove, add);
@@ -214,14 +280,15 @@ export function isAnnotation(
   return true;
 }
 
-/** A statement as the editor's annotation rows show it. */
-export const toAnnotation = (s: Statement): Annotation => ({
-  property: s.property,
-  value: annValue(s.value),
-  ...(s.annotations.length
-    ? { annotations: s.annotations.map((a) => ({ property: a.property, value: a.value })) }
-    : {}),
-});
+/** A statement as the editor's annotation rows show it, with every annotation it carries. */
+export const toAnnotation = (s: Stated): Annotation => {
+  const anns = annotationsOf(s);
+  return {
+    property: s.property,
+    value: annValue(s.value),
+    ...(anns.length ? { annotations: anns } : {}),
+  };
+};
 
 /**
  * The operation that turns the annotations `before` (statements of the edited graph) into
@@ -230,11 +297,13 @@ export const toAnnotation = (s: Statement): Annotation => ({
 export function annotationsOp(
   mode: EditMode,
   iri: string,
-  before: Statement[],
+  before: Stated[],
   next: Annotation[],
   graph: string | null,
 ): Op | null {
-  if (mode === 'skos') {
+  const nextKeys = new Set(next.map((a) => axiomKey(rowAxiom(iri, a))));
+  const removed = before.filter((s) => !nextKeys.has(axiomKey(rowAxiom(iri, toAnnotation(s)))));
+  if (mode === 'skos' && !removed.some((s) => s.annotations.length)) {
     const t = (a: { property: string; value: AnnValue }): HeaderTriple => ({
       s: iri,
       p: a.property,
@@ -247,16 +316,21 @@ export function annotationsOp(
     if (!remove.length && !add.length) return null;
     return { kind: 'update', sparql: dataUpdate(remove, add, graph).sparql };
   }
-  const d = diffAxioms(
-    before.map((s) => statementAxiom(iri, s)),
-    next.map((a) => ({
-      ...annotationAssertion(a.property, iri, a.value),
-      ...(a.annotations?.length ? { annotations: a.annotations } : {}),
-    })),
-  );
-  if (!d.add.length && !d.remove.length) return null;
-  return { kind: 'axioms', add: d.add, remove: d.remove };
+  // a row the caller left as it was keeps the axioms that state it, however many there are
+  const beforeKeys = new Set(before.map((s) => axiomKey(rowAxiom(iri, toAnnotation(s)))));
+  const remove = removed.flatMap((s) => removalsOf(iri, s));
+  const add = next
+    .filter((a) => !beforeKeys.has(axiomKey(rowAxiom(iri, a))))
+    .map((a) => rowAxiom(iri, a));
+  if (!add.length && !remove.length) return null;
+  return { kind: 'axioms', add, remove };
 }
+
+/** The annotation assertion a row of the annotation rows states. */
+const rowAxiom = (iri: string, a: Annotation): AxiomJson => ({
+  ...annotationAssertion(a.property, iri, a.value),
+  ...(a.annotations?.length ? { annotations: a.annotations } : {}),
+});
 
 // --- the hierarchy ----------------------------------------------------------------------
 

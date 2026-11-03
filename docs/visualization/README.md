@@ -338,8 +338,8 @@ or thesaurus editor and **Done**. The definition becomes a text field with its l
 and its sources as chips, and each synonym, annotation and parent gets edit and remove
 buttons with an add row below them. On an OWL page the parents are picked through the
 entity search and the axioms are added in Manchester syntax with completion and the
-server's parse errors underlined. On a SKOS page the broader, related and
-mapping concepts are picked the same way, and the labels are edited by language.
+server's parse errors underlined. On a SKOS page the broader, narrower,
+related and mapping concepts are picked the same way, and the labels are edited by language.
 
 Each change is one commit through the editors' write path. It is previewed as a dry run
 against the commit the page shows ([screenshot](../images/browse-edit-preview.png)),

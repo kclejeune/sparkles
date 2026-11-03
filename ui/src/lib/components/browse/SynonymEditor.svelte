@@ -1,9 +1,10 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   // The synonyms of an OWL entity in edit mode (ROADMAP item 630): each a row of its kind,
   // text, language and sources, with Edit and Remove, and an add row. Changing a kind or a
   // text is one change that removes the old annotation assertion and adds the new one with
   // the same sources. Synonyms that another graph states are listed without actions.
-  import { isLiteral, type Statement } from '$lib/browse';
+  import { isLiteral } from '$lib/browse';
   import {
     inGraph,
     OWL_SYNONYMS,
@@ -12,7 +13,9 @@
     statementOp,
     textLit,
     valueParts,
+    withPending,
     type OnEdit,
+    type Stated,
   } from '$lib/browse-edit';
   import { validLang } from '$lib/ontology';
   import Icon from '$components/Icon.svelte';
@@ -31,7 +34,7 @@
     iri: string;
     title: string;
     /** The synonym statements of the page, of every graph it reads. */
-    synonyms: Statement[];
+    synonyms: Stated[];
     /** Each synonym property with its kind's name. */
     kinds: [string, string][];
     graph: string | null;
@@ -61,8 +64,13 @@
   let eText = $state('');
   let eLang = $state('');
   let eSources = $state<string[]>([]);
-  function begin(s: Statement) {
+  let ePending = $state('');
+  /** The synonym as editing began, kept when another writer's commit changes or removes it. */
+  let editBase: Stated | null = null;
+  function begin(s: Stated) {
     editing = statementKey(s);
+    editBase = s;
+    ePending = '';
     const p = valueParts(s.value);
     eKind = s.property;
     eText = p.text;
@@ -79,8 +87,22 @@
       eKind !== editRow.property ||
       eText.trim() !== p.text ||
       eLang.trim().toLowerCase() !== p.lang.toLowerCase() ||
-      eSources.join('\n') !== sourcesOf(editRow).join('\n')
+      withPending(eSources, ePending).join('\n') !== sourcesOf(editRow).join('\n')
     );
+  });
+  // a commit by another writer that changes the synonym being edited ends the row, and the
+  // draft moves to the add row, so the typed text is not lost
+  $effect(() => {
+    if (!editing || editRow) return;
+    const base = untrack(() => editBase);
+    if (base) {
+      aKind = eKind;
+      aText = eText;
+      aLang = eLang;
+      aTouched = true;
+    }
+    editing = null;
+    editBase = null;
   });
   function save() {
     if (!editRow || !eDirty || !eText.trim() || !validLang(eLang.trim())) return;
@@ -88,7 +110,11 @@
       'owl',
       iri,
       editRow,
-      { property: eKind, value: textLit(eText.trim(), eLang), sources: eSources },
+      {
+        property: eKind,
+        value: textLit(eText.trim(), eLang),
+        sources: withPending(eSources, ePending),
+      },
       graph,
     );
     if (op)
@@ -100,9 +126,13 @@
   // --- the add row --------------------------------------------------------------------------
   let aKind = $state(OWL_SYNONYMS[0][0]);
   let aText = $state('');
+  // the page's language fills the new synonym's language until the caller edits the field,
+  // so clearing it adds an untagged synonym
   let aLang = $state('');
+  let aTouched = false;
   $effect(() => {
-    if (!aLang && defaultLang) aLang = defaultLang;
+    const l = defaultLang;
+    if (!untrack(() => aTouched)) aLang = l;
   });
   const aProblem = $derived(!validLang(aLang.trim()) ? 'The language tag is not valid.' : null);
   function add() {
@@ -118,6 +148,8 @@
     if (op)
       onedit(op, `Add the ${kindName(aKind).toLowerCase()} synonym ${text} to ${title}`, () => {
         aText = '';
+        aTouched = false;
+        aLang = defaultLang;
       });
   }
 </script>
@@ -147,7 +179,13 @@
               aria-label="Language"
               aria-invalid={!validLang(eLang.trim())}
             />
-            <span class="srcs"><SourceChips bind:sources={eSources} label="the synonym" /></span>
+            <span class="srcs"
+              ><SourceChips
+                bind:sources={eSources}
+                bind:pending={ePending}
+                label="the synonym"
+              /></span
+            >
             <span class="row-acts">
               <button type="button" class="btn sm" onclick={() => (editing = null)}>Cancel</button>
               <button
@@ -220,6 +258,7 @@
       <input
         class="input sm lng"
         bind:value={aLang}
+        oninput={() => (aTouched = true)}
         aria-label="Language of the new synonym"
         aria-invalid={!!aProblem}
       />

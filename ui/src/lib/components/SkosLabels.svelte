@@ -273,6 +273,8 @@
                     <form
                       class="edit"
                       aria-label="Change label"
+                      data-edit-form
+                      data-dirty={sameLabel(e.label, editDraft) ? 'false' : 'true'}
                       onsubmit={(ev) => {
                         ev.preventDefault();
                         saveEdit();
@@ -281,7 +283,9 @@
                       <!-- svelte-ignore a11y_autofocus -->
                       <input class="input sm" bind:value={editText} aria-label="Text" autofocus />
                       <input class="input sm lang" bind:value={editLang} aria-label="Language" />
-                      <button class="btn sm primary" disabled={!!editProblem}>Preview</button>
+                      <button class="btn sm primary" data-preview disabled={!!editProblem}
+                        >Preview</button
+                      >
                       <button class="btn sm ghost" type="button" onclick={() => (editing = null)}
                         >Cancel</button
                       >
@@ -358,6 +362,8 @@
     <form
       class="add"
       aria-label="Add a label"
+      data-edit-form
+      data-dirty={text.trim() ? 'true' : 'false'}
       onsubmit={(e) => {
         e.preventDefault();
         add();
@@ -378,7 +384,9 @@
       <datalist id="skos-langs">
         {#each langs as l (l)}<option value={l}></option>{/each}
       </datalist>
-      <button class="btn sm primary" disabled={!draft.value || !!draftProblem}>Add</button>
+      <button class="btn sm primary" data-preview disabled={!draft.value || !!draftProblem}
+        >Add</button
+      >
       {#if entries.some((e) => !e.xl)}
         <button class="btn sm" type="button" onclick={allToXl}>Make all SKOS-XL</button>
       {/if}

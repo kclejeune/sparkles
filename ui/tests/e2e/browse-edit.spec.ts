@@ -94,6 +94,58 @@ open('a definition and a synonym keep their sources through an edit', async ({ p
 });
 
 open(
+  'a definition that two axioms annotate is replaced whole, with both sources',
+  async ({ page, request }) => {
+    const c = CELLO(99);
+    const DEF = 'http://purl.obolibrary.org/obo/IAO_0000115';
+    const reif = (src: string) =>
+      `[] a owl:Axiom ; owl:annotatedSource <${c}> ; owl:annotatedProperty <${DEF}> ; ` +
+      `owl:annotatedTarget "A twice-sourced organelle."@en ; <${OIO}hasDbXref> "${src}" .`;
+    const seed = await request.post(`/${DS}/update`, {
+      headers: { 'Content-Type': 'application/sparql-update' },
+      data:
+        `PREFIX owl: <http://www.w3.org/2002/07/owl#> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ` +
+        `INSERT DATA { <${c}> a owl:Class ; rdfs:label "twice-sourced organelle"@en ; ` +
+        `<${DEF}> "A twice-sourced organelle."@en . ${reif('CELLO:one')} ${reif('CELLO:two')} }`,
+    });
+    expect(seed.ok(), await seed.text()).toBe(true);
+    await openEdit(page, DS, 99);
+    const def = page.getByRole('textbox', { name: 'Definition', exact: true });
+    await expect(def).toHaveValue('A twice-sourced organelle.');
+    await def.fill('An organelle with two sources.');
+    await page
+      .getByRole('group', { name: /^Definition/ })
+      .getByRole('button', { name: 'Preview change' })
+      .click();
+    await commit(page);
+    const t = await (
+      await request.get(`/$/ontology/${DS}/term?iri=${encodeURIComponent(c)}&graph=default`)
+    ).json();
+    const defs = (
+      t.statements as {
+        property: string;
+        value: { '@value': string };
+        annotations: { value: { '@value': string } }[];
+      }[]
+    ).filter((s) => s.property === DEF);
+    expect(defs.map((d) => d.value['@value'])).toEqual(['An organelle with two sources.']);
+    expect(defs[0].annotations.map((a) => a.value['@value']).sort()).toEqual([
+      'CELLO:one',
+      'CELLO:two',
+    ]);
+    // no reification of the old text is left behind
+    const left = await request.post(`/${DS}/query`, {
+      headers: {
+        'Content-Type': 'application/sparql-query',
+        Accept: 'application/sparql-results+json',
+      },
+      data: `ASK { ?a <http://www.w3.org/2002/07/owl#annotatedTarget> "A twice-sourced organelle."@en }`,
+    });
+    expect((await left.json()).boolean).toBe(false);
+  },
+);
+
+open(
   'a parent through the entity search and an axiom through the Manchester parser',
   async ({ page }) => {
     await openEdit(page, DS, 9);

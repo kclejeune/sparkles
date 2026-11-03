@@ -21,6 +21,9 @@
     parentRows,
     parentsEditable,
     toAnnotation,
+    valueParts,
+    withAssertions,
+    type Stated,
     type EditMode,
     type OnEdit,
   } from '$lib/browse-edit';
@@ -441,8 +444,15 @@
   beforeNavigate((nav) => {
     if (!editing || !unsaved() || nav.type === 'leave') return;
     const to = nav.to?.url;
-    // a change of view or mode keeps the forms; another entity or page does not
-    if (to && to.pathname === page.url.pathname && to.searchParams.get('iri') === iri) return;
+    // a change of view or mode keeps the forms; another entity, dataset, branch, graph,
+    // state or page does not
+    const same = (k: string) => to?.searchParams.get(k) === page.url.searchParams.get(k);
+    if (
+      to &&
+      to.pathname === page.url.pathname &&
+      ['ds', 'iri', 'branch', 'graph', 'at', 'imports'].every(same)
+    )
+      return;
     if (!confirm('Leave this page and discard the changes you have not previewed?')) nav.cancel();
   });
   onMount(() => {
@@ -517,18 +527,31 @@
     describeAxiom(a, (i) => displayName(i, term?.names, prefixes), prefixes);
 
   // the thesaurus editor's reading of a SKOS resource, for its labels and links
-  let details = $state<Details | null>(null);
+  // kept with the target, graph and entity it was read for, so the forms never pair one
+  // concept's labels with another's IRI and tag, and read again at each commit, dropping a
+  // superseded answer; the forms stay mounted across a commit so their drafts survive
+  let read = $state<{ key: string; details: Details } | null>(null);
+  const detailsKey = $derived(
+    term && termTarget ? JSON.stringify([termTarget, graph, term.iri]) : '',
+  );
+  const details = $derived(read && read.key === detailsKey ? read.details : null);
   $effect(() => {
-    if (!editing || !isSkos || !term) return;
-    const t = target;
+    if (!editing || !isSkos || !term || !detailsKey) return;
+    const key = detailsKey;
+    const t = termTarget!;
     const r = term.iri;
+    const g = graph;
     void term.commit;
-    api.select(t, detailsQuery(r, graph), { nocache: true }).then(
+    let live = true;
+    api.select(t, detailsQuery(r, g), { nocache: true }).then(
       (rows) => {
-        if (t === target && r === term?.iri) details = parseDetails(r, rows);
+        if (live && key === detailsKey) read = { key, details: parseDetails(r, rows) };
       },
-      (e) => toasts.error('Could not read the labels', e),
+      (e) => {
+        if (live) toasts.error('Could not read the labels', e);
+      },
     );
+    return () => (live = false);
   });
   const skosLangs = $derived([
     ...new Set([
@@ -544,7 +567,9 @@
     addedMappings = [];
   });
   const linkWord = (p: string) =>
-    p === 'broader' || p === 'related' ? p : (MAPPING_NAME[p] ?? p).toLowerCase();
+    p === 'broader' || p === 'narrower' || p === 'related'
+      ? p
+      : (MAPPING_NAME[p] ?? p).toLowerCase();
   function addLink(property: string, other: string, picked?: string) {
     if (!term) return;
     onedit(
@@ -560,21 +585,35 @@
     );
   }
 
+  /** The statements with the annotation assertions that state them in the edited graph. */
+  const stated = $derived(
+    term ? withAssertions(term.iri, term.statements, term.axioms, graph) : [],
+  );
   /** The definitions, the edited graph's first, then the others. */
   const definitions = $derived(
     term
-      ? term.statements
+      ? stated
           .filter((s) => DEFINITION_PROPS.includes(s.property))
           .sort((a, b) => Number(inGraph(b, graph)) - Number(inGraph(a, graph)))
       : [],
   );
+  /**
+   * A definition's place, by graph, property, language and order, so another writer's change
+   * to its text keeps the field and the draft it holds.
+   */
+  function definitionSlot(i: number) {
+    const slot = (d: Stated) =>
+      JSON.stringify([d.graph, d.property, valueParts(d.value).lang.toLowerCase()]);
+    const k = slot(definitions[i]);
+    return `${k}#${definitions.slice(0, i).filter((d) => slot(d) === k).length}`;
+  }
   let addingDefinition = $state(false);
   const synonymStatements = $derived(
-    term ? term.statements.filter((s) => SYNONYM_KINDS.some(([p]) => p === s.property)) : [],
+    stated.filter((s) => SYNONYM_KINDS.some(([p]) => p === s.property)),
   );
   const owned = new Set([...DEFINITION_PROPS, ...SYNONYM_KINDS.map(([p]) => p)]);
   const annotationStatements = $derived(
-    term ? term.statements.filter((s) => isAnnotation(s, owned, (p) => term?.names[p]?.kinds)) : [],
+    stated.filter((s) => isAnnotation(s, owned, (p) => term?.names[p]?.kinds)),
   );
   const ownAnnotations = $derived(annotationStatements.filter((s) => inGraph(s, graph)));
   const annotationProperties = $derived(
@@ -617,7 +656,10 @@
   // --- the keyboard and the palette ------------------------------------------------------
   /** Press the Preview button of the form that holds focus, or of the only changed form. */
   function previewForm() {
-    const here = document.activeElement?.closest<HTMLElement>('[data-edit-form]') ?? null;
+    const active = document.activeElement;
+    const here = active?.closest<HTMLElement>('[data-edit-form]') ?? null;
+    // focus in a field of another form previews nothing rather than some other change
+    if (!here && active?.closest('input, textarea, select, [contenteditable], .cm-editor')) return;
     const changed = [
       ...document.querySelectorAll<HTMLElement>('[data-edit-form][data-dirty="true"]'),
     ];
@@ -1012,7 +1054,7 @@
           </TermHeader>
           {#if editing}
             <div class="defs" aria-label="Definitions" role="group">
-              {#each definitions as d (JSON.stringify([d.graph, d.property, d.value]))}
+              {#each definitions as d, i (definitionSlot(i))}
                 {#if inGraph(d, graph)}
                   <DefinitionField
                     {mode}
@@ -1089,6 +1131,20 @@
                   onadd={(i, n) => addLink('broader', i, n)}
                   onremove={(i) => removeLink('broader', i)}
                   onrepair={(l) => addLink('broader', l.iri)}
+                />
+                <SkosLinks
+                  title="Narrower"
+                  id="narrower"
+                  links={details?.narrower ?? []}
+                  name={(i) => linker.name(i)}
+                  sub={(i) => linker.short(i)}
+                  {readonly}
+                  paired
+                  {picker}
+                  onopen={(i) => void goto(hrefOf(i))}
+                  onadd={(i, n) => addLink('narrower', i, n)}
+                  onremove={(i) => removeLink('narrower', i)}
+                  onrepair={(l) => addLink('narrower', l.iri)}
                 />
               </div>
             {:else if editing && parentsEditable(treeKind)}

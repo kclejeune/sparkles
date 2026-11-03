@@ -58,7 +58,7 @@ ROBOT keeps it.
 The ontology browser has an edit mode (spec U12, roadmap item 630). A caller who can write
 to a dataset switches an entity's page into edit mode and changes its definition and
 sources, synonyms, annotations, parents and axioms in place, or a concept's labels,
-broader, related and mapping concepts. Each change is a previewed commit through
+broader, narrower, related and mapping concepts. Each change is a previewed commit through
 the editors' write path, with their session branches, undo history and access checks, and
 a refused or stale write is explained in the preview. On a phone the edit bar sits at the
 bottom of the screen. A 403 in any editor's preview now names the dataset and graph that

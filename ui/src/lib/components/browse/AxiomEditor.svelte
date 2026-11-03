@@ -6,6 +6,7 @@
   // into the section's axiom as the ontology editor's frame does. "Any axiom" takes a
   // whole axiom in Manchester or functional-style syntax.
   import type { AxiomGroup, Linker } from '$lib/browse';
+  import { onDestroy } from 'svelte';
   import { axiomOp, inGraph, type OnEdit } from '$lib/browse-edit';
   import type { NameOption } from '$lib/manchester-complete';
   import {
@@ -90,18 +91,27 @@
     t === 'Class' ? 'classExpression' : t === 'Datatype' ? 'dataRange' : null;
   const sectionTitle = $derived(sections.find(([id]) => id === section)?.[1] ?? '');
 
+  let alive = true;
+  onDestroy(() => (alive = false));
   async function add() {
     const raw = text;
     const typed = raw.trim();
     if (!typed || busy) return;
+    // the section, entity and graph as submitted; a parse that answers after any of them
+    // changed, or after the editor went away, adds nothing
+    const sec = section;
+    const secTitle = sectionTitle;
+    const at = JSON.stringify([iri, graph, kind]);
+    const still = () => alive && at === JSON.stringify([iri, graph, kind]);
     problem = null;
     let ax: unknown = null;
-    if (section === 'axiom') {
+    if (sec === 'axiom') {
       ax = isFunctional(typed) ? typed : null;
       if (ax == null) {
         busy = true;
         try {
           const r = await parse(raw, 'axiom');
+          if (!still()) return;
           if (!r.ok) return void (problem = fromServer(r.problem));
           ax = r.parsed.value;
         } catch (e) {
@@ -111,7 +121,7 @@
         }
       }
     } else {
-      const t = sectionTarget(kind, section);
+      const t = sectionTarget(kind, sec);
       const options = names()
         .filter((n) => !t || n.kind === KIND_SINGULAR[t])
         .map((n) => ({ iri: n.iri, name: n.name }));
@@ -123,6 +133,7 @@
         busy = true;
         try {
           const r = await parse(raw, as);
+          if (!still()) return;
           if (!r.ok) return void (problem = fromServer(r.problem));
           value = r.parsed.value;
         } catch (e) {
@@ -131,15 +142,16 @@
           busy = false;
         }
       }
-      ax = sectionAxiom(kind, section, iri, value as string);
+      ax = sectionAxiom(kind, sec, iri, value as string);
       if (!ax)
         return void (problem = {
           message: 'This section takes a named entity, not an expression.',
         });
     }
+    if (!still()) return;
     onedit(
       axiomOp(ax as AxiomJson | string, false),
-      section === 'axiom' ? `Add ${typed}` : `${sectionTitle}: add ${typed} to ${title}`,
+      sec === 'axiom' ? `Add ${typed}` : `${secTitle}: add ${typed} to ${title}`,
       () => {
         text = '';
       },

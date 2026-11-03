@@ -1,9 +1,9 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   // One definition of an entity in edit mode (ROADMAP item 630): the text in the lede's
   // type, its language and, on an OWL page, its sources. Preview change hands the edit to
   // the page, which previews and commits it as the editors do. A definition that is new
   // has no `before`, and Remove previews the removal of one that exists.
-  import type { Statement } from '$lib/browse';
   import {
     definitionProperty,
     sourcesOf,
@@ -11,8 +11,10 @@
     statementOp,
     textLit,
     valueParts,
+    withPending,
     type EditMode,
     type OnEdit,
+    type Stated,
   } from '$lib/browse-edit';
   import { validLang } from '$lib/ontology';
   import Icon from '$components/Icon.svelte';
@@ -34,7 +36,7 @@
     iri: string;
     /** The entity's name, for the edits' labels. */
     title: string;
-    before: Statement | null;
+    before: Stated | null;
     graph: string | null;
     /** The language a new definition starts with. */
     lang?: string;
@@ -49,7 +51,10 @@
   let text = $state('');
   let lang = $state('');
   let sources = $state<string[]>([]);
+  let pending = $state('');
   let shownKey: string | null = null;
+  /** Set when this form's change commits, so the reload that follows starts it over. */
+  let committed = false;
   let area: HTMLTextAreaElement | undefined = $state();
 
   function reset() {
@@ -57,13 +62,21 @@
     text = p.text;
     lang = p.lang;
     sources = sourcesOf(before);
+    pending = '';
+    base = fields();
   }
-  // a reload that changed the definition, such as the commit of this form, starts over
+  /** The fields as the form last showed the definition, so a typed draft is told apart. */
+  let base = '';
+  const fields = () => JSON.stringify([text, lang, sources, pending]);
+  // the commit of this form starts it over, while another writer's change to the same
+  // definition keeps a draft the caller has typed, which then replaces the new value
   $effect(() => {
     const k = before ? statementKey(before) : '';
     if (k === shownKey) return;
+    const keep = shownKey !== null && !committed && untrack(fields) !== base;
     shownKey = k;
-    reset();
+    committed = false;
+    if (!keep) untrack(reset);
   });
   $effect(() => {
     if (autofocus && area) area.focus();
@@ -77,7 +90,7 @@
   const dirty = $derived(
     text !== original.text ||
       lang.trim().toLowerCase() !== original.lang.toLowerCase() ||
-      sources.join('\n') !== original.sources.join('\n'),
+      withPending(sources, pending).join('\n') !== original.sources.join('\n'),
   );
   const problem = $derived(!validLang(lang.trim()) ? 'The language tag is not valid.' : null);
 
@@ -91,7 +104,7 @@
         ? {
             property: before?.property ?? definitionProperty(mode),
             value: textLit(text.trim(), lang),
-            sources,
+            sources: withPending(sources, pending),
           }
         : null,
       graph,
@@ -104,6 +117,7 @@
           : before
             ? `Edit the definition of ${title}`
             : `Add a definition to ${title}`,
+        () => (committed = true),
       );
   }
 </script>
@@ -139,6 +153,7 @@
       <span class="f"
         ><span>Sources</span><SourceChips
           bind:sources
+          bind:pending
           label="the definition"
           disabled={readonly}
         /></span

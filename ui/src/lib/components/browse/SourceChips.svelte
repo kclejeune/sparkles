@@ -1,24 +1,26 @@
 <script lang="ts">
   // The sources of a definition or synonym in edit mode: each a chip with a remove button,
   // and a field that adds one on Enter or on leaving it, such as `GOC:al` or `PMID:123`.
+  // The field's text is bound out, so a preview by keyboard includes a source not added yet.
   import Icon from '$components/Icon.svelte';
 
   let {
     sources = $bindable([]),
+    pending = $bindable(''),
     label,
     disabled = false,
   }: {
     sources?: string[];
+    /** The text typed in the add field and not added, which a preview counts as a source. */
+    pending?: string;
     /** What the sources belong to, for the accessible names. */
     label: string;
     disabled?: boolean;
   } = $props();
 
-  let text = $state('');
-
   function add() {
-    const s = text.trim();
-    text = '';
+    const s = pending.trim();
+    pending = '';
     if (s && !sources.includes(s)) sources = [...sources, s];
   }
 </script>
@@ -38,7 +40,7 @@
   {/each}
   <input
     class="input sm add"
-    bind:value={text}
+    bind:value={pending}
     placeholder="Add source"
     aria-label="Add a source to {label}"
     size="12"

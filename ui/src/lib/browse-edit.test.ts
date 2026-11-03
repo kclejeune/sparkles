@@ -13,8 +13,10 @@ import {
   statementOp,
   textLit,
   toAnnotation,
+  withAssertions,
+  withPending,
 } from './browse-edit';
-import type { AxiomItem } from './ontology';
+import type { AxiomItem, AxiomJson } from './ontology';
 
 const GO = 'http://purl.obolibrary.org/obo/GO_0005739';
 const OBO = 'http://purl.obolibrary.org/obo/';
@@ -280,5 +282,108 @@ describe('graphs', () => {
     expect(inGraph({}, null)).toBe(true);
     expect(inGraph({ graph: 'urn:g' }, null)).toBe(false);
     expect(inGraph({ graph: 'urn:g' }, 'urn:g')).toBe(true);
+  });
+});
+
+const sub = (sup: string): AxiomItem => ({
+  type: 'SubClassOf',
+  ofn: '',
+  axiom: { type: 'SubClassOf', subClass: GO, superClass: sup },
+  graph: 'default',
+});
+
+describe('the assertions the store keeps', () => {
+  const DC = 'http://purl.org/dc/elements/1.1/';
+  const xref = (v: string) => ({ property: OIO + 'hasDbXref', value: { '@value': v } });
+  const value = { '@value': 'An organelle.', '@language': 'en' };
+  const assertion = (annotations: AxiomJson['annotations']): AxiomItem => ({
+    type: 'AnnotationAssertion',
+    ofn: '',
+    graph: 'default',
+    axiom: { type: 'AnnotationAssertion', property: DEF, subject: GO, value, annotations },
+  });
+  // two reifications of one triple, which the term route merges into one statement
+  const a1 = assertion([xref('GOC:a')]);
+  const a2 = assertion([
+    { ...xref('GOC:b'), annotations: [{ property: RDFS + 'comment', value: { '@value': 'n' } }] },
+  ]);
+  const merged: Statement = {
+    property: DEF,
+    value,
+    graph: 'default',
+    annotations: [xref('GOC:a'), xref('GOC:b')],
+  };
+  const [stated] = withAssertions(GO, [merged], [a1, a2, sub('urn:p')], null);
+
+  it('removes every axiom that states the edited definition and keeps nested annotations', () => {
+    expect(stated.asserted).toEqual([a1.axiom, a2.axiom]);
+    const op = statementOp(
+      'owl',
+      GO,
+      stated,
+      {
+        property: DEF,
+        value: textLit('An organelle of cells.', 'en'),
+        sources: ['GOC:a', 'GOC:b'],
+      },
+      null,
+    );
+    if (op?.kind !== 'axioms') throw new Error('expected axioms');
+    expect(op.remove).toEqual([a1.axiom, a2.axiom]);
+    expect(op.add).toHaveLength(1);
+    expect((op.add[0] as AxiomJson).annotations).toEqual([
+      a1.axiom.annotations![0],
+      a2.axiom.annotations![0],
+    ]);
+    const gone = statementOp('owl', GO, stated, null, null);
+    expect(gone?.kind === 'axioms' && gone.remove).toEqual([a1.axiom, a2.axiom]);
+  });
+
+  it('leaves an unchanged annotation row with several axioms alone', () => {
+    expect(annotationsOp('owl', GO, [stated], [toAnnotation(stated)], null)).toBeNull();
+    const op = annotationsOp('owl', GO, [stated], [], null);
+    expect(op?.kind === 'axioms' && op.remove).toEqual([a1.axiom, a2.axiom]);
+  });
+
+  it('keeps sources of different properties with the same text', () => {
+    const s: Statement = {
+      ...merged,
+      annotations: [xref('X'), { property: DC + 'source', value: { '@value': 'X' } }],
+    };
+    expect(sourcesOf(s)).toEqual(['X']);
+    const op = statementOp(
+      'owl',
+      GO,
+      s,
+      { property: DEF, value: textLit('New.', 'en'), sources: ['X'] },
+      null,
+    );
+    if (op?.kind !== 'axioms') throw new Error('expected axioms');
+    expect((op.add[0] as AxiomJson).annotations).toEqual(s.annotations);
+  });
+
+  it('changes an annotated SKOS definition as an assertion, so its sources follow', () => {
+    const c = 'http://example.org/thesaurus/fish';
+    const d: Statement = {
+      property: SKOS + 'definition',
+      value: { '@value': 'old' },
+      graph: 'default',
+      annotations: [xref('ISBN:1')],
+    };
+    const op = statementOp(
+      'skos',
+      c,
+      d,
+      { property: SKOS + 'definition', value: textLit('new', ''), sources: sourcesOf(d) },
+      null,
+    );
+    if (op?.kind !== 'axioms') throw new Error('expected axioms');
+    expect(op.add[0]).toMatchObject({ value: { '@value': 'new' }, annotations: [xref('ISBN:1')] });
+  });
+
+  it('counts a source typed and not added', () => {
+    expect(withPending(['A'], ' B ')).toEqual(['A', 'B']);
+    expect(withPending(['A'], 'A')).toEqual(['A']);
+    expect(withPending(['A'], '')).toEqual(['A']);
   });
 });

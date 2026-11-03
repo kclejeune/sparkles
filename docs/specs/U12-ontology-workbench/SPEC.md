@@ -515,7 +515,11 @@ which creates the same session branch as the editors and moves the page onto it.
 **What changes.** The definition is a text field with its language and its sources as
 chips. A definition or synonym edit removes the old annotation assertion and adds the new
 one with the axiom annotations that are not sources kept as they were, so a change of
-kind or text never loses a cross-reference. Synonyms, annotations and parents get edit
+kind or text never loses a cross-reference. The term route merges the annotations of
+every reification of a triple into one statement and leaves out nested ones, so an edit
+removes the annotation assertions of the term's axioms that state it, each as the store
+keeps it, and adds one assertion with all their annotations. A SKOS statement with axiom
+annotations is changed the same way, so its reification follows the new value. Synonyms, annotations and parents get edit
 and remove buttons with an add row. Parents are picked through the entity search and
 written as `SubClassOf`, `SubObjectPropertyOf`, `SubDataPropertyOf` or
 `SubAnnotationPropertyOf`. Axioms are added in the frame's sections with the Manchester
@@ -527,8 +531,11 @@ are shown without buttons. The ontology editor's `describe` moved to `describeAx
 
 **Errors.** A 403 from a write names the dataset and graph the caller can read but not
 write, and a stale tag offers **Reload**, which reads the term and hierarchy again and
-keeps the open forms' text. `Esc` and **Done** ask before leaving a field with an unsaved
-change, and so does navigating away.
+keeps the open forms' text. A definition keeps a typed draft when another writer changes
+it, and a synonym being edited that another writer changes moves its draft to the add
+row. A source typed and not added counts in the preview. `Esc` and **Done** ask before
+leaving any form with an unsaved change, the shared annotation and label forms included,
+and so does navigating to another entity, dataset, branch, graph or state.
 
 **Keyboard and phone.** `Mod+S` previews the field with focus and prevents the browser's
 save. `E`, `S`, `P` and `A` fire only when focus is outside text fields, contenteditable

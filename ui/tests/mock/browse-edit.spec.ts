@@ -247,6 +247,16 @@ test('SKOS edits: a label, a definition and a broader concept', async ({ page, r
     await broader.getByRole('button', { name: /Remove.*Marine animals/ }).click();
     await commit(page);
     await expect(broader).not.toContainText('Marine animals');
+
+    // a narrower concept writes both directions of the link
+    await tree.getByRole('button', { name: 'Add narrower' }).click();
+    const down = tree.getByRole('group', { name: 'Narrower picker' });
+    await down.getByRole('searchbox').fill('Insects');
+    await down.getByRole('button', { name: /Insects/ }).click();
+    await expect(preview(page)).toContainText('narrower');
+    await expect(preview(page)).toContainText('broader');
+    await commit(page);
+    await expect(tree.locator('[data-section="narrower"]')).toContainText('Insects');
     return branch;
   });
 });
@@ -346,6 +356,58 @@ test('the keyboard alone enters, edits, previews and leaves edit mode', async ({
   await page.keyboard.press('Control+k');
   await page.keyboard.press('e');
   await expect(bar(page)).toHaveCount(0);
+});
+
+test('drafts count what is typed: a pending source, an annotation form and an untagged synonym', async ({
+  page,
+}) => {
+  await open(page, term('uni', UNI + 'Student', '&edit=1'));
+  // a source typed and not added goes into a preview by keyboard
+  await page
+    .getByRole('textbox', { name: 'Definition', exact: true })
+    .fill('A person who studies.');
+  const src = page.getByRole('textbox', { name: 'Add a source to the definition' });
+  await src.fill('PMID:42');
+  await src.press('Control+s');
+  await expect(preview(page)).toContainText('Add a definition to Student');
+  await expect(preview(page)).toContainText('PMID:42');
+  await preview(page).getByRole('button', { name: 'Cancel' }).click();
+  await expect(preview(page)).toBeHidden();
+  await page
+    .getByRole('group', { name: /^Definition/ })
+    .getByRole('button', { name: 'Cancel' })
+    .click();
+
+  // an annotation typed and not previewed makes Done ask first
+  const anns = page.getByRole('region', { name: /^Annotations/ });
+  await anns.getByRole('button', { name: 'Add annotation' }).click();
+  await anns.getByRole('form').locator('textarea').fill('A note not previewed');
+  let asked = '';
+  page.once('dialog', (d) => {
+    asked = d.message();
+    void d.dismiss();
+  });
+  await bar(page).getByRole('button', { name: /^Done/ }).click();
+  await expect.poll(() => asked).toContain('discard');
+  await expect(bar(page)).toBeVisible();
+  // Mod+S in that form previews it and not another form's change
+  await anns.getByRole('form').locator('textarea').press('Control+s');
+  await expect(preview(page)).toContainText('A note not previewed');
+  await preview(page).getByRole('button', { name: 'Cancel' }).click();
+  // the form handed its rows to the preview and closed
+  await expect(anns.getByRole('form')).toHaveCount(0);
+
+  // a cleared language adds an untagged synonym
+  const add = page.getByRole('form', { name: 'Add a synonym' });
+  await page.getByRole('textbox', { name: 'New synonym', exact: true }).fill('pupil');
+  const lang = page.getByRole('textbox', { name: 'Language of the new synonym' });
+  await expect(lang).toHaveValue('en');
+  await lang.fill('');
+  await expect(lang).toHaveValue('');
+  await add.getByRole('button', { name: 'Add' }).click();
+  await expect(preview(page)).toContainText('"pupil"');
+  await expect(preview(page)).not.toContainText('"pupil"@');
+  await preview(page).getByRole('button', { name: 'Cancel' }).click();
 });
 
 test('the palette enters edit mode and focuses the add fields', async ({ page }) => {
