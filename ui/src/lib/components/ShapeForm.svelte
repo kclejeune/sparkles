@@ -66,6 +66,9 @@
     onsaved,
     ondraft,
     cls,
+    shapes,
+    groups,
+    onmodel,
   }: {
     /** The dataset (its main). */
     ds: string;
@@ -82,6 +85,15 @@
     onsaved?: (a: FormSaveAnswer) => void;
     /** Open the dialog that drafts shapes from the data (offered to admins). */
     ondraft?: () => void;
+    /** Where the shapes come from, instead of the dataset's `forms` setting. */
+    shapes?: 'guard' | 'graphs' | 'drafted' | 'skos';
+    /**
+     * Show only the fields of these property groups (by IRI), and not the properties the
+     * shapes do not cover. The other fields keep their values.
+     */
+    groups?: string[];
+    /** Called with each form model the form reads, so a host can check its graphs. */
+    onmodel?: (m: FormModel) => void;
   } = $props();
 
   const lang = typeof navigator === 'undefined' ? 'en' : (navigator.language || 'en').slice(0, 2);
@@ -151,9 +163,11 @@
         nested: true,
         signal: c.signal,
         ...(cls ? { class: cls } : {}),
+        ...(shapes ? { shapes } : {}),
       });
       if (c !== ctl) return;
       model = m;
+      onmodel?.(m);
       const es: Record<string, Entry[]> = Object.fromEntries(
         m.fields.map((f) => [f.id, entriesOf(f, m)]),
       );
@@ -279,6 +293,7 @@
     return {
       ...(cls ? { class: cls } : { focus: iri }),
       ...(openBranch !== MAIN ? { branch: openBranch } : {}),
+      ...(shapes ? { shapes } : {}),
       changes: changes.changes,
       expect: changes.expect,
       ...(changes.nested ? { nested: changes.nested } : {}),
@@ -551,7 +566,9 @@
           ? 'write-time guard'
           : m.shapes.source === 'graphs'
             ? 'shapes graphs'
-            : 'drafted from the data'}
+            : m.shapes.source === 'skos'
+              ? 'built-in SKOS shapes'
+              : 'drafted from the data'}
         ({m.shapes.nodeShapes.length}
         {m.shapes.nodeShapes.length === 1 ? 'shape' : 'shapes'})
       </span>
@@ -703,7 +720,7 @@
         onSave();
       }}
     >
-      {#each grouped(m) as g (g.group?.iri ?? '')}
+      {#each grouped(m).filter((g) => !groups || (g.group && groups.includes(g.group.iri ?? ''))) as g (g.group?.iri ?? '')}
         <fieldset class="group" disabled={saving}>
           {#if g.group}<legend>{g.group.label}</legend>{:else}<legend class="sr">Fields</legend
             >{/if}
@@ -726,7 +743,7 @@
         </fieldset>
       {/each}
 
-      {#if m.other.length}
+      {#if m.other.length && !groups}
         <fieldset class="group other">
           <legend>Other properties <span class="faint">not in the shapes</span></legend>
           {#if m.closed}

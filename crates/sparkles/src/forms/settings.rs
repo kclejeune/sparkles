@@ -15,6 +15,9 @@ pub enum ShapesSource {
     Graphs,
     /// shapes drafted from the data (C02), which nothing enforces
     Drafted,
+    /// the built-in SKOS shapes ([`crate::skos`]); a request's choice, which stored
+    /// settings do not take
+    Skos,
 }
 
 impl ShapesSource {
@@ -23,6 +26,7 @@ impl ShapesSource {
             ShapesSource::Guard => "guard",
             ShapesSource::Graphs => "graphs",
             ShapesSource::Drafted => "drafted",
+            ShapesSource::Skos => "skos",
         }
     }
 
@@ -31,6 +35,7 @@ impl ShapesSource {
             "guard" => ShapesSource::Guard,
             "graphs" => ShapesSource::Graphs,
             "drafted" => ShapesSource::Drafted,
+            "skos" => ShapesSource::Skos,
             _ => return None,
         })
     }
@@ -99,6 +104,11 @@ impl Default for FormSettings {
 impl FormSettings {
     /// Check the values (the C19 settings kind runs this).
     pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.shapes == ShapesSource::Skos {
+            return Err(
+                "shapes \"skos\" is chosen per request (shapes=skos), not in the settings".into(),
+            );
+        }
         if self.shapes == ShapesSource::Graphs && self.graphs.is_empty() {
             return Err("shapes \"graphs\" needs graphs: the shapes graphs to read".into());
         }

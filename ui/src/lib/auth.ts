@@ -38,6 +38,8 @@ export type Whoami = {
   server: ServerPerm[];
   /** Existing datasets the caller can see, with its level on each. */
   datasets: Record<string, Level>;
+  /** Datasets where the caller's grants cover only some graphs or endpoints. */
+  restricted?: Record<string, { graphs: boolean; triples?: boolean; endpoints?: string[] }>;
   canMintTokens: boolean;
   logout: boolean;
   tokensPolicy?: { defaultTtlSeconds: number; maxTtlSeconds: number };
@@ -64,6 +66,24 @@ export function can(who: Whoami | null | undefined, ds: string | null | undefine
   if (!ds) return false;
   if (who.server.includes('server-admin')) return true;
   return levelAtLeast(who.datasets[ds], need);
+}
+
+/**
+ * Whether the caller's grants may hide some graphs or triples of a dataset's branch from
+ * it. `/$/whoami` answers for the main branch, so another branch counts as hidden for a
+ * caller that is neither local nor a server administrator, whose grants there it cannot
+ * tell.
+ */
+export function graphRestricted(
+  who: Whoami | null | undefined,
+  ds: string | null | undefined,
+  branch: string | null = null,
+) {
+  if (!who || !who.authEnabled || !ds) return false;
+  if (who.principal.kind === 'local' || who.server.includes('server-admin')) return false;
+  if (branch && branch !== 'main') return true;
+  const r = who.restricted?.[ds];
+  return !!r && (r.graphs || !!r.triples);
 }
 
 /** Whether the caller holds a server permission (`server-admin` implies all). */

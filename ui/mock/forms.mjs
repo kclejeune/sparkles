@@ -269,6 +269,73 @@ LAYOUTS.set(`${SKOS}Collection`, {
     },
   ],
 });
+// The layouts of the built-in SKOS shapes (`shapes=skos`, crates/sparkles/src/skos/
+// shapes.ttl): the notes and documentation of every SKOS resource and the members of
+// collections, in the shapes' groups.
+const SKS = 'urn:x-sparkles:skos:';
+const NOTES = { iri: `${SKS}Notes`, label: 'Notes', order: 7 };
+const DOCS = { iri: `${SKS}Documentation`, label: 'Documentation', order: 8 };
+const MEMBERS = { iri: `${SKS}Members`, label: 'Members', order: 6 };
+const LABELS = { iri: `${SKS}Labels`, label: 'Labels', order: 1 };
+const note = (local, label, group, order, area = true) => ({
+  path: `${SKOS}${local}`,
+  label,
+  group: group.iri,
+  order,
+  widget: area ? 'textarea' : 'text',
+  ...(area ? { editor: 'http://datashapes.org/dash#TextAreaEditor' } : {}),
+  constraints: { nodeKind: `${SH}Literal` },
+});
+const SKOS_FIELDS = [
+  {
+    path: `${SKOS}prefLabel`,
+    label: 'Preferred label',
+    group: LABELS.iri,
+    order: 1,
+    widget: 'text-lang',
+    constraints: { nodeKind: `${SH}Literal`, uniqueLang: true },
+  },
+  note('note', 'Note', NOTES, 1),
+  note('definition', 'Definition', NOTES, 2),
+  note('scopeNote', 'Scope note', NOTES, 3),
+  note('example', 'Example', NOTES, 4, false),
+  note('historyNote', 'History note', DOCS, 1),
+  note('editorialNote', 'Editorial note', DOCS, 2),
+  note('changeNote', 'Change note', DOCS, 3),
+];
+const skosLayout = (shape, extra = [], groups = []) => ({
+  shape: `${SKS}${shape}`,
+  groups: [LABELS, ...groups, NOTES, DOCS],
+  fields: [...SKOS_FIELDS, ...extra],
+});
+const SKOS_LAYOUTS = new Map([
+  [`${SKOS}Concept`, skosLayout('ConceptShape')],
+  [`${SKOS}ConceptScheme`, skosLayout('ConceptSchemeShape')],
+  [
+    `${SKOS}Collection`,
+    skosLayout(
+      'CollectionShape',
+      [{ ...LAYOUTS.get(`${SKOS}Collection`).fields[0], group: MEMBERS.iri }],
+      [MEMBERS],
+    ),
+  ],
+  [
+    `${SKOS}OrderedCollection`,
+    skosLayout(
+      'OrderedCollectionShape',
+      [{ ...LAYOUTS.get(`${SKOS}Collection`).fields[1], group: MEMBERS.iri }],
+      [MEMBERS],
+    ),
+  ],
+]);
+
+/**
+ * The layouts a form reads: the built-in SKOS ones with `shapes=skos`, none for a dataset
+ * without shapes of its own (the `thes` dataset), and the mock's fixed ones otherwise.
+ */
+const layoutMap = (ds, shapes) =>
+  shapes === 'skos' ? SKOS_LAYOUTS : ds.noFormShapes ? new Map() : LAYOUTS;
+
 /** The fields of nested children, by the shapes a field's `constraints.node` names. */
 const NODE_LAYOUTS = new Map([
   [
@@ -324,9 +391,9 @@ function labelOf(store, t) {
 }
 
 /** The node shapes of the focus: the layouts of its classes. */
-function layoutsOf(store, focus) {
+function layoutsOf(store, focus, map = LAYOUTS) {
   const types = store.match(focus, named(RDF_TYPE), null, null).map((q) => q.object.value);
-  return { types, layouts: types.map((t) => LAYOUTS.get(t)).filter(Boolean) };
+  return { types, layouts: types.map((t) => map.get(t)).filter(Boolean) };
 }
 
 /** The values of a field: the objects of the focus and the predicate, in every graph. */
@@ -431,9 +498,10 @@ function nestedOf(store, fields, editable) {
 function model(ds, focusIri, opts) {
   const focus = named(focusIri);
   const store = ds.store;
+  const map = opts.map ?? LAYOUTS;
   const { types, layouts } = opts.class
-    ? { types: [opts.class], layouts: [LAYOUTS.get(opts.class)].filter(Boolean) }
-    : layoutsOf(store, focus);
+    ? { types: [opts.class], layouts: [map.get(opts.class)].filter(Boolean) }
+    : layoutsOf(store, focus, map);
   const fields = [];
   const groups = [];
   const covered = new Set([RDF_TYPE]);
@@ -494,7 +562,7 @@ function model(ds, focusIri, opts) {
     branch: ds.branchName ?? MAIN,
     editable: opts.editable,
     shapes: {
-      source: 'guard',
+      source: opts.map === SKOS_LAYOUTS ? 'skos' : 'guard',
       nodeShapes: layouts.map((l) => l.shape),
       unknownHints: [],
     },
@@ -542,9 +610,10 @@ function subtree(store, roots, gone) {
 /** The update of a change: the quads to delete and to insert, or an error. */
 function plan(ds, body) {
   const focus = named(body.focus);
+  const map = layoutMap(ds, body.shapes);
   const { layouts } = body.class
-    ? { layouts: [LAYOUTS.get(body.class)].filter(Boolean) }
-    : layoutsOf(ds.store, focus);
+    ? { layouts: [map.get(body.class)].filter(Boolean) }
+    : layoutsOf(ds.store, focus, map);
   const fields = new Map();
   for (const l of layouts) for (const f of l.fields) fields.set(idOf(f.path), f);
   const del = [];
@@ -729,7 +798,13 @@ export async function handleForms(req, res, url, seg, ctx) {
     const save = saveTarget(main, opened);
     const at = url.searchParams.get('at');
     const nested = ['true', '1'].includes(url.searchParams.get('nested') ?? '');
-    const m = model(ds, focus, { head: head(ds), editable: !at, class: cls, nested });
+    const m = model(ds, focus, {
+      head: head(ds),
+      editable: !at,
+      class: cls,
+      nested,
+      map: layoutMap(ds, url.searchParams.get('shapes')),
+    });
     send(res, 200, {
       ...m,
       save: { ...save, mainProtected: !!main.protected },

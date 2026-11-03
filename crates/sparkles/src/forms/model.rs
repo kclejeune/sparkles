@@ -779,6 +779,10 @@ impl Forms {
                 vopts.exclude_graphs.push(INFERRED.into());
                 Ok((Arc::new(shapes), vopts, None))
             }
+            ShapesSource::Skos => {
+                vopts.exclude_graphs.push(INFERRED.into());
+                Ok((crate::skos::shapes(), vopts, None))
+            }
             ShapesSource::Drafted => {
                 if types.is_empty() {
                     return Ok((empty(), vopts, Some("the resource has no type".into())));

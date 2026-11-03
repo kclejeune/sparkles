@@ -17,7 +17,7 @@ export type FormOptions = {
   /** The language labels prefer. */
   lang?: string;
   /** Where the shapes come from, overriding the dataset's setting. */
-  shapes?: 'guard' | 'graphs' | 'drafted';
+  shapes?: 'guard' | 'graphs' | 'drafted' | 'skos';
   /** The form of a new instance of this class instead of a resource's. */
   class?: string;
   /** Also read the blank-node children and the templates of new ones (`nested=true`). */
@@ -47,7 +47,7 @@ export type FormChangeBody = {
   focus?: string;
   class?: string;
   branch?: string;
-  shapes?: 'guard' | 'graphs' | 'drafted';
+  shapes?: 'guard' | 'graphs' | 'drafted' | 'skos';
   changes: FieldChange[];
   expect: Record<string, Term[]>;
   /** Changes to nested children, committed with `changes`. */

@@ -3278,6 +3278,26 @@ export interface paths {
         patch: operations["patchSettings"];
         trace?: never;
     };
+    "/$/skos/shapes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The built-in SKOS shapes
+         * @description The SHACL shapes that lay out the forms of concept schemes, concepts, collections, ordered collections and SKOS-XL labels and check the integrity conditions of the SKOS Reference: S9, S13, S14, S27, S37 and S46, with S51, S52 and S58 of SKOS-XL and the literal forms of SKOS-XL labels counted for S13 and S14. Each result's message names its condition. Forms read them with `shapes=skos`, and `POST /{ds}/shacl` and `PUT /$/validation/{ds}` take the text as shapes.
+         */
+        get: operations["getSkosShapes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/snapshots/{ds}": {
         parameters: {
             query?: never;
@@ -14751,8 +14771,8 @@ export interface operations {
                 focus?: string;
                 /** @description The class of a new instance. */
                 class?: string;
-                /** @description Where the shapes come from, when not the dataset's `forms` setting. */
-                shapes?: "guard" | "graphs" | "drafted";
+                /** @description Where the shapes come from, when not the dataset's `forms` setting. `skos` names the built-in SKOS shapes of `GET /$/skos/shapes`, which only a request can choose. */
+                shapes?: "guard" | "graphs" | "drafted" | "skos";
                 /** @description The language labels are picked in, then English, then untagged. */
                 lang?: string;
                 /** @description Also answer the blank-node children that fields declaring `sh:node` reach (`nestedNodes`) and the empty forms of new children (`templates`). A nested model past its allowances answers the flat form with `nested.refused`. */
@@ -14878,10 +14898,10 @@ export interface operations {
                         parent?: Record<string, never>;
                     }[];
                     /**
-                     * @description The shapes the form was built from, when not the setting's.
+                     * @description The shapes the form was built from, when not the setting's. `skos` names the built-in SKOS shapes.
                      * @enum {string}
                      */
-                    shapes?: "guard" | "graphs" | "drafted";
+                    shapes?: "guard" | "graphs" | "drafted" | "skos";
                 };
             };
         };
@@ -14972,10 +14992,10 @@ export interface operations {
                         parent?: Record<string, never>;
                     }[];
                     /**
-                     * @description The shapes the form was built from, when not the setting's.
+                     * @description The shapes the form was built from, when not the setting's. `skos` names the built-in SKOS shapes.
                      * @enum {string}
                      */
-                    shapes?: "guard" | "graphs" | "drafted";
+                    shapes?: "guard" | "graphs" | "drafted" | "skos";
                 };
             };
         };
@@ -20265,6 +20285,29 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             412: components["responses"]["PreconditionFailed"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getSkosShapes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The shapes. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/turtle": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             default: components["responses"]["Error"];
         };
     };

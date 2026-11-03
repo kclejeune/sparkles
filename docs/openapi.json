@@ -30626,14 +30626,15 @@
             }
           },
           {
-            "description": "Where the shapes come from, when not the dataset's `forms` setting.",
+            "description": "Where the shapes come from, when not the dataset's `forms` setting. `skos` names the built-in SKOS shapes of `GET /$/skos/shapes`, which only a request can choose.",
             "in": "query",
             "name": "shapes",
             "schema": {
               "enum": [
                 "guard",
                 "graphs",
-                "drafted"
+                "drafted",
+                "skos"
               ],
               "type": "string"
             }
@@ -30974,11 +30975,12 @@
                     "type": "array"
                   },
                   "shapes": {
-                    "description": "The shapes the form was built from, when not the setting's.",
+                    "description": "The shapes the form was built from, when not the setting's. `skos` names the built-in SKOS shapes.",
                     "enum": [
                       "guard",
                       "graphs",
-                      "drafted"
+                      "drafted",
+                      "skos"
                     ],
                     "type": "string"
                   }
@@ -31239,11 +31241,12 @@
                     "type": "array"
                   },
                   "shapes": {
-                    "description": "The shapes the form was built from, when not the setting's.",
+                    "description": "The shapes the form was built from, when not the setting's. `skos` names the built-in SKOS shapes.",
                     "enum": [
                       "guard",
                       "graphs",
-                      "drafted"
+                      "drafted",
+                      "skos"
                     ],
                     "type": "string"
                   }
@@ -42847,6 +42850,59 @@
           "Datasets"
         ],
         "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/skos/shapes": {
+      "get": {
+        "description": "The SHACL shapes that lay out the forms of concept schemes, concepts, collections, ordered collections and SKOS-XL labels and check the integrity conditions of the SKOS Reference: S9, S13, S14, S27, S37 and S46, with S51, S52 and S58 of SKOS-XL and the literal forms of SKOS-XL labels counted for S13 and S14. Each result's message names its condition. Forms read them with `shapes=skos`, and `POST /{ds}/shacl` and `PUT /$/validation/{ds}` take the text as shapes.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#skos-shapes"
+        },
+        "operationId": "getSkosShapes",
+        "responses": {
+          "200": {
+            "content": {
+              "text/turtle": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The shapes."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "The built-in SKOS shapes",
+        "tags": [
+          "Validation"
+        ],
+        "x-sparkles-permission": "any caller"
       }
     },
     "/$/snapshots/{ds}": {

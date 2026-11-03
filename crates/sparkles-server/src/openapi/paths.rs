@@ -937,7 +937,7 @@ fn forms(p: &mut Paths) {
             "focus": { "type": "string", "description": "The IRI of the resource. Give either `focus` or `class`." },
             "class": { "type": "string", "description": "The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`." },
             "branch": { "type": "string", "description": "The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch." },
-            "shapes": { "type": "string", "enum": ["guard", "graphs", "drafted"], "description": "The shapes the form was built from, when not the setting's." },
+            "shapes": { "type": "string", "enum": ["guard", "graphs", "drafted", "skos"], "description": "The shapes the form was built from, when not the setting's. `skos` names the built-in SKOS shapes." },
             "changes": field_changes.clone(),
             "expect": { "type": "object", "additionalProperties": { "type": "array", "items": term.clone() }, "description": "The values the form loaded, by field id, for every changed field, and for a list field the members of its list in order." },
             "nested": { "type": "array", "description": "Changes to nested blank-node children, committed atomically with `changes`. Each entry names its `node`, the `parent` it hangs from (absent for the root, else another entry's node) and the parent's `field`. A stored child must be a visible value of that field now, and every node between it and the root needs an entry.", "items": { "type": "object", "required": ["node", "field"], "additionalProperties": false, "properties": {
@@ -956,7 +956,7 @@ fn forms(p: &mut Paths) {
             .see("editing-forms")
             .query("focus", s(), "The IRI of the resource. Give either `focus` or `class`.")
             .query("class", s(), "The class of a new instance.")
-            .query("shapes", json!({ "type": "string", "enum": ["guard", "graphs", "drafted"] }), "Where the shapes come from, when not the dataset's `forms` setting.")
+            .query("shapes", json!({ "type": "string", "enum": ["guard", "graphs", "drafted", "skos"] }), "Where the shapes come from, when not the dataset's `forms` setting. `skos` names the built-in SKOS shapes of `GET /$/skos/shapes`, which only a request can choose.")
             .query("lang", s(), "The language labels are picked in, then English, then untagged.")
             .query("nested", json!({ "type": "boolean" }), "Also answer the blank-node children that fields declaring `sh:node` reach (`nestedNodes`) and the empty forms of new children (`templates`). A nested model past its allowances answers the flat form with `nested.refused`.")
             .params(&["branch", "at", "timeout"])
@@ -988,6 +988,12 @@ fn forms(p: &mut Paths) {
                 } } })),
             )
             .errors(&[400, 403, 404, 408, 501]),
+    );
+    p.add(
+        op(GET, "/$/skos/shapes", "getSkosShapes", "Validation", "The built-in SKOS shapes")
+            .doc("The SHACL shapes that lay out the forms of concept schemes, concepts, collections, ordered collections and SKOS-XL labels and check the integrity conditions of the SKOS Reference: S9, S13, S14, S27, S37 and S46, with S51, S52 and S58 of SKOS-XL and the literal forms of SKOS-XL labels counted for S13 and S14. Each result's message names its condition. Forms read them with `shapes=skos`, and `POST /{ds}/shacl` and `PUT /$/validation/{ds}` take the text as shapes.")
+            .see("skos-shapes")
+            .resp("200", "The shapes.", Some(json!({ "text/turtle": text() }))),
     );
     p.add(
         op(POST, "/$/forms/{ds}/check", "checkForm", "Validation", "Check a form's changes")

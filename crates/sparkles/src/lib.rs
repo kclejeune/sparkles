@@ -28,6 +28,7 @@ pub mod querybuilder;
 pub mod reasoning;
 pub mod request;
 pub mod shared_entity;
+pub mod skos;
 pub mod stats;
 pub mod syntax;
 pub mod terms;

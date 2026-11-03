@@ -1102,6 +1102,13 @@ function classify(o) {
 
 const etag = (ds, seq) => `W/"${ds.branchId ?? ds.id}:${seq}:owl"`;
 
+/** The `Sparkles-Commit-Message` of a request, decoded from `utf-8''` percent-encoding. */
+function commitMessageOf(req) {
+  const raw = req.headers['sparkles-commit-message'];
+  if (!raw) return undefined;
+  return /^utf-8''/i.test(raw) ? decodeURIComponent(raw.slice(7)) : raw;
+}
+
 function quadJson(op) {
   return (q) => ({
     op,
@@ -1446,7 +1453,7 @@ export async function handleOntology(req, res, url, seg, ctx) {
     });
     return true;
   }
-  const message = req.headers['sparkles-commit-message'] || p.get('message') || undefined;
+  const message = commitMessageOf(req) || p.get('message') || undefined;
   const receipt = commitWrite(ds, 'update', before, { message });
   const after = quadSet(ds);
   let inserted = 0;

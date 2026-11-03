@@ -146,9 +146,13 @@ tables, graphs and plans. [Explore](visualization/README.md#explore),
 connected graph inspection and editing. The
 [ontology editor](visualization/README.md#ontology-editor) edits OWL classes, properties,
 individuals and annotations as previewed commits beside the asserted and inferred class
-trees.
+trees. The [thesaurus editor](visualization/README.md#thesaurus-editor) edits SKOS concept
+schemes, concepts, collections and SKOS-XL labels in a concept tree, and checks them
+against the integrity conditions of the SKOS Reference.
 
 ![The ontology editor with the class tree and the frame of Professor](images/ontology-editor.png)
+
+![The thesaurus editor with the concept tree of an animals scheme and the labels of Whales](images/thesaurus-editor.png)
 
 [Editing forms](visualization/README.md#nested-form-read-models) generated from SHACL
 shapes edit a resource with its nested blank-node children, ordered lists and value
@@ -221,7 +225,8 @@ implementation status.
 | [Schema discovery](reasoning/README.md#reasoning-validation-and-schema) | Complete within the documented discovery scope. | Class and predicate profiles, schema diffs and constrained shape drafts are available. Drafts retain the limits in the compatibility boundaries. |
 | [OWL 2 ontology API](reasoning/README.md#owl-2-ontologies) | Partially complete. | The axiom model, RDF mappings, profile checks and axiom diffs are available in Rust, Python, Node.js, the JVM through `jena-ontapi`, HTTP, MCP and the CLI. Reads with inferences are available in all of them except MCP and the CLI. Entity accessors, typed axiom constructors and the literal rules of OWL 2 DL are included. A read budget, fetched imports, and inferred reads and entity reports over MCP and the CLI remain in items 539, 559, 565 and 578. |
 | [OWL 2 EL classification](reasoning/README.md#owl-2-ontologies) | Partially complete. | An incremental, concurrent EL classifier computes the inferred class hierarchy and the unsatisfiable classes in Rust, Python, Node.js, the JVM, HTTP and the CLI, and can write the taxonomy to a graph with provenance. Its taxonomies equal ELK's on GO, ChEBI lite and the ORE 2015 EL sample. Complete reasoning with individuals and datatypes, an MCP tool, reads with the classification, durable runs and lower memory with parallel indexing remain in items 586 to 590 and 592. |
-| [Ontology editor](visualization/README.md#ontology-editor) | Partially complete. | The web UI edits classes, properties, individuals, annotations and the ontology header as previewed commits, on session branches with undo, beside the asserted and inferred class trees. The SKOS editor, DL Query and the editable schema diagram remain in item 457, and large-ontology trees, Manchester input, inferred property trees, a server-side IRI policy and branch write grants in items 607 to 611. |
+| [Ontology editor](visualization/README.md#ontology-editor) | Partially complete. | The web UI edits classes, properties, individuals, annotations and the ontology header as previewed commits, on session branches with undo, beside the asserted and inferred class trees. DL Query and the editable schema diagram remain in item 457, and large-ontology trees, Manchester input, inferred property trees, a server-side IRI policy and branch write grants in items 607 to 611. |
+| [Thesaurus editor](visualization/README.md#thesaurus-editor) | Complete. | The web UI edits SKOS concept schemes, concepts, collections, multilingual and SKOS-XL labels, hierarchy and mapping links as previewed commits, with drag to re-parent. Built-in SKOS shapes check the SKOS Reference's integrity conditions and can guard writes. Larger trees and search, foreign mapping labels, label relations, combined guards and graph-scoped forms are items 638 to 642. |
 
 ### Server and security
 
