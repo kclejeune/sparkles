@@ -620,10 +620,21 @@ lists each request's mode, `C` for a cursor and `E` for eager.
 | cf033f12 | 1.19 | `CEEEEE` four times and `CECCCC` once |
 | 6b8f86e6 | 1.20 | `CECECC` five times |
 
-The 454 switches `set_remainders`, `node_sets`, `key_backoff` and `characteristic_sets`
-turned off left the first run of cf033f12 as slow, and a store without the `correlations`
-member did not show it. Counted with perf, the first request of the screen's binaries ran
-11.75 and 11.79 million instructions. Item 708 looks for that cold cost.
+With `SPARKLES_DISABLE_OPTIMIZATIONS` set to the 454 switches `set_remainders`,
+`node_sets`, `key_backoff` and `characteristic_sets`, the first cursor run took a median
+of 1.18 ms on cf033f12 and 0.98 ms on 40ca3535 over eight fresh servers each, in
+[switches-off.txt](runs/2026-11-03-mode-history-atlas-6b8f86e6/switches-off.txt). With
+each build serving a copy of the other's store, 125edd41 over the store of cf033f12, which
+holds the `correlations` member, took 0.98 ms and cf033f12 over the store of 125edd41,
+which lacks it, took 1.02 ms, against 0.98 and 1.18 ms over their own stores, in
+[cross-stores.txt](runs/2026-11-03-mode-history-atlas-6b8f86e6/cross-stores.txt). The
+stores' index files are identical, and only `stats.json`, `meta.json` and `commit.json`
+differ. The cost therefore needs both the code of item 454 and its statistics in the
+store. With perf attached to a ready server, which changes the timing itself, the first
+request ran 11.75 million user-space instructions on 125edd41 and 11.72 to 11.79 million on
+cf033f12 in three servers each, with no more user-space cycles, as the files under
+[perf](runs/2026-11-03-mode-history-atlas-6b8f86e6/perf/rec1.sh.txt) show. Item 708 looks
+for that cold cost.
 
 The interleaved A/Bs ran 8 rounds of A,B,B,A with 3 warm-ups and 40 timed requests per
 query and server process, once with the candidate second and once with it first, and give

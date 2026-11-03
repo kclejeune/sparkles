@@ -1,0 +1,13 @@
+# started on Tue Nov  3 18:33:56 2026
+
+
+ Performance counter stats for process id '364949':
+
+     <not counted>      cpu_atom/instructions/u                                                 (0.00%)
+        11,721,815      cpu_core/instructions/u                                               
+     <not counted>      cpu_atom/cycles/u                                                       (0.00%)
+         4,756,717      cpu_core/cycles/u                                                     
+                44      page-faults:u                                                         
+
+       0.541783235 seconds time elapsed
+
