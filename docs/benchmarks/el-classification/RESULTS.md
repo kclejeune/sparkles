@@ -508,30 +508,72 @@ milliseconds of the base.
 
 GO's `InverseObjectProperties(part_of has_part)` takes the Horn rules of roadmap item
 603, which give GO's taxonomy the 14 subsumptions that Konclude entails. An interleaved
-A/B on forge ran the build item 603 started from, commit 783acbde, and commit 8966216c,
-three rounds of five classifications on one and eight threads with the bench and heavy
-locks held. GO takes 17 to 18% longer, since 2,577 contexts of conjunctions derive their
-members' conclusions again, 3.5 million conclusions against 2.8 million, and its peak
-resident set rises from 195 to 248 MiB on one thread and from 288 to 331 MiB on eight.
-This slowdown, about 50 MiB of peak resident set and 17 to 18% of time on GO, is
-accepted as the tradeoff for GO's complete taxonomy, and roadmap item 693 follows
-it. `--reasoner ELK` and `Limits::el_only` classify by the EL rules alone, with the
-base's time and taxonomy. ChEBI lite's one `InverseObjectProperties`
-axiom fires no Horn rule, so it runs the EL rules, with the base's taxonomy and time and
-a peak resident set 16 to 26 MiB higher.
+A/B on forge ran three sides, each three rounds of five classifications on one and eight
+threads with the bench and heavy locks held. The base is commit 17d04145 with the Horn
+rules as item 603 left them, the EL side is the same build with `--el-only`, and the
+current rules of item 693 are commit 320d4708. The table gives the median over the rounds.
 
-| Ontology | Threads | Base ms | Item 603 ms | Ratio |
-|---|---:|---:|---:|---:|
-| GO | 1 | 278 | 325 | 1.17 |
-| | 8 | 81 | 95 | 1.18 |
-| ChEBI lite | 1 | 1,048 | 1,044 | 1.00 |
-| | 8 | 464 | 458 | 0.99 |
+| Ontology | Threads | Base Horn ms | EL rules ms | Current ms | Current / base |
+|---|---:|---:|---:|---:|---:|
+| GO | 1 | 320 | 274 | 306 | 0.96 |
+| | 8 | 87 | 92 | 91 | 1.05 |
+| ChEBI lite | 1 | 1,040 | 1,044 | 1,052 | 1.01 |
+| | 8 | 440 | 421 | 468 | 1.06 |
+| `ore_ont_9663` | 1 | 20,360 | 771 | 3,958 | 0.19 |
+| | 8 | 1,475 | 172 | 894 | 0.61 |
+| `ore_ont_14817` | 1 | 9,795 | 677 | 2,159 | 0.22 |
+| | 8 | 1,185 | 187 | 463 | 0.39 |
+| `ore_ont_9855` | 1 | 4,370 | 66 | 1,521 | 0.35 |
+| | 8 | 919 | 36 | 324 | 0.35 |
+| `ore_ont_3836` | 1 | 558 | 560 | 596 | 1.07 |
+| | 8 | 216 | 221 | 218 | 1.01 |
+| `ore_ont_13482` | 1 | 905 | 899 | 922 | 1.02 |
+| | 8 | 311 | 308 | 307 | 0.99 |
+
+GO classifies 4% faster than with the base's Horn rules on one thread and 12% slower
+than with the EL rules alone. It derives 2.9 million conclusions against 3.5 million for
+the base's Horn rules and 2.8 million for the EL rules, and its peak resident set on one
+thread is 223 MiB against 248 and 196 MiB. On eight threads the three sides differ by
+less than the spread of their rounds, which ran from 84 to 108 ms. GO's taxonomy is the
+base's with the Horn rules on both thread counts. The remaining cost on GO is accepted
+as the tradeoff for its complete taxonomy, and roadmap item 693 follows it.
+`--reasoner ELK` and `Limits::el_only` classify by the EL rules alone, with the EL
+side's time and taxonomy.
+
+The base's Horn rules pass their memory budget on `ore_ont_9663` and `ore_ont_14817`,
+two Uberon-based files of the ORE 2015 DL sample, and classify again by the EL rules.
+The current rules finish both with the Horn rules. `ore_ont_9663` takes 4.0 s with a
+peak resident set of 1.0 GiB on one thread and 0.89 s with 1.4 GiB on eight, and
+`ore_ont_14817` takes 2.2 s with 0.7 GiB and 0.46 s with 1.0 GiB. Konclude 0.7.0 took
+8.9 to 9.7 s and 3.5 to 4.2 GB on them on four threads on the laptop in the development
+set comparison of [F24](../../specs/F24-owl-classification/SPEC.md#the-horn-rules). The
+current taxonomies miss 33 and 27 of Konclude's subsumptions, which follow from axioms
+that are not Horn and stay left out, and give none that Konclude does not entail. Both
+files still cost several times the EL rules' time, since their conjunction contexts
+derive 52 million conclusions on one thread where the EL rules derive 18.5 million, and
+item 693 follows this too. `ore_ont_9855`, the slowest Horn file of the development
+set, classifies 2.9 times as fast as with the base's rules on one and eight threads,
+with the same taxonomy.
+
+The OWL 2 EL files and ChEBI lite take the EL rules on every side and give the same
+taxonomies. `ore_ont_3836`'s index stage takes 434 ms against 398 ms on one thread,
+which makes the classification 7% slower, and `ore_ont_13482` is 2% slower. The EL
+rules' code did not change, and the builds without and with chain selection, which EL
+runs never reach, execute the same number of instructions on `ore_ont_3836` on `atlas`,
+within 0.2%. A build of `sparkles-owl` with one codegen unit classifies `ore_ont_3836`
+on `atlas` in 543 ms with the current rules and 531 ms without chain selection, against
+600 and 559 ms for the same commits built by default, so the difference comes from how
+the compiler partitions the crate. Roadmap item NEW-ITEM-3 follows it. ChEBI lite's
+eight-thread rounds spread from 411 to 538 ms on every side, which roadmap item 683
+follows.
 
 ## Records
 
-The [record of item 603's A/B](runs/2026-11-03-horn-forge-8966216c/record.json) holds
-every classification time of both builds, the stage times, the conjunction contexts, the
-taxonomy hashes and the script that ran.
+The [record of item 693's A/B](runs/2026-11-03-horn-cost-forge-320d4708/record.json)
+holds every classification time of the three sides, the stage times, the conjunction
+contexts, the taxonomy hashes and the script that ran. The [record of item 603's
+A/B](runs/2026-11-03-horn-forge-8966216c/record.json) holds the same for the Horn rules
+as item 603 left them, against the build that item started from.
 
 The [materialize record](runs/2026-11-03-materialize-forge-81851812/record.json) holds
 every round of `materialize`, `reason` and the chain on GO and ChEBI lite, the binary

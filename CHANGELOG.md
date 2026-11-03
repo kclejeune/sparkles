@@ -192,8 +192,9 @@ and irreflexive properties and transitive properties and chains through automata
 creates contexts for the conjunctions that universal and at-most restrictions need.
 `Stats` reports the tier of rules a run needed, the axioms outside OWL 2 EL it took and
 the conjunctions it created. GO's taxonomy now has the 14 subsumptions that its inverse
-properties entail, as Konclude's does, and GO classifies 17 to 18% slower on the
-benchmark host. `sparkles ontology reason` and `reduce` with `--reasoner ELK`, and the
+properties entail, as Konclude's does, and GO classifies 12% slower on one thread on the
+benchmark host than with the EL rules alone. `sparkles ontology reason` and `reduce` with
+`--reasoner ELK`, and the
 library's `ClassifyRequest::el_only` and `Limits::el_only`, classify by the OWL 2 EL
 rules alone, as ELK does, so the ROBOT-compatible outputs equal ROBOT's with ELK. Without
 `--reasoner` they take the Horn axioms too. The functional-syntax reader can pass over SWRL rules and count them
@@ -201,7 +202,7 @@ with `ofn_read::Options::skip_rules`, and refuses them otherwise as before. A ru
 the Horn rules has a memory budget of 64 times its index and axioms, at least 1 GiB, and
 one that passes it classifies again by the EL rules alone and sets
 `Stats::horn_over_budget`. Two Uberon-based ORE 2015 ontologies that ran out of memory
-now classify in 4.2 s with the EL answer.
+now classify with the Horn rules in 4.0 and 2.2 s on one thread on the benchmark host.
 
 The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
 `dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and
@@ -286,6 +287,21 @@ view's rows against its query and records a forge baseline.
 CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
+
+A classification with the Horn rules costs less (roadmap item 693). A run composes only
+the property chains that a negative existential restriction kept on composed links
+needs, and unfolds every other such restriction over a property that chains reach by its
+automaton, so that conjunction contexts no longer compose Uberon's parthood chains
+again. A context merges every successor that an at-most restriction counts in one step,
+and the rule for a successor passes over fillers that no rule reads. On the benchmark
+host GO classifies in 306 ms on one thread against 320 ms before and 274 ms with the EL
+rules alone, with a peak resident set of 223 MiB against 248 MiB. ore_ont_9663 and
+ore_ont_14817 of the ORE 2015 DL sample finish with the Horn rules in 4.0 and 2.2 s on
+one thread, where they passed the memory budget after 20.4 and 9.8 s and fell back to
+the EL rules, and ore_ont_9855 classifies in 1.5 s against 4.4 s. The taxonomies
+measured are unchanged except those of the two Uberon files, which gain the subsumptions
+that the Horn rules give. The EL rules classify `ore_ont_3836` 7% slower on one thread,
+from code layout in the index stage, which roadmap item NEW-ITEM-3 follows.
 
 `sparkles ontology classify FILE` and `sparkles ontology check FILE` read a file of one
 graph into memory without a store and give the answers that a store of the loaded file
@@ -1400,6 +1416,18 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 (X14, item 478).
 
 ### Fixed
+
+A classification with the Horn rules no longer misses subsumptions that a property chain
+over an inverse gives through its mirror image (roadmap item 693). The rules of item 603
+composed each told chain `r_1 ∘ … ∘ r_n ⊑ s` but not `r_n⁻ ∘ … ∘ r_1⁻ ⊑ s⁻`, which the
+chain entails. With `r0 ∘ r2⁻ ⊑ r0` and `r2` the inverse of `r0`, for example, `r2` is
+transitive only through that mirror image, and `A ⊑ ∃r2.B`, `B ≡ ∃r2.C` did not give
+`A ⊑ B`. The inputs affected were ontologies the Horn rules take with a chain that names
+an inverse, a three-operand chain over inverses, or a chain whose mirror image's result
+sits under the inverse of a superproperty. A differential test found the case. It
+compares random small Horn ontologies with chains, inverses, transitivity and property
+hierarchies between two builds and shrinks each difference to a few axioms. Runs by the
+OWL 2 EL rules alone are unchanged.
 
 `check_query` no longer fails with `budget-memory` when a draft uses a predicate that no
 instance of its typed variable's class has. On the DBpedia 2022.12.01 database the
