@@ -20,6 +20,10 @@ WORK=$(cd "${1:?usage: rss-probe.sh WORKDIR [NAME]}" && pwd)
 NAME=${2:-sparkles}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
+# A binary in the managed target runs as a copy, which collection cannot remove.
+# shellcheck source=scripts/bench-tools.sh
+source "$ROOT/scripts/bench-tools.sh"
+SPARKLES=$(stage_binary "$SPARKLES")
 PORT=${PROBE_PORT:-3961}
 cd "$WORK"
 mkdir -p results
