@@ -508,6 +508,16 @@ fn the_top_and_bottom_properties() {
         sub(c("A"), c("D")),
     ]);
     assert!(out.taxonomy.is_subclass(&c("A"), &c("X")));
+    // every property is under the top property, so saying so is used in full
+    let mut k = Classifier::of(&[
+        ax(AxiomKind::SubObjectPropertyOf(
+            SubObjectPropertyExpression::Expression(ope("r")),
+            top.clone(),
+        )),
+        sub(c("A"), some("r", c("B"))),
+    ]);
+    k.classify(&Limits::default()).unwrap();
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
     // a chain through the top property is used in part
     let mut k = Classifier::of(&[ax(AxiomKind::SubObjectPropertyOf(
         SubObjectPropertyExpression::Chain(vec![top, ope("r")]),
@@ -1669,5 +1679,99 @@ proptest! {
             prop_assert_eq!(sat.excluded().to_vec(), k.excluded());
             before = now;
         }
+    }
+}
+
+#[test]
+fn a_number_past_128_bits_is_not_zero() {
+    let huge = Literal::typed("170141183460469231731687303715884105728.0", &xsd("decimal"));
+    let mut k = Classifier::of(&[
+        sub(c("A"), dvalue("d", huge)),
+        sub(dvalue("d", lit("0", "decimal")), c("B")),
+    ]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.taxonomy.is_subclass(&c("A"), &c("B")));
+    assert_eq!(partial_reasons(&k).values().sum::<usize>(), 1);
+    // zero is a number like any other
+    let out = run(&[
+        sub(c("A"), dvalue("d", lit("0.00", "decimal"))),
+        sub(dvalue("d", lit("0", "integer")), c("B")),
+    ]);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+}
+
+#[test]
+fn empty_universal_properties_are_inconsistent() {
+    let out = run(&[ax(AxiomKind::SubObjectPropertyOf(
+        SubObjectPropertyExpression::Expression(ObjectPropertyExpression::from(
+            ObjectProperty::top(),
+        )),
+        ObjectPropertyExpression::from(ObjectProperty::bottom()),
+    ))]);
+    assert!(!out.consistent);
+    let out = run(&[ax(AxiomKind::SubDataPropertyOf(
+        DataProperty::top(),
+        DataProperty::bottom(),
+    ))]);
+    assert!(!out.consistent);
+}
+
+#[test]
+fn keys_on_universal_properties_hold_for_every_pair() {
+    let different = ax(AxiomKind::DifferentIndividuals(
+        [ind("a"), ind("b")].into_iter().collect(),
+    ));
+    let by_object = run(&[
+        ax(AxiomKind::HasKey(
+            ce("C"),
+            [ObjectPropertyExpression::from(ObjectProperty::top())].into(),
+            Default::default(),
+        )),
+        is_a("C", "a"),
+        is_a("C", "b"),
+        different.clone(),
+    ]);
+    assert!(!by_object.consistent);
+    let by_data = run(&[
+        ax(AxiomKind::HasKey(
+            ce("C"),
+            Default::default(),
+            [DataProperty::top()].into(),
+        )),
+        is_a("C", "a"),
+        is_a("C", "b"),
+        different,
+    ]);
+    assert!(!by_data.consistent);
+}
+
+#[test]
+fn worlds_count_against_the_memory_limit() {
+    // A's world makes every C_i real, so the individual a, which each C_i is, takes every
+    // D_i and gives it back to every C_i: the world holds the square of n conclusions,
+    // where the global saturation holds a few per class
+    let n = 400;
+    let mut axioms = Vec::new();
+    for i in 0..n {
+        let ci = format!("C{i}");
+        axioms.push(sub(c("A"), some("r", c(&ci))));
+        axioms.push(sub(c(&ci), one("a")));
+        axioms.push(sub(c(&ci), c(&format!("D{i}"))));
+    }
+    let full = Classifier::of(&axioms)
+        .classify(&Limits::default())
+        .unwrap();
+    assert!(full.consistent);
+    assert!(!full.taxonomy.is_subclass(&c("C0"), &c("D7")));
+    // the peak counts the world's copies, which are gone once it ends
+    assert!(full.stats.peak_memory > full.stats.memory + 1_000_000);
+    let limit = Limits {
+        threads: 1,
+        max_memory: Some(full.stats.memory + 1_000_000),
+        ..Limits::default()
+    };
+    match Classifier::of(&axioms).classify(&limit).unwrap_err() {
+        Error::Memory { limit, used } => assert!(used > limit, "{used} <= {limit}"),
+        e => panic!("{e:?}"),
     }
 }

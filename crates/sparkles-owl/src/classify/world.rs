@@ -24,7 +24,7 @@
 
 use super::data::Value;
 use super::index::{BOTTOM, Ex, Index, Node, Role};
-use super::saturate::{Concl, Contexts, Sink, State, apply, init};
+use super::saturate::{CONCLUSION_BYTES, CONTEXT_BYTES, Concl, Contexts, Sink, State, apply, init};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Reads the state of a context in place: the global one, or a world's copy.
@@ -164,7 +164,12 @@ pub fn key_merges(ix: &Index, view: &dyn View) -> Vec<(Ex, Ex)> {
                 if subs[&a].contains(&b) {
                     continue;
                 }
+                // a universal role links every pair, so the two share every named
+                // individual and every literal by it
                 let objects = key.objects.iter().all(|&p| {
+                    if ix.is_universal(p) {
+                        return true;
+                    }
                     let of = |i: Ex| -> FxHashSet<Ex> {
                         obj.get(&i)
                             .into_iter()
@@ -177,6 +182,9 @@ pub fn key_merges(ix: &Index, view: &dyn View) -> Vec<(Ex, Ex)> {
                     va.iter().any(|z| vb.contains(z))
                 });
                 let data = key.data.iter().all(|&p| {
+                    if ix.is_universal(p) {
+                        return true;
+                    }
                     let of = |i: Ex| -> Vec<&Value> {
                         dat.get(&i)
                             .into_iter()
@@ -299,7 +307,22 @@ pub struct World<'a> {
     pending: Vec<(Ex, Concl)>,
     /// the facts of universal roles that hold in this world alone
     universal: Vec<Ex>,
+    /// told each change of the bytes the world holds: false stops it
+    bound: &'a (dyn Fn(isize) -> bool + Sync),
+    /// the bytes of the copies, the slots and the stored conclusions
+    held: usize,
+    /// the messages waiting in the slots' to-do lists
+    waiting: usize,
+    /// the bytes last told to `bound`
+    reported: usize,
+    applied: usize,
+    halted: bool,
 }
+
+/// The conclusions a world applies between checks of its bound.
+const CHECK_EVERY: usize = 1024;
+/// The bytes counted for a slot.
+const SLOT_BYTES: usize = 64;
 
 struct WorldSink<'b> {
     me: Ex,
@@ -346,8 +369,6 @@ impl View for World<'_> {
 pub struct Found {
     pub bottom: bool,
     pub subs: Vec<Ex>,
-    /// the contexts the world copied
-    pub copied: usize,
 }
 
 impl<'a> World<'a> {
@@ -356,6 +377,7 @@ impl<'a> World<'a> {
         ctx: &'a Contexts,
         global_universal: &'a [Ex],
         global_real: &'a [Ex],
+        bound: &'a (dyn Fn(isize) -> bool + Sync),
     ) -> World<'a> {
         World {
             ix,
@@ -366,6 +388,24 @@ impl<'a> World<'a> {
             queue: Vec::new(),
             pending: Vec::new(),
             universal: Vec::new(),
+            bound,
+            held: 0,
+            waiting: 0,
+            reported: 0,
+            applied: 0,
+            halted: false,
+        }
+    }
+
+    /// Tells the bound what the world holds now, its waiting messages included, and
+    /// stops the world when the bound refuses.
+    fn checkpoint(&mut self) {
+        let used =
+            self.held + (self.waiting + self.pending.len()) * std::mem::size_of::<(Ex, Concl)>();
+        let delta = used as isize - self.reported as isize;
+        self.reported = used;
+        if !(self.bound)(delta) {
+            self.halted = true;
         }
     }
 
@@ -385,6 +425,7 @@ impl<'a> World<'a> {
     fn deliver_one(&mut self, to: Ex, c: Concl) {
         if !self.slots.contains_key(&to) {
             let real = self.global_real(to);
+            self.held += SLOT_BYTES;
             self.slots.insert(
                 to,
                 Slot {
@@ -407,6 +448,7 @@ impl<'a> World<'a> {
         }
         let slot = self.slots.get_mut(&to).expect("slot");
         slot.todo.push(c);
+        self.waiting += 1;
         if slot.real && !slot.queued {
             slot.queued = true;
             self.queue.push(to);
@@ -424,6 +466,7 @@ impl<'a> World<'a> {
         slot.real = true;
         if slot.st.is_some() {
             slot.todo.push(Concl::Real);
+            self.waiting += 1;
         } else {
             let ix = self.ix;
             let mut init = false;
@@ -447,6 +490,7 @@ impl<'a> World<'a> {
             if !init {
                 // a context that the global saturation never reached
                 slot.todo.push(Concl::Real);
+                self.waiting += 1;
             }
             self.pending.extend(out);
         }
@@ -464,10 +508,14 @@ impl<'a> World<'a> {
     fn drain(&mut self) {
         self.deliver();
         while let Some(e) = self.queue.pop() {
+            if self.halted {
+                return;
+            }
             let ix = self.ix;
             let slot = self.slots.get_mut(&e).expect("slot");
             slot.queued = false;
             let mut todo = std::mem::take(&mut slot.todo);
+            self.waiting -= todo.len();
             let real = slot.real;
             let mut st = match slot.st.take() {
                 Some(st) => st,
@@ -477,6 +525,8 @@ impl<'a> World<'a> {
                     let mut st = copy.unwrap_or_default();
                     // the world made it real from the global state already
                     st.real |= real && st.init;
+                    self.held += CONTEXT_BYTES + st.bytes();
+                    self.checkpoint();
                     st
                 }
             };
@@ -500,7 +550,16 @@ impl<'a> World<'a> {
                 todo.reverse();
                 sink.local.append(&mut todo);
                 while let Some(c) = sink.local.pop() {
-                    apply(ix, e, &mut st, c, &mut sink);
+                    if apply(ix, e, &mut st, c, &mut sink) {
+                        self.held += CONCLUSION_BYTES;
+                    }
+                    self.applied += 1;
+                    if self.applied.is_multiple_of(CHECK_EVERY) {
+                        self.checkpoint();
+                        if self.halted {
+                            break;
+                        }
+                    }
                 }
             }
             let slot = self.slots.get_mut(&e).expect("slot");
@@ -513,10 +572,15 @@ impl<'a> World<'a> {
     /// Classifies `class` in its world: the class has an instance, and the world
     /// saturates what follows, with the facts of universal roles and the merges of keys
     /// that hold there.
-    pub fn classify(mut self, class: Ex) -> Found {
+    pub fn classify(mut self, class: Ex) -> Option<Found> {
         self.pending.push((class, Concl::Real));
         loop {
             self.drain();
+            self.checkpoint();
+            if self.halted {
+                (self.bound)(-(self.reported as isize));
+                return None;
+            }
             let known: Vec<Ex> = self
                 .global_universal
                 .iter()
@@ -555,12 +619,13 @@ impl<'a> World<'a> {
         let mut found = Found {
             bottom: clash,
             subs: Vec::new(),
-            copied: self.slots.values().filter(|s| s.st.is_some()).count(),
         };
         self.with(class, &mut |st, _| {
             found.bottom |= st.bottom;
             found.subs = st.subs.iter().copied().collect();
         });
-        found
+        // the world's copies go when it does
+        (self.bound)(-(self.reported as isize));
+        Some(found)
     }
 }

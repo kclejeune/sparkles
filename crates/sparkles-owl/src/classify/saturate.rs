@@ -304,7 +304,7 @@ const CHECK_EVERY: usize = 4096;
 /// The messages a worker sends between checks of the bounds.
 const SEND_EVERY: usize = 16_384;
 /// The bytes counted for each stored conclusion.
-const CONCLUSION_BYTES: usize = 16;
+pub const CONCLUSION_BYTES: usize = 16;
 /// The roots a worker takes from the shared list at a time.
 const ROOT_CHUNK: usize = 64;
 /// The roots a worker activates before the contexts they woke.

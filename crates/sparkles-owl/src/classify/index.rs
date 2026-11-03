@@ -863,6 +863,15 @@ pub struct Index {
     /// whether a link to an individual can close a loop that a negative `ObjectHasSelf`
     /// reads
     pub nominal_selfs: bool,
+    /// the top object and data roles, when the axioms use them
+    pub tops: [Option<Role>; 2],
+}
+
+impl Index {
+    /// Whether `r` is above a top role, so that it relates every pair of elements.
+    pub fn is_universal(&self, r: Role) -> bool {
+        self.tops.iter().flatten().any(|&t| self.roles.sub(t, r))
+    }
 }
 
 const NO_HEAD: Head = Head {
@@ -1035,6 +1044,17 @@ impl Index {
             b.positive(c, it, &mut ix);
             told.push((TOP, c));
         }
+        // the domain is never empty, so a universal role under the bottom role relates
+        // what it cannot
+        let top_data = it.role_id(&RoleName::Data(DataProperty::top()));
+        if top
+            .iter()
+            .chain(&top_data)
+            .any(|&t| ix.roles.is_empty_role(t))
+        {
+            told.push((TOP, BOTTOM));
+        }
+        ix.tops = [top, top_data];
         // every element is its own successor by a universal role
         for &(r, x) in &b.selfs {
             if top.is_some_and(|t| ix.roles.sub(t, r)) {
@@ -1068,7 +1088,6 @@ impl Index {
             data_succ.push((e, it.val(v)));
         }
         // every individual is linked to every literal by a universal data role
-        let top_data = it.role_id(&RoleName::Data(DataProperty::top()));
         if let Some(td) = top_data {
             for (&g, ns) in &ix.neg_data {
                 if ix.roles.sub(td, g) {

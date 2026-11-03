@@ -219,7 +219,13 @@ fn decimal(s: &str) -> Option<Value> {
     if all.is_empty() || !all.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let n: i128 = all.trim_start_matches('0').parse().unwrap_or(0);
+    // a number past 128 bits has no value here, and its literal is opaque
+    let digits = all.trim_start_matches('0');
+    let n: i128 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().ok()?
+    };
     let d = 10i128.checked_pow(u32::try_from(f.len()).ok()?)?;
     ratio(if neg { -n } else { n }, d)
 }

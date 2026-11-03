@@ -59,6 +59,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use saturate::{Bounds, Contexts, Stop};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// What bounds a run: the worker threads, a deadline, a memory budget and a cancellation
@@ -808,20 +809,69 @@ impl Saturation {
                 let real: Vec<Ex> = (0..self.ctx.len() as Ex)
                     .filter(|&e| self.ctx[e as usize].get().is_some_and(|c| c.st.lock().real))
                     .collect();
+                // the worlds running and the subsumers of those done count against the
+                // budget beside the saturated state, and the pool is charged for what
+                // passes the peak
+                let held = AtomicIsize::new(0);
+                let peak = AtomicUsize::new(totals.peak);
+                let halt = AtomicU8::new(0);
+                let halted_at = AtomicUsize::new(0);
+                let base = totals.memory;
+                let bound = |delta: isize| -> bool {
+                    let now = held.fetch_add(delta, Ordering::Relaxed) + delta;
+                    if halt.load(Ordering::Relaxed) != 0 {
+                        return false;
+                    }
+                    if delta <= 0 {
+                        return true;
+                    }
+                    let used = base + now.max(0) as usize;
+                    let before = peak.fetch_max(used, Ordering::Relaxed);
+                    let grown = used.saturating_sub(before);
+                    let why = if limits.max_memory.is_some_and(|m| used > m)
+                        || charge_fn.is_some_and(|f| grown > 0 && !f(grown))
+                    {
+                        halted_at.store(used, Ordering::Relaxed);
+                        WORLD_MEMORY
+                    } else if limits.deadline.is_some_and(|d| Instant::now() >= d) {
+                        WORLD_TIMEOUT
+                    } else if limits.cancelled.as_ref().is_some_and(|f| f()) {
+                        WORLD_CANCEL
+                    } else {
+                        return true;
+                    };
+                    halt.store(why, Ordering::Relaxed);
+                    false
+                };
                 let found = par_map(&classes, threads, |_, chunk| {
                     let mut out = Vec::with_capacity(chunk.len());
                     for &d in chunk {
-                        if poll(limits).is_err() {
+                        let w = world::World::new(&ix, &self.ctx, &universal, &real, &bound);
+                        let Some(f) = w.classify(d) else {
+                            break;
+                        };
+                        let kept = 48 + f.subs.len() * 4;
+                        if !bound(kept as isize) {
                             break;
                         }
-                        let w = world::World::new(&ix, &self.ctx, &universal, &real);
-                        out.push((d, w.classify(d)));
+                        out.push((d, f, kept));
                     }
                     out
                 });
-                poll(limits)?;
-                for (d, f) in found.into_iter().flatten() {
-                    world_bytes += 48 + f.subs.len() * 4 + f.copied * saturate::CONTEXT_BYTES;
+                match halt.load(Ordering::Relaxed) {
+                    WORLD_MEMORY => {
+                        return Err(Error::Memory {
+                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                            used: halted_at.load(Ordering::Relaxed),
+                        });
+                    }
+                    WORLD_TIMEOUT => return Err(Error::Timeout),
+                    WORLD_CANCEL => return Err(Error::Cancelled),
+                    _ => {}
+                }
+                totals.peak = peak.load(Ordering::Relaxed);
+                for (d, f, kept) in found.into_iter().flatten() {
+                    world_bytes += kept;
                     self.worlds.insert(d, (f.bottom, f.subs));
                 }
             }
@@ -1079,6 +1129,11 @@ fn range_table(
 const POLL_AXIOMS: usize = 65_536;
 
 /// The run's deadline and cancellation, as an error when either has come.
+/// Why the worlds stopped.
+const WORLD_MEMORY: u8 = 1;
+const WORLD_TIMEOUT: u8 = 2;
+const WORLD_CANCEL: u8 = 3;
+
 fn poll(limits: &Limits) -> Result<(), Error> {
     if limits.deadline.is_some_and(|d| Instant::now() >= d) {
         return Err(Error::Timeout);
