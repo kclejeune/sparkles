@@ -283,7 +283,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   of the same names and write the whole ontology with its inferred, reduced, relaxed or
   materialized axioms. They chain in one process as ROBOT's commands do, and they too
   run standalone from `--input` and `--output` files, with the database and server modes
-  on top. Roadmap items NEW-ITEM-1 to NEW-ITEM-4 cover them, and the
+  on top. Roadmap items 634 to 637 cover them, and the
   [ROBOT comparison](../benchmarks/el-classification/RESULTS.md#robot) checks their
   output against ROBOT's.
 * Python's `Dataset.ontology`, Node.js's `dataset.ontology` and the JVM's

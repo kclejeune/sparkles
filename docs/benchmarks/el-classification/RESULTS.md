@@ -94,9 +94,9 @@ and the 296,173 of ChEBI lite between named classes, which `scripts/el-oracle.py
 
 `sparkles ontology classify FILE --format ofn` writes the taxonomy without the rest of
 the ontology, and its output equals `el_classify`'s on both files. Sparkles has no
-counterpart of the other commands. Roadmap items NEW-ITEM-1 to NEW-ITEM-3 add
+counterpart of the other commands. Roadmap items 634 to 636 add
 `sparkles ontology reason`, `reduce`, `relax` and `materialize` with ROBOT's options,
-item NEW-ITEM-4 chains them in one process, and this comparison checks their output.
+item 637 chains them in one process, and this comparison checks their output.
 These times come from a loaded laptop, so they only show the scale and are not
 measurements. The benchmark host's times belong to roadmap items 604 and 606. Each
 is one end-to-end run in seconds, with the peak resident memory in MiB.

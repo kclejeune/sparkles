@@ -181,7 +181,7 @@ classes, with 7 more direct edges, all through
 classifier leaves out and reports. Whelk 1.2.1 agrees on GO, ChEBI lite and 296 ORE
 ontologies and is incomplete on one. ROBOT 1.9.11's `reason`, `reduce`, `relax` and
 `materialize` with ELK assert the classifier's direct hierarchy on GO and ChEBI lite, and
-items NEW-ITEM-1 to NEW-ITEM-4 add ROBOT-compatible `sparkles ontology` commands for the
+items 634 to 637 add ROBOT-compatible `sparkles ontology` commands for the
 outputs that Sparkles does not write. The
 reasoners are packaged in `nix/reasoners` from checksum-pinned releases and run through
 `scripts/elk-compare/elk.sh`. Their times on the benchmark host belong to items 604 and
