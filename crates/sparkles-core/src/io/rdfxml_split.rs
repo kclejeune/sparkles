@@ -274,13 +274,7 @@ impl<'a> Scanner<'a> {
             self.i += close + 1;
         }
         let tag = &self.b[start..self.i];
-        // an attribute named ID in any namespace, as rdf:ID is, outside the quoted values
-        // too: a quoted "ID=" refuses the cut needlessly but never wrongly
-        let id = |sep: u8| {
-            memchr::memmem::find(tag, &[sep, b'I', b'D', b'=']).is_some()
-                || memchr::memmem::find(tag, &[sep, b'I', b'D', b' ']).is_some()
-        };
-        if id(b':') || id(b' ') || id(b'\t') || id(b'\n') || id(b'\r') {
+        if has_id(tag) {
             return None;
         }
         Some(tag.ends_with(b"/>"))
@@ -376,6 +370,32 @@ impl<'a> Scanner<'a> {
     }
 }
 
+/// Whether a start tag has an attribute whose local name is `ID` or `bagID`, in any
+/// namespace, as `rdf:ID` and `rdf:bagID` are: a name before an `=` outside the quoted
+/// values, with any white space between the two.
+fn has_id(tag: &[u8]) -> bool {
+    let mut quote = None;
+    for (i, &c) in tag.iter().enumerate() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            None if c == b'=' => {
+                let name = tag[..i].trim_ascii_end();
+                let at = name
+                    .iter()
+                    .rposition(|b| b.is_ascii_whitespace() || *b == b':')
+                    .map_or(0, |j| j + 1);
+                if matches!(&name[at..], b"ID" | b"bagID") {
+                    return true;
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +443,9 @@ mod tests {
     fn what_the_scanner_does_not_expect_is_not_cut() {
         let refused = [
             DOC.replace("rdf:about=\"B\"", "rdf:ID=\"B\""),
+            DOC.replace("rdf:about=\"B\"", "rdf:ID\t=\"B\""),
+            DOC.replace("rdf:about=\"B\"", "r:ID\n =\r\"B\""),
+            DOC.replace("rdf:about=\"B\"", "rdf:bagID=\"B\""),
             DOC.replace("<rdf:RDF ", "<RDF ")
                 .replace("</rdf:RDF>", "</RDF>"),
             DOC.replace("<!-- after -->", "<x/>"),
@@ -522,6 +545,28 @@ mod tests {
                 assert_eq!(parse(&d, threads).unwrap(), want, "{n} {threads}");
             }
         }
+    }
+
+    #[test]
+    fn a_repeated_id_in_two_pieces_fails_as_in_the_whole_document() {
+        let d = document(300);
+        for spacing in ["", "\t", "\n ", "\r\n"] {
+            let b = d
+                .replacen(
+                    "<owl:Class rdf:about=\"&obo;C10\">",
+                    &format!("<owl:Class rdf:ID{spacing}=\"same\">"),
+                    1,
+                )
+                .replacen(
+                    "<owl:Class rdf:about=\"&obo;C250\">",
+                    &format!("<owl:Class rdf:ID{spacing}=\"same\">"),
+                    1,
+                );
+            let want = parse(&b, 1).unwrap_err().to_string();
+            assert_eq!(parse(&b, 8).unwrap_err().to_string(), want, "{spacing:?}");
+        }
+        assert!(!has_id(b"<x a=\"rdf:ID=\" b='ID = 1'>"));
+        assert!(has_id(b"<x a=\"1\" ID =\"2\">"));
     }
 
     #[test]
