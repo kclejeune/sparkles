@@ -521,11 +521,11 @@ fn xml_chars(s: &str) -> bool {
     s.chars().all(is_xml_char)
 }
 
-fn normalized(s: &str) -> bool {
+pub(crate) fn normalized(s: &str) -> bool {
     xml_chars(s) && !s.contains(['\r', '\n', '\t'])
 }
 
-fn token(s: &str) -> bool {
+pub(crate) fn token(s: &str) -> bool {
     normalized(s) && !s.starts_with(' ') && !s.ends_with(' ') && !s.contains("  ")
 }
 
@@ -548,13 +548,13 @@ fn is_name_start(c: char) -> bool {
 }
 
 /// `NameChar` of XML 1.0 fifth edition.
-fn is_name_char(c: char) -> bool {
+pub(crate) fn is_name_char(c: char) -> bool {
     is_name_start(c)
         || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
 }
 
 /// An XML `Name`, or with `colon` false an `NCName`.
-fn name(s: &str, colon: bool) -> bool {
+pub(crate) fn name(s: &str, colon: bool) -> bool {
     let mut cs = s.chars();
     cs.next()
         .is_some_and(|c| is_name_start(c) && (colon || c != ':'))

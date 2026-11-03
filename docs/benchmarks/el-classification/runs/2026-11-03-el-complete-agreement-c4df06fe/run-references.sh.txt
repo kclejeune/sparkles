@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# The runs of roadmap item 587 that start external reasoner code, for the maintainer to
+# start by hand on stanley: HermiT and Konclude classify every ontology of the fixture
+# suite crates/sparkles-owl/tests/fixtures/el587/case-*.ofn, whose taxonomies become the
+# suite's expected answers.
+#
+# Usage: run-references.sh   (writes under out/references/ next to this script)
+#
+# Every reasoner run has an explicit heap where it is a JVM, a timeout and a memory cap of
+# its own (scripts/elk-compare/elk.sh's systemd scope, MemoryMax=$MEM, no swap). A run
+# that fails or times out is recorded as such and the batch goes on. The last line of
+# out/references/batch.log is REFERENCES-DONE.
+set -uo pipefail
+L=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$L/../../.." && pwd)
+FIX=$ROOT/crates/sparkles-owl/tests/fixtures/el587
+OUT=$L/out/references
+ELK=$ROOT/scripts/elk-compare/elk.sh
+MEM=${MEM:-4G}
+export ELK_WORK=$L/elk-work
+mkdir -p "$OUT"
+HERMIT_CLASSIFY=$("$ELK" path hermit) || exit 1
+KONCLUDE=$("$ELK" path konclude) || exit 1
+export HERMIT_CLASSIFY KONCLUDE
+{
+  echo "host=$(hostname) started=$(date -u +%Y-%m-%dT%H:%M:%SZ) commit=$(git -C "$ROOT" rev-parse HEAD)"
+  echo "hermit=$HERMIT_CLASSIFY"
+  echo "konclude=$KONCLUDE"
+  echo "fixtures_sha256=$(cat "$FIX"/case-*.ofn | sha256sum | cut -d' ' -f1)"
+} > "$OUT/env.txt"
+: > "$OUT/hermit.jsonl"
+: > "$OUT/konclude.jsonl"
+for f in "$FIX"/case-*.ofn; do
+  n=$(basename "$f" .ofn)
+  for which in hermit konclude; do
+    if [ $which = hermit ]; then extra=(); heap=1g; else extra=(--threads 1); heap=-; fi
+    if line=$(ELK_HEAP=$heap ELK_MEM_MAX=$MEM timeout 300 "$ELK" run --reasoner $which "${extra[@]}" \
+      --taxonomy "$OUT/$n.$which.ofn" "$f" 2> "$OUT/$n.$which.err"); then
+      echo "$line" >> "$OUT/$which.jsonl"
+    else
+      s=$?
+      echo "{\"input\":\"$f\",\"reasoner\":\"$which\",\"failed\":$s,\"timeout\":$([ $s = 124 ] && echo true || echo false)}" \
+        >> "$OUT/$which.jsonl"
+    fi
+  done
+  echo "$n done" >> "$OUT/batch.log"
+done
+echo REFERENCES-DONE >> "$OUT/batch.log"

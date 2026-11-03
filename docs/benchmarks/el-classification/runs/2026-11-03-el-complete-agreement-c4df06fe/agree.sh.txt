@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Classifies GO, ChEBI lite and the 298 ORE 2015 EL ontologies with the lane's el_classify
+# and compares each taxonomy with Konclude's (item 604's record) and with the classifier's
+# taxonomy before the lane (equal to ELK's). Usage: agree.sh BIN OUTDIR [NAME...]
+set -uo pipefail
+BIN=$1; OUT=$2; shift 2
+R=/home/kclejeune/repositories/github.com/kclejeune
+REF=$R/sparkles-lane-reasoners-604/.artifacts/lanes/reasoners-604/out
+ORE=$R/sparkles-lane-el-classifier-580/.artifacts/lanes/el-580/data/ore-el
+DATA=$R/sparkles-lane-el-classifier-580/.artifacts/lanes/el-580/data
+ORACLE=$R/sparkles-lane-el-complete-587/scripts/el-oracle.py
+mkdir -p "$OUT/tax"
+: > "$OUT/compare.jsonl"; : > "$OUT/ours.jsonl"
+one() {
+  local name=$1 input=$2 kref=$3 old=$4
+  timeout 900 "$BIN" --threads 4 --taxonomy "$OUT/tax/$name.txt" "$input" >> "$OUT/ours.jsonl" 2>> "$OUT/err.txt" || echo "{\"name\":\"$name\",\"failed\":true}" >> "$OUT/ours.jsonl"
+  for pair in "konclude:$kref" "before:$old"; do
+    local label=${pair%%:*} ref=${pair#*:}
+    if [ -s "$ref" ] && [ -s "$OUT/tax/$name.txt" ]; then
+      echo "{\"name\":\"$name\",\"against\":\"$label\",\"report\":$(python3 "$ORACLE" "$ref" "$OUT/tax/$name.txt")}" >> "$OUT/compare.jsonl"
+    else
+      echo "{\"name\":\"$name\",\"against\":\"$label\",\"missing\":true}" >> "$OUT/compare.jsonl"
+    fi
+  done
+}
+if [ $# -gt 0 ]; then names="$*"; else names="go chebi_lite $(ls -Sr $ORE/*.owl | xargs -n1 basename | sed 's/\.owl$//')"; fi
+for n in $names; do
+  case $n in
+    go|chebi_lite) one "$n" "$DATA/$n.ofn" "$REF/big/$n.konclude.ofn" "$REF/ours/$n.ours.txt" ;;
+    *) one "$n" "$ORE/$n.owl" "$REF/ore/$n.konclude.ofn" "$REF/ours/ore/$n.ours.txt" ;;
+  esac
+done
+echo AGREE-DONE

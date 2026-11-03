@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# ab.sh ROUNDS LABEL... : interleaved el_classify runs of each LABEL on each ontology on 1
+# and 8 threads, three classifications per process; JSON lines to out/ab-<stamp>.jsonl.
+# Holds ~/lanes/.heavy.lock for the whole run so no gate or build runs beside it.
+set -uo pipefail
+D=~/lanes/el-complete-587
+cd $D
+exec 8> "$HOME/lanes/.heavy.lock"
+flock 8
+R=$1; shift
+mkdir -p out
+OUT=out/ab-$(date -u +%Y%m%dT%H%M%SZ).jsonl
+FILES=${FILES:-"go.ofn chebi_lite.ofn ore_ont_13482.owl ore_ont_868.owl ore_ont_9674.owl ore_ont_10689.owl ore_ont_1559.owl ore_ont_15059.owl ore_ont_3524.owl ore_ont_3836.owl"}
+for r in $(seq 1 "$R"); do
+  for f in $FILES; do
+    for th in 1 8; do
+      for L in "$@"; do
+        line=$(systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 bin/$L-el_classify --threads $th --repeat 3 data/$f 2>/dev/null)
+        echo "{\"label\":\"$L\",\"round\":$r,\"file\":\"$f\",\"threads\":$th,\"run\":${line:-null}}" >> $OUT
+      done
+    done
+  done
+done
+echo "AB-DONE $OUT"

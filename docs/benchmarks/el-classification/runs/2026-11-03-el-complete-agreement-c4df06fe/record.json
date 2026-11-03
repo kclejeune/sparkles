@@ -1,0 +1,63 @@
+{
+ "suite": "el-classification",
+ "kind": "agreement",
+ "scale": "GO 2026-07-26, ChEBI lite 256, the 298 ORE 2015 EL ontologies and the 400 fixtures of tests/fixtures/el587",
+ "manifest": {
+  "commit": "c4df06fe",
+  "binary": "crates/sparkles-owl/examples/el_classify.rs",
+  "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on stanley for the lane (sha256 c90be03d...), and the base build of the forge record (sha256 0411a65e...), both run on stanley",
+  "references": {
+   "base": "the taxonomies that the build of commit c9b6ebff, where the item started, writes with the same el_classify settings, whose equality with ELK 0.6.0's runs/2026-11-03-el-speed-forge-80644aec and the earlier records establish",
+   "konclude": "Konclude 0.7.0-1138 taxonomies of the same record",
+   "fixtures": "HermiT 1.4.5.519 and Konclude 0.7.0-1138 on the 400 fixtures, run by run-references.sh from the nix/reasoners packages"
+  }
+ },
+ "settings": {
+  "threads": 4,
+  "timeout_s": 900
+ },
+ "method": "agree.sh classifies each ontology on four threads, writes the taxonomy and compares it with Konclude's with scripts/el-oracle.py. The base build wrote its taxonomies with the same script and settings, and taxonomy-base.sha256 and taxonomy-lane.sha256 hold the hashes of both sets, which are compared byte for byte. tests/el_fixtures.rs compares the classifier's subsumptions between named classes on each fixture with HermiT's and Konclude's, read from the reasoners' direct hierarchies.",
+ "results": {
+  "ontologies": 300,
+  "failed": [],
+  "partial": [],
+  "against_base": {
+   "ontologies": 300,
+   "byte_differences": []
+  },
+  "against_konclude": {
+   "same": 299,
+   "differ": [
+    "go"
+   ]
+  },
+  "notes": [
+   "ore_ont_6720 is inconsistent, and the taxonomy makes every class equivalent to owl:Nothing, as Konclude's does.",
+   "GO differs from Konclude by the 7 missing and 2 extra direct edges that InverseObjectProperties(part_of has_part) gives, an axiom outside OWL 2 EL."
+  ],
+  "fixtures": {
+   "cases": 400,
+   "hermit_inconsistent": 76,
+   "hermit_failed": 0,
+   "konclude_failed": [
+    "case-059",
+    "case-090",
+    "case-141",
+    "case-153",
+    "case-168",
+    "case-229",
+    "case-237",
+    "case-260",
+    "case-292",
+    "case-302"
+   ],
+   "konclude_differs": [
+    "case-074",
+    "case-075",
+    "case-124",
+    "case-261"
+   ],
+   "classifier_differs_from_hermit": []
+  }
+ }
+}
