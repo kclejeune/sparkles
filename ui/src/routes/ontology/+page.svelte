@@ -16,6 +16,9 @@
   import { branchParam, MAIN, onBranch } from '$lib/branches';
   import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
   import { fmtInt } from '$lib/format';
+  import { fetchHierarchy, type TreeKind, type TreeNode } from '$lib/browse';
+  import { searchEntities } from '$lib/entity-search';
+  import { filteredTree, LEVEL_LIMIT, LevelTree } from '$lib/level-tree.svelte';
   import { useCommands, usePageSearch, useProvider } from '$lib/launcher.svelte';
   import { branchProvider } from '$lib/palette.svelte';
   import {
@@ -265,12 +268,120 @@
   const tree = $derived(kindTab ? trees.get(kindTab) : null);
   const keep = $derived(tree ? filterTree(tree, nameOf, filter) : null);
 
-  // open the path to the selection
+  // --- the class and property trees, one level at a time (item 607) ----------------------
+  // The hierarchy route reads a level from the store's indexes, so these trees are whole
+  // however large the ontology, where the capped listings above stop at 50,000 entries.
+  const LEVEL_KIND: Partial<Record<EntityKind, TreeKind>> = {
+    Class: 'class',
+    ObjectProperty: 'objectProperty',
+    DataProperty: 'dataProperty',
+    AnnotationProperty: 'annotationProperty',
+  };
+  /** The labels the hierarchy answers carry, merged into the page's labels. */
+  function takeNames(nodes: TreeNode[]) {
+    const more = new Map<string, Lit[]>();
+    for (const n of nodes)
+      if (n.label && !labels.get(n.iri)?.length)
+        more.set(n.iri, [
+          { '@value': n.label, ...(n.labelLang ? { '@language': n.labelLang } : {}) },
+        ]);
+    if (more.size) labels = withMissingLabels(labels, more);
+  }
+  const levelTrees = new Map<EntityKind, LevelTree>(
+    Object.entries(LEVEL_KIND).map(([k, kind]) => [
+      k as EntityKind,
+      new LevelTree(
+        (q) =>
+          fetchHierarchy(target, sel, {
+            kind,
+            iri: q.iri,
+            ancestors: q.ancestors,
+            limit: q.ancestors ? 1 : LEVEL_LIMIT,
+            lang: langs,
+          }),
+        takeNames,
+      ),
+    ]),
+  );
+  /** The level tree of the tab, when its kind has a hierarchy. */
+  const level = $derived(kindTab ? (levelTrees.get(kindTab) ?? null) : null);
+  // a new target, graph or commit reads the open levels again
+  $effect(() => {
+    void target;
+    void graph;
+    const commit = summary?.commit;
+    if (commit == null) return;
+    untrack(() => {
+      for (const [k, t] of levelTrees) t.reset(openSet(k));
+    });
+  });
+  function toggleLevel(k: EntityKind, id: string) {
+    toggle(k, id);
+    if (openSet(k).has(id)) void levelTrees.get(k)?.load(id);
+  }
+  // a filter reads the search's hits of the tab's kind and their ancestors
+  let filtered = $state<{ text: string; tree: ReturnType<typeof filteredTree> } | null>(null);
+  $effect(() => {
+    const text = filter.trim();
+    const k = kindTab;
+    const kind = k ? LEVEL_KIND[k] : undefined;
+    if (!kind || text.length < 2) {
+      filtered = null;
+      return;
+    }
+    const ctl = new AbortController();
+    const t = setTimeout(async () => {
+      try {
+        const r = await searchEntities(target, text, {
+          kind: [kind],
+          limit: 20,
+          graph,
+          signal: ctl.signal,
+        });
+        const answers = await Promise.all(
+          r.results.map((h) =>
+            fetchHierarchy(
+              target,
+              sel,
+              { kind, iri: h.iri, ancestors: true, limit: 1 },
+              ctl.signal,
+            ),
+          ),
+        );
+        if (ctl.signal.aborted) return;
+        for (const a of answers)
+          takeNames([...(a.node ? [a.node] : []), ...(a.ancestors?.nodes ?? [])]);
+        filtered = { text, tree: filteredTree(answers) };
+      } catch {
+        if (!ctl.signal.aborted) filtered = { text, tree: filteredTree([]) };
+      }
+    }, 200);
+    return () => {
+      clearTimeout(t);
+      ctl.abort();
+    };
+  });
+
+  // open the path to the selection: through the route's ancestors in a level tree
+  $effect(() => {
+    const iri = selected;
+    const lt = level;
+    const k = kindTab;
+    if (!iri || !lt || !k) return;
+    void summary?.commit;
+    untrack(() => {
+      void lt.reveal(iri).then((anc) => {
+        const cur = openSet(k);
+        if (anc.every((a) => cur.has(a))) return;
+        opened = { ...opened, [k]: new Set([...cur, ...anc]) };
+      });
+    });
+  });
   $effect(() => {
     const iri = selected;
     const t = tree;
     const k = kindTab;
-    if (!iri || !t || !k) return;
+    if (!iri || !t || !k || levelTrees.has(k)) return;
     const anc = ancestorsOf(t, iri);
     untrack(() => {
       const cur = openSet(k);
@@ -760,7 +871,9 @@
   );
 
   const counts = $derived(
-    Object.fromEntries(TREE_KINDS.map((k) => [k, entities.get(k)?.length ?? 0])),
+    Object.fromEntries(
+      TREE_KINDS.map((k) => [k, summary?.entities[k] ?? entities.get(k)?.length ?? 0]),
+    ),
   );
   const headerTitle = $derived(
     summary?.header.iri
@@ -891,9 +1004,11 @@
       {api.errorMessage(loadError)}
     </div>
   {/if}
-  {#if truncated}
+  <!-- the class and property trees read their levels whole; the individuals list is capped -->
+  {#if truncated && kindTab === 'NamedIndividual'}
     <p class="notice" role="status">
-      The ontology is larger than the editor reads at once. The trees show the first 50,000 entries.
+      The ontology is larger than the editor reads at once. The list shows the first 50,000
+      individuals.
     </p>
   {/if}
 
@@ -973,7 +1088,45 @@
             <div class="tree-col">
               {#if tab === 'Class' && inferredOn}<h2 class="col-title">Asserted</h2>{/if}
               <div class="tree-scroll">
-                {#if tree.roots.length}
+                {#if level && filtered}
+                  {#if filtered.tree.roots.length}
+                    <OntoTree
+                      label="{KIND_LABEL[kindTab]} (asserted)"
+                      roots={filtered.tree.roots}
+                      children={(id) => filtered?.tree.children.get(id) ?? []}
+                      name={nameOf}
+                      sub={subOf}
+                      open={filtered.tree.nodes}
+                      {selected}
+                      keep={filtered.tree.nodes}
+                      onselect={(id) => nav({ iri: id })}
+                      ontoggle={() => {}}
+                    />
+                  {:else}
+                    <p class="empty">Nothing matches “{filtered.text}”.</p>
+                  {/if}
+                {:else if level}
+                  {#if level.roots().length}
+                    <OntoTree
+                      label="{KIND_LABEL[kindTab]} (asserted)"
+                      roots={level.roots()}
+                      children={(id) => level?.children(id) ?? []}
+                      more={(id) => level?.more(id) ?? false}
+                      name={nameOf}
+                      sub={subOf}
+                      open={openSet(kindTab)}
+                      {selected}
+                      onselect={(id) => nav({ iri: id })}
+                      ontoggle={(id) => toggleLevel(kindTab!, id)}
+                    />
+                  {:else if level.loading}
+                    <p class="empty">Reading the {KIND_LABEL[kindTab].toLowerCase()}…</p>
+                  {:else if level.error}
+                    <p class="empty">{level.error}</p>
+                  {:else}
+                    <p class="empty">No {KIND_LABEL[kindTab].toLowerCase()}.</p>
+                  {/if}
+                {:else if tree.roots.length}
                   <OntoTree
                     label="{KIND_LABEL[kindTab]} (asserted)"
                     roots={tree.roots}
