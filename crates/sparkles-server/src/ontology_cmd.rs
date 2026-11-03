@@ -11,6 +11,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use serde_json::{Value as J, json};
 use sparkles::handles::ontology::classify::ClassifyRequest;
+use sparkles::handles::ontology::file::OntologyFile;
+use sparkles::handles::ontology::wire::{ClassificationView, classification_body, reports_body};
 use sparkles::handles::ontology::{
     self as onto, CheckRequest, EditRequest, OntologyRequest, check_opened,
 };
@@ -433,13 +435,43 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     bail!("--target writes to a database: name --loc or --server, not a FILE")
                 }
                 (Some(f), None) => {
-                    let ds = sparkles::Dataset::memory();
-                    let source = sparkles::io::Source::from_path(&f, None)
-                        .with_context(|| format!("cannot read {}", f.display()))?;
-                    ds.store()
-                        .load(&[source])
-                        .with_context(|| format!("cannot read {}", f.display()))?;
-                    local_run(&ds, &f.display().to_string())?
+                    let req = read.request()?;
+                    match OntologyFile::read(&f, &req, 0)? {
+                        // the file's axioms, read without a database
+                        Some(file) => {
+                            let out = file.classify(&c, &Default::default())?;
+                            let r = file.renderer();
+                            let view = file.view();
+                            let j = classification_body(
+                                &file.name,
+                                &ClassificationView {
+                                    read: &view,
+                                    classification: &out.classification,
+                                    excluded: &out.excluded,
+                                    reused: false,
+                                    written: None,
+                                },
+                                &req,
+                                &r,
+                                &q,
+                            )?;
+                            let doc = owl::ofn::document(
+                                &r,
+                                &owl::Header::default(),
+                                out.classification.taxonomy.axioms().iter(),
+                            );
+                            (j, doc)
+                        }
+                        None => {
+                            let ds = sparkles::Dataset::memory();
+                            let source = sparkles::io::Source::from_path(&f, None)
+                                .with_context(|| format!("cannot read {}", f.display()))?;
+                            ds.store()
+                                .load(&[source])
+                                .with_context(|| format!("cannot read {}", f.display()))?;
+                            local_run(&ds, &f.display().to_string())?
+                        }
+                    }
                 }
                 (None, Some(loc)) => {
                     let ds = crate::open_dataset(loc, opts)?;
@@ -601,9 +633,22 @@ fn axioms_of(files: &[PathBuf]) -> Result<Vec<Axiom>> {
     Ok(out)
 }
 
-/// Check an ontology file: read it into a database in memory and check its graphs.
-/// The imports of a file are followed only to the graphs of the file.
+/// Check an ontology file: read its axioms without a database when the file is one
+/// graph, else read it into a database in memory and check its graphs. The imports of a
+/// file are followed only to the graphs of the file.
 fn check_file(f: &Path, read: &Read, check: &CheckRequest) -> Result<J> {
+    let req = read.request()?;
+    if let Some(file) = OntologyFile::read(f, &req, 0)? {
+        let reports = file.check(check, &Default::default())?;
+        return Ok(reports_body(
+            &file.name,
+            &file.view(),
+            &req,
+            &file.renderer(),
+            &reports,
+            check.assertions,
+        ));
+    }
     let ds = sparkles::Dataset::memory();
     let source = sparkles::io::Source::from_path(f, None)
         .with_context(|| format!("cannot read {}", f.display()))?;
