@@ -290,6 +290,12 @@ test('SKOS label edits wait for the labels of the commit the page shows', async 
     await expect(preview(page)).toHaveCount(0);
     // the draft is still there, and once the labels arrive the edit goes through
     await expect(add.getByRole('textbox', { name: 'Label' })).toHaveValue('fishies');
+    // so is a second preferred label offered as the replacement of the first
+    await add.getByRole('combobox', { name: 'Kind', exact: true }).selectOption('pref');
+    await page.getByRole('button', { name: /^Make it preferred and keep/ }).click();
+    await expect(preview(page)).toHaveCount(0);
+    await expect(add.getByRole('textbox', { name: 'Label' })).toHaveValue('fishies');
+    await add.getByRole('combobox', { name: 'Kind', exact: true }).selectOption('hidden');
     for (const go of held.splice(0)) await go().catch(() => {});
     await page.unroute('**/sparql**');
     await expect(async () => {

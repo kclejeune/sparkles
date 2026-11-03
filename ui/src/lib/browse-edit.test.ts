@@ -466,3 +466,39 @@ describe('SKOS triples the mapper reads as data property assertions', () => {
     expect(op.sparql).toContain('owl#annotatedTarget> "new"');
   });
 });
+
+describe('a draft whose statement is gone', () => {
+  it('adds the draft with the property and annotations of the statement it began from', () => {
+    const DC = 'http://purl.org/dc/elements/1.1/';
+    const gone: Statement = {
+      property: SKOS + 'definition',
+      value: { '@value': 'old' },
+      graph: 'default',
+      annotations: [
+        { property: DC + 'source', value: 'http://example.org/book' },
+        { property: RDFS + 'comment', value: { '@value': 'kept' } },
+      ],
+    };
+    for (const mode of ['owl', 'skos'] as const) {
+      const op = statementOp(
+        mode,
+        GO,
+        null,
+        { property: gone.property, value: textLit('mine', ''), sources: sourcesOf(gone) },
+        null,
+        gone,
+      );
+      if (op?.kind !== 'axioms') throw new Error('expected axioms');
+      expect(op.remove).toEqual([]);
+      expect(op.add).toEqual([
+        {
+          type: 'AnnotationAssertion',
+          property: SKOS + 'definition',
+          subject: GO,
+          value: { '@value': 'mine' },
+          annotations: [gone.annotations[1], gone.annotations[0]],
+        },
+      ]);
+    }
+  });
+});

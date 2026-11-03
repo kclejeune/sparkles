@@ -186,8 +186,16 @@ export const withPending = (sources: string[], pending: string) => {
   return p && !sources.includes(p) ? [...sources, p] : sources;
 };
 
-/** A definition form's draft: its text, language and sources. */
-export type DefinitionDraft = { text: string; lang: string; sources: string[] };
+/**
+ * A definition form's draft: its text, language and sources, and the statement it began
+ * from, whose property and other annotations an addition of the draft keeps.
+ */
+export type DefinitionDraft = {
+  text: string;
+  lang: string;
+  sources: string[];
+  basis?: Stated | null;
+};
 
 /** A statement as a form edits it: a property, a value, and the sources of an OWL page. */
 export type Draft = { property: string; value: Value; sources: string[] };
@@ -230,7 +238,7 @@ export function statementOp(
   // past its limits, is changed in place, its reifications retargeted to the new value
   if (mode === 'skos' && before?.annotations.length && !before.asserted?.length)
     return { kind: 'update', sparql: retarget(iri, before, after, graph) };
-  if (mode === 'skos' && !before?.annotations.length) {
+  if (mode === 'skos' && !before?.annotations.length && !(!before && basis?.annotations.length)) {
     const remove: HeaderTriple[] = before
       ? [{ s: iri, p: before.property, o: headerValue(before.value) }]
       : [];

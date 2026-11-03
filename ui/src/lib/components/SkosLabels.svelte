@@ -129,7 +129,7 @@
     const copies = entries.filter(
       (e) => e.xl === null && e.kind !== 'pref' && sameLabel(e.label, draft),
     );
-    onedit(
+    const took = onedit(
       labelEdit(
         iri,
         [
@@ -144,7 +144,7 @@
       ),
       `Make ${shown(draft)} the preferred label of ${name}`,
     );
-    text = '';
+    if (took !== false) text = '';
   }
 
   // --- changing one label -----------------------------------------------------------------

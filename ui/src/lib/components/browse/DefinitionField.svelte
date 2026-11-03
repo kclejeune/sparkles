@@ -112,7 +112,12 @@
   // field; a typed draft then goes to the page, which shows it as a definition of its own
   onDestroy(() => {
     if (!committed && fields() !== base)
-      onorphan?.({ text, lang, sources: withPending(sources, pending) });
+      onorphan?.({
+        text,
+        lang,
+        sources: withPending(sources, pending),
+        basis: before ?? initial?.basis ?? null,
+      });
   });
 
   function preview() {
@@ -123,12 +128,13 @@
       before,
       text.trim()
         ? {
-            property: before?.property ?? definitionProperty(mode),
+            property: before?.property ?? initial?.basis?.property ?? definitionProperty(mode),
             value: textLit(text.trim(), lang),
             sources: withPending(sources, pending),
           }
         : null,
       graph,
+      before ? null : (initial?.basis ?? null),
     );
     if (op)
       onedit(
