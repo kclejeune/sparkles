@@ -10,10 +10,13 @@ import {
   hierarchyEdges,
   labelsOf,
   localFromLabel,
+  litText,
   manchester,
+  manchesterName,
   mintIri,
   pickLabel,
   renameUpdate,
+  resolveName,
   revertCommit,
   replaceAnnotation,
   sectionAxiom,
@@ -479,5 +482,61 @@ describe('reverts', () => {
     const r = await revertCommit('uni', 4, { head: 9 });
     expect(r).toMatchObject({ inserted: 2, deleted: 3, receipt: { committed: true } });
     expect((r as { receipt: { commit: { seq: number } } }).receipt.commit.seq).toBe(10);
+  });
+});
+
+describe('Manchester names and literals', () => {
+  it('quotes a name the reader would not read back as one word', () => {
+    expect(manchesterName('Person')).toBe('Person');
+    expect(manchesterName('uni:Person')).toBe('uni:Person');
+    expect(manchesterName('<http://ex.org/a b>')).toBe("'<http://ex.org/a b>'");
+    expect(manchesterName('<http://ex.org/A>')).toBe('<http://ex.org/A>');
+    expect(manchesterName('Graduate student')).toBe("'Graduate student'");
+    expect(manchesterName('some')).toBe("'some'");
+    expect(manchesterName('42nd street')).toBe("'42nd street'");
+    expect(manchesterName("O'Brien")).toBe("'O\\'Brien'");
+    expect(manchesterName('_:b0')).toBe("'_:b0'");
+  });
+
+  it('writes integers, decimals and booleans bare and other literals typed', () => {
+    const xsd = 'http://www.w3.org/2001/XMLSchema#';
+    const p = { xsd };
+    expect(litText({ '@value': '6', '@type': xsd + 'integer' }, p)).toBe('6');
+    expect(litText({ '@value': '-1.5', '@type': xsd + 'decimal' }, p)).toBe('-1.5');
+    expect(litText({ '@value': 'true', '@type': xsd + 'boolean' }, p)).toBe('true');
+    expect(litText({ '@value': '1', '@type': xsd + 'boolean' }, p)).toBe('"1"^^xsd:boolean');
+    expect(litText({ '@value': '1e3', '@type': xsd + 'double' }, p)).toBe('"1e3"^^xsd:double');
+    expect(litText({ '@value': 'chat', '@language': 'fr' }, p)).toBe('"chat"@fr');
+  });
+
+  it('quotes labels inside a class expression', () => {
+    const label: Record<string, string> = {
+      'http://ex.org/enrolledIn': 'enrolled in',
+      'http://ex.org/GraduateCourse': 'Graduate course',
+    };
+    expect(
+      manchester(
+        {
+          type: 'ObjectSomeValuesFrom',
+          property: 'http://ex.org/enrolledIn',
+          class: 'http://ex.org/GraduateCourse',
+        },
+        (i) => label[i] ?? i,
+        {},
+      ),
+    ).toBe("'enrolled in' some 'Graduate course'");
+  });
+});
+
+describe('names in the add fields', () => {
+  const opts = [{ iri: 'http://ex.org/G', name: 'Graduate student' }];
+  const prefixes = { ex: 'http://ex.org/' };
+  it('resolves one name or IRI and leaves expressions to the reader', () => {
+    expect(resolveName('Graduate student', opts, prefixes)).toBe('http://ex.org/G');
+    expect(resolveName('ex:A', opts, prefixes)).toBe('http://ex.org/A');
+    expect(resolveName(' <http://ex.org/B> ', opts, prefixes)).toBe('http://ex.org/B');
+    expect(resolveName('ex:p some ex:A', opts, prefixes)).toBeNull();
+    expect(resolveName('not ex:A', opts, prefixes)).toBeNull();
+    expect(resolveName('{ex:a}', opts, prefixes)).toBeNull();
   });
 });

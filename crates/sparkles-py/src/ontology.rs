@@ -591,6 +591,78 @@ impl PyOntologies {
         let j = self.run(py, "classify", a, cancel, timeout, writes)?;
         answer(py, j, &["excluded"])
     }
+
+    /// Read Manchester text against the ontology's names and labels (item 608) as `as_`
+    /// (`classExpression`, `dataRange`, `individual`, `literal` or `axiom`): the value
+    /// in its JSON form, `ofn` and `manchester`. Text that does not read raises
+    /// `InvalidInputError` with `reason`, the span `start` and `end` in UTF-16 code
+    /// units and, for an ambiguous name, `candidates`.
+    #[pyo3(signature=(text, graph=None, *, as_="classExpression", imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn parse<'py>(
+        &self,
+        py: Python<'py>,
+        text: String,
+        graph: Option<&Bound<'py, PyAny>>,
+        as_: &str,
+        imports: bool,
+        mode: &str,
+        at: Option<&Bound<'py, PyAny>>,
+        cancel: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut a = base(graph, imports, mode, false)?;
+        a.remove("inferences");
+        a.insert("at".into(), at_json(at)?);
+        a.insert("text".into(), J::String(text));
+        a.insert("as".into(), json!(as_));
+        let j = self.run(py, "parse", a, cancel, timeout, false)?;
+        answer(py, j, &[])
+    }
+
+    /// A DL query (spec U12): the equivalents, superclasses, subclasses and instances
+    /// of a class expression in Manchester syntax, functional-style syntax
+    /// (`syntax="functional"`) or the JSON form (a dict). The EL classifier answers
+    /// inside OWL 2 EL and the RL rules by demand outside it; `reasoning` (`auto`, `el`
+    /// or `rl`) chooses, and the answer's `reasoning` names the engine, whether the
+    /// answers are complete and the axioms that can make them incomplete.
+    #[pyo3(signature=(expression, graph=None, *, syntax=None, reasoning="auto", answers=None, limit=None, threads=None, max_derived=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn dl_query<'py>(
+        &self,
+        py: Python<'py>,
+        expression: &Bound<'py, PyAny>,
+        graph: Option<&Bound<'py, PyAny>>,
+        syntax: Option<&str>,
+        reasoning: &str,
+        answers: Option<Vec<String>>,
+        limit: Option<usize>,
+        threads: Option<usize>,
+        max_derived: Option<usize>,
+        imports: bool,
+        mode: &str,
+        at: Option<&Bound<'py, PyAny>>,
+        cancel: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut a = base(graph, imports, mode, false)?;
+        a.remove("inferences");
+        a.insert("at".into(), at_json(at)?);
+        let e = if let Ok(s) = expression.extract::<String>() {
+            J::String(s)
+        } else {
+            admin::from_py::<J>(expression, "expression")?
+        };
+        a.insert("expression".into(), e);
+        a.insert("syntax".into(), json!(syntax));
+        a.insert("reasoning".into(), json!(reasoning));
+        a.insert("answers".into(), json!(answers));
+        a.insert("limit".into(), json!(limit));
+        a.insert("threads".into(), json!(threads));
+        a.insert("maxDerived".into(), json!(max_derived));
+        let j = self.run(py, "dlQuery", a, cancel, timeout, false)?;
+        answer(py, j, &[])
+    }
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

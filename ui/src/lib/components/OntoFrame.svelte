@@ -1,8 +1,11 @@
 <script lang="ts">
   // The frame of one entity in the ontology editor (docs/specs/U12-ontology-workbench/
   // SPEC.md): its annotations, its characteristics and its axioms by section, as Protégé's
-  // and WebProtégé's frames show them, with class expressions in Manchester syntax. Every
-  // change is handed to the page as an operation, which previews it and commits it.
+  // and WebProtégé's frames show them, with class expressions in Manchester syntax. The add
+  // fields take an entity name, an IRI, or a class expression or data range in Manchester or
+  // functional-style syntax, and the last field takes a whole axiom in either syntax. The
+  // server reads Manchester text, and a problem it reports is underlined. Every change is
+  // handed to the page as an operation, which previews it and commits it.
   import {
     annotationAssertion,
     buildFrame,
@@ -13,7 +16,9 @@
     manchester,
     OBJECT_CHARACTERISTICS,
     propertyAssertion,
+    isFunctional,
     resolveInput,
+    resolveName,
     sectionAxiom,
     sectionTarget,
     validLang,
@@ -23,10 +28,15 @@
     type AxiomJson,
     type EntityKind,
     type Op,
+    type ManchesterProblem,
+    type ParseAs,
+    type Parsed,
   } from '$lib/ontology';
+  import type { NameOption } from '$lib/manchester-complete';
   import type { PrefixMap } from '$lib/rdf';
   import AnnotationRows from './AnnotationRows.svelte';
   import Icon from './Icon.svelte';
+  import ManchesterEditor from './ManchesterEditor.svelte';
 
   let {
     kind,
@@ -37,6 +47,8 @@
     options,
     annotationProperties,
     readonly = false,
+    names,
+    parse,
     onedit,
     onopen,
   }: {
@@ -49,6 +61,13 @@
     options: (kind: EntityKind) => { iri: string; name: string }[];
     annotationProperties: string[];
     readonly?: boolean;
+    /** The entity names that Manchester fields complete. */
+    names: () => NameOption[];
+    /** Read Manchester text on the server. */
+    parse: (
+      text: string,
+      as: ParseAs,
+    ) => Promise<{ ok: true; parsed: Parsed } | { ok: false; problem: ManchesterProblem }>;
     onedit: (op: Op, label: string) => void;
     onopen: (iri: string) => void;
   } = $props();
@@ -60,7 +79,10 @@
   let openAnn = $state<Set<string>>(new Set());
   /** The add form of each section: its text and its problem. */
   let adding = $state<Record<string, string>>({});
-  let problems = $state<Record<string, string | null>>({});
+  /** The problem of each add form, with the span of Manchester text the server reports. */
+  let problems = $state<Record<string, Problem | null>>({});
+  type Problem = { message: string; start?: number; end?: number; candidates?: string[] };
+  let busy = $state<string | null>(null);
   // a property assertion of an individual
   let assertProp = $state('');
   let assertValue = $state('');
@@ -105,24 +127,73 @@
     }
   }
 
-  function addTo(section: string, title: string) {
-    const text = adding[section] ?? '';
+  const problem = (section: string, p: Problem | string | null) =>
+    void (problems = { ...problems, [section]: typeof p === 'string' ? { message: p } : p });
+
+  /** A Manchester problem as the form shows it, with the candidates of an ambiguous name. */
+  const fromServer = (p: ManchesterProblem): Problem => ({
+    message: p.error,
+    start: p.start,
+    end: p.end,
+    candidates: p.candidates.map((c) => (c.label ? `${c.label} <${c.iri}>` : `<${c.iri}>`)),
+  });
+
+  /** What the server reads a section's Manchester text as, or null for a named entity only. */
+  const parseAs = (target: EntityKind | null): ParseAs | null =>
+    target === 'Class' ? 'classExpression' : target === 'Datatype' ? 'dataRange' : null;
+
+  async function addTo(section: string, title: string) {
+    // the server reads the text as it is in the field, so a problem's span fits it
+    const raw = adding[section] ?? '';
+    const text = raw.trim();
     const target = sectionTarget(kind, section);
-    const r = resolveInput(text, target ? options(target) : [], prefixes);
-    if (!r)
-      return void (problems = {
-        ...problems,
-        [section]: 'Name an entity, an IRI or a functional-style expression.',
-      });
-    const ax = sectionAxiom(kind, section, iri, typeof r === 'string' ? r : r.ofn);
-    if (!ax)
-      return void (problems = {
-        ...problems,
-        [section]: 'This section takes a named entity, not an expression.',
-      });
-    problems = { ...problems, [section]: null };
+    if (!text) return;
+    // a name or an IRI, then functional-style syntax, then Manchester syntax
+    let value: unknown =
+      resolveName(text, target ? options(target) : [], prefixes) ??
+      (isFunctional(text) ? text : null);
+    const as = parseAs(target);
+    if (value == null) {
+      if (!as) return problem(section, 'Name an entity or an IRI.');
+      busy = section;
+      try {
+        const r = await parse(raw, as);
+        if (!r.ok) return problem(section, fromServer(r.problem));
+        value = r.parsed.value;
+      } catch (e) {
+        return problem(section, e instanceof Error ? e.message : String(e));
+      } finally {
+        busy = null;
+      }
+    }
+    const ax = sectionAxiom(kind, section, iri, value as string);
+    if (!ax) return problem(section, 'This section takes a named entity, not an expression.');
+    problem(section, null);
     adding = { ...adding, [section]: '' };
-    onedit({ kind: 'axioms', add: [ax], remove: [] }, `${title}: add ${text.trim()} to ${label}`);
+    onedit({ kind: 'axioms', add: [ax], remove: [] }, `${title}: add ${text} to ${label}`);
+  }
+
+  /** An axiom in Manchester or functional-style syntax, added as it is. */
+  async function addAxiom() {
+    const raw = adding.axiom ?? '';
+    const text = raw.trim();
+    if (!text) return;
+    let ax: unknown = isFunctional(text) ? text : null;
+    if (ax == null) {
+      busy = 'axiom';
+      try {
+        const r = await parse(raw, 'axiom');
+        if (!r.ok) return problem('axiom', fromServer(r.problem));
+        ax = r.parsed.value;
+      } catch (e) {
+        return problem('axiom', e instanceof Error ? e.message : String(e));
+      } finally {
+        busy = null;
+      }
+    }
+    problem('axiom', null);
+    adding = { ...adding, axiom: '' };
+    onedit({ kind: 'axioms', add: [ax as AxiomJson | string], remove: [] }, `Add ${text}`);
   }
 
   const objectProps = $derived(options('ObjectProperty'));
@@ -132,17 +203,14 @@
     const p = assertProp.trim();
     const op = objectProps.find((o) => o.name === p || o.iri === p);
     const dp = dataProps.find((o) => o.name === p || o.iri === p);
-    if (!op && !dp)
-      return void (problems = { ...problems, assert: 'Choose an object or data property.' });
+    if (!op && !dp) return problem('assert', 'Choose an object or data property.');
     let ax: AxiomJson;
     if (op) {
       const v = resolveInput(assertValue, options('NamedIndividual'), prefixes);
-      if (typeof v !== 'string')
-        return void (problems = { ...problems, assert: 'Name an individual.' });
+      if (typeof v !== 'string') return problem('assert', 'Name an individual.');
       ax = propertyAssertion('ObjectProperty', op.iri, iri, v);
     } else {
-      if (!validLang(assertLang.trim()))
-        return void (problems = { ...problems, assert: 'The language tag is not valid.' });
+      if (!validLang(assertLang.trim())) return problem('assert', 'The language tag is not valid.');
       ax = propertyAssertion(
         'DataProperty',
         dp!.iri,
@@ -150,7 +218,7 @@
         literalOf(assertValue, assertLang.trim(), ''),
       );
     }
-    problems = { ...problems, assert: null };
+    problem('assert', null);
     assertValue = '';
     onedit({ kind: 'axioms', add: [ax], remove: [] }, `Assert ${p} of ${label}`);
   }
@@ -232,15 +300,15 @@
                   <span class="expr" title={r.item.ofn}>
                     {#if r.shown.length === 1 && linkable(r.shown[0])}
                       <button class="link" onclick={() => onopen(String(r.shown[0]))}
-                        >{show(r.shown[0])}</button
+                        >{name(String(r.shown[0]))}</button
                       >
                     {:else if s.id === 'objectAssertions' || s.id === 'dataAssertions' || s.id === 'negative'}
                       <button class="link" onclick={() => onopen(String(r.shown[0]))}
-                        >{show(r.shown[0])}</button
+                        >{name(String(r.shown[0]))}</button
                       >
                       {#if linkable(r.shown[1])}
                         <button class="link" onclick={() => onopen(String(r.shown[1]))}
-                          >{show(r.shown[1])}</button
+                          >{name(String(r.shown[1]))}</button
                         >
                       {:else}<span class="lit">{show(r.shown[1])}</span>{/if}
                     {:else}
@@ -287,28 +355,44 @@
           </ul>
         {/if}
         {#if addable}
+          {@const as = parseAs(target)}
+          {@const p = problems[s.id]}
           <form
             class="add"
             onsubmit={(e) => {
               e.preventDefault();
-              addTo(s.id, s.title);
+              void addTo(s.id, s.title);
             }}
           >
-            <input
-              class="input"
-              list={target ? `opts-${target}-${uid}` : undefined}
-              placeholder={target === 'Class'
-                ? 'Class name, IRI or functional-style expression'
-                : target
-                  ? `${KIND_SINGULAR[target]} name or IRI`
-                  : 'IRI'}
-              aria-label="Add to {s.title}"
-              value={adding[s.id] ?? ''}
-              oninput={(e) => (adding = { ...adding, [s.id]: e.currentTarget.value })}
-            />
-            <button class="btn sm" type="submit" disabled={!(adding[s.id] ?? '').trim()}>Add</button
+            {#if as}
+              <ManchesterEditor
+                bind:value={() => adding[s.id] ?? '', (v) => (adding = { ...adding, [s.id]: v })}
+                {names}
+                label="Add to {s.title}"
+                placeholder={as === 'classExpression'
+                  ? 'Class name, IRI or class expression'
+                  : 'Datatype, IRI or data range'}
+                problem={p?.start != null
+                  ? { start: p.start, end: p.end ?? p.start, message: p.message }
+                  : null}
+                onsubmit={() => void addTo(s.id, s.title)}
+              />
+            {:else}
+              <input
+                class="input"
+                list={target ? `opts-${target}-${uid}` : undefined}
+                placeholder={target ? `${KIND_SINGULAR[target]} name or IRI` : 'IRI'}
+                aria-label="Add to {s.title}"
+                value={adding[s.id] ?? ''}
+                oninput={(e) => (adding = { ...adding, [s.id]: e.currentTarget.value })}
+              />
+            {/if}
+            <button
+              class="btn sm"
+              type="submit"
+              disabled={!(adding[s.id] ?? '').trim() || busy === s.id}>Add</button
             >
-            {#if problems[s.id]}<p class="problem" role="alert">{problems[s.id]}</p>{/if}
+            {#if p}{@render problemText(p)}{/if}
           </form>
         {/if}
         {#if kind === 'NamedIndividual' && s.id === 'objectAssertions' && !readonly}
@@ -350,7 +434,7 @@
               type="submit"
               disabled={!assertProp.trim() || !assertValue.trim()}>Add</button
             >
-            {#if problems.assert}<p class="problem" role="alert">{problems.assert}</p>{/if}
+            {#if problems.assert}{@render problemText(problems.assert)}{/if}
           </form>
         {/if}
       </section>
@@ -381,7 +465,52 @@
       </ul>
     </section>
   {/if}
+
+  {#if !readonly}
+    <section class="block" aria-labelledby="axiom-{uid}">
+      <h3 id="axiom-{uid}">Add an axiom</h3>
+      <form
+        class="add"
+        onsubmit={(e) => {
+          e.preventDefault();
+          void addAxiom();
+        }}
+      >
+        <ManchesterEditor
+          bind:value={() => adding.axiom ?? '', (v) => (adding = { ...adding, axiom: v })}
+          {names}
+          label="Add an axiom"
+          placeholder="An axiom, such as {label.includes(' ') ? `'${label}'` : label} SubClassOf …"
+          problem={problems.axiom?.start != null
+            ? {
+                start: problems.axiom.start,
+                end: problems.axiom.end ?? problems.axiom.start,
+                message: problems.axiom.message,
+              }
+            : null}
+          onsubmit={() => void addAxiom()}
+        />
+        <button
+          class="btn sm"
+          type="submit"
+          disabled={!(adding.axiom ?? '').trim() || busy === 'axiom'}>Add</button
+        >
+        {#if problems.axiom}{@render problemText(problems.axiom)}{/if}
+      </form>
+    </section>
+  {/if}
 </div>
+
+{#snippet problemText(p: Problem)}
+  <div class="problem" role="alert">
+    {p.message}
+    {#if p.candidates?.length}
+      <ul class="candidates">
+        {#each p.candidates as c (c)}<li class="mono">{c}</li>{/each}
+      </ul>
+    {/if}
+  </div>
+{/snippet}
 
 {#each ['Class', 'ObjectProperty', 'DataProperty', 'AnnotationProperty', 'NamedIndividual', 'Datatype'] as k (k)}
   <datalist id="opts-{k}-{uid}">
@@ -508,5 +637,12 @@
     flex-basis: 100%;
     color: var(--danger);
     font-size: var(--fs-sm);
+  }
+  .candidates {
+    margin: 2px 0 0 16px;
+    padding: 0;
+    color: var(--text-2);
+    font-size: var(--fs-xs);
+    overflow-wrap: anywhere;
   }
 </style>

@@ -73,6 +73,26 @@ lists the axioms it added and removed as `addedAxioms` and `removedAxioms` in ev
 surface that answers the edit body. The OpenAPI description of an edit's `add` and
 `remove` takes functional-style strings beside the JSON form.
 
+The ontology editor has a **DL Query** tab (spec U12, roadmap item 457). It answers a
+class expression in Manchester syntax with its equivalent classes, direct and inferred
+superclasses and subclasses, and instances, as Protégé's DL Query does. Inside OWL 2 EL
+the dataset's kept EL classification answers the query incrementally and is left as it
+was, and outside EL the OWL 2 RL rules answer it by demand reasoning. Every answer says
+which reasoning gave it, whether it is complete and which axioms lie outside the
+profile. `ds.ontology().dl_query()`, `POST /$/ontology/{ds}/dl-query` and the Python,
+Node.js and JVM bindings' `dl_query` or `dlQuery` run it.
+
+The ontology editor's add fields take Manchester syntax with completion of entity names
+and labels, and an axiom field takes whole axioms (roadmap item 608). The new reader,
+`sparkles_owl::manchester`, reads class expressions, data ranges, individuals, literals
+and one-line axioms against an ontology's prefixes, local names and labels. A name that
+several entities share is an error that lists them, and every error carries its span.
+`POST /$/ontology/{ds}/parse` and the bindings' `parse` read text with the caller's
+grants. The editor's Manchester rendering now quotes labels that hold a space or a
+keyword, such as `'teaching assistant'`, so it reads back as the same expression. The
+entity-kind tabs, DL Query and Header share one strip that wraps in a narrow window
+instead of cutting off a label.
+
 An OWL 2 EL classifier computes the inferred class hierarchy and the unsatisfiable
 classes of an ontology (spec F24, roadmap item 580). `sparkles_owl::classify` follows
 ELK's consequence-based calculus on several threads, keeps its state so that a run after

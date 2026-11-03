@@ -21,6 +21,8 @@
     annotationAssertion,
     buildTree,
     classifyOntology,
+    dlQuery,
+    DL_ANSWERS,
     declaration,
     entityName,
     filterTree,
@@ -47,11 +49,17 @@
     validIri,
     validLang,
     opAxioms,
+    parseManchester,
     type AxiomInput,
     type AxiomJson,
     type AxiomItem,
     type Classification,
+    type DlAnswer,
+    type DlQueryResult,
+    type DlReasoning,
     type EntityKind,
+    type ManchesterProblem,
+    type ParseAs,
     type IriPolicy,
     type Lit,
     type Op,
@@ -60,13 +68,15 @@
     type Tree,
   } from '$lib/ontology';
   import Icon from '$components/Icon.svelte';
+  import ManchesterEditor from '$components/ManchesterEditor.svelte';
+  import type { NameOption } from '$lib/manchester-complete';
   import Modal from '$components/Modal.svelte';
   import OntoFrame from '$components/OntoFrame.svelte';
   import OntoHeader from '$components/OntoHeader.svelte';
   import OntoPreview from '$components/OntoPreview.svelte';
   import OntoTree from '$components/OntoTree.svelte';
 
-  type Tab = EntityKind | 'header';
+  type Tab = EntityKind | 'header' | 'dlquery';
 
   // --- the URL's state ---------------------------------------------------------------
   const q = $derived(page.url.searchParams);
@@ -76,10 +86,14 @@
   const graph = $derived(q.get('graph') || null);
   const sel: Selection = $derived({ graph, imports: true });
   const tab = $derived<Tab>(
-    (TREE_KINDS as string[]).includes(q.get('tab') ?? '') || q.get('tab') === 'header'
+    (TREE_KINDS as string[]).includes(q.get('tab') ?? '') ||
+      q.get('tab') === 'header' ||
+      q.get('tab') === 'dlquery'
       ? (q.get('tab') as Tab)
       : 'Class',
   );
+  /** The entity kind of the tab, when it shows a tree. */
+  const kindTab = $derived<EntityKind | null>(tab === 'header' || tab === 'dlquery' ? null : tab);
   const selected = $derived(q.get('iri'));
   const view = $derived(q.get('view') === 'usage' ? 'usage' : 'frame');
   const inferredOn = $derived(q.get('inferred') === '1');
@@ -238,19 +252,20 @@
     else s.add(id);
     opened = { ...opened, [key]: s };
   }
-  const tree = $derived(tab === 'header' ? null : trees.get(tab));
+  const tree = $derived(kindTab ? trees.get(kindTab) : null);
   const keep = $derived(tree ? filterTree(tree, nameOf, filter) : null);
 
   // open the path to the selection
   $effect(() => {
     const iri = selected;
     const t = tree;
-    if (!iri || !t || tab === 'header') return;
+    const k = kindTab;
+    if (!iri || !t || !k) return;
     const anc = ancestorsOf(t, iri);
     untrack(() => {
-      const cur = openSet(tab);
+      const cur = openSet(k);
       if (anc.every((a) => cur.has(a))) return;
-      opened = { ...opened, [tab]: new Set([...cur, ...anc]) };
+      opened = { ...opened, [k]: new Set([...cur, ...anc]) };
     });
   });
 
@@ -348,8 +363,8 @@
   });
   /** The kind the frame shows: the tab's when the entity has it. */
   const frameKind = $derived<EntityKind>(
-    tab !== 'header' && frameKinds.includes(tab)
-      ? tab
+    kindTab && frameKinds.includes(kindTab)
+      ? kindTab
       : (frameKinds.find((k) => k !== 'Datatype') ?? frameKinds[0] ?? 'Class'),
   );
   const options = (k: EntityKind) =>
@@ -373,6 +388,111 @@
     'gYear',
   ].map((t) => `http://www.w3.org/2001/XMLSchema#${t}`);
   const annotationProperties = $derived(entities.get('AnnotationProperty') ?? []);
+  /** The names that Manchester fields complete: labels and prefixed names of every kind. */
+  const completionNames = $derived.by(() => {
+    const out: NameOption[] = [];
+    for (const k of [...TREE_KINDS, 'Datatype'] as EntityKind[])
+      for (const iri of k === 'Datatype'
+        ? [...(entities.get('Datatype') ?? []), ...XSD_TYPES]
+        : (entities.get(k) ?? [])) {
+        const kind = KIND_SINGULAR[k];
+        const shown = nameOf(iri);
+        out.push({ name: shown, iri, kind });
+        const short = iriName(iri, prefixes);
+        if (short !== shown) out.push({ name: short, iri, kind });
+      }
+    return out;
+  });
+  const names = () => completionNames;
+  const parse = (text: string, as: ParseAs) => parseManchester(target, sel, text, as);
+
+  // --- the DL query --------------------------------------------------------------------
+  let dlText = $state('');
+  let dlAnswers = $state<DlAnswer[]>(DL_ANSWERS.map(([k]) => k));
+  let dlReasoning = $state<DlReasoning>('auto');
+  let dlResult = $state<DlQueryResult | null>(null);
+  let dlProblem = $state<ManchesterProblem | null>(null);
+  let dlError = $state<string | null>(null);
+  let dlBusy = $state(false);
+  /**
+   * The query text the answers or the problem shown are for, with the commit the page
+   * showed and the dataset, branch and graph it read.
+   */
+  let dlRan = $state<{ text: string; commit: number | null; scope: string } | null>(null);
+  let dlSeq = 0;
+  /** The run in flight: its scope and the query the address held when it started. */
+  let dlPending: { scope: string; url: string | null } | null = null;
+  const dlScope = () => `${target}\u0000${JSON.stringify(sel)}`;
+  /** Forget the run in flight, whose answer no longer fits the page. */
+  function dropDl() {
+    dlSeq++;
+    dlPending = null;
+    dlBusy = false;
+  }
+  async function runDl(text = dlText) {
+    // the text is sent as it is, so that a problem's span fits the editor's text
+    if (!text.trim()) return;
+    const my = ++dlSeq;
+    const scope = dlScope();
+    const commit = summary?.commit ?? null;
+    dlPending = { scope, url: q.get('dl') };
+    dlBusy = true;
+    dlError = null;
+    try {
+      const r = await dlQuery(target, sel, {
+        expression: text,
+        answers: dlAnswers,
+        reasoning: dlReasoning,
+      });
+      if (my !== dlSeq || dlScope() !== scope) return;
+      dlPending = null;
+      if (r.ok) {
+        dlResult = r.result;
+        dlProblem = null;
+      } else {
+        dlProblem = r.problem;
+        dlResult = null;
+      }
+      dlRan = { text, commit, scope };
+      // each query run is a step of the history, so that Back shows the one before
+      if (q.get('dl') !== text) void nav({ dl: text });
+    } catch (e) {
+      if (my === dlSeq) dlError = api.errorMessage(e);
+    } finally {
+      if (my === dlSeq) dlBusy = false;
+    }
+  }
+  // a link to the tab with a query runs it and shows it in the editor, and a commit the
+  // views show, or another dataset, branch or graph, runs it again
+  $effect(() => {
+    const text = q.get('dl');
+    const commit = summary?.commit;
+    const scope = dlScope();
+    untrack(() => {
+      // Back, another query in the address or another scope makes the run in flight moot
+      if (dlPending && (dlPending.scope !== scope || dlPending.url !== text)) dropDl();
+      if (dlRan && dlRan.scope !== scope) {
+        dlResult = null;
+        dlProblem = null;
+      }
+    });
+    if (tab !== 'dlquery' || !text || commit == null) return;
+    untrack(() => {
+      if (dlRan && dlRan.text === text && dlRan.commit === commit && dlRan.scope === scope) return;
+      if (dlRan && dlRan.scope !== scope) {
+        dlResult = null;
+        dlProblem = null;
+      }
+      if (!dlRan || dlRan.text !== text) dlText = text;
+      void runDl(text);
+    });
+  });
+  /** A reason or note of the server, which is a clause, as a sentence. */
+  const sentence = (t: string) =>
+    t ? t[0].toUpperCase() + t.slice(1) + (/[.!?]$/.test(t) ? '' : '.') : t;
+  function toggleAnswer(k: DlAnswer, on: boolean) {
+    dlAnswers = DL_ANSWERS.map(([a]) => a).filter((a) => (a === k ? on : dlAnswers.includes(a)));
+  }
   const usageGroups = $derived.by(() => {
     const g = new Map<string, AxiomItem[]>();
     for (const it of frameItems) g.set(it.type, [...(g.get(it.type) ?? []), it]);
@@ -736,27 +856,36 @@
   {/if}
 
   {#if name && summary}
+    <!-- one strip for the entity kinds and the ontology's views, which wraps rather than
+         hiding tabs past the edge -->
+    <div class="tabs onto-tabs" role="tablist" aria-label="Ontology views">
+      {#each TREE_KINDS as k (k)}
+        <button class="tab" role="tab" aria-selected={tab === k} onclick={() => nav({ tab: k })}
+          >{KIND_LABEL[k]} <span class="count">{counts[k] || ''}</span></button
+        >
+      {/each}
+      <span class="tab-sep" aria-hidden="true"></span>
+      <button
+        class="tab"
+        role="tab"
+        aria-selected={tab === 'dlquery'}
+        onclick={() => nav({ tab: 'dlquery' })}>DL Query</button
+      >
+      <button
+        class="tab"
+        role="tab"
+        aria-selected={tab === 'header'}
+        onclick={() => nav({ tab: 'header', iri: null })}>Header</button
+      >
+    </div>
     <div class="panes">
       <section class="panel trees" aria-label="Entities">
-        <div class="tabs" role="tablist" aria-label="Entity kinds">
-          {#each TREE_KINDS as k (k)}
-            <button class="tab" role="tab" aria-selected={tab === k} onclick={() => nav({ tab: k })}
-              >{KIND_LABEL[k]} <span class="count">{counts[k] || ''}</span></button
-            >
-          {/each}
-          <button
-            class="tab"
-            role="tab"
-            aria-selected={tab === 'header'}
-            onclick={() => nav({ tab: 'header', iri: null })}>Header</button
-          >
-        </div>
-        {#if tab !== 'header' && tree}
+        {#if kindTab && tree}
           <div class="tree-bar">
             <input
               class="input"
               type="search"
-              placeholder="Filter {KIND_LABEL[tab].toLowerCase()}"
+              placeholder="Filter {KIND_LABEL[kindTab].toLowerCase()}"
               aria-label="Filter"
               bind:value={filter}
             />
@@ -765,18 +894,18 @@
                 class="btn sm"
                 onclick={() =>
                   openCreate(
-                    tab as EntityKind,
-                    selected && tab !== 'NamedIndividual' && tree?.nodes.has(selected)
+                    kindTab,
+                    selected && kindTab !== 'NamedIndividual' && tree?.nodes.has(selected)
                       ? selected
-                      : tab === 'NamedIndividual' &&
+                      : kindTab === 'NamedIndividual' &&
                           selected &&
                           (trees.get('Class')?.nodes.has(selected) ?? false)
                         ? selected
                         : null,
                   )}
                 title={selected
-                  ? `New ${KIND_SINGULAR[tab]} under the selection`
-                  : `New ${KIND_SINGULAR[tab]}`}><Icon name="plus" size={13} /> New</button
+                  ? `New ${KIND_SINGULAR[kindTab]} under the selection`
+                  : `New ${KIND_SINGULAR[kindTab]}`}><Icon name="plus" size={13} /> New</button
               >
             {/if}
             {#if tab === 'Class'}
@@ -803,22 +932,22 @@
               <div class="tree-scroll">
                 {#if tree.roots.length}
                   <OntoTree
-                    label="{KIND_LABEL[tab]} (asserted)"
+                    label="{KIND_LABEL[kindTab]} (asserted)"
                     roots={tree.roots}
                     children={(id) => tree?.children.get(id) ?? []}
                     name={nameOf}
                     sub={subOf}
-                    badge={tab === 'NamedIndividual'
+                    badge={kindTab === 'NamedIndividual'
                       ? (id) => (typesOf.get(id) ?? []).map(nameOf).join(', ') || null
                       : undefined}
-                    open={openSet(tab)}
+                    open={openSet(kindTab)}
                     {selected}
                     {keep}
                     onselect={(id) => nav({ iri: id })}
-                    ontoggle={(id) => toggle(tab, id)}
+                    ontoggle={(id) => toggle(kindTab, id)}
                   />
                 {:else}
-                  <p class="empty">No {KIND_LABEL[tab].toLowerCase()}.</p>
+                  <p class="empty">No {KIND_LABEL[kindTab].toLowerCase()}.</p>
                 {/if}
               </div>
             </div>
@@ -866,6 +995,9 @@
         {/if}
         {#if tab === 'header'}
           <p class="faint pad">The header describes the ontology of the graph as a whole.</p>
+        {/if}
+        {#if tab === 'dlquery'}
+          {@render dlPanel()}
         {/if}
       </section>
 
@@ -944,6 +1076,8 @@
                   {options}
                   {annotationProperties}
                   {readonly}
+                  {names}
+                  {parse}
                   onedit={(op, label) => edit(op, label)}
                   onopen={(iri) => nav({ iri, view: null })}
                 />
@@ -1142,6 +1276,160 @@
   {/snippet}
 </Modal>
 
+{#snippet dlList(key: DlAnswer, title: string)}
+  {@const list = dlResult?.[key]}
+  {#if list}
+    {@const count = dlResult?.counts[key] ?? list.length}
+    <section class="dl-answer" aria-label={title}>
+      <h3>
+        {title} <span class="faint">{count}</span>
+      </h3>
+      {#if list.length}
+        <ul>
+          {#each list as iri (iri)}
+            <li>
+              <button
+                class="link"
+                class:on={selected === iri}
+                title={iri}
+                onclick={() => nav({ iri, view: null })}>{nameOf(iri)}</button
+              >
+            </li>
+          {/each}
+        </ul>
+        {#if count > list.length}
+          <p class="faint small">The first {list.length} of {count} are shown.</p>
+        {/if}
+      {:else}
+        <p class="faint small">None.</p>
+      {/if}
+    </section>
+  {/if}
+{/snippet}
+
+{#snippet dlPanel()}
+  <form
+    class="dl-form"
+    aria-label="DL query"
+    onsubmit={(e) => {
+      e.preventDefault();
+      void runDl();
+    }}
+  >
+    <span class="f">Class expression in Manchester syntax</span>
+    <ManchesterEditor
+      bind:value={dlText}
+      {names}
+      label="Class expression"
+      placeholder="Person and (teaches some Course)"
+      multiline
+      problem={dlProblem
+        ? { start: dlProblem.start, end: dlProblem.end, message: dlProblem.error }
+        : null}
+      onsubmit={() => void runDl()}
+    />
+    {#if dlProblem}
+      <div class="problem" role="alert">
+        {dlProblem.error}
+        {#if dlProblem.candidates?.length}
+          <span>It could be</span>
+          {#each dlProblem.candidates as c, i (c.iri)}
+            <code title={c.iri}>{c.label ?? iriName(c.iri, prefixes)}</code>{i <
+            dlProblem.candidates.length - 1
+              ? ', '
+              : '.'}
+          {/each}
+        {/if}
+      </div>
+    {/if}
+    {#if dlError}<p class="problem" role="alert">{dlError}</p>{/if}
+    <fieldset class="dl-answers">
+      <legend class="faint">Answers</legend>
+      {#each DL_ANSWERS as [k, label] (k)}
+        <label class="check"
+          ><input
+            type="checkbox"
+            checked={dlAnswers.includes(k)}
+            onchange={(e) => toggleAnswer(k, e.currentTarget.checked)}
+          />
+          {label}</label
+        >
+      {/each}
+    </fieldset>
+    <div class="dl-run">
+      <label class="pick">
+        <span>Reasoning</span>
+        <select class="input" bind:value={dlReasoning} aria-label="Reasoning">
+          <option value="auto">Automatic</option>
+          <option value="el">OWL 2 EL classifier</option>
+          <option value="rl">OWL 2 RL rules</option>
+        </select>
+      </label>
+      <button class="btn primary" type="submit" disabled={dlBusy || !dlText.trim()}
+        >{dlBusy ? 'Running…' : 'Execute'}</button
+      >
+    </div>
+  </form>
+  {#if dlResult}
+    {@const r = dlResult.reasoning}
+    <section class="dl-result" aria-label="DL query answers">
+      <div class="dl-label" role="status">
+        <span class="badge spark">{r.title}</span>
+        {#if r.complete && r.instancesComplete !== false}
+          <span class="badge ok">Complete</span>
+        {:else if r.complete}
+          <span class="badge ok">Classes complete</span>
+          <span class="badge danger">Instances possibly incomplete</span>
+        {:else if r.instancesComplete === true}
+          <span class="badge danger">Classes possibly incomplete</span>
+          <span class="badge ok">Instances complete</span>
+        {:else}
+          <span class="badge danger">Possibly incomplete</span>
+        {/if}
+        {#if dlResult.incremental}<span class="badge">Incremental</span>{/if}
+        <span class="faint small">{dlResult.elapsedMs.toFixed(1)} ms</span>
+      </div>
+      <p class="small muted">{sentence(r.why)}</p>
+      {#each r.notes as n (n)}<p class="small muted">{sentence(n)}</p>{/each}
+      {#if r.gaps.length}
+        <details class="dl-gaps">
+          <summary class="small"
+            >{r.gapCount} {r.gapCount === 1 ? 'axiom' : 'axioms'} outside the profile</summary
+          >
+          <ul>
+            {#each r.gaps as g, i (i)}
+              <li class="small">
+                <code>{g.manchester ?? g.ofn ?? ''}</code>
+                <span class="faint">{g.message}</span>
+              </li>
+            {/each}
+          </ul>
+          {#if r.gapCount > r.gaps.length}
+            <p class="faint small">The first {r.gaps.length} are shown.</p>
+          {/if}
+        </details>
+      {/if}
+      {#if dlResult.consistent === false}
+        <p class="problem" role="alert">
+          The ontology is inconsistent, so every class is a subclass of every other.
+        </p>
+      {:else if dlResult.satisfiable === false}
+        <p class="problem" role="alert">
+          The expression is unsatisfiable. It is equivalent to owl:Nothing and has no instances.
+        </p>
+      {/if}
+      {#each DL_ANSWERS as [k, label] (k)}
+        {@render dlList(k, label)}
+      {/each}
+    </section>
+  {:else if !dlProblem && !dlBusy}
+    <p class="faint pad">
+      Write a class expression and execute it to list its equivalent classes, superclasses,
+      subclasses and instances.
+    </p>
+  {/if}
+{/snippet}
+
 <style>
   .onto {
     gap: 12px;
@@ -1199,9 +1487,94 @@
     display: grid;
     align-content: start;
   }
-  .trees > .tabs {
-    padding: 0 8px;
+  .onto-tabs {
+    flex-wrap: wrap;
+    row-gap: 0;
     border-bottom: 1px solid var(--border);
+  }
+  .tab-sep {
+    width: 1px;
+    align-self: center;
+    height: 18px;
+    margin: 0 6px;
+    background: var(--border);
+    flex: none;
+  }
+  .dl-form {
+    display: grid;
+    gap: 8px;
+    padding: 10px;
+  }
+  .dl-answers {
+    border: 0;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    font-size: var(--fs-sm);
+  }
+  .dl-answers legend {
+    font-size: var(--fs-xs);
+    padding: 0;
+    margin-right: 4px;
+    float: left;
+  }
+  .check {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .dl-run {
+    display: flex;
+    gap: 8px;
+    align-items: end;
+    flex-wrap: wrap;
+    justify-content: space-between;
+  }
+  .dl-result {
+    display: grid;
+    gap: 6px;
+    padding: 0 10px 12px;
+    min-width: 0;
+  }
+  .dl-label {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+  }
+  .dl-gaps ul {
+    margin: 4px 0;
+    padding-left: 18px;
+    display: grid;
+    gap: 3px;
+  }
+  .dl-gaps code {
+    overflow-wrap: anywhere;
+  }
+  .dl-answer h3 {
+    font-size: var(--fs-sm);
+    font-weight: 600;
+    color: var(--text-2);
+    border-bottom: 1px solid var(--border);
+    margin: 6px 0 4px;
+  }
+  .dl-answer ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 2px;
+    max-height: 240px;
+    overflow: auto;
+  }
+  .dl-answer .link {
+    text-align: left;
+    overflow-wrap: anywhere;
+  }
+  .dl-answer .link.on {
+    font-weight: 600;
   }
   .tree-bar {
     display: flex;

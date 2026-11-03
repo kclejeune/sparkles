@@ -213,7 +213,19 @@ and its imports
 [reasoning guide](../reasoning/README.md#owl-2-ontologies),
 [screenshot](../images/ontology-editor.png)). Trees of classes, object, data and
 annotation properties and individuals sit beside the selected entity's frame, which
-lists its annotations, characteristics and axioms and adds and removes them. The
+lists its annotations, characteristics and axioms and adds and removes them. The frame's
+add fields take class expressions and whole axioms in Manchester syntax, with
+completion of entity names and labels and an underline under the part the server could
+not read, or in functional-style syntax. One strip of tabs holds the entity kinds, the
+DL Query tab and the header, and it wraps onto a second line in a narrow window.
+
+The **DL Query** tab answers a Manchester class expression with its equivalent classes,
+its direct and inferred superclasses and subclasses, and its instances
+([screenshot](../images/ontology-dl-query.png)). Each answer opens the entity's frame
+beside the query, and the query is kept in the page's address. A label above the
+answers names the reasoning that found them, the EL classifier inside OWL 2 EL or the
+OWL 2 RL rules outside it, says whether they are complete, and lists the axioms outside
+the profile that can leave them incomplete. The
 header tab edits the ontology IRI, version IRI, imports and header annotations, and the
 usage tab lists every axiom that mentions the entity. **Inferred** shows the EL
 classifier's taxonomy beside the asserted class tree
@@ -319,12 +331,15 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   preview cannot say whether a fix resolves its result, item 121. Callers whose grants
   cover only some graphs get no overlay, item 75.
 * The ontology editor reads every entity and hierarchy axiom of a graph to draw its
-  trees, up to 50,000 of each, 607. Class expressions are typed in functional-style
-  syntax, since Manchester syntax is rendered but not parsed, 608. Only the class
-  tree has an inferred view, 609, and the IRI policy is kept in the browser per
-  dataset, 610. Rename covers the graph the page reads and not IRIs inside triple
-  terms, under item 457's refactoring phase. The DL Query tab and the editable schema
-  diagram are further U12 phases of item 457.
+  trees, up to 50,000 of each, 607. Only the class tree has an inferred view, 609, and
+  the IRI policy is kept in the browser per dataset, 610. Rename covers the graph the
+  page reads and not IRIs inside triple terms, under item 457's refactoring phase. The
+  editable schema diagram is a further U12 phase of item 457.
+* The DL Query tab's instances come from a classification with the assertions, which
+  the dataset does not keep, so each instance query classifies the ontology again, and
+  a query outside OWL 2 EL copies the ontology into memory for the RL rules, item
+  662. Class answers under the RL rules can miss entailed subsumptions, and the
+  label marks them as possibly incomplete.
 * The thesaurus editor reads at most 2,000 narrower concepts of a concept and 5,000 roots
   of a scheme, and the label search scans the labels for a substring and answers
   its first 100 matches, 638. A mapping's target in another dataset is named by its

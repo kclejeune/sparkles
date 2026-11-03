@@ -37,10 +37,12 @@
 //! ```
 
 mod index;
+mod query;
 mod saturate;
 mod taxonomy;
 
 pub use index::Gap;
+pub use query::Description;
 pub use taxonomy::{Node as TaxonomyNode, Taxonomy};
 
 use crate::model::*;
@@ -113,6 +115,9 @@ pub struct Stats {
     /// the estimated bytes the run keeps: the index, the contexts, the taxonomy and a
     /// classifier's copy of the axioms
     pub memory: usize,
+    /// the part of [`memory`](Stats::memory) that the taxonomy takes, 0 for a run
+    /// without one
+    pub taxonomy_memory: usize,
     /// the most estimated bytes the run held at once, which a memory budget bounds:
     /// [`memory`](Stats::memory) and, while the saturation ran, the messages waiting in
     /// the contexts' to-do lists
@@ -121,6 +126,15 @@ pub struct Stats {
     pub index: Duration,
     pub saturation: Duration,
     pub taxonomy: Duration,
+}
+
+/// The result of a run that saturates without building a taxonomy
+/// ([`Saturation::saturate`]).
+#[derive(Clone, Debug)]
+pub struct Saturated {
+    /// false when the ontology has no model
+    pub consistent: bool,
+    pub stats: Stats,
 }
 
 /// The result of a run.
@@ -179,6 +193,8 @@ pub struct Saturation {
     excluded: Vec<Excluded>,
     /// set when a run stopped part way, so that the next run starts again
     dirty: bool,
+    /// whether the last run whose saturation ended found the ontology consistent
+    consistent: bool,
 }
 
 impl Default for Saturation {
@@ -387,6 +403,36 @@ impl Classifier {
     /// Classifies the axioms held, saturating again only what changed since the last
     /// run.
     pub fn classify(&mut self, limits: &Limits) -> Result<Classification, Error> {
+        self.run_held(limits, true)
+            .map(|(consistent, taxonomy, stats)| Classification {
+                consistent,
+                taxonomy: taxonomy.expect("a taxonomy was asked for"),
+                stats,
+            })
+    }
+
+    /// Saturates the axioms held as [`classify`](Self::classify) does, again only what
+    /// changed since the last run, but builds no taxonomy. [`describe`](Self::describe)
+    /// then answers for one class from the saturated contexts.
+    pub fn saturate(&mut self, limits: &Limits) -> Result<Saturated, Error> {
+        self.run_held(limits, false)
+            .map(|(consistent, _, stats)| Saturated { consistent, stats })
+    }
+
+    /// What the last run says about the class `c` ([`Saturation::describe`]), or `None`
+    /// also when axioms were added or removed since.
+    pub fn describe(&self, c: &Class) -> Option<Description> {
+        if self.axioms.values().any(|h| h.ran != h.count) {
+            return None;
+        }
+        self.sat.describe(c)
+    }
+
+    fn run_held(
+        &mut self,
+        limits: &Limits,
+        with_taxonomy: bool,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
         let threads = threads_of(limits);
         let mut added: Vec<&AxiomKind> = Vec::new();
         let mut removed: Vec<&AxiomKind> = Vec::new();
@@ -414,7 +460,9 @@ impl Classifier {
             added: &added,
             removed: &removed,
         };
-        let r = self.sat.run_with(&held, Some(changes), held_bytes, limits);
+        let r = self
+            .sat
+            .run_with(&held, Some(changes), held_bytes, limits, with_taxonomy);
         drop((added, removed, held));
         // the changes are applied whether the run ends or not
         self.held_bytes = held_bytes;
@@ -436,6 +484,7 @@ impl Saturation {
             ctx: Vec::new(),
             excluded: Vec::new(),
             dirty: true,
+            consistent: true,
         }
     }
 
@@ -455,7 +504,26 @@ impl Saturation {
         changes: Option<Changes<'_>>,
         limits: &Limits,
     ) -> Result<Classification, Error> {
-        self.run_with(axioms, changes, 0, limits)
+        self.run_with(axioms, changes, 0, limits, true)
+            .map(|(consistent, taxonomy, stats)| Classification {
+                consistent,
+                taxonomy: taxonomy.expect("a taxonomy was asked for"),
+                stats,
+            })
+    }
+
+    /// Saturates `axioms` as [`classify`](Saturation::classify) does, but builds no
+    /// taxonomy. [`describe`](Saturation::describe) then answers for one class from the
+    /// saturated contexts, which costs far less than a taxonomy of every class when
+    /// only a few classes are asked about.
+    pub fn saturate(
+        &mut self,
+        axioms: &[&AxiomKind],
+        changes: Option<Changes<'_>>,
+        limits: &Limits,
+    ) -> Result<Saturated, Error> {
+        self.run_with(axioms, changes, 0, limits, false)
+            .map(|(consistent, _, stats)| Saturated { consistent, stats })
     }
 
     /// [`classify`](Saturation::classify), with the bytes of the caller's copy of the
@@ -466,8 +534,9 @@ impl Saturation {
         changes: Option<Changes<'_>>,
         held_bytes: usize,
         limits: &Limits,
-    ) -> Result<Classification, Error> {
-        let r = self.run(axioms, changes, held_bytes, limits);
+        with_taxonomy: bool,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        let r = self.run(axioms, changes, held_bytes, limits, with_taxonomy);
         if r.is_err() && self.dirty {
             // the next run starts again, so the state of this one is of no use
             self.index = None;
@@ -610,7 +679,8 @@ impl Saturation {
         changes: Option<Changes<'_>>,
         held_bytes: usize,
         limits: &Limits,
-    ) -> Result<Classification, Error> {
+        with_taxonomy: bool,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
         let mut stats = Stats::default();
         let start = Instant::now();
         let threads = threads_of(limits);
@@ -727,8 +797,16 @@ impl Saturation {
         self.index = Some(ix);
         let t = Instant::now();
         let consistent = self.consistent(&ax);
+        self.consistent = consistent;
         let held = totals.memory - ax.bytes();
         drop(ax);
+        if !with_taxonomy {
+            stats.memory = held;
+            stats.peak_memory = totals.peak.max(held);
+            stats.contexts = self.ctx.iter().filter(|c| c.get().is_some()).count();
+            poll(limits)?;
+            return Ok((consistent, None, stats));
+        }
         let stop = || poll(limits).is_err();
         // the taxonomy's bytes join those held, and the budget and the pool's grant cover
         // what passes the saturation's peak. The build asks again as its estimate grows,
@@ -759,15 +837,12 @@ impl Saturation {
                 },
             })?;
         stats.memory = held + tax_bytes;
+        stats.taxonomy_memory = tax_bytes;
         stats.peak_memory = totals.peak.max(stats.memory);
         stats.taxonomy = t.elapsed();
         stats.contexts = self.ctx.iter().filter(|c| c.get().is_some()).count();
         poll(limits)?;
-        Ok(Classification {
-            consistent,
-            taxonomy,
-            stats,
-        })
+        Ok((consistent, Some(taxonomy), stats))
     }
 
     fn consistent(&self, ax: &Axioms) -> bool {

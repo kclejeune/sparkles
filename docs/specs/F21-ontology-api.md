@@ -997,7 +997,7 @@ These phases belong to [ROADMAP](../ROADMAP.md) item 457, the ontology workbench
 
 **The F21 axiom model as the workbench base.** Item 71 built the F21 Phase 1 axiom model, the reverse and forward mappings, the profile checks and `/$/ontology/{ds}` in the `sparkles-owl` crate. Almost every ontology editing, refactoring, diff, documentation and classification phase depends on it, so it is the root of this workstream.
 
-**Functional, Manchester, OWL/XML, OBO and OBO Graphs JSON syntaxes.** Add readers and writers for OFN, Manchester, OWL/XML, OBO 1.4 and OBO Graphs JSON in sparkles-owl, registered with the loader, formatter, linter and LSP, with a Manchester class-expression editor mode. Ontologies are distributed in these formats and Protégé users write Manchester. Manchester is only rendered today (`schema/expressions.rs`). It depends on item 71.
+**Functional, Manchester, OWL/XML, OBO and OBO Graphs JSON syntaxes.** Add readers and writers for OFN, Manchester, OWL/XML, OBO 1.4 and OBO Graphs JSON in sparkles-owl, registered with the loader, formatter, linter and LSP, with a Manchester class-expression editor mode. Ontologies are distributed in these formats and Protégé users write Manchester. `sparkles_owl::manchester` reads Manchester class expressions and one-line axioms against an ontology's names and labels for the ontology editor and `POST /$/ontology/{ds}/parse`, and whole Manchester documents remain. It depends on item 71.
 
 **SSSOM mapping sets.** Import and export SSSOM TSV as RDF and review mapping sets in the UI. Crosswalks between vocabularies have no support.
 

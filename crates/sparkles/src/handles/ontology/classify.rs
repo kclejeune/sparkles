@@ -114,12 +114,69 @@ pub struct CacheEntry {
     key: String,
     commit: u64,
     ontology: Option<Arc<sparkles_owl::read::Ontology>>,
-    saturation: Saturation,
+    /// the axioms beyond the ontology's that the saturation last read, such as a DL
+    /// query's defining axiom, which the next run removes unless it reads them again
+    extra: Vec<AxiomKind>,
+    pub(super) saturation: Saturation,
+    /// the taxonomy of the ontology at `commit`, once a classification computed it,
+    /// which a DL query's run over the saturation leaves as it is
     result: Option<(Arc<Classification>, Arc<Vec<Excluded>>)>,
 }
 
+impl CacheEntry {
+    /// The estimated bytes of the kept taxonomy, 0 when none is kept.
+    pub(super) fn taxonomy_memory(&self) -> usize {
+        self.result
+            .as_ref()
+            .map_or(0, |(cl, _)| cl.stats.taxonomy_memory)
+    }
+
+    /// Lets the kept taxonomy go, so that the next classification builds it again.
+    pub(super) fn drop_taxonomy(&mut self) {
+        self.result = None;
+    }
+
+    /// Runs `go` on the kept saturation over the logical axioms of `o` and `extra`, with
+    /// the changes since the axioms it last read, so that it saturates again only what
+    /// they reach. The saturation holds the new axioms afterwards whether the run ends
+    /// or not.
+    pub(super) fn run_over<R>(
+        &mut self,
+        o: &Opened,
+        extra: Vec<AxiomKind>,
+        go: impl FnOnce(&mut Saturation, &[&AxiomKind], Option<Changes<'_>>) -> Result<R>,
+    ) -> Result<R> {
+        let before = self.ontology.take();
+        let before_extra = std::mem::take(&mut self.extra);
+        let out = {
+            let mut axioms = logical_axioms(&o.ontology);
+            axioms.extend(extra.iter().filter(|k| logical(k)));
+            let (added, removed): (Vec<&AxiomKind>, Vec<&AxiomKind>) = match &before {
+                Some(b) => {
+                    let now: FxHashSet<&AxiomKind> = axioms.iter().copied().collect();
+                    let mut then: FxHashSet<&AxiomKind> = logical_axioms(b).into_iter().collect();
+                    then.extend(before_extra.iter().filter(|k| logical(k)));
+                    (
+                        now.iter().copied().filter(|k| !then.contains(k)).collect(),
+                        then.iter().copied().filter(|k| !now.contains(k)).collect(),
+                    )
+                }
+                None => (Vec::new(), Vec::new()),
+            };
+            let changes = before.as_ref().map(|_| Changes {
+                added: &added,
+                removed: &removed,
+            });
+            go(&mut self.saturation, &axioms, changes)
+        };
+        self.ontology = Some(o.ontology.clone());
+        self.extra = extra;
+        out
+    }
+}
+
 /// The logical axioms of an ontology, in its order.
-fn logical_axioms(o: &sparkles_owl::read::Ontology) -> Vec<&AxiomKind> {
+pub(super) fn logical_axioms(o: &sparkles_owl::read::Ontology) -> Vec<&AxiomKind> {
     o.axioms
         .keys()
         .map(|a| &a.kind)
@@ -186,7 +243,7 @@ impl Ontologies {
             let mut axioms = logical_axioms(&o.ontology);
             axioms.extend(assertions.iter().map(|a| &a.kind).filter(|k| logical(k)));
             let mut s = Saturation::new();
-            let par = admit(c, &opts)?;
+            let par = admit(c.threads, &opts)?;
             let out = run(&mut s, &axioms, None, par, &opts)?;
             (Arc::new(out), Arc::new(s.excluded().to_vec()), false)
         };
@@ -221,6 +278,40 @@ impl Ontologies {
         c: &ClassifyRequest,
         opts: &QueryOptions,
     ) -> Result<(Arc<Classification>, Arc<Vec<Excluded>>, bool)> {
+        let commit = o.snapshot.commit;
+        self.with_kept(req, opts, |e| {
+            if e.commit == commit
+                && let Some((cl, ex)) = &e.result
+            {
+                return Ok(((cl.clone(), ex.clone(), true), true));
+            }
+            // the threads come first: a wait that ends at the deadline leaves the kept
+            // state as it was
+            let par = admit(c.threads, opts)?;
+            let out = e.run_over(o, Vec::new(), |s, axioms, changes| {
+                run(s, axioms, changes, par, opts)
+            })?;
+            let cl = Arc::new(out);
+            let ex = Arc::new(e.saturation.excluded().to_vec());
+            let keep = cl.stats.memory <= CACHE_MAX_BYTES;
+            e.commit = commit;
+            e.result = keep.then(|| (cl.clone(), ex.clone()));
+            Ok(((cl, ex, false), keep))
+        })
+    }
+
+    /// Runs `f` on the dataset's kept classification of the ontology `req` names: its
+    /// saturation, which [`CacheEntry::run_over`] brings to an open ontology's axioms,
+    /// and the taxonomy of the commit it last classified. One caller at a time holds it,
+    /// and a second waits under its own deadline. `f` answers whether the dataset keeps
+    /// the entry afterwards, and an error from `f` keeps it. Only callers who read every
+    /// graph of a state that can be kept use it.
+    pub(super) fn with_kept<T>(
+        &self,
+        req: &OntologyRequest,
+        opts: &QueryOptions,
+        f: impl FnOnce(&mut CacheEntry) -> Result<(T, bool)>,
+    ) -> Result<T> {
         let key = format!("{:?}|{:?}|{}", req.graphs(), req.imports, req.mode.as_str());
         let state = self.ds.state();
         // one run at a time: a second caller waits, then reads the first one's answer
@@ -240,64 +331,23 @@ impl Ontologies {
                 key,
                 commit: 0,
                 ontology: None,
+                extra: Vec::new(),
                 saturation: Saturation::new(),
                 result: None,
             },
         };
-        let commit = o.snapshot.commit;
-        if e.commit == commit
-            && let Some((cl, ex)) = &e.result
-        {
-            let answer = (cl.clone(), ex.clone(), true);
-            *state.classify_cache.lock() = Some(e);
-            return Ok(answer);
-        }
-        // the threads come first: a wait that ends at the deadline leaves the kept state
-        // as it was
-        let par = match admit(c, opts) {
-            Ok(par) => par,
+        match f(&mut e) {
+            Ok((out, keep)) => {
+                if keep {
+                    *state.classify_cache.lock() = Some(e);
+                }
+                Ok(out)
+            }
             Err(err) => {
                 *state.classify_cache.lock() = Some(e);
-                return Err(err);
+                Err(err)
             }
-        };
-        // the axioms that changed since the ontology the saturation last read
-        let before = e.ontology.take();
-        let axioms = logical_axioms(&o.ontology);
-        let (added, removed) = match &before {
-            Some(b) => {
-                let now: FxHashSet<&AxiomKind> = axioms.iter().copied().collect();
-                let then: FxHashSet<&AxiomKind> = logical_axioms(b).into_iter().collect();
-                (
-                    now.iter().copied().filter(|k| !then.contains(k)).collect(),
-                    then.iter().copied().filter(|k| !now.contains(k)).collect(),
-                )
-            }
-            None => (Vec::new(), Vec::new()),
-        };
-        let changes = before.as_ref().map(|_| Changes {
-            added: &added,
-            removed: &removed,
-        });
-        e.commit = commit;
-        e.result = None;
-        let out = run(&mut e.saturation, &axioms, changes, par, opts);
-        // the saturation reflects the new axioms whether the run ends or not
-        e.ontology = Some(o.ontology.clone());
-        let out = match out {
-            Ok(out) => out,
-            Err(err) => {
-                *state.classify_cache.lock() = Some(e);
-                return Err(err);
-            }
-        };
-        let cl = Arc::new(out);
-        let ex = Arc::new(e.saturation.excluded().to_vec());
-        if cl.stats.memory <= CACHE_MAX_BYTES {
-            e.result = Some((cl.clone(), ex.clone()));
-            *state.classify_cache.lock() = Some(e);
         }
-        Ok((cl, ex, false))
     }
 
     /// Write the taxonomy to `target` in one commit: add its axioms, remove the taxonomy
@@ -493,14 +543,14 @@ thread_local! {
 
 /// The threads of a classification, from the algorithm pool. A caller takes them before
 /// it changes any kept state, since the wait can end at the deadline or a cancellation.
-fn admit(c: &ClassifyRequest, opts: &QueryOptions) -> Result<Par> {
+pub(super) fn admit(threads: usize, opts: &QueryOptions) -> Result<Par> {
     #[cfg(test)]
     if REFUSE_ADMISSION.with(|r| r.replace(false)) {
         return Err(Error::Timeout);
     }
     let flag = opts.cancel.clone().unwrap_or_default();
     let ctl = Control::new(flag, opts.deadline, u64::MAX);
-    Par::acquire(c.threads, &ctl)
+    Par::acquire(threads, &ctl)
 }
 
 /// Runs a classification on the threads of `par` under the options' deadline,
@@ -512,6 +562,27 @@ fn run(
     par: Par,
     opts: &QueryOptions,
 ) -> Result<Classification> {
+    bounded(par, opts, |limits| k.classify(axioms, changes, limits))
+}
+
+/// Saturates without a taxonomy, under the bounds [`run`] sets.
+pub(super) fn saturate(
+    k: &mut Saturation,
+    axioms: &[&AxiomKind],
+    changes: Option<Changes<'_>>,
+    par: Par,
+    opts: &QueryOptions,
+) -> Result<sparkles_owl::classify::Saturated> {
+    bounded(par, opts, |limits| k.saturate(axioms, changes, limits))
+}
+
+/// Calls `f` on the threads of `par` with the limits of `opts`: its deadline,
+/// cancellation and memory budget.
+fn bounded<T>(
+    par: Par,
+    opts: &QueryOptions,
+    f: impl FnOnce(&Limits) -> std::result::Result<T, sparkles_owl::classify::Error>,
+) -> Result<T> {
     let cancel = opts.cancel.clone();
     let cancellation = opts.cancellation.clone();
     let grant = opts.grant.clone();
@@ -528,7 +599,7 @@ fn run(
                 as Arc<dyn Fn(usize) -> bool + Send + Sync>
         }),
     };
-    let out = k.classify(axioms, changes, &limits);
+    let out = f(&limits);
     drop(par);
     out.map_err(|e| match e {
         sparkles_owl::classify::Error::Cancelled => Error::Cancelled,
