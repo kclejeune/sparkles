@@ -238,9 +238,9 @@
       }
     },
     {
-      "run_id": "sha256-0bbe7fbaf1b9e9cdfe9378f1384b6e0328eb2d4bfdfbebd0398d47b8a99995e0",
+      "run_id": "sha256-b5c87dca99195e736806b7e2591fd26c590ed2077985c2c4dbf9ab96d486e1ba",
       "path": "../2026-11-02-ask-cheap-tier-paid.json",
-      "sha256": "0bbe7fbaf1b9e9cdfe9378f1384b6e0328eb2d4bfdfbebd0398d47b8a99995e0",
+      "sha256": "b5c87dca99195e736806b7e2591fd26c590ed2077985c2c4dbf9ab96d486e1ba",
       "format": "legacy-assessment",
       "context": {
         "suite": null,
@@ -265,9 +265,9 @@
       }
     },
     {
-      "run_id": "sha256-e5908fd56ea7b55a2c2b430a43b80d5c4fe984f0db1f4caf06e5dbbdd3c4f976",
+      "run_id": "sha256-68fbd0d73c231858166948389a75f28efc38974a73dbc4c1814c045faa30b67f",
       "path": "../2026-11-03-ask-effort-paid.json",
-      "sha256": "e5908fd56ea7b55a2c2b430a43b80d5c4fe984f0db1f4caf06e5dbbdd3c4f976",
+      "sha256": "68fbd0d73c231858166948389a75f28efc38974a73dbc4c1814c045faa30b67f",
       "format": "legacy-assessment",
       "context": {
         "suite": null,

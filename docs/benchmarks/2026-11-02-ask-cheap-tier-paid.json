@@ -229,6 +229,7 @@
     "output": 206878,
     "cacheReadShare": 0.6033
    },
+   "elapsedSeconds": 1399.7668400680413,
    "sets": {
     "unseen": {
      "path": "sets/unseen-150.json",
@@ -889,6 +890,7 @@
     "output": 89381,
     "cacheReadShare": 0.5514
    },
+   "elapsedSeconds": 1446.0130638759583,
    "sets": {
     "unseen-a": {
      "path": "sets/unseen-150-a.json",
@@ -1594,8 +1596,10 @@
     "cacheWrite": 1701916,
     "cacheRead": 652892,
     "output": 127404,
+    "reasoning": 86598,
     "cacheReadShare": 0.2722
    },
+   "elapsedSeconds": 1616.818485373049,
    "sets": {
     "unseen": {
      "path": "sets/unseen-150.json",
@@ -2249,8 +2253,10 @@
     "cacheWrite": 1711266,
     "cacheRead": 346351,
     "output": 52199,
+    "reasoning": 10653,
     "cacheReadShare": 0.1647
    },
+   "elapsedSeconds": 1340.9091384250205,
    "sets": {
     "unseen-a": {
      "path": "sets/unseen-150-a.json",
@@ -2950,8 +2956,10 @@
     "cacheWrite": 1689176,
     "cacheRead": 294177,
     "output": 68073,
+    "reasoning": 30505,
     "cacheReadShare": 0.1448
    },
+   "elapsedSeconds": 1288.1610599959968,
    "sets": {
     "unseen": {
      "path": "sets/unseen-150.json",
@@ -3607,6 +3615,7 @@
     "output": 265126,
     "cacheReadShare": 0.5932
    },
+   "elapsedSeconds": 1930.7395325599937,
    "sets": {
     "synth-val": {
      "path": "synth/v3/synth-validation.json",
@@ -4454,6 +4463,7 @@
     "output": 265667,
     "cacheReadShare": 0.5988
    },
+   "elapsedSeconds": 2124.712581234984,
    "sets": {
     "synth-val": {
      "path": "synth/v3/synth-validation.json",
@@ -5302,6 +5312,7 @@
     "output": 92343,
     "cacheReadShare": 0.6591
    },
+   "elapsedSeconds": 658.8306888570078,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -5568,6 +5579,7 @@
     "output": 92220,
     "cacheReadShare": 0.6467
    },
+   "elapsedSeconds": 638.024357605027,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -5839,6 +5851,7 @@
     "output": 89272,
     "cacheReadShare": 0.6406
    },
+   "elapsedSeconds": 539.0307355918922,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -6108,6 +6121,7 @@
     "output": 95655,
     "cacheReadShare": 0.6616
    },
+   "elapsedSeconds": 659.3632763370406,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -6371,6 +6385,7 @@
     "output": 92986,
     "cacheReadShare": 0.6651
    },
+   "elapsedSeconds": 722.8740960480645,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -6635,6 +6650,7 @@
     "output": 87726,
     "cacheReadShare": 0.6217
    },
+   "elapsedSeconds": 525.1577958739363,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -6898,6 +6914,7 @@
     "output": 88344,
     "cacheReadShare": 0.6357
    },
+   "elapsedSeconds": 524.098471601028,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -7161,6 +7178,7 @@
     "output": 87338,
     "cacheReadShare": 0.6336
    },
+   "elapsedSeconds": 548.693988335086,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -7427,6 +7445,7 @@
     "output": 78722,
     "cacheReadShare": 0.6117
    },
+   "elapsedSeconds": 487.24042839196045,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -7683,6 +7702,7 @@
     "output": 76418,
     "cacheReadShare": 0.6277
    },
+   "elapsedSeconds": 483.6162809350062,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -7944,6 +7964,7 @@
     "output": 80031,
     "cacheReadShare": 0.6391
    },
+   "elapsedSeconds": 516.0008885859279,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -8204,6 +8225,7 @@
     "output": 225611,
     "cacheReadShare": 0.5718
    },
+   "elapsedSeconds": 1920.4171839939663,
    "sets": {
     "synth-val": {
      "path": "synth/v3/synth-validation.json",
@@ -9033,6 +9055,7 @@
     "output": 134795,
     "cacheReadShare": 0.5171
    },
+   "elapsedSeconds": null,
    "sets": {
     "synth-val": {
      "path": "synth/v3/synth-validation.json",
@@ -9631,6 +9654,7 @@
     "output": 174351,
     "cacheReadShare": 0.5568
    },
+   "elapsedSeconds": 1387.7509434530511,
    "sets": {
     "synth-validation": {
      "path": "synth/v2/synth-validation.json",
@@ -10239,8 +10263,10 @@
     "cacheWrite": 1502064,
     "cacheRead": 1371821,
     "output": 177686,
+    "reasoning": 128865,
     "cacheReadShare": 0.4668
    },
+   "elapsedSeconds": 3043.8614390989533,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -11115,8 +11141,10 @@
     "cacheWrite": 591692,
     "cacheRead": 359229,
     "output": 64617,
+    "reasoning": 46837,
     "cacheReadShare": 0.3726
    },
+   "elapsedSeconds": 981.5379892559722,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -11396,8 +11424,10 @@
     "cacheWrite": 582052,
     "cacheRead": 424978,
     "output": 66993,
+    "reasoning": 48733,
     "cacheReadShare": 0.4158
    },
+   "elapsedSeconds": 1188.5903704490047,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -11676,8 +11706,10 @@
     "cacheWrite": 572912,
     "cacheRead": 353493,
     "output": 66335,
+    "reasoning": 49633,
     "cacheReadShare": 0.3751
    },
+   "elapsedSeconds": 896.1382822250016,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -11956,8 +11988,10 @@
     "cacheWrite": 23688,
     "cacheRead": 931622,
     "output": 63328,
+    "reasoning": 46337,
     "cacheReadShare": 0.9597
    },
+   "elapsedSeconds": 1059.2902310319478,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -12231,8 +12265,10 @@
     "cacheWrite": 19639,
     "cacheRead": 879445,
     "output": 62631,
+    "reasoning": 46605,
     "cacheReadShare": 0.9631
    },
+   "elapsedSeconds": 1002.8356719089206,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -12510,8 +12546,10 @@
     "cacheWrite": 574316,
     "cacheRead": 255422,
     "output": 63199,
+    "reasoning": 47967,
     "cacheReadShare": 0.3018
    },
+   "elapsedSeconds": 882.3408202260034,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -12790,8 +12828,10 @@
     "cacheWrite": 33497,
     "cacheRead": 822747,
     "output": 65873,
+    "reasoning": 49044,
     "cacheReadShare": 0.9439
    },
+   "elapsedSeconds": 915.3966106160078,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -13067,8 +13107,10 @@
     "cacheWrite": 601855,
     "cacheRead": 203053,
     "output": 56978,
+    "reasoning": 41731,
     "cacheReadShare": 0.2472
    },
+   "elapsedSeconds": 849.1202985359123,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -13346,8 +13388,10 @@
     "cacheWrite": 574139,
     "cacheRead": 279300,
     "output": 55088,
+    "reasoning": 40118,
     "cacheReadShare": 0.3215
    },
+   "elapsedSeconds": 794.6095524349948,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -13610,8 +13654,10 @@
     "cacheWrite": 584690,
     "cacheRead": 280321,
     "output": 52783,
+    "reasoning": 38744,
     "cacheReadShare": 0.3183
    },
+   "elapsedSeconds": 660.5585466340417,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -13873,8 +13919,10 @@
     "cacheWrite": 572865,
     "cacheRead": 247892,
     "output": 49799,
+    "reasoning": 35713,
     "cacheReadShare": 0.2964
    },
+   "elapsedSeconds": 586.4108835069928,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -14133,8 +14181,10 @@
     "cacheWrite": 2069034,
     "cacheRead": 527292,
     "output": 132372,
+    "reasoning": 90381,
     "cacheReadShare": 0.1984
    },
+   "elapsedSeconds": 1662.7326841000468,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",

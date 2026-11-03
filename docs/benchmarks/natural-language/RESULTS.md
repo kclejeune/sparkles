@@ -480,15 +480,15 @@ run stopped on its token limit.
 | Claude Haiku 5.5 | 29, 27, 30 | 28.7 | 26, 27, 29 | 27.3 | $0.122 to $0.124, against $0.105 to $0.109 |
 | GPT-6 Luna | 30, 29, 30 | 29.7 | 31, 28, 30 | 29.7 | $0.116 with a cold cache, against $0.101 to $0.104 |
 
-High effort gains nothing on either model. Haiku writes about 41% more output tokens and
-Luna about 60% more reasoning tokens, and the runs take about 25% to 45% longer. An arm was to
-be confirmed on the held-out set only if its mean rose beyond the spread of the medium
-runs, so neither ran there, and the held-out comparison above stands. There both cheap
-models are within the noise of Sol and neither is within the noise of Opus with the same
-build. At high effort the 150 held-out questions would cost about $0.36 for either
-model, against $2.51 for Terra, so cost is not what rules high effort out. Effort stays
-`medium` for the cheapest models. The
-[effort record](../2026-11-03-ask-effort-paid.json) holds the runs.
+High effort gains nothing on either model. Over the three runs of each arm Haiku writes
+42% more output tokens and Luna 64% more reasoning tokens, and the runs take 23% and 56%
+longer. An arm was to be confirmed on the held-out set only if its mean rose beyond the
+spread of the medium runs, so neither ran there, and the held-out comparison above
+stands. There both cheap models are within the noise of Sol and neither is within the
+noise of Opus with the same build. At high effort the 150 held-out questions would cost
+about $0.36 for either model, against $2.51 for Terra, so cost is not what rules high
+effort out. Effort stays `medium` for the cheapest models. The [effort
+record](../2026-11-03-ask-effort-paid.json) holds the runs.
 
 ##### Synthetic questions
 

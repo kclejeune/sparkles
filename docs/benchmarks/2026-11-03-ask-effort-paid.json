@@ -133,6 +133,7 @@
     "output": 111066,
     "cacheReadShare": 0.6444
    },
+   "elapsedSeconds": 616.2763355020434,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -393,6 +394,7 @@
     "output": 113204,
     "cacheReadShare": 0.6373
    },
+   "elapsedSeconds": 621.4283738209633,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -650,6 +652,7 @@
     "output": 109396,
     "cacheReadShare": 0.6326
    },
+   "elapsedSeconds": 592.9899250379531,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -909,8 +912,10 @@
     "cacheWrite": 585428,
     "cacheRead": 250393,
     "output": 78511,
+    "reasoning": 63202,
     "cacheReadShare": 0.2944
    },
+   "elapsedSeconds": 1057.210619237041,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -1168,8 +1173,10 @@
     "cacheWrite": 25990,
     "cacheRead": 815544,
     "output": 82591,
+    "reasoning": 67374,
     "cacheReadShare": 0.9517
    },
+   "elapsedSeconds": 1162.005259432015,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
@@ -1424,8 +1431,10 @@
     "cacheWrite": 12574,
     "cacheRead": 785732,
     "output": 71433,
+    "reasoning": 57444,
     "cacheReadShare": 0.9656
    },
+   "elapsedSeconds": 973.7545119920978,
    "sets": {
     "qald-val": {
      "path": "sets/qald-validation-v2.json",
