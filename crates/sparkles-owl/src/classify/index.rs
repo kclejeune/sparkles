@@ -248,6 +248,8 @@ pub struct Interner {
     /// of [`Interner::conj`] rather than that of a class expression
     pub ands: Vec<(Vec<Ex>, bool)>,
     and_ids: FxHashMap<(Vec<Ex>, bool), u32>,
+    /// the operands of [`Interner::ands`], counted twice, once for the table's key
+    and_ops: usize,
 }
 
 impl Interner {
@@ -280,6 +282,7 @@ impl Interner {
             + self.individual_nodes.capacity() * 4
             + self.roles.capacity() * 48
             + self.ands.len() * 80
+            + self.and_ops * 4
     }
 
     /// Whether a chunk met data ranges or literals, whose ids its merge does not map, so
@@ -295,6 +298,7 @@ impl Interner {
             Some(&id) => id,
             None => {
                 let id = self.ands.len() as u32;
+                self.and_ops += 2 * key.0.len();
                 self.ands.push(key.clone());
                 self.and_ids.insert(key, id);
                 id
@@ -319,35 +323,54 @@ impl Interner {
     /// chunk's expressions and roles. Each name and expression gets the id the chunk's
     /// first occurrence would have given it in a normalization on one thread: a chunk
     /// lists them in the order it met them, and those this interner has keep their ids.
-    /// `poll` is called every [`POLL_MERGE`] names and expressions and stops the merge
-    /// with its error.
+    /// `poll` is told the bytes of this interner every [`POLL_MERGE`] names, roles,
+    /// expressions and operands, counted over all the chunks, and stops the merge with
+    /// its error.
     pub fn merge<E>(
         &mut self,
         mut chunks: Vec<Interner>,
-        poll: &mut dyn FnMut() -> Result<(), E>,
+        poll: &mut dyn FnMut(usize) -> Result<(), E>,
     ) -> Result<Vec<Mapped>, E> {
         debug_assert!(chunks.iter().all(|c| !c.chunk_has_data() && c.fresh == 0));
-        let classes = self
-            .classes
-            .merge_chunks(chunks.iter_mut().map(|c| c.classes.take()).collect(), poll)?;
+        let before = self.bytes();
+        let classes = self.classes.merge_chunks(
+            chunks.iter_mut().map(|c| c.classes.take()).collect(),
+            &mut || poll(before),
+        )?;
         for ids in &classes {
             for &id in ids {
                 self.mark_met(id);
             }
         }
+        let before = self.bytes();
         let individuals = self.individuals.merge_chunks(
             chunks.iter_mut().map(|c| c.individuals.take()).collect(),
-            poll,
+            &mut || poll(before),
         )?;
+        // the work since the last poll, over all the chunks
+        let mut work = 0usize;
         let mut out = Vec::with_capacity(chunks.len());
         for ((chunk, classes), individuals) in chunks.into_iter().zip(classes).zip(individuals) {
-            let roles: Vec<Role> = chunk.roles.iter().map(|r| self.role(r.clone())).collect();
+            let mut roles: Vec<Role> = Vec::with_capacity(chunk.roles.len());
+            for r in &chunk.roles {
+                work += 1;
+                if work >= POLL_MERGE {
+                    work = 0;
+                    poll(self.bytes())?;
+                }
+                roles.push(self.role(r.clone()));
+            }
             self.map.reserve(chunk.map.len());
             let mut map: Vec<Ex> = Vec::with_capacity(chunk.nodes.len());
             let mut ops: Vec<Ex> = Vec::new();
-            for (k, n) in chunk.nodes.iter().enumerate() {
-                if (k + 1).is_multiple_of(POLL_MERGE) {
-                    poll()?;
+            for n in &chunk.nodes {
+                work += match *n {
+                    Node::And(j) => 1 + chunk.ands[j as usize].0.len(),
+                    _ => 1,
+                };
+                if work >= POLL_MERGE {
+                    work = 0;
+                    poll(self.bytes())?;
                 }
                 let e = match *n {
                     Node::Top => TOP,
@@ -377,7 +400,14 @@ impl Interner {
             }
             out.push((map, roles));
         }
+        poll(self.bytes())?;
         Ok(out)
+    }
+
+    /// The bytes that merging this chunk's interner can add to the merged one, roughly:
+    /// its own, and a binary intersection for each operand of its intersections.
+    pub fn merge_bytes(&self) -> usize {
+        self.bytes() + self.and_ops * 20
     }
 
     /// The id of a class, which the run's normalization meets.

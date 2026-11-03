@@ -637,7 +637,6 @@ impl Saturation {
                 );
                 (r, it, out)
             });
-            peak = *gauge.peak.lock();
             for (r, _, _) in &parts {
                 match r {
                     Err(Error::Memory { .. }) => {}
@@ -647,9 +646,29 @@ impl Saturation {
             if !gauge.over.load(Ordering::Relaxed)
                 && !parts.iter().any(|(_, it, _)| it.chunk_has_data())
             {
+                // The chunks counted what their merge can add. The merge polls, and
+                // what it adds past that counts against the budget and the pool.
+                let start = self.interner.bytes();
+                let reserved: usize = parts.iter().map(|(_, it, _)| it.merge_bytes()).sum();
+                let mut told = 0usize;
+                let mut check = |bytes: usize| -> Result<(), Error> {
+                    poll(limits)?;
+                    let extra = bytes.saturating_sub(start).saturating_sub(reserved);
+                    if extra > told {
+                        let grown = extra - told;
+                        told = extra;
+                        if !gauge.tell(grown) {
+                            return Err(Error::Memory {
+                                limit: limits.max_memory.unwrap_or(usize::MAX),
+                                used: gauge.base + gauge.held.load(Ordering::Relaxed),
+                            });
+                        }
+                    }
+                    Ok(())
+                };
                 let (its, outs): (Vec<Interner>, Vec<Normalized>) =
                     parts.into_iter().map(|(_, it, out)| (it, out)).unzip();
-                let maps = self.interner.merge(its, &mut || poll(limits))?;
+                let maps = self.interner.merge(its, &mut check)?;
                 for ((nodes, roles), out) in maps.into_iter().zip(outs) {
                     ax.append_mapped(out.ax, &nodes, &roles);
                     partial.extend(out.partial);
@@ -657,6 +676,7 @@ impl Saturation {
                 }
                 merged = true;
             }
+            peak = *gauge.peak.lock();
         }
         if !merged {
             let mut out = Normalized {
@@ -899,7 +919,8 @@ impl Saturation {
                 woken.dedup();
                 let round = Bounds {
                     base_memory: totals.memory,
-                    peak_memory: 0,
+                    // the pool has been charged for the run's peak so far
+                    peak_memory: totals.peak,
                     ..bounds
                 };
                 let more = saturate::saturate(&ix, &self.ctx, &[], &woken, &universal, &round)
@@ -1201,8 +1222,8 @@ fn normalize_axioms<'k>(
     let mut told = 0usize;
     let mut tell = |it: &Interner, out: &Normalized| -> Result<(), Error> {
         if let Some(g) = gauge {
-            // the chunk's interner, and room for the copy the merge makes of it
-            let now = 2 * it.bytes() + out.ax.rough_bytes();
+            // the chunk's interner, and room for what its merge adds
+            let now = it.bytes() + it.merge_bytes() + out.ax.rough_bytes();
             let grown = now.saturating_sub(told);
             told = told.max(now);
             if !g.tell(grown) {
@@ -1739,12 +1760,111 @@ mod tests {
             })
             .collect();
         let mut calls = 0;
-        let r = Interner::new().merge(chunks, &mut || {
+        let r = Interner::new().merge(chunks, &mut |_| {
             calls += 1;
             Err(())
         });
         assert!(r.is_err());
         assert_eq!(calls, 1);
+    }
+
+    /// The interners of chunks of `axioms`, `n` axioms each.
+    fn chunk_interners(axioms: &[AxiomKind], n: usize) -> Vec<Interner> {
+        axioms
+            .chunks(n)
+            .map(|part| {
+                let mut it = Interner::chunk(&FxHashMap::default());
+                let mut ax = Axioms::default();
+                for k in part {
+                    index::normalize(k, &mut it, &mut ax);
+                }
+                it
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_merge_of_chunks_polls_over_chunks_and_roles() {
+        // chunks of roles alone, each shorter than the polls' interval
+        let axioms: Vec<AxiomKind> = (0..4 * index::POLL_MERGE / 2)
+            .map(|i| {
+                AxiomKind::FunctionalDataProperty(DataProperty::new(format!("http://ex.org/d{i}")))
+            })
+            .collect();
+        let chunks = chunk_interners(&axioms, index::POLL_MERGE / 2);
+        let mut calls = 0;
+        Interner::new()
+            .merge(chunks, &mut |_| -> Result<(), ()> {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert!(calls > 2, "{calls} polls");
+    }
+
+    #[test]
+    fn the_chunks_count_what_their_merge_adds() {
+        // wide intersections, each of which the merge makes into many binary ones
+        let c = |s: String| ClassExpression::Class(Class::new(format!("http://ex.org/{s}")));
+        let axioms: Vec<AxiomKind> = (0..256)
+            .map(|i| {
+                AxiomKind::SubClassOf(
+                    ClassExpression::ObjectIntersectionOf(
+                        std::iter::once(c(format!("A{i}")))
+                            .chain((0..64).map(|j| c(format!("S{j}"))))
+                            .collect(),
+                    ),
+                    c("X".into()),
+                )
+            })
+            .collect();
+        let chunks = chunk_interners(&axioms, 32);
+        let reserved: usize = chunks.iter().map(|it| it.merge_bytes()).sum();
+        let mut merged = Interner::new();
+        let start = merged.bytes();
+        merged
+            .merge(chunks, &mut |_| -> Result<(), ()> { Ok(()) })
+            .unwrap();
+        let added = merged.bytes() - start;
+        assert!(added <= reserved, "{added} added, {reserved} counted");
+    }
+
+    #[test]
+    fn rounds_after_individuals_charge_the_pool_no_more_than_the_peak() {
+        let mut axioms = ranges(8192, 16, 512);
+        axioms.push(AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("http://ex.org/C0")),
+            ClassExpression::ObjectOneOf(
+                [Individual::Named(NamedIndividual::new("http://ex.org/a"))]
+                    .into_iter()
+                    .collect(),
+            ),
+        ));
+        let kinds: Vec<&AxiomKind> = axioms.iter().collect();
+        for threads in [1, 8] {
+            let granted = Arc::new(AtomicUsize::new(0));
+            let g = granted.clone();
+            let out = Saturation::new()
+                .classify(
+                    &kinds,
+                    None,
+                    &Limits {
+                        threads,
+                        charge: Some(Arc::new(move |b| {
+                            g.fetch_add(b, Ordering::Relaxed);
+                            true
+                        })),
+                        ..Limits::default()
+                    },
+                )
+                .unwrap();
+            let granted = granted.load(Ordering::Relaxed);
+            assert!(
+                granted <= out.stats.peak_memory,
+                "{threads} threads: {granted} granted, peak {}",
+                out.stats.peak_memory
+            );
+        }
     }
 
     #[test]
