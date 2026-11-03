@@ -250,3 +250,47 @@ test('schema', async ({ page }) => {
   await expect(page.getByText('ex:worksFor').first()).toBeVisible();
   await shoot(page, 'schema');
 });
+
+// The app shell: the top bar's search at 1440 pixels, the icon rail at 900 and the drawer
+// on a phone.
+test('shell-search', async ({ page }) => {
+  await page.goto(`/ui/datasets/${DATASET}`);
+  await expect(page.getByRole('heading', { name: 'Top classes' })).toBeVisible();
+  await page.keyboard.press('ControlOrMeta+k');
+  await page.keyboard.type('org');
+  await expect(
+    page.getByRole('listbox', { name: 'Search results' }).getByRole('option', { name: /^Organi/ }),
+  ).toBeVisible();
+  await shoot(page, 'shell-search', { focus: true });
+});
+
+test('shell-medium', async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 900 });
+  await page.goto(
+    `/ui/ontology?ds=${DATASET}&iri=${encodeURIComponent('http://example.org/ns#Person')}`,
+  );
+  await expect(page.getByRole('heading', { name: 'Person', exact: true })).toBeVisible();
+  await shoot(page, 'shell-medium');
+});
+
+test('shell-phone', async ({ browser }) => {
+  const ctx = await browser.newContext({
+    viewport: { width: 390, height: 844 },
+    deviceScaleFactor: 2,
+    isMobile: true,
+    hasTouch: true,
+    colorScheme: 'dark',
+    baseURL: process.env.SPARKLES_SCREENSHOTS_URL,
+  });
+  await ctx.addInitScript((ds) => {
+    localStorage.setItem('sparkles.theme', 'dark');
+    localStorage.setItem('sparkles.dataset', ds);
+  }, DATASET);
+  const page = await ctx.newPage();
+  await page.goto(`/ui/datasets/${DATASET}`);
+  await expect(page.getByRole('heading', { name: 'Top classes' })).toBeVisible();
+  await page.getByRole('button', { name: 'Menu' }).click();
+  await expect(page.getByRole('dialog', { name: 'Menu' })).toBeVisible();
+  await shoot(page, 'shell-phone');
+  await ctx.close();
+});

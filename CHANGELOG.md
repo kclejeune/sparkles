@@ -24,6 +24,20 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+The web UI has one app shell and design system (roadmap item 632). A top bar on every
+page holds the dataset switcher and a search of the open dataset's entities through
+`GET /$/ontology/{ds}/search`, which `Ctrl+K`, `Cmd+K` and `/` focus, and the pages sit
+in a rail that shows labels from 1200 pixels, icons below that and a drawer from 760
+pixels down, where the search expands over the bar. The search is the launcher that
+the command palette of item 631 extends. Light and dark tokens for colour, type,
+spacing, control heights, radii and shadows replace one-off styles, every text colour
+meets WCAG AA contrast, and the pages share panels, buttons, count badges, tables, form
+rows and list and detail panes of equal height. The Ontology and Thesaurus pages lose
+their own dataset menus to the top bar, their graph, branch and language choices move
+to a row under the title, the query page's branch, state, history and row limit fold
+behind an Options button on a phone, and the ontology editor's trees show labels on
+ontologies larger than the 50,000 axioms it lists, such as the Gene Ontology.
+
 Ontologies and thesauri have a typo-tolerant entity search for typeahead (spec U12,
 roadmap item 616). `GET /$/ontology/{ds}/search?q=` matches the labels, synonyms, short
 forms and definitions of OWL, RDFS and SKOS entities in any language, with up to two

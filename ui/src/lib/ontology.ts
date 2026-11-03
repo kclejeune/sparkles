@@ -237,6 +237,71 @@ export async function ontologyAxioms(
   }
 }
 
+/** Jena's name for the stored default graph, which a query reads even under a union default. */
+const DEFAULT_GRAPH_IRI = 'urn:x-arq:DefaultGraph';
+
+/**
+ * The SPARQL of every label in the graph that `sel` reads: `rdfs:label`, then
+ * `skos:prefLabel`. With no graph selected it names the stored default graph, as the ontology
+ * routes read it, so a server with `--union-default-graph` does not add other graphs' labels.
+ */
+export function labelsQuery(sel: Selection): string {
+  const pattern = `VALUES ?p { ${sparqlIri(RDFS_LABEL)} ${sparqlIri(SKOS_PREF_LABEL)} } ?s ?p ?l FILTER(isIRI(?s) && isLiteral(?l))`;
+  return `SELECT ?s ?p ?l WHERE { GRAPH ${sparqlIri(sel.graph ?? DEFAULT_GRAPH_IRI)} { ${pattern} } }`;
+}
+
+type SparqlBinding = Record<string, { type: string; value: string; 'xml:lang'?: string }>;
+
+/** The labels of SPARQL JSON result rows of `labelsQuery`, `rdfs:label` first. */
+export function labelsOfBindings(rows: SparqlBinding[]): Map<string, Lit[]> {
+  const out = new Map<string, Lit[]>();
+  for (const r of rows) {
+    const s = r.s?.value;
+    const l = r.l;
+    if (!s || !l) continue;
+    const lit: Lit = { '@value': l.value };
+    if (l['xml:lang']) lit['@language'] = l['xml:lang'];
+    const list = out.get(s) ?? [];
+    if (r.p?.value === RDFS_LABEL) list.unshift(lit);
+    else list.push(lit);
+    out.set(s, list);
+  }
+  return out;
+}
+
+/**
+ * Every label of the graph that `sel` reads on `target`'s branch, in one SPARQL query. The
+ * editor fills the labels its capped axiom listing left out with these, so a large
+ * ontology's trees show labels rather than local names. Imported ontologies are not read.
+ */
+export async function ontologyLabels(
+  target: string,
+  sel: Selection,
+  signal?: AbortSignal,
+): Promise<Map<string, Lit[]>> {
+  const res = await request(`/${enc(target)}/sparql`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/sparql-query',
+      Accept: 'application/sparql-results+json',
+    },
+    body: labelsQuery(sel),
+    signal,
+  });
+  const j = await readJson<{ results: { bindings: SparqlBinding[] } }>(res);
+  return labelsOfBindings(j.results.bindings);
+}
+
+/** `labels` with the subjects of `more` that it has no label for. */
+export function withMissingLabels(
+  labels: Map<string, Lit[]>,
+  more: Map<string, Lit[]>,
+): Map<string, Lit[]> {
+  const out = new Map(labels);
+  for (const [s, l] of more) if (!out.get(s)?.length) out.set(s, l);
+  return out;
+}
+
 /** `GET /$/ontology/{ds}/entity`: the kinds and labels of an entity; null when unknown. */
 export async function ontologyEntity(
   target: string,

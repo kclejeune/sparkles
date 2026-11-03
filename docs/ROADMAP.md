@@ -152,16 +152,15 @@ Fragment composition follows the storage consolidation of item 455. Wave C runs
 alongside Wave A2 on the policy plumbing of items 480 to 483.
 
 The workbench UI runs as one stream of about two lanes beside the engine work. After the
-DL Query tab and the SKOS editor come these, in order:
-1. The web UI shell and design system of item 632.
-2. The ontology browser of item 616 on the server's entity search, together with lazy
+DL Query tab, the SKOS editor and the web UI shell of item 632 come these, in order:
+1. The ontology browser of item 616 on the server's entity search, together with lazy
    trees (607), rendering preferences (625), metrics (621) and the command palette (631),
-   all on item 632's shell. Then its edit mode (630).
-3. The design review of every page of item 633.
-4. Inferred axioms in entity frames (622), with the inferred property and individual
+   all on item 632's shell and its launcher. Then its edit mode (630).
+2. The design review of every page of item 633.
+3. Inferred axioms in entity frames (622), with the inferred property and individual
    trees of item 609. Their explanation links wait for F24's justifications.
-5. The visual SHACL shape editor of item 617.
-6. Entity history (620), discussions (618) and watches (619), the last after the
+4. The visual SHACL shape editor of item 617.
+5. Entity history (620), discussions (618) and watches (619), the last after the
    notifications of item 46.
 7. Import resolution (624), bulk edits (626) and pattern-based axiom generation (623).
 8. Vocabulary governance and change requests (627), after item 459.
@@ -790,7 +789,6 @@ Rows that need backend work name it first.
 | 629 | **Real-time co-editing.** Show other editors' presence and merge concurrent edits to one entity live, which U05 §1 leaves open. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | L |
 | 630 | **Edit mode on browser pages.** Let a caller with write access switch an ontology browser page into edit mode and change its definition, synonyms, annotations, hierarchy and axioms in place, through the ontology editor's previewed commits, session branches, undo and access checks. It follows item 616. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
 | 631 | **Command palette.** Open a launcher-style window anywhere in the web UI with `Ctrl+K` or `Cmd+K`, and `/` to focus a page's search. It searches entities, concepts, datasets, saved queries and pages with the browser's typo-tolerant search, and runs commands that each page registers, such as switching dataset or branch, starting a session, creating an entity, running or formatting a query and opening settings, with recent items first and each command's shortcut shown. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
-| 632 | **Web UI shell and design system.** Settle one app shell and design system for the web UI before the ontology browser builds on it: the navigation, a persistent top search and launcher bar that the command palette of item 631 fills in, the layout grid, gutters and spacing scale, light and dark theme tokens, shared panels, buttons, count badges and tables, and breakpoints for large, medium and phone screens. Apply them to the existing pages and fix mismatched panel sizes, spacing and alignment, checked with Playwright at each width in both themes against a server seeded with realistic data. | [Web UI](visualization/README.md#web-ui) | M–L |
 | 633 | **Web UI design review.** Review every page of the web UI once the ontology browser, command palette and edit mode of items 616, 631 and 630 exist, for a clean, uncluttered and consistent design on large, medium and phone screens in light and dark themes. Pages may be reordered, split or collapsed when every function stays reachable. Each change is checked with Playwright against a server seeded with realistic data, and the review builds on the shell and design system of item 632. | [Web UI](visualization/README.md#web-ui) | M |
 | 638 | **Large thesauri in the thesaurus editor.** The concept tree reads at most 2,000 narrower concepts of a concept and 5,000 roots of a scheme, and the label search scans every label for a substring and answers its first 100 matches. Page the levels of the tree and search labels through the full-text index with ranking. | [U12](specs/U12-ontology-workbench/SPEC.md#thesaurus-editor) | M |
 | 639 | **Mappings across datasets in the thesaurus editor.** A mapping's target in another dataset is shown by its IRI, and the relations tab lists the mappings a concept states and not those other concepts state about it. Read the target's labels from its dataset and list the inverse mappings beside the stated ones. | [U12](specs/U12-ontology-workbench/SPEC.md#thesaurus-editor) | S |
@@ -897,6 +895,7 @@ for them.
 These items are finished. [FEATURES.md](FEATURES.md) describes what they deliver, and the
 linked spec Outcome records how they landed.
 
+- **632.** Web UI shell and design system. Every page shares a top bar with the dataset switcher, an entity search that `Ctrl+K`, `Cmd+K` and `/` focus and that item 631 extends through `launcher.register`, and a rail that shows icons at medium width and becomes a drawer on a phone, where the search expands over the bar. Light and dark tokens meet WCAG AA contrast, the pages share panels, buttons, count badges, tables, form rows and equal-height list and detail panes, and the ontology editor's trees show labels on ontologies larger than its axiom listing. [Web UI](visualization/README.md#app-shell)
 - **649.** File classification without a store. `sparkles ontology classify FILE` and `check FILE` read a file of one graph into memory, parsing RDF/XML, Turtle and functional-style documents on several threads, and give the store path's answers. On forge ChEBI lite classifies from its functional-style file in 1.13 s against 3.36 s, and from RDF/XML in 5.9 s against 8.2 s, at a lower peak resident set. [F24](specs/F24-owl-classification/SPEC.md#outcome)
 - **646.** EL taxonomy assembly on several threads. The taxonomy sorts its classes by IRI, builds its nodes and looks up a class's node on several threads, with the same taxonomy on every thread count, which takes the taxonomy of `ore_ont_868` from 372 to 249 ms on eight threads on forge. [F24](specs/F24-owl-classification/SPEC.md#outcome)
 - **671.** Charged query-scoped state. Both accounting modes charge one decoded value cache of at most 64 MiB or an eighth of the budget, one decode envelope, the computed terms and memos and the geometry memo, with one record of a memory failure and one checked counter of produced rows. 674 charges the EXISTS memo. [X14](specs/X14-unified-executor/SPEC.md#charged-query-state-and-chunked-live-reservations)

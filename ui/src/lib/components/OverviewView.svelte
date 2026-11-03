@@ -836,6 +836,7 @@
     <label class="by faint small">
       <span class="hide-xs">Group by</span>
       <select
+        class="select sm"
         value={pickerValue}
         onchange={(e) => regroup((e.currentTarget as HTMLSelectElement).value)}
         aria-label="Group by"
@@ -863,7 +864,7 @@
     {#if communities && reportsReady}
       <label class="by faint small">
         <span class="hide-xs">Colour</span>
-        <select bind:value={colorBy} aria-label="Colour by">
+        <select class="select sm" bind:value={colorBy} aria-label="Colour by">
           <option value="status">Report status</option>
           <option value="community">Community</option>
         </select>
@@ -872,6 +873,7 @@
         <label class="by faint small">
           <span class="hide-xs">Level</span>
           <select
+            class="select sm"
             value={String(startLevel)}
             onchange={(e) => loadCommunities(Number((e.currentTarget as HTMLSelectElement).value))}
             aria-label="Level"

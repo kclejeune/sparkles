@@ -18,8 +18,11 @@ anonymous(
     await page.getByLabel('Password').fill(PASSWORD);
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await expect(page).toHaveURL(/\/ui\/query$/);
-    await expect(page.locator('.user .who')).toContainText(USER);
-    await expect(page.locator('.user .who')).toContainText('password');
+    const account = page.getByRole('button', { name: `Account: ${USER}` });
+    await account.click();
+    const menu = page.getByRole('menu', { name: 'Account' });
+    await expect(menu).toContainText(USER);
+    await expect(menu).toContainText('password');
   },
 );
 
