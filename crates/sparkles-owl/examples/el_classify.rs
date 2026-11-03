@@ -193,6 +193,12 @@ fn main() {
         (_, Some(s)) => s.excluded().to_vec(),
         _ => Vec::new(),
     };
+    // the axioms left out, on standard error, when EL_CLASSIFY_EXCLUDED is set
+    if std::env::var_os("EL_CLASSIFY_EXCLUDED").is_some() {
+        for e in &excluded {
+            eprintln!("excluded {:?}: {:?}", e.gap, e.axiom);
+        }
+    }
     let outside = excluded
         .iter()
         .filter(|e| matches!(e.gap, Gap::Outside { .. }))
@@ -251,6 +257,12 @@ fn main() {
             "outsideTaken": s.outside_el.taken,
             "conjunctions": s.conjunctions,
             "hornOverBudget": s.horn_over_budget,
+            "clauses": s.clauses,
+            "dlContexts": s.dl_contexts,
+            "dlOverBudget": s.dl_over_budget,
+            "dlTests": s.dl_tests,
+            "dlTestsHeld": s.dl_tests_held,
+            "dlTestingMs": s.dl_testing.as_secs_f64() * 1000.0,
             "partial": partial,
             "threads": s.threads,
             "readMs": read_ms,
