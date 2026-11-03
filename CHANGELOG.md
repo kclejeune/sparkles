@@ -1462,6 +1462,15 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+A quick query text no longer settles in its slower execution mode because of one cold
+run. The server's history ran a text's first run as an automatic cursor and its second
+eagerly, and kept whichever of those two single runs was faster for the server's whole
+life. The first cursor run is cold, so on atlas three fresh servers in four answered the
+synthetic `expr-bind-group` eagerly in 0.65 ms of execution instead of as a cursor in
+0.41 ms once the correlation-aware estimates of item 454 made that first run about
+0.2 ms slower. A text whose two modes are both quick now settles only once the slower
+mode has run twice, which costs it at most two runs in that mode.
+
 `check_query` no longer fails with `budget-memory` when a draft uses a predicate that no
 instance of its typed variable's class has. On the DBpedia 2022.12.01 database the
 class lookup's estimate passed the 2 GiB query memory budget, which failed the whole

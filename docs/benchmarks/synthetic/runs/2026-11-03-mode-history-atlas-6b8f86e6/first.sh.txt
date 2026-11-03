@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# first.sh N BIN... : for N rounds, start each binary's server (CPU 2, 1 Rayon thread, spinners),
+# send 6 requests of expr-bind-group, and print the mode and totalMs/execMs/wall of each.
+set -u
+N=$1; shift
+Q=${Q:-expr-bind-group}; PORT=${PORT:-4191}
+W=$HOME/lanes/bindgroup-fix/work
+cd $HOME/lanes/bindgroup-fix
+for b in "$@"; do
+  [ -d stores/$b ] || { zstd -dc $W/data.nt.zst > /tmp/bg-data.nt; bins/$b load --loc stores/$b /tmp/bg-data.nt > /dev/null 2>&1; rm -f /tmp/bg-data.nt; }
+done
+taskset -c 2 chrt -i 0 sh -c 'while :; do :; done' & S1=$!
+taskset -c 4 chrt -i 0 sh -c 'while :; do :; done' & S2=$!
+taskset -cp 4 $$ > /dev/null
+for r in $(seq $N); do
+  for b in "$@"; do
+    rm -rf srv-probe
+    taskset -c 2 env RAYON_NUM_THREADS=1 ${ENVX:-} bins/$b --result-cache-mb 0 serve --data srv-probe --loc bench="stores/$b" --port $PORT --timeout 600 --no-access-log > probe-server.log 2>&1 &
+    SP=$!
+    until curl -sf -o /dev/null "localhost:$PORT/\$/ready"; do sleep 0.1; done
+    sleep ${READY_SLEEP:-0}
+    line="$b r$r"
+    for i in 1 2 3 4 5 6; do
+      f0=$(awk '{print $10}' /proc/$SP/stat)
+      w=$(curl -sS -f -o resp.json -w '%{time_total}' -H 'Accept: application/x-sparkles+json' --data-urlencode "query@$W/queries/$Q.rq" localhost:$PORT/bench/sparql)
+      cp resp.json resp-$b-$i.json
+      k=$(grep -q '"materializes"' resp.json && echo C || echo E)
+      t=$(grep -o '"totalMs":[0-9.eE+-]*' resp.json | head -1 | cut -d: -f2)
+      e=$(grep -o '"execMs":[0-9.eE+-]*' resp.json | head -1 | cut -d: -f2)
+      f1=$(awk '{print $10}' /proc/$SP/stat)
+      line+=" $k:$(printf '%.3f/%.3f/%.3f' $t $e $(awk "BEGIN{print $w*1000}"))/pf$((f1-f0))"
+    done
+    echo "$line"
+    kill $SP; wait $SP 2>/dev/null
+  done
+done
+kill $S1 $S2

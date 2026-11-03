@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Interleaved A/B on this host with nsc-bench-remote.sh, in both orders.
+#   ab.sh WORK BASE CAND ROUNDS REPS   (env: QS, THREADS, SCPU, CCPU, SPINV, PORT, TAG, SHARE_STORE, ORDERS)
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+W=$(realpath "$1"); BASE=$(realpath "$2"); CAND=$(realpath "$3")
+ROUNDS=${4:-12}; REPS=${5:-40}
+QS=${QS:-expr-bind-group}
+OUT=$W/${TAG:-ab}-$(basename "$BASE")-$(basename "$CAND")
+mkdir -p "$OUT"
+run() { # <name> <bin A> <bin B>
+  local d=$OUT/$1
+  rm -rf "$d"; mkdir -p "$d/queries"
+  for q in $QS; do cp "$W/queries/$q.rq" "$d/queries/"; done
+  zstd -q -1 -f "$2" -o "$d/bin-A.zst"
+  zstd -q -1 -f "$3" -o "$d/bin-B.zst"
+  ln -s "${DATA:-$W/data.nt.zst}" "$d/data.nt.zst"
+  cp "$W/nsc-bench-remote.sh" "$d/"
+  cat > "$d/run.env" << ENV
+DYNAMIC_A=0
+DYNAMIC_B=0
+ROUNDS=$ROUNDS
+REPS=$REPS
+WARMUP=3
+RAYON_THREADS=${THREADS:-1}
+SERVER_CPU=${SCPU:-2}
+CLIENT_CPU=${CCPU:-4}
+SPIN=${SPINV:-1}
+PORT=${PORT:-4181}
+SHARE_STORE=${SHARE_STORE:-0}
+SERVE_ARGS_A="${SERVE_ARGS_A:-}"
+SERVE_ARGS_B="${SERVE_ARGS_B:-}"
+ENV
+  echo "$1: $(uptime)"
+  (cd "$d" && bash nsc-bench-remote.sh > /dev/null)
+  (cd "$d" && rm -rf stores srv data.nt A B bin-A.zst bin-B.zst)
+}
+for o in ${ORDERS:-second first}; do
+  case $o in
+  second) run cand-second "$BASE" "$CAND" ;;
+  first) run cand-first "$CAND" "$BASE" ;;
+  esac
+done
+echo AB-DONE "$OUT"

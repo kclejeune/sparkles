@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# rec1.sh BIN STORE OUT: perf-record a server that answers one request of expr-bind-group,
+# with a marker so the first request's samples can be separated (perf stat of the first request only).
+set -u
+B=$1; ST=$2; OUT=$3; PORT=${PORT:-4192}
+W=$HOME/lanes/bindgroup-fix/work
+cd $HOME/lanes/bindgroup-fix
+PERF="nix shell nixpkgs#perf -c perf"
+rm -rf srv-rec
+taskset -c 2 env RAYON_NUM_THREADS=1 bins/$B --result-cache-mb 0 serve --data srv-rec --loc bench="stores/$ST" --port $PORT --timeout 600 --no-access-log > rec-server.log 2>&1 &
+SP=$!
+until curl -sf -o /dev/null "localhost:$PORT/\$/ready"; do sleep 0.1; done
+sleep 0.5
+$PERF stat -e instructions:u,cycles:u,page-faults -p $SP -o $OUT.stat &
+PS=$!
+sleep 0.5
+curl -sS -f -o $OUT.json -H 'Accept: application/x-sparkles+json' --data-urlencode "query@$W/queries/expr-bind-group.rq" localhost:$PORT/bench/sparql
+sleep 0.2
+kill -INT $PS; wait $PS
+kill $SP; wait $SP 2>/dev/null
+grep -E "instructions|cycles|faults" $OUT.stat
+grep -o '"totalMs":[0-9.]*' $OUT.json

@@ -577,3 +577,85 @@ The batch that followed, 62d9cb53 to 125edd41, changed no executor code. With on
 1.05M triples it ran `count-all` at 0.966 of 62d9cb53, `distinct-obj` at 0.996,
 `predicate-counts` at 0.958, `types-grouped` at 0.964 and `path-plus` at 1.020, 0.21 µs
 more, so it added no cost to the short queries that the Namespace screen flagged.
+
+### Execution mode of quick texts in fresh servers
+
+The Namespace screen of cf033f12, the batch that merged items 679 and 454, against 125edd41
+flagged `expr-bind-group` at 1.465 in server execution time with identical answers. Its
+plan did not change. Each server process answered it either as a cursor in about 0.41 ms
+of execution or eagerly in about 0.65 ms for its whole life, and more processes of the
+batch answered it eagerly. The server's history of quick texts ran a text's first run as
+an automatic cursor and its second eagerly, and kept whichever of those two single runs was
+faster. The first cursor run is cold, and with item 454 it took about 0.2 ms longer, so it
+lost to the eager run in most fresh servers. The history now gives the slower mode a second
+run before a quick text settles, as the
+[X06 outcome](../../specs/X06-benchmark-coverage.md#query-threads-on-hybrid-cores)
+describes. The [run record](runs/2026-11-03-mode-history-atlas-6b8f86e6/) holds the
+samples, the answers, the scripts and the screen.
+
+All runs used one Rayon thread with the server on CPU 2, the client on CPU 4 and spinners
+on both, at 1.05M triples. The atlas runs went through `scripts/nsc-bench-remote.sh` on
+atlas, while an unpinned single-threaded job of another lane ran there. The wally builds
+used `scripts/nsc-build.sh`, and the server of cf033f12 is that of bf740bed, the merge of
+item 454, since cf033f12 changed only a Kotlin test.
+
+| build | commit | built on | sha256 |
+|---|---|---|---|
+| main, the screen's own binary | 125edd41 | the laptop | 9403375b8dbb728f39b876e085142a6ba289833022e1b5b8435dfb8331093bf1 |
+| the batch, the screen's own binary | cf033f12 | the laptop | ce66ebae0524d84c18f3bd02c737cfce5522a102913a746a71580e189d174225 |
+| main | 125edd41 | wally | 9af0131fa4215f251b392a561011fae8829dce2140b9ee37495411a3ce1dfba6 |
+| the merge of item 679 | 40ca3535 | wally | faeb8132307af95ab96b4ad3be52553e9bb276bb391d172dfc1f5d76e1f6e538 |
+| the batch | cf033f12 | wally | 91eff3a9d9f4c862f588ee6a1353aae55206b1765ca90257249ad97f4a7fbcb7 |
+| the fix | 6b8f86e6 | wally | dde7a5a390d025dae553cee72258dd50052ccda14ea8d6e316150dda00c07768 |
+
+Five fresh servers of each wally build each answered six requests of `expr-bind-group`
+without a warm-up, in
+[first-runs.txt](runs/2026-11-03-mode-history-atlas-6b8f86e6/first-runs.txt). A sequence
+lists each request's mode, `C` for a cursor and `E` for eager.
+
+| build | first cursor run, median total ms | mode sequences |
+|---|--:|---|
+| 125edd41 | 0.98 | `CECCCC` four times and `CEEEEE` once |
+| 40ca3535 | 1.01 | `CECCCC` four times and `CEEEEE` once |
+| cf033f12 | 1.19 | `CEEEEE` four times and `CECCCC` once |
+| 6b8f86e6 | 1.20 | `CECECC` five times |
+
+With `SPARKLES_DISABLE_OPTIMIZATIONS` set to the 454 switches `set_remainders`,
+`node_sets`, `key_backoff` and `characteristic_sets`, the first cursor run took a median
+of 1.18 ms on cf033f12 and 0.98 ms on 40ca3535 over eight fresh servers each, in
+[switches-off.txt](runs/2026-11-03-mode-history-atlas-6b8f86e6/switches-off.txt). With
+each build serving a copy of the other's store, 125edd41 over the store of cf033f12, which
+holds the `correlations` member, took 0.98 ms and cf033f12 over the store of 125edd41,
+which lacks it, took 1.02 ms, against 0.98 and 1.18 ms over their own stores, in
+[cross-stores.txt](runs/2026-11-03-mode-history-atlas-6b8f86e6/cross-stores.txt). The
+stores' index files are identical, and only `stats.json`, `meta.json` and `commit.json`
+differ. The cost therefore needs both the code of item 454 and its statistics in the
+store. With perf attached to a ready server, which changes the timing itself, the first
+request ran 11.75 million user-space instructions on 125edd41 and 11.72 to 11.79 million on
+cf033f12 in three servers each, with no more user-space cycles, as the files under
+[perf](runs/2026-11-03-mode-history-atlas-6b8f86e6/perf/rec1.sh.txt) show. Item 708 looks
+for that cold cost.
+
+The interleaved A/Bs ran 8 rounds of A,B,B,A with 3 warm-ups and 40 timed requests per
+query and server process, once with the candidate second and once with it first, and give
+the candidate's execution time over the base's as the square root of the two runs' median
+per-round ratios, with a 95% bootstrap interval. This is the rule of
+`scripts/x08-gates/combine.py` with a minimum of 8 rounds. A process counts as eager when
+its median execution time of `expr-bind-group` passed 0.5 ms. Every run's servers returned
+the same answer fingerprints.
+
+| base | candidate | query | base ms | ratio | 95% interval | eager processes of the base | eager processes of the candidate |
+|---|---|---|--:|--:|---|--:|--:|
+| 125edd41, laptop | cf033f12, laptop | `expr-bind-group` | 0.638 | 1.173 | 0.982 to 1.363 | 13 of 32 | 24 of 32 |
+| 125edd41, laptop | cf033f12, laptop | `expr-order-key` | 1.331 | 1.004 | 0.975 to 1.025 | | |
+| 125edd41, laptop | cf033f12, laptop | `group-avg` | 3.664 | 0.975 | 0.913 to 1.060 | | |
+| 125edd41, wally | 6b8f86e6, wally | `expr-bind-group` | 0.652 | 0.620 | 0.618 to 0.664 | 29 of 32 | 0 of 32 |
+| 125edd41, wally | 6b8f86e6, wally | `expr-order-key` | 1.241 | 0.988 | 0.984 to 0.994 | | |
+| 125edd41, wally | 6b8f86e6, wally | `group-avg` | 3.466 | 1.002 | 0.922 to 1.004 | | |
+
+The share of eager processes of one commit depends on the build and the host, as the two
+builds of 125edd41 show, because its cold cursor run and its first eager run took nearly the
+same time. On Namespace, the wally builds of 125edd41 and 6b8f86e6 ran in 4 rounds of 20
+timed requests over all 30 queries. The fix ran `expr-bind-group` at 0.852 of 125edd41 and
+the 30 queries at a geometric mean of 0.956. The first pass flagged `not-exists` at 1.119
+and `star-lookup` at 1.232, and the rerun in 8 rounds of 40 read them at 1.010 and 0.985.
