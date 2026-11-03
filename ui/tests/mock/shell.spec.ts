@@ -71,12 +71,32 @@ test.describe('at 1440 pixels', () => {
     await expect(page.getByRole('listbox', { name: 'Search results' })).toHaveCount(0);
 
     // in a text field `/` is a character
-    await visit(page, '/ui/explore?ds=uni');
-    const find = page.getByRole('combobox', { name: /Find a resource/ });
+    await visit(page, '/ui/explore?ds=uni&tab=search');
+    const find = page.getByRole('textbox', { name: 'Full-text query' });
     await find.click();
     await page.keyboard.type('a/b');
     await expect(find).toHaveValue('a/b');
     await expect(search(page)).not.toBeFocused();
+  });
+
+  test("Explore's resource finder is the top bar's search", async ({ page }) => {
+    await onDataset(page, 'uni');
+    // the text-search tab has a field of its own, which `/` focuses
+    await visit(page, '/ui/explore?ds=uni&tab=search');
+    await page.locator('body').click();
+    await page.keyboard.press('/');
+    await expect(page.getByRole('textbox', { name: 'Full-text query' })).toBeFocused();
+    // the graph view has none: `/` opens the top bar, which names what it finds
+    await visit(page, '/ui/explore?ds=uni');
+    await page.locator('body').click();
+    await page.keyboard.press('/');
+    const find = page.getByPlaceholder(/^Find a resource in uni/);
+    await expect(find).toBeFocused();
+    await find.fill('Professor');
+    const hits = page.getByRole('group', { name: 'Resources in uni' });
+    await expect(hits.getByRole('option').first()).toBeVisible();
+    await hits.getByRole('option').first().click();
+    await expect(page.getByRole('complementary', { name: 'Resource details' })).toBeVisible();
   });
 
   test('Enter waits for the results of what the field now says', async ({ page }) => {
@@ -167,7 +187,11 @@ test.describe('at 1440 pixels', () => {
     );
     await page.keyboard.press('Control+k');
     await page.keyboard.type('ada love');
-    await page.getByRole('option', { name: /^Ada Lovelace/ }).click();
+    // Explore's own resources come first; the entity search opens the entity's page
+    await page
+      .getByRole('group', { name: /^Entities/ })
+      .getByRole('option', { name: /^Ada Lovelace/ })
+      .click();
     await expect(page).toHaveURL(/\/ui\/browse\?ds=uni&iri=/);
     await page.getByRole('link', { name: 'Open in Explore' }).click();
     await expect(page).toHaveURL(/\/ui\/explore\?ds=uni&iri=/);

@@ -465,9 +465,13 @@ test('compare mode keeps the marks of path edges when the graph changes under th
     (await drawn(page)).edges.filter(([l]) => l.endsWith('knows · 1')).map(([, c]) => c);
   await expect.poll(knows).toEqual(['added']);
   // the graph moves to Carol, so the overlay draws Alice knows Bob itself
-  const search = page.getByRole('combobox', { name: /Find a resource/ });
+  const search = page.getByPlaceholder(/^Find a resource/);
   await search.fill('Carol');
-  await page.locator('#search-results').getByRole('option', { name: /Carol/ }).first().click();
+  await page
+    .getByRole('listbox', { name: 'Search results' })
+    .getByRole('option', { name: /Carol/ })
+    .first()
+    .click();
   await expect.poll(async () => (await drawn(page)).nodes.map(([l]) => l)).toContain('Acme');
   await expect(panel(page)).toBeVisible();
   await expect.poll(knows).toEqual(['added']);

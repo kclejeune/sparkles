@@ -219,35 +219,20 @@
           .join(', ')}
       </div>
     </div>
+    {#if info}
+      <dl class="stats">
+        <div>
+          <dt>Datasets</dt>
+          <dd>{fmtInt(info.datasets.length)}</dd>
+        </div>
+        <div>
+          <dt>Quads served</dt>
+          <dd>{fmtInt(totalQuads)}</dd>
+        </div>
+      </dl>
+    {/if}
     {#if info?.version}<span class="version mono">v{info.version}</span>{/if}
   </section>
-
-  {#if info}
-    <dl class="kv panel">
-      {#if info.version}
-        <div>
-          <dt>Version</dt>
-          <dd class="mono">{info.version}</dd>
-        </div>
-      {/if}
-      <div>
-        <dt>Started</dt>
-        <dd>{fmtTime(info.startedAt)}</dd>
-      </div>
-      <div>
-        <dt>Uptime</dt>
-        <dd>{fmtDuration(uptime)}</dd>
-      </div>
-      <div>
-        <dt>Datasets</dt>
-        <dd>{info.datasets.length}</dd>
-      </div>
-      <div>
-        <dt>Quads served</dt>
-        <dd>{fmtInt(totalQuads)}</dd>
-      </div>
-    </dl>
-  {/if}
 
   <section class="panel">
     <div class="panel-head">
@@ -515,14 +500,23 @@
     font-family: var(--font-mono);
     font-size: var(--fs-sm);
   }
+  /* the server's state in one panel: up or down, since when, the datasets it serves and
+     its version */
   .status {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 16px;
-    padding: 18px 20px;
+    gap: var(--sp-3) var(--sp-6);
+    padding: var(--sp-4) var(--sp-5);
+  }
+  .stats {
+    display: flex;
+    gap: var(--sp-6);
+    margin: 0;
   }
   .grow {
-    flex: 1;
+    flex: 1 1 14rem;
+    min-width: 0;
   }
   .big {
     font-size: var(--fs-lg);
@@ -548,18 +542,6 @@
     border-radius: 4px;
     background: var(--surface-2);
     border: 1px solid var(--border);
-  }
-  .kv {
-    display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    margin: 0;
-  }
-  .kv > div {
-    padding: 12px 16px;
-    border-right: 1px solid var(--border);
-  }
-  .kv > div:last-child {
-    border-right: 0;
   }
   dt {
     font-size: var(--fs-sm);
@@ -631,7 +613,6 @@
     font-size: var(--fs);
   }
   @media (max-width: 760px) {
-    .kv,
     .limits {
       grid-template-columns: 1fr 1fr;
     }

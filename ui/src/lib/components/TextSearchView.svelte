@@ -149,7 +149,7 @@
     <div class="box">
       <Icon name="search" size={15} />
       <input
-        class="q"
+        class="q text-search-field"
         placeholder={'Full-text search, e.g. brown fox, "exact phrase", +must -not'}
         bind:value={query}
         oninput={schedule}

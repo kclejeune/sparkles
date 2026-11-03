@@ -100,7 +100,7 @@ test('the explorer links to Similar, which ranks the neighbours of an entity', a
   await query.getByLabel('ef', { exact: true }).fill('40');
   await query.getByRole('button', { name: 'Search' }).click();
   await expect(results.locator('.foot')).toContainText('hnsw ef=40');
-  await query.getByLabel('exact', { exact: true }).check();
+  await query.getByLabel('Exact', { exact: true }).check();
   await query.getByRole('button', { name: 'Search' }).click();
   await expect(results.locator('.foot')).toContainText('exact (exact:true)');
   await expect(page).toHaveURL(/exact=true/);

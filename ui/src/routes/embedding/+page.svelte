@@ -667,13 +667,12 @@
         />
       {/if}
       <span class="spacer"></span>
-      <div class="seg" role="radiogroup" aria-label="Pointer">
+      <div class="segmented" role="radiogroup" aria-label="Pointer">
         {#each [['pan', 'Pan'], ['lasso', 'Lasso'], ['box', 'Box']] as [m, l] (m)}
           <button
             type="button"
             role="radio"
             aria-checked={mode === m}
-            class:on={mode === m}
             onclick={() => (mode = m as typeof mode)}>{l}</button
           >
         {/each}
@@ -845,30 +844,6 @@
   .colour {
     width: 14em;
   }
-  .seg {
-    display: inline-flex;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    overflow: hidden;
-  }
-  .seg button {
-    all: unset;
-    padding: 3px 10px;
-    font-size: var(--fs-sm);
-    cursor: pointer;
-    color: var(--text-2);
-  }
-  .seg button + button {
-    border-left: 1px solid var(--border);
-  }
-  .seg button.on {
-    background: color-mix(in srgb, var(--iri) 12%, transparent);
-    color: var(--iri);
-    font-weight: 600;
-  }
-  .seg button:focus-visible {
-    box-shadow: var(--focus);
-  }
   .lasso-toggle {
     display: none;
   }
@@ -989,7 +964,7 @@
     .body {
       grid-template-columns: 1fr;
     }
-    .seg {
+    .segmented {
       display: none;
     }
     .lasso-toggle {

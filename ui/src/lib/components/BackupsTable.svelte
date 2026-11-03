@@ -155,11 +155,12 @@
     <option value="-">Made by hand</option>
     {#each policies as p (p)}<option value={p}>Policy {p}</option>{/each}
   </select>
-  <span class="spacer"></span>
-  <span class="faint small">{filtered.length} of {backups.length}</span>
-  <button class="btn ghost icon sm" onclick={load} disabled={loading} aria-label="Reload backups">
-    {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={13} />{/if}
-  </button>
+  <span class="bar-end">
+    <span class="faint small">{filtered.length} of {backups.length}</span>
+    <button class="btn ghost icon sm" onclick={load} disabled={loading} aria-label="Reload backups">
+      {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={13} />{/if}
+    </button>
+  </span>
 </div>
 
 {#each problems as p (p)}
@@ -285,6 +286,28 @@
     border: 0;
     width: 220px;
     box-shadow: none;
+  }
+  .bar-end {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--sp-2);
+    margin-left: auto;
+  }
+  /* a phone: the search across, the filters two to a row */
+  @media (max-width: 760px) {
+    .bar {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .search {
+      grid-column: 1 / -1;
+    }
+    .search input {
+      flex: 1;
+      width: auto;
+      min-width: 0;
+    }
   }
   .small {
     font-size: var(--fs-sm);

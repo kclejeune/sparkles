@@ -266,9 +266,11 @@ test('the strip edits the projection and modifiers, and Count matches counts', a
   await strip.getByRole('button', { name: 'Count matches' }).click();
   await expect(pane(page).getByTestId('pattern-count')).toHaveText(/^\d+ match(es)?$/);
   // a count belongs to its state: another At clears it
+  await page.getByRole('button', { name: /^Options/ }).click();
   await page.getByRole('combobox', { name: 'At' }).fill('1');
   await expect(pane(page).getByTestId('pattern-count')).toHaveCount(0);
   await page.getByRole('combobox', { name: 'At' }).fill('');
+  await page.getByRole('button', { name: /^Options/ }).click();
   // a refused edit leaves the checkbox showing the query
   await strip.getByRole('checkbox', { name: '?person' }).click();
   await expect(live(page)).toHaveText('A query projects at least one variable');

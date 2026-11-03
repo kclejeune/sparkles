@@ -26,7 +26,7 @@
   } from '$lib/rowdiff';
   import { timeFailure } from '$lib/timeline';
   import { EXAMPLES } from '$lib/examples';
-  import { fmtInt, fmtMs, formatSse } from '$lib/format';
+  import { fmtCompact, fmtInt, fmtMs, formatSse } from '$lib/format';
   import { geoColumns } from '$lib/geo';
   import { locateEntities } from '$lib/locate';
   import { entityColumns, readAt } from '$lib/result-arcs';
@@ -196,6 +196,16 @@
   let formatMenuOpen = $state(false);
   /** On a phone: the branch, state, history and row limit, behind one button. */
   let optionsOpen = $state(false);
+  /** The run options that differ from their defaults, on the Options button. */
+  const optionsSummary = $derived(
+    [
+      app.queryBranch,
+      app.queryAt ? `at ${app.queryAt}` : '',
+      limit !== 10_000 ? `${fmtCompact(limit)} rows` : '',
+    ]
+      .filter(Boolean)
+      .join(' · '),
+  );
   let formatting = $state(false);
   /** Format the query before each Run (per viewer, off by default). */
   let formatOnRun = $state(load<boolean>(FORMAT_ON_RUN_KEY, false) === true);
@@ -2628,6 +2638,7 @@
       if (savedOpen && !(e.target as HTMLElement).closest('.saved')) savedOpen = false;
       if (formatMenuOpen && !(e.target as HTMLElement).closest('.format-group'))
         formatMenuOpen = false;
+      if (optionsOpen && !(e.target as HTMLElement).closest('.options')) optionsOpen = false;
     };
     window.addEventListener('keydown', onKey);
     document.addEventListener('mousedown', onDoc);
@@ -2791,298 +2802,331 @@
   <!-- toolbar -->
   <div class="toolstack">
     <div class="toolbar">
-      <span class="kind" data-kind={kind ?? ''}>{kind ?? 'SPARQL'}</span>
-      <span class="target faint">
-        {kind === 'UPDATE' ? 'POST' : 'POST'}
-        <span class="mono">/{target ?? '…'}/{kind === 'UPDATE' ? 'update' : 'sparql'}</span>
-      </span>
-      <span class="spacer"></span>
-      <button
-        class="btn sm"
-        aria-pressed={patternOpen}
-        title="Show the query's pattern beside the editor (Alt+P)"
-        onclick={() => (patternOpen ? (patternOpen = false) : void togglePattern('page'))}
-      >
-        <Icon name="graph" size={13} /> Pattern
-      </button>
-      <div class="examples">
-        <button
-          class="btn sm"
-          aria-haspopup="menu"
-          aria-expanded={examplesOpen}
-          onclick={() => (examplesOpen = !examplesOpen)}
+      <div class="toolbar-group">
+        <span
+          class="kind"
+          data-kind={kind ?? ''}
+          title="POST /{target ?? '…'}/{kind === 'UPDATE' ? 'update' : 'sparql'}"
+          >{kind ?? 'SPARQL'}</span
         >
-          Examples <Icon name="chevronDown" size={13} />
-        </button>
-        {#if examplesOpen}
-          <div class="menu" role="menu">
-            {#each EXAMPLES as ex, i (ex.title)}
-              <button role="menuitem" class="menu-item" onclick={() => openExample(i)}>
-                <span>{ex.title}</span>
-                <span class="faint">{ex.description}</span>
-              </button>
-            {/each}
-          </div>
-        {/if}
+        <span class="target faint">
+          POST
+          <span class="mono">/{target ?? '…'}/{kind === 'UPDATE' ? 'update' : 'sparql'}</span>
+        </span>
       </div>
-      <div class="saved">
-        <button
-          class="btn sm"
-          aria-haspopup="menu"
-          aria-expanded={savedOpen}
-          disabled={!ds}
-          onclick={() => (savedOpen = !savedOpen)}
-        >
-          Saved <Icon name="chevronDown" size={13} />
-        </button>
-        {#if savedOpen}
-          <div class="menu" role="menu">
-            {#each savedList as q (q.name)}
-              <button role="menuitem" class="menu-item" onclick={() => openSaved(q)}>
-                <span
-                  >{q.name}
-                  <span class="faint mono small"
-                    >{q.kind ?? ''}{Object.keys(q.parameters ?? {}).length
-                      ? ` · ${Object.keys(q.parameters ?? {})
-                          .map((n) => `?${n}`)
-                          .join(' ')}`
-                      : ''}</span
-                  ></span
-                >
-                <span class="faint">{q.description ?? ''}</span>
-              </button>
-            {:else}
-              <p class="faint small menu-note">
-                {savedError ?? `/${ds} has no saved queries.`}
-              </p>
-            {/each}
-            <button
-              role="menuitem"
-              class="menu-item"
-              onclick={openSave}
-              disabled={!canAdmin || !active.query.trim() || queryKind(active.query) === 'UPDATE'}
-              title={canAdmin ? undefined : `Requires admin access to /${ds}`}
-            >
-              <span><Icon name="plus" size={12} /> Save this query…</span>
-              <span class="faint"
-                >A named query with typed parameters, for HTTP, MCP and the CLI</span
+      <span class="toolbar-sep"></span>
+      <div class="toolbar-group">
+        <div class="examples">
+          <button
+            class="btn sm"
+            aria-haspopup="menu"
+            aria-expanded={examplesOpen}
+            onclick={() => (examplesOpen = !examplesOpen)}
+          >
+            Examples <Icon name="chevronDown" size={13} />
+          </button>
+          {#if examplesOpen}
+            <div class="dropdown-menu menu" role="menu">
+              {#each EXAMPLES as ex, i (ex.title)}
+                <button role="menuitem" class="dropdown-item" onclick={() => openExample(i)}>
+                  <span>{ex.title}</span>
+                  <span class="faint">{ex.description}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+        <div class="saved">
+          <button
+            class="btn sm"
+            aria-haspopup="menu"
+            aria-expanded={savedOpen}
+            disabled={!ds}
+            onclick={() => (savedOpen = !savedOpen)}
+          >
+            Saved <Icon name="chevronDown" size={13} />
+          </button>
+          {#if savedOpen}
+            <div class="dropdown-menu menu" role="menu">
+              {#each savedList as q (q.name)}
+                <button role="menuitem" class="dropdown-item" onclick={() => openSaved(q)}>
+                  <span
+                    >{q.name}
+                    <span class="faint mono small"
+                      >{q.kind ?? ''}{Object.keys(q.parameters ?? {}).length
+                        ? ` · ${Object.keys(q.parameters ?? {})
+                            .map((n) => `?${n}`)
+                            .join(' ')}`
+                        : ''}</span
+                    ></span
+                  >
+                  <span class="faint">{q.description ?? ''}</span>
+                </button>
+              {:else}
+                <p class="faint small menu-note">
+                  {savedError ?? `/${ds} has no saved queries.`}
+                </p>
+              {/each}
+              <button
+                role="menuitem"
+                class="dropdown-item"
+                onclick={openSave}
+                disabled={!canAdmin || !active.query.trim() || queryKind(active.query) === 'UPDATE'}
+                title={canAdmin ? undefined : `Requires admin access to /${ds}`}
               >
-            </button>
-            {#if serverAsked?.length || askedList.length}
-              <div class="menu-head faint small" role="presentation">Asked</div>
-              <div class="menu-scroll" role="group" aria-label="Asked">
-                {#each serverAsked ?? [] as a (a.id)}
-                  <div class="suggestion">
+                <span><Icon name="plus" size={12} /> Save this query…</span>
+                <span class="faint"
+                  >A named query with typed parameters, for HTTP, MCP and the CLI</span
+                >
+              </button>
+              {#if serverAsked?.length || askedList.length}
+                <div class="menu-head faint small" role="presentation">Asked</div>
+                <div class="menu-scroll" role="group" aria-label="Asked">
+                  {#each serverAsked ?? [] as a (a.id)}
+                    <div class="suggestion">
+                      <button
+                        role="menuitem"
+                        class="dropdown-item s-text"
+                        title={a.query}
+                        onclick={() => openAsked(a)}
+                      >
+                        <span>{a.question}</span>
+                        <span class="faint mono small one-line">{a.query.replace(/\s+/g, ' ')}</span
+                        >
+                      </button>
+                      <button
+                        class="btn ghost icon sm"
+                        aria-label="Forget this question"
+                        title="Remove it from your history on the server"
+                        onclick={() => void forgetAsked(a.id)}
+                        ><Icon name="trash" size={12} /></button
+                      >
+                    </div>
+                  {/each}
+                  {#each localAsked as a (a.question + a.at)}
                     <button
                       role="menuitem"
-                      class="menu-item s-text"
+                      class="dropdown-item"
                       title={a.query}
                       onclick={() => openAsked(a)}
                     >
                       <span>{a.question}</span>
                       <span class="faint mono small one-line">{a.query.replace(/\s+/g, ' ')}</span>
                     </button>
-                    <button
-                      class="btn ghost icon sm"
-                      aria-label="Forget this question"
-                      title="Remove it from your history on the server"
-                      onclick={() => void forgetAsked(a.id)}><Icon name="trash" size={12} /></button
-                    >
-                  </div>
-                {/each}
-                {#each localAsked as a (a.question + a.at)}
-                  <button
-                    role="menuitem"
-                    class="menu-item"
-                    title={a.query}
-                    onclick={() => openAsked(a)}
-                  >
-                    <span>{a.question}</span>
-                    <span class="faint mono small one-line">{a.query.replace(/\s+/g, ' ')}</span>
-                  </button>
-                {/each}
-              </div>
-            {/if}
-            {#if canAdmin}
-              <div class="menu-head faint small" role="presentation">Suggestions</div>
-              <div class="menu-scroll" role="group" aria-label="Suggestions">
-                {#each suggestionList as s (s.id)}
-                  <div class="suggestion">
-                    <span class="s-text" title={s.query}
-                      >{s.question}
-                      <span class="faint small">by {s.by}</span></span
-                    >
-                    <span class="s-actions">
-                      <button
-                        class="btn sm"
-                        onclick={() =>
-                          void openSaveExample(
-                            { question: s.question, query: s.query, explanation: s.explanation },
-                            undefined,
-                            s.id,
-                          )}>Promote</button
-                      >
-                      <button class="btn ghost sm" onclick={() => void dismissSuggestion(s)}
-                        >Dismiss</button
-                      >
-                    </span>
-                  </div>
-                {:else}
-                  <p class="faint small menu-note">
-                    {suggestionsError ?? 'No suggested examples.'}
-                  </p>
-                {/each}
-              </div>
-            {/if}
-          </div>
-        {/if}
-      </div>
-      <button
-        class="btn sm options-toggle"
-        aria-expanded={optionsOpen}
-        aria-controls="run-options"
-        onclick={() => (optionsOpen = !optionsOpen)}
-      >
-        Options <Icon name="chevronDown" size={13} />
-      </button>
-      <div class="run-options" class:open={optionsOpen} id="run-options">
-        {#if reasoningInfo && kind !== 'UPDATE'}
-          <label
-            class="limit inf"
-            title="Include the {fmtInt(
-              reasoningInfo.inferred,
-            )} triples inferred by {reasoningInfo.profile} reasoning (reasoning={inferences})"
-          >
-            <input type="checkbox" bind:checked={inferences} />
-            <span>Use inferences</span>
-          </label>
-        {/if}
-        {#if branchList}
-          <label class="at" title="The branch queries read and updates change (branch=)">
-            <span class="faint">Branch</span>
-            <select class="select sm mono" bind:value={app.queryBranch} aria-label="Branch">
-              {#each branchList as b (b.name)}
-                <option value={b.name === MAIN ? '' : b.name}>{branchOption(b)}</option>
-              {/each}
-              {#if branch && !branchList.some((b) => b.name === branch)}
-                <option value={branch}>{branch}</option>
+                  {/each}
+                </div>
               {/if}
-            </select>
-          </label>
-        {/if}
-        <label
-          class="at"
-          title="Read a past state (at=): a commit number, commit:N, time:<RFC 3339> or snapshot:NAME. Empty reads the head; updates always apply to the head."
-        >
-          <span class="faint">At</span>
-          <input
-            class="input sm mono"
-            class:invalid={!atOk}
-            placeholder="head"
-            list="at-options"
-            size="12"
-            aria-invalid={!atOk}
-            bind:value={app.queryAt}
-          />
-          <datalist id="at-options">
-            {#each snapshotNames as s (s)}<option value={s}></option>{/each}
-          </datalist>
-          {#if app.queryAt}
-            <button
-              class="btn ghost icon sm"
-              aria-label="Read the head"
-              title="Read the head"
-              onclick={() => (app.queryAt = '')}><Icon name="x" size={11} /></button
-            >
+              {#if canAdmin}
+                <div class="menu-head faint small" role="presentation">Suggestions</div>
+                <div class="menu-scroll" role="group" aria-label="Suggestions">
+                  {#each suggestionList as s (s.id)}
+                    <div class="suggestion">
+                      <span class="s-text" title={s.query}
+                        >{s.question}
+                        <span class="faint small">by {s.by}</span></span
+                      >
+                      <span class="s-actions">
+                        <button
+                          class="btn sm"
+                          onclick={() =>
+                            void openSaveExample(
+                              { question: s.question, query: s.query, explanation: s.explanation },
+                              undefined,
+                              s.id,
+                            )}>Promote</button
+                        >
+                        <button class="btn ghost sm" onclick={() => void dismissSuggestion(s)}
+                          >Dismiss</button
+                        >
+                      </span>
+                    </div>
+                  {:else}
+                    <p class="faint small menu-note">
+                      {suggestionsError ?? 'No suggested examples.'}
+                    </p>
+                  {/each}
+                </div>
+              {/if}
+            </div>
           {/if}
-        </label>
+        </div>
         <button
           class="btn sm"
           aria-pressed={timeOpen}
+          aria-label="History"
           title="Move through the commits of the branch (H)"
           onclick={toggleTime}
         >
-          <Icon name="clock" size={13} /> History
+          <Icon name="clock" size={13} /><span class="lbl">History</span>
         </button>
-        <label class="limit" title="Maximum rows the server sends to the browser (send=)">
-          <span class="faint">Show</span>
-          <select class="select sm" bind:value={limit}>
-            {#each LIMITS as l (l)}<option value={l}>{fmtInt(l)} rows</option>{/each}
-          </select>
-        </label>
-      </div>
-      <div class="format-group">
-        <button
-          class="btn sm format"
-          onclick={() => formatQuery()}
-          disabled={!active.query.trim() || formatting}
-          title="Format (Shift+Alt+F)"
-        >
-          <Icon name="wand" size={14} /> Format
-        </button>
-        <button
-          class="btn sm format-more"
-          aria-label="Format options"
-          aria-haspopup="true"
-          aria-expanded={formatMenuOpen}
-          onclick={() => (formatMenuOpen = !formatMenuOpen)}
-        >
-          <Icon name="chevronDown" size={13} />
-        </button>
-        {#if formatMenuOpen}
-          <div class="menu format-menu">
-            <label class="menu-item check">
-              <input type="checkbox" bind:checked={formatOnRun} />
-              <span>Format on run</span>
+        <div class="options">
+          <button
+            class="btn sm options-toggle"
+            aria-expanded={optionsOpen}
+            aria-controls="run-options"
+            title="Branch, state, row limit and inferences"
+            onclick={() => (optionsOpen = !optionsOpen)}
+          >
+            <Icon name="sliders" size={13} /> Options{#if optionsSummary}<span
+                class="opt-summary mono">{optionsSummary}</span
+              >{/if}
+            <Icon name="chevronDown" size={13} />
+          </button>
+          <div
+            class="dropdown-menu run-options"
+            hidden={!optionsOpen}
+            id="run-options"
+            role="group"
+            aria-label="Run options"
+          >
+            {#if reasoningInfo && kind !== 'UPDATE'}
+              <label
+                class="limit inf form-row"
+                title="Include the {fmtInt(
+                  reasoningInfo.inferred,
+                )} triples inferred by {reasoningInfo.profile} reasoning (reasoning={inferences})"
+              >
+                <input type="checkbox" bind:checked={inferences} />
+                <span>Use inferences</span>
+              </label>
+            {/if}
+            {#if branchList}
+              <label
+                class="at form-row"
+                title="The branch queries read and updates change (branch=)"
+              >
+                <span>Branch</span>
+                <select class="select sm mono" bind:value={app.queryBranch} aria-label="Branch">
+                  {#each branchList as b (b.name)}
+                    <option value={b.name === MAIN ? '' : b.name}>{branchOption(b)}</option>
+                  {/each}
+                  {#if branch && !branchList.some((b) => b.name === branch)}
+                    <option value={branch}>{branch}</option>
+                  {/if}
+                </select>
+              </label>
+            {/if}
+            <label
+              class="at form-row"
+              title="Read a past state (at=): a commit number, commit:N, time:<RFC 3339> or snapshot:NAME. Empty reads the head; updates always apply to the head."
+            >
+              <span>At</span>
+              <input
+                class="input sm mono"
+                class:invalid={!atOk}
+                placeholder="head"
+                list="at-options"
+                size="12"
+                aria-invalid={!atOk}
+                bind:value={app.queryAt}
+              />
+              <datalist id="at-options">
+                {#each snapshotNames as s (s)}<option value={s}></option>{/each}
+              </datalist>
+              {#if app.queryAt}
+                <button
+                  class="btn ghost icon sm"
+                  aria-label="Read the head"
+                  title="Read the head"
+                  onclick={() => (app.queryAt = '')}><Icon name="x" size={11} /></button
+                >
+              {/if}
             </label>
-            <label class="menu-item check">
-              <input type="checkbox" bind:checked={lintOn} />
-              <span>Lint while typing</span>
+            <label
+              class="limit form-row"
+              title="Maximum rows the server sends to the browser (send=)"
+            >
+              <span>Show</span>
+              <select class="select sm" bind:value={limit}>
+                {#each LIMITS as l (l)}<option value={l}>{fmtInt(l)} rows</option>{/each}
+              </select>
             </label>
-            <button class="menu-item" disabled={!fixable} onclick={() => void fixQuery()}>
-              Fix lint problems
-            </button>
           </div>
+        </div>
+      </div>
+      <div class="toolbar-end">
+        <button
+          class="btn sm"
+          aria-pressed={patternOpen}
+          aria-label="Pattern"
+          title="Show the query's pattern beside the editor (Alt+P)"
+          onclick={() => (patternOpen ? (patternOpen = false) : void togglePattern('page'))}
+        >
+          <Icon name="graph" size={13} /><span class="lbl">Pattern</span>
+        </button>
+        <div class="format-group">
+          <button
+            class="btn sm format"
+            onclick={() => formatQuery()}
+            disabled={!active.query.trim() || formatting}
+            title="Format (Shift+Alt+F)"
+          >
+            <Icon name="wand" size={14} /><span class="lbl">Format</span>
+          </button>
+          <button
+            class="btn sm format-more"
+            aria-label="Format options"
+            aria-haspopup="true"
+            aria-expanded={formatMenuOpen}
+            onclick={() => (formatMenuOpen = !formatMenuOpen)}
+          >
+            <Icon name="chevronDown" size={13} />
+          </button>
+          {#if formatMenuOpen}
+            <div class="dropdown-menu end format-menu">
+              <label class="dropdown-item check">
+                <input type="checkbox" bind:checked={formatOnRun} />
+                <span>Format on run</span>
+              </label>
+              <label class="dropdown-item check">
+                <input type="checkbox" bind:checked={lintOn} />
+                <span>Lint while typing</span>
+              </label>
+              <button class="dropdown-item" disabled={!fixable} onclick={() => void fixQuery()}>
+                Fix lint problems
+              </button>
+            </div>
+          {/if}
+        </div>
+        {#if lintOn && lintDiagnostics.length}
+          <span
+            class="lint-status"
+            class:error={lintCount.error > 0}
+            class:warning={lintCount.error === 0 && lintCount.warning > 0}
+            role="status"
+            title={lintDiagnostics
+              .map((d) => `${d.line}:${d.column} ${d.message} [${d.rule}]`)
+              .join('\n')}
+          >
+            <Icon name={lintCount.error || lintCount.warning ? 'alert' : 'info'} size={12} />
+            {lintSummary(lintDiagnostics)}
+          </span>
+        {/if}
+        <button
+          class="btn sm"
+          onclick={runExplain}
+          disabled={!ds || kind === 'UPDATE'}
+          title="Show algebra and plan without running"
+        >
+          <Icon name="plan" size={14} /> Explain
+        </button>
+        {#if outcome?.status === 'running' && outcome.controller}
+          <button class="btn sm danger" onclick={cancel}><Icon name="x" size={14} /> Cancel</button>
+        {:else}
+          <button
+            class="btn sm primary"
+            onclick={() => run()}
+            disabled={!ds || (kind === 'UPDATE' && !auth.can(ds, 'write'))}
+            title={kind === 'UPDATE' && ds && !auth.can(ds, 'write')
+              ? `Requires write access to /${ds}`
+              : undefined}
+          >
+            <Icon name="play" size={12} />
+            {kind === 'UPDATE' ? 'Run update' : 'Run'}
+            <span class="kbd">{isMac ? '⌘' : 'Ctrl'}↵</span>
+          </button>
         {/if}
       </div>
-      {#if lintOn && lintDiagnostics.length}
-        <span
-          class="lint-status"
-          class:error={lintCount.error > 0}
-          class:warning={lintCount.error === 0 && lintCount.warning > 0}
-          role="status"
-          title={lintDiagnostics
-            .map((d) => `${d.line}:${d.column} ${d.message} [${d.rule}]`)
-            .join('\n')}
-        >
-          <Icon name={lintCount.error || lintCount.warning ? 'alert' : 'info'} size={12} />
-          {lintSummary(lintDiagnostics)}
-        </span>
-      {/if}
-      <button
-        class="btn sm"
-        onclick={runExplain}
-        disabled={!ds || kind === 'UPDATE'}
-        title="Show algebra and plan without running"
-      >
-        <Icon name="plan" size={14} /> Explain
-      </button>
-      {#if outcome?.status === 'running' && outcome.controller}
-        <button class="btn sm danger" onclick={cancel}><Icon name="x" size={14} /> Cancel</button>
-      {:else}
-        <button
-          class="btn sm primary"
-          onclick={() => run()}
-          disabled={!ds || (kind === 'UPDATE' && !auth.can(ds, 'write'))}
-          title={kind === 'UPDATE' && ds && !auth.can(ds, 'write')
-            ? `Requires write access to /${ds}`
-            : undefined}
-        >
-          <Icon name="play" size={12} />
-          {kind === 'UPDATE' ? 'Run update' : 'Run'}
-          <span class="kbd">{isMac ? '⌘' : 'Ctrl'}↵</span>
-        </button>
-      {/if}
       {#if activeStored}
         {@const form = forms[activeId] ?? {}}
         <div class="params" aria-label="Saved query parameters">
@@ -4272,7 +4316,7 @@
     display: flex;
     align-items: flex-end;
     gap: 2px;
-    padding: 8px 12px 0;
+    padding: var(--sp-2) var(--gutter) 0;
     background: var(--bg);
     border-bottom: 1px solid var(--border);
     overflow-x: auto;
@@ -4366,23 +4410,31 @@
   .toolstack {
     min-width: 0;
   }
-  /* the branch, state, history and row limit: in the toolbar's row, and on a phone behind
-     the Options button */
-  .run-options {
-    display: contents;
+  /* the branch, state, history, row limit and inferences, behind the Options button at
+     every width; the button names the ones that differ from their defaults */
+  .options {
+    position: relative;
   }
-  .options-toggle {
+  .run-options {
+    gap: var(--sp-3);
+    padding: var(--sp-3);
+    min-width: 260px;
+  }
+  .run-options[hidden] {
     display: none;
   }
-  .toolbar {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-2);
-    padding: 6px var(--sp-3);
-    background: var(--surface);
-    border-bottom: 1px solid var(--border);
-    min-width: 0;
-    flex-wrap: wrap;
+  .run-options .form-row {
+    justify-content: space-between;
+  }
+  .opt-summary {
+    max-width: 16em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: var(--fs-xs);
+    color: var(--spark-ink);
+  }
+  .options-toggle[aria-expanded='true'] :global(.icon:last-child) {
+    transform: rotate(180deg);
   }
   .kind {
     font-size: var(--fs-xs);
@@ -4405,13 +4457,6 @@
   .target {
     font-size: var(--fs-sm);
   }
-  .limit,
-  .at {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: var(--fs-sm);
-  }
   .at input {
     width: 9.5em;
   }
@@ -4426,20 +4471,12 @@
     cursor: pointer;
     white-space: nowrap;
   }
-  .select.sm {
-    height: 24px;
-    font-size: var(--fs-sm);
-  }
   .examples,
   .saved {
     position: relative;
   }
   .menu-note {
     margin: 4px 8px;
-  }
-  .menu-item:disabled {
-    opacity: 0.5;
-    cursor: default;
   }
   .params {
     flex-basis: 100%;
@@ -4578,40 +4615,11 @@
     margin: 0;
   }
   .menu {
-    position: absolute;
-    right: 0;
-    top: calc(100% + 4px);
-    z-index: 30;
-    width: 300px;
-    padding: 4px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    box-shadow: var(--shadow-pop);
-    display: grid;
-  }
-  .menu-item {
-    all: unset;
-    display: grid;
-    gap: 1px;
-    padding: 6px 8px;
-    border-radius: 4px;
-    cursor: pointer;
-    font-weight: 500;
-  }
-  .menu-item span:last-child {
-    font-size: var(--fs-sm);
-    font-weight: 400;
-  }
-  .menu-item:hover,
-  .menu-item:focus-visible {
-    background: var(--hover);
+    width: 320px;
   }
   .format-group {
     position: relative;
     display: flex;
-    /* when the toolbar wraps the group to the start of a row, its right-aligned menu stays clear of the sidebar */
-    margin-left: 16px;
   }
   .format-group .format {
     border-top-right-radius: 0;
@@ -4640,11 +4648,6 @@
   }
   .lint-status.error {
     color: var(--danger);
-  }
-  .menu-item.check {
-    display: flex;
-    align-items: center;
-    gap: 8px;
   }
   .editor-wrap {
     min-height: 0;
@@ -4736,8 +4739,8 @@
   .rbar {
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 0 12px;
+    gap: var(--sp-3);
+    padding: 0 var(--gutter);
     border-bottom: 1px solid var(--border);
     min-height: 38px;
     flex-wrap: wrap;
@@ -4747,7 +4750,7 @@
     align-items: center;
     flex-wrap: wrap;
     gap: 6px 8px;
-    padding: 5px 12px;
+    padding: 5px var(--gutter);
     border-bottom: 1px solid var(--border);
     background: var(--surface-2);
     font-size: var(--fs-sm);
@@ -5004,23 +5007,14 @@
   /* a phone: the toolbar wraps and its buttons land anywhere, so the menus hang from the
      toolbar's right edge instead of their button's, which could put them off screen */
   @media (max-width: 760px) {
-    .options-toggle {
-      display: inline-flex;
+    .rbar > .tabs {
+      flex-basis: 100%;
     }
-    .options-toggle[aria-expanded='true'] :global(.icon) {
-      transform: rotate(180deg);
-    }
-    .run-options {
+    .rbar > .spacer {
       display: none;
     }
-    .run-options.open {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: var(--sp-2);
-      order: 10;
-      width: 100%;
-      padding-top: var(--sp-1);
+    .opt-summary {
+      max-width: 7em;
     }
     /* the wrapped toolbar and the editor would leave the results a sliver of a short
        screen: they get a fixed share of it, and the page scrolls down to them */
@@ -5059,12 +5053,22 @@
     }
     .examples,
     .saved,
+    .options,
     .format-group {
       position: static;
     }
-    .menu {
-      right: 12px;
-      max-width: calc(100% - 24px);
+    .toolbar :global(.dropdown-menu) {
+      left: var(--gutter);
+      right: var(--gutter);
+      width: auto;
+      max-width: none;
+    }
+  }
+  /* below the large width the endpoint stays in the kind's tooltip, so the tools keep one row */
+  @media (max-width: 1199px) {
+    .target,
+    .toolbar-group:first-child + .toolbar-sep {
+      display: none;
     }
   }
   @media (max-width: 900px) {
