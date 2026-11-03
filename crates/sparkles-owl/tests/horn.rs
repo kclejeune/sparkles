@@ -174,8 +174,10 @@ fn symmetric_and_inverse_properties() {
          SubClassOf(:A ObjectSomeValuesFrom(:r :B))
          SubClassOf(:B ObjectAllValuesFrom(:r :C))
          SubClassOf(:E ObjectSomeValuesFrom(:s :F))
-         SubClassOf(:F ObjectAllValuesFrom(:t :G))",
-        &[("A", "C"), ("E", "G")],
+         SubClassOf(:F ObjectAllValuesFrom(:t :G))
+         SubClassOf(:H ObjectSomeValuesFrom(:t :I))
+         SubClassOf(:I ObjectAllValuesFrom(:s :J))",
+        &[("A", "C"), ("E", "G"), ("H", "J")],
         &[("B", "C"), ("F", "G")],
     );
 }

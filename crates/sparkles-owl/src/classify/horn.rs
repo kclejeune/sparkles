@@ -703,8 +703,10 @@ impl Norm<'_> {
                 }
             }
             K::InverseObjectProperties(p, q) => {
+                // p is q⁻, both ways
                 let (p, q) = (self.role(p)?, self.role(&q.inverse())?);
                 self.out.role_subs.push((p, q));
+                self.out.role_subs.push((q, p));
             }
             K::SymmetricObjectProperty(p) => {
                 let (r, i) = (self.role(p)?, self.role(&p.inverse())?);
