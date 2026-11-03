@@ -532,6 +532,7 @@ fn entries() -> Vec<(&'static str, Entry)> {
                     &o,
                     "",
                     sparkles::owl::manchester::What::ClassExpression,
+                    &any(),
                 );
             }
         }),

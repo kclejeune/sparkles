@@ -2,6 +2,7 @@ use super::*;
 use crate::handles::ontology::classify::ClassifyRequest;
 use serde_json::json;
 use sparkles_owl::ObjectProperty;
+use std::sync::Arc;
 
 fn ex(local: &str) -> String {
     format!("http://ex.org/{local}")
@@ -39,7 +40,10 @@ fn query(ds: &Dataset, text: &str) -> DlQueryAnswer {
     let req = OntologyRequest::default();
     let opts = h.anchored(&Default::default()).unwrap();
     let o = h.open(&req, &opts).unwrap();
-    let e = match h.parse_manchester(&o, text, What::ClassExpression).unwrap() {
+    let e = match h
+        .parse_manchester(&o, text, What::ClassExpression, &opts)
+        .unwrap()
+    {
         Parsed::ClassExpression(e) => e,
         _ => unreachable!(),
     };
@@ -322,7 +326,12 @@ fn manchester_errors_carry_their_span_and_candidates() {
         .open(&OntologyRequest::default(), &Default::default())
         .unwrap();
     let e = h
-        .parse_manchester(&o, "teaches some Course", What::ClassExpression)
+        .parse_manchester(
+            &o,
+            "teaches some Course",
+            What::ClassExpression,
+            &Default::default(),
+        )
         .unwrap_err();
     let Error::Component(c) = &e else {
         panic!("{e:?}")
@@ -382,4 +391,156 @@ fn the_wire_operations_answer() {
     )
     .unwrap_err();
     assert!(e.to_string().contains("characters 12 to 12"), "{e}");
+}
+
+/// A query of Manchester `text` with the engine, the answers and the options given.
+fn query_with(
+    ds: &Dataset,
+    text: &str,
+    reasoning: DlReasoning,
+    answers: &[&str],
+    opts: &QueryOptions,
+) -> Result<DlQueryAnswer> {
+    let h = ds.ontology();
+    let req = OntologyRequest::default();
+    let opts = h.anchored(opts)?;
+    let o = h.open(&req, &opts)?;
+    let e = match h.parse_manchester(&o, text, What::ClassExpression, &opts)? {
+        Parsed::ClassExpression(e) => e,
+        _ => unreachable!(),
+    };
+    let mut q = DlQueryRequest::new(e);
+    q.reasoning = reasoning;
+    q.answers = DlAnswers::none();
+    for a in answers {
+        q.answers.set(a)?;
+    }
+    h.dl_query_opened(o, &req, &q, &opts)
+}
+
+#[test]
+fn the_rl_copy_is_charged_to_the_memory_grant() {
+    let ds = dataset("Declaration(Class(:A)) SubClassOf(:A ObjectUnionOf(:B :C))");
+    let pool = sparkles_core::sparql::pool::QueryPool::new(1024);
+    let grant = Arc::new(pool.try_grant(1024).unwrap());
+    let opts = QueryOptions {
+        grant: Some(grant.clone()),
+        ..Default::default()
+    };
+    let Err(e) = query_with(&ds, "A", DlReasoning::Rl, &["superclasses"], &opts) else {
+        panic!("an exhausted grant answered");
+    };
+    assert!(
+        matches!(
+            e,
+            Error::BudgetExceeded(crate::Budget {
+                kind: crate::BudgetKind::ServerMemory,
+                ..
+            })
+        ),
+        "{e}"
+    );
+    // a grant large enough is charged while the copy lives and released after
+    let pool = sparkles_core::sparql::pool::QueryPool::new(64 << 20);
+    let grant = Arc::new(pool.try_grant(64 << 20).unwrap());
+    let opts = QueryOptions {
+        grant: Some(grant.clone()),
+        ..Default::default()
+    };
+    query_with(&ds, "A", DlReasoning::Rl, &["superclasses"], &opts).unwrap();
+    assert_eq!(grant.used(), 0);
+}
+
+#[test]
+fn a_chain_past_the_rule_set_leaves_the_rl_instances_incomplete() {
+    // prp-spo2 covers chains of up to three properties, so r(a, e) and the domain C are
+    // not derived for a chain of four
+    let ds = dataset(
+        "Declaration(Class(:C)) Declaration(ObjectProperty(:r))
+         Declaration(ObjectProperty(:p1)) Declaration(ObjectProperty(:p2))
+         Declaration(ObjectProperty(:p3)) Declaration(ObjectProperty(:p4))
+         SubObjectPropertyOf(ObjectPropertyChain(:p1 :p2 :p3 :p4) :r)
+         ObjectPropertyDomain(:r :C)
+         ObjectPropertyAssertion(:p1 :a :b) ObjectPropertyAssertion(:p2 :b :c)
+         ObjectPropertyAssertion(:p3 :c :d) ObjectPropertyAssertion(:p4 :d :e)",
+    );
+    let a = query_with(
+        &ds,
+        "C",
+        DlReasoning::Rl,
+        &["instances"],
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(a.reasoning.instances_complete, Some(false));
+    assert!(
+        a.reasoning
+            .gaps
+            .iter()
+            .any(|g| g.rule.as_deref() == Some("prp-spo2") && g.partial),
+        "{:?}",
+        a.reasoning.gaps
+    );
+}
+
+#[test]
+fn rl_superclasses_alone_leave_out_the_class_itself() {
+    let ds = dataset("Declaration(Class(:A)) Declaration(Class(:B)) SubClassOf(:A :B)");
+    let a = query_with(
+        &ds,
+        "A",
+        DlReasoning::Rl,
+        &["superclasses", "directSuperclasses"],
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(a.direct_superclasses, Some(vec![c("B")]));
+    assert!(!a.superclasses.unwrap().contains(&c("A")));
+    assert_eq!(a.equivalents, None);
+}
+
+#[test]
+fn a_declared_individual_is_an_instance_of_what_holds_for_everything() {
+    let ds = dataset(
+        "Declaration(Class(:A)) Declaration(NamedIndividual(:a))
+         SubClassOf(<http://www.w3.org/2002/07/owl#Thing> :A)",
+    );
+    let a = query_with(
+        &ds,
+        "A",
+        DlReasoning::El,
+        &["instances"],
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(a.instances, Some(vec![Individual::named(ex("a"))]));
+}
+
+#[test]
+fn names_only_assertions_hold_are_read() {
+    let ds = dataset(
+        "Declaration(Class(:C)) Declaration(ObjectProperty(:p))
+         ClassAssertion(:C :a) ObjectPropertyAssertion(:p :a :b)",
+    );
+    for text in ["p value a", "p value b"] {
+        let a = query_with(
+            &ds,
+            text,
+            DlReasoning::Auto,
+            &["subclasses"],
+            &Default::default(),
+        )
+        .unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert_eq!(a.reasoning.engine, DlEngine::El, "{text}");
+    }
+    let Err(e) = query_with(
+        &ds,
+        "p value nobody",
+        DlReasoning::Auto,
+        &[],
+        &Default::default(),
+    ) else {
+        panic!("an unknown individual read");
+    };
+    assert!(e.to_string().contains("nobody"), "{e}");
 }

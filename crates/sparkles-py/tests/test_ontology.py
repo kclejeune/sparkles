@@ -357,8 +357,11 @@ def test_manchester_and_dl_query(ds: sparkles.Dataset) -> None:
     }
     ax = ds.ontology.parse("Professor SubClassOf teaches some Course", as_="axiom")
     assert ax["value"]["type"] == "SubClassOf"
-    with pytest.raises(sparkles.SparklesError, match="Lecture"):
+    with pytest.raises(sparkles.InvalidInputError, match="Lecture") as e:
         ds.ontology.parse("teaches some Lecture")
+    assert isinstance(e.value, ValueError)
+    assert (e.value.reason, e.value.start, e.value.end) == ("unknown", 13, 20)
+    assert e.value.candidates == []
     r = ds.ontology.dl_query("teaches some Course", answers=["subclasses", "instances"])
     assert r["reasoning"]["engine"] == "el" and r["reasoning"]["complete"]
     assert r["subclasses"] == [EX + "Professor"]

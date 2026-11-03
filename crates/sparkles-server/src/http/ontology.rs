@@ -494,7 +494,7 @@ pub(super) async fn parse(
         let opts = handle.anchored(&opts).map_err(ontology_error)?;
         let o = handle.open(&req, &opts).map_err(ontology_error)?;
         let parsed = handle
-            .parse_manchester(&o, &text, what)
+            .parse_manchester(&o, &text, what, &opts)
             .map_err(ontology_error)?;
         let body = onto::wire::parse_body(
             &ds.name,
@@ -555,7 +555,7 @@ pub(super) async fn dl_query(
         let opts = handle.anchored(&opts).map_err(ontology_error)?;
         let opened = handle.open(&req, &opts).map_err(ontology_error)?;
         let prefixes: Vec<(String, String)> = ds.dataset.prefixes().into_iter().collect();
-        let q = onto::wire::dl_expression(&handle, &opened, &o, q, &prefixes)
+        let q = onto::wire::dl_expression(&handle, &opened, &o, q, &prefixes, &opts)
             .map_err(ontology_error)?;
         let out = handle
             .dl_query_opened(opened, &req, &q, &opts)

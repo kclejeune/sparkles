@@ -332,8 +332,41 @@ impl Ontologies {
     /// that does not parse is an [`Error::Component`] of the `owl` component with the
     /// code `invalid-manchester`, whose source is the [`manchester::Error`] with its
     /// span and its candidates.
-    pub fn parse_manchester(&self, o: &Opened, text: &str, what: What) -> Result<Parsed> {
-        manchester::parse(text, what, &self.vocabulary(o)).map_err(|e| manchester_error(e, text))
+    ///
+    /// Individuals that only the store's assertions name, such as the objects of
+    /// property assertions, are not entities of `o`. A name the vocabulary does not know
+    /// is therefore looked for again among the entities of the assertions the caller can
+    /// read, which streams them once, so that a text that reads costs no such pass.
+    pub fn parse_manchester(
+        &self,
+        o: &Opened,
+        text: &str,
+        what: What,
+        opts: &QueryOptions,
+    ) -> Result<Parsed> {
+        let mut v = self.vocabulary(o);
+        match manchester::parse(text, what, &v) {
+            Ok(p) => Ok(p),
+            Err(e) if e.kind == manchester::ErrorKind::Unknown => {
+                let mut added = false;
+                o.assertions(opts, |a, _, _| {
+                    if let Some(a) = a {
+                        for ent in a.signature() {
+                            if !ent.is_builtin() && v.kinds(ent.iri().as_str()).is_empty() {
+                                v.add_entity(ent);
+                                added = true;
+                            }
+                        }
+                    }
+                    Ok(true)
+                })?;
+                if !added {
+                    return Err(manchester_error(e, text));
+                }
+                manchester::parse(text, what, &v).map_err(|e| manchester_error(e, text))
+            }
+            Err(e) => Err(manchester_error(e, text)),
+        }
     }
 
     /// Answer a DL query over the ontology `req` names (spec U12): the equivalent
@@ -519,6 +552,20 @@ impl Ontologies {
                 }
                 Ok(true)
             })?;
+            // an individual that only a declaration names is an instance of owl:Thing,
+            // which gives it a context of its own
+            let declared: Vec<Axiom> = o
+                .ontology
+                .entities(EntityKind::NamedIndividual)
+                .into_iter()
+                .filter_map(|e| match e {
+                    sparkles_owl::Entity::NamedIndividual(i) => {
+                        Some(Axiom::class_assertion(Class::thing(), Individual::Named(i)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            k.add(declared.iter());
             let (consistent, d, excluded, _) = describe(&mut k)?;
             answer.consistent = Some(consistent);
             if answer.satisfiable.is_none() {
@@ -581,6 +628,15 @@ pub fn manchester_error(e: manchester::Error, text: &str) -> Error {
 /// The bytes a copy in memory of a triple takes, roughly, for the memory budget.
 const COPY_BYTES_PER_TRIPLE: u64 = 256;
 
+/// Bytes charged to a memory grant, released when it drops.
+struct Charged(std::sync::Arc<sparkles_core::sparql::pool::PoolGrant>, u64);
+
+impl Drop for Charged {
+    fn drop(&mut self) {
+        self.0.release(self.1);
+    }
+}
+
 /// A query under the OWL 2 RL rules by demand reasoning, over a copy in memory of the
 /// terminology with the defining axiom, and with the assertions when instances are
 /// asked for.
@@ -619,6 +675,21 @@ fn rl(
             requested: bytes,
         }));
     }
+    // the copy is charged to the server's memory pool for as long as it lives, and the
+    // queries over it charge their own working memory to the same grant
+    let _charge = match &opts.grant {
+        Some(g) => {
+            g.charge(bytes).map_err(|_| {
+                Error::BudgetExceeded(crate::Budget {
+                    kind: crate::BudgetKind::ServerMemory,
+                    limit: g.granted(),
+                    requested: bytes,
+                })
+            })?;
+            Some(Charged(g.clone(), bytes))
+        }
+        None => None,
+    };
     let mem = Dataset::memory();
     mem.extend(quads.iter().map(|q| q.as_ref()))?;
     drop(quads);
@@ -631,6 +702,8 @@ fn rl(
     qo.cancel = opts.cancel.clone();
     qo.cancellation = opts.cancellation.clone();
     qo.max_memory_bytes = opts.max_memory_bytes;
+    qo.grant = opts.grant.clone();
+    qo.pool = opts.pool.clone();
     let select = |sparql: &str| -> Result<crate::dataset::Solutions> {
         let r = mem.query_with(sparql, &qo)?;
         Ok(crate::dataset::Solutions::from_result(&r))
@@ -647,8 +720,14 @@ fn rl(
                 || i == sparkles_owl::vocab::OWL_THING)
     };
     let a = &q.answers;
-    let want_supers = a.equivalents || a.superclasses || a.direct_superclasses;
-    let want_subs = a.equivalents || a.subclasses || a.direct_subclasses;
+    // the equivalents are the superclasses that are subclasses too, and each strict list
+    // leaves them out, so any class answer needs both directions
+    let want_supers = a.equivalents
+        || a.superclasses
+        || a.direct_superclasses
+        || a.subclasses
+        || a.direct_subclasses;
+    let want_subs = want_supers;
     let mut supers: Vec<String> = Vec::new();
     let mut subs: Vec<String> = Vec::new();
     if want_supers || want_subs {
@@ -753,6 +832,26 @@ fn rl(
             partial: false,
         })
         .collect();
+    // axioms in OWL 2 RL that need a rule the rule set covers only up to a size, such as
+    // chains of more than three properties
+    let mut subset_gaps = 0;
+    for (rule, max, what) in super::rl_gaps() {
+        for ax in part
+            .inside
+            .iter()
+            .filter(|ax| super::gap_size(rule, ax).is_some_and(|n| n > max))
+        {
+            subset_gaps += 1;
+            gaps.push(DlGap {
+                axiom: Some((*ax).clone()),
+                rule: Some(rule.to_string()),
+                message: format!(
+                    "needs rule {rule} for more than {max} {what}, which the rule set does not have"
+                ),
+                partial: true,
+            });
+        }
+    }
     let qc: ClassExpression = Class::new(QUERY_CLASS).into();
     let as_sub = profiles::axiom_violations(
         &Axiom::sub_class_of(q.expression.clone(), qc.clone()),
@@ -780,7 +879,7 @@ fn rl(
     // ontology inside OWL 2 RL
     let instances_complete = a
         .instances
-        .then_some(part.outside.is_empty() && as_sub.is_empty());
+        .then_some(part.outside.is_empty() && as_sub.is_empty() && subset_gaps == 0);
     Ok(DlQueryAnswer {
         opened: o.clone(),
         expression: q.expression.clone(),

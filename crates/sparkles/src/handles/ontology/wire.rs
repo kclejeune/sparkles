@@ -1020,7 +1020,7 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
             let what = what_of(string(a, "as")?)?;
             let opts = handle.anchored(opts)?;
             let o = handle.open(&req, &opts)?;
-            let parsed = handle.parse_manchester(&o, text, what)?;
+            let parsed = handle.parse_manchester(&o, text, what, &opts)?;
             Ok(parse_body(
                 name,
                 &o,
@@ -1035,7 +1035,7 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
             let (q, limit) = dl_query_of(a)?;
             let opts = handle.anchored(opts)?;
             let o = handle.open(&req, &opts)?;
-            let q = dl_expression(&handle, &o, a, q, &prefixes)?;
+            let q = dl_expression(&handle, &o, a, q, &prefixes, &opts)?;
             let out = handle.dl_query_opened(o, &req, &q, &opts)?;
             Ok(dl_query_body(
                 name,
@@ -1264,12 +1264,18 @@ pub fn dl_expression(
     a: &Map<String, J>,
     mut q: DlQueryRequest,
     prefixes: &[(String, String)],
+    opts: &QueryOptions,
 ) -> Result<DlQueryRequest> {
     let syntax = string(a, "syntax")?.unwrap_or("manchester");
     q.expression = match (a.get("expression"), syntax) {
         (None | Some(J::Null), _) => return Err(bad("expression: the class expression to query")),
         (Some(J::String(s)), "manchester") => {
-            match handle.parse_manchester(o, s, sparkles_owl::manchester::What::ClassExpression)? {
+            match handle.parse_manchester(
+                o,
+                s,
+                sparkles_owl::manchester::What::ClassExpression,
+                opts,
+            )? {
                 sparkles_owl::manchester::Parsed::ClassExpression(c) => c,
                 _ => unreachable!("asked for a class expression"),
             }

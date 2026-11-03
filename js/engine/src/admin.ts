@@ -828,8 +828,9 @@ export class Administration {
         ),
       /**
        * Read Manchester text against the ontology's names and labels as `as`
-       * (`classExpression` by default). Text that does not read throws a
-       * `SparklesError` whose details carry the span and the candidates.
+       * (`classExpression` by default). Text that does not read throws an
+       * `InvalidInputError` whose details carry the reason, the span in UTF-16 code
+       * units and the candidates of an ambiguous name.
        */
       parse: (text: string, o: OntologySelection & OperationOptions & { as?: ManchesterAs } = {}) =>
         call<ManchesterParsed>(

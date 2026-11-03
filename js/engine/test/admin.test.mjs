@@ -957,7 +957,14 @@ test('the ontology handle reads Manchester syntax and answers DL queries', async
     property: 'http://ex.org/p',
     class: 'http://ex.org/B',
   });
-  await assert.rejects(onto.parse('p some Nothing2'), /Nothing2/);
+  await assert.rejects(onto.parse('p some Nothing2'), (e) => {
+    assert.equal(e.name, 'InvalidInputError');
+    assert.match(e.message, /Nothing2/);
+    assert.equal(e.details.reason, 'unknown');
+    assert.deepEqual([e.details.start, e.details.end], [7, 15]);
+    assert.deepEqual(e.details.candidates, []);
+    return true;
+  });
   const r = await onto.dlQuery('p some B', { answers: ['subclasses', 'instances'] });
   assert.equal(r.reasoning.engine, 'el');
   assert.equal(r.reasoning.complete, true);

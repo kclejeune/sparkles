@@ -560,7 +560,8 @@ impl PyOntologies {
     /// Read Manchester text against the ontology's names and labels (item 608) as `as_`
     /// (`classExpression`, `dataRange`, `individual`, `literal` or `axiom`): the value
     /// in its JSON form, `ofn` and `manchester`. Text that does not read raises
-    /// `SparklesError` with the span and, for an ambiguous name, the candidates.
+    /// `InvalidInputError` with `reason`, the span `start` and `end` in UTF-16 code
+    /// units and, for an ambiguous name, `candidates`.
     #[pyo3(signature=(text, graph=None, *, as_="classExpression", imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn parse<'py>(
