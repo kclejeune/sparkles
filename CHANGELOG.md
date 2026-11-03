@@ -55,6 +55,15 @@ on the benchmark host it takes 3.31 s and 8.32 s, against 3.47 s and 8.77 s for 
 A term is kept only when it is a URN or a URL that OpenJDK 17's `java.net.URL` accepts, as
 ROBOT keeps it.
 
+The ontology browser has an edit mode (spec U12, roadmap item 630). A caller who can write
+to a dataset switches an entity's page into edit mode and changes its definition and
+sources, synonyms, annotations, parents and axioms in place, or a concept's labels,
+broader, narrower, related and mapping concepts. Each change is a previewed commit through
+the editors' write path, with their session branches, undo history and access checks, and
+a refused or stale write is explained in the preview. On a phone the edit bar sits at the
+bottom of the screen. A 403 in any editor's preview now names the dataset and graph that
+the caller can read but not write.
+
 The web UI has an ontology browser (spec U12, roadmap item 616). `/ui/browse` gives each
 entity of a dataset's ontologies and thesauri a read-only page with its label, short form,
 IRI, definition and sources, synonyms by kind, notes, SKOS labels by language,

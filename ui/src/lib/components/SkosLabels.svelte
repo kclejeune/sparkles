@@ -48,7 +48,8 @@
     /** The language tags the thesaurus uses, offered first. */
     langs: string[];
     readonly: boolean;
-    onedit: (sparql: string, label: string) => void;
+    /** Previews an edit; `false` means the caller did not take it, so the form keeps its text. */
+    onedit: (sparql: string, label: string) => void | boolean;
     /** Whether the graph already uses an IRI, so a minted SKOS-XL label IRI is new. */
     isUsed?: (iri: string) => Promise<boolean>;
     /** What the page edits (target and graph): an edit read for another one is dropped. */
@@ -116,11 +117,11 @@
 
   function add() {
     if (!draft.value || draftProblem) return;
-    onedit(
+    const took = onedit(
       labelEdit(iri, [], [{ kind, label: draft }], graph),
       `Add the ${KIND_NAME[kind].toLowerCase()} label ${shown(draft)} to ${name}`,
     );
-    text = '';
+    if (took !== false) text = '';
   }
 
   function replacePreferred() {
@@ -128,7 +129,7 @@
     const copies = entries.filter(
       (e) => e.xl === null && e.kind !== 'pref' && sameLabel(e.label, draft),
     );
-    onedit(
+    const took = onedit(
       labelEdit(
         iri,
         [
@@ -143,7 +144,7 @@
       ),
       `Make ${shown(draft)} the preferred label of ${name}`,
     );
-    text = '';
+    if (took !== false) text = '';
   }
 
   // --- changing one label -----------------------------------------------------------------
@@ -170,7 +171,7 @@
       return;
     }
     const what = `Change the ${KIND_NAME[e.kind].toLowerCase()} label ${shown(e.label)} of ${name} to ${shown(editDraft)}`;
-    onedit(
+    const took = onedit(
       e.xl
         ? xlFormEdit(iri, e.kind, e.xl, e.label, editDraft, graph)
         : labelEdit(
@@ -181,7 +182,7 @@
           ),
       what,
     );
-    editing = null;
+    if (took !== false) editing = null;
   }
 
   function remove(e: LabelEntry) {
@@ -273,6 +274,8 @@
                     <form
                       class="edit"
                       aria-label="Change label"
+                      data-edit-form
+                      data-dirty={sameLabel(e.label, editDraft) ? 'false' : 'true'}
                       onsubmit={(ev) => {
                         ev.preventDefault();
                         saveEdit();
@@ -281,7 +284,9 @@
                       <!-- svelte-ignore a11y_autofocus -->
                       <input class="input sm" bind:value={editText} aria-label="Text" autofocus />
                       <input class="input sm lang" bind:value={editLang} aria-label="Language" />
-                      <button class="btn sm primary" disabled={!!editProblem}>Preview</button>
+                      <button class="btn sm primary" data-preview disabled={!!editProblem}
+                        >Preview</button
+                      >
                       <button class="btn sm ghost" type="button" onclick={() => (editing = null)}
                         >Cancel</button
                       >
@@ -358,6 +363,8 @@
     <form
       class="add"
       aria-label="Add a label"
+      data-edit-form
+      data-dirty={text.trim() ? 'true' : 'false'}
       onsubmit={(e) => {
         e.preventDefault();
         add();
@@ -378,7 +385,9 @@
       <datalist id="skos-langs">
         {#each langs as l (l)}<option value={l}></option>{/each}
       </datalist>
-      <button class="btn sm primary" disabled={!draft.value || !!draftProblem}>Add</button>
+      <button class="btn sm primary" data-preview disabled={!draft.value || !!draftProblem}
+        >Add</button
+      >
       {#if entries.some((e) => !e.xl)}
         <button class="btn sm" type="button" onclick={allToXl}>Make all SKOS-XL</button>
       {/if}

@@ -796,6 +796,9 @@ function signature(a) {
   }
   if (t === 'ObjectPropertyAssertion') out.push(['ObjectProperty', a.property]);
   if (t === 'DataPropertyAssertion') out.push(['DataProperty', a.property]);
+  // an annotation assertion declares its property, as the server's edits do, so that the
+  // triple reads back as an annotation assertion that a later edit can remove
+  if (t === 'AnnotationAssertion') out.push(['AnnotationProperty', a.property]);
   return out.filter(
     ([, iri]) =>
       typeof iri === 'string' &&
@@ -1585,7 +1588,19 @@ export async function handleOntology(req, res, url, seg, ctx) {
         const value = q.object.termType === 'Literal' ? litJson(q.object) : q.object.value;
         note(q.predicate.value);
         note(value);
-        return { property: q.predicate.value, value, graph, annotations: [] };
+        // the annotations of the reified axiom that states the triple, as the server gives
+        const stated = o.axioms.find(
+          (x) =>
+            x.json.type === 'AnnotationAssertion' &&
+            x.json.subject === iri &&
+            x.json.property === q.predicate.value &&
+            JSON.stringify(x.json.value) === JSON.stringify(value),
+        );
+        const annotations = (stated?.json.annotations ?? []).map((x) => ({
+          property: x.property,
+          value: x.value,
+        }));
+        return { property: q.predicate.value, value, graph, annotations };
       });
     // as on the server, an axiom is about the entity when one of its triples has it as subject
     const about = (a) => a.quads.some((q) => isIri(q.subject) && q.subject.value === iri);

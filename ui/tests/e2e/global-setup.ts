@@ -28,7 +28,10 @@ import {
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { BROWSE_TURTLE } from '../browse-fixture';
 import {
+  BROWSE_EDIT_AUTH,
+  BROWSE_EDIT_OPEN_GRAPH,
   DATASET,
   DATA,
   DECLARED_DATASET,
@@ -182,8 +185,21 @@ dataset = "${PATHS_DATASET}"
 level = "read"
 lifts = ["${PATHS_PROTECTION}"]
 
+[[roles.pattern-writer.grants]]
+dataset = "${BROWSE_EDIT_AUTH}"
+level = "read"
+
+[[roles.pattern-writer.grants]]
+dataset = "${BROWSE_EDIT_AUTH}"
+level = "write"
+graphs = ["${BROWSE_EDIT_OPEN_GRAPH}"]
+
 [[roles.pattern-reader.grants]]
 dataset = "${PATTERN_DATASET}"
+level = "read"
+
+[[roles.pattern-reader.grants]]
+dataset = "${BROWSE_EDIT_AUTH}"
 level = "read"
 
 [[roles.pattern-reader.grants]]
@@ -277,6 +293,23 @@ graphs = ["urn:x-arq:DefaultGraph"]
         body: PATTERN_DATA,
       }),
       'loading the Pattern dataset',
+    );
+    // the ontology of the browser's edit mode under auth (item 630)
+    await check(
+      await fetch(`${url}/$/datasets`, {
+        method: 'POST',
+        headers: { ...auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dbName: BROWSE_EDIT_AUTH, dbType: 'mem' }),
+      }),
+      'creating the edit mode dataset',
+    );
+    await check(
+      await fetch(`${url}/${BROWSE_EDIT_AUTH}/data`, {
+        method: 'POST',
+        headers: { ...auth, 'Content-Type': 'text/turtle' },
+        body: BROWSE_TURTLE,
+      }),
+      'loading the edit mode dataset',
     );
     // the path finder's dataset, in two commits
     await check(

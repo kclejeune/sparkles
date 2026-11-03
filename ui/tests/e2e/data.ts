@@ -135,3 +135,11 @@ ex:edsger a ex:Person ;
   ex:embedding "[0.0, 0.0, 1.0]"^^spk:vector .
 `,
 ];
+
+/**
+ * The ontology browser's edit mode under auth (ROADMAP item 630): `READER` reads this
+ * dataset, and `USER` may write only its graph `BROWSE_EDIT_OPEN_GRAPH`, so a write to the
+ * default graph, which holds the ontology, is refused.
+ */
+export const BROWSE_EDIT_AUTH = 'browse-edit-auth';
+export const BROWSE_EDIT_OPEN_GRAPH = 'http://example.org/browse-edit/notes';
