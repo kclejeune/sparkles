@@ -376,7 +376,39 @@ impl KeyFilter {
 
     /// Whether the term with this key passes (type errors fail the filter).
     pub fn test(&self, key: &[u8]) -> bool {
+        self.test_with(key, |_, re, s| {
+            re.as_ref()
+                .expect("a tested filter has compiled its regular expressions")
+                .is_match(s)
+        })
+    }
+
+    /// The filter as this thread tests many keys with it, with the thread's copy of each
+    /// regular expression found once rather than for each key.
+    pub(super) fn bind(&self) -> BoundKeyFilter<'_> {
+        BoundKeyFilter {
+            filter: self,
+            matchers: self
+                .0
+                .iter()
+                .filter_map(|t| match t {
+                    Test::Regex { re, .. } => Some(re.as_ref().map(|re| re.matcher())),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// [`KeyFilter::test`] with `regex(i, program, text)` matching the `i`th regular
+    /// expression of the filter.
+    #[inline]
+    fn test_with(
+        &self,
+        key: &[u8],
+        mut regex: impl FnMut(usize, &Option<super::query_regex::RegexHandle>, &str) -> bool,
+    ) -> bool {
         let key = split(key);
+        let mut regexes = 0;
         // UTF-8 is self-synchronizing: a byte match of a UTF-8 needle in a UTF-8 string
         // is a match of the strings
         self.0.iter().all(|t| match t {
@@ -411,12 +443,11 @@ impl KeyFilter {
                     }
             }),
             Test::Regex { arg, re, .. } => {
-                let re = re
-                    .as_ref()
-                    .expect("a tested filter has compiled its regular expressions");
+                let i = regexes;
+                regexes += 1;
                 arg.read(&key)
                     .and_then(|(s, _)| std::str::from_utf8(s).ok())
-                    .is_some_and(|s| re.is_match(s))
+                    .is_some_and(|s| regex(i, re, s))
             }
             Test::LangMatches(range) => match &key {
                 // Basic language filtering only compares bytes. The final validity
@@ -427,6 +458,26 @@ impl KeyFilter {
                 _ => false,
             },
         }) && key.valid()
+    }
+}
+
+/// A key filter as one thread tests many keys with it, from [`KeyFilter::bind`].
+pub(super) struct BoundKeyFilter<'a> {
+    filter: &'a KeyFilter,
+    /// the thread's program of each regular expression of the filter, in order
+    matchers: Vec<Option<super::query_regex::Matcher<'a>>>,
+}
+
+impl BoundKeyFilter<'_> {
+    /// [`KeyFilter::test`] on this thread.
+    #[inline]
+    pub(super) fn test(&self, key: &[u8]) -> bool {
+        self.filter.test_with(key, |i, _, s| {
+            self.matchers[i]
+                .as_ref()
+                .expect("a tested filter has compiled its regular expressions")
+                .is_match(s)
+        })
     }
 }
 
@@ -595,6 +646,43 @@ mod tests {
             Literal::new_language_tagged_literal_unchecked("Ada", "EN").into()
         )));
         assert!(!f.test(&key(Literal::new_simple_literal("Ada").into())));
+    }
+
+    /// A bound filter takes each regular expression's own program after earlier tests
+    /// fail or pass, on a Rayon worker and outside one.
+    #[test]
+    fn a_bound_filter_tests_as_the_filter_does() {
+        let v = 0;
+        let str_v = || call(Function::Str, vec![Expr::Var(v)]);
+        let regex = |p: &str| call(Function::Regex, vec![str_v(), lit(p)]);
+        let filter = KeyFilter::new(
+            &[
+                regex("^http://x/a"),
+                call(Function::Contains, vec![str_v(), lit("b")]),
+                regex("[0-9]$"),
+            ],
+            v,
+        )
+        .unwrap();
+        let keys: Vec<Vec<u8>> = ["http://x/ab1", "http://x/ab", "http://x/a1", "http://y/b1"]
+            .into_iter()
+            .map(|iri| key(NamedNode::new_unchecked(iri).into()))
+            .collect();
+        let expected = [true, false, false, false];
+        assert_eq!(filter.bind().matchers.len(), 2);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let check = || {
+            let bound = filter.bind();
+            for (k, want) in keys.iter().zip(expected) {
+                assert_eq!(filter.test(k), want);
+                assert_eq!(bound.test(k), want);
+            }
+        };
+        pool.install(check);
+        check();
     }
 
     #[test]

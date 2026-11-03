@@ -296,6 +296,30 @@ impl RegexHandle {
     pub(super) fn is_match(&self, text: &str) -> bool {
         self.0.is_match(text)
     }
+
+    /// The program this thread searches with, found once for many searches.
+    #[inline]
+    pub(super) fn matcher(&self) -> Matcher<'_> {
+        self.0.matcher()
+    }
+}
+
+/// A program as one thread searches it: the thread's worker clone, or the locked cache.
+/// Finding the clone takes the thread's Rayon index, its number and the clone's slot,
+/// which cost a filter over 100,000 IRIs about 6% when it was done for each key. A matcher
+/// stays on the thread that made it, so that no clone's pool makes a cache for a second
+/// thread.
+pub(super) struct Matcher<'a> {
+    state: &'a RegexState,
+    own: Option<&'a Regex>,
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl Matcher<'_> {
+    #[inline]
+    pub(super) fn is_match(&self, text: &str) -> bool {
+        self.state.search(self.own, text)
+    }
 }
 
 impl RegexState {
@@ -479,9 +503,27 @@ impl RegexState {
 
     #[inline]
     pub(super) fn is_match(&self, text: &str) -> bool {
+        self.search(self.worker(), text)
+    }
+
+    /// [`RegexState::is_match`] with this thread's worker clone found once, for a run of
+    /// searches on this thread.
+    #[inline]
+    pub(super) fn matcher(&self) -> Matcher<'_> {
+        Matcher {
+            state: self,
+            own: self.worker(),
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    /// Whether `text` matches, searched with `own`, this thread's worker clone, or with
+    /// the locked cache.
+    #[inline]
+    fn search(&self, own: Option<&Regex>, text: &str) -> bool {
         let input = Input::new(text).earliest(true);
-        match self.worker() {
-            Some(program) => program.search(&input).is_some(),
+        match own {
+            Some(program) => program.is_match(input),
             None => self
                 .program
                 .search_with(&mut self.shared.lock(), &input)
@@ -603,8 +645,29 @@ mod tests {
                         oracle.is_match(t),
                         "{pattern} {flags} {t:?}"
                     );
+                    // a matcher found once searches as the state does, with the
+                    // worker's own clone
+                    let matcher = state.matcher();
+                    assert!(matcher.own.is_some(), "{pattern} {flags}");
+                    for t in texts {
+                        assert_eq!(
+                            matcher.is_match(t),
+                            oracle.is_match(t),
+                            "{pattern} {flags} {t:?}"
+                        );
+                    }
                 });
             });
+            // outside the pool a matcher searches with the locked cache
+            let matcher = state.matcher();
+            assert!(matcher.own.is_none());
+            for t in texts {
+                assert_eq!(
+                    matcher.is_match(t),
+                    oracle.is_match(t),
+                    "{pattern} {flags} {t:?}"
+                );
+            }
         }
         assert!(RegexState::compile(None, "[", "").unwrap().is_none());
         assert!(RegexState::compile(None, "a", "!").unwrap().is_none());

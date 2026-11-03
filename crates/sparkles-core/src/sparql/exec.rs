@@ -2037,11 +2037,12 @@ fn par_count_on_keys(
                 });
                 let mut pass = vec![false; ids.len()];
                 let mut j = 0;
+                let bound = kf.bind();
                 let mut test = |p, key: &[u8]| {
                     while ids[j] != p {
                         j += 1;
                     }
-                    pass[j] = kf.test(key);
+                    pass[j] = bound.test(key);
                 };
                 let scratch = ctx.charge(0)?;
                 let mut reserved = 0;
@@ -2372,6 +2373,7 @@ pub(super) fn filter_scan_morsel(
                 // for its match caches. The copies are kept for later tasks, whose regular
                 // expressions then start with warm caches.
                 let kf = filters.lock().pop().unwrap_or_else(|| kf.clone());
+                let bound = kf.bind();
                 let scratch = ctx.charge(0)?;
                 let mut reserved = 0;
                 let mut at = 0;
@@ -2388,10 +2390,11 @@ pub(super) fn filter_scan_morsel(
                         while payloads[at] != p {
                             at += 1;
                         }
-                        pass[lo + at] = kf.test(k);
+                        pass[lo + at] = bound.test(k);
                         Ok::<(), Error>(())
                     },
                 )?;
+                drop(bound);
                 drop(payloads);
                 filters.lock().push(kf);
                 if lo > 0 || hi < values.len() {
