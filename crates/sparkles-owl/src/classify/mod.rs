@@ -58,6 +58,8 @@
 
 mod data;
 mod dl;
+mod dl_clause;
+mod dl_norm;
 mod horn;
 mod horn_rules;
 mod index;
