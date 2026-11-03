@@ -698,7 +698,8 @@ thread again. With both changes, eager execution at 10.5M triples with 12 thread
 1.029 of main for `subquery-agg`, 1.023 for `expr-bind-group`, 1.020 for `regex-iri`,
 1.011 for `lang-filter`, and 0.995 and 0.998 for `expr-agg-arg` and `group-avg`. The same
 queries read at most 1.011 when streamed at 10.5M triples, and with `star-join` at most
-1.02 in both modes at 1.05M triples, where eager `regex-iri` read 0.998. With one query
+1.02 in both modes at 1.05M triples, where eager `regex-iri` read 0.998. Item NEW-ITEM-13
+holds the costs of 1% to 3% that remain in eager execution at 10.5M triples. With one query
 thread at 1.05M triples, `regex-iri` read 0.990 in eager execution and
 0.978 when streamed. The latency harness ran on the merge before the unchecked rebuild and
 these two changes, which leave queries this short alone. It passed every query under 0.3 ms in both modes except

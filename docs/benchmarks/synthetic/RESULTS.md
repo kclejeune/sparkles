@@ -529,7 +529,10 @@ of them are queries under 0.3 ms. The other seven are eager `lang-filter`, `rege
 times of large eager answers, such as `export-500k` at 1.13.
 
 Interleaved A/Bs on forge then compared the stage with main at the commit it merged,
-58bbfca5, in rounds of A,B,B,A in each order with 12 threads. They traced the flags to
+58bbfca5, in rounds of A,B,B,A in each order with 12 threads. The samples, answers and
+settings of the A/Bs after the fixes are kept in their own
+[run record](runs/2026-11-03-executor-stage4-ab-forge-815822db/summary.md) with their
+[commands](runs/2026-11-03-executor-stage4-ab-forge-815822db/run.sh.txt). They traced the flags to
 three costs, which the stage removed. The `application/x-sparkles+json` writer rebuilt
 each eager cell's key on the checked path, which made eager `export-500k` 1.248 times as
 slow in wall time. Each key of a regular-expression filter looked up its thread's copy of
@@ -540,7 +543,8 @@ After the fixes, eager `export-500k` read 1.0085 in wall time, and eager executi
 10.5M triples read 1.029 for `subquery-agg`, 1.023 for `expr-bind-group`, 1.020 for
 `regex-iri`, 1.011 for `lang-filter`, 0.995 for `expr-agg-arg` and 0.998 for `group-avg`.
 The same queries read at most 1.011 when streamed at 10.5M triples, and with `star-join` at
-most 1.02 in both modes at 1.05M triples. The latency harness of X14's decision D4 passed every query under 0.3 ms
+most 1.02 in both modes at 1.05M triples. Item NEW-ITEM-13 holds the costs of 1% to 3%
+that remain in eager execution at 10.5M triples. The latency harness of X14's decision D4 passed every query under 0.3 ms
 except `star-lookup` at 1.019 in eager execution and 1.017 when streamed, and eager
 `types-grouped` at 1.186, about 1.1 and 1.3 µs, which items NEW-ITEM-12 and NEW-ITEM-10
 investigate. Streamed `expr-order-key` at 10.5M triples read 1.045 against the build
