@@ -175,3 +175,37 @@ open(
     expect(await count(request, on, '<urn:unrelated:s> <urn:unrelated:p> "kept as it is"')).toBe(1);
   },
 );
+
+open(
+  'the forms of a named graph lock while the stored default graph holds a copy',
+  async ({ page, request }) => {
+    const ds = 'thes-graphs-e2e';
+    const r = await request.post('/$/datasets', { data: { dbName: ds, dbType: 'mem' } });
+    expect(r.ok(), await r.text()).toBe(true);
+    const up = (u: string) =>
+      request.post(`/${ds}/update`, {
+        headers: { 'Content-Type': 'application/sparql-update' },
+        data: u,
+      });
+    const note = `<${TH}owls> <${SKOS}note> "Night birds"@en`;
+    expect(
+      (
+        await up(`INSERT DATA { GRAPH <urn:g> { <${TH}owls> a <${SKOS}Concept> ;
+        <${SKOS}prefLabel> "Owls"@en . ${note} } ${note} }`)
+      ).ok(),
+    ).toBe(true);
+    const url = `/ui/thesaurus?ds=${ds}&graph=${encodeURIComponent('urn:g')}&iri=${encodeURIComponent(
+      TH + 'owls',
+    )}&view=notes`;
+    const details = page.getByRole('region', { name: 'Details' });
+    await page.goto(url);
+    await expect(details.getByRole('status')).toContainText("a form's save could change them", {
+      timeout: 30_000,
+    });
+    // without the copy the dataset keeps urn:g alone, and the page lifts its lock
+    expect((await up(`DELETE DATA { ${note} }`)).ok()).toBe(true);
+    await page.goto(url);
+    await expect(details).toContainText('built-in SKOS shapes', { timeout: 30_000 });
+    await expect(details.getByText("a form's save could change them")).toHaveCount(0);
+  },
+);

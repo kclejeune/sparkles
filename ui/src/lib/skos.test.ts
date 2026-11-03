@@ -419,19 +419,32 @@ describe('label edits keep what other resources and labels need', () => {
 });
 
 describe('the graphs outside the editor', () => {
-  it('are found in named graphs and, for a named graph, in the default graph', () => {
+  // oxigraph does not know Jena's name of the stored default graph, so these tests keep
+  // the stored default graph's triples in a graph of that name, as Sparkles reads them
+  const stored = ox.namedNode('urn:x-arq:DefaultGraph');
+  const both = (s: ox.Store, q: string) => [
+    s.query(q) as boolean,
+    s.query(q, { use_default_graph_as_union: true }) as boolean,
+  ];
+
+  it('are the named graphs and the stored default graph, in either default-graph mode', () => {
     const s = new ox.Store();
-    s.load(PREFIXES + 'ex:a a skos:Concept .', {
+    const g = ox.namedNode('urn:g');
+    s.load(PREFIXES + 'ex:a a skos:Concept ; skos:note "n" .', {
       format: 'text/turtle',
-      to_graph_name: ox.namedNode('urn:g'),
+      to_graph_name: g,
     });
-    expect(ask(s, otherGraphsQuery('urn:g'))).toBe(false);
-    expect(ask(s, otherGraphsQuery(null))).toBe(true);
-    // a default graph that is the union of the named graphs holds nothing of its own
-    expect(s.query(otherGraphsQuery('urn:g'), { use_default_graph_as_union: true })).toBe(false);
-    s.load(PREFIXES + 'ex:b a skos:Concept .', { format: 'text/turtle' });
-    expect(ask(s, otherGraphsQuery('urn:g'))).toBe(true);
-    expect(s.query(otherGraphsQuery('urn:g'), { use_default_graph_as_union: true })).toBe(true);
+    expect(both(s, otherGraphsQuery('urn:g'))).toEqual([false, false]);
+    expect(both(s, otherGraphsQuery(null))).toEqual([true, true]);
+    // a copy of a triple of urn:g in the stored default graph is another graph's triple
+    s.add(ox.quad(ox.namedNode(EX + 'a'), ox.namedNode(SKOS + 'note'), ox.literal('n'), stored));
+    expect(both(s, otherGraphsQuery('urn:g'))).toEqual([true, true]);
+  });
+
+  it('is nothing for a dataset with the stored default graph alone', () => {
+    const s = new ox.Store();
+    s.add(ox.quad(ox.namedNode(EX + 'a'), ox.namedNode(SKOS + 'note'), ox.literal('n'), stored));
+    expect(both(s, otherGraphsQuery(null))).toEqual([false, false]);
   });
 });
 

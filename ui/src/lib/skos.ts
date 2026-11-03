@@ -861,16 +861,20 @@ export async function readHead(
   };
 }
 
+/** Jena's name of the stored default graph, which a union default graph does not change. */
+export const STORED_DEFAULT_GRAPH = 'urn:x-arq:DefaultGraph';
+
 /**
- * Whether a dataset holds any triple outside `graph` (`null`: the default graph). For a
- * named graph, the default graph counts only with triples that are in no named graph, so
- * a server whose default graph is the union of the named graphs answers as one without.
+ * Whether a dataset holds any triple outside `graph` (`null`: the default graph). The
+ * default graph is read by its Jena name, which is the stored default graph even when the
+ * server makes the unnamed default graph the union of the named graphs.
  */
 export function otherGraphsQuery(graph: string | null): string {
+  const stored = iri(STORED_DEFAULT_GRAPH);
   return graph
-    ? `ASK { { GRAPH ?g { ?s ?p ?o } FILTER(?g != ${iri(graph)}) }
-  UNION { ?s ?p ?o FILTER NOT EXISTS { GRAPH ?n { ?s ?p ?o } } } }`
-    : 'ASK { GRAPH ?g { ?s ?p ?o } }';
+    ? `ASK { { GRAPH ?g { ?s ?p ?o } FILTER(?g != ${iri(graph)} && ?g != ${stored}) }
+  UNION { GRAPH ${stored} { ?s ?p ?o } } }`
+    : `ASK { GRAPH ?g { ?s ?p ?o } FILTER(?g != ${stored}) }`;
 }
 
 /** Any graph of a dataset whose graphs the editor does not know: for the picker. */

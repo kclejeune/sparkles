@@ -331,7 +331,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   cannot keep its own shapes and the SKOS shapes together, NEW-ITEM-4. Editing forms
   read every graph and have no graph or commit precondition of a request's own, so the
   thesaurus editor's notes and members forms are read-only in a dataset with more than one
-  graph and their saves do not name the commit the page shows, NEW-ITEM-5. Blank-node SKOS-XL labels of
+  graph and their saves do not name the commit the page shows. A form finds a resource's
+  shapes through the default graph, so a resource kept only in a named graph gets no
+  editable form, NEW-ITEM-5. Blank-node SKOS-XL labels of
   one kind with the same literal form cannot be told apart by an update and are shown
   without edit buttons.
 * The ontology editor decides whether the caller can write from the caller's level on the
