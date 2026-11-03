@@ -399,3 +399,29 @@ def test_search_ranks_entities_with_typos() -> None:
     assert d.ontology.search("glucose", lang="de")["results"][0]["label"] == "Glukose"
     assert d.ontology.search("saccharide")["results"][0]["match"]["field"] == "synonym"
     assert [r["iri"] for r in d.ontology.search("gluc", kind="property")["results"]] == [EX + "has"]
+
+
+def test_hierarchy_and_term_read_one_entity() -> None:
+    d = sparkles.Dataset()
+    d.update(
+        f"""{PREFIXES} INSERT DATA {{
+          :Animal a owl:Class ; rdfs:label "animal" .
+          :Dog a owl:Class ; rdfs:label "dog" ; rdfs:subClassOf :Animal .
+          :Tail a owl:Class ; rdfs:subClassOf [ a owl:Restriction ;
+            owl:onProperty :partOf ; owl:someValuesFrom :Dog ] .
+          :partOf a owl:ObjectProperty .
+        }}"""
+    )
+    roots = d.ontology.hierarchy()
+    assert [n["label"] for n in roots["children"]][0] == "animal"
+    kids = d.ontology.hierarchy(EX + "Animal")
+    assert [n["iri"] for n in kids["children"]] == [EX + "Dog"]
+    up = d.ontology.hierarchy(EX + "Dog", ancestors=True)
+    assert up["ancestors"]["edges"] == [[EX + "Dog", EX + "Animal"]]
+    t = d.ontology.term(EX + "Dog")
+    assert t["label"] == "dog" and t["kinds"] == ["class"]
+    assert any(a["type"] == "SubClassOf" for a in t["axioms"])
+    assert t["mentions"]["total"] == 1
+    assert t["names"][EX + "Tail"]["shortForm"]
+    with pytest.raises(sparkles.NotFoundError):
+        d.ontology.term(EX + "Nothing")
