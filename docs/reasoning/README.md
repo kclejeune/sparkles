@@ -259,7 +259,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   after added or removed axioms saturates again only the contexts that those axioms can
   reach. A change to the property hierarchy, chains, reflexivity or ranges, to an axiom
   with an individual, a data property, a datatype or a key, and any change after a run
-  that took that step or the Horn rules, saturates everything again. A run stops at its deadline, its
+  that took that step or an axiom outside OWL 2 EL, saturates everything again. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
   closure, saturates and builds the taxonomy. A run of 16,384 axioms or more on several
   threads normalizes chunks of the axioms in parallel, with the same ids and taxonomy as

@@ -922,9 +922,11 @@ impl Saturation {
         stats.tier = stats.outside_el.tier();
         poll(limits)?;
         let n = self.interner.len();
-        // a run with the Horn rules starts its contexts again, since the invalidation
-        // follows only the EL rules, and its conjunctions get contexts above the index's
-        let horn = ix.horn.is_some();
+        // a run whose axioms the Horn normalization took starts its contexts again, with
+        // the Horn rules or without, since the invalidation follows only the EL
+        // normalization, and the conjunctions of the Horn rules get contexts above the
+        // index's
+        let horn = ax.horn.is_some();
         self.dynamic = None;
         let premises = if horn {
             self.ctx = Vec::new();
@@ -1103,7 +1105,7 @@ impl Saturation {
         } else {
             self.entangled = false;
         }
-        // a change after a run with the Horn rules saturates everything again
+        // a change after a run with the Horn normalization saturates everything again
         self.entangled |= horn;
         if let Some(d) = &dynamic {
             totals.memory += d.bytes();

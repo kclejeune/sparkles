@@ -630,3 +630,24 @@ fn a_universal_on_a_role_with_an_automaton_holds_for_direct_successors() {
         &[("E", "F")],
     );
 }
+
+#[test]
+fn an_incremental_change_after_a_horn_normalization_without_horn_rules_classifies_again() {
+    // ≥2 r.C becomes two existentials, which the EL rules take, but the EL invalidation
+    // cannot read the at-least restriction
+    let base = axioms(
+        "SubClassOf(:A :B)
+         SubClassOf(ObjectSomeValuesFrom(:r :C) :D)",
+    );
+    let more = axioms("SubClassOf(:A ObjectMinCardinality(2 :r :C))");
+    let mut k = Classifier::of(&base);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+    k.add(&more);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    k.remove(&more);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+}
