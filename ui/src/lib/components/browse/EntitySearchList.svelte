@@ -1,7 +1,9 @@
 <script lang="ts">
   // The landing page's search: the entity search of the ontology as a list in the page,
   // by label, synonym, short form, IRI and definition, with kind chips and pages of 20.
+  // While it is mounted, `/` focuses it in place of opening the command palette.
   import * as api from '$lib/api';
+  import { usePageSearch } from '$lib/launcher.svelte';
   import { kindWord } from '$lib/browse';
   import { searchEntities, type EntityHit, type EntitySearchKind } from '$lib/entity-search';
   import Icon from '$components/Icon.svelte';
@@ -30,6 +32,12 @@
   let error = $state<string | null>(null);
   let asked = $state('');
   let run = 0;
+  let field: HTMLInputElement | undefined = $state();
+  usePageSearch(() => {
+    if (!field) return false;
+    field.focus();
+    field.select();
+  });
 
   async function search(offset = 0) {
     const text = q.trim();
@@ -97,7 +105,14 @@
   <label class="field">
     <Icon name="search" size={18} />
     <span class="sr-only">Search</span>
-    <input type="search" bind:value={q} {placeholder} autocomplete="off" spellcheck="false" />
+    <input
+      type="search"
+      bind:this={field}
+      bind:value={q}
+      {placeholder}
+      autocomplete="off"
+      spellcheck="false"
+    />
   </label>
   <div class="chips" role="radiogroup" aria-label="Kind">
     <button

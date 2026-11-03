@@ -239,3 +239,18 @@ test('a list whose count is a lower bound pages on until a short page', async ({
   await expect(grp.getByRole('link')).toHaveCount(57);
   await expect(grp.getByRole('button', { name: /Show more/ })).toHaveCount(0);
 });
+
+test('`/` focuses the landing page search and opens the palette on an entity page', async ({
+  page,
+}) => {
+  await page.goto('/ui/browse?ds=uni');
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible({ timeout: 30_000 });
+  await page.locator('main h1').click();
+  await page.keyboard.press('/');
+  await expect(page.locator('main').getByRole('searchbox')).toBeFocused();
+
+  await openTerm(page, 'Professor');
+  await page.locator('main h1').click();
+  await page.keyboard.press('/');
+  await expect(page.getByRole('listbox')).toBeVisible();
+});
