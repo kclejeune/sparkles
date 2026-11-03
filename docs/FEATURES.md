@@ -152,9 +152,16 @@ schemes, concepts, collections and SKOS-XL labels in a concept tree, and checks 
 against the integrity conditions of the SKOS Reference.
 
 Every page shares one [app shell](visualization/README.md#app-shell), with a top bar
-whose search finds the open dataset's entities from anywhere with `Ctrl+K`, `Cmd+K` or
-`/`, a rail of pages that narrows to icons at medium width and becomes a drawer on a
-phone, and one set of light and dark design tokens that meet WCAG AA contrast.
+whose search is a command palette, a rail of pages that narrows to icons at medium width
+and becomes a drawer on a phone, and one set of light and dark design tokens that meet
+WCAG AA contrast. `Ctrl+K` or `Cmd+K` opens the palette from anywhere. It lists recent
+picks and the open page's commands, searches the open dataset's entities, the datasets,
+saved queries, branches and pages, and runs commands such as running or formatting a
+query, starting a session, creating an entity, switching the dataset or branch and
+setting the theme. The prefixes `>`, `@`, `#` and `?` show commands, entities,
+datasets and saved queries alone.
+
+![The command palette on the Query page with nothing typed, listing the page's commands with their shortcuts and the pages of the shell](images/palette.png)
 
 ![The top bar's search listing the demo dataset's classes and properties that match org, with the matched text highlighted](images/shell-search.png)
 
@@ -255,7 +262,7 @@ implementation status.
 | [Ask, ingestion and agent memory](ai/README.md#ai-and-agents) | Partially complete. | Checked queries, cited memory and ingestion review are available. Accuracy, contextual linking, additional ingest formats and scratch-branch controls remain open. |
 | [GraphRAG reports](ai/README.md#ai-and-agents) | Partially complete. | Community reports, global Ask, memory retrieval and change-feed refresh are available. View-based refresh and reports for distinct audiences remain planned. |
 | [Web graph, map and editing tools](visualization/README.md#web-ui) | Partially complete. | Explore, paths, lenses, derivation trees, maps, linked selections and the visual query builder are available. Live profiling, additional builder blocks and larger rendering work remain. |
-| [App shell and design system](visualization/README.md#app-shell) | Complete. | Every page shares a top bar that searches the open dataset's entities and a rail that narrows to icons and becomes a drawer on a phone. Light and dark tokens and shared components set the layout at large, medium and phone widths. The launcher's commands and pages are planned in item 631. |
+| [App shell and design system](visualization/README.md#app-shell) | Complete. | Every page shares a top bar whose command palette searches entities, datasets, saved queries and pages and runs each page's commands, and a rail that narrows to icons and becomes a drawer on a phone. Light and dark tokens and shared components set the layout at large, medium and phone widths. |
 | [Rust, Python, JVM and Node.js APIs](integrations/README.md#libraries-and-bindings) | Partially complete. | All four embed the engine, and the JVM binding integrates with Jena. Administration, callback and platform coverage differ by binding. |
 | [Formatting, linting and command-line tools](querying/README.md#formatter-and-editor-support) | Complete within the documented scope. | Formatting, linting, completion and CLI tools are available. The [querying guide](querying/README.md#sparql-and-formats) lists embedded-query limits and remaining linter work. |
 | [Backups and operations](operations/README.md#operations) | Partially complete. | Dataset backups, integrity checks, format migration and degraded startup are available. Whole-server recovery and published release artifacts remain open. |

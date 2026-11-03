@@ -18,18 +18,47 @@ The SvelteKit UI is embedded in the server binary.
   a drawer that the menu button opens, together with the dataset switcher, the status,
   the theme and the account. Choosing a dataset on a page that names one in its address
   reopens that page on the new dataset.
-* `Ctrl+K` or `Cmd+K` focuses the search field from anywhere, including the query
-  editor, and `/` does the same outside a text field. Escape gives the focus back to
-  where it was. On a phone the bar shows a search button, and the button or the keys
-  expand the field over the whole bar with a back button. The field searches the open
-  dataset's classes, properties, individuals and SKOS concepts through the
-  [entity search](../search/README.md#entity-search), with the matched text
-  highlighted, and Enter opens a class or property in the ontology editor, a concept in
-  the thesaurus editor and anything else in Explore
+* The search field is also the command palette. `Ctrl+K` or `Cmd+K` opens it from
+  anywhere, including the query editor, and pressing it again closes it. `/` opens it
+  outside a text field, except on a page with a search of its own, where `/` focuses that
+  search instead, such as the class tree filter of the ontology editor and the label
+  search of the thesaurus editor. Escape gives the focus back to where it was, and a
+  command that runs in place returns the focus there before it runs. On a phone the bar
+  shows a search button, and the button or the keys expand the field over the whole bar
+  with a back button ([screenshot](../images/palette-phone.png)).
+* With nothing typed, the palette lists the viewer's recent picks, the commands of the
+  open page and the pages of the shell ([screenshot](../images/palette.png)). A typed
+  query also searches the open dataset's classes, properties, individuals and SKOS
+  concepts through the [entity search](../search/README.md#entity-search), the shell's
+  commands, the datasets, the open dataset's saved queries and, on the Query, Ontology,
+  Thesaurus and dataset pages, the dataset's branches. Enter opens a class or property in
+  the ontology editor, a concept in the thesaurus editor, any other entity in Explore and
+  a saved query in a new tab of the Query page
   ([screenshot](../images/shell-search.png)).
-* The search is the launcher that item 631's command palette fills. A page or feature
-  registers a provider with `launcher.register` in `ui/src/lib/launcher.svelte.ts`, and
-  the field shows each provider's items as a group.
+* A prefix shows one kind of item. `>` lists commands and pages, `@` entities, `#`
+  datasets and branches, and `?` saved queries, and a row of chips above the results sets
+  the same prefixes by touch. Escape on a prefix with nothing after it returns to every
+  kind before a second Escape closes the palette ([screenshot](../images/palette-commands.png)). Commands,
+  pages, datasets, branches and saved queries are ranked in the browser by an exact
+  match, a prefix, a word start, every word at a word start, initials such as `fq` for
+  Format query, and one typo in a query of five or more letters. A command's keywords
+  match only at the start of a word. Entities keep the server's typo-tolerant ranking.
+* The shell's commands switch the dataset or branch, open a saved query, set the theme,
+  open the dataset settings, the server status, the access tokens and the backups, and
+  create a dataset. The Query page adds running, formatting, explaining and saving the
+  query, a new tab, history and the pattern pane. The Ontology page adds starting a
+  session, creating a class, property or individual, undo, redo and the DL query tab,
+  and the Thesaurus page adds a session, new concepts, schemes and collections, the
+  checks, undo and redo. The Datasets page refreshes its list and the dataset page opens
+  its tabs. Each row shows its keyboard shortcut where it has one.
+* The recent picks are kept per viewer in the browser's local storage, newest first, and
+  the palette works without them when storage is blocked. A recent command shows only
+  while its page offers it, and a recent entity or saved query only on its dataset.
+* A page or feature extends the palette through `ui/src/lib/launcher.svelte.ts`.
+  `useCommands` registers the page's commands, each with a label, an optional shortcut,
+  keywords, an `active` predicate and a run function, for as long as the page is
+  mounted. `useProvider` and `launcher.register` add a group of items, and
+  `usePageSearch` gives `/` to the page's own search field.
 * One set of design tokens in `ui/src/app.css` gives the colours of the light and dark
   themes, a type scale, a 4-pixel spacing scale, the page gutter of 24, 20 and 16
   pixels at large, medium and phone widths, control heights, radii and shadows. Every text

@@ -402,3 +402,23 @@ and the run.
 word segmentation for scripts written without spaces is item 659. The ontology
 editor's tree filter, the DL Query entity completion and the thesaurus editor's label
 search can move to this search under item 660.
+
+### Command palette
+
+Item 631 builds the command palette on the top bar's search of item 632, in
+`ui/src/lib/launcher.svelte.ts`, `palette.svelte.ts`, `fuzzy.ts` and `recents.ts`.
+`Ctrl+K` or `Cmd+K` opens it from anywhere, and `/` opens it outside a text field except
+where a page registers a search of its own, which `/` then focuses. With nothing typed it
+lists the viewer's recent picks, the open page's commands and the pages. A query searches
+the entities through the server's ranking and ranks commands, pages, datasets, branches
+and saved queries in the browser, and the prefixes `>`, `@`, `#` and `?` show one kind.
+Pages register commands while mounted through `useCommands`, each with a label, an
+optional shortcut, keywords, an `active` predicate and a run function. The recent picks
+live in the browser's local storage, and the palette works without it. The command list
+and its behaviour are described in the [visualization guide](../../visualization/README.md#app-shell).
+
+**Remaining work.** The entity pages of item 616 register their own page search and
+commands, and edit mode (item 630) adds its commands the same way. Item 633's design
+review adds commands to the pages that have none, such as Explore, Similar, Memory and
+Embedding, under NEW-ITEM-1. The shortcuts the palette shows are written beside each
+command and not read from the keymaps that bind them, which NEW-ITEM-2 unifies.
