@@ -2498,6 +2498,7 @@ pub mod classify;
 pub mod dl_query;
 pub mod file;
 pub mod search;
+pub mod transform;
 pub mod wire;
 
 #[cfg(test)]
