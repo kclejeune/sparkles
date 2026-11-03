@@ -167,7 +167,10 @@ creates contexts for the conjunctions that universal and at-most restrictions ne
 `Stats` reports the tier of rules a run needed, the axioms outside OWL 2 EL it took and
 the conjunctions it created. GO's taxonomy now has the 14 subsumptions that its inverse
 properties entail, as Konclude's does, and GO classifies 17 to 18% slower on the
-benchmark host. The functional-syntax reader can pass over SWRL rules and count them
+benchmark host. `sparkles ontology reason` and `reduce` with `--reasoner ELK`, and the
+library's `ClassifyRequest::el_only` and `Limits::el_only`, classify by the OWL 2 EL
+rules alone, as ELK does, so the ROBOT-compatible outputs equal ROBOT's with ELK. Without
+`--reasoner` they take the Horn axioms too. The functional-syntax reader can pass over SWRL rules and count them
 with `ofn_read::Options::skip_rules`, and refuses them otherwise as before.
 
 The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's

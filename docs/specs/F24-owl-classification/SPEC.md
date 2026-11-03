@@ -416,7 +416,9 @@ disjoint, asymmetric and irreflexive properties, and complements, unions and uni
 restrictions that move to the other side of an axiom as their duals. An at-least
 restriction of up to 64 becomes that many existential restrictions with fresh, pairwise
 disjoint fillers, as the paper's Lemma 2 does. The rules run when one of them can fire
-and the ontology has no individuals, functional data properties or top properties. With
+and the ontology has no individuals, functional data properties or top properties, and
+not at all under `Limits::el_only`, the ELK mode, which leaves every axiom outside OWL 2
+EL out as ELK does and gives ELK's taxonomy. With
 any of these the axioms outside OWL 2 EL stay left out and reported, and Horn reasoning
 with individuals is item NEW-ITEM-1. So do axioms that are not Horn, property hierarchies
 that are not regular, automata of more than 65,536 states and data restrictions outside
@@ -445,7 +447,9 @@ from 195 to 248 MiB on one thread and from 288 to 331 MiB on eight
 ([record](../../benchmarks/el-classification/runs/2026-11-03-horn-forge-8966216c/record.json)).
 ChEBI lite's one `InverseObjectProperties` axiom fires no Horn rule, so it runs the EL
 rules in the same time.
-Item NEW-ITEM-2 follows that cost. The taxonomies of the 298 ORE 2015 EL ontologies and
+The maintainer accepted this cost as the
+tradeoff for GO's complete taxonomy, and the ELK mode keeps the EL rules' time and
+taxonomy. Item NEW-ITEM-2 follows the cost. The taxonomies of the 298 ORE 2015 EL ontologies and
 ChEBI lite are byte for byte those of the EL rules on one and eight threads.
 
 The functional-syntax reader refuses a document with a SWRL rule. A read with
@@ -476,7 +480,12 @@ fails, and the last is found with ROBOT's probe for ELK, a fresh class under
 and left out of every answer. `--dump-unsatisfiable` writes the syntactic bottom-locality
 module of the unsatisfiable classes, which holds every justification, as ROBOT's `BOT`
 extraction does. The subclass, equivalence and class assertion generators work over the
-classes and individuals of the ontology's signature. A class the taxonomy does not hold,
+classes and individuals of the ontology's signature. `--reasoner ELK`, and `emr`, which
+ROBOT builds on ELK, classify by the OWL 2 EL rules alone (`ClassifyRequest::el_only`,
+which sets `Limits::el_only`), so that the output is ROBOT's with ELK. Without
+`--reasoner`, and with `hermit`, `jfact`, `whelk` or `structural`, which run it with a
+warning, the classifier also takes the Horn axioms outside OWL 2 EL, so on GO `reason`
+adds the 14 subsumptions that `InverseObjectProperties(part_of has_part)` entails. A class the taxonomy does not hold,
 such as a declared obsolete class, is a direct subclass of `owl:Thing`, as ELK answers,
 and class assertions come from a second classification with a fresh class equivalent to
 `ObjectOneOf(a)` for each individual. The generators whose queries ELK does not answer
@@ -511,7 +520,7 @@ status.
 **Comparison with ROBOT.** `scripts/elk-compare/ofn-axioms.py` compares two
 functional-style files after expanding prefixes and sorting the operands of n-ary
 constructors. On GO and ChEBI lite the outputs of `reason`, `reduce`, `relax` and the
-chain `reason relax reduce` equal ROBOT 1.9.11's with ELK 0.6.0 axiom for axiom,
+chain `reason relax reduce` with `--reasoner ELK` equal ROBOT 1.9.11's with ELK 0.6.0 axiom for axiom,
 annotations included: 622,357 axioms of GO's reasoned ontology and 1,682,146 of ChEBI
 lite's, of which 96,847 and 424,904 are logical. On the benchmark host `reason` took 3.45 s
 on GO and 7.74 s on ChEBI lite from the RDF/XML release, against `robot reason`'s 14.04 s

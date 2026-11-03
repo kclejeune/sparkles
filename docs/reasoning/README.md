@@ -326,13 +326,18 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   `sparkles ontology reason --input x.owl relax reduce --output y.owl`. `classify` and
   `check` can join a chain to classify or check the ontology at that point, and a chain
   can start from `classify FILE` or `check FILE`, which answer as they do alone. A chain
-  from a database starts with `reason`, `reduce` or `relax` and `--loc`. The
-  classifier stands in for ELK, so `--reasoner` accepts ROBOT's other reasoners with a
-  warning, and the queries ELK does not answer, such as the disjoint classes and the
-  property hierarchy, add no axioms, as they add none in ROBOT. Errors and the exit
+  from a database starts with `reason`, `reduce` or `relax` and `--loc`. Without
+  `--reasoner` the classifier also takes the Horn axioms outside OWL 2 EL, such as GO's
+  inverse properties, so `reason` adds the subsumptions they entail. `--reasoner ELK`,
+  and `emr`, which ROBOT builds on ELK, run the OWL 2 EL rules alone and leave those
+  axioms out, as ELK does, so the output is ROBOT's with ELK. `hermit`, `jfact`, `whelk`
+  and `structural` run the default classifier with a warning. The library has the same
+  switch as `ClassifyRequest::el_only` and `Limits::el_only`. The queries ELK does not
+  answer, such as the disjoint classes and the property hierarchy, add no axioms, as they
+  add none in ROBOT. Errors and the exit
   status 1 follow ROBOT's, and a malformed command line exits with status 2, as every
-  `sparkles` command does. The outputs equal ROBOT's axiom for axiom on GO and ChEBI lite
-  ([ROBOT comparison](../benchmarks/el-classification/RESULTS.md#robot)). The commands
+  `sparkles` command does. With `--reasoner ELK` the outputs equal ROBOT's axiom for axiom
+  on GO and ChEBI lite ([ROBOT comparison](../benchmarks/el-classification/RESULTS.md#robot)). The commands
   read no `--server`, which item 685 follows, write no OWL/XML, Manchester, OBO
   or OBO Graphs JSON, item 686, and refuse `--prevent-invalid-references true`,
   item 687. `robot materialize` is item 636.
@@ -568,6 +573,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   individuals, functional data properties or top properties. Roadmap item NEW-ITEM-1.
 * GO's inverse properties take the Horn rules, which classify it 17 to 18% slower than
   the EL rules and raise its peak resident set. Roadmap item NEW-ITEM-2.
+* The ELK mode, which classifies by the OWL 2 EL rules alone, is an option of the Rust
+  library and the ROBOT-compatible commands only, and HTTP, the other CLI commands and
+  the bindings always take the Horn axioms. Roadmap item NEW-ITEM-3.
 * Axioms outside OWL 2 EL that are not Horn are left out, and an external DL reasoner
   bridge is planned. Roadmap item 603.
 * No MCP tool classifies, roadmap item 586, and the entity accessors and the

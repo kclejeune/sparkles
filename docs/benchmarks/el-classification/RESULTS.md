@@ -482,7 +482,10 @@ three rounds of five classifications on one and eight threads with the bench and
 locks held. GO takes 17 to 18% longer, since 2,577 contexts of conjunctions derive their
 members' conclusions again, 3.5 million conclusions against 2.8 million, and its peak
 resident set rises from 195 to 248 MiB on one thread and from 288 to 331 MiB on eight.
-Roadmap item NEW-ITEM-2 follows that cost. ChEBI lite's one `InverseObjectProperties`
+This slowdown, about 50 MiB of peak resident set and 17 to 18% of time on GO, is
+accepted as the tradeoff for GO's complete taxonomy, and roadmap item NEW-ITEM-2 follows
+it. `--reasoner ELK` and `Limits::el_only` classify by the EL rules alone, with the
+base's time and taxonomy. ChEBI lite's one `InverseObjectProperties`
 axiom fires no Horn rule, so it runs the EL rules, with the base's taxonomy and time and
 a peak resident set 16 to 26 MiB higher.
 
