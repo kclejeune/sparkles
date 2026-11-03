@@ -1,0 +1,200 @@
+scripts/elk-compare/ofn-axioms.py --all, on atlas, between lane 604's ROBOT 1.9.11 materialize outputs with ELK 0.6.0 (GO with --term BFO:0000050, ChEBI lite with --term RO:0000087) as a and the outputs of the same sparkles build as b. The atlas outputs are byte-identical to the forge outputs (warnings-and-outputs.txt). The rows other than go.materialize and chebi_lite.materialize compare other runs with ROBOT's part-of or has-role output, so their onlyB axioms are the ones those runs add.
+
+== ROBOT go.materialize (--term as ROBOT ran it) vs sparkles go.materialize
+{
+ "logical": {
+  "a": 82950,
+  "b": 82950,
+  "common": 82950,
+  "onlyA": 0,
+  "onlyB": 0,
+  "onlyAByType": {},
+  "onlyBByType": {},
+  "onlyAExamples": [],
+  "onlyBExamples": []
+ },
+ "all": {
+  "a": 608460,
+  "b": 608460,
+  "common": 608460,
+  "onlyA": 0,
+  "onlyB": 0,
+  "onlyAByType": {},
+  "onlyBByType": {},
+  "onlyAExamples": [],
+  "onlyBExamples": []
+ }
+}
+== ROBOT go.materialize (--term as ROBOT ran it) vs sparkles go.materialize-regulates
+{
+ "logical": {
+  "a": 82950,
+  "b": 83260,
+  "common": 82950,
+  "onlyA": 0,
+  "onlyB": 310,
+  "onlyAByType": {},
+  "onlyBByType": {
+   "SubClassOf": 310
+  },
+  "onlyAExamples": [],
+  "onlyBExamples": [
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000749> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0002211> <http://purl.obolibrary.org/obo/GO_0000747>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000774> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0002211> <http://purl.obolibrary.org/obo/GO_0005524>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000774> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0002211> <http://purl.obolibrary.org/obo/GO_0043531>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0001671> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0002211> <http://purl.obolibrary.org/obo/GO_0140657>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0001759> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0002211> <http://purl.obolibrary.org/obo/GO_0010092>))"
+  ]
+ },
+ "all": {
+  "a": 608460,
+  "b": 608770,
+  "common": 608460,
+  "onlyA": 0,
+  "onlyB": 310,
+  "onlyAByType": {},
+  "onlyBByType": {
+   "SubClassOf": 310
+  },
+  "onlyAExamples": [],
+  "onlyBExamples": [
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000749> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0002211> <http://purl.obolibrary.org/obo/GO_0000747>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000774> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0002211> <http://purl.obolibrary.org/obo/GO_0005524>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000774> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0002211> <http://purl.obolibrary.org/obo/GO_0043531>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0001671> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0002211> <http://purl.obolibrary.org/obo/GO_0140657>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0001759> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0002211> <http://purl.obolibrary.org/obo/GO_0010092>))"
+  ]
+ }
+}
+== ROBOT go.materialize (--term as ROBOT ran it) vs sparkles go.materialize-all
+{
+ "logical": {
+  "a": 82950,
+  "b": 82950,
+  "common": 82950,
+  "onlyA": 0,
+  "onlyB": 0,
+  "onlyAByType": {},
+  "onlyBByType": {},
+  "onlyAExamples": [],
+  "onlyBExamples": []
+ },
+ "all": {
+  "a": 608460,
+  "b": 608460,
+  "common": 608460,
+  "onlyA": 0,
+  "onlyB": 0,
+  "onlyAByType": {},
+  "onlyBByType": {},
+  "onlyAExamples": [],
+  "onlyBExamples": []
+ }
+}
+== ROBOT go.materialize (--term as ROBOT ran it) vs sparkles go.chain-rmr
+{
+ "logical": {
+  "a": 82950,
+  "b": 96847,
+  "common": 82950,
+  "onlyA": 0,
+  "onlyB": 13897,
+  "onlyAByType": {},
+  "onlyBByType": {
+   "SubClassOf": 13897
+  },
+  "onlyAExamples": [],
+  "onlyBExamples": [
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000002> <http://www.w3.org/2002/07/owl#Thing>)",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000003> <http://www.w3.org/2002/07/owl#Thing>)",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000004> <http://www.w3.org/2002/07/owl#Thing>)",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000005> <http://www.w3.org/2002/07/owl#Thing>)",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000008> <http://www.w3.org/2002/07/owl#Thing>)"
+  ]
+ },
+ "all": {
+  "a": 608460,
+  "b": 622357,
+  "common": 608460,
+  "onlyA": 0,
+  "onlyB": 13897,
+  "onlyAByType": {},
+  "onlyBByType": {
+   "SubClassOf": 13897
+  },
+  "onlyAExamples": [],
+  "onlyBExamples": [
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000002> <http://www.w3.org/2002/07/owl#Thing>)",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000003> <http://www.w3.org/2002/07/owl#Thing>)",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000004> <http://www.w3.org/2002/07/owl#Thing>)",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000005> <http://www.w3.org/2002/07/owl#Thing>)",
+   "SubClassOf(<http://purl.obolibrary.org/obo/GO_0000008> <http://www.w3.org/2002/07/owl#Thing>)"
+  ]
+ }
+}
+== ROBOT chebi_lite.materialize (--term as ROBOT ran it) vs sparkles chebi_lite.materialize
+{
+ "logical": {
+  "a": 409525,
+  "b": 409525,
+  "common": 409525,
+  "onlyA": 0,
+  "onlyB": 0,
+  "onlyAByType": {},
+  "onlyBByType": {},
+  "onlyAExamples": [],
+  "onlyBExamples": []
+ },
+ "all": {
+  "a": 1666767,
+  "b": 1666767,
+  "common": 1666767,
+  "onlyA": 0,
+  "onlyB": 0,
+  "onlyAByType": {},
+  "onlyBByType": {},
+  "onlyAExamples": [],
+  "onlyBExamples": []
+ }
+}
+== ROBOT chebi_lite.materialize (--term as ROBOT ran it) vs sparkles chebi_lite.materialize-all
+{
+ "logical": {
+  "a": 409525,
+  "b": 409538,
+  "common": 409525,
+  "onlyA": 0,
+  "onlyB": 13,
+  "onlyAByType": {},
+  "onlyBByType": {
+   "SubClassOf": 13
+  },
+  "onlyAExamples": [],
+  "onlyBExamples": [
+   "SubClassOf(<http://purl.obolibrary.org/obo/CHEBI_131706> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0018036> <http://purl.obolibrary.org/obo/CHEBI_131707>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/CHEBI_131706> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0018036> <http://purl.obolibrary.org/obo/CHEBI_131967>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/CHEBI_131707> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0018036> <http://purl.obolibrary.org/obo/CHEBI_131706>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/CHEBI_131707> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0018036> <http://purl.obolibrary.org/obo/CHEBI_131966>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/CHEBI_131966> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0018036> <http://purl.obolibrary.org/obo/CHEBI_131707>))"
+  ]
+ },
+ "all": {
+  "a": 1666767,
+  "b": 1666780,
+  "common": 1666767,
+  "onlyA": 0,
+  "onlyB": 13,
+  "onlyAByType": {},
+  "onlyBByType": {
+   "SubClassOf": 13
+  },
+  "onlyAExamples": [],
+  "onlyBExamples": [
+   "SubClassOf(<http://purl.obolibrary.org/obo/CHEBI_131706> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0018036> <http://purl.obolibrary.org/obo/CHEBI_131707>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/CHEBI_131706> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0018036> <http://purl.obolibrary.org/obo/CHEBI_131967>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/CHEBI_131707> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0018036> <http://purl.obolibrary.org/obo/CHEBI_131706>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/CHEBI_131707> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0018036> <http://purl.obolibrary.org/obo/CHEBI_131966>))",
+   "SubClassOf(<http://purl.obolibrary.org/obo/CHEBI_131966> ObjectSomeValuesFrom(<http://purl.obolibrary.org/obo/RO_0018036> <http://purl.obolibrary.org/obo/CHEBI_131707>))"
+  ]
+ }
+}
