@@ -473,6 +473,7 @@
                 tabindex="-1"
                 aria-selected={i === active}
                 class="hit"
+                class:single={!it.subtitle}
                 onmousedown={(e) => e.preventDefault()}
                 onclick={() => void pick(g, j)}
                 onkeydown={(e) => e.key === 'Enter' && void pick(g, j)}
@@ -646,13 +647,15 @@
     display: grid;
     grid-template-columns: 18px minmax(0, 1fr) auto;
     align-items: center;
-    /* a row without a subtitle keeps its title on the middle line */
-    align-content: center;
     column-gap: var(--sp-3);
     min-height: 34px;
     padding: 6px var(--sp-3);
     border-radius: var(--r);
     cursor: pointer;
+  }
+  /* a row without a subtitle keeps its title on the middle line */
+  .single .title {
+    grid-row: 1 / 3;
   }
   .ic {
     grid-row: 1 / 3;
