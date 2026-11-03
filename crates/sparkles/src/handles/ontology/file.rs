@@ -213,6 +213,83 @@ impl OntologyFile {
         })
     }
 
+    /// An ontology file of a document's axioms held in memory, as a chained command
+    /// hands it on, with `prefixes` for the renderer. The axioms are split as a read of a
+    /// functional-style document splits them: an assertion that a store would stream
+    /// becomes its triples, which `assertions` options then include or leave out, and
+    /// every other axiom is in the terminology as it is. The imports of the header do not
+    /// resolve, as a file's do not.
+    pub fn from_document(
+        name: String,
+        doc: sparkles_owl::transform::Document,
+        prefixes: BTreeMap<String, String>,
+    ) -> Result<OntologyFile> {
+        let imports: Vec<String> = doc
+            .header
+            .imports
+            .iter()
+            .map(|i| i.as_str().to_string())
+            .collect();
+        let declared: FxHashSet<String> = doc
+            .axioms
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AxiomKind::Declaration(Entity::AnnotationProperty(p)) => {
+                    Some(p.as_str().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut fresh = sparkles_owl::write::counter("file");
+        let mut terminology = Vec::with_capacity(doc.axioms.len());
+        let mut assertions = Vec::new();
+        for ax in doc.axioms {
+            if streamed(&ax, &declared) {
+                assertions.extend(sparkles_owl::write::axiom_triples(&ax, &mut fresh));
+            } else {
+                terminology.push(ax);
+            }
+        }
+        let order = StoreOrder::new(&assertions);
+        assertions.par_sort_by_cached_key(|t| {
+            (
+                order.key(&t.subject.clone().into()),
+                order.key(&Term::NamedNode(t.predicate.clone())),
+                order.key(&t.object),
+            )
+        });
+        assertions.dedup();
+        let ontology = read::Ontology::from_axioms(doc.header, terminology, Mode::Lenient);
+        OntologyFile::new(
+            name,
+            RdfSyntax::OwlFunctional,
+            ontology,
+            assertions,
+            prefixes,
+            (imports, Vec::new()),
+            &OntologyRequest::default(),
+        )
+    }
+
+    /// The header and every axiom of the file, the terminology and the assertions that
+    /// map to axioms, as a document a command transforms. A triple that maps to no axiom
+    /// is left out, as the reverse mapping leaves it out of the ontology.
+    pub fn into_document(self, opts: &QueryOptions) -> Result<sparkles_owl::transform::Document> {
+        let mut axioms: Vec<Axiom> = Vec::new();
+        self.assertions(opts, |ax, _| {
+            if let Some(ax) = ax {
+                axioms.push(ax.into_owned());
+            }
+            Ok(true)
+        })?;
+        let (header, terminology): (_, Vec<Axiom>) = match Arc::try_unwrap(self.ontology) {
+            Ok(o) => (o.header, o.axioms.into_keys().collect()),
+            Err(o) => (o.header.clone(), o.axioms.keys().cloned().collect()),
+        };
+        axioms.extend(terminology);
+        Ok(sparkles_owl::transform::Document::new(header, axioms))
+    }
+
     /// The members of the read that answers carry, as a read of the loaded file gives them.
     pub fn view(&self) -> ReadView<'_> {
         const NO_INFERENCES: Option<&Inferences> = None;
