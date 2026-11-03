@@ -345,6 +345,8 @@ fn writes(op: &str) -> bool {
             | "ontology.entities"
             | "ontology.entity"
             | "ontology.search"
+            | "ontology.hierarchy"
+            | "ontology.term"
             | "ontology.check"
             | "ontology.diff"
             | "ontology.classify"

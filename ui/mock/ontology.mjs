@@ -1488,6 +1488,187 @@ export async function handleOntology(req, res, url, seg, ctx) {
     send(res, 200, searchEntities(ds, graph, p));
     return true;
   }
+  if (req.method === 'GET' && sub === 'hierarchy') {
+    const b = browseIndex(ds, graph);
+    const kind = p.get('kind') ?? 'class';
+    const iri = p.get('iri');
+    const limit = Math.min(Number(p.get('limit') ?? 100), 1000);
+    const offset = Number(p.get('offset') ?? 0);
+    const tree = b.trees[kind];
+    if (!tree) return (fail(res, 400, `unknown hierarchy kind: ${kind}`), true);
+    if (iri && !b.kinds.has(iri))
+      return (fail(res, 404, `the graphs do not mention <${iri}>`, { code: 'not-found' }), true);
+    const node = (i) => ({
+      ...b.name(i),
+      children: (tree.children.get(i) ?? []).length,
+      parents: (tree.parents.get(i) ?? []).length,
+    });
+    const order = (a, c) => (a.label ?? a.iri).localeCompare(c.label ?? c.iri);
+    const all = (iri ? (tree.children.get(iri) ?? []) : tree.roots)
+      .map(node)
+      .sort((a, c) => Number(a.deprecated) - Number(c.deprecated) || order(a, c));
+    const page = all.slice(offset, offset + limit);
+    const body = {
+      dataset: ds.name,
+      commit: head(),
+      graphs: [graph],
+      imports: [],
+      warnings: [],
+      kind,
+      node: iri ? node(iri) : null,
+      children: page,
+      total: all.length,
+      offset,
+      limit,
+      next: offset + page.length < all.length ? offset + page.length : null,
+      order: 'label',
+    };
+    if (!iri) {
+      body.roots = 'computed';
+      body.deprecatedRoots = all.filter((n) => n.deprecated).length;
+    }
+    if (iri && ['true', '1'].includes(p.get('ancestors') ?? '')) {
+      const nodes = [];
+      const edges = [];
+      const seen = new Set([iri]);
+      const todo = [iri];
+      while (todo.length) {
+        const c = todo.shift();
+        for (const par of tree.parents.get(c) ?? []) {
+          edges.push([c, par]);
+          if (seen.has(par)) continue;
+          seen.add(par);
+          nodes.push(node(par));
+          todo.push(par);
+        }
+      }
+      body.ancestors = { nodes, edges, truncated: false };
+    }
+    send(res, 200, body, 'application/json', { ETag: etag(ds, head()) });
+    return true;
+  }
+  if (req.method === 'GET' && sub === 'term') {
+    const b = browseIndex(ds, graph);
+    const iri = p.get('iri');
+    if (!iri || !b.mentioned.has(iri))
+      return (fail(res, 404, `the graphs do not mention <${iri}>`, { code: 'not-found' }), true);
+    const own = b.quads.filter(
+      (q) => q.subject.termType === 'NamedNode' && q.subject.value === iri,
+    );
+    const format = p.get('format');
+    if (format && format !== 'json') {
+      const types = {
+        ttl: 'text/turtle',
+        nt: 'application/n-triples',
+        rdfxml: 'application/rdf+xml',
+        jsonld: 'application/ld+json',
+        ofn: 'text/owl-functional',
+      };
+      if (!types[format]) return (fail(res, 400, `unknown format: ${format}`), true);
+      const text = own.map((q) => `${q.subject} ${q.predicate} ${q.object} .`).join('\n');
+      const ext = { ttl: 'ttl', nt: 'nt', rdfxml: 'rdf', jsonld: 'jsonld', ofn: 'ofn' }[format];
+      send(res, 200, text + '\n', types[format], {
+        'Content-Disposition': `attachment; filename="${iri.replace(/^.*[#/]/, '') || 'term'}.${ext}"`,
+      });
+      return true;
+    }
+    const o = readOntology(ds, graph);
+    const used = new Set([iri]);
+    const note = (v) => {
+      if (typeof v === 'string') used.add(v);
+      else if (Array.isArray(v)) v.forEach(note);
+      else if (v && typeof v === 'object' && !isLit(v)) Object.values(v).forEach(note);
+    };
+    const statements = own
+      .filter((q) => q.object.termType !== 'BlankNode')
+      .map((q) => {
+        const value = q.object.termType === 'Literal' ? litJson(q.object) : q.object.value;
+        note(q.predicate.value);
+        note(value);
+        return { property: q.predicate.value, value, graph, annotations: [] };
+      });
+    // as on the server, an axiom is about the entity when one of its triples has it as subject
+    const about = (a) => a.quads.some((q) => isIri(q.subject) && q.subject.value === iri);
+    const axioms = [];
+    const mentioning = [];
+    // as on the server, a mention is an axiom whose blank nodes hold the entity; a triple
+    // of a named subject that points at it is an incoming statement instead
+    const viaBlank = (a) => a.quads.some((q) => isBlank(q.subject) && q.object.value === iri);
+    for (const a of o.axioms) {
+      if (a.json.type === 'AnnotationAssertion' || !mentions(a.json, iri)) continue;
+      if (about(a)) axioms.push(a);
+      else if (viaBlank(a)) mentioning.push(a);
+      else continue;
+      note(a.json);
+    }
+    const groups = new Map();
+    for (const q of b.quads) {
+      if (q.object.termType !== 'NamedNode' || q.object.value !== iri) continue;
+      if (q.subject.termType !== 'NamedNode' || q.subject.value === iri) continue;
+      const g = groups.get(q.predicate.value) ?? [];
+      if (!g.includes(q.subject.value)) g.push(q.subject.value);
+      groups.set(q.predicate.value, g);
+    }
+    const cap = Number(p.get('incoming') ?? 20);
+    const incoming = [...groups].map(([property, subjects]) => {
+      note(property);
+      subjects.slice(0, cap).forEach(note);
+      return {
+        property,
+        count: subjects.length,
+        more: subjects.length > cap,
+        subjects: subjects.slice(0, cap),
+      };
+    });
+    const users = [
+      ...new Set(
+        b.quads
+          .filter((q) => q.predicate.value === iri && q.subject.termType === 'NamedNode')
+          .map((q) => q.subject.value),
+      ),
+    ];
+    users.slice(0, cap).forEach(note);
+    const names = {};
+    for (const i of used) {
+      if (i === iri || !b.mentioned.has(i)) continue;
+      const { iri: _, ...rest } = b.name(i);
+      names[i] = rest;
+    }
+    send(
+      res,
+      200,
+      {
+        dataset: ds.name,
+        commit: head(),
+        graphs: [graph],
+        imports: [],
+        warnings: [],
+        ...b.name(iri),
+        types: own
+          .filter((q) => q.predicate.value === TYPE && isIri(q.object))
+          .map((q) => q.object.value),
+        ontologies: [{ graph, ontology: o.header.iri }],
+        statements,
+        statementsTruncated: false,
+        xlLabels: [],
+        axioms: axioms.map(item),
+        mentions: { axioms: mentioning.map(item), total: mentioning.length, truncated: false },
+        incoming,
+        usage: users.length
+          ? {
+              property: iri,
+              count: users.length,
+              more: users.length > cap,
+              subjects: users.slice(0, cap),
+            }
+          : null,
+        names,
+      },
+      'application/json',
+      { ETag: etag(ds, head()) },
+    );
+    return true;
+  }
   if (req.method === 'GET' && sub === 'entities') {
     const o = readOntology(ds, graph);
     const want = p.get('kind')?.split(',');
@@ -2226,4 +2407,86 @@ function searchEntities(ds, graph, p) {
     next: more ? offset + limit : null,
     index: 'current',
   };
+}
+
+// --- the browser ---------------------------------------------------------------------
+
+const TREE_LINKS = {
+  class: [[RDFS + 'subClassOf', false]],
+  objectProperty: [[RDFS + 'subPropertyOf', false]],
+  dataProperty: [[RDFS + 'subPropertyOf', false]],
+  annotationProperty: [[RDFS + 'subPropertyOf', false]],
+  concept: [
+    [SKOS + 'broader', false],
+    [SKOS + 'narrower', true],
+  ],
+};
+const TOP = new Set([OWL + 'Thing', OWL + 'topObjectProperty', OWL + 'topDataProperty']);
+
+/**
+ * The names, kinds and hierarchies of a graph, in brief, for the mock's
+ * `GET /$/ontology/{ds}/hierarchy` and `GET /$/ontology/{ds}/term`.
+ */
+function browseIndex(ds, graph) {
+  const quads = ds.store.match(null, null, null, graphTerm(graph));
+  const kinds = new Map();
+  const labels = new Map();
+  const deprecated = new Set();
+  const mentioned = new Set();
+  for (const x of quads) {
+    for (const t of [x.subject, x.object]) if (t.termType === 'NamedNode') mentioned.add(t.value);
+    if (x.subject.termType !== 'NamedNode') continue;
+    const s = x.subject.value;
+    const pr = x.predicate.value;
+    if (pr === TYPE && ENTITY_KINDS[x.object.value]) {
+      const k = kinds.get(s) ?? new Set();
+      k.add(ENTITY_KINDS[x.object.value]);
+      kinds.set(s, k);
+    } else if (LABELS[pr] && x.object.termType === 'Literal') {
+      const l = labels.get(s) ?? [];
+      l.push({ text: x.object.value, lang: x.object.language || null });
+      labels.set(s, l);
+    } else if (pr === OWL + 'deprecated' && x.object.value === 'true') deprecated.add(s);
+  }
+  const name = (iri) => {
+    const ls = labels.get(iri) ?? [];
+    const l = ls.find((t) => t.lang?.startsWith('en')) ?? ls.find((t) => !t.lang) ?? ls[0] ?? null;
+    return {
+      iri,
+      label: l?.text ?? null,
+      labelLang: l?.lang ?? null,
+      shortForm: iri.replace(/^.*[#/]/, '') || iri,
+      kinds: [...(kinds.get(iri) ?? [])],
+      deprecated: deprecated.has(iri),
+    };
+  };
+  const trees = {};
+  for (const [kind, links] of Object.entries(TREE_LINKS)) {
+    const members = [...kinds].filter(([, ks]) => ks.has(kind)).map(([i]) => i);
+    const set = new Set(members);
+    const parents = new Map();
+    const children = new Map();
+    const link = (c, par) => {
+      if (!set.has(c) || !set.has(par) || TOP.has(par)) return;
+      const ps = parents.get(c) ?? [];
+      if (ps.includes(par)) return;
+      ps.push(par);
+      parents.set(c, ps);
+      const cs = children.get(par) ?? [];
+      cs.push(c);
+      children.set(par, cs);
+    };
+    for (const x of quads) {
+      if (x.subject.termType !== 'NamedNode' || x.object.termType !== 'NamedNode') continue;
+      for (const [pr, inverse] of links)
+        if (x.predicate.value === pr)
+          inverse ? link(x.object.value, x.subject.value) : link(x.subject.value, x.object.value);
+    }
+    trees[kind] = {
+      parents,
+      children,
+      roots: members.filter((m) => !parents.has(m) && !TOP.has(m)),
+    };
+  }
+  return { quads, kinds, name, trees, mentioned };
 }

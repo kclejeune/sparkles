@@ -93,19 +93,12 @@ const hit = (over: Partial<EntityHit>): EntityHit => ({
 });
 
 describe('entity hits', () => {
-  it('open classes in the ontology editor, concepts in the thesaurus and others in Explore', () => {
+  it('open every kind on its page in the ontology browser', () => {
     expect(entityHref('/ui', 'go', hit({}))).toBe(
-      '/ui/ontology?ds=go&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FGO_0005739',
+      '/ui/browse?ds=go&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FGO_0005739',
     );
-    expect(entityHref('/ui', 'th', hit({ kinds: ['concept'] }))).toMatch(/^\/ui\/thesaurus\?/);
-    expect(entityHref('/ui', 'd', hit({ kinds: ['individual'] }))).toMatch(/^\/ui\/explore\?/);
-    // a property opens on its own tree's tab
-    expect(entityHref('/ui', 'go', hit({ kinds: ['objectProperty'] }))).toMatch(
-      /^\/ui\/ontology\?ds=go&iri=[^&]+&tab=ObjectProperty$/,
-    );
-    expect(entityHref('/ui', 'go', hit({ kinds: ['annotationProperty'] }))).toMatch(
-      /&tab=AnnotationProperty$/,
-    );
+    for (const k of ['concept', 'individual', 'objectProperty', 'conceptScheme'])
+      expect(entityHref('/ui', 'th', hit({ kinds: [k] }))).toMatch(/^\/ui\/browse\?ds=th&iri=/);
   });
 
   it('highlight a label match and name any other field', () => {

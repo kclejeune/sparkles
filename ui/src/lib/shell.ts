@@ -10,12 +10,20 @@ export interface NavItem {
 }
 
 /** The pages whose link carries the open dataset as `?ds=`. */
-const CARRIES_DATASET = new Set(['/explore', '/ontology', '/thesaurus', '/similar', '/memory']);
+const CARRIES_DATASET = new Set([
+  '/explore',
+  '/browse',
+  '/ontology',
+  '/thesaurus',
+  '/similar',
+  '/memory',
+]);
 
 export function navItems(backupsVisible: boolean): NavItem[] {
   return [
     { href: '/query', label: 'Query', icon: 'query', group: 'work' },
     { href: '/explore', label: 'Explore', icon: 'explore', group: 'work' },
+    { href: '/browse', label: 'Browse', icon: 'book', group: 'work' },
     { href: '/ontology', label: 'Ontology', icon: 'tree', group: 'work' },
     { href: '/thesaurus', label: 'Thesaurus', icon: 'layers', group: 'work' },
     { href: '/similar', label: 'Similar', icon: 'similar', group: 'work' },

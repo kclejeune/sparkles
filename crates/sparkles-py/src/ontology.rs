@@ -386,6 +386,75 @@ impl PyOntologies {
         answer(py, j, &[])
     }
 
+    /// One level of the class, property or concept hierarchy, as
+    /// `GET /$/ontology/{ds}/hierarchy` answers it, read from the store's indexes without
+    /// reading the whole ontology: a dict with the `node`, a page of its `children` (or
+    /// of the roots when `iri` is None), each with its own numbers of `children` and
+    /// `parents`, and its `ancestors` with `ancestors=True`. `kind` is `class`,
+    /// `objectProperty`, `dataProperty`, `annotationProperty` or `concept`.
+    #[pyo3(signature=(iri=None, graph=None, *, kind="class", ancestors=false, scheme=None, deprecated=true, lang=None, limit=100, offset=0, imports=true, at=None, cancel=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn hierarchy<'py>(
+        &self,
+        py: Python<'py>,
+        iri: Option<&str>,
+        graph: Option<&Bound<'py, PyAny>>,
+        kind: &str,
+        ancestors: bool,
+        scheme: Option<&str>,
+        deprecated: bool,
+        lang: Option<&Bound<'py, PyAny>>,
+        limit: usize,
+        offset: usize,
+        imports: bool,
+        at: Option<&Bound<'py, PyAny>>,
+        cancel: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut a = base(graph, imports, "lenient", false)?;
+        a.insert("at".into(), at_json(at)?);
+        a.insert("kind".into(), json!(kind));
+        a.insert("iri".into(), json!(iri));
+        a.insert("ancestors".into(), json!(ancestors));
+        a.insert("scheme".into(), json!(scheme));
+        a.insert("deprecated".into(), json!(deprecated));
+        a.insert("lang".into(), names_json(lang)?);
+        a.insert("limit".into(), json!(limit));
+        a.insert("offset".into(), json!(offset));
+        let j = self.run(py, "hierarchy", a, cancel, timeout, false)?;
+        answer(py, j, &[])
+    }
+
+    /// What the graphs say about the entity `iri`, as `GET /$/ontology/{ds}/term` answers
+    /// it, read without reading the whole ontology: a dict with its `statements` and
+    /// their annotations, the `axioms` they map to, the axioms of other entities that
+    /// mention it (`mentions`), the statements that point at it (`incoming`), and the
+    /// label, short form and kinds of every IRI used (`names`).
+    #[pyo3(signature=(iri, graph=None, *, mentions=200, incoming=20, lang=None, imports=true, at=None, cancel=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn term<'py>(
+        &self,
+        py: Python<'py>,
+        iri: &str,
+        graph: Option<&Bound<'py, PyAny>>,
+        mentions: usize,
+        incoming: usize,
+        lang: Option<&Bound<'py, PyAny>>,
+        imports: bool,
+        at: Option<&Bound<'py, PyAny>>,
+        cancel: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut a = base(graph, imports, "lenient", false)?;
+        a.insert("at".into(), at_json(at)?);
+        a.insert("iri".into(), json!(iri));
+        a.insert("mentions".into(), json!(mentions));
+        a.insert("incoming".into(), json!(incoming));
+        a.insert("lang".into(), names_json(lang)?);
+        let j = self.run(py, "term", a, cancel, timeout, false)?;
+        answer(py, j, &[])
+    }
+
     /// What the ontology says about the entity `iri`: its `kinds`, `labels` and
     /// `annotations`, and for each kind a dict of its accessors, such as `superClasses`
     /// under `class` or `domains` under `objectProperty`. Each expression is a dict with

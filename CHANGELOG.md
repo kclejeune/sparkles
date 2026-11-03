@@ -55,6 +55,22 @@ on the benchmark host it takes 3.31 s and 8.32 s, against 3.47 s and 8.77 s for 
 A term is kept only when it is a URN or a URL that OpenJDK 17's `java.net.URL` accepts, as
 ROBOT keeps it.
 
+The web UI has an ontology browser (spec U12, roadmap item 616). `/ui/browse` gives each
+entity of a dataset's ontologies and thesauri a read-only page with its label, short form,
+IRI, definition and sources, synonyms by kind, notes, SKOS labels by language,
+cross-references, an infobox, a lineage tree with a graph view on the Explore canvas, its
+axioms as linked Manchester prose, what links here, its use in other datasets and
+downloads in Turtle, RDF/XML, OWL functional syntax and JSON-LD. Each ontology gets a
+landing page with its header, counts, top classes and search, and the top bar's search
+now opens these pages for every kind of entity, where it opened the editors and Explore
+before. Two routes serve the pages and read the store's indexes around one entity
+instead of the whole ontology. `GET /$/ontology/{ds}/hierarchy` answers one level of a
+class, property or concept hierarchy with child counts and, on request, the ancestors,
+and `GET /$/ontology/{ds}/term` answers an entity's statements, axioms, mentions,
+incoming statements and the names of every IRI it uses, or a download with `format=`.
+The Rust library, the wire dispatcher and the ontology handles of Python, Node.js and
+the JVM call them as `hierarchy` and `term`.
+
 The web UI has one app shell and design system (roadmap item 632). A top bar on every
 page holds the dataset switcher and a search of the open dataset's entities through
 `GET /$/ontology/{ds}/search`, which `Ctrl+K`, `Cmd+K` and `/` focus, and the pages sit

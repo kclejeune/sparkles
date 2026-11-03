@@ -952,6 +952,126 @@ fn ontology(p: &mut Paths) {
             )
             .errors(&[400, 404, 408, 409]),
     );
+    let name_props = json!({
+        "iri": { "type": "string" },
+        "label": { "type": ["string", "null"], "description": "The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language." },
+        "labelLang": { "type": ["string", "null"] },
+        "shortForm": { "type": ["string", "null"], "description": "The `oboInOwl:id`, `skos:notation`, prefixed name or local name." },
+        "kinds": { "type": "array", "items": { "type": "string" } },
+        "deprecated": { "type": "boolean" }
+    });
+    let mut node_props = name_props.clone();
+    node_props["children"] =
+        json!({ "type": "integer", "description": "The number of direct children." });
+    node_props["parents"] =
+        json!({ "type": "integer", "description": "The number of direct parents." });
+    let node = json!({ "type": "object", "properties": node_props });
+    p.add(
+        read(op(GET, "/$/ontology/{ds}/hierarchy", "ontologyHierarchy", "Ontology", "List one level of an entity hierarchy"))
+            .doc("One level of the class, object property, data property, annotation property or SKOS concept hierarchy, read from the store's indexes without reading the whole ontology: the direct children of `iri`, or the roots, a page at a time in label order with deprecated entities last, each with the numbers of its own children and parents. Classes follow `rdfs:subClassOf` between named classes, properties `rdfs:subPropertyOf`, and concepts `skos:broader` and `skos:narrower` in either direction. The roots of the class hierarchy are the ontology header's `IAO_0000700` root terms when it names some, and otherwise the classes without a parent; the roots of a scheme are its top concepts with its concepts that have no broader one. `ancestors=true` adds the ancestors of `iri` up to the roots, with the edges between them, at most 2,000. The caller sees only the graphs and triples their grants allow. `inferences` is refused.")
+            .see("ontology")
+            .query("kind", json!({ "type": "string", "enum": ["class", "objectProperty", "dataProperty", "annotationProperty", "concept"] }), "The hierarchy (`class` by default).")
+            .query("iri", s(), "The node whose children to list; the roots when absent.")
+            .query("ancestors", boolean(), "Also list the ancestors of `iri`.")
+            .query("scheme", s(), "Keep the concepts of this scheme, and start the roots at its top concepts.")
+            .query("deprecated", boolean(), "List deprecated children (true by default, after the others).")
+            .query("lang", s(), "The caller's languages for labels, comma separated and most preferred first. `Accept-Language` is read when it is absent.")
+            .query("limit", int(), "The most children listed, from 1 to 1,000 (100 by default).")
+            .query("offset", int(), "The children skipped.")
+            .resp(
+                "200",
+                "The node, a page of its children or of the roots, and its ancestors when asked for.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "properties": {
+                        "dataset": { "type": "string" },
+                        "commit": { "type": "integer" },
+                        "graphs": { "type": "array", "items": { "type": "string" } },
+                        "kind": { "type": "string" },
+                        "node": { "oneOf": [node.clone(), { "type": "null" }] },
+                        "children": { "type": "array", "items": node.clone() },
+                        "total": { "type": "integer" },
+                        "offset": { "type": "integer" },
+                        "limit": { "type": "integer" },
+                        "next": { "type": ["integer", "null"] },
+                        "order": { "type": "string", "enum": ["label", "iri"], "description": "`iri` for a node with more than 20,000 children, which are listed in IRI order." },
+                        "roots": { "type": "string", "enum": ["ontology", "scheme", "computed"], "description": "Where the roots came from, for a list of roots." },
+                        "deprecatedRoots": { "type": "integer", "description": "The deprecated roots `deprecated=false` left out." },
+                        "ancestors": { "type": "object", "properties": {
+                            "nodes": { "type": "array", "items": node.clone() },
+                            "edges": { "type": "array", "description": "`[child, parent]` IRI pairs.", "items": { "type": "array", "items": { "type": "string" } } },
+                            "truncated": { "type": "boolean" }
+                        } }
+                    }
+                } } })),
+            )
+            .errors(&[400, 404, 408]),
+    );
+    let incoming = json!({ "type": "object", "properties": {
+        "property": { "type": "string" },
+        "count": { "type": "integer", "description": "The statements counted, at most 10,000." },
+        "more": { "type": "boolean" },
+        "subjects": { "type": "array", "items": { "type": "string" } }
+    } });
+    p.add(
+        read(op(GET, "/$/ontology/{ds}/term", "ontologyTerm", "Ontology", "Describe one entity"))
+            .doc("What the graphs read say about one entity, read from the store's indexes without reading the whole ontology: its triples with a named or literal object and the annotations their reifications give (`statements`), the axioms the triples about it map to by the OWL 2 reverse mapping (`axioms`), the axioms of other entities that hold it inside a class expression (`mentions`), the statements of named subjects that point at it by predicate (`incoming`), the statements that use it as their predicate (`usage`), and the label, short form and kinds of every IRI the answer uses (`names`). `format` downloads the triples about the entity, its blank nodes and the reifications of its annotated triples in Turtle, N-Triples, RDF/XML or JSON-LD, or its axioms in functional-style syntax, as an attachment. The caller sees only the graphs and triples their grants allow. `inferences` is refused.")
+            .see("ontology")
+            .query("iri", s(), "The entity.")
+            .query("mentions", int(), "The most axioms of other entities listed, from 0 to 2,000 (200 by default).")
+            .query("incoming", int(), "The subjects listed per incoming predicate, from 0 to 200 (20 by default).")
+            .query("lang", s(), "The caller's languages for labels, comma separated and most preferred first. `Accept-Language` is read when it is absent.")
+            .query("format", json!({ "type": "string", "enum": ["json", "ttl", "nt", "rdfxml", "jsonld", "ofn"] }), "`json` (the default), or a download format.")
+            .resp(
+                "200",
+                "The entity's description, or a download.",
+                Some(json!({
+                    "application/json": { "schema": {
+                        "type": "object",
+                        "properties": {
+                            "dataset": { "type": "string" },
+                            "commit": { "type": "integer" },
+                            "graphs": { "type": "array", "items": { "type": "string" } },
+                            "iri": { "type": "string" },
+                            "label": { "type": ["string", "null"] },
+                            "labelLang": { "type": ["string", "null"] },
+                            "shortForm": { "type": ["string", "null"] },
+                            "kinds": { "type": "array", "items": { "type": "string" } },
+                            "deprecated": { "type": "boolean" },
+                            "types": { "type": "array", "items": { "type": "string" } },
+                            "ontologies": { "type": "array", "items": { "type": "object", "properties": { "graph": { "type": "string" }, "ontology": { "type": ["string", "null"] } } } },
+                            "statements": { "type": "array", "items": { "type": "object", "properties": {
+                                "property": { "type": "string" },
+                                "value": { "description": "An IRI as a string, or a literal as `{\"@value\", \"@language\"?, \"@type\"?}`." },
+                                "graph": { "type": "string" },
+                                "annotations": { "type": "array", "items": { "type": "object", "properties": { "property": { "type": "string" }, "value": {} } } }
+                            } } },
+                            "statementsTruncated": { "type": "boolean" },
+                            "xlLabels": { "type": "array", "description": "The literal forms of the entity's SKOS-XL labels, with the label property and the graph.", "items": { "type": "object", "properties": {
+                                "property": { "type": "string" },
+                                "value": { "description": "A literal as `{\"@value\", \"@language\"?, \"@type\"?}`." },
+                                "graph": { "type": "string" }
+                            } } },
+                            "axioms": { "type": "array", "items": { "type": "object", "description": "An axiom with `type`, `ofn`, `axiom` (its JSON form) and `graph`." } },
+                            "mentions": { "type": "object", "properties": {
+                                "axioms": { "type": "array", "items": { "type": "object" } },
+                                "total": { "type": "integer" },
+                                "truncated": { "type": "boolean" }
+                            } },
+                            "incoming": { "type": "array", "items": incoming.clone() },
+                            "usage": { "oneOf": [incoming, { "type": "null" }] },
+                            "names": { "type": "object", "additionalProperties": { "type": "object", "properties": name_props } }
+                        }
+                    } },
+                    "text/turtle": { "schema": { "type": "string" } },
+                    "application/n-triples": { "schema": { "type": "string" } },
+                    "application/rdf+xml": { "schema": { "type": "string" } },
+                    "application/ld+json": { "schema": { "type": "object" } },
+                    "text/owl-functional": { "schema": { "type": "string" } }
+                })),
+            )
+            .errors(&[400, 404, 408]),
+    );
     // an axiom an edit takes: its JSON form, or a string in functional-style syntax
     let axiom_in = json!({ "oneOf": [
         { "type": "object", "description": "The axiom's JSON form." },

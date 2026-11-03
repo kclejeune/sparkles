@@ -1220,3 +1220,231 @@ async fn the_entity_search_reads_the_branch_asked_for() {
     let j = get(&s.app, "/$/ontology/h/search?q=lectur").await.json();
     assert_eq!(j["results"], json!([]), "{j}");
 }
+
+#[tokio::test]
+async fn the_hierarchy_answers_one_level_at_a_time() {
+    let s = server();
+    let r = get(&s.app, "/$/ontology/t/hierarchy").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.headers.contains_key("sparkles-commit"));
+    let tag = r.headers[header::ETAG].to_str().unwrap().to_string();
+    let j = r.json();
+    assert_eq!(j["kind"], "class");
+    assert_eq!(j["roots"], "computed");
+    let roots: Vec<&str> = j["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["iri"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roots,
+        ["http://ex.org/Course", "http://ex.org/Person"],
+        "{j}"
+    );
+    assert_eq!(j["children"][1]["children"], 1);
+    // the same commit is not sent again
+    let r = send(
+        &s.app,
+        "GET",
+        "/$/ontology/t/hierarchy",
+        &[("if-none-match", &tag)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_MODIFIED);
+    // each route's own tag is a valid precondition of a read
+    for uri in [
+        "/$/ontology/t/hierarchy".to_string(),
+        format!("/$/ontology/t/term?iri={}", enc("http://ex.org/Person")),
+    ] {
+        let tag = get(&s.app, &uri).await.headers[header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let r = send(&s.app, "GET", &uri, &[("if-match", &tag)], "").await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+    }
+    let j = get(
+        &s.app,
+        &format!(
+            "/$/ontology/t/hierarchy?iri={}&ancestors=true",
+            enc("http://ex.org/Professor")
+        ),
+    )
+    .await
+    .json();
+    assert_eq!(j["node"]["parents"], 1, "{j}");
+    assert_eq!(j["children"], json!([]));
+    assert_eq!(j["ancestors"]["nodes"][0]["iri"], "http://ex.org/Person");
+    assert_eq!(
+        j["ancestors"]["edges"],
+        json!([["http://ex.org/Professor", "http://ex.org/Person"]])
+    );
+    let j = get(&s.app, "/$/ontology/t/hierarchy?kind=objectProperty")
+        .await
+        .json();
+    assert_eq!(j["children"][0]["iri"], "http://ex.org/teaches", "{j}");
+    for uri in [
+        "/$/ontology/t/hierarchy?kind=planet",
+        "/$/ontology/t/hierarchy?limit=0",
+        "/$/ontology/t/hierarchy?limit=x",
+        "/$/ontology/t/hierarchy?inferences=true",
+    ] {
+        let r = get(&s.app, uri).await;
+        assert!(
+            r.status.is_client_error(),
+            "{uri}: {} {}",
+            r.status,
+            r.text()
+        );
+    }
+    let r = get(
+        &s.app,
+        &format!("/$/ontology/t/hierarchy?iri={}", enc("http://ex.org/none")),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+}
+
+#[tokio::test]
+async fn the_term_route_describes_one_entity_and_downloads_it() {
+    let s = server();
+    let iri = enc("http://ex.org/Professor");
+    let r = get(&s.app, &format!("/$/ontology/t/term?iri={iri}")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["iri"], "http://ex.org/Professor");
+    assert_eq!(j["kinds"], json!(["class"]));
+    assert_eq!(j["ontologies"][0]["ontology"], "http://ex.org/o");
+    let types: Vec<&str> = j["axioms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["type"].as_str().unwrap())
+        .collect();
+    assert!(types.contains(&"SubClassOf"), "{j}");
+    let instances = j["incoming"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["property"] == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+        .unwrap();
+    assert_eq!(instances["subjects"], json!(["http://ex.org/ada"]));
+    assert!(j["names"]["http://ex.org/teaches"].is_object(), "{j}");
+    // the course is mentioned by the professor's restriction
+    let j = get(
+        &s.app,
+        &format!("/$/ontology/t/term?iri={}", enc("http://ex.org/Course")),
+    )
+    .await
+    .json();
+    assert_eq!(j["mentions"]["total"], 1, "{j}");
+    assert_eq!(j["mentions"]["axioms"][0]["type"], "SubClassOf");
+    // downloads
+    for (f, mime, needle) in [
+        ("ttl", "text/turtle", "subClassOf"),
+        ("nt", "application/n-triples", "<http://ex.org/Professor>"),
+        ("rdfxml", "application/rdf+xml", "rdf:RDF"),
+        ("jsonld", "application/ld+json", "@id"),
+        ("ofn", "text/owl-functional", "SubClassOf("),
+    ] {
+        let r = get(&s.app, &format!("/$/ontology/t/term?iri={iri}&format={f}")).await;
+        assert_eq!(r.status, StatusCode::OK, "{f}: {}", r.text());
+        assert!(
+            r.headers[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with(mime),
+            "{f}"
+        );
+        assert!(
+            r.headers[header::CONTENT_DISPOSITION]
+                .to_str()
+                .unwrap()
+                .contains("attachment"),
+            "{f}"
+        );
+        assert!(r.text().contains(needle), "{f}: {}", r.text());
+    }
+    for uri in [
+        "/$/ontology/t/term".to_string(),
+        format!("/$/ontology/t/term?iri={iri}&format=xls"),
+        format!("/$/ontology/t/term?iri={iri}&mentions=999999"),
+    ] {
+        let r = get(&s.app, &uri).await;
+        assert!(
+            r.status.is_client_error(),
+            "{uri}: {} {}",
+            r.status,
+            r.text()
+        );
+    }
+    let r = get(
+        &s.app,
+        &format!("/$/ontology/t/term?iri={}", enc("http://ex.org/none")),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_browser_routes_read_the_branch_asked_for() {
+    let s = persistent();
+    s._state
+        .get("h")
+        .unwrap()
+        .dataset
+        .create_branch("dev", &Default::default())
+        .unwrap();
+    let r = post(
+        &s.app,
+        "/$/ontology/h/axioms?branch=dev",
+        json!({"add": [sub("http://ex.org/Lecturer", json!("http://ex.org/Person"))]}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let person = enc("http://ex.org/Person");
+    let r = get(
+        &s.app,
+        &format!("/$/ontology/h/hierarchy?iri={person}&branch=dev"),
+    )
+    .await;
+    assert_eq!(r.headers["sparkles-branch"], "dev");
+    let kids: Vec<String> = r.json()["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["iri"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        kids.contains(&"http://ex.org/Lecturer".to_string()),
+        "{kids:?}"
+    );
+    let j = get(&s.app, &format!("/$/ontology/h/hierarchy?iri={person}"))
+        .await
+        .json();
+    assert!(
+        !j["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["iri"] == "http://ex.org/Lecturer"),
+        "{j}"
+    );
+    let r = get(
+        &s.app,
+        &format!(
+            "/$/ontology/h/term?iri={}&branch=dev",
+            enc("http://ex.org/Lecturer")
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = get(
+        &s.app,
+        &format!("/$/ontology/h/term?iri={}", enc("http://ex.org/Lecturer")),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+}

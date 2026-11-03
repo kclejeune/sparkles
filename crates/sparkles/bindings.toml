@@ -796,6 +796,16 @@ python = "Dataset.ontology.search"
 jvm = "SparklesOnt.search"
 node = "Dataset.ontology.search"
 
+["ontology.hierarchy"]
+python = "Dataset.ontology.hierarchy"
+jvm = "SparklesOnt.hierarchy"
+node = "Dataset.ontology.hierarchy"
+
+["ontology.term"]
+python = "Dataset.ontology.term"
+jvm = "SparklesOnt.term"
+node = "Dataset.ontology.term"
+
 ["ontology.summary"]
 python = "Dataset.ontology.summary"
 jvm = "SparklesOnt.summary"

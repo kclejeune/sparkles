@@ -393,7 +393,7 @@ fn removes_an_entity() {
 // ---- review regressions ----------------------------------------------------------
 
 /// A caller from whom triples with predicate `p` are hidden.
-fn hiding(p: &str) -> QueryOptions {
+pub(super) fn hiding(p: &str) -> QueryOptions {
     use crate::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
     QueryOptions {
         graphs: Some(Arc::new(GraphAccess::with_triples(

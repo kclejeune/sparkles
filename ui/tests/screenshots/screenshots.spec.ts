@@ -8,6 +8,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { settle, shoot } from '../shoot';
 import { DATASET, DEMO } from './global-setup';
+import { BROWSE_DATASET, BROWSE_TURTLE, CELLO } from '../browse-fixture';
 
 const test = base.extend({
   baseURL: async ({}, use) => {
@@ -332,4 +333,64 @@ test('shell-phone', async ({ browser }) => {
   await expect(page.getByRole('dialog', { name: 'Menu' })).toBeVisible();
   await shoot(page, 'shell-phone');
   await ctx.close();
+});
+
+// The ontology browser on a small OBO-style ontology of its own (tests/browse-fixture.ts):
+// an entity's page at 1440 pixels, the landing page, and the entity's page on a phone.
+test.describe('browse', () => {
+  test.beforeAll(async ({ request }) => {
+    const made = await request.post('/$/datasets', {
+      data: { dbName: BROWSE_DATASET, dbType: 'mem' },
+    });
+    expect(made.ok() || made.status() === 409, await made.text()).toBe(true);
+    const loaded = await request.put(`/${BROWSE_DATASET}/data`, {
+      headers: { 'Content-Type': 'text/turtle' },
+      data: BROWSE_TURTLE,
+    });
+    expect(loaded.ok(), await loaded.text()).toBe(true);
+  });
+
+  const term = `/ui/browse?ds=${BROWSE_DATASET}&iri=${encodeURIComponent(CELLO(5))}`;
+
+  test('browse-term', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.goto(term);
+    await expect(page.getByRole('heading', { level: 1, name: 'mitochondrion' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'mitochondrial matrix' }).first()).toBeVisible();
+    await expect(page.getByRole('region', { name: 'In other datasets' })).not.toContainText(
+      'Looking in',
+    );
+    await shoot(page, 'browse-term');
+  });
+
+  test('browse-landing', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(`/ui/browse?ds=${BROWSE_DATASET}`);
+    await expect(page.getByRole('region', { name: 'Top classes' })).toContainText(
+      'A location in or around a cell',
+    );
+    await page.getByRole('searchbox').fill('mitoch');
+    await expect(page.locator('.hits li')).not.toHaveCount(0);
+    await shoot(page, 'browse-landing');
+  });
+
+  test('browse-phone', async ({ browser }) => {
+    const ctx = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      deviceScaleFactor: 2,
+      isMobile: true,
+      hasTouch: true,
+      colorScheme: 'dark',
+      baseURL: process.env.SPARKLES_SCREENSHOTS_URL,
+    });
+    await ctx.addInitScript(() => localStorage.setItem('sparkles.theme', 'dark'));
+    const page = await ctx.newPage();
+    await page.goto(term);
+    await expect(page.getByRole('heading', { level: 1, name: 'mitochondrion' })).toBeVisible();
+    await expect(page.getByRole('complementary', { name: 'Hierarchy' })).toContainText(
+      'cellular component',
+    );
+    await shoot(page, 'browse-phone');
+    await ctx.close();
+  });
 });

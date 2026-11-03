@@ -337,7 +337,7 @@ impl SearchSlot {
 
 /// The prefixed name of `iri` with the longest namespace of `prefixes` that leaves a
 /// local part without `/`, `#` or `?`.
-fn prefixed(iri: &str, prefixes: &BTreeMap<String, String>) -> Option<String> {
+pub(super) fn prefixed(iri: &str, prefixes: &BTreeMap<String, String>) -> Option<String> {
     prefixes
         .iter()
         .filter(|(_, ns)| !ns.is_empty() && iri.len() > ns.len() && iri.starts_with(ns.as_str()))

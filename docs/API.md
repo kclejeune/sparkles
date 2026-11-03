@@ -1918,6 +1918,81 @@ branch's entity index already reflected the head, applied the changes of later c
 or was built for this request, which the first search of a branch after the server
 starts does.
 
+`GET /$/ontology/{ds}/hierarchy` answers one level of a hierarchy for the ontology
+browser and for trees that open one level at a time. It reads the store's indexes and
+not the whole ontology, so its cost does not grow with the ontology's size. `kind` is
+`class` (the default), `objectProperty`, `dataProperty`, `annotationProperty` or
+`concept`. Classes follow `rdfs:subClassOf` between named classes, properties
+`rdfs:subPropertyOf`, and concepts `skos:broader` and `skos:narrower` in either
+direction. `owl:Thing` and the top properties do not count as parents. With `iri` the
+answer lists the direct children of that entity, and without it the roots. The roots of
+the class hierarchy are the root terms the ontology header names with `IAO_0000700` when
+it names some, and otherwise the classes that have no parent in the graphs read. With
+`scheme` the concepts are those of that scheme, and its roots are its top concepts with
+its concepts that have no broader concept. `deprecated=false` leaves out deprecated
+children, and `deprecatedRoots` counts the deprecated roots it left out.
+
+Children come `limit` at a time (100 by default, at most 1,000) from `offset`, with
+`total` and `next`. They are ordered with deprecated entities last, then by label and
+IRI, and a node with more than 20,000 children lists them in IRI order with `order` set
+to `iri`. Each node has the `iri`, `label` and `labelLang` in the caller's best language
+(`lang` or `Accept-Language`), the `shortForm` (`oboInOwl:id`, `skos:notation`, a
+prefixed name or the local name), the `kinds`, `deprecated`, and its numbers of direct
+`children` and `parents`. `ancestors=true` adds the ancestors of `iri` up to the roots as
+`nodes` and `[child, parent]` `edges`, at most 2,000 nodes, with `truncated`. A cycle is
+followed once. The route takes `graph`, `imports`, `branch` and `at`, answers with the
+commit as its entity tag, and refuses `inferences`.
+
+```json
+{ "dataset": "go", "commit": 1, "kind": "class",
+  "node": { "iri": "http://purl.obolibrary.org/obo/GO_0005739", "label": "mitochondrion",
+    "labelLang": null, "shortForm": "GO:0005739", "kinds": ["class"], "deprecated": false,
+    "children": 0, "parents": 2 },
+  "children": [], "total": 0, "offset": 0, "limit": 100, "next": null, "order": "label",
+  "ancestors": { "nodes": [{ "iri": "http://purl.obolibrary.org/obo/GO_0043231",
+      "label": "intracellular membrane-bounded organelle", "labelLang": null,
+      "shortForm": "GO:0043231", "kinds": ["class"], "deprecated": false,
+      "children": 36, "parents": 2 }],
+    "edges": [["http://purl.obolibrary.org/obo/GO_0005739",
+      "http://purl.obolibrary.org/obo/GO_0043231"]], "truncated": false } }
+```
+
+`GET /$/ontology/{ds}/term?iri=IRI` answers what the graphs read say about one entity
+for the ontology browser's pages, again from the store's indexes without reading the
+whole ontology. `statements` are the entity's triples whose object is an IRI or a
+literal, each with its `property`, `value`, `graph` and the `annotations` that a
+reification of the triple (`owl:Axiom` with `owl:annotatedSource`) gives it, such as the
+sources of a definition. `xlLabels` gives the `skosxl:literalForm` of each SKOS-XL label
+the entity has, with the label's property and graph. `statementsTruncated` says whether a
+property had more than 500 values or more than 500 SKOS-XL labels, so that `statements`
+and `xlLabels` hold the first 500, or whether the reading stopped at its limits of 20,000
+triples about the entity and 40,000 triples with the blank nodes they reach, which also
+cut the axioms and the downloads. `axioms`
+are the axioms that the entity's triples, the blank nodes they reach and those
+reifications map to by the reverse mapping in the request's `mode`, in the forms the
+axiom listing uses. The types of the IRIs they use are read too, so the mapping types
+them, but the axioms that those types alone give, such as another entity's class
+assertion, are left out. `mentions` lists the axioms of other entities that hold the entity
+inside a class expression, such as `SubClassOf(:envelope ObjectSomeValuesFrom(:partOf
+:mitochondrion))`, found by walking up from the blank nodes that point at it, at most
+`mentions` of them (200 by default, at most 2,000), with their `total` up to 5,000 and
+`truncated`. A mention keeps the annotations of its reified axiom. `incoming` lists the statements of named subjects that point at the entity
+by predicate, such as its subclasses and instances, each with its `count` up to 10,000,
+`more`, and the first distinct `incoming` subjects (20 by default, at most 200) in index
+order. `usage` does the same for the statements that use the entity as their predicate,
+with `count` the number of distinct named subjects among the first 10,000 statements. `names` gives the
+label, short form, kinds and deprecation of every IRI the answer uses, so a page can
+link them without more requests. The answer also has the entity's own name members, its
+`types`, and the `ontologies` that the graphs read declare.
+
+`format` downloads the entity's description as an attachment: `ttl`, `nt`, `rdfxml` and
+`jsonld` give the triples about the entity, the blank nodes they reach and the
+reifications of its annotated triples, and `ofn` gives its axioms in functional-style
+syntax. An IRI that the graphs read do not mention is `404`. The route takes `graph`,
+`imports`, `mode`, `branch`, `at` and `lang`, and refuses `inferences`. A JSON answer
+carries the commit as its entity tag and answers `If-None-Match` and `If-Match`, and a
+download carries the commit in its headers without an entity tag.
+
 `GET /$/ontology/{ds}/entity?iri=IRI` answers what the ontology says about one entity.
 `kinds` lists the kinds the IRI has, and `labels` and `annotations` its `rdfs:label`
 literals and annotation assertions. Each kind adds a member. `class` has
@@ -2169,12 +2244,12 @@ caller whose grants limit endpoints needs the `query` endpoint.
 
 The library's `sparkles::handles::ontology::wire::call` answers the same operations
 in the same JSON forms, and the bindings call it. Python's `Dataset.ontology` has
-`summary`, `axioms`, `entities`, `entity`, `check`, `edit`, `remove_entity`, `diff`,
-`classify`, `parse` and `dl_query`, with the members as keyword arguments and `as_` for
+`summary`, `axioms`, `entities`, `entity`, `search`, `hierarchy`, `term`, `check`,
+`edit`, `remove_entity`, `diff`, `classify`, `parse` and `dl_query`, with the members as keyword arguments and `as_` for
 `as`, and `Axiom` reads and writes one
 axiom with structural equality. Node.js's `dataset.ontology` has `summary`, `axiomPage`,
-`axioms` (an async iterable in batches), `entities`, `entity`, `check`, `edit`,
-`removeEntity`, `diff`, `classify`, `parse` and `dlQuery`. On the JVM,
+`axioms` (an async iterable in batches), `entities`, `entity`, `search`, `hierarchy`,
+`term`, `check`, `edit`, `removeEntity`, `diff`, `classify`, `parse` and `dlQuery`. On the JVM,
 `DatasetGraphSparkles.ontology()` has the same operations, with `classify` taking a
 `ClassifyQuery` and `dlQuery` a `DlQuery`,
 `SparklesOnt` has them over one graph, and `SparklesOnt.model` returns a `jena-ontapi`
