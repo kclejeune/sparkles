@@ -10,7 +10,9 @@
 //! top and bottom properties. A class whose instances reach an individual through a
 //! context that holds only where the class has an instance is classified again in a
 //! world of its own. An axiom outside OWL 2 EL is left out and reported, with
-//! the rule of the OWL 2 Profiles recommendation it breaks. An axiom with a literal or a
+//! the rule of the OWL 2 Profiles recommendation it breaks, and the run's [`Stats`] count
+//! these axioms by whether they are Horn and give the [`Tier`] of rules the ontology
+//! needs. An axiom with a literal or a
 //! datatype that the classifier cannot compare, or with a property chain through the top
 //! property, is used as far as the calculus goes and reported as partial. Every
 //! subsumption the classifier answers is entailed. It derives every entailed subsumption
@@ -44,12 +46,14 @@
 //! ```
 
 mod data;
+mod dl;
 mod index;
 mod query;
 mod saturate;
 mod taxonomy;
 mod world;
 
+pub use dl::{OutsideEl, Tier};
 pub use index::Gap;
 pub use query::Description;
 pub use taxonomy::{Node as TaxonomyNode, Taxonomy};
@@ -63,6 +67,10 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// The rule of the EL profile that a chain breaks when its superproperty has a range that
+/// its last property lacks.
+const CHAIN_RANGE_RULE: &str = "OWL 2 Profiles §2.2.6";
 
 /// What bounds a run: the worker threads, a deadline, a memory budget and a cancellation
 /// check.
@@ -136,6 +144,11 @@ pub struct Stats {
     pub index: Duration,
     pub saturation: Duration,
     pub taxonomy: Duration,
+    /// the axioms outside OWL 2 EL, by what classifying them needs, which the run leaves
+    /// out until roadmap item 603's rules take them
+    pub outside_el: OutsideEl,
+    /// the rules the run's axioms need
+    pub tier: Tier,
 }
 
 /// The result of a run that saturates without building a taxonomy
@@ -754,7 +767,7 @@ impl Saturation {
             excluded.push(Excluded {
                 axiom: k.clone(),
                 gap: Gap::Outside {
-                    rule: "OWL 2 Profiles §2.2.6".to_string(),
+                    rule: CHAIN_RANGE_RULE.to_string(),
                     message,
                 },
             });
@@ -813,25 +826,36 @@ impl Saturation {
             }
             _ => None,
         };
-        // the profile check of each axiom, which depends on it alone
-        let outside: Vec<(usize, (String, String))> = par_map(axioms, threads, |at, chunk| {
+        // the profile check of each axiom, which depends on it alone, and what each axiom
+        // outside OWL 2 EL needs (item 603)
+        let mut outside: Vec<(usize, (String, String))> = Vec::new();
+        for (part, counts) in par_map(axioms, threads, |at, chunk| {
             let mut out = Vec::new();
+            let mut counts = dl::OutsideEl::default();
             for (i, k) in chunk.iter().enumerate() {
                 if logical(k)
                     && let Some(b) = profiles::el_axiom(k).into_iter().next()
                 {
+                    counts.add(dl::shape(k));
                     out.push((at + i, (b.rule.to_string(), b.message)));
                 }
             }
-            out
-        })
-        .into_iter()
-        .flatten()
-        .collect();
+            (out, counts)
+        }) {
+            outside.extend(part);
+            stats.outside_el.merge(counts);
+        }
         poll(limits)?;
         let (ax, ix, normalized_peak) =
             self.build(axioms, &outside, threads, held_bytes, limits)?;
         drop(outside);
+        // a chain whose superproperty has a range its last property lacks is Horn
+        stats.outside_el.horn += self
+            .excluded
+            .iter()
+            .filter(|x| matches!(&x.gap, Gap::Outside { rule, .. } if rule == CHAIN_RANGE_RULE))
+            .count();
+        stats.tier = stats.outside_el.tier();
         poll(limits)?;
         let n = self.interner.len();
         self.ctx.resize_with(n, OnceLock::new);
