@@ -1560,86 +1560,103 @@ fn decode_in_pieces(
     let step = ctx.reservation_step();
     let refused = std::sync::atomic::AtomicBool::new(false);
     let owner = charge.as_ref();
-    let pieces = out
+    // Every piece runs to its end or its first error and returns its charge with it, so
+    // that no charge is released while values it admitted are still in `out`.
+    let mut pieces: Vec<_> = out
         .par_chunks_mut(DECODE_PIECE)
         .zip(payloads.par_chunks(DECODE_PIECE))
         .map(|(out, piece)| {
-            ctx.check()?;
-            // the payloads to decode and where their values go in `out`
-            let (rest, rest_at): (std::borrow::Cow<'_, [u64]>, Option<Vec<usize>>) = match numeric {
-                Some(num) => {
-                    let mut rest = Vec::new();
-                    let mut rest_at = Vec::new();
-                    for (i, (&p, n)) in piece.iter().zip(num.get_many(piece)).enumerate() {
-                        match n.value() {
-                            Some(v) => out[i] = Some(v),
-                            None => {
-                                rest.push(p);
-                                rest_at.push(i);
-                            }
-                        }
-                    }
-                    (rest.into(), Some(rest_at))
-                }
-                None => (piece.into(), None),
-            };
-            let scratch = ctx.charge(0)?;
-            let mut reserved = 0;
             let part = owner.map(|c| c.part(ctx));
             let mut covered = 0u64;
             let mut bytes = 0u64;
-            let mut at = 0usize;
-            ctx.snap.generation.vocab.get_sorted_checked(
-                &rest,
-                |need| {
-                    let need = need as u64 * 2;
-                    scratch.add(need.saturating_sub(reserved))?;
-                    reserved = need;
-                    ctx.check()
-                },
-                |_, key| {
-                    if at.is_multiple_of(1024) {
-                        ctx.check()?;
-                    }
-                    bytes = bytes.saturating_add(key.len() as u64 * 8 + 128);
-                    if let Some(part) = &part
-                        && bytes > covered
-                    {
-                        let ahead = bytes.saturating_add(step);
-                        match part.add(ahead - covered) {
-                            Ok(()) => covered = ahead,
-                            Err(_) => {
-                                part.add(bytes - covered).inspect_err(|_| {
-                                    refused.store(true, std::sync::atomic::Ordering::Relaxed)
-                                })?;
-                                covered = bytes;
+            let mut decode = || -> Result<()> {
+                ctx.check()?;
+                // the payloads to decode and where their values go in `out`
+                let (rest, rest_at): (std::borrow::Cow<'_, [u64]>, Option<Vec<usize>>) =
+                    match numeric {
+                        Some(num) => {
+                            let mut rest = Vec::new();
+                            let mut rest_at = Vec::new();
+                            for (i, (&p, n)) in piece.iter().zip(num.get_many(piece)).enumerate() {
+                                match n.value() {
+                                    Some(v) => out[i] = Some(v),
+                                    None => {
+                                        rest.push(p);
+                                        rest_at.push(i);
+                                    }
+                                }
+                            }
+                            (rest.into(), Some(rest_at))
+                        }
+                        None => (piece.into(), None),
+                    };
+                let scratch = ctx.charge(0)?;
+                let mut reserved = 0;
+                let mut at = 0usize;
+                ctx.snap.generation.vocab.get_sorted_checked(
+                    &rest,
+                    |need| {
+                        let need = need as u64 * 2;
+                        scratch.add(need.saturating_sub(reserved))?;
+                        reserved = need;
+                        ctx.check()
+                    },
+                    |_, key| {
+                        if at.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        bytes = bytes.saturating_add(key.len() as u64 * 8 + 128);
+                        if let Some(part) = &part
+                            && bytes > covered
+                        {
+                            let ahead = bytes.saturating_add(step);
+                            match part.add(ahead - covered) {
+                                Ok(()) => covered = ahead,
+                                Err(_) => {
+                                    part.add(bytes - covered).inspect_err(|_| {
+                                        refused.store(true, std::sync::atomic::Ordering::Relaxed)
+                                    })?;
+                                    covered = bytes;
+                                }
                             }
                         }
-                    }
-                    let i = rest_at.as_ref().map_or(at, |r| r[at]);
-                    out[i] = Some(super::value::Value::from_key(key));
-                    at += 1;
-                    Ok::<_, crate::error::Error>(())
-                },
-            )?;
-            ctx.check()?;
-            Ok((bytes, covered, part))
+                        let i = rest_at.as_ref().map_or(at, |r| r[at]);
+                        out[i] = Some(super::value::Value::from_key(key));
+                        at += 1;
+                        Ok::<_, crate::error::Error>(())
+                    },
+                )?;
+                ctx.check()
+            };
+            let result = decode();
+            (result, bytes, covered, part)
         })
-        .collect::<Result<Vec<_>>>();
-    let pieces = match pieces {
-        Err(crate::Error::BudgetExceeded(_))
-            if refused.load(std::sync::atomic::Ordering::Relaxed) =>
-        {
-            return Ok(None);
-        }
-        pieces => pieces?,
-    };
+        .collect();
+    if let Some(at) = pieces.iter().position(|(result, ..)| result.is_err()) {
+        let (result, _, _, part) = pieces.swap_remove(at);
+        // The values go before the charges that admitted them.
+        out.par_iter_mut()
+            .with_min_len(PAR_MIN_LEN)
+            .for_each(|value| *value = None);
+        drop((part, pieces));
+        return match result {
+            Err(crate::Error::BudgetExceeded(_))
+                if refused.load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                Ok(None)
+            }
+            result => result.map(|()| None),
+        };
+    }
     let (mut payload, mut slack) = (0u64, 0u64);
-    for (bytes, covered, part) in pieces {
+    for (_, bytes, covered, part) in pieces {
         payload = payload.saturating_add(bytes);
-        slack = slack.saturating_add(covered - bytes);
-        if let (Some(charge), Some(part)) = (charge.as_mut(), part) {
-            charge.absorb(part);
+        // only a charged piece covers its payload, a step ahead at most
+        if let Some(part) = part {
+            slack = slack.saturating_add(covered - bytes);
+            if let Some(charge) = charge.as_mut() {
+                charge.absorb(part);
+            }
         }
     }
     if let Some(charge) = charge.as_mut()
@@ -1918,6 +1935,39 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// A piece whose payload the budget refuses after pieces wrote values clears every
+    /// value before any piece's charge goes, declines the decoding and keeps no charge,
+    /// and a context without an owner decodes the same column uncharged.
+    #[test]
+    fn a_refused_piece_clears_the_values_before_their_charges() {
+        let (store, col) = vocabulary_column(4 * DECODE_PIECE);
+        let (ctx, _) = owned(&store, 1 << 30, &[]);
+        let mut payloads: Vec<u64> = col.iter().map(|id| id.payload()).collect();
+        payloads.sort_unstable();
+        payloads.dedup();
+        let numeric = ctx.snap.generation.vocab.numeric();
+        let mut out = vec![None; payloads.len()];
+        let mut charge = ctx.retained_charge(4096).unwrap();
+        let storage = ctx.charge(ctx.memory_room() - 300_000).unwrap();
+        let before = ctx.live_bytes();
+        assert!(matches!(
+            decode_in_pieces(&ctx, &payloads, &mut out, numeric, &mut charge),
+            Ok(None)
+        ));
+        assert!(out.iter().all(Option::is_none));
+        assert_eq!(ctx.live_bytes(), before);
+        assert_eq!(charge.as_ref().map(|c| c.bytes()), Some(4096));
+        drop((storage, charge));
+        let unowned = Ctx::new(store.snapshot());
+        let mut none = None;
+        let payload = decode_in_pieces(&unowned, &payloads, &mut out, numeric, &mut none)
+            .unwrap()
+            .expect("an uncharged decoding");
+        assert!(payload > 0);
+        assert!(out.iter().all(Option::is_some));
+        assert_eq!(unowned.live_bytes(), 0);
     }
 
     /// A refused payload charge of query-local terms in a large input declines the
