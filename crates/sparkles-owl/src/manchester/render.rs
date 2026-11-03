@@ -69,10 +69,12 @@ impl<'a> Renderer<'a> {
         let iri = e.iri().as_str();
         if let Some(v) = self.vocabulary
             && let Some(label) = v.label(iri)
+            // the label names this IRI alone among every kind, since a position such as
+            // a restriction's property reads more than one kind
             && let Found::Entities(es) =
-                v.lookup(&lex::Name::Quoted(label.to_string()), &[e.kind()])
-            && es.len() == 1
-            && es[0].iri().as_str() == iri
+                v.lookup(&lex::Name::Quoted(label.to_string()), &EntityKind::ALL)
+            && es.iter().all(|x| x.iri().as_str() == iri)
+            && es.iter().any(|x| x.kind() == e.kind())
         {
             return quote_name(label);
         }

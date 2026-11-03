@@ -457,12 +457,19 @@ impl<'v> Parser<'v> {
     }
 
     /// Whether a data range rather than a class expression starts at token `k`.
-    fn data_ahead(&self, k: usize) -> bool {
+    /// It skips the `not` and `(` that open either kind in a loop, so a long run of them
+    /// costs no stack.
+    fn data_ahead(&self, mut k: usize) -> bool {
+        loop {
+            match self.tok(k) {
+                Some(Tok::Name(Name::Word(w))) if w == "not" => k += 1,
+                Some(Tok::LParen) => k += 1,
+                _ => break,
+            }
+        }
         match self.tok(k) {
             Some(Tok::Str { .. } | Tok::Number(_)) => true,
             Some(Tok::Name(Name::Word(w))) if w == "true" || w == "false" => true,
-            Some(Tok::Name(Name::Word(w))) if w == "not" => self.data_ahead(k + 1),
-            Some(Tok::LParen) => self.data_ahead(k + 1),
             Some(Tok::LBrace) => self.literal_ahead(k + 1),
             Some(Tok::Name(n)) => {
                 self.tok(k + 1) == Some(&Tok::LBracket)

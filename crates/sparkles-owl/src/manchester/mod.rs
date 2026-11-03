@@ -36,7 +36,7 @@
 //!     ClassExpression::some(ObjectProperty::new("http://ex.org/partOf"), Class::new("http://ex.org/Cell")),
 //! );
 //! let e = manchester::class_expression("'part of' some Cel", &v).unwrap_err();
-//! assert_eq!((e.span.start, e.span.end), (18, 21));
+//! assert_eq!((e.span.start, e.span.end), (15, 18));
 //! ```
 
 mod lex;

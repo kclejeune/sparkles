@@ -344,6 +344,22 @@ fn deep_nesting_is_refused() {
     assert!(err(&text).message.contains("nests"));
 }
 
+#[test]
+fn a_long_lookahead_costs_no_stack() {
+    // the filler of a property of unknown kind is looked at before it is read, and a
+    // recursive look at 100,000 `not`s overflowed the stack
+    for p in ["nobody", "teaches"] {
+        let text = format!("{p} some {}Person", "not ".repeat(100_000));
+        let e = err(&text);
+        assert!(
+            e.message.contains("nests") || e.kind == ErrorKind::Unknown,
+            "{p}: {e}"
+        );
+    }
+    let text = format!("nobody some {}Person", "(".repeat(100_000));
+    err(&text);
+}
+
 fn ax(text: &str) -> Axiom {
     axiom(text, &uni()).unwrap_or_else(|e| panic!("{text}: {e}"))
 }
@@ -472,6 +488,21 @@ fn axioms() {
     assert!(e.message.contains("chain"), "{}", e.message);
     let e = axiom("Professor Domain Person", &uni()).unwrap_err();
     assert_eq!(e.kind, ErrorKind::Kind);
+}
+
+#[test]
+fn a_label_two_kinds_share_is_not_written() {
+    // a restriction's property reads both property kinds, so a label an object and a
+    // data property share would not read back
+    let mut v = uni();
+    v.add_entity(Entity::ObjectProperty(op("shares")));
+    v.add_label(&format!("{EX}shares"), "shared");
+    v.add_entity(Entity::DataProperty(dp("sharedValue")));
+    v.add_label(&format!("{EX}sharedValue"), "shared");
+    let e = ClassExpression::some(op("shares"), c("Person"));
+    let text = Renderer::of_vocabulary(&v).class_expression(&e);
+    assert!(text.starts_with("ex:shares"), "{text}");
+    assert_eq!(class_expression(&text, &v).unwrap(), e);
 }
 
 #[test]
