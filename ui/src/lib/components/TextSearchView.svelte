@@ -289,7 +289,7 @@
     flex-wrap: wrap;
     align-items: center;
     gap: 8px;
-    padding: 10px 14px 4px;
+    padding: 10px var(--gutter) 4px;
   }
   .box {
     flex: 1;
@@ -343,7 +343,7 @@
   }
   .syntax {
     margin: 0;
-    padding: 2px 14px 10px;
+    padding: 2px var(--gutter) 10px;
     font-size: var(--fs-xs);
     border-bottom: 1px solid var(--border);
   }
@@ -352,26 +352,27 @@
     min-height: 0;
   }
   .pad {
-    padding: 12px 14px;
+    padding: 12px var(--gutter);
   }
   .notice {
     display: flex;
     align-items: center;
     gap: 6px;
-    padding: 6px 14px;
+    padding: 6px var(--gutter);
     font-size: var(--fs-sm);
     color: var(--warn);
     background: color-mix(in srgb, var(--warn) 8%, var(--surface));
     border-bottom: 1px solid var(--border);
   }
   .meta {
-    padding: 8px 14px 4px;
+    padding: 8px var(--gutter) 4px;
     font-size: var(--fs-sm);
   }
   .hits {
     list-style: none;
     margin: 0;
-    padding: 0 6px 16px;
+    /* the hits' text starts at the gutter, inside each row's own 8 px */
+    padding: 0 calc(var(--gutter) - 8px) 16px;
   }
   .hits li {
     display: grid;

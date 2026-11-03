@@ -1172,7 +1172,7 @@
     max-width: 24ch;
   }
   .ov-notes {
-    padding: 4px 12px;
+    padding: 4px var(--gutter);
     border-bottom: 1px solid var(--border);
   }
   .ov-notes p {
@@ -1245,7 +1245,7 @@
     flex: none;
   }
   .ov-foot {
-    padding: 4px 12px;
+    padding: 4px var(--gutter);
     border-top: 1px solid var(--border);
   }
   .link {

@@ -85,6 +85,19 @@ for (const [w, h] of WIDTHS) {
             '.toolbar > :first-child, .bar .tabs > :first-child, .qtabs > :first-child',
           );
         const edge = first ? first.getBoundingClientRect().left - left : null;
+        // controls and text that start inside the gutter: neither full-bleed nor on it
+        const inset = [
+          ...main.querySelectorAll<HTMLElement>(
+            'input, select, textarea, button, h1, h2, h3, p, table, .panel, .toolbar > *',
+          ),
+        ]
+          .filter((e) => e.offsetParent && e.getBoundingClientRect().width)
+          .map((e) => [e, e.getBoundingClientRect().left - left] as const)
+          .filter(([, x]) => x > 0.5 && x < gutter - 0.5)
+          .map(
+            ([e, x]) => `${e.tagName.toLowerCase()}.${e.className.split(' ')[0]}@${Math.round(x)}`,
+          )
+          .slice(0, 5);
         // the rows of each toolbar's children
         const toolbars = [...main.querySelectorAll<HTMLElement>('.toolbar')]
           .filter((t) => t.offsetParent)
@@ -112,6 +125,7 @@ for (const [w, h] of WIDTHS) {
         return {
           gutter,
           edge,
+          inset,
           toolbars,
           uneven,
           overflow: Math.max(
@@ -123,6 +137,7 @@ for (const [w, h] of WIDTHS) {
       expect(m.overflow, `${path}: sideways scroll`).toBeLessThanOrEqual(0);
       if (m.edge != null)
         expect(Math.abs(m.edge - m.gutter), `${path}: content edge`).toBeLessThanOrEqual(1);
+      expect.soft(m.inset, `${path}: inside the gutter`).toEqual([]);
       for (const rows of m.toolbars)
         expect(rows, `${path}: toolbar rows`).toBeLessThanOrEqual(phone ? 3 : 1);
       expect(m.uneven, `${path}: panel heights`).toEqual([]);
