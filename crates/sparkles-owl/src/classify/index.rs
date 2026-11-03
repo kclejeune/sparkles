@@ -48,6 +48,13 @@ pub enum Node {
     /// its index in [`Interner::ands`]. Its binary form depends on the order of the
     /// operands' ids, so it waits for the ids of the merged interner.
     And(u32),
+    /// `ObjectAllValuesFrom(r F)` in a positive position, which only the Horn rules
+    /// (roadmap item 603) read
+    Forall(Role, Ex),
+    /// `ObjectMaxCardinality(1 r F)` in a positive position, with F's negative form
+    AtMost1(Role, Ex),
+    /// a class that the Horn normalization introduces, which no axiom names
+    Fresh(u32),
 }
 
 /// Entities named by an IRI, which a [`Names`] table keys by the IRI.
@@ -215,6 +222,8 @@ pub enum RoleName {
     Data(DataProperty),
     /// a role the binarization of a property chain introduces
     Fresh(u32),
+    /// the inverse of an object property, which only a run with the Horn rules has
+    Inverse(ObjectProperty),
 }
 
 /// The interned expressions and the names they use. Ids are never reused, so an
@@ -241,6 +250,8 @@ pub struct Interner {
     pub roles: Vec<RoleName>,
     role_ids: FxHashMap<RoleName, Role>,
     fresh: u32,
+    /// the fresh classes of the Horn normalization
+    fresh_classes: u32,
     /// whether this is the interner of a chunk of a parallel normalization, which keeps
     /// intersections whole as [`Node::And`]
     chunk: bool,
@@ -381,6 +392,9 @@ impl Interner {
                     Node::Exist(r, f) => self.node(Node::Exist(roles[r as usize], map[f as usize])),
                     Node::SelfLoop(r) => self.node(Node::SelfLoop(roles[r as usize])),
                     Node::DataSome(..) => unreachable!("a chunk with data merges on one thread"),
+                    Node::Forall(..) | Node::AtMost1(..) | Node::Fresh(_) => {
+                        unreachable!("the Horn normalization runs on the merged interner")
+                    }
                     Node::And(j) => {
                         let (xs, binary) = &chunk.ands[j as usize];
                         ops.clear();
@@ -559,6 +573,12 @@ impl Interner {
         self.role(RoleName::Fresh(self.fresh))
     }
 
+    /// A class that no axiom names, for the Horn normalization.
+    pub fn fresh_class(&mut self) -> Ex {
+        self.fresh_classes += 1;
+        self.node(Node::Fresh(self.fresh_classes))
+    }
+
     /// The binary intersection of two expressions, with its operands ordered.
     pub fn conj(&mut self, a: Ex, b: Ex) -> Ex {
         if a == b {
@@ -597,7 +617,16 @@ pub struct Roles {
     pub empty: Vec<bool>,
     /// whether any role is empty
     pub any_empty: bool,
+    /// for each role, its inverse, [`NO_ROLE`] when the run has none
+    pub inv: Vec<Role>,
+    /// pairs of roles that cannot both link one element to another: a role under the
+    /// first and a role under the second between the same pair is a clash, which
+    /// disjoint and asymmetric roles give
+    pub clash: Vec<(Role, Role)>,
 }
+
+/// No role, in [`Roles::inv`].
+pub const NO_ROLE: Role = Role::MAX;
 
 impl Roles {
     /// The bytes the tables take, roughly.
@@ -658,6 +687,20 @@ impl Roles {
     pub fn keeps_forward(&self, r: Role) -> bool {
         self.right.get(r as usize).copied().unwrap_or(false)
     }
+
+    /// The inverse of a role, when the run has one.
+    #[inline]
+    pub fn inv(&self, r: Role) -> Option<Role> {
+        self.inv.get(r as usize).copied().filter(|&i| i != NO_ROLE)
+    }
+
+    /// Whether two roles between the same pair of elements, both read from the first
+    /// element to the second, contradict a disjointness or an asymmetry.
+    pub fn clashes(&self, r1: Role, r2: Role) -> bool {
+        self.clash
+            .iter()
+            .any(|&(s, t)| self.sub(r1, s) && self.sub(r2, t))
+    }
 }
 
 /// Why an axiom takes part only in part, or not at all.
@@ -703,6 +746,8 @@ pub struct Axioms {
     pub individuals: Vec<Ex>,
     /// the classes of the signature
     pub classes: Vec<Ex>,
+    /// what the Horn normalization adds, when the run takes axioms outside OWL 2 EL
+    pub horn: Option<Box<super::horn::HornAx>>,
 }
 
 impl Axioms {
@@ -796,6 +841,7 @@ impl Axioms {
                 .sum::<usize>()
             + self.individuals.capacity() * 4
             + self.classes.capacity() * 4
+            + self.horn.as_ref().map_or(0, |h| h.bytes())
     }
 }
 
@@ -1302,6 +1348,8 @@ pub struct Index {
     pub nominal_selfs: bool,
     /// the top object and data roles, when the axioms use them
     pub tops: [Option<Role>; 2],
+    /// what the Horn rules read, when the run takes axioms outside OWL 2 EL
+    pub horn: Option<Box<super::horn::HornIx>>,
 }
 
 impl Index {
@@ -1419,6 +1467,7 @@ impl Index {
             + self.universal.capacity() * 8
             + self.nominals.capacity() * 4
             + self.roles.bytes()
+            + self.horn.as_ref().map_or(0, |h| h.bytes())
     }
 
     /// Builds the index of normalized axioms. It may intern new expressions: the
@@ -1452,6 +1501,11 @@ impl Index {
         }
         for k in &ax.keys {
             b.negative(k.class, it);
+        }
+        if let Some(h) = &ax.horn {
+            for &e in &h.premises {
+                b.negative(e, it);
+            }
         }
         for &(r, w, x) in &b.neg_data {
             ix.neg_data.entry(r).or_default().push((w, x));
@@ -1547,6 +1601,20 @@ impl Index {
                 told.push((TOP, BOTTOM));
             }
         }
+        if let Some(h) = &ax.horn {
+            // the run takes the Horn rules only when one can fire: without universals,
+            // at-most restrictions, loops or role clashes the EL rules derive all
+            let hi = horn_index(ax, h, it, &mut ix, &mut b, &mut told);
+            let fires = !ix.roles.clash.is_empty()
+                || !ix.roles.reflexive.is_empty()
+                || it
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n, Node::Forall(..) | Node::AtMost1(..) | Node::SelfLoop(_)));
+            if fires {
+                ix.horn = Some(Box::new(hi));
+            }
+        }
         ix.heads = it
             .nodes
             .iter()
@@ -1576,6 +1644,155 @@ impl Index {
         ix.nominals = it.nominals().collect();
         ix.vals = it.vals.clone();
         Ok(ix)
+    }
+}
+
+/// The index of the Horn rules, built after the occurrences of the normalized axioms:
+/// the universals that the negative existential restrictions stand for where links run
+/// against them, the negative existentials that the ranges stand for, the automata of the
+/// universals on roles that chains reach, and the fillers of the at-most restrictions.
+fn horn_index(
+    ax: &Axioms,
+    h: &super::horn::HornAx,
+    it: &mut Interner,
+    ix: &mut Index,
+    b: &mut Builder,
+    told: &mut Vec<(Ex, Ex)>,
+) -> super::horn::HornIx {
+    let roles = &ix.roles;
+    // the roles of the links the saturation creates: those of the positive existential
+    // restrictions, and the inverses of those that an at-most restriction on an inverse
+    // role can identify a predecessor through
+    let mut links: Vec<Role> = b
+        .succ
+        .iter()
+        .filter_map(|&(e, _)| match it.nodes[e as usize] {
+            Node::Exist(r, _) => Some(r),
+            _ => None,
+        })
+        .collect();
+    links.sort_unstable();
+    links.dedup();
+    let most: Vec<Role> = it
+        .nodes
+        .iter()
+        .filter_map(|n| match *n {
+            Node::AtMost1(s, _) => Some(s),
+            _ => None,
+        })
+        .collect();
+    let back: Vec<Role> = links
+        .iter()
+        .filter(|&&l| most.iter().any(|&s| roles.sub(l, s)))
+        .filter_map(|&l| roles.inv(l))
+        .collect();
+    links.extend(back);
+    links.sort_unstable();
+    links.dedup();
+    let linked = |s: Role| links.iter().any(|&l| roles.sub(l, s));
+    // a range of s holds of the predecessors of the links that run against s
+    let mut news: Vec<(Ex, Ex)> = Vec::new();
+    for &(s, c) in &ax.ranges {
+        if let Some(i) = roles.inv(s)
+            && linked(i)
+        {
+            let e = it.node(Node::Exist(i, TOP));
+            news.push((e, c));
+        }
+    }
+    for &(e, c) in &news {
+        b.negative(e, it);
+        told.push((e, c));
+    }
+    // ∃r.F ⊑ G is F ⊑ ∀r⁻.G, which the backward links propagate as for EL, and which the
+    // successors of F's contexts by roles under r⁻ need too. A filler ⊤ is a domain, which
+    // the role's inverse takes as a range.
+    // a universal on a role with an automaton is unfolded on its holder: on F itself for
+    // those of the negative existentials, and on the universal for the others
+    let mut unfold: Vec<(Ex, Role, Ex)> = Vec::new();
+    let mut alls: Vec<(Ex, Ex)> = Vec::new();
+    for &(f, (r, e)) in &b.exist {
+        if f == TOP {
+            continue;
+        }
+        let Some(i) = roles.inv(r) else { continue };
+        match h.autos.get(&i) {
+            Some(a) if a.trans.iter().any(|t| t.1.is_some_and(linked)) => unfold.push((f, i, e)),
+            Some(_) => {}
+            None if linked(i) => {
+                let fa = it.node(Node::Forall(i, e));
+                alls.push((f, fa));
+            }
+            None => {}
+        }
+    }
+    for (f, fa) in alls {
+        told.push((f, fa));
+        b.positive(fa, it, ix);
+    }
+    for &(_, _, e) in &unfold {
+        b.positive(e, it, ix);
+    }
+    // the universals on roles that chains reach, unfolded by the automata, each state a
+    // fresh class; the universals the automata make are not unfolded again
+    let mut flags = vec![0u8; it.nodes.len()];
+    for (e, n) in it.nodes.iter().enumerate() {
+        if let Node::Forall(r, f) = *n
+            && h.autos.contains_key(&r)
+        {
+            flags[e] |= super::horn::HornIx::UNFOLDED;
+            unfold.push((e as Ex, r, f));
+        }
+    }
+    // each state of an automaton without ε-transitions is a class: the holder for the
+    // start when no transition enters it, the filler for a final state that none leaves,
+    // and a fresh class otherwise
+    let mut autos: FxHashMap<Role, super::horn::EpsFree> = FxHashMap::default();
+    // the universals the transitions make, which the rules apply even when one is a
+    // universal that is unfolded too
+    let mut made: Vec<Ex> = Vec::new();
+    for (holder, r, f) in unfold {
+        let a = autos.entry(r).or_insert_with(|| h.autos[&r].eps_free());
+        let states: Vec<Ex> = (0..a.states)
+            .map(|s| {
+                if s == a.start && !a.entered[s as usize] {
+                    holder
+                } else if a.finals[s as usize] && !a.left[s as usize] {
+                    f
+                } else {
+                    it.fresh_class()
+                }
+            })
+            .collect();
+        let start = states[a.start as usize];
+        if start != holder {
+            told.push((holder, start));
+        }
+        for (s, &x) in states.iter().enumerate() {
+            if a.finals[s] && x != f {
+                told.push((x, f));
+            }
+        }
+        for &(p, l, q) in &a.trans {
+            let x = it.node(Node::Forall(l, states[q as usize]));
+            made.push(x);
+            if states[p as usize] != x {
+                told.push((states[p as usize], x));
+            }
+        }
+    }
+    flags.resize(it.nodes.len(), 0);
+    for x in made {
+        flags[x as usize] &= !super::horn::HornIx::UNFOLDED;
+    }
+    for n in &it.nodes {
+        if let Node::AtMost1(_, f) = *n {
+            flags[f as usize] |= super::horn::HornIx::FILLER;
+        }
+    }
+    super::horn::HornIx {
+        flags,
+        base: it.nodes.len() as Ex,
     }
 }
 
@@ -1667,6 +1884,7 @@ impl Builder {
                     self.told.push((e, BOTTOM));
                 }
             }
+            Node::Forall(_, f) => self.positive(f, it, ix),
             Node::DataSome(r, w) => {
                 // the one data value of the restriction is in its range and the role's
                 let mut v = it.vals[w as usize].clone();
@@ -1703,7 +1921,7 @@ pub enum Halt {
 
 /// The steps of the property closure between two polls of the run's deadline and
 /// cancellation, where a step visits one edge or one entry.
-const POLL_WORK: usize = 65_536;
+pub(super) const POLL_WORK: usize = 65_536;
 
 fn roles(
     ax: &Axioms,
@@ -1888,7 +2106,22 @@ fn roles(
             }
         }
     }
-    Ok(Roles {
+    // with the Horn rules: the inverses, and the roles that clash with themselves, which
+    // relate nothing
+    let (inv, mut clash) = match &ax.horn {
+        Some(h) => (super::horn::inverses(it), h.clash.clone()),
+        None => (Vec::new(), Vec::new()),
+    };
+    // two roles that clash clash on their inverses too
+    let mirrored: Vec<(Role, Role)> = clash
+        .iter()
+        .filter_map(|&(s, t)| Some((*inv.get(s as usize)?, *inv.get(t as usize)?)))
+        .filter(|&(s, t)| s != NO_ROLE && t != NO_ROLE)
+        .collect();
+    clash.extend(mirrored);
+    clash.sort_unstable();
+    clash.dedup();
+    let mut roles = Roles {
         sup,
         comp,
         right,
@@ -1897,7 +2130,18 @@ fn roles(
         range,
         data_range,
         functional,
-        any_empty: empty.contains(&true),
+        any_empty: false,
         empty,
-    })
+        inv,
+        clash,
+    };
+    if !roles.clash.is_empty() {
+        for r in 0..n as Role {
+            if roles.clashes(r, r) {
+                roles.empty[r as usize] = true;
+            }
+        }
+    }
+    roles.any_empty = roles.empty.contains(&true);
+    Ok(roles)
 }

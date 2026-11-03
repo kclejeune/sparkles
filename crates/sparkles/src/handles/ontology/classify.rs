@@ -80,6 +80,11 @@ pub struct ClassifyRequest {
     /// a class the caller asks about: a taxonomy without it is not found, and then
     /// nothing is written
     pub about: Option<String>,
+    /// classify by the OWL 2 EL rules alone, as ELK does, with every axiom outside
+    /// OWL 2 EL left out; the default also takes the Horn axioms outside OWL 2 EL
+    /// ([`sparkles_owl::classify::Limits::el_only`]). Such a run does not use the
+    /// dataset's kept classification.
+    pub el_only: bool,
 }
 
 /// The opening of the comment the classifier writes on a taxonomy graph's header, by
@@ -227,7 +232,7 @@ impl Ontologies {
         }
         let (snap, opts) = self.state(req, opts)?;
         let o = self.open_at(&snap, req, &opts)?;
-        let keep = opts.graphs.is_none() && snap.cacheable && !c.assertions;
+        let keep = opts.graphs.is_none() && snap.cacheable && !c.assertions && !c.el_only;
         let (classification, excluded, reused) = if keep {
             self.classify_kept(&o, req, c, &opts)?
         } else {
@@ -287,7 +292,7 @@ impl Ontologies {
             // state as it was
             let par = admit(c.threads, opts)?;
             let out = e.run_over(o, Vec::new(), |s, axioms, changes| {
-                run(s, axioms, changes, par, opts)
+                run(s, axioms, changes, par, opts, false)
             })?;
             let cl = Arc::new(out);
             let ex = Arc::new(e.saturation.excluded().to_vec());
@@ -561,20 +566,27 @@ pub(crate) fn classify_once(
 ) -> Result<(Classification, Vec<Excluded>)> {
     let mut s = Saturation::new();
     let par = admit(c.threads, opts)?;
-    let out = run(&mut s, axioms, None, par, opts)?;
+    let out = run(&mut s, axioms, None, par, opts, c.el_only)?;
     Ok((out, s.excluded().to_vec()))
 }
 
 /// Runs a classification on the threads of `par` under the options' deadline,
-/// cancellation and memory budget.
+/// cancellation and memory budget, by the OWL 2 EL rules alone when `el_only`.
 fn run(
     k: &mut Saturation,
     axioms: &[&AxiomKind],
     changes: Option<Changes<'_>>,
     par: Par,
     opts: &QueryOptions,
+    el_only: bool,
 ) -> Result<Classification> {
-    bounded(par, opts, |limits| k.classify(axioms, changes, limits))
+    bounded(par, opts, |limits| {
+        let limits = Limits {
+            el_only,
+            ..limits.clone()
+        };
+        k.classify(axioms, changes, &limits)
+    })
 }
 
 /// Saturates without a taxonomy, under the bounds [`run`] sets.
@@ -599,6 +611,7 @@ fn bounded<T>(
     let cancellation = opts.cancellation.clone();
     let grant = opts.grant.clone();
     let limits = Limits {
+        el_only: false,
         threads: par.threads(),
         deadline: opts.deadline,
         max_memory: opts.max_memory_bytes.map(|m| m as usize),

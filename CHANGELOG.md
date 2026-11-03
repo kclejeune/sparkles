@@ -184,6 +184,25 @@ lite and the ORE 2015 EL sample are unchanged. An incremental run after a change
 axiom with an individual or a key now saturates everything again, as one after a change
 to a data axiom already did.
 
+The classifier takes Horn axioms outside OWL 2 EL in ontologies without individuals
+(roadmap item 603), with Kazakov's consequence-based rules for Horn-SHIQ. It covers
+inverse properties, universal restrictions, at-most-one and at-least restrictions,
+functional and inverse-functional properties, self restrictions, disjoint, asymmetric
+and irreflexive properties and transitive properties and chains through automata, and
+creates contexts for the conjunctions that universal and at-most restrictions need.
+`Stats` reports the tier of rules a run needed, the axioms outside OWL 2 EL it took and
+the conjunctions it created. GO's taxonomy now has the 14 subsumptions that its inverse
+properties entail, as Konclude's does, and GO classifies 17 to 18% slower on the
+benchmark host. `sparkles ontology reason` and `reduce` with `--reasoner ELK`, and the
+library's `ClassifyRequest::el_only` and `Limits::el_only`, classify by the OWL 2 EL
+rules alone, as ELK does, so the ROBOT-compatible outputs equal ROBOT's with ELK. Without
+`--reasoner` they take the Horn axioms too. The functional-syntax reader can pass over SWRL rules and count them
+with `ofn_read::Options::skip_rules`, and refuses them otherwise as before. A run with
+the Horn rules has a memory budget of 64 times its index and axioms, at least 1 GiB, and
+one that passes it classifies again by the EL rules alone and sets
+`Stats::horn_over_budget`. Two Uberon-based ORE 2015 ontologies that ran out of memory
+now classify in 4.2 s with the EL answer.
+
 The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
 `dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and
 axioms, check profiles, edit axioms, remove entities and diff commits in the JSON forms

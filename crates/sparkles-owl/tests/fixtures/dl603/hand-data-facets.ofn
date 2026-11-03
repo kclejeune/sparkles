@@ -1,0 +1,13 @@
+Prefix(:=<http://example.org/d#>)
+Prefix(xsd:=<http://www.w3.org/2001/XMLSchema#>)
+Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
+Prefix(rdf:=<http://www.w3.org/1999/02/22-rdf-syntax-ns#>)
+Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)
+Ontology(<http://example.org/d#hand-data-facets>
+Declaration(Class(:A))
+Declaration(Class(:D))
+Declaration(DataProperty(:d))
+SubClassOf(:A DataSomeValuesFrom(:d DatatypeRestriction(xsd:integer xsd:minInclusive "1"^^xsd:integer xsd:maxInclusive "2"^^xsd:integer)))
+SubClassOf(:A DataAllValuesFrom(:d DataComplementOf(DataOneOf("1"^^xsd:integer))))
+EquivalentClasses(:D DataHasValue(:d "2"^^xsd:integer))
+)

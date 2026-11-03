@@ -50,10 +50,12 @@ pub struct Io {
 /// `reason`, with ROBOT's options. Each takes a value, as ROBOT's do.
 #[derive(Args, Debug, Clone)]
 pub struct ReasonArgs {
-    /// The reasoner: ELK, which the classifier stands for; hermit, jfact, whelk, emr
-    /// and structural are accepted with a warning and the classifier runs
-    #[arg(short = 'r', long, default_value = "ELK")]
-    pub reasoner: String,
+    /// The reasoner. ELK, and emr, which asserts named superclasses only, run the OWL 2
+    /// EL rules alone and give ROBOT's output with ELK. Without it the classifier also
+    /// takes the Horn axioms outside OWL 2 EL, and hermit, jfact, whelk and structural
+    /// run it so with a warning
+    #[arg(short = 'r', long)]
+    pub reasoner: Option<String>,
     /// The inferred axiom generators, space separated: SubClass, EquivalentClass,
     /// ClassAssertion, and ROBOT's others, which ELK answers none of
     #[arg(short = 'A', long, default_value = "subclass")]
@@ -105,8 +107,8 @@ pub struct ReasonArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ReduceArgs {
     /// The reasoner, as for reason (emr is not one)
-    #[arg(short = 'r', long, default_value = "ELK")]
-    pub reasoner: String,
+    #[arg(short = 'r', long)]
+    pub reasoner: Option<String>,
     /// true: keep annotated subclass axioms
     #[arg(short = 'p', long, default_value = "false")]
     pub preserve_annotated_axioms: String,
@@ -315,14 +317,20 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
     match step {
         Step::Reason(a) => {
             let o = reason_options(&a)?;
-            reasoner(&a.reasoner, true)?;
+            let c = ClassifyRequest {
+                el_only: reasoner(a.reasoner.as_deref(), true)?,
+                ..c.clone()
+            };
             match w.reason(&o, &c, &q) {
                 Ok(r) => log(&r),
                 Err(e) => return Err(failed(e, a.dump_unsatisfiable.as_deref(), &w)),
             }
         }
         Step::Reduce(a) => {
-            reasoner(&a.reasoner, false)?;
+            let c = ClassifyRequest {
+                el_only: reasoner(a.reasoner.as_deref(), false)?,
+                ..c.clone()
+            };
             let o = ReduceOptions {
                 preserve_annotated_axioms: is_true(&a.preserve_annotated_axioms),
                 named_classes_only: is_true(&a.named_classes_only),
@@ -342,7 +350,11 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
             log(&w.relax(&o));
         }
         Step::Materialize(a) => {
-            reasoner(&a.reasoner, false)?;
+            // ELK by default, as ROBOT's materialize, so the EL rules alone
+            let c = ClassifyRequest {
+                el_only: reasoner(Some(&a.reasoner), false)?,
+                ..c.clone()
+            };
             let o = materialize_options(&a)?;
             match w.materialize(&o, &c, &q) {
                 Ok(r) => log(&r),
@@ -438,23 +450,28 @@ fn boolean(s: &str, name: &str) -> Result<bool> {
     }
 }
 
-/// ROBOT's reasoner names: ELK runs the classifier, the others are accepted with a
-/// warning that the classifier runs in their place, and an unknown name is refused.
-fn reasoner(name: &str, emr: bool) -> Result<()> {
+/// ROBOT's reasoner names, and whether the run takes the OWL 2 EL rules alone. ELK and
+/// emr, which ROBOT builds on ELK, do, so that the output is ROBOT's with ELK. Without a
+/// name the classifier also takes the Horn axioms outside OWL 2 EL, and the DL
+/// reasoners' names run it so with a warning. An unknown name is refused.
+fn reasoner(name: Option<&str>, emr: bool) -> Result<bool> {
+    let Some(name) = name else {
+        return Ok(false);
+    };
     let n = name.trim().to_lowercase();
     match n.as_str() {
-        "elk" => Ok(()),
+        "elk" => Ok(true),
         "hermit" | "jfact" | "whelk" | "structural" => {
             eprintln!(
-                "WARN --reasoner {name} is ignored: the OWL 2 EL classifier runs, as ELK would"
+                "WARN --reasoner {name} is ignored: the classifier runs with its Horn rules in its place"
             );
-            Ok(())
+            Ok(false)
         }
         "emr" if emr => {
             eprintln!(
                 "WARN --reasoner {name} is ignored: the OWL 2 EL classifier runs, as ELK would, and asserts named superclasses only"
             );
-            Ok(())
+            Ok(true)
         }
         _ => bail!("INVALID REASONER ERROR unknown reasoner: {n}"),
     }

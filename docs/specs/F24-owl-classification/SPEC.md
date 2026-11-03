@@ -77,10 +77,11 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 The OWL 2 EL classifier is delivered as roadmap item 580 and covers OWL 2 EL, apart
-from the literals and the chains that item 663 follows, since item 587. The export of
-inferred axioms and the removal of redundant ones are delivered as the ROBOT-compatible
-commands of items 634, 635 and 637, and the existential superclasses as `materialize`,
-item 636. The other phases remain under
+from the literals and the chains that item 663 follows, since item 587. Item 603 extends
+it to Horn ontologies without individuals, as [the Horn rules](#the-horn-rules)
+describe. The export of inferred axioms and the removal of redundant ones are delivered
+as the ROBOT-compatible commands of items 634, 635 and 637, and the existential
+superclasses as `materialize`, item 636. The other phases remain under
 [item 457](../../ROADMAP.md).
 
 ### The OWL 2 EL classifier
@@ -155,8 +156,8 @@ datatype map or a number past 128 bits, is an atom that only equals itself, and 
 axiom is reported as used in part. So is a property chain through the top object
 property, whose links the classifier does not compose. An axiom with an expression
 nested more than 256 deep takes no part, since no stand-in for a left-out expression is
-sound on both sides of a subsumption. Axioms outside OWL 2 EL are left out and reported
-with the rule the EL check names. Annotations and annotation axioms carry no logical
+sound on both sides of a subsumption. Axioms outside OWL 2 EL that the Horn rules do not
+take are left out and reported with the rule the EL check names. Annotations and annotation axioms carry no logical
 content. A classification can include the store's assertions, which makes it a
 consistency check of the individuals.
 
@@ -324,8 +325,10 @@ two subsumptions and an inconsistency. Since item 587 the classifier derives the
 HermiT, Konclude and Whelk do. Konclude 0.7.0-1138 gives the same taxonomy on all 298
 ORE ontologies and ChEBI lite, and on GO it entails 14 more subsumptions between named
 classes, with 7 more direct edges, all through
-`InverseObjectProperties(part_of has_part)`, the GO axiom outside OWL 2 EL that the
-classifier leaves out and reports. Whelk 1.2.1 agrees on GO, ChEBI lite and 296 ORE
+`InverseObjectProperties(part_of has_part)`, the GO axiom outside OWL 2 EL. Since item
+603 the classifier takes that axiom with the Horn rules and entails the same 14
+subsumptions, so its taxonomy of GO equals Konclude's and has 7 direct edges that ELK's
+and GO's release do not. Whelk 1.2.1 agrees on GO, ChEBI lite and 296 ORE
 ontologies and is incomplete on one. ROBOT 1.9.11's `reason`, `reduce`, `relax` and
 `materialize` with ELK assert the classifier's direct hierarchy on GO and ChEBI lite, and
 `sparkles ontology reason`, `reduce` and `relax` write the same outputs, as the
@@ -404,6 +407,98 @@ Cheaper contexts remain item 648, integer class ids in the taxonomy item 647, th
 saturation's sensitivity to axiom order item 683 and the rest of the index stage
 on several threads item 684.
 
+### The Horn rules
+
+Item 603 classifies Horn ontologies outside OWL 2 EL with the consequence-based calculus
+for Horn-SHIQ of Kazakov (*Consequence-Driven Reasoning for Horn SHIQ Ontologies*, IJCAI
+2009), written from the paper over the EL classifier's contexts. It covers inverse
+properties, universal restrictions, at-most-one and at-least restrictions in Horn
+positions, functional and inverse-functional properties, self restrictions, property
+chains and transitive properties through the automata of Horrocks, Kutz and Sattler,
+disjoint, asymmetric and irreflexive properties, and complements, unions and universal
+restrictions that move to the other side of an axiom as their duals. An at-least
+restriction of up to 64 becomes that many existential restrictions with fresh, pairwise
+disjoint fillers, as the paper's Lemma 2 does. The rules run when one of them can fire
+and the ontology has no individuals, functional data properties or top properties, and
+not at all under `Limits::el_only`, the ELK mode, which leaves every axiom outside OWL 2
+EL out as ELK does and gives ELK's taxonomy. With
+any of these the axioms outside OWL 2 EL stay left out and reported, and Horn reasoning
+with individuals is item 692. So do axioms that are not Horn, property hierarchies
+that are not regular, automata of more than 65,536 states and data restrictions outside
+OWL 2 EL. `Stats::tier` says which rules a run needed, `Stats::outside_el` counts the
+axioms outside OWL 2 EL and those taken, and `Stats::conjunctions` counts the contexts
+the rules created.
+
+A universal restriction on a successor's property extends the successor to the
+conjunction of its classes and the restriction's filler, and at-most restrictions merge
+successors and identify a predecessor with a successor. These conjunctions get contexts
+of their own in a table beside the index, which the saturation's threads share. A context
+extends its successors once at the end of its activation, with every universal it holds
+by then, so that universals that arrive one after another create no context for each
+conjunction on the way. OWL 2 RL and QL ontologies create no such context, since QL has
+no universal or at-most restriction in a positive position and RL no existential one, so
+they stay polynomial. A test checks that their contexts grow linearly.
+
+The classifier's answers entail only what HermiT 1.4.5.519 entails on 640 generated and
+hand-written OWL 2 DL ontologies, are the same on one and four threads, and equal
+HermiT's on the 54 Horn ones that the rules take whole. On GO, whose
+`InverseObjectProperties(part_of has_part)` the rules take, it creates 2,577 contexts of
+conjunctions and derives 3.5 million conclusions where the EL rules derived 2.8 million.
+On the benchmark host GO classifies in 325 ms on one thread and 95 ms on eight, against
+278 and 81 ms for the EL rules alone, 17 to 18% slower, and its peak resident set rises
+from 195 to 248 MiB on one thread and from 288 to 331 MiB on eight
+([record](../../benchmarks/el-classification/runs/2026-11-03-horn-forge-8966216c/record.json)).
+ChEBI lite's one `InverseObjectProperties` axiom fires no Horn rule, so it runs the EL
+rules in the same time.
+The maintainer accepted this cost as the
+tradeoff for GO's complete taxonomy, and the ELK mode keeps the EL rules' time and
+taxonomy. Item 693 follows the cost. The taxonomies of the 298 ORE 2015 EL ontologies and
+ChEBI lite are byte for byte those of the EL rules on one and eight threads.
+
+A run with the Horn rules has a memory budget of its own. The budget is 64 times the
+estimated bytes of the run's index and axioms, at least 1 GiB, and never more than the
+caller's `Limits::max_memory`. A run that passes it classifies again by the EL rules
+alone, as the ELK mode does, leaves the axioms outside OWL 2 EL out and reports them,
+and sets `Stats::horn_over_budget`. Two ontologies of the ORE 2015 DL sample derived from
+Uberon, ore_ont_9663 and ore_ont_14817, need this. Their transitive parthood properties
+are each other's inverses, and the contexts of conjunctions compose the parthood chains
+again until the run passes 10 GiB, with most of the memory in waiting messages. The EL
+rules alone classify them in 0.8 s with a peak resident set of 0.4 GB. With the budget
+they classify in 4.2 s and 2.4 GB on four threads on the laptop, against 8.9 and 9.7 s
+for Konclude 0.7.0. Item 693 follows this cost with GO's. The largest Horn run on
+the development set below, ore_ont_9855, peaks at 666 MB, and GO at 74 MB, so neither
+reaches the budget.
+
+The development set of the ORE 2015 DL sample was compared on the laptop with four
+threads and a 10 GiB cap, as an unpublished measurement. The classifier's taxonomy
+equals the reference on 62 of the 206 files, 37 by the EL rules and 25 by the Horn rules.
+It is sound on 137 files whose axioms it uses in part. 91 of these have axioms that are
+not Horn, and 46 are Horn ontologies with individuals, functional data properties or top
+properties, which item 692 covers. The comparison marks one file, ore_ont_15993,
+as unsound because neither reference has an answer for it. Konclude read none of it and
+HermiT refused its SWRL built-ins, and every subsumption the classifier reports is told
+or follows from the file's told equivalences. Two files have no reference and the reader
+refuses one. Three ran out of memory: ore_ont_9663 and ore_ont_14817, which the Horn
+budget now classifies, and ore_ont_8737, whose 2.5 million existential restrictions take
+the EL saturation past 10 GiB, item 695. The classification time is 0.16 of
+Konclude's in geometric mean on the equal files and 0.23 on the sound ones, and never
+above HermiT's. Two equal files and 11 sound ones classify slower than Konclude. The
+largest gap is ore_ont_9855, an equal file at 2.5 s against 1.3 s.
+
+The references disagree on two files of the set. On ore_ont_15516, Konclude's parsers all
+failed at the first SWRL rule and it classified an empty ontology. HermiT found the
+ontology inconsistent, which its rules cannot cause, since the properties in their heads
+occur in no other axiom. The classifier leaves out the assertions about individuals and
+is sound against HermiT. On ore_ont_9540, HermiT makes `Image_type` equivalent to
+`Image_with_uji_office_door`, which the ontology does not entail. `Image_type` is a single
+image whose shapes each have all 60 of the enumerated line-to-line points, so none is a
+quadrilateral with exactly four, and the image has no office door in some model. HermiT's
+second equivalence follows from the first, so Konclude's answer stands for both.
+
+The functional-syntax reader refuses a document with a SWRL rule. A read with
+`ofn_read::Options::skip_rules` passes over the rules and counts them, which the
+classification comparison uses to report them as left out.
+
 ### ROBOT-compatible commands
 
 **The commands.** `sparkles ontology reason`, `reduce` and `relax` (items 634 and 635)
@@ -428,7 +523,13 @@ fails, and the last is found with ROBOT's probe for ELK, a fresh class under
 and left out of every answer. `--dump-unsatisfiable` writes the syntactic bottom-locality
 module of the unsatisfiable classes, which holds every justification, as ROBOT's `BOT`
 extraction does. The subclass, equivalence and class assertion generators work over the
-classes and individuals of the ontology's signature. A class the taxonomy does not hold,
+classes and individuals of the ontology's signature. `--reasoner ELK`, and `emr`, which
+ROBOT builds on ELK, classify by the OWL 2 EL rules alone (`ClassifyRequest::el_only`,
+which sets `Limits::el_only`), so that the output is ROBOT's with ELK. `materialize`
+takes ELK by default, as ROBOT's does. Without `--reasoner` in `reason` and `reduce`, and
+with `hermit`, `jfact`, `whelk` or `structural`, which run it with a
+warning, the classifier also takes the Horn axioms outside OWL 2 EL, so on GO `reason`
+adds the 14 subsumptions that `InverseObjectProperties(part_of has_part)` entails. A class the taxonomy does not hold,
 such as a declared obsolete class, is a direct subclass of `owl:Thing`, as ELK answers,
 and class assertions come from a second classification with a fresh class equivalent to
 `ObjectOneOf(a)` for each individual. The generators whose queries ELK does not answer
@@ -495,7 +596,7 @@ status.
 **Comparison with ROBOT.** `scripts/elk-compare/ofn-axioms.py` compares two
 functional-style files after expanding prefixes and sorting the operands of n-ary
 constructors. On GO and ChEBI lite the outputs of `reason`, `reduce`, `relax` and the
-chain `reason relax reduce` equal ROBOT 1.9.11's with ELK 0.6.0 axiom for axiom,
+chain `reason relax reduce` with `--reasoner ELK` equal ROBOT 1.9.11's with ELK 0.6.0 axiom for axiom,
 annotations included: 622,357 axioms of GO's reasoned ontology and 1,682,146 of ChEBI
 lite's, of which 96,847 and 424,904 are logical. On the benchmark host `reason` took 3.45 s
 on GO and 7.74 s on ChEBI lite from the RDF/XML release, against `robot reason`'s 14.04 s

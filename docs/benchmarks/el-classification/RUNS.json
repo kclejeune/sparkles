@@ -750,6 +750,55 @@
     }
    },
    "metadata_note": "A manual measurement record of sparkles ontology materialize with one property, with every property and with regulates, of reason and of the chain reason materialize reduce on the benchmark host, with the axiom comparison against ROBOT 1.9.11's materialize outputs."
+  },
+  {
+   "run_id": "sha256-913ee575a8d2bae896ecd33e16d85e937179e3512802f2d9eee1c8469c14acd3",
+   "path": "runs/2026-11-03-horn-forge-8966216c/record.json",
+   "sha256": "913ee575a8d2bae896ecd33e16d85e937179e3512802f2d9eee1c8469c14acd3",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26 and ChEBI lite 256",
+    "manifest": {
+     "commit": "8966216c",
+     "base_commit": "783acbde",
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": {
+      "bin/base": "a901bef0083c65822e8870b0f4fb41abc60b91f91813d5994ccea10c44b73af4",
+      "bin/lane": "19d1d7527163973c7f4cdbe11d5cd2d463a7bece6e36aeaaa41f48dcf0d956b4"
+     },
+     "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on stanley at 8966216c for the lane, and the release build of 783acbde for the base, copied to the benchmark host.",
+     "data": {
+      "chebi_lite": {
+       "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+      },
+      "go": {
+       "sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+      }
+     }
+    },
+    "settings": {
+     "repeat": 5,
+     "rounds": 3,
+     "threads": [
+      1,
+      8
+     ]
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "forge",
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "ram_mib": 15620,
+      "kernel": "7.2.9"
+     },
+     "method": "forge-ab.sh.txt holds the bench and heavy locks, and in each of three rounds runs el_classify of the base and of the lane, in alternating order, on each ontology on one and eight threads, one process each with five classifications, in a systemd scope with a 13 GiB cap. Each process reports the median of its five classifications. The table gives the median over the rounds. The load average was 0.18 when the run started.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual measurement record of the Horn rules of item 603 against the EL rules on GO and ChEBI lite on the benchmark host. Read the method with each time."
   }
  ]
 }

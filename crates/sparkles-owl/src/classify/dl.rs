@@ -374,6 +374,8 @@ pub struct OutsideEl {
     pub disjunctive: usize,
     /// the disjunctive axioms whose premise holds everywhere
     pub global: usize,
+    /// the axioms the Horn rules take, which the run does not leave out
+    pub taken: usize,
 }
 
 impl OutsideEl {
@@ -593,7 +595,8 @@ mod tests {
             OutsideEl {
                 horn: 1,
                 disjunctive: 1,
-                global: 1
+                global: 1,
+                taken: 0
             }
         );
     }

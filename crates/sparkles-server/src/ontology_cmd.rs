@@ -444,6 +444,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     .transpose()?,
                 message: message.clone(),
                 about: about.clone(),
+                el_only: false,
             };
             let q = ClassifyQuery {
                 about: about.clone(),

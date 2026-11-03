@@ -22,6 +22,8 @@
 //! an instance; [`super::world`] classifies the classes that reach such a context.
 
 use super::data::DataVal;
+use super::horn::HornIx;
+use super::horn_rules;
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use parking_lot::{Condvar, Mutex};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -50,6 +52,13 @@ pub enum Concl {
     Real,
     /// an instance of this context has the individual as an `r`-successor
     LinkTo(Role, Ex),
+    /// Tier H: the context, a successor of this one, holds the at-most filler
+    SuccIn(Ex, Ex),
+    /// Tier H: the context, a predecessor of this one, holds the at-most filler
+    PredIn(Ex, Ex),
+    /// Tier H: an instance of this context has an instance of the target as an
+    /// `r`-successor, which this context links to
+    Succ(Role, Ex),
 }
 
 /// A set kept as a list in the order of insertion, with a hash set beside it once it
@@ -279,6 +288,8 @@ pub struct Extra {
     pub links: Vec<(Role, Ex)>,
     /// the data values that functional data roles make one
     pub groups: Vec<Group>,
+    /// what the Horn rules keep
+    pub horn: super::horn_rules::HornSt,
 }
 
 /// Data successors of a context that functional data roles make one value: the
@@ -301,6 +312,7 @@ impl Extra {
                 .iter()
                 .map(|g| 96 + (g.funs.len() + g.roles.len() + g.val.opaque.len()) * 4)
                 .sum::<usize>()
+            + self.horn.bytes()
     }
 }
 
@@ -317,7 +329,7 @@ impl State {
             + self.extra.as_ref().map_or(0, |x| x.bytes())
     }
 
-    fn extra(&mut self) -> &mut Extra {
+    pub fn extra(&mut self) -> &mut Extra {
         self.extra.get_or_insert_with(Box::default)
     }
 
@@ -340,6 +352,7 @@ impl State {
                 .extra
                 .as_ref()
                 .is_some_and(|x| x.links.contains(&(r, n))),
+            Concl::SuccIn(..) | Concl::PredIn(..) | Concl::Succ(..) => false,
         }
     }
 
@@ -417,6 +430,8 @@ pub struct Bounds<'a> {
     /// the peak the run reached before the saturation, which the pool has been charged
     /// for, so that only growth past it is charged
     pub peak_memory: usize,
+    /// the contexts of conjunctions that the Horn rules create, in a run with them
+    pub dynamic: Option<&'a Dynamic>,
 }
 
 const STOP_NONE: u8 = 0;
@@ -471,6 +486,9 @@ struct Run<'a> {
     batch: bool,
     /// whether the rules run without those of individuals and functional data roles
     plain: bool,
+    /// whether the rules are those of Tier H
+    horn: bool,
+    dynamic: Option<&'a Dynamic>,
     bounds: &'a Bounds<'a>,
 }
 
@@ -524,6 +542,8 @@ pub fn saturate(
         merged: AtomicBool::new(false),
         batch: bounds.threads > 1,
         plain: plain(ix),
+        horn: ix.horn.is_some() && bounds.dynamic.is_some(),
+        dynamic: bounds.dynamic,
         bounds,
     };
     {
@@ -639,6 +659,18 @@ pub trait Sink {
     fn me(&mut self, c: Concl);
     /// the context the rules run in derived an individual other than its root
     fn merged(&mut self) {}
+    /// the conjunction a context stands for, as the sorted expressions that are not
+    /// intersections, which the Horn rules read
+    fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
+        let _ = (ix, e, out);
+        unreachable!("the Horn rules run only in a saturation")
+    }
+    /// the context of a conjunction of two or more expressions, sorted, which the Horn
+    /// rules create
+    fn intern(&mut self, core: &[Ex]) -> Ex {
+        let _ = core;
+        unreachable!("the Horn rules run only in a saturation")
+    }
 }
 
 impl Sink for Out<'_, '_> {
@@ -674,11 +706,157 @@ impl Sink for Out<'_, '_> {
             self.run.merged.store(true, Ordering::Relaxed);
         }
     }
+
+    fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
+        out.clear();
+        if (e as usize) < self.run.ctx.len() {
+            flatten(ix, e, out);
+        } else {
+            out.extend_from_slice(self.run.get_dynamic_core(e));
+        }
+    }
+
+    fn intern(&mut self, core: &[Ex]) -> Ex {
+        self.run
+            .dynamic
+            .expect("a run with the Horn rules")
+            .intern(core)
+    }
 }
 
 impl<'a> Run<'a> {
+    fn get_dynamic_core(&self, e: Ex) -> &'a [Ex] {
+        self.dynamic.expect("a run with the Horn rules").core(e)
+    }
+}
+
+/// The expressions an expression is the intersection of, sorted, without `owl:Thing`.
+pub fn flatten(ix: &Index, e: Ex, out: &mut Vec<Ex>) {
+    let start = out.len();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        match ix.head(x).node {
+            Node::Conj(a, b) => {
+                stack.push(a);
+                stack.push(b);
+            }
+            Node::Top => {}
+            _ => out.push(x),
+        }
+    }
+    out[start..].sort_unstable();
+    let mut v = out.split_off(start);
+    v.dedup();
+    out.extend(v);
+}
+
+/// The contexts of conjunctions that the Horn rules create during a saturation, with ids
+/// above the index's: a sharded table from each conjunction, as its sorted expressions,
+/// to its id, and an append-only table of the conjunctions and their contexts whose
+/// entries never move, so that a worker reads a context without a lock on the table.
+pub struct Dynamic {
+    base: Ex,
+    shards: Box<[Shard]>,
+    next: std::sync::atomic::AtomicU32,
+    segs: Box<[OnceLock<Box<[Slot]>>]>,
+    bytes: AtomicUsize,
+}
+
+/// One shard of [`Dynamic`]'s table from conjunctions to ids.
+type Shard = Mutex<FxHashMap<Box<[Ex]>, Ex>>;
+
+#[derive(Default)]
+struct Slot {
+    core: OnceLock<Box<[Ex]>>,
+    ctx: OnceLock<Box<Ctx>>,
+}
+
+/// The slots of the first segment of [`Dynamic`]; each further one doubles.
+const SEG0: usize = 1024;
+/// The shards of [`Dynamic`]'s table.
+const SHARDS: usize = 64;
+
+impl Dynamic {
+    pub fn new(base: Ex) -> Dynamic {
+        Dynamic {
+            base,
+            shards: (0..SHARDS)
+                .map(|_| Mutex::new(FxHashMap::default()))
+                .collect(),
+            next: std::sync::atomic::AtomicU32::new(0),
+            segs: (0..32).map(|_| OnceLock::new()).collect(),
+            bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn slot(&self, e: Ex) -> &Slot {
+        let off = (e - self.base) as usize;
+        let k = (off / SEG0 + 1).ilog2() as usize;
+        let at = off - SEG0 * ((1 << k) - 1);
+        let seg = self.segs[k].get_or_init(|| {
+            self.bytes
+                .fetch_add((SEG0 << k) * std::mem::size_of::<Slot>(), Ordering::Relaxed);
+            (0..SEG0 << k).map(|_| Slot::default()).collect()
+        });
+        &seg[at]
+    }
+
+    /// The id of a conjunction of two or more sorted expressions.
+    pub fn intern(&self, core: &[Ex]) -> Ex {
+        use std::hash::BuildHasher;
+        debug_assert!(core.len() >= 2 && core.is_sorted());
+        let h = rustc_hash::FxBuildHasher.hash_one(core);
+        let mut m = self.shards[(h >> 32) as usize % SHARDS].lock();
+        if let Some(&e) = m.get(core) {
+            return e;
+        }
+        let e = self.base + self.next.fetch_add(1, Ordering::Relaxed);
+        let b: Box<[Ex]> = core.into();
+        let _ = self.slot(e).core.set(b.clone());
+        self.bytes.fetch_add(
+            2 * core.len() * 4 + 64 + std::mem::size_of::<Ctx>(),
+            Ordering::Relaxed,
+        );
+        m.insert(b, e);
+        e
+    }
+
+    pub fn core(&self, e: Ex) -> &[Ex] {
+        self.slot(e).core.get().map_or(&[], |c| c)
+    }
+
+    pub fn ctx(&self, e: Ex) -> &Ctx {
+        self.slot(e).ctx.get_or_init(Box::default)
+    }
+
+    /// The contexts created.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.next.load(Ordering::Relaxed) as usize
+    }
+
+    /// The bytes of the tables and the conjunctions.
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
+impl<'a> Run<'a> {
+    #[inline]
     fn get(&self, e: Ex) -> &'a Ctx {
-        self.ctx[e as usize].get_or_init(Box::default)
+        match self.ctx.get(e as usize) {
+            Some(c) => c.get_or_init(Box::default),
+            None => self.get_dynamic(e),
+        }
+    }
+
+    /// The context of a conjunction that the Horn rules created.
+    #[cold]
+    #[inline(never)]
+    fn get_dynamic(&self, e: Ex) -> &'a Ctx {
+        self.dynamic
+            .expect("a context above the index's in a run with the Horn rules")
+            .ctx(e)
     }
 
     /// Marks a context active, and says whether this call did, so that the caller
@@ -836,7 +1014,9 @@ impl<'a> Run<'a> {
                 self.flush(&mut tally);
                 return;
             }
-            if self.plain {
+            if self.horn {
+                self.process::<Horn>(next, &mut mine, &mut tally, &mut local, &mut outbox);
+            } else if self.plain {
                 self.process::<Plain>(next, &mut mine, &mut tally, &mut local, &mut outbox);
             } else {
                 self.process::<Full>(next, &mut mine, &mut tally, &mut local, &mut outbox);
@@ -855,7 +1035,8 @@ impl<'a> Run<'a> {
         self.applied.fetch_add(applied, Ordering::Relaxed);
         let held = self.memory.fetch_add(bytes, Ordering::Relaxed) + bytes;
         let waiting = self.queued.fetch_add(queued, Ordering::Relaxed) + queued;
-        let used = held + waiting.max(0) as usize * std::mem::size_of::<Concl>();
+        let dynamic = self.dynamic.map_or(0, |d| d.bytes());
+        let used = held + dynamic + waiting.max(0) as usize * std::mem::size_of::<Concl>();
         let before = self.peak.fetch_max(used, Ordering::Relaxed);
         if self.stopped() {
             return false;
@@ -909,7 +1090,19 @@ impl<'a> Run<'a> {
         };
         if !st.init {
             tally.stored += CONTEXT_BYTES / CONCLUSION_BYTES;
-            init(self.ix, me, &mut st, self.universal, &mut out);
+            if R::HORN && me as usize >= self.ctx.len() {
+                let core = self.dynamic.expect("a run with the Horn rules").core(me);
+                st.init = true;
+                out.me(Concl::Sub(TOP));
+                for &m in core {
+                    out.me(Concl::Sub(m));
+                }
+                for &r in &self.ix.roles.reflexive {
+                    out.me(Concl::Loop(r));
+                }
+            } else {
+                init(self.ix, me, &mut st, self.universal, &mut out);
+            }
             ctx.started.store(true, Ordering::Release);
         }
         'outer: loop {
@@ -933,12 +1126,20 @@ impl<'a> Run<'a> {
             }
             // the to-do list leaves the context with its buffer, so that a context keeps
             // no room for the messages it took
-            let mut batch = {
+            let batch = {
                 let mut t = ctx.todo.lock();
                 if t.is_empty() {
-                    break;
+                    None
+                } else {
+                    Some(std::mem::take(&mut *t))
                 }
-                std::mem::take(&mut *t)
+            };
+            let Some(mut batch) = batch else {
+                // R3 of the Horn rules waits for the activation's universals
+                if R::HORN && horn_rules::flush(self.ix, &mut st, &mut out) {
+                    continue;
+                }
+                break;
             };
             tally.queued -= batch.len() as isize;
             // apply the batch in the order it arrived
@@ -999,6 +1200,17 @@ pub fn plain(ix: &Index) -> bool {
 trait Rules {
     /// the rules of individuals and functional data roles, which [`plain`] leaves out
     const FULL: bool;
+    /// the rules of Tier H (roadmap item 603)
+    const HORN: bool = false;
+}
+
+/// The rules of Tier H over an index that [`plain`] accepts: the EL rules without those
+/// of individuals, with the Horn rules beside them.
+struct Horn;
+
+impl Rules for Horn {
+    const FULL: bool = false;
+    const HORN: bool = true;
 }
 
 /// The rules of an index without individuals, universal roles or functional data roles.
@@ -1057,7 +1269,16 @@ fn apply_rules<S: Sink, R: Rules>(
                     if R::FULL && st.real {
                         out.send(succ, Concl::Real);
                     }
+                    if R::HORN {
+                        horn_rules::succ(ix, me, st, r, succ, true, out);
+                    }
                 }
+                Node::Forall(s, a)
+                    if R::HORN && !ix.horn.as_ref().is_some_and(|h| h.is(d, HornIx::UNFOLDED)) =>
+                {
+                    horn_rules::forall(ix, me, st, s, a, out)
+                }
+                Node::AtMost1(s, b) if R::HORN => horn_rules::at_most(ix, me, st, s, b, out),
                 Node::SelfLoop(r) => out.me(Concl::Loop(r)),
                 Node::Nominal(_) if R::FULL && d != me => nominal(ix, me, st, d, out),
                 Node::DataSome(r, _) if R::FULL && !roles.functional(r).is_empty() => {
@@ -1098,6 +1319,9 @@ fn apply_rules<S: Sink, R: Rules>(
             if R::FULL && st.extra.is_some() {
                 give(st, d, out);
             }
+            if R::HORN && ix.horn.as_ref().is_some_and(|h| h.is(d, HornIx::FILLER)) && d != TOP {
+                horn_rules::fill(ix, me, st, d, out);
+            }
             true
         }
         Concl::Back(e, r) => {
@@ -1120,6 +1344,9 @@ fn apply_rules<S: Sink, R: Rules>(
             }
             if R::FULL && ix.nominal_selfs {
                 link_to(ix, me, st, e, r, out);
+            }
+            if R::HORN {
+                horn_rules::back(ix, me, st, e, r, out);
             }
             true
         }
@@ -1162,6 +1389,9 @@ fn apply_rules<S: Sink, R: Rules>(
                     out.me(Concl::Loop(t));
                 }
             }
+            if R::HORN {
+                horn_rules::self_loop(ix, me, st, r, out);
+            }
             true
         }
         Concl::Nom(k) if R::FULL => apply_nom(me, st, k, out),
@@ -1169,6 +1399,15 @@ fn apply_rules<S: Sink, R: Rules>(
         Concl::LinkTo(r, n) if R::FULL => apply_link_to(me, st, r, n, out),
         Concl::Nom(_) | Concl::Real | Concl::LinkTo(..) => {
             unreachable!("a conclusion of individuals in a saturation without them")
+        }
+        Concl::SuccIn(n, b) if R::HORN => horn_rules::succ_in(ix, me, st, n, b, out),
+        Concl::PredIn(m, b) if R::HORN => horn_rules::pred_in(ix, me, st, m, b, out),
+        Concl::Succ(r, n) if R::HORN => {
+            horn_rules::succ(ix, me, st, r, n, false, out);
+            true
+        }
+        Concl::SuccIn(..) | Concl::PredIn(..) | Concl::Succ(..) => {
+            unreachable!("a conclusion of the Horn rules in a saturation without them")
         }
     }
 }

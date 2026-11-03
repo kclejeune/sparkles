@@ -1,0 +1,2 @@
+Declaration(Class(<http://www.w3.org/2002/07/owl#Thing>))
+EquivalentClasses(<http://example.org/d#A> <http://www.w3.org/2002/07/owl#Nothing>)

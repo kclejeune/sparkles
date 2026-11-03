@@ -1227,6 +1227,7 @@ pub(super) async fn classify(
         target: text("target")?.map(|g| graph_ref(&g)).transpose()?,
         message: text("message")?,
         about: about.clone(),
+        el_only: false,
     };
     let q = ClassifyQuery {
         about,

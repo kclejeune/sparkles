@@ -48,11 +48,27 @@ pub struct Document {
     pub header: Header,
     /// the axioms in document order; an axiom written twice is listed twice
     pub axioms: Vec<Axiom>,
+    /// the SWRL rules (`DLSafeRule`) passed over, which are outside OWL 2 and which a
+    /// read with [`Options::skip_rules`] counts and every other read refuses
+    pub rules: usize,
+}
+
+/// What a read accepts beyond the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    /// pass over SWRL rules and count them in [`Document::rules`], where a read without
+    /// it refuses the document at the first one
+    pub skip_rules: bool,
 }
 
 /// Read a whole document.
 pub fn parse(text: &str) -> Result<Document, ParseError> {
-    let mut r = Reader::new(text)?;
+    parse_with(text, Options::default())
+}
+
+/// Read a whole document with `options`.
+pub fn parse_with(text: &str, options: Options) -> Result<Document, ParseError> {
+    let mut r = Reader::new(text)?.with(options);
     let mut axioms = Vec::new();
     for ax in r.by_ref() {
         axioms.push(ax?);
@@ -61,6 +77,7 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
         prefixes: r.prefixes,
         header: r.header,
         axioms,
+        rules: r.rules,
     })
 }
 
@@ -78,20 +95,29 @@ const PARALLEL_MIN_CHUNK: usize = if cfg!(test) { 64 } else { 256 * 1024 };
 /// string, which is an error. Whenever a chunk fails, the document is read again by
 /// [`parse`], whose answer or error is returned, so a cut never changes the answer.
 pub fn parse_parallel(text: &str, threads: usize) -> Result<Document, ParseError> {
-    match chunked(text, threads) {
+    parse_parallel_with(text, threads, Options::default())
+}
+
+/// [`parse_parallel`] with `options`.
+pub fn parse_parallel_with(
+    text: &str,
+    threads: usize,
+    options: Options,
+) -> Result<Document, ParseError> {
+    match chunked(text, threads, options) {
         Some(d) => Ok(d),
-        None => parse(text),
+        None => parse_with(text, options),
     }
 }
 
 /// The document read in chunks on up to `threads` threads, or `None` when it has fewer
 /// than two chunks or a chunk fails.
-fn chunked(text: &str, threads: usize) -> Option<Document> {
+fn chunked(text: &str, threads: usize, options: Options) -> Option<Document> {
     let chunks = threads.min(text.len() / PARALLEL_MIN_CHUNK);
     if chunks <= 1 {
         return None;
     }
-    let mut r = Reader::new(text).ok()?;
+    let mut r = Reader::new(text).ok()?.with(options);
     // the start of the first axiom, which the preamble may have read ahead
     let body = match &r.peeked {
         Some((_, at)) => *at,
@@ -112,7 +138,7 @@ fn chunked(text: &str, threads: usize) -> Option<Document> {
     if bounds.len() <= 2 {
         return None;
     }
-    let parts: Vec<Option<Vec<Axiom>>> = std::thread::scope(|s| {
+    let parts: Vec<Option<(Vec<Axiom>, usize)>> = std::thread::scope(|s| {
         let handles: Vec<_> = bounds
             .windows(2)
             .enumerate()
@@ -128,13 +154,17 @@ fn chunked(text: &str, threads: usize) -> Option<Document> {
             .collect()
     });
     let mut axioms = Vec::new();
+    let mut rules = 0;
     for p in parts {
-        axioms.extend(p?);
+        let (a, n) = p?;
+        axioms.extend(a);
+        rules += n;
     }
     Some(Document {
         prefixes: std::mem::take(&mut r.prefixes),
         header: std::mem::take(&mut r.header),
         axioms,
+        rules,
     })
 }
 
@@ -194,6 +224,8 @@ impl<'a> Reader<'a> {
             header: Header::default(),
             depth: 0,
             done: false,
+            options: Options::default(),
+            rules: 0,
         }
     }
 
@@ -266,6 +298,9 @@ pub struct Reader<'a> {
     header: Header,
     depth: usize,
     done: bool,
+    options: Options,
+    /// the SWRL rules passed over
+    rules: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -285,15 +320,23 @@ impl<'a> Reader<'a> {
             header: Header::default(),
             depth: 0,
             done: false,
+            options: Options::default(),
+            rules: 0,
         };
         r.preamble()?;
         Ok(r)
     }
 
+    /// The reader with `options` for the axioms after the header.
+    pub fn with(mut self, options: Options) -> Reader<'a> {
+        self.options = options;
+        self
+    }
+
     /// The axioms of `text[start..end]`, read with this reader's prefixes, or `None` when
     /// the chunk does not end right after an axiom (after the ontology's end when `last`)
     /// or holds an error.
-    fn chunk(&self, start: usize, end: usize, last: bool) -> Option<Vec<Axiom>> {
+    fn chunk(&self, start: usize, end: usize, last: bool) -> Option<(Vec<Axiom>, usize)> {
         let mut c = Reader {
             text: &self.text[..end],
             pos: start,
@@ -304,23 +347,54 @@ impl<'a> Reader<'a> {
             header: Header::default(),
             depth: 0,
             done: false,
+            options: self.options,
+            rules: 0,
         };
         let mut out = Vec::new();
         if last {
             for ax in c.by_ref() {
                 out.push(ax.ok()?);
             }
-            return Some(out);
+            return Some((out, c.rules));
         }
         loop {
             match c.peek().ok()? {
-                Tok::End => return Some(out),
+                Tok::End => return Some((out, c.rules)),
                 Tok::Close => return None,
                 _ => {}
             }
             c.depth = 0;
+            if c.skip_rule().ok()? {
+                continue;
+            }
             out.push(c.axiom().ok()?);
         }
+    }
+
+    /// The SWRL rules passed over so far.
+    pub fn rules(&self) -> usize {
+        self.rules
+    }
+
+    /// Passes over a SWRL rule, `DLSafeRule(…)`, when one comes next and the options
+    /// say so, with its parentheses balanced, and says whether it did.
+    fn skip_rule(&mut self) -> Result<bool, ParseError> {
+        if !self.options.skip_rules || !self.at_keyword("DLSafeRule")? {
+            return Ok(false);
+        }
+        self.take()?;
+        self.open()?;
+        let mut depth = 1usize;
+        while depth > 0 {
+            match self.take()? {
+                Tok::Open => depth += 1,
+                Tok::Close => depth -= 1,
+                Tok::End => return Err(self.error("a rule is not closed with ')'")),
+                _ => {}
+            }
+        }
+        self.rules += 1;
+        Ok(true)
     }
 
     /// The prefix declarations, in document order.
@@ -1112,6 +1186,12 @@ impl<'a> Reader<'a> {
 
     /// The next axiom, or `None` at the ontology's closing parenthesis.
     fn next_axiom(&mut self) -> Result<Option<Axiom>, ParseError> {
+        loop {
+            self.depth = 0;
+            if !self.skip_rule()? {
+                break;
+            }
+        }
         if self.at_close()? {
             self.take()?;
             match self.take()? {
@@ -1205,13 +1285,59 @@ mod tests {
             .replace("\nand", " and");
         let want = parse(&d).unwrap();
         for threads in [2, 8] {
-            assert_eq!(chunked(&d, threads), Some(want.clone()), "{threads}");
+            assert_eq!(
+                chunked(&d, threads, Options::default()),
+                Some(want.clone()),
+                "{threads}"
+            );
         }
         // a cut inside such a string fails its chunk, and the sequential read answers
         let d = document(600);
         let want = parse(&d).unwrap();
-        assert!((2..40).any(|threads| chunked(&d, threads).is_none()));
+        assert!((2..40).any(|threads| chunked(&d, threads, Options::default()).is_none()));
         assert_eq!(parse_parallel(&d, 8).unwrap(), want);
+    }
+
+    #[test]
+    fn swrl_rules_are_refused_or_passed_over_and_counted() {
+        let rule = "DLSafeRule(Annotation(rdfs:comment \"a (rule)\") \
+                    Body(ClassAtom(:A Variable(:x)) ObjectPropertyAtom(:r Variable(:x) Variable(:y))) \
+                    Head(ClassAtom(:B Variable(:y))))";
+        let d = format!(
+            "Prefix(:=<http://ex.org/>)\nOntology(\n{rule}\nSubClassOf(:A :B)\n{rule}\n{rule}\nSubClassOf(:B :C)\n)"
+        );
+        // a read without the option refuses the document, as it did before rules were
+        // read at all
+        assert!(parse(&d).is_err());
+        assert!(parse_parallel(&d, 4).is_err());
+        let skip = Options { skip_rules: true };
+        let doc = parse_with(&d, skip).unwrap();
+        assert_eq!(doc.axioms.len(), 2);
+        assert_eq!(doc.rules, 3);
+        // a rule that is not closed is an error
+        let open = "Prefix(:=<http://ex.org/>)\nOntology(\nDLSafeRule(Body(\n";
+        assert!(parse_with(open, skip).is_err());
+        // the chunks of a parallel read count the rules they pass over
+        let big: String = (0..3000)
+            .map(|i| format!("SubClassOf(:A{i} :B{i})\n{rule}\n"))
+            .collect();
+        let d = format!("Prefix(:=<http://ex.org/>)\nOntology(\n{big})\n");
+        let want = parse_with(&d, skip).unwrap();
+        assert_eq!(want.rules, 3000);
+        let got = chunked(&d, 4, skip).expect("the chunks answer");
+        assert_eq!(got, want);
+        assert!(chunked(&d, 4, Options::default()).is_none());
+        // rules one after another are passed over in a loop, not a call for each
+        let many: String = (0..50_000).map(|_| format!("{rule}\n")).collect();
+        let d = format!("Prefix(:=<http://ex.org/>)\nOntology(\n{many}SubClassOf(:A :B)\n)\n");
+        let doc = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || parse_with(&d, skip))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!((doc.rules, doc.axioms.len()), (50_000, 1));
     }
 
     #[test]
