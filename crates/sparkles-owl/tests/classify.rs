@@ -1815,3 +1815,112 @@ fn messages_a_world_sends_count_against_the_memory_limit() {
         e => panic!("{e:?}"),
     }
 }
+
+// DL queries: what the saturated contexts say about one class, where some classes and
+// the query's fresh class are classified in worlds of their own.
+
+/// Checks that `describe` answers as the taxonomy does for every satisfiable named class.
+fn describe_matches_taxonomy(axioms: &[Axiom]) {
+    let t = run(axioms).taxonomy;
+    let mut k = Classifier::of(axioms);
+    k.saturate(&Limits::default()).unwrap();
+    let firsts = |ns: Vec<usize>| -> Vec<Class> {
+        let mut v: Vec<Class> = ns
+            .into_iter()
+            .flat_map(|n| t.node(n).classes.clone())
+            .collect();
+        v.sort();
+        v
+    };
+    for class in t.classes().cloned().collect::<Vec<_>>() {
+        if t.is_unsatisfiable(&class) || class == Class::thing() {
+            continue;
+        }
+        let d = k.describe(&class).unwrap();
+        let n = t.node_of(&class).unwrap();
+        let mut eq: Vec<Class> = t.equivalents(&class).to_vec();
+        eq.retain(|e| *e != class);
+        eq.sort();
+        assert_eq!(d.equivalents, eq, "{class:?}");
+        assert_eq!(
+            d.direct_superclasses,
+            firsts(t.node(n).parents.clone()),
+            "{class:?}"
+        );
+        assert_eq!(d.superclasses, firsts(t.ancestors(n)), "{class:?}");
+        assert_eq!(
+            d.direct_subclasses,
+            firsts(t.node(n).children.clone()),
+            "{class:?}"
+        );
+        assert_eq!(d.subclasses, firsts(t.descendants(n)), "{class:?}");
+    }
+}
+
+fn describe_with(axioms: &[Axiom], q: ClassExpression) -> sparkles_owl::classify::Description {
+    let mut all = axioms.to_vec();
+    all.push(Axiom::equivalent_classes([ce("Q"), q]));
+    let mut k = Classifier::of(&all);
+    k.saturate(&Limits::default()).unwrap();
+    k.describe(&c("Q")).unwrap()
+}
+
+fn named(cs: &[&str]) -> Vec<Class> {
+    let mut v: Vec<Class> = cs
+        .iter()
+        .map(|s| if *s == "Thing" { Class::thing() } else { c(s) })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn describe_reads_the_subsumers_a_world_finds() {
+    // T ≡ ∃r.{b} ⊓ ∃s.{b}, where T has an instance, puts b in C by range(r) = C, so
+    // T ⊑ ∃s.C ≡ X in T's world only, and Q ≡ Y ⊓ ∃s.{b} is below T and X
+    let axioms = [
+        sub(c("Y"), value("r", "b")),
+        range("r", "C"),
+        Axiom::equivalent_classes([ce("X"), some("s", c("C"))]),
+        Axiom::equivalent_classes([ce("T"), and([value("r", "b"), value("s", "b")])]),
+        sub(c("W"), value("s", "b")),
+        sub(c("Z"), and([ce("Y"), value("s", "b")])),
+    ];
+    describe_matches_taxonomy(&axioms);
+    let d = describe_with(&axioms, and([ce("Y"), value("s", "b")]));
+    assert!(d.satisfiable);
+    assert_eq!(d.superclasses, named(&["T", "Thing", "X", "Y"]));
+    // X is above T, which only T's world shows
+    assert_eq!(d.direct_superclasses, named(&["T", "Y"]));
+    assert_eq!(d.subclasses, named(&["Z"]));
+    let x = describe_with(&axioms, some("s", c("C")));
+    assert_eq!(x.equivalents, named(&["X"]));
+    assert_eq!(x.subclasses, named(&["T", "Z"]));
+    assert_eq!(x.direct_subclasses, named(&["T"]));
+}
+
+#[test]
+fn describe_answers_for_individuals_and_nominals() {
+    // a is in Y, so b is in C everywhere, and d, which reaches b by s, is in X
+    let axioms = [
+        sub(c("Y"), value("r", "b")),
+        range("r", "C"),
+        Axiom::equivalent_classes([ce("X"), some("s", c("C"))]),
+        sub(c("W"), value("s", "b")),
+        is_a("Y", "a"),
+        assert_("s", "d", "b"),
+    ];
+    describe_matches_taxonomy(&axioms);
+    let x = describe_with(&axioms, some("s", c("C")));
+    assert_eq!(x.equivalents, named(&["X"]));
+    assert_eq!(x.subclasses, named(&["W"]));
+    assert_eq!(x.instances, vec![NamedIndividual::new("http://ex.org/d")]);
+    // a class of one individual takes what the individual has
+    let a = describe_with(&axioms, one("a"));
+    assert_eq!(a.superclasses, named(&["Thing", "Y"]));
+    assert_eq!(a.instances, vec![NamedIndividual::new("http://ex.org/a")]);
+    let b = describe_with(&axioms, value("s", "b"));
+    assert_eq!(b.superclasses, named(&["Thing", "X"]));
+    assert_eq!(b.subclasses, named(&["W"]));
+    assert_eq!(b.instances, vec![NamedIndividual::new("http://ex.org/d")]);
+}

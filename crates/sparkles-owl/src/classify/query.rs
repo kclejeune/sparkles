@@ -108,18 +108,22 @@ impl Saturation {
                 ..Default::default()
             });
         }
-        // `a ⊑ b` among saturated contexts
+        // `a ⊑ b` among saturated contexts, where a class classified in a world of its
+        // own reads its subsumers from that world
         let below = |a: Ex, b: Ex| -> bool {
-            b == TOP
-                || a == b
-                || self
-                    .ctx
-                    .get(a as usize)
-                    .and_then(|x| x.get())
-                    .is_some_and(|x| {
-                        let st = x.st.lock();
-                        st.bottom || st.subs.contains(&b)
-                    })
+            if b == TOP || a == b {
+                return true;
+            }
+            if let Some((bottom, subs)) = self.worlds.get(&a) {
+                return *bottom || subs.contains(&b);
+            }
+            self.ctx
+                .get(a as usize)
+                .and_then(|x| x.get())
+                .is_some_and(|x| {
+                    let st = x.st.lock();
+                    st.bottom || st.subs.contains(&b)
+                })
         };
         let mut equivalents = Vec::new();
         let mut supers: Vec<Ex> = Vec::new();

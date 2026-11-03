@@ -209,9 +209,9 @@ fn el_answers_match_the_taxonomy_for_every_named_class() {
 }
 
 #[test]
-fn a_range_that_meets_an_individual_is_reported_as_incomplete() {
-    // range(r) = C and r(a, b) put b in C, so Y ⊑ ∃s.{b} ⊑ ∃s.C, which both EL
-    // reasoners miss (item 591)
+fn a_range_that_meets_an_individual_reaches_it() {
+    // range(r) = C and r(a, b) put b in C, so Y ⊑ ∃s.{b} ⊑ ∃s.C with the assertions,
+    // which the class answers do not read, and the terminology alone leaves b out of C
     let ds = dataset(
         "Declaration(Class(:C)) Declaration(Class(:Y)) Declaration(ObjectProperty(:r)) Declaration(ObjectProperty(:s))
          ObjectPropertyRange(:r :C)
@@ -220,18 +220,54 @@ fn a_range_that_meets_an_individual_is_reported_as_incomplete() {
     );
     let a = query(&ds, "s some C");
     assert_eq!(a.reasoning.engine, DlEngine::El);
-    // known gap of item 587: Y is a subclass
     assert_eq!(a.subclasses, Some(vec![]));
-    assert!(!a.reasoning.complete);
-    assert!(
-        a.reasoning
-            .gaps
-            .iter()
-            .any(|g| g.partial && g.message.contains("individuals")),
-        "{:?}",
-        a.reasoning.gaps
+    assert!(a.reasoning.complete, "{:?}", a.reasoning.gaps);
+    assert_eq!(a.reasoning.instances_complete, Some(true));
+    // with the assertions, b is in C and an individual that reaches b is in ∃s.C
+    let ds = dataset(
+        "Declaration(Class(:C)) Declaration(ObjectProperty(:r)) Declaration(ObjectProperty(:s))
+         ObjectPropertyRange(:r :C)
+         ObjectPropertyAssertion(:r :a :b)
+         ObjectPropertyAssertion(:s :d :b)",
     );
-    assert_eq!(a.reasoning.instances_complete, Some(false));
+    let a = query(&ds, "s some C");
+    assert!(a.reasoning.complete, "{:?}", a.reasoning.gaps);
+    assert_eq!(a.instances, Some(vec![Individual::named(ex("d"))]));
+}
+
+#[test]
+fn a_query_class_with_individuals_and_nominals_reads_its_world() {
+    // T ≡ ∃r.{b} ⊓ ∃s.{b} puts b in C by range(r) = C where T has an instance, so
+    // T ⊑ ∃s.C ≡ X holds in T's world only, and an expression below T is below X
+    let ds = dataset(
+        "Declaration(Class(:C)) Declaration(Class(:X)) Declaration(Class(:Y)) Declaration(Class(:T))
+         Declaration(Class(:W)) Declaration(ObjectProperty(:r)) Declaration(ObjectProperty(:s))
+         SubClassOf(:Y ObjectHasValue(:r :b))
+         ObjectPropertyRange(:r :C)
+         EquivalentClasses(:X ObjectSomeValuesFrom(:s :C))
+         EquivalentClasses(:T ObjectIntersectionOf(ObjectHasValue(:r :b) ObjectHasValue(:s :b)))
+         SubClassOf(:W ObjectHasValue(:s :b))
+         ObjectPropertyAssertion(:s :d :b)",
+    );
+    let a = query(&ds, "Y and s value b");
+    assert!(a.reasoning.complete, "{:?}", a.reasoning.gaps);
+    assert_eq!(
+        a.superclasses,
+        Some(vec![c("T"), c("X"), c("Y"), Class::thing()])
+    );
+    assert_eq!(a.direct_superclasses, Some(vec![c("T"), c("Y")]));
+    // d reaches b, which is in C only where something is in T, as d is not
+    assert_eq!(a.instances, Some(vec![]));
+    let x = query(&ds, "s some C");
+    assert_eq!(x.equivalents, Some(vec![c("X")]));
+    assert_eq!(x.subclasses, Some(vec![c("T")]));
+    assert_eq!(x.instances, Some(vec![]));
+    let b = query(&ds, "{b}");
+    assert_eq!(b.superclasses, Some(vec![Class::thing()]));
+    assert_eq!(b.instances, Some(vec![Individual::named(ex("b"))]));
+    let s = query(&ds, "s value b");
+    assert_eq!(s.subclasses, Some(vec![c("T"), c("W")]));
+    assert_eq!(s.instances, Some(vec![Individual::named(ex("d"))]));
 }
 
 #[test]
