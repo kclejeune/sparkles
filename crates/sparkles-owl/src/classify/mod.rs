@@ -1082,6 +1082,7 @@ impl Saturation {
                     cleared += 1;
                 }
                 *st = saturate::State::default();
+                *c.started.get_mut() = false;
             } else if st.init {
                 st.drop_links_from(&affected);
                 st.reindex(ix);
