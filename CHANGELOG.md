@@ -37,7 +37,10 @@ ROBOT's with ELK axiom for axiom.
 for the properties of `--term` and `--term-file`, which take full IRIs and the OBO
 prefixes of ROBOT's default context, or for every property when none is given. It runs
 from a file or a database and joins chains such as `reason materialize reduce`. On GO
-with part of and ChEBI lite with has role its output equals ROBOT's axiom for axiom.
+with part of and ChEBI lite with has role its output equals ROBOT's axiom for axiom, and
+on the benchmark host it takes 3.31 s and 8.32 s, against 3.47 s and 8.77 s for `reason`.
+A term is kept only when it is a URN or a URL that OpenJDK 17's `java.net.URL` accepts, as
+ROBOT keeps it.
 
 The web UI has one app shell and design system (roadmap item 632). A top bar on every
 page holds the dataset switcher and a search of the open dataset's entities through

@@ -473,10 +473,11 @@ disjointness, gets no fresh class, since no class can then be below the restrict
 ontology with individuals, a reflexive property, `ObjectHasSelf` or the top property
 names every class, as ROBOT does. A property test checks on random EL ontologies that
 the pruning changes no output. It keeps about 41% of GO's classes and 16% of ChEBI
-lite's as fillers, which takes `materialize` with all nine of ChEBI lite's properties
-from more than 12 GiB to 5.2 GiB on atlas. Each named restriction costs memory, so a run
-with more properties holds more than `reason`, about 0.3 GiB for each further property
-on ChEBI lite.
+lite's as fillers. Without the pruning, `materialize` with all nine of ChEBI lite's
+properties ran out of a 12 GiB memory cap, and with it the run takes 5,084 MiB on the
+benchmark host. Each named restriction costs memory, so a run with more properties holds
+more than `reason`, about 280 MiB for each further property on ChEBI lite
+([materialize results](../../benchmarks/el-classification/RESULTS.md#materialize)).
 
 **Chains.** Each command ends in a hidden list of the arguments that follow it, which is
 parsed again as the next command, so that `sparkles ontology reason --input x.owl relax
