@@ -405,9 +405,10 @@ impl Interner {
     }
 
     /// The bytes that merging this chunk's interner can add to the merged one, roughly:
-    /// its own, and a binary intersection for each operand of its intersections.
+    /// its own and a binary intersection for each operand of its intersections, twice
+    /// over, since the merged interner's lists and tables grow by doubling.
     pub fn merge_bytes(&self) -> usize {
-        self.bytes() + self.and_ops * 20
+        2 * self.bytes() + self.and_ops * 40
     }
 
     /// The id of a class, which the run's normalization meets.

@@ -1804,10 +1804,14 @@ mod tests {
 
     #[test]
     fn the_chunks_count_what_their_merge_adds() {
-        // wide intersections, each of which the merge makes into many binary ones
+        // wide intersections, each of which the merge makes into many binary ones, since
+        // the class that differs comes first in the order of ids
         let c = |s: String| ClassExpression::Class(Class::new(format!("http://ex.org/{s}")));
-        let axioms: Vec<AxiomKind> = (0..256)
-            .map(|i| {
+        let declared = (0..256).map(|i| {
+            AxiomKind::Declaration(Entity::Class(Class::new(format!("http://ex.org/A{i}"))))
+        });
+        let axioms: Vec<AxiomKind> = declared
+            .chain((0..256).map(|i| {
                 AxiomKind::SubClassOf(
                     ClassExpression::ObjectIntersectionOf(
                         std::iter::once(c(format!("A{i}")))
@@ -1816,7 +1820,7 @@ mod tests {
                     ),
                     c("X".into()),
                 )
-            })
+            }))
             .collect();
         let chunks = chunk_interners(&axioms, 32);
         let reserved: usize = chunks.iter().map(|it| it.merge_bytes()).sum();
