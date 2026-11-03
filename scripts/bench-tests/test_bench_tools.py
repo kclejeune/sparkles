@@ -139,6 +139,48 @@ for output in outputs:
         self.assertEqual(p.returncode, 42)
         self.assertEqual(p.stdout, "")
 
+    def test_binary_in_the_managed_target_is_staged_out_of_it(self):
+        # The checkout's target is a link into Boxington's cache, as a managed target is.
+        checkout = self.work / "checkout"
+        view = self.work / "cache view"
+        (view / "release").mkdir(parents=True)
+        built = view / "release" / "sparkles"
+        built.write_text("#!/bin/sh\necho built\n")
+        built.chmod(0o755)
+        checkout.mkdir()
+        (checkout / "target").symlink_to(view)
+        other = self.work / "elsewhere" / "sparkles"
+        other.parent.mkdir()
+        other.write_text("#!/bin/sh\n")
+        run = self.work / "run"
+
+        def stage(given):
+            p = subprocess.run(["bash", "-euc", 'source "$1"; cd "$ROOT"; stage_binary "$2"', "bash",
+                                str(TOOLS), given], env=self.env | {"ROOT": str(checkout), "WORK": str(run)},
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            return p.stdout.strip()
+
+        staged = Path(stage(str(checkout / "target/release/sparkles")))
+        self.assertEqual(staged.parent.parent, run / "bin")
+        self.assertEqual(staged.name, "sparkles")
+        self.assertEqual(staged.read_text(), built.read_text())
+        self.assertTrue(os.access(staged, os.X_OK))
+        # The same build stages to the same path, by relative or resolved path.
+        self.assertEqual(stage("target/release/sparkles"), str(staged))
+        self.assertEqual(stage(str(built)), str(staged))
+        # Paths outside the target, and missing binaries, come back unchanged.
+        self.assertEqual(stage(str(other)), str(other))
+        self.assertEqual(stage(str(checkout / "target/release/missing")), str(checkout / "target/release/missing"))
+        # Another build in the same WORK gets its own path and leaves the first copy alone.
+        built.write_text("#!/bin/sh\necho rebuilt\n")
+        rebuilt = Path(stage("target/release/sparkles"))
+        self.assertNotEqual(rebuilt, staged)
+        self.assertEqual(subprocess.run([str(staged)], capture_output=True, text=True).stdout, "built\n")
+        # The copies outlive the collection of the target.
+        shutil.rmtree(view)
+        self.assertEqual(subprocess.run([str(rebuilt)], capture_output=True, text=True).stdout, "rebuilt\n")
+
     def test_missing_binary_is_an_error(self):
         p = self.shell("nixbin qlever qlever-server", MISSING_BIN="1")
         self.assertNotEqual(p.returncode, 0)

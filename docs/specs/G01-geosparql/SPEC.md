@@ -1364,7 +1364,7 @@ not against the rounded numbers shown here.
   vendors nor links it.
 
   An opt-in developer script, `scripts/geosparql-benchmark.sh` (Phase 2), clones it at a
-  pinned commit into `target/geosparql-benchmark/`. The script loads the dataset into a
+  pinned commit into `.artifacts/geosparql-benchmark/`. The script loads the dataset into a
   scratch server, runs the queries over HTTP and prints the score per requirement. Like
   `shellcheck` (README, PROVENANCE), it is a development tool and never ships. It needs
   the maintainer's approval (§11 q12).

@@ -18,6 +18,9 @@
 #   bench-scripts the script unit tests, which include the CI task-profile test, and the
 #                 crash harness's tests (test:bench-scripts)
 #
+# Before the checks, a `target` link that Boxington's collection left dangling is repaired
+# by placing a fresh managed target with `mbx sparkles-task`.
+#
 # Usage: scripts/premerge.sh [--fix] [check...]
 #   --fix   regenerate what can be regenerated (client:gen, client:types, py:lock, node:lock,
 #           jvm:lock and licenses) before checking, and list the files that changed, to commit
@@ -56,6 +59,7 @@ main() {
   rm -rf "$out"
   mkdir -p "$out"
   start=$SECONDS
+  repair_target || return 1
 
   if [ -n "$fix" ]; then
     before=$(git status --porcelain)
@@ -92,6 +96,20 @@ main() {
     tail -n 20 "$out/$c.log"
   done
   printf '\npremerge failed: %s\n' "${failed[*]}"
+  return 1
+}
+
+# Boxington collects a whole managed target whose lease no command holds, and it can leave
+# `target` as a link to a directory that no longer exists. A step that writes under it then
+# fails with "File exists" or "Not a directory". `mbx sparkles-task` places a fresh target
+# before it runs its command, so an empty command under it repairs the link.
+repair_target() {
+  [ -L target ] && [ ! -e target ] || return 0
+  echo "premerge: target links to a collected directory, placing a fresh one with mbx sparkles-task"
+  if PATH="$PWD/scripts:$PATH" mbx sparkles-task -- true > "$out/repair-target.log" 2>&1 && [ -e target ]; then
+    return 0
+  fi
+  echo "premerge: could not repair the dangling target link, see $out/repair-target.log" >&2
   return 1
 }
 

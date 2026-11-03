@@ -34,7 +34,7 @@ See the [spec landing page](README.md), [design](SPEC.md) and
   - The spatial index (packed R-tree base, overlay and tail) and the planner and
     executor are written from the spec and the Sparkles store and planner code.
   - **Test data and tools:** the GeoSPARQL Compliance Benchmark is GPL-2.0 and is never
-    vendored. `scripts/geosparql-benchmark.sh` fetches it at test time into `target/`
+    vendored. `scripts/geosparql-benchmark.sh` fetches it at test time into `.artifacts/`
     at pinned commit 879e0746, and only with `SPARKLES_ALLOW_GPL_BENCHMARK=1`. Its README
     and file names were consulted to write the runner. Its code was not.
 - **Phase 2** (2026-10-01): spatial joins, nearest neighbours, query rewrite, hulls and

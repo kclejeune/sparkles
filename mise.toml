@@ -216,7 +216,8 @@ cache = { enabled = false }
 description = "Build the formatter for the browser into ui/src/lib/wasm (optional: the UI uses it when present, else POST /$/format; later UI builds keep it up to date)"
 # the wasm-bindgen CLI must be the version of the wasm-bindgen crate in Cargo.lock
 tools = { "github:wasm-bindgen/wasm-bindgen" = "0.2.129" }
-run = "scripts/build-fmt-wasm.sh"
+# The lease keeps the module in the managed target until wasm-bindgen has read it.
+run = "mbx sparkles-task -- scripts/build-fmt-wasm.sh"
 sources = ["crates/sparkles-fmt/src/**/*", "crates/sparkles-fmt/Cargo.toml", "crates/sparkles-fmt-wasm/**/*", "Cargo.lock", "rust-toolchain.toml", "scripts/build-fmt-wasm.sh"]
 outputs = ["ui/src/lib/wasm/sparkles_fmt_wasm_bg.wasm"]
 # The output above marks a finished run; the task writes more than it, so the task
@@ -533,7 +534,9 @@ run = "mbx test -p sparkles-core --test csvw_conformance -- --nocapture"
 description = "Unit tests of the benchmark record builder and the record comparison (scripts/bench-record.py, bench-regressions.py compare), and the crash harness's own tests (scripts/crash-harness.rs)"
 run = [
   "python3 -m unittest discover -s scripts/bench-tests",
-  'out="${CARGO_TARGET_DIR:-{{config_root}}/target}/crash-harness-test" && mkdir -p "$(dirname "$out")" && rustc --edition 2024 --test -o "$out" scripts/crash-harness.rs && "$out"',
+  # The test binary is scratch output outside the managed target, which Boxington can
+  # collect between commands and leave as a dangling link.
+  'out="{{config_root}}/.artifacts/crash-harness/crash-harness-test" && mkdir -p "$(dirname "$out")" && rustc --edition 2024 --test -o "$out" scripts/crash-harness.rs && "$out"',
 ]
 
 [tasks."test:jena-clients"]
@@ -658,7 +661,7 @@ run = [
 
 [tasks."jvm:nix-deps"]
 description = "Refresh nix/jvm-deps.json, the Gradle dependencies the Nix build of the jar fetches (after jvm/ dependencies change)"
-run = "nix build .#sparkles-jena.mitmCache.updateScript -o target/jvm-nix-deps-update && target/jvm-nix-deps-update"
+run = "nix build .#sparkles-jena.mitmCache.updateScript -o .artifacts/jvm-nix-deps-update && .artifacts/jvm-nix-deps-update"
 
 # --------------------------------------------------------------------- Node bindings ----
 

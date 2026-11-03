@@ -209,6 +209,10 @@ pub struct DatasetState {
     /// held while a kept classification runs, so that one runs at a time
     #[cfg(feature = "ontology")]
     pub classify_flight: Mutex<()>,
+    /// the entity index of the ontology search, built at the first search and kept up
+    /// to date from each commit's changes
+    #[cfg(feature = "ontology")]
+    pub entity_search: crate::handles::ontology::search::SearchSlot,
     /// the objects of predicates measured for reports of [`crate::schema::Basis::Statistics`]
     pub objects_cache: Mutex<ObjectsCache>,
     /// where a clone was made from (`origin.json`, or kept in memory for an in-memory
@@ -424,6 +428,8 @@ impl Dataset {
             classify_cache: Mutex::new(None),
             #[cfg(feature = "ontology")]
             classify_flight: Mutex::new(()),
+            #[cfg(feature = "ontology")]
+            entity_search: Default::default(),
             objects_cache: Mutex::new(ObjectsCache::default()),
             origin,
             store,

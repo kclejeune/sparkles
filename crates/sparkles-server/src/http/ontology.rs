@@ -3,8 +3,9 @@
 //! `GET /$/ontology/{ds}/entities` and `GET /$/ontology/{ds}/entity`, the removal of an
 //! entity `DELETE /$/ontology/{ds}/entity`, the profile checks
 //! `POST /$/ontology/{ds}/check`, edits `POST /$/ontology/{ds}/axioms` and the diff of
-//! the axioms of two commits `GET /$/ontology/{ds}/diff`, and the OWL 2 EL
-//! classification `POST /$/ontology/{ds}/classify` (spec F24). The library
+//! the axioms of two commits `GET /$/ontology/{ds}/diff`, the OWL 2 EL
+//! classification `POST /$/ontology/{ds}/classify` (spec F24) and the entity search
+//! `GET /$/ontology/{ds}/search` (item 616). The library
 //! reads, checks and edits (`sparkles::handles::ontology`); these handlers parse the
 //! request and apply the caller's grants through [`CallerContext`].
 //!
@@ -719,6 +720,95 @@ pub(super) async fn diff(
             Json(diff_body(&ds.name, &d, &req, assertions, limit, &r)).into_response()
         };
         Ok(with_commit(resp, &ds, d.to))
+    })
+    .await
+}
+
+/// The language tags of an `Accept-Language` header, most preferred first: tags with a
+/// weight of zero, `*` and malformed tags are left out.
+fn accept_languages(headers: &HeaderMap) -> Vec<String> {
+    let Some(v) = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Vec::new();
+    };
+    let mut tags: Vec<(u32, usize, String)> = Vec::new();
+    for (i, part) in v.split(',').enumerate() {
+        let mut it = part.split(';');
+        let tag = it.next().unwrap_or("").trim();
+        let mut q = 1000u32;
+        for p in it {
+            if let Some(w) = p.trim().strip_prefix("q=") {
+                q = w
+                    .trim()
+                    .parse::<f32>()
+                    .map_or(0, |w| (w.clamp(0.0, 1.0) * 1000.0) as u32);
+            }
+        }
+        if q == 0 || tag.is_empty() || tag == "*" {
+            continue;
+        }
+        if oxilangtag::LanguageTag::parse(tag).is_err() {
+            continue;
+        }
+        tags.push((q, i, tag.to_string()));
+    }
+    tags.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    tags.into_iter().map(|(_, _, t)| t).collect()
+}
+
+/// `GET /$/ontology/{ds}/search`: the entities whose labels, synonyms, short forms or
+/// definitions match `q`, ranked for typeahead with typo tolerance, from the branch's
+/// entity index (`kind`, `lang` or `Accept-Language`, `limit`, `offset`, `fuzzy`,
+/// `definitions`, and the graphs of the ontology read).
+pub(super) async fn search(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let req = request_of(&params)?;
+    let mut a = serde_json::Map::new();
+    let q = params
+        .get("q")
+        .ok_or_else(|| bad("q is the text searched for"))?;
+    a.insert("q".into(), json!(q));
+    let kinds = params.all("kind");
+    if !kinds.is_empty() {
+        a.insert("kind".into(), json!(kinds.join(",")));
+    }
+    match params.get("lang") {
+        Some(l) => {
+            a.insert("lang".into(), json!(l));
+        }
+        None => {
+            a.insert("lang".into(), json!(accept_languages(&headers)));
+        }
+    }
+    for k in ["limit", "offset"] {
+        if let Some(v) = params.get(k) {
+            a.insert(k.into(), json!(v));
+        }
+    }
+    for k in ["fuzzy", "definitions"] {
+        if let Some(v) = params.get(k) {
+            a.insert(k.into(), json!(truthy(v)));
+        }
+    }
+    let s = onto::wire::search_request_of(&a).map_err(|e| bad(e.to_string()))?;
+    let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+    blocking(move || {
+        let found = ds
+            .dataset
+            .ontology()
+            .search(&req, &s, &opts)
+            .map_err(ontology_error)?;
+        let j = onto::wire::search_body(&ds.name, &s, &found);
+        Ok(with_commit(Json(j).into_response(), &ds, found.commit))
     })
     .await
 }

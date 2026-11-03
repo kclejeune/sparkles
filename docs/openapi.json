@@ -37853,6 +37853,288 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/$/ontology/{ds}/search": {
+      "get": {
+        "description": "The entities whose labels, synonyms, short forms, IRIs or definitions match `q`, in any language and with typo tolerance, ranked for a typeahead: a label equal to the query first, then labels that start with it, synonyms, short forms and IRIs equal to it or starting with it, labels and then synonyms that contain its words, matches within a few edits, and definitions that contain its words. Within each tier the order is the edits, the field, entities that are not deprecated first, the caller's language, the length of the matched text, the text and the IRI. The search reads the head of the branch from an entity index that each commit's changes keep current, and the caller sees only the graphs their grants allow. A query of 1 to 3 characters takes no edits as typed, 4 to 7 characters take one and longer queries two. `at` and `inferences` are refused.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "searchOntology",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The text searched for.",
+            "in": "query",
+            "name": "q",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Entity kinds, comma separated: `class`, `property` (every kind of property), `objectProperty`, `dataProperty`, `annotationProperty`, `individual`, `datatype`, `concept`, `conceptScheme` or `collection` (all kinds by default).",
+            "in": "query",
+            "name": "kind",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The caller's languages, comma separated and most preferred first, as BCP 47 tags. `Accept-Language` is read when it is absent. Values in these languages rank first within a tier, then untagged values, then English, then the others.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most entities listed, from 1 to 100 (10 by default).",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The entities skipped. `offset` and `limit` together reach at most 10,000, and `next` is null when no later page fits in that window although `more` is true.",
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Rank the matches within a few edits (true by default).",
+            "in": "query",
+            "name": "fuzzy",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Rank the matches in definitions (true by default).",
+            "in": "query",
+            "name": "definitions",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "dataset": {
+                      "type": "string"
+                    },
+                    "graphs": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "index": {
+                      "description": "Whether the index reflected the head, applied the changes of later commits or was built for this search.",
+                      "enum": [
+                        "current",
+                        "updated",
+                        "built"
+                      ],
+                      "type": "string"
+                    },
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "more": {
+                      "type": "boolean"
+                    },
+                    "next": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "offset": {
+                      "type": "integer"
+                    },
+                    "query": {
+                      "type": "string"
+                    },
+                    "results": {
+                      "items": {
+                        "description": "One entity. `type` is `entity`, so that lists which mix kinds of result tell them apart.",
+                        "properties": {
+                          "deprecated": {
+                            "type": "boolean"
+                          },
+                          "iri": {
+                            "type": "string"
+                          },
+                          "kinds": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "label": {
+                            "description": "The label in the caller's best language.",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "labelLang": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "match": {
+                            "properties": {
+                              "distance": {
+                                "type": "integer"
+                              },
+                              "field": {
+                                "enum": [
+                                  "label",
+                                  "synonym",
+                                  "shortForm",
+                                  "definition"
+                                ],
+                                "type": "string"
+                              },
+                              "highlight": {
+                                "description": "The matched ranges of `text` as `[start, end]` pairs in UTF-16 code units.",
+                                "items": {
+                                  "items": {
+                                    "type": "integer"
+                                  },
+                                  "type": "array"
+                                },
+                                "type": "array"
+                              },
+                              "kind": {
+                                "enum": [
+                                  "exact",
+                                  "prefix",
+                                  "words",
+                                  "fuzzy"
+                                ],
+                                "type": "string"
+                              },
+                              "lang": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "property": {
+                                "description": "The property of the value, or null for the IRI and its local name.",
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "text": {
+                                "type": "string"
+                              },
+                              "tier": {
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "shortForm": {
+                            "description": "The `oboInOwl:id`, `skos:notation`, prefixed name or local name.",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "type": {
+                            "enum": [
+                              "entity"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "One page of ranked entities."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Search the entities of an ontology",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/openapi.json": {
       "get": {
         "externalDocs": {

@@ -846,7 +846,7 @@ class Cap(Base):
 
     def test_the_cap_is_global_not_per_ledger_file(self):
         carry = {"name": "pilot", "cost": 1_002_560_000}
-        self.assertEqual(px.HARD_CAP, 95 * 10**9)
+        self.assertEqual(px.HARD_CAP, 105 * 10**9)
         with self.assertRaises(Invalid):
             px.Ledger(self.root / "big.jsonl", px.HARD_CAP, carry)  # with carryover
         with self.assertRaises(Invalid):
@@ -1227,7 +1227,7 @@ class OpenAI(Base):
                 SOL: ((2000, 2500, 5000, 100, 10000), (4000, 5000, 10000, 200, 15000)),
             },
         )
-        self.assertEqual(px.HARD_CAPS, {"anthropic": 95 * 10**9, "openai": 50 * 10**9})
+        self.assertEqual(px.HARD_CAPS, {"anthropic": 105 * 10**9, "openai": 50 * 10**9})
 
     def test_cost_splits_reads_writes_and_long_context(self):
         u = CHAT_REPLY["usage"]

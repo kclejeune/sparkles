@@ -1,0 +1,10 @@
+chebi_lite same
+go same
+ore_ont_10689 same
+ore_ont_11395 same
+ore_ont_14042 same
+ore_ont_14459 same
+ore_ont_16008 same
+ore_ont_8486 same
+ore_ont_868 same
+ore_ont_9674 same

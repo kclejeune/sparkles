@@ -236,6 +236,68 @@
           "schema": 1
         }
       }
+    },
+    {
+      "run_id": "sha256-b5c87dca99195e736806b7e2591fd26c590ed2077985c2c4dbf9ab96d486e1ba",
+      "path": "../2026-11-02-ask-cheap-tier-paid.json",
+      "sha256": "b5c87dca99195e736806b7e2591fd26c590ed2077985c2c4dbf9ab96d486e1ba",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": {
+          "effort": "medium",
+          "contextTokens": 200000,
+          "maxOutputTokens": 16384,
+          "requestTimeoutSecs": 180,
+          "askDeadlineSecs": 300,
+          "queryTimeoutSecs": 60,
+          "askTokenBudget": 100000,
+          "clarifications": "answer"
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": "A development laptop with 16 cores and 30 GB of memory that was running other work. Binaries were built on atlas and copied back.",
+          "measurement": "Ask cheap-tier hill-climb on DBpedia 2022.12.01, Phase 2: robustness fixes of the draft check, well-known prefix completion, a ranked class profile and an answer-projection prompt rule, judged on Claude Haiku 5.5 and OpenAI GPT-6 Luna over qald-validation-v2, with finals on unseen-150 for Luna, Haiku, GPT-6.1 Terra, GPT-6.1 Sol and Claude Opus 5.5",
+          "schema": 1
+        }
+      }
+    },
+    {
+      "run_id": "sha256-68fbd0d73c231858166948389a75f28efc38974a73dbc4c1814c045faa30b67f",
+      "path": "../2026-11-03-ask-effort-paid.json",
+      "sha256": "68fbd0d73c231858166948389a75f28efc38974a73dbc4c1814c045faa30b67f",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": {
+          "effort": "high",
+          "contextTokens": 200000,
+          "maxOutputTokens": 16384,
+          "requestTimeoutSecs": 180,
+          "askDeadlineSecs": 300,
+          "queryTimeoutSecs": 60,
+          "askTokenBudget": 100000,
+          "clarifications": "answer",
+          "haiku": {
+            "maxOutputTokens": 16384,
+            "requestTimeoutSecs": 180
+          },
+          "luna": {
+            "maxOutputTokens": 16384,
+            "requestTimeoutSecs": 180
+          }
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": "A development laptop with 16 cores and 30 GB of memory that was running other work. Binaries were built on atlas and copied back.",
+          "measurement": "Ask effort trial on DBpedia 2022.12.01: Claude Haiku 5.5 and GPT-6 Luna at effort high against the medium runs of the cheap-tier round, build p2final-ace00e4b, 51 qald-validation-v2 questions, three runs per arm",
+          "schema": 1
+        }
+      }
     }
   ]
 }

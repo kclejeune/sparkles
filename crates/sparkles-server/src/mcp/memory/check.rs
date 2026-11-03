@@ -27,6 +27,8 @@ const DIR_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#dirLan
 const MAX_LOOKUPS: usize = 200;
 /// The instances of a class whose predicates suggest replacements for a mismatch.
 const PROFILE_SAMPLE: usize = 200;
+/// The most used predicates of a class's sample from which its suggestions are chosen.
+const PROFILE_PREDICATES: usize = 50;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -590,26 +592,32 @@ impl Tools<'_> {
                 continue;
             }
             lookups += 1;
-            let used = r
-                .ask(
-                    &format!(
-                        "ASK {{ {} {} }}",
-                        r.quads("?s a ?c", &[]),
-                        r.quads_in("?s ?pp ?o", &[], "h")
-                    ),
-                    vec![
-                        ("c".into(), c.clone().into()),
-                        ("pp".into(), p.clone().into()),
-                    ],
-                )
-                .map_err(|e| ctx.engine(e))?;
-            if used {
-                continue;
+            // The class and the predicate are written into the query. Passed as
+            // bindings, they left a large store's planner an estimate over every quad
+            // that passed the query memory budget, which failed the whole check of a
+            // draft that used a predicate its class lacks. The lookup is advice about
+            // the draft, so a lookup over its budget leaves the pattern unjudged.
+            let used = r.ask(
+                &format!(
+                    "ASK {{ {} {} }}",
+                    r.quads(&format!("?s a {c}"), &[]),
+                    r.quads_in(&format!("?s {p} ?o"), &[], "h")
+                ),
+                Vec::new(),
+            );
+            match used {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) if over_budget(&e) => continue,
+                Err(e) => return Err(ctx.engine(e)),
             }
             let (tc, tp) = (terms.iri(c.as_str()), terms.iri(p.as_str()));
-            let suggestions = self
-                .class_predicates(&r, c, max)
-                .map_err(|e| ctx.engine(e))?
+            let suggestions = match self.class_predicates(&r, report.as_deref(), c, p, max) {
+                Ok(s) => s,
+                Err(e) if over_budget(&e) => Vec::new(),
+                Err(e) => return Err(ctx.engine(e)),
+            };
+            let suggestions = suggestions
                 .into_iter()
                 .map(|(p, n)| json!({ "term": terms.iri(p.as_str()), "count": n, "why": "class-profile" }))
                 .collect();
@@ -870,22 +878,56 @@ impl Tools<'_> {
         }
     }
 
-    /// The predicates that a sample of the instances of `c` use, most used first.
+    /// The predicates that a sample of the instances of `c` use, with how many of the
+    /// sample use each. Those in the namespace of `near` come first, and within each
+    /// group a predicate ranks by its share of the sample weighted by how rare it is in
+    /// the dataset, when `report` counts it, so that a predicate every page has, such as
+    /// a link to other pages, ranks below one that is particular to the class. The
+    /// sample's subjects are written into the profile query, so that each is looked up
+    /// through the index. Joined as a subquery, they left the planner a scan of every
+    /// quad, which on a large store passed the query memory budget.
     fn class_predicates(
         &self,
         r: &Reader,
+        report: Option<&SchemaReport>,
         c: &NamedNode,
+        near: &NamedNode,
         max: usize,
     ) -> Result<Vec<(NamedNode, u64)>, Error> {
         if max == 0 {
             return Ok(Vec::new());
         }
-        let q = format!(
-            "SELECT ?p (COUNT(*) AS ?n) WHERE {{ {{ SELECT DISTINCT ?s WHERE {{ {} }} LIMIT {PROFILE_SAMPLE} }} {} FILTER(?p != <{RDF_TYPE}>) }} GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT {max}",
-            r.quads("?s a ?c", &[]),
-            r.quads_in("?s ?p ?o", &[], "h"),
+        let sample = format!(
+            "SELECT DISTINCT ?s WHERE {{ {} }} LIMIT {PROFILE_SAMPLE}",
+            r.quads(&format!("?s a {c}"), &[]),
         );
-        Ok(r.rows(&q, vec![("c".into(), c.clone().into())])?
+        let rows = r.rows(&sample, Vec::new())?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let subjects: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(Some(Term::NamedNode(s))) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect();
+        let pattern = r.quads_in("?s ?p ?o", &[], "h");
+        let limit = max.max(PROFILE_PREDICATES);
+        // A blank node cannot be written into the query, so a sample that holds one is
+        // profiled through the subquery, which the caller's budget still bounds.
+        let q = if subjects.len() == rows.len() {
+            format!(
+                "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{ VALUES ?s {{ {} }} {pattern} FILTER(?p != <{RDF_TYPE}>) }} GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT {limit}",
+                subjects.join(" "),
+            )
+        } else {
+            format!(
+                "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{ {{ {sample} }} {pattern} FILTER(?p != <{RDF_TYPE}>) }} GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT {limit}",
+            )
+        };
+        let mut found: Vec<(NamedNode, u64)> = r
+            .rows(&q, Vec::new())?
             .into_iter()
             .filter_map(|row| match row.as_slice() {
                 [Some(Term::NamedNode(p)), Some(Term::Literal(n))] => {
@@ -893,6 +935,31 @@ impl Tools<'_> {
                 }
                 _ => None,
             })
+            .collect();
+        let ns = namespace(near.as_str());
+        let weight = |p: &NamedNode, n: u64| -> f64 {
+            let rarity = report
+                .and_then(|rep| {
+                    let triples = predicate(rep, p.as_str())?.observed.triples;
+                    (rep.totals.triples > 0)
+                        .then(|| ((rep.totals.triples + 1) as f64 / (triples + 1) as f64).ln())
+                })
+                .unwrap_or(1.0);
+            n as f64 * rarity
+        };
+        let mut ranked: Vec<(bool, f64, NamedNode, u64)> = found
+            .drain(..)
+            .map(|(p, n)| (namespace(p.as_str()) != ns, weight(&p, n), p, n))
+            .collect();
+        ranked.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(b.1.total_cmp(&a.1))
+                .then(a.2.as_str().cmp(b.2.as_str()))
+        });
+        Ok(ranked
+            .into_iter()
+            .take(max)
+            .map(|(_, _, p, n)| (p, n))
             .collect())
     }
 }
@@ -909,13 +976,20 @@ fn finish(mut out: Value, issues: &[Issue], estimated: Option<u64>, terms: &Term
 }
 
 /// The prefix name of the prefixed name at a 1-based line and column.
-fn prefix_at(q: &str, line: usize, col: usize) -> Option<String> {
+pub(crate) fn prefix_at(q: &str, line: usize, col: usize) -> Option<String> {
     let l: Vec<char> = q.lines().nth(line.checked_sub(1)?)?.chars().collect();
-    let pn = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':');
+    // A character of a prefixed name, with `%` escapes and the backslash escapes of a
+    // local name such as `dbr:Mercury_\(planet\)`.
+    let pn = |i: usize| {
+        let c = l[i];
+        c.is_alphanumeric()
+            || matches!(c, '_' | '-' | '.' | ':' | '%' | '\\')
+            || (i > 0 && l[i - 1] == '\\')
+    };
     let at = col.checked_sub(1)?.min(l.len());
     // the prefixed name at the position, or the one that ends just before it
     let (mut start, mut end) = (at, at);
-    while end < l.len() && pn(l[end]) {
+    while end < l.len() && pn(end) {
         end += 1;
     }
     if start == end {
@@ -924,7 +998,7 @@ fn prefix_at(q: &str, line: usize, col: usize) -> Option<String> {
         }
         end = start;
     }
-    while start > 0 && pn(l[start - 1]) {
+    while start > 0 && pn(start - 1) {
         start -= 1;
     }
     let token: String = l[start..end].iter().collect();
@@ -1080,4 +1154,23 @@ pub(super) fn literal_issue(
         at: None,
         suggestions,
     })
+}
+
+/// A lookup that passed one of its budgets, which a diagnostic treats as no answer.
+fn over_budget(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::BudgetExceeded(b) if matches!(
+            b.kind,
+            sparkles::BudgetKind::Memory
+                | sparkles::BudgetKind::ServerMemory
+                | sparkles::BudgetKind::Rows
+                | sparkles::BudgetKind::RowsProduced
+        )
+    )
+}
+
+/// The namespace of an IRI: everything up to its last `#` or `/`.
+fn namespace(iri: &str) -> &str {
+    iri.rfind(['#', '/']).map_or(iri, |i| &iri[..=i])
 }

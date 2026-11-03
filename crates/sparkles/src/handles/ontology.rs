@@ -2489,6 +2489,7 @@ pub fn rl_inspector(
 
 pub mod classify;
 pub mod file;
+pub mod search;
 pub mod wire;
 
 #[cfg(test)]
