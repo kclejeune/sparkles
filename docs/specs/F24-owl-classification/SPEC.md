@@ -410,15 +410,23 @@ equivalences, and of complex superclasses with `--include-subclass-of`.
 parsed again as the next command, so that `sparkles ontology reason --input x.owl relax
 reduce --output y.owl` runs in one process with the ontology in memory (item 637).
 `classify` and `check` can join a chain and end it with status 1 where they would exit
-with it alone. `--input` on a later command is ROBOT's chained input error, and
-`--output` on any command writes the ontology after it.
+with it alone. A chain can also start from `classify FILE` or `check FILE`, which answer
+from the file as they do alone before the rest of the chain reads it. FILE is their
+first positional argument and the next command is the second, so the options after the
+next command belong to it. A chain from a database starts with `reason`, `reduce` or
+`relax` and `--loc`. `--input` on a later command is ROBOT's chained input error, and
+`--output` on any command writes the ontology after it. A malformed command line exits
+with status 2, as every `sparkles` command does, where ROBOT documents only a non-zero
+status.
 
 **Comparison with ROBOT.** `scripts/elk-compare/ofn-axioms.py` compares two
 functional-style files after expanding prefixes and sorting the operands of n-ary
 constructors. On GO and ChEBI lite the outputs of `reason`, `reduce`, `relax` and the
 chain `reason relax reduce` equal ROBOT 1.9.11's with ELK 0.6.0 axiom for axiom,
 annotations included: 622,357 axioms of GO's reasoned ontology and 1,682,146 of ChEBI
-lite's, of which 96,847 and 424,904 are logical. The run record of the
+lite's, of which 96,847 and 424,904 are logical. On the benchmark host `reason` took 3.45 s
+on GO and 7.74 s on ChEBI lite from the RDF/XML release, against `robot reason`'s 14.04 s
+and 30.63 s, and the chain took 3.87 s and 10.27 s. The run record of the
 [ROBOT comparison](../../benchmarks/el-classification/RESULTS.md#robot) keeps the
 comparison and the timings.
 

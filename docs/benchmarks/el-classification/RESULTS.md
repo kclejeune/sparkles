@@ -114,31 +114,54 @@ subsumptions.
 <a id="robot"></a>
 
 OBO release pipelines classify with ROBOT's `reason`, `reduce`, `relax` and `materialize`
-commands. ROBOT 1.9.11 ran each with its bundled ELK 0.6.0 on GO and ChEBI lite, from the
-release's RDF/XML file to a written functional-style file. In every output, each asserted
-subsumption between named classes is entailed by the classifier's taxonomy, and each
-direct edge of the taxonomy is asserted. `reason` asserts every direct subsumption of the
-classifier's hierarchy in the ontology. `reduce` leaves exactly the 57,456 direct subsumptions of GO
-and the 296,173 of ChEBI lite between named classes, which `scripts/el-oracle.py
---asserted` compared.
+commands. `sparkles ontology reason`, `reduce` and `relax` take ROBOT 1.9.11's options and
+defaults and chain in one process, and `materialize` is roadmap item 636. ROBOT 1.9.11
+ran each command with its bundled ELK 0.6.0 on GO and ChEBI lite, from the release's
+RDF/XML file to a written functional-style file, and the Sparkles commands ran on the
+same files with their default options. `scripts/elk-compare/ofn-axioms.py --all`
+compared each pair of outputs after expanding prefixed names and sorting the operands of
+n-ary axioms. The outputs are equal axiom for axiom, annotations included, for every
+command and for the chain `reason relax reduce`.
 
-`sparkles ontology classify FILE --format ofn` writes the taxonomy without the rest of
-the ontology, and its output equals `el_classify`'s on both files. Sparkles has no
-counterpart of the other commands. Roadmap items 634 to 636 add
-`sparkles ontology reason`, `reduce`, `relax` and `materialize` with ROBOT's options,
-item 637 chains them in one process, and this comparison checks their output.
+| Output | GO axioms | GO logical axioms | ChEBI lite axioms | ChEBI lite logical axioms |
+|---|---:|---:|---:|---:|
+| `reason` | 622,357 | 96,847 | 1,682,146 | 424,904 |
+| `reduce` | 608,460 | 82,950 | 1,658,143 | 400,901 |
+| `relax` | 617,214 | 91,704 | 1,666,767 | 409,525 |
+| `reason relax reduce` | 622,357 | 96,847 | 1,677,573 | 420,331 |
 
-On forge, the benchmark host, `robot reason` with ELK took a median of 14.0 s on GO and
-30.6 s on ChEBI lite over three runs, from the release's RDF/XML file to the written
-functional-style file, at peak resident sets of 3,597 MiB and 8,287 MiB with an 8 GiB
-heap. `sparkles ontology classify`, built before item 602 as below, took 4.3 s and 9.8 s on the same files, at 1,850 MiB
-and 3,587 MiB, so it is 3.3 times as fast on GO and 3.1 times on ChEBI lite. It writes
-the taxonomy only, while `robot reason` writes the whole ontology with the inferred
-axioms, so the comparison counts the larger output against ROBOT.
+The logical axioms are every axiom but the declarations and the annotation axioms. In
+every output, each asserted subsumption between named classes is entailed by the
+classifier's taxonomy, and each direct edge of the taxonomy is asserted. `reduce` leaves
+exactly the 57,456 direct subsumptions of GO and the 296,173 of ChEBI lite between named
+classes, which `scripts/el-oracle.py --asserted` compared.
 
-The other commands ran once each on a loaded laptop, so their times only show the scale
-and are not measurements. Each is one end-to-end run in seconds, with the peak resident
-memory in MiB.
+On forge, the benchmark host, each command ran three times end to end from the release's
+RDF/XML file to the written functional-style file. The table gives the median time in
+seconds and the median peak resident memory in MiB. ROBOT's `reason` figures come from
+the [reference reasoners run](runs/2026-11-03-reasoners-forge-ea96e8f5/record.json) on
+the same host and files, with an 8 GiB heap.
+
+| Run | GO time | GO peak RSS | ChEBI lite time | ChEBI lite peak RSS |
+|---|---:|---:|---:|---:|
+| `robot reason` | 14.04 | 3,597 | 30.63 | 8,287 |
+| `sparkles ontology reason` | 3.45 | 1,525 | 7.74 | 2,516 |
+| `sparkles ontology reduce` | 3.49 | 1,521 | 8.30 | 2,508 |
+| `sparkles ontology relax` | 3.04 | 1,492 | 5.70 | 2,499 |
+| `sparkles ontology reason relax reduce` | 3.87 | 1,527 | 10.27 | 2,516 |
+| `sparkles ontology classify` | 2.77 | 1,374 | 5.61 | 2,563 |
+
+`sparkles ontology reason` writes the same ontology as `robot reason` 4.1 times as fast
+on GO and 4.0 times on ChEBI lite, in 42% and 30% of its peak resident memory. The
+chain `reason relax reduce` takes 12% more time than `reason` alone on GO and 33% more
+on ChEBI lite. `reduce` classifies the relaxed ontology again in memory, and no file is
+read or written between the commands. `classify` writes the taxonomy only. The
+[run record](runs/2026-11-03-robot-commands-forge-71fcf893/record.json) keeps every
+round, the host, the binary's checksum and the axiom comparison.
+
+ROBOT's other commands ran once each on a loaded laptop, so their times only show the
+scale and are not measurements. Each is one end-to-end run in seconds, with the peak
+resident memory in MiB. Roadmap item NEW-ITEM-4 takes them on the benchmark host.
 
 | Run | GO time | GO peak RSS | ChEBI lite time | ChEBI lite peak RSS |
 |---|---:|---:|---:|---:|
@@ -148,8 +171,6 @@ memory in MiB.
 | `robot relax` | 9.0 | 1,491 | 14.8 | 2,279 |
 | `robot materialize` | 14.4 | 2,106 | 37.7 | 7,509 |
 | `robot reason relax reduce` | 23.2 | 7,088 | 68.4 | 8,612 |
-| `sparkles ontology classify` | 8.0 | 1,684 | 16.4 | 3,499 |
-| `sparkles ontology classify` from the functional-style file | 2.0 | 694 | 11.3 | 2,402 |
 
 ROBOT ran with an 8 GiB heap. The materialized property was part of, `BFO:0000050`, for
 GO and has role, `RO:0000087`, for ChEBI lite.
