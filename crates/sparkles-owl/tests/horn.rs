@@ -1,0 +1,477 @@
+//! The Horn rules of roadmap item 603 (Tier H): each rule of Kazakov's calculus for
+//! Horn-SHIQ, the role constructs beside it and their interactions, on ontologies with
+//! the entailments and non-entailments written from the semantics.
+
+use sparkles_owl::classify::{Classification, Classifier, Limits, Tier};
+use sparkles_owl::model::*;
+use sparkles_owl::ofn_read;
+
+const EX: &str = "http://ex.org/";
+
+fn c(s: &str) -> Class {
+    Class::new(format!("{EX}{s}"))
+}
+
+/// The axioms of a functional-syntax body with the prefix `:` for `http://ex.org/`.
+fn axioms(body: &str) -> Vec<Axiom> {
+    let doc = ofn_read::parse(&format!(
+        "Prefix(:=<{EX}>)\nPrefix(owl:=<http://www.w3.org/2002/07/owl#>)\nOntology(\n{body}\n)"
+    ))
+    .unwrap();
+    doc.axioms
+}
+
+/// Classifies at one and at eight threads, checks that the answers are the same, and
+/// returns one with the axioms left out.
+fn run(body: &str) -> (Classification, Vec<sparkles_owl::classify::Excluded>) {
+    let ax = axioms(body);
+    let mut outs = Vec::new();
+    for threads in [1, 8] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                ..Limits::default()
+            })
+            .unwrap();
+        outs.push((out, k.excluded()));
+    }
+    let (b, _) = outs.pop().unwrap();
+    let (a, ex) = outs.pop().unwrap();
+    let pairs = |o: &Classification| -> Vec<(String, String)> {
+        let t = &o.taxonomy;
+        let cs: Vec<Class> = t.classes().cloned().collect();
+        let mut v = Vec::new();
+        for x in &cs {
+            for y in &cs {
+                if t.is_subclass(x, y) {
+                    v.push((x.as_str().to_string(), y.as_str().to_string()));
+                }
+            }
+        }
+        v.sort();
+        v
+    };
+    assert_eq!(pairs(&a), pairs(&b), "the answer depends on the threads");
+    (a, ex)
+}
+
+/// Asserts that the whole ontology is taken and that each pair is entailed or not.
+fn check(body: &str, yes: &[(&str, &str)], no: &[(&str, &str)]) -> Classification {
+    let (out, ex) = run(body);
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    let t = &out.taxonomy;
+    for (a, b) in yes {
+        assert!(t.is_subclass(&c(a), &c(b)), "{a} ⊑ {b} is entailed");
+    }
+    for (a, b) in no {
+        assert!(!t.is_subclass(&c(a), &c(b)), "{a} ⊑ {b} is not entailed");
+    }
+    out
+}
+
+fn unsat(body: &str, classes: &[&str], sat: &[&str]) {
+    let (out, ex) = run(body);
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    for a in classes {
+        assert!(out.taxonomy.is_unsatisfiable(&c(a)), "{a} is unsatisfiable");
+    }
+    for a in sat {
+        assert!(!out.taxonomy.is_unsatisfiable(&c(a)), "{a} is satisfiable");
+    }
+}
+
+#[test]
+fn r4_a_universal_on_an_inverse_reaches_the_predecessor() {
+    let out = check(
+        "SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:B ObjectAllValuesFrom(ObjectInverseOf(:r) :C))",
+        &[("A", "C")],
+        &[("B", "C")],
+    );
+    assert_eq!(out.stats.tier, Tier::Horn);
+    assert_eq!(out.stats.outside_el.taken, 1);
+}
+
+#[test]
+fn r3_a_universal_reaches_the_successor() {
+    check(
+        "SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:A ObjectAllValuesFrom(:r :C))
+         EquivalentClasses(:D ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :C)))",
+        &[("A", "D")],
+        &[("B", "C"), ("D", "A")],
+    );
+}
+
+#[test]
+fn r3_through_a_superrole_and_nested_universals() {
+    check(
+        "SubObjectPropertyOf(:s :r)
+         SubClassOf(:A ObjectSomeValuesFrom(:s ObjectSomeValuesFrom(:s :B)))
+         SubClassOf(:A ObjectAllValuesFrom(:r ObjectAllValuesFrom(:r :C)))
+         SubClassOf(ObjectIntersectionOf(:B :C) :E)
+         SubClassOf(ObjectSomeValuesFrom(:s :E) :F)
+         SubClassOf(ObjectSomeValuesFrom(:s :F) :G)",
+        &[("A", "G")],
+        &[("B", "E")],
+    );
+}
+
+#[test]
+fn a_universal_on_an_inverse_goes_back_two_steps() {
+    // hand-horn-inverse-chain
+    check(
+        "SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:B ObjectSomeValuesFrom(:r :C))
+         SubClassOf(:C ObjectAllValuesFrom(ObjectInverseOf(:r) ObjectAllValuesFrom(ObjectInverseOf(:r) :E)))",
+        &[("A", "E")],
+        &[("B", "E"), ("C", "E")],
+    );
+}
+
+#[test]
+fn a_negative_existential_on_an_inverse_reaches_the_successor() {
+    // an A's r-successor has an r⁻-successor in A, so it is B
+    check(
+        "SubClassOf(:A ObjectSomeValuesFrom(:r :C))
+         SubClassOf(ObjectSomeValuesFrom(ObjectInverseOf(:r) :A) :B)
+         SubClassOf(ObjectSomeValuesFrom(:r :B) :D)",
+        &[("A", "D")],
+        &[("C", "B")],
+    );
+}
+
+#[test]
+fn domains_and_ranges_of_inverses() {
+    check(
+        "ObjectPropertyDomain(ObjectInverseOf(:r) :X)
+         ObjectPropertyRange(ObjectInverseOf(:s) :Y)
+         SubClassOf(:A ObjectSomeValuesFrom(:r :C))
+         SubClassOf(ObjectSomeValuesFrom(:r :X) :D)
+         SubClassOf(:E ObjectSomeValuesFrom(:s :C))",
+        &[("A", "D"), ("E", "Y")],
+        &[("C", "X"), ("A", "Y")],
+    );
+}
+
+#[test]
+fn a_range_reaches_the_predecessor_of_an_inverse_link() {
+    // A has an r⁻-successor, whose r-successor the A is, so A is in r's range
+    check(
+        "ObjectPropertyRange(:r :X)
+         SubClassOf(:A ObjectSomeValuesFrom(ObjectInverseOf(:r) :C))",
+        &[("A", "X")],
+        &[("C", "X")],
+    );
+}
+
+#[test]
+fn symmetric_and_inverse_properties() {
+    check(
+        "SymmetricObjectProperty(:r)
+         InverseObjectProperties(:s :t)
+         SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:B ObjectAllValuesFrom(:r :C))
+         SubClassOf(:E ObjectSomeValuesFrom(:s :F))
+         SubClassOf(:F ObjectAllValuesFrom(:t :G))",
+        &[("A", "C"), ("E", "G")],
+        &[("B", "C"), ("F", "G")],
+    );
+}
+
+#[test]
+fn a_universal_on_a_transitive_role_reaches_every_step() {
+    // hand-forall-transitive
+    check(
+        "TransitiveObjectProperty(:r)
+         SubClassOf(:A ObjectAllValuesFrom(:r :B))
+         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:r :C))))
+         EquivalentClasses(:D ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :C)))",
+        &[("A", "D")],
+        &[("C", "B")],
+    );
+}
+
+#[test]
+fn a_universal_on_a_chain_follows_its_automaton() {
+    check(
+        "SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+         SubClassOf(:A ObjectAllValuesFrom(:t :B))
+         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :C)))
+         SubClassOf(ObjectIntersectionOf(:B :C) :E)
+         SubClassOf(ObjectSomeValuesFrom(:s :E) :F)
+         SubClassOf(ObjectSomeValuesFrom(:r :F) :G)",
+        &[("A", "G")],
+        &[("C", "E")],
+    );
+    // on the inverse of a chain, the universal goes back along it
+    check(
+        "SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :C)))
+         SubClassOf(:C ObjectAllValuesFrom(ObjectInverseOf(:t) :E))",
+        &[("A", "E")],
+        &[("C", "E")],
+    );
+}
+
+#[test]
+fn a_chain_with_an_inverse_operand() {
+    // hand-inverse-chain
+    check(
+        "SubObjectPropertyOf(ObjectPropertyChain(ObjectInverseOf(:r) :s) :t)
+         SubClassOf(:A ObjectSomeValuesFrom(ObjectInverseOf(:r) ObjectSomeValuesFrom(:s :B)))
+         EquivalentClasses(:D ObjectSomeValuesFrom(:t :B))",
+        &[("A", "D")],
+        &[],
+    );
+}
+
+#[test]
+fn links_into_a_shared_filler_do_not_join() {
+    // hand-shared-filler-no-join
+    check(
+        "SubObjectPropertyOf(ObjectPropertyChain(:r ObjectInverseOf(:s)) :t)
+         SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:C ObjectSomeValuesFrom(:s :B))
+         EquivalentClasses(:D ObjectSomeValuesFrom(:t :C))",
+        &[],
+        &[("A", "D")],
+    );
+}
+
+#[test]
+fn r5_a_functional_role_merges_its_successors() {
+    // hand-functional-merge
+    check(
+        "FunctionalObjectProperty(:r)
+         SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:r :B) ObjectSomeValuesFrom(:r :C)))
+         EquivalentClasses(:D ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :C)))",
+        &[("A", "D")],
+        &[("B", "C")],
+    );
+}
+
+#[test]
+fn r5_a_qualified_at_most_merges_the_successors_in_its_filler() {
+    // hand-max-qualified-merge
+    check(
+        "SubClassOf(:A ObjectMaxCardinality(1 :r :B))
+         SubClassOf(:A ObjectSomeValuesFrom(:r :C))
+         SubClassOf(:A ObjectSomeValuesFrom(:r :E))
+         SubClassOf(:C :B)
+         SubClassOf(:E :B)
+         EquivalentClasses(:D ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C :E)))",
+        &[("A", "D")],
+        &[],
+    );
+    // a successor outside the filler stays apart
+    check(
+        "SubClassOf(:A ObjectMaxCardinality(1 :r :B))
+         SubClassOf(:A ObjectSomeValuesFrom(:r :C))
+         SubClassOf(:A ObjectSomeValuesFrom(:r :E))
+         SubClassOf(:C :B)
+         EquivalentClasses(:D ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C :E)))",
+        &[],
+        &[("A", "D")],
+    );
+}
+
+#[test]
+fn r5_with_a_universal_on_the_merged_successor() {
+    check(
+        "SubClassOf(:A ObjectMaxCardinality(1 :r owl:Thing))
+         SubObjectPropertyOf(:s :r)
+         SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:A ObjectSomeValuesFrom(:s :C))
+         SubClassOf(:A ObjectAllValuesFrom(:s :E))
+         SubClassOf(ObjectIntersectionOf(:B :E) :F)
+         EquivalentClasses(:D ObjectSomeValuesFrom(:r :F))",
+        &[("A", "D")],
+        &[],
+    );
+}
+
+#[test]
+fn at_least_needs_distinct_successors() {
+    // hand-max-clash
+    unsat(
+        "SubClassOf(:A ObjectMinCardinality(2 :r :B))
+         SubClassOf(:A ObjectMaxCardinality(1 :r))",
+        &["A"],
+        &["B"],
+    );
+    unsat(
+        "FunctionalObjectProperty(:r)
+         SubObjectPropertyOf(:s :r)
+         SubClassOf(:A ObjectMinCardinality(3 :s :B))
+         SubClassOf(:E ObjectMinCardinality(1 :s :B))",
+        &["A"],
+        &["E", "B"],
+    );
+}
+
+#[test]
+fn r6_an_inverse_at_most_identifies_the_predecessor() {
+    // hand-inverse-max
+    check(
+        "SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:B ObjectMaxCardinality(1 ObjectInverseOf(:r) owl:Thing))
+         SubClassOf(:B ObjectSomeValuesFrom(ObjectInverseOf(:r) :C))",
+        &[("A", "C")],
+        &[("B", "C"), ("C", "A")],
+    );
+    // hand-inverse-functional-merge
+    check(
+        "InverseFunctionalObjectProperty(:r)
+         SubClassOf(:B ObjectSomeValuesFrom(ObjectInverseOf(:r) :A))
+         SubClassOf(:B ObjectSomeValuesFrom(ObjectInverseOf(:r) :C))
+         EquivalentClasses(:D ObjectSomeValuesFrom(ObjectInverseOf(:r) ObjectIntersectionOf(:A :C)))",
+        &[("B", "D")],
+        &[],
+    );
+}
+
+#[test]
+fn r6_with_a_qualified_filler_and_the_link_back() {
+    // an A's r-successor has one r⁻-successor in B, which the A is, so A ⊑ C, and the
+    // A is then an s⁻-predecessor of the successor, s being under r⁻
+    check(
+        "SubClassOf(:A :B)
+         SubObjectPropertyOf(:s ObjectInverseOf(:r))
+         SubClassOf(:A ObjectSomeValuesFrom(:r :N))
+         SubClassOf(:N ObjectMaxCardinality(1 ObjectInverseOf(:r) :B))
+         SubClassOf(:N ObjectSomeValuesFrom(:s ObjectIntersectionOf(:B :C)))
+         SubClassOf(ObjectSomeValuesFrom(ObjectInverseOf(:s) :N) :G)",
+        &[("A", "C"), ("A", "G")],
+        &[("B", "C"), ("B", "G")],
+    );
+}
+
+#[test]
+fn self_restrictions_count_as_successors() {
+    // hand-self-cardinality
+    check(
+        "SubClassOf(:A ObjectIntersectionOf(ObjectHasSelf(:r) ObjectMaxCardinality(1 :r owl:Thing)))
+         SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:A :C)
+         EquivalentClasses(:D ObjectIntersectionOf(:B :C))",
+        &[("A", "D")],
+        &[],
+    );
+}
+
+#[test]
+fn irreflexive_asymmetric_and_disjoint_roles() {
+    // hand-asymmetric-self
+    unsat(
+        "AsymmetricObjectProperty(:r)
+         EquivalentClasses(:A ObjectHasSelf(:r))",
+        &["A"],
+        &[],
+    );
+    unsat(
+        "IrreflexiveObjectProperty(:r)
+         SubClassOf(:A ObjectHasSelf(:r))
+         SubClassOf(:E ObjectSomeValuesFrom(:r :E))",
+        &["A"],
+        &["E"],
+    );
+    // two successors that a functional superrole merges, by disjoint roles
+    unsat(
+        "FunctionalObjectProperty(:t)
+         SubObjectPropertyOf(:r :t)
+         SubObjectPropertyOf(:s :t)
+         DisjointObjectProperties(:r :s)
+         SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:r :B) ObjectSomeValuesFrom(:s :C)))
+         SubClassOf(:E ObjectSomeValuesFrom(:r :B))",
+        &["A"],
+        &["E"],
+    );
+    // a symmetric subrole of an asymmetric role relates nothing
+    unsat(
+        "AsymmetricObjectProperty(:r)
+         SymmetricObjectProperty(:s)
+         SubObjectPropertyOf(:s :r)
+         SubClassOf(:A ObjectSomeValuesFrom(:s :B))
+         SubClassOf(:E ObjectSomeValuesFrom(:r :B))",
+        &["A"],
+        &["E"],
+    );
+    // the predecessor that an at-most restriction identifies with a successor is
+    // linked back by the successor's role, which an asymmetric role forbids
+    unsat(
+        "AsymmetricObjectProperty(:r)
+         SubObjectPropertyOf(:r :t)
+         SubObjectPropertyOf(ObjectInverseOf(:r) :t)
+         SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:B ObjectMaxCardinality(1 :t owl:Thing))
+         SubClassOf(:B ObjectSomeValuesFrom(:r :C))
+         SubClassOf(:E ObjectSomeValuesFrom(:r :F))",
+        &["A"],
+        &["B", "E"],
+    );
+}
+
+#[test]
+fn negations_move_to_their_side() {
+    check(
+        "DisjointClasses(ObjectComplementOf(:A) :B)
+         SubClassOf(:C ObjectComplementOf(:E))
+         SubClassOf(:F ObjectIntersectionOf(:C :E))
+         SubClassOf(ObjectUnionOf(:G :H) :I)
+         SubClassOf(:J :H)
+         SubClassOf(:K ObjectAllValuesFrom(:r ObjectComplementOf(:L)))
+         SubClassOf(:K ObjectSomeValuesFrom(:r :L))",
+        &[("B", "A"), ("J", "I"), ("G", "I")],
+        &[("A", "B")],
+    );
+    unsat(
+        "SubClassOf(:C ObjectComplementOf(:E)) SubClassOf(:F ObjectIntersectionOf(:C :E)) SubClassOf(:K ObjectAllValuesFrom(:r ObjectComplementOf(:L))) SubClassOf(:K ObjectSomeValuesFrom(:r :L))",
+        &["F", "K"],
+        &["C", "E", "L"],
+    );
+}
+
+#[test]
+fn axioms_the_horn_rules_cannot_take_stay_left_out() {
+    let (out, ex) = run("SubClassOf(:A ObjectAllValuesFrom(:r :B))
+         SubClassOf(:A ObjectUnionOf(:B :C))
+         SubClassOf(ObjectAllValuesFrom(:r :B) :D)
+         SubClassOf(:A ObjectMaxCardinality(2 :r :B))");
+    assert_eq!(ex.len(), 3, "{ex:#?}");
+    assert_eq!(out.stats.outside_el.taken, 1);
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    // with an individual the run keeps the EL rules alone
+    let (out, ex) = run("SubClassOf(:A ObjectAllValuesFrom(:r :B))
+         ClassAssertion(:A :a)");
+    assert_eq!(ex.len(), 1, "{ex:#?}");
+    assert_eq!(out.stats.outside_el.taken, 0);
+}
+
+#[test]
+fn an_incremental_change_after_a_horn_run_classifies_again() {
+    let ax = axioms(
+        "SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:B ObjectAllValuesFrom(ObjectInverseOf(:r) :C))",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("C")));
+    let more = axioms("SubClassOf(:E :A)");
+    k.add(&more);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(out.taxonomy.is_subclass(&c("E"), &c("C")));
+    k.remove(&ax[1..]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.taxonomy.is_subclass(&c("E"), &c("C")));
+    assert!(k.excluded().is_empty());
+    // an EL run that a Horn axiom joins starts its contexts again
+    let mut k = Classifier::of(&axioms("SubClassOf(:A ObjectSomeValuesFrom(:r :B))"));
+    k.classify(&Limits::default()).unwrap();
+    k.add(&axioms(
+        "SubClassOf(:B ObjectAllValuesFrom(ObjectInverseOf(:r) :C))",
+    ));
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("C")));
+}

@@ -225,17 +225,29 @@ type Excl = sparkles_owl::classify::Excluded;
 
 #[test]
 fn chains_against_the_range_restriction_are_left_out() {
-    let mut k = Classifier::of(&[
+    let axioms = [
         ax(AxiomKind::ObjectPropertyRange(ope("s"), ce("R"))),
         ax(AxiomKind::SubObjectPropertyOf(
             SubObjectPropertyExpression::Chain(vec![ope("a"), ope("b")]),
             ope("s"),
         )),
-    ]);
-    k.classify(&Limits::default()).unwrap();
+        sub(c("A"), some("a", some("b", ce("X")))),
+        ax(AxiomKind::EquivalentClasses(
+            [ce("D"), some("s", and([ce("X"), ce("R")]))].into(),
+        )),
+    ];
+    // with an individual, the run has only the EL rules
+    let mut k = Classifier::of(axioms.iter().chain(&[is_a("E", "i")]));
+    let out = k.classify(&Limits::default()).unwrap();
     let ex = k.excluded();
     assert_eq!(ex.len(), 1);
     assert!(matches!(&ex[0].gap, Gap::Outside { rule, .. } if rule.contains("2.2.6")));
+    assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+    // without one, the Horn rules take the chain, and the range holds along it
+    let mut k = Classifier::of(&axioms);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
 }
 
 #[test]

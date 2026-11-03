@@ -47,6 +47,8 @@
 
 mod data;
 mod dl;
+mod horn;
+mod horn_rules;
 mod index;
 mod query;
 mod saturate;
@@ -144,11 +146,14 @@ pub struct Stats {
     pub index: Duration,
     pub saturation: Duration,
     pub taxonomy: Duration,
-    /// the axioms outside OWL 2 EL, by what classifying them needs, which the run leaves
-    /// out until roadmap item 603's rules take them
+    /// the axioms outside OWL 2 EL, by what classifying them needs, with those the Horn
+    /// rules of roadmap item 603 take; the others are left out and reported
     pub outside_el: OutsideEl,
     /// the rules the run's axioms need
     pub tier: Tier,
+    /// the contexts of conjunctions that the Horn rules created, which
+    /// [`contexts`](Stats::contexts) includes
+    pub conjunctions: usize,
 }
 
 /// The result of a run that saturates without building a taxonomy
@@ -225,6 +230,8 @@ pub struct Saturation {
     entangled: bool,
     /// whether the last run whose saturation ended found the ontology consistent
     consistent: bool,
+    /// the contexts of conjunctions that the last run's Horn rules created
+    dynamic: Option<saturate::Dynamic>,
 }
 
 impl Default for Saturation {
@@ -523,6 +530,7 @@ impl Saturation {
             worlds: FxHashMap::default(),
             entangled: false,
             consistent: true,
+            dynamic: None,
         }
     }
 
@@ -595,7 +603,7 @@ impl Saturation {
         threads: usize,
         held_bytes: usize,
         limits: &Limits,
-    ) -> Result<(Axioms, Index, usize), Error> {
+    ) -> Result<(Axioms, Index, usize, OutsideEl), Error> {
         let mut ax = Axioms::default();
         let mut partial: BTreeMap<&AxiomKind, &'static str> = BTreeMap::new();
         let mut chains: Vec<&AxiomKind> = Vec::new();
@@ -741,6 +749,33 @@ impl Saturation {
                 }
             }
         }
+        // what each axiom outside OWL 2 EL needs, counted once however often it occurs; a
+        // chain whose superproperty has a range its last property lacks is Horn
+        let mut candidates: Vec<&AxiomKind> = outside.iter().map(|(i, _)| axioms[*i]).collect();
+        candidates.extend(chain_ranges.iter().map(|(k, _)| *k));
+        candidates.sort();
+        candidates.dedup();
+        let mut outside_el = OutsideEl::default();
+        for k in &candidates {
+            if chain_ranges.iter().any(|(c, _)| c == k) {
+                outside_el.horn += 1;
+            } else {
+                outside_el.add(dl::shape(k));
+            }
+        }
+        // The Horn rules take what they can of these (item 603) when the EL part needs
+        // no rules of individuals, universal roles or functional data roles.
+        let mut taken: FxHashSet<&AxiomKind> = FxHashSet::default();
+        if !candidates.is_empty() && self.horn_allowed(&ax) {
+            let flags = horn::normalize(&candidates, &mut self.interner, &mut ax);
+            taken.extend(
+                candidates
+                    .iter()
+                    .zip(flags)
+                    .filter(|(_, t)| *t)
+                    .map(|(k, _)| *k),
+            );
+        }
         ax.classes.extend(self.interner.met_classes());
         let stop = || poll(limits).is_err();
         let ix =
@@ -755,6 +790,9 @@ impl Saturation {
             )?;
         let mut excluded: Vec<Excluded> = Vec::new();
         for (i, (rule, message)) in outside {
+            if taken.contains(axioms[*i]) {
+                continue;
+            }
             excluded.push(Excluded {
                 axiom: axioms[*i].clone(),
                 gap: Gap::Outside {
@@ -764,6 +802,9 @@ impl Saturation {
             });
         }
         for (k, message) in chain_ranges {
+            if taken.contains(k) {
+                continue;
+            }
             excluded.push(Excluded {
                 axiom: k.clone(),
                 gap: Gap::Outside {
@@ -781,7 +822,23 @@ impl Saturation {
         excluded.sort();
         excluded.dedup();
         self.excluded = excluded;
-        Ok((ax, ix, peak))
+        outside_el.taken = taken.len();
+        Ok((ax, ix, peak, outside_el))
+    }
+
+    /// Whether the Horn rules may take axioms outside OWL 2 EL: when the EL part has no
+    /// individuals, top properties or functional data roles, whose rules the Horn
+    /// instantiation leaves out.
+    fn horn_allowed(&self, ax: &Axioms) -> bool {
+        let it = &self.interner;
+        it.individuals.is_empty()
+            && ax.functional.is_empty()
+            && it
+                .role_id(&index::RoleName::Object(ObjectProperty::top()))
+                .is_none()
+            && it
+                .role_id(&index::RoleName::Data(DataProperty::top()))
+                .is_none()
     }
 
     fn run(
@@ -842,25 +899,28 @@ impl Saturation {
         .flatten()
         .collect();
         poll(limits)?;
-        let (ax, ix, normalized_peak) =
+        let (ax, ix, normalized_peak, outside_el) =
             self.build(axioms, &outside, threads, held_bytes, limits)?;
         drop(outside);
-        // what each axiom left out needs (item 603), counted once however often it
-        // occurs, as the excluded axioms are; a chain whose superproperty has a range its
-        // last property lacks is Horn
-        for x in &self.excluded {
-            if let Gap::Outside { rule, .. } = &x.gap {
-                if rule == CHAIN_RANGE_RULE {
-                    stats.outside_el.horn += 1;
-                } else {
-                    stats.outside_el.add(dl::shape(&x.axiom));
-                }
-            }
-        }
+        stats.outside_el = outside_el;
         stats.tier = stats.outside_el.tier();
         poll(limits)?;
         let n = self.interner.len();
+        // a run with the Horn rules starts its contexts again, since the invalidation
+        // follows only the EL rules, and its conjunctions get contexts above the index's
+        let horn = ix.horn.is_some();
+        self.dynamic = None;
+        let premises = if horn {
+            self.ctx = Vec::new();
+            None
+        } else {
+            premises
+        };
         self.ctx.resize_with(n, OnceLock::new);
+        let dynamic = ix.horn.as_ref().map(|h| {
+            debug_assert_eq!(h.base as usize, n);
+            saturate::Dynamic::new(n as Ex)
+        });
         if let Some(scratch) = premises {
             stats.incremental = true;
             stats.cleared = self.invalidate(&scratch, &ix);
@@ -898,6 +958,7 @@ impl Saturation {
             charge: charge_fn,
             base_memory: base,
             peak_memory: normalized_peak,
+            dynamic: dynamic.as_ref(),
         };
         // the pool has been charged for the peak of a parallel normalization
         let more = base.saturating_sub(normalized_peak);
@@ -1026,6 +1087,14 @@ impl Saturation {
         } else {
             self.entangled = false;
         }
+        // a change after a run with the Horn rules saturates everything again
+        self.entangled |= horn;
+        if let Some(d) = &dynamic {
+            totals.memory += d.bytes();
+            totals.peak = totals.peak.max(totals.memory);
+            stats.conjunctions = d.len();
+        }
+        self.dynamic = dynamic;
         stats.saturation = t.elapsed();
         stats.conclusions = totals.conclusions;
         totals.memory += world_bytes;
@@ -1042,7 +1111,7 @@ impl Saturation {
         if !with_taxonomy {
             stats.memory = held;
             stats.peak_memory = totals.peak.max(held);
-            stats.contexts = self.ctx.iter().filter(|c| c.get().is_some()).count();
+            stats.contexts = self.context_count();
             poll(limits)?;
             return Ok((consistent, None, stats));
         }
@@ -1079,9 +1148,15 @@ impl Saturation {
         stats.taxonomy_memory = tax_bytes;
         stats.peak_memory = totals.peak.max(stats.memory);
         stats.taxonomy = t.elapsed();
-        stats.contexts = self.ctx.iter().filter(|c| c.get().is_some()).count();
+        stats.contexts = self.context_count();
         poll(limits)?;
         Ok((consistent, Some(taxonomy), stats))
+    }
+
+    /// The contexts saturated, those of the Horn rules' conjunctions included.
+    fn context_count(&self) -> usize {
+        self.ctx.iter().filter(|c| c.get().is_some()).count()
+            + self.dynamic.as_ref().map_or(0, |d| d.len())
     }
 
     fn consistent(&self, ax: &Axioms, nominals: &[Ex]) -> bool {
@@ -1510,7 +1585,8 @@ mod tests {
                 OutsideEl {
                     horn: 1,
                     disjunctive: 1,
-                    global: 0
+                    global: 0,
+                    taken: 1
                 }
             );
             assert_eq!(out.stats.tier, Tier::Disjunctive);

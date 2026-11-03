@@ -97,6 +97,8 @@ fn main() {
         std::process::exit(2);
     };
     let t = Instant::now();
+    // the SWRL rules the reader passes over, which the run leaves out
+    let mut rules = 0usize;
     let bytes = std::fs::read(&input).expect("read input");
     let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).to_string();
     let functional = input.ends_with(".ofn")
@@ -105,6 +107,7 @@ fn main() {
     let (axioms, header): (Vec<Axiom>, sparkles_owl::Header) = if functional {
         let text = String::from_utf8(bytes).expect("UTF-8");
         let doc = ofn_read::parse(&text).unwrap_or_else(|e| panic!("{input}: {e}"));
+        rules = doc.rules;
         (doc.axioms, doc.header)
     } else {
         let format = if input.ends_with(".ttl") {
@@ -233,11 +236,14 @@ fn main() {
             "nodes": out.taxonomy.nodes().len(),
             "unsatisfiable": out.taxonomy.unsatisfiable().count(),
             "consistent": out.consistent,
-            "outside": outside,
+            "outside": outside + rules,
+            "rules": rules,
             "tier": s.tier.as_str(),
             "outsideHorn": s.outside_el.horn,
             "outsideDisjunctive": s.outside_el.disjunctive,
             "outsideGlobal": s.outside_el.global,
+            "outsideTaken": s.outside_el.taken,
+            "conjunctions": s.conjunctions,
             "partial": partial,
             "threads": s.threads,
             "readMs": read_ms,
