@@ -1949,7 +1949,29 @@ fn roles(
     // binarize chains: r1 ∘ r2 ∘ … ∘ rn ⊑ s becomes r1 ∘ r2 ⊑ u1, u1 ∘ r3 ⊑ u2, …
     let mut binary: Vec<(Role, Role, Role)> = Vec::new();
     let mut prefixes: FxHashMap<(Role, Role), Role> = FxHashMap::default();
-    for (rs, s) in &ax.chains {
+    // with the Horn rules, a chain holds in its mirror image too, r1⁻ ∘ … ∘ rn⁻ ⊑ s⁻ for
+    // r1 ∘ … ∘ rn ⊑ s reversed, which composes the links a told chain over inverses gives
+    let mirrors: Vec<(Vec<Role>, Role)> = match &ax.horn {
+        Some(_) => {
+            let told: FxHashSet<&(Vec<Role>, Role)> = ax.chains.iter().collect();
+            let inv = super::horn::inverses(it);
+            let inv = |r: Role| Some(inv[r as usize]).filter(|&i| i != NO_ROLE);
+            let mut m: Vec<(Vec<Role>, Role)> = ax
+                .chains
+                .iter()
+                .filter_map(|(rs, s)| {
+                    let m: Option<Vec<Role>> = rs.iter().rev().map(|&r| inv(r)).collect();
+                    Some((m?, inv(*s)?))
+                })
+                .filter(|c| !told.contains(c))
+                .collect();
+            m.sort();
+            m.dedup();
+            m
+        }
+        None => Vec::new(),
+    };
+    for (rs, s) in ax.chains.iter().chain(&mirrors) {
         let mut left = rs[0];
         for (k, &r) in rs.iter().enumerate().skip(1) {
             if k + 1 == rs.len() {
