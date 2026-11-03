@@ -606,3 +606,27 @@ fn a_maximum_whose_dual_overflows_is_left_out() {
     assert_eq!(ex.len(), 1, "{ex:#?}");
     assert!(!out.taxonomy.is_subclass(&c("B"), &c("A")));
 }
+
+#[test]
+fn a_universal_on_a_role_with_an_automaton_holds_for_direct_successors() {
+    // the automaton of r takes r itself as well as p∘q
+    unsat(
+        "SubObjectPropertyOf(ObjectPropertyChain(:p :q) :r)
+         SubClassOf(:A ObjectAllValuesFrom(:r :C))
+         SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         DisjointClasses(:B :C)
+         SubClassOf(:D ObjectSomeValuesFrom(:p ObjectSomeValuesFrom(:q :E)))
+         SubClassOf(:D ObjectAllValuesFrom(:r :F))
+         SubClassOf(ObjectSomeValuesFrom(:p ObjectSomeValuesFrom(:q ObjectIntersectionOf(:E :F))) :G)",
+        &["A"],
+        &["D", "B", "C"],
+    );
+    check(
+        "SubObjectPropertyOf(ObjectPropertyChain(:p :q) :r)
+         SubClassOf(:D ObjectSomeValuesFrom(:p ObjectSomeValuesFrom(:q :E)))
+         SubClassOf(:D ObjectAllValuesFrom(:r :F))
+         SubClassOf(ObjectSomeValuesFrom(:p ObjectSomeValuesFrom(:q ObjectIntersectionOf(:E :F))) :G)",
+        &[("D", "G")],
+        &[("E", "F")],
+    );
+}

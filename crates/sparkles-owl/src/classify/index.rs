@@ -1602,7 +1602,18 @@ impl Index {
             }
         }
         if let Some(h) = &ax.horn {
-            ix.horn = Some(Box::new(horn_index(ax, h, it, &mut ix, &mut b, &mut told)));
+            // the run takes the Horn rules only when one can fire: without universals,
+            // at-most restrictions, loops or role clashes the EL rules derive all
+            let hi = horn_index(ax, h, it, &mut ix, &mut b, &mut told);
+            let fires = !ix.roles.clash.is_empty()
+                || !ix.roles.reflexive.is_empty()
+                || it
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n, Node::Forall(..) | Node::AtMost1(..) | Node::SelfLoop(_)));
+            if fires {
+                ix.horn = Some(Box::new(hi));
+            }
         }
         ix.heads = it
             .nodes
@@ -1737,15 +1748,16 @@ fn horn_index(
     // start when no transition enters it, the filler for a final state that none leaves,
     // and a fresh class otherwise
     let mut autos: FxHashMap<Role, super::horn::EpsFree> = FxHashMap::default();
+    // the universals the transitions make, which the rules apply even when one is a
+    // universal that is unfolded too
+    let mut made: Vec<Ex> = Vec::new();
     for (holder, r, f) in unfold {
         let a = autos.entry(r).or_insert_with(|| h.autos[&r].eps_free());
-        let enters = |s: u32| a.trans.iter().any(|t| t.2 == s);
-        let leaves = |s: u32| a.trans.iter().any(|t| t.0 == s);
         let states: Vec<Ex> = (0..a.states)
             .map(|s| {
-                if s == a.start && !enters(s) {
+                if s == a.start && !a.entered[s as usize] {
                     holder
-                } else if a.finals[s as usize] && !leaves(s) {
+                } else if a.finals[s as usize] && !a.left[s as usize] {
                     f
                 } else {
                     it.fresh_class()
@@ -1763,10 +1775,16 @@ fn horn_index(
         }
         for &(p, l, q) in &a.trans {
             let x = it.node(Node::Forall(l, states[q as usize]));
-            told.push((states[p as usize], x));
+            made.push(x);
+            if states[p as usize] != x {
+                told.push((states[p as usize], x));
+            }
         }
     }
     flags.resize(it.nodes.len(), 0);
+    for x in made {
+        flags[x as usize] &= !super::horn::HornIx::UNFOLDED;
+    }
     for n in &it.nodes {
         if let Node::AtMost1(_, f) = *n {
             flags[f as usize] |= super::horn::HornIx::FILLER;

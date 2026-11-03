@@ -107,6 +107,10 @@ pub struct EpsFree {
     pub start: u32,
     pub finals: Vec<bool>,
     pub trans: Vec<(u32, Role, u32)>,
+    /// for each state, whether a transition enters it
+    pub entered: Vec<bool>,
+    /// for each state, whether a transition leaves it
+    pub left: Vec<bool>,
 }
 
 impl Nfa {
@@ -115,17 +119,20 @@ impl Nfa {
     pub fn eps_free(&self) -> EpsFree {
         let n = self.states as usize;
         let mut eps: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut labeled: Vec<Vec<(Role, u32)>> = vec![Vec::new(); n];
         for &(p, l, q) in &self.trans {
-            if l.is_none() {
-                eps[p as usize].push(q);
+            match l {
+                None => eps[p as usize].push(q),
+                Some(l) => labeled[p as usize].push((l, q)),
             }
         }
-        let closure = |p: u32| -> Vec<u32> {
-            let mut seen = vec![false; n];
+        // the visits of the closures, marked by the state each started from
+        let mut seen: Vec<u32> = vec![u32::MAX; n];
+        let mut closure = |p: u32| -> Vec<u32> {
             let mut stack = vec![p];
             let mut out = Vec::new();
             while let Some(x) = stack.pop() {
-                if std::mem::replace(&mut seen[x as usize], true) {
+                if std::mem::replace(&mut seen[x as usize], p) == p {
                     continue;
                 }
                 out.push(x);
@@ -145,27 +152,32 @@ impl Nfa {
             let c = closure(p);
             finals.push(c.contains(&self.end));
             for x in c {
-                for &(a, l, q) in &self.trans {
-                    if a == x
-                        && let Some(l) = l
-                    {
-                        let q = *id[q as usize].get_or_insert_with(|| {
-                            order.push(q);
-                            order.len() as u32 - 1
-                        });
-                        trans.push((at as u32, l, q));
-                    }
+                for &(l, q) in &labeled[x as usize] {
+                    let q = *id[q as usize].get_or_insert_with(|| {
+                        order.push(q);
+                        order.len() as u32 - 1
+                    });
+                    trans.push((at as u32, l, q));
                 }
             }
             at += 1;
         }
         trans.sort_unstable();
         trans.dedup();
+        let states = order.len();
+        let mut entered = vec![false; states];
+        let mut left = vec![false; states];
+        for &(p, _, q) in &trans {
+            left[p as usize] = true;
+            entered[q as usize] = true;
+        }
         EpsFree {
-            states: order.len() as u32,
+            states: states as u32,
             start: 0,
             finals,
             trans,
+            entered,
+            left,
         }
     }
 }
