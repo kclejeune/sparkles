@@ -79,6 +79,12 @@ impl HornIx {
     /// The expression is a universal on a role with an automaton, whose told subsumer,
     /// the automaton's first state, stands for it, so that the Horn rules pass over it.
     pub const UNFOLDED: u8 = 2;
+    /// The expression adds nothing to a successor that every context does not hold: it is
+    /// a class that no rule takes as a premise, whose told subsumers are those of
+    /// `owl:Thing` or absorbed classes. R3 passes over a universal with such a filler,
+    /// whose successors would send nothing back for it, while R4 still takes the filler
+    /// to the predecessors, where it can be a named class's answer.
+    pub const ABSORBED: u8 = 4;
 
     #[inline]
     pub fn is(&self, e: Ex, flag: u8) -> bool {
@@ -87,6 +93,63 @@ impl HornIx {
 
     pub fn bytes(&self) -> usize {
         self.flags.capacity()
+    }
+}
+
+/// Marks the expressions that [`HornIx::ABSORBED`] describes, as the greatest set
+/// closed under its definition.
+pub fn absorb(ix: &mut super::index::Index) {
+    let n = ix
+        .horn
+        .as_ref()
+        .expect("a run with the Horn rules")
+        .flags
+        .len();
+    let mut global = vec![false; n];
+    let mut stack = vec![TOP];
+    while let Some(x) = stack.pop() {
+        if !std::mem::replace(&mut global[x as usize], true) {
+            stack.extend(ix.told_of(ix.head(x)).iter().copied());
+        }
+    }
+    let flags = &ix.horn.as_ref().expect("a run with the Horn rules").flags;
+    let inert = |e: Ex| {
+        let h = ix.head(e);
+        matches!(h.node, Node::Class(_) | Node::Fresh(_))
+            && ix.conj_of(h).is_empty()
+            && ix.exist_of(h).is_empty()
+            && ix.disjoint_of(h).is_empty()
+            && flags
+                .get(e as usize)
+                .is_none_or(|&f| f & HornIx::FILLER == 0)
+    };
+    let mut cand: Vec<bool> = (0..n as Ex).map(|e| e != TOP && inert(e)).collect();
+    loop {
+        let mut changed = false;
+        for e in 0..n {
+            if !cand[e] {
+                continue;
+            }
+            // a universal among them is not absorbed, since R4 takes its filler back to
+            // the predecessor that gave the successor the class
+            let ok = ix
+                .told_of(ix.head(e as Ex))
+                .iter()
+                .all(|&t| global[t as usize] || cand[t as usize]);
+            if !ok {
+                cand[e] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let flags = &mut ix.horn.as_mut().expect("a run with the Horn rules").flags;
+    for (e, c) in cand.into_iter().enumerate() {
+        if c {
+            flags[e] |= HornIx::ABSORBED;
+        }
     }
 }
 

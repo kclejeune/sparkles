@@ -29,6 +29,7 @@
 //! used only to send a conclusion to its source, and two links into one context are never
 //! composed.
 
+use super::horn::HornIx;
 use super::index::{BOTTOM, Ex, Index, Role, TOP};
 use super::saturate::{Concl, Sink, Small, State};
 
@@ -271,6 +272,10 @@ pub fn forall<S: Sink>(ix: &Index, _me: Ex, st: &mut State, s: Role, a: Ex, out:
                 }
             }
         }
+    }
+    // R3 passes over a filler that changes no successor
+    if absorbed(ix, a) {
+        return;
     }
     let h = hs(st);
     if h.alls.contains(&(s, a)) {
@@ -529,4 +534,11 @@ pub fn self_loop<S: Sink>(ix: &Index, me: Ex, st: &mut State, r: Role, out: &mut
             counted(ix, me, st, s, b, Member::Loop(r), out);
         }
     }
+}
+
+/// Whether an expression adds nothing that every context does not hold, which
+/// [`HornIx::ABSORBED`] describes.
+#[inline]
+fn absorbed(ix: &Index, a: Ex) -> bool {
+    ix.horn.as_ref().is_some_and(|h| h.is(a, HornIx::ABSORBED))
 }

@@ -1050,3 +1050,20 @@ fn r5_merges_every_counted_successor_at_once() {
     assert!(out.stats.conjunctions < 1_000, "{}", out.stats.conjunctions);
     assert!(out.taxonomy.is_subclass(&c("A0"), &c("A6")));
 }
+
+#[test]
+fn a_filler_no_rule_reads_still_reaches_named_classes() {
+    // C has no told subsumer and no rule takes it as a premise: R3 passes over it, but
+    // R4 takes it to the predecessor, and a loop by a reflexive role to the class itself
+    check(
+        "SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:B ObjectAllValuesFrom(ObjectInverseOf(:r) :C))
+         ReflexiveObjectProperty(:s)
+         SubClassOf(:D ObjectAllValuesFrom(:s :C))
+         SubClassOf(:E ObjectSomeValuesFrom(:q :F))
+         SubClassOf(:E ObjectAllValuesFrom(:q :C))
+         EquivalentClasses(:G ObjectSomeValuesFrom(:q ObjectIntersectionOf(:F :C)))",
+        &[("A", "C"), ("D", "C"), ("E", "G")],
+        &[("B", "C"), ("F", "C")],
+    );
+}

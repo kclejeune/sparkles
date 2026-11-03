@@ -1017,7 +1017,7 @@ impl Saturation {
         .flatten()
         .collect();
         poll(limits)?;
-        let (ax, ix, normalized_peak, outside_el) =
+        let (ax, mut ix, normalized_peak, outside_el) =
             self.build(axioms, &outside, threads, held_bytes, limits)?;
         drop(outside);
         stats.outside_el = outside_el;
@@ -1038,6 +1038,9 @@ impl Saturation {
             premises
         };
         self.ctx.resize_with(n, OnceLock::new);
+        if ix.horn.is_some() {
+            horn::absorb(&mut ix);
+        }
         let dynamic = ix.horn.as_ref().map(|h| {
             debug_assert_eq!(h.base as usize, n);
             saturate::Dynamic::new(n as Ex)
