@@ -81,16 +81,6 @@ const KEY_GAP_COST: f64 = 6.0;
 /// only how many keys there are, does not see.
 const GALLOP_KEY_COST: f64 = 15.0;
 const GALLOP_KEY_GAP_COST: f64 = 3.5;
-/// Added to a galloping key's cost per square root of the pattern's rows per input key.
-/// Keys spread at random over a pattern cost more than the doublings tell. On WatDiv
-/// patterns of 70k to 90k rows on an Intel host, a key cost about 120 rows read at 23
-/// rows a key and 300 to 600 at 230 to 2,300, a third to a seventh of which the terms
-/// above priced, and probing 704 keys of `familyName` took as long as scanning it. With
-/// this term the spread alone costs more than a scan once there are fewer than 121 rows
-/// a key, and keys spread at random are priced at 0.6 to 1.1 times what they cost. Keys
-/// close together are priced at 1.5 to 2.4 times what they cost, where the terms above
-/// alone priced them at 0.2 to 0.7 times.
-const GALLOP_KEY_SPREAD_COST: f64 = 11.0;
 /// A block the keys touch: fetching it from the block cache and finding the first key.
 const BLOCK_COST: f64 = 256.0;
 /// A row read: copied out of its block, then joined with the input rows of its key, 25 to
@@ -138,14 +128,12 @@ fn probe_cost(keys: f64, rows: f64, per_key: f64, gallop: bool) -> (f64, f64) {
     let touched = blocks * (1.0 - (1.0 - 1.0 / blocks).powf(keys));
     let read = (keys * per_key).min(rows);
     let gap = (rows / keys).max(1.0);
-    let (key, key_gap, spread) = if gallop {
-        (GALLOP_KEY_COST, GALLOP_KEY_GAP_COST, GALLOP_KEY_SPREAD_COST)
+    let (key, key_gap) = if gallop {
+        (GALLOP_KEY_COST, GALLOP_KEY_GAP_COST)
     } else {
-        (KEY_COST, KEY_GAP_COST, 0.0)
+        (KEY_COST, KEY_GAP_COST)
     };
-    let probe = keys * (key + key_gap * gap.log2() + spread * gap.sqrt())
-        + touched * BLOCK_COST
-        + read * ROW_COST;
+    let probe = keys * (key + key_gap * gap.log2()) + touched * BLOCK_COST + read * ROW_COST;
     (probe, if rows > 0.0 { read / rows } else { 0.0 })
 }
 
@@ -2683,31 +2671,5 @@ mod dense_ahead_tests {
         assert!(snap.cache.has_cols(idx, b, mask));
         // segment 2 was not decoded on its own before the block was read whole
         assert_eq!(single_segments(&snap, b), 2);
-    }
-}
-
-#[cfg(test)]
-mod probe_cost_tests {
-    use super::*;
-
-    #[test]
-    fn many_spread_keys_cost_more_than_a_scan_and_few_keys_less() {
-        // WatDiv S4: 704 keys of `familyName`, one row each among 69,986, probed in about
-        // the time a scan of the pattern takes, so the probe must not look cheaper.
-        let (probe, _) = probe_cost(704.0, 69_986.0, 1.0, true);
-        assert!(probe > 69_986.0, "probe of 704 keys priced at {probe}");
-        // A few keys over a large pattern stay far cheaper than reading it.
-        let (probe, share) = probe_cost(30.0, 2_500_000.0, 1.0, true);
-        assert!(probe < 250_000.0, "probe of 30 keys priced at {probe}");
-        assert!(share < 0.001);
-        // The binary-search reader is priced as before.
-        let (probe, _) = probe_cost(704.0, 69_986.0, 1.0, false);
-        let gap = 69_986.0f64 / 704.0;
-        let blocks = (69_986.0 / BLOCK_ROWS as f64).ceil();
-        let touched = blocks * (1.0 - (1.0 - 1.0 / blocks).powf(704.0));
-        let want = 704.0 * (KEY_COST + KEY_GAP_COST * gap.log2())
-            + touched * BLOCK_COST
-            + 704.0 * ROW_COST;
-        assert!((probe - want).abs() < 1e-6, "{probe} against {want}");
     }
 }
