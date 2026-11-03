@@ -1067,3 +1067,29 @@ fn a_filler_no_rule_reads_still_reaches_named_classes() {
         &[("B", "C"), ("F", "C")],
     );
 }
+
+#[test]
+fn mirror_images_of_longer_chains_told_mirrors_and_superroles() {
+    // three operands: q ∘ s⁻ ∘ r⁻ ⊑ t⁻ is the mirror image of r ∘ s ∘ q⁻ ⊑ t
+    let three = "SubObjectPropertyOf(ObjectPropertyChain(:r :s ObjectInverseOf(:q)) :t)
+         SubClassOf(:A ObjectSomeValuesFrom(:q ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectSomeValuesFrom(ObjectInverseOf(:r) :B))))
+         EquivalentClasses(:C ObjectSomeValuesFrom(ObjectInverseOf(:t) :B))";
+    // a chain told beside its own mirror image, which is composed once
+    let told = "SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+         SubObjectPropertyOf(ObjectPropertyChain(ObjectInverseOf(:s) ObjectInverseOf(:r)) ObjectInverseOf(:t))
+         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :B)))
+         SubClassOf(:D ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectSomeValuesFrom(ObjectInverseOf(:r) :E)))
+         EquivalentClasses(:C ObjectSomeValuesFrom(:t :B))
+         EquivalentClasses(:F ObjectSomeValuesFrom(ObjectInverseOf(:t) :E))";
+    // the mirror image's result under the inverse of a superrole
+    let sup = "SubObjectPropertyOf(ObjectPropertyChain(:r ObjectInverseOf(:s)) :t)
+         SubObjectPropertyOf(:t :u)
+         SubClassOf(:A ObjectSomeValuesFrom(:s ObjectSomeValuesFrom(ObjectInverseOf(:r) :B)))
+         EquivalentClasses(:C ObjectSomeValuesFrom(ObjectInverseOf(:u) :B))";
+    for body in [three, sup] {
+        check(body, &[("A", "C")], &[("B", "C")]);
+        chain_free(body, &[("A", "C")], &[("B", "C")]);
+    }
+    check(told, &[("A", "C"), ("D", "F")], &[("A", "F"), ("D", "C")]);
+    chain_free(told, &[("A", "C"), ("D", "F")], &[("A", "F"), ("D", "C")]);
+}
