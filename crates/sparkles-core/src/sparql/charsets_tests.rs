@@ -517,3 +517,100 @@ fn restricted_node_variables_use_the_subject_sets() {
     assert!(all(off())[0] > 1.0);
     assert_eq!(answer(&snap, q, sets()), answer(&snap, q, off()));
 }
+
+/// Data with more node signatures than a small cap: subject `i` has the predicates `p(j)`
+/// for the bits `j` of `i % 64` and `i % 7`, and `ex:q`, so the signatures differ in how
+/// many nodes they hold.
+fn many_signatures() -> String {
+    let mut t = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..20_000u32 {
+        let bits = (i % 64) | ((i % 7) << 6);
+        for j in 0..9 {
+            if bits >> j & 1 == 1 {
+                t.push_str(&format!("ex:s{i} ex:p{j} ex:o{} .\n", i % 13));
+            }
+        }
+        t.push_str(&format!("ex:s{i} ex:q {} .\n", i % 500));
+    }
+    t
+}
+
+/// The node pass keeps the same sets and remainder at every thread count, with and
+/// without more signatures than it counts, and past its cap it keeps the signatures with
+/// the most nodes.
+#[test]
+fn node_sets_are_the_same_at_every_thread_count() {
+    use crate::builder::correlations::node_sets_seen;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    s.load(&[Source::from_bytes(
+        many_signatures().into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    drop(s);
+    let generation = gen_dir(&root);
+    let never = || Ok(());
+    let (all, _) = node_sets_seen(&generation, None, 1, usize::MAX, &never).unwrap();
+    assert!(all.len() > 100, "{} signatures", all.len());
+    for seen in [5, 40, usize::MAX] {
+        let one = node_sets_seen(&generation, None, 1, seen, &never).unwrap();
+        for threads in [2, 3, 8] {
+            let other = node_sets_seen(&generation, None, threads, seen, &never).unwrap();
+            assert!(
+                one == other,
+                "seen {seen}: {threads} threads differ from one"
+            );
+        }
+        if seen < all.len() {
+            // the kept sets are those of the most nodes, as the sketch tells them apart
+            let (kept, _) = &one;
+            assert_eq!(kept.len(), seen);
+            let least = kept.iter().map(|c| c.subjects).min().unwrap();
+            let left_out = all
+                .iter()
+                .filter(|c| !kept.iter().any(|k| k.preds == c.preds))
+                .map(|c| c.subjects)
+                .max()
+                .unwrap();
+            assert!(
+                least >= left_out,
+                "seen {seen}: kept {least}, left out {left_out}"
+            );
+        }
+    }
+}
+
+/// Loads of the same data at different thread counts write the same `stats.json`, byte
+/// for byte, with the node pass under and over its cap.
+#[test]
+fn loads_at_every_thread_count_write_the_same_statistics() {
+    let data = many_signatures();
+    for seen in [40, crate::builder::correlations::MAX_NODE_SETS_SEEN] {
+        let mut written: Vec<Vec<u8>> = Vec::new();
+        for threads in [1, 2, 8] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("db");
+            let opts = StoreOptions {
+                build: crate::builder::BuildOptions {
+                    threads,
+                    node_sets_seen: seen,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let s = Store::open(&root, opts).unwrap();
+            s.load(&[Source::from_bytes(
+                data.clone().into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+            drop(s);
+            written.push(std::fs::read(gen_dir(&root).join("stats.json")).unwrap());
+        }
+        assert!(written.iter().all(|w| *w == written[0]), "seen {seen}");
+    }
+}

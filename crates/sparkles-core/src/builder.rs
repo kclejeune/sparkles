@@ -74,6 +74,11 @@ pub struct BuildOptions {
     /// generation format 4. `None` is [`VocabCodec::default`] for a new database, and
     /// the codec of the generation it replaces for a compaction or a bulk commit.
     pub vocab_codec: Option<VocabCodec>,
+    /// Distinct node signatures the node-set pass counts exactly at most
+    /// ([`correlations::MAX_NODE_SETS_SEEN`] by default). With more in the data it keeps
+    /// the ones with the most nodes by a sketch, so the statistics stay the same at every
+    /// thread count.
+    pub node_sets_seen: usize,
 }
 
 impl Default for BuildOptions {
@@ -88,6 +93,7 @@ impl Default for BuildOptions {
             patterns: true,
             pattern_bytes: crate::patterns::DEFAULT_BUDGET,
             vocab_codec: None,
+            node_sets_seen: correlations::MAX_NODE_SETS_SEEN,
         }
     }
 }
@@ -747,10 +753,13 @@ impl Builder {
         if let Some(c) = stats.correlations.get_mut() {
             self.interrupted()?;
             self.report("counting node sets");
-            let (sets, rest) =
-                correlations::node_sets(&self.dir, rdf_type, self.opts.threads, &|| {
-                    self.interrupted()
-                })?;
+            let (sets, rest) = correlations::node_sets_seen(
+                &self.dir,
+                rdf_type,
+                self.opts.threads,
+                self.opts.node_sets_seen,
+                &|| self.interrupted(),
+            )?;
             c.node_sets = sets;
             c.node_rest = rest;
             self.phase_done("node sets");
@@ -1982,6 +1991,7 @@ mod tests {
             patterns: true,
             pattern_bytes: crate::patterns::DEFAULT_BUDGET,
             vocab_codec: None,
+            node_sets_seen: correlations::MAX_NODE_SETS_SEEN,
         });
         let no_hot = build(BuildOptions {
             batch_quads: 7,

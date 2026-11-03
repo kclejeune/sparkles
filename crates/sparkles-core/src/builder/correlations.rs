@@ -14,7 +14,9 @@
 //! variable, such as an object join `?a p ?v . ?b q ?v` or a chain `?a p ?v . ?v q ?b`, can
 //! be summed over the sets that hold it. They are counted after the permutations are
 //! written, in one pass over SPO and OPS together, both sorted on the node. The same cap
-//! and remainder apply to them.
+//! and remainder apply to them. The sets kept do not depend on the thread count: past
+//! [`MAX_NODE_SETS_SEEN`] distinct signatures a second pass counts those with the most
+//! nodes by a sketch (see [`node_sets_seen`]).
 //!
 //! The member `correlations` of `stats.json` holds both, with a version of its own that
 //! is read before anything else of it. A version this build does not read is refused:
@@ -38,9 +40,11 @@ pub const VERSION: u32 = 1;
 /// Node sets kept at most, those of the most nodes.
 pub const MAX_NODE_SETS: usize = MAX_CHARSETS;
 
-/// Distinct node sets counted while the pass runs, at most, over all its threads. The
-/// nodes of sets first met after that go to the remainder with their items.
-const MAX_NODE_SETS_SEEN: usize = 1 << 20;
+/// Distinct node sets counted while the pass runs, at most, over all its threads (the
+/// default of [`super::BuildOptions::node_sets_seen`]). Past it the pass keeps the
+/// best-ranked signatures (see [`Admitted`]), and the nodes of the others go to the
+/// remainder with their items.
+pub const MAX_NODE_SETS_SEEN: usize = 1 << 20;
 
 /// The tag of an in-item: no term has it, and it sorts after every predicate and before
 /// the classes.
@@ -426,17 +430,14 @@ struct Piece {
 }
 
 /// Count the node sets of the generation in `dir`, whose SPO and OPS are written, on
-/// `threads` threads.
-pub(crate) fn node_sets(
-    dir: &Path,
-    rdf_type: Option<u64>,
-    threads: usize,
-    interrupted: &(dyn Fn() -> Result<()> + Sync),
-) -> Result<(Vec<CharSet>, Rest)> {
-    node_sets_seen(dir, rdf_type, threads, MAX_NODE_SETS_SEEN, interrupted)
-}
-
-/// [`node_sets`] with at most `seen` distinct sets counted while the pass runs.
+/// `threads` threads, with at most `seen` distinct sets counted while a pass runs.
+///
+/// The result does not depend on `threads` or on the order the threads meet the nodes.
+/// When the data has at most `seen` distinct signatures, one pass counts them all
+/// exactly. Otherwise the first pass also fills a count-min sketch of the nodes per
+/// signature, and a second pass counts exactly the `seen` signatures with the most nodes
+/// by the sketch, ties broken by a stable hash of the signature. Either way every kept
+/// signature holds all its nodes and the remainder all the others.
 pub(crate) fn node_sets_seen(
     dir: &Path,
     rdf_type: Option<u64>,
@@ -466,9 +467,70 @@ pub(crate) fn node_sets_seen(
         })
         .filter(|(lo, hi)| hi.is_none_or(|h| h > *lo))
         .collect();
+    // a sketch of about one counter per four rows of either permutation, up to 2^20 a row
+    let rows: u64 = spo
+        .blocks
+        .iter()
+        .chain(ops.blocks.iter())
+        .map(|m| m.rows as u64)
+        .sum();
+    let sketch = Sketch::new(((rows / 4) as usize).clamp(1 << 10, 1 << 20));
+    let first = count_pass(
+        &spo,
+        &ops,
+        &ranges,
+        threads,
+        rdf_type,
+        seen,
+        Rank::Hash,
+        Some(&sketch),
+        interrupted,
+    )?;
+    let (sets, rest) = match first {
+        Ok(done) => done,
+        // more signatures than `seen`: count again, the best-ranked by the sketch
+        Err(()) => match count_pass(
+            &spo,
+            &ops,
+            &ranges,
+            threads,
+            rdf_type,
+            seen,
+            Rank::Sketch(&sketch),
+            None,
+            interrupted,
+        )? {
+            Ok(done) => done,
+            Err(()) => unreachable!("a pass without a sketch to fill finishes"),
+        },
+    };
+    let mut rest = rest;
+    let kept = keep_top(sets, MAX_NODE_SETS, &mut rest);
+    Ok((kept, rest.finish()))
+}
+
+/// One pass of the node count over `ranges` on `threads` threads, admitting signatures by
+/// `rank` and adding every node's signature to `fill`. `Err(())` when the data had more
+/// than `seen` distinct signatures and `fill` was given, so that a second pass ranks them
+/// by the filled sketch; the result of the pass otherwise, which is exact for the
+/// signatures it admits whatever the order of the nodes.
+#[allow(clippy::too_many_arguments)]
+fn count_pass(
+    spo: &PermIndex,
+    ops: &PermIndex,
+    ranges: &[(u64, Option<u64>)],
+    threads: usize,
+    rdf_type: Option<u64>,
+    seen: usize,
+    rank: Rank<'_>,
+    fill: Option<&Sketch>,
+    interrupted: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<std::result::Result<(SetMap, RestTally), ()>> {
     let admitted = Admitted {
-        sigs: Mutex::new(FxHashSet::default()),
+        state: Mutex::new(AdmitState::default()),
         cap: seen,
+        rank,
+        overflowed: std::sync::atomic::AtomicBool::new(false),
     };
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results: Vec<Result<Piece>> = std::thread::scope(|s| {
@@ -476,13 +538,16 @@ pub(crate) fn node_sets_seen(
             .map(|_| {
                 s.spawn(|| -> Result<Piece> {
                     let mut acc = Piece::default();
+                    let mut worst = None;
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some(&(lo, hi)) = ranges.get(i) else {
                             return Ok(acc);
                         };
                         interrupted()?;
-                        count_piece(&spo, &ops, lo, hi, rdf_type, &admitted, &mut acc)?;
+                        count_piece(
+                            spo, ops, lo, hi, rdf_type, &admitted, fill, &mut worst, &mut acc,
+                        )?;
                     }
                 })
             })
@@ -498,12 +563,30 @@ pub(crate) fn node_sets_seen(
             })
             .collect()
     });
+    let overflowed = admitted
+        .overflowed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if overflowed && fill.is_some() {
+        // the results are dropped; a pass ranked by the sketch follows
+        for r in results {
+            r?;
+        }
+        return Ok(Err(()));
+    }
+    // the signatures admitted at the end are the `seen` best-ranked of the data, each
+    // with all its nodes; a piece's sets admitted earlier and pushed out later go to the
+    // remainder with the nodes that went there directly
+    let state = admitted.state.into_inner();
     let mut sets = SetMap::default();
     let mut rest = RestTally::default();
     for r in results {
         let p = r?;
         rest.merge(p.rest);
         for (k, (n, t)) in p.sets {
+            if !state.sigs.contains(&k) {
+                rest.add(n, &k, &t, 1);
+                continue;
+            }
             match sets.get_mut(&k) {
                 Some((m, u)) => {
                     *m += n;
@@ -517,8 +600,7 @@ pub(crate) fn node_sets_seen(
             }
         }
     }
-    let kept = keep_top(sets, MAX_NODE_SETS, &mut rest);
-    Ok((kept, rest.finish()))
+    Ok(Ok((sets, rest)))
 }
 
 /// The blocks of `perm` that hold keys whose first column is in `[lo, hi)`.
@@ -576,6 +658,7 @@ impl<'a> Rows<'a> {
 
 /// Count the node sets of the nodes in `[lo, hi)` into `acc`, reading their outgoing
 /// rows from SPO and their incoming rows from OPS together, in node order.
+#[allow(clippy::too_many_arguments)]
 fn count_piece(
     spo: &PermIndex,
     ops: &PermIndex,
@@ -583,6 +666,8 @@ fn count_piece(
     hi: Option<u64>,
     rdf_type: Option<u64>,
     admitted: &Admitted,
+    fill: Option<&Sketch>,
+    worst: &mut Option<Ranked>,
     acc: &mut Piece,
 ) -> Result<()> {
     let inside = |x: u64| x >= lo && hi.is_none_or(|h| x < h);
@@ -623,6 +708,9 @@ fn count_piece(
         if items.is_empty() {
             continue;
         }
+        if let Some(f) = fill {
+            f.add(sig_hash(&items));
+        }
         let kept = match acc.sets.get_mut(&items[..]) {
             Some((n, t)) => {
                 *n += 1;
@@ -631,7 +719,7 @@ fn count_piece(
                 }
                 true
             }
-            None if admitted.admit(&items) => {
+            None if admitted.admit(&items, worst) => {
                 acc.sets
                     .insert(items.clone().into_boxed_slice(), (1, counts.clone()));
                 true
@@ -645,26 +733,154 @@ fn count_piece(
     Ok(())
 }
 
-/// The signatures the node pass counts as sets, shared by its threads. A signature is
-/// admitted when it is first met while fewer than `cap` are, and never after, so all the nodes of a signature are counted in one place, its set or the
-/// remainder, whichever thread meets them. A partial compaction relies on that when it
-/// removes a node's old signature.
-struct Admitted {
-    sigs: Mutex<FxHashSet<Box<[u64]>>>,
-    cap: usize,
+/// A stable 64-bit hash of a signature, the same in every build and on every host.
+fn sig_hash(items: &[u64]) -> u64 {
+    // splitmix64's finalizer over a running sum, item by item
+    let mix = |mut z: u64| {
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    items.iter().fold(items.len() as u64, |h, &x| {
+        mix(h.wrapping_add(0x9e37_79b9_7f4a_7c15).wrapping_add(x) ^ h.rotate_left(17))
+    })
 }
 
-impl Admitted {
-    fn admit(&self, items: &[u64]) -> bool {
-        let mut sigs = self.sigs.lock();
-        if sigs.contains(items) {
-            return true;
+/// A count-min sketch of the nodes per signature: four rows of `width` counters, each
+/// signature counted in one counter of each row and estimated by the smallest. Its counts
+/// are sums, the same whatever the order the threads add them in.
+struct Sketch {
+    width: usize,
+    counts: Vec<std::sync::atomic::AtomicU64>,
+}
+
+impl Sketch {
+    const ROWS: usize = 4;
+
+    fn new(width: usize) -> Sketch {
+        let width = width.next_power_of_two();
+        Sketch {
+            width,
+            counts: (0..width * Self::ROWS)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
         }
-        if sigs.len() >= self.cap {
+    }
+
+    fn slot(&self, h: u64, row: usize) -> usize {
+        // double hashing: the low and high halves of the hash
+        let step = (h >> 32) | 1;
+        row * self.width
+            + ((h as u32 as u64).wrapping_add(row as u64 * step) as usize & (self.width - 1))
+    }
+
+    fn add(&self, h: u64) {
+        for row in 0..Self::ROWS {
+            self.counts[self.slot(h, row)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn estimate(&self, h: u64) -> u64 {
+        (0..Self::ROWS)
+            .map(|row| self.counts[self.slot(h, row)].load(std::sync::atomic::Ordering::Relaxed))
+            .min()
+            .unwrap_or(0)
+    }
+}
+
+/// How a pass ranks the signatures it meets once more than its cap of them are counted:
+/// by their hash alone, or by their nodes in a filled sketch, most first, ties broken by
+/// the hash.
+#[derive(Clone, Copy)]
+enum Rank<'a> {
+    Hash,
+    Sketch(&'a Sketch),
+}
+
+/// A signature with its rank: smaller ranks better, and the signature itself breaks a tie
+/// of hashes, so that the order is total.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Ranked {
+    fewer: u64,
+    hash: u64,
+    sig: Box<[u64]>,
+}
+
+impl Rank<'_> {
+    fn of(&self, items: &[u64]) -> (u64, u64) {
+        let hash = sig_hash(items);
+        let fewer = match self {
+            Rank::Hash => 0,
+            Rank::Sketch(s) => u64::MAX - s.estimate(hash),
+        };
+        (fewer, hash)
+    }
+}
+
+/// The signatures the node pass counts as sets, shared by its threads: the `cap`
+/// best-ranked of those met so far. A signature met while fewer than `cap` are admitted
+/// is admitted, and once `cap` are, it is admitted only by pushing out the worst-ranked.
+/// The worst admitted rank only improves, so a signature turned away or pushed out never
+/// returns. A signature among the `cap` best-ranked of the whole data is therefore
+/// admitted the first time any thread meets it and never pushed out, and holds all its
+/// nodes, whichever order the threads meet them in. A partial compaction relies on that
+/// when it removes a node's old signature.
+struct Admitted<'a> {
+    state: Mutex<AdmitState>,
+    cap: usize,
+    rank: Rank<'a>,
+    /// whether a signature was turned away or pushed out
+    overflowed: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct AdmitState {
+    sigs: FxHashSet<Box<[u64]>>,
+    /// the admitted signatures by rank, the worst on top
+    ranked: std::collections::BinaryHeap<Ranked>,
+}
+
+impl Admitted<'_> {
+    /// Whether `items` is admitted now. `worst` caches the worst admitted rank a thread
+    /// last saw once `cap` are admitted: a signature ranked below it is turned away
+    /// without the lock, since that rank only improves.
+    fn admit(&self, items: &[u64], worst: &mut Option<Ranked>) -> bool {
+        let (fewer, hash) = self.rank.of(items);
+        let below = |w: &Ranked| (fewer, hash, items) > (w.fewer, w.hash, &w.sig[..]);
+        if worst.as_ref().is_some_and(below) {
             return false;
         }
-        sigs.insert(items.to_vec().into_boxed_slice());
-        true
+        let mut st = self.state.lock();
+        if st.sigs.contains(items) {
+            return true;
+        }
+        let me = Ranked {
+            fewer,
+            hash,
+            sig: items.to_vec().into_boxed_slice(),
+        };
+        let admit = if st.sigs.len() < self.cap {
+            true
+        } else {
+            self.overflowed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            match st.ranked.peek() {
+                Some(w) if me < *w => {
+                    let out = st.ranked.pop().expect("a worst signature");
+                    st.sigs.remove(&out.sig);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if admit {
+            st.sigs.insert(me.sig.clone());
+            st.ranked.push(me);
+        }
+        if st.sigs.len() >= self.cap {
+            *worst = st.ranked.peek().cloned();
+        }
+        admit
     }
 }
 
