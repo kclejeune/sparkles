@@ -233,20 +233,27 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   calculus in the manner of ELK. It reads the axiom model only, saturates its contexts
   on several threads and computes the class taxonomy: the classes grouped into
   equivalence classes, their direct superclasses and the unsatisfiable classes. It
-  covers intersections, existential restrictions, `owl:Thing` and `owl:Nothing`, the
-  property hierarchy, property chains, transitive and reflexive properties, domains,
-  ranges, disjointness and `ObjectHasSelf`. An axiom outside OWL 2 EL is left out and
-  reported with its rule. An axiom with an individual in a class expression, a data
-  range or a data value, or a key, a negative property assertion or a functional data
-  property, is used as far as the calculus goes and reported as partial, since the
-  classifier treats individuals and data ranges as atoms. Every answer is entailed, and
-  it is complete for named classes when nothing is reported. The classifier keeps its
-  contexts between runs, and a run after added or removed axioms saturates again only
-  the contexts that those axioms can reach. A change to the property hierarchy, chains,
-  reflexivity or ranges, or to an axiom with a data property or datatype, saturates
-  everything again. A run stops at its deadline, its memory budget or a cancellation,
-  which it checks while it indexes, builds the property closure, saturates and builds
-  the taxonomy. On the benchmark
+  covers all of OWL 2 EL, with intersections, existential restrictions, `owl:Thing` and
+  `owl:Nothing`, individuals in class expressions and assertions, the property
+  hierarchy with the top and bottom properties, property chains, transitive and
+  reflexive properties, domains, ranges, disjointness, `ObjectHasSelf`, the datatypes,
+  literals and data ranges of the profile, functional data properties, datatype
+  definitions, keys and negative property assertions. A class whose instances reach an
+  individual through a context that holds only where the class has an instance is
+  classified again in a world of its own. An ontology where only an individual's own
+  context derives the individual, and that has no keys or universal roles, skips that
+  step, and so does every ontology without individuals. An axiom outside OWL 2 EL is
+  left out and reported with its rule. An axiom with a literal or datatype that the
+  classifier cannot compare, such as an XML literal, an ill-typed literal or a datatype
+  outside the OWL 2 datatype map, or with a property chain through the top object
+  property, is used as far as the calculus goes and reported as partial. Every answer is entailed, and it is complete for named classes
+  when nothing is reported. The classifier keeps its contexts between runs, and a run
+  after added or removed axioms saturates again only the contexts that those axioms can
+  reach. A change to the property hierarchy, chains, reflexivity or ranges, to an axiom
+  with an individual, a data property, a datatype or a key, and any change after a run
+  that took that step, saturates everything again. A run stops at its deadline, its
+  memory budget or a cancellation, which it checks while it indexes, builds the property
+  closure, saturates and builds the taxonomy. On the benchmark
   host GO classifies in 83 ms and ChEBI lite in 0.84 seconds on eight threads, and the
   classifier is 2.5 to 13 times as fast as ELK on GO, ChEBI lite and the largest ORE
   2015 EL ontologies on one and eight threads. The classifier's direct hierarchy equals the hierarchy that GO's release
@@ -481,10 +488,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   report. Roadmap item 578.
 * An ontology read has no size budget of its own beyond the query deadline, and its cost
   on large ontologies is not measured. Roadmap item 539.
-* The EL classifier treats individuals in class expressions, data ranges and data values
-  as atoms, so axioms that use them may lose consequences, and keys, negative property
-  assertions, functional data properties and data property ranges take no part.
-  Roadmap item 587.
+* The EL classifier uses literals and datatypes it cannot compare, which are XML
+  literals, ill-typed literals, datatypes outside the OWL 2 datatype map and numbers
+  past 128 bits, and property chains through the top object property only in part.
+  Roadmap item NEW-ITEM-1.
+* An EL classification after a change to an axiom with an individual, a data property
+  or a key saturates everything again, and so does any change after a run that merged
+  a context with an individual.
+  Roadmap item NEW-ITEM-2.
 * No MCP tool classifies, roadmap item 586, and the entity accessors and the
   inferred reads do not answer from a classification, nor does any surface answer the
   subclasses of a class expression, roadmap item 588.
