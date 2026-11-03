@@ -289,9 +289,9 @@
       "metadata_note": "An interleaved A/B record of abtime.py. Read the record for its method, manifest, settings, summary and per-query results."
     },
     {
-      "run_id": "sha256-3b3a6b06cf3521127530888e085fa422eadd531a2c3f983d2b1f75875ef38f27",
+      "run_id": "sha256-5a226b76fe45f44ce250e544bcbf7ebe27a3f30b9ed4f0427c396e764137c731",
       "path": "runs/2026-11-03-estimation-ab-forge-e8e0e4cd/record.json",
-      "sha256": "3b3a6b06cf3521127530888e085fa422eadd531a2c3f983d2b1f75875ef38f27",
+      "sha256": "5a226b76fe45f44ce250e544bcbf7ebe27a3f30b9ed4f0427c396e764137c731",
       "format": "legacy-assessment",
       "context": {
         "suite": "estimation-ab",

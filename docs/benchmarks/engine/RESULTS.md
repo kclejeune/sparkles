@@ -428,10 +428,11 @@ queries under 0.15 ms spend 1 to 90 microseconds longer in planning, 5% to 10% o
 time, on registering the sets of their variables and walking their plans for set masks.
 Roadmap item NEW-ITEM-6 keeps that work across queries. In eight rounds `expr-agg-arg`
 ran 0.99 times as long, the synthetic `f-regex-iri-join` 1.06 times and
-`f-expr-range-join` 1.11 times, the last two in execution. The servers of either build ran `f-expr-range-join` in 1.7 to 1.9 ms or in 2.7
-to 3.3 ms, so its median depends on which servers a round starts. `two-hop-count` and
-`births-by-decade`, which an earlier pair of builds ran 1.15 and 1.13 times as long, ran
-0.98 and 1.00 times as long here. Roadmap item NEW-ITEM-7 separates code layout from
+`f-expr-range-join` 1.11 times, the last two in execution. The rounds of either build
+ran `f-expr-range-join` in 1.7 to 2.3 ms or in 2.7 to 3.3 ms of execution, as the
+record's per-round medians show, so its median depends on which rounds fall slow.
+`two-hop-count` and `births-by-decade`, which an earlier pair of builds ran 1.15 and 1.13
+times as long, ran 0.98 and 1.00 times as long here. Roadmap item NEW-ITEM-7 separates code layout from
 code in these execution differences.
 
 ## Rewrite gate baselines

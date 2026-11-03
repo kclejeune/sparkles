@@ -189,9 +189,29 @@
   {
    "answers": "same",
    "base_exec_ms": 0.0051,
+   "base_exec_ms_per_round": [
+    0.0052,
+    0.0051,
+    0.0049,
+    0.005,
+    0.0045,
+    0.0049,
+    0.0055,
+    0.0058
+   ],
    "base_ms": 0.0205,
    "base_plan_ms": 0.0153,
    "candidate_exec_ms": 0.0053,
+   "candidate_exec_ms_per_round": [
+    0.0054,
+    0.0056,
+    0.0048,
+    0.0048,
+    0.0054,
+    0.0052,
+    0.0055,
+    0.0052
+   ],
    "candidate_ms": 0.0226,
    "candidate_plan_ms": 0.0171,
    "per_round": [
@@ -212,9 +232,29 @@
   {
    "answers": "same",
    "base_exec_ms": 0.0043,
+   "base_exec_ms_per_round": [
+    0.0043,
+    0.0042,
+    0.0042,
+    0.004,
+    0.0038,
+    0.0044,
+    0.0044,
+    0.0048
+   ],
    "base_ms": 0.0223,
    "base_plan_ms": 0.0181,
    "candidate_exec_ms": 0.0043,
+   "candidate_exec_ms_per_round": [
+    0.0045,
+    0.0047,
+    0.0042,
+    0.0045,
+    0.0044,
+    0.004,
+    0.0046,
+    0.0041
+   ],
    "candidate_ms": 0.0244,
    "candidate_plan_ms": 0.0201,
    "per_round": [
@@ -235,9 +275,29 @@
   {
    "answers": "same",
    "base_exec_ms": 0.034,
+   "base_exec_ms_per_round": [
+    0.0352,
+    0.0345,
+    0.0325,
+    0.0338,
+    0.0314,
+    0.0344,
+    0.0344,
+    0.0368
+   ],
    "base_ms": 0.0842,
    "base_plan_ms": 0.0502,
    "candidate_exec_ms": 0.0351,
+   "candidate_exec_ms_per_round": [
+    0.0351,
+    0.0356,
+    0.0334,
+    0.0338,
+    0.035,
+    0.0345,
+    0.0355,
+    0.0367
+   ],
    "candidate_ms": 0.0896,
    "candidate_plan_ms": 0.0544,
    "per_round": [
@@ -258,9 +318,29 @@
   {
    "answers": "same",
    "base_exec_ms": 3.7259,
+   "base_exec_ms_per_round": [
+    3.3321,
+    3.6172,
+    3.5076,
+    4.7061,
+    4.0189,
+    3.3785,
+    2.8822,
+    4.7909
+   ],
    "base_ms": 3.7831,
    "base_plan_ms": 0.0574,
    "candidate_exec_ms": 3.7001,
+   "candidate_exec_ms_per_round": [
+    3.3978,
+    2.8724,
+    3.9244,
+    3.7075,
+    4.6285,
+    3.3054,
+    3.4741,
+    4.7087
+   ],
    "candidate_ms": 3.7585,
    "candidate_plan_ms": 0.0601,
    "per_round": [
@@ -281,9 +361,29 @@
   {
    "answers": "same",
    "base_exec_ms": 2.4127,
+   "base_exec_ms_per_round": [
+    1.8681,
+    1.7239,
+    2.8371,
+    2.7166,
+    3.1786,
+    1.7413,
+    2.9253,
+    1.753
+   ],
    "base_ms": 2.5262,
    "base_plan_ms": 0.1135,
    "candidate_exec_ms": 2.6947,
+   "candidate_exec_ms_per_round": [
+    2.2593,
+    1.7872,
+    2.8013,
+    1.8392,
+    3.282,
+    2.2108,
+    1.8681,
+    1.8405
+   ],
    "candidate_ms": 2.8064,
    "candidate_plan_ms": 0.1157,
    "per_round": [
@@ -304,9 +404,29 @@
   {
    "answers": "same",
    "base_exec_ms": 6.9229,
+   "base_exec_ms_per_round": [
+    6.7908,
+    7.1905,
+    6.3375,
+    6.8505,
+    7.2134,
+    6.5422,
+    7.1586,
+    7.211
+   ],
    "base_ms": 7.0128,
    "base_plan_ms": 0.0888,
    "candidate_exec_ms": 7.329,
+   "candidate_exec_ms_per_round": [
+    7.3383,
+    7.3319,
+    6.8774,
+    6.3728,
+    6.9206,
+    7.0641,
+    7.6211,
+    7.6972
+   ],
    "candidate_ms": 7.4201,
    "candidate_plan_ms": 0.0898,
    "per_round": [
@@ -327,9 +447,29 @@
   {
    "answers": "same",
    "base_exec_ms": 0.0055,
+   "base_exec_ms_per_round": [
+    0.0051,
+    0.005,
+    0.0055,
+    0.0057,
+    0.0058,
+    0.0054,
+    0.0055,
+    0.0062
+   ],
    "base_ms": 0.0263,
    "base_plan_ms": 0.0208,
    "candidate_exec_ms": 0.0055,
+   "candidate_exec_ms_per_round": [
+    0.0053,
+    0.0054,
+    0.0056,
+    0.0048,
+    0.0057,
+    0.0055,
+    0.0057,
+    0.0058
+   ],
    "candidate_ms": 0.0269,
    "candidate_plan_ms": 0.0215,
    "per_round": [
@@ -350,9 +490,29 @@
   {
    "answers": "same",
    "base_exec_ms": 0.0075,
+   "base_exec_ms_per_round": [
+    0.0068,
+    0.0068,
+    0.0078,
+    0.0077,
+    0.0071,
+    0.0076,
+    0.0079,
+    0.0078
+   ],
    "base_ms": 0.0173,
    "base_plan_ms": 0.0099,
    "candidate_exec_ms": 0.0075,
+   "candidate_exec_ms_per_round": [
+    0.0076,
+    0.0074,
+    0.007,
+    0.0068,
+    0.0073,
+    0.0078,
+    0.0075,
+    0.008
+   ],
    "candidate_ms": 0.018,
    "candidate_plan_ms": 0.0105,
    "per_round": [
@@ -373,9 +533,29 @@
   {
    "answers": "same",
    "base_exec_ms": 0.0533,
+   "base_exec_ms_per_round": [
+    0.0526,
+    0.0542,
+    0.0532,
+    0.0534,
+    0.0522,
+    0.0526,
+    0.0521,
+    0.0558
+   ],
    "base_ms": 0.1288,
    "base_plan_ms": 0.0761,
    "candidate_exec_ms": 0.054,
+   "candidate_exec_ms_per_round": [
+    0.0533,
+    0.0536,
+    0.0534,
+    0.0532,
+    0.0532,
+    0.0527,
+    0.0544,
+    0.0593
+   ],
    "candidate_ms": 0.1331,
    "candidate_plan_ms": 0.0792,
    "per_round": [
@@ -396,9 +576,29 @@
   {
    "answers": "same",
    "base_exec_ms": 0.0247,
+   "base_exec_ms_per_round": [
+    0.0245,
+    0.0247,
+    0.0249,
+    0.0245,
+    0.0251,
+    0.025,
+    0.0248,
+    0.0235
+   ],
    "base_ms": 0.0948,
    "base_plan_ms": 0.0701,
    "candidate_exec_ms": 0.0247,
+   "candidate_exec_ms_per_round": [
+    0.0249,
+    0.025,
+    0.0236,
+    0.0249,
+    0.0249,
+    0.025,
+    0.0243,
+    0.0244
+   ],
    "candidate_ms": 0.0956,
    "candidate_plan_ms": 0.0708,
    "per_round": [
@@ -419,9 +619,29 @@
   {
    "answers": "same",
    "base_exec_ms": 0.0062,
+   "base_exec_ms_per_round": [
+    0.0059,
+    0.0063,
+    0.006,
+    0.0059,
+    0.0066,
+    0.0064,
+    0.0062,
+    0.0059
+   ],
    "base_ms": 0.0234,
    "base_plan_ms": 0.0172,
    "candidate_exec_ms": 0.006,
+   "candidate_exec_ms_per_round": [
+    0.0062,
+    0.0065,
+    0.0058,
+    0.0057,
+    0.0064,
+    0.0063,
+    0.0059,
+    0.0053
+   ],
    "candidate_ms": 0.0239,
    "candidate_plan_ms": 0.0179,
    "per_round": [
@@ -442,9 +662,29 @@
   {
    "answers": "same",
    "base_exec_ms": 0.0283,
+   "base_exec_ms_per_round": [
+    0.0284,
+    0.029,
+    0.0286,
+    0.028,
+    0.0281,
+    0.0277,
+    0.0278,
+    0.029
+   ],
    "base_ms": 0.0865,
    "base_plan_ms": 0.0583,
    "candidate_exec_ms": 0.0283,
+   "candidate_exec_ms_per_round": [
+    0.0295,
+    0.0284,
+    0.0283,
+    0.0277,
+    0.0284,
+    0.0284,
+    0.0278,
+    0.0278
+   ],
    "candidate_ms": 0.0878,
    "candidate_plan_ms": 0.0595,
    "per_round": [
