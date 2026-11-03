@@ -329,11 +329,12 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   `sparkles ontology reason --input x.owl relax reduce --output y.owl`. `classify` and
   `check` can join a chain to classify or check the ontology at that point, and a chain
   can start from `classify FILE` or `check FILE`, which answer as they do alone. A chain
-  from a database starts with `reason`, `reduce` or `relax` and `--loc`. Without
-  `--reasoner` the classifier also takes the Horn axioms outside OWL 2 EL, such as GO's
-  inverse properties, so `reason` adds the subsumptions they entail. `--reasoner ELK`,
-  and `emr`, which ROBOT builds on ELK, run the OWL 2 EL rules alone and leave those
-  axioms out, as ELK does, so the output is ROBOT's with ELK. `hermit`, `jfact`, `whelk`
+  from a database starts with `reason`, `reduce`, `relax` or `materialize` and `--loc`.
+  Without `--reasoner`, `reason` and `reduce` also take the Horn axioms outside OWL 2 EL,
+  such as GO's inverse properties, so `reason` adds the subsumptions they entail.
+  `--reasoner ELK`, which `materialize` takes by default as ROBOT's does, and `emr`, which
+  ROBOT builds on ELK, run the OWL 2 EL rules alone and leave those axioms out, as ELK
+  does, so the output is ROBOT's with ELK. `hermit`, `jfact`, `whelk`
   and `structural` run the default classifier with a warning. The library has the same
   switch as `ClassifyRequest::el_only` and `Limits::el_only`. The queries ELK does not
   answer, such as the disjoint classes and the property hierarchy, add no axioms, as they
@@ -343,7 +344,31 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   on GO and ChEBI lite ([ROBOT comparison](../benchmarks/el-classification/RESULTS.md#robot)). The commands
   read no `--server`, which item 685 follows, write no OWL/XML, Manchester, OBO
   or OBO Graphs JSON, item 686, and refuse `--prevent-invalid-references true`,
-  item 687. `robot materialize` is item 636.
+  item 687.
+* `sparkles ontology materialize` does what `robot materialize` does. It asserts each
+  class's direct superclasses of the form `ObjectSomeValuesFrom(p C)` for the properties
+  of `--term` and `--term-file`, together with the direct named superclasses that are not
+  asserted, and with no term it takes every object property of the ontology. A term is a
+  full IRI or a CURIE with one of the OBO prefixes of ROBOT's default context, such as
+  `BFO:0000050`, and a term file holds one a line with `#` comments. A term that is
+  neither a URN nor a URL that Java's URL parser accepts, such as an IRI with a malformed
+  port, is left out with a warning, as ROBOT leaves it out. A superclass is
+  direct in the taxonomy that has a class for each such restriction, so a superclass is
+  left out when another superclass of the class, named or a restriction, lies below it.
+  The command validates the ontology first, as `reason` does, and takes `--reasoner` as
+  `reduce` does, with ELK by default, so it runs the OWL 2 EL rules alone unless another
+  reasoner is named. `--create-new-ontology true` adds nothing, because ROBOT's command saves
+  the ontology without the axioms it found, and `--remove-redundant-subclass-axioms` and
+  `--annotate-inferred-axioms` are accepted and ignored, as ROBOT ignores them. It runs
+  from a file or a database and joins a chain, as in
+  `sparkles ontology reason --input go.owl materialize --term BFO:0000050 reduce --output y.owl`.
+  On GO with part of and ChEBI lite with has role its output equals ROBOT's axiom for
+  axiom. The classifier names each restriction by a fresh class equivalent to it, as
+  ROBOT's expression materializing reasoner does, but only for the classes that can be
+  fillers, so one property takes about as long as `reason`. Each further property holds
+  more memory, about 280 MiB on ChEBI lite, where all nine properties take 5,084 MiB of
+  peak resident memory against 2,506 MiB for `reason`
+  ([materialize results](../benchmarks/el-classification/RESULTS.md#materialize)).
 * `sparkles ontology check FILE` reports the profile and the axioms outside it, and
   `sparkles ontology axioms` lists the axioms of a database or a server.
 * Python's `Dataset.ontology`, Node.js's `dataset.ontology` and the JVM's

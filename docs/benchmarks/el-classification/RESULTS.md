@@ -117,8 +117,8 @@ subsumptions.
 <a id="robot"></a>
 
 OBO release pipelines classify with ROBOT's `reason`, `reduce`, `relax` and `materialize`
-commands. `sparkles ontology reason`, `reduce` and `relax` take ROBOT 1.9.11's options and
-defaults and chain in one process, and `materialize` is roadmap item 636. ROBOT 1.9.11
+commands. `sparkles ontology reason`, `reduce`, `relax` and `materialize` take ROBOT
+1.9.11's options and defaults and chain in one process. ROBOT 1.9.11
 ran each command with its bundled ELK 0.6.0 on GO and ChEBI lite, from the release's
 RDF/XML file to a written functional-style file, and the Sparkles commands ran on the
 same files with their default options. `scripts/elk-compare/ofn-axioms.py --all`
@@ -177,6 +177,37 @@ resident memory in MiB. Roadmap item 688 takes them on the benchmark host.
 
 ROBOT ran with an 8 GiB heap. The materialized property was part of, `BFO:0000050`, for
 GO and has role, `RO:0000087`, for ChEBI lite.
+
+### Materialize
+
+`sparkles ontology materialize` with part of on GO and has role on ChEBI lite writes the
+same ontology as `robot materialize` with ELK, axiom for axiom. The outputs hold 608,460
+axioms on GO and 1,666,767 on ChEBI lite, and neither command adds an axiom, since both
+releases already assert every direct existential superclass for those properties. Other
+choices of properties add axioms. Regulates, `RO:0002211`, adds 310 on GO through its
+sub-properties, and every object property of ChEBI lite adds 13, all with
+`RO:0018036`. Every object property of GO adds none. Roadmap item 688 compares these
+runs with ROBOT's outputs and times `robot materialize` on the benchmark host.
+
+On forge each run went three times end to end from the release's RDF/XML file to the
+written functional-style file. The table gives the median time in seconds and the
+median peak resident memory in MiB.
+
+| Run | GO time | GO peak RSS | ChEBI lite time | ChEBI lite peak RSS |
+|---|---:|---:|---:|---:|
+| `sparkles ontology reason` | 3.47 | 1,520 | 8.77 | 2,506 |
+| `sparkles ontology materialize` with one property | 3.31 | 1,522 | 8.32 | 2,824 |
+| `sparkles ontology materialize` with every property | 4.20 | 1,681 | 14.89 | 5,084 |
+| `sparkles ontology materialize --term RO:0002211` | 3.42 | 1,519 | | |
+| `sparkles ontology reason materialize reduce` | 4.14 | 1,530 | | |
+
+One property takes about as long as `reason`, because the classifier runs once with a
+class named for each restriction of that property. Each named restriction holds
+memory, so one property on ChEBI lite adds 318 MiB of peak resident memory to
+`reason`'s, and each of its other eight properties adds about 280 MiB more. On GO, which
+also has nine properties, all of them together add 161 MiB. The
+[run record](runs/2026-11-03-materialize-forge-81851812/record.json) keeps every round,
+the host, the binary's checksum and the axiom comparison.
 
 ## File classification
 
@@ -501,6 +532,10 @@ a peak resident set 16 to 26 MiB higher.
 The [record of item 603's A/B](runs/2026-11-03-horn-forge-8966216c/record.json) holds
 every classification time of both builds, the stage times, the conjunction contexts, the
 taxonomy hashes and the script that ran.
+
+The [materialize record](runs/2026-11-03-materialize-forge-81851812/record.json) holds
+every round of `materialize`, `reason` and the chain on GO and ChEBI lite, the binary
+and data hashes, the comparison with ROBOT's materialize outputs and the warnings.
 
 The [record of item 587's A/B](runs/2026-11-03-el-complete-forge-c4df06fe/record.json)
 holds every classification time of both builds, the stage times, the taxonomy hashes and

@@ -1,5 +1,5 @@
-//! Ontologies that commands transform in memory (spec F24): `reason`, `reduce` and
-//! `relax` with the meaning of ROBOT 1.9.11's commands, run on an ontology read from a
+//! Ontologies that commands transform in memory (spec F24): `reason`, `reduce`, `relax`
+//! and `materialize` with the meaning of ROBOT 1.9.11's commands, run on an ontology read from a
 //! file or a database and handed from one command of a chain to the next without a
 //! file, and the writers of the result. The transformations are those of
 //! [`sparkles_owl::transform`], and the classification is the OWL 2 EL classifier's,
@@ -13,7 +13,9 @@ use crate::error::{Error, Result};
 use crate::sparql::QueryOptions;
 use sparkles_owl::classify::{Classification, Excluded};
 use sparkles_owl::ofn::Renderer;
-use sparkles_owl::transform::{self, Document, ReasonOptions, ReduceOptions, RelaxOptions, Report};
+use sparkles_owl::transform::{
+    self, Document, MaterializeOptions, ReasonOptions, ReduceOptions, RelaxOptions, Report,
+};
 use sparkles_owl::{Axiom, AxiomKind};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -129,6 +131,16 @@ impl WorkingOntology {
         opts: &QueryOptions,
     ) -> std::result::Result<Report, TransformError> {
         transform::reduce(&mut self.doc, o, &mut classifier(c, opts))
+    }
+
+    /// `materialize`. The ontology is unchanged when it fails.
+    pub fn materialize(
+        &mut self,
+        o: &MaterializeOptions,
+        c: &ClassifyRequest,
+        opts: &QueryOptions,
+    ) -> std::result::Result<Report, TransformError> {
+        transform::materialize(&mut self.doc, o, &mut classifier(c, opts))
     }
 
     /// `relax`, which classifies nothing.

@@ -758,6 +758,8 @@ sparkles ontology reason --input go.owl --reasoner ELK --output go-elk.ofn   # O
 sparkles ontology reduce --input x.owl --output y.ofn   # robot reduce: without the entailed subclass axioms
 sparkles ontology relax  --input x.owl --output y.owl   # robot relax: subclass axioms from equivalences
 sparkles ontology reason --input x.owl relax reduce --output y.owl   # a chain in one process, as ROBOT runs it
+sparkles ontology materialize --input go.owl --term BFO:0000050 --output y.ofn   # robot materialize: direct part-of superclasses
+sparkles ontology materialize --input x.owl --term-file terms.txt reduce --output y.ofn   # properties from a file, then reduce
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --language en|all,
                                               #   --language fr=french-light (a tag with an analyzer),
                                               #   --rebuild, --status, --disable, --text-dicts DIR

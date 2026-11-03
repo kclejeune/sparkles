@@ -47,10 +47,19 @@ export interface EntitySearch {
 export async function searchEntities(
   ds: string,
   q: string,
-  opts: { limit?: number; kind?: EntitySearchKind[]; signal?: AbortSignal } = {},
+  opts: {
+    limit?: number;
+    offset?: number;
+    kind?: EntitySearchKind[];
+    /** the graph to search, null for the default graph; the server's choice when absent */
+    graph?: string | null;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<EntitySearch> {
   const p = new URLSearchParams({ q, limit: String(opts.limit ?? 10) });
+  if (opts.offset) p.set('offset', String(opts.offset));
   if (opts.kind?.length) p.set('kind', opts.kind.join(','));
+  if (opts.graph !== undefined) p.set('graph', opts.graph ?? 'default');
   const res = await request(`/$/ontology/${encodeURIComponent(ds)}/search?${p}`, {
     headers: { Accept: 'application/json' },
     signal: opts.signal,
@@ -77,27 +86,12 @@ const FIELD_NAME: Record<string, string> = {
   definition: 'definition',
 };
 
-/** The ontology editor's tree tab of each property kind. */
-const PROPERTY_TAB: Record<string, string> = {
-  objectProperty: 'ObjectProperty',
-  dataProperty: 'DataProperty',
-  annotationProperty: 'AnnotationProperty',
-};
-
 /**
- * Where a hit opens: a concept, scheme or collection in the thesaurus editor, a class or
- * property in the ontology editor, and anything else in Explore. Item 616's browser pages
- * replace the first two.
+ * Where a hit opens: the entity's page in the ontology browser, for every kind. The
+ * browser's Edit button opens the ontology or thesaurus editor on it.
  */
 export function entityHref(base: string, ds: string, hit: Pick<EntityHit, 'iri' | 'kinds'>) {
-  const q = `?ds=${encodeURIComponent(ds)}&iri=${encodeURIComponent(hit.iri)}`;
-  const k = hit.kinds;
-  if (k.some((x) => x === 'concept' || x === 'conceptScheme' || x === 'collection'))
-    return `${base}/thesaurus${q}`;
-  if (k.some((x) => x === 'class' || x === 'datatype')) return `${base}/ontology${q}`;
-  const prop = k.find((x) => x in PROPERTY_TAB);
-  if (prop) return `${base}/ontology${q}&tab=${PROPERTY_TAB[prop]}`;
-  return `${base}/explore${q}`;
+  return `${base}/browse?ds=${encodeURIComponent(ds)}&iri=${encodeURIComponent(hit.iri)}`;
 }
 
 /** A hit as a launcher row: the label with its match, and what matched when not the label. */

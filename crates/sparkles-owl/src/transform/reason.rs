@@ -4,6 +4,7 @@
 use super::{
     BOTTOM, Classify, Document, Error, Report, Signature, View, fresh_class, nothing, thing,
 };
+use crate::classify::Classification;
 use crate::model::*;
 use crate::vocab;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -178,6 +179,77 @@ pub const IS_INFERRED: &str = "http://www.geneontology.org/formats/oboInOwl#is_i
 const PROBE: &str = "urn:sparkles:reason:probe:";
 const NOMINAL: &str = "urn:sparkles:reason:individual:";
 
+/// ROBOT's check for unsatisfiable object properties with ELK: a fresh class under
+/// `ObjectSomeValuesFrom(p owl:Thing)` for each property of the signature, which no other
+/// class can be below or equal to, so it changes no answer about the other classes and
+/// joins the classification the command runs anyway.
+pub(crate) struct Probes {
+    of: Vec<(Class, ObjectProperty)>,
+    pub axioms: Vec<AxiomKind>,
+}
+
+impl Probes {
+    /// The probes of the signature's object properties, each fresh class added to `fresh`.
+    pub fn new(sig: &Signature, fresh: &mut FxHashSet<Class>) -> Probes {
+        let mut of: Vec<(Class, ObjectProperty)> = Vec::new();
+        for (i, p) in sig.object_properties.iter().enumerate() {
+            let c = fresh_class(PROBE, i, &sig.classes);
+            fresh.insert(c.clone());
+            of.push((c, p.clone()));
+        }
+        let axioms = of
+            .iter()
+            .map(|(c, p)| {
+                AxiomKind::SubClassOf(
+                    ClassExpression::Class(c.clone()),
+                    ClassExpression::some(p.clone(), thing()),
+                )
+            })
+            .collect();
+        Probes { of, axioms }
+    }
+
+    /// ROBOT's `ReasonerHelper.validate`: an inconsistent ontology, then the unsatisfiable
+    /// classes that `is_fresh` does not name, then the object properties whose probe is
+    /// unsatisfiable, fail. `dump` gives the document whose bottom-locality module of the
+    /// unsatisfiable classes the error carries, when one is asked for.
+    pub fn validate<'d, E>(
+        &self,
+        classification: &Classification,
+        is_fresh: impl Fn(&Class) -> bool,
+        dump: impl FnOnce() -> Option<&'d Document>,
+    ) -> Result<(), Error<E>> {
+        if !classification.consistent {
+            return Err(Error::Inconsistent);
+        }
+        let unsat: Vec<Class> = classification
+            .taxonomy
+            .node(BOTTOM)
+            .classes
+            .iter()
+            .filter(|c| c.as_str() != vocab::OWL_NOTHING && !is_fresh(c))
+            .cloned()
+            .collect();
+        if !unsat.is_empty() {
+            let module = dump().map(|d| super::bottom_module(d.axioms.iter(), unsat.iter()));
+            return Err(Error::UnsatisfiableClasses {
+                classes: unsat,
+                module,
+            });
+        }
+        let unsat_props: Vec<ObjectProperty> = self
+            .of
+            .iter()
+            .filter(|(c, _)| classification.taxonomy.is_unsatisfiable(c))
+            .map(|(_, p)| p.clone())
+            .collect();
+        if !unsat_props.is_empty() {
+            return Err(Error::UnsatisfiableProperties(unsat_props));
+        }
+        Ok(())
+    }
+}
+
 /// Classify the document and assert the inferred axioms, as ROBOT's `reason` does. The
 /// document is changed only when the run succeeds.
 pub fn reason<E>(
@@ -188,58 +260,20 @@ pub fn reason<E>(
     let mut report = Report::default();
     let sig = doc.signature();
 
-    // ROBOT's check for unsatisfiable object properties with ELK: a fresh class under
-    // `ObjectSomeValuesFrom(p owl:Thing)` for each property, which no other class can be
-    // below or equal to, so it changes no answer about the other classes
     let mut fresh: FxHashSet<Class> = FxHashSet::default();
-    let mut probes: Vec<(Class, ObjectProperty)> = Vec::new();
-    for (i, p) in sig.object_properties.iter().enumerate() {
-        let c = fresh_class(PROBE, i, &sig.classes);
-        fresh.insert(c.clone());
-        probes.push((c, p.clone()));
-    }
-    let probe_axioms: Vec<AxiomKind> = probes
-        .iter()
-        .map(|(c, p)| {
-            AxiomKind::SubClassOf(
-                ClassExpression::Class(c.clone()),
-                ClassExpression::some(p.clone(), thing()),
-            )
-        })
-        .collect();
+    let probes = Probes::new(&sig, &mut fresh);
     let mut kinds = doc.logical_kinds();
-    kinds.extend(probe_axioms.iter());
+    kinds.extend(probes.axioms.iter());
     let (classification, excluded) = classify(&kinds).map_err(Error::Classifier)?;
     drop(kinds);
     report.excluded = excluded;
     let view = View::new(&classification, &fresh);
-
-    // ReasonerHelper.validate: consistency, the classes, the properties
-    if !classification.consistent {
-        return Err(Error::Inconsistent);
-    }
-    let unsat: Vec<Class> = view
-        .members(BOTTOM)
-        .filter(|c| c.as_str() != vocab::OWL_NOTHING)
-        .cloned()
-        .collect();
-    if !unsat.is_empty() {
-        let module = o
-            .dump_unsatisfiable
-            .then(|| super::bottom_module(doc.axioms.iter(), unsat.iter()));
-        return Err(Error::UnsatisfiableClasses {
-            classes: unsat,
-            module,
-        });
-    }
-    let unsat_props: Vec<ObjectProperty> = probes
-        .iter()
-        .filter(|(c, _)| classification.taxonomy.is_unsatisfiable(c))
-        .map(|(_, p)| p.clone())
-        .collect();
-    if !unsat_props.is_empty() {
-        return Err(Error::UnsatisfiableProperties(unsat_props));
-    }
+    let input: &Document = doc;
+    probes.validate(
+        &classification,
+        |c| fresh.contains(c),
+        || o.dump_unsatisfiable.then_some(input),
+    )?;
 
     // the equivalences between named classes, as `EquivalentClassReasoning` finds them
     if o.equivalent_classes != EquivalentClasses::All {

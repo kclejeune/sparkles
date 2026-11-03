@@ -700,6 +700,58 @@
    "metadata_note": "A manual measurement record of sparkles ontology reason, reduce, relax, their chain and classify on the benchmark host, with the axiom comparison against ROBOT 1.9.11's outputs."
   },
   {
+   "run_id": "sha256-cb02e9c642186e59fb4de0ad92f445edc9bbd00473160ce93b51295f924c8b6a",
+   "path": "runs/2026-11-03-materialize-forge-81851812/record.json",
+   "sha256": "cb02e9c642186e59fb4de0ad92f445edc9bbd00473160ce93b51295f924c8b6a",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26 and ChEBI lite 256, RDF/XML releases",
+    "manifest": {
+     "binary": "The sparkles CLI built with mbx build --release -p sparkles-server on atlas at commit 81851812, stripped and copied to the benchmark host",
+     "binary_sha256": {
+      "sparkles": "aa01715d6132929beec1471acf13b3e2cacf0b01893f9c63d15ec8eb3dedb6d2"
+     },
+     "commit": "81851812",
+     "data": {
+      "chebi_lite": {
+       "rdfxml_sha256": "ebea75e0500818e319245a1bf605a684b2e22a2069680290b5dda638d5d25b16"
+      },
+      "go": {
+       "rdfxml_sha256": "653ce47cd7b02304e67eb67c54d3be02ec5b0ba5e00eb7384dfa0da00f9682ec"
+      }
+     },
+     "ended": "2026-11-03T16:12:55Z",
+     "host_load_after": "1.33 0.65 0.30",
+     "host_load_before": "0.04 0.10 0.08",
+     "reference": {
+      "robot": "ROBOT 1.9.11's materialize has only laptop figures, 14.4 s on GO and 37.7 s on ChEBI lite with an 8 GiB heap, from lane 604. Its forge stage is in the batch roadmap item 636 left to the maintainer."
+     },
+     "started": "2026-11-03T16:10:23Z"
+    },
+    "settings": {
+     "build": "release profile",
+     "memory_cap": "MemoryMax=12G, MemorySwapMax=0 per process",
+     "repeat": 3,
+     "threads": "0 (the classifier's default)",
+     "timeout_s": 1800
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "kernel": "7.2.9",
+      "name": "forge",
+      "ram_mib": 15620
+     },
+     "method": "forge-sparkles.sh.txt took ~/lanes/.bench.lock once and ran three interleaved rounds. Each round timed, from the release's RDF/XML file to a functional-style file, sparkles ontology reason, materialize with one property (part of, BFO:0000050, on GO and has role, RO:0000087, on ChEBI lite) and materialize with every object property on both, and on GO also materialize with regulates (RO:0002211) and the chain reason --input FILE materialize --term BFO:0000050 reduce --output FILE, each through timed.py.txt, which records the wall time, the peak resident set and the exit status in runs.jsonl. compare.txt is scripts/elk-compare/ofn-axioms.py --all between lane 604's ROBOT outputs and the same build's outputs on atlas.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual measurement record of sparkles ontology materialize with one property, with every property and with regulates, of reason and of the chain reason materialize reduce on the benchmark host, with the axiom comparison against ROBOT 1.9.11's materialize outputs."
+  },
+  {
    "run_id": "sha256-913ee575a8d2bae896ecd33e16d85e937179e3512802f2d9eee1c8469c14acd3",
    "path": "runs/2026-11-03-horn-forge-8966216c/record.json",
    "sha256": "913ee575a8d2bae896ecd33e16d85e937179e3512802f2d9eee1c8469c14acd3",

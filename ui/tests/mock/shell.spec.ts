@@ -39,7 +39,7 @@ test.describe('at 1440 pixels', () => {
     await expect(hit.locator('mark')).toHaveText('Stud');
     await page.keyboard.press('Enter');
     await expect(page).toHaveURL(
-      new RegExp(`/ui/ontology\\?ds=uni&iri=${encodeURIComponent(`${UNI}Student`)}`),
+      new RegExp(`/ui/browse\\?ds=uni&iri=${encodeURIComponent(`${UNI}Student`)}`),
     );
     await expect(list).toHaveCount(0);
   });
@@ -93,7 +93,7 @@ test.describe('at 1440 pixels', () => {
     await search(page).fill('stud');
     await page.keyboard.press('Enter');
     await expect(page).toHaveURL(
-      new RegExp(`/ui/ontology\\?ds=uni&iri=${encodeURIComponent(`${UNI}Student`)}`),
+      new RegExp(`/ui/browse\\?ds=uni&iri=${encodeURIComponent(`${UNI}Student`)}`),
     );
   });
 
@@ -159,7 +159,7 @@ test.describe('at 1440 pixels', () => {
     await expect(page).toHaveURL(/\/ui\/datasets$/);
   });
 
-  test("a hit opened from Explore's Schema tab shows in the graph", async ({ page }) => {
+  test("Open in Explore from an entity's page shows it in the graph", async ({ page }) => {
     await visit(page, '/ui/explore?ds=uni&tab=schema');
     await expect(page.getByRole('tab', { name: /Schema/ })).toHaveAttribute(
       'aria-selected',
@@ -168,15 +168,9 @@ test.describe('at 1440 pixels', () => {
     await page.keyboard.press('Control+k');
     await page.keyboard.type('ada love');
     await page.getByRole('option', { name: /^Ada Lovelace/ }).click();
+    await expect(page).toHaveURL(/\/ui\/browse\?ds=uni&iri=/);
+    await page.getByRole('link', { name: 'Open in Explore' }).click();
     await expect(page).toHaveURL(/\/ui\/explore\?ds=uni&iri=/);
-    await expect(page.getByRole('tab', { name: /Graph/ })).toHaveAttribute('aria-selected', 'true');
-
-    // the same resource again, after a switch to Schema
-    await page.getByRole('tab', { name: /Schema/ }).click();
-    await expect(page).toHaveURL(/tab=schema/);
-    await page.keyboard.press('Control+k');
-    await page.keyboard.type('ada love');
-    await page.getByRole('option', { name: /^Ada Lovelace/ }).click();
     await expect(page).not.toHaveURL(/tab=schema/);
     await expect(page.getByRole('tab', { name: /Graph/ })).toHaveAttribute('aria-selected', 'true');
   });
@@ -294,7 +288,7 @@ test.describe('at 390 pixels', () => {
       .getByRole('option', { name: /Person/ })
       .first()
       .click();
-    await expect(page).toHaveURL(/\/ui\/ontology\?ds=uni&iri=/);
+    await expect(page).toHaveURL(/\/ui\/browse\?ds=uni&iri=/);
     await expect(search(page)).toBeHidden();
   });
 
@@ -315,6 +309,7 @@ test.describe('at 390 pixels', () => {
     for (const name of [
       'Query',
       'Explore',
+      'Browse',
       'Ontology',
       'Thesaurus',
       'Similar',
@@ -336,6 +331,8 @@ test.describe('at 390 pixels', () => {
 const PAGES = [
   '/ui/query',
   '/ui/explore?ds=foaf',
+  '/ui/browse?ds=uni',
+  '/ui/browse?ds=uni&iri=http%3A%2F%2Fexample.org%2Funi%23Professor',
   '/ui/ontology?ds=uni',
   '/ui/thesaurus?ds=uni',
   '/ui/similar?ds=foaf',

@@ -300,3 +300,50 @@ async fn the_entity_search_holds_only_what_the_caller_reads() {
     let r = call(&app, "GET", &uri, &[], "").await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
 }
+
+#[tokio::test]
+async fn the_browser_routes_hold_only_what_the_caller_reads() {
+    let (_dir, app) = server();
+    let a = "iri=http%3A%2F%2Fex%2FA";
+    let tree = format!("/$/ontology/ont/hierarchy?{OPEN}&{a}&ancestors=true");
+    let r = as_user(&app, "ofull", "GET", &tree, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        r.json()["ancestors"]["nodes"][0]["iri"],
+        "http://ex/Hidden",
+        "{}",
+        r.text()
+    );
+    // the imported graph the caller cannot read gives no parent
+    let r = as_user(&app, "oopen", "GET", &tree, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["ancestors"]["nodes"], json!([]), "{}", r.text());
+    assert!(!r.text().contains("Hidden"), "{}", r.text());
+    let term = format!("/$/ontology/ont/term?{OPEN}&{a}");
+    let r = as_user(&app, "ofull", "GET", &term, &json!(null)).await;
+    assert!(r.text().contains("Hidden"), "{}", r.text());
+    let r = as_user(&app, "oopen", "GET", &term, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(!r.text().contains("Hidden"), "{}", r.text());
+    let r = as_user(
+        &app,
+        "oopen",
+        "GET",
+        &format!("{term}&format=ttl"),
+        &json!(null),
+    )
+    .await;
+    assert!(!r.text().contains("Hidden"), "{}", r.text());
+    // an entity of the unreadable graph is not found
+    let r = as_user(
+        &app,
+        "oopen",
+        "GET",
+        &format!("/$/ontology/ont/term?{OPEN}&iri=http%3A%2F%2Fex%2FHidden"),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let r = call(&app, "GET", &tree, &[], "").await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+}

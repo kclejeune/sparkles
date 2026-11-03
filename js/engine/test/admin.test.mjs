@@ -1042,6 +1042,27 @@ test('the ontology handle searches entities with typos', async (t) => {
   assert.deepEqual(none.results, []);
 });
 
+test('the ontology handle reads one hierarchy level and one entity', async (t) => {
+  const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
+  await ds.update(`PREFIX : <http://ex.org/>
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    INSERT DATA { :Animal a owl:Class ; rdfs:label "animal" .
+      :Dog a owl:Class ; rdfs:label "dog" ; rdfs:subClassOf :Animal . }`);
+  const onto = ds.ontology;
+  const roots = await onto.hierarchy();
+  assert.equal(roots.children[0].iri, 'http://ex.org/Animal');
+  assert.equal(roots.children[0].children, 1);
+  assert.equal(typeof roots.commit, 'bigint');
+  const up = await onto.hierarchy({ iri: 'http://ex.org/Dog', ancestors: true });
+  assert.deepEqual(up.ancestors.edges, [['http://ex.org/Dog', 'http://ex.org/Animal']]);
+  const term = await onto.term('http://ex.org/Dog');
+  assert.equal(term.label, 'dog');
+  assert.deepEqual(term.kinds, ['class']);
+  assert.ok(term.axioms.some((a) => a.type === 'SubClassOf'));
+  assert.equal(term.names['http://ex.org/Animal'].label, 'animal');
+});
+
 test('owl literals of numbers take XML Schema lexical forms', () => {
   const XSD = 'http://www.w3.org/2001/XMLSchema#';
   assert.deepEqual(owl.Literal(1e21), { '@value': '1' + '0'.repeat(21), '@type': XSD + 'integer' });

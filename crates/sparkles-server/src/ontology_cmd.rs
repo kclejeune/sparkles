@@ -140,6 +140,11 @@ pub enum OntologyCmd {
     /// Add subclass axioms for the existentials and named conjuncts of equivalences, as
     /// `robot relax` does, with its options; other commands can follow in one chain
     Relax(ontology_chain::RelaxArgs),
+    /// Assert the direct superclasses of the form ObjectSomeValuesFrom(p C) for the
+    /// properties of --term and --term-file, as `robot materialize` does, with its options;
+    /// other commands can follow in one chain. Exits with status 1 when the ontology is
+    /// inconsistent or has an unsatisfiable class or property
+    Materialize(ontology_chain::MaterializeArgs),
     /// Add and remove axioms in one commit
     Edit {
         #[command(flatten)]
@@ -534,6 +539,9 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
         OntologyCmd::Reason(a) => ontology_chain::run(ontology_chain::Step::Reason(a), opts),
         OntologyCmd::Reduce(a) => ontology_chain::run(ontology_chain::Step::Reduce(a), opts),
         OntologyCmd::Relax(a) => ontology_chain::run(ontology_chain::Step::Relax(a), opts),
+        OntologyCmd::Materialize(a) => {
+            ontology_chain::run(ontology_chain::Step::Materialize(a), opts)
+        }
         OntologyCmd::Edit {
             at,
             read,
@@ -620,7 +628,7 @@ fn chain_head(
     match file {
         Some(f) if at.loc.is_none() && at.server.is_none() => Ok(Some(f.clone())),
         _ => bail!(
-            "a chain from classify or check starts with a FILE; a chain from a database starts with reason, reduce or relax and --loc"
+            "a chain from classify or check starts with a FILE; a chain from a database starts with reason, reduce, relax or materialize and --loc"
         ),
     }
 }
@@ -633,7 +641,7 @@ fn not_a_chain(f: &Path) -> Result<()> {
         Some("reason" | "reduce" | "relax" | "classify" | "check")
     ) {
         bail!(
-            "a chain from a database starts with reason, reduce or relax and --loc, not with classify or check"
+            "a chain from a database starts with reason, reduce, relax or materialize and --loc, not with classify or check"
         );
     }
     Ok(())

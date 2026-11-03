@@ -1,0 +1,66 @@
+== chebi_lite.materialize-all.r1.err
+WARN http://purl.obolibrary.org/obo/RO_0018036 gives 13 materialized superclasses
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== chebi_lite.materialize-all.r2.err
+WARN http://purl.obolibrary.org/obo/RO_0018036 gives 13 materialized superclasses
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== chebi_lite.materialize-all.r3.err
+WARN http://purl.obolibrary.org/obo/RO_0018036 gives 13 materialized superclasses
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== chebi_lite.materialize.r1.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== chebi_lite.materialize.r2.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== chebi_lite.materialize.r3.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== chebi_lite.reason.r1.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== chebi_lite.reason.r2.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== chebi_lite.reason.r3.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.chain-rmr.r1.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.chain-rmr.r2.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.chain-rmr.r3.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.materialize-all.r1.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.materialize-all.r2.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.materialize-all.r3.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.materialize.r1.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.materialize.r2.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.materialize.r3.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.materialize-regulates.r1.err
+WARN http://purl.obolibrary.org/obo/RO_0002211 gives 310 materialized superclasses
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.materialize-regulates.r2.err
+WARN http://purl.obolibrary.org/obo/RO_0002211 gives 310 materialized superclasses
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.materialize-regulates.r3.err
+WARN http://purl.obolibrary.org/obo/RO_0002211 gives 310 materialized superclasses
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.reason.r1.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.reason.r2.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== go.reason.r3.err
+WARN the classifier left out 1 axioms outside OWL 2 EL or used them only in part
+== sha256 of the outputs
+eefbc2cac06b94c983aedfc9cf389c26825ce3391b20978bf8e9be84be2e66ec  chebi_lite.materialize-all.ofn
+b26bb1d0d225f6ae2b36cbde1a684acde170ce9bbd5978f57a5f5f25d661d498  chebi_lite.materialize.ofn
+5e9764e0675d28179452cb2f7df4ca164c01a14c31d268b2d87a3495ad21bdde  chebi_lite.reason.ofn
+3720ba4c8079c4ac2e4f61c5d5ba28fa8334128d28e1afd748ac9c58d26dfe2b  go.chain-rmr.ofn
+65dbfe0a62b23098d444ff210c2f5bc766391aa98253356dd52105ee391f95b4  go.materialize-all.ofn
+65dbfe0a62b23098d444ff210c2f5bc766391aa98253356dd52105ee391f95b4  go.materialize.ofn
+35b506d22560aa8dc60d39a899982e5bdd92b56fb4e47b40eb9cd80bc66d3d5a  go.materialize-regulates.ofn
+3720ba4c8079c4ac2e4f61c5d5ba28fa8334128d28e1afd748ac9c58d26dfe2b  go.reason.ofn

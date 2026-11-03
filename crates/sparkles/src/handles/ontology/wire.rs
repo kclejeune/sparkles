@@ -10,6 +10,7 @@
 //! ([`sparkles_owl::json`]) or as a string in functional-style syntax, with the dataset's
 //! prefixes and the standard ones.
 
+use super::browse;
 use super::classify::{Classified, ClassifyRequest};
 use super::dl_query::{DlAnswers, DlQueryAnswer, DlQueryRequest, DlReasoning};
 use super::search;
@@ -655,7 +656,7 @@ pub fn entity_body(
 // ------------------------------------------------------------- requests ------
 
 /// The operations [`call`] answers, in the names of the bindings' surface keys.
-pub const OPERATIONS: [&str; 12] = [
+pub const OPERATIONS: [&str; 14] = [
     "summary",
     "axioms",
     "entities",
@@ -668,6 +669,8 @@ pub const OPERATIONS: [&str; 12] = [
     "search",
     "parse",
     "dlQuery",
+    "hierarchy",
+    "term",
 ];
 
 /// The members each operation reads besides those that name the ontology.
@@ -701,6 +704,17 @@ fn members(op: &str) -> &'static [&'static str] {
             "threads",
         ],
         "parse" => &["text", "as"],
+        "hierarchy" => &[
+            "kind",
+            "iri",
+            "ancestors",
+            "limit",
+            "offset",
+            "scheme",
+            "deprecated",
+            "lang",
+        ],
+        "term" => &["iri", "mentions", "incoming", "lang"],
         "dlQuery" => &[
             "expression",
             "syntax",
@@ -1083,6 +1097,16 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
             let found = handle.search(&req, &s, opts)?;
             Ok(search_body(name, &s, &found))
         }
+        "hierarchy" => {
+            let h = hierarchy_request_of(a)?;
+            let found = handle.hierarchy(&req, &h, opts)?;
+            Ok(hierarchy_body(name, &h, &found))
+        }
+        "term" => {
+            let t = term_request_of(a)?;
+            let page = handle.term(&req, &t, opts)?;
+            Ok(term_body(name, &page, &r))
+        }
         _ => unreachable!("checked above"),
     }
 }
@@ -1142,6 +1166,195 @@ pub fn search_request_of(a: &Map<String, J>) -> Result<search::SearchRequest> {
     s.fuzzy = boolean(a, "fuzzy")?.unwrap_or(true);
     s.definitions = boolean(a, "definitions")?.unwrap_or(true);
     Ok(s)
+}
+
+fn languages_of(a: &Map<String, J>) -> Result<Vec<String>> {
+    let langs = list_of(a, "lang")?;
+    for l in &langs {
+        if oxilangtag::LanguageTag::parse(l.as_str()).is_err() {
+            return Err(bad(format!("lang: '{l}' is not a BCP 47 language tag")));
+        }
+    }
+    Ok(langs)
+}
+
+fn iri_arg(a: &Map<String, J>, k: &str) -> Result<Option<String>> {
+    Ok(string(a, k)?.map(|s| s.trim_start_matches('<').trim_end_matches('>').to_string()))
+}
+
+/// The hierarchy level a `hierarchy` request names.
+pub fn hierarchy_request_of(a: &Map<String, J>) -> Result<browse::HierarchyRequest> {
+    let mut h = browse::HierarchyRequest::default();
+    if let Some(k) = string(a, "kind")? {
+        h.kind = browse::TreeKind::parse(k).ok_or_else(|| {
+            bad(format!(
+                "unknown kind '{k}': {}",
+                browse::TreeKind::ALL.map(|k| k.name()).join(", ")
+            ))
+        })?;
+    }
+    h.iri = iri_arg(a, "iri")?;
+    h.scheme = iri_arg(a, "scheme")?;
+    h.ancestors = boolean(a, "ancestors")?.unwrap_or(false);
+    h.deprecated = boolean(a, "deprecated")?.unwrap_or(true);
+    h.limit = number(a, "limit", 1, browse::MAX_LIMIT)?.unwrap_or(browse::DEFAULT_LIMIT);
+    h.offset = number(a, "offset", 0, usize::MAX)?.unwrap_or(0);
+    h.languages = languages_of(a)?;
+    Ok(h)
+}
+
+/// The entity a `term` request names.
+pub fn term_request_of(a: &Map<String, J>) -> Result<browse::TermRequest> {
+    let iri = iri_arg(a, "iri")?.ok_or_else(|| bad("iri names the entity"))?;
+    let mut t = browse::TermRequest::new(iri);
+    t.mentions =
+        number(a, "mentions", 0, browse::MAX_MENTIONS)?.unwrap_or(browse::DEFAULT_MENTIONS);
+    t.incoming =
+        number(a, "incoming", 0, browse::MAX_INCOMING)?.unwrap_or(browse::DEFAULT_INCOMING);
+    t.languages = languages_of(a)?;
+    Ok(t)
+}
+
+fn name_members(n: &browse::Name) -> Map<String, J> {
+    let mut m = Map::new();
+    m.insert("iri".into(), json!(n.iri));
+    m.insert("label".into(), json!(n.label));
+    m.insert("labelLang".into(), json!(n.label_lang));
+    m.insert("shortForm".into(), json!(n.short_form));
+    m.insert("kinds".into(), json!(n.kinds));
+    m.insert("deprecated".into(), json!(n.deprecated));
+    m
+}
+
+/// The JSON of a hierarchy node: its name and the numbers of its children and parents.
+pub fn hierarchy_node(n: &browse::Node) -> J {
+    let mut m = name_members(&n.name);
+    m.insert("children".into(), json!(n.children));
+    m.insert("parents".into(), json!(n.parents));
+    J::Object(m)
+}
+
+/// The JSON of a hierarchy level, as `GET /$/ontology/{ds}/hierarchy` answers it.
+pub fn hierarchy_body(name: &str, h: &browse::HierarchyRequest, r: &browse::Hierarchy) -> J {
+    let next = r.offset + r.children.len();
+    let mut j = json!({
+        "dataset": name,
+        "commit": r.commit,
+        "graphs": r.graphs.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
+        "imports": r.imports.iter().map(|i| json!({"iri": i.iri, "graph": i.graph})).collect::<Vec<_>>(),
+        "warnings": r.warnings,
+        "kind": r.kind.name(),
+        "node": r.node.as_ref().map(hierarchy_node),
+        "children": r.children.iter().map(hierarchy_node).collect::<Vec<_>>(),
+        "total": r.total,
+        "offset": r.offset,
+        "limit": h.limit,
+        "next": if next < r.total { json!(next) } else { J::Null },
+        "order": if r.sorted { "label" } else { "iri" },
+    });
+    if let Some(from) = r.roots_from {
+        j["roots"] = json!(from.name());
+        j["deprecatedRoots"] = json!(r.deprecated_roots);
+    }
+    if let Some(a) = &r.ancestors {
+        j["ancestors"] = json!({
+            "nodes": a.nodes.iter().map(hierarchy_node).collect::<Vec<_>>(),
+            "edges": a.edges.iter().map(|(c, p)| json!([c, p])).collect::<Vec<_>>(),
+            "truncated": a.truncated,
+        });
+    }
+    j
+}
+
+fn value_json(v: &browse::Value) -> J {
+    match v {
+        browse::Value::Iri(i) => json!(i),
+        browse::Value::Literal(l) => {
+            sparkles_owl::json::literal(&sparkles_owl::Literal::from(l.clone()))
+        }
+    }
+}
+
+fn incoming_json(i: &browse::Incoming) -> J {
+    json!({
+        "property": i.property,
+        "count": i.count,
+        "more": i.more,
+        "subjects": i.subjects,
+    })
+}
+
+/// The JSON of what the graphs say about one entity, as `GET /$/ontology/{ds}/term`
+/// answers it.
+pub fn term_body(name: &str, t: &browse::TermPage, r: &Renderer) -> J {
+    let axioms = |list: &[(Axiom, u32)]| -> Vec<J> {
+        list.iter()
+            .map(|(a, g)| axiom_json(a, Some(t.graph_name(*g)), r))
+            .collect()
+    };
+    let mut j = json!({
+        "dataset": name,
+        "commit": t.commit,
+        "graphs": t.graphs.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
+        "imports": t.imports.iter().map(|i| json!({"iri": i.iri, "graph": i.graph})).collect::<Vec<_>>(),
+        "warnings": t.warnings,
+    });
+    for (k, v) in name_members(&t.name) {
+        j[k] = v;
+    }
+    j["types"] = json!(t.types);
+    j["ontologies"] = J::Array(
+        t.ontologies
+            .iter()
+            .enumerate()
+            .map(|(n, o)| json!({"graph": t.graph_name(n as u32), "ontology": o}))
+            .collect(),
+    );
+    j["statements"] = J::Array(
+        t.statements
+            .iter()
+            .map(|s| {
+                json!({
+                    "property": s.property,
+                    "value": value_json(&s.value),
+                    "graph": t.graph_name(s.graph),
+                    "annotations": s.annotations.iter().map(|(p, v)| json!({"property": p, "value": value_json(v)})).collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    );
+    j["statementsTruncated"] = json!(t.statements_truncated);
+    j["xlLabels"] = J::Array(
+        t.xl_labels
+            .iter()
+            .map(|s| {
+                json!({
+                    "property": s.property,
+                    "value": value_json(&s.value),
+                    "graph": t.graph_name(s.graph),
+                })
+            })
+            .collect(),
+    );
+    j["axioms"] = J::Array(axioms(&t.axioms));
+    j["mentions"] = json!({
+        "axioms": axioms(&t.mentions),
+        "total": t.mentions_total,
+        "truncated": t.mentions_truncated,
+    });
+    j["incoming"] = J::Array(t.incoming.iter().map(incoming_json).collect());
+    j["usage"] = t.usage.as_ref().map_or(J::Null, incoming_json);
+    j["names"] = J::Object(
+        t.names
+            .iter()
+            .map(|(iri, n)| {
+                let mut m = name_members(n);
+                m.remove("iri");
+                (iri.clone(), J::Object(m))
+            })
+            .collect(),
+    );
+    j
 }
 
 /// The UTF-16 offset of byte `b` of `s`.

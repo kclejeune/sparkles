@@ -180,8 +180,9 @@ through a form remains for later. Rename covers the one graph the page
 reads and does not reach IRIs inside triple terms. Real-time co-editing stays with the
 U05 §1 open question. The page decides whether the caller can write from its level on
 the dataset, so write grants on a branch alone leave the page read-only, roadmap item
-611. Roadmap item 607 covers a lazy hierarchy route for large
-ontologies, 609 inferred property trees and 610 an IRI policy kept on the server with
+611. Roadmap item 607 moves the trees onto the
+[ontology browser](#ontology-browser)'s hierarchy route for large ontologies, 609
+inferred property trees and 610 an IRI policy kept on the server with
 the resource catalog of [C30](../C30-resource-catalog/README.md).
 
 ### Manchester input
@@ -343,8 +344,8 @@ read and write one graph and name the commit a page shows.
 
 The server part of item 616's ontology browser is built as an entity search,
 `GET /$/ontology/{ds}/search`, with the Rust call `Ontologies::search` and `search` on the
-ontology handles of Python, Node.js and the JVM. The browser's pages are not built, and
-item 616 stays open for them.
+ontology handles of Python, Node.js and the JVM. The browser's pages are described
+under [Ontology browser](#ontology-browser).
 
 **What is indexed.** An entity is an IRI with a type fact for an OWL class, property,
 named individual or datatype, an RDFS class, property or datatype, or a SKOS concept,
@@ -396,8 +397,7 @@ small commits applied the commit in under 3 ms with no rebuild. The
 [entity search benchmark](../../benchmarks/entity-search/README.md) records the method
 and the run.
 
-**Remaining work.** The browser's entity pages, hierarchy and graph views stay in item
-616. A persisted index that avoids the build at the first search after a start is item
+**Remaining work.** A persisted index that avoids the build at the first search after a start is item
 657, searches at a past commit or with inferred kinds are item 658, and
 word segmentation for scripts written without spaces is item 659. The ontology
 editor's tree filter, the DL Query entity completion and the thesaurus editor's label
@@ -417,8 +417,77 @@ optional shortcut, keywords, an `active` predicate and a run function. The recen
 live in the browser's local storage, and the palette works without it. The command list
 and its behaviour are described in the [visualization guide](../../visualization/README.md#app-shell).
 
-**Remaining work.** The entity pages of item 616 register their own page search and
-commands, and edit mode (item 630) adds its commands the same way. Item 633's design
+**Remaining work.** The browser pages of item 616 register their search, which `/`
+focuses, and gain their commands with edit mode (item 630), which adds them the same way. Item 633's design
 review adds commands to the pages that have none, such as Explore, Similar, Memory and
 Embedding, under 689. The shortcuts the palette shows are written beside each
 command and not read from the keymaps that bind them, which 690 unifies.
+
+### Ontology browser
+
+Item 616's pages are built as the UI's **Browse** page, `/ui/browse`, on two new routes,
+`GET /$/ontology/{ds}/hierarchy` and `GET /$/ontology/{ds}/term`, with the Rust calls
+`Ontologies::hierarchy` and `Ontologies::term`, the `hierarchy` and `term` operations of
+the wire dispatcher, and `hierarchy` and `term` on the ontology handles of Python,
+Node.js and the JVM. The hierarchy route is the lazy hierarchy that item 607 asked for.
+The ontology editor's trees still read the whole graph, and item 607 now covers moving
+them onto it.
+
+**Why two routes.** The entity and summary routes open the whole ontology through the
+reverse mapping, which reads every quad of GO at the first call and is not cached for a
+caller with graph grants. Both new routes read the store through index scans around one
+entity, so their cost follows the entity's neighbourhood and not the ontology's size.
+They take `graph`, `imports`, `mode`, `branch` and `at` as the other ontology routes do,
+read through the caller's masked view, answer the commit they read in the body and the
+`ETag`, and refuse `inferences`.
+
+**Hierarchy.** One request answers one level: the roots, or the children of a node, each
+with its label, short form, kinds, deprecation and counts of children and parents.
+Classes follow `rdfs:subClassOf` between named classes, properties
+`rdfs:subPropertyOf`, and concepts `skos:broader` and `skos:narrower` in both directions.
+Roots are the ontology header's `IAO_0000700` root terms when it names them, then the
+top concepts of a scheme, and otherwise the entities with no parent of their kind, found
+by one scan of the parent links. Children are ordered with deprecated ones last, then by
+label and IRI, so pages are stable, and a level of more than 20,000 children falls back
+to IRI order. `ancestors=true` adds the ancestors as a graph of nodes and edges up to the
+roots, capped at 2,000 nodes, with a cycle drawn once.
+
+**Term.** The route reads a fragment around the entity and maps it through the same
+reverse mapping as the full read, so its axioms are the full read's axioms about the
+entity. The fragment is every quad with the entity as subject in the graphs read, the
+closure of the blank nodes those reach, the reified axioms whose source is the entity,
+the axioms of other entities whose blank nodes hold it, found by walking up from each
+blank-node subject that points at it, and the `rdf:type` quads of every IRI the fragment
+uses, so the lenient mapping types the properties right. The other statements that
+point at the entity come back as counts by property with the first subjects of each,
+and a property's own uses as counts with its first subjects. `names` gives the label,
+short form, kinds and deprecation of every IRI in the answer, so the page renders its
+links without further calls. A test compares the fragment's axioms about each entity of
+the test ontologies with those of the full read. `format=ttl`, `nt`, `rdfxml`, `jsonld`
+or `ofn` answers the entity's own quads, or its axioms in functional-style syntax, as a
+download.
+
+**Pages.** The page's components, in `ui/src/lib/components/browse`, take their data as
+properties: the header, the infobox, the lineage tree, the axioms as Manchester prose,
+the synonyms, notes, labels and cross-references, what links here, the reuse in other
+datasets, the graph view and the downloads. The prose comes from `manchesterTokens`,
+which `manchester()` now joins, so the editor's text and the browser's links come from
+one renderer. The landing page reads the header, the counts by kind and the graphs that
+hold an ontology or scheme by SPARQL, and its search is the entity search. The edit
+button opens the ontology or thesaurus editor until item 630's edit mode replaces it.
+
+**Measurements.** A script timed the two calls an entity page waits for, `term` and then
+`hierarchy` with its ancestors, for 500 random classes of each ontology, one after the
+other over HTTP on the same machine. It ran against a release build of commit b23a2077
+on a development laptop while other builds ran, so the numbers are an upper bound
+for a quiet host. On GO, with 51,986 classes, a page took 2.6 ms at the median, 6.6 ms at
+the 95th percentile and 10 ms at the 99th. On ChEBI lite, with 238,150 classes, it took
+4.7 ms, 8.9 ms and 17.6 ms. The heaviest GO pages, the three top classes and `part of`
+with its 150 KB of uses, answered within 60 ms on the first call. The landing page's
+roots, which ChEBI lite does not name and the route finds by one scan of the parent links,
+took 183 ms on the first call and 97 ms after it, for 19,430 roots. Every page stays far
+under the 300 ms target.
+
+**Remaining work.** Edit mode is item 630, inferred axioms and hierarchies item 622,
+search at a past state item 658, rendering preferences item 625, metrics item 621 and
+other servers' term pages item 461.

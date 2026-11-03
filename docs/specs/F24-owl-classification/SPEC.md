@@ -39,6 +39,8 @@ representation.
 
 **Inferred-axiom export and redundancy removal (items 634, 635 and 637, delivered).** Export inferred subclass and equivalence axioms only, annotated as inferred, and remove redundant asserted subclass axioms. Every OBO release uses these ROBOT reason options.
 
+**Existential superclasses (item 636, delivered).** Assert the direct inferred superclasses of the form `ObjectSomeValuesFrom(p C)` for chosen properties, as `robot materialize` does, so that a release can carry the part-of and has-role parents that its classification derives.
+
 **Justifications for any entailed axiom.** Compute minimal and laconic justifications for entailed axioms, not only for findings and unsatisfiable classes, rendered in Manchester syntax. Sparkles' explanations are strong but limited to facts and RL findings. It depends on item 18.
 
 **Hitting-set repair suggestions.** Compute minimal axiom sets whose removal repairs all justifications of an unwanted entailment, ranked by impact. Support-fact removal preview exists for one support at a time. It depends on item 18.
@@ -78,7 +80,8 @@ The OWL 2 EL classifier is delivered as roadmap item 580 and covers OWL 2 EL, ap
 from the literals and the chains that item 663 follows, since item 587. Item 603 extends
 it to Horn ontologies without individuals, as [the Horn rules](#the-horn-rules)
 describe. The export of inferred axioms and the removal of redundant ones are delivered
-as the ROBOT-compatible commands of items 634, 635 and 637. The other phases remain under
+as the ROBOT-compatible commands of items 634, 635 and 637, and the existential
+superclasses as `materialize`, item 636. The other phases remain under
 [item 457](../../ROADMAP.md).
 
 ### The OWL 2 EL classifier
@@ -522,8 +525,9 @@ module of the unsatisfiable classes, which holds every justification, as ROBOT's
 extraction does. The subclass, equivalence and class assertion generators work over the
 classes and individuals of the ontology's signature. `--reasoner ELK`, and `emr`, which
 ROBOT builds on ELK, classify by the OWL 2 EL rules alone (`ClassifyRequest::el_only`,
-which sets `Limits::el_only`), so that the output is ROBOT's with ELK. Without
-`--reasoner`, and with `hermit`, `jfact`, `whelk` or `structural`, which run it with a
+which sets `Limits::el_only`), so that the output is ROBOT's with ELK. `materialize`
+takes ELK by default, as ROBOT's does. Without `--reasoner` in `reason` and `reduce`, and
+with `hermit`, `jfact`, `whelk` or `structural`, which run it with a
 warning, the classifier also takes the Horn axioms outside OWL 2 EL, so on GO `reason`
 adds the 14 subsumptions that `InverseObjectProperties(part_of has_part)` entails. A class the taxonomy does not hold,
 such as a declared obsolete class, is a direct subclass of `owl:Thing`, as ELK answers,
@@ -538,11 +542,43 @@ axioms the empty ontology entails are exactly ROBOT's structural tautologies, so
 subclass axioms and the property characteristics alone, with each anonymous class
 expression of a subclass axiom named by a fresh class equivalent to it, as ROBOT does,
 so it removes redundant existential axioms with the classifier's taxonomy of named
-classes and needs none of the existential subsumers that item 636 exposes.
+classes.
 `--named-classes-only` keeps the subclass axioms between named classes that are direct
 edges of the whole ontology's taxonomy. `relax` adds the subclass axioms for the
 existential restrictions, cardinality restrictions above zero and named conjuncts of
 equivalences, and of complex superclasses with `--include-subclass-of`.
+
+**Materialize.** `sparkles ontology materialize` (item 636) follows ROBOT 1.9.11's
+`MaterializeOperation` and the expression materializing reasoner 0.1.3 that ROBOT wraps
+around ELK. It validates the ontology as `reason` does, then asserts for each class with
+a class axiom, owl:Nothing aside, the members of its direct superclass nodes in a
+taxonomy that has a class equivalent to `ObjectSomeValuesFrom(p B)` for each chosen
+property p and filler B, each such class read back as its restriction. It leaves out a
+superclass with owl:Thing or the class itself in its signature and an axiom the ontology
+already holds without annotations, as ROBOT does, so it also asserts direct named
+superclasses that are not asserted. The properties come from `--term` and
+`--term-file`, read as ROBOT reads term lists, with the 282 prefixes of ROBOT's default
+JSON-LD context. An expanded term is kept when it is a URN or a URL that OpenJDK 17's
+`java.net.URL` parses, which ROBOT checks, so a full IRI with a malformed port or
+host is left out with ROBOT's warning. When none is given, or none is an IRI, every object
+property of the signature is taken. `--create-new-ontology true` adds nothing, since
+ROBOT's operation adds its axioms to a new ontology that the command never saves, and
+`-s` and `-a` are accepted and ignored. The saturation derives an existential
+superclass as a link to a context whose subsumers hold the filler, but whether the
+restriction is direct depends on what the restriction is itself subsumed by, which only
+a context of its own derives. So the restrictions are named by fresh classes and
+classified together with the ontology and the validation's property probes, as `reduce`
+names expressions, and the classifier is unchanged. A filler that occurs only where it
+could be given no instances, such as the subclass of a subclass axiom or an operand of a
+disjointness, gets no fresh class, since no class can then be below the restriction. An
+ontology with individuals, a reflexive property, `ObjectHasSelf` or the top property
+names every class, as ROBOT does. A property test checks on random EL ontologies that
+the pruning changes no output. It keeps about 41% of GO's classes and 16% of ChEBI
+lite's as fillers. Without the pruning, `materialize` with all nine of ChEBI lite's
+properties ran out of a 12 GiB memory cap, and with it the run takes 5,084 MiB on the
+benchmark host. Each named restriction costs memory, so a run with more properties holds
+more than `reason`, about 280 MiB for each further property on ChEBI lite
+([materialize results](../../benchmarks/el-classification/RESULTS.md#materialize)).
 
 **Chains.** Each command ends in a hidden list of the arguments that follow it, which is
 parsed again as the next command, so that `sparkles ontology reason --input x.owl relax
@@ -551,8 +587,8 @@ reduce --output y.owl` runs in one process with the ontology in memory (item 637
 with it alone. A chain can also start from `classify FILE` or `check FILE`, which answer
 from the file as they do alone before the rest of the chain reads it. FILE is their
 first positional argument and the next command is the second, so the options after the
-next command belong to it. A chain from a database starts with `reason`, `reduce` or
-`relax` and `--loc`. `--input` on a later command is ROBOT's chained input error, and
+next command belong to it. A chain from a database starts with `reason`, `reduce`,
+`relax` or `materialize` and `--loc`. `--input` on a later command is ROBOT's chained input error, and
 `--output` on any command writes the ontology after it. A malformed command line exits
 with status 2, as every `sparkles` command does, where ROBOT documents only a non-zero
 status.
@@ -572,4 +608,4 @@ comparison and the timings.
 Manchester, OBO or OBO Graphs JSON (item 686), and refuse
 `--prevent-invalid-references true` (item 687). `reason --reasoner emr` asserts
 named superclasses only, as ELK does, not the class expressions that ROBOT's expression
-materializing reasoner adds. `robot materialize` is item 636.
+materializing reasoner adds, which item 691 follows.

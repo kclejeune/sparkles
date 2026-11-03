@@ -2250,6 +2250,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ontology/{ds}/hierarchy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List one level of an entity hierarchy
+         * @description One level of the class, object property, data property, annotation property or SKOS concept hierarchy, read from the store's indexes without reading the whole ontology: the direct children of `iri`, or the roots, a page at a time in label order with deprecated entities last, each with the numbers of its own children and parents. Classes follow `rdfs:subClassOf` between named classes, properties `rdfs:subPropertyOf`, and concepts `skos:broader` and `skos:narrower` in either direction. The roots of the class hierarchy are the ontology header's `IAO_0000700` root terms when it names some, and otherwise the classes without a parent; the roots of a scheme are its top concepts with its concepts that have no broader one. `ancestors=true` adds the ancestors of `iri` up to the roots, with the edges between them, at most 2,000. The caller sees only the graphs and triples their grants allow. `inferences` is refused.
+         */
+        get: operations["ontologyHierarchy"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/ontology/{ds}/parse": {
         parameters: {
             query?: never;
@@ -2282,6 +2302,26 @@ export interface paths {
          * @description The entities whose labels, synonyms, short forms, IRIs or definitions match `q`, in any language and with typo tolerance, ranked for a typeahead: a label equal to the query first, then labels that start with it, synonyms, short forms and IRIs equal to it or starting with it, labels and then synonyms that contain its words, matches within a few edits, and definitions that contain its words. Within each tier the order is the edits, the field, entities that are not deprecated first, the caller's language, the length of the matched text, the text and the IRI. The search reads the head of the branch from an entity index that each commit's changes keep current, and the caller sees only the graphs their grants allow. A query of 1 to 3 characters takes no edits as typed, 4 to 7 characters take one and longer queries two. `at` and `inferences` are refused.
          */
         get: operations["searchOntology"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ontology/{ds}/term": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Describe one entity
+         * @description What the graphs read say about one entity, read from the store's indexes without reading the whole ontology: its triples with a named or literal object and the annotations their reifications give (`statements`), the axioms the triples about it map to by the OWL 2 reverse mapping (`axioms`), the axioms of other entities that hold it inside a class expression (`mentions`), the statements of named subjects that point at it by predicate (`incoming`), the statements that use it as their predicate (`usage`), and the label, short form and kinds of every IRI the answer uses (`names`). `format` downloads the triples about the entity, its blank nodes and the reifications of its annotated triples in Turtle, N-Triples, RDF/XML or JSON-LD, or its axioms in functional-style syntax, as an attachment. The caller sees only the graphs and triples their grants allow. `inferences` is refused.
+         */
+        get: operations["ontologyTerm"];
         put?: never;
         post?: never;
         delete?: never;
@@ -18002,6 +18042,128 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    ontologyHierarchy: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The hierarchy (`class` by default). */
+                kind?: "class" | "objectProperty" | "dataProperty" | "annotationProperty" | "concept";
+                /** @description The node whose children to list; the roots when absent. */
+                iri?: string;
+                /** @description Also list the ancestors of `iri`. */
+                ancestors?: boolean;
+                /** @description Keep the concepts of this scheme, and start the roots at its top concepts. */
+                scheme?: string;
+                /** @description List deprecated children (true by default, after the others). */
+                deprecated?: boolean;
+                /** @description The caller's languages for labels, comma separated and most preferred first. `Accept-Language` is read when it is absent. */
+                lang?: string;
+                /** @description The most children listed, from 1 to 1,000 (100 by default). */
+                limit?: number;
+                /** @description The children skipped. */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The node, a page of its children or of the roots, and its ancestors when asked for. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        ancestors?: {
+                            /** @description `[child, parent]` IRI pairs. */
+                            edges?: string[][];
+                            nodes?: {
+                                /** @description The number of direct children. */
+                                children?: number;
+                                deprecated?: boolean;
+                                iri?: string;
+                                kinds?: string[];
+                                /** @description The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language. */
+                                label?: string | null;
+                                labelLang?: string | null;
+                                /** @description The number of direct parents. */
+                                parents?: number;
+                                /** @description The `oboInOwl:id`, `skos:notation`, prefixed name or local name. */
+                                shortForm?: string | null;
+                            }[];
+                            truncated?: boolean;
+                        };
+                        children?: {
+                            /** @description The number of direct children. */
+                            children?: number;
+                            deprecated?: boolean;
+                            iri?: string;
+                            kinds?: string[];
+                            /** @description The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language. */
+                            label?: string | null;
+                            labelLang?: string | null;
+                            /** @description The number of direct parents. */
+                            parents?: number;
+                            /** @description The `oboInOwl:id`, `skos:notation`, prefixed name or local name. */
+                            shortForm?: string | null;
+                        }[];
+                        commit?: number;
+                        dataset?: string;
+                        /** @description The deprecated roots `deprecated=false` left out. */
+                        deprecatedRoots?: number;
+                        graphs?: string[];
+                        kind?: string;
+                        limit?: number;
+                        next?: number | null;
+                        node?: {
+                            /** @description The number of direct children. */
+                            children?: number;
+                            deprecated?: boolean;
+                            iri?: string;
+                            kinds?: string[];
+                            /** @description The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language. */
+                            label?: string | null;
+                            labelLang?: string | null;
+                            /** @description The number of direct parents. */
+                            parents?: number;
+                            /** @description The `oboInOwl:id`, `skos:notation`, prefixed name or local name. */
+                            shortForm?: string | null;
+                        } | null;
+                        offset?: number;
+                        /**
+                         * @description `iri` for a node with more than 20,000 children, which are listed in IRI order.
+                         * @enum {string}
+                         */
+                        order?: "label" | "iri";
+                        /**
+                         * @description Where the roots came from, for a list of roots.
+                         * @enum {string}
+                         */
+                        roots?: "ontology" | "scheme" | "computed";
+                        total?: number;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
     parseManchester: {
         parameters: {
             query?: {
@@ -18142,6 +18304,124 @@ export interface operations {
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    ontologyTerm: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The entity. */
+                iri?: string;
+                /** @description The most axioms of other entities listed, from 0 to 2,000 (200 by default). */
+                mentions?: number;
+                /** @description The subjects listed per incoming predicate, from 0 to 200 (20 by default). */
+                incoming?: number;
+                /** @description The caller's languages for labels, comma separated and most preferred first. `Accept-Language` is read when it is absent. */
+                lang?: string;
+                /** @description `json` (the default), or a download format. */
+                format?: "json" | "ttl" | "nt" | "rdfxml" | "jsonld" | "ofn";
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The entity's description, or a download. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        axioms?: Record<string, never>[];
+                        commit?: number;
+                        dataset?: string;
+                        deprecated?: boolean;
+                        graphs?: string[];
+                        incoming?: {
+                            /** @description The statements counted, at most 10,000. */
+                            count?: number;
+                            more?: boolean;
+                            property?: string;
+                            subjects?: string[];
+                        }[];
+                        iri?: string;
+                        kinds?: string[];
+                        label?: string | null;
+                        labelLang?: string | null;
+                        mentions?: {
+                            axioms?: Record<string, never>[];
+                            total?: number;
+                            truncated?: boolean;
+                        };
+                        names?: {
+                            [key: string]: {
+                                deprecated?: boolean;
+                                iri?: string;
+                                kinds?: string[];
+                                /** @description The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language. */
+                                label?: string | null;
+                                labelLang?: string | null;
+                                /** @description The `oboInOwl:id`, `skos:notation`, prefixed name or local name. */
+                                shortForm?: string | null;
+                            };
+                        };
+                        ontologies?: {
+                            graph?: string;
+                            ontology?: string | null;
+                        }[];
+                        shortForm?: string | null;
+                        statements?: {
+                            annotations?: {
+                                property?: string;
+                                value?: unknown;
+                            }[];
+                            graph?: string;
+                            property?: string;
+                            /** @description An IRI as a string, or a literal as `{"@value", "@language"?, "@type"?}`. */
+                            value?: unknown;
+                        }[];
+                        statementsTruncated?: boolean;
+                        types?: string[];
+                        usage?: {
+                            /** @description The statements counted, at most 10,000. */
+                            count?: number;
+                            more?: boolean;
+                            property?: string;
+                            subjects?: string[];
+                        } | null;
+                        /** @description The literal forms of the entity's SKOS-XL labels, with the label property and the graph. */
+                        xlLabels?: {
+                            graph?: string;
+                            property?: string;
+                            /** @description A literal as `{"@value", "@language"?, "@type"?}`. */
+                            value?: unknown;
+                        }[];
+                    };
+                    "application/ld+json": Record<string, never>;
+                    "application/n-triples": string;
+                    "application/rdf+xml": string;
+                    "text/owl-functional": string;
+                    "text/turtle": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
             default: components["responses"]["Error"];
         };
     };

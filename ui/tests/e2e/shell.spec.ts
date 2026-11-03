@@ -32,7 +32,7 @@ test.describe('at 1440 pixels', () => {
     await expect(hit).toContainText('class');
     await page.keyboard.press('Enter');
     await expect(page).toHaveURL(
-      new RegExp(`/ui/ontology\\?ds=${DATASET}&iri=${encodeURIComponent(`${EX}Person`)}`),
+      new RegExp(`/ui/browse\\?ds=${DATASET}&iri=${encodeURIComponent(`${EX}Person`)}`),
     );
   });
 

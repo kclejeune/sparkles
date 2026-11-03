@@ -191,6 +191,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/ontology/{ds}/dl-query", post(ontology::dl_query))
         .route("/$/ontology/{ds}/diff", get(ontology::diff))
         .route("/$/ontology/{ds}/search", get(ontology::search))
+        .route("/$/ontology/{ds}/hierarchy", get(ontology::hierarchy))
+        .route("/$/ontology/{ds}/term", get(ontology::term))
         .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/graph/{ds}/facets", post(graph::facets))
         .route("/$/skos/shapes", get(skos_shapes))

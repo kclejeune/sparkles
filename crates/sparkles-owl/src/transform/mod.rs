@@ -1,7 +1,9 @@
 //! Ontology transformations with the meaning of ROBOT 1.9.11's commands (spec F24):
 //! [`reason`] asserts the inferred axioms of a classification in the ontology,
-//! [`reduce`] removes the subclass axioms that other subclass axioms entail, and
-//! [`relax`] turns equivalences with class expressions into subclass axioms. Each works
+//! [`reduce`] removes the subclass axioms that other subclass axioms entail,
+//! [`relax`] turns equivalences with class expressions into subclass axioms, and
+//! [`materialize`] asserts the direct superclasses of the form `ObjectSomeValuesFrom(p B)`
+//! for chosen properties. Each works
 //! on a [`Document`] in memory, so that commands chain without writing a file.
 //!
 //! The commands follow ROBOT's operations as they are written, not only as they are
@@ -11,19 +13,24 @@
 //! such as the disjoint classes or the property hierarchy, adds no axioms here, as it adds
 //! none in ROBOT, which logs a warning. Where ROBOT asks ELK a question of a class
 //! expression, the expression is named by a fresh class, as ROBOT itself does in
-//! `reduce`, so the classifier answers it from its taxonomy of named classes.
+//! `reduce` and `materialize`, so the classifier answers it from its taxonomy of named
+//! classes.
 
+pub(crate) mod materialize;
 mod module;
 mod reason;
 mod reduce;
 mod relax;
+mod terms;
 
+pub use materialize::{MaterializeOptions, materialize};
 pub use module::bottom_module;
 pub use reason::{
     EquivalentClasses, Generator, NewOntology, ReasonOptions, Tautologies, is_tautology, reason,
 };
 pub use reduce::{ReduceOptions, reduce};
 pub use relax::{RelaxOptions, relax};
+pub use terms::parse_terms;
 
 use crate::classify::{Classification, Excluded, Taxonomy, TaxonomyNode};
 use crate::model::*;

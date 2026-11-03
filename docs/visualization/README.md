@@ -295,6 +295,57 @@ committed with the commit it was previewed against
 branch that **Start session** creates. Undo and redo are previewed commits too, and
 another writer's commit reloads the page through the change feed.
 
+### Ontology browser
+
+The **Browse** page, `/ui/browse`, is a read-only reference to the ontologies and thesauri
+of a dataset, with a page for each entity in the manner of the term pages of OLS and
+Ontobee ([U12](../specs/U12-ontology-workbench/SPEC.md#ontology-browser),
+[screenshot](../images/browse-term.png)). The top bar's search opens an entity's page,
+and every name on a page links to the page of that entity. `/ui/browse?ds=NAME` is the
+landing page of the default graph's ontology, and `&iri=IRI` opens an entity. `graph`,
+`branch` and `at` choose what the pages read, as on the other pages.
+
+An entity's page leads with its label, short form, kind, IRI and definition with the
+sources its axiom annotations name. A deprecated entity says so under its title and
+links its replacement. The hierarchy beside the article shows the lineage from a root to
+the entity on one line, the entity's other direct parents under it, its children with
+their counts and its siblings behind one row, and it reads each further level when it
+opens. **Graph** draws the entity's neighbourhood on the Explore canvas with Explore's
+lenses instead: its parents, its first children, the entities its axioms relate it to
+and those whose axioms hold it, with each edge named by its property. Double-clicking a
+node adds that entity's neighbourhood, and **Open in Explore** opens the entity there.
+
+The article gives the axioms about the entity in the sections of the ontology editor's
+frame, each one a line of Manchester prose whose names link to their pages. Synonyms
+follow by kind with their languages and sources, then comments and notes in the
+reader's language, with the others behind **Other languages**. A SKOS concept gets a
+table of its labels by language and its related concepts and mappings. Cross-references
+to well-known databases such as Wikipedia, PubMed and DOI are links. **What links here**
+lists the axioms of other entities that mention it, grouped by the restriction that holds
+it as in "part of some mitochondrion", then the other statements that point at it by
+property, with their counts and further pages. **In other datasets** asks every other
+dataset the caller can read, up to 20, whether it mentions the IRI, and links its page
+there. The infobox lists the kind, status, identifiers, ontology, subsets and the counts
+of parents, children and instances, and downloads the entity in Turtle, RDF/XML, OWL
+functional syntax or JSON-LD. **Edit** opens the entity in the ontology or thesaurus
+editor. On a phone the page is one column with the header first, then the infobox, the
+hierarchy and the article ([screenshot](../images/browse-phone.png)).
+
+The landing page shows the ontology or scheme header with its title, version, license and
+description, a graph picker when named graphs hold ontologies or schemes, a search over
+the entity search with kind filters, the top classes or concepts with their definitions
+and child counts, and the counts of each kind of entity
+([screenshot](../images/browse-landing.png)). The top classes are the root terms the
+ontology names with `IAO_0000700` when it names them, and the classes without a named
+parent otherwise.
+
+The pages read two routes of the [API reference](../API.md#ontology), `hierarchy` and
+`term`, which read the store's indexes around one entity, so a page costs the same on
+GO or ChEBI as on a small ontology. The landing page search takes `/`,
+which opens the command palette on the other browser pages. The components of the page
+live in `ui/src/lib/components/browse` and take their data as properties, so other pages
+can reuse them.
+
 ### Thesaurus editor
 
 The **Thesaurus** page, `/ui/thesaurus`, edits the SKOS concept schemes, concepts and
@@ -391,7 +442,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   preview cannot say whether a fix resolves its result, item 121. Callers whose grants
   cover only some graphs get no overlay, item 75.
 * The ontology editor reads every entity and hierarchy axiom of a graph to draw its
-  trees, up to 50,000 of each, 607. When that listing stops early, as on the Gene
+  trees, up to 50,000 of each, and its trees move onto the hierarchy route that the
+  browser reads under item 607. When that listing stops early, as on the Gene
   Ontology, one SPARQL query reads the labels of the selected graph so the trees still
   show labels, but the hierarchy above the cut is missing. Only the class tree has an inferred view, 609, and
   the IRI policy is kept in the browser per dataset, 610. Rename covers the graph the
@@ -421,10 +473,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   read-only, 611. For the same reason the thesaurus editor's notes and members forms are
   read-only on branches other than main when authentication is on. Undo and redo revert commits, which needs write access to the
   whole branch, so a caller whose grants cover some graphs only can edit but not undo.
-* The ontology browser has no pages in the web UI. Its typo-tolerant typeahead runs on
-  the server as the [entity search](../search/README.md#entity-search), and the entity
-  pages, hierarchy and graph views and the browser's search box remain in item 616. The
-  ontology editor's tree filter matches the names it has loaded and does not call the
+* The ontology browser is read-only, and its edit mode is item 630. Its pages and
+  hierarchy show asserted axioms only, and inferred ones are item 622. Its search reads
+  the head of a branch, so a page at a past state has no search box, item 658. It shows
+  entities by label with the reader's languages first, and a choice of label, prefixed
+  name or IRI is item 625. Reuse is looked up in the other datasets of the same server,
+  and other servers' term pages are item 461. The landing page counts entities by kind
+  without axiom counts or expressivity, item 621.
+* The ontology editor's tree filter matches the names it has loaded and does not call the
   entity search, item 660.
 
 ## Configuration and usage
@@ -445,7 +501,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 616](../ROADMAP.md), [item 612](../ROADMAP.md), [item 613](../ROADMAP.md), [item 614](../ROADMAP.md), [item 615](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
+The remaining work described above refers to [item 607](../ROADMAP.md), [item 621](../ROADMAP.md), [item 622](../ROADMAP.md), [item 625](../ROADMAP.md), [item 630](../ROADMAP.md), [item 658](../ROADMAP.md), [item 461](../ROADMAP.md), [item 612](../ROADMAP.md), [item 613](../ROADMAP.md), [item 614](../ROADMAP.md), [item 615](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

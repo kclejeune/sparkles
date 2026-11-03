@@ -239,6 +239,14 @@ class OntologyTest {
             val typo = onto.search("profesor", read, kinds = listOf("class")).get("results").asArray[0].asObject
             assertEquals("http://ex.org/Professor", typo.getString("iri"))
             assertEquals("fuzzy", typo.get("match").asObject.getString("kind"))
+            // the browser's reads: one hierarchy level and one entity
+            val roots = SparklesOnt.hierarchy(ds, null, "http://ex.org/onto")
+            assertTrue(roots.get("children").asArray.size > 0)
+            val tree = onto.hierarchy("http://ex.org/Professor", read, ancestors = true)
+            assertEquals("http://ex.org/Professor", tree.get("node").asObject.getString("iri"))
+            val term = SparklesOnt.term(ds, "http://ex.org/Professor", "http://ex.org/onto")
+            assertEquals(listOf("class"), term.get("kinds").asArray.map { it.asString().value() })
+            assertTrue(term.get("axioms").asArray.any { it.asObject.getString("type") == "SubClassOf" })
             val before = ds.headCommit().seq
             val done = SparklesOnt.edit(
                 ds,

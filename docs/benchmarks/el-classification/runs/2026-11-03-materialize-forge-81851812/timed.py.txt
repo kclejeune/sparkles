@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Run a command once and append one JSON line with its wall time, peak resident memory
+and exit status to LOG.
+
+    timed.py LOG LABEL [--stdout FILE] [--timeout S] -- COMMAND...
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+log, label = sys.argv[1], sys.argv[2]
+rest = sys.argv[3:]
+stdout_path, timeout = None, None
+while rest and rest[0] != "--":
+    if rest[0] == "--stdout":
+        stdout_path, rest = rest[1], rest[2:]
+    elif rest[0] == "--timeout":
+        timeout, rest = float(rest[1]), rest[2:]
+    else:
+        sys.exit(f"unknown option {rest[0]}")
+cmd = rest[1:]
+out = open(stdout_path, "wb") if stdout_path else None
+t0 = time.monotonic()
+p = subprocess.Popen(cmd, stdout=out)
+timed_out = False
+deadline = t0 + timeout if timeout else None
+while True:
+    pid, status, usage = os.wait4(p.pid, os.WNOHANG)
+    if pid:
+        break
+    if deadline and time.monotonic() > deadline:
+        p.kill()
+        timed_out = True
+        pid, status, usage = os.wait4(p.pid, 0)
+        break
+    time.sleep(0.01)
+wall = (time.monotonic() - t0) * 1000
+p.returncode = os.waitstatus_to_exitcode(status)
+rec = {
+    "label": label,
+    "cmd": cmd,
+    "status": p.returncode,
+    "timeout": timed_out,
+    "wallMs": round(wall, 1),
+    "peakRssKib": usage.ru_maxrss,
+    "userMs": round(usage.ru_utime * 1000, 1),
+    "sysMs": round(usage.ru_stime * 1000, 1),
+}
+with open(log, "a") as f:
+    f.write(json.dumps(rec) + "\n")
+sys.exit(0 if p.returncode == 0 and not timed_out else 1)

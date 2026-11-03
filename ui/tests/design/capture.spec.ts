@@ -18,6 +18,41 @@ export const PAGES: { name: string; path: string; ready?: string }[] = [
   { name: 'explore', path: '/ui/explore?ds=demo' },
   { name: 'ontology', path: '/ui/ontology?ds=go' },
   { name: 'thesaurus', path: '/ui/thesaurus?ds=unesco' },
+  { name: 'browse-go', path: '/ui/browse?ds=go' },
+  {
+    name: 'browse-go-term',
+    path: '/ui/browse?ds=go&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FGO_0005739',
+  },
+  {
+    name: 'browse-go-graph',
+    path: '/ui/browse?ds=go&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FGO_0005739&view=graph',
+  },
+  {
+    name: 'browse-go-process',
+    path: '/ui/browse?ds=go&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FGO_0006915',
+  },
+  {
+    name: 'browse-go-property',
+    path: '/ui/browse?ds=go&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FBFO_0000050',
+  },
+  {
+    name: 'browse-go-deprecated',
+    path: '/ui/browse?ds=go&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FGO_0000005',
+  },
+  { name: 'browse-unesco', path: '/ui/browse?ds=unesco' },
+  {
+    name: 'browse-unesco-concept',
+    path: '/ui/browse?ds=unesco&iri=http%3A%2F%2Fvocabularies.unesco.org%2Fthesaurus%2Fconcept4011',
+  },
+  {
+    name: 'browse-unesco-scheme',
+    path: '/ui/browse?ds=unesco&iri=http%3A%2F%2Fvocabularies.unesco.org%2Fthesaurus',
+  },
+  {
+    name: 'browse-unesco-collection',
+    path: '/ui/browse?ds=unesco&iri=http%3A%2F%2Fvocabularies.unesco.org%2Fthesaurus%2Fmt2.35',
+  },
+  { name: 'browse-demo', path: '/ui/browse?ds=demo' },
   { name: 'similar', path: '/ui/similar?ds=demo' },
   { name: 'memory', path: '/ui/memory?ds=demo' },
   { name: 'embedding', path: '/ui/embedding?ds=demo' },

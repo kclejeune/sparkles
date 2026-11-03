@@ -340,6 +340,79 @@ export interface OntologySearchPage {
   /** `current`, `updated` or `built` */
   index: string;
 }
+/** An entity as the browser's answers name it: its label, short form and kinds. */
+export interface OntologyName {
+  iri: string;
+  label: string | null;
+  labelLang: string | null;
+  /** its `oboInOwl:id`, `skos:notation`, prefixed name or local name */
+  shortForm: string | null;
+  kinds: string[];
+  deprecated: boolean;
+}
+/** A node of a hierarchy, with the numbers of its direct children and parents. */
+export interface OntologyHierarchyNode extends OntologyName {
+  children: number;
+  parents: number;
+}
+/** One level of a hierarchy, as `GET /$/ontology/{ds}/hierarchy` answers it. */
+export interface OntologyHierarchy {
+  dataset: string;
+  commit: bigint;
+  graphs: string[];
+  imports: { iri: string; graph: string | null }[];
+  warnings: string[];
+  kind: string;
+  node: OntologyHierarchyNode | null;
+  children: OntologyHierarchyNode[];
+  total: number;
+  offset: number;
+  limit: number;
+  next: bigint | null;
+  /** `label`, or `iri` for a node with more than 20,000 children */
+  order: string;
+  /** where the roots came from: `ontology`, `scheme` or `computed` */
+  roots?: string;
+  deprecatedRoots?: number;
+  ancestors?: {
+    nodes: OntologyHierarchyNode[];
+    /** `[child, parent]` IRI pairs */
+    edges: [string, string][];
+    truncated: boolean;
+  };
+}
+/** The statements of one predicate that point at an entity. */
+export interface OntologyIncoming {
+  property: string;
+  count: number;
+  more: boolean;
+  subjects: string[];
+}
+/** What the graphs say about one entity, as `GET /$/ontology/{ds}/term` answers it. */
+export interface OntologyTerm extends OntologyName {
+  dataset: string;
+  commit: bigint;
+  graphs: string[];
+  imports: { iri: string; graph: string | null }[];
+  warnings: string[];
+  types: string[];
+  ontologies: { graph: string; ontology: string | null }[];
+  statements: {
+    property: string;
+    /** an IRI, or a literal in its JSON form */
+    value: string | Configuration;
+    graph: string;
+    annotations: { property: string; value: string | Configuration }[];
+  }[];
+  statementsTruncated: boolean;
+  /** the literal forms of the entity's SKOS-XL labels */
+  xlLabels: { property: string; value: Configuration; graph: string }[];
+  axioms: OntologyAxiom[];
+  mentions: { axioms: OntologyAxiom[]; total: number; truncated: boolean };
+  incoming: OntologyIncoming[];
+  usage: OntologyIncoming | null;
+  names: Record<string, Omit<OntologyName, 'iri'>>;
+}
 /** An expression of an entity answer: its functional-style form and its JSON form. */
 export interface OntologyExpression {
   ofn: string;
@@ -800,6 +873,67 @@ export class Administration {
             offset: o.offset,
             fuzzy: o.fuzzy,
             definitions: o.definitions,
+          },
+          o,
+          false,
+        ),
+      /**
+       * One level of the class, property or concept hierarchy, read from the store's
+       * indexes without reading the whole ontology: the children of `iri`, or the roots
+       * when it is absent, a page at a time, and its ancestors with `ancestors`.
+       */
+      hierarchy: (
+        o: OntologyRead &
+          OperationOptions & {
+            iri?: string | { termType: 'NamedNode'; value: string };
+            kind?: 'class' | 'objectProperty' | 'dataProperty' | 'annotationProperty' | 'concept';
+            ancestors?: boolean;
+            scheme?: string | { termType: 'NamedNode'; value: string };
+            deprecated?: boolean;
+            lang?: string | string[];
+            limit?: number;
+            offset?: number;
+          } = {},
+      ) =>
+        call<OntologyHierarchy>(
+          'ontology.hierarchy',
+          {
+            ...readSelection(o),
+            iri: o.iri === undefined || typeof o.iri === 'string' ? o.iri : o.iri.value,
+            kind: o.kind,
+            ancestors: o.ancestors,
+            scheme:
+              o.scheme === undefined || typeof o.scheme === 'string' ? o.scheme : o.scheme.value,
+            deprecated: o.deprecated,
+            lang: Array.isArray(o.lang) ? o.lang.join(',') : o.lang,
+            limit: o.limit,
+            offset: o.offset,
+          },
+          o,
+          false,
+        ),
+      /**
+       * What the graphs say about the entity `iri`, read without reading the whole
+       * ontology: its statements, the axioms they map to, the axioms of other entities
+       * that mention it, the statements that point at it, and the names of every IRI used.
+       */
+      term: (
+        iri: string | { termType: 'NamedNode'; value: string },
+        o: OntologyRead &
+          OperationOptions & {
+            mentions?: number;
+            incoming?: number;
+            lang?: string | string[];
+          } = {},
+      ) =>
+        call<OntologyTerm>(
+          'ontology.term',
+          {
+            ...readSelection(o),
+            iri: typeof iri === 'string' ? iri : iri.value,
+            mentions: o.mentions,
+            incoming: o.incoming,
+            lang: Array.isArray(o.lang) ? o.lang.join(',') : o.lang,
           },
           o,
           false,

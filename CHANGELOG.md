@@ -45,6 +45,32 @@ pages. `/` focuses a page's own search where it has one, such as the ontology ed
 tree filter, and opens the palette elsewhere. The Query page opens a saved query from
 `?saved=NAME`.
 
+`sparkles ontology materialize` does what ROBOT 1.9.11's `materialize` does (roadmap item
+636). It asserts each class's direct superclasses of the form `ObjectSomeValuesFrom(p C)`
+for the properties of `--term` and `--term-file`, which take full IRIs and the OBO
+prefixes of ROBOT's default context, or for every property when none is given. It runs
+from a file or a database and joins chains such as `reason materialize reduce`. On GO
+with part of and ChEBI lite with has role its output equals ROBOT's axiom for axiom, and
+on the benchmark host it takes 3.31 s and 8.32 s, against 3.47 s and 8.77 s for `reason`.
+A term is kept only when it is a URN or a URL that OpenJDK 17's `java.net.URL` accepts, as
+ROBOT keeps it.
+
+The web UI has an ontology browser (spec U12, roadmap item 616). `/ui/browse` gives each
+entity of a dataset's ontologies and thesauri a read-only page with its label, short form,
+IRI, definition and sources, synonyms by kind, notes, SKOS labels by language,
+cross-references, an infobox, a lineage tree with a graph view on the Explore canvas, its
+axioms as linked Manchester prose, what links here, its use in other datasets and
+downloads in Turtle, RDF/XML, OWL functional syntax and JSON-LD. Each ontology gets a
+landing page with its header, counts, top classes and search, and the top bar's search
+now opens these pages for every kind of entity, where it opened the editors and Explore
+before. Two routes serve the pages and read the store's indexes around one entity
+instead of the whole ontology. `GET /$/ontology/{ds}/hierarchy` answers one level of a
+class, property or concept hierarchy with child counts and, on request, the ancestors,
+and `GET /$/ontology/{ds}/term` answers an entity's statements, axioms, mentions,
+incoming statements and the names of every IRI it uses, or a download with `format=`.
+The Rust library, the wire dispatcher and the ontology handles of Python, Node.js and
+the JVM call them as `hierarchy` and `term`.
+
 The web UI has one app shell and design system (roadmap item 632). A top bar on every
 page holds the dataset switcher and a search of the open dataset's entities through
 `GET /$/ontology/{ds}/search`, which `Ctrl+K`, `Cmd+K` and `/` focus, and the pages sit

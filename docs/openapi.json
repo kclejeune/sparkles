@@ -38010,6 +38010,376 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/$/ontology/{ds}/hierarchy": {
+      "get": {
+        "description": "One level of the class, object property, data property, annotation property or SKOS concept hierarchy, read from the store's indexes without reading the whole ontology: the direct children of `iri`, or the roots, a page at a time in label order with deprecated entities last, each with the numbers of its own children and parents. Classes follow `rdfs:subClassOf` between named classes, properties `rdfs:subPropertyOf`, and concepts `skos:broader` and `skos:narrower` in either direction. The roots of the class hierarchy are the ontology header's `IAO_0000700` root terms when it names some, and otherwise the classes without a parent; the roots of a scheme are its top concepts with its concepts that have no broader one. `ancestors=true` adds the ancestors of `iri` up to the roots, with the edges between them, at most 2,000. The caller sees only the graphs and triples their grants allow. `inferences` is refused.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "ontologyHierarchy",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The hierarchy (`class` by default).",
+            "in": "query",
+            "name": "kind",
+            "schema": {
+              "enum": [
+                "class",
+                "objectProperty",
+                "dataProperty",
+                "annotationProperty",
+                "concept"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The node whose children to list; the roots when absent.",
+            "in": "query",
+            "name": "iri",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Also list the ancestors of `iri`.",
+            "in": "query",
+            "name": "ancestors",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Keep the concepts of this scheme, and start the roots at its top concepts.",
+            "in": "query",
+            "name": "scheme",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "List deprecated children (true by default, after the others).",
+            "in": "query",
+            "name": "deprecated",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The caller's languages for labels, comma separated and most preferred first. `Accept-Language` is read when it is absent.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most children listed, from 1 to 1,000 (100 by default).",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The children skipped.",
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "ancestors": {
+                      "properties": {
+                        "edges": {
+                          "description": "`[child, parent]` IRI pairs.",
+                          "items": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "type": "array"
+                        },
+                        "nodes": {
+                          "items": {
+                            "properties": {
+                              "children": {
+                                "description": "The number of direct children.",
+                                "type": "integer"
+                              },
+                              "deprecated": {
+                                "type": "boolean"
+                              },
+                              "iri": {
+                                "type": "string"
+                              },
+                              "kinds": {
+                                "items": {
+                                  "type": "string"
+                                },
+                                "type": "array"
+                              },
+                              "label": {
+                                "description": "The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language.",
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "labelLang": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "parents": {
+                                "description": "The number of direct parents.",
+                                "type": "integer"
+                              },
+                              "shortForm": {
+                                "description": "The `oboInOwl:id`, `skos:notation`, prefixed name or local name.",
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "truncated": {
+                          "type": "boolean"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "children": {
+                      "items": {
+                        "properties": {
+                          "children": {
+                            "description": "The number of direct children.",
+                            "type": "integer"
+                          },
+                          "deprecated": {
+                            "type": "boolean"
+                          },
+                          "iri": {
+                            "type": "string"
+                          },
+                          "kinds": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "label": {
+                            "description": "The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language.",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "labelLang": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "parents": {
+                            "description": "The number of direct parents.",
+                            "type": "integer"
+                          },
+                          "shortForm": {
+                            "description": "The `oboInOwl:id`, `skos:notation`, prefixed name or local name.",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "dataset": {
+                      "type": "string"
+                    },
+                    "deprecatedRoots": {
+                      "description": "The deprecated roots `deprecated=false` left out.",
+                      "type": "integer"
+                    },
+                    "graphs": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "kind": {
+                      "type": "string"
+                    },
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "next": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "node": {
+                      "oneOf": [
+                        {
+                          "properties": {
+                            "children": {
+                              "description": "The number of direct children.",
+                              "type": "integer"
+                            },
+                            "deprecated": {
+                              "type": "boolean"
+                            },
+                            "iri": {
+                              "type": "string"
+                            },
+                            "kinds": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "label": {
+                              "description": "The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language.",
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "labelLang": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "parents": {
+                              "description": "The number of direct parents.",
+                              "type": "integer"
+                            },
+                            "shortForm": {
+                              "description": "The `oboInOwl:id`, `skos:notation`, prefixed name or local name.",
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          },
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "offset": {
+                      "type": "integer"
+                    },
+                    "order": {
+                      "description": "`iri` for a node with more than 20,000 children, which are listed in IRI order.",
+                      "enum": [
+                        "label",
+                        "iri"
+                      ],
+                      "type": "string"
+                    },
+                    "roots": {
+                      "description": "Where the roots came from, for a list of roots.",
+                      "enum": [
+                        "ontology",
+                        "scheme",
+                        "computed"
+                      ],
+                      "type": "string"
+                    },
+                    "total": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The node, a page of its children or of the roots, and its ancestors when asked for."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List one level of an entity hierarchy",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/ontology/{ds}/parse": {
       "post": {
         "description": "Reads `text` in OWL 2 Manchester syntax as `as` (`classExpression` by default, or `dataRange`, `individual`, `literal` or `axiom`) and answers its JSON form, its functional-style text and its Manchester rendering. Names are full IRIs in angle brackets, prefixed names with the dataset's prefixes, local names, and labels in single quotes when they hold a space. They resolve against the entities and the `rdfs:label` and `skos:prefLabel` values of the ontology. Text that does not read is `400` with `code` `invalid-manchester`, `reason` (`syntax`, `unknown`, `ambiguous` or `kind`), the span `start` and `end` in UTF-16 code units, and for an ambiguous name the `candidates` with their IRIs, kinds and labels.",
@@ -38401,6 +38771,392 @@
           }
         },
         "summary": "Search the entities of an ontology",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/ontology/{ds}/term": {
+      "get": {
+        "description": "What the graphs read say about one entity, read from the store's indexes without reading the whole ontology: its triples with a named or literal object and the annotations their reifications give (`statements`), the axioms the triples about it map to by the OWL 2 reverse mapping (`axioms`), the axioms of other entities that hold it inside a class expression (`mentions`), the statements of named subjects that point at it by predicate (`incoming`), the statements that use it as their predicate (`usage`), and the label, short form and kinds of every IRI the answer uses (`names`). `format` downloads the triples about the entity, its blank nodes and the reifications of its annotated triples in Turtle, N-Triples, RDF/XML or JSON-LD, or its axioms in functional-style syntax, as an attachment. The caller sees only the graphs and triples their grants allow. `inferences` is refused.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "ontologyTerm",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The entity.",
+            "in": "query",
+            "name": "iri",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most axioms of other entities listed, from 0 to 2,000 (200 by default).",
+            "in": "query",
+            "name": "mentions",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The subjects listed per incoming predicate, from 0 to 200 (20 by default).",
+            "in": "query",
+            "name": "incoming",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The caller's languages for labels, comma separated and most preferred first. `Accept-Language` is read when it is absent.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`json` (the default), or a download format.",
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "enum": [
+                "json",
+                "ttl",
+                "nt",
+                "rdfxml",
+                "jsonld",
+                "ofn"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "axioms": {
+                      "items": {
+                        "description": "An axiom with `type`, `ofn`, `axiom` (its JSON form) and `graph`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "dataset": {
+                      "type": "string"
+                    },
+                    "deprecated": {
+                      "type": "boolean"
+                    },
+                    "graphs": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "incoming": {
+                      "items": {
+                        "properties": {
+                          "count": {
+                            "description": "The statements counted, at most 10,000.",
+                            "type": "integer"
+                          },
+                          "more": {
+                            "type": "boolean"
+                          },
+                          "property": {
+                            "type": "string"
+                          },
+                          "subjects": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "iri": {
+                      "type": "string"
+                    },
+                    "kinds": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "label": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "labelLang": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "mentions": {
+                      "properties": {
+                        "axioms": {
+                          "items": {
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "total": {
+                          "type": "integer"
+                        },
+                        "truncated": {
+                          "type": "boolean"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "names": {
+                      "additionalProperties": {
+                        "properties": {
+                          "deprecated": {
+                            "type": "boolean"
+                          },
+                          "iri": {
+                            "type": "string"
+                          },
+                          "kinds": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "label": {
+                            "description": "The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language.",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "labelLang": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "shortForm": {
+                            "description": "The `oboInOwl:id`, `skos:notation`, prefixed name or local name.",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "object"
+                    },
+                    "ontologies": {
+                      "items": {
+                        "properties": {
+                          "graph": {
+                            "type": "string"
+                          },
+                          "ontology": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "shortForm": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "statements": {
+                      "items": {
+                        "properties": {
+                          "annotations": {
+                            "items": {
+                              "properties": {
+                                "property": {
+                                  "type": "string"
+                                },
+                                "value": {}
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "graph": {
+                            "type": "string"
+                          },
+                          "property": {
+                            "type": "string"
+                          },
+                          "value": {
+                            "description": "An IRI as a string, or a literal as `{\"@value\", \"@language\"?, \"@type\"?}`."
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "statementsTruncated": {
+                      "type": "boolean"
+                    },
+                    "types": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "usage": {
+                      "oneOf": [
+                        {
+                          "properties": {
+                            "count": {
+                              "description": "The statements counted, at most 10,000.",
+                              "type": "integer"
+                            },
+                            "more": {
+                              "type": "boolean"
+                            },
+                            "property": {
+                              "type": "string"
+                            },
+                            "subjects": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "xlLabels": {
+                      "description": "The literal forms of the entity's SKOS-XL labels, with the label property and the graph.",
+                      "items": {
+                        "properties": {
+                          "graph": {
+                            "type": "string"
+                          },
+                          "property": {
+                            "type": "string"
+                          },
+                          "value": {
+                            "description": "A literal as `{\"@value\", \"@language\"?, \"@type\"?}`."
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "application/ld+json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "application/n-triples": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/rdf+xml": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/owl-functional": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/turtle": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The entity's description, or a download."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Describe one entity",
         "tags": [
           "Ontology"
         ],

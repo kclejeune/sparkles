@@ -1122,6 +1122,198 @@ export function manchesterName(s: string): string {
 }
 
 /**
+ * One piece of a Manchester rendering: a keyword, a name with the IRI it stands for, a
+ * literal, punctuation or a space. Joining the texts gives [`manchester`]'s string, and
+ * the browser renders each name as a link.
+ */
+export type ManchesterToken = {
+  text: string;
+  role: 'kw' | 'name' | 'lit' | 'punct' | 'space' | 'bnode';
+  iri?: string;
+};
+
+/**
+ * A class expression, property expression, data range, individual or literal of the
+ * JSON form as Manchester tokens (W3C OWL 2 Manchester Syntax, second edition), with
+ * entity names from `name`. Nested expressions are parenthesized.
+ */
+export function manchesterTokens(
+  e: unknown,
+  rawName: (iri: string) => string,
+  prefixes: PrefixMap,
+  nested = false,
+): ManchesterToken[] {
+  const out: ManchesterToken[] = [];
+  const kw = (text: string) => out.push({ text, role: 'kw' });
+  const sp = () => out.push({ text: ' ', role: 'space' });
+  const punct = (text: string) => out.push({ text, role: 'punct' });
+  const name = (iri: string) => out.push({ text: manchesterName(rawName(iri)), role: 'name', iri });
+  const m = (v: unknown) => out.push(...manchesterTokens(v, rawName, prefixes, true));
+  const wrap = (body: () => void) => {
+    if (nested) punct('(');
+    body();
+    if (nested) punct(')');
+  };
+  const list = (k: string, sep: string, x: Record<string, unknown>) =>
+    ((x[k] as unknown[]) ?? []).forEach((v, i) => {
+      if (i > 0) {
+        if (sep === ',') {
+          punct(',');
+          sp();
+        } else {
+          sp();
+          kw(sep);
+          sp();
+        }
+      }
+      m(v);
+    });
+  if (typeof e === 'string') {
+    if (e.startsWith('_:')) out.push({ text: e, role: 'bnode' });
+    else name(e);
+    return out;
+  }
+  if (isLit(e)) {
+    out.push({ text: litText(e, prefixes), role: 'lit' });
+    return out;
+  }
+  if (!e || typeof e !== 'object') {
+    out.push({ text: String(e), role: 'lit' });
+    return out;
+  }
+  const x = e as Record<string, unknown>;
+  if (typeof x.inverseOf === 'string') {
+    kw('inverse');
+    sp();
+    name(x.inverseOf);
+    return out;
+  }
+  const restriction = (prop: unknown, word: string, filler: unknown) =>
+    wrap(() => {
+      m(prop);
+      sp();
+      kw(word);
+      if (filler !== undefined) {
+        sp();
+        m(filler);
+      }
+    });
+  const card = (word: string) => {
+    const filler = x.class ?? x.range;
+    wrap(() => {
+      m(x.property);
+      sp();
+      kw(word);
+      sp();
+      out.push({ text: String(x.cardinality), role: 'lit' });
+      if (filler) {
+        sp();
+        m(filler);
+      }
+    });
+  };
+  switch (x.type) {
+    case 'Class':
+    case 'Datatype':
+      name(String(x.iri));
+      return out;
+    case 'ObjectIntersectionOf':
+      wrap(() => list('classes', 'and', x));
+      return out;
+    case 'ObjectUnionOf':
+      wrap(() => list('classes', 'or', x));
+      return out;
+    case 'ObjectComplementOf':
+      kw('not');
+      sp();
+      m(x.class);
+      return out;
+    case 'ObjectOneOf':
+      punct('{');
+      list('individuals', ',', x);
+      punct('}');
+      return out;
+    case 'ObjectSomeValuesFrom':
+      restriction(x.property, 'some', x.class);
+      return out;
+    case 'ObjectAllValuesFrom':
+      restriction(x.property, 'only', x.class);
+      return out;
+    case 'ObjectHasValue':
+      restriction(x.property, 'value', x.individual);
+      return out;
+    case 'ObjectHasSelf':
+      restriction(x.property, 'Self', undefined);
+      return out;
+    case 'ObjectMinCardinality':
+    case 'DataMinCardinality':
+      card('min');
+      return out;
+    case 'ObjectMaxCardinality':
+    case 'DataMaxCardinality':
+      card('max');
+      return out;
+    case 'ObjectExactCardinality':
+    case 'DataExactCardinality':
+      card('exactly');
+      return out;
+    case 'DataSomeValuesFrom':
+      restriction(x.property ?? (x.properties as unknown[])?.[0], 'some', x.range);
+      return out;
+    case 'DataAllValuesFrom':
+      restriction(x.property ?? (x.properties as unknown[])?.[0], 'only', x.range);
+      return out;
+    case 'DataHasValue':
+      restriction(x.property, 'value', x.value);
+      return out;
+    case 'DataIntersectionOf':
+      wrap(() => list('ranges', 'and', x));
+      return out;
+    case 'DataUnionOf':
+      wrap(() => list('ranges', 'or', x));
+      return out;
+    case 'DataComplementOf':
+      kw('not');
+      sp();
+      m(x.range);
+      return out;
+    case 'DataOneOf':
+      punct('{');
+      list('values', ',', x);
+      punct('}');
+      return out;
+    case 'DatatypeRestriction': {
+      m(x.datatype);
+      punct('[');
+      ((x.restrictions as { facet: string; value: unknown }[]) ?? []).forEach((f, i) => {
+        if (i > 0) {
+          punct(',');
+          sp();
+        }
+        const local = f.facet.slice(f.facet.lastIndexOf('#') + 1);
+        kw(FACETS[local] ?? local);
+        sp();
+        m(f.value);
+      });
+      punct(']');
+      return out;
+    }
+    case 'Chain':
+      ((x.chain as unknown[]) ?? []).forEach((v, i) => {
+        if (i > 0) {
+          sp();
+          kw('o');
+          sp();
+        }
+        m(v);
+      });
+      return out;
+  }
+  out.push({ text: JSON.stringify(e), role: 'lit' });
+  return out;
+}
+
+/**
  * A class expression, property expression, data range, individual or literal of the
  * JSON form in Manchester syntax (W3C OWL 2 Manchester Syntax, second edition), with
  * entity names from `name`. Nested expressions are parenthesized.
@@ -1132,73 +1324,9 @@ export function manchester(
   prefixes: PrefixMap,
   nested = false,
 ): string {
-  const name = (iri: string) => manchesterName(rawName(iri));
-  if (typeof e === 'string') return e.startsWith('_:') ? e : name(e);
-  if (isLit(e)) return litText(e, prefixes);
-  if (!e || typeof e !== 'object') return String(e);
-  const x = e as Record<string, unknown>;
-  if (typeof x.inverseOf === 'string') return `inverse ${name(x.inverseOf)}`;
-  const m = (v: unknown) => manchester(v, rawName, prefixes, true);
-  const wrap = (s: string) => (nested ? `(${s})` : s);
-  const list = (k: string, sep: string) => ((x[k] as unknown[]) ?? []).map(m).join(sep);
-  const card = (word: string) => {
-    const filler = x.class ?? x.range;
-    return wrap(`${m(x.property)} ${word} ${x.cardinality}${filler ? ` ${m(filler)}` : ''}`);
-  };
-  switch (x.type) {
-    case 'Class':
-    case 'Datatype':
-      return name(String(x.iri));
-    case 'ObjectIntersectionOf':
-      return wrap(list('classes', ' and '));
-    case 'ObjectUnionOf':
-      return wrap(list('classes', ' or '));
-    case 'ObjectComplementOf':
-      return `not ${m(x.class)}`;
-    case 'ObjectOneOf':
-      return `{${list('individuals', ', ')}}`;
-    case 'ObjectSomeValuesFrom':
-      return wrap(`${m(x.property)} some ${m(x.class)}`);
-    case 'ObjectAllValuesFrom':
-      return wrap(`${m(x.property)} only ${m(x.class)}`);
-    case 'ObjectHasValue':
-      return wrap(`${m(x.property)} value ${m(x.individual)}`);
-    case 'ObjectHasSelf':
-      return wrap(`${m(x.property)} Self`);
-    case 'ObjectMinCardinality':
-    case 'DataMinCardinality':
-      return card('min');
-    case 'ObjectMaxCardinality':
-    case 'DataMaxCardinality':
-      return card('max');
-    case 'ObjectExactCardinality':
-    case 'DataExactCardinality':
-      return card('exactly');
-    case 'DataSomeValuesFrom':
-      return wrap(`${m(x.property ?? (x.properties as unknown[])?.[0])} some ${m(x.range)}`);
-    case 'DataAllValuesFrom':
-      return wrap(`${m(x.property ?? (x.properties as unknown[])?.[0])} only ${m(x.range)}`);
-    case 'DataHasValue':
-      return wrap(`${m(x.property)} value ${m(x.value)}`);
-    case 'DataIntersectionOf':
-      return wrap(list('ranges', ' and '));
-    case 'DataUnionOf':
-      return wrap(list('ranges', ' or '));
-    case 'DataComplementOf':
-      return `not ${m(x.range)}`;
-    case 'DataOneOf':
-      return `{${list('values', ', ')}}`;
-    case 'DatatypeRestriction': {
-      const fs = ((x.restrictions as { facet: string; value: unknown }[]) ?? []).map((f) => {
-        const local = f.facet.slice(f.facet.lastIndexOf('#') + 1);
-        return `${FACETS[local] ?? local} ${m(f.value)}`;
-      });
-      return `${m(x.datatype)}[${fs.join(', ')}]`;
-    }
-    case 'Chain':
-      return ((x.chain as unknown[]) ?? []).map(m).join(' o ');
-  }
-  return JSON.stringify(e);
+  return manchesterTokens(e, rawName, prefixes, nested)
+    .map((t) => t.text)
+    .join('');
 }
 
 // --- operations and their inverses ---------------------------------------------------

@@ -95,6 +95,18 @@ public object SparklesOnt {
     public fun search(dataset: DatasetGraphSparkles, query: String, graphIri: String? = null, kinds: List<String> = emptyList(), limit: Int = 10): JsonObject =
         dataset.ontology().search(query, OntologyRead(graph = graphIri), kinds, limit = limit)
 
+    /** One level of the class hierarchy of the graph, as [SparklesOntology.hierarchy] answers it. */
+    @JvmStatic
+    @JvmOverloads
+    public fun hierarchy(dataset: DatasetGraphSparkles, iri: String? = null, graphIri: String? = null, kind: String = "class", ancestors: Boolean = false): JsonObject =
+        dataset.ontology().hierarchy(iri, OntologyRead(graph = graphIri), kind, ancestors)
+
+    /** What the graph says about one entity, read without the whole ontology, as [SparklesOntology.term] answers it. */
+    @JvmStatic
+    @JvmOverloads
+    public fun term(dataset: DatasetGraphSparkles, iri: String, graphIri: String? = null): JsonObject =
+        dataset.ontology().term(iri, OntologyRead(graph = graphIri))
+
     /** What the ontology of the graph says about one entity, as [SparklesOntology.entity] answers it. */
     @JvmStatic
     @JvmOverloads
@@ -382,6 +394,79 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         args.put("fuzzy", fuzzy)
         args.put("definitions", definitions)
         return call("search", args, operation, false)
+    }
+
+    /**
+     * One level of the class, property or concept hierarchy, read from the store's indexes
+     * without reading the whole ontology: the children of `iri` (the roots when it is
+     * null), a page of `limit` from `offset`, each with the numbers of its own children
+     * and parents, and the ancestors of `iri` with `ancestors`. `kind` is `class`,
+     * `objectProperty`, `dataProperty`, `annotationProperty` or `concept`.
+     */
+    @JvmOverloads public fun hierarchy(
+        iri: String? = null,
+        read: OntologyRead = OntologyRead(),
+        kind: String = "class",
+        ancestors: Boolean = false,
+        scheme: String? = null,
+        deprecated: Boolean = true,
+        languages: List<String> = emptyList(),
+        limit: Int = 100,
+        offset: Long = 0,
+    ): JsonObject = SparklesOperation().use { hierarchy(iri, read, kind, ancestors, scheme, deprecated, languages, limit, offset, it) }
+    public fun hierarchy(
+        iri: String?,
+        read: OntologyRead,
+        kind: String,
+        ancestors: Boolean,
+        scheme: String?,
+        deprecated: Boolean,
+        languages: List<String>,
+        limit: Int,
+        offset: Long,
+        operation: SparklesOperation,
+    ): JsonObject {
+        require(limit > 0 && offset >= 0)
+        val args = read.value()
+        if (iri != null) args.put("iri", iri)
+        args.put("kind", kind)
+        args.put("ancestors", ancestors)
+        if (scheme != null) args.put("scheme", scheme)
+        args.put("deprecated", deprecated)
+        if (languages.isNotEmpty()) args.put("lang", languages.joinToString(","))
+        args.put("limit", limit.toLong())
+        args.put("offset", offset)
+        return call("hierarchy", args, operation, false)
+    }
+
+    /**
+     * What the graphs say about the entity `iri`, read without reading the whole ontology:
+     * its statements with their annotations, the axioms they map to, the axioms of other
+     * entities that mention it (at most `mentions`), the statements that point at it with
+     * `incoming` subjects each, and the label, short form and kinds of every IRI used.
+     */
+    @JvmOverloads public fun term(
+        iri: String,
+        read: OntologyRead = OntologyRead(),
+        mentions: Int = 200,
+        incoming: Int = 20,
+        languages: List<String> = emptyList(),
+    ): JsonObject = SparklesOperation().use { term(iri, read, mentions, incoming, languages, it) }
+    public fun term(
+        iri: String,
+        read: OntologyRead,
+        mentions: Int,
+        incoming: Int,
+        languages: List<String>,
+        operation: SparklesOperation,
+    ): JsonObject {
+        require(mentions >= 0 && incoming >= 0)
+        val args = read.value()
+        args.put("iri", iri)
+        args.put("mentions", mentions.toLong())
+        args.put("incoming", incoming.toLong())
+        if (languages.isNotEmpty()) args.put("lang", languages.joinToString(","))
+        return call("term", args, operation, false)
     }
 
     /**

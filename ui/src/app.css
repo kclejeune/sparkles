@@ -22,6 +22,8 @@
   --fs-md: 14px;
   --fs-lg: 17px;
   --fs-xl: 22px;
+  /* the one display size: the title of an entity's page in the ontology browser */
+  --fs-display: 30px;
   --lh: 1.45;
   --lh-tight: 1.2;
 
@@ -218,6 +220,7 @@
   :root {
     --gutter: 16px;
     --gap: 12px;
+    --fs-display: 26px;
   }
 }
 /* a finger needs a larger target than a mouse */
@@ -892,4 +895,82 @@ kbd,
     animation-duration: 0.001ms !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* The sections of an entity's page in the ontology browser (routes/browse) and of the
+   components in lib/components/browse that other pages reuse: a title, subtitles, and
+   lists of linked entities with their short forms. */
+.term-sec h2 {
+  font-size: var(--fs-lg);
+  margin-bottom: var(--sp-3);
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+.term-sec h2 .count-badge {
+  font-size: var(--fs-xs);
+}
+.term-sec h3 {
+  font-size: var(--fs-sm);
+  color: var(--text-2);
+  font-weight: 600;
+  margin: var(--sp-3) 0 var(--sp-1);
+}
+.term-sec h2 + h3 {
+  margin-top: 0;
+}
+.term-links {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 4px;
+}
+.term-links li {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: baseline;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.term-links a,
+.term-flow a {
+  color: var(--iri);
+}
+.term-links .sfx {
+  font: 11px var(--font-mono);
+  color: var(--text-3);
+}
+.term-flow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  min-width: 0;
+}
+.term-flow > * {
+  overflow-wrap: anywhere;
+}
+.lang-tag {
+  font: 600 10px var(--font-ui);
+  color: var(--text-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 0 4px;
+  margin-left: 4px;
+  vertical-align: 1px;
+}
+.more-btn {
+  color: var(--text-2);
+  font-weight: 500;
+  font-size: var(--fs-sm);
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 2px;
+}
+.more-btn:hover {
+  color: var(--text);
 }

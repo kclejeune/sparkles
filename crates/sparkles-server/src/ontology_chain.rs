@@ -1,5 +1,5 @@
-//! `sparkles ontology reason`, `reduce` and `relax` with ROBOT 1.9.11's options (spec
-//! F24), and chains of them with `classify` and `check` in one process, as
+//! `sparkles ontology reason`, `reduce`, `relax` and `materialize` with ROBOT 1.9.11's
+//! options (spec F24), and chains of them with `classify` and `check` in one process, as
 //! `sparkles ontology reason --input x.owl relax reduce --output y.owl`, where each
 //! command takes the ontology the one before it left in memory.
 //!
@@ -13,9 +13,10 @@ use clap::{Args, Parser, Subcommand};
 use sparkles::handles::ontology::classify::ClassifyRequest;
 use sparkles::handles::ontology::transform::{OutputFormat, TransformError, WorkingOntology};
 use sparkles::handles::ontology::{self as onto, CheckRequest};
+use sparkles::owl::ObjectProperty;
 use sparkles::owl::transform::{
-    EquivalentClasses, Error as TError, Generator, NewOntology, ReasonOptions, ReduceOptions,
-    RelaxOptions, Report, Tautologies,
+    EquivalentClasses, Error as TError, Generator, MaterializeOptions, NewOntology, ReasonOptions,
+    ReduceOptions, RelaxOptions, Report, Tautologies, parse_terms,
 };
 use sparkles::sparql::QueryOptions;
 use sparkles::store::StoreOptions;
@@ -137,6 +138,32 @@ pub struct RelaxArgs {
     pub io: Io,
 }
 
+/// `materialize`, with ROBOT's options.
+#[derive(Args, Debug, Clone)]
+pub struct MaterializeArgs {
+    /// The reasoner, as for reduce: ELK runs the classifier
+    #[arg(short = 'r', long, default_value = "ELK")]
+    pub reasoner: String,
+    /// A property whose existential superclasses to assert, as an IRI or an OBO CURIE such
+    /// as BFO:0000050 (repeatable); with none, every object property of the ontology
+    #[arg(short = 't', long)]
+    pub term: Vec<String>,
+    /// A file of such properties, one a line, with # comments (repeatable)
+    #[arg(short = 'T', long)]
+    pub term_file: Vec<PathBuf>,
+    /// true: validate only, as ROBOT, which adds the axioms to an ontology it does not save
+    #[arg(short = 'n', long, default_value = "false")]
+    pub create_new_ontology: String,
+    /// Accepted and ignored, as ROBOT's materialize ignores it
+    #[arg(short = 's', long, default_value = "true")]
+    pub remove_redundant_subclass_axioms: String,
+    /// Accepted and ignored, as ROBOT's materialize ignores it
+    #[arg(short = 'a', long, default_value = "false")]
+    pub annotate_inferred_axioms: String,
+    #[command(flatten)]
+    pub io: Io,
+}
+
 /// `classify` as a later command of a chain.
 #[derive(Args, Debug, Clone)]
 pub struct ClassifyStep {
@@ -181,6 +208,7 @@ pub enum Step {
     Reason(Box<ReasonArgs>),
     Reduce(ReduceArgs),
     Relax(RelaxArgs),
+    Materialize(MaterializeArgs),
     Classify(ClassifyStep),
     Check(CheckStep),
 }
@@ -198,6 +226,7 @@ impl Step {
             Step::Reason(a) => &a.io,
             Step::Reduce(a) => &a.io,
             Step::Relax(a) => &a.io,
+            Step::Materialize(a) => &a.io,
             Step::Classify(a) => &a.io,
             Step::Check(a) => &a.io,
         }
@@ -319,6 +348,18 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
                 enforce_obo_format: boolean(&a.enforce_obo_format, "enforce-obo-format")?,
             };
             log(&w.relax(&o));
+        }
+        Step::Materialize(a) => {
+            // ELK by default, as ROBOT's materialize, so the EL rules alone
+            let c = ClassifyRequest {
+                el_only: reasoner(Some(&a.reasoner), false)?,
+                ..c.clone()
+            };
+            let o = materialize_options(&a)?;
+            match w.materialize(&o, &c, &q) {
+                Ok(r) => log(&r),
+                Err(e) => return Err(failed(e, None, &w)),
+            }
         }
         Step::Classify(a) => {
             let about = a
@@ -474,6 +515,33 @@ fn reason_options(a: &ReasonArgs) -> Result<ReasonOptions> {
             NewOntology::No
         },
         dump_unsatisfiable: a.dump_unsatisfiable.is_some(),
+    })
+}
+
+/// The options of `materialize`: the properties of `--term` and `--term-file`, read as
+/// ROBOT reads term lists, with its warning for each term that is not an IRI.
+fn materialize_options(a: &MaterializeArgs) -> Result<MaterializeOptions> {
+    let mut warnings = Vec::new();
+    let mut iris = std::collections::BTreeSet::new();
+    for t in &a.term {
+        iris.extend(parse_terms(t, &mut warnings));
+    }
+    for f in &a.term_file {
+        let text = std::fs::read_to_string(f)
+            .with_context(|| format!("cannot read the term file {}", f.display()))?;
+        iris.extend(parse_terms(&text, &mut warnings));
+    }
+    for w in &warnings {
+        eprintln!("WARN {w}");
+    }
+    if iris.is_empty() && !(a.term.is_empty() && a.term_file.is_empty()) {
+        eprintln!(
+            "WARN no term is a valid IRI: every object property of the ontology is materialized, as ROBOT does"
+        );
+    }
+    Ok(MaterializeOptions {
+        properties: iris.into_iter().map(ObjectProperty::new).collect(),
+        create_new_ontology: is_true(&a.create_new_ontology),
     })
 }
 

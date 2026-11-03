@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Time `sparkles ontology materialize` beside `reason`, and the chain `reason materialize reduce`,
+# on GO and ChEBI lite on forge, the benchmark host, end to end from the
+# release's RDF/XML file to a written functional-style file. Three rounds interleave the
+# commands. ~/lanes/.bench.lock is taken once for the whole run. No reasoner other than
+# the binary's own classifier runs, and nothing is built here.
+# Usage: forge-sparkles.sh DIR   (DIR as stage-forge.sh leaves it: bin/sparkles, data/,
+# timed.py)
+set -uo pipefail
+D=$(cd "$1" && pwd) || exit 1
+OUT=$D/sparkles-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT"
+MEM=${MEM:-12G}
+exec 9> "$HOME/lanes/.bench.lock"
+flock 9
+{
+  echo "host=$(hostname)"
+  echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')"
+  echo "cpus=$(nproc) ram_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
+  echo "kernel=$(uname -r)"
+  echo "sparkles_sha256=$(sha256sum "$D/bin/sparkles" | cut -d' ' -f1)"
+  for f in "$D"/data/*.owl; do echo "data_sha256 $(basename "$f")=$(sha256sum "$f" | cut -d' ' -f1)"; done
+  echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)"
+} > "$OUT/env.txt"
+
+# t LABEL [--stdout FILE] -- COMMAND...: one timed run under the memory cap
+t() {
+  local label=$1
+  shift
+  systemd-run --user --scope --quiet -p "MemoryMax=$MEM" -p MemorySwapMax=0 -p OOMPolicy=continue \
+    python3 "$D/timed.py" "$OUT/runs.jsonl" "$label" "$@" 2>> "$OUT/$label.err"
+}
+
+S=$D/bin/sparkles
+for round in 1 2 3; do
+  for o in go chebi_lite; do
+    in=$D/data/$o.owl
+    r=$OUT/$o
+    term=RO:0000087
+    [ "$o" = go ] && term=BFO:0000050
+    t "$o.reason.r$round" --timeout 1800 -- "$S" ontology reason --input "$in" --output "$r.reason.ofn"
+    t "$o.materialize.r$round" --timeout 1800 -- "$S" ontology materialize --input "$in" \
+      --term "$term" --output "$r.materialize.ofn"
+    t "$o.materialize-all.r$round" --timeout 1800 -- "$S" ontology materialize --input "$in" \
+      --output "$r.materialize-all.ofn"
+    if [ "$o" = go ]; then
+      t "$o.materialize-regulates.r$round" --timeout 1800 -- "$S" ontology materialize \
+        --input "$in" --term RO:0002211 --output "$r.materialize-regulates.ofn"
+      t "$o.chain-rmr.r$round" --timeout 1800 -- "$S" ontology reason --input "$in" \
+        materialize --term "$term" reduce --output "$r.chain-rmr.ofn"
+    fi
+  done
+done
+echo "ended=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$OUT/env.txt"
+echo "FORGE-SPARKLES-DONE $OUT"
