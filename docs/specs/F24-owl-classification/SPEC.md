@@ -585,7 +585,10 @@ development files that classify slower than Konclude without them, the disjuncti
 take only ore_ont_5940, whose taxonomy is now complete and faster than Konclude's. ore_ont_12141, BioTop,
 classifies slower than Konclude, item NEW-ITEM-1. The taxonomies of the 298 ORE 2015 EL
 ontologies, GO, ChEBI lite and every development file that the disjunctive rules do not
-take are byte for byte those of the Horn tier on one and eight threads.
+take are byte for byte those of the Horn tier on one and eight threads. The saturation's
+arms for the disjunctive rules compile away in other runs, but on the benchmark host GO and
+ChEBI lite classify 0.9% and 1.4% slower on one thread and in the same time on eight, item
+NEW-ITEM-4.
 
 ### ROBOT-compatible commands
 
