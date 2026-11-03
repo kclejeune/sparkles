@@ -8,7 +8,8 @@
 // `share_query`. The maps of relations, the communities, the Pattern pane, the diff graph
 // and the path finder on a query's graph use the `world` showcase dataset of
 // mock/world.mjs. The model configuration form uses the declared configuration of
-// mock/models.mjs. The ontology editor uses the `uni` dataset of mock/ontology.mjs. Run
+// mock/models.mjs. The ontology editor uses the `uni` dataset of mock/ontology.mjs, and the
+// thesaurus editor the `thes` dataset of mock/skos.mjs. Run
 // with `mise run docs:screenshots`.
 
 import { test as base, expect, type APIRequestContext, type Page } from '@playwright/test';
@@ -1340,5 +1341,51 @@ test('ontology-preview', async ({ page }) => {
   const preview = page.getByRole('dialog');
   await expect(preview.locator('[data-outcome]')).toHaveAttribute('data-outcome', 'commit');
   await shoot(page, 'ontology-preview');
+  await preview.getByRole('button', { name: 'Cancel' }).click();
+});
+
+// The thesaurus editor on the mock's `thes` dataset (mock/skos.mjs): the concept tree with
+// the polyhierarchy of Whales and its multilingual labels, the checks of the built-in SKOS
+// shapes, and the preview of a drag that moves Bats under Flying animals, which is
+// cancelled so the mock keeps its thesaurus.
+const THES = 'http://example.org/thesaurus/';
+const thesTree = (page: Page) => page.getByRole('tree', { name: 'Concepts' });
+
+test('thesaurus-editor', async ({ page }) => {
+  await page.goto(`/ui/thesaurus?ds=thes&iri=${encodeURIComponent(`${THES}whales`)}`);
+  const tree = thesTree(page);
+  await expect(page.getByRole('heading', { name: 'Whales' })).toBeVisible({ timeout: 30_000 });
+  await expect(tree.getByRole('button', { name: 'Collapse Vertebrates' })).toBeVisible();
+  const marine = tree.getByRole('button', { name: 'Expand Marine animals' });
+  if (await marine.count()) await marine.first().click();
+  await expect(tree.getByRole('button', { name: 'Whales', exact: true })).toHaveCount(2);
+  await expect(
+    page.getByRole('region', { name: 'Labels' }).locator('tr[data-lang="fr"]'),
+  ).toContainText('Baleines');
+  await shoot(page, 'thesaurus-editor');
+});
+
+test('thesaurus-checks', async ({ page }) => {
+  await page.goto('/ui/thesaurus?ds=thes');
+  await expect(
+    thesTree(page).getByRole('button', { name: 'Vertebrates', exact: true }),
+  ).toBeVisible({
+    timeout: 30_000,
+  });
+  await page.getByRole('tab', { name: 'Checks' }).click();
+  await expect(page.getByRole('list', { name: 'Check results' })).toContainText('S13');
+  await shoot(page, 'thesaurus-checks');
+});
+
+test('thesaurus-move', async ({ page }) => {
+  await page.goto(`/ui/thesaurus?ds=thes&iri=${encodeURIComponent(`${THES}bats`)}`);
+  const tree = thesTree(page);
+  await expect(page.getByRole('heading', { name: 'Bats' })).toBeVisible({ timeout: 30_000 });
+  const node = (name: string) => tree.getByRole('button', { name, exact: true }).first();
+  await node('Bats').dragTo(node('Flying animals'));
+  const preview = page.getByRole('dialog');
+  await expect(preview).toContainText('Move Bats under Flying animals');
+  await expect(preview.locator('[data-outcome]')).toHaveAttribute('data-outcome', 'commit');
+  await shoot(page, 'thesaurus-move');
   await preview.getByRole('button', { name: 'Cancel' }).click();
 });

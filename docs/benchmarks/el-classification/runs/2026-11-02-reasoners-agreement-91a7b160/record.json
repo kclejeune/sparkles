@@ -1,0 +1,90 @@
+{
+ "checks": [
+  {
+   "detail": "298 of 298, with no class named on one side only, ore_ont_6720 inconsistent for both",
+   "name": "konclude/ore-agrees-with-classifier",
+   "ok": true
+  },
+  {
+   "detail": "296 of 298. ore_ont_412, a BioTop ontology with 18 two-property chains and no axiom outside OWL 2 EL, gives Whelk 20,401 entailed subsumptions between named classes against 20,802 for the classifier, which ELK and Konclude also give, and none of its own (ore412-whelk-closure.json, closure.py.txt). ore_ont_3524 ended Whelk at the 12G memory cap",
+   "name": "whelk/ore-agrees-with-classifier",
+   "ok": false
+  },
+  {
+   "detail": "Whelk equals the classifier on GO and ChEBI lite, Konclude on ChEBI lite",
+   "name": "big/agrees",
+   "ok": true
+  },
+  {
+   "detail": "Konclude's GO taxonomy has 7 direct edges that the classifier's and ELK's do not and entails 14 subsumptions between named classes that they do not (go-konclude-closure.json), all through the InverseObjectProperties axiom that both leave out (go-konclude-extra.json)",
+   "name": "big/konclude-go",
+   "ok": true
+  },
+  {
+   "detail": "4 of 4 each, including the two subsumptions and the inconsistency that ELK and the classifier miss",
+   "name": "range/whelk-and-konclude-agree-with-hermit",
+   "ok": true
+  },
+  {
+   "detail": "ROBOT reason, reduce, relax, materialize and reason relax reduce with ELK on GO and ChEBI lite: every asserted named subsumption of each output is entailed by the classifier's taxonomy, and every direct edge of the taxonomy is asserted",
+   "name": "robot/asserted-hierarchy",
+   "ok": true
+  },
+  {
+   "detail": "sparkles ontology classify on the RDF/XML and functional-style files of GO and ChEBI lite writes a taxonomy equal to el_classify's",
+   "name": "robot/sparkles-classify",
+   "ok": true
+  }
+ ],
+ "host": {
+  "name": "stanley",
+  "role": "laptop, loaded by other work, so the times are a rough screen and not measurements"
+ },
+ "kind": "agreement",
+ "manifest": {
+  "binary": "crates/sparkles-owl/examples/el_classify.rs and the sparkles CLI, built with mbx build --release at 6ae55297, whose sparkles-owl sources equal 1e0760c9",
+  "binary_sha256": {
+   "el_classify": "e778dfa719ec8c66164ebab1fd8ea52eb42a916a68312610208d6022c3c3b2cb",
+   "sparkles": "a41dc0bc4ca2f643921ef2cd86488e5f87336dbb39636f3aef3da5300b135671"
+  },
+  "commit": "91a7b160",
+  "data": {
+   "chebi_lite": {
+    "ofn_sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4",
+    "rdfxml_sha256": "ebea75e0500818e319245a1bf605a684b2e22a2069680290b5dda638d5d25b16"
+   },
+   "go": {
+    "ofn_sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375",
+    "rdfxml_sha256": "653ce47cd7b02304e67eb67c54d3be02ec5b0ba5e00eb7384dfa0da00f9682ec"
+   },
+   "ore": "ore2015_sample.zip of Zenodo record 18578, pool_sample/el/classification"
+  },
+  "reference": {
+   "hermit": "HermiT 1.4.5.519 taxonomies of the range cases from runs/2026-11-02-hermit-agreement-aa0a41a6",
+   "konclude": "Konclude 0.7.0-1138, the flake's .#konclude /nix/store/wdpc7cr8as4kscxmaxlf7wh9rhayd0r6-konclude-0.7.0-1138, through scripts/elk-compare/konclude.py",
+   "robot": "ROBOT 1.9.11 with its bundled ELK 0.6.0, the flake's .#robot /nix/store/lxh315ayg2wpmwbgw97zkigr4r8prrgy-robot-1.9.11, OpenJDK 17.0.20.1",
+   "whelk": "Whelk 1.2.1 on OWL API 4.5.22, the flake's .#whelk /nix/store/3d5mrs612arm3p4ky514b5s5qgvf714a-whelk-1.2.1 (ElkClassify of commit 91a7b160), OpenJDK 17.0.20.1"
+  }
+ },
+ "method": "run.sh.txt ran each reasoner once per input and compared its taxonomy with the classifier's (gen-ours.sh.txt wrote those) and, for the range cases, with HermiT's, through scripts/el-oracle.py. The first range and big pass of Whelk failed in the harness, which commit 91a7b160 fixed, and the batch then ran Whelk again with ONLY=whelk, so env.txt lists three starts. The robot stage timed each ROBOT command with timed.py.txt from the release's RDF/XML file, or from the functional-style file for the -ofn rows, to the written functional-style output, and checked each output's asserted named hierarchy with el-oracle.py --asserted against the classifier's taxonomy. The batch's sparkles runs failed because the release binary had been removed from the build directory, so the four sparkles-classify rows of robot/runs.jsonl after the failed ones ran afterwards with the same binary under the same cap. closure.py.txt counts the subsumptions between named classes that two taxonomies entail, with each class's equivalent classes and the classes above its node, after el-oracle.py's normalization. The Whelk package of these runs is the build of commit 91a7b160 that env.txt names. Commit ea96e8f5 later made the harness treat an unsatisfiable owl:Thing as inconsistent, which changes none of these results, since Whelk reported the inconsistent ontologies here as inconsistent itself.",
+ "results": [],
+ "scale": "Four range test ontologies, GO 2026-07-26, ChEBI lite 256 and the 298 ORE 2015 EL classification ontologies",
+ "settings": {
+  "konclude_threads": {
+   "big": 8,
+   "ore": 4,
+   "range": 1
+  },
+  "memory_cap": "MemoryMax=12G and no swap per run",
+  "repeat": 1,
+  "robot_java": "-Xms8g -Xmx8g -XX:+UseG1GC",
+  "timeout_s": {
+   "big": 3600,
+   "ore": 1800,
+   "range": 600,
+   "robot": 3600
+  },
+  "whelk_heap": "1g for the range cases, 10g for GO and ChEBI lite, 16 MiB of heap per MiB of file plus 2 GiB, at most 10g, for ORE"
+ },
+ "suite": "el-classification"
+}

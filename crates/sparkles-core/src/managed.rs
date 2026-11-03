@@ -328,6 +328,9 @@ pub enum ManagedErrorKind {
     /// A policy's projection was written under protections that have since changed,
     /// so its supports no longer authenticate and it must be reconciled first.
     ProjectionUnavailable,
+    /// A review of identity proposals would put two entities that an accepted
+    /// separation keeps apart into one cluster of its resolution map.
+    IdentityConflict,
 }
 
 /// An error of the managed-graph boundary, with its stable code. Nothing was written.
@@ -341,7 +344,7 @@ pub struct ManagedError {
     /// `immutable-record-conflict`, and the typed-write codes `head-changed`,
     /// `idempotency-conflict` and `authority-changed`, and the review codes
     /// `policy-changed`, `target-changed`, `decision-superseded`, `target-withdrawn`,
-    /// `evidence-conflict` and `projection-unavailable`
+    /// `evidence-conflict`, `projection-unavailable` and `identity-conflict`
     pub code: &'static str,
     pub message: String,
 }
@@ -371,6 +374,7 @@ impl ManagedError {
             ManagedErrorKind::TargetWithdrawn => "target-withdrawn",
             ManagedErrorKind::EvidenceConflict => "evidence-conflict",
             ManagedErrorKind::ProjectionUnavailable => "projection-unavailable",
+            ManagedErrorKind::IdentityConflict => "identity-conflict",
         };
         Error::Managed(Box::new(ManagedError {
             kind,
@@ -400,7 +404,8 @@ impl ManagedError {
             | ManagedErrorKind::TargetChanged
             | ManagedErrorKind::DecisionSuperseded
             | ManagedErrorKind::TargetWithdrawn
-            | ManagedErrorKind::EvidenceConflict => 409,
+            | ManagedErrorKind::EvidenceConflict
+            | ManagedErrorKind::IdentityConflict => 409,
             ManagedErrorKind::AuthorityChanged | ManagedErrorKind::ProjectionUnavailable => 503,
         }
     }

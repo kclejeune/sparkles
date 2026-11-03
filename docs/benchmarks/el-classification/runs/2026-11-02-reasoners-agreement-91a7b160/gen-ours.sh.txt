@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# The classifier's taxonomies that run-reasoners.sh compares with (out/ours).
+set -uo pipefail
+L=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$L/../../.." && pwd)
+DATA=$ROOT/../sparkles-lane-el-classifier-580/.artifacts/lanes/el-580/data
+BIN=$ROOT/target/release/examples/el_classify
+O=$L/out/ours
+mkdir -p "$O/range" "$O/ore"
+for c in range-assertion range-hasvalue two-ranges one-range; do f=$L/data/range/$c.ofn; n=$(basename "$f" .ofn); "$BIN" --threads 1 --taxonomy "$O/range/$n.ours.txt" "$f" >> "$O/range.jsonl" 2>/dev/null; done
+for o in go chebi_lite; do "$BIN" --threads 4 --taxonomy "$O/$o.ours.txt" "$DATA/$o.ofn" >> "$O/big.jsonl"; done
+for f in $(ls -Sr "$DATA"/ore-el/*.owl); do
+  n=$(basename "$f" .owl)
+  timeout 600 "$BIN" --threads 4 --taxonomy "$O/ore/$n.ours.txt" "$f" >> "$O/ore.jsonl" 2>> "$O/ore.err" || echo "{\"input\":\"$f\",\"failed\":$?}" >> "$O/ore.jsonl"
+done
+echo OURS-DONE

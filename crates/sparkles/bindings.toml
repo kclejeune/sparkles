@@ -461,6 +461,11 @@ python = "planned: evidence resolution in the bindings with the typed evidence o
 jvm = "planned: evidence resolution in the bindings with the typed evidence operations"
 node = "planned: evidence resolution in the bindings with the typed evidence operations"
 
+["evidence.resolve_entities"]
+python = "planned: identity resolution in the bindings with the typed evidence operations"
+jvm = "planned: identity resolution in the bindings with the typed evidence operations"
+node = "planned: identity resolution in the bindings with the typed evidence operations"
+
 ["evidence.review"]
 python = "planned: evidence reviews in the bindings with the typed evidence operations"
 jvm = "planned: evidence reviews in the bindings with the typed evidence operations"
@@ -1020,6 +1025,11 @@ node = "parseUpdate"
 python = "check_iri"
 jvm = "SparklesHelpers.checkIri"
 node = "checkIri"
+
+["skos.shapes"]
+python = "skos_shapes"
+jvm = "planned: SparklesHelpers.skosShapes, after the Python binding"
+node = "planned: skosShapes, after the Python binding"
 
 ["terms.check_langtag"]
 python = "check_langtag"

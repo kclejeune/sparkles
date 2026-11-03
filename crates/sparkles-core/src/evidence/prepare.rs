@@ -1,7 +1,8 @@
 use super::{
     AssessmentInput, BlankAnchor, ClaimInput, Confidence, ConfidenceFacets, EvidenceInput,
-    EvidenceRefTarget, GraphIdentity, MethodRef, RecordKind, RecordRef, RenditionContent,
-    Sha256Digest, SourceContent, canonical::FrameHash, primitives::validate_iri,
+    EvidenceRefTarget, GraphIdentity, IdentityInput, IdentityRelation, MethodRef, RecordKind,
+    RecordRef, RenditionContent, Sha256Digest, SourceContent, canonical::FrameHash,
+    primitives::validate_iri,
 };
 use crate::{Error, Result, task::Control};
 use oxrdf::{Literal, NamedOrBlankNode, Term, Triple, vocab::xsd};
@@ -11,6 +12,11 @@ use std::collections::BTreeMap;
 /// The declared default bounds, independent of lower HTTP or host memory limits.
 pub const MAX_CLAIMS: usize = 1_000;
 pub const MAX_LINKS: usize = 10_000;
+/// The most identity proposals one batch holds.
+pub const MAX_IDENTITIES: usize = 1_000;
+/// The fewest and most entities one identity proposal names.
+pub const MIN_IDENTITY_ENTITIES: usize = 2;
+pub const MAX_IDENTITY_ENTITIES: usize = 64;
 
 /// Work that a typed runtime resolver must complete before publishing any record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +101,11 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
             "evidence batch exceeds 1000 claims or 10000 links",
         ));
     }
+    if input.identities.len() > MAX_IDENTITIES {
+        return Err(Error::invalid(
+            "evidence batch exceeds 1000 identity proposals",
+        ));
+    }
     let mut aliases = BTreeMap::new();
     let mut frame = FrameHash::new(b"sparkles-evidence-input-v1", control)?;
     macro_rules! register {
@@ -119,6 +130,7 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
     register!(&input.claims, RecordKind::Claim);
     register!(&input.links, RecordKind::EvidenceLink);
     register!(&input.assessments, RecordKind::Assessment);
+    register!(&input.identities, RecordKind::IdentityProposal);
     let mut preparation = Preparation {
         frame,
         aliases,
@@ -365,7 +377,14 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
     for link in &input.links {
         preparation.start(RecordKind::EvidenceLink, link.key.as_str())?;
         preparation.text(link.occurrence_key.as_str())?;
-        preparation.reference(&link.target, &[RecordKind::Claim, RecordKind::Assessment])?;
+        preparation.reference(
+            &link.target,
+            &[
+                RecordKind::Claim,
+                RecordKind::Assessment,
+                RecordKind::IdentityProposal,
+            ],
+        )?;
         preparation.reference(&link.evidence, &[RecordKind::EvidenceRef])?;
         preparation.text(match link.relation {
             super::EvidenceRelation::Supports => "supports",
@@ -381,6 +400,9 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
             assessment.key.as_str().to_owned(),
             normalize_time(&assessment.evaluated_at)?,
         );
+    }
+    for identity in &input.identities {
+        preparation.identity(identity)?;
     }
     Ok(PreparedInput {
         input,
@@ -560,12 +582,62 @@ impl Preparation<'_> {
         self.facets(&claim.confidence)
     }
 
+    fn identity(&mut self, identity: &IdentityInput) -> Result<()> {
+        let n = identity.entities.len();
+        if !(MIN_IDENTITY_ENTITIES..=MAX_IDENTITY_ENTITIES).contains(&n) {
+            return Err(Error::invalid(format!(
+                "identities: a proposal names {MIN_IDENTITY_ENTITIES} to {MAX_IDENTITY_ENTITIES} entities"
+            )));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        if !identity.entities.iter().all(|e| seen.insert(e.as_str())) {
+            return Err(Error::invalid(
+                "identities: a proposal names an entity twice",
+            ));
+        }
+        match (&identity.preferred, identity.relation) {
+            (Some(p), IdentityRelation::PossibleMatch) if !seen.contains(p.as_str()) => {
+                return Err(Error::invalid(
+                    "identities: the preferred entity is not one of the proposal's entities",
+                ));
+            }
+            (Some(_), IdentityRelation::DistinctEntities) => {
+                return Err(Error::invalid(
+                    "identities: only a possible match names a preferred entity",
+                ));
+            }
+            _ => {}
+        }
+        self.start(RecordKind::IdentityProposal, identity.key.as_str())?;
+        self.text(identity.occurrence_key.as_str())?;
+        // the entities are a set, so their order is not part of the payload
+        self.number(n as u64)?;
+        for e in &seen {
+            self.node(&oxrdf::NamedNode::new_unchecked(*e))?;
+        }
+        self.text(identity.relation.name())?;
+        self.number(u64::from(identity.preferred.is_some()))?;
+        if let Some(p) = &identity.preferred {
+            self.node(p)?;
+        }
+        self.node(&identity.attributed_author)?;
+        self.number(u64::from(identity.method.is_some()))?;
+        if let Some(method) = &identity.method {
+            self.method(method)?;
+        }
+        Ok(())
+    }
+
     fn assessment(&mut self, assessment: &AssessmentInput) -> Result<()> {
         self.start(RecordKind::Assessment, assessment.key.as_str())?;
         self.text(assessment.occurrence_key.as_str())?;
         self.reference(
             &assessment.target,
-            &[RecordKind::Claim, RecordKind::Assessment],
+            &[
+                RecordKind::Claim,
+                RecordKind::Assessment,
+                RecordKind::IdentityProposal,
+            ],
         )?;
         self.frame.term(&assessment.conclusion)?;
         self.method(&assessment.method)?;

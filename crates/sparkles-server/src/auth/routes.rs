@@ -42,6 +42,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // the OpenAPI description (`openapi`)
     ("/$/openapi.json", &["GET"]),
     ("/$/openapi.yaml", &["GET"]),
+    ("/$/skos/shapes", &["GET"]),
     ("/$/server", &["GET", "POST"]),
     ("/$/metrics", &["GET"]),
     ("/$/server/memory", &["GET"]),
@@ -288,6 +289,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // review decisions, accepted projections and withdrawals (C25 §5 and §6)
     ("/{ds}/claims/review", &["POST"]),
     ("/{ds}/claims/withdraw", &["POST"]),
+    // resolution maps of identity reviews (C25 §6)
+    ("/{ds}/claims/identities", &["POST"]),
     // `register_source` and `list_sources` over HTTP (C18 Phase 3m-b)
     ("/{ds}/sources", &["GET", "POST"]),
     ("/{ds}/text", &["GET", "POST"]),
@@ -343,6 +346,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/" | "/ui" | "/ui/" | "/ui/{*path}" | "/$/ping" | "/$/ready" | "/$/whoami" => Public,
         // describes the binary's API, not its data or configuration
         "/$/openapi.json" | "/$/openapi.yaml" => Public,
+        // the built-in SKOS shapes: text compiled into the binary, not data
+        "/$/skos/shapes" => Caller,
         // where MCP clients find the authorization server, before they hold a token
         "/.well-known/oauth-protected-resource" | "/.well-known/oauth-protected-resource/$/mcp" => {
             Public
@@ -514,6 +519,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/claims/resolve"
+        | "/{ds}/claims/identities"
         | "/{ds}/sparql/diagnose"
         | "/{ds}/sparql/diff"
         | "/{ds}/sparql/explain"
@@ -653,6 +659,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/claims/resolve"
+        | "/{ds}/claims/identities"
         | "/{ds}/sparql/diagnose"
         | "/{ds}/sparql/diff"
         | "/{ds}/sparql/explain"

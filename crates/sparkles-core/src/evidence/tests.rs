@@ -116,6 +116,7 @@ fn sample() -> EvidenceInput {
             confidence: None,
             scope: Scope::default(),
         }],
+        identities: Vec::new(),
     }
 }
 

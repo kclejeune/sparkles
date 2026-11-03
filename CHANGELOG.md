@@ -36,6 +36,18 @@ Rust library and Python's `ds.forms.model(…, nested=True)` expose the same mod
 bodies now accept blank node terms, a conflict on a child's field carries the child's
 `node`, and a form model's values carry a list's `items`.
 
+The web UI has a SKOS and SKOS-XL thesaurus editor, the **Thesaurus** page (spec U12,
+roadmap item 457). It shows the concept tree of a scheme one level at a time with its
+polyhierarchy, searches labels in any language, and edits multilingual and SKOS-XL
+labels, broader, narrower, related and mapping links, collections and ordered collections,
+and notes, each as a previewed commit with `If-Match`. Dragging a concept moves it under
+another or adds a broader concept. The page shares the ontology editor's session branches,
+undo by revert and live refresh. The built-in SKOS shapes check the integrity conditions
+of the SKOS Reference, S9, S13, S14, S27, S37 and S46 with S51, S52 and S58 of SKOS-XL.
+`GET /$/skos/shapes` serves them, forms read them with `shapes=skos`, and the Rust library
+exposes them as `sparkles::skos`, so a write guard can enforce them. The ontology editor's
+commit messages in other scripts are now sent percent-encoded as UTF-8 instead of failing.
+
 The web UI has an ontology editor, the **Ontology** page (spec U12, roadmap item 457). It
 shows trees of classes, object, data and annotation properties and individuals, an entity
 frame with its axioms in Manchester syntax, an annotation editor with language tags and
@@ -390,6 +402,28 @@ read of a review is made at its required `ifHead`. The codes `409 policy-changed
 `capabilities.claims` lists both routes. The vocabulary and shapes add
 `ev:supersedes`, `ev:AcceptanceSupport`, `ev:Withdrawal`, `ev:Projection` and their
 properties (spec C25 Phase 2).
+
+Identity proposals are reviewed into reversible resolution maps (spec C25 §6, roadmap
+item 81). A claims batch takes `identities`, which name two to 64 entity IRIs as a
+possible match or as distinct entities and assert no `owl:sameAs`, and `identityGraph`.
+Evidence settings take `matchingPolicies`, each with its version, boundary, decisions,
+maps and output graphs, as an additive amendment of `evidence.json` format 1 that a
+build without it refuses as unreadable settings. `POST /{ds}/claims/review` under a
+matching policy decides proposals, and the policy's output graph holds the current map
+as `ev:resolvesTo` triples from each member of a cluster to its representative. An
+accepted separation keeps entities apart, and joining them is the new `409
+identity-conflict`. A split is a superseding decision, and every change of the
+decisions a map follows writes an immutable `ev:ResolutionMap` revision with the
+decisions it added and ended. The review answer adds `mapRevision` and `changed.map`
+with the entities whose selected entity changed. `POST /{ds}/claims/identities` and
+`sparkles::evidence::resolve_entities` read the current map, and `capabilities.claims`
+lists the route. Evidence links and assessments may target identity proposals. A
+revision records the identity graphs of the boundary it was built from, and a map one of
+them has left, or whose graph was protected again, answers `projection-unavailable`.
+Identity reviews need read grants on every identity graph of the boundary, and one
+operation retains at most 64 MiB of entity identifiers. The vocabulary and shapes add
+`ev:preferredEntity`, `ev:ResolutionMap`, `ev:mapRevision`, `ev:adds`, `ev:ends`,
+`ev:resolvesTo`, `ev:mapsProtection` and `ev:boundaryProtection`.
 
 Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
 and `owl:sameAs` with closure operators instead of joins, and derives the same facts.

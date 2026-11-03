@@ -1,7 +1,7 @@
 # U12: Ontology workbench
 
-> **Status:** partially complete. The ontology editor and DL Query phases are built, and
-> the other phases are planned.
+> **Status:** partially complete. The ontology editor, DL Query and thesaurus editor
+> phases are built, and the editable schema diagram is planned.
 >
 > **Roadmap:** [item 457](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
@@ -34,7 +34,7 @@ The workbench edits entities, axioms and annotations through the axiom model of
 
 **Editable schema diagram.** Draw the schema diagram from declared axioms as well as observed data, with restrictions as labelled edges, an optional VOWL notation and SVG, Mermaid and PlantUML export, and turn it into a modeling canvas that adds classes, properties and restrictions by drawing. Stardog Designer and Gra.fo offer the same canvas. It depends on item 31.
 
-**Ontology browser.** Browse an ontology or thesaurus as linked articles, taking cues from the term pages of the EBI Ontology Lookup Service and Ontobee while keeping a clean, uncluttered layout. Search is a typeahead with typo tolerance over labels, synonyms, short forms and definitions in any language, ranking exact and prefix matches of preferred labels first, from an entity index that each commit updates and that answers within 20 ms on the server for ontologies of ChEBI's size. A command palette opened with `Ctrl+K` or `Cmd+K` reaches the same search, with datasets, saved queries, pages and actions, from anywhere in the UI. Each entity's page shows its label, IRI and short form, definition, synonyms and cross-references, an infobox of types and key annotations, a collapsible hierarchy tree centred on the entity, its axioms rendered as prose with links, instances, the ontologies that reuse the term, a "what links here" list and downloads of the entity in each RDF format. An edit mode lets a caller with write access change the page in place, with the ontology editor's previewed commits, session branches and undo. The editor, the DL Query tab and the term pages of [C32](../C32-linked-data-publishing/README.md) reuse these pages.
+**Ontology browser.** Browse an ontology or thesaurus as linked articles, taking cues from the term pages of the EBI Ontology Lookup Service, including its graph view of a term, and Ontobee while keeping a clean, uncluttered layout. Search is a typeahead with typo tolerance over labels, synonyms, short forms and definitions in any language, ranking exact and prefix matches of preferred labels first, from an entity index that each commit updates and that answers within 20 ms on the server for ontologies of ChEBI's size. A command palette opened with `Ctrl+K` or `Cmd+K` reaches the same search, with datasets, saved queries, pages and actions, from anywhere in the UI. Each entity's page shows its label, IRI and short form, definition, synonyms and cross-references, an infobox of types and key annotations, a collapsible hierarchy tree centred on the entity with a graph view as the alternative, which draws the entity's superclasses, subclasses and related entities on the Explore canvas with its lenses and opens into Explore, its axioms rendered as prose with links, instances, the ontologies that reuse the term, a "what links here" list and downloads of the entity in each RDF format. An edit mode lets a caller with write access change the page in place, with the ontology editor's previewed commits, session branches and undo. The editor, the DL Query tab and the term pages of [C32](../C32-linked-data-publishing/README.md) reuse these pages.
 
 **Visual SHACL shape editor.** Author node and property shapes as trees and forms, with targets, paths, constraints and severities, validated live against sample data and written as previewed commits. TopBraid Composer and EDG offer it.
 
@@ -235,3 +235,105 @@ completion and the Manchester add fields against the mock backend and a real ser
 The instances need a classification with the assertions, which the dataset does not
 keep, so an instance query classifies the ontology again. Roadmap item 588 can reuse
 the same engine to answer the entity accessors from the kept classification.
+
+### Thesaurus editor
+
+The SKOS and SKOS-XL thesaurus editor phase is built as the UI's **Thesaurus** page,
+`/ui/thesaurus`. It reads and writes one graph of a dataset with SPARQL queries and
+`DELETE DATA` and `INSERT DATA` updates, so it needs no routes of its own beyond the
+built-in shapes.
+
+**Schemes and the concept tree.** The page lists the graph's concept schemes, and the tree
+of the chosen scheme starts at its top concepts, from `skos:hasTopConcept` and
+`skos:topConceptOf`. Concepts of the scheme without a broader concept are roots too, marked
+when they are not top concepts. Each level is read when it opens, from `skos:broader` and
+`skos:narrower` in both directions, with the number of narrower and broader concepts of
+each child, so the tree reads one level of a large thesaurus at a time. A concept with
+several broader concepts sits under each of them. A level shows its first 2,000 concepts
+and the roots their first 5,000.
+
+**Moves.** Dragging a concept onto another removes its link to the old broader concept and
+adds the new one, writing `skos:broader` and `skos:narrower` together. Holding Ctrl or Alt
+keeps the old link, which builds a polyhierarchy, and the top zone makes a concept a top
+concept. A move under one of the concept's own narrower concepts is refused before the
+preview.
+
+**Labels.** The label table shows the preferred, alternative and hidden labels by language,
+with SKOS-XL labels marked. Adding or changing a label refuses a second preferred label in
+one language (S14) and a label that is already another kind of label (S13), counting the
+literal forms of SKOS-XL labels as S55 to S57 imply. A label converts between its plain
+and SKOS-XL forms, and a new SKOS-XL label gets an IRI minted from the resource's IRI.
+Deleting a SKOS-XL label removes its label resource.
+
+**Links.** The relations tab edits broader, narrower, related and the five mapping
+relations. Broader, narrower and related links are written in both directions, and a link
+stated in one direction only is marked with a repair that adds the other. The picker finds
+concepts by label in any scheme of the dataset or in another dataset the caller can read,
+or takes an IRI.
+
+**Collections, notes and search.** Collections and ordered collections list their members,
+and their members and `skos:memberList` are edited through the shape-driven form of
+[U02](../U02-shape-driven-forms/README.md) with its list editor. Notes and documentation
+are edited through the same form over the built-in SKOS shapes, grouped as notes and
+documentation. The search matches a substring of any label, SKOS-XL literal forms
+included, in all languages or one, and answers its first 100 matches.
+
+**Integrity shapes.** The built-in SKOS shapes, served by `GET /$/skos/shapes` and read by
+forms with `shapes=skos`, check S9, S13, S14, S27, S37 and S46 of the SKOS Reference with
+S51, S52 and S58 of the SKOS-XL appendix. They live in the Rust library as
+`sparkles::skos`, so a write guard enforces them like any shapes, and the page's checks
+tab runs them over the graph and installs them as the dataset's guard with grandfathered
+existing results. Each SPARQL constraint reads one property path or one basic graph
+pattern from the focus node, so a form check finds the resources an edit affects without
+validating the whole graph. The shapes graph does not hold the SKOS vocabulary, so the
+disjointness checks name the types the SKOS properties imply, ordered collections count
+as collections, the hierarchical and related mappings count for S27, and S46 follows the
+transitive closure of `skos:exactMatch`. Linked resources without their `rdf:type` are
+reported at `sh:Info` severity, since the Reference's own examples leave their resources
+untyped.
+
+**Sessions.** The page reuses the ontology editor's session through a shared module. Every
+edit of the tree, labels and links is a dry run with `If-Match` and a commit with the same
+precondition, undo and redo revert commits, **Start session** creates a
+`skos.<user>.<date>` branch, the change feed reloads the page after another writer's
+commit, and a protected branch or a reader's access makes the page read-only. The page
+reads its tag from the graph it edits and is read-only when it cannot, so no edit leaves
+without a precondition. The notes and members forms save through the forms of U02, whose
+saves check the stored values of the fields they change instead of the commit. The page
+lets them edit only a dataset that keeps no graph but the one it edits, and only when the
+form's target is that graph. A form reads every graph and deletes a removed value's
+nested nodes and list cells wherever they are, and its model names the graph of a list's
+members but not of its cells, so no narrower check could keep a save inside one graph.
+The check reads the stored default graph by its Jena name, `urn:x-arq:DefaultGraph`, so a
+stored copy of a named graph's triple counts as another graph, and a default graph that the
+server serves as the union of the named graphs does not. A caller whose grants cover only
+some graphs or triples cannot see every graph the check needs, so the forms are read-only
+for it. `/$/whoami` reports these limits for a dataset's main branch only, so with
+authentication on, the forms are read-only on other branches for every caller but a local
+one or a server administrator, until roadmap item 611 answers a caller's access per
+branch.
+Until the head and its tag are read, the page and its undo and redo are read-only.
+
+**Label edits.** A SKOS-XL label resource that another resource still refers to stays when
+one concept drops it or is deleted. Making a label preferred moves every alternative and
+hidden representation of that literal to preferred and demotes the language's other
+preferred labels, plain or SKOS-XL, to alternative labels. A conversion that waits for the
+graph's answer is dropped when the page has moved to another resource, graph or dataset. A new SKOS-XL label's IRI is
+checked against the whole graph. Blank-node SKOS-XL labels of one kind with the same
+literal form are shown without edit buttons, since an update can find a blank node only
+by its triples. Commit messages that are not ASCII are sent percent-encoded
+as UTF-8, which also fixed the ontology editor's labels in other scripts.
+
+The Rust tests check every condition against the consistent and inconsistent examples of
+the SKOS Reference and its SKOS-XL appendix, the forms over the shapes, form checks of
+edits that break S13, S14, S27 and S46, and the HTTP route. The UI's unit tests cover the
+label rules, the queries and the updates against an in-browser store. Playwright covers
+the tree, search, labels, links, moves, collections, notes, undo, stale edits and live
+refresh against the mock backend, and edits on a session branch against a real server,
+which leave main and the unrelated triples unchanged.
+
+Roadmap item 638 covers paged trees and an indexed label search for large
+thesauri, 639 labels for mapping targets in other datasets and mappings stated by
+the other concept, 640 the editing of `skosxl:labelRelation`, 641 a write
+guard that keeps a dataset's shapes beside the SKOS shapes, and 642 forms that
+read and write one graph and name the commit a page shows.

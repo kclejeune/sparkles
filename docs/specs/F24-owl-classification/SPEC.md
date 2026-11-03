@@ -174,8 +174,19 @@ reports possible incompleteness. HermiT 1.4.5.519, a complete OWL 2 DL reasoner,
 the same taxonomy on the 36 ORE ontologies where either EL reasoner uses axioms in part.
 Four test ontologies show what both EL reasoners miss when a property's range meets an
 individual, two subsumptions and an inconsistency, which the classifier reports as axioms
-used in part and item 587 covers. SNOMED CT is not available to the project and was not
-used, so the acceptance gate's SNOMED CT comparison remains open.
+used in part and item 587 covers. Konclude 0.7.0-1138 gives the same taxonomy on all 298
+ORE ontologies and ChEBI lite, and on GO it entails 14 more subsumptions between named
+classes, with 7 more direct edges, all through
+`InverseObjectProperties(part_of has_part)`, the GO axiom outside OWL 2 EL that the
+classifier leaves out and reports. Whelk 1.2.1 agrees on GO, ChEBI lite and 296 ORE
+ontologies and is incomplete on one. ROBOT 1.9.11's `reason`, `reduce`, `relax` and
+`materialize` with ELK assert the classifier's direct hierarchy on GO and ChEBI lite, and
+items 634 to 637 add ROBOT-compatible `sparkles ontology` commands for the
+outputs that Sparkles does not write. The
+reasoners are packaged in `nix/reasoners` from checksum-pinned releases and run through
+`scripts/elk-compare/elk.sh`. Their times on the benchmark host belong to items 604 and
+606. SNOMED CT is not available to the project and was not used, so the acceptance
+gate's SNOMED CT comparison remains open.
 
 **Measurements.** On forge, GO classifies in 410 ms and ChEBI lite in 2.97 s on four
 threads, at peak resident sets of 438 MiB and 1.66 GiB that include the axioms read.

@@ -1,9 +1,9 @@
 # The jars of ELK 0.6.0's OWL API binding and their runtime dependencies, which Maven
 # resolved for io.github.liveontologies:elk-owlapi:0.6.0 (OWL API 5.1.20), with
-# slf4j-simple 2.0.13 to print ELK's warnings. Each is fetched from Maven Central under
-# this path and checked against its SHA-256 here and against Maven Central's published
-# SHA-1. ELK is licensed under Apache-2.0 and the OWL API under LGPL-3.0 or Apache-2.0.
-# The jars are fetched at run time and never committed.
+# slf4j-simple 2.0.13 to print ELK's warnings. nix/reasoners/default.nix fetches each from
+# Maven Central under this path and checks it against its SHA-256 here, which was checked
+# against Maven Central's published SHA-1 when it was pinned. ELK is licensed under
+# Apache-2.0 and the OWL API under LGPL-3.0 or Apache-2.0. The jars are never committed.
 # path	sha256
 com/fasterxml/jackson/core/jackson-annotations/2.10.1/jackson-annotations-2.10.1.jar	673f8ae16becea4fa937404b3a851417faf42df3bbc592028bbe2bfe0cc9d8cb
 com/fasterxml/jackson/core/jackson-core/2.11.4/jackson-core-2.11.4.jar	e1dda269f16f3be00578f3a46c754f098245c7a480b86e07030b6ee7087ee1f1

@@ -192,6 +192,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/ontology/{ds}/diff", get(ontology::diff))
         .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/graph/{ds}/facets", post(graph::facets))
+        .route("/$/skos/shapes", get(skos_shapes))
         .route("/$/forms/{ds}", get(forms_model))
         .route("/$/forms/{ds}/check", post(forms_check))
         .route("/$/forms/{ds}/save", post(forms_save))
@@ -4190,6 +4191,9 @@ async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<
                 "resolve": "/{ds}/claims/resolve",
                 "review": "/{ds}/claims/review",
                 "withdraw": "/{ds}/claims/withdraw",
+                // identity proposals are reviewed through `review` under a matching
+                // policy, and their resolution maps are read here
+                "identities": "/{ds}/claims/identities",
             },
         },
     });
@@ -6018,6 +6022,18 @@ fn shacl_target(
                 format!("invalid target '{t}': {e}"),
             )
         })
+}
+
+/// `GET /$/skos/shapes`: the built-in SKOS shapes as Turtle (`sparkles::skos`).
+async fn skos_shapes() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/turtle; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        sparkles::skos::SHAPES,
+    )
+        .into_response()
 }
 
 #[cfg(not(feature = "shacl"))]

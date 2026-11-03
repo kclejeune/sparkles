@@ -3318,6 +3318,26 @@ export interface paths {
         patch: operations["patchSettings"];
         trace?: never;
     };
+    "/$/skos/shapes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The built-in SKOS shapes
+         * @description The SHACL shapes that lay out the forms of concept schemes, concepts, collections, ordered collections and SKOS-XL labels and check the integrity conditions of the SKOS Reference: S9, S13, S14, S27, S37 and S46, with S51, S52 and S58 of SKOS-XL and the literal forms of SKOS-XL labels counted for S13 and S14. Each result's message names its condition. Forms read them with `shapes=skos`, and `POST /{ds}/shacl` and `PUT /$/validation/{ds}` take the text as shapes.
+         */
+        get: operations["getSkosShapes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/snapshots/{ds}": {
         parameters: {
             query?: never;
@@ -3973,6 +3993,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/claims/identities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resolve entities through a resolution map
+         * @description Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again.
+         */
+        post: operations["resolveIdentities"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/claims/resolve": {
         parameters: {
             query?: never;
@@ -4004,7 +4044,7 @@ export interface paths {
         put?: never;
         /**
          * Review claims under a policy
-         * @description Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.
+         * @description Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Under a matching policy the targets are identity proposals and the policy's resolution map follows the decisions: an operation that changes which accepted decisions it follows writes one immutable map revision in the policy's maps graph and rewrites the clusters it changed in the output graph, and needs update and read grants on the decisions, maps and output graphs and read access to every effective proposal of those clusters. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 identity-conflict` when an accepted separation would share a cluster, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.
          */
         post: operations["reviewClaims"];
         delete?: never;
@@ -6523,7 +6563,35 @@ export interface components {
              */
             id?: string;
         };
-        /** @description One batch of evidence records. At most 1,000 claims, 10,000 links and 16 MiB of decoded input. */
+        /** @description Entities to resolve through a matching policy's current resolution map. */
+        EvidenceIdentities: {
+            /** @description The entity IRIs to resolve. */
+            entities: string[];
+            /** @description The name of a matching policy of the evidence settings. */
+            policy: string;
+        };
+        /** @description What the current resolution map selects for each entity. */
+        EvidenceIdentitiesResult: {
+            /** @description The commit the map was read at. */
+            commit: number;
+            entities: {
+                /** @description The current accepted decisions that join the cluster. */
+                decisions: string[];
+                entity: string;
+                /** @description The members of its cluster, sorted, at most 1,000. */
+                members: string[];
+                membersComplete: boolean;
+                /** @description The entity the map selects, the entity itself when the map does not name it. */
+                representative: string;
+            }[];
+            /** @description Its number, 0 before the first. */
+            number: number;
+            /** @description The matching policy. */
+            policy: string;
+            /** @description The latest resolution map revision, `null` before the first. */
+            revision: string | null;
+        };
+        /** @description One batch of evidence records. At most 1,000 claims, 10,000 links, 1,000 identity proposals and 16 MiB of decoded input. */
         EvidenceProposal: {
             assessments?: {
                 /** @description An N-Triples term. */
@@ -6565,7 +6633,7 @@ export interface components {
                 scope?: {
                     [key: string]: string[];
                 };
-                /** @description A claim or assessment. */
+                /** @description A claim, assessment or identity proposal. */
                 target: {
                     /** @description An existing authenticated record, by its IRI. */
                     iri?: string;
@@ -6646,6 +6714,28 @@ export interface components {
             dryRun?: boolean;
             /** @description Makes a retry with the same payload answer the first receipt. The operation IRI is derived from the dataset, the caller and the key. */
             idempotencyKey?: string;
+            identities?: {
+                /** @description The attributed proposer. */
+                author: string;
+                /** @description The exact entity IRIs, distinct, in any order. */
+                entities: string[];
+                /** @description The record's key in this batch. */
+                key: string;
+                method?: {
+                    /** @description The method's IRI. */
+                    method: string;
+                    /** @description The method's version. */
+                    version: string;
+                };
+                /** @description The proposal's key within its set of entities. */
+                occurrenceKey: string;
+                /** @description For a possible match, the entity it prefers as its cluster's selected entity, one of `entities`. */
+                preferredEntity?: string;
+                /** @enum {string} */
+                relation: "possibleMatch" | "distinctEntities";
+            }[];
+            /** @description The identity graph of the batch's identity proposals, needed when the settings name more than one. */
+            identityGraph?: string;
             /** @description Publish only while this commit is the branch head, else `409 head-changed`. */
             ifHead?: number;
             links?: {
@@ -6664,7 +6754,7 @@ export interface components {
                 occurrenceKey: string;
                 /** @enum {string} */
                 relation: "supports" | "contradicts" | "mentions";
-                /** @description A claim or assessment. */
+                /** @description A claim, assessment or identity proposal. */
                 target: {
                     /** @description An existing authenticated record, by its IRI. */
                     iri?: string;
@@ -6858,7 +6948,7 @@ export interface components {
                 iri: string;
                 key: string;
                 /** @enum {string} */
-                kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection";
+                kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection" | "ResolutionMap";
                 /** @description The digest of the record's immutable content. */
                 recordDigest: string;
             }[];
@@ -6877,7 +6967,7 @@ export interface components {
                     /** @description The record's IRI. */
                     iri: string;
                     /** @description The kinds the record may have. Any profile kind when absent. */
-                    kinds?: ("SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection")[];
+                    kinds?: ("SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection" | "ResolutionMap")[];
                 };
                 storedFact?: {
                     /**
@@ -6914,7 +7004,7 @@ export interface components {
                     graph: string;
                     iri: string;
                     /** @enum {string} */
-                    kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection";
+                    kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection" | "ResolutionMap";
                     receipt: {
                         /**
                          * Format: uuid
@@ -6973,7 +7063,7 @@ export interface components {
                 key: string;
                 /** @description The target's current decision under the policy, required when it has one, else `409 decision-superseded`. */
                 supersedes?: string;
-                /** @description The reviewed claim or assessment. */
+                /** @description The reviewed claim or assessment, or under a matching policy the reviewed identity proposal. */
                 target: string;
                 /** @description The target's record digest as the reviewer saw it, else `409 target-changed`. */
                 targetDigest: string;
@@ -6986,7 +7076,7 @@ export interface components {
             ifHead: number;
             /** @description The commit message. */
             message?: string;
-            /** @description The name of a review policy of the evidence settings. */
+            /** @description The name of a review policy or a matching policy of the evidence settings. */
             policy: string;
             /** @description The policy version the reviewer saw, else `409 policy-changed`. */
             policyVersion: number;
@@ -6998,7 +7088,7 @@ export interface components {
              * @description The branch the commit published on.
              */
             branchId: string;
-            /** @description The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay. */
+            /** @description The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay. */
             changed: {
                 inserted: {
                     /** @description The output graph. */
@@ -7006,6 +7096,20 @@ export interface components {
                     /** @description The projected triple in N-Triples. */
                     triple: string;
                 }[];
+                /** @description A review under a matching policy that changed which accepted decisions its resolution map follows. */
+                map?: {
+                    decisionsAdded: string[];
+                    decisionsEnded: string[];
+                    /** @description The entities whose selected entity changed. */
+                    entities: string[];
+                    number: number;
+                    /** @description The matching policy. */
+                    policy: string;
+                    /** @description The revision it follows, whose consumers may need review. */
+                    previous: string | null;
+                    /** @description The resolution map revision the operation published. */
+                    revision: string;
+                };
                 removed: {
                     /** @description The output graph. */
                     output: string;
@@ -7039,6 +7143,8 @@ export interface components {
                 inserted: number;
                 wouldCommit: boolean;
             };
+            /** @description The resolution map revision a review under a matching policy published, also for a replay. */
+            mapRevision?: string | null;
             /** @description The operation, every decision's availability receipt. */
             operation: string;
             /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
@@ -7053,7 +7159,22 @@ export interface components {
             format: 1;
             /** @description Graphs of identity proposals and resolution maps. */
             identity?: string[];
-            /** @description Named review policies. */
+            /** @description Named matching policies of identity proposals. Their names are distinct from the review policies' names, and the two kinds together hold at most 64 policies. */
+            matchingPolicies?: {
+                [key: string]: {
+                    /** @description The identity, sourceRecords and proposals graphs whose records the policy's reviews may use. At least one is an identity graph. */
+                    boundary: string[];
+                    /** @description The decisions graph the policy's reviews append to. */
+                    decisions: string;
+                    /** @description The identity graph that holds the policy's resolution map revisions. */
+                    maps: string;
+                    /** @description The projection graph that holds the current resolution map. */
+                    output: string;
+                    /** @description Raised whenever the policy's meaning changes. */
+                    version: number;
+                };
+            };
+            /** @description Named review policies of claims and assessments. */
             policies?: {
                 [key: string]: {
                     /** @description The claim kinds the policy can admit. Only positive claims are admitted. */
@@ -7123,7 +7244,7 @@ export interface components {
              * @description The branch the commit published on.
              */
             branchId: string;
-            /** @description The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay. */
+            /** @description The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay. */
             changed: {
                 inserted: {
                     /** @description The output graph. */
@@ -7131,6 +7252,20 @@ export interface components {
                     /** @description The projected triple in N-Triples. */
                     triple: string;
                 }[];
+                /** @description A review under a matching policy that changed which accepted decisions its resolution map follows. */
+                map?: {
+                    decisionsAdded: string[];
+                    decisionsEnded: string[];
+                    /** @description The entities whose selected entity changed. */
+                    entities: string[];
+                    number: number;
+                    /** @description The matching policy. */
+                    policy: string;
+                    /** @description The revision it follows, whose consumers may need review. */
+                    previous: string | null;
+                    /** @description The resolution map revision the operation published. */
+                    revision: string;
+                };
                 removed: {
                     /** @description The output graph. */
                     output: string;
@@ -14791,8 +14926,8 @@ export interface operations {
                 focus?: string;
                 /** @description The class of a new instance. */
                 class?: string;
-                /** @description Where the shapes come from, when not the dataset's `forms` setting. */
-                shapes?: "guard" | "graphs" | "drafted";
+                /** @description Where the shapes come from, when not the dataset's `forms` setting. `skos` names the built-in SKOS shapes of `GET /$/skos/shapes`, which only a request can choose. */
+                shapes?: "guard" | "graphs" | "drafted" | "skos";
                 /** @description The language labels are picked in, then English, then untagged. */
                 lang?: string;
                 /** @description Also answer the blank-node children that fields declaring `sh:node` reach (`nestedNodes`) and the empty forms of new children (`templates`). A nested model past its allowances answers the flat form with `nested.refused`. */
@@ -14918,10 +15053,10 @@ export interface operations {
                         parent?: Record<string, never>;
                     }[];
                     /**
-                     * @description The shapes the form was built from, when not the setting's.
+                     * @description The shapes the form was built from, when not the setting's. `skos` names the built-in SKOS shapes.
                      * @enum {string}
                      */
-                    shapes?: "guard" | "graphs" | "drafted";
+                    shapes?: "guard" | "graphs" | "drafted" | "skos";
                 };
             };
         };
@@ -15012,10 +15147,10 @@ export interface operations {
                         parent?: Record<string, never>;
                     }[];
                     /**
-                     * @description The shapes the form was built from, when not the setting's.
+                     * @description The shapes the form was built from, when not the setting's. `skos` names the built-in SKOS shapes.
                      * @enum {string}
                      */
-                    shapes?: "guard" | "graphs" | "drafted";
+                    shapes?: "guard" | "graphs" | "drafted" | "skos";
                 };
             };
         };
@@ -20423,6 +20558,29 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getSkosShapes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The shapes. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/turtle": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
     listSnapshots: {
         parameters: {
             query?: never;
@@ -22446,6 +22604,42 @@ export interface operations {
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
             409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    resolveIdentities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceIdentities"];
+            };
+        };
+        responses: {
+            /** @description The map's revision and each entity's resolution. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceIdentitiesResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
             413: components["responses"]["PayloadTooLarge"];
             422: components["responses"]["Unprocessable"];
             503: components["responses"]["Unavailable"];

@@ -991,7 +991,7 @@ fn forms(p: &mut Paths) {
             "focus": { "type": "string", "description": "The IRI of the resource. Give either `focus` or `class`." },
             "class": { "type": "string", "description": "The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`." },
             "branch": { "type": "string", "description": "The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch." },
-            "shapes": { "type": "string", "enum": ["guard", "graphs", "drafted"], "description": "The shapes the form was built from, when not the setting's." },
+            "shapes": { "type": "string", "enum": ["guard", "graphs", "drafted", "skos"], "description": "The shapes the form was built from, when not the setting's. `skos` names the built-in SKOS shapes." },
             "changes": field_changes.clone(),
             "expect": { "type": "object", "additionalProperties": { "type": "array", "items": term.clone() }, "description": "The values the form loaded, by field id, for every changed field, and for a list field the members of its list in order." },
             "nested": { "type": "array", "description": "Changes to nested blank-node children, committed atomically with `changes`. Each entry names its `node`, the `parent` it hangs from (absent for the root, else another entry's node) and the parent's `field`. A stored child must be a visible value of that field now, and every node between it and the root needs an entry.", "items": { "type": "object", "required": ["node", "field"], "additionalProperties": false, "properties": {
@@ -1010,7 +1010,7 @@ fn forms(p: &mut Paths) {
             .see("editing-forms")
             .query("focus", s(), "The IRI of the resource. Give either `focus` or `class`.")
             .query("class", s(), "The class of a new instance.")
-            .query("shapes", json!({ "type": "string", "enum": ["guard", "graphs", "drafted"] }), "Where the shapes come from, when not the dataset's `forms` setting.")
+            .query("shapes", json!({ "type": "string", "enum": ["guard", "graphs", "drafted", "skos"] }), "Where the shapes come from, when not the dataset's `forms` setting. `skos` names the built-in SKOS shapes of `GET /$/skos/shapes`, which only a request can choose.")
             .query("lang", s(), "The language labels are picked in, then English, then untagged.")
             .query("nested", json!({ "type": "boolean" }), "Also answer the blank-node children that fields declaring `sh:node` reach (`nestedNodes`) and the empty forms of new children (`templates`). A nested model past its allowances answers the flat form with `nested.refused`.")
             .params(&["branch", "at", "timeout"])
@@ -1042,6 +1042,12 @@ fn forms(p: &mut Paths) {
                 } } })),
             )
             .errors(&[400, 403, 404, 408, 501]),
+    );
+    p.add(
+        op(GET, "/$/skos/shapes", "getSkosShapes", "Validation", "The built-in SKOS shapes")
+            .doc("The SHACL shapes that lay out the forms of concept schemes, concepts, collections, ordered collections and SKOS-XL labels and check the integrity conditions of the SKOS Reference: S9, S13, S14, S27, S37 and S46, with S51, S52 and S58 of SKOS-XL and the literal forms of SKOS-XL labels counted for S13 and S14. Each result's message names its condition. Forms read them with `shapes=skos`, and `POST /{ds}/shacl` and `PUT /$/validation/{ds}` take the text as shapes.")
+            .see("skos-shapes")
+            .resp("200", "The shapes.", Some(json!({ "text/turtle": text() }))),
     );
     p.add(
         op(POST, "/$/forms/{ds}/check", "checkForm", "Validation", "Check a form's changes")
@@ -3342,7 +3348,7 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(POST, "/{ds}/claims/review", "reviewClaims", "SPARQL", "Review claims under a policy")
-            .doc("Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.")
+            .doc("Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Under a matching policy the targets are identity proposals and the policy's resolution map follows the decisions: an operation that changes which accepted decisions it follows writes one immutable map revision in the policy's maps graph and rewrites the clusters it changed in the output graph, and needs update and read grants on the decisions, maps and output graphs and read access to every effective proposal of those clusters. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 identity-conflict` when an accepted separation would share a cluster, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.")
             .see("evidence-reviews")
             .json_body(true, "EvidenceReview")
             .json("200", "The operation and its decisions, published, replayed or previewed.", "EvidenceReviewResult")
@@ -3355,6 +3361,14 @@ fn assist(p: &mut Paths) {
             .json_body(true, "EvidenceWithdrawal")
             .json("200", "The operation and its withdrawals, published, replayed or previewed.", "EvidenceWithdrawalResult")
             .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
+    );
+    p.add(
+        op(POST, "/{ds}/claims/identities", "resolveIdentities", "SPARQL", "Resolve entities through a resolution map")
+            .doc("Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again.")
+            .see("evidence-identities")
+            .json_body(true, "EvidenceIdentities")
+            .json("200", "The map's revision and each entity's resolution.", "EvidenceIdentitiesResult")
+            .errors(&[400, 403, 404, 408, 413, 422, 503]),
     );
     p.add(
         op(POST, "/{ds}/sources", "registerSource", "SPARQL", "Register a source document")

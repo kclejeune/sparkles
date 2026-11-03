@@ -4,6 +4,7 @@ import {
   deniedCallback,
   displayName,
   fmtExpires,
+  graphRestricted,
   hasServer,
   interactive,
   loginErrorMessage,
@@ -61,6 +62,27 @@ describe('permissions', () => {
     expect(can(alice, 'anything', 'admin')).toBe(true);
     expect(hasServer(alice, 'metrics')).toBe(true);
     expect(hasServer(bob, 'metrics')).toBe(false);
+  });
+  it('tells a dataset whose grants may hide some graphs or triples', () => {
+    const carol = {
+      ...bob,
+      restricted: {
+        wiki: { graphs: true },
+        team: { graphs: false },
+        notes: { graphs: false, triples: true },
+      },
+    };
+    expect(graphRestricted(carol, 'wiki')).toBe(true);
+    expect(graphRestricted(carol, 'team')).toBe(false);
+    expect(graphRestricted(carol, 'notes')).toBe(true);
+    expect(graphRestricted(bob, 'wiki')).toBe(false);
+    expect(graphRestricted(open, 'wiki')).toBe(false);
+    // whoami answers for main, so another branch's grants are unknown
+    expect(graphRestricted(bob, 'wiki', 'work')).toBe(true);
+    expect(graphRestricted(bob, 'wiki', 'main')).toBe(false);
+    expect(graphRestricted(open, 'wiki', 'work')).toBe(false);
+    const admin = { ...bob, server: ['server-admin' as const] };
+    expect(graphRestricted(admin, 'wiki', 'work')).toBe(false);
   });
   it('orders levels', () => {
     expect(minLevel('admin', 'read')).toBe('read');

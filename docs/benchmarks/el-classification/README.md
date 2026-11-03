@@ -32,39 +32,50 @@ release's RDF/XML file, with the annotation assertions left out. The classifier 
 annotations, so both reasoners read the same logical axioms from a smaller file. The
 records give each file's SHA-256.
 
-## The ELK harness
+## The reference reasoners
 
-`scripts/elk-compare/elk.sh` runs ELK 0.6.0 through OWL API 5.1.20. Its `fetch` step
-downloads the jars that `scripts/elk-compare/pins.tsv` lists from Maven Central, checks
-each against its pinned SHA-256 and Maven Central's SHA-1, and compiles
-`scripts/elk-compare/ElkClassify.java`. Its `run` step starts the JVM with the heap of
-`ELK_HEAP` as both `-Xms` and `-Xmx`, the G1 collector and a memory-capped systemd scope.
-ElkClassify reads the same functional-style file as `el_classify`, refuses a file with
-imports, and repeats a load and a classification `--repeat` times in one JVM. Each run
-loads the file with a fresh OWL API manager, creates an ELK reasoner with `--threads`
-workers and precomputes the class hierarchy. The JSON line it prints gives the load time
-and the classification time of every run, the live heap after a full collection with the
-reasoner still open, the peak resident memory of the process and the JVM's arguments.
+`scripts/elk-compare/elk.sh` runs the reference reasoners that `nix/reasoners` packages
+from checksum-pinned releases. The flake builds them as `.#elk`, `.#hermit`, `.#whelk`,
+`.#konclude` and `.#robot`. ELK 0.6.0 and HermiT 1.4.5.519 run on OWL API 5.1.20, and
+Whelk 1.2.1 runs on OWL API 4.5.22 and Scala 2.13. Their jars come from Maven Central
+and are checked against the SHA-256 sums of `nix/reasoners/elk.tsv`, `hermit.tsv` and
+`whelk.tsv`. Konclude 0.7.0-1138 is the project's Linux x86_64 release binary, which links
+Qt statically and is patched for Nix's C libraries, and it exists only on x86_64 Linux. ROBOT 1.9.11 is its release jar, which
+bundles OWL API 4.5.29, ELK 0.6.0 and HermiT. Each Java package has a wrapper that names
+nixpkgs' JDK 17, so a systemd unit with a minimal PATH runs it as it is.
+`elk.sh path NAME` builds a package and prints its executable, and `ELK_CLASSIFY`,
+`HERMIT_CLASSIFY`, `WHELK_CLASSIFY`, `KONCLUDE` and `ROBOT` name an executable built
+elsewhere for a host that runs no Nix build.
 
-ELK's classification time runs from the creation of the reasoner to the end of
-`precomputeInferences`. It includes ELK's own reading of the axioms from the OWL API
-ontology and the construction of its taxonomy, as the classification time of
-`el_classify` includes indexing and the taxonomy. Reading the file is the OWL API's load
-for ELK and `el_classify`'s parse for Sparkles, and both are reported apart. The first
-run in a JVM includes the compilation of its hot code, so the tables give the median of
-five runs in one process and the first run separately. The JVM's peak resident memory
-follows its heap setting more than its live data, so the records also give the live
-heap and a run with a smaller heap.
+`elk.sh run --reasoner elk|hermit|whelk|konclude` classifies a file. A JVM gets the heap
+of `ELK_HEAP` as both `-Xms` and `-Xmx` and the G1 collector, and every reasoner runs in
+a memory-capped systemd scope. The Java reasoners run
+`scripts/elk-compare/ElkClassify.java`, which each package compiles against its own jars.
+It reads the same functional-style file as `el_classify`, refuses a file with imports,
+and repeats a load and a classification `--repeat` times in one JVM. Each run loads the
+file with a fresh OWL API manager, creates the reasoner, with `--threads` workers for
+ELK, and precomputes the class hierarchy. HermiT and Whelk classify on one thread. The
+JSON line it prints gives the load time and the classification time of every run, the
+live heap after a full collection with the reasoner still open, the peak resident memory
+of the process and the JVM's arguments.
 
-`--taxonomy` writes ELK's direct hierarchy in the functional-style form that
+`--taxonomy` writes the reasoner's direct hierarchy in the functional-style form that
 `scripts/el-oracle.py` reads, with the unsatisfiable classes in the node of
 `owl:Nothing`. ELK stops at an inconsistent ontology, and the harness then writes one
 node of every class, as the classifier does.
 
-`--reasoner hermit` runs HermiT 1.4.5.519 in place of ELK over the same OWL API jars, with
-the jars that `scripts/elk-compare/hermit-pins.tsv` pins. HermiT is a complete OWL 2 DL
-reasoner, so it checks the entailments that an EL reasoner may miss on ontologies with
-individuals.
+Konclude runs through `scripts/elk-compare/konclude.py`, one process per classification
+with `-w` set to `--threads`. Its JSON line gives each process's wall time, which covers
+the parse, the classification and the written hierarchy, the parse and total times that
+Konclude's log reports and each process's peak resident memory. The script converts
+Konclude's class hierarchy into the form above. It groups the classes by the cycles of
+the subclass graph, since Konclude can write an equivalence as two subclass axioms, a
+class equivalent to `owl:Thing` as `SubClassOf(owl:Thing A)` and an inconsistent
+ontology as `SubClassOf(owl:Thing owl:Nothing)`.
+
+HermiT and Konclude are complete OWL 2 DL reasoners, so they check the entailments that an
+EL reasoner may miss on ontologies with individuals. Whelk is a second OWL 2 EL reasoner,
+and ROBOT is the OWL API tool that OBO release pipelines classify with.
 
 ## Correctness evidence
 

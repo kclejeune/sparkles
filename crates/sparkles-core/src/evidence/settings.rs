@@ -54,9 +54,13 @@ pub struct Settings {
     /// Dedicated graphs of accepted projections. A projection graph has no other role.
     #[serde(default, deserialize_with = "graphs")]
     pub projections: Vec<String>,
-    /// Named review policies.
+    /// Named review policies of claims and assessments.
     #[serde(default, deserialize_with = "policies")]
     pub policies: BTreeMap<String, Policy>,
+    /// Named matching policies of identity proposals. Their names share one namespace
+    /// and one bound with `policies`.
+    #[serde(default, deserialize_with = "policies")]
+    pub matching_policies: BTreeMap<String, MatchingPolicy>,
 }
 
 impl Default for Settings {
@@ -72,6 +76,7 @@ impl Default for Settings {
             identity: Vec::new(),
             projections: Vec::new(),
             policies: BTreeMap::new(),
+            matching_policies: BTreeMap::new(),
         }
     }
 }
@@ -119,6 +124,27 @@ pub struct Policy {
     /// The supports graph that owns the policy's projected triples.
     pub supports: String,
     /// The projection graph the policy writes. Each projection graph has one policy.
+    pub output: String,
+}
+
+/// One named matching policy. A review of identity proposals names the policy and its
+/// `version`, as a claim review does. The policy's accepted `possibleMatch` proposals
+/// form clusters of entities, and its output graph holds the current resolution map.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MatchingPolicy {
+    /// Raised by the administrator whenever the policy's meaning changes.
+    pub version: u32,
+    /// The identity, source-record and proposal graphs whose records the policy's
+    /// reviews may use. It holds at least one identity graph, where the proposals are.
+    #[serde(deserialize_with = "graphs")]
+    pub boundary: Vec<String>,
+    /// The decisions graph the policy's reviews append to.
+    pub decisions: String,
+    /// The identity graph that holds the policy's resolution map revisions.
+    pub maps: String,
+    /// The projection graph that holds the current resolution map. Each projection graph
+    /// has one policy of either kind.
     pub output: String,
 }
 
@@ -322,6 +348,62 @@ impl Settings {
                 )));
             }
         }
+        if self.policies.len() + self.matching_policies.len() > MAX_POLICIES {
+            return Err(Error::invalid(format!(
+                "more than {MAX_POLICIES} review and matching policies"
+            )));
+        }
+        let identity_boundary: BTreeSet<&str> = boundary
+            .iter()
+            .copied()
+            .chain(self.identity.iter().map(String::as_str))
+            .collect();
+        for (name, policy) in &self.matching_policies {
+            control.check()?;
+            let invalid =
+                |message: String| Error::invalid(format!("matchingPolicies.{name}: {message}"));
+            policy_name(name).map_err(|m| invalid(m.to_string()))?;
+            if self.policies.contains_key(name) {
+                return Err(invalid(
+                    "a review policy has the same name; policy names are shared".into(),
+                ));
+            }
+            if policy.version == 0 {
+                return Err(invalid("version starts at 1".into()));
+            }
+            let mut seen = BTreeSet::new();
+            for graph in &policy.boundary {
+                if !seen.insert(graph.as_str()) {
+                    return Err(invalid("boundary names a graph twice".into()));
+                }
+                if !identity_boundary.contains(graph.as_str()) {
+                    return Err(invalid(format!(
+                        "boundary graph <{graph}> is not an identity, sourceRecords or proposals graph"
+                    )));
+                }
+            }
+            if !policy.boundary.iter().any(|g| self.identity.contains(g)) {
+                return Err(invalid("boundary names no identity graph".into()));
+            }
+            for (field, graph, role, named) in [
+                ("decisions", &policy.decisions, &self.decisions, "decisions"),
+                ("maps", &policy.maps, &self.identity, "identity"),
+                ("output", &policy.output, &self.projections, "projections"),
+            ] {
+                graph_iri(graph).map_err(|m| invalid(format!("{field}: {m}")))?;
+                if !role.contains(graph) {
+                    return Err(invalid(format!(
+                        "{field} graph <{graph}> is not one of the {named} graphs"
+                    )));
+                }
+            }
+            if let Some(other) = outputs.insert(policy.output.as_str(), name.as_str()) {
+                return Err(invalid(format!(
+                    "output graph <{}> is already the output of policy {other}",
+                    policy.output
+                )));
+            }
+        }
         if let Some(graph) = self
             .projections
             .iter()
@@ -382,11 +464,21 @@ impl Settings {
         }
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
+        struct MatchingBody<'a> {
+            boundary: Vec<&'a str>,
+            decisions: &'a str,
+            maps: &'a str,
+            output: &'a str,
+            version: u32,
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
         struct Body<'a> {
             decisions: Vec<&'a str>,
             enabled: bool,
             format: u32,
             identity: Vec<&'a str>,
+            matching_policies: BTreeMap<&'a str, MatchingBody<'a>>,
             policies: BTreeMap<&'a str, PolicyBody<'a>>,
             profile: u32,
             projections: Vec<&'a str>,
@@ -421,6 +513,22 @@ impl Settings {
             enabled: self.enabled,
             format: self.format,
             identity: sorted(&self.identity),
+            matching_policies: self
+                .matching_policies
+                .iter()
+                .map(|(name, p)| {
+                    (
+                        name.as_str(),
+                        MatchingBody {
+                            boundary: sorted(&p.boundary),
+                            decisions: &p.decisions,
+                            maps: &p.maps,
+                            output: &p.output,
+                            version: p.version,
+                        },
+                    )
+                })
+                .collect(),
             policies,
             profile: self.profile,
             projections: sorted(&self.projections),
@@ -564,12 +672,12 @@ fn graphs<'de, D: Deserializer<'de>>(
 
 /// A bounded object of named policies that refuses a name given twice, which a plain
 /// map would silently collapse.
-fn policies<'de, D: Deserializer<'de>>(
+fn policies<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
-) -> std::result::Result<BTreeMap<String, Policy>, D::Error> {
-    struct Policies;
-    impl<'de> de::Visitor<'de> for Policies {
-        type Value = BTreeMap<String, Policy>;
+) -> std::result::Result<BTreeMap<String, T>, D::Error> {
+    struct Policies<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> de::Visitor<'de> for Policies<T> {
+        type Value = BTreeMap<String, T>;
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("an object of at most 64 named review policies")
         }
@@ -588,13 +696,13 @@ fn policies<'de, D: Deserializer<'de>>(
                 if out.contains_key(&name) {
                     return Err(de::Error::custom(format!("policy {name} is defined twice")));
                 }
-                let policy = map.next_value::<Policy>()?;
+                let policy = map.next_value::<T>()?;
                 out.insert(name, policy);
             }
             Ok(out)
         }
     }
-    deserializer.deserialize_map(Policies)
+    deserializer.deserialize_map(Policies(std::marker::PhantomData))
 }
 
 #[cfg(test)]
@@ -614,10 +722,10 @@ mod tests {
     fn canonical_settings_are_sorted_explicit_and_match_an_independent_golden() {
         let settings = enabled();
         let canonical = settings.canonical(&Control::none()).unwrap();
-        assert_eq!(canonical.bytes(), br#"{"decisions":[],"enabled":true,"format":1,"identity":[],"policies":{},"profile":1,"projections":[],"proposals":["urn:p"],"sourceRecords":["urn:a","urn:z"],"supports":[]}"#);
+        assert_eq!(canonical.bytes(), br#"{"decisions":[],"enabled":true,"format":1,"identity":[],"matchingPolicies":{},"policies":{},"profile":1,"projections":[],"proposals":["urn:p"],"sourceRecords":["urn:a","urn:z"],"supports":[]}"#);
         assert_eq!(
             canonical.digest().to_string(),
-            "sha256:b9f31672e9b7074e5bacdf766ed40d5573994432b9478ec4a7b87671fb57efd3"
+            "sha256:31ae14441a76c5997057785d3bd60f5e658d15708611adc18f006b8e08c7e9cf"
         );
         assert_eq!(
             serde_json::to_vec(canonical.value()).unwrap(),
@@ -637,11 +745,11 @@ mod tests {
         let default = Settings::default().canonical(&Control::none()).unwrap();
         assert_eq!(
             default.bytes(),
-            br#"{"decisions":[],"enabled":false,"format":1,"identity":[],"policies":{},"profile":1,"projections":[],"proposals":[],"sourceRecords":[],"supports":[]}"#
+            br#"{"decisions":[],"enabled":false,"format":1,"identity":[],"matchingPolicies":{},"policies":{},"profile":1,"projections":[],"proposals":[],"sourceRecords":[],"supports":[]}"#
         );
         assert_eq!(
             default.digest().to_string(),
-            "sha256:dd5218a7a36fad4454037e9c2debaafc6e114da10bf022dab2bccd7326ef7d33"
+            "sha256:824b515f8aa27bb74ca59d2395e1e025ddcb895570ade6bb4975fee237bad518"
         );
     }
 
@@ -673,11 +781,11 @@ mod tests {
         let canonical = settings.canonical(&Control::none()).unwrap();
         assert_eq!(
             canonical.bytes(),
-            br#"{"decisions":["urn:d"],"enabled":true,"format":1,"identity":["urn:i"],"policies":{"advisories":{"admittedKinds":["observation","reported"],"boundary":["urn:a","urn:p"],"conflicts":"admitLabelled","decisions":"urn:d","output":"urn:out","requiredScope":["urn:scope:release"],"supports":"urn:s","version":2}},"profile":1,"projections":["urn:out"],"proposals":["urn:p"],"sourceRecords":["urn:a","urn:z"],"supports":["urn:s"]}"#
+            br#"{"decisions":["urn:d"],"enabled":true,"format":1,"identity":["urn:i"],"matchingPolicies":{},"policies":{"advisories":{"admittedKinds":["observation","reported"],"boundary":["urn:a","urn:p"],"conflicts":"admitLabelled","decisions":"urn:d","output":"urn:out","requiredScope":["urn:scope:release"],"supports":"urn:s","version":2}},"profile":1,"projections":["urn:out"],"proposals":["urn:p"],"sourceRecords":["urn:a","urn:z"],"supports":["urn:s"]}"#
         );
         assert_eq!(
             canonical.digest().to_string(),
-            "sha256:5d0b582f8a3cd6ee16aaf155fe4ca45cb3ed820e902d4701881fdbd2e725518a"
+            "sha256:7a2edb8c95bf9f818e9cdd0ced09077b50230c4ae144e7a64d69c3504d95c084"
         );
         let decoded = Settings::from_slice(canonical.bytes(), &Control::none()).unwrap();
         assert_eq!(
@@ -859,6 +967,139 @@ mod tests {
         settings.policies.clear();
         assert!(settings.validate(&Control::none()).is_err());
         settings.projections.clear();
+        assert!(settings.validate(&Control::none()).is_ok());
+    }
+
+    fn matched() -> Settings {
+        let mut settings = reviewed();
+        settings.identity.push("urn:m".into());
+        settings.projections.push("urn:map".into());
+        settings.matching_policies.insert(
+            "people".into(),
+            MatchingPolicy {
+                version: 3,
+                boundary: vec!["urn:p".into(), "urn:i".into()],
+                decisions: "urn:d".into(),
+                maps: "urn:m".into(),
+                output: "urn:map".into(),
+            },
+        );
+        settings
+    }
+
+    #[test]
+    fn matching_policies_have_an_independent_golden_and_reference_their_roles() {
+        let settings = matched();
+        let canonical = settings.canonical(&Control::none()).unwrap();
+        assert_eq!(
+            canonical.bytes(),
+            br#"{"decisions":["urn:d"],"enabled":true,"format":1,"identity":["urn:i","urn:m"],"matchingPolicies":{"people":{"boundary":["urn:i","urn:p"],"decisions":"urn:d","maps":"urn:m","output":"urn:map","version":3}},"policies":{"advisories":{"admittedKinds":["observation","reported"],"boundary":["urn:a","urn:p"],"conflicts":"admitLabelled","decisions":"urn:d","output":"urn:out","requiredScope":["urn:scope:release"],"supports":"urn:s","version":2}},"profile":1,"projections":["urn:map","urn:out"],"proposals":["urn:p"],"sourceRecords":["urn:a","urn:z"],"supports":["urn:s"]}"#
+        );
+        assert_eq!(
+            canonical.digest().to_string(),
+            "sha256:603171de274f97d4af635aeb6b7f6ddcd170aafde6dbffa0c6d1bb56b9642303"
+        );
+        let decoded = Settings::from_slice(canonical.bytes(), &Control::none()).unwrap();
+        assert_eq!(
+            decoded.canonical(&Control::none()).unwrap().bytes(),
+            canonical.bytes()
+        );
+        assert_eq!(decoded.matching_policies, {
+            let mut m = settings.matching_policies.clone();
+            m.get_mut("people").unwrap().boundary.sort();
+            m
+        });
+        let text = std::str::from_utf8(canonical.bytes()).unwrap();
+        for (from, to) in [
+            (
+                r#""version":3"#,
+                r#""version":3,"relations":["possibleMatch"]"#,
+            ),
+            (r#""maps":"urn:m""#, r#""maps":["urn:m"]"#),
+        ] {
+            assert!(text.contains(from), "{from}");
+            let changed = text.replace(from, to);
+            assert!(Settings::from_slice(changed.as_bytes(), &Control::none()).is_err());
+        }
+        let check = |change: &dyn Fn(&mut Settings)| {
+            let mut settings = matched();
+            change(&mut settings);
+            settings.validate(&Control::none())
+        };
+        assert!(check(&|_| {}).is_ok());
+        type Change = Box<dyn Fn(&mut Settings)>;
+        let with = |f: fn(&mut MatchingPolicy)| -> Change {
+            Box::new(move |s: &mut Settings| f(s.matching_policies.get_mut("people").unwrap()))
+        };
+        let refusals: Vec<(&str, Change)> = vec![
+            ("version zero", with(|p| p.version = 0)),
+            ("maps outside identity", with(|p| p.maps = "urn:p".into())),
+            (
+                "decisions outside decisions",
+                with(|p| p.decisions = "urn:s".into()),
+            ),
+            (
+                "output outside projections",
+                with(|p| p.output = "urn:i".into()),
+            ),
+            (
+                "output of a review policy",
+                with(|p| p.output = "urn:out".into()),
+            ),
+            (
+                "boundary without identity",
+                with(|p| p.boundary = vec!["urn:p".into()]),
+            ),
+            (
+                "boundary outside roles",
+                with(|p| p.boundary = vec!["urn:i".into(), "urn:d".into()]),
+            ),
+            (
+                "boundary twice",
+                with(|p| p.boundary = vec!["urn:i".into(), "urn:i".into()]),
+            ),
+            ("empty boundary", with(|p| p.boundary.clear())),
+            (
+                "shared name",
+                Box::new(|s| {
+                    let p = s.matching_policies.remove("people").unwrap();
+                    s.matching_policies.insert("advisories".into(), p);
+                }),
+            ),
+            (
+                "bad name",
+                Box::new(|s| {
+                    let p = s.matching_policies.remove("people").unwrap();
+                    s.matching_policies.insert("People".into(), p);
+                }),
+            ),
+            (
+                "unowned map output",
+                Box::new(|s| {
+                    s.matching_policies.clear();
+                }),
+            ),
+        ];
+        for (case, change) in refusals {
+            assert!(check(&*change).is_err(), "{case}");
+        }
+        // the two kinds of policy share one bound
+        let mut settings = matched();
+        let template = settings.matching_policies["people"].clone();
+        for index in 0..(MAX_POLICIES - 1) {
+            let output = format!("urn:map:{index}");
+            settings.projections.push(output.clone());
+            settings.matching_policies.insert(
+                format!("m{index}"),
+                MatchingPolicy {
+                    output,
+                    ..template.clone()
+                },
+            );
+        }
+        assert!(settings.validate(&Control::none()).is_err());
+        settings.matching_policies.remove("m0");
+        settings.projections.retain(|g| g != "urn:map:0");
         assert!(settings.validate(&Control::none()).is_ok());
     }
 

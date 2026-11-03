@@ -14,8 +14,8 @@
 
 use super::canonical::FrameHash;
 use super::write::{
-    Operation, PlannedRecord, Record, Stamp, ev, no_blank, prov, publish_quads, record_digest,
-    string,
+    Operation, PlannedRecord, Record, Stamp, ev, integer, no_blank, prov, publish_quads,
+    record_digest, string,
 };
 use super::{ConflictMode, IdentityNamespace, RecordKey, RecordKind, Sha256Digest};
 use crate::task::Control;
@@ -325,6 +325,16 @@ pub const NONCE_PREDICATES: [&str; 3] = [
     "urn:x-sparkles:evidence:outputProtection",
 ];
 
+/// The predicate of a resolution map revision's boundary protections. Each value is
+/// the literal `"<nonce> <graph IRI>"` of one protected identity graph of the policy's
+/// boundary when the revision was written.
+pub const BOUNDARY_PROTECTION: &str = "urn:x-sparkles:evidence:boundaryProtection";
+
+/// The value of [`BOUNDARY_PROTECTION`] for `graph` under `nonce`.
+pub fn boundary_protection(graph: &NamedNode, nonce: Uuid) -> String {
+    format!("{nonce} {}", graph.as_str())
+}
+
 /// The projection record of `policy` at `version` in its supports graph `graph`. Its
 /// identity is minted in the policy's own namespace from the version, so every
 /// reviewer of that version finds the same record.
@@ -375,6 +385,96 @@ pub fn projection_iri(
         &version.to_string(),
         control,
     )
+}
+
+/// The protection nonces of a matching policy's decisions, maps and output graphs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapNonces {
+    pub decisions: Uuid,
+    pub maps: Uuid,
+    pub output: Uuid,
+}
+
+/// The predicates of a resolution map revision's nonces.
+pub const MAP_NONCE_PREDICATES: [&str; 3] = [
+    "urn:x-sparkles:evidence:decisionsProtection",
+    "urn:x-sparkles:evidence:mapsProtection",
+    "urn:x-sparkles:evidence:outputProtection",
+];
+
+/// The identity of revision `number` of the resolution map of the matching policy
+/// `policy`. It is minted in the policy's own namespace from the number, so two
+/// operations that would publish the same revision mint the same identity.
+pub fn map_iri(dataset: Uuid, policy: &str, number: u64, control: &Control) -> Result<NamedNode> {
+    mint(
+        dataset,
+        &policy_iri(policy),
+        RecordKind::ResolutionMap,
+        policy,
+        &format!("revision {number}"),
+        control,
+    )
+}
+
+/// What one resolution map revision records.
+#[derive(Clone, Debug)]
+pub struct MapRevision<'a> {
+    pub policy: &'a str,
+    pub version: u32,
+    /// The revision's number, from 1.
+    pub number: u64,
+    /// The revision this one follows, `None` for the first.
+    pub previous: Option<&'a NamedNode>,
+    pub output: &'a NamedNode,
+    /// The accepted decisions this revision makes effective.
+    pub adds: &'a [NamedNode],
+    /// The accepted decisions whose effect this revision ends, because a decision of its
+    /// operation supersedes them.
+    pub ends: &'a [NamedNode],
+    pub nonces: MapNonces,
+    /// The protected identity graphs of the policy's boundary and their nonces, whose
+    /// proposals the map was built from.
+    pub boundary: &'a [(NamedNode, Uuid)],
+}
+
+/// Revision `m.number` of a matching policy's resolution map, in its maps graph
+/// `graph`. The map at a revision is the effect of the accepted decisions its chain
+/// adds and has not ended, and every revision stays an immutable record.
+pub fn map_record(
+    dataset: Uuid,
+    m: &MapRevision<'_>,
+    graph: &NamedNode,
+    control: &Control,
+) -> Result<PlannedRecord> {
+    let iri = map_iri(dataset, m.policy, m.number, control)?;
+    let mut r = Record::new(&iri, RecordKind::ResolutionMap);
+    r.add(ev("reviewPolicy"), policy_iri(m.policy));
+    r.add(ev("policyVersion"), string(&m.version.to_string()));
+    r.add(ev("mapRevision"), integer(m.number));
+    if let Some(previous) = m.previous {
+        r.add(prov("wasRevisionOf"), previous.clone());
+    }
+    r.add(ev("output"), m.output.clone());
+    for d in m.adds {
+        r.add(ev("adds"), d.clone());
+    }
+    for d in m.ends {
+        r.add(ev("ends"), d.clone());
+    }
+    for (p, n) in
+        MAP_NONCE_PREDICATES
+            .iter()
+            .zip([m.nonces.decisions, m.nonces.maps, m.nonces.output])
+    {
+        r.add(NamedNode::new_unchecked(*p), string(&n.to_string()));
+    }
+    for (g, n) in m.boundary {
+        r.add(
+            NamedNode::new_unchecked(BOUNDARY_PROTECTION),
+            string(&boundary_protection(g, *n)),
+        );
+    }
+    planned("map", RecordKind::ResolutionMap, r, graph, control)
 }
 
 /// The records of one review or withdrawal operation.

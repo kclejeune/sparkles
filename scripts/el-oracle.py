@@ -14,6 +14,10 @@ differ.
 
     scripts/el-oracle.py REFERENCE.ofn OURS.txt
 
+The second file may also be a taxonomy in the reference form, such as another reference
+reasoner's, which the script recognizes by its first line, so that two reference
+reasoners can be compared with each other.
+
 With `--asserted`, the first file is the ontology itself in functional-style syntax, and
 the taxonomy is compared with its asserted SubClassOf axioms between named classes. Some
 ontologies, such as the Gene Ontology, publish the direct hierarchy that ELK inferred as
@@ -79,6 +83,17 @@ def read_ours(path):
             elif parts[0] == "SUB":
                 subs.append((parts[1], parts[2]))
     return eqs, subs
+
+
+def read_second(path):
+    """A taxonomy in el_classify's form, or in the reference form when it starts as one."""
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                if line.startswith(("EQ ", "SUB ")):
+                    break
+                return read_reference(path)
+    return read_ours(path)
 
 
 def normalize(eqs, subs):
@@ -197,7 +212,7 @@ def main():
     if sys.argv[1] == "--asserted":
         compare_asserted(sys.argv[2], sys.argv[3])
     ref_node, ref_edges = normalize(*read_reference(sys.argv[1]))
-    our_node, our_edges = normalize(*read_ours(sys.argv[2]))
+    our_node, our_edges = normalize(*read_second(sys.argv[2]))
     common = set(ref_node) & set(our_node)
     only_ref = sorted(set(ref_node) - common)
     only_ours = sorted(set(our_node) - common)

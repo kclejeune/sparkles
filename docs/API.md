@@ -9139,6 +9139,7 @@ need the `shacl` cargo feature, which is on by default, and return `501` without
 | `GET /$/forms/{ds}?focus=IRI` | `read` | The form model of a resource, or with `class=IRI` the empty form of a new instance. |
 | `POST /$/forms/{ds}/check` | `write` | A dry run of a change and its validation against the form's shapes. |
 | `POST /$/forms/{ds}/save` | `write` | The commit of a change, unless another commit changed its fields. |
+| `GET /$/skos/shapes` | any caller | The built-in SKOS shapes as Turtle. |
 
 Checks follow shape dependencies in the base and candidate states rather than a fixed
 number of graph hops. The allowance admits 500 additional distinct targets beyond the
@@ -9161,11 +9162,13 @@ cover its target selection and work, not all SHACL heap use or cold index decodi
 * **`class`** asks for the form of a new instance of that class instead, built from the
   node shapes that target the class or one of its superclasses, with no values and a
   `focus` of `null`. A request names `focus` or `class`, and a `class` form takes no `at`.
-* **`shapes`** is `guard`, `graphs` or `drafted` and overrides the `forms` setting's
-  source. `guard` reads the shapes of the dataset's write-time SHACL guard, `graphs` reads
-  the shapes graphs the setting names, and `drafted` drafts shapes from the data as the
-  schema report does. A dataset without a SHACL guard answers with no fields and
-  `shapes.missing` set, rather than an error.
+* **`shapes`** is `guard`, `graphs`, `drafted` or `skos` and overrides the `forms`
+  setting's source. `guard` reads the shapes of the dataset's write-time SHACL guard,
+  `graphs` reads the shapes graphs the setting names, and `drafted` drafts shapes from the
+  data as the schema report does. `skos` reads the built-in SKOS shapes that
+  [SKOS shapes](#skos-shapes) describes, which only a request can choose. A dataset
+  without a SHACL guard answers with no fields and `shapes.missing` set, rather than an
+  error.
 * **`branch`** opens the form on a branch, as on other routes. **`at`** opens the form at
   a past state, as the history routes take it, and such a form is never editable.
 * **`lang`** is the language whose `sh:name` and `sh:description` the labels prefer. The
@@ -9445,7 +9448,7 @@ kept in `<db>/forms.json`. Its fields are these.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `shapes` | `guard` | Where the shapes come from, which is `guard`, `graphs` or `drafted`. |
+| `shapes` | `guard` | Where the shapes come from, which is `guard`, `graphs` or `drafted`. A request can also name `skos`. |
 | `graphs` | `[]` | The shapes graphs that `shapes: "graphs"` reads. |
 | `saveTo` | `auto` | Where saves of a form on `main` go, which is `auto`, `main` or `branch`. |
 | `branchTemplate` | `edits.{user}.{date}` | The name of the session branch. It must hold `{user}`. |
@@ -9456,6 +9459,31 @@ kept in `<db>/forms.json`. Its fields are these.
 curl -X PATCH 'localhost:3030/$/settings/people/forms' \
   -H 'content-type: application/json' -d '{"saveTo": "branch"}'
 ```
+
+### SKOS shapes
+
+`GET /$/skos/shapes` answers the built-in SKOS shapes as Turtle. They lay out the forms of
+concept schemes, concepts, collections, ordered collections and SKOS-XL labels, and they
+check the integrity conditions of the
+[SKOS Reference](https://www.w3.org/TR/skos-reference/). The conditions are S9, S13,
+S14, S27, S37 and S46, with S51, S52 and S58 of the SKOS-XL appendix. The literal forms of
+SKOS-XL labels count for S13 and S14, as S55 to S57 imply. Each result's message names
+its condition. A linked concept, scheme or collection member without its `rdf:type` is
+reported at `sh:Info` severity, which a guard with the default threshold lets through.
+The shapes graph does not hold the SKOS vocabulary, so the checks name its consequences.
+`skos:OrderedCollection` counts as `skos:Collection`, the subjects and objects of the
+semantic and mapping relations count as concepts, and the properties of concept schemes
+and collections type their subjects and objects. S27 reads `skos:broadMatch`,
+`skos:narrowMatch` and `skos:relatedMatch` as the sub-properties of `skos:broader`,
+`skos:narrower` and `skos:related` they are, and S46 follows `skos:exactMatch` through
+its symmetry and transitivity. Each SPARQL constraint reads one property path or basic
+graph pattern from the focus node, so a form check with `shapes=skos` validates only the
+resources an edit affects. The results of S27, S46 and the clash of two SKOS-XL labels
+name the focus node without a value.
+
+Forms read the shapes with `shapes=skos`. `POST /{ds}/shacl` runs them over a graph, and
+`PUT /$/validation/{ds}` installs them as a write guard with `{"shapes": {"inline": …}}`.
+The `forms` setting refuses `shapes: "skos"`, so a stored setting never depends on them.
 
 ## ShEx validation
 
@@ -12434,7 +12462,8 @@ new entity. A client without elicitation, or of an older revision, gets the
 ### Evidence settings
 
 A dataset's evidence settings declare the graphs of the
-[evidence profile](ai/README.md#evidence-profile) and its named review policies. They are
+[evidence profile](ai/README.md#evidence-profile), its named review policies and its
+named matching policies. They are
 kept in `<db>/evidence.json` as format 1 and profile 1, and in the process for an
 in-memory dataset. The design is in
 [C25 §7](specs/C25-evidence-and-assessments.md#7-configuration-access-and-retention).
@@ -12447,7 +12476,7 @@ in-memory dataset. The design is in
   "decisions": ["https://example.org/ev/decisions"],
   "supports": ["https://example.org/ev/supports"],
   "identity": ["https://example.org/ev/identity"],
-  "projections": ["https://example.org/ev/accepted"],
+  "projections": ["https://example.org/ev/accepted", "https://example.org/ev/people"],
   "policies": {
     "advisories": {
       "version": 1, "admittedKinds": ["reported", "observation"],
@@ -12457,12 +12486,21 @@ in-memory dataset. The design is in
       "supports": "https://example.org/ev/supports",
       "output": "https://example.org/ev/accepted"
     }
+  },
+  "matchingPolicies": {
+    "people": {
+      "version": 1,
+      "boundary": ["https://example.org/ev/identity", "https://example.org/ev/claims"],
+      "decisions": "https://example.org/ev/decisions",
+      "maps": "https://example.org/ev/identity",
+      "output": "https://example.org/ev/people"
+    }
   }
 }
 ```
 
-Each role is a set of absolute graph IRIs, and the roles together name at most 1,024
-graphs. Enabled settings need `sourceRecords` and `proposals`. A graph may have several
+The `projections` role lists the output graphs of both policies. Each role is a set of
+absolute graph IRIs, and the roles together name at most 1,024 graphs. Enabled settings need `sourceRecords` and `proposals`. A graph may have several
 roles, except that a `projections` graph has no other role. The members after
 `proposals` may be left out and then default to empty. A policy name uses `a-z`, `0-9`
 and `-`, with at most 64 policies. A policy's `version` starts at 1, and
@@ -12472,7 +12510,12 @@ predicates an admitted claim must carry. `conflicts` is `refuse` or `admitLabell
 `boundary` lists the `sourceRecords` and `proposals` graphs whose records the
 policy's reviews may use. `decisions`, `supports` and `output` name one graph of the
 `decisions`, `supports` and `projections` roles, and each projection graph is the output
-of one policy. Anything else, including an unknown member, is a `400`. A `format` or
+of one policy. A matching policy decides [identity proposals](#evidence-identities). Its
+`boundary` lists the `identity`, `sourceRecords` and `proposals` graphs whose records its
+reviews may use, with at least one `identity` graph. `decisions`, `maps` and `output`
+name one graph of the `decisions`, `identity` and `projections` roles, the last owned by
+no other policy of either kind. Review and matching policies share one namespace of
+names and the bound of 64. Anything else, including an unknown member, is a `400`. A `format` or
 `profile` other than 1 is a `409` with the code `unsupported-profile`.
 
 `GET /$/evidence/{ds}/settings` needs `admin` and answers the canonical settings with
@@ -12631,7 +12674,8 @@ folded in may answer `incomplete-evidence`.
 
 `POST /{ds}/claims` publishes one batch of [evidence profile](ai/README.md#evidence-profile)
 records as one commit: source revisions, renditions and passages, evidence references,
-claim occurrences, evidence links and assessments. Claims describe their propositions
+claim occurrences, evidence links, assessments and
+[identity proposals](#evidence-identities). Claims describe their propositions
 and never assert them. The route needs `write` on the dataset or branch through the
 update endpoint and counts as an update. The design is in
 [C25 §5 and §7](specs/C25-evidence-and-assessments.md#5-writes-review-and-accepted-projections).
@@ -12661,13 +12705,14 @@ record as `{"iri"}`. Content is `{"text"}`, `{"base64"}` or the `{"digest"}` of 
 that is not retained. A proposition, scope value, rights term and conclusion is an
 N-Triples term without blank nodes. A stored fact has the form of
 [evidence resolution](#evidence-resolution). `ifHead`, `dryRun` and `message` have their
-usual meanings, and `sourceGraph` and `proposalGraph` choose among the settings' graphs
-when a role has more than one. A batch holds at most 1,000 claims, 10,000 links and
-16 MiB of decoded input, in a body of at most 24 MiB.
+usual meanings, and `sourceGraph`, `proposalGraph` and `identityGraph` choose among the
+settings' graphs when a role has more than one. A batch holds at most 1,000 claims,
+10,000 links, 1,000 identity proposals and 16 MiB of decoded input, in a body of at most
+24 MiB.
 
 Source revisions, renditions and passages go to the
-[evidence settings'](#evidence-settings) source-record graph, and the other records to
-the proposal graph. The caller needs update grants on every graph the batch writes, and
+[evidence settings'](#evidence-settings) source-record graph, identity proposals to an
+identity graph, and the other records to the proposal graph. The caller needs update grants on every graph the batch writes, and
 read access to every record and stored fact it references, decided as evidence
 resolution decides it. A reference the caller cannot read answers as a missing one.
 Record IRIs are `urn:uuid:` identities derived from the dataset, the authenticated
@@ -12717,7 +12762,8 @@ lists the profile versions this build serves.
 
 `POST /{ds}/claims/review` appends review decisions under one named review policy of
 the [evidence settings](#evidence-settings), and `POST /{ds}/claims/withdraw` withdraws
-claim occurrences. Both need `write` on the dataset or branch through the update
+claim occurrences. A review under a matching policy decides
+[identity proposals](#evidence-identities) instead. Both need `write` on the dataset or branch through the update
 endpoint, count as updates and publish one commit of the evidence owner. Neither edits
 a record in place. The design is in
 [C25 §5 and §6](specs/C25-evidence-and-assessments.md#5-writes-review-and-accepted-projections).
@@ -12803,6 +12849,7 @@ results that depend on them. A replay answers the first receipt with an empty
 | `409 decision-superseded` | `supersedes` is not the target's current decision under the policy. |
 | `409 target-withdrawn` | An acceptance names a withdrawn claim. |
 | `409 evidence-conflict` | An acceptance meets contrary evidence under a policy that refuses conflicts. |
+| `409 identity-conflict` | Under a matching policy, the final decisions would put two entities of an accepted separation in one cluster. |
 | `409 idempotency-conflict` | The key was used with a different payload. |
 | `422 evidence-unavailable` | A target, or evidence that an acceptance must read, is missing, unreadable or outside the policy's boundary. |
 | `422 incomplete-evidence` | The acceptances need more than 10,000 evidence records. |
@@ -12810,6 +12857,93 @@ results that depend on them. A replay answers the first receipt with an empty
 | `503 authority-changed` | The caller's credential or the access policy changed before the commit published. |
 
 A refusal writes nothing. `GET /$/server` lists both routes in `capabilities.claims`.
+
+### Evidence identities
+
+An identity proposal names two to 64 exact entity IRIs and proposes that they may denote
+one thing, `possibleMatch`, or that they denote different things, `distinctEntities`.
+Neither the proposal nor its acceptance asserts `owl:sameAs`. Proposals are records of a
+[claims proposal](#evidence-proposals) batch, in its `identities` member, and go to an
+`identity` graph of the [evidence settings](#evidence-settings). The design is in
+[C25 §6](specs/C25-evidence-and-assessments.md#6-identity-validity-and-correction).
+
+```json
+{
+  "identityGraph": "https://example.org/ev/identity",
+  "identities": [{"key": "p1", "occurrenceKey": "crm-import-7",
+                  "entities": ["https://example.org/crm/1042", "https://example.org/hr/ana"],
+                  "relation": "possibleMatch",
+                  "preferredEntity": "https://example.org/hr/ana",
+                  "author": "https://example.org/matcher",
+                  "method": {"method": "https://example.org/names", "version": "3"}}]
+}
+```
+
+A [review](#evidence-reviews) that names a matching policy decides proposals under it,
+with the same request, preconditions, supersession and replay as a review of claims. The
+policy's accepted possible matches join entities into clusters, the connected components
+of the entities they name, and its output graph holds the current resolution map as
+`<member> ev:resolvesTo <representative>` for every member of every cluster of two or
+more entities, the representative included. The representative is the smallest IRI
+among the preferred entities of the cluster's accepted matches, or the smallest member
+when none names one. An accepted separation keeps its entities in different clusters,
+and a review whose final decisions would join them is a `409 identity-conflict` that
+writes nothing. A split rejects the match that joined the entities, with a decision that
+supersedes its acceptance, and may accept the separation in the same request.
+
+Every review that adds an acceptance or supersedes one writes an immutable
+`ev:ResolutionMap` revision in the policy's `maps` graph. It records its number, the
+revision it follows as `prov:wasRevisionOf`, the decisions it `ev:adds` and `ev:ends`,
+the output graph, the protection nonces of the policy's graphs and, as
+`ev:boundaryProtection`, the nonce and IRI of each identity graph of the boundary whose
+proposals the map was built from. Accepting a reversed
+match again restores the earlier map, and no proposal, decision or revision is edited.
+The review answer adds `mapRevision` and `changed.map`, which names the policy, the new
+revision and its predecessor, the decisions added and ended, and the entities whose
+selected entity changed, so that consumers of the earlier revision can be found. The
+resolvesTo triples written and removed are in `changed.inserted` and `changed.removed`.
+
+A review under a matching policy needs update and read grants on its decisions, maps and
+output graphs, read grants on every identity graph of its boundary, read access to each
+target, and for an acceptance read access to the target's evidence links. It also needs
+read access to every accepted proposal of each cluster it reads, before and after its
+decisions, and one whose triples the caller's view hides answers as an unavailable
+target. A proposal no decision accepts takes no part in a cluster and is not counted
+when the caller cannot read it. More than 10,000 proposals naming one entity answer
+`422 incomplete-evidence` when the caller's view shows that many, and otherwise answer
+as an unavailable target, so no refusal reports a count that includes a hidden record.
+One review reads at most 10,000 entities and proposals for its clusters in each state
+and retains at most 64 MiB of the identifiers of its targets and clusters, beyond which
+it answers `422 incomplete-evidence`.
+
+A map follows the matches of the identity graphs it was built from. When one of them
+leaves the boundary, or is detached and protected again so that its proposals no longer
+authenticate, reviews and reads under the policy answer `503 projection-unavailable`
+until the boundary is restored. A graph added to the boundary keeps the map available.
+No operation rebuilds a map from its decisions after such a change, so a new matching
+policy with its own maps and output graphs starts a new map.
+
+`POST /{ds}/claims/identities` with `{"policy", "entities"}` reads the current map. It
+needs `read` on the dataset or branch through the query endpoint and read grants on the
+policy's decisions, maps and output graphs and on the identity graphs of its boundary,
+and counts as a query. The answer is `{policy, revision, number, commit, entities}`, and
+each entity is `{entity, representative, members, membersComplete, decisions}`, with at
+most 1,000 members and the current accepted decisions that join the cluster as far as
+the caller's view reaches from the entity, whatever else the request names. The map's
+latest revision is checked against the store as written, and a caller whose view hides
+part of it is refused with `503 projection-unavailable`. An entity
+the map does not name resolves to itself. A request names 1 to 100 entities. Queries
+read the map by joining the output graph explicitly, and no query is rewritten through
+it.
+
+| Status and code | Meaning |
+|---|---|
+| `400` | The body is malformed or the policy is unknown. |
+| `403` | The caller may not read a graph of the policy. |
+| `422 incomplete-evidence` | A cluster's records exceed 10,000. |
+| `503 projection-unavailable` | A graph of the policy was detached and protected again, an identity graph the map was built from left the boundary, or the output holds a map without a revision. |
+
+`GET /$/server` lists the route in `capabilities.claims.identities`.
 
 ### Suggested examples
 

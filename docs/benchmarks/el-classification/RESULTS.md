@@ -51,6 +51,70 @@ classifier's direct hierarchy is the transitive reduction of the asserted one.
 
 SNOMED CT is not available to the project and was not used.
 
+<a id="whelk-and-konclude"></a>
+
+Konclude 0.7.0-1138, a complete OWL 2 DL reasoner, gives the classifier's taxonomy on all
+298 ORE ontologies and on ChEBI lite, and finds `ore_ont_6720` inconsistent as the
+classifier does. On the Gene Ontology its taxonomy has 7 direct edges that the
+classifier's and ELK's do not, such as filopodium membrane `GO_0031527` under organelle
+membrane `GO_0031090`, and it entails 14 subsumptions between named classes that they do
+not. All 14 follow from `InverseObjectProperties(part_of has_part)`, the one GO
+axiom outside OWL 2 EL, which both EL reasoners leave out and report. Part of is
+transitive, and a membrane-bounded organelle is defined as an organelle that has a
+membrane as a part. A filopodium membrane is part of a filopodium, which is part of the
+actin cytoskeleton, an organelle. The inverse then makes that cytoskeleton a
+membrane-bounded organelle and the membrane an organelle membrane. These subsumptions
+are entailed, so they are evidence for the inverse properties that roadmap items 587 and
+603 cover. Konclude and Whelk 1.2.1 both agree with HermiT on the four range test
+ontologies, including the two subsumptions and the inconsistency that ELK and the
+classifier miss.
+
+Whelk, a second OWL 2 EL reasoner, gives the classifier's taxonomy on GO, ChEBI lite and
+296 of the ORE ontologies. On `ore_ont_412`, a BioTop ontology with 18 two-property chains
+and no axiom outside OWL 2 EL, Whelk entails 20,401 subsumptions between named classes
+where the classifier, ELK and Konclude entail 20,802, and none that they do not, so Whelk
+misses 401 there. Whelk
+exceeded the 12 GiB memory cap of the laptop run on `ore_ont_3524`. The
+[agreement record](runs/2026-11-02-reasoners-agreement-91a7b160/record.json) keeps every
+comparison, the trace of the GO subsumptions and the script that counts entailed
+subsumptions.
+
+## ROBOT workflows
+
+<a id="robot"></a>
+
+OBO release pipelines classify with ROBOT's `reason`, `reduce`, `relax` and `materialize`
+commands. ROBOT 1.9.11 ran each with its bundled ELK 0.6.0 on GO and ChEBI lite, from the
+release's RDF/XML file to a written functional-style file. In every output, each asserted
+subsumption between named classes is entailed by the classifier's taxonomy, and each
+direct edge of the taxonomy is asserted. `reason` asserts every direct subsumption of the
+classifier's hierarchy in the ontology. `reduce` leaves exactly the 57,456 direct subsumptions of GO
+and the 296,173 of ChEBI lite between named classes, which `scripts/el-oracle.py
+--asserted` compared.
+
+`sparkles ontology classify FILE --format ofn` writes the taxonomy without the rest of
+the ontology, and its output equals `el_classify`'s on both files. Sparkles has no
+counterpart of the other commands. Roadmap items 634 to 636 add
+`sparkles ontology reason`, `reduce`, `relax` and `materialize` with ROBOT's options,
+item 637 chains them in one process, and this comparison checks their output.
+These times come from a loaded laptop, so they only show the scale and are not
+measurements. The benchmark host's times belong to roadmap items 604 and 606. Each
+is one end-to-end run in seconds, with the peak resident memory in MiB.
+
+| Run | GO time | GO peak RSS | ChEBI lite time | ChEBI lite peak RSS |
+|---|---:|---:|---:|---:|
+| `robot reason` | 21.2 | 3,743 | 40.3 | 7,361 |
+| `robot reason` from the functional-style file | 7.1 | 1,255 | 21.1 | 4,549 |
+| `robot reduce` | 12.5 | 2,080 | 44.0 | 7,570 |
+| `robot relax` | 9.0 | 1,491 | 14.8 | 2,279 |
+| `robot materialize` | 14.4 | 2,106 | 37.7 | 7,509 |
+| `robot reason relax reduce` | 23.2 | 7,088 | 68.4 | 8,612 |
+| `sparkles ontology classify` | 8.0 | 1,684 | 16.4 | 3,499 |
+| `sparkles ontology classify` from the functional-style file | 2.0 | 694 | 11.3 | 2,402 |
+
+ROBOT ran with an 8 GiB heap. The materialized property was part of, `BFO:0000050`, for
+GO and has role, `RO:0000087`, for ChEBI lite.
+
 ## Against ELK
 
 <a id="against-elk"></a>
@@ -150,3 +214,8 @@ oracle's reports. The [ORE agreement record](runs/2026-11-02-ore-elk-agreement-a
 and the [HermiT agreement record](runs/2026-11-02-hermit-agreement-aa0a41a6/record.json)
 hold the comparisons on the ORE 2015 sample and the range test ontologies. Their times
 come from a loaded laptop and are not measurements.
+
+The [reference reasoner agreement record](runs/2026-11-02-reasoners-agreement-91a7b160/record.json)
+holds Whelk's and Konclude's output lines and comparisons on the range test ontologies,
+GO, ChEBI lite and the ORE 2015 sample, the ROBOT runs and their checks, and the trace of
+Konclude's extra GO subsumptions. Its times also come from a loaded laptop.
