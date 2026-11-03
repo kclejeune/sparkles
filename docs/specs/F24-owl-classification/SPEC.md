@@ -74,8 +74,8 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-The OWL 2 EL classifier is delivered as roadmap item 580. The other phases remain under
-[item 457](../../ROADMAP.md).
+The OWL 2 EL classifier is delivered as roadmap item 580 and covers all of OWL 2 EL
+since item 587. The other phases remain under [item 457](../../ROADMAP.md).
 
 ### The OWL 2 EL classifier
 
@@ -199,11 +199,13 @@ additions and removals gives the taxonomy of a full run.
 **Bounds.** A run stops at its deadline, at a cancellation and when the estimated memory
 passes the budget. The deadline and the cancellation are checked while the axioms are
 normalized, while the property closure is built, between the stages and while the
-taxonomy is built, as well as during the saturation. The estimate counts the classifier's copy of the axioms, the normalized axioms, the index with
+taxonomy is built, as well as during the saturation and in the worlds. The estimate
+counts the classifier's copy of the axioms, the normalized axioms, the index with
 the property closure, which stops as soon as it passes the budget, the context slots and
 roots, the stored conclusions, the messages waiting in the contexts' to-do lists and
 the taxonomy with its links, which the budget checks before the taxonomy is built and
-again before the links are stored. The memory pool is charged for the growth of the peak.
+again before the links are stored. The worlds count their copies, stored conclusions and
+waiting messages while they run, and the subsumers they keep once they end. The memory pool is charged for the growth of the peak.
 A counting allocator measured each run's peak heap within 14% of the estimate on GO,
 ChEBI lite and the largest ORE 2015 EL ontologies. A run that stops before its saturation ends
 drops its contexts, since the next run starts again. In the handle the threads come from the
@@ -301,7 +303,10 @@ CLI test classifies a file and a database, and each binding's tests classify and
 taxonomy.
 
 **Roadmap follow-ups.** An MCP tool is item 586. Complete reasoning with
-individuals and datatypes is item 587. Reads that answer from the classification
+individuals and datatypes was item 587, with item 605. The literals and datatypes the
+classifier cannot compare and chains through the top property are item NEW-ITEM-1, and
+incremental runs that follow merges, keys and worlds are item NEW-ITEM-2. Reads that
+answer from the classification
 and DL Query are item 588. Durable and automatic classification is item
 589, after item 339. A kept classification with assertions is item 590,
 the comparison and measurements against ELK were item 591, the speed and memory work

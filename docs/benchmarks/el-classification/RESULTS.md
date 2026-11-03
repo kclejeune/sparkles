@@ -33,14 +33,40 @@ HermiT 1.4.5.519, a complete OWL 2 DL reasoner, checked the 36 ORE ontologies wh
 either EL reasoner reports axioms it uses in part or possible incompleteness. Its
 taxonomy equals the classifier's and ELK's on all 36, so neither EL reasoner misses a
 subsumption or an unsatisfiable class there. Four small test ontologies show the
-entailments that both EL reasoners miss when a property's range meets an individual.
-HermiT derives a subsumption through a range on an asserted property and one through a
-range reached by `ObjectHasValue`, and it finds an individual in two disjoint ranges
-inconsistent. ELK and the classifier miss all three, and the classifier reports the
-axioms involved as used in part. A fourth ontology, where one range clashes with a class
-assertion, is inconsistent for all three reasoners. The tests in
-`crates/sparkles-owl/tests/classify.rs` hold these cases as known gaps of roadmap item
-587.
+entailments that ELK misses when a property's range meets an individual. HermiT derives
+a subsumption through a range on an asserted property and one through a range reached
+by `ObjectHasValue`, and it finds an individual in two disjoint ranges inconsistent.
+ELK misses all three, and the classifier derives them. A fourth ontology, where one
+range clashes with a class assertion, is inconsistent for all of them. The tests in
+`crates/sparkles-owl/tests/classify.rs` hold the four cases with HermiT's answers.
+
+<a id="complete-el"></a>
+
+The classifier covers all of OWL 2 EL and reports no axiom of the 298 ORE ontologies
+as used in part. Its taxonomies of GO, ChEBI lite and the 298 ORE ontologies are byte
+for byte those of the build before, which equal ELK's, and they equal Konclude's on
+all but GO, whose difference the next section explains. Before, it used axioms with
+individuals, data ranges or literals in part on 18 ORE ontologies, and HermiT's
+taxonomy of those ontologies had already shown that nothing it left out changed a
+subsumption there.
+
+A suite of 400 random OWL 2 EL ontologies, which
+`crates/sparkles-owl/tests/fixtures/el587/generate.py` writes with seed 587, exercises
+what the ORE sample does not. Each has six classes, four object properties, three data
+properties, four individuals and 8 to 22 axioms. The axioms draw on class and property
+assertions, negative assertions, same and different individuals, `ObjectOneOf` and
+`ObjectHasValue`, domains and ranges, regular chains, transitive and reflexive
+properties, functional data properties, the top object property, data ranges,
+numeric, string and date-time literals, and keys. HermiT finds 76 of them
+inconsistent. The classifier entails exactly HermiT's subsumptions between named
+classes on all 400, reports no axiom as used in part, and agrees with HermiT on which
+ontologies are inconsistent. Konclude stopped with a segmentation fault on 10 of them
+and differs from HermiT on 4 of the other 390. On `case-074` it misses a subsumption
+from a range of `xsd:token` under `rdfs:Literal`, on `case-124` one from the top
+object property, and on `case-075` and `case-261` it takes the `owl:rational` value
+3/2 for an integer. HermiT's answer follows from the axioms in each case, and the
+fixture test keeps the four cases with these reasons. `tests/el_fixtures.rs` checks
+the suite on every test run.
 
 The classifier's direct hierarchy of the Gene Ontology release of 2026-07-26 is also the
 hierarchy that the release asserts, which GO's pipeline computes with ELK. Both sides
@@ -66,10 +92,9 @@ transitive, and a membrane-bounded organelle is defined as an organelle that has
 membrane as a part. A filopodium membrane is part of a filopodium, which is part of the
 actin cytoskeleton, an organelle. The inverse then makes that cytoskeleton a
 membrane-bounded organelle and the membrane an organelle membrane. These subsumptions
-are entailed, so they are evidence for the inverse properties that roadmap items 587 and
-603 cover. Konclude and Whelk 1.2.1 both agree with HermiT on the four range test
-ontologies, including the two subsumptions and the inconsistency that ELK and the
-classifier miss.
+are entailed, so they are evidence for the inverse properties that roadmap item 603
+covers. Konclude and Whelk 1.2.1 both agree with HermiT on the four range test
+ontologies, including the two subsumptions and the inconsistency that ELK misses.
 
 Whelk, a second OWL 2 EL reasoner, gives the classifier's taxonomy on GO, ChEBI lite and
 296 of the ORE ontologies. On `ore_ont_412`, a BioTop ontology with 18 two-property chains

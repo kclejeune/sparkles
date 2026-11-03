@@ -79,6 +79,20 @@ the 36 ORE ontologies with individuals (roadmap item 591). `scripts/elk-compare/
 runs ELK or HermiT through the OWL API from pinned Maven Central jars, and the EL
 classification report gives times and memory beside ELK's on the benchmark host.
 
+The OWL 2 EL classifier covers all of OWL 2 EL (roadmap items 587 and 605). It reasons
+with individuals in class expressions and assertions, ranges that meet them, the
+datatypes, literals and data ranges of the profile, functional data properties, data
+property ranges, datatype definitions, keys, negative property assertions and the top
+and bottom properties, with the rules of EL++. A class whose instances reach an
+individual through a context that holds only where the class has an instance is
+classified again in a copy-on-write world of its own. The classifier no longer reports
+these axioms as used in part, and it reports only literals and datatypes it cannot
+compare and property chains through the top object property. On 400 random OWL 2 EL
+ontologies its subsumptions equal HermiT 1.4.5.519's, and its taxonomies of GO, ChEBI
+lite and the ORE 2015 EL sample are unchanged. An incremental run after a change to an
+axiom with an individual or a key now saturates everything again, as one after a change
+to a data axiom already did.
+
 The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
 `dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and
 axioms, check profiles, edit axioms, remove entities and diff commits in the JSON forms
