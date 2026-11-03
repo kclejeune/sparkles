@@ -289,8 +289,9 @@ thread and take most of a run on eight threads on the ORE ontologies, which item
 644 follows. Item 587's rules left the largest ORE ontologies within 3% of the build
 before, on either side, and ChEBI lite within 3%, and cost GO 2 to 3%, which item
 NEW-ITEM-3 follows. The rules for individuals run in functions of their own, outside the
-saturation's loop, since a first build that kept them inline made the saturation of
-ontologies without individuals up to 20% slower on one thread. The [benchmark
+saturation's loop, since a first build that kept them inline, commit 68a683b5, made the
+saturation of ontologies without individuals 3 to 19% slower on one thread in an
+interleaved A/B on `atlas` ([record](../../benchmarks/el-classification/runs/2026-11-03-el-inline-atlas-68a683b5/record.json)). The [benchmark
 report](../../benchmarks/el-classification/RESULTS.md) has the numbers and the records.
 
 **Testing.** Tests in `crates/sparkles-owl/tests/classify.rs` cover worked examples of

@@ -425,9 +425,9 @@
    "metadata_note": "A manual record of item 587. Read the record for its method, results and checks."
   },
   {
-   "run_id": "sha256-1db6396f2afb7bfb731ab60e06f3b57ce4cf5f78a75fe3a81208e202dfc8e977",
+   "run_id": "sha256-3c9bc67ca6387258a8433ee3897124959367126c729210370952b78724ccdb27",
    "path": "runs/2026-11-03-el-complete-agreement-c4df06fe/record.json",
-   "sha256": "1db6396f2afb7bfb731ab60e06f3b57ce4cf5f78a75fe3a81208e202dfc8e977",
+   "sha256": "3c9bc67ca6387258a8433ee3897124959367126c729210370952b78724ccdb27",
    "format": "legacy-assessment",
    "context": {
     "suite": "el-classification",
@@ -435,9 +435,9 @@
     "manifest": {
      "commit": "c4df06fe",
      "binary": "crates/sparkles-owl/examples/el_classify.rs",
-     "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on stanley",
+     "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on stanley for the lane (sha256 c90be03d...), and the base build of the forge record (sha256 0411a65e...), both run on stanley",
      "references": {
-      "before": "the taxonomies of the build of commit 91a7b160 in runs/2026-11-02-reasoners-agreement-91a7b160, equal to ELK 0.6.0's",
+      "base": "the taxonomies that the build of commit c9b6ebff, where the item started, writes with the same el_classify settings, whose equality with ELK 0.6.0's runs/2026-11-03-el-speed-forge-80644aec and the earlier records establish",
       "konclude": "Konclude 0.7.0-1138 taxonomies of the same record",
       "fixtures": "HermiT 1.4.5.519 and Konclude 0.7.0-1138 on the 400 fixtures, run by run-references.sh from the nix/reasoners packages"
      }
@@ -448,11 +448,53 @@
     },
     "durability_classes": [],
     "legacy_metadata": {
-     "method": "agree.sh classifies each ontology on four threads, writes the taxonomy and compares it with scripts/el-oracle.py against the build before the lane and against Konclude. tests/el_fixtures.rs compares the classifier's subsumptions between named classes on each fixture with HermiT's and Konclude's, read from the reasoners' direct hierarchies.",
+     "method": "agree.sh classifies each ontology on four threads, writes the taxonomy and compares it with Konclude's with scripts/el-oracle.py. The base build wrote its taxonomies with the same script and settings, and taxonomy-base.sha256 and taxonomy-lane.sha256 hold the hashes of both sets, which are compared byte for byte. tests/el_fixtures.rs compares the classifier's subsumptions between named classes on each fixture with HermiT's and Konclude's, read from the reasoners' direct hierarchies.",
      "kind": "agreement"
     }
    },
    "metadata_note": "A manual record of item 587. Read the record for its method, results and checks."
+  },
+  {
+   "run_id": "sha256-4661035e92ce93487dd918e85ddb93e204ba0fb846f2cac90526e7edd86795ab",
+   "path": "runs/2026-11-03-el-inline-atlas-68a683b5/record.json",
+   "sha256": "4661035e92ce93487dd918e85ddb93e204ba0fb846f2cac90526e7edd86795ab",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26, ChEBI lite 256 and the eight largest ORE 2015 EL ontologies",
+    "manifest": {
+     "commit": "68a683b5",
+     "base_commit": "c9b6ebff",
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": {
+      "base": "0411a65e421f3e0b231e0cda0893ffdbb72425247fc1bd9fb3da2e8a51153130",
+      "inline": "44d05f93a55f865014aa89037183341fedad29fec79db65cc8a424735727a400"
+     },
+     "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on atlas",
+     "lock_note": "ab.sh held ~/lanes/.heavy.lock for the run, which was stopped after four or five rounds once the cause was clear."
+    },
+    "settings": {
+     "repeat": 3,
+     "threads": [
+      1,
+      8
+     ],
+     "labels": {
+      "base": "c9b6ebff",
+      "lane": "68a683b5, with the rules for individuals inline in the saturation"
+     }
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "atlas",
+      "note": "a gate and build host identical to the benchmark host"
+     },
+     "method": "Interleaved el_classify runs of both builds on each ontology on one and eight threads, three classifications per process. Times are medians over the rounds of the median classification and of the last classification's saturation stage.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual record of item 587's first build. Read the record for its method and results."
   }
  ]
 }

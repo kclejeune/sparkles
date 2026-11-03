@@ -45,11 +45,10 @@ range clashes with a class assertion, is inconsistent for all of them. The tests
 The classifier covers OWL 2 EL apart from literals it cannot compare and property chains
 through the top object property, which it uses in part and reports, and it reports no
 axiom of the 298 ORE ontologies as used in part. Its taxonomies of GO, ChEBI lite and
-the 298 ORE ontologies equal those of the build of commit 91a7b160, which equal ELK's,
-on all but `ore_ont_6720`. That ontology is inconsistent, and the build the item started
-from already made every class equivalent to `owl:Nothing` there, as Konclude does,
-where the older build kept `owl:Thing` apart. The taxonomies equal Konclude's on all but
-GO, whose difference the next section explains. Before, it used axioms with
+the 298 ORE ontologies are byte for byte those of the build the item started from,
+commit c9b6ebff. Its classifier is that of commit 80644aec up to two lines without
+effect, and those taxonomies equal ELK's. They equal Konclude's on all but GO, whose
+difference the next section explains. Before, it used axioms with
 individuals, data ranges or literals in part on 18 ORE ontologies, and HermiT's
 taxonomy of those ontologies had already shown that nothing it left out changed a
 subsumption there.
