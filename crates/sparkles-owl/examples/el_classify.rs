@@ -106,7 +106,8 @@ fn main() {
         || head.trim_start().starts_with("Ontology(");
     let (axioms, header): (Vec<Axiom>, sparkles_owl::Header) = if functional {
         let text = String::from_utf8(bytes).expect("UTF-8");
-        let doc = ofn_read::parse(&text).unwrap_or_else(|e| panic!("{input}: {e}"));
+        let doc = ofn_read::parse_with(&text, ofn_read::Options { skip_rules: true })
+            .unwrap_or_else(|e| panic!("{input}: {e}"));
         rules = doc.rules;
         (doc.axioms, doc.header)
     } else {
