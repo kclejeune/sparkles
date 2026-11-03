@@ -1028,3 +1028,25 @@ fn a_chain_over_an_inverse_holds_in_its_mirror_image() {
         &[("A0", "A5")],
     );
 }
+
+#[test]
+fn r5_merges_every_counted_successor_at_once() {
+    // A1's at-most restriction counts successors that arrive one by one; merging them in
+    // pairs made a context for each subset on the way and passed the Horn budget
+    let (out, ex) = run("SubObjectPropertyOf(:r1 :r0)
+         InverseObjectProperties(:r0 :r1)
+         EquivalentClasses(:A0 ObjectSomeValuesFrom(:r0 ObjectIntersectionOf(:A5 :A4)))
+         EquivalentClasses(:A6 ObjectSomeValuesFrom(:r1 ObjectIntersectionOf(:A2 :A3)))
+         SubClassOf(:A3 ObjectAllValuesFrom(:r0 :A1))
+         SubClassOf(:A7 :A0)
+         EquivalentClasses(:A7 ObjectSomeValuesFrom(:r0 ObjectIntersectionOf(:A2 :A1)))
+         SubClassOf(:A6 ObjectSomeValuesFrom(:r1 ObjectSomeValuesFrom(:r1 :A5)))
+         SubClassOf(:A1 ObjectMaxCardinality(1 :r1 :A3))
+         SubClassOf(:A0 ObjectSomeValuesFrom(ObjectInverseOf(:r0) ObjectSomeValuesFrom(:r1 :A6)))
+         SubClassOf(ObjectSomeValuesFrom(ObjectInverseOf(:r1) :A5) :A3)
+         SubClassOf(ObjectSomeValuesFrom(:r0 :A5) :A6)");
+    assert!(ex.is_empty(), "{ex:#?}");
+    assert!(!out.stats.horn_over_budget);
+    assert!(out.stats.conjunctions < 1_000, "{}", out.stats.conjunctions);
+    assert!(out.taxonomy.is_subclass(&c("A0"), &c("A6")));
+}
