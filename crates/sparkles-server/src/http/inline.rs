@@ -37,8 +37,8 @@
 //! for the first time. On atlas the first cursor run of the synthetic `expr-bind-group`
 //! took 0.94 to 1.16 ms of server time and the later ones 0.58 ms, and the first eager
 //! run 1.07 to 1.18 ms and the later ones 0.77 ms. Comparing the cold cursor run with the
-//! eager run after it left about one server process in two answering that query eagerly
-//! for its whole life. A text whose two modes are both quick therefore settles only once
+//! eager run after it left three fresh servers in four of one build answering that query
+//! eagerly for their whole life. A text whose two modes are both quick therefore settles only once
 //! the slower mode has run twice, and until then its next run goes to the mode that lost
 //! with a single run. That costs a text at most two runs in its slower mode.
 //!
