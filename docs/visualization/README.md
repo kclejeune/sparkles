@@ -264,7 +264,8 @@ commit reloads the page, and a protected branch is read-only. The page is also r
 when it cannot read the commit its graph is at. The notes and members forms save through
 the editing forms, which check the stored values of each field they change instead of the
 commit. They are editable only when the dataset keeps no graph but the one the page edits
-and their target is that graph, since a form's save could otherwise change another graph. The [API reference](../API.md#skos-shapes) lists the shapes'
+and their target is that graph, since a form's save could otherwise change another graph,
+and they are read-only for a caller whose grants cover only some graphs. The [API reference](../API.md#skos-shapes) lists the shapes'
 conditions.
 
 ## Known gaps

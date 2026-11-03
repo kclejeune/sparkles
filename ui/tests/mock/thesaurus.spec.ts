@@ -322,3 +322,25 @@ test('undo waits for the head tag', async ({ page }) => {
   await expect(node(page, 'Vertebrates')).toBeVisible({ timeout: 30_000 });
   await expect(undo).toBeEnabled();
 });
+
+test('the forms are read-only for a caller whose grants cover some graphs', async ({ page }) => {
+  await page.route('**/$/whoami', (route) =>
+    route.fulfill({
+      json: {
+        authEnabled: true,
+        principal: { kind: 'token', name: 'writer' },
+        method: 'bearer',
+        server: [],
+        datasets: { thes: 'write' },
+        restricted: { thes: { graphs: true } },
+        canMintTokens: false,
+        logout: false,
+      },
+    }),
+  );
+  await open(page, `&iri=${encodeURIComponent(TH + 'fish')}&view=notes`);
+  const details = page.getByRole('region', { name: 'Details' });
+  await expect(details.getByRole('status')).toContainText('covers only some graphs');
+  // the page's own edits stay, scoped to its graph by their updates
+  await expect(page.getByRole('tab', { name: /Labels/ })).toBeVisible();
+});

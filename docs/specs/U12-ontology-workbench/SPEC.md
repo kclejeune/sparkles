@@ -232,8 +232,10 @@ lets them edit only a dataset that keeps no graph but the one it edits, and only
 form's target is that graph. A form reads every graph and deletes a removed value's
 nested nodes and list cells wherever they are, and its model names the graph of a list's
 members but not of its cells, so no narrower check could keep a save inside one graph.
-The default graph counts as another graph only with triples that are in no named graph,
-which keeps the rule right when the default graph is the union of the named graphs.
+The check reads the stored default graph by its Jena name, `urn:x-arq:DefaultGraph`, so a
+stored copy of a named graph's triple counts as another graph, and a default graph that the
+server serves as the union of the named graphs does not. A caller whose grants cover only
+some graphs cannot see every graph the check needs, so the forms are read-only for it.
 Until the head and its tag are read, the page and its undo and redo are read-only.
 
 **Label edits.** A SKOS-XL label resource that another resource still refers to stays when

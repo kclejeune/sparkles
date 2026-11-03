@@ -13,6 +13,7 @@
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
+  import { graphRestricted } from '$lib/auth';
   import { branchParam, MAIN, onBranch } from '$lib/branches';
   import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
   import { getForm, type FormSaveAnswer } from '$lib/forms-api';
@@ -745,16 +746,19 @@
   const formKey = $derived(`${selected}|${branch}|${formShapes}|${view}|${head?.commit}`);
   const formLock = $derived.by(() => {
     if (readonly) return 'The page is read-only, so the form is too.';
+    // the graphs a caller cannot read are hidden from the check below
+    if (graphRestricted(auth.who, name))
+      return 'Your access covers only some graphs of this dataset, so the page cannot tell whether a form’s save stays in the graph it edits, and the form is read-only.';
     const fm = formModel?.key === formKey ? formModel.m : null;
     if (!fm) return null;
     const here = graph ?? null;
-    const name = (g: string | null) => (g ? iriName(g, prefixes) : 'the default graph');
+    const graphName = (g: string | null) => (g ? iriName(g, prefixes) : 'the default graph');
     if ((fm.graph ?? null) !== here)
-      return `The form would write to ${name(fm.graph ?? null)}, not to ${name(here)} that the page edits, so it is read-only here.`;
+      return `The form would write to ${graphName(fm.graph ?? null)}, not to ${graphName(here)} that the page edits, so it is read-only here.`;
     const others = otherGraphs?.key === graphsKey ? otherGraphs.others : null;
     if (others === null) return 'Checking the graphs of the dataset…';
     if (others)
-      return `The dataset keeps triples outside ${name(here)}, and a form's save could change them, so the form is read-only here.`;
+      return `The dataset keeps triples outside ${graphName(here)}, and a form's save could change them, so the form is read-only here.`;
     return null;
   });
 

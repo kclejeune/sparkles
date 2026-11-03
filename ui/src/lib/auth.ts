@@ -38,6 +38,8 @@ export type Whoami = {
   server: ServerPerm[];
   /** Existing datasets the caller can see, with its level on each. */
   datasets: Record<string, Level>;
+  /** Datasets where the caller's grants cover only some graphs or endpoints. */
+  restricted?: Record<string, { graphs: boolean; endpoints?: string[] }>;
   canMintTokens: boolean;
   logout: boolean;
   tokensPolicy?: { defaultTtlSeconds: number; maxTtlSeconds: number };
@@ -64,6 +66,12 @@ export function can(who: Whoami | null | undefined, ds: string | null | undefine
   if (!ds) return false;
   if (who.server.includes('server-admin')) return true;
   return levelAtLeast(who.datasets[ds], need);
+}
+
+/** Whether the caller's grants on a dataset cover only some of its graphs. */
+export function graphRestricted(who: Whoami | null | undefined, ds: string | null | undefined) {
+  if (!who || !who.authEnabled || !ds) return false;
+  return !!who.restricted?.[ds]?.graphs;
 }
 
 /** Whether the caller holds a server permission (`server-admin` implies all). */
