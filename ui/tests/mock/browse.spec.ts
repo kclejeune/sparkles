@@ -130,7 +130,7 @@ test('downloads answer the entity in each format as an attachment', async ({ pag
   expect(await res.text()).toContain(UNI + 'Professor');
 });
 
-test('an individual has no tree, shows its types and edits in the ontology editor', async ({
+test('an individual has no tree, shows its types and edits in place or in the ontology editor', async ({
   page,
 }) => {
   await openTerm(page, 'ada');
@@ -140,10 +140,11 @@ test('an individual has no tree, shows its types and edits in the ontology edito
       name: 'Types',
     }),
   ).toBeVisible();
-  await expect(page.getByRole('link', { name: 'Edit' })).toHaveAttribute(
-    'href',
-    /\/ui\/ontology\?ds=uni&iri=.*ada&tab=NamedIndividual/,
-  );
+  // Edit switches the page into edit mode (item 630), whose bar links the full editor
+  await page.getByRole('button', { name: 'Edit', exact: true }).click();
+  await expect(
+    page.getByRole('toolbar', { name: 'Edit mode' }).getByRole('link', { name: 'Ontology editor' }),
+  ).toHaveAttribute('href', /\/ui\/ontology\?ds=uni&iri=.*ada&tab=NamedIndividual/);
 });
 
 test('an IRI the graphs do not mention says so', async ({ page }) => {
