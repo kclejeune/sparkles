@@ -420,18 +420,24 @@
   let dlProblem = $state<ManchesterProblem | null>(null);
   let dlError = $state<string | null>(null);
   let dlBusy = $state(false);
-  /** The query text the result answers, and the commit it read. */
-  let dlRan = $state<{ text: string; commit: number } | null>(null);
+  /**
+   * The query text the answers or the problem shown are for, with the commit the page
+   * showed and the dataset, branch and graph it read.
+   */
+  let dlRan = $state<{ text: string; commit: number | null; scope: string } | null>(null);
   let dlSeq = 0;
+  const dlScope = () => `${target}\u0000${JSON.stringify(sel)}`;
   async function runDl(text = dlText) {
-    const t = text.trim();
-    if (!t) return;
+    // the text is sent as it is, so that a problem's span fits the editor's text
+    if (!text.trim()) return;
     const my = ++dlSeq;
+    const scope = dlScope();
+    const commit = summary?.commit ?? null;
     dlBusy = true;
     dlError = null;
     try {
       const r = await dlQuery(target, sel, {
-        expression: t,
+        expression: text,
         answers: dlAnswers,
         reasoning: dlReasoning,
       });
@@ -439,26 +445,33 @@
       if (r.ok) {
         dlResult = r.result;
         dlProblem = null;
-        dlRan = { text: t, commit: r.result.commit };
       } else {
         dlProblem = r.problem;
         dlResult = null;
       }
-      if (q.get('dl') !== t) void nav({ dl: t }, true);
+      dlRan = { text, commit, scope };
+      // each query run is a step of the history, so that Back shows the one before
+      if (q.get('dl') !== text) void nav({ dl: text });
     } catch (e) {
       if (my === dlSeq) dlError = api.errorMessage(e);
     } finally {
       if (my === dlSeq) dlBusy = false;
     }
   }
-  // a link to the tab with a query runs it, and a commit the views show runs it again
+  // a link to the tab with a query runs it and shows it in the editor, and a commit the
+  // views show, or another dataset, branch or graph, runs it again
   $effect(() => {
     const text = q.get('dl');
     const commit = summary?.commit;
+    const scope = dlScope();
     if (tab !== 'dlquery' || !text || commit == null) return;
     untrack(() => {
-      if (dlRan && dlRan.text === text && dlRan.commit === commit) return;
-      if (!dlText) dlText = text;
+      if (dlRan && dlRan.text === text && dlRan.commit === commit && dlRan.scope === scope) return;
+      if (dlRan && dlRan.scope !== scope) {
+        dlResult = null;
+        dlProblem = null;
+      }
+      if (!dlRan || dlRan.text !== text) dlText = text;
       void runDl(text);
     });
   });
@@ -1460,13 +1473,16 @@
     <section class="dl-result" aria-label="DL query answers">
       <div class="dl-label" role="status">
         <span class="badge spark">{r.title}</span>
-        {#if r.complete}
+        {#if r.complete && r.instancesComplete !== false}
           <span class="badge ok">Complete</span>
+        {:else if r.complete}
+          <span class="badge ok">Classes complete</span>
+          <span class="badge danger">Instances possibly incomplete</span>
+        {:else if r.instancesComplete === true}
+          <span class="badge danger">Classes possibly incomplete</span>
+          <span class="badge ok">Instances complete</span>
         {:else}
           <span class="badge danger">Possibly incomplete</span>
-        {/if}
-        {#if r.instancesComplete === true && !r.complete}
-          <span class="badge ok">Instances complete</span>
         {/if}
         {#if dlResult.incremental}<span class="badge">Incremental</span>{/if}
         <span class="faint small">{dlResult.elapsedMs.toFixed(1)} ms</span>

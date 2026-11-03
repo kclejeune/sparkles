@@ -16,6 +16,7 @@ import {
   mintIri,
   pickLabel,
   renameUpdate,
+  resolveName,
   revertCommit,
   replaceAnnotation,
   sectionAxiom,
@@ -524,5 +525,18 @@ describe('Manchester names and literals', () => {
         {},
       ),
     ).toBe("'enrolled in' some 'Graduate course'");
+  });
+});
+
+describe('names in the add fields', () => {
+  const opts = [{ iri: 'http://ex.org/G', name: 'Graduate student' }];
+  const prefixes = { ex: 'http://ex.org/' };
+  it('resolves one name or IRI and leaves expressions to the reader', () => {
+    expect(resolveName('Graduate student', opts, prefixes)).toBe('http://ex.org/G');
+    expect(resolveName('ex:A', opts, prefixes)).toBe('http://ex.org/A');
+    expect(resolveName(' <http://ex.org/B> ', opts, prefixes)).toBe('http://ex.org/B');
+    expect(resolveName('ex:p some ex:A', opts, prefixes)).toBeNull();
+    expect(resolveName('not ex:A', opts, prefixes)).toBeNull();
+    expect(resolveName('{ex:a}', opts, prefixes)).toBeNull();
   });
 });

@@ -143,7 +143,9 @@
     target === 'Class' ? 'classExpression' : target === 'Datatype' ? 'dataRange' : null;
 
   async function addTo(section: string, title: string) {
-    const text = (adding[section] ?? '').trim();
+    // the server reads the text as it is in the field, so a problem's span fits it
+    const raw = adding[section] ?? '';
+    const text = raw.trim();
     const target = sectionTarget(kind, section);
     if (!text) return;
     // a name or an IRI, then functional-style syntax, then Manchester syntax
@@ -155,7 +157,7 @@
       if (!as) return problem(section, 'Name an entity or an IRI.');
       busy = section;
       try {
-        const r = await parse(text, as);
+        const r = await parse(raw, as);
         if (!r.ok) return problem(section, fromServer(r.problem));
         value = r.parsed.value;
       } catch (e) {
@@ -173,13 +175,14 @@
 
   /** An axiom in Manchester or functional-style syntax, added as it is. */
   async function addAxiom() {
-    const text = (adding.axiom ?? '').trim();
+    const raw = adding.axiom ?? '';
+    const text = raw.trim();
     if (!text) return;
     let ax: unknown = isFunctional(text) ? text : null;
     if (ax == null) {
       busy = 'axiom';
       try {
-        const r = await parse(text, 'axiom');
+        const r = await parse(raw, 'axiom');
         if (!r.ok) return problem('axiom', fromServer(r.problem));
         ax = r.parsed.value;
       } catch (e) {

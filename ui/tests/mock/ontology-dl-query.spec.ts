@@ -135,3 +135,39 @@ test('an unknown name in a frame section is reported with its span', async ({ pa
   await expect(sub.getByRole('alert')).toContainText('attends');
   await expect(sub.locator('.cm-lint-error')).toHaveText('attends');
 });
+
+test('the editor follows the address through the history', async ({ page }) => {
+  await open(page, '/ui/ontology?ds=uni&tab=dlquery');
+  const result = page.getByLabel('DL query answers');
+  for (const q of ['Student', 'Course']) {
+    await editor(page).click();
+    await page.keyboard.press('ControlOrMeta+a');
+    await page.keyboard.press('Delete');
+    await page.keyboard.type(q);
+    await page.keyboard.press('Escape');
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(new RegExp(`dl=${q}`));
+    await expect(result.getByRole('region', { name: 'Equivalent classes' })).toContainText(q);
+  }
+  // a frame opened from the answers keeps the query, and going back shows the earlier one
+  await result
+    .getByRole('region', { name: 'Direct subclasses' })
+    .getByRole('button', { name: 'Graduate course' })
+    .click();
+  await expect(editor(page)).toHaveText('Course');
+  await page.goBack();
+  await page.goBack();
+  await expect(editor(page)).toHaveText('Student');
+  await expect(result.getByRole('region', { name: 'Direct subclasses' })).toContainText(
+    'Graduate student',
+  );
+});
+
+test('a problem is underlined where it is when the text starts with spaces', async ({ page }) => {
+  await open(page, '/ui/ontology?ds=uni&tab=dlquery');
+  await editor(page).click();
+  await page.keyboard.type('  Person and Robot');
+  await page.keyboard.press('Escape');
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.cm-lint-error')).toHaveText('Robot');
+});

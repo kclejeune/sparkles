@@ -1719,7 +1719,13 @@ export function resolveName(
   options: { iri: string; name: string }[],
   prefixes: PrefixMap,
 ): string | null {
-  const r = resolveInput(text.includes('(') ? '' : text, options, prefixes);
+  const s = text.trim();
+  // an option's name may hold spaces, and anything else with a space or a bracket is an
+  // expression for the server's reader, such as `ex:p some ex:A`
+  const named = options.find((o) => o.name === s);
+  if (named) return named.iri;
+  if (/[\s()[\]{},]/.test(s)) return null;
+  const r = resolveInput(s, options, prefixes);
   return typeof r === 'string' ? r : null;
 }
 
