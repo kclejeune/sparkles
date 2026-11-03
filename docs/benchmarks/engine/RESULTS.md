@@ -347,84 +347,92 @@ from 17 to 49 at 8,192 sets and that of `F4-2` from 9 to 58, and at 16,384 sets 
 
 ### Estimation timing on forge
 
-`abtime.py` timed the base build against the build with the correlation-aware estimates on
-forge, with every other benchmark held off by the bench lock. Each workload ran four rounds
+`abtime.py` timed main without the correlation-aware estimates against the build with them
+on forge, with every other benchmark held off by the bench lock. Both builds came from
+the same host, wally, without learned incremental reuse. Each workload ran four rounds
 of base, change, change and base. Each run was a fresh server pinned to 12 CPUs with 12
 threads and the result cache off, and each query got 3 warm-ups and 20 timed requests. A
 request's time is the server's planning and execution time, and the table gives the
-geometric mean of the per-query ratios of the medians. Each build ran on stores that it
-loaded itself, and every query returned the same answers on both. The
-[run record](runs/2026-11-03-estimation-ab-forge-96984649/record.json) holds every query's
-medians, per-round ratios and changed plans, and its
-[commands](runs/2026-11-03-estimation-ab-forge-96984649/run.sh.txt).
+geometric mean of the per-query ratios of the medians. The change ran on stores that it
+loaded itself, and every query returned the same answers on both. The flagged synthetic
+and DBpedia queries ran again in eight rounds. The
+[run record](runs/2026-11-03-estimation-ab-forge-e8e0e4cd/record.json) holds every query's
+medians, per-round ratios, changed plans and reruns, and its
+[commands](runs/2026-11-03-estimation-ab-forge-e8e0e4cd/run.sh.txt).
 
 | Workload | Queries | Change to base | Queries 5% or more slower |
 |---|---|---|---|
-| Synthetic, 1.05M triples | 45 | 1.005 | `two-hop-count` |
-| WatDiv at scale 100 | 88 | 0.969 | `F3-1`, `F3-3`, `F4-1` to `F4-4`, `S4-2` and `S4-4` |
-| BSBM explore, 10M | 33 | 1.001 | `explore-q9-1` and `explore-q9-2` |
-| BSBM BI, 10M | 24 | 0.936 | None. |
-| LUBM(10) with OWL RL | 14 | 0.958 | None. |
-| DBpedia, 8.2M-triple slice | 30 | 1.009 | Seven queries under 0.1 ms and `births-by-decade`. |
+| Synthetic, 1.05M triples | 45 | 1.028 | Five queries under 0.15 ms, `expr-agg-arg`, `f-expr-range-join` and `f-regex-iri-join`. |
+| WatDiv at scale 100 | 88 | 0.968 | `F4-1` to `F4-5`, `S4-2` and `S4-4`. |
+| BSBM explore, 10M | 33 | 1.000 | None. |
+| BSBM BI, 10M | 24 | 0.933 | None. |
+| LUBM(10) with OWL RL | 14 | 0.946 | None. |
+| DBpedia, 8.2M-triple slice | 30 | 0.993 | Three queries under 0.1 ms, each within 2.5% in eight rounds. |
 
-The plans of 41 queries change. WatDiv's `C` queries take 0.20 to 0.44 times as long,
-BSBM BI `q1-3` 0.23 times, LUBM `q2` 0.52 times and DBpedia's `costar-birthplace` 0.64
+The plans of 41 queries change. WatDiv's `C` queries take 0.20 to 0.45 times as long,
+BSBM BI `q1-3` 0.23 times, LUBM `q2` 0.51 times and DBpedia's `costar-birthplace` 0.63
 times. WatDiv `S4-2` and `S4-4` take 1.6 times as long. The node sets estimate their join
 of `artist` and `familyName` within 3%, and the planner then probes `familyName` with 704
-keys, which costs about 0.1 ms more than the base plan's merge join of a 12,284-row scan.
-Roadmap item NEW-ITEM-5 calibrates that probe cost.
+keys, which costs about 0.1 ms more than the base plan's merge join with a scan of the
+pattern. A cost term for keys spread at random brought the base plan back but slowed
+other queries more, as the
+[performance experiments](../../PERFORMANCE-EXPERIMENTS.md#query-execution) record, and
+roadmap item NEW-ITEM-5 prices probes by how their keys spread.
 
 | Workload | Query | Base ms | Change ms | Ratio |
 |---|---|---|---|---|
-| WatDiv | `C1-1` | 3.083 | 0.913 | 0.30 |
-| WatDiv | `C2-1` | 5.134 | 1.052 | 0.20 |
-| WatDiv | `C3-1` | 31.712 | 14.065 | 0.44 |
-| WatDiv | `F2-1` | 0.270 | 0.270 | 1.00 |
-| WatDiv | `F2-2` | 0.400 | 0.414 | 1.04 |
-| WatDiv | `F2-3` | 0.317 | 0.317 | 1.00 |
-| WatDiv | `F2-4` | 0.302 | 0.303 | 1.00 |
-| WatDiv | `F2-5` | 0.261 | 0.259 | 0.99 |
-| WatDiv | `F4-1` | 1.038 | 1.108 | 1.07 |
-| WatDiv | `F4-2` | 1.007 | 1.067 | 1.06 |
-| WatDiv | `F4-3` | 1.010 | 1.066 | 1.05 |
-| WatDiv | `F4-4` | 0.900 | 0.951 | 1.06 |
-| WatDiv | `F4-5` | 1.008 | 1.050 | 1.04 |
-| WatDiv | `F5-1` | 0.231 | 0.231 | 1.00 |
-| WatDiv | `F5-2` | 0.320 | 0.317 | 0.99 |
-| WatDiv | `F5-3` | 0.282 | 0.282 | 1.00 |
-| WatDiv | `F5-4` | 0.291 | 0.284 | 0.98 |
-| WatDiv | `F5-5` | 0.241 | 0.238 | 0.99 |
-| WatDiv | `S3-1` | 0.131 | 0.131 | 1.00 |
-| WatDiv | `S3-2` | 0.123 | 0.123 | 1.00 |
-| WatDiv | `S3-3` | 0.123 | 0.123 | 1.00 |
-| WatDiv | `S3-4` | 0.123 | 0.122 | 0.99 |
-| WatDiv | `S3-5` | 0.215 | 0.202 | 0.94 |
-| WatDiv | `S4-2` | 0.165 | 0.270 | 1.64 |
-| WatDiv | `S4-4` | 0.164 | 0.265 | 1.62 |
-| WatDiv | `S5-1` | 0.169 | 0.165 | 0.98 |
-| WatDiv | `S5-2` | 0.163 | 0.169 | 1.04 |
-| WatDiv | `S5-3` | 0.163 | 0.169 | 1.04 |
-| WatDiv | `S5-4` | 0.162 | 0.167 | 1.03 |
-| WatDiv | `S5-5` | 0.163 | 0.170 | 1.04 |
-| BSBM explore | `explore-q7-2` | 0.418 | 0.427 | 1.02 |
+| WatDiv | `C1-1` | 3.099 | 0.923 | 0.30 |
+| WatDiv | `C2-1` | 5.140 | 1.050 | 0.20 |
+| WatDiv | `C3-1` | 31.586 | 14.280 | 0.45 |
+| WatDiv | `F2-1` | 0.266 | 0.267 | 1.01 |
+| WatDiv | `F2-2` | 0.398 | 0.417 | 1.05 |
+| WatDiv | `F2-3` | 0.314 | 0.316 | 1.01 |
+| WatDiv | `F2-4` | 0.303 | 0.303 | 1.00 |
+| WatDiv | `F2-5` | 0.258 | 0.259 | 1.00 |
+| WatDiv | `F4-1` | 1.028 | 1.108 | 1.08 |
+| WatDiv | `F4-2` | 0.996 | 1.068 | 1.07 |
+| WatDiv | `F4-3` | 0.996 | 1.070 | 1.07 |
+| WatDiv | `F4-4` | 0.899 | 0.965 | 1.07 |
+| WatDiv | `F4-5` | 0.987 | 1.057 | 1.07 |
+| WatDiv | `F5-1` | 0.229 | 0.230 | 1.01 |
+| WatDiv | `F5-2` | 0.314 | 0.319 | 1.02 |
+| WatDiv | `F5-3` | 0.279 | 0.284 | 1.02 |
+| WatDiv | `F5-4` | 0.291 | 0.283 | 0.97 |
+| WatDiv | `F5-5` | 0.242 | 0.238 | 0.98 |
+| WatDiv | `S3-1` | 0.132 | 0.133 | 1.00 |
+| WatDiv | `S3-2` | 0.125 | 0.123 | 0.99 |
+| WatDiv | `S3-3` | 0.124 | 0.122 | 0.99 |
+| WatDiv | `S3-4` | 0.122 | 0.122 | 1.00 |
+| WatDiv | `S3-5` | 0.218 | 0.202 | 0.93 |
+| WatDiv | `S4-2` | 0.167 | 0.272 | 1.63 |
+| WatDiv | `S4-4` | 0.164 | 0.265 | 1.61 |
+| WatDiv | `S5-1` | 0.169 | 0.166 | 0.98 |
+| WatDiv | `S5-2` | 0.163 | 0.168 | 1.03 |
+| WatDiv | `S5-3` | 0.163 | 0.169 | 1.03 |
+| WatDiv | `S5-4` | 0.165 | 0.167 | 1.02 |
+| WatDiv | `S5-5` | 0.163 | 0.169 | 1.04 |
+| BSBM explore | `explore-q7-2` | 0.417 | 0.428 | 1.02 |
 | BSBM explore | `explore-q8-3` | 0.291 | 0.295 | 1.01 |
-| BSBM BI | `bi-q1-2` | 6.917 | 6.156 | 0.89 |
-| BSBM BI | `bi-q1-3` | 86.601 | 19.759 | 0.23 |
-| BSBM BI | `bi-q4-3` | 229.868 | 234.204 | 1.02 |
-| LUBM | `q12` | 0.138 | 0.143 | 1.03 |
-| LUBM | `q2` | 4.048 | 2.089 | 0.52 |
-| LUBM | `q9` | 6.223 | 5.086 | 0.82 |
-| DBpedia | `category-people-1` | 0.094 | 0.098 | 1.04 |
-| DBpedia | `category-people-2` | 0.090 | 0.096 | 1.07 |
-| DBpedia | `costar-birthplace` | 0.332 | 0.212 | 0.64 |
+| BSBM BI | `bi-q1-2` | 6.952 | 6.140 | 0.88 |
+| BSBM BI | `bi-q1-3` | 86.681 | 19.725 | 0.23 |
+| BSBM BI | `bi-q4-3` | 230.362 | 232.738 | 1.01 |
+| LUBM | `q12` | 0.136 | 0.142 | 1.04 |
+| LUBM | `q2` | 4.136 | 2.089 | 0.51 |
+| LUBM | `q9` | 6.372 | 4.984 | 0.78 |
+| DBpedia | `category-people-1` | 0.094 | 0.096 | 1.02 |
+| DBpedia | `category-people-2` | 0.088 | 0.093 | 1.06 |
+| DBpedia | `costar-birthplace` | 0.333 | 0.210 | 0.63 |
 
-The other slower queries keep their plans. WatDiv `F3` and `F4`, BSBM explore `q9` and
-the DBpedia queries under 0.1 ms spend 1 to 75 microseconds longer in planning, 5% to 10%
-of their time, on registering the sets of their variables and walking their plans for set
-masks. Roadmap item NEW-ITEM-6 keeps that work across queries. `two-hop-count` runs
-identical machine code in its hot loop, except one field offset, at an alignment 16 bytes
-off a cache line, and its rounds range from 1.08 to 1.15. `births-by-decade` was slower in
-one round of four. Roadmap item NEW-ITEM-7 rechecks both on the next build of the engine.
+The other slower queries keep their plans. WatDiv `F4` and the synthetic and DBpedia
+queries under 0.15 ms spend 1 to 90 microseconds longer in planning, 5% to 10% of their
+time, on registering the sets of their variables and walking their plans for set masks.
+Roadmap item NEW-ITEM-6 keeps that work across queries. In eight rounds `expr-agg-arg`
+ran 0.99 times as long, the synthetic `f-regex-iri-join` 1.06 times and
+`f-expr-range-join` 1.11 times, the last two in execution. The servers of either build ran `f-expr-range-join` in 1.7 to 1.9 ms or in 2.7
+to 3.3 ms, so its median depends on which servers a round starts. `two-hop-count` and
+`births-by-decade`, which an earlier pair of builds ran 1.15 and 1.13 times as long, ran
+0.98 and 1.00 times as long here. Roadmap item NEW-ITEM-7 separates code layout from
+code in these execution differences.
 
 ## Rewrite gate baselines
 

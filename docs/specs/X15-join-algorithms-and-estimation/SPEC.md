@@ -181,21 +181,22 @@ sets, of `F4-2` from 9 to 58 and of DBpedia's `film-director-optional` from 1.0 
 from 1.0 to 2.1.
 
 On forge at 12 threads, with interleaved rounds of fresh servers and identical answers,
-the geometric mean of the query times against the base build is 0.969 on WatDiv, 0.936
-on BSBM BI, 0.958 on LUBM, 1.001 on BSBM explore, 1.005 on the synthetic workload and
-1.009 on DBpedia. The plans of 41 queries change. WatDiv's `C` queries take 0.20 to 0.44
-times as long, BSBM BI `q1-3` 0.23 times, LUBM `q2` 0.52 times and DBpedia's
-`costar-birthplace` 0.64 times. WatDiv `S4-2` and `S4-4` take 1.6 times as long, since an
+the geometric mean of the query times against main without these estimates is 0.968 on
+WatDiv, 0.933 on BSBM BI, 0.946 on LUBM, 1.000 on BSBM explore, 1.028 on the synthetic
+workload and 0.993 on DBpedia. The plans of 41 queries change. WatDiv's `C` queries take
+0.20 to 0.45 times as long, BSBM BI `q1-3` 0.23 times, LUBM `q2` 0.51 times and DBpedia's
+`costar-birthplace` 0.63 times. WatDiv `S4-2` and `S4-4` take 1.6 times as long, since an
 accurate estimate leads the planner to a 704-key index join that the cost model prices
 too low. A cost term for keys spread at random brought their base plan back, but the 64
 queries whose plans it changed took 1.15 times as long, since keys close together cost a
 third of what spread keys cost and the planner cannot tell them apart. The
 [experiment](../../PERFORMANCE-EXPERIMENTS.md#query-execution) is recorded, and item
-NEW-ITEM-5 prices probes by how their keys spread. Planning takes 1 to 75 microseconds
-longer on short WatDiv, BSBM explore and DBpedia queries, 5% to 10% of their time, which
-item NEW-ITEM-6 follows up, and two queries with unchanged plans are rechecked under item
-NEW-ITEM-7. Interleaved runs on
-atlas, an Intel host like forge, found the same slowdowns of `S4-2`, `S4-4` and `F4`. The
+NEW-ITEM-5 prices probes by how their keys spread. Planning takes 1 to 90 microseconds
+longer on WatDiv `F4` and on short synthetic, WatDiv and DBpedia queries, 5% to 10% of
+their time, which item NEW-ITEM-6 follows up. Two synthetic queries with unchanged plans
+run 1.06 and 1.11 times as long in execution in eight rounds, and item NEW-ITEM-7 follows
+them up. Interleaved runs on atlas, an Intel host like forge, found the same slowdowns of
+`S4-2`, `S4-4` and `F4`. The
 [engine results](../../benchmarks/engine/RESULTS.md#estimation-timing-on-forge) list every
 changed plan.
 

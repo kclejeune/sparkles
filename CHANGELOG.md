@@ -244,9 +244,10 @@ on LUBM(10), and answers are unchanged. The switches are `set_remainders`, `node
 slice, and the node pass adds about 0.2 s to a WatDiv load and 0.7 s to the DBpedia
 load. On atlas, opening the DBpedia slice takes 0.30 s instead of 0.07 s and the server
 holds 214 MB instead of 133 MB once ready. The node pass keeps the same sets at any
-thread count. On forge, WatDiv's `C` queries run 2.3 to 5 times as fast, BSBM BI `q1-3` 4.4 times
-and LUBM `q2` 1.9 times. WatDiv `S4-2` and `S4-4` take 1.6 times as long after a plan
-change, and planning takes 1 to 75 microseconds longer on short queries.
+thread count. On forge, WatDiv's `C` queries run 2.2 to 4.9 times as fast, BSBM BI
+`q1-3` 4.4 times and LUBM `q2` 2.0 times. WatDiv `S4-2` and `S4-4` take 1.6 times as long
+after a plan change, and planning takes 1 to 90 microseconds longer on short queries and
+WatDiv `F4`.
 
 `sparkles ontology classify FILE` and `sparkles ontology check FILE` read a file of one
 graph into memory without a store and give the answers that a store of the loaded file
