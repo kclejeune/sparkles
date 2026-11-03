@@ -253,9 +253,14 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   with an individual, a data property, a datatype or a key, and any change after a run
   that took that step, saturates everything again. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
-  closure, saturates and builds the taxonomy. On the benchmark
-  host GO classifies in 83 ms and ChEBI lite in 0.84 seconds on eight threads, and the
-  classifier is 2.5 to 13 times as fast as ELK on GO, ChEBI lite and the largest ORE
+  closure, saturates and builds the taxonomy. A run of 16,384 axioms or more on several
+  threads normalizes chunks of the axioms in parallel, with the same ids and taxonomy as
+  on one thread. The chunks hold the names they meet until they merge and count against
+  the memory budget, and a run whose chunks would pass it normalizes on one thread. This
+  and the saturation's message buffers raise the peak resident set on eight threads by
+  up to 13% on some ontologies in exchange for the speed. On the benchmark host GO
+  classifies in 77 ms and ChEBI lite in 0.39 seconds on eight threads, and the
+  classifier is 3.1 to 20 times as fast as ELK on GO, ChEBI lite and the largest ORE
   2015 EL ontologies on one and eight threads. The classifier's direct hierarchy equals the hierarchy that GO's release
   publishes, and its taxonomy of ChEBI entails every subsumption ChEBI asserts and
   gives no direct subsumption that ChEBI does not assert

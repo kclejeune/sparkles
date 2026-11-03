@@ -192,6 +192,8 @@
   let examplesOpen = $state(false);
   let savedOpen = $state(false);
   let formatMenuOpen = $state(false);
+  /** On a phone: the branch, state, history and row limit, behind one button. */
+  let optionsOpen = $state(false);
   let formatting = $state(false);
   /** Format the query before each Run (per viewer, off by default). */
   let formatOnRun = $state(load<boolean>(FORMAT_ON_RUN_KEY, false) === true);
@@ -219,7 +221,7 @@
   let isPhone = $state(false);
   $effect(() => {
     if (typeof matchMedia !== 'function') return;
-    const m = matchMedia('(max-width: 600px)');
+    const m = matchMedia('(max-width: 760px)');
     isPhone = m.matches;
     const on = () => (isPhone = m.matches);
     m.addEventListener('change', on);
@@ -2564,6 +2566,7 @@
 
 <svelte:head><title>Query | Sparkles</title></svelte:head>
 
+<h1 class="sr-only">Query</h1>
 <div class="page" style:--editor-h="{editorH}px">
   <!-- the Ask bar, when the dataset has an assistant -->
   <div class="askbar-slot">
@@ -2852,70 +2855,80 @@
           </div>
         {/if}
       </div>
-      {#if reasoningInfo && kind !== 'UPDATE'}
+      <button
+        class="btn sm options-toggle"
+        aria-expanded={optionsOpen}
+        aria-controls="run-options"
+        onclick={() => (optionsOpen = !optionsOpen)}
+      >
+        Options <Icon name="chevronDown" size={13} />
+      </button>
+      <div class="run-options" class:open={optionsOpen} id="run-options">
+        {#if reasoningInfo && kind !== 'UPDATE'}
+          <label
+            class="limit inf"
+            title="Include the {fmtInt(
+              reasoningInfo.inferred,
+            )} triples inferred by {reasoningInfo.profile} reasoning (reasoning={inferences})"
+          >
+            <input type="checkbox" bind:checked={inferences} />
+            <span>Use inferences</span>
+          </label>
+        {/if}
+        {#if branchList}
+          <label class="at" title="The branch queries read and updates change (branch=)">
+            <span class="faint">Branch</span>
+            <select class="select sm mono" bind:value={app.queryBranch} aria-label="Branch">
+              {#each branchList as b (b.name)}
+                <option value={b.name === MAIN ? '' : b.name}>{branchOption(b)}</option>
+              {/each}
+              {#if branch && !branchList.some((b) => b.name === branch)}
+                <option value={branch}>{branch}</option>
+              {/if}
+            </select>
+          </label>
+        {/if}
         <label
-          class="limit inf"
-          title="Include the {fmtInt(
-            reasoningInfo.inferred,
-          )} triples inferred by {reasoningInfo.profile} reasoning (reasoning={inferences})"
+          class="at"
+          title="Read a past state (at=): a commit number, commit:N, time:<RFC 3339> or snapshot:NAME. Empty reads the head; updates always apply to the head."
         >
-          <input type="checkbox" bind:checked={inferences} />
-          <span>Use inferences</span>
+          <span class="faint">At</span>
+          <input
+            class="input sm mono"
+            class:invalid={!atOk}
+            placeholder="head"
+            list="at-options"
+            size="12"
+            aria-invalid={!atOk}
+            bind:value={app.queryAt}
+          />
+          <datalist id="at-options">
+            {#each snapshotNames as s (s)}<option value={s}></option>{/each}
+          </datalist>
+          {#if app.queryAt}
+            <button
+              class="btn ghost icon sm"
+              aria-label="Read the head"
+              title="Read the head"
+              onclick={() => (app.queryAt = '')}><Icon name="x" size={11} /></button
+            >
+          {/if}
         </label>
-      {/if}
-      {#if branchList}
-        <label class="at" title="The branch queries read and updates change (branch=)">
-          <span class="faint">Branch</span>
-          <select class="select sm mono" bind:value={app.queryBranch} aria-label="Branch">
-            {#each branchList as b (b.name)}
-              <option value={b.name === MAIN ? '' : b.name}>{branchOption(b)}</option>
-            {/each}
-            {#if branch && !branchList.some((b) => b.name === branch)}
-              <option value={branch}>{branch}</option>
-            {/if}
+        <button
+          class="btn sm"
+          aria-pressed={timeOpen}
+          title="Move through the commits of the branch (H)"
+          onclick={toggleTime}
+        >
+          <Icon name="clock" size={13} /> History
+        </button>
+        <label class="limit" title="Maximum rows the server sends to the browser (send=)">
+          <span class="faint">Show</span>
+          <select class="select sm" bind:value={limit}>
+            {#each LIMITS as l (l)}<option value={l}>{fmtInt(l)} rows</option>{/each}
           </select>
         </label>
-      {/if}
-      <label
-        class="at"
-        title="Read a past state (at=): a commit number, commit:N, time:<RFC 3339> or snapshot:NAME. Empty reads the head; updates always apply to the head."
-      >
-        <span class="faint">At</span>
-        <input
-          class="input sm mono"
-          class:invalid={!atOk}
-          placeholder="head"
-          list="at-options"
-          size="12"
-          aria-invalid={!atOk}
-          bind:value={app.queryAt}
-        />
-        <datalist id="at-options">
-          {#each snapshotNames as s (s)}<option value={s}></option>{/each}
-        </datalist>
-        {#if app.queryAt}
-          <button
-            class="btn ghost icon sm"
-            aria-label="Read the head"
-            title="Read the head"
-            onclick={() => (app.queryAt = '')}><Icon name="x" size={11} /></button
-          >
-        {/if}
-      </label>
-      <button
-        class="btn sm"
-        aria-pressed={timeOpen}
-        title="Move through the commits of the branch (H)"
-        onclick={toggleTime}
-      >
-        <Icon name="clock" size={13} /> History
-      </button>
-      <label class="limit" title="Maximum rows the server sends to the browser (send=)">
-        <span class="faint">Show</span>
-        <select class="select sm" bind:value={limit}>
-          {#each LIMITS as l (l)}<option value={l}>{fmtInt(l)} rows</option>{/each}
-        </select>
-      </label>
+      </div>
       <div class="format-group">
         <button
           class="btn sm format"
@@ -4271,11 +4284,19 @@
   .toolstack {
     min-width: 0;
   }
+  /* the branch, state, history and row limit: in the toolbar's row, and on a phone behind
+     the Options button */
+  .run-options {
+    display: contents;
+  }
+  .options-toggle {
+    display: none;
+  }
   .toolbar {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 6px 12px;
+    gap: var(--sp-2);
+    padding: 6px var(--sp-3);
     background: var(--surface);
     border-bottom: 1px solid var(--border);
     min-width: 0;
@@ -4825,7 +4846,7 @@
   .node-menu .btn {
     justify-content: flex-start;
   }
-  @media (max-width: 600px) {
+  @media (max-width: 760px) {
     .gpaths {
       position: absolute;
       left: 0;
@@ -4900,10 +4921,29 @@
   }
   /* a phone: the toolbar wraps and its buttons land anywhere, so the menus hang from the
      toolbar's right edge instead of their button's, which could put them off screen */
-  @media (max-width: 600px) {
+  @media (max-width: 760px) {
+    .options-toggle {
+      display: inline-flex;
+    }
+    .options-toggle[aria-expanded='true'] :global(.icon) {
+      transform: rotate(180deg);
+    }
+    .run-options {
+      display: none;
+    }
+    .run-options.open {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: var(--sp-2);
+      order: 10;
+      width: 100%;
+      padding-top: var(--sp-1);
+    }
     /* the wrapped toolbar and the editor would leave the results a sliver of a short
        screen: they get a fixed share of it, and the page scrolls down to them */
     .page {
+      flex: none;
       height: auto;
       --editor-row: min(var(--editor-h), 40vh);
       --results-row: max(320px, 70vh);

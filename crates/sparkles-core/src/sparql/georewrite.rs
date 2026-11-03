@@ -163,7 +163,7 @@ mod on {
         match e {
             RelateEnd::Var(v) => format!("?{}", ctx.var_name(*v)),
             RelateEnd::Geometry(_, g) => summary(g),
-            RelateEnd::Node(id) => ctx.term(*id).map_or_else(|| "?".into(), |t| short(&t)),
+            RelateEnd::Node(id) => ctx.plan_term(*id).map_or_else(|| "?".into(), |t| short(&t)),
             RelateEnd::Absent => "(absent)".into(),
         }
     }

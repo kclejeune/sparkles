@@ -360,7 +360,7 @@ mod tests {
         let (x, y) = (ctx.var("x"), ctx.var("y"));
         ctx.enable_cursor_accounting().unwrap();
         let ctx = Arc::new(ctx);
-        ctx.attach_cursor_owner();
+        ctx.attach_owner();
         let values = |v| {
             let mut t = Table::new(vec![v]);
             for row in 0..64 {

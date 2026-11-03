@@ -1,0 +1,15 @@
+# Run on forge alone under ~/lanes/.bench.lock and ~/lanes/.heavy.lock, with the scripts of
+# commit e52937ca copied from a clean export, so the manifest says "scripts commit: unknown".
+# The binary is a release build of e52937ca made off forge inside `nix develop` with the
+# same compilers as the baseline, and its build configuration was printed in that
+# environment. Its environment lacks the baseline's CARGO_INCREMENTAL=0, which a release
+# profile does not read, so the comparison with the baseline passes --allow-different:
+#   nix develop -c mbx sparkles-task -- mbx build --release -p sparkles-server --bin sparkles
+#   python3 scripts/bench-gate.py build-config --cargo 'build --release -p sparkles-server --bin sparkles'
+L=~/lanes/exec-453; R=$L/runs/p1-e52937ca
+flock ~/lanes/.bench.lock flock ~/lanes/.heavy.lock $L/src-e52937ca/scripts/bench-executors.sh \
+  --out $R/executors --commit e52937ca --data-dir $L/data \
+  --build-config "$(cat $L/bin/sparkles-e52937ca.build-config.json)" $L/bin/sparkles-e52937ca
+python3 scripts/bench-gate.py compare --threshold 0.05 --keys '/exec$' --allow-different \
+  docs/benchmarks/synthetic/runs/2026-11-01-executor-matrix-forge-6cd4b67e/record.json \
+  docs/benchmarks/synthetic/runs/2026-11-02-executor-matrix-forge-e52937ca/record.json

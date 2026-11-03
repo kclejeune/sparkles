@@ -108,6 +108,26 @@ and the lookup from a class to its node is a table in IRI order that a binary se
 reads, in place of a hash map. The IRIs are distinct, so every number of threads gives
 one order (roadmap item 646).
 
+**Normalization and messages on several threads.** A run of 16,384 axioms or more on
+several threads normalizes chunks of the axioms in parallel, each into an interner of
+its own that keeps an intersection whole until the operands have their final ids. The
+chunks then merge in order into the run's interner, so that each name and expression
+gets the id a normalization on one thread gives it, the binary intersections are folded
+from the final ids and every thread count gives the same ids and taxonomy (roadmap
+item 644). A run whose chunks meet data ranges or literals, whose ids sit inside their
+values, normalizes on one thread. Each IRI is hashed once, held once in a table that
+keeps its hash, and a class's or an individual's expression is found by its id in an
+array (item 647). On several threads a worker buffers the messages it sends to other
+contexts and delivers them grouped by destination with a radix sort, taking each
+destination's lock once per batch, when the buffer fills, when another worker is idle
+and before it waits, and a long activation shares the contexts it woke with idle
+workers as it goes (item 645). The count of pending work is the shared queue's entries
+plus the busy workers, so a context marked active costs no shared counter. A context's
+subsumers stay a list of up to 12 members, searched eight at a time, before they become
+a hash set (item 648). The rules are compiled twice, and a run whose index has no
+individuals, universal roles, nominal self restrictions or functional data roles uses
+the copy without their checks (item 665).
+
 `Saturation` keeps the contexts over axioms that the caller keeps, reads them in place
 on every run and takes the axioms added and removed since the last run. `Classifier`
 keeps a copy of the axioms on top of it, for callers that add and remove axioms one at a
@@ -213,8 +233,12 @@ the property closure, which stops as soon as it passes the budget, the context s
 roots, the stored conclusions, the messages waiting in the contexts' to-do lists and
 the taxonomy with its links, which the budget checks before the taxonomy is built and
 again before the links are stored. The worlds count their copies, stored conclusions and
-waiting messages while they run, and the subsumers they keep once they end. The memory pool is charged for the growth of the peak.
-A counting allocator measured each run's peak heap within 14% of the estimate on GO,
+waiting messages while they run, and the subsumers they keep once they end. The chunks
+of a parallel normalization count their interners and axioms with room for what their
+merge adds, the merge counts what it adds past that room, and a run whose chunks pass
+the budget or a refused grant normalizes on one thread instead. The memory pool is
+charged for the growth of the peak, once, from the normalization on.
+A counting allocator measured each run's peak heap within 15% of the estimate on GO,
 ChEBI lite and the largest ORE 2015 EL ontologies. A run that stops before its saturation ends
 drops its contexts, since the next run starts again. In the handle the threads come from the
 algorithm pool, the budget from the query's memory budget and the server's memory pool
@@ -325,11 +349,22 @@ expression, sent every activation through a shared queue and left out the taxono
 its estimate. An interleaved A/B on `atlas` against the build of commit aa0a41a6 took
 ChEBI lite on eight threads from 2,955 to 1,009 ms, `ore_ont_868` from 8,226 to 1,393 ms
 and `ore_ont_1559` from 8,099 to 781 ms, and the peak resident set from 1,337 to 804 MiB,
-3,514 to 1,686 MiB and 3,593 to 1,773 MiB. Normalization and interning still run on one
-thread and take most of a run on eight threads on the ORE ontologies, which item
-644 follows. Item 587's rules left the largest ORE ontologies within 3% of the build
-before, on either side, and ChEBI lite within 3%, and cost GO 2 to 3%, which item
-665 follows. The rules for individuals run in functions of their own, outside the
+3,514 to 1,686 MiB and 3,593 to 1,773 MiB. Item 587's rules left the largest ORE ontologies within 3% of the build
+before, on either side, and ChEBI lite within 3%, and cost GO 2 to 3%. Items 644, 645,
+648 and 665 then took ChEBI lite on eight threads from 912 to 393 ms, `ore_ont_868`
+from 862 to 599 ms, `ore_ont_13482` from 588 to 368 ms and GO from 88 to 77 ms, and GO
+on one thread from 288 to 279 ms, on forge against the build of commit 790cffae with the
+same taxonomy. On eight threads ChEBI lite's saturation fell from 737 to 273 ms and
+`ore_ont_868`'s index stage from 495 to 263 ms. The parallel normalization holds each
+chunk's names until the merge and the outboxes hold up to 4,096 messages per worker,
+which raises the peak resident set on eight threads from 911 to 988 MiB on ChEBI lite
+and from 279 to 295 MiB on GO, while that of the ORE ontologies falls, 1,739 to
+1,688 MiB on `ore_ont_868`. The chunks count against the memory budget, and a run whose
+chunks would pass it normalizes on one thread. Three variants measured no faster and
+are in [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md), the outboxes on
+one thread, outboxes that sort and drop repeated messages, and subsumer lists of up to
+32 members, and so is a merge of the chunks' names through sharded tables, commit
+208b8efc, reverted in 9ea7a425. The rules for individuals run in functions of their own, outside the
 saturation's loop, since a first build that kept them inline, commit 68a683b5, made the
 saturation of ontologies without individuals 3 to 19% slower on one thread in an
 interleaved A/B on `atlas` ([record](../../benchmarks/el-classification/runs/2026-11-03-el-inline-atlas-68a683b5/record.json)). The [benchmark
@@ -360,8 +395,11 @@ through `Classifier::saturate` and `Classifier::describe`, as
 Durable and automatic classification is item
 589, after item 339. A kept classification with assertions is item 590,
 the comparison and measurements against ELK were item 591, the speed and memory work
-against ELK were items 602 and 592, and normalization and interning on several threads
-are item 644.
+against ELK were items 602 and 592, and normalization on several threads, the
+saturation's scaling and the cost of item 587 on GO were items 644, 645 and 665.
+Cheaper contexts remain item 648, integer class ids in the taxonomy item 647, the
+saturation's sensitivity to axiom order item 683 and the rest of the index stage
+on several threads item 684.
 
 ### ROBOT-compatible commands
 

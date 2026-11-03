@@ -148,7 +148,7 @@ pub fn key_merges(ix: &Index, view: &dyn View) -> Vec<(Ex, Ex)> {
             // an individual without an instance makes the ontology inconsistent, and
             // a merge with it would add nothing
             if matches!(ix.head(k).node, Node::Nominal(_)) && !st.bottom {
-                subs.insert(k, st.subs.clone());
+                subs.insert(k, st.subs.iter().copied().collect());
             }
         });
     }

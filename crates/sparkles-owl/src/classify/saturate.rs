@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicUsize, Ordering
 use std::time::Instant;
 
 /// A conclusion waiting in a context's to-do list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Concl {
     /// the context's root is subsumed by the expression
     Sub(Ex),
@@ -128,11 +128,129 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
     }
 }
 
+/// The members a context's subsumers keep in a list before they become a hash set.
+const SUBS_LIST: usize = 12;
+
+/// A context's subsumers: a list while they are few, which most contexts' are, so that
+/// a small context takes one allocation and no rehashing as it grows, and a hash set
+/// once they pass [`SUBS_LIST`].
+#[derive(Clone)]
+pub enum Subs {
+    List(Vec<Ex>),
+    Set(FxHashSet<Ex>),
+}
+
+impl Default for Subs {
+    fn default() -> Subs {
+        Subs::List(Vec::new())
+    }
+}
+
+impl Subs {
+    /// Adds a member, and says whether it is new.
+    #[inline]
+    pub fn insert(&mut self, x: Ex) -> bool {
+        match self {
+            Subs::Set(set) => set.insert(x),
+            Subs::List(list) => {
+                if has(list, x) {
+                    return false;
+                }
+                if list.len() < SUBS_LIST {
+                    if list.capacity() == 0 {
+                        list.reserve_exact(8);
+                    }
+                    list.push(x);
+                } else {
+                    let mut set: FxHashSet<Ex> =
+                        FxHashSet::with_capacity_and_hasher(2 * SUBS_LIST, Default::default());
+                    set.extend(list.iter().copied());
+                    set.insert(x);
+                    *self = Subs::Set(set);
+                }
+                true
+            }
+        }
+    }
+
+    #[inline]
+    pub fn contains(&self, x: &Ex) -> bool {
+        match self {
+            Subs::Set(set) => set.contains(x),
+            Subs::List(list) => has(list, *x),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Subs::Set(set) => set.len(),
+            Subs::List(list) => list.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn iter(&self) -> SubsIter<'_> {
+        match self {
+            Subs::Set(set) => SubsIter::Set(set.iter()),
+            Subs::List(list) => SubsIter::List(list.iter()),
+        }
+    }
+
+    /// The bytes the members take.
+    pub fn bytes(&self) -> usize {
+        match self {
+            Subs::Set(set) => table_bytes(set.capacity(), 4),
+            Subs::List(list) => list.capacity() * 4,
+        }
+    }
+}
+
+/// Whether a list holds `x`, comparing eight members at a time without a branch, which
+/// the compiler can do in vector registers.
+#[inline]
+fn has(list: &[Ex], x: Ex) -> bool {
+    let (chunks, rest) = list.as_chunks::<8>();
+    for c in chunks {
+        if c.iter().fold(false, |a, &y| a | (y == x)) {
+            return true;
+        }
+    }
+    rest.contains(&x)
+}
+
+/// The members of a [`Subs`], in no particular order.
+pub enum SubsIter<'a> {
+    List(std::slice::Iter<'a, Ex>),
+    Set(std::collections::hash_set::Iter<'a, Ex>),
+}
+
+impl<'a> Iterator for SubsIter<'a> {
+    type Item = &'a Ex;
+    #[inline]
+    fn next(&mut self) -> Option<&'a Ex> {
+        match self {
+            SubsIter::List(i) => i.next(),
+            SubsIter::Set(i) => i.next(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a Subs {
+    type Item = &'a Ex;
+    type IntoIter = SubsIter<'a>;
+    fn into_iter(self) -> SubsIter<'a> {
+        self.iter()
+    }
+}
+
 /// The conclusions of one context.
 #[derive(Default, Clone)]
 pub struct State {
     pub init: bool,
-    pub subs: FxHashSet<Ex>,
+    pub subs: Subs,
     pub bottom: bool,
     /// whether the context has an instance in every model
     pub real: bool,
@@ -189,7 +307,7 @@ impl Extra {
 impl State {
     /// The bytes the state's tables and lists take, roughly.
     pub fn bytes(&self) -> usize {
-        table_bytes(self.subs.capacity(), 4)
+        self.subs.bytes()
             + self.props.capacity() * 8
             + self.back.capacity() * std::mem::size_of::<(Role, Small<Ex>)>()
             + self.back.iter().map(|(_, v)| v.bytes()).sum::<usize>()
@@ -266,6 +384,10 @@ impl State {
 #[derive(Default)]
 pub struct Ctx {
     active: AtomicBool,
+    /// whether the context's state is started, which [`State::init`] says under the
+    /// state's lock, kept here so that the workers that take roots need not wait for
+    /// that lock while the context is processed
+    pub started: AtomicBool,
     pub todo: Mutex<Vec<Concl>>,
     pub st: Mutex<State>,
 }
@@ -292,6 +414,9 @@ pub struct Bounds<'a> {
     pub charge: Option<&'a (dyn Fn(usize) -> bool + Sync)>,
     /// the bytes held before the saturation starts
     pub base_memory: usize,
+    /// the peak the run reached before the saturation, which the pool has been charged
+    /// for, so that only growth past it is charged
+    pub peak_memory: usize,
 }
 
 const STOP_NONE: u8 = 0;
@@ -311,6 +436,8 @@ const ROOT_CHUNK: usize = 64;
 const ROOTS_PER_ROUND: usize = 1024;
 /// The bytes counted for each context a saturation starts.
 pub const CONTEXT_BYTES: usize = 320;
+/// The messages a worker's outbox holds before it delivers them.
+const OUTBOX: usize = 4096;
 
 struct Run<'a> {
     ix: &'a Index,
@@ -323,7 +450,10 @@ struct Run<'a> {
     next_root: AtomicUsize,
     queue: Mutex<Vec<Ex>>,
     ready: Condvar,
-    /// the active contexts, on a worker's stack, in the queue or being processed
+    /// the contexts in the shared queue and the workers that are not idle, which hold
+    /// the other active contexts on their stacks or in their outboxes: the saturation
+    /// ends when it is 0. A worker that wakes a context keeps it, so this changes only
+    /// when contexts go to the shared queue and when a worker goes idle.
     pending: AtomicUsize,
     /// the workers waiting for the queue
     idle: AtomicUsize,
@@ -337,6 +467,10 @@ struct Run<'a> {
     applied: AtomicUsize,
     /// whether a context derived an individual other than its root
     merged: AtomicBool,
+    /// whether the workers send through outboxes, which they do when there are several
+    batch: bool,
+    /// whether the rules run without those of individuals and functional data roles
+    plain: bool,
     bounds: &'a Bounds<'a>,
 }
 
@@ -380,14 +514,16 @@ pub fn saturate(
         next_root: AtomicUsize::new(0),
         queue: Mutex::new(Vec::new()),
         ready: Condvar::new(),
-        pending: AtomicUsize::new(0),
+        pending: AtomicUsize::new(bounds.threads.max(1)),
         idle: AtomicUsize::new(0),
         stop: AtomicU8::new(STOP_NONE),
         memory: AtomicUsize::new(bounds.base_memory),
         queued: AtomicIsize::new(0),
-        peak: AtomicUsize::new(bounds.base_memory),
+        peak: AtomicUsize::new(bounds.base_memory.max(bounds.peak_memory)),
         applied: AtomicUsize::new(0),
         merged: AtomicBool::new(false),
+        batch: bounds.threads > 1,
+        plain: plain(ix),
         bounds,
     };
     {
@@ -397,6 +533,7 @@ pub fn saturate(
                 q.push(e);
             }
         }
+        run.pending.fetch_add(q.len(), Ordering::SeqCst);
     }
     let threads = bounds.threads.max(1);
     if threads == 1 {
@@ -426,15 +563,72 @@ pub fn saturate(
 }
 
 /// Where a context's rules send their conclusions: to itself, applied in the same pass,
-/// or to other contexts' to-do lists.
+/// or to the worker's outbox, which delivers them to other contexts' to-do lists.
 struct Out<'r, 'a> {
     run: &'r Run<'a>,
     me: Ex,
     local: &'r mut Vec<Concl>,
     /// the contexts this worker activated
     woke: &'r mut VecDeque<Ex>,
+    /// the messages for other contexts that wait to be delivered
+    outbox: &'r mut Outbox,
     /// the messages sent to other contexts since the last check
     sent: usize,
+}
+
+/// A worker's messages for other contexts, which it delivers by destination, with the
+/// buffers that group them.
+#[derive(Default)]
+struct Outbox {
+    msgs: Vec<(Ex, Concl)>,
+    tmp: Vec<(Ex, Concl)>,
+    counts: Vec<u32>,
+}
+
+/// The bits of a destination that one pass of the outbox's radix sort reads.
+const RADIX_BITS: u32 = 11;
+/// The messages below which an outbox sorts by comparison instead.
+const RADIX_MIN: usize = 512;
+
+impl Outbox {
+    fn is_empty(&self) -> bool {
+        self.msgs.is_empty()
+    }
+
+    /// Orders the messages by destination, keeping the order of each destination's.
+    fn group(&mut self) {
+        let n = self.msgs.len();
+        if n < RADIX_MIN {
+            self.msgs.sort_by_key(|m| m.0);
+            return;
+        }
+        let max = self.msgs.iter().map(|m| m.0).max().unwrap_or(0);
+        let buckets = 1usize << RADIX_BITS;
+        let mask = (buckets - 1) as u32;
+        let mut shift = 0u32;
+        self.tmp.clear();
+        self.tmp.resize(n, (0, Concl::Real));
+        while shift == 0 || (shift < 32 && max >> shift != 0) {
+            self.counts.clear();
+            self.counts.resize(buckets, 0);
+            for m in &self.msgs {
+                self.counts[((m.0 >> shift) & mask) as usize] += 1;
+            }
+            let mut at = 0u32;
+            for c in self.counts.iter_mut() {
+                let k = *c;
+                *c = at;
+                at += k;
+            }
+            for &m in &self.msgs {
+                let d = ((m.0 >> shift) & mask) as usize;
+                self.tmp[self.counts[d] as usize] = m;
+                self.counts[d] += 1;
+            }
+            std::mem::swap(&mut self.msgs, &mut self.tmp);
+            shift += RADIX_BITS;
+        }
+    }
 }
 
 /// Where the rules of a context send their conclusions.
@@ -452,12 +646,20 @@ impl Sink for Out<'_, '_> {
     fn send(&mut self, to: Ex, c: Concl) {
         if to == self.me {
             self.local.push(c);
-        } else {
+        } else if !self.run.batch {
+            // one worker meets no other at a to-do list, and sorting costs more than it
+            // saves
             let ctx = self.run.get(to);
             ctx.todo.lock().push(c);
             self.sent += 1;
             if self.run.mark(ctx) {
                 self.woke.push_back(to);
+            }
+        } else {
+            self.outbox.msgs.push((to, c));
+            self.sent += 1;
+            if self.outbox.msgs.len() >= OUTBOX {
+                self.run.deliver(self.outbox, self.woke);
             }
         }
     }
@@ -486,11 +688,32 @@ impl<'a> Run<'a> {
     /// before it looks at the list, both under the list's lock.
     #[inline]
     fn mark(&self, c: &Ctx) -> bool {
-        if c.active.load(Ordering::SeqCst) || c.active.swap(true, Ordering::SeqCst) {
-            return false;
+        !(c.active.load(Ordering::SeqCst) || c.active.swap(true, Ordering::SeqCst))
+    }
+
+    /// Delivers a worker's outbox: the messages grouped by destination, each
+    /// destination's to-do list taken once, and the contexts they activate added to the
+    /// worker's queue.
+    fn deliver(&self, outbox: &mut Outbox, mine: &mut VecDeque<Ex>) {
+        if outbox.is_empty() {
+            return;
         }
-        self.pending.fetch_add(1, Ordering::SeqCst);
-        true
+        outbox.group();
+        let outbox = &mut outbox.msgs;
+        let mut at = 0;
+        while at < outbox.len() {
+            let to = outbox[at].0;
+            let end = at + outbox[at..].iter().take_while(|m| m.0 == to).count();
+            let ctx = self.get(to);
+            ctx.todo
+                .lock()
+                .extend(outbox[at..end].iter().map(|&(_, c)| c));
+            if self.mark(ctx) {
+                mine.push_back(to);
+            }
+            at = end;
+        }
+        outbox.clear();
     }
 
     /// Moves half of a worker's queue to the shared queue when a worker waits for it.
@@ -500,6 +723,8 @@ impl<'a> Run<'a> {
             return;
         }
         let give = mine.len().div_ceil(2);
+        // counted before another worker can take them
+        self.pending.fetch_add(give, Ordering::SeqCst);
         let mut q = self.queue.lock();
         q.extend(mine.drain(..give));
         if give >= idle {
@@ -537,7 +762,7 @@ impl<'a> Run<'a> {
             let end = (at + ROOT_CHUNK).min(self.roots.len());
             for &r in self.roots[at..end].iter().rev() {
                 let c = self.get(r);
-                if !c.st.lock().init && self.mark(c) {
+                if !c.started.load(Ordering::Acquire) && self.mark(c) {
                     chunk.push(r);
                 }
             }
@@ -556,6 +781,7 @@ impl<'a> Run<'a> {
         let mut tally = Tally::default();
         // the buffer of a context's conclusions, kept across contexts
         let mut local: Vec<Concl> = Vec::new();
+        let mut outbox = Outbox::default();
         loop {
             if round >= ROOTS_PER_ROUND && mine.is_empty() {
                 round = 0;
@@ -570,16 +796,31 @@ impl<'a> Run<'a> {
                 r
             } else if let Some(e) = mine.pop_front() {
                 e
+            } else if !outbox.is_empty() {
+                // the messages the worker holds go out before it looks for more work
+                self.deliver(&mut outbox, &mut mine);
+                continue;
             } else {
                 // no roots are left: what the worker counted goes to the totals before
                 // it waits for the others
                 round = 0;
-                self.flush(&mut tally);
+                if tally.applied > 0 || tally.stored > 0 || tally.queued != 0 {
+                    self.flush(&mut tally);
+                }
+                // the worker goes idle; the last to do so with the queue empty ends the
+                // saturation
+                if self.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    let _q = self.queue.lock();
+                    self.ready.notify_all();
+                    return;
+                }
                 let mut q = self.queue.lock();
                 loop {
                     if self.stopped() {
                         return;
                     }
+                    // a context taken from the queue makes the worker busy again, which
+                    // leaves the count as it was
                     if let Some(e) = q.pop() {
                         break e;
                     }
@@ -595,12 +836,15 @@ impl<'a> Run<'a> {
                 self.flush(&mut tally);
                 return;
             }
-            self.process(next, &mut mine, &mut tally, &mut local);
-            self.share(&mut mine);
-            if self.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
-                let _q = self.queue.lock();
-                self.ready.notify_all();
+            if self.plain {
+                self.process::<Plain>(next, &mut mine, &mut tally, &mut local, &mut outbox);
+            } else {
+                self.process::<Full>(next, &mut mine, &mut tally, &mut local, &mut outbox);
             }
+            if !outbox.is_empty() && self.idle.load(Ordering::Relaxed) > 0 {
+                self.deliver(&mut outbox, &mut mine);
+            }
+            self.share(&mut mine);
         }
     }
 
@@ -642,7 +886,16 @@ impl<'a> Run<'a> {
         ok
     }
 
-    fn process(&self, me: Ex, mine: &mut VecDeque<Ex>, tally: &mut Tally, local: &mut Vec<Concl>) {
+    /// Activates a context: applies the rules to what waits in its to-do list until none
+    /// is left, with the rules that `R` holds.
+    fn process<R: Rules>(
+        &self,
+        me: Ex,
+        mine: &mut VecDeque<Ex>,
+        tally: &mut Tally,
+        local: &mut Vec<Concl>,
+        outbox: &mut Outbox,
+    ) {
         let ctx = self.get(me);
         let mut st = ctx.st.lock();
         local.clear();
@@ -651,15 +904,17 @@ impl<'a> Run<'a> {
             me,
             local,
             woke: mine,
+            outbox,
             sent: 0,
         };
         if !st.init {
             tally.stored += CONTEXT_BYTES / CONCLUSION_BYTES;
             init(self.ix, me, &mut st, self.universal, &mut out);
+            ctx.started.store(true, Ordering::Release);
         }
         'outer: loop {
             while let Some(c) = out.local.pop() {
-                if apply(self.ix, me, &mut st, c, &mut out) {
+                if apply_rules::<_, R>(self.ix, me, &mut st, c, &mut out) {
                     tally.stored += 1;
                 }
                 tally.applied += 1;
@@ -668,6 +923,11 @@ impl<'a> Run<'a> {
                     out.sent = 0;
                     if !self.flush(tally) {
                         break 'outer;
+                    }
+                    // a long activation gives idle workers what it woke as it goes
+                    if self.idle.load(Ordering::Relaxed) > 0 {
+                        self.deliver(out.outbox, out.woke);
+                        self.share(out.woke);
                     }
                 }
             }
@@ -723,6 +983,47 @@ fn individuals(ix: &Index, me: Ex, st: &State, mut f: impl FnMut(Ex)) {
 
 /// Applies the rules to one conclusion. The answer says whether it was new.
 pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S) -> bool {
+    apply_rules::<S, Full>(ix, me, st, c, out)
+}
+
+/// Whether the rules of individuals and functional data roles can apply to the index:
+/// when it has no individuals, universal roles or functional data roles, no context
+/// derives an individual, becomes real, takes a link to an individual or keeps data
+/// values, and the saturation runs the rules without their checks.
+pub fn plain(ix: &Index) -> bool {
+    !ix.has_individuals() && !ix.nominal_selfs && ix.roles.functional.iter().all(|f| f.is_empty())
+}
+
+/// The rules a saturation runs, as constants that the compiler folds, so that each set
+/// is its own instantiation of [`apply_rules`] and a rule left out costs no check.
+trait Rules {
+    /// the rules of individuals and functional data roles, which [`plain`] leaves out
+    const FULL: bool;
+}
+
+/// The rules of an index without individuals, universal roles or functional data roles.
+struct Plain;
+
+/// Every rule of the EL calculus.
+struct Full;
+
+impl Rules for Plain {
+    const FULL: bool = false;
+}
+
+impl Rules for Full {
+    const FULL: bool = true;
+}
+
+/// [`apply`], with the rules that `R` holds.
+#[inline(always)]
+fn apply_rules<S: Sink, R: Rules>(
+    ix: &Index,
+    me: Ex,
+    st: &mut State,
+    c: Concl,
+    out: &mut S,
+) -> bool {
     let roles = &ix.roles;
     match c {
         Concl::Sub(d) => {
@@ -738,7 +1039,7 @@ pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S)
                             out.send(e, Concl::Sub(BOTTOM));
                         }
                     }
-                    if st.extra.is_some() {
+                    if R::FULL && st.extra.is_some() {
                         give(st, BOTTOM, out);
                     }
                     return true;
@@ -753,13 +1054,13 @@ pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S)
                     if roles.keeps_forward(r) {
                         out.me(Concl::Fwd(r, succ));
                     }
-                    if st.real {
+                    if R::FULL && st.real {
                         out.send(succ, Concl::Real);
                     }
                 }
                 Node::SelfLoop(r) => out.me(Concl::Loop(r)),
-                Node::Nominal(_) if d != me => nominal(ix, me, st, d, out),
-                Node::DataSome(r, _) if !roles.functional(r).is_empty() => {
+                Node::Nominal(_) if R::FULL && d != me => nominal(ix, me, st, d, out),
+                Node::DataSome(r, _) if R::FULL && !roles.functional(r).is_empty() => {
                     functional(ix, st, r, h.succ, out)
                 }
                 _ => {}
@@ -794,7 +1095,7 @@ pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S)
                     }
                 }
             }
-            if st.extra.is_some() {
+            if R::FULL && st.extra.is_some() {
                 give(st, d, out);
             }
             true
@@ -817,7 +1118,7 @@ pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S)
                     compose(roles, e, t, f, out);
                 }
             }
-            if ix.nominal_selfs {
+            if R::FULL && ix.nominal_selfs {
                 link_to(ix, me, st, e, r, out);
             }
             true
@@ -863,9 +1164,12 @@ pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S)
             }
             true
         }
-        Concl::Nom(k) => apply_nom(me, st, k, out),
-        Concl::Real => apply_real(ix, st, out),
-        Concl::LinkTo(r, n) => apply_link_to(me, st, r, n, out),
+        Concl::Nom(k) if R::FULL => apply_nom(me, st, k, out),
+        Concl::Real if R::FULL => apply_real(ix, st, out),
+        Concl::LinkTo(r, n) if R::FULL => apply_link_to(me, st, r, n, out),
+        Concl::Nom(_) | Concl::Real | Concl::LinkTo(..) => {
+            unreachable!("a conclusion of individuals in a saturation without them")
+        }
     }
 }
 

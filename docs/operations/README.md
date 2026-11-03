@@ -94,6 +94,17 @@ callers and records the selected numeric user in its receipt.
   all operators produce ([C01](../specs/C01-observability-and-budgets.md)). A request can
   lower a budget but never raise it, and a query over budget fails with `507`. Queries and
   writes stop when their client disconnects.
+* The memory estimate of a query counts its decoded value cache, which holds at most
+  64 MiB or an eighth of the query's memory budget, its computed terms and memos, its
+  parsed geometries and the working space of dictionary decoding, whether it runs eagerly
+  or as a cursor. A query close to its limit can therefore fail where an estimate without
+  that state would let it pass. Eager evaluation counts its decoding space when the
+  budget has room and never fails on it, so a finished result always reads back whole.
+  The EXISTS memo and key sets count as well, and so do the programs and search caches of
+  a query's regular expressions. The server keeps up to 64 compiled programs of at most
+  16 MiB in all across queries, with up to another 16 MiB of their warm search caches,
+  outside every query's budget, so that a repeated pattern is not compiled again and its
+  searches start warm.
 * Persistent datasets have storage quotas, a default with `--max-dataset-mb` and per
   dataset through `/$/quota/{ds}` and `sparkles quota` ([API.md](../API.md#storage-quotas)).
   A write that would exceed the quota is refused with `507` before it commits, while

@@ -2396,7 +2396,7 @@ impl<'a> Planner<'a> {
         if vars.len() == [s, p].iter().filter(|x| matches!(x, PT::V(_))).count()
             && matches!(p, PT::V(_))
             // a cursor streams the scan, and stops at a LIMIT
-            && !self.ctx.is_cursor()
+            && !self.ctx.streams()
             && !matches!(g, ActiveGraph::Var(_))
             && let Some((gf, None)) = self.graph_filter(g)
             && let Some(uses) = usable(self.ctx, &gf)
@@ -2505,7 +2505,7 @@ impl<'a> Planner<'a> {
         let graph = match g {
             ActiveGraph::Default => None,
             ActiveGraph::Union => Some(format!("<{}>", super::ctx::UNION_GRAPH_IRI)),
-            ActiveGraph::Named(id) => self.ctx.term(*id).map(|t| t.to_string()),
+            ActiveGraph::Named(id) => self.ctx.plan_term(*id).map(|t| t.to_string()),
             ActiveGraph::Var(v) => Some(self.pt_str(&PT::V(*v))),
         };
         let mut pattern = Arc::new(PlanPattern {
@@ -2946,7 +2946,7 @@ impl<'a> Planner<'a> {
             }
             PT::C(id) => self
                 .ctx
-                .term(*id)
+                .plan_term(*id)
                 .map_or_else(|| format!("{id:?}"), |t| short(&t)),
         }
     }
@@ -4246,7 +4246,7 @@ fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
         .filter(|e| super::exprcache::input(&[e]) == Ok(Some(v)))
         .cloned()
         .collect();
-    let prefixes = super::keyfilter::KeyFilter::new_for(ctx, &on_key, v)?.key_prefixes()?;
+    let prefixes = super::keyfilter::KeyFilter::plan_prefixes(&on_key, v)?;
     let vocab = &ctx.snap.generation.vocab;
     let mut ids = vec![(0, Id::vocab(0).0 - 1)];
     for p in prefixes {

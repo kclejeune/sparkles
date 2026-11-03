@@ -10,7 +10,9 @@
 //! top and bottom properties. A class whose instances reach an individual through a
 //! context that holds only where the class has an instance is classified again in a
 //! world of its own. An axiom outside OWL 2 EL is left out and reported, with
-//! the rule of the OWL 2 Profiles recommendation it breaks. An axiom with a literal or a
+//! the rule of the OWL 2 Profiles recommendation it breaks, and the run's [`Stats`] count
+//! these axioms by whether they are Horn and give the [`Tier`] of rules the ontology
+//! needs. An axiom with a literal or a
 //! datatype that the classifier cannot compare, or with a property chain through the top
 //! property, is used as far as the calculus goes and reported as partial. Every
 //! subsumption the classifier answers is entailed. It derives every entailed subsumption
@@ -44,12 +46,14 @@
 //! ```
 
 mod data;
+mod dl;
 mod index;
 mod query;
 mod saturate;
 mod taxonomy;
 mod world;
 
+pub use dl::{OutsideEl, Tier};
 pub use index::Gap;
 pub use query::Description;
 pub use taxonomy::{Node as TaxonomyNode, Taxonomy};
@@ -63,6 +67,10 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// The rule of the EL profile that a chain breaks when its superproperty has a range that
+/// its last property lacks.
+const CHAIN_RANGE_RULE: &str = "OWL 2 Profiles §2.2.6";
 
 /// What bounds a run: the worker threads, a deadline, a memory budget and a cancellation
 /// check.
@@ -136,6 +144,11 @@ pub struct Stats {
     pub index: Duration,
     pub saturation: Duration,
     pub taxonomy: Duration,
+    /// the axioms outside OWL 2 EL, by what classifying them needs, which the run leaves
+    /// out until roadmap item 603's rules take them
+    pub outside_el: OutsideEl,
+    /// the rules the run's axioms need
+    pub tier: Tier,
 }
 
 /// The result of a run that saturates without building a taxonomy
@@ -573,12 +586,16 @@ impl Saturation {
 
     /// Normalizes the axioms inside OWL 2 EL and builds the index. `outside` names the
     /// axioms the profile check leaves out.
+    /// The answer's last part is the estimated peak of a parallel normalization, with
+    /// `held_bytes`, which the pool has been charged for, or 0.
     fn build(
         &mut self,
         axioms: &[&AxiomKind],
         outside: &[(usize, (String, String))],
+        threads: usize,
+        held_bytes: usize,
         limits: &Limits,
-    ) -> Result<(Axioms, Index), Error> {
+    ) -> Result<(Axioms, Index, usize), Error> {
         let mut ax = Axioms::default();
         let mut partial: BTreeMap<&AxiomKind, &'static str> = BTreeMap::new();
         let mut chains: Vec<&AxiomKind> = Vec::new();
@@ -601,28 +618,98 @@ impl Saturation {
                     .insert(d.clone(), r.clone());
             }
         }
-        for (i, &k) in axioms.iter().enumerate() {
-            if i % POLL_AXIOMS == 0 {
-                poll(limits)?;
+        // Chunks of the axioms normalize on the run's threads into interners of their
+        // own, which merge in order into the run's, so that every id is the one a
+        // normalization on one thread gives. Data ranges and literals have ids inside
+        // their values, which the merge does not map, so a run that has them normalizes
+        // on one thread. So does a run whose chunks pass the memory budget or the pool's
+        // grant, since each chunk holds the names it meets and the merge copies them.
+        let mut merged = false;
+        let mut peak = 0;
+        if threads > 1 && axioms.len() >= PARALLEL_AXIOMS {
+            let gauge = Gauge {
+                limits,
+                base: held_bytes + self.interner.bytes(),
+                held: AtomicUsize::new(0),
+                peak: parking_lot::Mutex::new(0),
+                over: std::sync::atomic::AtomicBool::new(false),
+            };
+            let definitions = &self.interner.ranges.definitions;
+            let is_outside = &is_outside;
+            let parts = par_map(axioms, threads, |at, chunk| {
+                let mut it = Interner::chunk(definitions);
+                let mut out = Normalized::default();
+                let r = normalize_axioms(
+                    chunk,
+                    at,
+                    is_outside,
+                    &mut it,
+                    &mut out,
+                    limits,
+                    Some(&gauge),
+                );
+                (r, it, out)
+            });
+            for (r, _, _) in &parts {
+                match r {
+                    Err(Error::Memory { .. }) => {}
+                    r => r.clone()?,
+                }
             }
-            if !logical(k) {
-                continue;
+            if !gauge.over.load(Ordering::Relaxed)
+                && !parts.iter().any(|(_, it, _)| it.chunk_has_data())
+            {
+                // The chunks counted what their merge can add. The merge polls, and
+                // what it adds past that counts against the budget and the pool.
+                let start = self.interner.bytes();
+                let reserved: usize = parts.iter().map(|(_, it, _)| it.merge_bytes()).sum();
+                let mut told = 0usize;
+                let mut check = |bytes: usize| -> Result<(), Error> {
+                    poll(limits)?;
+                    let extra = bytes.saturating_sub(start).saturating_sub(reserved);
+                    if extra > told {
+                        let grown = extra - told;
+                        told = extra;
+                        if !gauge.tell(grown) {
+                            return Err(Error::Memory {
+                                limit: limits.max_memory.unwrap_or(usize::MAX),
+                                used: gauge.base + gauge.held.load(Ordering::Relaxed),
+                            });
+                        }
+                    }
+                    Ok(())
+                };
+                let (its, outs): (Vec<Interner>, Vec<Normalized>) =
+                    parts.into_iter().map(|(_, it, out)| (it, out)).unzip();
+                let maps = self.interner.merge(its, &mut check)?;
+                for ((nodes, roles), out) in maps.into_iter().zip(outs) {
+                    ax.append_mapped(out.ax, &nodes, &roles);
+                    partial.extend(out.partial);
+                    chains.extend(out.chains);
+                }
+                merged = true;
             }
-            if is_outside[i] {
-                index::intern_signature(k, &mut self.interner);
-                continue;
-            }
-            if matches!(
-                k,
-                AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
-            ) {
-                chains.push(k);
-                continue;
-            }
-            if let Some(why) = index::normalize(k, &mut self.interner, &mut ax) {
-                partial.insert(k, why);
-            }
+            peak = *gauge.peak.lock();
         }
+        if !merged {
+            let mut out = Normalized {
+                ax,
+                ..Normalized::default()
+            };
+            normalize_axioms(
+                axioms,
+                0,
+                &is_outside,
+                &mut self.interner,
+                &mut out,
+                limits,
+                None,
+            )?;
+            ax = out.ax;
+            partial.extend(out.partial);
+            chains.extend(out.chains);
+        }
+        poll(limits)?;
         // the range restriction of OWL 2 EL (Profiles §2.2.6): a chain's superproperty
         // has no range that its last property lacks
         if !chains.is_empty() {
@@ -680,7 +767,7 @@ impl Saturation {
             excluded.push(Excluded {
                 axiom: k.clone(),
                 gap: Gap::Outside {
-                    rule: "OWL 2 Profiles §2.2.6".to_string(),
+                    rule: CHAIN_RANGE_RULE.to_string(),
                     message,
                 },
             });
@@ -694,7 +781,7 @@ impl Saturation {
         excluded.sort();
         excluded.dedup();
         self.excluded = excluded;
-        Ok((ax, ix))
+        Ok((ax, ix, peak))
     }
 
     fn run(
@@ -755,8 +842,22 @@ impl Saturation {
         .flatten()
         .collect();
         poll(limits)?;
-        let (ax, ix) = self.build(axioms, &outside, limits)?;
+        let (ax, ix, normalized_peak) =
+            self.build(axioms, &outside, threads, held_bytes, limits)?;
         drop(outside);
+        // what each axiom left out needs (item 603), counted once however often it
+        // occurs, as the excluded axioms are; a chain whose superproperty has a range its
+        // last property lacks is Horn
+        for x in &self.excluded {
+            if let Gap::Outside { rule, .. } = &x.gap {
+                if rule == CHAIN_RANGE_RULE {
+                    stats.outside_el.horn += 1;
+                } else {
+                    stats.outside_el.add(dl::shape(&x.axiom));
+                }
+            }
+        }
+        stats.tier = stats.outside_el.tier();
         poll(limits)?;
         let n = self.interner.len();
         self.ctx.resize_with(n, OnceLock::new);
@@ -796,8 +897,13 @@ impl Saturation {
             cancelled: cancel_fn,
             charge: charge_fn,
             base_memory: base,
+            peak_memory: normalized_peak,
         };
-        if limits.max_memory.is_some_and(|m| base > m) || charge_fn.is_some_and(|f| !f(base)) {
+        // the pool has been charged for the peak of a parallel normalization
+        let more = base.saturating_sub(normalized_peak);
+        if limits.max_memory.is_some_and(|m| base > m)
+            || charge_fn.is_some_and(|f| more > 0 && !f(more))
+        {
             return Err(Error::Memory {
                 limit: limits.max_memory.unwrap_or(base),
                 used: base,
@@ -839,6 +945,8 @@ impl Saturation {
                 woken.dedup();
                 let round = Bounds {
                     base_memory: totals.memory,
+                    // the pool has been charged for the run's peak so far
+                    peak_memory: totals.peak,
                     ..bounds
                 };
                 let more = saturate::saturate(&ix, &self.ctx, &[], &woken, &universal, &round)
@@ -989,14 +1097,10 @@ impl Saturation {
     }
 
     fn index_bytes(&self, ix: &Index) -> usize {
-        let iris = |len: usize| len + 56;
+        // each class's IRI is held once, beside its hash and its entry in the table
         self.interner.len() * 40
-            + self
-                .interner
-                .classes
-                .iter()
-                .map(|c| 2 * iris(c.as_str().len()))
-                .sum::<usize>()
+            + self.interner.classes.bytes()
+            + self.interner.classes.name_bytes()
             + ix.bytes()
     }
 
@@ -1082,6 +1186,7 @@ impl Saturation {
                     cleared += 1;
                 }
                 *st = saturate::State::default();
+                *c.started.get_mut() = false;
             } else if st.init {
                 st.drop_links_from(&affected);
                 st.reindex(ix);
@@ -1110,6 +1215,121 @@ impl Saturation {
             .filter(|&s| matches!(self.interner.nodes[s as usize], Node::Class(_) | Node::Top))
             .collect();
         Some((st.bottom, named))
+    }
+}
+
+/// The axioms below which a run normalizes on one thread.
+const PARALLEL_AXIOMS: usize = if cfg!(test) { 64 } else { 16_384 };
+
+/// What the normalization of a run of axioms gives: the normalized axioms, the axioms used
+/// in part, and the chains, which the range restriction checks once every axiom is read.
+#[derive(Default)]
+struct Normalized<'k> {
+    ax: Axioms,
+    partial: BTreeMap<&'k AxiomKind, &'static str>,
+    chains: Vec<&'k AxiomKind>,
+}
+
+/// Normalizes a run of axioms that starts at `at` in the run's axioms into `it`. Axioms
+/// outside OWL 2 EL give only their classes, and chains wait in `out.chains`.
+/// A chunk of a parallel normalization tells `gauge` what it holds every
+/// [`GAUGE_AXIOMS`] axioms and at its end, and stops with [`Error::Memory`] once the
+/// chunks pass the budget.
+#[allow(clippy::too_many_arguments)]
+fn normalize_axioms<'k>(
+    axioms: &[&'k AxiomKind],
+    at: usize,
+    is_outside: &[bool],
+    it: &mut Interner,
+    out: &mut Normalized<'k>,
+    limits: &Limits,
+    gauge: Option<&Gauge>,
+) -> Result<(), Error> {
+    let mut told = 0usize;
+    let mut tell = |it: &Interner, out: &Normalized| -> Result<(), Error> {
+        if let Some(g) = gauge {
+            // the chunk's interner, and room for what its merge adds
+            let now = it.bytes() + it.merge_bytes() + out.ax.rough_bytes();
+            let grown = now.saturating_sub(told);
+            told = told.max(now);
+            if !g.tell(grown) {
+                return Err(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used: g.base + g.held.load(Ordering::Relaxed),
+                });
+            }
+        }
+        Ok(())
+    };
+    for (i, &k) in axioms.iter().enumerate() {
+        if (at + i).is_multiple_of(POLL_AXIOMS) {
+            poll(limits)?;
+        }
+        if i > 0 && i.is_multiple_of(GAUGE_AXIOMS) {
+            tell(it, out)?;
+        }
+        if !logical(k) {
+            continue;
+        }
+        if is_outside[at + i] {
+            index::intern_signature(k, it);
+            continue;
+        }
+        if matches!(
+            k,
+            AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
+        ) {
+            out.chains.push(k);
+            continue;
+        }
+        if let Some(why) = index::normalize(k, it, &mut out.ax) {
+            out.partial.insert(k, why);
+        }
+    }
+    tell(it, out)
+}
+
+/// The axioms a chunk of a parallel normalization reads between two reports of what it
+/// holds.
+const GAUGE_AXIOMS: usize = if cfg!(test) { 16 } else { 4096 };
+
+/// What the chunks of a parallel normalization hold, against the memory budget and the
+/// pool. The pool is charged for each growth of the peak, from nothing, so the run
+/// charges only what its state passes the peak by.
+struct Gauge<'a> {
+    limits: &'a Limits,
+    /// the caller's bytes and the run's interner before the normalization
+    base: usize,
+    held: AtomicUsize,
+    /// the peak of `base` and `held`, which the pool has been charged for
+    peak: parking_lot::Mutex<usize>,
+    /// set when a chunk passed the budget or the pool refused a grant
+    over: std::sync::atomic::AtomicBool,
+}
+
+impl Gauge<'_> {
+    /// Adds `grown` bytes, and answers false once the chunks pass the budget, the pool
+    /// refuses the growth, or another chunk found either.
+    fn tell(&self, grown: usize) -> bool {
+        if self.over.load(Ordering::Relaxed) {
+            return false;
+        }
+        let used = self.base + self.held.fetch_add(grown, Ordering::Relaxed) + grown;
+        if self.limits.max_memory.is_some_and(|m| used > m) {
+            self.over.store(true, Ordering::Relaxed);
+            return false;
+        }
+        let mut peak = self.peak.lock();
+        let more = used.saturating_sub(*peak);
+        if more == 0 {
+            return true;
+        }
+        if self.limits.charge.as_ref().is_some_and(|f| !f(more)) {
+            self.over.store(true, Ordering::Relaxed);
+            return false;
+        }
+        *peak = used;
+        true
     }
 }
 
@@ -1257,6 +1477,464 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn axioms_outside_el_count_once_however_often_they_occur() {
+        let c = |n: &str| ClassExpression::Class(Class::new(format!("http://ex.org/{n}")));
+        let or = AxiomKind::SubClassOf(
+            c("A"),
+            ClassExpression::ObjectUnionOf([c("B"), c("C")].into()),
+        );
+        let all = AxiomKind::SubClassOf(
+            c("A"),
+            ClassExpression::ObjectAllValuesFrom(
+                ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/r")),
+                Box::new(c("B")),
+            ),
+        );
+        let mut axioms = vec![&or; 3000];
+        axioms.extend(vec![&all; 3000]);
+        for threads in [1, 8] {
+            let out = Saturation::default()
+                .classify(
+                    &axioms,
+                    None,
+                    &Limits {
+                        threads,
+                        ..Limits::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                out.stats.outside_el,
+                OutsideEl {
+                    horn: 1,
+                    disjunctive: 1,
+                    global: 0
+                }
+            );
+            assert_eq!(out.stats.tier, Tier::Disjunctive);
+        }
+    }
+
+    /// Random axioms over a few hundred classes, with intersections whose operands come
+    /// in every order, so that chunks meet expressions in orders other than the run's.
+    fn mixed_axioms(n: usize, seed: u64) -> Vec<AxiomKind> {
+        let mut seed = seed;
+        let mut next = move |m: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % m as u64) as usize
+        };
+        let c = |i: usize| ClassExpression::Class(Class::new(format!("http://ex.org/C{i}")));
+        let p = |i: usize| ObjectProperty::new(format!("http://ex.org/p{i}"));
+        let ind = |i: usize| Individual::Named(NamedIndividual::new(format!("http://ex.org/i{i}")));
+        let mut out = vec![
+            AxiomKind::TransitiveObjectProperty(ObjectPropertyExpression::Property(p(0))),
+            AxiomKind::SubObjectPropertyOf(
+                SubObjectPropertyExpression::Chain(vec![
+                    ObjectPropertyExpression::Property(p(1)),
+                    ObjectPropertyExpression::Property(p(2)),
+                ]),
+                ObjectPropertyExpression::Property(p(1)),
+            ),
+        ];
+        let classes = 300;
+        for _ in 0..n {
+            let expr = |next: &mut dyn FnMut(usize) -> usize| -> ClassExpression {
+                match next(4) {
+                    0 => c(next(classes)),
+                    1 => ClassExpression::some(p(next(4)), c(next(classes))),
+                    2 => ClassExpression::ObjectIntersectionOf(
+                        (0..2 + next(3)).map(|_| c(next(classes))).collect(),
+                    ),
+                    _ => ClassExpression::some(
+                        p(next(4)),
+                        ClassExpression::ObjectIntersectionOf(
+                            [
+                                c(next(classes)),
+                                ClassExpression::some(p(next(4)), c(next(classes))),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        ),
+                    ),
+                }
+            };
+            let k = match next(10) {
+                0 => AxiomKind::EquivalentClasses(
+                    [expr(&mut next), c(next(classes))].into_iter().collect(),
+                ),
+                1 => AxiomKind::DisjointClasses(
+                    [c(next(classes)), c(next(classes))].into_iter().collect(),
+                ),
+                2 => AxiomKind::ClassAssertion(c(next(classes)), ind(next(40))),
+                3 => AxiomKind::ObjectPropertyAssertion(
+                    ObjectPropertyExpression::Property(p(next(4))),
+                    ind(next(40)),
+                    ind(next(40)),
+                ),
+                4 => AxiomKind::SubObjectPropertyOf(
+                    SubObjectPropertyExpression::Expression(ObjectPropertyExpression::Property(p(
+                        4 + next(4),
+                    ))),
+                    ObjectPropertyExpression::Property(p(next(4))),
+                ),
+                5 => AxiomKind::Declaration(Entity::Class(Class::new(format!(
+                    "http://ex.org/D{}",
+                    next(classes)
+                )))),
+                _ => AxiomKind::SubClassOf(expr(&mut next), expr(&mut next)),
+            };
+            out.push(k);
+        }
+        out
+    }
+
+    #[test]
+    fn an_incremental_parallel_normalization_keeps_the_ids_of_one_thread() {
+        // without individuals a change keeps the interner, so the merge meets names and
+        // expressions the interner already has
+        let axioms: Vec<AxiomKind> = mixed_axioms(4000, 645)
+            .into_iter()
+            .filter(|k| {
+                !matches!(
+                    k,
+                    AxiomKind::ClassAssertion(..) | AxiomKind::ObjectPropertyAssertion(..)
+                )
+            })
+            .collect();
+        let (before, added) = axioms.split_at(axioms.len() * 2 / 3);
+        let added: Vec<&AxiomKind> = added.iter().filter(|k| !needs_full_run(k)).collect();
+        let first: Vec<&AxiomKind> = before.iter().collect();
+        let all: Vec<&AxiomKind> = first.iter().copied().chain(added.iter().copied()).collect();
+        let run = |threads: usize| {
+            let limits = Limits {
+                threads,
+                ..Limits::default()
+            };
+            let mut s = Saturation::new();
+            s.classify(&first, None, &limits).unwrap();
+            let changes = Changes {
+                added: &added,
+                removed: &[],
+            };
+            let out = s.classify(&all, Some(changes), &limits).unwrap();
+            assert!(out.stats.incremental);
+            (s, out)
+        };
+        let (one, a) = run(1);
+        let (many, b) = run(8);
+        assert_eq!(one.interner.nodes, many.interner.nodes);
+        assert_eq!(one.interner.classes[..], many.interner.classes[..]);
+        assert_eq!(one.interner.met, many.interner.met);
+        assert_eq!(a.taxonomy, b.taxonomy);
+        let fresh = Saturation::new()
+            .classify(&all, None, &Limits::default())
+            .unwrap();
+        assert_eq!(a.taxonomy, fresh.taxonomy);
+    }
+
+    #[test]
+    fn a_parallel_normalization_gives_the_ids_of_one_thread() {
+        for seed in [1u64, 0x9e37_79b9_7f4a_7c15, 587] {
+            let axioms = mixed_axioms(3000, seed);
+            let kinds: Vec<&AxiomKind> = axioms.iter().collect();
+            let run = |threads: usize| {
+                let mut s = Saturation::new();
+                let out = s
+                    .classify(
+                        &kinds,
+                        None,
+                        &Limits {
+                            threads,
+                            ..Limits::default()
+                        },
+                    )
+                    .unwrap();
+                (s, out)
+            };
+            let (one, a) = run(1);
+            for threads in [2, 3, 8] {
+                let (many, b) = run(threads);
+                assert_eq!(
+                    one.interner.nodes, many.interner.nodes,
+                    "seed {seed}, {threads} threads"
+                );
+                assert_eq!(one.interner.classes[..], many.interner.classes[..]);
+                assert_eq!(one.interner.roles, many.interner.roles);
+                assert_eq!(one.interner.individuals[..], many.interner.individuals[..]);
+                assert_eq!(one.interner.met, many.interner.met);
+                assert_eq!(one.excluded, many.excluded);
+                assert_eq!(a.taxonomy, b.taxonomy);
+                assert_eq!(a.consistent, b.consistent);
+            }
+        }
+    }
+
+    /// Classifies on each thread count, and checks that the interner, the answer and the
+    /// taxonomy are those of one thread.
+    fn same_on_every_thread_count(axioms: &[AxiomKind]) -> Classification {
+        let kinds: Vec<&AxiomKind> = axioms.iter().collect();
+        let run = |threads: usize| {
+            let mut s = Saturation::new();
+            let out = s
+                .classify(
+                    &kinds,
+                    None,
+                    &Limits {
+                        threads,
+                        ..Limits::default()
+                    },
+                )
+                .unwrap();
+            (s, out)
+        };
+        let (one, a) = run(1);
+        for threads in [2, 3, 8] {
+            let (many, b) = run(threads);
+            assert_eq!(one.interner.nodes, many.interner.nodes, "{threads} threads");
+            assert_eq!(one.interner.classes[..], many.interner.classes[..]);
+            assert_eq!(one.excluded, many.excluded);
+            assert_eq!(a.consistent, b.consistent, "{threads} threads");
+            assert_eq!(a.taxonomy, b.taxonomy, "{threads} threads");
+        }
+        a
+    }
+
+    fn padding(n: usize, at: usize) -> impl Iterator<Item = AxiomKind> {
+        (at..at + n).map(|i| {
+            AxiomKind::Declaration(Entity::Class(Class::new(format!("http://ex.org/P{i}"))))
+        })
+    }
+
+    #[test]
+    fn a_parallel_normalization_keeps_functional_data_roles() {
+        let mut axioms = mixed_axioms(400, 7);
+        axioms.push(AxiomKind::FunctionalDataProperty(DataProperty::new(
+            crate::vocab::OWL_TOP_DATA_PROPERTY,
+        )));
+        axioms.extend(padding(100, 0));
+        let a = same_on_every_thread_count(&axioms);
+        assert!(!a.consistent);
+    }
+
+    #[test]
+    fn operands_that_the_merge_makes_one_expression_count_once() {
+        let c = |s: &str| ClassExpression::Class(Class::new(format!("http://ex.org/{s}")));
+        let and = |xs: Vec<ClassExpression>| {
+            ClassExpression::ObjectIntersectionOf(xs.into_iter().collect())
+        };
+        let abc = || and(vec![c("A"), c("B"), c("C")]);
+        let c_ab = || and(vec![c("C"), and(vec![c("A"), c("B")])]);
+        let mut axioms: Vec<AxiomKind> = padding(200, 0).collect();
+        axioms.push(AxiomKind::DisjointClasses(
+            [abc(), c_ab()].into_iter().collect(),
+        ));
+        for s in ["A", "B", "C"] {
+            axioms.push(AxiomKind::SubClassOf(c("X"), c(s)));
+        }
+        axioms.push(AxiomKind::SubClassOf(
+            and(vec![c("D"), abc(), c_ab()]),
+            c("E"),
+        ));
+        axioms.extend(padding(200, 200));
+        let a = same_on_every_thread_count(&axioms);
+        let x = Class::new("http://ex.org/X");
+        assert!(a.taxonomy.unsatisfiable().any(|u| *u == x));
+    }
+
+    /// Ranges of a few properties over many classes, so that every chunk of a parallel
+    /// normalization meets every class.
+    fn ranges(n: usize, properties: usize, classes: usize) -> Vec<AxiomKind> {
+        (0..n)
+            .map(|i| {
+                AxiomKind::ObjectPropertyRange(
+                    ObjectPropertyExpression::Property(ObjectProperty::new(format!(
+                        "http://ex.org/p{}",
+                        i / classes % properties
+                    ))),
+                    ClassExpression::Class(Class::new(format!("http://ex.org/C{}", i % classes))),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_chunks_of_a_parallel_normalization_count_against_the_budget() {
+        let axioms = ranges(8192, 16, 512);
+        let kinds: Vec<&AxiomKind> = axioms.iter().collect();
+        let run = |threads: usize, max_memory: Option<usize>| {
+            let granted = Arc::new(AtomicUsize::new(0));
+            let g = granted.clone();
+            let out = Saturation::new()
+                .classify(
+                    &kinds,
+                    None,
+                    &Limits {
+                        threads,
+                        max_memory,
+                        charge: Some(Arc::new(move |b| {
+                            g.fetch_add(b, Ordering::Relaxed);
+                            true
+                        })),
+                        ..Limits::default()
+                    },
+                )
+                .unwrap();
+            (out, granted.load(Ordering::Relaxed))
+        };
+        let (one, one_granted) = run(1, None);
+        // each of the chunks holds every class, which the peak and the pool's grant count
+        let (many, many_granted) = run(16, None);
+        assert!(
+            many.stats.peak_memory > 2 * one.stats.peak_memory,
+            "{} against {}",
+            many.stats.peak_memory,
+            one.stats.peak_memory
+        );
+        assert!(
+            many_granted > 2 * one_granted,
+            "{many_granted} against {one_granted}"
+        );
+        assert!(many_granted >= many.stats.peak_memory);
+        // under a budget that one thread fits in, the run normalizes on one thread
+        let limit = one.stats.peak_memory + one.stats.peak_memory / 10;
+        let (bounded, _) = run(16, Some(limit));
+        assert!(
+            bounded.stats.peak_memory <= limit,
+            "{} over {limit}",
+            bounded.stats.peak_memory
+        );
+        assert_eq!(bounded.taxonomy, one.taxonomy);
+    }
+
+    #[test]
+    fn a_merge_of_chunks_polls() {
+        let axioms = mixed_axioms(500, 3);
+        let chunks: Vec<Interner> = axioms
+            .chunks(250)
+            .map(|part| {
+                let mut it = Interner::chunk(&FxHashMap::default());
+                let mut ax = Axioms::default();
+                for k in part {
+                    index::normalize(k, &mut it, &mut ax);
+                }
+                it
+            })
+            .collect();
+        let mut calls = 0;
+        let r = Interner::new().merge(chunks, &mut |_| {
+            calls += 1;
+            Err(())
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    /// The interners of chunks of `axioms`, `n` axioms each.
+    fn chunk_interners(axioms: &[AxiomKind], n: usize) -> Vec<Interner> {
+        axioms
+            .chunks(n)
+            .map(|part| {
+                let mut it = Interner::chunk(&FxHashMap::default());
+                let mut ax = Axioms::default();
+                for k in part {
+                    index::normalize(k, &mut it, &mut ax);
+                }
+                it
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_merge_of_chunks_polls_over_chunks_and_roles() {
+        // chunks of roles alone, each shorter than the polls' interval
+        let axioms: Vec<AxiomKind> = (0..4 * index::POLL_MERGE / 2)
+            .map(|i| {
+                AxiomKind::FunctionalDataProperty(DataProperty::new(format!("http://ex.org/d{i}")))
+            })
+            .collect();
+        let chunks = chunk_interners(&axioms, index::POLL_MERGE / 2);
+        let mut calls = 0;
+        Interner::new()
+            .merge(chunks, &mut |_| -> Result<(), ()> {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert!(calls > 2, "{calls} polls");
+    }
+
+    #[test]
+    fn the_chunks_count_what_their_merge_adds() {
+        // wide intersections, each of which the merge makes into many binary ones, since
+        // the class that differs comes first in the order of ids
+        let c = |s: String| ClassExpression::Class(Class::new(format!("http://ex.org/{s}")));
+        let declared = (0..256).map(|i| {
+            AxiomKind::Declaration(Entity::Class(Class::new(format!("http://ex.org/A{i}"))))
+        });
+        let axioms: Vec<AxiomKind> = declared
+            .chain((0..256).map(|i| {
+                AxiomKind::SubClassOf(
+                    ClassExpression::ObjectIntersectionOf(
+                        std::iter::once(c(format!("A{i}")))
+                            .chain((0..64).map(|j| c(format!("S{j}"))))
+                            .collect(),
+                    ),
+                    c("X".into()),
+                )
+            }))
+            .collect();
+        let chunks = chunk_interners(&axioms, 32);
+        let reserved: usize = chunks.iter().map(|it| it.merge_bytes()).sum();
+        let mut merged = Interner::new();
+        let start = merged.bytes();
+        merged
+            .merge(chunks, &mut |_| -> Result<(), ()> { Ok(()) })
+            .unwrap();
+        let added = merged.bytes() - start;
+        assert!(added <= reserved, "{added} added, {reserved} counted");
+    }
+
+    #[test]
+    fn rounds_after_individuals_charge_the_pool_no_more_than_the_peak() {
+        let mut axioms = ranges(8192, 16, 512);
+        axioms.push(AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("http://ex.org/C0")),
+            ClassExpression::ObjectOneOf(
+                [Individual::Named(NamedIndividual::new("http://ex.org/a"))]
+                    .into_iter()
+                    .collect(),
+            ),
+        ));
+        let kinds: Vec<&AxiomKind> = axioms.iter().collect();
+        for threads in [1, 8] {
+            let granted = Arc::new(AtomicUsize::new(0));
+            let g = granted.clone();
+            let out = Saturation::new()
+                .classify(
+                    &kinds,
+                    None,
+                    &Limits {
+                        threads,
+                        charge: Some(Arc::new(move |b| {
+                            g.fetch_add(b, Ordering::Relaxed);
+                            true
+                        })),
+                        ..Limits::default()
+                    },
+                )
+                .unwrap();
+            let granted = granted.load(Ordering::Relaxed);
+            assert!(
+                granted <= out.stats.peak_memory,
+                "{threads} threads: {granted} granted, peak {}",
+                out.stats.peak_memory
+            );
+        }
+    }
 
     #[test]
     fn the_world_budget_polls_the_cancellation_when_nothing_grows() {

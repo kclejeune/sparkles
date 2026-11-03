@@ -860,6 +860,10 @@ gate tasks record the compilers and the build configuration themselves when they
 A prebuilt binary for the matrix needs `--build-config` with that command's output from
 its build environment, and a record without it cannot be compared.
 
+The build configuration records Boxington's policy but not whether a build reused learned
+incremental state, which timed binaries leave off, so `compare` cannot refuse a pair in
+which one side reused it. [Item 677](ROADMAP.md) tracks recording it.
+
 `compare` then pairs the metrics by key. Each ratio is oriented so that a value above 1 is
 a loss, and a metric is flagged when its ratio reaches 1 plus the baseline's threshold.
 When both records hold a range over several processes, a flagged metric also needs the
