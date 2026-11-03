@@ -464,17 +464,24 @@ impl<'a, 's> Ranker<'a, 's> {
         }
         let e = x.entity;
         let prop = &PROPS[x.prop as usize];
-        let rank = Rank {
+        let mut rank = Rank {
             tier,
             distance,
             field: prop.field as u8,
-            deprecated: !ix.entities[e as usize].deprecated.is_empty() && self.scope.deprecated(e),
+            deprecated: false,
             sub: prop.rank,
             lang: self.langs.get(x.lang as usize).copied().unwrap_or(u8::MAX),
-            len: chars(&x.text) as u32,
+            len: x.text.len() as u32,
             text: &x.text,
-            iri: &ix.entities[e as usize].iri,
+            iri: "",
         };
+        // the best rank the value can have, before the entity is read
+        if self.beyond(&rank) {
+            return;
+        }
+        let ent = &ix.entities[e as usize];
+        rank.deprecated = !ent.deprecated.is_empty() && self.scope.deprecated(e);
+        rank.iri = &ent.iri;
         if self.beyond(&rank) || self.done.contains(&e) {
             return;
         }
@@ -502,7 +509,7 @@ impl<'a, 's> Ranker<'a, 's> {
             deprecated: self.scope.deprecated(e),
             sub: 0,
             lang: 0,
-            len: chars(iri) as u32,
+            len: iri.len() as u32,
             text: iri,
             iri,
         };
@@ -825,63 +832,45 @@ fn fuzzy(ix: &Index, q: &mut Query, r: &mut Ranker<'_, '_>) {
     if !any_edit {
         return;
     }
-    // the candidates of the term with the fewest postings, checked against the others
+    // each term's values with the fewest edits, as sorted lists, intersected from the
+    // shortest
+    let union = |m: &FxHashMap<&[u8], u8>| -> Vec<(u32, u8)> {
+        let mut out: Vec<(u32, u8)> = Vec::new();
+        for (w, &d) in m {
+            if let Some(l) = ix.words.get(*w) {
+                out.extend(l.iter().map(|&v| (v, d)));
+            }
+        }
+        out.sort_unstable();
+        out.dedup_by_key(|(v, _)| *v);
+        out
+    };
     let size = |m: &FxHashMap<&[u8], u8>| -> usize {
         m.keys().map(|w| ix.words.get(*w).map_or(0, Vec::len)).sum()
     };
-    let first = (0..n).min_by_key(|&i| size(&sets[i])).unwrap_or(0);
-    let mut cands: FxHashMap<u32, u8> = FxHashMap::default();
-    for (w, &d) in &sets[first] {
-        if let Some(l) = ix.words.get(*w) {
-            for &v in l {
-                let e = cands.entry(v).or_insert(d);
-                *e = (*e).min(d);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| size(&sets[i]));
+    let mut cands = union(&sets[order[0]]);
+    for &i in &order[1..] {
+        let other = union(&sets[i]);
+        let mut j = 0;
+        cands.retain_mut(|(v, d)| {
+            while j < other.len() && other[j].0 < *v {
+                j += 1;
             }
+            if j < other.len() && other[j].0 == *v {
+                *d += other[j].1;
+                *d <= 2
+            } else {
+                false
+            }
+        });
+        if cands.is_empty() {
+            return;
         }
     }
-    for (v, d0) in cands {
-        let x = &ix.values[v as usize];
-        if x.field() == Field::Definition || !x.live() {
-            continue;
-        }
-        let mut total = d0;
-        if n > 1 {
-            let mut norm: Option<String> = None;
-            let mut ok = true;
-            for (i, set) in sets.iter().enumerate() {
-                if i == first {
-                    continue;
-                }
-                // a few words: their postings; many: the value's own words
-                let best = if set.len() <= 16 {
-                    set.iter()
-                        .filter(|(w, _)| {
-                            ix.words
-                                .get(**w)
-                                .is_some_and(|l| l.binary_search(&v).is_ok())
-                        })
-                        .map(|(_, d)| *d)
-                        .min()
-                } else {
-                    let n = norm.get_or_insert_with(|| normalize(&x.text));
-                    words(n)
-                        .filter_map(|w| set.get(w.as_bytes()))
-                        .min()
-                        .copied()
-                };
-                match best {
-                    Some(d) => total += d,
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if !ok {
-                continue;
-            }
-        }
-        if total > 0 && total <= 2 {
+    for (v, total) in cands {
+        if total > 0 && ix.values[v as usize].field() != Field::Definition {
             r.offer(v, 6, total, MatchKind::Fuzzy, false);
         }
     }

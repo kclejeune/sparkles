@@ -97,6 +97,7 @@ fn main() {
     let mut rounds = 5usize;
     let mut seed = 1u64;
     let mut commits = 50usize;
+    let mut only: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let v = |i: usize| args.get(i + 1).cloned().expect("a value");
@@ -111,6 +112,10 @@ fn main() {
             }
             "--seed" => {
                 seed = v(i).parse().unwrap();
+                i += 1;
+            }
+            "--query" => {
+                only.push(v(i));
                 i += 1;
             }
             "--commits" => {
@@ -131,13 +136,14 @@ fn main() {
 
     // the texts the queries come from: labels and exact synonyms of classes
     let mut texts: Vec<(String, String)> = Vec::new();
+    let mut labels: Vec<(String, String)> = Vec::new();
     let sols = ds
         .select(
             "PREFIX owl: <http://www.w3.org/2002/07/owl#>
              PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
              PREFIX oio: <http://www.geneontology.org/formats/oboInOwl#>
-             SELECT ?s ?l WHERE { ?s a owl:Class .
-               { ?s rdfs:label ?l } UNION { ?s oio:hasExactSynonym ?l } }",
+             SELECT ?s ?l ?syn WHERE { ?s a owl:Class .
+               { ?s rdfs:label ?l } UNION { ?s oio:hasExactSynonym ?l BIND(true AS ?syn) } }",
         )
         .unwrap();
     for row in sols.iter() {
@@ -147,9 +153,14 @@ fn main() {
             continue;
         };
         texts.push((s.as_str().to_string(), l.value().to_string()));
+        if row.get("syn").is_none() && l.language().is_none() {
+            labels.push((s.as_str().to_string(), l.value().to_string()));
+        }
     }
     texts.sort();
     texts.dedup();
+    labels.sort();
+    labels.dedup();
     eprintln!("{} label and synonym texts", texts.len());
 
     let rss_before = rss_kib();
@@ -167,6 +178,22 @@ fn main() {
         (rss_after.saturating_sub(rss_before)) >> 10
     );
     assert_eq!(first["index"], "built");
+    if !only.is_empty() {
+        // diagnosis: time the given queries and print their first hits
+        for q in &only {
+            for _ in 0..3 {
+                let t = Instant::now();
+                let j = search(&ds, q);
+                eprintln!("{q:?}: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+                if let Some(r) = j["results"].as_array() {
+                    for h in r.iter().take(3) {
+                        eprintln!("   {} {}", h["match"]["text"], h["match"]["tier"]);
+                    }
+                }
+            }
+        }
+        return;
+    }
 
     // the queries: (length, typos) buckets
     let mut rng = Rng(seed.max(1).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -206,6 +233,8 @@ fn main() {
     let mut by_typos: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
     let mut all: Vec<f64> = Vec::new();
     let mut found: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+    let mut found_bucket: BTreeMap<(usize, usize), (usize, usize)> = BTreeMap::new();
+    let mut slowest: Vec<(f64, String)> = Vec::new();
     for round in 0..rounds {
         for (len, typos, q, iri) in &queries {
             let t = Instant::now();
@@ -221,7 +250,11 @@ fn main() {
                 let e = found.entry(*typos).or_default();
                 e.0 += hit as usize;
                 e.1 += 1;
+                let e = found_bucket.entry((*len, *typos)).or_default();
+                e.0 += hit as usize;
+                e.1 += 1;
             }
+            slowest.push((ms, q.clone()));
         }
     }
     let buckets: Vec<J> = by_bucket
@@ -230,6 +263,8 @@ fn main() {
             let mut s = summary(v);
             s["length"] = json!(len);
             s["typos"] = json!(typos);
+            let (h, n) = found_bucket[&(*len, *typos)];
+            s["source_in_top10"] = json!(h as f64 / n.max(1) as f64);
             s
         })
         .collect();
@@ -244,6 +279,9 @@ fn main() {
         })
         .collect();
     let overall = summary(&mut all);
+    slowest.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    slowest.dedup_by(|a, b| a.1 == b.1);
+    slowest.truncate(20);
     eprintln!("overall {overall}");
 
     // commits, each followed by a search that applies its changes
@@ -258,7 +296,7 @@ fn main() {
                    rdfs:label \"benchmark class {k}\" ; rdfs:label \"zzbench {k}\"@en }}"
             )
         } else {
-            let (iri, text) = &texts[rng.below(texts.len())];
+            let (iri, text) = &labels[rng.below(labels.len())];
             format!(
                 "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
                  DELETE DATA {{ <{iri}> rdfs:label {} }}",
@@ -302,6 +340,7 @@ fn main() {
         "overall": overall,
         "by_typos": typo_rows,
         "by_bucket": buckets,
+        "slowest": slowest.iter().map(|(ms, q)| json!({"ms": ms, "q": q})).collect::<Vec<_>>(),
         "maintenance": {
             "commit": summary(&mut commit_ms),
             "search_after_commit": summary(&mut after_commit),
