@@ -1931,6 +1931,10 @@ the per-case results and ledgers. The round spent $12.09 on Anthropic models and
 on OpenAI models. OpenAI's report matches its ledger for every day it had closed when
 it was read, its report for the last day lagged the Sol runs, and the Anthropic spend
 stands in the ledger.
+Effort `high` for Haiku and Luna, three runs each on the validation questions with the
+final build, scored 27.3 and 29.7 against 28.7 and 29.7 at `medium` for 12% to 15% more cost per
+run, so it was not confirmed on the held-out set and effort stays `medium`. The [effort
+record](../../benchmarks/2026-11-03-ask-effort-paid.json) holds the runs.
 
 ### Roadmap follow-ups
 

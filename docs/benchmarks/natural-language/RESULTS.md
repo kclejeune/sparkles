@@ -465,6 +465,29 @@ fixes stay because they remove failures of the check and the parser. Luna stays 
 model of the `openai` preset, since one run per model moved none of them beyond the noise
 of the provider comparison on which the preset was chosen.
 
+##### Effort for the cheapest models
+
+Haiku and Luna then ran at effort `high` with the final build, three times each on the 51
+validation questions, against the three `medium` runs of the final build above. Haiku
+ran with 16,384 output tokens and a 180-second request timeout, as Luna does, so that
+neither a token limit nor a timeout could cut a longer answer short, and no reply in any
+run stopped on its token limit.
+
+| Model | Medium | Mean | High | Mean | Cost per run at high |
+|---|---|---|---|---|---|
+| Claude Haiku 5.5 | 29, 27, 30 | 28.7 | 26, 27, 29 | 27.3 | $0.122 to $0.124, against $0.105 to $0.109 |
+| GPT-6 Luna | 30, 29, 30 | 29.7 | 31, 28, 30 | 29.7 | $0.116 with a cold cache, against $0.101 to $0.104 |
+
+High effort gains nothing on either model. Haiku writes about 41% more output tokens and
+Luna about 60% more reasoning tokens, and the runs take about 25% to 45% longer. An arm was to
+be confirmed on the held-out set only if its mean rose beyond the spread of the medium
+runs, so neither ran there, and the held-out comparison above stands. There both cheap
+models are within the noise of Sol and neither is within the noise of Opus with the same
+build. At high effort the 150 held-out questions would cost about $0.36 for either
+model, against $2.51 for Terra, so cost is not what rules high effort out. Effort stays
+`medium` for the cheapest models. The
+[effort record](../2026-11-03-ask-effort-paid.json) holds the runs.
+
 ##### Synthetic questions
 
 The synthetic DBpedia sets in `testsuite/ask/synth` have gold queries that were executed

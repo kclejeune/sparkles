@@ -263,6 +263,41 @@
           "schema": 1
         }
       }
+    },
+    {
+      "run_id": "sha256-e5908fd56ea7b55a2c2b430a43b80d5c4fe984f0db1f4caf06e5dbbdd3c4f976",
+      "path": "../2026-11-03-ask-effort-paid.json",
+      "sha256": "e5908fd56ea7b55a2c2b430a43b80d5c4fe984f0db1f4caf06e5dbbdd3c4f976",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": {
+          "effort": "high",
+          "contextTokens": 200000,
+          "maxOutputTokens": 16384,
+          "requestTimeoutSecs": 180,
+          "askDeadlineSecs": 300,
+          "queryTimeoutSecs": 60,
+          "askTokenBudget": 100000,
+          "clarifications": "answer",
+          "haiku": {
+            "maxOutputTokens": 16384,
+            "requestTimeoutSecs": 180
+          },
+          "luna": {
+            "maxOutputTokens": 16384,
+            "requestTimeoutSecs": 180
+          }
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": "A development laptop with 16 cores and 30 GB of memory that was running other work. Binaries were built on atlas and copied back.",
+          "measurement": "Ask effort trial on DBpedia 2022.12.01: Claude Haiku 5.5 and GPT-6 Luna at effort high against the medium runs of the cheap-tier round, build p2final-ace00e4b, 51 qald-validation-v2 questions, three runs per arm",
+          "schema": 1
+        }
+      }
     }
   ]
 }
