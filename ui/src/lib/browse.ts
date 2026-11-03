@@ -1052,6 +1052,16 @@ export function definitionsQuery(iris: readonly string[], graph: string | null) 
   return `SELECT ?s ?d WHERE { VALUES ?s { ${values} } ${inGraph(graph, `?s ${props} ?d`)} }`;
 }
 
+/**
+ * The SPARQL of the labels of `iris`, `rdfs:label` or `skos:prefLabel`, for names such as the
+ * properties and values of an ontology's header. `parseDefinitions` reads its rows.
+ */
+export function namesQuery(iris: readonly string[], graph: string | null) {
+  const values = iris.map((i) => `<${i}>`).join(' ');
+  const props = [RDFS + 'label', SKOS + 'prefLabel'].map((p) => `<${p}>`).join('|');
+  return `SELECT ?s ?d WHERE { VALUES ?s { ${values} } ${inGraph(graph, `?s ${props} ?d`)} FILTER(isLiteral(?d)) }`;
+}
+
 /** The best definition of each subject in `definitionsQuery`'s rows, in the caller's languages. */
 export function parseDefinitions(rows: Row[], langs: readonly string[]): Map<string, string> {
   const best = new Map<string, { text: string; rank: number }>();

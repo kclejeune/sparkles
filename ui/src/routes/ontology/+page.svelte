@@ -158,7 +158,11 @@
     loading = true;
     try {
       const r = await ontologySummary(t, s);
-      const [ents, ax, types] = await Promise.all([
+      // Every label of the graph in one query, beside the capped listings, so that a large
+      // ontology's trees show labels from their first paint rather than local names until
+      // a later query answers. A failure leaves the labels the listings carry.
+      const allLabels = ontologyLabels(t, s).catch(() => new Map<string, Lit[]>());
+      const [ents, ax, types, more] = await Promise.all([
         ontologyEntities(t, s, [...TREE_KINDS, 'Datatype']),
         ontologyAxioms(t, s, {
           types: [
@@ -170,6 +174,7 @@
           ],
         }),
         ontologyAxioms(t, s, { types: ['ClassAssertion'], assertions: true, cap: 10_000 }),
+        allLabels,
       ]);
       if (my !== loadSeq) return;
       const byKind = new Map<EntityKind, string[]>();
@@ -191,17 +196,9 @@
       entities = byKind;
       hierarchy = ax.axioms;
       typeAxioms = types.axioms;
-      labels = labelsOf(ax.axioms);
+      labels = withMissingLabels(labelsOf(ax.axioms), more);
       truncated = ents.truncated || ax.truncated || types.truncated;
       loadError = null;
-      // The capped listing stops before most labels of a large ontology: one query reads
-      // them all and fills in those it left out.
-      if (ax.truncated)
-        void ontologyLabels(t, s)
-          .then((more) => {
-            if (my === loadSeq) labels = withMissingLabels(labels, more);
-          })
-          .catch(() => {});
     } catch (e) {
       if (my === loadSeq) loadError = e as Error;
     } finally {

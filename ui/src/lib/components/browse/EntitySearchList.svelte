@@ -179,7 +179,6 @@
     border-radius: var(--r-lg);
     background: var(--surface);
     color: var(--text-3);
-    max-width: 720px;
     min-width: 0;
   }
   .field:focus-within {
@@ -225,7 +224,6 @@
     padding: 0;
     display: grid;
     gap: 2px;
-    max-width: 860px;
   }
   .hits li {
     display: flex;

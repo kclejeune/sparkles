@@ -63,6 +63,7 @@
     builtIn,
     countsQuery,
     definitionsQuery,
+    namesQuery,
     DEFINITION_PROPS,
     displayName,
     downloadHref,
@@ -866,6 +867,8 @@
 
   // --- the landing page ----------------------------------------------------------------
   let head = $state<{ head: OntologyHead; scheme: boolean } | null>(null);
+  /** The labels of the header's annotation properties and IRI values, by IRI. */
+  let aboutNames = $state<Map<string, string>>(new Map());
   let counts = $state<{ kind: string; label: string; count: number }[]>([]);
   let roots = $state<Hierarchy | null>(null);
   let rootItems = $state<TreeNode[]>([]);
@@ -887,6 +890,7 @@
 
   async function loadLanding(t: string, s: BrowseSelection, signal: AbortSignal) {
     head = null;
+    aboutNames = new Map();
     counts = [];
     roots = null;
     rootItems = [];
@@ -907,6 +911,7 @@
       headGraphs = g;
       head = h;
       counts = c;
+      if (h) void loadAboutNames(t, s, h.head, signal);
       const has = (k: string) => c.some((x) => x.kind === k);
       const kind: TreeKind = !has(OWL + 'Class') && has(SKOS + 'Concept') ? 'concept' : 'class';
       const r = await fetchHierarchy(t, s, { kind, limit: 50 }, signal);
@@ -918,6 +923,30 @@
       if (!signal.aborted) landingError = api.errorMessage(e);
     } finally {
       if (!signal.aborted) landingLoading = false;
+    }
+  }
+
+  /** Labels for the header's properties and IRI values, so they read as words, not IDs. */
+  async function loadAboutNames(
+    t: string,
+    s: BrowseSelection,
+    h: OntologyHead,
+    signal: AbortSignal,
+  ) {
+    const iris = new Set<string>();
+    for (const a of h.annotations.slice(0, 12)) {
+      iris.add(a.property);
+      if (!isLiteral(a.value) && /^https?:/.test(a.value)) iris.add(a.value);
+    }
+    if (!iris.size) return;
+    try {
+      const rows = await api.select(t, namesQuery([...iris], s.graph), {
+        at: s.at ?? undefined,
+        signal,
+      });
+      if (!signal.aborted) aboutNames = parseDefinitions(rows as never, langs);
+    } catch {
+      // the names stay short IRIs
     }
   }
 
@@ -1594,12 +1623,17 @@
               <div class="panel-body">
                 <dl class="about">
                   {#each head.head.annotations.slice(0, 12) as a, i (i)}
-                    <dt>{displayName(a.property, undefined, prefixes)}</dt>
+                    <dt title={a.property}>
+                      {aboutNames.get(a.property) ?? displayName(a.property, undefined, prefixes)}
+                    </dt>
                     <dd>
-                      {#if isLiteral(a.value)}{a.value[
-                          '@value'
-                        ]}{:else if /^https?:/.test(a.value)}<a
+                      {#if isLiteral(a.value)}{a.value['@value']}{:else if aboutNames.has(a.value)}
+                        <!-- a term of this graph opens its own page -->
+                        <a href={browseHref(base, name, a.value, keep)} title={a.value}
+                          >{aboutNames.get(a.value)}</a
+                        >{:else if /^https?:/.test(a.value)}<a
                           href={a.value}
+                          title={a.value}
                           rel="noopener noreferrer"
                           target="_blank">{iriName(a.value, prefixes)}</a
                         >{:else}{a.value}{/if}
@@ -1915,9 +1949,12 @@
     padding-left: var(--sp-3);
   }
   .about {
-    grid-template-columns: 96px minmax(0, 1fr);
+    grid-template-columns: minmax(6rem, 2fr) minmax(0, 3fr);
   }
+  /* a long key such as hasOBOFormatVersion wraps inside its column */
   .about dt {
+    min-width: 0;
+    overflow-wrap: anywhere;
     color: var(--text-3);
     font-size: var(--fs-sm);
   }
