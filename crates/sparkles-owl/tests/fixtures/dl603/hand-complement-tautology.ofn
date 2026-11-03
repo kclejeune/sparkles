@@ -1,0 +1,13 @@
+Prefix(:=<http://example.org/d#>)
+Prefix(xsd:=<http://www.w3.org/2001/XMLSchema#>)
+Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
+Prefix(rdf:=<http://www.w3.org/1999/02/22-rdf-syntax-ns#>)
+Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)
+Ontology(<http://example.org/d#hand-complement-tautology>
+Declaration(Class(:A))
+Declaration(Class(:B))
+Declaration(Class(:D))
+SubClassOf(:B :D)
+SubClassOf(ObjectComplementOf(:B) :D)
+SubClassOf(:A owl:Thing)
+)
