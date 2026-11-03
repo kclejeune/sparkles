@@ -24,6 +24,14 @@ fn off() -> Optimizations {
     }
 }
 
+/// The subject sets alone, without the node sets.
+fn subject_sets() -> Optimizations {
+    Optimizations {
+        node_sets: false,
+        ..sets()
+    }
+}
+
 fn opts(opt: Optimizations) -> QueryOptions {
     QueryOptions {
         optimizations: Some(opt),
@@ -166,7 +174,7 @@ fn classes_are_items_of_the_sets() {
 }
 
 /// Patterns with a constant object other than a class, or a predicate that occurs twice,
-/// keep the estimate from distinct values.
+/// keep the estimate from distinct values, and so does a chain without the node sets.
 #[test]
 fn other_patterns_keep_the_estimate_from_distinct_values() {
     let s = load(subjects(300));
@@ -175,8 +183,13 @@ fn other_patterns_keep_the_estimate_from_distinct_values() {
         "SELECT * WHERE { ?s ex:b ?b ; ex:c 2 }",
         "SELECT * WHERE { ?s ex:c ?x ; ex:c ?y }",
         "SELECT * WHERE { ?s ex:d ?o . ?o ex:b ?b }",
+        "SELECT * WHERE { ?s ex:d ?s . ?s ex:b ?b }",
     ] {
-        assert_eq!(root_est(&snap, q, sets()), root_est(&snap, q, off()), "{q}");
+        assert_eq!(
+            root_est(&snap, q, subject_sets()),
+            root_est(&snap, q, off()),
+            "{q}"
+        );
     }
 }
 
@@ -218,4 +231,203 @@ fn estimates_from_sets_never_change_answers() {
         q.push_str(" }");
         assert_eq!(answer(&snap, &q, sets()), answer(&snap, &q, off()), "{q}");
     }
+}
+
+/// The node sets count every node by its outgoing and incoming predicates and classes, and
+/// the remainders are empty when every set is kept.
+#[test]
+fn builds_count_node_sets() {
+    let s = load(subjects(60));
+    let snap = s.snapshot();
+    let stats = &snap.generation.stats;
+    let c = stats.correlations.get().expect("correlations");
+    assert_eq!(c.version, crate::builder::correlations::VERSION);
+    assert_eq!(c.subject_rest.n, 0);
+    assert_eq!(c.node_rest.n, 0);
+    // 60 subjects, the integers 0 to 59 (ex:c's 1 and 2 among them) and 30 strings
+    let nodes: u64 = c.node_sets.iter().map(|n| n.subjects).sum();
+    assert_eq!(nodes, 150, "{:?}", c.node_sets);
+    // every quad is an outgoing item of its subject and an incoming item of its object
+    let (mut out, mut inn) = (0, 0);
+    for n in &c.node_sets {
+        for (&i, &t) in n.preds.iter().zip(&n.triples) {
+            if crate::builder::correlations::is_in_item(i) {
+                inn += t;
+            } else if crate::builder::item_class(i).is_none() {
+                out += t;
+            }
+        }
+    }
+    assert_eq!((out, inn), (stats.quads, stats.quads));
+    assert!(crate::builder::correlations::check(stats, c).is_none());
+}
+
+/// Joins on a variable that is an object, chains and object joins, are estimated from the
+/// node sets: exactly here, where every node of a set has the same number of triples of
+/// each item, and far from it without them.
+#[test]
+fn object_joins_and_chains_are_estimated_from_node_sets() {
+    let n = 600;
+    let s = load(subjects(n));
+    let snap = s.snapshot();
+    for q in [
+        // ex:d points at subjects, half of which have ex:b
+        "SELECT * WHERE { ?x ex:d ?y . ?y ex:b ?b }",
+        // ex:c's objects 1 and 2 are also objects of ex:a, once each
+        "SELECT * WHERE { ?x ex:a ?v . ?y ex:c ?v }",
+        // the subjects that ex:d points at, by their own ex:c
+        "SELECT * WHERE { ?x ex:d ?y . ?y ex:c ?c }",
+    ] {
+        let rows = answer(&snap, q, sets()).len() as f64;
+        let est = root_est(&snap, q, sets());
+        assert!(
+            (est - rows.max(1.0)).abs() <= 0.5 + rows * 0.02,
+            "{q}: estimated {est} for {rows}"
+        );
+        let old = root_est(&snap, q, subject_sets());
+        let q_err = |e: f64| e.max(rows).max(1.0) / e.min(rows).max(1.0);
+        assert!(
+            q_err(old) > q_err(est),
+            "{q}: {old} without the node sets, {est} with"
+        );
+        assert_eq!(
+            answer(&snap, q, sets()),
+            answer(&snap, q, subject_sets()),
+            "{q}"
+        );
+    }
+}
+
+/// The generation directory of an on-disk store.
+fn gen_dir(root: &std::path::Path) -> std::path::PathBuf {
+    let mut gens: Vec<_> = std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("gen-"))
+        })
+        .collect();
+    gens.sort();
+    gens.pop().expect("a generation")
+}
+
+/// Rewrite the statistics of the store at `root`, then open it again.
+fn with_stats(root: &std::path::Path, f: impl FnOnce(&mut serde_json::Value)) -> Store {
+    let path = gen_dir(root).join("stats.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    f(&mut v);
+    std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+    Store::open(root, StoreOptions::default()).unwrap()
+}
+
+/// A store whose sets all moved into the remainder estimates stars of independent items
+/// from it as the kept sets did, and one without a remainder keeps the coverage rule.
+#[test]
+fn stars_are_estimated_from_the_remainder() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let q = "SELECT * WHERE { ?s ex:b ?b ; ex:c ?c ; ex:d ?d }";
+    let (kept, rows) = {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        s.load(&[Source::from_bytes(
+            subjects(600).into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        (
+            root_est(&snap, q, subject_sets()),
+            answer(&snap, q, sets()).len() as f64,
+        )
+    };
+    assert!((kept - rows).abs() < 0.5, "{kept} for {rows}");
+    // every set into the remainder
+    let s = with_stats(&root, |v| {
+        let sets = v["charsets"].as_array().unwrap().clone();
+        let mut n = 0u64;
+        let mut items: std::collections::BTreeMap<u64, (u64, u64)> = Default::default();
+        for c in &sets {
+            let h = c["subjects"].as_u64().unwrap();
+            n += h;
+            for (p, t) in c["preds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(c["triples"].as_array().unwrap())
+            {
+                let e = items.entry(p.as_u64().unwrap()).or_default();
+                e.0 += h;
+                e.1 += t.as_u64().unwrap();
+            }
+        }
+        v["charsets"] = serde_json::json!([]);
+        v["charset_others"] = serde_json::json!(n);
+        v["correlations"]["subjectRest"] = serde_json::json!({
+            "n": n,
+            "items": items.iter().map(|(&i, &(h, t))| [i, h, t]).collect::<Vec<_>>(),
+        });
+    });
+    let snap = s.snapshot();
+    let est = root_est(&snap, q, subject_sets());
+    assert!((est - rows).abs() <= rows * 0.05, "{est} for {rows}");
+    // without the remainder, no item is covered by the kept sets
+    let old = root_est(
+        &snap,
+        q,
+        Optimizations {
+            set_remainders: false,
+            ..subject_sets()
+        },
+    );
+    assert_eq!(old, root_est(&snap, q, off()));
+    assert_eq!(answer(&snap, q, sets()), answer(&snap, q, off()));
+}
+
+/// Correlations of a version this build does not read are refused with a reason, the
+/// store opens, and the planner estimates as without them; a version after the other
+/// members is read as well as one before them.
+#[test]
+fn correlations_of_another_version_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let q = "SELECT * WHERE { ?x ex:d ?y . ?y ex:b ?b }";
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        s.load(&[Source::from_bytes(
+            subjects(300).into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    }
+    // the version last: the same statistics
+    let s = with_stats(&root, |v| {
+        let c = v["correlations"].as_object_mut().unwrap();
+        let version = c.remove("version").unwrap();
+        c.insert("version".into(), version);
+    });
+    let snap = s.snapshot();
+    assert!(snap.generation.stats.correlations.get().is_some());
+    let with = root_est(&snap, q, sets());
+    drop((snap, s));
+    let s = with_stats(&root, |v| {
+        v["correlations"] = serde_json::json!({ "version": 2, "nodeSets": "a shape of later" });
+    });
+    let snap = s.snapshot();
+    let c = &snap.generation.stats.correlations;
+    assert!(c.get().is_none());
+    let why = c.refusal().expect("a reason");
+    assert!(why.contains("version 2"), "{why}");
+    let refused = root_est(&snap, q, sets());
+    assert_eq!(refused, root_est(&snap, q, subject_sets()));
+    assert_ne!(refused, with);
+    let rep = crate::check::check(&root, &Default::default()).unwrap();
+    assert!(rep.to_text().contains("version 2"), "{}", rep.to_text());
+    // the next write of the statistics leaves the refused member out
+    let j = serde_json::to_value(&snap.generation.stats).unwrap();
+    assert!(j.get("correlations").is_none(), "{j}");
 }

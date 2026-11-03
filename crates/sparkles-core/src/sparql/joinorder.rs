@@ -120,12 +120,21 @@ struct Cand {
 }
 
 /// The estimated rows of joining `a` and `b`, the same for every way of joining them:
-/// as `model` tells, else from the distinct values.
-fn pair_est(a: &Sum, b: &Sum, shared: &[Shared], model: Option<JoinModel>) -> f64 {
+/// as `model` tells, else from the distinct values, with several keys combined as
+/// [`plan::keys_denom`] does when `backoff`.
+fn pair_est(
+    a: &Sum,
+    b: &Sum,
+    shared: &[Shared],
+    model: Option<JoinModel>,
+    backoff: bool,
+    capped: bool,
+) -> f64 {
     if let Some(m) = model {
         return m.est(a.est, b.est);
     }
-    let denom = shared.iter().map(|s| s.da.max(s.db)).fold(1.0f64, f64::max);
+    let cap = capped.then_some((a.est, b.est));
+    let denom = plan::keys_denom(shared.iter().map(|s| (s.da, s.db)), backoff, cap);
     plan::join_est_from(a.est, b.est, denom)
 }
 
@@ -332,6 +341,9 @@ struct Models {
     /// some input has a star mask or a side
     starred: bool,
     probed: bool,
+    /// per input, the variables, sorted, of each of its inputs that binds two or more,
+    /// when several keys back off (see [`plan::keys_denom`])
+    inputs: Vec<Vec<Vec<VarId>>>,
 }
 
 /// What the inputs of one side of a join hold on a join variable: their star mask and
@@ -352,6 +364,17 @@ impl Held {
 }
 
 impl Models {
+    /// Whether one input of the inputs `ins` binds every one of `keys`, as
+    /// [`plan::one_input_binds`] finds in the plan of them.
+    fn one_binds<I: Iterator<Item = usize>>(&self, mut ins: I, keys: &[VarId]) -> bool {
+        ins.any(|i| {
+            self.inputs.get(i).is_some_and(|xs| {
+                xs.iter()
+                    .any(|x| keys.iter().all(|k| x.binary_search(k).is_ok()))
+            })
+        })
+    }
+
     /// What the inputs `ins` hold on join variable `j`.
     fn held<I: Iterator<Item = usize>>(&self, j: u32, ins: I) -> Held {
         let mut h = Held::default();
@@ -538,6 +561,17 @@ impl Group {
                 }
             }
             models.sides.push(sides);
+            let mut inputs = Vec::new();
+            if ctx.opt.key_backoff {
+                plan::input_vars(&it[0], &mut |vars| {
+                    if vars.len() > 1 {
+                        let mut x = vars.to_vec();
+                        x.sort_unstable();
+                        inputs.push(x);
+                    }
+                });
+            }
+            models.inputs.push(inputs);
         }
         models.starred = models.stars.iter().any(|s| !s.is_empty());
         models.probed = models.sides.iter().any(|s| !s.is_empty());
@@ -940,7 +974,19 @@ impl Greedy {
             }
             _ => None,
         };
-        let est = pair_est(&ua.sum, &ub.sum, shared, model.map(|(_, m)| m));
+        let capped = ctx.opt.key_backoff && shared.len() > 1 && {
+            let keys: Vec<VarId> = shared.iter().map(|s| s.v).collect();
+            g.models.one_binds(ua.inputs.ones(), &keys)
+                && g.models.one_binds(ub.inputs.ones(), &keys)
+        };
+        let est = pair_est(
+            &ua.sum,
+            &ub.sum,
+            shared,
+            model.map(|(_, m)| m),
+            ctx.opt.key_backoff,
+            capped,
+        );
         joins(
             &ua.sum,
             ua.probe.as_ref(),
@@ -1626,6 +1672,10 @@ impl Dp {
                 sc.cached.push(v);
             }
         }
+        let capped = ctx.opt.key_backoff && sc.shared.len() > 1 && {
+            let keys: Vec<VarId> = sc.shared.iter().map(|s| s.v).collect();
+            self.models.one_binds(bits_of(ia), &keys) && self.models.one_binds(bits_of(ib), &keys)
+        };
         let Scratch {
             shared,
             pos,
@@ -1640,7 +1690,14 @@ impl Dp {
                     s.da = self.dval[(a.d + pa) as usize];
                     s.db = self.dval[(b.d + pb) as usize];
                 }
-                let est = pair_est(&a.sum, &b.sum, shared, model.map(|(_, m)| m));
+                let est = pair_est(
+                    &a.sum,
+                    &b.sum,
+                    shared,
+                    model.map(|(_, m)| m),
+                    ctx.opt.key_backoff,
+                    capped,
+                );
                 let probe_a = batched.index_joins && a.probe.is_some();
                 let probe_b = batched.index_joins && b.probe.is_some();
                 let mut floor = pair_floor(&a.sum, probe_a, &b.sum, probe_b, est);
