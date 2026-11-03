@@ -617,3 +617,232 @@ async fn repair_options_come_from_the_settings_and_the_request() {
     .await;
     assert_eq!(s, StatusCode::OK, "{b}");
 }
+
+/// The history of `org` as `GET /$/asks/org{query}` answers it.
+async fn history(app: &Router, query: &str) -> (StatusCode, Value) {
+    let (s, b) = send(
+        app,
+        Request::get(format!("/$/asks/org{query}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    (s, serde_json::from_str(&b).unwrap_or(Value::Null))
+}
+
+/// Ask threads (C18 §6.4): an ask stores its answer, its citations and its steps but
+/// never its rows; a follow-up that names the thread joins it; the list filters by
+/// thread oldest first; `about` reaches the model as the question's resource while the
+/// history keeps the person's words.
+#[tokio::test(flavor = "multi_thread")]
+async fn threads_store_answers_and_group_follow_ups() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let m = {
+        let seen = seen.clone();
+        MockModel::start(move |r, _| {
+            seen.lock().push(r.body.to_string());
+            if is_summary(r) {
+                return (
+                    200,
+                    mock::openai(
+                        &json!({ "text": "Two teams [1] [2].", "citations": [1, 2] }).to_string(),
+                    ),
+                );
+            }
+            (200, mock::openai(&draft(EASY)))
+        })
+    };
+    let (st, app) = app(
+        [&m.url(), &m.url(), &m.url()],
+        json!({ "draft": [pair("cheap")], "summarize": [pair("cheap")] }),
+    );
+    put_settings(&app, json!({ "enabled": true, "send": "rows" })).await;
+    let ev = ask_sse(
+        &app,
+        json!({ "question": "Which teams are there?", "about": { "iri": "http://example.org/Team", "kind": "class", "label": "Team" } }),
+    )
+    .await;
+    let usage = find(&ev, "usage");
+    let first = usage["askId"].as_str().unwrap().to_string();
+    assert_eq!(usage["threadId"], first, "{usage}");
+    assert!(
+        seen.lock()
+            .iter()
+            .any(|b| b.contains("Which teams are there? (about <http://example.org/Team>)")),
+        "the model reads the resource"
+    );
+    // a follow-up in the thread, over JSON
+    let (s, out) = ask_json(
+        &app,
+        json!({ "question": "And their members?", "thread": first,
+                "context": [{ "question": "Which teams are there?", "query": EASY }] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert_eq!(out["threadId"], first);
+    assert_eq!(out["usage"]["threadId"], first);
+    let second = out["usage"]["askId"].as_str().unwrap().to_string();
+    // another thread
+    ask_json(&app, json!({ "question": "Who leads them?" })).await;
+    let (_, all) = history(&app, "").await;
+    assert_eq!(all["asks"].as_array().unwrap().len(), 3, "{all}");
+    let (s, t) = history(&app, &format!("?thread={first}")).await;
+    assert_eq!(s, StatusCode::OK);
+    let t = t["asks"].as_array().unwrap();
+    assert_eq!(t.len(), 2);
+    assert_eq!(t[0]["id"], first, "oldest first");
+    assert_eq!(t[1]["id"], second);
+    assert!(t.iter().all(|r| r["thread"] == first.as_str()));
+    // the person's words, the resource, the stored answer and the steps; no rows
+    assert_eq!(t[0]["question"], "Which teams are there?");
+    assert_eq!(
+        t[0]["about"],
+        json!({ "iri": "http://example.org/Team", "kind": "class", "label": "Team" })
+    );
+    let a = &t[0]["answer"];
+    assert_eq!(a["summary"]["text"], "Two teams [1] [2].", "{a}");
+    assert_eq!(a["summary"]["citations"], json!([1, 2]));
+    assert!(a["explanation"].is_string(), "{a}");
+    assert!(
+        t[0]["routing"]["steps"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty())
+    );
+    assert!(
+        t[0].get("access").is_none(),
+        "what an answer read stays on the server"
+    );
+    assert!(t[0].get("answerWithheld").is_none());
+    let raw = st.get("org").map(|ds| {
+        crate::assist::read_file(&st, &ds, crate::assistant::ASKS_FILE)
+            .unwrap()
+            .unwrap()
+    });
+    let raw = raw.unwrap();
+    assert_eq!(raw["format"], 2);
+    assert!(!raw.to_string().contains("\"rows\""), "no rows are stored");
+    assert!(raw["asks"][0]["access"]["footprint"].is_object(), "{raw}");
+    // bad threads and resources are refused
+    for (body, what) in [
+        (json!({ "question": "x", "thread": "a b" }), "thread"),
+        (
+            json!({ "question": "x", "thread": "x".repeat(65) }),
+            "thread",
+        ),
+        (
+            json!({ "question": "x", "about": { "iri": "not an iri" } }),
+            "about",
+        ),
+        (
+            json!({ "question": "x", "about": { "iri": "http://e/x", "label": "l".repeat(201) } }),
+            "about",
+        ),
+    ] {
+        let (s, v) = ask_json(&app, body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {v}");
+    }
+    let (s, _) = history(&app, "?thread=a%20b").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}
+
+fn put_raw_history(st: &AppState, v: Value) {
+    let ds = st.get("org").unwrap();
+    crate::assist::write_file(st, &ds, crate::assistant::ASKS_FILE, &v).unwrap();
+}
+
+fn raw_history(st: &AppState) -> Value {
+    let ds = st.get("org").unwrap();
+    crate::assist::read_file(st, &ds, crate::assistant::ASKS_FILE)
+        .unwrap()
+        .unwrap()
+}
+
+/// A history written before format 2 reads: its records have no thread, no `about`
+/// and no answer, each is a thread of its own, and a new ask keeps them.
+#[tokio::test(flavor = "multi_thread")]
+async fn format_1_history_round_trips() {
+    let m = scripted(vec![draft(EASY)]);
+    let (st, app) = app(
+        [&m.url(), &m.url(), &m.url()],
+        json!({ "draft": [pair("cheap")] }),
+    );
+    put_settings(&app, json!({ "enabled": true })).await;
+    let at = chrono::Utc::now().to_rfc3339();
+    put_raw_history(
+        &st,
+        json!({ "format": 1, "asks": [{
+            "id": "old1", "principal": "local", "at": at, "question": "Which teams are there?",
+            "query": EASY, "commit": 1, "result": "answered", "outcome": "accepted",
+            "routing": { "steps": [] }
+        }] }),
+    );
+    let (s, h) = history(&app, "").await;
+    assert_eq!(s, StatusCode::OK, "{h}");
+    let r = &h["asks"][0];
+    assert_eq!(r["id"], "old1");
+    assert_eq!(r["thread"], "old1", "a record without a thread is its own");
+    assert!(
+        r.get("answer").is_none() && r.get("answerWithheld").is_none(),
+        "{r}"
+    );
+    let (_, t) = history(&app, "?thread=old1").await;
+    assert_eq!(t["asks"].as_array().unwrap().len(), 1);
+    // a follow-up of the old record joins its thread, and the old record survives
+    let (_, out) = ask_json(&app, json!({ "question": "Members?", "thread": "old1" })).await;
+    assert_eq!(out["threadId"], "old1");
+    let (_, t) = history(&app, "?thread=old1").await;
+    let t = t["asks"].as_array().unwrap();
+    assert_eq!(t.len(), 2);
+    assert_eq!(t[0]["outcome"], "accepted");
+    assert_eq!(raw_history(&st)["format"], 2);
+}
+
+/// A history of a newer format, or one this release cannot parse, is refused on every
+/// route and never written over by an ask, feedback or a delete.
+#[tokio::test(flavor = "multi_thread")]
+async fn newer_or_damaged_history_is_refused_and_kept() {
+    let m = scripted(vec![draft(EASY)]);
+    let (st, app) = app(
+        [&m.url(), &m.url(), &m.url()],
+        json!({ "draft": [pair("cheap")] }),
+    );
+    put_settings(&app, json!({ "enabled": true })).await;
+    for (file, code) in [
+        (
+            json!({ "format": 3, "asks": [{ "id": "future", "shape": "unknown" }] }),
+            "unsupported-format",
+        ),
+        (
+            json!({ "format": 2, "asks": "not a list" }),
+            "unreadable-history",
+        ),
+    ] {
+        put_raw_history(&st, file.clone());
+        let (s, v) = history(&app, "").await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["code"], code, "{v}");
+        let (_, out) = ask_json(&app, json!({ "question": "Which teams are there?" })).await;
+        let id = out["usage"]["askId"].as_str().unwrap().to_string();
+        assert_eq!(raw_history(&st), file, "an ask leaves the file");
+        let (s, _) = send(
+            &app,
+            req(
+                "POST",
+                &format!("/$/asks/org/{id}/feedback"),
+                json!({ "outcome": "rejected" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "feedback still counts");
+        assert_eq!(raw_history(&st), file, "feedback leaves the file");
+        let (s, _) = send(
+            &app,
+            Request::delete("/$/asks/org").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert_eq!(raw_history(&st), file, "a delete leaves the file");
+        crate::assistant::prune(&st);
+        assert_eq!(raw_history(&st), file, "pruning leaves the file");
+    }
+}

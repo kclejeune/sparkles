@@ -72,14 +72,14 @@ export interface paths {
         };
         /**
          * List your asked questions
-         * @description The caller's own asks on the dataset, newest first, kept for `historyDays`. An entry holds the question, the final query, the commit, the feedback and the routing record, never rows or summaries.
+         * @description The caller's own asks on the dataset, newest first, kept for `historyDays`. An entry holds the question, the final query, the commit, the feedback, the routing record with its steps, its thread and, from format 2 of the history, the answer's text, citations and explanation, never its rows. The answer is listed only while the caller's view covers every graph the ask read under the same protections, and otherwise the entry has `answerWithheld`. With `thread` the route lists that thread's entries oldest first. A history file of a newer format, or one this server cannot parse, is refused with `409` and left as it is.
          */
         get: operations["listAsks"];
         put?: never;
         post?: never;
         /**
          * Forget your asked questions
-         * @description Removes the caller's entries, or the one entry `id` names.
+         * @description Removes the caller's entries, or the one entry `id` names. A history file this server cannot read is refused with `409` and left as it is.
          */
         delete: operations["deleteAsks"];
         options?: never;
@@ -4870,9 +4870,65 @@ export interface components {
             /** @enum {string} */
             outcome: "accepted" | "edited" | "rejected";
         };
-        /** @description The caller's asked questions, newest first. */
+        /** @description The caller's asked questions, newest first, or one thread's oldest first. */
         AskHistory: {
             asks: {
+                about?: {
+                    /** @description An absolute IRI of at most 2000 characters. */
+                    iri: string;
+                    /** @description What the resource is, such as `class`, `property` or `concept`, at most 32 characters. */
+                    kind?: string;
+                    /** @description Its label, at most 200 characters. */
+                    label?: string;
+                };
+                /** @description The answer as it was given, from format 2 of the history: never its rows. Present only while the caller's view covers every graph the ask read under the same protections. */
+                answer?: {
+                    assumptions?: string[];
+                    clarify?: {
+                        choices: {
+                            label: string;
+                            value: string;
+                        }[];
+                        question: string;
+                    };
+                    /** @description The community reports the ask read for context. */
+                    communities?: string[];
+                    /** @description Why the result was empty. */
+                    diagnosis?: string;
+                    /** @description The entities the question linked exactly. */
+                    entities?: string[];
+                    error?: {
+                        code?: string;
+                        message?: string;
+                    };
+                    explanation?: string;
+                    global?: {
+                        points: {
+                            n: number;
+                            reports?: string[];
+                            text: string;
+                        }[];
+                        uncitedSentences?: string[];
+                    };
+                    graph?: {
+                        object?: string;
+                        predicate?: string;
+                        subject?: string;
+                    };
+                    notes?: string[];
+                    summary?: {
+                        citations: number[];
+                        model?: string;
+                        provider?: string;
+                        rowsSent?: number;
+                        text: string;
+                        uncited?: boolean;
+                    };
+                    /** @enum {string} */
+                    verdict?: "query" | "data" | "unknown";
+                };
+                /** @description The answer is kept, but the caller's view no longer covers what it read. */
+                answerWithheld?: boolean;
                 /** Format: date-time */
                 at: string;
                 commit?: number;
@@ -4894,12 +4950,23 @@ export interface components {
                 routing: {
                     [key: string]: unknown;
                 };
+                /** @description The ask's thread. A record kept before threads has its own id. */
+                thread?: string;
             }[];
             dataset: string;
             historyDays: number;
         };
         /** @description A question for the dataset. */
         AskRequest: {
+            /** @description The resource on the page the question was asked from. The pipeline reads the question with `(about <iri>)` after it, and the history keeps the question as written with `about` beside it. */
+            about?: {
+                /** @description An absolute IRI of at most 2000 characters. */
+                iri: string;
+                /** @description What the resource is, such as `class`, `property` or `concept`, at most 32 characters. */
+                kind?: string;
+                /** @description Its label, at most 200 characters. */
+                label?: string;
+            };
             /** @description A commit or time to read, as for `/{ds}/sparql`. */
             at?: unknown;
             branch?: string;
@@ -4937,6 +5004,8 @@ export interface components {
             shapeCheck?: boolean;
             /** @description Whether to summarize the rows. `true` by default when the dataset sends rows. */
             summary?: boolean;
+            /** @description The thread a follow-up continues: the `threadId` of an earlier ask, 1 to 64 letters, digits, `_` or `-`. The first ask of a thread names none and its own id becomes the thread's. */
+            thread?: string;
             /** @description The id of an earlier ask of the caller. Drafting starts at the pair after the one that drafted it. */
             tryHarder?: string;
             /** @description Link mentions with the classes the words around them name. Over the dataset's `repairs.typeHints`. */
@@ -4994,7 +5063,9 @@ export interface components {
                 uncited?: boolean;
                 uncitedSentences?: string[];
             };
-            /** @description `askId`, the tokens (with the prompt cache's `cacheWriteInputTokens`, `cacheWrite1hInputTokens`, `cacheReadInputTokens` and `budgetTokens` when the provider used it) and estimated cost, `complexity`, the `steps` with their pairs and signals, `escalations`, `draftPair`, `answeredBy` and `tryHarder`. */
+            /** @description The ask's thread: the request's `thread`, or the ask's own id. */
+            threadId?: string;
+            /** @description `askId`, `threadId`, the tokens (with the prompt cache's `cacheWriteInputTokens`, `cacheWrite1hInputTokens`, `cacheReadInputTokens` and `budgetTokens` when the provider used it) and estimated cost, `complexity`, the `steps` with their pairs and signals, `escalations`, `draftPair`, `answeredBy` and `tryHarder`. */
             usage: {
                 [key: string]: unknown;
             };
@@ -12723,6 +12794,8 @@ export interface operations {
             query?: {
                 /** @description The most entries listed. */
                 limit?: number;
+                /** @description Only the entries of this thread, oldest first. An entry kept before threads is the thread of its own id. */
+                thread?: string;
             };
             header?: never;
             path: {
@@ -12742,9 +12815,11 @@ export interface operations {
                     "application/json": components["schemas"]["AskHistory"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };
@@ -12773,6 +12848,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };

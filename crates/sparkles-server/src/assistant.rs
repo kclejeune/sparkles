@@ -795,13 +795,15 @@ fn counts_json(c: &Counts) -> Value {
 // ------------------------------------------------------------- the history ------
 
 /// One entry of a principal's history: the question, the final query, the commit, the
-/// feedback and the routing record of §5.5, but never the rows or the summary.
+/// feedback, the routing record of §5.5, the thread it belongs to and, from format 2,
+/// the answer's text, citations and steps, but never the rows.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AskRecord {
     pub id: String,
     pub principal: String,
     pub at: String,
+    /// the question as the person wrote it, without the rendered `about`
     pub question: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
@@ -824,29 +826,368 @@ pub struct AskRecord {
     pub reports: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reports_graph: Option<String>,
+    /// the thread of the ask (format 2); a record without one is a thread of its own
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    /// the resource the question was asked about (format 2)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<AskAbout>,
+    /// the answer's text, citations, explanation, diagnosis and notes (format 2), shown
+    /// only to a reader whose view covers [`AskRecord::access`]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Value>,
+    /// what the answer read, for deciding who may see it again
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<AnswerAccess>,
+}
+
+/// The resource a question is about: the page's context in the UI (C18 §6.2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AskAbout {
+    pub iri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl AskAbout {
+    /// The checks of a request's `about`.
+    pub fn check(&self) -> Result<(), String> {
+        if self.iri.is_empty()
+            || self.iri.chars().count() > 2000
+            || oxrdf::NamedNode::new(&self.iri).is_err()
+        {
+            return Err("about.iri must be an absolute IRI of at most 2000 characters".into());
+        }
+        if self
+            .kind
+            .as_ref()
+            .is_some_and(|k| k.is_empty() || k.chars().count() > 32)
+        {
+            return Err("about.kind must hold 1 to 32 characters".into());
+        }
+        if self.label.as_ref().is_some_and(|l| l.chars().count() > 200) {
+            return Err("about.label must be at most 200 characters".into());
+        }
+        Ok(())
+    }
+
+    /// The question as the pipeline reads it: the person's words and the resource.
+    pub fn render(&self, question: &str) -> String {
+        format!("{question} (about <{}>)", self.iri)
+    }
+}
+
+/// The most graphs an answer's access record lists. A view over more graphs keeps no
+/// footprint, and only unrestricted readers see that answer again.
+pub const MAX_ACCESS_GRAPHS: usize = 512;
+
+/// What an ask could read, so that its stored answer is shown again only to a reader
+/// who can read all of it under the same protections (C18 §6.4). The footprint is the
+/// disclosure guard's (C22 §6.2) over every graph the asker's view read; the guarded
+/// graphs, such as reports graphs, are checked on their own.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerAccess {
+    /// `None` when the graphs could not be described: only unrestricted readers pass
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint: Option<crate::graphrag::guard::Footprint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guarded: Vec<String>,
+    /// the branch the ask read, `main` when absent
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// The access record of an ask over `snap`, read through `view` (`None`:
+/// unrestricted) by `principal`.
+pub fn answer_access(
+    snap: &Arc<sparkles::store::Snapshot>,
+    view: Option<&Arc<sparkles::access::GraphAccess>>,
+    caller: &sparkles::access::Caller,
+    dataset: &str,
+    branch: Option<&str>,
+    principal: &str,
+) -> AnswerAccess {
+    use crate::graphrag::guard::{CaptureInput, capture};
+    use crate::graphrag::settings::is_guarded;
+    let bound = view.map(|v| v.bound(snap));
+    let mut graphs = vec!["default".to_string()];
+    let mut guarded = Vec::new();
+    let mut describable = true;
+    let ids = snap.graph_ids().unwrap_or_default();
+    for g in ids {
+        let Some(t) = snap.term(g) else { continue };
+        let oxrdf::Term::NamedNode(n) = &t else {
+            // a blank-node graph has no name a footprint can keep
+            if bound.as_ref().is_none_or(|v| v.read.allows(Some(&t))) {
+                describable = false;
+            }
+            continue;
+        };
+        if bound.as_ref().is_some_and(|v| !v.read.allows(Some(&t))) {
+            continue;
+        }
+        if is_guarded(n.as_str()) {
+            guarded.push(n.as_str().to_string());
+        } else {
+            graphs.push(n.as_str().to_string());
+        }
+    }
+    if bound.as_ref().is_some_and(|v| !v.read.allows(None)) {
+        graphs.retain(|g| g != "default");
+    }
+    guarded.truncate(MAX_ACCESS_GRAPHS);
+    let footprint = (describable && graphs.len() <= MAX_ACCESS_GRAPHS)
+        .then(|| {
+            capture(&CaptureInput {
+                dataset,
+                branch: branch.unwrap_or(sparkles::branch::MAIN),
+                source_commit: snap.commit,
+                principal,
+                endpoint: "query",
+                view: bound.as_deref(),
+                caller,
+                graphs: &graphs,
+                reports: &[],
+            })
+            .ok()
+        })
+        .flatten();
+    AnswerAccess {
+        footprint,
+        guarded,
+        branch: branch.map(str::to_string),
+    }
+}
+
+/// Whether a reader with `view` (`None`: unrestricted) may see a stored answer.
+pub fn answer_visible(
+    access: Option<&AnswerAccess>,
+    view: Option<&Arc<sparkles::access::GraphAccess>>,
+    snap: &Arc<sparkles::store::Snapshot>,
+) -> bool {
+    use crate::graphrag::guard::{Decision, covers, unrestricted};
+    let bound = view.map(|v| v.bound(snap));
+    if unrestricted(bound.as_deref()) {
+        return true;
+    }
+    // an answer stored without what it read is seen only by unrestricted readers
+    let Some(a) = access else { return false };
+    let Some(fp) = &a.footprint else { return false };
+    if covers(bound.as_deref(), fp) != Decision::Proven {
+        return false;
+    }
+    a.guarded.iter().all(|g| {
+        bound.as_ref().is_none_or(|v| {
+            v.read.allows(Some(&oxrdf::Term::NamedNode(
+                oxrdf::NamedNode::new_unchecked(g),
+            )))
+        })
+    })
+}
+
+/// The most characters of a stored text, and the most items of a stored list.
+const MAX_STORED_TEXT: usize = 8000;
+const MAX_STORED_ITEMS: usize = 50;
+
+fn cut(v: &Value) -> Option<Value> {
+    v.as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| Value::from(s.chars().take(MAX_STORED_TEXT).collect::<String>()))
+}
+
+fn cut_list(v: &Value, each: impl Fn(&Value) -> Option<Value>) -> Option<Value> {
+    let a: Vec<Value> = v
+        .as_array()?
+        .iter()
+        .filter_map(each)
+        .take(MAX_STORED_ITEMS)
+        .collect();
+    (!a.is_empty()).then_some(Value::Array(a))
+}
+
+/// The answer a record stores from the pipeline's output and the lists of its
+/// `ground` event: never the rows.
+pub fn stored_answer(out: &Value, ground: &Value) -> Option<Value> {
+    let mut a = serde_json::Map::new();
+    let r = &out["result"];
+    let mut put = |k: &str, v: Option<Value>| {
+        if let Some(v) = v {
+            a.insert(k.into(), v);
+        }
+    };
+    put("explanation", cut(&r["explanation"]));
+    put("assumptions", cut_list(&r["assumptions"], cut));
+    put(
+        "graph",
+        r["graph"].is_object().then(|| {
+            json!({
+                "subject": cut(&r["graph"]["subject"]),
+                "predicate": cut(&r["graph"]["predicate"]),
+                "object": cut(&r["graph"]["object"]),
+            })
+        }),
+    );
+    let s = &out["summary"];
+    if s["text"].is_string() {
+        let mut sum = json!({
+            "text": cut(&s["text"]),
+            "citations": cut_list(&s["citations"], |c| c.as_u64().map(Value::from)).unwrap_or(json!([])),
+        });
+        for k in ["rowsSent", "provider", "model", "uncited"] {
+            if !s[k].is_null() {
+                sum[k] = s[k].clone();
+            }
+        }
+        put("summary", Some(sum));
+    }
+    let g = &out["global"];
+    if g.is_object() {
+        let points = cut_list(&g["points"], |p| {
+            Some(json!({
+                "n": p["n"].as_u64()?,
+                "text": cut(&p["text"])?,
+                "reports": cut_list(&p["reports"], cut).unwrap_or(json!([])),
+            }))
+        });
+        let mut gl = json!({ "points": points.unwrap_or(json!([])) });
+        if let Some(u) = cut_list(&s["uncitedSentences"], cut) {
+            gl["uncitedSentences"] = u;
+        }
+        put("global", Some(gl));
+    }
+    put("verdict", cut(&r["verdict"]));
+    let diag = out["attempts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .rev()
+        .find_map(|t| {
+            t["diagnosis"]
+                .as_str()
+                .or(t["whyEmpty"]["message"].as_str())
+        });
+    put("diagnosis", diag.and_then(|d| cut(&Value::from(d))));
+    put("notes", cut_list(&out["notes"], cut));
+    if out["clarify"].is_object() {
+        let c = &out["clarify"];
+        put(
+            "clarify",
+            Some(json!({
+                "question": cut(&c["question"]),
+                "choices": cut_list(&c["choices"], |ch| Some(json!({
+                    "label": cut(&ch["label"])?, "value": cut(&ch["value"])?,
+                }))).unwrap_or(json!([])),
+            })),
+        );
+    }
+    if out["error"].is_object() {
+        put(
+            "error",
+            Some(
+                json!({ "code": cut(&out["error"]["code"]), "message": cut(&out["error"]["message"]) }),
+            ),
+        );
+    }
+    put(
+        "entities",
+        cut_list(&ground["entities"], |e| {
+            e["candidates"][0]["iri"]
+                .as_str()
+                .filter(|_| e["verdict"] == "exact")
+                .and_then(|i| cut(&Value::from(i)))
+        }),
+    );
+    put("communities", cut_list(&ground["communities"], cut));
+    // nulls left by optional members
+    for v in a.values_mut() {
+        if let Some(o) = v.as_object_mut() {
+            o.retain(|_, x| !x.is_null());
+        }
+    }
+    (!a.is_empty()).then_some(Value::Object(a))
 }
 
 /// Serializes the read-modify-write of history files.
 static HISTORY_LOCK: Mutex<()> = Mutex::new(());
 
-fn history_of(st: &AppState, ds: &Dataset) -> Vec<AskRecord> {
+/// Why a history file cannot be read: a newer format, or a damaged file. Either way it
+/// is left as it is.
+#[derive(Debug)]
+pub enum HistoryError {
+    Unsupported(String),
+    Unreadable(String),
+}
+
+impl HistoryError {
+    fn api(&self) -> crate::http::ApiError {
+        match self {
+            HistoryError::Unsupported(m) => {
+                err_code(StatusCode::CONFLICT, "unsupported-format", m.clone())
+            }
+            HistoryError::Unreadable(m) => {
+                err_code(StatusCode::CONFLICT, "unreadable-history", m.clone())
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for HistoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HistoryError::Unsupported(m) | HistoryError::Unreadable(m) => f.write_str(m),
+        }
+    }
+}
+
+/// A dataset's history, oldest first. A file this release cannot read is refused, never
+/// read as empty, so that no write replaces it.
+pub(crate) fn history_of(st: &AppState, ds: &Dataset) -> Result<Vec<AskRecord>, HistoryError> {
     match read_file(st, ds, ASKS_FILE) {
-        Ok(Some(v)) => serde_json::from_value(v.get("asks").cloned().unwrap_or_default())
-            .unwrap_or_else(|e| {
-                tracing::warn!(dataset = %ds.name, "{ASKS_FILE}: {e}");
-                Vec::new()
-            }),
-        Ok(None) => Vec::new(),
+        Ok(Some(v)) => {
+            // read_file checks the files on disk; an in-memory dataset's is checked here
+            match sparkles::formats::check_settings(ASKS_FILE, &v) {
+                Err(sparkles::Error::Unsupported(m)) => {
+                    return Err(HistoryError::Unsupported(format!("{m} ({})", ds.name)));
+                }
+                Err(e) => return Err(HistoryError::Unreadable(format!("{e} ({})", ds.name))),
+                Ok(_) => {}
+            }
+            serde_json::from_value(v.get("asks").cloned().unwrap_or(json!([])))
+                .map_err(|e| HistoryError::Unreadable(format!("{ASKS_FILE} of {}: {e}", ds.name)))
+        }
+        Ok(None) => Ok(Vec::new()),
         Err(e) => {
-            tracing::warn!(dataset = %ds.name, "{e:#}");
-            Vec::new()
+            let unsupported = e.chain().any(|c| {
+                matches!(
+                    c.downcast_ref::<sparkles::Error>(),
+                    Some(sparkles::Error::Unsupported(_))
+                )
+            });
+            let m = format!("{e:#}");
+            Err(if unsupported {
+                HistoryError::Unsupported(m)
+            } else {
+                HistoryError::Unreadable(m)
+            })
         }
     }
 }
 
 pub(crate) fn store_history(st: &AppState, ds: &Dataset, list: &[AskRecord]) -> anyhow::Result<()> {
-    write_file(st, ds, ASKS_FILE, &json!({ "format": 1, "asks": list }))
+    write_file(
+        st,
+        ds,
+        ASKS_FILE,
+        &json!({ "format": HISTORY_FORMAT, "asks": list }),
+    )
 }
+
+/// The format of `asks.json` this release writes; it reads 1 and 2.
+pub const HISTORY_FORMAT: u32 = 2;
 
 /// Entries older than `days` days.
 fn expired(r: &AskRecord, days: u32) -> bool {
@@ -862,7 +1203,13 @@ pub fn remember(st: &AppState, ds: &Dataset, rec: AskRecord) {
         return;
     }
     let _g = HISTORY_LOCK.lock();
-    let mut list = history_of(st, ds);
+    let mut list = match history_of(st, ds) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(dataset = %ds.name, "the ask is not kept: {e}");
+            return;
+        }
+    };
     list.retain(|r| !expired(r, days));
     list.push(rec);
     if list.len() > MAX_HISTORY {
@@ -879,7 +1226,13 @@ pub fn prune(st: &AppState) {
     for ds in st.datasets().values() {
         let days = settings(st, ds).history_days(st);
         let _g = HISTORY_LOCK.lock();
-        let list = history_of(st, ds);
+        let list = match history_of(st, ds) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(dataset = %ds.name, "the history is not pruned: {e}");
+                continue;
+            }
+        };
         if list.is_empty() {
             continue;
         }
@@ -908,7 +1261,8 @@ pub fn spawn_pruning(st: Arc<AppState>) {
     });
 }
 
-/// The record of a finished ask, from the pipeline's output.
+/// The record of a finished ask, from the pipeline's output. It is a thread of its own
+/// and stores no answer until [`AskRecord::with_answer`].
 pub fn record_of(id: &str, principal: &str, out: &Value) -> AskRecord {
     let u = &out["usage"];
     let mut routing = json!({
@@ -950,6 +1304,35 @@ pub fn record_of(id: &str, principal: &str, out: &Value) -> AskRecord {
             .filter_map(|r| r["iri"].as_str().map(str::to_string))
             .collect(),
         reports_graph: out["global"]["reportsGraph"].as_str().map(str::to_string),
+        thread: Some(id.to_string()),
+        about: None,
+        answer: None,
+        access: None,
+    }
+}
+
+impl AskRecord {
+    /// The record with its thread, its `about`, the question as written, and the stored
+    /// answer with what it read.
+    pub fn with_answer(
+        mut self,
+        thread: &str,
+        question: &str,
+        about: Option<AskAbout>,
+        answer: Option<Value>,
+        access: AnswerAccess,
+    ) -> AskRecord {
+        self.thread = Some(thread.to_string());
+        self.question = question.to_string();
+        self.about = about;
+        self.answer = answer;
+        self.access = Some(access);
+        self
+    }
+
+    /// The thread of the record: its own id when it has none.
+    pub fn thread_id(&self) -> &str {
+        self.thread.as_deref().unwrap_or(&self.id)
     }
 }
 
@@ -991,7 +1374,11 @@ pub fn feedback(
     let mut in_history = false;
     {
         let _g = HISTORY_LOCK.lock();
-        let mut list = history_of(st, ds);
+        // a file this release cannot read keeps its entries as they are
+        let mut list = history_of(st, ds).unwrap_or_else(|e| {
+            tracing::warn!(dataset = %ds.name, "the feedback is not kept in the history: {e}");
+            Vec::new()
+        });
         if let Some(r) = list
             .iter_mut()
             .find(|r| r.id == id && r.principal == principal)
@@ -1087,6 +1474,14 @@ async fn put_settings(
 struct ListParams {
     limit: Option<usize>,
     id: Option<String>,
+    thread: Option<String>,
+}
+
+/// Whether `t` is a thread id a request may carry: 1 to 64 of `[A-Za-z0-9_-]`.
+pub fn valid_thread(t: &str) -> bool {
+    (1..=64).contains(&t.len())
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 async fn list_asks(
@@ -1097,6 +1492,13 @@ async fn list_asks(
 ) -> ApiResult<Json<Value>> {
     let ds = dataset(&st, &name)?;
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    if q.thread.as_deref().is_some_and(|t| !valid_thread(t)) {
+        return Err(err_code(
+            StatusCode::BAD_REQUEST,
+            "bad-argument",
+            "thread must hold 1 to 64 letters, digits, '_' or '-'",
+        ));
+    }
     let me = p.id();
     blocking(move || {
         let s = settings(&st, &ds);
@@ -1105,12 +1507,20 @@ async fn list_asks(
             Vec::new()
         } else {
             history_of(&st, &ds)
+                .map_err(|e| e.api())?
                 .into_iter()
                 .filter(|r| r.principal == me && !expired(r, days))
+                .filter(|r| q.thread.as_deref().is_none_or(|t| r.thread_id() == t))
                 .collect()
         };
-        list.reverse();
-        list.truncate(limit);
+        // a thread reads oldest first, the whole history newest first
+        if q.thread.is_some() {
+            let drop = list.len().saturating_sub(limit);
+            list.drain(..drop);
+        } else {
+            list.reverse();
+            list.truncate(limit);
+        }
         // C22 §6.6: the reports of a global answer only while their graph is proven,
         // in every build, since a history may come from a build with global answers
         let snap = ds.store.snapshot();
@@ -1118,19 +1528,69 @@ async fn list_asks(
         let mut opts = ds.dataset.query_options();
         #[cfg(feature = "auth")]
         crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
-        for r in &mut list {
-            if let Some(g) = &r.reports_graph
-                && !crate::graphrag::guard::readable(&snap, &opts, g)
-            {
-                r.reports.clear();
-                r.reports_graph = None;
-            }
-        }
+        let out: Vec<Value> = list
+            .into_iter()
+            .map(|mut r| {
+                let reports_hidden = r
+                    .reports_graph
+                    .as_ref()
+                    .is_some_and(|g| !crate::graphrag::guard::readable(&snap, &opts, g));
+                if reports_hidden {
+                    r.reports.clear();
+                    r.reports_graph = None;
+                }
+                // C18 §6.4: the answer only to a reader whose view covers what it read,
+                // and a global answer's text only while its reports are readable
+                if r.answer.is_some() {
+                    let view = reader_view(&p, &ds.name, &opts, r.access.as_ref());
+                    let visible =
+                        !reports_hidden && answer_visible(r.access.as_ref(), view.as_ref(), &snap);
+                    if !visible {
+                        r.answer = None;
+                    }
+                    let mut v = record_json(&r);
+                    if !visible {
+                        v["answerWithheld"] = true.into();
+                    }
+                    v
+                } else {
+                    record_json(&r)
+                }
+            })
+            .collect();
         Ok(Json(
-            json!({ "dataset": ds.name, "historyDays": days, "asks": list }),
+            json!({ "dataset": ds.name, "historyDays": days, "asks": out }),
         ))
     })
     .await
+}
+
+/// A record as `GET /$/asks/{ds}` gives it: always with its thread, never with what
+/// its answer read.
+fn record_json(r: &AskRecord) -> Value {
+    let mut v = serde_json::to_value(r).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("access");
+        o.insert("thread".into(), r.thread_id().into());
+    }
+    v
+}
+
+/// The reader's view of the branch a record's answer read (`None`: unrestricted).
+#[cfg_attr(not(feature = "auth"), allow(unused_variables))]
+fn reader_view(
+    p: &Principal,
+    ds: &str,
+    opts: &sparkles::sparql::QueryOptions,
+    access: Option<&AnswerAccess>,
+) -> Option<Arc<sparkles::access::GraphAccess>> {
+    #[cfg(feature = "auth")]
+    if let Some(b) = access.and_then(|a| a.branch.as_deref())
+        && b != sparkles::branch::MAIN
+    {
+        return p.view(&format!("{ds}@{b}"), crate::auth::Endpoint::Query);
+    }
+    opts.graphs.clone()
 }
 
 async fn delete_asks(
@@ -1143,7 +1603,7 @@ async fn delete_asks(
     let me = p.id();
     blocking(move || {
         let _g = HISTORY_LOCK.lock();
-        let mut list = history_of(&st, &ds);
+        let mut list = history_of(&st, &ds).map_err(|e| e.api())?;
         let before = list.len();
         list.retain(|r| r.principal != me || q.id.as_ref().is_some_and(|id| *id != r.id));
         if let Some(id) = &q.id

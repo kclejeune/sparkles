@@ -1016,3 +1016,93 @@ fn the_overview_uses_the_guarded_namespace_of_the_server() {
     );
     const { assert!(sparkles::overview::MAX_REPORT_LEVEL >= MAX_LEVELS) };
 }
+
+/// C18 §6.4: a stored answer can reveal data from the graphs its ask read, so the
+/// history shows it only to a reader whose view covers what the asker's view read,
+/// with the same protections in force; otherwise the record comes without its answer
+/// and says so. The records are written as if each reader had asked earlier under the
+/// asker's grants, which is what a later narrowing of the reader's grants looks like.
+#[tokio::test]
+async fn stored_answers_need_the_askers_view() {
+    let s = server();
+    let ds = s.state.datasets().get("rag").cloned().unwrap();
+    let snap = ds.store.snapshot();
+    let at = chrono::Utc::now().to_rfc3339();
+    let access = |asker: &str| {
+        let p = guarded(&s, asker);
+        crate::assistant::answer_access(
+            &snap,
+            p.view("rag", Endpoint::Query).as_ref(),
+            &p.caller(),
+            "rag",
+            None,
+            &p.id(),
+        )
+    };
+    // (reader, the view the answer was stored under, whether the reader sees it)
+    let cases: &[(&str, Option<&str>, bool)] = &[
+        // the same view
+        ("tua", Some("tua"), true),
+        ("tlift", Some("tlift"), true),
+        // an unrestricted reader is proven for any view
+        ("tadmin", Some("tua"), true),
+        ("tadmin", None, true),
+        // fewer graphs than the asker
+        ("tpart", Some("tua"), false),
+        ("tnarrow", Some("tlift"), false),
+        // the same graphs, but `own` depends on `?user`, so tub sees other triples
+        ("tub", Some("tua"), false),
+        // masking: `own` is lifted for the asker and in force for the reader
+        ("tub", Some("tlift"), false),
+        // an answer stored without what it read is shown to unrestricted readers only
+        ("tua", None, false),
+    ];
+    let mut records = Vec::new();
+    for (i, (reader, asker, _)) in cases.iter().enumerate() {
+        let mut r: crate::assistant::AskRecord = serde_json::from_value(serde_json::json!({
+            "id": format!("ask{i}"),
+            "principal": s.auth().user_principal(reader).unwrap().id(),
+            "at": at,
+            "question": "What does x keep secret?",
+            "query": "SELECT ?o { ?s <http://ex/secret> ?o }",
+            "result": "answered",
+            "outcome": "none",
+            "routing": {},
+            "thread": format!("t{i}"),
+            "answer": { "summary": { "text": "x keeps \"s\" [1].", "citations": [1] } },
+        }))
+        .unwrap();
+        r.access = asker.map(access);
+        records.push(r);
+    }
+    crate::assistant::store_history(&s.state, &ds, &records).unwrap();
+    for (i, (reader, asker, sees)) in cases.iter().enumerate() {
+        let r = get(
+            &s.app,
+            reader,
+            &format!("/$/asks/rag?thread=t{i}"),
+            "application/json",
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{reader}");
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        let rec = &v["asks"][0];
+        assert_eq!(rec["id"], format!("ask{i}"), "{reader}: {v}");
+        assert!(rec.get("access").is_none(), "{reader}: {v}");
+        if *sees {
+            assert_eq!(
+                rec["answer"]["summary"]["text"], "x keeps \"s\" [1].",
+                "{reader} under {asker:?}: {v}"
+            );
+            assert!(rec.get("answerWithheld").is_none(), "{reader}: {v}");
+        } else {
+            assert!(rec.get("answer").is_none(), "{reader} under {asker:?}: {v}");
+            assert_eq!(rec["answerWithheld"], true, "{reader}: {v}");
+            // the question and the query stay, as before stored answers
+            assert_eq!(rec["question"], "What does x keep secret?");
+        }
+    }
+    // the reports graph is guarded: tua's view reads it and records it apart
+    assert!(access("tua").guarded.iter().any(|g| g == REPORTS));
+    assert!(access("tua").footprint.is_some());
+}
