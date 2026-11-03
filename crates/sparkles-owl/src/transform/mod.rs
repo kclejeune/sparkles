@@ -32,6 +32,11 @@ use rustc_hash::FxHashSet;
 use std::collections::BTreeSet;
 use std::fmt;
 
+/// The classification an operation runs: the taxonomy of a list of logical axioms and
+/// the axioms the classifier left out or used in part.
+pub type Classify<'a, E> =
+    dyn FnMut(&[&AxiomKind]) -> Result<(Classification, Vec<Excluded>), E> + 'a;
+
 /// An ontology held in memory: its header and its axioms, each once.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Document {

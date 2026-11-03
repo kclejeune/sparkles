@@ -1,8 +1,7 @@
 //! `reduce`: the ontology without the subclass axioms that other subclass axioms entail,
 //! as ROBOT 1.9.11's `ReduceOperation` removes them with ELK.
 
-use super::{Document, Error, Report, TOP, View, fresh_class};
-use crate::classify::{Classification, Excluded};
+use super::{Classify, Document, Error, Report, TOP, View, fresh_class};
 use crate::model::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
@@ -27,7 +26,7 @@ const EXPRESSION: &str = "urn:sparkles:reduce:expression:";
 pub fn reduce<E>(
     doc: &mut Document,
     o: &ReduceOptions,
-    classify: &mut dyn FnMut(&[&AxiomKind]) -> Result<(Classification, Vec<Excluded>), E>,
+    classify: &mut Classify<'_, E>,
 ) -> Result<Report, Error<E>> {
     if o.named_classes_only {
         named_only(doc, o, classify)
@@ -46,7 +45,7 @@ pub fn reduce<E>(
 fn all_expressions<E>(
     doc: &mut Document,
     o: &ReduceOptions,
-    classify: &mut dyn FnMut(&[&AxiomKind]) -> Result<(Classification, Vec<Excluded>), E>,
+    classify: &mut Classify<'_, E>,
 ) -> Result<Report, Error<E>> {
     let mut report = Report::default();
     let taken: BTreeSet<Class> = doc.signature().classes;
@@ -159,7 +158,7 @@ fn all_expressions<E>(
 fn named_only<E>(
     doc: &mut Document,
     o: &ReduceOptions,
-    classify: &mut dyn FnMut(&[&AxiomKind]) -> Result<(Classification, Vec<Excluded>), E>,
+    classify: &mut Classify<'_, E>,
 ) -> Result<Report, Error<E>> {
     let mut report = Report::default();
     let kinds = doc.logical_kinds();

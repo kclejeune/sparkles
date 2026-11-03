@@ -568,7 +568,9 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             }
             Ok(())
         }
-        OntologyCmd::Reason(a) => ontology_chain::run(ontology_chain::Step::Reason(a), opts),
+        OntologyCmd::Reason(a) => {
+            ontology_chain::run(ontology_chain::Step::Reason(Box::new(a)), opts)
+        }
         OntologyCmd::Reduce(a) => ontology_chain::run(ontology_chain::Step::Reduce(a), opts),
         OntologyCmd::Relax(a) => ontology_chain::run(ontology_chain::Step::Relax(a), opts),
         OntologyCmd::Edit {

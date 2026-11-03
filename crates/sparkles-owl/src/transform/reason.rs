@@ -1,8 +1,9 @@
 //! `reason`: the ontology with the axioms its classification infers, as ROBOT 1.9.11's
 //! `ReasonOperation` writes it with ELK.
 
-use super::{BOTTOM, Document, Error, Report, Signature, View, fresh_class, nothing, thing};
-use crate::classify::{Classification, Excluded};
+use super::{
+    BOTTOM, Classify, Document, Error, Report, Signature, View, fresh_class, nothing, thing,
+};
 use crate::model::*;
 use crate::vocab;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -182,7 +183,7 @@ const NOMINAL: &str = "urn:sparkles:reason:individual:";
 pub fn reason<E>(
     doc: &mut Document,
     o: &ReasonOptions,
-    classify: &mut dyn FnMut(&[&AxiomKind]) -> Result<(Classification, Vec<Excluded>), E>,
+    classify: &mut Classify<'_, E>,
 ) -> Result<Report, Error<E>> {
     let mut report = Report::default();
     let sig = doc.signature();
@@ -436,7 +437,7 @@ fn individual_types<E>(
     doc: &Document,
     sig: &Signature,
     indirect: bool,
-    classify: &mut dyn FnMut(&[&AxiomKind]) -> Result<(Classification, Vec<Excluded>), E>,
+    classify: &mut Classify<'_, E>,
 ) -> Result<(Vec<Axiom>, Vec<String>), Error<E>> {
     if sig.individuals.is_empty() {
         return Ok((Vec::new(), Vec::new()));

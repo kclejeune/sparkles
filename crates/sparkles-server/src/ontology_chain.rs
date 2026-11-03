@@ -173,7 +173,7 @@ pub struct CheckStep {
 /// A command of a chain.
 #[derive(Subcommand, Debug, Clone)]
 pub enum Step {
-    Reason(ReasonArgs),
+    Reason(Box<ReasonArgs>),
     Reduce(ReduceArgs),
     Relax(RelaxArgs),
     Classify(ClassifyStep),
