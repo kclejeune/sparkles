@@ -505,7 +505,7 @@ pub(crate) fn node_sets_seen(
         },
     };
     let mut rest = rest;
-    let kept = keep_top(sets, super::set_cap(), &mut rest);
+    let kept = keep_top(sets, MAX_NODE_SETS, &mut rest);
     Ok((kept, rest.finish()))
 }
 
