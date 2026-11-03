@@ -74,6 +74,10 @@ pub const MAX_VALUES: usize = 500;
 /// The most reifications of one axiom target that the term route reads to find the
 /// annotations of the axioms that mention an entity.
 const MAX_REIFIERS: usize = 20 * MAX_VALUES;
+
+/// The annotations of reified triples, as (property, value) pairs by the triple's
+/// property and object.
+type Reifications = FxHashMap<(Id, Id), Vec<(Id, Id)>>;
 /// The most IRIs an answer names with their labels.
 pub const MAX_NAMES: usize = 4000;
 
@@ -683,7 +687,7 @@ impl Ontologies {
         for root in &roots {
             match root {
                 Root::Named(q) => {
-                    let q: [Id; 4] = q.clone();
+                    let q: [Id; 4] = *q;
                     mention.add(q);
                     mentions_cut |= !s.closure(&mut mention, [q[2]])?;
                     // the axiom's annotations, reified with the same source, property
@@ -1222,7 +1226,7 @@ impl Scope {
 
     /// The annotations of the reified triples of `reifiers`, by their property and
     /// target.
-    fn reifications(&mut self, reifiers: &[Id]) -> Result<FxHashMap<(Id, Id), Vec<(Id, Id)>>> {
+    fn reifications(&mut self, reifiers: &[Id]) -> Result<Reifications> {
         let (Some(prop), Some(tgt), Some(src)) = (
             self.id(OWL_ANNOTATED_PROPERTY),
             self.id(OWL_ANNOTATED_TARGET),
