@@ -165,7 +165,8 @@ the build of commit c9b6ebff, which loads the file into a store first, classifie
 ChEBI lite from the release's RDF/XML file and from the functional-style file to a
 written taxonomy, on every core and on one thread. The table gives the median time in
 seconds from the start of the process to its end, and the median peak resident set in
-MiB. The two builds wrote byte-identical taxonomies on every run.
+MiB. In the last round the two builds wrote byte-identical taxonomies of every file on
+every thread count.
 
 | File | Threads | Store path | File path | Store path peak RSS | File path peak RSS |
 |---|---:|---:|---:|---:|---:|
@@ -207,17 +208,22 @@ lookup ran on several threads.
 | `ore_ont_13482` | 8 | 517 | 511 | 17 | 14 |
 | `ore_ont_868` | 1 | 1,855 | 1,835 | 751 | 714 |
 
-On one thread every classification is within 2% of before, and the peak resident set of
-`el_classify` is within 3%. An interleaved run of three rounds on `atlas` gives the same
-picture, with `ore_ont_868` at 990 and 861 ms and its taxonomy at 391 and 246 ms on eight
-threads.
+On one thread every classification and its peak resident set are within 3% of before.
+On eight threads the peak resident set of `el_classify` is within 2% of before on every
+ontology but GO, where it rises from 242 to 256 MiB. An interleaved run of three rounds
+on `atlas` gives the same picture, with `ore_ont_868` at 990 and 861 ms and its taxonomy
+at 391 and 246 ms on eight threads.
 
-The taxonomies that `el_classify` writes, which `scripts/el-oracle.py` compares, were
-byte for byte the same before and after on GO, ChEBI lite and the 298 ORE ontologies on
-one and eight threads. The command line's taxonomies, its JSON answers without the
-times and its `check --format json` answers were compared on GO, ChEBI lite and the ORE
-ontologies from functional-style, RDF/XML and Turtle files, and on cut and malformed
-files, whose errors and exit codes must match. The
+The taxonomies that `el_classify` writes were byte for byte the same in the build of
+commit c9b6ebff and the build of commit e196d28b, whose taxonomy stage is that of
+62704d5b, on GO, ChEBI lite and the 298 ORE ontologies on one and eight threads. The
+command line's taxonomies on one and eight threads, its JSON answers without the times
+and its `check --format json` answers were compared between the builds of 62704d5b and
+c9b6ebff on 904 files. These are GO, ChEBI lite and the 298 ORE ontologies, each in
+functional-style, RDF/XML and Turtle syntax, and four cut or malformed files, whose
+errors and exit codes must match. All 3,616 comparisons gave the same bytes. A file that
+ran out of memory with five comparisons at once on `atlas` was compared again alone with
+12 GiB. The
 [run record](runs/2026-11-03-file-classification-forge-62704d5b/record.json) holds every
 time, the binaries' hashes, the environment, the outputs' comparison and these checks.
 
