@@ -24,6 +24,15 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+The web UI asks through an Ask thread, a page at `/ui/ask` and a drawer beside any page
+that `Shift+A` and the palette open with the page's resource or query as context. Each
+answer folds its query, rows, sources and steps, follow-ups continue the thread, and the
+history reopens threads. The Ask bar on the query page is replaced by the docked thread.
+`POST /{ds}/ask` takes `thread` and `about`, and `GET /$/asks/{ds}` filters by `thread`
+and returns each stored answer to callers whose grants cover the graphs it read. The
+history file `asks.json` moves to format 2, which older builds refuse, so a downgrade
+after an Ask leaves that dataset's history unreadable to the older build.
+
 `sparkles ontology reason`, `reduce` and `relax` do what ROBOT 1.9.11's commands of the
 same names do, with ROBOT's options, defaults, errors and exit statuses (roadmap items
 634 and 635). They read a file without a database or a database with `--loc`, write

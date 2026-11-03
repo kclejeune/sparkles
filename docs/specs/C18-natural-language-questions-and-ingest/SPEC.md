@@ -896,6 +896,14 @@ A separate page would duplicate all of that. The page gains two things.
 The Explore page's search box gets a hint "Ask a question…" that switches to the query
 page with the question filled in, when the dataset has an assistant.
 
+The Ask bar later became an Ask thread, one component shown as a page at `/ui/ask` and as
+a drawer docked beside any page. The drawer opens from the palette's Ask row and with
+Shift+A, carries the page's resource or query as a removable context chip, and becomes a
+bottom sheet on a phone. On the query page the thread docks beside the editor and still
+opens each answer in a tab, so every step of §6.2 keeps its place. Each turn folds its
+query, rows, sources and steps under the answer, follow-ups continue the thread, and the
+history lists threads and reopens them from their stored answers.
+
 The Ask bar gives the UI the same flow that an MCP agent has, with the steps of §4.1 run
 by the server. Nothing about the result is special. It is a query tab like any other,
 and it uses the query page's existing components.
@@ -1028,9 +1036,23 @@ the other tabs, and an **Asked** list in the Saved menu shows the last 50 questi
 this browser with their queries. Nothing is stored on the server.
 
 From Phase 2 the server keeps each principal's asks for the dataset, with the question,
-the final query, the commit, the feedback, the usage and the routing record of §5.5,
-but not the rows or the summary text. Only the principal sees its own history, through
-`GET /$/asks/{ds}`, and can delete entries. No role can read another principal's
+the final query, the commit, the feedback, the usage and the routing record of §5.5.
+Format 2 of `asks.json` also keeps a thread id, the resource the question was about, and
+the answer without its rows. The answer holds the explanation, the assumptions, the
+summary text with its citations, the points of a global answer with their reports, the
+check verdict, the diagnosis and the linked entities, with each text capped at 8000
+characters and each list at 50 items. Rows are not kept, and the UI reruns the stored
+query read-only at its commit to show them again, with no model call. A reader that
+knows only format 1 refuses format 2 cleanly, and format 2 reads format 1 records as
+threads of one question without an answer.
+
+A stored answer was written from the asker's view of the data, so the server records
+which graphs it read, as a footprint of the guarded and named graphs and the branch. The
+list route returns the answer only to a caller whose current view, under the same grants
+and masking as a query, can read every graph in that footprint, and otherwise returns
+the record with `answerWithheld` set and no answer, the same rule as the cleared global
+text of C22 §6.6. Only the principal sees its own history, through
+`GET /$/asks/{ds}`, which filters by `thread`, and can delete entries. No role can read another principal's
 questions, including dataset and server admins, because a question can contain
 personal or confidential text (§14). Admins see counts and usage only.
 

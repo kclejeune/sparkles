@@ -3,8 +3,9 @@
 // the mock backend that playwright.screenshots-mock.config.ts starts. The SKOS editing forms
 // use a `thesaurus` dataset and the SKOS layouts of mock/forms.mjs. The `org` dataset
 // gets a branch whose changes clash with main, so that the dataset page shows branches and
-// the commit graph and the merge page shows conflicts. The Ask bar runs the scripted
-// pipeline of mock/assistant.mjs, and a handoff link stands in for an agent's
+// the commit graph and the merge page shows conflicts. The Ask thread runs the scripted
+// pipeline of mock/assistant.mjs on its page, docked on the Query page and on a Browse
+// page, and a handoff link stands in for an agent's
 // `share_query`. The maps of relations, the communities, the Pattern pane, the diff graph
 // and the path finder on a query's graph use the `world` showcase dataset of
 // mock/world.mjs. The model configuration form uses the declared configuration of
@@ -138,43 +139,71 @@ test('merge', async ({ page }) => {
   await shoot(page, 'merge');
 });
 
-async function openQuery(page: Page) {
+async function runMode(page: Page) {
   await page.addInitScript(() =>
     localStorage.setItem('sparkles.askPrefs.local', JSON.stringify({ mode: 'run' })),
   );
-  await page.goto(`/ui/query?ds=${DATASET}`);
-  await expect(page.getByRole('region', { name: 'Ask bar' })).toBeVisible({ timeout: 30_000 });
 }
 
-async function ask(page: Page, question: string) {
-  const bar = page.getByRole('region', { name: 'Ask bar' });
-  await bar.getByRole('textbox').fill(question);
-  await bar.getByRole('button', { name: 'Ask' }).click();
+async function ask(scope: ReturnType<Page['getByRole']>, question: string) {
+  await scope.getByRole('textbox', { name: 'Question' }).fill(question);
+  await scope.getByRole('textbox', { name: 'Question' }).press('Enter');
 }
 
 test('ask-steps', async ({ page }) => {
-  // the mock holds this ask before its summary, so the step indicator stays up
+  // the mock holds this ask before its summary, so the turn shows its step and Stop
   await page.route(`**/${DATASET}/ask`, (route) =>
     route.continue({
       postData: JSON.stringify({ ...route.request().postDataJSON(), hold: 'summary' }),
     }),
   );
-  await openQuery(page);
-  await ask(page, 'Who is in the payments team?');
-  const bar = page.getByRole('region', { name: 'Ask bar' });
-  await expect(bar.getByRole('status')).toContainText('Summarizing');
+  await runMode(page);
+  await page.goto(`/ui/query?ds=${DATASET}`);
+  await page.getByRole('button', { name: 'Ask', exact: true }).click({ timeout: 30_000 });
+  const drawer = page.getByRole('complementary', { name: 'Ask' });
+  await ask(drawer, 'Who is in the payments team?');
+  await expect(drawer.getByRole('status')).toContainText('Summarizing');
   await expect(page.getByRole('grid')).toContainText('Kai Ito');
   await shoot(page, 'ask-steps', { spinners: 1 });
 });
 
 test('ask-answer', async ({ page }) => {
-  await openQuery(page);
-  await ask(page, 'Who is in the payments team?');
-  const answer = page.getByRole('region', { name: 'Answer' });
-  await expect(answer).toContainText(/cites \d+ of \d+ rows/);
-  await answer.getByRole('button', { name: '[1]' }).click();
-  await expect(page.getByRole('grid').locator('[aria-selected="true"]')).toHaveCount(1);
+  await runMode(page);
+  await page.goto(`/ui/ask?ds=${DATASET}`);
+  const thread = page.getByRole('region', { name: 'Thread' });
+  await ask(thread, 'Who is in the payments team?');
+  const turn = thread.getByRole('article', { name: 'Who is in the payments team?' });
+  await expect(turn.getByRole('group', { name: 'Feedback' })).toBeVisible({ timeout: 30_000 });
+  await turn.getByRole('button', { name: /^Query/ }).click();
+  await turn.getByRole('button', { name: 'Citation [1]' }).click();
+  await expect(turn.getByText('Cited rows', { exact: true })).toBeVisible();
+  await expect(turn.locator('blockquote').first()).toBeVisible();
   await shoot(page, 'ask-answer');
+});
+
+test('ask-drawer', async ({ page, request }) => {
+  expect(
+    (await request.put('/$/assistant/uni', { data: { enabled: true, send: 'rows' } })).ok(),
+  ).toBe(true);
+  try {
+    await runMode(page);
+    await page.goto(
+      `/ui/browse?ds=uni&iri=${encodeURIComponent('http://example.org/uni#Professor')}`,
+    );
+    await expect(page.locator('h1.term-title')).toBeVisible({ timeout: 30_000 });
+    await page.locator('h1.term-title').click();
+    await page.keyboard.press('Shift+A');
+    const drawer = page.getByRole('complementary', { name: 'Ask' });
+    // the empty thread offers questions about the class it carries as context
+    await expect(
+      drawer
+        .getByRole('group', { name: 'Suggested questions' })
+        .getByRole('button', { name: 'What are its subclasses?' }),
+    ).toBeVisible();
+    await shoot(page, 'ask-drawer');
+  } finally {
+    await request.put('/$/assistant/uni', { data: {} });
+  }
 });
 
 test('handoff', async ({ page }) => {
@@ -1369,9 +1398,7 @@ test('thesaurus-checks', async ({ page }) => {
   await page.goto('/ui/thesaurus?ds=thes');
   await expect(
     thesTree(page).getByRole('button', { name: 'Vertebrates', exact: true }),
-  ).toBeVisible({
-    timeout: 30_000,
-  });
+  ).toBeVisible({ timeout: 30_000 });
   await page.getByRole('tab', { name: 'Checks' }).click();
   await expect(page.getByRole('list', { name: 'Check results' })).toContainText('S13');
   await shoot(page, 'thesaurus-checks');
