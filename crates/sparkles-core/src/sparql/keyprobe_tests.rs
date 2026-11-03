@@ -235,3 +235,16 @@ fn few_matching_values_of_a_small_input_are_not_estimated_at_one_row() {
         "estimated {with_sets} for 300 from the node sets"
     );
 }
+
+/// Probed keys cover a small input only when its values were read whole: a scan that
+/// stopped at its row limit gave the values of its first rows, and a value after them was
+/// never probed.
+#[test]
+fn keys_cover_a_source_only_when_it_was_read_whole() {
+    use super::keyprobe::covers_every_value;
+    let ids = |v: &[u64]| v.iter().map(|&x| crate::id::Id(x)).collect::<Vec<_>>();
+    let vals = ids(&[1, 1, 2, 3, 3]);
+    assert!(covers_every_value(&vals, &ids(&[1, 2, 3]), true));
+    assert!(!covers_every_value(&vals, &ids(&[1, 3]), true));
+    assert!(!covers_every_value(&vals, &ids(&[1, 2, 3]), false));
+}

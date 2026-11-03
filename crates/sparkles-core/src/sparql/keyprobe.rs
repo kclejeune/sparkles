@@ -177,8 +177,11 @@ pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>]) {
 }
 
 /// The values of `v` in the small input `src`, with their rows: from a VALUES table or
-/// read from the pattern's scan.
-fn source_values(ctx: &Ctx, src: &Node, v: VarId) -> Result<Option<Vec<Id>>> {
+/// read from the pattern's scan, and whether they are all of its values. A scan stops
+/// reading at four times the rows of a small input, so a pattern estimated too small
+/// gives the values of its first rows only.
+fn source_values(ctx: &Ctx, src: &Node, v: VarId) -> Result<Option<(Vec<Id>, bool)>> {
+    let mut read_all = true;
     let mut vals: Vec<Id> = match &src.kind {
         Kind::Values(t) => {
             let Some(c) = t.col_of(v) else {
@@ -238,7 +241,9 @@ fn source_values(ctx: &Ctx, src: &Node, v: VarId) -> Result<Option<Vec<Id>>> {
                         }
                     }
                 }
-                Ok(out.len() < limit)
+                let more = out.len() < limit;
+                read_all &= more;
+                Ok(more)
             })?;
             out
         }
@@ -248,7 +253,28 @@ fn source_values(ctx: &Ctx, src: &Node, v: VarId) -> Result<Option<Vec<Id>>> {
         return Ok(None);
     }
     vals.sort_unstable();
-    Ok(Some(vals))
+    Ok(Some((vals, read_all)))
+}
+
+/// Whether the sorted `keys` are every distinct value of the sorted `vals`, which only
+/// values read whole (`read_all`) can tell.
+pub(super) fn covers_every_value(vals: &[Id], keys: &[Id], read_all: bool) -> bool {
+    if !read_all {
+        return false;
+    }
+    let mut ki = 0;
+    for (i, &x) in vals.iter().enumerate() {
+        if i > 0 && vals[i - 1] == x {
+            continue;
+        }
+        while ki < keys.len() && keys[ki] < x {
+            ki += 1;
+        }
+        if ki >= keys.len() || keys[ki] != x {
+            return false;
+        }
+    }
+    true
 }
 
 fn probe_var(
@@ -291,7 +317,7 @@ fn probe_var(
         ),
         _ => return Ok(None),
     };
-    let Some(vals) = source_values(ctx, src, v)? else {
+    let Some((vals, read_all)) = source_values(ctx, src, v)? else {
         return Ok(None);
     };
     // rows of the small input spread over its values in order
@@ -299,25 +325,7 @@ fn probe_var(
     let keys: Vec<Id> = (0..k)
         .map(|i| vals[(2 * i + 1) * vals.len() / (2 * k)])
         .collect();
-    // whether the keys are every distinct value of the small input
-    let complete = {
-        let mut distinct = 0usize;
-        let mut covered = 0usize;
-        let mut ki = 0;
-        for (i, &x) in vals.iter().enumerate() {
-            if i > 0 && vals[i - 1] == x {
-                continue;
-            }
-            distinct += 1;
-            while ki < keys.len() && keys[ki] < x {
-                ki += 1;
-            }
-            if ki < keys.len() && keys[ki] == x {
-                covered += 1;
-            }
-        }
-        covered == distinct
-    };
+    let complete = covers_every_value(&vals, &keys, read_all);
     let mut targets = Vec::new();
     for (i, opts) in leaves.iter().enumerate() {
         if i == si || !opts[0].vars.contains(&v) {
