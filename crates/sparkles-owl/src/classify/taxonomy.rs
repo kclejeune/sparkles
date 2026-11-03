@@ -656,6 +656,7 @@ fn close_rows(
         }
         row.shrink_to_fit();
         held += row.len() * 4 + 32;
+        ask(held, &mut asked)?;
         rows.push((unsat, row));
     }
     drop(scratch);
@@ -962,5 +963,25 @@ mod tests {
             close_rows(&mut subs, &[], &|b| b <= out_bytes / 4),
             Err(Halt::Memory(_))
         ));
+    }
+
+    #[test]
+    fn closing_sparse_rows_asks_the_budget() {
+        // rows of one class each, which no merge joins
+        let n = 350_000u32;
+        let mut subs: Vec<(bool, Vec<u32>)> = (0..n).map(|i| (false, vec![i])).collect();
+        let first = std::cell::Cell::new(0usize);
+        let r = close_rows(&mut subs, &[], &|b| {
+            if first.get() == 0 {
+                first.set(b);
+            }
+            false
+        });
+        assert!(matches!(r, Err(Halt::Memory(_))));
+        assert!(
+            first.get() <= 2 << 20,
+            "first asked for {} bytes",
+            first.get()
+        );
     }
 }

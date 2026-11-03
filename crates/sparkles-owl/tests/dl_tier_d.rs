@@ -779,11 +779,11 @@ fn a_wide_case_analysis_stays_within_the_memory_budget() {
     }
 }
 
-/// A ⊑ B, B ⊑ A ⊔ Cᵢ for 300 classes, and B ⊑ D ⊔ E with D and E below F: A's context
+/// A ⊑ B, B ⊑ A ⊔ Cᵢ for 260 classes, past one block of the bounds checks, and B ⊑ D ⊔ E with D and E below F: A's context
 /// goes through the choices that are redundant, since A holds, before the one that gives F.
 fn redundant_choices() -> Vec<Axiom> {
     let mut s = String::from("SubClassOf(:A :B)\n");
-    for i in 0..300 {
+    for i in 0..260 {
         s.push_str(&format!("SubClassOf(:B ObjectUnionOf(:A :C{i:03}))\n"));
     }
     s.push_str("SubClassOf(:B ObjectUnionOf(:D :E))\nSubClassOf(:D :F)\nSubClassOf(:E :F)\n");
@@ -810,7 +810,11 @@ fn a_stop_among_redundant_choices_leaves_the_context_open() {
         },
     )
     .unwrap();
-    for stop in 0..polls.load(Ordering::Relaxed) {
+    // every stop in a release build, and in a debug one, which runs the rules some ten
+    // times slower, the first 64, where A's context goes through its choices, and every
+    // third after them
+    let step = if cfg!(debug_assertions) { 3 } else { 1 };
+    for stop in (0..polls.load(Ordering::Relaxed)).filter(|&k| k < 64 || k % step == 0) {
         if let Ok(out) = in_order(&ax, &cancelled_at(stop, 1, Expansion::Cautious)) {
             check_partial(&out, &full, &cs);
         }
@@ -848,11 +852,17 @@ fn wide_many(m: usize, n: usize) -> Vec<Axiom> {
 
 #[test]
 fn a_stop_ends_every_waiting_case_analysis() {
-    let ax = wide_many(6, 12);
+    // products of 2^11 choices, and of 2^8, exactly one block of the bounds' checks
+    for (m, n) in [(6, 12), (12, 9)] {
+        waiting_case_analyses(&wide_many(m, n));
+    }
+}
+
+fn waiting_case_analyses(ax: &[Axiom]) {
     let cap = 400_000;
     for partial in [false, true] {
         let out = in_order(
-            &ax,
+            ax,
             &Limits {
                 partial,
                 max_memory: Some(cap),

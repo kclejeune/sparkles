@@ -213,6 +213,8 @@ pub struct DlSt {
     props: FxHashMap<(Role, Ex), u32>,
     /// in a test context, the named classes that do not hold, sorted
     pub neg: Vec<Ex>,
+    /// the choices of products derived since the last check of the run's bounds
+    choices: u32,
 }
 
 impl DlSt {
@@ -456,8 +458,8 @@ impl Found {
 const PRODUCT_POLL: usize = 256;
 
 /// Derives what the rules found: the single conclusions, then each product's choices in
-/// the order of their lists, the last list fastest. The run's bounds are checked every
-/// [`PRODUCT_POLL`] choices, and a stop of the run, found there or made by another worker,
+/// the order of their lists, the last list fastest. The run's bounds are checked after
+/// every [`PRODUCT_POLL`] choices the context derives, counted across calls, and a stop of the run, found there or made by another worker,
 /// leaves the rest of the inference undone and marks the context's store interrupted, a
 /// store made for the mark if the context has none, so that the dependency record of a
 /// partial answer counts the context as open.
@@ -465,11 +467,10 @@ fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
     for c in found.one {
         derive(ix, st, c, out);
     }
-    let mut n = 0usize;
     for (lists, base) in found.prods {
         let mut at = vec![0usize; lists.len()];
         'choices: loop {
-            if out.stopped() || (n > 0 && n.is_multiple_of(PRODUCT_POLL) && !out.go_on()) {
+            if out.stopped() {
                 ds(st).store.interrupted = true;
                 return;
             }
@@ -479,7 +480,17 @@ fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
                 s.1.extend_from_slice(&l[i].1);
             }
             derive(ix, st, s, out);
-            n += 1;
+            let x = ds(st);
+            x.choices += 1;
+            if x.choices as usize >= PRODUCT_POLL {
+                x.choices = 0;
+                if !out.go_on() {
+                    // the stop can come after the last choice, and the mark then only
+                    // keeps the context open
+                    ds(st).store.interrupted = true;
+                    return;
+                }
+            }
             let mut k = lists.len();
             loop {
                 if k == 0 {
