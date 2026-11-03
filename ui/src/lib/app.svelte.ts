@@ -28,6 +28,8 @@ class AppState {
     title?: string;
     question?: TabQuestion;
     ask?: string;
+    /** Open the Save as example dialog for the question and its query. */
+    saveExample?: boolean;
   } | null>(null);
 
   /** The state the Query page reads (`at=`): empty for the head. */
