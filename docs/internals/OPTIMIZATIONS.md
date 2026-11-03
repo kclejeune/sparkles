@@ -199,13 +199,18 @@ implementation and always apply. EXPLAIN shows which ones ran.
   of `?x a ?c` keeps the subject sets, since what a class gains depends almost wholly on
   what its instances are. The counts take one pass over the SPO and OPS
   permutations after they are written, on the build's threads, and a partial compaction
-  updates them for the nodes its changes touch. On WatDiv the L1 chains were estimated 10
+  updates them for the nodes its changes touch. The sets kept do not depend on the thread
+  count. Past 2^20 distinct node signatures, a count-min sketch filled by the first pass
+  ranks them by their nodes, with ties broken by a stable hash, and a second pass counts
+  the best-ranked ones exactly, so a load writes the same `stats.json` at any thread count. On WatDiv the L1 chains were estimated 10
   to 87 times too high and are now 2 to 11 times, and the C2 template's worst join goes
   from 1,222 times too high to 30. DBpedia's join of two `birthPlace` patterns on their
   object goes from 1,478 times too high to 8 times. The statistics trade memory for these
   estimates. With the larger subject-set cap, `stats.json` grows from 5.0 MB to 44.3 MB on
-  that slice, opening it takes about 0.15 s instead of 0.04 s, and the server holds 249 MB
-  instead of 157 MB once ready.
+  that slice. On atlas, opening it takes 0.30 s instead of 0.07 s, and the server holds
+  214 MB instead of 133 MB once ready. Smaller caps cost less but give up much of the
+  gain, as the [engine results](../benchmarks/engine/RESULTS.md#cardinality-estimates)
+  show.
 * **Joins on several keys** (`key_backoff`). A join on several variables divided by the
   largest distinct count of one key, as if the other keys added nothing. A cycle closed by
   a join on two keys, such as the last edge of a triangle or LUBM `q9`'s

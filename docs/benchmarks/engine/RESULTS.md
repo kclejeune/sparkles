@@ -322,6 +322,29 @@ with the build that adds them. Both answered every query identically.
 
 *Recorded on the development laptop. Estimates do not depend on the host.*
 
+Both set families keep 32,768 sets. The table compares smaller caps on WatDiv and the
+DBpedia slice, with the q-errors from the laptop and the open time and memory from atlas,
+an Intel host like forge. Open is the median of five server starts to the ready endpoint,
+polled every 20 ms, and memory is the resident set once ready. At 16,384 sets the
+geometric mean rises by 10% on WatDiv and 5% on DBpedia, and at 8,192 by 19% and 71%, so
+the smaller caps give up much of the gain.
+
+| Workload | Sets | Geometric mean | 90th percentile | Largest | `stats.json` | Open | Memory once ready |
+|---|---|---|---|---|---|---|---|
+| WatDiv at scale 100 | Base build | 8.80 | 661 | 1,222 | 2.5 MB | 0.10 s | 127 MB |
+| WatDiv at scale 100 | 8,192 | 4.72 | 49 | 666 | 4.4 MB | 0.07 s | 133 MB |
+| WatDiv at scale 100 | 16,384 | 4.36 | 31 | 666 | 9.3 MB | 0.10 s | 144 MB |
+| WatDiv at scale 100 | 32,768 | 3.98 | 59 | 666 | 16.3 MB | 0.13 s | 156 MB |
+| DBpedia, 8.2M-triple slice | Base build | 4.84 | 78 | 1,478 | 5.0 MB | 0.07 s | 133 MB |
+| DBpedia, 8.2M-triple slice | 8,192 | 3.36 | 15 | 78 | 7.1 MB | 0.07 s | 141 MB |
+| DBpedia, 8.2M-triple slice | 16,384 | 2.06 | 6.0 | 78 | 16.7 MB | 0.14 s | 157 MB |
+| DBpedia, 8.2M-triple slice | 32,768 | 1.96 | 7.7 | 78 | 44.3 MB | 0.30 s | 214 MB |
+
+The 90th percentile is lower at 16,384 sets than at 32,768 because the plans, and so the
+joins measured, differ. Against 32,768 sets, the largest join error of WatDiv `F1-2` rises
+from 17 to 49 at 8,192 sets and that of `F4-2` from 9 to 58, and at 16,384 sets that of
+`F4-1` rises from 2.1 to 7.0. A load writes the same statistics at any thread count.
+
 ### Estimation timing on forge
 
 `abtime.py` timed the base build against the build with the correlation-aware estimates on

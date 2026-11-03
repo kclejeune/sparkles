@@ -105,6 +105,12 @@ phases are not. [Item 454](../../ROADMAP.md) tracks the remaining work.
   join over its outgoing items alone is estimated from the subject sets, which take the
   restriction to be independent, and other joins keep the estimate from distinct values.
   This is the characteristic-pair idea reduced to the join node. Pairs keyed by both ends' sets are not built.
+* **Same sets at any thread count.** A load writes the same `stats.json` at any thread
+  count. When the data has at most 2^20 distinct node signatures, the node pass counts
+  them all exactly. Otherwise its first pass also fills a count-min sketch of the nodes
+  per signature, and a second pass counts exactly the 2^20 signatures with the most nodes
+  by the sketch, with ties broken by a stable hash of the signature. None of the
+  benchmark stores has that many signatures, so none pays for the second pass.
 * **Several keys.** A join on several keys divides by the key tuples of the larger side,
   from its distinct counts with exponents 1, 1/2, 1/4 and 1/8, at most its rows when each
   side has one input binding every key.
@@ -145,8 +151,31 @@ category's people to be as likely as others to have a label and a class.
 The node pass takes 0.2 s of a 5 to 6 s WatDiv load and 0.7 s of a 10 to 20 s DBpedia
 load on the laptop, and the peak memory of a load stays within 5% of the base build's.
 `stats.json` grows from 2.5 MB to 16.3 MB on WatDiv and from 5.0 MB to 44.3 MB on DBpedia.
-Opening the DBpedia slice takes 0.15 to 0.23 s instead of 0.04 s, and the server holds
-249 MB instead of 157 MB once ready. On WatDiv it holds 184 MB instead of 154 MB.
+On atlas, an Intel host like forge, the DBpedia slice opens in 0.30 s instead of 0.07 s
+and the server holds 214 MB instead of 133 MB once ready. WatDiv opens in 0.13 s instead
+of 0.10 s and holds 156 MB instead of 127 MB. These are medians of five opens, polled
+every 20 ms. Items NEW-ITEM-4, NEW-ITEM-8 and NEW-ITEM-9 would reduce these costs.
+
+Both families keep 32,768 sets. Smaller caps, measured on the same stores, lose much of
+the gain on WatDiv, where 16,384 sets raise the geometric mean of the join q-error by
+10% and 8,192 by 19%. The 90th percentile is lower at 16,384 than at 32,768 because the
+plans, and so the joins measured, differ.
+
+| Workload | Sets | Geometric mean | 90th percentile | Largest | `stats.json` | Open | Memory once ready |
+|---|---|---|---|---|---|---|---|
+| WatDiv at scale 100 | Base build | 8.80 | 661 | 1,222 | 2.5 MB | 0.10 s | 127 MB |
+| WatDiv at scale 100 | 8,192 | 4.72 | 49 | 666 | 4.4 MB | 0.07 s | 133 MB |
+| WatDiv at scale 100 | 16,384 | 4.36 | 31 | 666 | 9.3 MB | 0.10 s | 144 MB |
+| WatDiv at scale 100 | 32,768 | 3.98 | 59 | 666 | 16.3 MB | 0.13 s | 156 MB |
+| DBpedia, 8.2M-triple slice | Base build | 4.84 | 78 | 1,478 | 5.0 MB | 0.07 s | 133 MB |
+| DBpedia, 8.2M-triple slice | 8,192 | 3.36 | 15 | 78 | 7.1 MB | 0.07 s | 141 MB |
+| DBpedia, 8.2M-triple slice | 16,384 | 2.06 | 6.0 | 78 | 16.7 MB | 0.14 s | 157 MB |
+| DBpedia, 8.2M-triple slice | 32,768 | 1.96 | 7.7 | 78 | 44.3 MB | 0.30 s | 214 MB |
+
+Against 32,768 sets, the largest join error of WatDiv `F1-2` rises from 17 to 49 at 8,192
+sets, of `F4-2` from 9 to 58 and of DBpedia's `film-director-optional` from 1.0 to 15. At
+16,384 sets that of WatDiv `F4-1` rises from 2.1 to 7.0 and of DBpedia's `births-by-decade`
+from 1.0 to 2.1.
 
 On forge at 12 threads, with interleaved rounds of fresh servers and identical answers,
 the geometric mean of the query times against the base build is 0.969 on WatDiv, 0.936
@@ -155,9 +184,14 @@ on BSBM BI, 0.958 on LUBM, 1.001 on BSBM explore, 1.005 on the synthetic workloa
 times as long, BSBM BI `q1-3` 0.23 times, LUBM `q2` 0.52 times and DBpedia's
 `costar-birthplace` 0.64 times. WatDiv `S4-2` and `S4-4` take 1.6 times as long, since an
 accurate estimate leads the planner to a 704-key index join that the cost model prices
-too low, which item NEW-ITEM-5 follows up. Planning takes 1 to 75 microseconds longer on
-short WatDiv, BSBM explore and DBpedia queries, 5% to 10% of their time, which item
-NEW-ITEM-6 follows up, and two queries with unchanged plans are rechecked under item NEW-ITEM-7. Interleaved runs on
+too low. A cost term for keys spread at random brought their base plan back, but the 64
+queries whose plans it changed took 1.15 times as long, since keys close together cost a
+third of what spread keys cost and the planner cannot tell them apart. The
+[experiment](../../PERFORMANCE-EXPERIMENTS.md#query-execution) is recorded, and item
+NEW-ITEM-5 prices probes by how their keys spread. Planning takes 1 to 75 microseconds
+longer on short WatDiv, BSBM explore and DBpedia queries, 5% to 10% of their time, which
+item NEW-ITEM-6 follows up, and two queries with unchanged plans are rechecked under item
+NEW-ITEM-7. Interleaved runs on
 atlas, an Intel host like forge, found the same slowdowns of `S4-2`, `S4-4` and `F4`. The
 [engine results](../../benchmarks/engine/RESULTS.md#estimation-timing-on-forge) list every
 changed plan.
