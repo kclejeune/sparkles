@@ -187,6 +187,19 @@ counts the taxonomy and its links and comes within 14% of a counted peak heap, a
 `Stats::peak_memory` gives the peak. `el_classify` uses the server's mimalloc allocator,
 reads the axioms in place unless `--owned` is given and counts the heap with `--heap`.
 
+Ask's draft rules tell the model to select only the variables that answer the question,
+without label, predicate or helper columns unless the question asks for them, and never
+to add a variable only to fill the draft's `graph` member. Over three runs of 51
+QALD-9-plus validation questions the mean strict score rose from 27.0 to 28.7 with Haiku
+5.5 and from 29.0 to 29.7 with GPT-6 Luna, and answers with columns beyond the gold's
+fell from 27 to 8 and from 59 to 10 over the three runs. On 150 held-out QALD-9-plus
+questions Haiku answers 102 and Luna 101, within the noise of GPT-6.1 Sol and short of
+70%, and no model moved beyond the noise of its run with the earlier build.
+
+Ask declares the well-known vocabulary prefixes that a draft uses without declaring,
+such as `dbo` and `dbr`, before the check, unless the query or the dataset defines them.
+A draft that used one of them failed the check with a syntax error and needed a repair.
+
 `sparkles ask` takes its question argument as optional, since `--questions FILE` reads
 questions from a batch file instead. A command line that passes a question parses and
 behaves as before, and one that gives neither a question nor `--questions` is refused.
@@ -425,9 +438,21 @@ lists the route. Evidence links and assessments may target identity proposals. A
 revision records the identity graphs of the boundary it was built from, and a map one of
 them has left, or whose graph was protected again, answers `projection-unavailable`.
 Identity reviews need read grants on every identity graph of the boundary, and one
-operation retains at most 64 MiB of entity identifiers. The vocabulary and shapes add
+operation retains at most 64 MiB of entity identifiers. The resolution read leaves out
+a proposal or decision whose triples the caller's view hides in part, so it neither joins
+a cluster nor reveals its decision. The vocabulary and shapes add
 `ev:preferredEntity`, `ev:ResolutionMap`, `ev:mapRevision`, `ev:adds`, `ev:ends`,
 `ev:resolvesTo`, `ev:mapsProtection` and `ev:boundaryProtection`.
+
+Assessments name the records they consumed, and the assessments that depend on changed
+evidence can be found (spec C25 Phase 3, roadmap item 81). An assessment's `inputs`
+names up to 64 claims, assessments, identity proposals, source revisions, review
+decisions, acceptance supports or resolution map revisions, written as `prov:used`, and
+an assessment without them keeps its digests. `POST /{ds}/claims/dependents` and
+`sparkles::evidence::find_dependents` answer the authenticated assessments in readable
+proposal graphs whose target or inputs name a changed record, optionally transitively,
+and `Changed::identities` gathers what an operation changed. `capabilities.claims` lists
+the route.
 
 Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
 and `owl:sameAs` with closure operators instead of joins, and derives the same facts.
@@ -1216,6 +1241,26 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 (X14, item 478).
 
 ### Fixed
+
+`check_query` no longer fails with `budget-memory` when a draft uses a predicate that no
+instance of its typed variable's class has. On the DBpedia 2022.12.01 database the
+class lookup's estimate passed the 2 GiB query memory budget, which failed the whole
+check, so Ask lost the draft instead of repairing it. The lookup now writes its terms
+into the query and leaves the pattern unjudged when a lookup still passes the budget.
+Its suggestions profile a sample of the class through the index and rank the sample's
+predicates by their share of it and their rarity in the dataset, with the namespace of
+the draft's predicate first, so that a link every page has ranks below a predicate of
+the class.
+
+`scripts/premerge.sh` and the development tasks no longer fail when Boxington has
+collected a checkout's managed target and left `target` as a dangling link. Premerge now
+places a fresh target with `mbx sparkles-task` before its checks, with a one-line
+message. The crash harness's test binary, the feature-test logs, the fetched test
+suites, the GeoSPARQL benchmark checkout, the Graphalytics results and the JVM Nix
+dependency script now live under `.artifacts`, where collection does not reach them.
+`mise run ui:wasm` runs inside a target lease, so the module that wasm-bindgen reads
+cannot be collected after the build. The benchmark and probe scripts copy a binary that
+lies in the managed target to their work directory before they start it.
 
 A rename or delete of a persistent dataset no longer fails with `409` and "still has
 live handles" because the dataset's own views worker started a round at the wrong

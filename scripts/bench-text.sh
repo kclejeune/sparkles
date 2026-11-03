@@ -76,6 +76,8 @@ cd "$WORK"
 
 # shellcheck source=scripts/bench-tools.sh
 source "$ROOT/scripts/bench-tools.sh"
+# A binary in the managed target runs as a copy, which collection cannot remove.
+SPARKLES=$(stage_binary "$SPARKLES")
 ENGINES=${ENGINES:-sparkles jena qlever}
 has() { [[ " $ENGINES " == *" $1 "* ]]; }
 resolve_tools

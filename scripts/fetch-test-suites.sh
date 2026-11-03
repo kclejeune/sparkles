@@ -23,7 +23,7 @@
 #
 # The JSON-LD API suite (SPARKLES_JSONLD_TESTS) is opt-in and not fetched.
 #
-# Usage: scripts/fetch-test-suites.sh [DIR]   (default: target/test-suites)
+# Usage: scripts/fetch-test-suites.sh [DIR]   (default: .artifacts/test-suites)
 # A checkout already at its pinned commit is kept, so a second run fetches nothing new.
 set -euo pipefail
 
@@ -34,7 +34,7 @@ owl2_tests_url=https://www.w3.org/2009/11/owl-test/approved/all.rdf
 owl2_tests_sha256=6236dab71c2264903131042808e79e4aa41afab528f7cf6e633d2e3926b89b04
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-dir="${1:-$root/target/test-suites}"
+dir="${1:-$root/.artifacts/test-suites}"
 mkdir -p "$dir"
 dir="$(cd "$dir" && pwd)"
 

@@ -123,8 +123,8 @@ MCP entity linking exposes bounded, versioned candidate evidence and can order l
 matches by use. Ask uses it for full choice identities and conservative ordering while
 retaining required clarification. Ask also grounds each question with the predicates
 that its entities and best-matching classes use in the data. GPT-6 Luna, the `openai`
-preset's model, answers 106 of 150 held-out QALD-9-plus questions at $0.0021 each,
-within the noise of the best model measured.
+preset's model, answers 101 of 150 held-out QALD-9-plus questions at $0.0019 each,
+within the noise of GPT-6.1 Sol, while Opus 5.5 answers 114.
 
 [Ask stage diagnostics](ai/README.md#ask-stage-diagnostics) separate grounding, tool
 and execution timings while the remaining accuracy and latency work stays open.
@@ -252,7 +252,7 @@ implementation status.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections, withdrawals and reviewed, reversible identity resolution maps are available with protected records and retained source holds. Integration with memory, ingestion, reports and maintained analyses remains under item 81. |
+| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections, withdrawals, reviewed, reversible identity resolution maps, assessment inputs and the dependents of changed records are available with protected records and retained source holds. Recall and Ask citations, ingestion into proposals, reports, MCP tools and maintained analyses are planned under items 650 to 653 and 340. |
 | [Shared entity representation](ai/README.md#shared-entity-representation) | Partially complete. | Versioned resources, fixed fixtures and a bounded private offline resolver are available. Authenticated managed integration remains under item 396. |
 | [Durable jobs and delivery](specs/C26-durable-jobs-and-delivery.md) | Planned. | Item 339 specifies checkpointed jobs, fenced workers and a transactional outbox. Current tasks and notifications do not provide that recovery contract. |
 | [Maintained analysis results](specs/F22-analysis-lifecycle.md) | Planned. | Item 340 specifies reproducible runs, dependency checks, freshness and guarded publication. |

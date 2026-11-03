@@ -85,6 +85,8 @@ die() {
 }
 # shellcheck source=scripts/bench-tools.sh
 source "$ROOT/scripts/bench-tools.sh"
+# A binary in the managed target runs as a copy, which collection cannot remove.
+SPARKLES=$(stage_binary "$SPARKLES")
 has() { [[ " $ENGINES " == *" $1 "* ]]; }
 selected() { [ -z "${QUERIES:-}" ] || [[ " $QUERIES " == *" $1 "* ]]; }
 ZSTD=$(nixbin zstd zstd)

@@ -4182,6 +4182,8 @@ async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<
                 // identity proposals are reviewed through `review` under a matching
                 // policy, and their resolution maps are read here
                 "identities": "/{ds}/claims/identities",
+                // the assessments that depend on changed evidence records
+                "dependents": "/{ds}/claims/dependents",
             },
         },
     });

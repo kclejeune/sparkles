@@ -1303,3 +1303,50 @@ fn a_resolution_answers_each_entity_as_alone() {
     assert_eq!(decisions(&["b", "a"])[0], b);
     assert_eq!(decisions(&["a"])[0], decisions(&["b", "a"])[1]);
 }
+
+/// A proposal or decision the caller's view hides any triple of takes no part in what
+/// the resolution read answers, even when the hidden triple is not one the cluster
+/// needs: the read neither counts the proposal toward a cluster nor reveals the
+/// decision that accepts it.
+#[test]
+fn a_resolution_leaves_out_masked_proposals_and_decisions() {
+    let ds = configured();
+    let ab = propose_in(
+        &ds,
+        HIDDEN,
+        proposal("ab", IdentityRelation::PossibleMatch, &["a", "b"], None),
+    );
+    let bc = matched(&ds, "bc", &["b", "c"], None);
+    let dab = accept(&ds, "ab", &ab);
+    let dbc = accept(&ds, "bc", &bc);
+    let read = |entities: &[&str], access: Option<Arc<GraphAccess>>| {
+        let entities: Vec<NamedNode> = entities.iter().map(|n| e(n)).collect();
+        evidence::resolve_entities(&ds, &ds, "people", &entities, access, &Control::none())
+            .unwrap()
+            .entities
+    };
+    let mut both = vec![dab.clone(), dbc.clone()];
+    both.sort();
+    assert_eq!(read(&["b"], all())[0].decisions, both);
+    // the restricted proposal's attribution is hidden, so it joins nothing
+    let attribution = masking("http://www.w3.org/ns/prov#wasAttributedTo", HIDDEN);
+    assert_eq!(
+        read(&["b"], attribution.clone())[0].decisions,
+        vec![dbc.clone()]
+    );
+    assert_eq!(
+        read(&["a"], attribution.clone())[0].decisions,
+        Vec::<NamedNode>::new()
+    );
+    assert_eq!(read(&["a", "b"], attribution)[1].decisions, vec![dbc]);
+    // every decision's target digest is hidden, so no decision is revealed
+    let decisions = masking(&format!("{EV}targetDigest"), DECISIONS);
+    let r = read(&["b"], decisions);
+    assert!(r[0].decisions.is_empty(), "{r:?}");
+    // the map itself is read in the caller's view
+    assert_eq!(r[0].representative, e("a"));
+    // decision targets the view hides are not counted, so they cannot reach a bound
+    let targets = masking(&format!("{EV}target"), DECISIONS);
+    let r = read(&["b"], targets);
+    assert!(r[0].decisions.is_empty(), "{r:?}");
+}

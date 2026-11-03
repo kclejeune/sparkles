@@ -458,6 +458,7 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
                             "evaluator": iri("The attributed evaluator."),
                             "confidence": confidence(),
                             "scope": terms(),
+                            "inputs": with_desc(json!({ "type": "array", "items": record_ref("A claim, assessment, identity proposal, source revision, review decision, acceptance support or resolution map revision."), "maxItems": 64 }), "The records the evaluation consumed, each once, written as `prov:used`."),
                         }),
                     )),
                     "identities": array(closed(
@@ -742,6 +743,43 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
             ),
             "What the current resolution map selects for each entity.",
             "evidence-identities",
+        ),
+    );
+    put(
+        "EvidenceDependents",
+        doc(
+            closed(
+                &["changed"],
+                json!({
+                    "changed": with_desc(json!({ "type": "array", "items": string(), "minItems": 1, "maxItems": 1000 }), "The record identities that changed, such as a withdrawn claim, an ended support or the revision a new map revision follows."),
+                    "transitive": with_desc(boolean(), "Also find the assessments that depend on a dependent. Defaults to `false`."),
+                }),
+            ),
+            "Changed evidence records whose dependent assessments to find.",
+            "evidence-dependents",
+        ),
+    );
+    put(
+        "EvidenceDependentsResult",
+        doc(
+            closed(
+                &["commit", "dependents"],
+                json!({
+                    "commit": commit("The commit the records were read at."),
+                    "dependents": array(closed(
+                        &["assessment", "graph", "on", "dependence", "depth"],
+                        json!({
+                            "assessment": iri("An authenticated assessment."),
+                            "graph": iri("Its proposal graph."),
+                            "on": iri("The changed record it depends on, or for a transitive dependent the assessment it depends on."),
+                            "dependence": string_enum(&["target", "used"]),
+                            "depth": with_desc(int(), "How many assessments lie between it and a changed record, 0 for a direct dependent."),
+                        }),
+                    )),
+                }),
+            ),
+            "The assessments that depend on the changed records, each once at its smallest depth.",
+            "evidence-dependents",
         ),
     );
 }

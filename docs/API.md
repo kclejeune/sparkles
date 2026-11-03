@@ -12632,6 +12632,15 @@ settings' graphs when a role has more than one. A batch holds at most 1,000 clai
 10,000 links, 1,000 identity proposals and 16 MiB of decoded input, in a body of at most
 24 MiB.
 
+An assessment's `inputs` names up to 64 records the evaluation consumed, each once, as
+`{"key"}` or `{"iri"}`: claims, assessments, identity proposals, source revisions,
+review decisions, acceptance supports and resolution map revisions. They are written as
+`prov:used` and verified as authenticated records of those kinds before publication, and
+an assessment without them keeps the record digest it would have had before the field
+existed. Inputs and targets of the batch's assessments may not form a cycle.
+[Evidence dependents](#evidence-dependents) finds the assessments that used a record
+after it changed.
+
 Source revisions, renditions and passages go to the
 [evidence settings'](#evidence-settings) source-record graph, identity proposals to an
 identity graph, and the other records to the proposal graph. The caller needs update grants on every graph the batch writes, and
@@ -12851,9 +12860,11 @@ policy's decisions, maps and output graphs and on the identity graphs of its bou
 and counts as a query. The answer is `{policy, revision, number, commit, entities}`, and
 each entity is `{entity, representative, members, membersComplete, decisions}`, with at
 most 1,000 members and the current accepted decisions that join the cluster as far as
-the caller's view reaches from the entity, whatever else the request names. The map's
-latest revision is checked against the store as written, and a caller whose view hides
-part of it is refused with `503 projection-unavailable`. An entity
+the caller's view reaches from the entity, whatever else the request names. A proposal
+or decision whose triples the caller's view hides in part takes no part in the cluster
+the read traverses and is not reported. The map's latest revision is checked against
+the store as written, and a caller whose view hides part of it is refused with `503
+projection-unavailable`. An entity
 the map does not name resolves to itself. A request names 1 to 100 entities. Queries
 read the map by joining the output graph explicitly, and no query is rewritten through
 it.
@@ -12866,6 +12877,38 @@ it.
 | `503 projection-unavailable` | A graph of the policy was detached and protected again, an identity graph the map was built from left the boundary, or the output holds a map without a revision. |
 
 `GET /$/server` lists the route in `capabilities.claims.identities`.
+
+### Evidence dependents
+
+`POST /{ds}/claims/dependents` with `{"changed", "transitive"}` finds the authenticated
+assessments whose `ev:target` or `prov:used` names one of 1 to 1,000 changed record
+identities, so that a maintained analysis built on them can be reviewed or recomputed.
+It decides nothing about the assessments, whose conclusions may still hold. With
+`transitive: true` it also finds the assessments that depend on a dependent. It needs
+`read` on the dataset or branch through the query endpoint and counts as a query. The
+design is in [C25 §6](specs/C25-evidence-and-assessments.md#6-identity-validity-and-correction).
+
+```json
+{"changed": ["urn:uuid:5c0e…"], "transitive": true}
+```
+
+The changed identities of an operation are the claims it withdrew, the decisions it
+superseded, the supports in `changed.supportsEnded`, and for a new resolution map
+revision the revision in `changed.map.previous` and the decisions in
+`changed.map.decisionsEnded`. `sparkles::evidence::Changed::identities` gathers those of
+`changed`. The answer is `{commit, dependents}`, and each dependent is `{assessment,
+graph, on, dependence, depth}`, where `on` is the changed record or, for a transitive
+dependent, the assessment it depends on, `dependence` is `target` or `used`, and `depth`
+is 0 for a direct dependent. Each assessment is reported once, at its smallest depth,
+sorted by depth and IRI. Only the proposal graphs the caller can read are searched, and a
+record any of whose triples the caller's view hides is neither reported nor followed.
+
+| Status and code | Meaning |
+|---|---|
+| `400` | The body is malformed or names no identity. |
+| `422 incomplete-evidence` | More than 10,000 candidate records would be read. |
+
+`GET /$/server` lists the route in `capabilities.claims.dependents`.
 
 ### Suggested examples
 

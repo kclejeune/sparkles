@@ -472,6 +472,90 @@ pub(super) async fn identities(
     .await
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DependentsRequest {
+    changed: Vec<String>,
+    #[serde(default)]
+    transitive: bool,
+}
+
+/// `POST /{ds}/claims/dependents`: the authenticated assessments in the proposal graphs
+/// the caller can read whose `ev:target` or `prov:used` names one of the changed record
+/// identities, and with `transitive` the assessments that depend on those. `200` with
+/// the commit read and each dependent's assessment, graph, the record it depends on, how
+/// and at what depth. `400` for a malformed request, `422 incomplete-evidence` beyond the
+/// bound. Needs `read` through the query endpoint and counts as a query.
+pub(super) async fn dependents(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    AdminBody(bytes): AdminBody,
+) -> ApiResult {
+    if bytes.len() > MAX_BYTES {
+        return Err(err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("a dependents request holds at most {MAX_BYTES} bytes"),
+        ));
+    }
+    let r: DependentsRequest =
+        serde_json::from_slice(&bytes).map_err(|e| invalid("dependents request", e))?;
+    if r.changed.is_empty() || r.changed.len() > sparkles::evidence::MAX_CHANGED {
+        return Err(bad(
+            "changed".into(),
+            format!(
+                "a request names 1 to {} identities",
+                sparkles::evidence::MAX_CHANGED
+            ),
+        ));
+    }
+    let changed = r
+        .changed
+        .iter()
+        .enumerate()
+        .map(|(i, e)| named(&format!("changed[{i}]"), e))
+        .collect::<ApiResult<Vec<_>>>()?;
+    let branch =
+        crate::http::branches::current().unwrap_or_else(|| sparkles::branch::MAIN.to_string());
+    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
+    blocking(move || {
+        use crate::auth::{Endpoint, on_branch};
+        let logical = dataset(&st, &name)?;
+        let main = if branch == sparkles::branch::MAIN {
+            logical.clone()
+        } else {
+            crate::http::main_dataset(&st, &name)?
+        };
+        let here = on_branch(&main.name, &branch);
+        let caller = crate::http::caller::CallerContext::for_caller(&st, &logical, &p);
+        let opts = caller.options_on(&crate::http::Params::empty(), &here, Endpoint::Query);
+        let control = Control {
+            deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
+            ..Control::with_cancel(cancel)
+        };
+        let found = sparkles::evidence::find_dependents(
+            &main.dataset,
+            &logical.dataset,
+            &changed,
+            r.transitive,
+            opts.graphs.clone(),
+            &control,
+        )?;
+        Ok(Json(json!({
+            "commit": found.commit,
+            "dependents": found.dependents.iter().map(|d| json!({
+                "assessment": d.assessment.as_str(),
+                "graph": d.graph.as_str(),
+                "on": d.on.as_str(),
+                "dependence": d.dependence.name(),
+                "depth": d.depth,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response())
+    })
+    .await
+}
+
 type Policy = Option<Arc<sparkles::access::GraphAccess>>;
 
 /// What the caller may read on a dataset and branch, asked once per pair.

@@ -37,6 +37,46 @@ one the query does not use. The set keeps the source query as `sourceGold` and l
 rewrites. The DBpedia sets run with `--loc` against a database of the release their gold
 answers were recomputed on.
 
+## Synthetic DBpedia sets
+
+`synth/v3` holds 461 synthetic questions over DBpedia 2022.12.01, in a train split of
+186, a validation split of 134 and a test split of 141. `synth/synth.py` writes them
+from six templates over well-known instances of eleven DBpedia classes: the value of a
+relation, the instances that share a value, their count, a yes or no question, the
+instance with the largest value of a number, and two hops through a value. Each relation
+has its phrasings written by hand in `synth/phrases.py`. A subject whose page title needs
+a parenthesized qualifier is left out, since the question would name it ambiguously. A
+list or count is kept only when instances of the class reach the value through the
+relation and at most half again as many reach it through any other property. The SHA-256
+of each question's ID chooses its split, so the splits are fixed before any run. The
+generator executes every gold query and keeps a question only when the answer is bounded
+and not empty. `synth/check.py` runs every gold again and writes `check.json`, and none
+of the committed questions returns nothing. No question comes from a QALD-9-plus or
+Text2SPARQL'25 question, and with `--exclude` no resource that a gold query of those
+sets names becomes a question's subject.
+
+The paid runs read copies of these files whose `description` named the campaign's path
+to the generator. The questions are identical, and the evaluated copies have the SHA-256
+digests `d471fd79d0b933e41aac0dd0879c3d41707fe32846dfee7ac9a3592342aae3c2` for train,
+`e698843f2d61435ed93ca32e07c1cee903ad9bd71374b48cef39b473852792a8` for validation and
+`829647ae2073ced7e823494cf04432a215463a34263da96f0b294aa0a283fb5a` for test, the digests
+that the [paid record](../../docs/benchmarks/2026-11-02-ask-cheap-tier-paid.json) gives.
+The generator read resource names with ASCII letters only when the sets were made, so
+three excluded resources with other letters, such as `dbr:Düsseldorf_Airport`, were read
+cut short. None of them is the subject of a committed question, and the generator now
+reads names in any script and with escapes.
+
+The synthetic questions are easier than the public sets. On the validation split Haiku
+5.5 answers about 82% and GPT-6 Luna about 88%, against 45% to 63% on 51 QALD-9-plus
+validation questions, so a gain on them is a coarse guide. A gain must also hold on the
+public sets. The generator needs a DBpedia database:
+
+```
+python3 testsuite/ask/synth/synth.py --bin target/release/sparkles --loc DBPEDIA_DB \
+  --exclude QALD_TEST.json --exclude QALD_TRAIN.json --exclude DB25.json testsuite/ask/synth/v3 4
+python3 testsuite/ask/synth/check.py --bin target/release/sparkles --loc DBPEDIA_DB testsuite/ask/synth/v3
+```
+
 ## What is scored
 
 Every pair of a provider and a model is one whole pipeline, which supplies the draft,
@@ -226,7 +266,7 @@ and the reply writes a settle line with the cost from its usage. A request is re
 when the spent total plus its bound would pass `localCapNanodollars`. The spent total
 includes the carryover, so the cap covers the carryover as well, and new requests can
 spend the cap minus the carryover. The run file is also refused when the cap plus the
-carryover passes the hard cap of one ledger, USD 95 for Anthropic and USD 50 for OpenAI,
+carryover passes the hard cap of one ledger, USD 105 for Anthropic and USD 50 for OpenAI,
 which counts the carryover twice and keeps the run on the safe side. The person who pays sets each campaign's total, which can
 span several ledgers in separate directories. An error reply is free, a lost reply costs the bound, a reply without usage costs
 the bound, and any other fault of the request costs the bound. Replaying the ledger
@@ -336,7 +376,14 @@ ledger holds the rest with a cap of USD 49.1452. The two caps together equal the
 The Anthropic wallet of the same campaign was raised the same way from USD 50 to 95 with
 the approval of the person who pays, so that every model could run its baseline and its
 final build on the same three sets. Its first ledger closed with USD 30.7865 of upper
-liability, and the second has a cap of USD 64.2135. The ledgers stay the record of
+liability, and the second has a cap of USD 64.2135. The person who pays raised the
+wallet again to USD 105 on 2026-11-02, so that Opus 5.5 could answer the held-out set
+with the same final build as the cheaper models. The second ledger closed with
+USD 53.5667 of upper liability, USD 0.0632 of it one request held at its bound, and the
+third has a cap of USD 20.6468. On the same day the person who pays raised the OpenAI
+wallet from USD 50 to 60 for an effort trial of the cheapest models. The second OpenAI
+ledger closed with USD 43.6791 settled and nothing unresolved, and the third has a cap of
+USD 15.4660, so the three OpenAI caps again equal the wallet. The ledgers stay the record of
 Anthropic spend until the person who pays reconciles them against the Console's usage
 export, which stays outside the repository. Only the reconciled totals are recorded.
 
