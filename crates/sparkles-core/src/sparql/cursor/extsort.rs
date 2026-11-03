@@ -226,7 +226,7 @@ impl External {
                         b.kind,
                         crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
                     ) && n > MIN_PIECE_ROWS
-                        && ctx.check_cursor_memory().is_ok() =>
+                        && ctx.check_memory_failure().is_ok() =>
                 {
                     piece = (n / 2).max(MIN_PIECE_ROWS);
                 }

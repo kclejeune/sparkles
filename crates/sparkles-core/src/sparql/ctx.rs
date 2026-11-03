@@ -91,6 +91,122 @@ const VALUE_SHARDS: usize = 64;
 /// decoded values kept per shard before the shard is cleared
 const VALUE_SHARD_CAP: usize = 1 << 16;
 
+/// Bytes of query state that a context charges in steps and keeps charged until
+/// it drops: its decoded value cache, its query-local terms and memos and its parsed
+/// geometries. The state counts its bytes itself, and [`Ctx::grow_reservation`] grows
+/// the reservation to cover them, so that most additions take one atomic load.
+#[derive(Default)]
+pub(crate) struct StepReservation {
+    /// the bytes charged
+    reserved: AtomicU64,
+    /// serializes growth, with the owner the charges went to
+    grow: parking_lot::Mutex<Option<u64>>,
+}
+
+impl StepReservation {
+    /// Whether the reservation covers `bytes` already.
+    #[inline]
+    pub(crate) fn covers(&self, bytes: u64) -> bool {
+        bytes <= self.reserved.load(Ordering::Acquire)
+    }
+
+    /// The bytes charged.
+    #[cfg(test)]
+    pub(crate) fn reserved(&self) -> u64 {
+        self.reserved.load(Ordering::Acquire)
+    }
+}
+
+/// The query-local terms and memos of a context: the terms its expressions compute and
+/// the blank nodes it mints, charged in both accounting modes (see [`Ctx::retain_bytes`]).
+#[derive(Default)]
+struct RetainedTerms {
+    /// the estimated bytes retained
+    used: AtomicU64,
+    charge: StepReservation,
+}
+
+/// The most the decoded value cache of one query holds, before the memory budget's
+/// share (see [`ValueCache::cap`]).
+const VALUE_CACHE_BYTES: u64 = 64 << 20;
+
+/// The query's cache of decoded dictionary values, in shards that a hash of the id
+/// picks. It is charged to the query in both accounting modes: the cache reserves
+/// [`EAGER_STEP`]s from the query's account as its entries grow, and a value whose
+/// reservation is refused is returned without being cached. The cache holds at most
+/// [`VALUE_CACHE_BYTES`] or an eighth of the memory budget, whichever is smaller, and a
+/// shard that reaches its share of that is cleared and freed. The reservation is kept
+/// until the context drops.
+pub(super) struct ValueCache {
+    shards: Box<[RwLock<ValueShard>]>,
+    /// the estimated bytes of the entries held now
+    used: AtomicU64,
+    /// the bytes charged for the cache, never fewer than `used`
+    charge: StepReservation,
+}
+
+#[derive(Default)]
+struct ValueShard {
+    map: FxHashMap<Id, Value>,
+    /// the estimated bytes of `map`'s entries
+    bytes: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// growths of a step reservation on this thread
+    static VALUE_GROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Default for ValueCache {
+    fn default() -> Self {
+        Self {
+            shards: (0..VALUE_SHARDS).map(|_| Default::default()).collect(),
+            used: AtomicU64::new(0),
+            charge: Default::default(),
+        }
+    }
+}
+
+impl ValueCache {
+    /// The estimated bytes one cached entry keeps: its slot, counted twice since a map
+    /// grows by doubling, and the heap storage of its text.
+    pub(super) fn entry_bytes(v: &Value) -> u64 {
+        fn text(s: &str) -> u64 {
+            s.len() as u64 + 16
+        }
+        let heap = match v {
+            Value::Iri(a) | Value::BNode(a) | Value::Str(a) => text(a),
+            Value::Lang(a, b) | Value::LangDir(a, b, _) => text(a) + text(b),
+            Value::Other { lex, dt } => text(lex) + text(dt),
+            Value::Triple(t) => 64 + t.to_string().len() as u64,
+            _ => 0,
+        };
+        2 * (std::mem::size_of::<(Id, Value)>() as u64 + 1) + heap
+    }
+
+    /// The most the cache holds under a memory budget of `mem_limit` bytes.
+    fn cap(mem_limit: u64) -> u64 {
+        VALUE_CACHE_BYTES.min(mem_limit / 8)
+    }
+
+    #[inline]
+    fn shard(&self, id: Id) -> &RwLock<ValueShard> {
+        &self.shards[(id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % VALUE_SHARDS]
+    }
+
+    #[inline]
+    fn get(&self, id: Id) -> Option<Value> {
+        self.shard(id).read().map.get(&id).cloned()
+    }
+
+    /// The bytes charged for the cache.
+    #[cfg(test)]
+    fn reserved(&self) -> u64 {
+        self.charge.reserved()
+    }
+}
+
 /// Executor optimizations that can be switched off for diagnosis (every one of them has
 /// a generic fallback with the same results). `SPARKLES_DISABLE_OPTIMIZATIONS` holds a
 /// comma-separated list of names that are off by default in a process.
@@ -442,7 +558,7 @@ pub struct Ctx {
     pub(super) reasoning_memory: Vec<QueryMemoryLease>,
     pub snap: Arc<Snapshot>,
     local: RwLock<AppendVocab>,
-    values: Vec<RwLock<FxHashMap<Id, Value>>>,
+    values: ValueCache,
     next_bnode: AtomicU64,
     bnode_memo: parking_lot::Mutex<FxHashMap<(Vec<Id>, String), Id>>,
     /// blank nodes given to the query from outside (initial bindings) that are not
@@ -550,8 +666,22 @@ pub struct Ctx {
     pub(crate) extension_writers: Vec<(uuid::Uuid, super::extensions::Failure)>,
     callback_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
     callback_terms: parking_lot::Mutex<FxHashMap<Id, u64>>,
+    /// A budget refusal in infallible code, which fails the next check (see
+    /// [`Ctx::fail_memory`]).
+    memory_failure: MemoryFailure,
+    /// the envelope of transient dictionary decoding
+    decode: DecodeEnvelope,
+    /// the charge of the query-local terms and memos
+    retained: RetainedTerms,
+    /// the context itself, once it is shared, which retained charges release through
+    /// (see [`Ctx::attach_owner`])
+    owner: parking_lot::Mutex<Weak<Ctx>>,
+    /// the query's compiled regular expressions, charged in both accounting modes
+    regex: super::query_regex::RegexCache,
     // Opt-in cursor accounting stays after the ordinary execution fields.
-    cursor_memory: Option<Box<CursorMemory>>,
+    /// whether the query streams through pull cursors, whose grant follows their live
+    /// bytes (see [`Ctx::streams`])
+    streams: bool,
     // Data and weak retained caches drop before final ledger ownership.
     fast: FastMemory,
     memory: std::sync::OnceLock<Arc<QueryMemoryLedger>>,
@@ -631,13 +761,35 @@ impl Drop for FastMemory {
     }
 }
 
-struct CursorMemory {
+/// How a context accounts its memory, the one place that reads the mode (see
+/// [`Ctx::accounting`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Accounting {
+    /// Eager execution, which collects whole tables. Its pool contribution stays at
+    /// the admitted high point until the result is dropped.
+    Collect,
+    /// Pull cursors, whose grant follows their live bytes.
+    Cursor,
+}
+
+/// The first budget refusal that infallible code met. Scalar evaluation cannot return
+/// a budget error, so it records the refusal here and the next check fails with it,
+/// which keeps a refused allocation from becoming an unbound value.
+#[derive(Default)]
+struct MemoryFailure {
     failure: parking_lot::Mutex<Option<Budget>>,
     failed: AtomicBool,
-    decode_peak: parking_lot::Mutex<u64>,
-    decoded_reserved: AtomicU64,
-    owner: parking_lot::Mutex<Weak<Ctx>>,
-    regex: super::cursor_regex::RegexCache,
+}
+
+/// The high-water envelope that transient dictionary decoding reserves in both
+/// accounting modes: a key of the largest size seen so far on every worker, charged once
+/// when it grows and released when the work ends (see [`Ctx::reserve_decode_checked`]).
+#[derive(Default)]
+struct DecodeEnvelope {
+    /// the reserved bytes, with the owner of an eager reservation
+    state: parking_lot::Mutex<(u64, Option<u64>)>,
+    /// the reserved bytes, read without the lock
+    reserved: AtomicU64,
 }
 
 #[cfg(test)]
@@ -809,6 +961,12 @@ impl Ctx {
         }
     }
 
+    /// [`Ctx::live_bytes`] for the tests of other modules.
+    #[cfg(all(test, feature = "geo"))]
+    pub(crate) fn live_bytes_for_tests(&self) -> u64 {
+        self.live_bytes()
+    }
+
     /// The query's live estimate, from the ledger once it exists.
     #[inline]
     pub(super) fn live_bytes(&self) -> u64 {
@@ -831,14 +989,17 @@ impl Ctx {
             calls_extensions: false,
             callback_bnodes: Default::default(),
             callback_terms: Default::default(),
-            cursor_memory: None,
+            memory_failure: Default::default(),
+            decode: Default::default(),
+            retained: Default::default(),
+            owner: Default::default(),
+            regex: Default::default(),
+            streams: false,
             fast: Default::default(),
             memory: Default::default(),
             snap,
             local: RwLock::new(AppendVocab::default()),
-            values: (0..VALUE_SHARDS)
-                .map(|_| RwLock::new(FxHashMap::default()))
-                .collect(),
+            values: Default::default(),
             next_bnode: AtomicU64::new(0),
             bnode_memo: Default::default(),
             outside_bnodes: Default::default(),
@@ -1053,7 +1214,7 @@ impl Ctx {
     /// Record a warning for the plan (once, however often it is raised).
     pub fn warn(&self, w: PlanWarning) {
         let mut ws = self.warnings.lock();
-        if !ws.contains(&w) && self.retain_cursor_bytes(w.message.len() as u64 + 128) {
+        if !ws.contains(&w) && self.retain_bytes(w.message.len() as u64 + 128) {
             ws.push(w);
         }
     }
@@ -1114,7 +1275,7 @@ impl Ctx {
     pub fn check(&self) -> Result<()> {
         #[cfg(test)]
         CHECKS.with(|n| n.set(n.get() + 1));
-        self.check_cursor_memory()?;
+        self.check_memory_failure()?;
         if self.calls_extensions
             && let Some(state) = &self.extension_failure
             && let Some(failure) = state.lock().as_ref()
@@ -1160,74 +1321,108 @@ impl Ctx {
 
     pub(super) fn enable_cursor_accounting(&mut self) -> Result<()> {
         self.memory().check_cursor_transition()?;
-        for shard in &self.values {
-            *shard.write() = FxHashMap::default();
-        }
-        let bytes = self.local.read().bytes() as u64;
-        std::mem::forget(self.charge(bytes)?);
+        // A cursor reserves its decoding on the ledger, so the eager envelope goes.
+        self.release_decode_envelope();
+        // The decoded value cache, the query-local terms and the parsed geometries are
+        // charged already, and the ledger carries their reservations over, so the
+        // cursor keeps them.
         self.memory().cursor_mode()?;
-        self.cursor_memory = Some(Box::new(CursorMemory {
-            failure: Default::default(),
-            failed: AtomicBool::new(false),
-            decode_peak: Default::default(),
-            decoded_reserved: AtomicU64::new(0),
-            owner: Default::default(),
-            regex: Default::default(),
-        }));
+        self.streams = true;
+        // The result cache and sampled filters are planning choices that stage 6 of
+        // item 453 makes independent of the execution mode.
         self.use_cache = false;
         self.opt.sampled_filters = false;
-        #[cfg(feature = "geo")]
-        {
-            let vertices = self.geo.op_vertices();
-            // Parsed geometry retention is separate from ID batches. Until its
-            // cache has charge-owning entries, cursor evaluation does not keep it.
-            self.geo = crate::geo::memo::GeoMemo::with_budget(0);
-            self.geo.set_op_vertices(vertices);
-        }
         Ok(())
     }
 
-    pub(super) fn is_cursor(&self) -> bool {
-        self.cursor_memory.is_some()
+    /// How this context accounts its memory.
+    #[inline]
+    pub(super) fn accounting(&self) -> Accounting {
+        if self.streams {
+            Accounting::Cursor
+        } else {
+            Accounting::Collect
+        }
     }
 
-    pub(super) fn attach_cursor_owner(self: &Arc<Self>) {
-        if let Some(memory) = &self.cursor_memory {
-            *memory.owner.lock() = Arc::downgrade(self);
+    /// Whether the query streams through pull cursors. Both modes charge the same state,
+    /// so only planning and routing choices, the accumulation of an EXISTS key set across
+    /// batches and whether a decoding envelope can refuse read it.
+    #[inline]
+    pub(super) fn streams(&self) -> bool {
+        self.accounting() == Accounting::Cursor
+    }
+
+    /// Let retained charges release through this shared context, in both accounting
+    /// modes. Query preparation attaches every context it shares.
+    ///
+    /// Regular expressions compiled before, such as those of sampled filters in eager
+    /// planning, are uncharged, so the first attachment drops them and execution
+    /// compiles them again with their charges.
+    pub(super) fn attach_owner(self: &Arc<Self>) {
+        let mut owner = self.owner.lock();
+        let first = owner.strong_count() == 0;
+        *owner = Arc::downgrade(self);
+        drop(owner);
+        if first {
+            self.regex.clear();
         }
+    }
+
+    /// Drop the context's weak reference to itself, which lets a test take the prepared
+    /// context back with `Arc::get_mut`.
+    #[cfg(test)]
+    pub(super) fn detach_owner_for_tests(&self) {
+        *self.owner.lock() = Weak::new();
     }
 
     /// The cursor's own context, for state that runs a cursor operator tree of its own
     /// (the key set of an EXISTS pattern). `None` in eager execution.
     pub(super) fn cursor_owner(&self) -> Option<Arc<Ctx>> {
-        self.cursor_memory.as_ref()?.owner.lock().upgrade()
+        if !self.streams {
+            return None;
+        }
+        self.owner.lock().upgrade()
     }
 
-    /// A retained cache belongs to the plan, which may also occur in context
-    /// bookkeeping. Use a weak owner to avoid a plan/context reference cycle.
+    /// Charge `bytes` of state that outlives the call that builds it, such as a cache
+    /// that belongs to the plan, in both accounting modes. The charge holds a weak owner,
+    /// which avoids a plan and context reference cycle. A context that was never shared
+    /// has no owner to release through, so an eager one keeps such state uncharged, as
+    /// `None` says, while a cursor always has one.
     pub(super) fn retained_charge(&self, bytes: u64) -> Result<Option<RetainedCharge>> {
-        let Some(memory) = &self.cursor_memory else {
-            return Ok(None);
-        };
-        let charge = self.charge(bytes)?;
-        let owner = memory.owner.lock().clone();
+        let owner = self.owner.lock().clone();
         if owner.strong_count() == 0 {
+            if !self.streams {
+                return Ok(None);
+            }
             return Err(Error::invalid("cursor context owner has not been attached"));
         }
+        let charge = self.charge(bytes)?;
         let id = charge.disarm();
         Ok(Some(RetainedCharge { owner, id, bytes }))
     }
 
-    pub(super) fn cursor_regex(
+    /// The query's program of a regular expression, compiled and charged on first use.
+    /// `Ok(None)` for a pattern or flags that do not compile.
+    pub(super) fn regex(
         &self,
         pattern: &str,
         flags: &str,
-    ) -> Result<Option<Arc<super::cursor_regex::RegexState>>> {
-        self.cursor_memory
-            .as_ref()
-            .expect("cursor regex context")
-            .regex
-            .get(self, pattern, flags)
+    ) -> Result<Option<Arc<super::query_regex::RegexState>>> {
+        self.regex.get(self, pattern, flags)
+    }
+
+    /// Run `f` on the query's program of a regular expression without taking a
+    /// reference to it, which is the per-row path of `REGEX` and `REPLACE`.
+    #[inline]
+    pub(super) fn with_regex<R>(
+        &self,
+        pattern: &str,
+        flags: &str,
+        f: impl FnOnce(&super::query_regex::RegexState) -> R,
+    ) -> Result<Option<R>> {
+        self.regex.with(self, pattern, flags, f)
     }
 
     /// Give back `bytes` of estimated memory, and the pool's granules the query no
@@ -1271,65 +1466,100 @@ impl Ctx {
         }
     }
 
+    /// Release the state that only running work needs: the decode envelope and the
+    /// query's regular expressions. Execution ends with it in both accounting modes.
+    pub(super) fn release_work(&self) {
+        self.regex.clear();
+        self.release_decode_envelope();
+    }
+
+    /// [`Ctx::release_work`] under the name the cursor executor calls.
     pub(super) fn release_cursor_work(&self) {
-        if let Some(memory) = &self.cursor_memory {
-            memory.regex.clear();
-            let _bytes = std::mem::take(&mut *memory.decode_peak.lock());
-            memory.decoded_reserved.store(0, Ordering::Release);
-            self.memory().release_decode();
+        self.release_work();
+    }
+
+    fn release_decode_envelope(&self) {
+        let envelope = &self.decode;
+        let mut state = envelope.state.lock();
+        let (bytes, owner) = std::mem::take(&mut *state);
+        envelope.reserved.store(0, Ordering::Release);
+        drop(state);
+        if bytes == 0 {
+            return;
+        }
+        match owner {
+            // An eager envelope is a charge of its own.
+            Some(owner) => self.release_live(Some(owner), bytes),
+            // A cursor's is decode bytes on the ledger.
+            None => self.memory().release_decode(),
         }
     }
 
-    pub(super) fn check_cursor_memory(&self) -> Result<()> {
-        if let Some(memory) = &self.cursor_memory
-            && memory.failed.load(Ordering::Acquire)
-            && let Some(budget) = *memory.failure.lock()
-        {
-            return Err(Error::BudgetExceeded(budget));
+    /// Fail with the budget refusal that infallible code recorded (see
+    /// [`Ctx::fail_memory`]).
+    #[inline]
+    pub(super) fn check_memory_failure(&self) -> Result<()> {
+        let failure = &self.memory_failure;
+        if failure.failed.load(Ordering::Acquire) {
+            return self.recorded_failure();
         }
         Ok(())
     }
 
-    pub(super) fn fail_cursor(&self, error: &Error) {
-        if let Some(memory) = &self.cursor_memory
-            && let Error::BudgetExceeded(budget) = error
-        {
-            memory.failure.lock().get_or_insert(*budget);
-            memory.failed.store(true, Ordering::Release);
+    #[cold]
+    #[inline(never)]
+    fn recorded_failure(&self) -> Result<()> {
+        match *self.memory_failure.failure.lock() {
+            Some(budget) => Err(Error::BudgetExceeded(budget)),
+            None => Ok(()),
         }
     }
 
-    // Infallible expression interning must not turn a resource failure into an
-    // ordinary unbound BIND. Record it, refuse allocation, and fail the next check.
-    pub(crate) fn retain_cursor_bytes(&self, bytes: u64) -> bool {
-        let Some(memory) = &self.cursor_memory else {
-            return true;
-        };
-        if memory.failed.load(Ordering::Acquire) {
+    /// Record a budget refusal that infallible code met, so that the next check fails
+    /// with it, in both accounting modes.
+    pub(super) fn fail_memory(&self, error: &Error) {
+        if let Error::BudgetExceeded(budget) = error {
+            self.record_failure(*budget);
+        }
+    }
+
+    fn record_failure(&self, budget: Budget) {
+        let failure = &self.memory_failure;
+        failure.failure.lock().get_or_insert(budget);
+        failure.failed.store(true, Ordering::Release);
+    }
+
+    /// Charge `bytes` more of query-local terms and memos, which stay until the context
+    /// drops, in both accounting modes. Infallible expression interning must not turn a
+    /// resource failure into an ordinary unbound BIND, so a refusal is recorded and fails
+    /// the next check, and `false` tells the caller not to allocate.
+    pub(crate) fn retain_bytes(&self, bytes: u64) -> bool {
+        if self.memory_failure.failed.load(Ordering::Acquire) {
             return false;
         }
-        match self.charge(bytes) {
-            Ok(charge) => {
-                std::mem::forget(charge);
-                true
-            }
-            Err(Error::BudgetExceeded(budget)) => {
-                memory.failure.lock().get_or_insert(budget);
-                memory.failed.store(true, Ordering::Release);
+        let retained = &self.retained;
+        let used = retained.used.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        if retained.charge.covers(used) {
+            return true;
+        }
+        match self.grow_reservation(&retained.charge, used, u64::MAX, true) {
+            Ok(()) => true,
+            Err(error) => {
+                retained.used.fetch_sub(bytes, Ordering::AcqRel);
+                self.fail_memory(&error);
                 false
             }
-            Err(_) => unreachable!("memory charge returns a budget error"),
         }
     }
 
-    /// Admit transient decoding for an explicitly fallible operation. A refused
-    /// sort trial can release its storage and try a smaller piece; it must not
-    /// poison the cursor as an infallible scalar evaluation would.
-    pub(super) fn cursor_decode_checked(&self, bytes: usize) -> Result<()> {
-        let Some(memory) = &self.cursor_memory else {
-            return Ok(());
-        };
-        self.check_cursor_memory()?;
+    /// Admit transient decoding of a key of `bytes` bytes for an explicitly fallible
+    /// operation. A refused sort trial can release its storage and try a smaller piece,
+    /// so it must not poison the context as an infallible scalar evaluation would. The
+    /// envelope covers a key of the largest size seen so far on every worker, so the
+    /// common path is one atomic load.
+    #[inline]
+    pub(super) fn reserve_decode_checked(&self, bytes: usize) -> Result<()> {
+        self.check_memory_failure()?;
         let workers = if rayon::current_thread_index().is_some() {
             rayon::current_num_threads() as u64 + 1
         } else {
@@ -1339,28 +1569,92 @@ impl Ctx {
             .saturating_mul(8)
             .saturating_add(1024)
             .saturating_mul(workers);
-        if memory.decoded_reserved.load(Ordering::Acquire) >= need {
-            return self.check_cursor_memory();
+        if self.decode.reserved.load(Ordering::Acquire) >= need {
+            return Ok(());
         }
-        let mut peak = memory.decode_peak.lock();
-        if need > *peak {
-            let owner = self.memory().owner(self.grant.as_ref())?;
-            self.memory()
-                .reserve(&owner, self.mem_limit, need - *peak, true)?;
-            *peak = need;
-            memory.decoded_reserved.store(need, Ordering::Release);
-        }
-        self.check_cursor_memory()
+        self.grow_decode(need)
     }
 
-    /// Reserve the same high-water envelope for an infallible scalar caller.
-    /// Its failure must stay sticky so an expression cannot become unbound.
-    pub(super) fn cursor_decode(&self, bytes: usize) -> bool {
-        match self.cursor_decode_checked(bytes) {
+    /// Whether the decode envelope can refuse a key before it is rebuilt. A cursor's
+    /// callers report a refusal through the next check, and eager callers cannot.
+    #[inline]
+    fn envelope_refuses(&self) -> bool {
+        self.streams()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_decode(&self, need: u64) -> Result<()> {
+        let envelope = &self.decode;
+        let mut state = envelope.state.lock();
+        let (peak, owner) = &mut *state;
+        if need > *peak {
+            // A cursor's callers of `term` and `value` report a refusal through the
+            // next check, so its envelope reserves on the ledger and can fail.
+            if self.envelope_refuses() {
+                let ledger = self.memory();
+                let account = ledger.owner(self.grant.as_ref())?;
+                ledger.reserve(&account, self.mem_limit, need - *peak, true)?;
+            } else {
+                // Eager callers of `term` and `value`, the planner's plan text and the
+                // readers of a finished result among them, cannot report a refusal. An
+                // eager envelope is therefore charged when the budget and the pool allow
+                // it, and otherwise the key is decoded without it, as eager decoding
+                // always was. The next growth tries the charge again.
+                let Ok(charge) = self.charge(need - *peak) else {
+                    return Ok(());
+                };
+                let id = charge.disarm();
+                debug_assert!(owner.is_none() || id.is_none() || *owner == id);
+                if owner.is_none() {
+                    *owner = id;
+                }
+            }
+            *peak = need;
+            envelope.reserved.store(need, Ordering::Release);
+        }
+        drop(state);
+        self.check_memory_failure()
+    }
+
+    /// Reserve the same envelope for an infallible scalar caller. Its failure stays
+    /// sticky so an expression cannot become unbound.
+    #[inline]
+    pub(super) fn reserve_decode(&self, bytes: usize) -> bool {
+        match self.reserve_decode_checked(bytes) {
             Ok(()) => true,
             Err(error) => {
-                self.fail_cursor(&error);
+                self.fail_memory(&error);
                 false
+            }
+        }
+    }
+
+    /// `f` of the key of base vocabulary id `id`, with its reconstruction and its
+    /// decoding inside the envelope. A refusal records a failure and gives `None`.
+    #[inline]
+    fn with_vocab_key<T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
+        if !self.envelope_refuses() {
+            // An envelope that never refuses is charged after the key is rebuilt, on the
+            // vocabulary's unchecked path. Checking it before each step of the rebuild
+            // made an eager `term` about a quarter slower, which writing a large answer
+            // term by term pays for every cell.
+            return self
+                .snap
+                .generation
+                .vocab
+                .get_with(id, |key| self.reserve_decode(key.len()).then(|| f(key)))
+                .flatten();
+        }
+        match self.snap.generation.vocab.get_with_checked(
+            id,
+            |need| self.reserve_decode_checked(need),
+            |key| self.reserve_decode(key.len()).then(|| f(key)),
+        ) {
+            Ok(found) => found.flatten(),
+            Err(error) => {
+                self.fail_memory(&error);
+                None
             }
         }
     }
@@ -1379,26 +1673,19 @@ impl Ctx {
     }
 
     /// An operator finished with `rows` rows: count them as produced, and fail once the
-    /// total passes [`Ctx::max_rows_produced`]. One atomic add per operator.
+    /// total passes [`Ctx::max_rows_produced`]. One atomic update per operator, in both
+    /// accounting modes. The counter never wraps: a total past `u64::MAX` fails the
+    /// query and leaves the counter as it was.
     #[inline]
     pub fn produced(&self, rows: usize) -> Result<()> {
-        if self.is_cursor() {
-            let prior = self
-                .rows_produced
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    n.checked_add(rows as u64)
-                })
-                .map_err(|_| self.produced_exceeded(u64::MAX))?;
-            let total = prior + rows as u64;
-            if total > self.max_rows_produced {
-                return Err(self.produced_exceeded(total));
-            }
-            return Ok(());
-        }
-        let total = self
+        let rows = rows as u64;
+        let prior = self
             .rows_produced
-            .fetch_add(rows as u64, Ordering::Relaxed)
-            .saturating_add(rows as u64);
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                n.checked_add(rows)
+            })
+            .map_err(|_| self.produced_exceeded(u64::MAX))?;
+        let total = prior + rows;
         if total > self.max_rows_produced {
             return Err(self.produced_exceeded(total));
         }
@@ -1480,18 +1767,15 @@ impl Ctx {
         Ok(c)
     }
 
-    /// The highest memory estimate of this context so far.
     /// Lower a finished eager query's retained pool contribution to what its result
-    /// keeps: `result` bytes of allocated output columns, the uncharged state that the
-    /// context still owns ([`Ctx::retained_state_bytes`]) and its live charges
-    /// (X08-P1-retained-results). The contribution otherwise stays at the query's
-    /// highest admitted estimate, including build and transient state, until the context
-    /// drops. A fast account within [`RETAIN_SLACK`] of what the result keeps is left
-    /// alone, so that a small query never takes the ledger. The grant and the fast
-    /// account are read before the context's caches, so that a query without a pool or
-    /// with a small contribution takes none of their locks.
+    /// keeps: `result` bytes of allocated output columns and its live charges, which
+    /// include the state the context keeps, its value cache, terms, memos and
+    /// geometries (X08-P1-retained-results). The contribution otherwise stays at the
+    /// query's highest admitted estimate, including build and transient state, until the
+    /// context drops. A fast account within [`RETAIN_SLACK`] of what the result keeps is
+    /// left alone, so that a small query never takes the ledger.
     pub(super) fn shrink_retained(&self, result: u64) -> Result<()> {
-        if self.cursor_memory.is_some() {
+        if self.streams {
             return Ok(());
         }
         let fast = match self.memory.get() {
@@ -1501,68 +1785,14 @@ impl Ctx {
                 _ => return Ok(()),
             },
         };
-        // What the context keeps is never less than its columns, so a contribution
-        // within the slack of those cannot shrink by more than the slack.
-        if fast.is_some_and(|admitted| admitted <= result.saturating_add(RETAIN_SLACK)) {
-            return Ok(());
-        }
-        let keep = result.saturating_add(self.retained_state_bytes());
+        // The output columns hold no lease, so the result keeps them on top of the
+        // live charges.
+        let keep = result.saturating_add(self.live_bytes());
+        // A contribution within the slack of what the result keeps is left alone.
         if fast.is_some_and(|admitted| admitted <= keep.saturating_add(RETAIN_SLACK)) {
             return Ok(());
         }
-        self.memory().shrink_eager(keep)
-    }
-
-    /// The bytes of the state an eager context keeps after execution without a charge:
-    /// the terms computed into its local vocabulary, its cached decoded values, its
-    /// parsed geometries and the memos of its blank nodes and callback terms. A map
-    /// counts the slots it has allocated, which clearing it keeps, and the heap storage
-    /// of its live keys and values.
-    fn retained_state_bytes(&self) -> u64 {
-        fn text(s: &str) -> u64 {
-            s.len() as u64 + 16
-        }
-        fn value(v: &Value) -> u64 {
-            match v {
-                Value::Iri(a) | Value::BNode(a) | Value::Str(a) => text(a),
-                Value::Lang(a, b) | Value::LangDir(a, b, _) => text(a) + text(b),
-                Value::Other { lex, dt } => text(lex) + text(dt),
-                Value::Triple(t) => 64 + t.to_string().len() as u64,
-                _ => 0,
-            }
-        }
-        /// The slots of a hash map with `capacity` entries of type `T`, with one
-        /// control byte each.
-        fn slots<T>(capacity: usize) -> u64 {
-            (capacity as u64).saturating_mul(std::mem::size_of::<T>() as u64 + 1)
-        }
-        let mut bytes = (self.local.read().bytes() as u64).saturating_add(self.geo.bytes() as u64);
-        for shard in &self.values {
-            let shard = shard.read();
-            bytes = bytes.saturating_add(slots::<(Id, Value)>(shard.capacity()));
-            for v in shard.values() {
-                bytes = bytes.saturating_add(value(v));
-            }
-        }
-        {
-            let memo = self.bnode_memo.lock();
-            bytes = bytes.saturating_add(slots::<((Vec<Id>, String), Id)>(memo.capacity()));
-            for (key, label) in memo.keys() {
-                bytes = bytes.saturating_add(key.capacity() as u64 * 8 + label.capacity() as u64);
-            }
-        }
-        for labels in [
-            &self.outside_bnodes,
-            &self.literal_bnodes,
-            &self.callback_bnodes,
-        ] {
-            let labels = labels.lock();
-            bytes = bytes.saturating_add(slots::<(String, Id)>(labels.capacity()));
-            for label in labels.keys() {
-                bytes = bytes.saturating_add(label.capacity() as u64);
-            }
-        }
-        bytes.saturating_add(slots::<(Id, u64)>(self.callback_terms.lock().capacity()))
+        self.memory().shrink_eager(result)
     }
 
     pub fn mem_peak(&self) -> u64 {
@@ -1654,7 +1884,7 @@ impl Ctx {
             let mut memo = self.literal_bnodes.lock();
             let id = match memo.get(b) {
                 Some(id) => *id,
-                None if self.retain_cursor_bytes(b.len() as u64 + 128) => {
+                None if self.retain_bytes(b.len() as u64 + 128) => {
                     let id = self.fresh_bnode();
                     memo.insert(b.to_string(), id);
                     id
@@ -1693,7 +1923,7 @@ impl Ctx {
             if let Some(&id) = scope.get(b) {
                 return id;
             }
-            if !self.retain_cursor_bytes(b.len() as u64 + 128) {
+            if !self.retain_bytes(b.len() as u64 + 128) {
                 return Id::UNDEF;
             }
             let id = self.fresh_bnode();
@@ -1726,7 +1956,7 @@ impl Ctx {
         if let Some(&id) = memo.get(label) {
             return id;
         }
-        if !self.retain_cursor_bytes(label.len() as u64 + 128) {
+        if !self.retain_bytes(label.len() as u64 + 128) {
             return Id::UNDEF;
         }
         let id = self.fresh_bnode();
@@ -1760,7 +1990,7 @@ impl Ctx {
         if let Some(i) = local.find(key) {
             return Id::local(i);
         }
-        if !self.retain_cursor_bytes(key.len() as u64 + 96) {
+        if !self.retain_bytes(key.len() as u64 + 96) {
             return Id::UNDEF;
         }
         Id::local(local.insert(key).0)
@@ -1830,7 +2060,11 @@ impl Ctx {
     /// Take the local terms and minted blank nodes of `other`, so that this context reads
     /// the ids `other` gave them (a query that reads a view with derived facts).
     pub(crate) fn share_local(&self, other: &Ctx) {
-        *self.local.write() = other.local.read().clone();
+        let local = other.local.read().clone();
+        // The copy is this context's own, so it is charged here, and a refusal fails the
+        // next check.
+        self.retain_bytes(local.bytes() as u64);
+        *self.local.write() = local;
         self.next_bnode
             .store(other.next_bnode.load(Ordering::Relaxed), Ordering::Relaxed);
     }
@@ -1846,7 +2080,7 @@ impl Ctx {
         if let Some(id) = memo.get(&key) {
             return *id;
         }
-        if !self.retain_cursor_bytes(key.0.len() as u64 * 8 + s.len() as u64 + 128) {
+        if !self.retain_bytes(key.0.len() as u64 * 8 + s.len() as u64 + 128) {
             return Id::UNDEF;
         }
         let id = self.fresh_bnode();
@@ -1854,32 +2088,31 @@ impl Ctx {
         id
     }
 
-    pub fn term(&self, id: Id) -> Option<Term> {
-        if self.is_cursor() {
-            return match id.tag() {
-                Tag::Local => {
-                    let local = self.local.read();
-                    let key = local.get(id.payload())?;
-                    self.cursor_decode(key.len()).then(|| id::key_to_term(key))
-                }
-                Tag::Vocab => self
-                    .with_cursor_vocab_key(id.payload(), |key| {
-                        self.cursor_decode(key.len()).then(|| id::key_to_term(key))
-                    })
-                    .inspect_err(|error| self.fail_cursor(error))
-                    .ok()
-                    .flatten()
-                    .flatten(),
-                Tag::Delta => self.snap.generation.dvocab.with(|vocab| {
-                    vocab
-                        .get(id.payload())
-                        .and_then(|key| self.cursor_decode(key.len()).then(|| id::key_to_term(key)))
-                }),
-                _ => self.snap.term(id),
-            };
-        }
+    /// A term for plan text, which no answer depends on. It is decoded without the
+    /// decode envelope in both accounting modes, as eager decoding always was, so that
+    /// describing a plan, such as a constant the planner substituted for a variable,
+    /// never fails the query it describes.
+    pub(super) fn plan_term(&self, id: Id) -> Option<Term> {
         match id.tag() {
             Tag::Local => self.local.read().get(id.payload()).map(id::key_to_term),
+            Tag::BNode => Some(Term::BlankNode(bnode_for(id))),
+            _ => self.snap.term(id),
+        }
+    }
+
+    pub fn term(&self, id: Id) -> Option<Term> {
+        match id.tag() {
+            Tag::Local => {
+                let local = self.local.read();
+                let key = local.get(id.payload())?;
+                self.reserve_decode(key.len()).then(|| id::key_to_term(key))
+            }
+            Tag::Vocab => self.with_vocab_key(id.payload(), id::key_to_term),
+            Tag::Delta => self.snap.generation.dvocab.with(|vocab| {
+                vocab
+                    .get(id.payload())
+                    .and_then(|key| self.reserve_decode(key.len()).then(|| id::key_to_term(key)))
+            }),
             Tag::BNode => Some(Term::BlankNode(bnode_for(id))),
             _ => self.snap.term(id),
         }
@@ -2064,10 +2297,9 @@ impl Ctx {
     /// Inline and numeric-column values keep their existing paths. Dictionary
     /// reconstruction and admitted decoding retain the same owner and charges.
     pub(super) fn cursor_value_checked(&self, id: Id) -> Result<Option<Value>> {
-        debug_assert!(self.is_cursor());
-        self.check_cursor_memory()?;
+        self.check_memory_failure()?;
         let decode = |key: &[u8]| -> Result<Value> {
-            self.cursor_decode_checked(key.len())?;
+            self.reserve_decode_checked(key.len())?;
             Ok(Value::from_key(key))
         };
         match id.tag() {
@@ -2106,61 +2338,103 @@ impl Ctx {
                 {
                     return Some(v);
                 }
-                // Inline scalars need no retained cache or RDF round trip. Only
-                // dictionary/local values bypass the uncharged eager cache.
-                if self.is_cursor() {
-                    let decode =
-                        |key: &[u8]| self.cursor_decode(key.len()).then(|| Value::from_key(key));
-                    return match id.tag() {
-                        Tag::Vocab => match self.with_cursor_vocab_key(id.payload(), decode) {
-                            Ok(value) => value.flatten(),
-                            Err(error) => {
-                                self.fail_cursor(&error);
-                                None
-                            }
-                        },
-                        Tag::Delta => self
-                            .snap
-                            .generation
-                            .dvocab
-                            .with(|v| v.get(id.payload()).and_then(decode)),
-                        Tag::Local => self.local.read().get(id.payload()).and_then(decode),
-                        _ => unreachable!("dictionary value tag"),
-                    };
+                if let Some(v) = self.values.get(id) {
+                    return Some(v);
                 }
-                let shard = self.shard(id);
-                if let Some(v) = shard.read().get(&id) {
-                    return Some(v.clone());
-                }
-                // straight from the key: building an RDF term first cost two string
-                // allocations per value (lexical form and datatype IRI)
+                let decode =
+                    |key: &[u8]| self.reserve_decode(key.len()).then(|| Value::from_key(key));
                 let v = match id.tag() {
-                    Tag::Vocab => self
-                        .snap
-                        .generation
-                        .vocab
-                        .get_with(id.payload(), Value::from_key)?,
+                    Tag::Vocab => self.with_vocab_key(id.payload(), Value::from_key),
                     Tag::Delta => self
                         .snap
                         .generation
                         .dvocab
-                        .with(|v| v.get(id.payload()).map(Value::from_key))?,
-                    Tag::Local => self.local.read().get(id.payload()).map(Value::from_key)?,
-                    _ => Value::from_term(&self.term(id)?),
-                };
-                let mut w = shard.write();
-                if w.len() > VALUE_SHARD_CAP {
-                    w.clear();
-                }
-                w.insert(id, v.clone());
+                        .with(|v| v.get(id.payload()).and_then(decode)),
+                    Tag::Local => self.local.read().get(id.payload()).and_then(decode),
+                    _ => unreachable!("dictionary value tag"),
+                }?;
+                self.cache_value(id, &v);
                 Some(v)
             }
         }
     }
 
-    #[inline]
-    fn shard(&self, id: Id) -> &RwLock<FxHashMap<Id, Value>> {
-        &self.values[(id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % VALUE_SHARDS]
+    /// Keep `v` as the decoded value of `id`, when the cache's reservation can grow to
+    /// hold it (see [`ValueCache`]). A refused reservation leaves the value uncached and
+    /// records no failure, since the cache is optional.
+    fn cache_value(&self, id: Id, v: &Value) {
+        let cache = &self.values;
+        let cap = ValueCache::cap(self.mem_limit);
+        let share = cap / VALUE_SHARDS as u64;
+        let entry = ValueCache::entry_bytes(v);
+        if entry > share {
+            return;
+        }
+        let mut shard = cache.shard(id).write();
+        if shard.map.contains_key(&id) {
+            return;
+        }
+        if shard.bytes + entry > share || shard.map.len() > VALUE_SHARD_CAP {
+            // The map is freed with its slots, so that the entries' estimate, slots
+            // included, leaves the cache with them.
+            cache.used.fetch_sub(shard.bytes, Ordering::AcqRel);
+            shard.bytes = 0;
+            shard.map = FxHashMap::default();
+        }
+        let used = cache.used.fetch_add(entry, Ordering::AcqRel) + entry;
+        if !cache.charge.covers(used)
+            && self
+                .grow_reservation(&cache.charge, used, cap, false)
+                .is_err()
+        {
+            cache.used.fetch_sub(entry, Ordering::AcqRel);
+            return;
+        }
+        shard.bytes += entry;
+        shard.map.insert(id, v.clone());
+    }
+
+    /// Grow `reservation` to cover `used` bytes, a step ahead within `cap`. The step is
+    /// [`EAGER_STEP`], or a sixty-fourth of a smaller memory budget. When the
+    /// budget or the pool cannot give the step, state that the query needs (`exact`)
+    /// takes exactly what it needs, while an optional cache declines, so that it never
+    /// takes the last room an operator needs. The charge stays with the context until it
+    /// drops. A refusal changes nothing.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn grow_reservation(
+        &self,
+        reservation: &StepReservation,
+        used: u64,
+        cap: u64,
+        exact: bool,
+    ) -> Result<()> {
+        #[cfg(test)]
+        VALUE_GROWS.with(|n| n.set(n.get() + 1));
+        let mut owner = reservation.grow.lock();
+        let reserved = reservation.reserved.load(Ordering::Acquire);
+        if used <= reserved {
+            return Ok(());
+        }
+        // A small budget takes small steps, so that the slack of the steps never holds
+        // more than a sixty-fourth of it.
+        let step = (self.mem_limit / 64).clamp(256, EAGER_STEP);
+        let ahead = used.next_multiple_of(step).min(cap).max(used);
+        let (charge, admitted) = match self.charge(ahead - reserved) {
+            Ok(charge) => (charge, ahead),
+            Err(_) if exact && ahead > used => (self.charge(used - reserved)?, used),
+            Err(error) => return Err(error),
+        };
+        let id = charge.disarm();
+        debug_assert!(
+            owner.is_none() || id.is_none() || *owner == id,
+            "one owner of a reservation"
+        );
+        if owner.is_none() {
+            *owner = id;
+        }
+        reservation.reserved.store(admitted, Ordering::Release);
+        Ok(())
     }
 
     /// Is the id an IRI / blank node / literal (without full decoding where possible)?
@@ -2204,42 +2478,31 @@ impl Ctx {
         let lexical = |k: &[u8]| -> Option<std::ops::Range<usize>> {
             (k.len() >= 2 && k[0] == b'"' && k[k.len() - 1] == id::KEY_SEP).then(|| 1..k.len() - 1)
         };
-        if self.is_cursor() {
-            // A cursor reserves the reconstruction of both keys before it grows them,
-            // within the high-water envelope of its transient decoding
-            // ([`Ctx::cursor_decode`]). That envelope covers a key of the largest size
-            // seen so far on every worker, both keys of a comparison included, is
-            // charged once when it grows and is released when the cursor ends, so a
-            // comparison of keys within it takes no lock. A reservation that fails
-            // fails the cursor, and the generic comparison follows.
-            let reserve = |need: usize| {
-                if self.cursor_decode(need) {
-                    Ok(())
-                } else {
-                    Err(())
-                }
-            };
-            let order = v.get_with_checked(x, reserve, |kx| {
-                let rx = lexical(kx)?;
-                v.get_with_checked(y, reserve, |ky| {
-                    let ry = lexical(ky)?;
-                    Some(kx[rx.clone()].cmp(&ky[ry]))
-                })
-                .ok()
-                .flatten()
-                .flatten()
-            });
-            return order.ok().flatten().flatten();
-        }
-        v.get_with(x, |kx| {
+        // The reconstruction of both keys is reserved before it grows them, within the
+        // high-water envelope of transient decoding ([`Ctx::reserve_decode`]). That
+        // envelope covers a key of the largest size seen so far on every worker, both
+        // keys of a comparison included, is charged once when it grows and is released
+        // when the work ends, so a comparison of keys within it takes no lock. A
+        // reservation that fails records the failure, and the generic comparison
+        // follows.
+        let reserve = |need: usize| {
+            if self.reserve_decode(need) {
+                Ok(())
+            } else {
+                Err(())
+            }
+        };
+        let order = v.get_with_checked(x, reserve, |kx| {
             let rx = lexical(kx)?;
-            v.get_with(y, |ky| {
+            v.get_with_checked(y, reserve, |ky| {
                 let ry = lexical(ky)?;
                 Some(kx[rx.clone()].cmp(&ky[ry]))
             })
+            .ok()
             .flatten()
-        })
-        .flatten()
+            .flatten()
+        });
+        order.ok().flatten().flatten()
     }
 
     /// For a base-vocabulary simple literal, the first base id whose key starts with its
@@ -2393,13 +2656,15 @@ impl RetainedCharge {
             .upgrade()
             .ok_or_else(|| Error::invalid("cursor context was released"))?;
         if bytes > self.bytes {
-            let ledger = ctx.memory();
-            let owner = self
-                .id
-                .map(|id| ledger.owner_by_id(id))
-                .map_or_else(|| ledger.owner(ctx.grant.as_ref()), Ok)?;
-            ledger.reserve(&owner, ctx.mem_limit, bytes - self.bytes, false)?;
-            self.id = Some(owner.id);
+            // A charge on the same owner, which an eager context's lock-free account
+            // takes without the ledger.
+            let charge = Charge {
+                ctx: &ctx,
+                bytes: std::cell::Cell::new(0),
+                owner: std::cell::Cell::new(self.id),
+            };
+            charge.add(bytes - self.bytes)?;
+            self.id = charge.disarm();
         } else {
             ctx.release_live(self.id, self.bytes - bytes);
         }
@@ -2524,13 +2789,83 @@ mod charge_tests {
         assert!(inline > 20, "most of the values are inline: {inline}");
     }
 
+    /// The executors read the accounting mode in at most this many places outside tests.
+    /// Stage 4 of item 453 lowers it as each `cursor_*` twin merges, to the planning and
+    /// routing sites that stage 6 removes, so that new twins do not come back.
+    const MODE_CHECKS: usize = 6;
+
+    /// Counts the calls of `streams()` in the non-test sources of the SPARQL engine,
+    /// and fails when they exceed [`MODE_CHECKS`] (decision D9 of item 453).
+    #[test]
+    fn the_accounting_mode_is_read_in_a_bounded_number_of_places() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sparql");
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        let mut sites = Vec::new();
+        for file in files {
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            if name == "tests.rs" || name.ends_with("_tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            // a file's unit tests follow its code
+            let code = text
+                .find("\n#[cfg(test)]\nmod ")
+                .map_or(text.as_str(), |end| &text[..end]);
+            for (line, content) in code.lines().enumerate() {
+                if content.contains(".streams()") {
+                    sites.push(format!("{name}:{}", line + 1));
+                }
+            }
+        }
+        assert!(
+            sites.len() <= MODE_CHECKS,
+            "{} reads of the accounting mode, more than {MODE_CHECKS}: {sites:?}",
+            sites.len()
+        );
+    }
+
+    /// A program compiled before the context has an owner, as in eager planning, is
+    /// uncharged, so the first attachment drops it and the next use charges it.
+    #[test]
+    fn regex_programs_compiled_before_the_owner_are_compiled_again_with_charges() {
+        let store = Store::in_memory(StoreOptions::default());
+        let context = Arc::new(Ctx::new(store.snapshot()));
+        let before = context.live_bytes();
+        let planned = context.regex("^ab+c$", "").unwrap().unwrap();
+        assert_eq!(context.live_bytes(), before, "no owner, no retained charge");
+        context.attach_owner();
+        let executed = context.regex("^ab+c$", "").unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&planned, &executed));
+        assert!(context.live_bytes() > before);
+        let charged = context.live_bytes();
+        // a second attachment keeps the charged programs
+        context.attach_owner();
+        let again = context.regex("^ab+c$", "").unwrap().unwrap();
+        assert!(Arc::ptr_eq(&executed, &again));
+        assert_eq!(context.live_bytes(), charged);
+        drop((planned, executed, again));
+        context.release_work();
+        assert_eq!(context.live_bytes(), before);
+    }
+
     #[test]
     fn retained_cursor_charges_release_and_do_not_keep_context_alive() {
         let store = Store::in_memory(StoreOptions::default());
         let mut context = Ctx::new(store.snapshot());
         context.enable_cursor_accounting().unwrap();
         let context = Arc::new(context);
-        context.attach_cursor_owner();
+        context.attach_owner();
         let before = context.memory().live.load(Ordering::Relaxed);
         let mut retained = context.retained_charge(4096).unwrap().unwrap();
         assert_eq!(context.memory().live.load(Ordering::Relaxed), before + 4096);
@@ -2676,25 +3011,209 @@ mod charge_tests {
         assert_eq!(grant.granted(), 16 * MIB);
     }
 
-    /// A value cache shard that overflowed is cleared without giving back its slots,
-    /// and a finished result keeps them counted (X08-P1-retained-results).
-    #[test]
-    fn retained_state_counts_the_slots_a_cleared_value_shard_keeps() {
-        let ctx = Ctx::new(Store::in_memory(StoreOptions::default()).snapshot());
-        let empty = ctx.retained_state_bytes();
-        {
-            let mut shard = ctx.values[0].write();
-            for i in 0..70_000u64 {
-                shard.insert(Id(i), Value::Bool(true));
-            }
-            shard.clear();
+    /// `n` distinct query-local simple literals and their texts.
+    fn local_literals(ctx: &Ctx, n: usize) -> Vec<(Id, String)> {
+        (0..n)
+            .map(|i| {
+                let text = format!("literal number {i}");
+                let term = Term::Literal(oxrdf::Literal::new_simple_literal(text.clone()));
+                let id = ctx.intern_term(&term);
+                assert_eq!(id.tag(), Tag::Local);
+                (id, text)
+            })
+            .collect()
+    }
+
+    fn assert_text(value: Option<Value>, text: &str) {
+        match value {
+            Some(Value::Str(s)) => assert_eq!(&*s, text),
+            other => panic!("{other:?} for {text:?}"),
         }
-        let slots = 70_000 * std::mem::size_of::<(Id, Value)>() as u64;
-        assert!(
-            ctx.retained_state_bytes() >= empty + slots,
-            "{} bytes for {slots} bytes of slots",
-            ctx.retained_state_bytes()
+    }
+
+    /// Cached values are charged to the query, and a finished eager result keeps
+    /// their reservation in its pool contribution.
+    #[test]
+    fn cached_values_are_charged_and_kept_by_a_finished_result() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(256 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let ctx = pooled(&store, &grant);
+        let literals = local_literals(&ctx, 2_000);
+        for (id, text) in &literals {
+            assert_text(ctx.value(*id), text);
+        }
+        let reserved = ctx.values.reserved();
+        assert!(reserved >= 2_000 * 40, "{reserved} bytes reserved");
+        assert!(ctx.live_bytes() >= reserved);
+        assert!(grant.used() >= reserved);
+        ctx.shrink_retained(0).unwrap();
+        assert!(grant.used() >= reserved, "{} of {reserved}", grant.used());
+        // a second read hits the cache and reserves nothing more
+        for (id, text) in &literals {
+            assert_text(ctx.value(*id), text);
+        }
+        assert_eq!(ctx.values.reserved(), reserved);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    /// A cursor keeps the values cached before its transition and the charge of
+    /// them, and caches repeated values with one reservation step per 64 KiB.
+    #[test]
+    fn a_cursor_caches_repeated_values_in_steps() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(256 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let mut ctx = pooled(&store, &grant);
+        ctx.mem_limit = 64 * MIB;
+        let literals = local_literals(&ctx, 1_000);
+        assert_text(ctx.value(literals[0].0), &literals[0].1);
+        let prepared = ctx.values.reserved();
+        assert!(prepared > 0);
+        ctx.enable_cursor_accounting().unwrap();
+        assert_eq!(
+            ctx.values.reserved(),
+            prepared,
+            "the transition keeps the cache"
         );
+        assert!(ctx.memory().live.load(Ordering::SeqCst) >= prepared);
+        let before = super::VALUE_GROWS.with(|n| n.get());
+        for i in 0..100_000 {
+            let (id, text) = &literals[i % literals.len()];
+            assert_text(ctx.value(*id), text);
+        }
+        let grows = super::VALUE_GROWS.with(|n| n.get()) - before;
+        let reserved = ctx.values.reserved();
+        assert!(
+            grows as u64 <= reserved / EAGER_STEP + 1,
+            "{grows} growths for {reserved} bytes"
+        );
+        assert!(reserved <= ValueCache::cap(ctx.mem_limit));
+        assert!(ctx.live_bytes() <= ctx.mem_limit);
+        assert!(ctx.check().is_ok());
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    /// A budget that cannot hold the cache's reservation leaves every value bound and
+    /// uncached, in both accounting modes, and records no failure.
+    #[test]
+    fn a_refused_cache_reservation_leaves_values_bound() {
+        let store = Store::in_memory(StoreOptions::default());
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = MIB;
+            let literals = local_literals(&ctx, 200);
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let held = ctx.charge(MIB - ctx.live_bytes() - 10_000).unwrap();
+            for (id, text) in &literals {
+                assert_text(ctx.value(*id), text);
+            }
+            assert_eq!(ctx.values.reserved(), 0, "cursor {cursor}");
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+            drop(held);
+        }
+    }
+
+    /// Decoding a term reserves the decode envelope in both accounting modes, and the end
+    /// of the work releases it. A cursor refuses a decode that the budget cannot hold,
+    /// gives no term and fails the next check, so a refused decode never becomes an
+    /// unbound value. Eager callers cannot report a refusal, so an eager context decodes
+    /// without the envelope then.
+    #[test]
+    fn refused_decode_envelopes_fail_the_next_check() {
+        let store = Store::in_memory(StoreOptions::default());
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = MIB;
+            let literals = local_literals(&ctx, 2);
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let live = ctx.live_bytes();
+            assert!(ctx.term(literals[0].0).is_some(), "cursor {cursor}");
+            assert!(
+                ctx.live_bytes() > live,
+                "cursor {cursor}: the envelope is charged"
+            );
+            ctx.release_work();
+            assert_eq!(ctx.live_bytes(), live, "cursor {cursor}: and released");
+            let held = ctx.charge(MIB - live - 100).unwrap();
+            if cursor {
+                assert_eq!(ctx.term(literals[1].0), None);
+                assert!(
+                    matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
+                );
+            } else {
+                assert!(ctx.term(literals[1].0).is_some());
+                assert!(ctx.check().is_ok());
+            }
+            drop(held);
+        }
+    }
+
+    /// A finished result keeps its unleased output columns on top of the charged state
+    /// the context retains, such as its value cache.
+    #[test]
+    fn a_finished_result_keeps_its_output_and_its_charged_state() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(512 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let ctx = pooled(&store, &grant);
+        for (id, text) in &local_literals(&ctx, 2_000) {
+            assert_text(ctx.value(*id), text);
+        }
+        let state = ctx.live_bytes();
+        assert!(state > 0);
+        ctx.check_output((200 * MIB / 8) as usize, 1).unwrap();
+        ctx.shrink_retained(32 * MIB).unwrap();
+        assert!(
+            grant.used() >= state + 32 * MIB,
+            "{} of {}",
+            grant.used(),
+            state + 32 * MIB
+        );
+        assert!(grant.used() < 200 * MIB);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    /// A shard that reaches its share of the cache is freed with its slots, so that the
+    /// slots of cleared shards never pile up outside the reservation. The test watches
+    /// one shard through its evictions: a map cleared in place would keep the capacity
+    /// it had before the eviction.
+    #[test]
+    fn a_cleared_value_shard_frees_its_slots() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 8 * MIB;
+        let watched = ctx.values.shard(Id(0)) as *const _;
+        let literals: Vec<_> = local_literals(&ctx, 40_000)
+            .into_iter()
+            .filter(|(id, _)| std::ptr::eq(ctx.values.shard(*id), watched))
+            .collect();
+        let share = ValueCache::cap(ctx.mem_limit) / VALUE_SHARDS as u64;
+        let (mut before, mut evictions) = (0, 0);
+        for (id, text) in &literals {
+            assert_text(ctx.value(*id), text);
+            let shard = ctx.values.shard(*id).read();
+            if shard.bytes < before {
+                evictions += 1;
+                assert_eq!(shard.map.len(), 1);
+                assert!(
+                    shard.map.capacity() <= 4,
+                    "a cleared shard keeps {} slots",
+                    shard.map.capacity()
+                );
+            }
+            assert!(shard.bytes <= share);
+            before = shard.bytes;
+        }
+        assert!(evictions >= 2, "{evictions} evictions of the watched shard");
+        assert!(ctx.values.reserved() <= ValueCache::cap(ctx.mem_limit));
     }
 
     #[test]

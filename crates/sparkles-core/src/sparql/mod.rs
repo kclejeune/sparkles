@@ -11,7 +11,6 @@ pub mod charsets;
 mod constkeys;
 pub mod ctx;
 pub mod cursor;
-mod cursor_regex;
 pub mod depth;
 pub mod describe;
 pub mod enhancer;
@@ -40,6 +39,7 @@ pub mod policy;
 pub mod pool;
 mod propertyext;
 pub(crate) mod query_memory;
+mod query_regex;
 mod rangemask;
 pub mod rdfs;
 pub mod reasoning;
@@ -823,7 +823,7 @@ fn prepare_query(
     }
     let mut ctx = Arc::new(ctx);
     if cursor_started.is_some() && automatic.is_none() {
-        ctx.attach_cursor_owner();
+        ctx.attach_owner();
     }
     crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
     // the keys are visited only when asking for their groups can do something
@@ -871,8 +871,11 @@ fn prepare_query(
             .ok_or_else(|| Error::invalid("automatic cursor context is shared"))?;
         mutable.enable_cursor_accounting()?;
         mutable.deadline = opts.effective_deadline(started)?;
-        ctx.attach_cursor_owner();
     }
+    // Retained charges release through the shared context in both accounting modes.
+    // An eager context is attached once the automatic choice no longer needs it alone,
+    // so its planning keeps what it retains uncharged, as before.
+    ctx.attach_owner();
     ctx.check()?;
     Ok(PreparedQuery {
         ctx,
@@ -1026,9 +1029,13 @@ fn execute_prepared(
         let plan = Some(std::mem::take(&mut result.plan));
         return Err(Box::new(Failed { error, plan }));
     }
-    // The operators' state is gone, so the pool keeps only what the result holds. A
-    // graph result's triples are not measured, and it keeps its query's highest
-    // estimate as before.
+    // The operators' state goes with the plan, so the pool keeps only what the result
+    // holds. The plan's retained charges, such as an EXISTS memo or key set, are
+    // released before the shrink, which they would otherwise keep. A graph result's
+    // triples are not measured, and it keeps its query's highest estimate as before.
+    // Decoding the result reserves its envelope again when the budget allows.
+    drop(node);
+    ctx.release_work();
     if matches!(kind, QueryKind::Select | QueryKind::Ask)
         && let Err(error) = ctx.shrink_retained(result.table.capacity_bytes())
     {
@@ -1295,7 +1302,7 @@ fn template_term(
             let id = t.cols[c][row];
             if id.is_undef() {
                 None
-            } else if ctx.is_cursor() {
+            } else {
                 match ctx.batch_term(id) {
                     Ok(term) => term,
                     Err(error) => {
@@ -1303,8 +1310,6 @@ fn template_term(
                         None
                     }
                 }
-            } else {
-                ctx.term(id)
             }
         },
         &mut |b| {

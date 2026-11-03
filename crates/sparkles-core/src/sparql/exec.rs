@@ -28,6 +28,10 @@ pub(super) const PAR_THRESHOLD: usize = 16_384;
 /// than the work, and a short request would wait for threads on idle cores to wake.
 pub(super) const PAR_MIN_LEN: usize = 4096;
 
+/// Rows that the partitioned job of [`map_rows`] maps between two polls of cancellation
+/// and the deadline.
+const MAP_POLL_ROWS: usize = 1024;
+
 /// Map `f` over rows `0..n` (in parallel when `par`) in chunks, checking cancellation and
 /// the deadline between chunks: one clock read per chunk rather than per row, while an
 /// expensive expression still stops within one chunk of the deadline.
@@ -37,10 +41,14 @@ pub(super) fn map_rows<T: Send>(
     par: bool,
     f: impl Fn(usize) -> T + Sync + Send,
 ) -> Result<Vec<T>> {
-    if par && ctx.is_cursor() {
-        // Submit one partitioned job and poll within each partition. Repeated
-        // 1024-row pool submissions cost more than cheap numeric predicates.
-        // Temporary collector capacity is optional and reserved before dispatch.
+    if par {
+        // Submit one partitioned job and poll within each partition. Repeated pool
+        // submissions cost more than cheap numeric predicates. Temporary collector
+        // capacity is optional and reserved before dispatch. A piece holds at least
+        // one poll's rows, and no more, so that a table just above `PAR_THRESHOLD`
+        // still spreads over every thread: pieces of `PAR_MIN_LEN` rows left the
+        // 20,000 groups of `subquery-agg` at 10.5M triples on four of twelve threads,
+        // which made its eager FILTER about 12% slower.
         let bytes = (n as u64)
             .saturating_mul(std::mem::size_of::<T>() as u64)
             .saturating_mul(2)
@@ -48,9 +56,9 @@ pub(super) fn map_rows<T: Send>(
         if let Ok(_scratch) = ctx.charge(bytes) {
             return (0..n)
                 .into_par_iter()
-                .with_min_len(PAR_MIN_LEN)
+                .with_min_len(MAP_POLL_ROWS)
                 .map(|i| {
-                    if i.is_multiple_of(1024) {
+                    if i.is_multiple_of(MAP_POLL_ROWS) {
                         ctx.check()?;
                     }
                     Ok(f(i))
@@ -58,11 +66,9 @@ pub(super) fn map_rows<T: Send>(
                 .collect();
         }
     }
-    let chunk = if par && !ctx.is_cursor() {
-        1 << 16
-    } else {
-        1 << 10
-    };
+    // Without the collector's charge, a parallel map runs in pieces that each collect
+    // into the output.
+    let chunk = if par { 1 << 16 } else { 1 << 10 };
     let mut out = Vec::with_capacity(n);
     let mut start = 0;
     while start < n {
@@ -89,8 +95,8 @@ const BATCH_PAR_NANOS: u128 = 200_000;
 /// Rows per parallel piece of a cursor batch.
 const BATCH_PAR_PIECE: usize = 256;
 
-/// [`map_rows`] for one batch of a cursor, whose rows are too few for the row count
-/// alone to say whether the pool pays. The first [`BATCH_SAMPLE_ROWS`] rows are mapped
+/// [`map_rows`] for a batch of at most [`PAR_THRESHOLD`] rows, such as one of a cursor,
+/// whose rows are too few for the row count alone to say whether the pool pays. The first [`BATCH_SAMPLE_ROWS`] rows are mapped
 /// on this thread and timed, and the rest are mapped in parallel when `par` allows it
 /// and their projected time reaches [`BATCH_PAR_NANOS`]. A cheap expression, such as
 /// arithmetic on inline numbers, stays on this thread, and an expensive one, such as
@@ -2015,22 +2021,13 @@ fn par_count_on_keys(
         return Ok(None);
     }
     let vocab = &ctx.snap.generation.vocab;
-    let piece = if ctx.is_cursor() {
-        PIECE.min(
-            (ctx.memory_remaining() / rayon::current_num_threads().max(1) as u64 / 128).max(1)
-                as usize,
-        )
-    } else {
-        PIECE
-    };
+    let piece = PIECE.min(
+        (ctx.memory_remaining() / rayon::current_num_threads().max(1) as u64 / 128).max(1) as usize,
+    );
     let parts =
         ctx.snap
             .par_blocks_in_ranges(spec.perm, ranges, run_mask(spec), piece, |b, s, e| {
-                let _scratch = if ctx.is_cursor() {
-                    Some(ctx.charge((e - s) as u64 * 48 + 1024)?)
-                } else {
-                    None
-                };
+                let _scratch = ctx.charge((e - s) as u64 * 48 + 1024)?;
                 let mut out = KeyCount {
                     _cursor_charge: ctx.retained_charge((e - s) as u64 * 32 + 256)?,
                     ..Default::default()
@@ -2048,37 +2045,34 @@ fn par_count_on_keys(
                 });
                 let mut pass = vec![false; ids.len()];
                 let mut j = 0;
+                let bound = kf.bind();
                 let mut test = |p, key: &[u8]| {
                     while ids[j] != p {
                         j += 1;
                     }
-                    pass[j] = kf.test(key);
+                    pass[j] = bound.test(key);
                 };
-                if ctx.is_cursor() {
-                    let scratch = ctx.charge(0)?;
-                    let mut reserved = 0;
-                    let mut tested = 0usize;
-                    vocab.get_sorted_checked(
-                        &ids,
-                        |need| {
+                let scratch = ctx.charge(0)?;
+                let mut reserved = 0;
+                let mut tested = 0usize;
+                vocab.get_sorted_checked(
+                    &ids,
+                    |need| {
+                        ctx.check()?;
+                        let bytes = (need as u64).saturating_mul(2);
+                        scratch.add(bytes.saturating_sub(reserved))?;
+                        reserved = bytes;
+                        Ok::<(), Error>(())
+                    },
+                    |p, key| {
+                        test(p, key);
+                        tested += 1;
+                        if tested.is_multiple_of(1024) {
                             ctx.check()?;
-                            let bytes = (need as u64).saturating_mul(2);
-                            scratch.add(bytes.saturating_sub(reserved))?;
-                            reserved = bytes;
-                            Ok::<(), Error>(())
-                        },
-                        |p, key| {
-                            test(p, key);
-                            tested += 1;
-                            if tested.is_multiple_of(1024) {
-                                ctx.check()?;
-                            }
-                            Ok::<(), Error>(())
-                        },
-                    )?;
-                } else {
-                    vocab.get_sorted(&ids, test);
-                }
+                        }
+                        Ok::<(), Error>(())
+                    },
+                )?;
                 for (h, n) in pass.iter().zip(&counts) {
                     if *h {
                         out.rows += n;
@@ -2387,6 +2381,7 @@ pub(super) fn filter_scan_morsel(
                 // for its match caches. The copies are kept for later tasks, whose regular
                 // expressions then start with warm caches.
                 let kf = filters.lock().pop().unwrap_or_else(|| kf.clone());
+                let bound = kf.bind();
                 let scratch = ctx.charge(0)?;
                 let mut reserved = 0;
                 let mut at = 0;
@@ -2403,10 +2398,11 @@ pub(super) fn filter_scan_morsel(
                         while payloads[at] != p {
                             at += 1;
                         }
-                        pass[lo + at] = kf.test(k);
+                        pass[lo + at] = bound.test(k);
                         Ok::<(), Error>(())
                     },
                 )?;
+                drop(bound);
                 drop(payloads);
                 filters.lock().push(kf);
                 if lo > 0 || hi < values.len() {
@@ -3472,25 +3468,13 @@ fn totally_ordered(ctx: &Ctx, id: Id) -> bool {
     match id.tag() {
         Tag::Double => !id.as_f64().is_nan(),
         Tag::DateTime | Tag::Date => false,
-        Tag::Vocab | Tag::Delta => match ctx.value(id) {
-            Some(Value::Double(d)) => !d.is_nan(),
-            Some(Value::Float(f)) => !f.is_nan(),
-            Some(
-                Value::DateTime(_)
-                | Value::Date(_)
-                | Value::Time(_)
-                | Value::Duration(_)
-                | Value::YearMonth(_)
-                | Value::DayTime(_)
-                | Value::Triple(_),
-            ) => false,
-            _ => true,
-        },
+        Tag::Vocab | Tag::Delta => value_totally_ordered(ctx.value(id).as_ref()),
         _ => true,
     }
 }
 
-fn cursor_totally_ordered(value: Option<&Value>) -> bool {
+/// [`totally_ordered`] for a decoded dictionary value.
+fn value_totally_ordered(value: Option<&Value>) -> bool {
     match value {
         Some(Value::Double(d)) => !d.is_nan(),
         Some(Value::Float(f)) => !f.is_nan(),
@@ -3524,16 +3508,16 @@ fn topk_rest(
         rest.append(t);
         ctx.check_output(rest.len(), rest.width())?;
     }
-    // Cursor contexts deliberately have no eager decoded-value cache. Decode
-    // dictionary ORDER values in one charged, operation-local pass instead of
-    // reconstructing a front-coded key again for every row of every check.
-    let decoded = if ctx.is_cursor() {
+    // Up to `PAR_THRESHOLD` rows, decode the dictionary ORDER values once each in key
+    // order, in one charged, operation-local pass, for the checks and the prefilter
+    // below. A larger input reads them through the value cache in parallel.
+    let decoded = if rest.len() <= PAR_THRESHOLD {
         super::exprcache::cursor_dictionary_values(ctx, &rest, &Expr::Var(spec.var))?
     } else {
         None
     };
     let total = match &decoded {
-        Some(values) => cursor_rest_total(ctx, &rest, values)?,
+        Some(values) => rest_total(ctx, &rest, values)?,
         None => {
             let total = |id: &Id| totally_ordered(ctx, *id);
             if rest.len() > PAR_THRESHOLD / 4 {
@@ -3547,13 +3531,12 @@ fn topk_rest(
         return Ok(None);
     }
     let keys = [(Expr::Var(spec.var), spec.asc)];
-    // A cursor ranks the rounded values it decoded above, rather than decoding the same
-    // dictionary values again in the prefilter of `order_by`.
+    // Rank the rounded values decoded above, rather than decoding the same dictionary
+    // values again in the prefilter of `order_by`.
     if let Some(values) = &decoded
         && ctx.opt.topk_prefilter
         && rest.len() > spec.k
-        && let Some((rows, charge)) =
-            cursor_topk_candidates(ctx, &rest, &keys, spec.k, Some(values))?
+        && let Some((rows, charge)) = topk_candidates(ctx, &rest, &keys, spec.k, Some(values))?
         && rows.len() < rest.len()
     {
         ctx.check_output(rows.len(), rest.width())?;
@@ -3571,7 +3554,7 @@ fn topk_rest(
 
 /// Whether every value of the first column of `rest` is totally ordered, with its
 /// dictionary values decoded in `values`.
-fn cursor_rest_total(
+fn rest_total(
     ctx: &Ctx,
     rest: &Table,
     values: &super::exprcache::PerValue<Option<Value>>,
@@ -3580,7 +3563,7 @@ fn cursor_rest_total(
         if i.is_multiple_of(1024) {
             ctx.check()?;
         }
-        if !cursor_totally_ordered(value.as_ref()) {
+        if !value_totally_ordered(value.as_ref()) {
             return Ok(false);
         }
     }
@@ -3599,7 +3582,7 @@ fn cursor_rest_total(
     Ok(true)
 }
 
-/// The rows that the heap of [`cursor_topk_rest`] holds, a slot of the scan's ids for
+/// The rows that the heap of [`topk_rest_morsels`] holds, a slot of the scan's ids for
 /// each row.
 struct RestSlots {
     width: usize,
@@ -3608,7 +3591,7 @@ struct RestSlots {
     key_bytes: u64,
 }
 
-/// The rows of one morsel offered to the heap of [`cursor_topk_rest`].
+/// The rows of one morsel offered to the heap of [`topk_rest_morsels`].
 struct RestOffer<'a> {
     slots: &'a mut RestSlots,
     table: &'a Table,
@@ -3649,11 +3632,11 @@ impl HeapRows<u32> for RestOffer<'_> {
 /// piece without value order: a single block.
 const TOPK_MORSEL_ROWS: usize = crate::index::BLOCK_ROWS;
 
-/// The rows a morsel of [`cursor_topk_rest`] keeps, the rows its scan produced and, when
+/// The rows a morsel of [`topk_rest_morsels`] keeps, the rows its scan produced and, when
 /// the scan drops union-graph duplicates, the last of those rows.
 type MorselBest = (Table, usize, Option<Vec<Id>>);
 
-/// The keys `[first, last]` of one morsel of [`cursor_topk_rest`], the piece it belongs
+/// The keys `[first, last]` of one morsel of [`topk_rest_morsels`], the piece it belongs
 /// to and the rows of its blocks.
 struct Morsel {
     first: Key,
@@ -3663,16 +3646,16 @@ struct Morsel {
     rows: usize,
 }
 
-/// [`topk_rest`] for a cursor. The pieces are split into morsels of whole index blocks,
+/// [`topk_rest`] with a heap. The pieces are split into morsels of whole index blocks,
 /// which are read in parallel. Each morsel keeps its rows that have fewer than k rows of
 /// the morsel ahead of them, ties broken by arrival, in arrival order, and those rows are
 /// then offered in order to one heap of the best k. A row that a morsel drops has k rows
 /// of the same morsel at least as good that arrived before it, so the heap keeps the
-/// rows that [`order_by`] keeps over the concatenated pieces. The cursor holds a morsel
+/// rows that [`order_by`] keeps over the concatenated pieces. The query holds a morsel
 /// per worker thread and the rows they keep, instead of every row of the pieces. A morsel
 /// is checked for values that are not totally ordered before it ranks its rows, and one
 /// such value sends the whole query to the generic plan, as it does eagerly.
-fn cursor_topk_rest(
+fn topk_rest_morsels(
     ctx: &Ctx,
     spec: &OrderedTopK,
     vars: &[VarId],
@@ -3818,7 +3801,7 @@ fn cursor_topk_rest(
     Ok(Some(rest))
 }
 
-/// The rows of one morsel of [`cursor_topk_rest`] that have fewer than k rows of the
+/// The rows of one morsel of [`topk_rest_morsels`] that have fewer than k rows of the
 /// morsel ahead of them, in arrival order, and the rows the morsel read; `None` when one
 /// of its values is not totally ordered.
 fn morsel_best(
@@ -3839,7 +3822,7 @@ fn morsel_best(
     rows.add(t.mem_bytes().saturating_sub(estimate))?;
     let decoded = super::exprcache::cursor_dictionary_values(ctx, &t, &Expr::Var(spec.var))?;
     let total = match &decoded {
-        Some(values) => cursor_rest_total(ctx, &t, values)?,
+        Some(values) => rest_total(ctx, &t, values)?,
         // without a decoded column, values are read one at a time, as eager execution
         // reads them
         None => t.cols[0].iter().all(|&id| totally_ordered(ctx, id)),
@@ -3849,8 +3832,7 @@ fn morsel_best(
     }
     if ctx.opt.topk_prefilter
         && t.len() > spec.k
-        && let Some((rows, charge)) =
-            cursor_topk_candidates(ctx, &t, keys, spec.k, decoded.as_ref())?
+        && let Some((rows, charge)) = topk_candidates(ctx, &t, keys, spec.k, decoded.as_ref())?
         && rows.len() < t.len()
     {
         t = t.take_rows(&rows);
@@ -3906,8 +3888,8 @@ pub(super) fn ordered_topk(
             }),
         }
     }
-    let rest = if ctx.is_cursor() && heap_eligible(ctx) {
-        cursor_topk_rest(ctx, spec, &vars, &whole, &mut scanned)?
+    let rest = if heap_eligible(ctx) {
+        topk_rest_morsels(ctx, spec, &vars, &whole, &mut scanned)?
     } else {
         topk_rest(ctx, spec, &vars, &whole, &mut scanned)?
     };
@@ -5548,11 +5530,26 @@ fn anti_join(
 
 // ------------------------------------------------------------ expressions ------
 
+/// Row-aligned decoded value columns with the charge that holds their slots and values.
+struct Decoded {
+    cols: super::expr::DecodedCols,
+    _charge: Option<super::ctx::RetainedCharge>,
+}
+
+impl Decoded {
+    fn cols(decoded: &Option<Decoded>) -> Option<&super::expr::DecodedCols> {
+        decoded.as_ref().map(|d| &d.cols)
+    }
+}
+
 /// Decode the base-vocabulary ids of the columns the expressions read into row-aligned
-/// value columns: rows are argsorted by id so every distinct term is decoded once and
-/// each front-coded block is touched once (in parallel); per-row lookups are then O(1)
-/// and lock-free.
-fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::DecodedCols> {
+/// value columns for a table of more than [`PAR_THRESHOLD`] rows: rows are argsorted by
+/// id so every distinct term is decoded once and each front-coded block is touched once
+/// (in parallel); per-row lookups are then O(1) and lock-free. A smaller table, such as
+/// a cursor's batch, reads its values through the value cache row by row. Each column's
+/// slots are charged before it is decoded and its values after, and a column whose
+/// charge does not fit is left to the rows, as are the columns after it.
+fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<Decoded> {
     if t.len() < 2 || !exprs.iter().any(|e| super::expr::needs_values(e)) {
         return None;
     }
@@ -5571,11 +5568,28 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
         }
         return None;
     }
-    if ctx.is_cursor() {
+    if t.len() <= PAR_THRESHOLD {
         return None;
     }
     let vocab = &ctx.snap.generation.vocab;
     let mut out: super::expr::DecodedCols = vec![None; t.width()];
+    let mut charge: Option<super::ctx::RetainedCharge> = None;
+    // Charge `total` bytes in all, `false` when the query cannot hold them. Shrinking
+    // always fits.
+    let mut set = |total: u64| -> bool {
+        match &mut charge {
+            Some(charge) => charge.resize(total).is_ok(),
+            None => match ctx.retained_charge(total) {
+                Ok(c) => {
+                    charge = c;
+                    true
+                }
+                Err(_) => false,
+            },
+        }
+    };
+    // what the finished columns hold
+    let mut kept = 0u64;
     for v in vars {
         let Some(c) = t.col_of(v) else { continue };
         let col = &t.cols[c];
@@ -5585,11 +5599,20 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
         if idx.len() < 4096 {
             continue;
         }
+        // While the column is made: its slots, the sorted rows with their distinct ids,
+        // and the distinct decoded values before they move to their rows.
+        let slots = col.len() as u64 * std::mem::size_of::<Option<Value>>() as u64;
+        let scratch = idx.len() as u64 * (12 + std::mem::size_of::<Value>() as u64);
+        if !set(kept.saturating_add(slots).saturating_add(scratch)) {
+            set(kept);
+            break;
+        }
         idx.par_sort_unstable_by_key(|&i| col[i as usize]);
         let mut uniq: Vec<u64> = idx.iter().map(|&i| col[i as usize].payload()).collect();
         uniq.dedup();
         let decoded = decode_sorted(vocab, &uniq);
         if decoded.len() != uniq.len() {
+            set(kept);
             continue;
         }
         let mut vals: Vec<Option<Value>> = vec![None; col.len()];
@@ -5608,9 +5631,25 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
                 vals[i as usize] = Some(decoded[j].clone());
             }
         }
+        let payload: u64 = vals
+            .par_iter()
+            .with_min_len(PAR_MIN_LEN)
+            .map(key_payload)
+            .sum();
+        // A column that does not fit gives back everything it charged.
+        let total = kept.saturating_add(slots).saturating_add(payload);
+        if !set(total) {
+            set(kept);
+            break;
+        }
+        kept = total;
         out[c] = Some(vals);
     }
-    Some(out)
+    drop(set);
+    Some(Decoded {
+        cols: out,
+        _charge: charge,
+    })
 }
 
 /// Ask for the vocabulary pages of the terms in the columns of `vars` of a small table
@@ -5747,12 +5786,12 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
             table: t,
             i,
             map: &map,
-            dec: dec.as_ref(),
+            dec: Decoded::cols(&dec),
         };
         exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
     };
     let parallel = exprs.iter().all(Expr::parallel);
-    let keep = if ctx.is_cursor() && t.len() <= PAR_THRESHOLD {
+    let keep = if t.len() <= PAR_THRESHOLD {
         map_batch(ctx, t.len(), parallel, test)?
     } else {
         map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && parallel, test)?
@@ -5789,9 +5828,10 @@ fn string_order_mask(
     let (Some(cx), Some(cy)) = (t.col_of(x), t.col_of(y)) else {
         return Ok(None);
     };
-    // A cursor's batch would rebuild the cache for each batch. Its rows compare their
-    // two keys directly instead (see `val_cmp`).
-    if n < STRING_ORDER_ROWS || ctx.is_cursor() {
+    // A cursor's batch would reconstruct the floors of its strings without reserving
+    // the decoding, which only an eager query may do. Its rows compare their two keys
+    // directly instead (see `val_cmp`), with the decoding admitted.
+    if n < STRING_ORDER_ROWS || ctx.streams() {
         return Ok(None);
     }
     let (xs, ys) = (&t.cols[cx], &t.cols[cy]);
@@ -5880,21 +5920,10 @@ pub(super) fn compute_column(
     if let Some(col) = super::exists::column(ctx, t, e)? {
         return Ok(col);
     }
-    if ctx.is_cursor() {
-        return match super::exprcache::cursor_column(ctx, t, e, report, |v| column_rows(ctx, v, e))?
-        {
-            Some(ids) => Ok(ids),
-            None => column_rows(ctx, t, e),
-        };
+    match super::exprcache::column(ctx, t, e, report, |v| column_rows(ctx, v, e))? {
+        Some(ids) => Ok(ids),
+        None => column_rows(ctx, t, e),
     }
-    if t.len() >= super::exprcache::MIN_ROWS
-        && super::exprcache::eligible(&[e]).is_ok()
-        && let Some(p) =
-            super::exprcache::per_value(ctx, t, &[e], false, report, |v| column_rows(ctx, v, e))?
-    {
-        return Ok(p.rows(t.len()));
-    }
-    column_rows(ctx, t, e)
 }
 
 fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
@@ -5906,66 +5935,37 @@ fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
             table: t,
             i,
             map: &map,
-            dec: dec.as_ref(),
+            dec: Decoded::cols(&dec),
         },
         ctx,
     ) {
         Ok(v) => v.into_id(ctx),
         Err(_) => Id::UNDEF,
     };
-    if ctx.is_cursor() && t.len() <= PAR_THRESHOLD {
+    if t.len() <= PAR_THRESHOLD {
         return map_batch(ctx, t.len(), e.parallel(), f);
     }
     map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && e.parallel(), f)
 }
 
+type Candidates = (Vec<usize>, Option<super::ctx::RetainedCharge>);
+
 /// Candidate rows for `ORDER BY ?v LIMIT k` when every `?v` is a number other than NaN:
 /// a rounded `f64` per row is cheap, and rows whose rounded key is worse than the k-th
 /// best rounded key have at least k rows strictly ahead of them in the exact order (the
 /// rounding is monotone and numbers order by value first), so they cannot be among the
-/// first k. `None` when the shortcut does not apply.
-fn topk_candidates(ctx: &Ctx, t: &Table, keys: &[(Expr, bool)], k: usize) -> Option<Vec<usize>> {
-    let [(Expr::Var(v), asc)] = keys else {
-        return None;
-    };
-    if k == 0 || k.saturating_mul(8) > t.len() {
-        return None;
-    }
-    let col = &t.cols[t.col_of(*v)?];
-    let approx = |id: Id| -> Option<f64> {
-        use crate::id::Tag;
-        match id.tag() {
-            Tag::Int => Some(id.as_i64() as f64),
-            Tag::Double => Some(id.as_f64()).filter(|d| !d.is_nan()),
-            Tag::Decimal => Some(super::value::decimal_f64(crate::id::unpack_decimal(
-                id.payload(),
-            ))),
-            Tag::Vocab | Tag::Delta => super::value::approx_f64(&ctx.value(id)?),
-            _ => None,
-        }
-    };
-    // ascending order ⇔ smallest first; negate so that "best" is always the largest
-    let sign = if *asc { -1.0 } else { 1.0 };
-    let f: Vec<f64> = col
-        .par_iter()
-        .with_min_len(PAR_MIN_LEN)
-        .map(|&id| approx(id).map(|d| d * sign))
-        .collect::<Option<Vec<f64>>>()?;
-    let mut sorted = f.clone();
-    let (_, kth, _) = sorted.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
-    let tau = *kth;
-    Some((0..f.len()).filter(|&i| f[i] >= tau).collect())
-}
-
-type CursorCandidates = (Vec<usize>, Option<super::ctx::RetainedCharge>);
-
-fn cursor_topk_candidates(
+/// first k. `None` when the shortcut does not apply, or when its charge does not fit.
+///
+/// Dictionary values come from `decoded` when a caller has them. Otherwise an input of
+/// at most [`PAR_THRESHOLD`] rows decodes its dictionary values once each in key order,
+/// and a larger input reads them through the value cache in parallel.
+fn topk_candidates(
     ctx: &Ctx,
     t: &Table,
     keys: &[(Expr, bool)],
     k: usize,
     decoded: Option<&super::exprcache::PerValue<Option<Value>>>,
-) -> Result<Option<CursorCandidates>> {
+) -> Result<Option<Candidates>> {
     let [(expr @ Expr::Var(var), asc)] = keys else {
         return Ok(None);
     };
@@ -5984,10 +5984,11 @@ fn cursor_topk_candidates(
     let owned;
     let values = match decoded {
         Some(values) => Some(values),
-        None => {
+        None if t.len() <= PAR_THRESHOLD => {
             owned = super::exprcache::cursor_dictionary_values(ctx, t, expr)?;
             owned.as_ref()
         }
+        None => None,
     };
     let column = &t.cols[column];
     let sign = if *asc { -1.0 } else { 1.0 };
@@ -6075,17 +6076,13 @@ fn order_by(
         ctx.snap.generation.vocab.prefetch_values(&ids);
     }
     let mut notes = Vec::new();
-    let mut cursor_candidate_charge = None;
+    let mut candidate_charge = None;
     if let Some(k) = limit
         && ctx.opt.topk_prefilter
-        && let Some(cand) = if ctx.is_cursor() {
-            cursor_topk_candidates(ctx, &t, keys, k, None)?.map(|(rows, charge)| {
-                cursor_candidate_charge = charge;
-                rows
-            })
-        } else {
-            topk_candidates(ctx, &t, keys, k)
-        }
+        && let Some(cand) = topk_candidates(ctx, &t, keys, k, None)?.map(|(rows, charge)| {
+            candidate_charge = charge;
+            rows
+        })
         && cand.len() < t.len()
     {
         // the candidates keep their relative order, so ties break as in the full sort
@@ -6093,7 +6090,7 @@ fn order_by(
         ctx.check_output(cand.len(), t.width())?;
         t = t.take_rows(&cand);
     }
-    drop(cursor_candidate_charge);
+    drop(candidate_charge);
     if let Some(k) = limit
         && ctx.opt.topk_first_key
         && keys.len() > 1
@@ -6188,38 +6185,36 @@ pub(super) fn offer_rows<P>(
     report: &mut ExprReport,
     rows: &mut impl HeapRows<P>,
 ) -> Result<usize> {
-    // the first key's column of SortKeys, beyond the values a cursor column charges
-    let _first_charge = if ctx.is_cursor() {
-        Some(ctx.charge(t.len() as u64 * std::mem::size_of::<SortKey>() as u64 + 128)?)
-    } else {
-        None
-    };
+    // the first key's column of SortKeys, beyond the values its column charges
+    let _first_charge = ctx.charge(t.len() as u64 * std::mem::size_of::<SortKey>() as u64 + 128)?;
     let mut sources = Vec::with_capacity(keys.len());
     for (i, (e, _)) in keys.iter().enumerate() {
         sources.push(match e {
-            // A large first key is decoded in parallel in eager execution, where values
-            // come from the shared cache. A cursor has no such cache, and decodes each
-            // dictionary value of the batch once, in key order.
-            Expr::Var(v) if i == 0 && !ctx.is_cursor() && t.len() > PAR_THRESHOLD => {
-                match t.col_of(*v) {
-                    Some(c) => {
-                        let col = &t.cols[c];
-                        HeapKey::Column(super::exprcache::Column::Rows {
-                            vals: col
-                                .par_iter()
-                                .with_min_len(PAR_MIN_LEN)
-                                .map(|&id| id_key(ctx, id))
-                                .collect(),
-                            _charge: None,
-                        })
-                    }
-                    None => HeapKey::Var(None),
+            // A large first key is decoded in parallel through the value cache. A smaller
+            // one decodes each dictionary value once, in key order.
+            Expr::Var(v) if i == 0 && t.len() > PAR_THRESHOLD => match t.col_of(*v) {
+                Some(c) => {
+                    let col = &t.cols[c];
+                    let vals: Vec<SortKey> = col
+                        .par_iter()
+                        .with_min_len(PAR_MIN_LEN)
+                        .map(|&id| id_key(ctx, id))
+                        .collect();
+                    // The keys' decoded payloads stay with the column until the heap
+                    // is done, whatever the value cache keeps.
+                    let payload: u64 = vals
+                        .par_iter()
+                        .with_min_len(PAR_MIN_LEN)
+                        .map(SortKey::payload_bytes)
+                        .sum();
+                    HeapKey::Column(super::exprcache::Column::Rows {
+                        vals,
+                        _charge: ctx.retained_charge(payload)?,
+                    })
                 }
-            }
-            Expr::Var(_) if i == 0 && ctx.is_cursor() => {
-                HeapKey::Column(key_column(ctx, t, e, report)?.map(SortKey::new))
-            }
-            Expr::Var(v) => HeapKey::Var(t.col_of(*v).map(|c| t.cols[c].as_slice())),
+                None => HeapKey::Var(None),
+            },
+            Expr::Var(v) if i > 0 => HeapKey::Var(t.col_of(*v).map(|c| t.cols[c].as_slice())),
             _ if i == 0 => HeapKey::Column(key_column(ctx, t, e, report)?.map(SortKey::new)),
             _ => HeapKey::Expr(e),
         });
@@ -6402,10 +6397,54 @@ fn key_rows(
     map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && e.parallel(), f)
 }
 
+/// The bytes an ORDER key's value holds beyond its slot.
+fn key_payload(value: &Option<Value>) -> u64 {
+    match value {
+        Some(Value::Iri(s) | Value::BNode(s) | Value::Str(s)) => s.len() as u64 + 64,
+        Some(Value::Lang(s, lang) | Value::LangDir(s, lang, _)) => {
+            (s.len() + lang.len()) as u64 + 128
+        }
+        Some(Value::Other { lex, dt }) => (lex.len() + dt.len()) as u64 + 128,
+        Some(Value::Triple(triple)) => super::graph_triple_bytes(triple),
+        _ => 0,
+    }
+}
+
+/// The value of an ORDER key on every row, charged until the sort releases it. An input
+/// of at most [`PAR_THRESHOLD`] rows is evaluated on this thread, each value admitted
+/// before the column keeps it. A larger input is evaluated in parallel, with `dec`'s
+/// decoded columns, after its slots are charged, and its values' payload is charged
+/// once they are made, so a query over its budget fails after one column's payload.
+fn key_column_charged(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    dec: Option<&super::expr::DecodedCols>,
+) -> Result<super::exprcache::Column<Option<Value>>> {
+    if t.len() <= PAR_THRESHOLD {
+        return key_rows_charged(ctx, t, e);
+    }
+    let slots = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
+    let mut charge = ctx.retained_charge(slots)?;
+    let vals = key_rows(ctx, t, e, dec)?;
+    let payload: u64 = vals
+        .par_iter()
+        .with_min_len(PAR_MIN_LEN)
+        .map(key_payload)
+        .sum();
+    if let Some(charge) = &mut charge {
+        charge.resize(slots.saturating_add(payload))?;
+    }
+    Ok(super::exprcache::Column::Rows {
+        vals,
+        _charge: charge,
+    })
+}
+
 /// Own decoded ORDER keys until the sort releases them. The current evaluated
 /// value is transient expression memory; admit its payload before retaining it
 /// in the column, rather than retaining an uncharged whole-answer value array.
-fn cursor_key_rows(
+fn key_rows_charged(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
@@ -6435,16 +6474,7 @@ fn cursor_key_rows(
             Some(Val::V(v) | Val::Dec(_, v)) => Some(v),
             None => None,
         };
-        let payload = match &value {
-            Some(Value::Iri(s) | Value::BNode(s) | Value::Str(s)) => s.len() as u64 + 64,
-            Some(Value::Lang(s, lang) | Value::LangDir(s, lang, _)) => {
-                (s.len() + lang.len()) as u64 + 128
-            }
-            Some(Value::Other { lex, dt }) => (lex.len() + dt.len()) as u64 + 128,
-            Some(Value::Triple(triple)) => super::graph_triple_bytes(triple),
-            _ => 0,
-        };
-        bytes = bytes.saturating_add(payload);
+        bytes = bytes.saturating_add(key_payload(&value));
         if let Some(charge) = &mut charge {
             charge.resize(bytes)?;
         }
@@ -6465,20 +6495,38 @@ fn key_per_value(
     e: &Expr,
     report: &mut ExprReport,
 ) -> Result<Option<super::exprcache::PerValue<Option<Value>>>> {
-    if ctx.is_cursor() {
-        if let Some(values) = super::exprcache::cursor_numeric_values(ctx, t, e, report, |v| {
-            key_rows(ctx, v, e, None)
-        })? {
-            return Ok(Some(values));
-        }
+    // Numeric keys reuse their input ids, from a dense range of integers at any size and
+    // from a sort up to `PAR_THRESHOLD` rows. A variable's values are decoded once each
+    // in key order at any size, so that the sort holds one value per distinct term, and
+    // another key of a larger input evaluates each distinct value once, in parallel.
+    if let Some(values) =
+        super::exprcache::cursor_numeric_values(ctx, t, e, report, |v| key_rows(ctx, v, e, None))?
+    {
+        return Ok(Some(values));
+    }
+    if t.len() <= PAR_THRESHOLD {
         return super::exprcache::cursor_variable_values(ctx, t, e);
+    }
+    if let Some(values) = super::exprcache::cursor_variable_values(ctx, t, e)? {
+        return Ok(Some(values));
     }
     if t.len() < super::exprcache::MIN_ROWS {
         return Ok(None);
     }
-    super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
-        key_rows(ctx, v, e, decode_for(ctx, v, &[e]).as_ref())
-    })
+    let mut values = super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
+        key_rows(ctx, v, e, Decoded::cols(&decode_for(ctx, v, &[e])))
+    })?;
+    // The distinct keys' payloads stay with them until the sort is done.
+    if let Some(values) = &mut values {
+        let payload: u64 = values
+            .vals
+            .par_iter()
+            .with_min_len(PAR_MIN_LEN)
+            .map(key_payload)
+            .sum();
+        values.retain(ctx, payload)?;
+    }
+    Ok(values)
 }
 
 /// The value of an ORDER BY key on every row, per distinct value where it can be.
@@ -6490,16 +6538,8 @@ fn key_column(
 ) -> Result<super::exprcache::Column<Option<Value>>> {
     Ok(match key_per_value(ctx, t, e, report)? {
         Some(p) => super::exprcache::Column::Values(p),
-        None => {
-            if ctx.is_cursor() {
-                return cursor_key_rows(ctx, t, e);
-            }
-            let dec = decode_for(ctx, t, &[e]);
-            super::exprcache::Column::Rows {
-                vals: key_rows(ctx, t, e, dec.as_ref())?,
-                _charge: None,
-            }
-        }
+        None if t.len() <= PAR_THRESHOLD => key_column_charged(ctx, t, e, None)?,
+        None => key_column_charged(ctx, t, e, Decoded::cols(&decode_for(ctx, t, &[e])))?,
     })
 }
 
@@ -6510,18 +6550,13 @@ fn order_by_rows(
     limit: Option<usize>,
     report: &mut ExprReport,
 ) -> Result<Table> {
-    let _cursor_sort_charge = if ctx.is_cursor() {
-        Some(
-            ctx.charge(
-                (t.len() as u64)
-                    .saturating_mul(24)
-                    .saturating_add(t.mem_bytes().saturating_mul(2))
-                    .saturating_add(keys.len() as u64 * 128 + 1024),
-            )?,
-        )
-    } else {
-        None
-    };
+    // the sort's positions and the sorted copy of the table
+    let _sort_charge = ctx.charge(
+        (t.len() as u64)
+            .saturating_mul(24)
+            .saturating_add(t.mem_bytes().saturating_mul(2))
+            .saturating_add(keys.len() as u64 * 128 + 1024),
+    )?;
     let mut cached = Vec::with_capacity(keys.len());
     for (e, _) in keys {
         cached.push(key_per_value(ctx, &t, e, report)?);
@@ -6533,18 +6568,18 @@ fn order_by_rows(
         .filter(|(_, c)| c.is_none())
         .map(|((e, _), _)| e)
         .collect();
-    let dec = decode_for(ctx, &t, &rest);
+    let dec = if t.len() > PAR_THRESHOLD {
+        decode_for(ctx, &t, &rest)
+    } else {
+        None
+    };
     let key_vals: Vec<super::exprcache::Column<Option<Value>>> = keys
         .iter()
         .zip(cached)
         .map(|((e, _), c)| {
             Ok(match c {
                 Some(p) => super::exprcache::Column::Values(p),
-                None if ctx.is_cursor() => cursor_key_rows(ctx, &t, e)?,
-                None => super::exprcache::Column::Rows {
-                    vals: key_rows(ctx, &t, e, dec.as_ref())?,
-                    _charge: None,
-                },
+                None => key_column_charged(ctx, &t, e, Decoded::cols(&dec))?,
             })
         })
         .collect::<Result<_>>()?;

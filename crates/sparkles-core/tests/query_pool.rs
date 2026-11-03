@@ -1031,3 +1031,28 @@ fn a_result_keeps_its_blank_node_memo_covered() {
         "{used} bytes for 100,000 memo entries, at least {floor}"
     );
 }
+
+/// The EXISTS memo and key sets of a finished eager query are charged and belong to its
+/// plan, which goes before the pool contribution shrinks, so a small result of a query
+/// with 100,000 EXISTS keys does not keep them in the pool (item 453 stage 4).
+#[test]
+fn a_finished_result_gives_back_its_exists_state() {
+    let s = store_rows(100_000);
+    let pool = QueryPool::new(1024 * MB);
+    let opts = QueryOptions {
+        pool: Some(pool.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let q = "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER EXISTS { ?s <urn:p> ?w } }";
+    let result = query(s.snapshot(), q, &opts).unwrap();
+    assert_eq!(result.rows().len(), 1);
+    assert!(result.mem_peak_bytes > 4 * MB, "{}", result.mem_peak_bytes);
+    let used = result.ctx.grant().unwrap().used();
+    assert!(
+        used <= 2 * MB,
+        "the one-row result keeps {used} bytes of the pool"
+    );
+    drop(result);
+    assert_eq!(pool.granted(), 0);
+}

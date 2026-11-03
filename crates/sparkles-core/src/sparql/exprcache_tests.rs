@@ -242,6 +242,143 @@ fn random_queries_agree_with_and_without_the_cache() {
     }
 }
 
+/// The sorted rows of a cursor with `batch_rows` rows a batch.
+fn cursor_rows(
+    snap: &Arc<crate::store::Snapshot>,
+    text: &str,
+    opt: Optimizations,
+    batch_rows: usize,
+) -> Vec<String> {
+    let mut rows = cursor_rows_in_order(snap, text, opt, batch_rows);
+    rows.sort();
+    rows
+}
+
+fn cursor_rows_in_order(
+    snap: &Arc<crate::store::Snapshot>,
+    text: &str,
+    opt: Optimizations,
+    batch_rows: usize,
+) -> Vec<String> {
+    let opts = QueryOptions {
+        optimizations: Some(opt),
+        no_cache: true,
+        ..Default::default()
+    };
+    let cursor = super::cursor::CursorOptions {
+        batch_rows,
+        ..Default::default()
+    };
+    let text = format!("{PREFIXES}{text}");
+    let mut c = select_cursor(snap.clone(), &text, &opts, &cursor)
+        .unwrap_or_else(|e| panic!("{text}: {e}"));
+    let mut rows = Vec::new();
+    while let Some(b) = c.next_batch().unwrap_or_else(|e| panic!("{text}: {e}")) {
+        for i in 0..b.len() {
+            rows.push(
+                b.row(i)
+                    .unwrap()
+                    .into_iter()
+                    .map(|t| t.map_or("UNDEF".to_string(), |t| t.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+    }
+    rows
+}
+
+/// ORDER BY and its top k choose their key columns, candidate prefilter and decoding by
+/// input size in both accounting modes. Sorts of inputs on both sides of
+/// `exec::PAR_THRESHOLD` rows give the same rows in the same order eagerly and in
+/// cursors with batches on both sides of it. The keys break every tie between distinct
+/// rows, so the first k rows are one set.
+#[test]
+fn sorts_agree_on_both_sides_of_the_threshold() {
+    let queries = [
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ?v STR(?v) LANG(?v) DATATYPE(?v) ?s",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } \
+         ORDER BY DESC(?v) DESC(STR(?v)) DESC(LANG(?v)) DESC(DATATYPE(?v)) ?s LIMIT 40",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY STR(?v) ?s LIMIT 25",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY UCASE(STR(?v)) STR(?v) ?s",
+        "SELECT (xsd:double(?v) AS ?d) WHERE { ?s ex:v ?v FILTER(isNumeric(?v)) } \
+         ORDER BY ?v LIMIT 30",
+        "SELECT (xsd:double(?v) AS ?d) WHERE { ?s ex:v ?v FILTER(isNumeric(?v)) } \
+         ORDER BY DESC(?v) LIMIT 30",
+        // keys over a dense range of computed integers, bound on every row
+        "SELECT ?s ?k WHERE { ?s ex:v ?v BIND(COALESCE(STRLEN(STR(?v)), 0) AS ?k) } \
+         ORDER BY DESC(ABS(?k - 6)) ?s STR(?v) LIMIT 40",
+        "SELECT ?s ?k WHERE { ?s ex:v ?v BIND(COALESCE(STRLEN(STR(?v)), 0) AS ?k) } \
+         ORDER BY (?k * 2) ?s STR(?v)",
+    ];
+    for (seed, n) in [
+        (0x2f0e_11d3_95a1_c407, super::exec::PAR_THRESHOLD / 2),
+        (0x6c3a_8e51_02bd_f913, 2 * super::exec::PAR_THRESHOLD),
+    ] {
+        let s = store(seed, n, false);
+        let snap = s.snapshot();
+        for q in queries {
+            let eager = show(&run_on(snap.clone(), q, Optimizations::ALL));
+            assert!(!eager.is_empty(), "{q}");
+            assert_eq!(show(&run_on(snap.clone(), q, without())), eager, "{n} {q}");
+            for batch_rows in [4096, super::exec::PAR_THRESHOLD + 4096] {
+                assert_eq!(
+                    cursor_rows_in_order(&snap, q, Optimizations::ALL, batch_rows),
+                    eager,
+                    "{n} {q}; {batch_rows}"
+                );
+            }
+        }
+    }
+}
+
+/// Inputs above `exec::PAR_THRESHOLD` rows take the table algorithms (an estimate of
+/// the distinct inputs and a parallel expansion) and inputs below it the batch
+/// algorithms, in both accounting modes, and both agree with evaluation row by row:
+/// eager execution of the whole table, and cursors with batches on both sides of the
+/// threshold.
+#[test]
+fn the_table_and_batch_algorithms_agree_with_rows_on_both_sides_of_the_threshold() {
+    let mut next = xorshift(0x51_7cc1_b727_220a);
+    let s = store(next(), 2 * super::exec::PAR_THRESHOLD, false);
+    let snap = s.snapshot();
+    let mut cached = 0;
+    for i in 0..24 {
+        let shape = SHAPES[i % SHAPES.len()];
+        let e = EXPRS[(next() % EXPRS.len() as u64) as usize];
+        let p = PATTERNS[(next() % PATTERNS.len() as u64) as usize];
+        let q = shape.replace("{E}", e).replace("{P}", p);
+        cached += check(&snap, &q) as usize;
+        if q.contains("ORDER BY") || q.contains("GROUP BY") {
+            continue;
+        }
+        let expected = cursor_rows(&snap, &q, without(), 4096);
+        for batch_rows in [4096, super::exec::PAR_THRESHOLD + 4096] {
+            assert_eq!(
+                cursor_rows(&snap, &q, Optimizations::ALL, batch_rows),
+                expected,
+                "{q}; {batch_rows}"
+            );
+        }
+    }
+    assert!(cached > 0);
+    // A pattern that does not compile fails the filter on every row in both modes,
+    // where the key tests decline it. The 2,000 rows of repeated values take the batch
+    // FILTER, which admits key tests by the shape of the conjunct.
+    let values: String = (0..2000).map(|i| format!("\"v{}\" ", i % 7)).collect();
+    for filter in ["REGEX(STR(?x), \"[\")", "REGEX(?x, \"[\")"] {
+        let q = format!("SELECT ?x WHERE {{ VALUES ?x {{ {values} }} FILTER({filter}) }}");
+        assert!(
+            show(&run_on(snap.clone(), &q, Optimizations::ALL)).is_empty(),
+            "{filter}"
+        );
+        assert!(
+            cursor_rows(&snap, &q, Optimizations::ALL, 4096).is_empty(),
+            "{filter}"
+        );
+    }
+}
+
 /// The cache runs on repeated values, says how often it reused a result, and steps
 /// aside for nearly distinct inputs and impure expressions.
 #[test]

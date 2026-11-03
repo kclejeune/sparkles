@@ -7,7 +7,7 @@
 //! straight off the key are compiled; ids that are not stored terms (inline numbers and
 //! dates, blank nodes, unbound) are left to the general evaluator.
 
-use super::expr::{CmpOp, Expr, Func, compile_regex, lang_matches_bytes};
+use super::expr::{CmpOp, Expr, Func, lang_matches_bytes};
 use super::table::VarId;
 use super::value::Value;
 use crate::id::KEY_SEP;
@@ -38,13 +38,9 @@ enum Test {
     },
     Regex {
         arg: Arg,
-        re: regex::Regex,
+        /// the query's program, or `None` in a filter compiled only for its prefixes
+        re: Option<super::query_regex::RegexHandle>,
         /// the text every match starts with, for a pattern anchored at the start
-        prefix: Option<Arc<str>>,
-    },
-    CursorRegex {
-        arg: Arg,
-        re: super::cursor_regex::RegexHandle,
         prefix: Option<Arc<str>>,
     },
     /// `LANGMATCHES(LANG(?v), "range")`
@@ -83,6 +79,18 @@ fn length_test(e: &Expr, v: VarId) -> Option<Test> {
         op,
         bound: constant,
     })
+}
+
+/// Where a key filter's regular expressions come from.
+#[derive(Clone, Copy)]
+enum Programs<'a> {
+    /// the query's charged programs
+    Query(&'a super::ctx::Ctx),
+    /// uncharged programs of the filter's own, for the tests of the filter alone
+    #[cfg_attr(not(test), allow(dead_code))]
+    Own,
+    /// none, for a filter that only gives its prefixes
+    None,
 }
 
 /// A conjunction of key tests over one variable.
@@ -192,21 +200,25 @@ fn const_str(e: &Expr) -> Option<&str> {
 }
 
 impl KeyFilter {
-    /// Cursor fallbacks and planning use this admission too: otherwise an eager
-    /// subtree could compile an uncharged regex into the thread-local cache.
+    /// Compile filter conjuncts over `v` with the query's charged regular expressions,
+    /// in both accounting modes. `None` unless every conjunct is a supported test, or
+    /// when the filter's state does not fit the budget.
     pub(super) fn new_for(ctx: &super::ctx::Ctx, exprs: &[Expr], v: VarId) -> Option<Self> {
-        if !ctx.is_cursor() {
-            return Self::new(exprs, v);
-        }
         let bytes = Self::cursor_scratch_bytes(
             exprs,
             v,
             rayon::current_num_threads().saturating_mul(4096),
         )?;
         let charge = ctx.retained_charge(bytes).ok()?;
-        let mut filter = Self::compile(Some(ctx), exprs, v)?;
+        let mut filter = Self::compile(Programs::Query(ctx), exprs, v)?;
         filter.1 = charge.map(Arc::new);
         Some(filter)
+    }
+
+    /// [`KeyFilter::key_prefixes`] of the filter [`KeyFilter::new_for`] would compile,
+    /// without compiling its regular expressions, for the planner's estimates.
+    pub(super) fn plan_prefixes(exprs: &[Expr], v: VarId) -> Option<Vec<Vec<u8>>> {
+        Self::compile(Programs::None, exprs, v)?.key_prefixes()
     }
 
     /// Reserve cursor metadata before compiling key tests. Regex programs and
@@ -256,18 +268,15 @@ impl KeyFilter {
         Some(total.saturating_mul(rows.div_ceil(4096).saturating_add(1) as u64))
     }
 
-    /// Compile filter conjuncts over `v`; `None` unless every conjunct is a supported test.
+    /// Compile filter conjuncts over `v` with uncharged programs of their own; `None`
+    /// unless every conjunct is a supported test.
+    #[cfg(test)]
     pub fn new(exprs: &[Expr], v: VarId) -> Option<KeyFilter> {
-        Self::compile(None, exprs, v)
+        Self::compile(Programs::Own, exprs, v)
     }
 
-    fn compile(ctx: Option<&super::ctx::Ctx>, exprs: &[Expr], v: VarId) -> Option<KeyFilter> {
-        fn add(
-            ctx: Option<&super::ctx::Ctx>,
-            e: &Expr,
-            v: VarId,
-            out: &mut Vec<Test>,
-        ) -> Option<()> {
+    fn compile(ctx: Programs<'_>, exprs: &[Expr], v: VarId) -> Option<KeyFilter> {
+        fn add(ctx: Programs<'_>, e: &Expr, v: VarId, out: &mut Vec<Test>) -> Option<()> {
             if let Some(test) = length_test(e, v) {
                 out.push(test);
                 return Some(());
@@ -303,17 +312,19 @@ impl KeyFilter {
                         _ => "",
                     };
                     let pattern = const_str(p)?;
-                    match ctx {
-                        Some(ctx) => Test::CursorRegex {
-                            arg: Arg::of(a, v)?,
-                            re: ctx.cursor_regex(pattern, flags).ok()??.handle(),
-                            prefix: regex_prefix(pattern, flags).map(Into::into),
-                        },
-                        None => Test::Regex {
-                            arg: Arg::of(a, v)?,
-                            re: compile_regex(pattern, flags).ok()?,
-                            prefix: regex_prefix(pattern, flags).map(Into::into),
-                        },
+                    let arg = Arg::of(a, v)?;
+                    let re = match ctx {
+                        Programs::Query(ctx) => Some(ctx.regex(pattern, flags).ok()??.handle()),
+                        Programs::Own => Some(Arc::new(
+                            super::query_regex::RegexState::compile(None, pattern, flags).ok()??,
+                        )
+                        .handle()),
+                        Programs::None => None,
+                    };
+                    Test::Regex {
+                        arg,
+                        re,
+                        prefix: regex_prefix(pattern, flags).map(Into::into),
                     }
                 }
                 (Function::LangMatches, [Expr::Call(Func::Builtin(Function::Lang), l), r])
@@ -349,11 +360,6 @@ impl KeyFilter {
                     arg,
                     prefix: Some(p),
                     ..
-                }
-                | Test::CursorRegex {
-                    arg,
-                    prefix: Some(p),
-                    ..
                 } => (*arg, p),
                 _ => return None,
             };
@@ -370,7 +376,39 @@ impl KeyFilter {
 
     /// Whether the term with this key passes (type errors fail the filter).
     pub fn test(&self, key: &[u8]) -> bool {
+        self.test_with(key, |_, re, s| {
+            re.as_ref()
+                .expect("a tested filter has compiled its regular expressions")
+                .is_match(s)
+        })
+    }
+
+    /// The filter as this thread tests many keys with it, with the thread's copy of each
+    /// regular expression found once rather than for each key. Each copy is found at the
+    /// first search of its expression, as an unbound test finds it, so that a worker's
+    /// optional cache is admitted only after the storage the first key needed.
+    pub(super) fn bind(&self) -> BoundKeyFilter<'_> {
+        let regexes = self
+            .0
+            .iter()
+            .filter(|t| matches!(t, Test::Regex { .. }))
+            .count();
+        BoundKeyFilter {
+            filter: self,
+            matchers: (0..regexes).map(|_| std::cell::OnceCell::new()).collect(),
+        }
+    }
+
+    /// [`KeyFilter::test`] with `regex(i, program, text)` matching the `i`th regular
+    /// expression of the filter.
+    #[inline]
+    fn test_with<'s>(
+        &'s self,
+        key: &[u8],
+        mut regex: impl FnMut(usize, &'s Option<super::query_regex::RegexHandle>, &str) -> bool,
+    ) -> bool {
         let key = split(key);
+        let mut regexes = 0;
         // UTF-8 is self-synchronizing: a byte match of a UTF-8 needle in a UTF-8 string
         // is a match of the strings
         self.0.iter().all(|t| match t {
@@ -404,14 +442,13 @@ impl KeyFilter {
                         _ => s.ends_with(needle.as_bytes()),
                     }
             }),
-            Test::Regex { arg, re, .. } => arg
-                .read(&key)
-                .and_then(|(s, _)| std::str::from_utf8(s).ok())
-                .is_some_and(|s| re.is_match(s)),
-            Test::CursorRegex { arg, re, .. } => arg
-                .read(&key)
-                .and_then(|(s, _)| std::str::from_utf8(s).ok())
-                .is_some_and(|s| re.is_match(s)),
+            Test::Regex { arg, re, .. } => {
+                let i = regexes;
+                regexes += 1;
+                arg.read(&key)
+                    .and_then(|(s, _)| std::str::from_utf8(s).ok())
+                    .is_some_and(|s| regex(i, re, s))
+            }
             Test::LangMatches(range) => match &key {
                 // Basic language filtering only compares bytes. The final validity
                 // check rejects malformed UTF-8 after all predicates pass.
@@ -421,6 +458,30 @@ impl KeyFilter {
                 _ => false,
             },
         }) && key.valid()
+    }
+}
+
+/// A key filter as one thread tests many keys with it, from [`KeyFilter::bind`].
+pub(super) struct BoundKeyFilter<'a> {
+    filter: &'a KeyFilter,
+    /// the thread's program of each regular expression of the filter, in order, found
+    /// at its first search
+    matchers: Vec<std::cell::OnceCell<super::query_regex::Matcher<'a>>>,
+}
+
+impl BoundKeyFilter<'_> {
+    /// [`KeyFilter::test`] on this thread.
+    #[inline]
+    pub(super) fn test(&self, key: &[u8]) -> bool {
+        self.filter.test_with(key, |i, re, s| {
+            self.matchers[i]
+                .get_or_init(|| {
+                    re.as_ref()
+                        .expect("a tested filter has compiled its regular expressions")
+                        .matcher()
+                })
+                .is_match(s)
+        })
     }
 }
 
@@ -589,6 +650,80 @@ mod tests {
             Literal::new_language_tagged_literal_unchecked("Ada", "EN").into()
         )));
         assert!(!f.test(&key(Literal::new_simple_literal("Ada").into())));
+    }
+
+    /// A bound filter takes each regular expression's own program after earlier tests
+    /// fail or pass, on a Rayon worker and outside one.
+    #[test]
+    fn a_bound_filter_tests_as_the_filter_does() {
+        let v = 0;
+        let str_v = || call(Function::Str, vec![Expr::Var(v)]);
+        let regex = |p: &str| call(Function::Regex, vec![str_v(), lit(p)]);
+        let filter = KeyFilter::new(
+            &[
+                regex("^http://x/a"),
+                call(Function::Contains, vec![str_v(), lit("b")]),
+                regex("[0-9]$"),
+            ],
+            v,
+        )
+        .unwrap();
+        let keys: Vec<Vec<u8>> = ["http://x/ab1", "http://x/ab", "http://x/a1", "http://y/b1"]
+            .into_iter()
+            .map(|iri| key(NamedNode::new_unchecked(iri).into()))
+            .collect();
+        let expected = [true, false, false, false];
+        assert_eq!(filter.bind().matchers.len(), 2);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let check = || {
+            let bound = filter.bind();
+            for (k, want) in keys.iter().zip(expected) {
+                assert_eq!(filter.test(k), want);
+                assert_eq!(bound.test(k), want);
+            }
+        };
+        pool.install(check);
+        check();
+    }
+
+    /// Binding a charged filter admits no worker cache: a worker's cache is optional and
+    /// is charged at the first search, after the storage the first key needed, as an
+    /// unbound test charges it.
+    #[test]
+    fn binding_a_filter_charges_its_worker_caches_at_the_first_search() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = super::super::ctx::Ctx::new(store.snapshot());
+        ctx.mem_limit = 256 << 20;
+        let ctx = Arc::new(ctx);
+        ctx.attach_owner();
+        let v = 0;
+        let expr = call(
+            Function::Regex,
+            vec![
+                call(Function::Str, vec![Expr::Var(v)]),
+                lit("bound-order-[0-9]$"),
+            ],
+        );
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let filter = KeyFilter::new_for(&ctx, &[expr], v).unwrap();
+            let before = ctx.live_bytes();
+            let bound = filter.bind();
+            assert_eq!(ctx.live_bytes(), before, "binding admits nothing");
+            assert!(bound.test(&key(
+                NamedNode::new_unchecked("http://x/bound-order-1").into()
+            )));
+            assert!(
+                ctx.live_bytes() > before,
+                "the first search charges the worker's cache"
+            );
+        });
     }
 
     #[test]

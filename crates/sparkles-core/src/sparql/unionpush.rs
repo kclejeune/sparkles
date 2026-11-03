@@ -107,7 +107,7 @@ pub(super) fn limited_input(ctx: &super::ctx::Ctx, node: &Node) -> bool {
         _ => None,
     };
 
-    !ctx.is_cursor()
+    !ctx.streams()
         && matches!(
             node.kind,
             Kind::Project(_)
@@ -1241,6 +1241,7 @@ mod tests {
         assert!(!limited_input(&prepared.ctx, &prepared.node.children[0]));
         order_ask(&prepared.ctx, &mut prepared.node);
         assert!(limited_input(&prepared.ctx, &prepared.node.children[0]));
+        prepared.ctx.detach_owner_for_tests();
         std::sync::Arc::get_mut(&mut prepared.ctx)
             .unwrap()
             .enable_cursor_accounting()

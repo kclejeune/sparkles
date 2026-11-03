@@ -1,0 +1,26 @@
+# Run on forge alone under ~/lanes/.bench.lock with the A/B harness of commit e52937ca
+# (scripts/x08-gates/ab.sh and nsc-bench-remote.sh), its synthetic queries and the people
+# datasets of 100,000 and 1,000,000 people (1.05M and 10.5M triples). Each A/B runs A=main,
+# B=candidate (the *-cand-second directories) and A=candidate, B=main (*-cand-first), with
+# the server pinned to CPUs 0-11 and the client to CPU 12, or CPUs 2 and 4 with one thread.
+# The binaries are release builds made off forge inside `nix develop` with learned
+# incremental reuse turned off (build-config.json; the three builds share it):
+#   MBX_LEARNED_INCREMENTAL=false nix develop -c mbx sparkles-task -- mbx build --release -p sparkles-server --bin sparkles
+# main is 58bbfca5, the candidate of j1 and k1 is fec1a9aa and that of q1, q2 and q3 is
+# 815822db.
+L=~/lanes/exec-453; S=$L/src-e52937ca/scripts
+ab() { # <tag> <threads> <server cpus> <client cpu> <spin> <data> <rounds> <reps> <modes> <queries> <base> <cand>
+  flock ~/lanes/.bench.lock env TAG=$1 THREADS=$2 SCPU=$3 CCPU=$4 SPINV=$5 PORT=4177 \
+    DATA=$L/data/$6.nt.zst QS="${10}" \
+    bash $S/x08-gates/ab.sh work bin/sparkles-${11} bin/sparkles-${12} $7 $8 "$9"
+}
+ab q1 12 0-11 12 0 people-1000000 8 30 eager "subquery-agg expr-bind-group expr-agg-arg group-avg regex-iri lang-filter" 58bbfca5-noinc mapfix-noinc
+ab q2 12 0-11 12 0 people-100000 10 30 "eager streaming" "regex-iri lang-filter star-join expr-bind-group expr-agg-arg group-avg" 58bbfca5-noinc mapfix-noinc
+ab q3 12 0-11 12 0 people-1000000 8 30 streaming "subquery-agg expr-bind-group expr-agg-arg group-avg regex-iri lang-filter" 58bbfca5-noinc mapfix-noinc
+ab j1 1 2 4 1 people-100000 10 30 "eager streaming" "regex-iri" 58bbfca5-noinc matcher2-noinc
+ab k1 12 0-11 12 0 people-100000 12 200 eager "subquery-agg" 58bbfca5-noinc matcher2-noinc
+ab k2 12 0-11 12 0 people-100000 12 200 eager "subquery-agg" 58bbfca5-noinc 58bbfca5-noinc
+# Each directory keeps results/samples.tsv, answers.tsv and env.txt of one order, and its
+# run.env. summary.md combines the two orders of each run:
+#   python3 scripts/x08-gates/combine.py <run>/<mode>-cand-second/samples.tsv <run>/<mode>-cand-first/samples.tsv
+# with MIN_ROUNDS lowered to 8 for q1 and q3.

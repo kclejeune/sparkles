@@ -254,7 +254,7 @@ mod tests {
         let mut ctx = Ctx::new(store.snapshot());
         ctx.enable_cursor_accounting().unwrap();
         let ctx = std::sync::Arc::new(ctx);
-        ctx.attach_cursor_owner();
+        ctx.attach_owner();
         let input = ctx.var("date");
         let target = ctx.var("year");
         let expr = Expr::Call(Func::Builtin(Function::Year), vec![Expr::Var(input)]);
@@ -297,7 +297,7 @@ mod tests {
         ctx.mem_limit = memory;
         ctx.enable_cursor_accounting().unwrap();
         let ctx = std::sync::Arc::new(ctx);
-        ctx.attach_cursor_owner();
+        ctx.attach_owner();
         ctx
     }
 

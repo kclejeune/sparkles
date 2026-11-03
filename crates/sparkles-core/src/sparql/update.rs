@@ -626,6 +626,10 @@ fn run_op(
                     ins.push([s, p, o, g]);
                 }
             }
+            // Decoding a template term records a refused memory budget on the context
+            // instead of returning it, so the context is checked before anything of the
+            // update is applied: a refused term must fail the update, not skip its quad.
+            ctx.check()?;
             req.check()?;
             for (i, q) in dels.into_iter().enumerate() {
                 if i % 4096 == 4095 {
