@@ -246,7 +246,7 @@ reveal the size of hidden data.
 | Live tree | `ui/src/lib/components/PlanView.svelte` gains `live: Map<string, NodeProgress>` |
 | Stream client | `ui/src/lib/progress.ts` (new), reusing `SseParser` |
 | Query page wiring | `routes/query/+page.svelte`: sets `X-Request-Id` and `Sparkles-Progress` in `api.query` |
-| Running queries card | `routes/server/+page.svelte` |
+| Running queries card | `routes/admin/server/+page.svelte` |
 | Explanation | the existing `ExplainPanel.svelte` and `explainStream` with `profile: "given"` |
 
 ## 6. Phases

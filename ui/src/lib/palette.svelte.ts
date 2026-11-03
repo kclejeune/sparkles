@@ -13,7 +13,7 @@ import {
   type LauncherItem,
   type LauncherProvider,
 } from './launcher.svelte';
-import { datasetSwitchHref, navItems, navLink } from './shell';
+import { adminTabs, datasetSwitchHref, navItems, navLink } from './shell';
 
 /** The ranking, loaded with the first typed query rather than with the shell. */
 const ranking = () => import('./fuzzy').then((m) => m.rank);
@@ -71,8 +71,8 @@ export function commandProvider(group: 'page' | 'global'): LauncherProvider {
 /** The shell's pages, with the open dataset's own page. */
 export function pageProvider(base: string, backupsVisible: () => boolean): LauncherProvider {
   const pages = (ds: string | null) => {
-    const out: (LauncherItem & { keywords?: string[] })[] = navItems(backupsVisible()).map((n) => ({
-      id: n.href,
+    const out: (LauncherItem & { keywords?: string[] })[] = navItems().map((n) => ({
+      id: n.match ?? n.href,
       title: n.label,
       icon: n.icon,
       href: navLink(base, n.href, ds),
@@ -84,13 +84,16 @@ export function pageProvider(base: string, backupsVisible: () => boolean): Launc
       href: navLink(base, '/embedding', ds),
       keywords: ['vectors', 'projection', 'umap'],
     });
-    out.push({
-      id: '/tokens',
-      title: 'Access tokens',
-      icon: 'key',
-      href: `${base}/tokens`,
-      keywords: ['tokens', 'api keys'],
-    });
+    // the Admin page's tabs, each its own row
+    for (const t of adminTabs(backupsVisible()))
+      out.push({
+        id: t.href,
+        title: `Admin › ${t.label}`,
+        icon: t.icon,
+        href: `${base}${t.href}`,
+        keywords:
+          t.href === '/admin/tokens' ? ['access tokens', 'api keys'] : [t.label.toLowerCase()],
+      });
     if (ds) {
       out.push({
         id: '/dataset',
@@ -302,7 +305,7 @@ export function shellCommands(
       group: 'global',
       icon: 'server',
       keywords: ['metrics', 'health', 'tasks'],
-      run: go('/server'),
+      run: go('/admin/server'),
     },
     {
       id: 'go.tokens',
@@ -310,7 +313,7 @@ export function shellCommands(
       group: 'global',
       icon: 'key',
       keywords: ['api keys', 'credentials'],
-      run: go('/tokens'),
+      run: go('/admin/tokens'),
     },
     {
       id: 'go.backups',
@@ -319,7 +322,7 @@ export function shellCommands(
       icon: 'archive',
       keywords: ['restore', 'snapshots'],
       active: can.backups,
-      run: go('/backups'),
+      run: go('/admin/backups'),
     },
     {
       id: 'dataset.new',

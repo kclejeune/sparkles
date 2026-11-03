@@ -20,9 +20,9 @@ const PAGES = [
   '/ui/datasets/demo?tab=settings',
   '/ui/datasets/demo/review/draft-places',
   '/ui/datasets/demo/merge?source=draft-places',
-  '/ui/backups',
-  '/ui/server',
-  '/ui/tokens',
+  '/ui/admin/backups',
+  '/ui/admin/server',
+  '/ui/admin/tokens',
 ];
 
 const WIDTHS = [

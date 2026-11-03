@@ -46,7 +46,7 @@ test.describe('at 1440 pixels', () => {
   });
 
   test('`@` finds entities with the server ranking', async ({ page }) => {
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await palette(page, '@pers');
     await expect(list(page).getByRole('group', { name: `Entities in ${DATASET}` })).toBeVisible();
     await expect(option(page, 'Person')).toBeVisible();

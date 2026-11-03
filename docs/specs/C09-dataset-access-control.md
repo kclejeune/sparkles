@@ -522,7 +522,7 @@ The `Need` values are:
 
 | Route | Method | Need | Notes |
 |---|---|---|---|
-| `/`, `/ui`, `/ui/`, `/ui/{*path}` | GET | Public | static SPA, including `/ui/login`, `/ui/tokens`, `/ui/cli/*` |
+| `/`, `/ui`, `/ui/`, `/ui/{*path}` | GET | Public | static SPA, including `/ui/login`, `/ui/admin/tokens`, `/ui/cli/*` |
 | `/$/ping` | GET, POST | Public | |
 | `/$/ready` | GET | Public | filtered `datasets` (all with `metrics`) |
 | `/$/ready/{ds}` | GET | R | |
@@ -1220,7 +1220,7 @@ requests send cookies by default.
 - `readOnly` gating is kept. The server always enforces access, and the UI only hides
   controls.
 
-**`/ui/tokens`** (API tokens):
+**`/ui/admin/tokens`** (API tokens):
 
 - a table of own tokens: name, id, scope summary, created, expires, last used, and a
   **Revoke** button;
@@ -1937,7 +1937,7 @@ These tests run against a real listener on 127.0.0.1, with `HOME` and
   - The sidebar shows `bob` with a `password` or `token` badge, and Sign out returns to
     the login page.
 - **A40. Tokens and device pages.**
-  - `/ui/tokens` → New token → the token is shown once. After a reload, the list shows
+  - `/ui/admin/tokens` → New token → the token is shown once. After a reload, the list shows
     the name without the token. Revoke removes the row.
   - `/ui/cli/device?code=WDJB-MJHT` while signed out → redirect to login, then back.
     Approve → "Return to your terminal".

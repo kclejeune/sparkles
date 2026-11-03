@@ -1109,7 +1109,7 @@ test('forms-list', async ({ page, request }) => {
 /** The server page's model configuration form, scrolled to the row of `field`. */
 async function modelsForm(page: Page, request: APIRequestContext, field: string) {
   await request.delete('/$/server/settings/models');
-  await page.goto('/ui/server');
+  await page.goto('/ui/admin/server');
   const panel = page.getByTestId('settings-model-configuration');
   const row = (f: string) => panel.locator(`[data-field="${f}"]`);
   await expect(row(field)).toBeVisible();

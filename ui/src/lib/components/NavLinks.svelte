@@ -5,7 +5,6 @@
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
   import { app } from '$lib/app.svelte';
-  import { auth } from '$lib/auth.svelte';
   import { reviewCounts } from '$lib/review-count.svelte';
   import { navActive, navItems, navLink } from '$lib/shell';
   import Icon from './Icon.svelte';
@@ -15,17 +14,13 @@
     $props();
 
   const base = resolve('/').replace(/\/$/, '');
-  // Backups: server admins, and dataset admins in a reduced form
-  const backupsVisible = $derived(
-    auth.hasServer('server-admin') || Object.values(auth.who?.datasets ?? {}).includes('admin'),
-  );
-  const items = $derived(navItems(backupsVisible));
+  const items = $derived(navItems());
   const review = $derived(reviewCounts.of(app.current));
 </script>
 
 <nav class="nav {variant}" aria-label="Pages">
   {#each items as item, i (item.href)}
-    {@const active = navActive(base, item.href, page.url.pathname)}
+    {@const active = navActive(base, item.match ?? item.href, page.url.pathname)}
     {#if i > 0 && item.group !== items[i - 1].group}<div
         class="rule"
         role="presentation"

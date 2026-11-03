@@ -55,9 +55,9 @@ test.describe('at 1440 pixels', () => {
       ['/ui/embedding?ds=uni', null],
       ['/ui/datasets', 'Refresh the dataset list'],
       ['/ui/datasets/uni', 'Show settings'],
-      ['/ui/backups', null],
-      ['/ui/server', null],
-      ['/ui/tokens', null],
+      ['/ui/admin/backups', null],
+      ['/ui/admin/server', null],
+      ['/ui/admin/tokens', null],
     ];
     for (const [url, command] of pages) {
       await visit(page, url);
@@ -83,9 +83,9 @@ test.describe('at 1440 pixels', () => {
     // a client-side navigation: the layout and its palette stay, the page goes
     await page
       .getByRole('navigation', { name: 'Pages' })
-      .getByRole('link', { name: 'Server', exact: true })
+      .getByRole('link', { name: 'Admin', exact: true })
       .click();
-    await expect(page).toHaveURL(/\/ui\/server$/);
+    await expect(page).toHaveURL(/\/ui\/admin\/server$/);
     await palette(page, '#');
     await expect(group(page, 'Datasets')).toBeVisible();
     await expect(group(page, /^Branches/)).toHaveCount(0);
@@ -140,7 +140,7 @@ test.describe('at 1440 pixels', () => {
   });
 
   test('switches the theme', async ({ page }) => {
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await palette(page, '>dark');
     await expect(titles(page)).toHaveText(['Theme: dark']);
     await page.keyboard.press('Enter');
@@ -180,7 +180,7 @@ test.describe('at 1440 pixels', () => {
     });
     expect(put.ok()).toBe(true);
     await onDataset(page, 'uni');
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await palette(page, '?');
     await expect(group(page, 'Saved queries in uni')).toBeVisible();
     await expect(option(page, 'people-by-name')).toContainText('Everyone by name');
@@ -194,7 +194,7 @@ test.describe('at 1440 pixels', () => {
 
   test('entity mode searches entities only', async ({ page }) => {
     await onDataset(page, 'uni');
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await palette(page, '@');
     await expect(list(page)).toContainText('Type to search the entities of uni.');
     await page.keyboard.type('stud');
@@ -222,7 +222,7 @@ test.describe('at 1440 pixels', () => {
     await expect(page).toHaveURL(/\/ui\/datasets\/uni\?tab=settings$/);
     await palette(page, '>tokens');
     await page.keyboard.press('Enter');
-    await expect(page).toHaveURL(/\/ui\/tokens$/);
+    await expect(page).toHaveURL(/\/ui\/admin\/tokens$/);
     await palette(page, '>new dataset');
     await page.keyboard.press('Enter');
     await expect(page).toHaveURL(/\/ui\/datasets$/);
@@ -248,7 +248,7 @@ test.describe('at 1440 pixels', () => {
     await page.keyboard.press('/');
     await expect(page.getByRole('searchbox', { name: 'Search labels' })).toBeFocused();
 
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await page.keyboard.press('/');
     await expect(search(page)).toBeFocused();
   });
@@ -258,7 +258,7 @@ test.describe('at 1440 pixels', () => {
     await visit(page, '/ui/datasets');
     await palette(page, '>server');
     await page.keyboard.press('Enter');
-    await expect(page).toHaveURL(/\/ui\/server$/);
+    await expect(page).toHaveURL(/\/ui\/admin\/server$/);
     await palette(page, 'thes');
     await option(page, 'Thesaurus').click();
     await expect(page).toHaveURL(/\/ui\/thesaurus/);
@@ -278,7 +278,12 @@ test.describe('at 1440 pixels', () => {
     await onDataset(page, 'uni');
     // a page picked once with a dataset recorded and once without
     await page.addInitScript(() => {
-      const pick = { provider: 'pages', id: '/server', title: 'Server', href: '/ui/server' };
+      const pick = {
+        provider: 'pages',
+        id: '/admin/server',
+        title: 'Admin › Server',
+        href: '/ui/admin/server',
+      };
       localStorage.setItem(
         'sparkles.launcher.recent',
         JSON.stringify([
@@ -289,7 +294,7 @@ test.describe('at 1440 pixels', () => {
     });
     await visit(page, '/ui/datasets');
     await palette(page);
-    await expect(titles(page, group(page, 'Recent'))).toHaveText(['Server']);
+    await expect(titles(page, group(page, 'Recent'))).toHaveText(['Admin › Server']);
   });
 
   test('works when the browser blocks storage', async ({ page }) => {
@@ -299,10 +304,10 @@ test.describe('at 1440 pixels', () => {
       };
       Object.defineProperty(window, 'localStorage', { get: fail });
     });
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await palette(page, '>tokens');
     await page.keyboard.press('Enter');
-    await expect(page).toHaveURL(/\/ui\/tokens$/);
+    await expect(page).toHaveURL(/\/ui\/admin\/tokens$/);
     // the pick is remembered for this visit only
     await palette(page);
     await expect(titles(page, group(page, 'Recent'))).toHaveText(['Open access tokens']);
@@ -355,7 +360,7 @@ test.describe('at 1440 pixels', () => {
 
   test('the chips choose a mode', async ({ page }) => {
     await onDataset(page, 'uni');
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await palette(page, 'or');
     await chip(page, 'Datasets').click();
     await expect(search(page)).toHaveValue('#or');
@@ -404,7 +409,7 @@ test.describe('at 390 pixels', () => {
 
   test('the rows are tall enough for a finger', async ({ page }) => {
     await onDataset(page, 'uni');
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await page.getByRole('button', { name: 'Open search' }).tap();
     const box = await list(page).getByRole('option').first().boundingBox();
     expect(box!.height).toBeGreaterThanOrEqual(44);

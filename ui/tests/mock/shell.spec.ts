@@ -46,7 +46,7 @@ test.describe('at 1440 pixels', () => {
 
   test('a query that matches nothing says so', async ({ page }) => {
     await onDataset(page, 'uni');
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await search(page).click();
     await page.keyboard.type('zzzzqqq');
     await expect(page.getByRole('listbox', { name: 'Search results' })).toContainText(
@@ -209,7 +209,7 @@ test.describe('at 1440 pixels', () => {
   });
 
   test('a provider can suggest items before anything is typed', async ({ page }) => {
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     // the mock runs under Vite, which serves the app's own instance of the module
     await page.evaluate(async () => {
       const path = '/ui/src/lib/launcher.svelte.ts';
@@ -257,15 +257,15 @@ test.describe('at 1440 pixels', () => {
   });
 
   test('the rail names every page and marks the open one', async ({ page }) => {
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     const rail = page.getByRole('navigation', { name: 'Pages' });
     for (const name of ['Query', 'Explore', 'Ontology', 'Thesaurus', 'Similar', 'Memory'])
       await expect(rail.getByRole('link', { name, exact: true })).toBeVisible();
-    await expect(rail.getByRole('link', { name: 'Server', exact: true })).toHaveAttribute(
+    await expect(rail.getByRole('link', { name: 'Admin', exact: true })).toHaveAttribute(
       'aria-current',
       'page',
     );
-    await expect(rail.getByText('Server', { exact: true })).toBeVisible();
+    await expect(rail.getByText('Admin', { exact: true })).toBeVisible();
   });
 
   test('choosing a dataset reopens a page that names its dataset', async ({ page }) => {
@@ -316,7 +316,7 @@ test.describe('at 900 pixels', () => {
   test.use({ viewport: MEDIUM });
 
   test('the rail shows icons and keeps each page name', async ({ page }) => {
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     const rail = page.getByRole('navigation', { name: 'Pages' });
     const query = rail.getByRole('link', { name: 'Query', exact: true });
     await expect(query).toBeVisible();
@@ -350,7 +350,7 @@ test.describe('at 390 pixels', () => {
 
   test('the keys expand the search, Escape collapses it', async ({ page }) => {
     await onDataset(page, 'uni');
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await page.keyboard.press('Control+k');
     await expect(search(page)).toBeFocused();
     await page.keyboard.press('Escape');
@@ -367,7 +367,7 @@ test.describe('at 390 pixels', () => {
   });
 
   test('the drawer holds the dataset switcher and every page', async ({ page }) => {
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await expect(page.getByRole('navigation', { name: 'Pages' })).toBeHidden();
     await page.getByRole('button', { name: 'Menu' }).click();
     const drawer = page.getByRole('dialog', { name: 'Menu' });
@@ -414,8 +414,8 @@ const PAGES = [
   '/ui/embedding?ds=foaf',
   '/ui/datasets',
   '/ui/datasets/foaf',
-  '/ui/backups',
-  '/ui/server',
+  '/ui/admin/backups',
+  '/ui/admin/server',
 ];
 
 for (const [name, viewport] of Object.entries({ large: LARGE, medium: MEDIUM, phone: PHONE })) {

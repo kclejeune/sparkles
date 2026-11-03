@@ -7,6 +7,8 @@ export interface NavItem {
   icon: string;
   /** The working pages come first; the administration pages follow a rule. */
   group: 'work' | 'admin';
+  /** The path whose pages make the link current, when it is not `href`: a page's tabs. */
+  match?: string;
 }
 
 /** The pages whose link carries the open dataset as `?ds=`. */
@@ -19,7 +21,7 @@ const CARRIES_DATASET = new Set([
   '/memory',
 ]);
 
-export function navItems(backupsVisible: boolean): NavItem[] {
+export function navItems(): NavItem[] {
   return [
     { href: '/query', label: 'Query', icon: 'query', group: 'work' },
     { href: '/explore', label: 'Explore', icon: 'explore', group: 'work' },
@@ -29,10 +31,19 @@ export function navItems(backupsVisible: boolean): NavItem[] {
     { href: '/similar', label: 'Similar', icon: 'similar', group: 'work' },
     { href: '/memory', label: 'Memory', icon: 'brain', group: 'work' },
     { href: '/datasets', label: 'Datasets', icon: 'database', group: 'admin' },
-    ...(backupsVisible
-      ? [{ href: '/backups', label: 'Backups', icon: 'archive', group: 'admin' as const }]
-      : []),
-    { href: '/server', label: 'Server', icon: 'server', group: 'admin' },
+    // Server, Backups and Tokens are the tabs of one Admin page
+    { href: '/admin/server', label: 'Admin', icon: 'server', group: 'admin', match: '/admin' },
+  ];
+}
+
+/** The tabs of the Admin page; Backups only for a caller who may see backups. */
+export function adminTabs(
+  backupsVisible: boolean,
+): { href: string; label: string; icon: string }[] {
+  return [
+    { href: '/admin/server', label: 'Server', icon: 'server' },
+    ...(backupsVisible ? [{ href: '/admin/backups', label: 'Backups', icon: 'archive' }] : []),
+    { href: '/admin/tokens', label: 'Tokens', icon: 'key' },
   ];
 }
 
@@ -45,6 +56,7 @@ export function navLink(base: string, href: string, ds: string | null): string {
 /** Whether `pathname` is the page of `href` or one under it. */
 export function navActive(base: string, href: string, pathname: string): boolean {
   const full = base + href;
+  if (pathname === full) return true;
   return pathname === full || pathname.startsWith(full + '/');
 }
 

@@ -172,7 +172,7 @@ test('Similar: from an entity and from a pasted vector', async ({ page }) => {
 });
 
 test('backups: every tab, the drawer and the dialogs', async ({ page }) => {
-  await visit(page, '/ui/backups');
+  await visit(page, '/ui/admin/backups');
   await open(page, 'foaf-before-reload');
   await page.keyboard.press('Escape');
   await open(page, /Repositories/, 'tab');
@@ -185,7 +185,7 @@ test('backups: every tab, the drawer and the dialogs', async ({ page }) => {
 });
 
 test('the server, tokens, sign-in and CLI pages', async ({ page }) => {
-  for (const url of ['/ui/', '/ui/server', '/ui/tokens', '/ui/login', '/ui/cli/device'])
+  for (const url of ['/ui/', '/ui/admin/server', '/ui/admin/tokens', '/ui/login', '/ui/cli/device'])
     await visit(page, url);
 });
 

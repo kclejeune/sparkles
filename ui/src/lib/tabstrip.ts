@@ -13,7 +13,7 @@ function edges(el: HTMLElement) {
 }
 
 function reveal(el: HTMLElement) {
-  const sel = el.querySelector<HTMLElement>('[aria-selected="true"]');
+  const sel = el.querySelector<HTMLElement>('[aria-selected="true"], [aria-current="page"]');
   if (!sel || el.scrollWidth <= el.clientWidth) return;
   const a = sel.offsetLeft - el.offsetLeft;
   const b = a + sel.offsetWidth;
@@ -26,7 +26,11 @@ function attach(el: HTMLElement, resize: ResizeObserver, sel: MutationObserver) 
   SEEN.add(el);
   el.addEventListener('scroll', () => edges(el), { passive: true });
   resize.observe(el);
-  sel.observe(el, { subtree: true, attributes: true, attributeFilter: ['aria-selected'] });
+  sel.observe(el, {
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['aria-selected', 'aria-current'],
+  });
   reveal(el);
   edges(el);
 }

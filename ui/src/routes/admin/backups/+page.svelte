@@ -66,7 +66,7 @@
     if (t === 'backups') p.delete('tab');
     else p.set('tab', t);
     const qs = p.toString();
-    goto(`${resolve('/backups')}${qs ? `?${qs}` : ''}`, {
+    goto(`${resolve('/admin/backups')}${qs ? `?${qs}` : ''}`, {
       replaceState: true,
       keepFocus: true,
       noScroll: true,
@@ -80,7 +80,11 @@
     const p = new URLSearchParams(page.url.searchParams);
     if (dataset) p.set('dataset', dataset);
     else p.delete('dataset');
-    goto(`${resolve('/backups')}?${p}`, { replaceState: true, keepFocus: true, noScroll: true });
+    goto(`${resolve('/admin/backups')}?${p}`, {
+      replaceState: true,
+      keepFocus: true,
+      noScroll: true,
+    });
   });
 
   function onTabKey(e: KeyboardEvent, i: number) {
@@ -113,7 +117,8 @@
 <div class="page-container">
   <header class="page-head">
     <div>
-      <h1>Backups</h1>
+      <!-- the Admin tab names the page -->
+      <h2 class="sr-only">Backups</h2>
       <p class="muted">
         {#if !loaded}Loading…{:else if unsupported}Not available on this server{:else}{repositories.length}
           repositor{repositories.length === 1 ? 'y' : 'ies'}{repositories.length !== reachableCount

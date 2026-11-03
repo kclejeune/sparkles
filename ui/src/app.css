@@ -1136,7 +1136,8 @@ table.data .num {
 .tab:hover {
   color: var(--text);
 }
-.tab[aria-selected='true'] {
+.tab[aria-selected='true'],
+.tab[aria-current='page'] {
   color: var(--text);
   border-bottom-color: var(--spark);
 }
@@ -1145,7 +1146,7 @@ table.data .num {
   padding: 0 5px;
   font-size: var(--fs-xs);
 }
-.tab[aria-selected='true'] .count {
+.tab:is([aria-selected='true'], [aria-current='page']) .count {
   background: var(--spark-soft);
   color: var(--spark-ink);
 }

@@ -25,9 +25,9 @@ const PAGES = [
   ['datasets', '/ui/datasets'],
   ['dataset', '/ui/datasets/demo'],
   ['merge', '/ui/datasets/demo/merge?source=draft-places'],
-  ['backups', '/ui/backups'],
-  ['server', '/ui/server'],
-  ['tokens', '/ui/tokens'],
+  ['backups', '/ui/admin/backups'],
+  ['server', '/ui/admin/server'],
+  ['tokens', '/ui/admin/tokens'],
 ].map(([name, path]) => ({ name, path }));
 const WIDTHS = { large: [1440, 900], medium: [900, 1000], phone: [390, 844] } as const;
 
