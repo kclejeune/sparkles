@@ -2042,7 +2042,9 @@ that `as` names, which is `classExpression` by default or `dataRange`, `individu
 name is a full IRI in angle brackets, a prefixed name with the dataset's prefixes, a
 local name, or a label, which takes single quotes when it holds a space or a keyword.
 Names resolve against the entities of the ontology read and their `rdfs:label` and
-`skos:prefLabel` values, so a caller reads only the names its grants show. An axiom is
+`skos:prefLabel` values, so a caller reads only the names its grants show. A name the
+ontology does not have is looked for again among the entities of the assertions the
+caller can read, such as an individual that only a property assertion names. An axiom is
 written as one frame line such as `Professor SubClassOf teaches some Course`. The reader
 takes the keywords `SubClassOf`, `EquivalentTo`, `DisjointWith`, `SubPropertyOf`,
 `InverseOf`, `Domain`, `Range`, `Types`, `SameAs`, `DifferentFrom` and
@@ -2122,7 +2124,9 @@ axiom with structural equality. Node.js's `dataset.ontology` has `summary`, `axi
 `OntModel` over a Sparkles graph
 ([integrations](integrations/README.md#libraries-and-bindings)). An axiom given to an
 edit is its JSON form or a string in functional-style syntax with the dataset's
-prefixes.
+prefixes. Manchester text that `parse` or `dl_query` cannot read raises Python's
+`InvalidInputError`, a `ValueError`, with `reason`, `start`, `end` and `candidates` as
+attributes, and Node.js's `InvalidInputError` with them under `details`.
 
 Typed constructors build axioms without writing their syntax. Python's `sparkles.owl`
 and Node.js's `owl` namespace have one constructor per axiom type and per expression,
