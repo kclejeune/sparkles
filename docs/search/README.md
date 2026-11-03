@@ -69,7 +69,7 @@ rest of a query. Entity search answers the typeahead of ontology browsers and ed
   unavailable change record rebuilds the index, and a restarted server builds it again
   at the first search. The index of ChEBI lite holds 238,190 entities in about 233 MiB,
   292 MiB resident, and is built in 1.3 s. That memory buys typeahead that answers
-  within 8.4 ms at the 99th percentile ([entity search
+  within 8.3 ms at the 99th percentile ([entity search
   benchmark](../benchmarks/entity-search/README.md)).
 * A caller sees only the graphs and triples their grants allow. When the grants hide
   some triples, each candidate's matched value is checked against the caller's view

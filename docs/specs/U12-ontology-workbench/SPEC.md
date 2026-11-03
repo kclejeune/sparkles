@@ -224,7 +224,7 @@ rebuilds the index at the first search. Tests compare the index after random com
 on a branch, a merge, its revert and a reopen with one built from scratch.
 
 **Measurements.** On atlas, an Intel Core i5-13500, typeahead queries of 1 to 12
-characters with up to two typos answered within 8.4 ms at the 99th percentile on ChEBI
+characters with up to two typos answered within 8.3 ms at the 99th percentile on ChEBI
 lite and 4.9 ms on GO, against the 20 ms target. ChEBI lite's index of 238,190 entities
 took 1.3 s to build and about 233 MiB by its own estimate, 292 MiB resident, and GO's of
 52,057 entities 0.64 s and 116 MiB resident. That memory, held per searched branch, is
