@@ -249,9 +249,12 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   inverse-functional properties, disjoint, asymmetric and irreflexive properties and
   complements that move to the other side as their duals. Universal and at-most
   restrictions create contexts for conjunctions of classes, which OWL 2 RL and QL
-  ontologies never need, so these stay polynomial. Any other axiom outside OWL 2 EL is
-  left out and reported with its rule, and Horn reasoning with individuals is item
-  NEW-ITEM-1. An axiom with a literal or datatype that the
+  ontologies never need, so these stay polynomial. A run with the Horn rules has a
+  memory budget of 64 times its index and axioms, at least 1 GiB and no more than the
+  caller's. A run that passes it classifies again by the EL rules alone, leaves the Horn
+  axioms out and reports them, and sets `Stats::horn_over_budget`. Any other axiom
+  outside OWL 2 EL is left out and reported with its rule, and Horn reasoning with
+  individuals is item NEW-ITEM-1. An axiom with a literal or datatype that the
   classifier cannot compare, such as an XML literal, an ill-typed literal or a datatype
   outside the OWL 2 datatype map, or with a property chain through the top object
   property, is used as far as the calculus goes and reported as partial. Every answer is entailed, and it is complete for named classes
@@ -572,7 +575,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * The classifier leaves out the Horn axioms outside OWL 2 EL in an ontology with
   individuals, functional data properties or top properties. Roadmap item NEW-ITEM-1.
 * GO's inverse properties take the Horn rules, which classify it 17 to 18% slower than
-  the EL rules and raise its peak resident set. Roadmap item NEW-ITEM-2.
+  the EL rules and raise its peak resident set. Two Uberon-based ontologies of the ORE
+  2015 DL sample pass the Horn rules' memory budget and get the EL answer in 4.2 seconds
+  instead of 0.8. Roadmap item NEW-ITEM-2.
+* The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
+  restrictions passes 10 GiB. Roadmap item NEW-ITEM-4.
 * The ELK mode, which classifies by the OWL 2 EL rules alone, is an option of the Rust
   library and the ROBOT-compatible commands only, and HTTP, the other CLI commands and
   the bindings always take the Horn axioms. Roadmap item NEW-ITEM-3.

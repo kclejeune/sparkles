@@ -452,6 +452,46 @@ tradeoff for GO's complete taxonomy, and the ELK mode keeps the EL rules' time a
 taxonomy. Item NEW-ITEM-2 follows the cost. The taxonomies of the 298 ORE 2015 EL ontologies and
 ChEBI lite are byte for byte those of the EL rules on one and eight threads.
 
+A run with the Horn rules has a memory budget of its own. The budget is 64 times the
+estimated bytes of the run's index and axioms, at least 1 GiB, and never more than the
+caller's `Limits::max_memory`. A run that passes it classifies again by the EL rules
+alone, as the ELK mode does, leaves the axioms outside OWL 2 EL out and reports them,
+and sets `Stats::horn_over_budget`. Two ontologies of the ORE 2015 DL sample derived from
+Uberon, ore_ont_9663 and ore_ont_14817, need this. Their transitive parthood properties
+are each other's inverses, and the contexts of conjunctions compose the parthood chains
+again until the run passes 10 GiB, with most of the memory in waiting messages. The EL
+rules alone classify them in 0.8 s with a peak resident set of 0.4 GB. With the budget
+they classify in 4.2 s and 2.4 GB on four threads on the laptop, against 8.9 and 9.7 s
+for Konclude 0.7.0. Item NEW-ITEM-2 follows this cost with GO's. The largest Horn run on
+the development set below, ore_ont_9855, peaks at 666 MB, and GO at 74 MB, so neither
+reaches the budget.
+
+The development set of the ORE 2015 DL sample was compared on the laptop with four
+threads and a 10 GiB cap, as an unpublished measurement. The classifier's taxonomy
+equals the reference on 62 of the 206 files, 37 by the EL rules and 25 by the Horn rules.
+It is sound on 137 files whose axioms it uses in part. 91 of these have axioms that are
+not Horn, and 46 are Horn ontologies with individuals, functional data properties or top
+properties, which item NEW-ITEM-1 covers. The comparison marks one file, ore_ont_15993,
+as unsound because neither reference has an answer for it. Konclude read none of it and
+HermiT refused its SWRL built-ins, and every subsumption the classifier reports is told
+or follows from the file's told equivalences. Two files have no reference and the reader
+refuses one. Three ran out of memory: ore_ont_9663 and ore_ont_14817, which the Horn
+budget now classifies, and ore_ont_8737, whose 2.5 million existential restrictions take
+the EL saturation past 10 GiB, item NEW-ITEM-4. The classification time is 0.16 of
+Konclude's in geometric mean on the equal files and 0.23 on the sound ones, and never
+above HermiT's. Two equal files and 11 sound ones classify slower than Konclude. The
+largest gap is ore_ont_9855, an equal file at 2.5 s against 1.3 s.
+
+The references disagree on two files of the set. On ore_ont_15516, Konclude's parsers all
+failed at the first SWRL rule and it classified an empty ontology. HermiT found the
+ontology inconsistent, which its rules cannot cause, since the properties in their heads
+occur in no other axiom. The classifier leaves out the assertions about individuals and
+is sound against HermiT. On ore_ont_9540, HermiT makes `Image_type` equivalent to
+`Image_with_uji_office_door`, which the ontology does not entail. `Image_type` is a single
+image whose shapes each have all 60 of the enumerated line-to-line points, so none is a
+quadrilateral with exactly four, and the image has no office door in some model. HermiT's
+second equivalence follows from the first, so Konclude's answer stands for both.
+
 The functional-syntax reader refuses a document with a SWRL rule. A read with
 `ofn_read::Options::skip_rules` passes over the rules and counts them, which the
 classification comparison uses to report them as left out.

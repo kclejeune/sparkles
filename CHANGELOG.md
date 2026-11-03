@@ -171,7 +171,11 @@ benchmark host. `sparkles ontology reason` and `reduce` with `--reasoner ELK`, a
 library's `ClassifyRequest::el_only` and `Limits::el_only`, classify by the OWL 2 EL
 rules alone, as ELK does, so the ROBOT-compatible outputs equal ROBOT's with ELK. Without
 `--reasoner` they take the Horn axioms too. The functional-syntax reader can pass over SWRL rules and count them
-with `ofn_read::Options::skip_rules`, and refuses them otherwise as before.
+with `ofn_read::Options::skip_rules`, and refuses them otherwise as before. A run with
+the Horn rules has a memory budget of 64 times its index and axioms, at least 1 GiB, and
+one that passes it classifies again by the EL rules alone and sets
+`Stats::horn_over_budget`. Two Uberon-based ORE 2015 ontologies that ran out of memory
+now classify in 4.2 s with the EL answer.
 
 The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
 `dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and
