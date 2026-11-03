@@ -2044,7 +2044,10 @@ local name, or a label, which takes single quotes when it holds a space or a key
 Names resolve against the entities of the ontology read and their `rdfs:label` and
 `skos:prefLabel` values, so a caller reads only the names its grants show. A name the
 ontology does not have is looked for again among the entities of the assertions the
-caller can read, such as an individual that only a property assertion names. An axiom is
+caller can read, such as an individual that only a property assertion names. That search
+follows the same rules of case and quoting, and keeps at most 256 entities for one name,
+so a local name that more assertion entities share reads as ambiguous among the first
+256. An axiom is
 written as one frame line such as `Professor SubClassOf teaches some Course`. The reader
 takes the keywords `SubClassOf`, `EquivalentTo`, `DisjointWith`, `SubPropertyOf`,
 `InverseOf`, `Domain`, `Range`, `Types`, `SameAs`, `DifferentFrom` and

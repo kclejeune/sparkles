@@ -365,23 +365,23 @@ impl Ontologies {
             }
             tries += 1;
             let token = text.get(e.span.start..e.span.end).unwrap_or("");
-            let (iris, simple) = meant(&v, token);
+            let meant = v.meant(token);
+            let mut seen = rustc_hash::FxHashSet::default();
             let mut found = Vec::new();
             o.assertions(opts, |a, _, _| {
                 if let Some(a) = a {
                     for ent in a.signature() {
                         let iri = ent.iri().as_str();
                         if !ent.is_builtin()
-                            && (iris.contains(iri)
-                                || simple.as_deref() == Some(manchester::local_name(iri)))
+                            && meant.matches(iri)
                             && !v.kinds(iri).contains(&ent.kind())
-                            && !found.contains(&ent)
+                            && seen.insert((iri.to_string(), ent.kind()))
                         {
                             found.push(ent);
                         }
                     }
                 }
-                Ok(true)
+                Ok(found.len() < RETRY_ENTITIES)
             })?;
             if found.is_empty() {
                 return Err(manchester_error(e, text));
@@ -609,28 +609,6 @@ impl Ontologies {
     }
 }
 
-/// The IRIs a name token of Manchester text can mean, and the bare name for matching
-/// local names: an IRI in angle brackets means itself, a prefixed name its expansion,
-/// and a word or a quoted label the IRIs the vocabulary names by it.
-fn meant(v: &Vocabulary, token: &str) -> (std::collections::BTreeSet<String>, Option<String>) {
-    let mut iris = std::collections::BTreeSet::new();
-    if let Some(i) = token.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
-        iris.insert(i.to_string());
-        return (iris, None);
-    }
-    let simple = match token.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
-        Some(q) => q.replace("\\'", "'").replace("\\\\", "\\"),
-        None => {
-            if let Some(i) = v.expand(token) {
-                iris.insert(i);
-            }
-            token.to_string()
-        }
-    };
-    iris.extend(v.named(&simple).map(str::to_string));
-    (iris, Some(simple))
-}
-
 /// Manchester text that does not parse, with the error: the source of the
 /// [`Error::Component`] that [`Ontologies::parse_manchester`] answers.
 #[derive(Debug)]
@@ -669,6 +647,11 @@ pub fn manchester_error(e: manchester::Error, text: &str) -> Error {
         source: Some(Box::new(failure)),
     }))
 }
+
+/// The entities of the assertions that one retry of [`Ontologies::parse_manchester`]
+/// adds at most for an unknown name. A name that more entities share reads as ambiguous
+/// among the first ones the assertions hold.
+const RETRY_ENTITIES: usize = 256;
 
 /// The bytes a copy in memory of a triple takes, roughly, for the memory budget.
 const COPY_BYTES_PER_TRIPLE: u64 = 256;

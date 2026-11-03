@@ -319,6 +319,41 @@ impl Vocabulary {
         self.kinds.get(iri).map_or(&[], |k| k.as_slice())
     }
 
+    /// What the name `token`, written as Manchester text writes a name, may stand for
+    /// beyond this vocabulary: its IRI, the IRIs that carry it as a label or local name,
+    /// and any IRI whose local name it is in any case. A caller that finds a name unknown
+    /// can look for these entities elsewhere, such as in an ontology's assertions, and
+    /// add them. Text that is not one name means nothing.
+    pub fn meant(&self, token: &str) -> Meant {
+        let mut m = Meant::default();
+        let name = match lex::tokens(token).as_deref() {
+            Ok([(lex::Tok::Name(n), _)]) => n.clone(),
+            _ => return m,
+        };
+        let simple = match &name {
+            lex::Name::Iri(i) => {
+                m.iris.insert(i.clone());
+                return m;
+            }
+            lex::Name::Word(w) => {
+                if let Some(iri) = self.expand(w) {
+                    m.iris.insert(iri);
+                }
+                if let Some(iri) = self.expand(&format!(":{w}")) {
+                    m.iris.insert(iri);
+                }
+                w.as_str()
+            }
+            lex::Name::Quoted(q) => q.as_str(),
+        };
+        let folded = simple.to_lowercase();
+        let named = self.names.get(simple).into_iter().flatten();
+        let named = named.chain(self.folded.get(&folded).into_iter().flatten());
+        m.iris.extend(named.cloned());
+        m.folded = Some(folded);
+        m
+    }
+
     /// The prefixes, the standard ones included.
     pub fn prefixes(&self) -> &[(String, String)] {
         &self.prefixes
@@ -446,6 +481,25 @@ impl Vocabulary {
             return self.by_iri(&iri, want);
         }
         Found::Unknown { iri: None, others }
+    }
+}
+
+/// What a name may stand for beyond a vocabulary ([`Vocabulary::meant`]).
+#[derive(Clone, Debug, Default)]
+pub struct Meant {
+    iris: BTreeSet<String>,
+    /// the simple name in lower case, which the local names of IRIs are matched against
+    folded: Option<String>,
+}
+
+impl Meant {
+    /// Whether the name may stand for the entity `iri`.
+    pub fn matches(&self, iri: &str) -> bool {
+        self.iris.contains(iri)
+            || self.folded.as_deref().is_some_and(|f| {
+                let local = local_name(iri);
+                !local.is_empty() && local.chars().flat_map(char::to_lowercase).eq(f.chars())
+            })
     }
 }
 

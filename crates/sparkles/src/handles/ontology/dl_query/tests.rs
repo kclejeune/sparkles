@@ -521,13 +521,18 @@ fn names_only_assertions_hold_are_read() {
     // :k is a class and, through an assertion only, an individual too
     let ds = dataset(
         "Declaration(Class(:C)) Declaration(Class(:k)) Declaration(ObjectProperty(:p))
-         ClassAssertion(:C :a) ObjectPropertyAssertion(:p :a :b) ObjectPropertyAssertion(:p :b :k)",
+         ClassAssertion(:C :a) ObjectPropertyAssertion(:p :a :b) ObjectPropertyAssertion(:p :b :k)
+         AnnotationAssertion(rdfs:label :b \"Ada Lovelace\")",
     );
     for text in [
         "p value a",
         "p value b",
         "p value b and p value k",
         "k and p value k",
+        // the lookup's own rules: names in another case, and labels with escapes
+        "p value B",
+        "p value 'Ada Lovelace'",
+        "p value 'Ada\\u0020Lovelace'",
     ] {
         let a = query_with(
             &ds,
@@ -549,4 +554,32 @@ fn names_only_assertions_hold_are_read() {
         panic!("an unknown individual read");
     };
     assert!(e.to_string().contains("nobody"), "{e}");
+}
+
+#[test]
+fn a_name_many_assertions_share_reads_as_ambiguous_within_a_bound() {
+    let members: String = (0..400)
+        .map(|n| format!("ClassAssertion(:C <http://ex.org/g/{n}/member>) "))
+        .collect();
+    let ds = dataset(&format!(
+        "Declaration(Class(:C)) Declaration(ObjectProperty(:p)) {members}"
+    ));
+    let h = ds.ontology();
+    let opts = h.anchored(&Default::default()).unwrap();
+    let o = h.open(&OntologyRequest::default(), &opts).unwrap();
+    let Err(Error::Component(c)) =
+        h.parse_manchester(&o, "p value member", What::ClassExpression, &opts)
+    else {
+        panic!("a name 400 individuals share read");
+    };
+    let j = c
+        .source
+        .as_ref()
+        .unwrap()
+        .downcast_ref::<ManchesterFailure>()
+        .unwrap()
+        .json();
+    assert_eq!(j["reason"], "ambiguous");
+    let n = j["candidates"].as_array().unwrap().len();
+    assert!((2..=256).contains(&n), "{n} candidates");
 }
