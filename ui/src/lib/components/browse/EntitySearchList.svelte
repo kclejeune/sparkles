@@ -66,6 +66,7 @@
     void q;
     void kind;
     void target;
+    void graph;
     clearTimeout(timer);
     timer = setTimeout(() => void search(0), 180);
     return () => clearTimeout(timer);

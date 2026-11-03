@@ -25,6 +25,7 @@
     fetchTerm,
     headGraphsQuery,
     incomingQuery,
+    usageQuery,
     kindWord,
     mentionGroups,
     mergePieces,
@@ -210,9 +211,17 @@
     }
   }
 
-  async function moreIncoming(property: string, offset: number): Promise<string[]> {
-    if (!iri) return [];
-    const rows = await api.select(target, incomingQuery(iri, property, graph, offset), {
+  async function moreIncoming(
+    kind: 'incoming' | 'usage',
+    property: string,
+    offset: number,
+  ): Promise<string[]> {
+    if (!term) return [];
+    const q =
+      kind === 'usage'
+        ? usageQuery(term.iri, term.graphs, offset)
+        : incomingQuery(term.iri, property, term.graphs, offset);
+    const rows = await api.select(target, q, {
       at: at ?? undefined,
     });
     return rows.flatMap((r) => (r.s && r.s.type === 'uri' ? [r.s.value] : []));

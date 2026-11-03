@@ -24,6 +24,7 @@ import {
   termSections,
   treeKindOf,
   xrefHref,
+  usageQuery,
   type Statement,
   type TermPage,
   type TreeNode,
@@ -132,6 +133,69 @@ describe('the sections of a page', () => {
     ]);
     expect(s.related).toEqual([EX + 'Genetics']);
     expect(s.mappings).toEqual([{ kind: 'Exact match', values: [EX + 'other'] }]);
+  });
+
+  it('lists a value once when several graphs state it', () => {
+    const twice = (x: Statement): Statement[] => [x, { ...x, graph: 'urn:other' }];
+    const s = termSections(
+      {
+        statements: [
+          st(OBO + 'IAO_0000115', lit('A definition')),
+          {
+            ...st(OBO + 'IAO_0000115', lit('A definition'), [
+              { property: OIO + 'hasDbXref', value: lit('GOC:al') },
+            ]),
+            graph: 'urn:other',
+          },
+          ...twice(st(OIO + 'hasExactSynonym', lit('mitochondria'))),
+          ...twice(st(OIO + 'hasDbXref', lit('Wikipedia:Mitochondrion'))),
+          ...twice(st(OIO + 'id', lit('GO:0005739'))),
+          ...twice(st(SKOS + 'related', EX + 'Genetics')),
+          ...twice(st(RDFS + 'seeAlso', EX + 'page')),
+          ...twice(st(EX + 'custom', lit('kept'))),
+        ],
+      },
+      ['en'],
+    );
+    // the sources of every copy stay with the one value
+    expect(s.definition?.sources).toEqual(['GOC:al']);
+    expect(s.otherDefinitions).toEqual([]);
+    expect(s.synonyms[0].values).toHaveLength(1);
+    expect(s.xrefs).toHaveLength(1);
+    expect(s.info[0].values).toHaveLength(1);
+    expect(s.related).toEqual([EX + 'Genetics']);
+    expect(s.seeAlso).toHaveLength(1);
+    expect(s.other).toEqual([{ property: EX + 'custom', values: [lit('kept')] }]);
+  });
+
+  it('reads the literal forms of SKOS-XL labels as SKOS labels', () => {
+    const XL = 'http://www.w3.org/2008/05/skos-xl#';
+    const s = termSections(
+      {
+        statements: [st(SKOS + 'prefLabel', lit('Biodiversity', 'en'))],
+        xlLabels: [
+          { property: XL + 'prefLabel', value: lit('Biodiversity', 'en'), graph: 'default' },
+          { property: XL + 'prefLabel', value: lit('Biodiversité', 'fr'), graph: 'default' },
+          { property: XL + 'altLabel', value: lit('Biological diversity', 'en'), graph: 'default' },
+        ],
+      },
+      ['en'],
+    );
+    expect(s.labels).toEqual([
+      {
+        lang: 'en',
+        preferred: ['Biodiversity'],
+        alternative: ['Biological diversity'],
+        hidden: [],
+      },
+      { lang: 'fr', preferred: ['Biodiversité'], alternative: [], hidden: [] },
+    ]);
+    expect(s.synonyms).toEqual([
+      expect.objectContaining({
+        kind: 'Alternative',
+        values: [expect.objectContaining({ lang: 'en' })],
+      }),
+    ]);
   });
 
   it('ranks languages: the caller’s, then none, then English, then the rest', () => {
@@ -444,8 +508,15 @@ describe('SPARQL of the landing page and the further reads', () => {
       { s: { type: 'uri', value: EX + 'a' }, d: { type: 'literal', value: 'Definition' } },
     ];
     expect(parseDefinitions(rows, ['en']).get(EX + 'a')).toBe('Definition');
-    expect(incomingQuery(EX + 'a', RDF + 'type', 'urn:g', 20)).toBe(
-      `SELECT DISTINCT ?s WHERE { GRAPH <urn:g> { ?s <${RDF}type> <${EX}a> FILTER(isIRI(?s)) } } ORDER BY ?s LIMIT 50 OFFSET 20`,
+    expect(incomingQuery(EX + 'a', RDF + 'type', ['urn:g'], 20)).toBe(
+      `SELECT DISTINCT ?s WHERE { { VALUES ?g { <urn:g> } GRAPH ?g { ?s <${RDF}type> <${EX}a> FILTER(isIRI(?s)) } } } ORDER BY ?s LIMIT 50 OFFSET 20`,
+    );
+    // the default graph and the imported graphs the term answer names
+    const q = incomingQuery(EX + 'a', RDF + 'type', ['default', 'urn:g', 'urn:imp'], 0);
+    expect(q).toContain(`{ ?s <${RDF}type> <${EX}a> FILTER(isIRI(?s)) } UNION`);
+    expect(q).toContain('VALUES ?g { <urn:g> <urn:imp> }');
+    expect(usageQuery(EX + 'p', ['default'], 50)).toBe(
+      `SELECT DISTINCT ?s WHERE { { ?s <${EX}p> ?o FILTER(isIRI(?s)) } } ORDER BY ?s LIMIT 50 OFFSET 50`,
     );
   });
 });

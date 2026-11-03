@@ -1650,6 +1650,7 @@ export async function handleOntology(req, res, url, seg, ctx) {
         ontologies: [{ graph, ontology: o.header.iri }],
         statements,
         statementsTruncated: false,
+        xlLabels: [],
         axioms: axioms.map(item),
         mentions: { axioms: mentioning.map(item), total: mentioning.length, truncated: false },
         incoming,

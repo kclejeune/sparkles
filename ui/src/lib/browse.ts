@@ -83,6 +83,8 @@ export type TermPage = Name & {
   ontologies: { graph: string; ontology: string | null }[];
   statements: Statement[];
   statementsTruncated: boolean;
+  /** The literal forms of the entity's SKOS-XL labels, by the SKOS-XL property. */
+  xlLabels?: { property: string; value: Lit; graph: string }[];
   axioms: AxiomItem[];
   mentions: { axioms: AxiomItem[]; total: number; truncated: boolean };
   incoming: Incoming[];
@@ -399,27 +401,69 @@ export type Sections = {
   other: { property: string; values: Value[] }[];
 };
 
+/** Each value once, by its text and language, keeping the sources of every copy. */
+function uniqueSourced(list: Sourced[]): Sourced[] {
+  const by = new Map<string, Sourced>();
+  for (const v of list) {
+    const k = `${isLiteral(v.value) ? 'l' : 'i'}\u0000${valueText(v.value)}\u0000${v.lang ?? ''}`;
+    const was = by.get(k);
+    if (!was) by.set(k, { ...v, sources: [...v.sources] });
+    else for (const src of v.sources) if (!was.sources.includes(src)) was.sources.push(src);
+  }
+  return [...by.values()];
+}
+
+/** Each value once, by its kind, text, language and datatype. */
+function uniqueValues(list: Value[]): Value[] {
+  const seen = new Set<string>();
+  return list.filter((v) => {
+    const k = isLiteral(v)
+      ? `l\u0000${v['@value']}\u0000${v['@language'] ?? ''}\u0000${v['@type'] ?? ''}`
+      : `i\u0000${v}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+const unique = <T>(list: T[]) => [...new Set(list)];
+
 const groupsOf = (kinds: [string, string][], stmts: Statement[], langs: readonly string[]) =>
   kinds
     .map(([p, kind]) => ({
       kind,
-      values: stmts
-        .filter((s) => s.property === p)
-        .map(sourced)
-        .sort(byLang(langs)),
+      values: uniqueSourced(stmts.filter((s) => s.property === p).map(sourced)).sort(byLang(langs)),
     }))
     .filter((g) => g.values.length > 0);
 
-/** Sort a page's statements into its sections, in the caller's languages. */
+const SKOSXL = 'http://www.w3.org/2008/05/skos-xl#';
+/** The plain SKOS property that each SKOS-XL label property stands for in the sections. */
+const XL_PLAIN: Record<string, string> = {
+  [SKOSXL + 'prefLabel']: SKOS + 'prefLabel',
+  [SKOSXL + 'altLabel']: SKOS + 'altLabel',
+  [SKOSXL + 'hiddenLabel']: SKOS + 'hiddenLabel',
+};
+
+/**
+ * Sort a page's statements into its sections, in the caller's languages. A value that
+ * several graphs state comes once, and the literal forms of SKOS-XL labels count as the
+ * plain SKOS labels they stand for.
+ */
 export function termSections(
-  t: Pick<TermPage, 'statements'> & Partial<Pick<TermPage, 'names'>>,
+  t: Pick<TermPage, 'statements'> & Partial<Pick<TermPage, 'names' | 'xlLabels'>>,
   langs: readonly string[],
 ): Sections {
-  const stmts = t.statements;
-  const defs = stmts
-    .filter((s) => DEFINITION_PROPS.includes(s.property))
-    .map(sourced)
-    .sort(byLang(langs));
+  const stmts: Statement[] = [
+    ...t.statements,
+    ...(t.xlLabels ?? []).flatMap((x) =>
+      XL_PLAIN[x.property]
+        ? [{ property: XL_PLAIN[x.property], value: x.value, graph: x.graph, annotations: [] }]
+        : [],
+    ),
+  ];
+  const defs = uniqueSourced(
+    stmts.filter((s) => DEFINITION_PROPS.includes(s.property)).map(sourced),
+  ).sort(byLang(langs));
   const labelRows = new Map<
     string,
     { preferred: string[]; alternative: string[]; hidden: string[] }
@@ -429,12 +473,13 @@ export function termSections(
     if (!r) labelRows.set(lang, (r = { preferred: [], alternative: [], hidden: [] }));
     return r;
   };
+  const push = (l: string[], v: string) => l.includes(v) || l.push(v);
   for (const s of stmts) {
     if (!isLiteral(s.value)) continue;
     const lang = s.value['@language'] ?? '';
-    if (s.property === SKOS + 'prefLabel') row(lang).preferred.push(s.value['@value']);
-    else if (s.property === SKOS + 'altLabel') row(lang).alternative.push(s.value['@value']);
-    else if (s.property === SKOS + 'hiddenLabel') row(lang).hidden.push(s.value['@value']);
+    if (s.property === SKOS + 'prefLabel') push(row(lang).preferred, s.value['@value']);
+    else if (s.property === SKOS + 'altLabel') push(row(lang).alternative, s.value['@value']);
+    else if (s.property === SKOS + 'hiddenLabel') push(row(lang).hidden, s.value['@value']);
   }
   const labels = [...labelRows]
     .filter(([, r]) => r.preferred.length || r.alternative.length || r.hidden.length)
@@ -444,10 +489,10 @@ export function termSections(
         langRank(a.lang || null, langs) - langRank(b.lang || null, langs) ||
         a.lang.localeCompare(b.lang),
     );
-  const xrefs = stmts
-    .filter((s) => XREF_PROPS.includes(s.property))
-    .map((s) => {
-      const v = valueText(s.value);
+  const xrefs = unique(
+    stmts.filter((s) => XREF_PROPS.includes(s.property)).map((s) => valueText(s.value)),
+  )
+    .map((v) => {
       const i = v.indexOf(':');
       const database = i > 0 && !/^https?:/.test(v) ? v.slice(0, i) : '';
       const id = database ? v.slice(i + 1) : v;
@@ -455,7 +500,9 @@ export function termSections(
     })
     .sort((a, b) => a.database.localeCompare(b.database) || a.id.localeCompare(b.id));
   const iris = (p: string) =>
-    stmts.filter((s) => s.property === p && !isLiteral(s.value)).map((s) => s.value as string);
+    unique(
+      stmts.filter((s) => s.property === p && !isLiteral(s.value)).map((s) => s.value as string),
+    );
   const otherMap = new Map<string, Value[]>();
   const facts = new Set(['objectProperty', 'dataProperty']);
   for (const s of stmts) {
@@ -466,6 +513,13 @@ export function termSections(
     l.push(s.value);
     otherMap.set(s.property, l);
   }
+  const seeAlso = new Map<string, { property: string; value: Value }>();
+  for (const s of stmts)
+    if (SEE_ALSO_PROPS.includes(s.property))
+      seeAlso.set(`${s.property}\u0000${valueText(s.value)}`, {
+        property: s.property,
+        value: s.value,
+      });
   return {
     definition: defs[0] ?? null,
     otherDefinitions: defs.slice(1),
@@ -473,9 +527,7 @@ export function termSections(
     notes: groupsOf(NOTE_KINDS, stmts, langs),
     labels,
     xrefs,
-    seeAlso: stmts
-      .filter((s) => SEE_ALSO_PROPS.includes(s.property))
-      .map((s) => ({ property: s.property, value: s.value })),
+    seeAlso: [...seeAlso.values()],
     mappings: MAPPING_KINDS.map(([p, kind]) => ({ kind, values: iris(p) })).filter(
       (g) => g.values.length > 0,
     ),
@@ -483,9 +535,9 @@ export function termSections(
     members: iris(SKOS + 'member'),
     info: INFO_KINDS.map(([p, kind]) => ({
       kind,
-      values: stmts.filter((s) => s.property === p).map((s) => s.value),
+      values: uniqueValues(stmts.filter((s) => s.property === p).map((s) => s.value)),
     })).filter((g) => g.values.length > 0),
-    other: [...otherMap].map(([property, values]) => ({ property, values })),
+    other: [...otherMap].map(([property, values]) => ({ property, values: uniqueValues(values) })),
   };
 }
 
@@ -953,15 +1005,38 @@ export const builtIn = (iri: string) => BUILT_IN.some((ns) => iri.startsWith(ns)
 const inGraph = (graph: string | null, body: string) =>
   graph ? `GRAPH <${graph}> { ${body} }` : body;
 
-/** The SPARQL of a further page of the named subjects that point at `iri` through `property`. */
+/** A pattern over the graphs a term answer names, where `default` is the default graph. */
+function overGraphs(graphs: readonly string[], body: string) {
+  const named = graphs.filter((g) => g !== 'default');
+  const parts = [
+    ...(graphs.includes('default') ? [`{ ${body} }`] : []),
+    ...(named.length
+      ? [`{ VALUES ?g { ${named.map((g) => `<${g}>`).join(' ')} } GRAPH ?g { ${body} } }`]
+      : []),
+  ];
+  return parts.length ? parts.join(' UNION ') : `{ ${body} }`;
+}
+
+/** Where a page of named subjects continues: the page size of `incomingQuery` and `usageQuery`. */
+export const PAGE = 50;
+
+/**
+ * The SPARQL of a page of the named subjects that point at `iri` through `property`, in the
+ * graphs the term answer read (its `graphs`, which include the imports), in IRI order.
+ */
 export function incomingQuery(
   iri: string,
   property: string,
-  graph: string | null,
+  graphs: readonly string[],
   offset: number,
-  limit = 50,
+  limit = PAGE,
 ) {
-  return `SELECT DISTINCT ?s WHERE { ${inGraph(graph, `?s <${property}> <${iri}> FILTER(isIRI(?s))`)} } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}`;
+  return `SELECT DISTINCT ?s WHERE { ${overGraphs(graphs, `?s <${property}> <${iri}> FILTER(isIRI(?s))`)} } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}`;
+}
+
+/** The SPARQL of a page of the named subjects that use the property `iri`, in IRI order. */
+export function usageQuery(iri: string, graphs: readonly string[], offset: number, limit = PAGE) {
+  return `SELECT DISTINCT ?s WHERE { ${overGraphs(graphs, `?s <${iri}> ?o FILTER(isIRI(?s))`)} } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}`;
 }
 
 /** The SPARQL of the definitions and labels of some IRIs, for lists such as the top classes. */

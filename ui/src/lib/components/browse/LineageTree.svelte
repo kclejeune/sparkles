@@ -111,14 +111,15 @@
   const nodeName = (n: TreeNode) => n.label ?? n.shortForm ?? n.iri;
 </script>
 
-{#snippet rows(of: string, skip: string | null)}
+{#snippet rows(of: string, skip: string | null, path: string[])}
   {@const lv = levels[of]}
   {#if lv}
     <ul class="kids" role="group">
       {#each lv.items.filter((n) => n.iri !== skip) as n (n.iri)}
+        {@const loop = path.includes(n.iri)}
         <li>
           <div class="row">
-            {#if n.children}
+            {#if n.children && !loop}
               <button
                 class="tw"
                 type="button"
@@ -130,12 +131,14 @@
               <span class="tw" aria-hidden="true"></span>
             {/if}
             <a href={href(n.iri)} class:dep={n.deprecated} title={n.iri}
-              ><span class="l">{nodeName(n)}</span>{#if n.children}<span class="n"
-                  >{n.children.toLocaleString('en-US')}</span
+              ><span class="l">{nodeName(n)}</span>{#if loop}<span
+                  class="cyc"
+                  title="This entity is also an ancestor of this branch">cycle</span
+                >{:else if n.children}<span class="n">{n.children.toLocaleString('en-US')}</span
                 >{/if}</a
             >
           </div>
-          {#if openRows[n.iri]}{@render rows(n.iri, null)}{/if}
+          {#if openRows[n.iri] && !loop}{@render rows(n.iri, null, [...path, n.iri])}{/if}
         </li>
       {/each}
       {#if lv.loading}
@@ -174,7 +177,7 @@
     {#if answer.total === 0}
       <p class="nokids">No {words.children}</p>
     {:else}
-      {@render rows(iri, null)}
+      {@render rows(iri, null, [...lin.spine.map((n) => n.iri), iri])}
     {/if}
   </li>
   {#if parent && parent.children > 1}
@@ -184,7 +187,11 @@
           parent,
         )}</button
       >
-      {#if siblingsOpen}{@render rows(parent.iri, iri)}{/if}
+      {#if siblingsOpen}{@render rows(
+          parent.iri,
+          iri,
+          lin.spine.map((n) => n.iri),
+        )}{/if}
     </li>
   {/if}
 </ol>
@@ -357,6 +364,13 @@
   }
   .tw span.open {
     transform: rotate(90deg);
+  }
+  .cyc {
+    margin-left: auto;
+    font-size: var(--fs-xs);
+    color: var(--text-3);
+    font-style: italic;
+    flex: none;
   }
   .nokids {
     font-size: var(--fs-sm);

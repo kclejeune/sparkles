@@ -83,11 +83,18 @@ open('the lineage tree follows one path and names the other parent', async ({ pa
   const spine = tree.getByRole('list', { name: 'Lineage' });
   await expect(spine.getByRole('link', { name: 'cellular component' })).toBeVisible();
   await expect(spine.getByRole('link', { name: /^organelle/ })).toBeVisible();
-  await expect(tree.locator('.alsop')).toContainText('Also under');
+  // the path takes the first parent by label, and the other one is named beside it
+  await expect(spine.getByRole('link', { name: /^intracellular organelle/ })).toBeVisible();
+  await expect(tree.locator('.alsop')).toContainText('Also under membrane-bounded organelle');
   await expect(tree.getByRole('link', { name: 'mitochondrial nucleoid' })).toBeVisible();
-  await tree.getByRole('button', { name: /3 other subclasses of/ }).click();
-  await expect(tree.getByRole('link', { name: 'nucleus' })).toBeVisible();
-  await expect(tree.getByRole('link', { name: 'vacuole' })).toBeVisible();
+
+  await page.goto(term(9));
+  await tree
+    .getByRole('button', { name: /3 other subclasses of membrane-bounded organelle/ })
+    .click();
+  await expect(tree.getByRole('link', { name: /^mitochondrion/ })).toBeVisible();
+  await expect(tree.getByRole('link', { name: /^vacuole/ })).toBeVisible();
+  await expect(tree.getByRole('link', { name: /^mitosome/ })).toBeVisible();
 });
 
 open('what links here groups the restrictions that hold the class', async ({ page }) => {
@@ -131,4 +138,30 @@ open('the graph view draws the neighbourhood', async ({ page }) => {
   await page.goto(term(5, '&view=graph'));
   await expect(page.locator('.canvas canvas').first()).toBeVisible({ timeout: 20_000 });
   await expect(page.getByRole('link', { name: 'Open in Explore' }).first()).toBeVisible();
+});
+
+open('a cycle in the hierarchy stops at the class it returns to', async ({ page, request }) => {
+  const ds = 'browse-e2e-cycle';
+  const ex = 'http://example.org/cycle#';
+  expect((await request.post('/$/datasets', { data: { dbName: ds, dbType: 'mem' } })).ok()).toBe(
+    true,
+  );
+  const loaded = await request.post(`/${ds}/data`, {
+    headers: { 'Content-Type': 'text/turtle' },
+    data: `@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix : <${ex}> .
+:Root a owl:Class ; rdfs:label "root" .
+:A a owl:Class ; rdfs:label "alpha" ; rdfs:subClassOf :Root , :B .
+:B a owl:Class ; rdfs:label "beta" ; rdfs:subClassOf :A .`,
+  });
+  expect(loaded.ok(), await loaded.text()).toBe(true);
+  await page.goto(`/ui/browse?ds=${ds}&iri=${encodeURIComponent(ex + 'Root')}`);
+  const tree = page.getByRole('complementary', { name: 'Hierarchy' });
+  await tree.getByRole('button', { name: 'Open alpha' }).click();
+  await tree.getByRole('button', { name: 'Open beta' }).click();
+  // alpha comes again under beta, marked as a cycle, with nothing further to open
+  await expect(tree.locator('.cyc')).toHaveCount(1);
+  await expect(tree.getByRole('button', { name: 'Open alpha' })).toHaveCount(0);
+  await expect(tree.getByRole('link', { name: /^alpha/ })).toHaveCount(2);
 });
