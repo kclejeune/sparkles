@@ -26,6 +26,11 @@ entail and the direct edges of the taxonomy that are not asserted, up to equival
 Both are zero when the asserted hierarchy is the taxonomy's direct hierarchy.
 
     scripts/el-oracle.py --asserted ONTOLOGY.ofn OURS.txt
+
+With `--strict`, two taxonomies agree only when they also name the same classes, so that
+a class one of them leaves out counts as a difference.
+
+    scripts/el-oracle.py --strict REFERENCE.ofn OTHER
 """
 
 import json
@@ -211,8 +216,10 @@ def compare_asserted(ontology, ours):
 def main():
     if sys.argv[1] == "--asserted":
         compare_asserted(sys.argv[2], sys.argv[3])
-    ref_node, ref_edges = normalize(*read_reference(sys.argv[1]))
-    our_node, our_edges = normalize(*read_second(sys.argv[2]))
+    strict = sys.argv[1] == "--strict"
+    args = sys.argv[2:] if strict else sys.argv[1:]
+    ref_node, ref_edges = normalize(*read_reference(args[0]))
+    our_node, our_edges = normalize(*read_second(args[1]))
     common = set(ref_node) & set(our_node)
     only_ref = sorted(set(ref_node) - common)
     only_ours = sorted(set(our_node) - common)
@@ -249,7 +256,7 @@ def main():
             "extra": [show(e) for e in sorted(extra, key=show)[:5]],
         },
     }
-    report["agree"] = not (node_diff or missing or extra)
+    report["agree"] = not (node_diff or missing or extra or (strict and (only_ref or only_ours)))
     print(json.dumps(report))
     sys.exit(0 if report["agree"] else 1)
 

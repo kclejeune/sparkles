@@ -197,7 +197,14 @@ class Gen:
         below = [0, 1] if sup == 3 else [0, 1, 3]
         x, y = self.r.choice(below), self.r.choice(below)
         a, b = self.r.choice([(x, y), (sup, x), (x, sup), (sup, sup)])
-        return f"SubObjectPropertyOf(ObjectPropertyChain(:r{a} :r{b}) :r{sup})"
+        ops = [f":r{a}", f":r{b}"]
+        # an operand below the superproperty may be inverted: the order of the chains
+        # puts a role and its inverse in the same place (Structural Specification §11.2)
+        if self.inverse and self.r.random() < 0.3:
+            k = 0 if a != sup else 1
+            if (a, b)[k] != sup:
+                ops[k] = f"ObjectInverseOf({ops[k]})"
+        return f"SubObjectPropertyOf(ObjectPropertyChain({ops[0]} {ops[1]}) :r{sup})"
 
     def axiom(self):
         r = self.r
@@ -261,7 +268,7 @@ FAMILIES = {
                                        "transitive", "functional", "inverse_functional",
                                        "domain", "range"], True),
     # Horn-SROIQ: Horn with nominals, chains and qualified at-least restrictions
-    # (Ortiz, Rudolph and Šimkus, IJCAI 2011)
+    # (Ortiz, Rudolph and Šimkus, KR 2010)
     "horn-sroiq": (["forall", "max1", "min", "nominal"], ["horn", "role_sub", "inverses",
                                                           "chain", "transitive", "functional",
                                                           "inverse_functional", "class_assertion",
@@ -287,8 +294,7 @@ FAMILIES = {
     "shoi": (["union", "complement", "forall", "nominal", "oneof"],
              CORE + ROLES + ABOX + ["inverses", "transitive"], True),
     # SHOIQ and SROIQ: nominals with inverses and number restrictions, where a nominal's
-    # predecessors are bounded (Bate, Motik, Cuenca Grau, Tena Cucala, Simančík and
-    # Horrocks, JAIR 2018)
+    # predecessors are bounded (Tena Cucala, Cuenca Grau and Horrocks, IJCAI 2018)
     "sroiq": (["union", "forall", "card", "nominal", "oneof", "self"],
               CORE + ROLES + ABOX + ["inverses", "functional", "inverse_functional", "chain",
                                      "transitive", "negative_assertion"], True),
@@ -441,6 +447,58 @@ HAND = {
         # A ⊑ ∃r.(B ⊔ C), ∃r.B ⊑ D, ∃r.C ⊑ D: case analysis in the successor's context
         ["SubClassOf(:A ObjectSomeValuesFrom(:r ObjectUnionOf(:B :C)))",
          "SubClassOf(ObjectSomeValuesFrom(:r :B) :D)", "SubClassOf(ObjectSomeValuesFrom(:r :C) :D)"],
+    "complement-left":
+        # ¬A ⊑ B is ⊤ ⊑ A ⊔ B, so with A ⊑ D and B ⊑ D every class is below D
+        ["SubClassOf(ObjectComplementOf(:A) :B)", "SubClassOf(:A :D)", "SubClassOf(:B :D)",
+         "SubClassOf(:C owl:Thing)"],
+    "inverse-chain":
+        # r⁻ ∘ s ⊑ t: an r-predecessor's s-successor in B is a t-successor, so A ⊑ D
+        ["SubObjectPropertyOf(ObjectPropertyChain(ObjectInverseOf(:r) :s) :t)",
+         "SubClassOf(:A ObjectSomeValuesFrom(ObjectInverseOf(:r) ObjectSomeValuesFrom(:s :B)))",
+         "EquivalentClasses(:D ObjectSomeValuesFrom(:t :B))"],
+    "shared-filler-no-join":
+        # r ∘ s⁻ ⊑ t: an A's r-successor in B need not be the s-successor of any C, so A
+        # is not below D, although B is the filler of both
+        ["SubObjectPropertyOf(ObjectPropertyChain(:r ObjectInverseOf(:s)) :t)",
+         "SubClassOf(:A ObjectSomeValuesFrom(:r :B))", "SubClassOf(:C ObjectSomeValuesFrom(:s :B))",
+         "EquivalentClasses(:D ObjectSomeValuesFrom(:t :C))"],
+    "top-forall-conditional":
+        # ∀U.B on an A holds for every element, the A among them, with no individual:
+        # A ⊑ B, and E ⊑ ∃r.¬B makes A ⊓ E unsatisfiable
+        ["SubClassOf(:A ObjectAllValuesFrom(owl:topObjectProperty :B))",
+         "SubClassOf(:E ObjectSomeValuesFrom(:r ObjectComplementOf(:B)))",
+         "EquivalentClasses(:F ObjectIntersectionOf(:A :E))"],
+    "data-cross-property":
+        # d and e are below the functional f, so their values are one and 1 is not 2
+        ["SubDataPropertyOf(:d :f)", "SubDataPropertyOf(:e :f)", "FunctionalDataProperty(:f)",
+         'SubClassOf(:A ObjectIntersectionOf(DataHasValue(:d "1"^^xsd:integer) DataHasValue(:e "2"^^xsd:integer)))'],
+    "data-disjoint-properties":
+        # disjoint data properties cannot share a value
+        ["DisjointDataProperties(:d :e)",
+         'SubClassOf(:A ObjectIntersectionOf(DataHasValue(:d "1"^^xsd:integer) DataHasValue(:e "1"^^xsd:integer)))'],
+    "data-finite-cases":
+        # a boolean value is true or false, and both cases lead to D
+        ["SubClassOf(:A DataSomeValuesFrom(:d xsd:boolean))",
+         'EquivalentClasses(:B DataHasValue(:d "true"^^xsd:boolean))',
+         'EquivalentClasses(:C DataHasValue(:d "false"^^xsd:boolean))',
+         "SubClassOf(:B :D)", "SubClassOf(:C :D)"],
+    "key-disjunction":
+        # a is K by cases, so the key makes a and b one, and b gets a's class G
+        ["HasKey(:K (:r) ())", "SubClassOf(:E :K)", "ClassAssertion(ObjectUnionOf(:K :E) :a)",
+         "ClassAssertion(:K :b)", "ObjectPropertyAssertion(:r :a :o)",
+         "ObjectPropertyAssertion(:r :b :o)", "ClassAssertion(:G :a)",
+         "EquivalentClasses(:D ObjectOneOf(:b))"],
+    "nominal-predecessor-cases":
+        # o has one r-predecessor, a, so every A is a, and a is not C, so A ⊑ E
+        ["SubClassOf(ObjectOneOf(:o) ObjectMaxCardinality(1 ObjectInverseOf(:r) owl:Thing))",
+         "ObjectPropertyAssertion(:r :a :o)",
+         "SubClassOf(:A ObjectIntersectionOf(ObjectHasValue(:r :o) ObjectUnionOf(:C :E)))",
+         "ClassAssertion(ObjectComplementOf(:C) :a)"],
+    "finite-domain":
+        # the domain is {a, b}, a is not B, so every B is b
+        ["SubClassOf(owl:Thing ObjectOneOf(:a :b))", "DifferentIndividuals(:a :b)",
+         "ClassAssertion(ObjectComplementOf(:B) :a)", "SubClassOf(:A ObjectSomeValuesFrom(:r :B))",
+         "EquivalentClasses(:D ObjectOneOf(:b))"],
     "el-control":
         # an OWL 2 EL ontology, which the EL rules classify alone
         ["SubClassOf(:A ObjectSomeValuesFrom(:r :B))", "SubClassOf(:B :C)",
@@ -474,10 +532,9 @@ def random_case(family, r, n):
 
 
 def hand_case(name, axioms):
-
     found = sorted({m for a in axioms for m in re.findall(r"(?<![\w>]):[A-Za-z]\w*", a)})
     roles = sorted({m for m in found if m[1] in "rst"})
-    data = sorted({m for m in found if m[1] == "d" and m != ":D"})
+    data = sorted({m for m in found if m[1] in "def"})
     inds = sorted({m for m in found if m[1] in "abo"})
     classes = sorted(set(found) - set(roles) - set(data) - set(inds))
     out = header(f"hand-{name}", classes, roles, data, inds)
