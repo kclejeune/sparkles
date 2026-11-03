@@ -483,3 +483,37 @@ fn node_sets_past_the_limit_keep_whole_signatures() {
         assert!(kept.len() <= seen, "seen {seen}: {} sets kept", kept.len());
     }
 }
+
+/// A node-family variable that a constant object also restricts is estimated from its
+/// outgoing items over the subject sets, which treat the restriction as independent,
+/// instead of falling back to the distinct values: `ex:b` and `ex:e` never share a
+/// subject, which the subject sets tell, whatever the subjects of `ex:k` are.
+#[test]
+fn restricted_node_variables_use_the_subject_sets() {
+    let n = 600;
+    let mut t = subjects(n);
+    for i in 0..n {
+        if i % 2 == 1 {
+            t.push_str(&format!("ex:s{i} ex:e {i} .\n"));
+        }
+        if i % 100 == 0 {
+            t.push_str(&format!("ex:s{i} ex:k ex:K .\n"));
+        }
+    }
+    let s = load(t);
+    let snap = s.snapshot();
+    // `?x ex:a ?y` gives `?y` an incoming item, so the node sets estimate its joins
+    let q = "SELECT * WHERE { ?y ex:k ex:K . ?y ex:b ?b . ?y ex:e ?e . ?x ex:a ?y }";
+    assert!(answer(&snap, q, sets()).is_empty());
+    let all = |o| {
+        let (_, info) = explain(snap.clone(), &format!("{PREFIXES}{q}"), &opts(o)).unwrap();
+        let mut js = Vec::new();
+        joins(&info, &mut js);
+        js
+    };
+    let with = all(sets());
+    assert_eq!(with, all(subject_sets()));
+    assert!(with[0] <= 1.0, "{with:?}");
+    assert!(all(off())[0] > 1.0);
+    assert_eq!(answer(&snap, q, sets()), answer(&snap, q, off()));
+}

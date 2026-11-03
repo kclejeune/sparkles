@@ -62,8 +62,13 @@ use std::sync::Arc;
 /// unregistered, too rarely kept, or present twice.
 pub(super) const BAD: u64 = 1 << 63;
 
+/// The bit of a node-family variable's star mask that marks a restriction the node sets
+/// do not count, such as a constant object: the subject sets then estimate the join from
+/// its outgoing items alone, as if the variable had no incoming ones.
+pub(super) const RESTRICTED: u64 = 1 << 62;
+
 /// Predicates registered per subject variable at most.
-const MAX_PREDS: usize = 63;
+const MAX_PREDS: usize = 62;
 
 /// A predicate is used when the sets kept hold at least this share of its triples.
 const COVERAGE: f64 = 0.95;
@@ -293,6 +298,10 @@ pub(super) struct StarVar {
     rest: Option<(f64, Vec<(f64, f64)>)>,
     /// mask → (rows, holders) of its star
     memo: FxHashMap<u64, (f64, f64)>,
+    /// for a node-family variable, its outgoing items over the subject sets and the bit
+    /// there of each of its bits (`u8::MAX` for an incoming item); made when a restricted
+    /// join first needs it
+    outgoing: Option<(Box<StarVar>, Vec<u8>)>,
 }
 
 /// The sets that hold exactly the registered predicates `mask`, summed.
@@ -448,50 +457,56 @@ pub(super) fn register(ctx: &Ctx, stars: &[(VarId, u64)]) {
     }
     for v in changed {
         let Some(sv) = reg.get_mut(&v) else { continue };
-        let kin = sv.kin;
-        let (sets, rest) = sets_of(stats, kin);
-        let fam = idx.family(kin);
-        fam.find(sets, &sv.preds);
-        // with a remainder every triple is accounted for, and the node sets always have
-        // one; without, an item is used when the kept sets hold nearly all of it
-        let rest = rest.filter(|_| remainder || kin == Kin::Node);
-        let mut usable = 0u64;
-        for (bit, &p) in sv.preds.iter().enumerate() {
-            let ok = if rest.is_some() {
-                // an incoming item of the subject family has no sets
-                kin == Kin::Node || !is_in_item(p)
-            } else {
-                let count = match crate::builder::item_class(p) {
-                    Some(c) => stats.classes.iter().find(|x| x.0 == c).map_or(0, |x| x.1),
-                    None => stats.predicate(p).map_or(0, |s| s.count),
-                };
-                let covered: f64 = fam.postings(sets, p).iter().map(|x| x.1).sum();
-                !is_in_item(p) && count > 0 && covered >= COVERAGE * count as f64
-            };
-            if ok {
-                usable |= 1 << bit;
-            }
-        }
-        sv.usable = usable;
-        sv.rest = rest.map(|r| {
-            (
-                r.n as f64,
-                sv.preds
-                    .iter()
-                    .map(|&p| r.item(p).map_or((0.0, 0.0), |(h, t)| (h as f64, t as f64)))
-                    .collect(),
-            )
-        });
-        sv.groups = Some(fam.groups(sets, &sv.preds, sv.usable));
-        sv.memo.clear();
+        fill(sv, stats, idx, remainder);
     }
+}
+
+/// Find the sets of the items registered for `sv` and sum them by the items they hold.
+fn fill(sv: &mut StarVar, stats: &crate::builder::Stats, idx: &CharIndex, remainder: bool) {
+    let kin = sv.kin;
+    let (sets, rest) = sets_of(stats, kin);
+    let fam = idx.family(kin);
+    fam.find(sets, &sv.preds);
+    // with a remainder every triple is accounted for, and the node sets always have
+    // one; without, an item is used when the kept sets hold nearly all of it
+    let rest = rest.filter(|_| remainder || kin == Kin::Node);
+    let mut usable = 0u64;
+    for (bit, &p) in sv.preds.iter().enumerate() {
+        let ok = if rest.is_some() {
+            // an incoming item of the subject family has no sets
+            kin == Kin::Node || !is_in_item(p)
+        } else {
+            let count = match crate::builder::item_class(p) {
+                Some(c) => stats.classes.iter().find(|x| x.0 == c).map_or(0, |x| x.1),
+                None => stats.predicate(p).map_or(0, |s| s.count),
+            };
+            let covered: f64 = fam.postings(sets, p).iter().map(|x| x.1).sum();
+            !is_in_item(p) && count > 0 && covered >= COVERAGE * count as f64
+        };
+        if ok {
+            usable |= 1 << bit;
+        }
+    }
+    sv.usable = usable;
+    sv.rest = rest.map(|r| {
+        (
+            r.n as f64,
+            sv.preds
+                .iter()
+                .map(|&p| r.item(p).map_or((0.0, 0.0), |(h, t)| (h as f64, t as f64)))
+                .collect(),
+        )
+    });
+    sv.groups = Some(fam.groups(sets, &sv.preds, sv.usable));
+    sv.memo.clear();
+    sv.outgoing = None;
 }
 
 /// Combine the star masks of two sets of patterns on one variable: a predicate in both
 /// makes the result unusable.
 #[inline]
 pub(super) fn merge(a: u64, b: u64) -> u64 {
-    if a & b & !BAD != 0 {
+    if a & b & !(BAD | RESTRICTED) != 0 {
         a | b | BAD
     } else {
         a | b
@@ -613,7 +628,7 @@ fn walk(
                 continue;
             }
             if reg.get(&v).is_some_and(|sv| sv.kin == Kin::Node) {
-                add(v, BAD);
+                add(v, RESTRICTED);
             }
         }
     };
@@ -639,7 +654,7 @@ fn walk(
                     continue;
                 }
                 if reg.get(&v).is_some_and(|sv| sv.kin == Kin::Node) {
-                    add(v, BAD);
+                    add(v, RESTRICTED);
                 }
             }
         }
@@ -650,11 +665,55 @@ fn walk(
 /// product of their rows that it keeps and the share of the product of their distinct
 /// values of `v`. `None` when the sets cannot tell.
 pub(super) fn factor(ctx: &Ctx, v: VarId, qa: u64, qb: u64) -> Option<(f64, f64)> {
-    if qa == 0 || qb == 0 || (qa | qb) & BAD != 0 || qa & qb != 0 {
+    let (pa, pb) = (qa & !RESTRICTED, qb & !RESTRICTED);
+    if pa == 0 || pb == 0 || (qa | qb) & BAD != 0 || pa & pb != 0 {
         return None;
     }
     let mut reg = ctx.stars.lock();
     let sv = reg.get_mut(&v)?;
+    if (qa | qb) & RESTRICTED == 0 {
+        return star_factor(sv, pa, pb);
+    }
+    // a restricted node-family variable: its outgoing items over the subject sets
+    if sv.kin != Kin::Node {
+        return None;
+    }
+    if sv.outgoing.is_none() {
+        let generation = &ctx.snap.generation;
+        let idx = generation.charsets.get()?;
+        let mut out = StarVar::default();
+        let mut at = Vec::with_capacity(sv.preds.len());
+        for &p in &sv.preds {
+            if is_in_item(p) {
+                at.push(u8::MAX);
+            } else {
+                at.push(out.preds.len() as u8);
+                out.preds.push(p);
+            }
+        }
+        let remainder = ctx.opt.set_remainders && generation.stats.correlations.get().is_some();
+        fill(&mut out, &generation.stats, idx, remainder);
+        sv.outgoing = Some((Box::new(out), at));
+    }
+    let (out, at) = sv.outgoing.as_mut()?;
+    let map = |mut m: u64| -> Option<u64> {
+        let mut r = 0;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            match at[i] {
+                u8::MAX => return None,
+                j => r |= 1 << j,
+            }
+        }
+        Some(r)
+    };
+    let (oa, ob) = (map(pa)?, map(pb)?);
+    star_factor(out, oa, ob)
+}
+
+/// [`factor`] from the sets of `sv` for the items `qa` and `qb`.
+fn star_factor(sv: &mut StarVar, qa: u64, qb: u64) -> Option<(f64, f64)> {
     if (qa | qb) & !sv.usable != 0 {
         return None;
     }
