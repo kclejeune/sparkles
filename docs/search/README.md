@@ -7,7 +7,7 @@ each stated scope.
 ## Search
 
 Full-text, vector, path and graph-algorithm search run inside SPARQL and join with the
-rest of a query.
+rest of a query. Entity search answers the typeahead of ontology browsers and editors.
 
 ### Full-text search
 
@@ -42,6 +42,38 @@ rest of a query.
   one, from several threads, while documents continue to publish. Under steady writes it
   repeats its unlocked pass over the newest files and takes the writer lock only for a
   short last pass when those repetitions keep being raced.
+
+### Entity search
+
+* `GET /$/ontology/{ds}/search` searches the entities of an ontology or thesaurus for a
+  typeahead or a results page ([API.md](../API.md#ontology)), and Python's, Node.js's
+  and the JVM's ontology handles call the same search. An entity is an IRI that a graph
+  types as an OWL or RDFS class, property, individual or datatype, or as a SKOS concept,
+  concept scheme or collection. The search matches labels, synonyms in SKOS, SKOS-XL and
+  oboInOwl, short forms such as `oboInOwl:id`, `skos:notation`, prefixed names and local
+  names, and definitions in any language.
+* Texts are compared with case, diacritics and punctuation folded. A query finds labels
+  and synonyms that equal it, that start with it or whose words start with its words.
+  Misspelt words match within one edit from 3 characters and two from 6, and a word still
+  being typed within one edit from 4 characters and two from 8, with a transposition as
+  one edit. Levenshtein automata walk the sorted words and texts of the index and skip
+  every run of keys whose common prefix is already too far from the query.
+* Hits are ranked in tiers, with exact labels first, then label prefixes, synonyms and
+  short forms, the words of labels and synonyms, matches with edits and last the words
+  of definitions. Within a tier the ranking prefers fewer edits, entities that are not
+  deprecated and the caller's languages, and it breaks ties by length, text and IRI, so
+  the same request on the same commit gives the same page.
+* Each branch keeps its own index in memory. The first search of a branch builds it from
+  the head, and a later search applies the commits made since, so a commit costs nothing
+  until the next search. A change too large to apply, a head that moved back or an
+  unavailable change record rebuilds the index, and a restarted server builds it again
+  at the first search. The index of ChEBI lite holds 238,190 entities in about 233 MiB,
+  292 MiB resident, and is built in 1.3 s. That memory buys typeahead that answers
+  within 8.4 ms at the 99th percentile ([entity search
+  benchmark](../benchmarks/entity-search/README.md)).
+* A caller sees only the graphs and triples their grants allow. When the grants hide
+  some triples, each candidate's matched value is checked against the caller's view
+  before it is returned.
 
 ### Vector search and embeddings
 
@@ -195,6 +227,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 ### Search and graph algorithms
 
+* The entity search keeps its index in memory only, so the first search of each branch
+  after a start builds it, item NEW-ITEM-1. It reads the head and refuses `at` and
+  `inferences`, item NEW-ITEM-2. Words are split at spaces, punctuation, camel case and
+  digits, so a label in a script written without spaces matches only as a whole text or
+  its prefix, item NEW-ITEM-3.
 * Full-text search uses Tantivy's Snowball stemmers by default, and the analyzers that
   reproduce Lucene's are selected per language. Lucene's analyzers for other languages,
   such as Greek and Arabic, have no counterpart. Roadmap item 251.
@@ -267,6 +304,7 @@ The following guides describe configuration and supported UI, command-line, HTTP
 or library workflows. Exact HTTP contracts remain in the API reference.
 
 * Read [Full-text search](../API.md#full-text-search).
+* Read [Ontology](../API.md#ontology) for the entity search route.
 * Read [Vector indexes](../API.md#vector-indexes).
 * Read [Embeddings on write](../API.md#embeddings-on-write).
 * Read [Model providers](../API.md#model-providers).
@@ -279,7 +317,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 8](../ROADMAP.md), [item 20](../ROADMAP.md), [item 23](../ROADMAP.md), [item 24](../ROADMAP.md), [item 34](../ROADMAP.md), [item 35](../ROADMAP.md), [item 79](../ROADMAP.md), [item 80](../ROADMAP.md), [item 82](../ROADMAP.md), [item 250](../ROADMAP.md), [item 251](../ROADMAP.md), [item 275](../ROADMAP.md), [item 491](../ROADMAP.md), [item 492](../ROADMAP.md), [item 493](../ROADMAP.md).
+The remaining work described above refers to [item 8](../ROADMAP.md), [item 616](../ROADMAP.md), [item 20](../ROADMAP.md), [item 23](../ROADMAP.md), [item 24](../ROADMAP.md), [item 34](../ROADMAP.md), [item 35](../ROADMAP.md), [item 79](../ROADMAP.md), [item 80](../ROADMAP.md), [item 82](../ROADMAP.md), [item 250](../ROADMAP.md), [item 251](../ROADMAP.md), [item 275](../ROADMAP.md), [item 491](../ROADMAP.md), [item 492](../ROADMAP.md), [item 493](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

@@ -1,0 +1,58 @@
+{
+ "catalog_version": 1,
+ "sources": [
+  {
+   "run_id": "sha256-95c382b187bd1682d5f0c484d7627307c7866f2f7ea8e641f3edfab0f8be12d5",
+   "path": "runs/2026-11-03-chebi-go-atlas-d48c4d74/record.json",
+   "sha256": "95c382b187bd1682d5f0c484d7627307c7866f2f7ea8e641f3edfab0f8be12d5",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "entity-search",
+    "scale": "ChEBI lite 256 and GO 2026-07-26",
+    "manifest": {
+     "binary": "crates/sparkles/examples/entity_search_bench.rs",
+     "binary_sha256": "9fc058e460a0ddaaa4e5bcebe0571ed99a460990b3341ad6a388368f1e6b01dd",
+     "build": "mbx build --release -p sparkles --features ontology --example entity_search_bench on atlas",
+     "build_note": "Built from the lane's working tree synchronized to atlas, whose crates/sparkles sources equal the commit.",
+     "commit": "d48c4d74",
+     "data": {
+      "chebi_lite": {
+       "rdfxml_sha256": "ebea75e0500818e319245a1bf605a684b2e22a2069680290b5dda638d5d25b16",
+       "release": "256",
+       "url": "http://purl.obolibrary.org/obo/chebi/256/chebi_lite.owl"
+      },
+      "go": {
+       "rdfxml_sha256": "653ce47cd7b02304e67eb67c54d3be02ec5b0ba5e00eb7384dfa0da00f9682ec",
+       "release": "2026-07-26",
+       "url": "http://purl.obolibrary.org/obo/go/releases/2026-07-26/go.owl"
+      }
+     },
+     "ended": "2026-11-03T01:47:22Z",
+     "harness_sha256": "bd2ea1b0d0787c78081ed39a0dc8a55bec53586610600faa01be6ae047dc76f8",
+     "host_load_after": "1.27 3.48 10.79",
+     "host_load_before": "1.40 3.87 11.27",
+     "started": "2026-11-03T01:46:38Z"
+    },
+    "settings": {
+     "commits": 50,
+     "per_bucket": 60,
+     "rounds": 5,
+     "seed": 1
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "kernel": "7.2.9",
+      "name": "atlas",
+      "ram_mib": 15620
+     },
+     "method": "entity_search_bench ONTOLOGY.owl --per-bucket 60 --rounds 5 --seed 1 --commits 50, one process per ontology under the host's heavy-work lock with no other build, test or benchmark running. The ontology is loaded into a persistent dataset, the first search builds the index, and 60 seeded queries per bucket of prefix length 1 to 12 and 0 to 2 typos run five times each after a warm-up pass through wire::call(ds, \"search\"), the call of the HTTP route, JSON answer included. Fifty commits then each add a labelled class or remove a label, with the search after each one timed.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual measurement record of entity_search_bench. Read the record for its method, results and checks."
+  }
+ ]
+}

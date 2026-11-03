@@ -24,6 +24,16 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+Ontologies and thesauri have a typo-tolerant entity search for typeahead (spec U12,
+roadmap item 616). `GET /$/ontology/{ds}/search?q=` matches the labels, synonyms, short
+forms and definitions of OWL, RDFS and SKOS entities in any language, with up to two
+edits in longer words, and ranks exact labels, label prefixes, synonyms and short forms,
+word matches, matches with edits and definitions in that order. Each result carries the
+matched field, text and highlight, the preferred label and the entity's kinds. The
+ontology handles of Python, Node.js and the JVM call it as `search`. Each branch keeps
+the index in memory and applies later commits at its next search, about 292 MiB
+resident for ChEBI lite.
+
 Editing forms edit nested blank-node children, SHACL 1.2 lists and `sh:or` or `sh:xone`
 value alternatives (spec U02, roadmap item 21). `GET /$/forms/{ds}?nested=true` returns
 the children that `sh:node` fields reach and the empty forms of new ones, and check and

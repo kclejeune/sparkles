@@ -175,3 +175,66 @@ the dataset, so write grants on a branch alone leave the page read-only, roadmap
 ontologies, 608 Manchester input of class expressions, 609 inferred
 property trees and 610 an IRI policy kept on the server with the resource catalog
 of [C30](../C30-resource-catalog/README.md).
+
+### Ontology browser search
+
+The server part of item 616's ontology browser is built as an entity search,
+`GET /$/ontology/{ds}/search`, with the Rust call `Ontologies::search` and `search` on the
+ontology handles of Python, Node.js and the JVM. The browser's pages are not built, and
+item 616 stays open for them.
+
+**What is indexed.** An entity is an IRI with a type fact for an OWL class, property,
+named individual or datatype, an RDFS class, property or datatype, or a SKOS concept,
+concept scheme or collection. Its labels are `rdfs:label`, `skos:prefLabel` and SKOS-XL
+preferred labels. Its synonyms are `skos:altLabel`, `skos:hiddenLabel`, their SKOS-XL
+forms and the five oboInOwl synonym properties. Its short forms are `oboInOwl:id`,
+`skos:notation` and the local name of the IRI, and its definitions are `skos:definition`
+and `IAO_0000115`. Each value keeps its graph, language and property, so a request that
+reads some graphs or that a caller's grants limit sees only those values.
+
+**Matching.** Texts are folded to lower case without diacritics or punctuation through a
+table generated from Unicode's decompositions by `scripts/gen-search-fold-table.py`.
+Whole labels and synonyms are kept in sorted maps for exact and prefix matches, and their
+words, split also at camel case and digits in local names, in a sorted map of postings
+for word matches. Misspelt words are found by Levenshtein automata from the
+`levenshtein_automata` crate walked over those sorted keys, skipping each subtree whose
+prefix the automaton rejects. A prefix automaton stops descending once its distance is
+settled, so a short prefix does not enumerate every word below it. The text index of
+[F03](../F03-full-text-search/README.md) expands fuzzy terms with automata from the same
+crate over Tantivy's term dictionary. It indexes quads and not entities, keeps no state
+per branch and commits on its own schedule, so the entity index is separate and shares
+only the automaton crate.
+
+**Ranking.** The eight tiers of the API reference are fixed, and within a tier hits are
+ordered by the number of edits, the field, deprecation, the property's rank within the
+field, the language, the matched text's length, the text and the IRI. Each entity
+appears once, at its best match. The ranking keeps a bounded heap of the best hits so
+far and skips candidates that cannot enter it, which keeps typo queries over short
+prefixes within the latency target.
+
+**Maintenance.** Each branch holds its index in its dataset state. The first search
+builds it from the head, and a later search reads the commits since its own through the
+change ring or the change feed and applies their added and removed triples. A change
+record that is not available, more than 500,000 changed triples, or a head behind the
+index, as after a restore, rebuild it. An aborted transaction leaves no commit and so no
+change. Commits do not touch the index, so the write path is
+unchanged. Nothing is persisted, so there is no format to version, and a restart
+rebuilds the index at the first search. Tests compare the index after random commits, SKOS-XL relinks, writes
+on a branch, a merge, its revert and a reopen with one built from scratch.
+
+**Measurements.** On atlas, an Intel Core i5-13500, typeahead queries of 1 to 12
+characters with up to two typos answered within 8.4 ms at the 99th percentile on ChEBI
+lite and 4.9 ms on GO, against the 20 ms target. ChEBI lite's index of 238,190 entities
+took 1.3 s to build and about 233 MiB by its own estimate, 292 MiB resident, and GO's of
+52,057 entities 0.64 s and 116 MiB resident. That memory, held per searched branch, is
+the price of answering typeahead without reading the store. The search after each of 50
+small commits applied the commit in under 3 ms with no rebuild. The
+[entity search benchmark](../../benchmarks/entity-search/README.md) records the method
+and the run.
+
+**Remaining work.** The browser's entity pages, hierarchy and graph views stay in item
+616. A persisted index that avoids the build at the first search after a start is item
+NEW-ITEM-1, searches at a past commit or with inferred kinds are item NEW-ITEM-2, and
+word segmentation for scripts written without spaces is item NEW-ITEM-3. The ontology
+editor's tree filter, the DL Query entity completion and the thesaurus editor's label
+search can move to this search under item NEW-ITEM-4.
