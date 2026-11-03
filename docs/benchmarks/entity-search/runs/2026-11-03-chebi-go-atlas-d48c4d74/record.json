@@ -1,0 +1,911 @@
+{
+ "checks": [
+  {
+   "detail": "p99 8.42 ms over 7800 timed searches",
+   "name": "chebi_lite/p99-within-20ms",
+   "ok": true
+  },
+  {
+   "detail": "50 updates and 1 build over 50 commits",
+   "name": "chebi_lite/incremental-maintenance",
+   "ok": true
+  },
+  {
+   "detail": "p99 4.94 ms over 7800 timed searches",
+   "name": "go/p99-within-20ms",
+   "ok": true
+  },
+  {
+   "detail": "50 updates and 1 build over 50 commits",
+   "name": "go/incremental-maintenance",
+   "ok": true
+  }
+ ],
+ "host": {
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "kernel": "7.2.9",
+  "name": "atlas",
+  "ram_mib": 15620
+ },
+ "kind": "measurement",
+ "manifest": {
+  "binary": "crates/sparkles/examples/entity_search_bench.rs",
+  "binary_sha256": "9fc058e460a0ddaaa4e5bcebe0571ed99a460990b3341ad6a388368f1e6b01dd",
+  "build": "mbx build --release -p sparkles --features ontology --example entity_search_bench on atlas",
+  "build_note": "Built from the lane's working tree synchronized to atlas, whose crates/sparkles sources equal the commit.",
+  "commit": "d48c4d74",
+  "data": {
+   "chebi_lite": {
+    "rdfxml_sha256": "ebea75e0500818e319245a1bf605a684b2e22a2069680290b5dda638d5d25b16",
+    "release": "256",
+    "url": "http://purl.obolibrary.org/obo/chebi/256/chebi_lite.owl"
+   },
+   "go": {
+    "rdfxml_sha256": "653ce47cd7b02304e67eb67c54d3be02ec5b0ba5e00eb7384dfa0da00f9682ec",
+    "release": "2026-07-26",
+    "url": "http://purl.obolibrary.org/obo/go/releases/2026-07-26/go.owl"
+   }
+  },
+  "ended": "2026-11-03T01:47:22Z",
+  "harness_sha256": "bd2ea1b0d0787c78081ed39a0dc8a55bec53586610600faa01be6ae047dc76f8",
+  "host_load_after": "1.27 3.48 10.79",
+  "host_load_before": "1.40 3.87 11.27",
+  "started": "2026-11-03T01:46:38Z"
+ },
+ "method": "entity_search_bench ONTOLOGY.owl --per-bucket 60 --rounds 5 --seed 1 --commits 50, one process per ontology under the host's heavy-work lock with no other build, test or benchmark running. The ontology is loaded into a persistent dataset, the first search builds the index, and 60 seeded queries per bucket of prefix length 1 to 12 and 0 to 2 typos run five times each after a warm-up pass through wire::call(ds, \"search\"), the call of the HTTP route, JSON answer included. Fifty commits then each add a labelled class or remove a label, with the search after each one timed.",
+ "results": {
+  "chebi_lite": {
+   "by_bucket": [
+    {
+     "length": 1,
+     "max_ms": 0.676459,
+     "n": 300,
+     "p50_ms": 0.193116,
+     "p95_ms": 0.42744899999999997,
+     "p99_ms": 0.642895,
+     "source_in_top10": 0.0,
+     "typos": 0
+    },
+    {
+     "length": 2,
+     "max_ms": 0.522094,
+     "n": 300,
+     "p50_ms": 0.093219,
+     "p95_ms": 0.39054,
+     "p99_ms": 0.517722,
+     "source_in_top10": 0.016666666666666666,
+     "typos": 0
+    },
+    {
+     "length": 3,
+     "max_ms": 0.352876,
+     "n": 300,
+     "p50_ms": 0.059639000000000005,
+     "p95_ms": 0.337157,
+     "p99_ms": 0.343375,
+     "source_in_top10": 0.11666666666666667,
+     "typos": 0
+    },
+    {
+     "length": 4,
+     "max_ms": 2.425588,
+     "n": 300,
+     "p50_ms": 0.072721,
+     "p95_ms": 1.4575600000000002,
+     "p99_ms": 2.179176,
+     "source_in_top10": 0.2,
+     "typos": 0
+    },
+    {
+     "length": 4,
+     "max_ms": 3.427699,
+     "n": 300,
+     "p50_ms": 0.596992,
+     "p95_ms": 1.410465,
+     "p99_ms": 3.3165400000000003,
+     "source_in_top10": 0.13333333333333333,
+     "typos": 1
+    },
+    {
+     "length": 5,
+     "max_ms": 1.489762,
+     "n": 300,
+     "p50_ms": 0.063446,
+     "p95_ms": 0.740379,
+     "p99_ms": 1.378282,
+     "source_in_top10": 0.21666666666666667,
+     "typos": 0
+    },
+    {
+     "length": 5,
+     "max_ms": 5.957845,
+     "n": 300,
+     "p50_ms": 0.747873,
+     "p95_ms": 2.141553,
+     "p99_ms": 5.787526000000001,
+     "source_in_top10": 0.16666666666666666,
+     "typos": 1
+    },
+    {
+     "length": 6,
+     "max_ms": 4.645118,
+     "n": 300,
+     "p50_ms": 0.07428399999999999,
+     "p95_ms": 1.3196690000000002,
+     "p99_ms": 4.509526,
+     "source_in_top10": 0.35,
+     "typos": 0
+    },
+    {
+     "length": 6,
+     "max_ms": 5.103390999999999,
+     "n": 300,
+     "p50_ms": 1.025345,
+     "p95_ms": 2.173223,
+     "p99_ms": 4.906521,
+     "source_in_top10": 0.4,
+     "typos": 1
+    },
+    {
+     "length": 7,
+     "max_ms": 4.440951,
+     "n": 300,
+     "p50_ms": 0.075449,
+     "p95_ms": 1.429963,
+     "p99_ms": 4.402138,
+     "source_in_top10": 0.5166666666666667,
+     "typos": 0
+    },
+    {
+     "length": 7,
+     "max_ms": 5.847911,
+     "n": 300,
+     "p50_ms": 1.1725329999999998,
+     "p95_ms": 4.84151,
+     "p99_ms": 5.2024230000000005,
+     "source_in_top10": 0.36666666666666664,
+     "typos": 1
+    },
+    {
+     "length": 8,
+     "max_ms": 6.948561,
+     "n": 300,
+     "p50_ms": 0.180315,
+     "p95_ms": 6.035795,
+     "p99_ms": 6.4244259999999995,
+     "source_in_top10": 0.6333333333333333,
+     "typos": 0
+    },
+    {
+     "length": 8,
+     "max_ms": 6.423041,
+     "n": 300,
+     "p50_ms": 3.314436,
+     "p95_ms": 5.655539,
+     "p99_ms": 6.272519,
+     "source_in_top10": 0.6,
+     "typos": 1
+    },
+    {
+     "length": 8,
+     "max_ms": 6.8297490000000005,
+     "n": 300,
+     "p50_ms": 1.525482,
+     "p95_ms": 5.806585,
+     "p99_ms": 6.227896,
+     "source_in_top10": 0.36666666666666664,
+     "typos": 2
+    },
+    {
+     "length": 9,
+     "max_ms": 8.587092,
+     "n": 300,
+     "p50_ms": 0.116131,
+     "p95_ms": 6.013223,
+     "p99_ms": 7.769832,
+     "source_in_top10": 0.6,
+     "typos": 0
+    },
+    {
+     "length": 9,
+     "max_ms": 9.219064000000001,
+     "n": 300,
+     "p50_ms": 4.12521,
+     "p95_ms": 6.619933,
+     "p99_ms": 8.777443,
+     "source_in_top10": 0.65,
+     "typos": 1
+    },
+    {
+     "length": 9,
+     "max_ms": 7.243319,
+     "n": 300,
+     "p50_ms": 4.153207,
+     "p95_ms": 6.195213,
+     "p99_ms": 6.824364999999999,
+     "source_in_top10": 0.43333333333333335,
+     "typos": 2
+    },
+    {
+     "length": 10,
+     "max_ms": 10.190753,
+     "n": 300,
+     "p50_ms": 0.10649099999999999,
+     "p95_ms": 6.6899489999999995,
+     "p99_ms": 9.494038,
+     "source_in_top10": 0.6333333333333333,
+     "typos": 0
+    },
+    {
+     "length": 10,
+     "max_ms": 10.592381999999999,
+     "n": 300,
+     "p50_ms": 4.815967,
+     "p95_ms": 7.6238649999999994,
+     "p99_ms": 10.352478999999999,
+     "source_in_top10": 0.6666666666666666,
+     "typos": 1
+    },
+    {
+     "length": 10,
+     "max_ms": 8.417361999999999,
+     "n": 300,
+     "p50_ms": 4.7725729999999995,
+     "p95_ms": 6.697381,
+     "p99_ms": 7.983169999999999,
+     "source_in_top10": 0.5333333333333333,
+     "typos": 2
+    },
+    {
+     "length": 11,
+     "max_ms": 10.573136,
+     "n": 300,
+     "p50_ms": 2.037215,
+     "p95_ms": 7.48975,
+     "p99_ms": 9.573695,
+     "source_in_top10": 0.7333333333333333,
+     "typos": 0
+    },
+    {
+     "length": 11,
+     "max_ms": 7.974275,
+     "n": 300,
+     "p50_ms": 4.6463470000000004,
+     "p95_ms": 6.407636,
+     "p99_ms": 7.472594,
+     "source_in_top10": 0.6833333333333333,
+     "typos": 1
+    },
+    {
+     "length": 11,
+     "max_ms": 10.572026,
+     "n": 300,
+     "p50_ms": 4.871244,
+     "p95_ms": 7.615977,
+     "p99_ms": 9.621235,
+     "source_in_top10": 0.6,
+     "typos": 2
+    },
+    {
+     "length": 12,
+     "max_ms": 10.847893000000001,
+     "n": 300,
+     "p50_ms": 3.156477,
+     "p95_ms": 7.190795,
+     "p99_ms": 10.807316,
+     "source_in_top10": 0.7,
+     "typos": 0
+    },
+    {
+     "length": 12,
+     "max_ms": 9.494455,
+     "n": 300,
+     "p50_ms": 5.109111,
+     "p95_ms": 8.149567,
+     "p99_ms": 9.290803,
+     "source_in_top10": 0.6333333333333333,
+     "typos": 1
+    },
+    {
+     "length": 12,
+     "max_ms": 10.654959999999999,
+     "n": 300,
+     "p50_ms": 4.789458,
+     "p95_ms": 7.455266,
+     "p99_ms": 10.24903,
+     "source_in_top10": 0.55,
+     "typos": 2
+    }
+   ],
+   "by_typos": [
+    {
+     "max_ms": 10.847893000000001,
+     "n": 3600,
+     "p50_ms": 0.09102600000000001,
+     "p95_ms": 5.967842,
+     "p99_ms": 7.829635999999999,
+     "source_in_top10": 0.39305555555555555,
+     "typos": 0
+    },
+    {
+     "max_ms": 10.592381999999999,
+     "n": 2700,
+     "p50_ms": 1.723411,
+     "p95_ms": 6.359918,
+     "p99_ms": 8.660085,
+     "source_in_top10": 0.4777777777777778,
+     "typos": 1
+    },
+    {
+     "max_ms": 10.654959999999999,
+     "n": 1500,
+     "p50_ms": 4.32749,
+     "p95_ms": 6.80402,
+     "p99_ms": 8.691428,
+     "source_in_top10": 0.49666666666666665,
+     "typos": 2
+    }
+   ],
+   "file": "chebi_lite.owl",
+   "index": {
+    "build_ms": 1330.184874,
+    "entities": 238190,
+    "estimated_bytes": 244536692,
+    "rss_after_kib": 589612,
+    "rss_before_kib": 290448,
+    "rss_delta_kib": 299164,
+    "texts": 456243,
+    "values": 731179,
+    "words": 324140
+   },
+   "load_s": 2.782344945,
+   "maintenance": {
+    "builds": 1,
+    "commit": {
+     "max_ms": 12.782976,
+     "n": 50,
+     "p50_ms": 1.878081,
+     "p95_ms": 2.5830509999999998,
+     "p99_ms": 12.782976
+    },
+    "search_after_commit": {
+     "max_ms": 2.845548,
+     "n": 50,
+     "p50_ms": 0.570966,
+     "p95_ms": 2.611565,
+     "p99_ms": 2.845548
+    },
+    "updates": 50
+   },
+   "overall": {
+    "max_ms": 10.847893000000001,
+    "n": 7800,
+    "p50_ms": 1.079291,
+    "p95_ms": 6.321002,
+    "p99_ms": 8.415462
+   },
+   "quads": 1994673,
+   "queries": 1560,
+   "settings": {
+    "commits": 50,
+    "per_bucket": 60,
+    "rounds": 5,
+    "seed": 1
+   },
+   "slowest": [
+    {
+     "ms": 10.847893000000001,
+     "q": "3,7R,11R,15-"
+    },
+    {
+     "ms": 10.654959999999999,
+     "q": "CID 9184681n"
+    },
+    {
+     "ms": 10.592381999999999,
+     "q": "4,4,4-turif"
+    },
+    {
+     "ms": 10.573136,
+     "q": "paraquat di"
+    },
+    {
+     "ms": 10.572026,
+     "q": "Methyzl4-me"
+    },
+    {
+     "ms": 10.530831,
+     "q": "3,7R,11R,15-"
+    },
+    {
+     "ms": 10.486625,
+     "q": "CID 9184681n"
+    },
+    {
+     "ms": 10.486289,
+     "q": "paraquat di"
+    },
+    {
+     "ms": 10.471841000000001,
+     "q": "4,4,4-turif"
+    },
+    {
+     "ms": 10.426397,
+     "q": "paraquat di"
+    },
+    {
+     "ms": 10.352478999999999,
+     "q": "PEq(20:2(11"
+    },
+    {
+     "ms": 10.254002999999999,
+     "q": "CID 9184681n"
+    },
+    {
+     "ms": 10.239180000000001,
+     "q": "4,4,4-turif"
+    },
+    {
+     "ms": 10.190753,
+     "q": "labdane di"
+    },
+    {
+     "ms": 10.160473999999999,
+     "q": "PEq(20:2(11"
+    },
+    {
+     "ms": 10.154253,
+     "q": "labdane di"
+    },
+    {
+     "ms": 10.123668,
+     "q": "CID 9184681n"
+    },
+    {
+     "ms": 10.110351,
+     "q": "PEq(20:2(11"
+    },
+    {
+     "ms": 10.069761999999999,
+     "q": "Methyzl4-me"
+    },
+    {
+     "ms": 9.982951,
+     "q": "PEq(20:2(11"
+    }
+   ],
+   "texts": 218723
+  },
+  "go": {
+   "by_bucket": [
+    {
+     "length": 1,
+     "max_ms": 0.34759,
+     "n": 300,
+     "p50_ms": 0.080398,
+     "p95_ms": 0.186127,
+     "p99_ms": 0.339003,
+     "source_in_top10": 0.0,
+     "typos": 0
+    },
+    {
+     "length": 2,
+     "max_ms": 0.849819,
+     "n": 300,
+     "p50_ms": 0.062477000000000005,
+     "p95_ms": 0.322081,
+     "p99_ms": 0.804176,
+     "source_in_top10": 0.0,
+     "typos": 0
+    },
+    {
+     "length": 3,
+     "max_ms": 0.339512,
+     "n": 300,
+     "p50_ms": 0.056125999999999995,
+     "p95_ms": 0.307799,
+     "p99_ms": 0.332911,
+     "source_in_top10": 0.18333333333333332,
+     "typos": 0
+    },
+    {
+     "length": 4,
+     "max_ms": 1.184114,
+     "n": 300,
+     "p50_ms": 0.06896000000000001,
+     "p95_ms": 0.382595,
+     "p99_ms": 1.1265669999999999,
+     "source_in_top10": 0.18333333333333332,
+     "typos": 0
+    },
+    {
+     "length": 4,
+     "max_ms": 2.503836,
+     "n": 300,
+     "p50_ms": 1.051326,
+     "p95_ms": 2.208028,
+     "p99_ms": 2.351633,
+     "source_in_top10": 0.08333333333333333,
+     "typos": 1
+    },
+    {
+     "length": 5,
+     "max_ms": 1.151153,
+     "n": 300,
+     "p50_ms": 0.069522,
+     "p95_ms": 0.648082,
+     "p99_ms": 1.0404550000000001,
+     "source_in_top10": 0.18333333333333332,
+     "typos": 0
+    },
+    {
+     "length": 5,
+     "max_ms": 2.4370789999999998,
+     "n": 300,
+     "p50_ms": 0.9843700000000001,
+     "p95_ms": 1.923992,
+     "p99_ms": 2.350611,
+     "source_in_top10": 0.16666666666666666,
+     "typos": 1
+    },
+    {
+     "length": 6,
+     "max_ms": 1.506502,
+     "n": 300,
+     "p50_ms": 0.07176700000000001,
+     "p95_ms": 1.188854,
+     "p99_ms": 1.4763650000000001,
+     "source_in_top10": 0.26666666666666666,
+     "typos": 0
+    },
+    {
+     "length": 6,
+     "max_ms": 3.189263,
+     "n": 300,
+     "p50_ms": 0.9566209999999999,
+     "p95_ms": 2.274929,
+     "p99_ms": 3.053966,
+     "source_in_top10": 0.21666666666666667,
+     "typos": 1
+    },
+    {
+     "length": 7,
+     "max_ms": 2.2068719999999997,
+     "n": 300,
+     "p50_ms": 0.152587,
+     "p95_ms": 1.187636,
+     "p99_ms": 1.990236,
+     "source_in_top10": 0.26666666666666666,
+     "typos": 0
+    },
+    {
+     "length": 7,
+     "max_ms": 4.373434,
+     "n": 300,
+     "p50_ms": 1.273428,
+     "p95_ms": 3.524448,
+     "p99_ms": 4.2618,
+     "source_in_top10": 0.21666666666666667,
+     "typos": 1
+    },
+    {
+     "length": 8,
+     "max_ms": 3.9506710000000003,
+     "n": 300,
+     "p50_ms": 0.100134,
+     "p95_ms": 3.07742,
+     "p99_ms": 3.782718,
+     "source_in_top10": 0.3333333333333333,
+     "typos": 0
+    },
+    {
+     "length": 8,
+     "max_ms": 5.002853,
+     "n": 300,
+     "p50_ms": 2.9335720000000003,
+     "p95_ms": 4.235142,
+     "p99_ms": 4.779449,
+     "source_in_top10": 0.3333333333333333,
+     "typos": 1
+    },
+    {
+     "length": 8,
+     "max_ms": 5.013624,
+     "n": 300,
+     "p50_ms": 2.729474,
+     "p95_ms": 4.502491,
+     "p99_ms": 4.70545,
+     "source_in_top10": 0.18333333333333332,
+     "typos": 2
+    },
+    {
+     "length": 9,
+     "max_ms": 4.530514999999999,
+     "n": 300,
+     "p50_ms": 0.16556200000000001,
+     "p95_ms": 3.261856,
+     "p99_ms": 3.983366,
+     "source_in_top10": 0.4,
+     "typos": 0
+    },
+    {
+     "length": 9,
+     "max_ms": 5.457894,
+     "n": 300,
+     "p50_ms": 3.093238,
+     "p95_ms": 4.639983,
+     "p99_ms": 4.838075,
+     "source_in_top10": 0.36666666666666664,
+     "typos": 1
+    },
+    {
+     "length": 9,
+     "max_ms": 16.985842,
+     "n": 300,
+     "p50_ms": 2.913014,
+     "p95_ms": 3.752849,
+     "p99_ms": 7.486038000000001,
+     "source_in_top10": 0.36666666666666664,
+     "typos": 2
+    },
+    {
+     "length": 10,
+     "max_ms": 3.677465,
+     "n": 300,
+     "p50_ms": 0.112943,
+     "p95_ms": 3.217214,
+     "p99_ms": 3.599414,
+     "source_in_top10": 0.55,
+     "typos": 0
+    },
+    {
+     "length": 10,
+     "max_ms": 5.293062,
+     "n": 300,
+     "p50_ms": 3.100738,
+     "p95_ms": 4.329536,
+     "p99_ms": 4.7258379999999995,
+     "source_in_top10": 0.5,
+     "typos": 1
+    },
+    {
+     "length": 10,
+     "max_ms": 4.530244,
+     "n": 300,
+     "p50_ms": 3.099658,
+     "p95_ms": 3.8776409999999997,
+     "p99_ms": 4.244117,
+     "source_in_top10": 0.4666666666666667,
+     "typos": 2
+    },
+    {
+     "length": 11,
+     "max_ms": 4.567664,
+     "n": 300,
+     "p50_ms": 0.154758,
+     "p95_ms": 3.857657,
+     "p99_ms": 4.330269,
+     "source_in_top10": 0.45,
+     "typos": 0
+    },
+    {
+     "length": 11,
+     "max_ms": 6.698896,
+     "n": 300,
+     "p50_ms": 3.5708889999999998,
+     "p95_ms": 6.014997,
+     "p99_ms": 6.428496,
+     "source_in_top10": 0.4666666666666667,
+     "typos": 1
+    },
+    {
+     "length": 11,
+     "max_ms": 6.406509000000001,
+     "n": 300,
+     "p50_ms": 3.177619,
+     "p95_ms": 5.814884999999999,
+     "p99_ms": 6.179061,
+     "source_in_top10": 0.4666666666666667,
+     "typos": 2
+    },
+    {
+     "length": 12,
+     "max_ms": 4.134677,
+     "n": 300,
+     "p50_ms": 0.160719,
+     "p95_ms": 3.434758,
+     "p99_ms": 4.071455,
+     "source_in_top10": 0.45,
+     "typos": 0
+    },
+    {
+     "length": 12,
+     "max_ms": 6.506012,
+     "n": 300,
+     "p50_ms": 3.415464,
+     "p95_ms": 4.857244000000001,
+     "p99_ms": 5.749074,
+     "source_in_top10": 0.4,
+     "typos": 1
+    },
+    {
+     "length": 12,
+     "max_ms": 4.892402,
+     "n": 300,
+     "p50_ms": 3.213818,
+     "p95_ms": 4.517321,
+     "p99_ms": 4.72133,
+     "source_in_top10": 0.35,
+     "typos": 2
+    }
+   ],
+   "by_typos": [
+    {
+     "max_ms": 4.567664,
+     "n": 3600,
+     "p50_ms": 0.08927199999999999,
+     "p95_ms": 2.944225,
+     "p99_ms": 3.662105,
+     "source_in_top10": 0.2722222222222222,
+     "typos": 0
+    },
+    {
+     "max_ms": 6.698896,
+     "n": 2700,
+     "p50_ms": 2.243495,
+     "p95_ms": 4.46234,
+     "p99_ms": 5.749074,
+     "source_in_top10": 0.3055555555555556,
+     "typos": 1
+    },
+    {
+     "max_ms": 16.985842,
+     "n": 1500,
+     "p50_ms": 3.060747,
+     "p95_ms": 4.4240319999999995,
+     "p99_ms": 5.8709169999999995,
+     "source_in_top10": 0.36666666666666664,
+     "typos": 2
+    }
+   ],
+   "file": "go.owl",
+   "index": {
+    "build_ms": 635.299465,
+    "entities": 52057,
+    "estimated_bytes": 103387698,
+    "rss_after_kib": 297652,
+    "rss_before_kib": 178472,
+    "rss_delta_kib": 119180,
+    "texts": 215205,
+    "values": 326642,
+    "words": 83432
+   },
+   "load_s": 2.037610715,
+   "maintenance": {
+    "builds": 1,
+    "commit": {
+     "max_ms": 14.082065,
+     "n": 50,
+     "p50_ms": 0.31328,
+     "p95_ms": 0.713301,
+     "p99_ms": 14.082065
+    },
+    "search_after_commit": {
+     "max_ms": 1.03139,
+     "n": 50,
+     "p50_ms": 0.19228800000000001,
+     "p95_ms": 0.770931,
+     "p99_ms": 1.03139
+    },
+    "updates": 50
+   },
+   "overall": {
+    "max_ms": 16.985842,
+    "n": 7800,
+    "p50_ms": 0.9862950000000001,
+    "p95_ms": 4.127031,
+    "p99_ms": 4.938905
+   },
+   "quads": 1445043,
+   "queries": 1560,
+   "settings": {
+    "commits": 50,
+    "per_bucket": 60,
+    "rounds": 5,
+    "seed": 1
+   },
+   "slowest": [
+    {
+     "ms": 16.985842,
+     "q": "B-jcellc o"
+    },
+    {
+     "ms": 8.901434,
+     "q": "smetaphsae"
+    },
+    {
+     "ms": 7.931845,
+     "q": "endosepmr"
+    },
+    {
+     "ms": 7.486038000000001,
+     "q": "doin-reu"
+    },
+    {
+     "ms": 6.698896,
+     "q": "downregulawt"
+    },
+    {
+     "ms": 6.514308,
+     "q": "positie re"
+    },
+    {
+     "ms": 6.506012,
+     "q": "cajthepsin H "
+    },
+    {
+     "ms": 6.4673359999999995,
+     "q": "positnve re"
+    },
+    {
+     "ms": 6.428496,
+     "q": "positie re"
+    },
+    {
+     "ms": 6.406509000000001,
+     "q": "oitive re"
+    },
+    {
+     "ms": 6.336286,
+     "q": "positie re"
+    },
+    {
+     "ms": 6.333362999999999,
+     "q": "oitive re"
+    },
+    {
+     "ms": 6.327404,
+     "q": "negatbive re"
+    },
+    {
+     "ms": 6.183663,
+     "q": "ngeative re"
+    },
+    {
+     "ms": 6.179061,
+     "q": "oitive re"
+    },
+    {
+     "ms": 6.172719,
+     "q": "positnve re"
+    },
+    {
+     "ms": 6.148218000000001,
+     "q": "ositive re"
+    },
+    {
+     "ms": 6.120821,
+     "q": "negatbive re"
+    },
+    {
+     "ms": 6.095823,
+     "q": "obsolext re"
+    },
+    {
+     "ms": 6.079721,
+     "q": "ositive re"
+    }
+   ],
+   "texts": 125303
+  }
+ },
+ "scale": "ChEBI lite 256 and GO 2026-07-26",
+ "settings": {
+  "commits": 50,
+  "per_bucket": 60,
+  "rounds": 5,
+  "seed": 1
+ },
+ "suite": "entity-search"
+}

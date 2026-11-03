@@ -89,6 +89,12 @@ public object SparklesOnt {
     public fun entities(dataset: DatasetGraphSparkles, graphIri: String? = null, kinds: List<String> = emptyList(), limit: Int = 100, offset: Long = 0): JsonObject =
         dataset.ontology().entities(OntologyRead(graph = graphIri), kinds, limit, offset)
 
+    /** Search the entities of the graph's ontology with typos tolerated, as [SparklesOntology.search] does. */
+    @JvmStatic
+    @JvmOverloads
+    public fun search(dataset: DatasetGraphSparkles, query: String, graphIri: String? = null, kinds: List<String> = emptyList(), limit: Int = 10): JsonObject =
+        dataset.ontology().search(query, OntologyRead(graph = graphIri), kinds, limit = limit)
+
     /** What the ontology of the graph says about one entity, as [SparklesOntology.entity] answers it. */
     @JvmStatic
     @JvmOverloads
@@ -324,6 +330,46 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         args.put("limit", limit.toLong())
         args.put("offset", offset)
         return call("entities", args, operation, false)
+    }
+
+    /**
+     * Search the entities by label, synonym, short form and definition, with typos
+     * tolerated, ranked as `GET /$/ontology/{ds}/search` ranks them: one page of `limit`
+     * hits from `offset`. `kinds` keeps some kinds, such as `class` or `concept`, and
+     * `languages` lists the preferred languages, most preferred first. The search reads
+     * the head, so `read` names neither `at` nor `inferences`.
+     */
+    @JvmOverloads public fun search(
+        query: String,
+        read: OntologyRead = OntologyRead(),
+        kinds: List<String> = emptyList(),
+        languages: List<String> = emptyList(),
+        limit: Int = 10,
+        offset: Long = 0,
+        fuzzy: Boolean = true,
+        definitions: Boolean = true,
+    ): JsonObject = SparklesOperation().use { search(query, read, kinds, languages, limit, offset, fuzzy, definitions, it) }
+    public fun search(
+        query: String,
+        read: OntologyRead,
+        kinds: List<String>,
+        languages: List<String>,
+        limit: Int,
+        offset: Long,
+        fuzzy: Boolean,
+        definitions: Boolean,
+        operation: SparklesOperation,
+    ): JsonObject {
+        require(limit > 0 && offset >= 0)
+        val args = read.value()
+        args.put("q", query)
+        if (kinds.isNotEmpty()) args.put("kind", kinds.joinToString(","))
+        if (languages.isNotEmpty()) args.put("lang", languages.joinToString(","))
+        args.put("limit", limit.toLong())
+        args.put("offset", offset)
+        args.put("fuzzy", fuzzy)
+        args.put("definitions", definitions)
+        return call("search", args, operation, false)
     }
 
     /**

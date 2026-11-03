@@ -997,3 +997,99 @@ async fn edits_take_functional_syntax() {
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
     assert_eq!(r.json()["code"], "invalid-axiom", "{}", r.text());
 }
+
+#[tokio::test]
+async fn the_entity_search_ranks_typeahead_hits() {
+    let s = server();
+    let r = get(&s.app, "/$/ontology/t/search?q=prof").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.headers.contains_key("sparkles-commit"));
+    let j = r.json();
+    assert_eq!(j["results"][0]["iri"], "http://ex.org/Professor", "{j}");
+    assert_eq!(j["results"][0]["type"], "entity");
+    assert_eq!(j["results"][0]["kinds"], json!(["class"]));
+    assert_eq!(j["results"][0]["match"]["field"], "shortForm");
+    assert_eq!(j["results"][0]["match"]["highlight"], json!([[0, 4]]));
+    assert_eq!(j["index"], "built");
+    // a typo, a kind filter, a page and the languages of Accept-Language
+    let j = get(&s.app, "/$/ontology/t/search?q=Profesor").await.json();
+    assert_eq!(j["results"][0]["match"]["kind"], "fuzzy", "{j}");
+    assert_eq!(j["index"], "current");
+    let j = get(&s.app, "/$/ontology/t/search?q=teach&kind=property")
+        .await
+        .json();
+    assert_eq!(j["results"][0]["iri"], "http://ex.org/teaches", "{j}");
+    assert_eq!(
+        get(&s.app, "/$/ontology/t/search?q=teach&kind=class")
+            .await
+            .json()["results"],
+        json!([])
+    );
+    let r = send(
+        &s.app,
+        "GET",
+        "/$/ontology/t/search?q=teaching",
+        &[("accept-language", "fr-CH, fr;q=0.9, en;q=0.5, *;q=0.1")],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // a commit is searched at once
+    let r = send(
+        &s.app,
+        "POST",
+        "/t/update",
+        &[(header::CONTENT_TYPE.as_str(), "application/sparql-update")],
+        "INSERT DATA { <http://ex.org/Lecturer> a <http://www.w3.org/2002/07/owl#Class> ; <http://www.w3.org/2000/01/rdf-schema#label> \"lecturer\"@en }",
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let j = get(&s.app, "/$/ontology/t/search?q=lect&limit=1")
+        .await
+        .json();
+    assert_eq!(j["results"][0]["label"], "lecturer", "{j}");
+    assert_eq!(j["results"][0]["labelLang"], "en", "{j}");
+    assert_ne!(j["index"], "current", "{j}");
+    // bad requests
+    for uri in [
+        "/$/ontology/t/search",
+        "/$/ontology/t/search?q=x&limit=0",
+        "/$/ontology/t/search?q=x&limit=101",
+        "/$/ontology/t/search?q=x&kind=planet",
+        "/$/ontology/t/search?q=x&lang=not_a_tag!",
+        "/$/ontology/t/search?q=x&at=1",
+        "/$/ontology/t/search?q=x&offset=10000",
+    ] {
+        let r = get(&s.app, uri).await;
+        assert!(
+            r.status.is_client_error(),
+            "{uri}: {} {}",
+            r.status,
+            r.text()
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_entity_search_reads_the_branch_asked_for() {
+    let s = persistent();
+    s._state
+        .get("h")
+        .unwrap()
+        .dataset
+        .create_branch("dev", &Default::default())
+        .unwrap();
+    let r = post(
+        &s.app,
+        "/$/ontology/h/axioms?branch=dev",
+        json!({"add": [sub("http://ex.org/Lecturer", json!("http://ex.org/Person"))]}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = get(&s.app, "/$/ontology/h/search?q=lectur&branch=dev").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.headers["sparkles-branch"], "dev");
+    assert_eq!(r.json()["results"][0]["iri"], "http://ex.org/Lecturer");
+    let j = get(&s.app, "/$/ontology/h/search?q=lectur").await.json();
+    assert_eq!(j["results"], json!([]), "{j}");
+}

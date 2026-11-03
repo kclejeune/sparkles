@@ -1865,6 +1865,59 @@ read, types by their use, as `{kind, iri}` in IRI order, 100 at a time by defaul
 most 10,000 (`limit`, `offset`, and `next` in the answer). `kind` keeps the kinds it
 lists, comma separated, such as `Class,ObjectProperty`.
 
+`GET /$/ontology/{ds}/search?q=TEXT` searches the entities of the ontology for a
+typeahead or a results page. An entity is an IRI that some graph types as an OWL class,
+property, named individual or datatype, an RDFS class, property or datatype, or a SKOS
+concept, concept scheme or collection. The search matches its labels (`rdfs:label`,
+`skos:prefLabel` and SKOS-XL preferred labels), synonyms (`skos:altLabel`,
+`skos:hiddenLabel`, their SKOS-XL forms and the oboInOwl synonym properties), short forms
+(`oboInOwl:id`, `skos:notation` and the local name of the IRI) and definitions
+(`skos:definition` and `IAO_0000115`), in any language, in a form with case, diacritics
+and punctuation folded. A query that is an IRI, or a prefixed name with one of the
+dataset's prefixes, also matches the IRIs it equals or begins.
+
+The hits come in eight tiers. A label that equals the query comes first, then labels
+that start with it, then synonyms, short forms and IRIs that equal it, then those that
+start with it, then labels and then synonyms that contain every word of the query, the
+last word as a prefix. Matches within a few edits follow, and then definitions that
+contain the query's words. A word typed so far takes no edit up to 3 characters, one up
+to 7 and two beyond, and a whole word takes one from 3 characters and two from 6, with a
+transposition as one edit. Within a tier, hits are ordered by the edits, the field,
+entities that are not deprecated first, the language of the matched text, its length,
+the text and the IRI, so the same request on the same commit gives the same page.
+`lang` names the caller's languages, most preferred first, and defaults to the tags of
+`Accept-Language`. Texts in those languages rank first, then untagged ones, then English,
+then the others, and without a preference untagged and English texts rank alike.
+
+`kind` keeps some kinds, comma separated: `class`, `property` (every kind of property),
+`objectProperty`, `dataProperty`, `annotationProperty`, `individual`, `datatype`,
+`concept`, `conceptScheme` and `collection`. `limit` is 10 by default and at most 100,
+`offset` and `limit` reach at most 10,000 hits. `more` says whether further hits exist,
+and `next` gives the offset of the next page, or null when no page can start there
+because the window ends. `fuzzy=false` and `definitions=false` leave out those tiers. The
+graphs, imports and branch are chosen as for the other routes, and the caller sees only
+the graphs and triples their grants allow. The search reads the head, so `at` and
+`inferences` are refused. An IRI prefix ranks at most the first 10,000 matching IRIs
+that the caller can see, in IRI order, and the answer warns when it matched more.
+
+```json
+{ "dataset": "chebi", "commit": 3, "graphs": ["default"], "query": "glucos",
+  "results": [{ "type": "entity", "iri": "http://purl.obolibrary.org/obo/CHEBI_17234",
+    "kinds": ["class"], "label": "glucose", "labelLang": null, "shortForm": "CHEBI:17234",
+    "deprecated": false,
+    "match": { "field": "label", "property": "http://www.w3.org/2000/01/rdf-schema#label",
+      "text": "glucose", "lang": null, "kind": "prefix", "distance": 0, "tier": 1,
+      "highlight": [[0, 6]] } }],
+  "offset": 0, "limit": 10, "more": true, "next": 10, "index": "current" }
+```
+
+`highlight` gives the matched ranges of `match.text` in UTF-16 code units, the offsets
+of JavaScript and Java strings. Every result has `type` set to `entity`, so a list that
+mixes them with other kinds of result can tell them apart. `index` says whether the
+branch's entity index already reflected the head, applied the changes of later commits,
+or was built for this request, which the first search of a branch after the server
+starts does.
+
 `GET /$/ontology/{ds}/entity?iri=IRI` answers what the ontology says about one entity.
 `kinds` lists the kinds the IRI has, and `labels` and `annotations` its `rdfs:label`
 literals and annotation assertions. Each kind adds a member. `class` has
