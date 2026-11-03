@@ -234,7 +234,27 @@ describe('recent picks', () => {
     list = addRecent(list, on('a', 3));
     expect(list.map((e) => `${e.ds}${e.at}`)).toEqual(['a3', 'b2']);
     // a pick that belongs to no dataset is one item everywhere
-    list = addRecent(addRecent([], entry('/x', 1)), { ...entry('/x', 2), ds: 'other' }, false);
+    list = addRecent(addRecent([], entry('/x', 1)), entry('/x', 2));
     expect(list).toHaveLength(1);
+  });
+
+  it('keeps the picks another tab stored meanwhile', () => {
+    const store = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(k, v),
+      removeItem: (k: string) => void store.delete(k),
+    });
+    // two tabs open with the same (empty) history
+    let tabA = loadRecent();
+    let tabB = loadRecent();
+    tabA = recordRecent(tabA, entry('/a', 1));
+    tabB = recordRecent(tabB, entry('/b', 2));
+    expect(loadRecent().map((e) => e.id)).toEqual(['/b', '/a']);
+    // and a tab's own picks survive a store another tab cleared
+    store.clear();
+    tabA = recordRecent(tabA, entry('/c', 3));
+    expect(tabA.map((e) => e.id)).toEqual(['/c', '/a']);
+    vi.unstubAllGlobals();
   });
 });

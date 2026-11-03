@@ -26,31 +26,35 @@ export function loadRecent(): RecentEntry[] {
   return Array.isArray(raw) ? raw.filter(valid).slice(0, RECENT_MAX) : [];
 }
 
+/** Whether two picks are of the same item: the same provider, id and dataset. */
+const sameItem = (a: RecentEntry, b: RecentEntry) =>
+  a.provider === b.provider && a.id === b.id && a.ds === b.ds;
+
 /**
- * `list` with `entry` first and an earlier pick of the same item dropped. With `perDataset`
- * the item is the same only on the same dataset, so a pick on one dataset keeps the pick of
- * the same IRI or name on another.
+ * `list` with `entry` first and an earlier pick of the same item dropped. A pick that
+ * belongs to a dataset is the same item only on the same dataset, so a pick on one dataset
+ * keeps the pick of the same IRI or name on another; a pick of no dataset has `ds` null.
  */
-export function addRecent(
-  list: readonly RecentEntry[],
-  entry: RecentEntry,
-  perDataset = true,
-): RecentEntry[] {
-  const same = (e: RecentEntry) =>
-    e.provider === entry.provider && e.id === entry.id && (!perDataset || e.ds === entry.ds);
-  return [entry, ...list.filter((e) => !same(e))].slice(0, RECENT_MAX);
+export function addRecent(list: readonly RecentEntry[], entry: RecentEntry): RecentEntry[] {
+  return [entry, ...list.filter((e) => !sameItem(e, entry))].slice(0, RECENT_MAX);
+}
+
+/** The picks of both lists, each item once with its latest pick, newest first. */
+export function mergeRecent(a: readonly RecentEntry[], b: readonly RecentEntry[]): RecentEntry[] {
+  const out: RecentEntry[] = [];
+  for (const e of [...a, ...b].sort((x, y) => y.at - x.at))
+    if (!out.some((o) => sameItem(o, e))) out.push(e);
+  return out.slice(0, RECENT_MAX);
 }
 
 /**
- * Remembers a pick on top of `list`, the palette's own copy, and stores the result as far as
- * storage allows. The returned list is the new copy, also when storage refuses it.
+ * Remembers a pick and stores the result as far as storage allows. The pick goes on top of
+ * the stored list, which another tab may have added to, merged with `list`, the palette's
+ * own copy, which keeps the picks of this visit when storage refuses them. The returned
+ * list is the new copy.
  */
-export function recordRecent(
-  list: readonly RecentEntry[],
-  entry: RecentEntry,
-  perDataset = true,
-): RecentEntry[] {
-  const next = addRecent(list, entry, perDataset);
+export function recordRecent(list: readonly RecentEntry[], entry: RecentEntry): RecentEntry[] {
+  const next = addRecent(mergeRecent(loadRecent(), list), entry);
   save(RECENT_KEY, next);
   return next;
 }
