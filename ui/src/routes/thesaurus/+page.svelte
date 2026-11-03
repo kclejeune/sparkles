@@ -16,7 +16,7 @@
   import { branchParam, MAIN, onBranch } from '$lib/branches';
   import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
   import { getForm, type FormSaveAnswer } from '$lib/forms-api';
-  import type { FormModel, FormValue } from '$lib/forms';
+  import type { FormModel } from '$lib/forms';
   import { fmtInt } from '$lib/format';
   import {
     iriName,
@@ -176,16 +176,11 @@
     try {
       // without the tag no edit could name the commit it was made against: read-only
       const h = await readHead(t, graph).catch(() => ({ etag: null, commit: 0 }));
-      const [sRows, cRows, lRows, others] = await Promise.all([
+      const [sRows, cRows, lRows] = await Promise.all([
         select(schemesQuery(graph)),
         select(collectionsQuery(graph)),
         select(languagesQuery(graph)).catch(() => []),
-        api
-          .query(t, otherGraphsQuery(graph), { nocache: true })
-          .then((r) => !!r.boolean)
-          .catch(() => true),
       ]);
-      otherGraphs = others;
       if (my !== loadSeq) return;
       schemes = sRows.flatMap((r) => (r.s?.type === 'uri' ? [r.s.value] : []));
       collections = cRows.flatMap((r) =>
@@ -724,13 +719,29 @@
     }
   }
 
-  // The notes and members forms read every graph and write where the dataset's forms
-  // setting says, so the page lets them edit only the graph it shows.
+  // The notes and members forms read every graph, write where the dataset's forms setting
+  // says, and delete a removed value's nested nodes and list cells wherever they are. The
+  // page lets them edit only a dataset that keeps no graph but the one it shows, where no
+  // write can reach another graph, and only when their target is that graph.
   let formModel = $state<{ key: string; m: FormModel } | null>(null);
-  /** The dataset holds triples outside the graph the page edits (true until read). */
-  let otherGraphs = $state(true);
-  const outside = (vs: FormValue[], here: string | null): boolean =>
-    vs.some((v) => (v.graph ?? null) !== here || (!!v.items && outside(v.items, here)));
+  /** For a target and graph, whether the dataset holds triples elsewhere (absent: unread). */
+  let otherGraphs = $state<{ key: string; others: boolean } | null>(null);
+  const graphsKey = $derived(`${target}|${graph ?? ''}|${head?.commit}`);
+  $effect(() => {
+    if (view !== 'notes' && view !== 'members') return;
+    const key = graphsKey;
+    const t = target;
+    const g = graph;
+    if (otherGraphs?.key === key) return;
+    void api
+      .query(t, otherGraphsQuery(g), { nocache: true })
+      .then((r) => !!r.boolean)
+      .catch(() => true)
+      .then((others) => {
+        // an answer for a page that has moved on is dropped
+        if (key === graphsKey) otherGraphs = { key, others };
+      });
+  });
   const formKey = $derived(`${selected}|${branch}|${formShapes}|${view}|${head?.commit}`);
   const formLock = $derived.by(() => {
     if (readonly) return 'The page is read-only, so the form is too.';
@@ -740,20 +751,10 @@
     const name = (g: string | null) => (g ? iriName(g, prefixes) : 'the default graph');
     if ((fm.graph ?? null) !== here)
       return `The form would write to ${name(fm.graph ?? null)}, not to ${name(here)} that the page edits, so it is read-only here.`;
-    const elsewhere =
-      fm.fields.some((f) => outside(f.values, here)) ||
-      fm.other.some((o) => outside(o.values, here)) ||
-      (fm.nestedNodes ?? []).some(
-        (n) =>
-          (n.graph ?? null) !== here ||
-          n.anchors.some((a) => (a.graph ?? null) !== here) ||
-          n.fields.some((f) => outside(f.values, here)),
-      );
-    if (elsewhere)
-      return `Some of these values are in other graphs than ${name(here)}, so the form is read-only here.`;
-    // the cells of a list name no graph, so a list is edited only where no other graph is
-    if (otherGraphs && fm.fields.some((f) => f.values.some((v) => v.items)))
-      return `The dataset keeps triples outside ${name(here)}, and a list's cells could sit there, so the list is read-only here.`;
+    const others = otherGraphs?.key === graphsKey ? otherGraphs.others : null;
+    if (others === null) return 'Checking the graphs of the dataset…';
+    if (others)
+      return `The dataset keeps triples outside ${name(here)}, and a form's save could change them, so the form is read-only here.`;
     return null;
   });
 

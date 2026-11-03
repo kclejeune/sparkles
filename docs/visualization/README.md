@@ -263,9 +263,8 @@ revert commits, **Start session** creates a `skos.<user>.<date>` branch, another
 commit reloads the page, and a protected branch is read-only. The page is also read-only
 when it cannot read the commit its graph is at. The notes and members forms save through
 the editing forms, which check the stored values of each field they change instead of the
-commit, and they are read-only when a value or their target is in another graph than the
-one the page edits. An ordered collection's list is editable only while the dataset keeps
-no other graph, since the form does not say which graph a list's cells are in. The [API reference](../API.md#skos-shapes) lists the shapes'
+commit. They are editable only when the dataset keeps no graph but the one the page edits
+and their target is that graph, since a form's save could otherwise change another graph. The [API reference](../API.md#skos-shapes) lists the shapes'
 conditions.
 
 ## Known gaps
@@ -331,8 +330,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   SKOS rules become a write guard only by replacing the dataset's guard, so a dataset
   cannot keep its own shapes and the SKOS shapes together, NEW-ITEM-4. Editing forms
   read every graph and have no graph or commit precondition of a request's own, so the
-  thesaurus editor's notes and members forms edit the default graph's resources and their
-  saves do not name the commit the page shows, NEW-ITEM-5. Blank-node SKOS-XL labels of
+  thesaurus editor's notes and members forms are read-only in a dataset with more than one
+  graph and their saves do not name the commit the page shows, NEW-ITEM-5. Blank-node SKOS-XL labels of
   one kind with the same literal form cannot be told apart by an update and are shown
   without edit buttons.
 * The ontology editor decides whether the caller can write from the caller's level on the

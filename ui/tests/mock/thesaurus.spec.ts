@@ -280,7 +280,7 @@ test('without the head tag the page cannot guard its edits and is read-only', as
   await expect(page.getByRole('form', { name: 'Add a label' })).toHaveCount(0);
 });
 
-test('a list is read-only while the dataset keeps another graph', async ({ page, request }) => {
+test('the forms are read-only while the dataset keeps another graph', async ({ page, request }) => {
   const other = `GRAPH <urn:other> { <urn:x> <urn:y> "z" }`;
   const up = (u: string) =>
     request.post('/thes/update', {
@@ -291,7 +291,7 @@ test('a list is read-only while the dataset keeps another graph', async ({ page,
   try {
     await open(page, `&iri=${encodeURIComponent(TH + 'bySize')}&view=members`);
     const details = page.getByRole('region', { name: 'Details' });
-    await expect(details.getByRole('status')).toContainText("a list's cells could sit there");
+    await expect(details.getByRole('status')).toContainText("a form's save could change them");
     await expect(
       details.getByRole('button', { name: 'Move Ordered members member 2 up' }),
     ).toBeDisabled();

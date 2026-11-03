@@ -861,10 +861,15 @@ export async function readHead(
   };
 }
 
-/** Whether a dataset holds any triple outside `graph` (`null`: the default graph). */
+/**
+ * Whether a dataset holds any triple outside `graph` (`null`: the default graph). For a
+ * named graph, the default graph counts only with triples that are in no named graph, so
+ * a server whose default graph is the union of the named graphs answers as one without.
+ */
 export function otherGraphsQuery(graph: string | null): string {
   return graph
-    ? `ASK { { GRAPH ?g { ?s ?p ?o } FILTER(?g != ${iri(graph)}) } UNION { ?s ?p ?o } }`
+    ? `ASK { { GRAPH ?g { ?s ?p ?o } FILTER(?g != ${iri(graph)}) }
+  UNION { ?s ?p ?o FILTER NOT EXISTS { GRAPH ?n { ?s ?p ?o } } } }`
     : 'ASK { GRAPH ?g { ?s ?p ?o } }';
 }
 

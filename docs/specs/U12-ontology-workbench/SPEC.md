@@ -228,10 +228,13 @@ commit, and a protected branch or a reader's access makes the page read-only. Th
 reads its tag from the graph it edits and is read-only when it cannot, so no edit leaves
 without a precondition. The notes and members forms save through the forms of U02, whose
 saves check the stored values of the fields they change instead of the commit. The page
-locks them when a value, a nested node or the form's target graph is outside the graph it
-edits, and locks a list while the dataset keeps any other graph, since a form names the
-graph of a list's members but not of its cells. Until the head and its tag are read, the
-page and its undo and redo are read-only.
+lets them edit only a dataset that keeps no graph but the one it edits, and only when the
+form's target is that graph. A form reads every graph and deletes a removed value's
+nested nodes and list cells wherever they are, and its model names the graph of a list's
+members but not of its cells, so no narrower check could keep a save inside one graph.
+The default graph counts as another graph only with triples that are in no named graph,
+which keeps the rule right when the default graph is the union of the named graphs.
+Until the head and its tag are read, the page and its undo and redo are read-only.
 
 **Label edits.** A SKOS-XL label resource that another resource still refers to stays when
 one concept drops it or is deleted. Making a label preferred moves every alternative and

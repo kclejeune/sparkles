@@ -427,8 +427,11 @@ describe('the graphs outside the editor', () => {
     });
     expect(ask(s, otherGraphsQuery('urn:g'))).toBe(false);
     expect(ask(s, otherGraphsQuery(null))).toBe(true);
+    // a default graph that is the union of the named graphs holds nothing of its own
+    expect(s.query(otherGraphsQuery('urn:g'), { use_default_graph_as_union: true })).toBe(false);
     s.load(PREFIXES + 'ex:b a skos:Concept .', { format: 'text/turtle' });
     expect(ask(s, otherGraphsQuery('urn:g'))).toBe(true);
+    expect(s.query(otherGraphsQuery('urn:g'), { use_default_graph_as_union: true })).toBe(true);
   });
 });
 
