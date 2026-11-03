@@ -1,0 +1,65 @@
+{
+ "suite": "el-classification",
+ "kind": "agreement",
+ "scale": "GO 2026-07-26, ChEBI lite 256, the 298 ORE 2015 EL ontologies and the 400 fixtures of tests/fixtures/el587",
+ "manifest": {
+  "commit": "c4df06fe",
+  "binary": "crates/sparkles-owl/examples/el_classify.rs",
+  "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on stanley",
+  "references": {
+   "before": "the taxonomies of the build of commit 91a7b160 in runs/2026-11-02-reasoners-agreement-91a7b160, equal to ELK 0.6.0's",
+   "konclude": "Konclude 0.7.0-1138 taxonomies of the same record",
+   "fixtures": "HermiT 1.4.5.519 and Konclude 0.7.0-1138 on the 400 fixtures, run by run-references.sh from the nix/reasoners packages"
+  }
+ },
+ "settings": {
+  "threads": 4,
+  "timeout_s": 900
+ },
+ "method": "agree.sh classifies each ontology on four threads, writes the taxonomy and compares it with scripts/el-oracle.py against the build before the lane and against Konclude. tests/el_fixtures.rs compares the classifier's subsumptions between named classes on each fixture with HermiT's and Konclude's, read from the reasoners' direct hierarchies.",
+ "results": {
+  "ontologies": 300,
+  "failed": [],
+  "partial": [],
+  "against_before": {
+   "same": 299,
+   "differ": [
+    "ore_ont_6720"
+   ]
+  },
+  "against_konclude": {
+   "same": 299,
+   "differ": [
+    "go"
+   ]
+  },
+  "notes": [
+   "ore_ont_6720 is inconsistent. The lane's taxonomy makes every class equivalent to owl:Nothing, as Konclude's does, and is byte for byte the taxonomy of the base build c9b6ebff (sha256 e3e2f8ff...). The build of commit 91a7b160 kept owl:Thing apart, which is the difference against_before reports.",
+   "GO differs from Konclude by the 7 missing and 2 extra direct edges that InverseObjectProperties(part_of has_part) gives, an axiom outside OWL 2 EL."
+  ],
+  "fixtures": {
+   "cases": 400,
+   "hermit_inconsistent": 76,
+   "hermit_failed": 0,
+   "konclude_failed": [
+    "case-059",
+    "case-090",
+    "case-141",
+    "case-153",
+    "case-168",
+    "case-229",
+    "case-237",
+    "case-260",
+    "case-292",
+    "case-302"
+   ],
+   "konclude_differs": [
+    "case-074",
+    "case-075",
+    "case-124",
+    "case-261"
+   ],
+   "classifier_differs_from_hermit": []
+  }
+ }
+}

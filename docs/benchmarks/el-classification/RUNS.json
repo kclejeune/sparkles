@@ -160,7 +160,7 @@
      },
      "ended": "2026-11-02T20:50:54Z",
      "lock_note": "Each process took the bench lock and the heavy lock for itself. env.txt gives the time and load average when each took them. Another lane's benchmark jobs ran between the processes and never beside them.",
-     "reference": "ELK 0.6.0 with OWL API 5.1.20, the harness of commit 3d8fd876 (ElkClassify.java sha256 036a7224\u2026, pins.tsv sha256 4d470f93\u2026), Temurin 17.0.20+8",
+     "reference": "ELK 0.6.0 with OWL API 5.1.20, the harness of commit 3d8fd876 (ElkClassify.java sha256 036a7224…, pins.tsv sha256 4d470f93…), Temurin 17.0.20+8",
      "started": "2026-11-02T17:11:55Z"
     },
     "settings": {
@@ -262,7 +262,7 @@
      "binary": "crates/sparkles-owl/examples/el_classify.rs",
      "binary_sha256": "21ea154f772d48d70c60026e67bd5c8db20845f73d3cb3ee9472634efc7c7c06",
      "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on wally, copied to the benchmark host",
-     "reference": "ELK 0.6.0 with OWL API 5.1.20 through scripts/elk-compare/elk.sh (ElkClassify.java sha256 8bc9178d\u2026, pins.tsv sha256 4d470f93\u2026), openjdk version \"17.0.20\" 2026-07-21 OpenJDK Runtime Environment Temurin-17.0.20+8 (build 17.0.20+8) OpenJDK 64-Bit Server VM Temurin-17.0.20+8 (build 17.0.20+8, mixed mode, sharing)",
+     "reference": "ELK 0.6.0 with OWL API 5.1.20 through scripts/elk-compare/elk.sh (ElkClassify.java sha256 8bc9178d…, pins.tsv sha256 4d470f93…), openjdk version \"17.0.20\" 2026-07-21 OpenJDK Runtime Environment Temurin-17.0.20+8 (build 17.0.20+8) OpenJDK 64-Bit Server VM Temurin-17.0.20+8 (build 17.0.20+8, mixed mode, sharing)",
      "data": {
       "chebi_lite": {
        "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
@@ -325,6 +325,134 @@
     }
    },
    "metadata_note": "A manual measurement record of el_classify and ELK 0.6.0 on GO, ChEBI lite and the largest ORE 2015 EL ontologies on the benchmark host. Read the record for its method, results and checks."
+  },
+  {
+   "run_id": "sha256-9c9d05b5a9431e4cbf8ea1a614838264bd424bc780b4264e80f865b601a168e6",
+   "path": "runs/2026-11-03-el-complete-forge-c4df06fe/record.json",
+   "sha256": "9c9d05b5a9431e4cbf8ea1a614838264bd424bc780b4264e80f865b601a168e6",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26, ChEBI lite 256, the eight largest ORE 2015 EL ontologies and seven ORE 2015 EL ontologies with individuals",
+    "manifest": {
+     "commit": "c4df06fe",
+     "base_commit": "c9b6ebff",
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": {
+      "out-20261103T033904Z/bin/base-el_classify": "0411a65e421f3e0b231e0cda0893ffdbb72425247fc1bd9fb3da2e8a51153130",
+      "out-20261103T033904Z/bin/lane-el_classify": "5248b22645201a13e0d924e1e96114f3f3378fbf8c70bdeed3ca3e7af04e33ee"
+     },
+     "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on atlas at c4df06fe for the lane and c9b6ebff for the base, copied to the benchmark host. Commits after c4df06fe change only tests and docs.",
+     "data": {
+      "chebi_lite": {
+       "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+      },
+      "go": {
+       "sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+      },
+      "ore_ont_10242": {
+       "sha256": "f96f51b735f6d031cfc93d9134d10bdfa61c0bfe682c2bf17525c12d865caa82"
+      },
+      "ore_ont_10689": {
+       "sha256": "7f8292bea124fb29e961b40226d491453c453d95ff1bd7058a776f1d8b709e8d"
+      },
+      "ore_ont_10749": {
+       "sha256": "97fea7f29aa689ee27b5f6f09117b8e16688c4fcb87cdf2ef467b849ab869be1"
+      },
+      "ore_ont_13035": {
+       "sha256": "928d80b509e864f90623c554d047db091af777710187fed00ed82e3f0d65b509"
+      },
+      "ore_ont_13482": {
+       "sha256": "f732cc7d4ebdb45099e421d062e05d64837b22e60b53d6848a723aa8f0e8d971"
+      },
+      "ore_ont_13621": {
+       "sha256": "f1f6bb14b8ce323c692880283a15401a91612e79d4db7d74d5d1c774a9516dbb"
+      },
+      "ore_ont_1481": {
+       "sha256": "10768871c06f7bac78cc8b5cf02da037fbc0474f3738a216919f4026e465fa6e"
+      },
+      "ore_ont_15059": {
+       "sha256": "903db098c81789f0359b659b0d1c854626d46b3ab4b9d11f8fe56ffdcd3d07fb"
+      },
+      "ore_ont_1559": {
+       "sha256": "1e65b8add2b5a38441e832dd090922a05cd89cbb5198c8a481a2e2991b9b30b4"
+      },
+      "ore_ont_2453": {
+       "sha256": "7349e934d400490d2455800b3f1dbb744eed12a8cc7427e2c7c115f2c5a95d05"
+      },
+      "ore_ont_3524": {
+       "sha256": "00c1b5dd0106e077813b8998eff80f14bc4b43ac1a83a95ccc4ad5a216ad85a2"
+      },
+      "ore_ont_3836": {
+       "sha256": "fc559045f566b2837188505b707480dc3416b3e699c5188632fa5be3d4cf2473"
+      },
+      "ore_ont_6226": {
+       "sha256": "7121672c2308782df6175656e76ea65685bed8619b4c72c095ef1c92c77a9f15"
+      },
+      "ore_ont_868": {
+       "sha256": "21f1849747854eae7692beb53bdc9801c9387e3765cf1644914dfba864558d6b"
+      },
+      "ore_ont_9674": {
+       "sha256": "8a33686cd3ecc033851652d43f0ac4f07a9022682e165ef06cad6c96bfa85a02"
+      }
+     },
+     "started": "2026-11-03T03:39:06Z",
+     "ended": "2026-11-03T03:54:09Z",
+     "lock_note": "forge-ab.sh took the bench lock and the heavy lock once and held them for every process of the run, so no other job ran during it. env.txt gives the load average at the start, at each round and at the end. The script's last step, rm -r of its copies of the binaries, waited at a prompt for about 15 minutes after the end while it still held the locks, and no measurement ran then. The copy kept here as forge-ab.sh.txt is the script as it ran."
+    },
+    "settings": {
+     "repeat": 3,
+     "rounds": 5,
+     "threads": [
+      1,
+      8
+     ],
+     "taxonomy_threads": 4
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "forge",
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "ram_mib": 15620,
+      "kernel": "7.2.9"
+     },
+     "method": "Each round runs el_classify of the base and of the lane, interleaved, on each ontology on one and eight threads, one process each with three classifications by a fresh classifier with the axioms in memory. classifyMedianMs is the median of the three, and medianOfMediansMs the median over the rounds. Stage times are medians over the rounds of the last classification's stages. After the rounds each build writes its taxonomy of each ontology on four threads, and taxonomy.sha256 holds their hashes.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual record of item 587. Read the record for its method, results and checks."
+  },
+  {
+   "run_id": "sha256-1db6396f2afb7bfb731ab60e06f3b57ce4cf5f78a75fe3a81208e202dfc8e977",
+   "path": "runs/2026-11-03-el-complete-agreement-c4df06fe/record.json",
+   "sha256": "1db6396f2afb7bfb731ab60e06f3b57ce4cf5f78a75fe3a81208e202dfc8e977",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26, ChEBI lite 256, the 298 ORE 2015 EL ontologies and the 400 fixtures of tests/fixtures/el587",
+    "manifest": {
+     "commit": "c4df06fe",
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on stanley",
+     "references": {
+      "before": "the taxonomies of the build of commit 91a7b160 in runs/2026-11-02-reasoners-agreement-91a7b160, equal to ELK 0.6.0's",
+      "konclude": "Konclude 0.7.0-1138 taxonomies of the same record",
+      "fixtures": "HermiT 1.4.5.519 and Konclude 0.7.0-1138 on the 400 fixtures, run by run-references.sh from the nix/reasoners packages"
+     }
+    },
+    "settings": {
+     "threads": 4,
+     "timeout_s": 900
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "method": "agree.sh classifies each ontology on four threads, writes the taxonomy and compares it with scripts/el-oracle.py against the build before the lane and against Konclude. tests/el_fixtures.rs compares the classifier's subsumptions between named classes on each fixture with HermiT's and Konclude's, read from the reasoners' direct hierarchies.",
+     "kind": "agreement"
+    }
+   },
+   "metadata_note": "A manual record of item 587. Read the record for its method, results and checks."
   }
  ]
 }

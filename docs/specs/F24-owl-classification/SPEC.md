@@ -286,7 +286,11 @@ ChEBI lite on eight threads from 2,955 to 1,009 ms, `ore_ont_868` from 8,226 to 
 and `ore_ont_1559` from 8,099 to 781 ms, and the peak resident set from 1,337 to 804 MiB,
 3,514 to 1,686 MiB and 3,593 to 1,773 MiB. Normalization and interning still run on one
 thread and take most of a run on eight threads on the ORE ontologies, which item
-644 follows. The [benchmark
+644 follows. Item 587's rules left the largest ORE ontologies within 3% of the build
+before, on either side, and ChEBI lite within 3%, and cost GO 2 to 3%, which item
+NEW-ITEM-3 follows. The rules for individuals run in functions of their own, outside the
+saturation's loop, since a first build that kept them inline made the saturation of
+ontologies without individuals up to 20% slower on one thread. The [benchmark
 report](../../benchmarks/el-classification/RESULTS.md) has the numbers and the records.
 
 **Testing.** Tests in `crates/sparkles-owl/tests/classify.rs` cover worked examples of

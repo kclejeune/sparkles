@@ -235,7 +235,42 @@ ontology, so a memory budget bounds what it states. The classifier reads the axi
 place, as the server's kept classification reads those of the open ontology, so the
 peak resident set above holds one copy of the axioms.
 
+<a id="complete-el-cost"></a>
+
+The rules of item 587 cost little where they have nothing to do. An interleaved A/B on
+forge ran the build the item started from, commit c9b6ebff, and the item's build, commit
+c4df06fe, five rounds each on one and eight threads with the bench and heavy locks held
+for the whole run. On the eight largest ORE 2015 EL ontologies the item's build takes
+0.97 to 1.03 times the time of the base, and on ChEBI lite 1.03 times on one thread and
+the same on eight. GO takes 287 ms instead of 281 on one thread and 81 ms instead of 79
+on eight, 2 to 3% more, almost all of it in the saturation, which roadmap item NEW-
+ITEM-3 follows. Both builds give the same taxonomy of every ontology in the run, and the
+peak resident set of the large ontologies changes by under 3%. On seven small ORE
+ontologies with individuals the item's build uses every axiom in full where the base
+used some in part, derives up to 28% more conclusions and takes 2 to 14 ms, within a few
+milliseconds of the base.
+
+| Ontology | Threads | Base ms | Item 587 ms | Ratio |
+|---|---:|---:|---:|---:|
+| GO | 1 | 281 | 287 | 1.02 |
+| | 8 | 79 | 81 | 1.03 |
+| ChEBI lite | 1 | 1,106 | 1,136 | 1.03 |
+| | 8 | 910 | 907 | 1.00 |
+| `ore_ont_13482` | 1 | 1,027 | 1,036 | 1.01 |
+| | 8 | 507 | 521 | 1.03 |
+| `ore_ont_868` | 1 | 1,858 | 1,831 | 0.99 |
+| | 8 | 990 | 980 | 0.99 |
+| `ore_ont_1559` | 1 | 1,195 | 1,202 | 1.01 |
+| | 8 | 764 | 754 | 0.99 |
+
 ## Records
+
+The [record of item 587's A/B](runs/2026-11-03-el-complete-forge-c4df06fe/record.json)
+holds every classification time of both builds, the stage times, the taxonomy hashes and
+the script that ran, and the [agreement record of item
+587](runs/2026-11-03-el-complete-agreement-c4df06fe/record.json) holds the comparisons on
+GO, ChEBI lite and the ORE 2015 sample and the reference reasoners' outputs on the 400
+fixtures.
 
 The [run record](runs/2026-11-03-el-speed-forge-80644aec/record.json) holds the host,
 the binary, harness and data hashes, the settings, every classification time of both
