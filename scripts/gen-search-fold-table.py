@@ -2,6 +2,7 @@
 """Write the fold table of the ontology entity search to stdout:
 
     python3 scripts/gen-search-fold-table.py > crates/sparkles/src/handles/ontology/search/fold_table.rs
+    cargo fmt -p sparkles
 
 Every character of Unicode is folded to its NFKD decomposition without the marks of the
 combining diacritical mark blocks, recomposed with NFC and lowercased. NFC keeps Hangul
