@@ -8,6 +8,7 @@ import { expect, test, type Page } from '@playwright/test';
 test.describe.configure({ timeout: 90_000 });
 
 const UNI = 'http://example.org/uni#';
+const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 const termUrl = (local: string, extra = '') =>
   `/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + local)}${extra}`;
 
@@ -202,4 +203,39 @@ test('the phone page keeps the order head, facts, hierarchy, article', async ({ 
   expect(tree).toBeLessThan(article);
   // the shell's search icon stands in for the field
   await expect(page.getByRole('button', { name: 'Open search' })).toBeVisible();
+});
+
+test('a list whose count is a lower bound pages on until a short page', async ({ page }) => {
+  const shown = Array.from({ length: 3 }, (_, n) => `${UNI}x0${n}`);
+  // the server stopped counting at the subjects it shows, and SPARQL has 50 and then 7 more
+  await page.route(/\/\$\/ontology\/uni\/term\?/, async (route) => {
+    const res = await route.fetch();
+    const t = await res.json();
+    t.incoming = [{ property: RDF_TYPE, count: 3, more: true, subjects: shown }];
+    await route.fulfill({ response: res, json: t });
+  });
+  const pages = [
+    Array.from({ length: 50 }, (_, n) => `${UNI}x${String(n).padStart(2, '0')}`),
+    Array.from({ length: 7 }, (_, n) => `${UNI}y${n}`),
+  ];
+  let asked = 0;
+  await page.route(/\/uni\/sparql/, async (route) => {
+    const q = route.request().postData() ?? '';
+    if (!q.includes(`?s <${RDF_TYPE}> <${UNI}Professor>`)) return route.fallback();
+    const rows = pages[asked++] ?? [];
+    // the UI's own result format: variables and rows
+    await route.fulfill({
+      json: { vars: ['s'], rows: rows.map((value) => [{ type: 'uri', value }]) },
+    });
+  });
+  await openTerm(page, 'Professor');
+  const usage = page.getByRole('region', { name: /What links here/ });
+  const grp = usage.locator('.grp', { has: page.getByRole('heading', { name: /Instances/ }) });
+  await expect(grp.getByRole('link')).toHaveCount(3);
+  await grp.getByRole('button', { name: 'Show more' }).click();
+  // the first page repeats the three subjects already shown, which come once
+  await expect(grp.getByRole('link')).toHaveCount(50);
+  await grp.getByRole('button', { name: 'Show more' }).click();
+  await expect(grp.getByRole('link')).toHaveCount(57);
+  await expect(grp.getByRole('button', { name: /Show more/ })).toHaveCount(0);
 });
