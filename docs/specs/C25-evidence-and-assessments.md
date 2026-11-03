@@ -1168,7 +1168,7 @@ clusters before an operation are recomputed from the boundary, so a map whose ma
 are no longer read would otherwise keep stale triples for entities the operation does
 not reach. A graph added to the boundary is accepted, since no proposal in it was
 accepted under the policy while the map was built. Rebuilding a map after a boundary
-change is roadmap item NEW-ITEM-1. A split is a superseding rejection, and accepting the
+change is roadmap item 643. A split is a superseding rejection, and accepting the
 match again restores the earlier map. Proposals, decisions and earlier revisions are
 never edited, and the output graph's history serves the map of any retained commit.
 `Changed::map` and the answer's `changed.map` name the policy, the new revision and its
