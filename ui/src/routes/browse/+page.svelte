@@ -1160,22 +1160,25 @@
                   {onedit}
                 />
               {:else if details}
-                <section class="term-sec" aria-labelledby="labels-edit-h">
+                <section class="term-sec labels-edit" aria-labelledby="labels-edit-h">
                   <h2 id="labels-edit-h">Labels and synonyms</h2>
-                  <SkosLabels
-                    iri={term.iri}
-                    name={title}
-                    entries={details.labels}
-                    {graph}
-                    langs={skosLangs}
-                    {readonly}
-                    onedit={(sparql, label) => onedit({ kind: 'update', sparql }, label)}
-                    scope={`${target}|${graph ?? ''}`}
-                    isUsed={async (i) => {
-                      const r = await api.query(target, usedQuery(i, graph), { nocache: true });
-                      return !!r.boolean;
-                    }}
-                  />
+                  <!-- the editor's label table is wider than a phone, so it scrolls in place -->
+                  <div class="labels-scroll">
+                    <SkosLabels
+                      iri={term.iri}
+                      name={title}
+                      entries={details.labels}
+                      {graph}
+                      langs={skosLangs}
+                      {readonly}
+                      onedit={(sparql, label) => onedit({ kind: 'update', sparql }, label)}
+                      scope={`${target}|${graph ?? ''}`}
+                      isUsed={async (i) => {
+                        const r = await api.query(target, usedQuery(i, graph), { nocache: true });
+                        return !!r.boolean;
+                      }}
+                    />
+                  </div>
                 </section>
                 <section class="term-sec links-edit" aria-labelledby="links-edit-h">
                   <h2 id="links-edit-h">Related concepts and mappings</h2>
@@ -1543,6 +1546,12 @@
 />
 
 <style>
+  .labels-edit {
+    min-width: 0;
+  }
+  .labels-scroll {
+    overflow-x: auto;
+  }
   .wrap {
     container: browse / inline-size;
     min-width: 0;

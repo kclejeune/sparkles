@@ -397,4 +397,24 @@ test.describe('on a phone', () => {
     await bottom.getByRole('button', { name: 'Done' }).tap();
     await expect(bar(page)).toHaveCount(0);
   });
+
+  test('a concept’s label table scrolls inside the page', async ({ page }) => {
+    await open(page, term('thes', TH + 'fish', '&edit=1'));
+    await expect(page.getByRole('form', { name: 'Add a label' })).toBeVisible();
+    // a thesaurus with labels in four scripts makes the table wider than the phone, as
+    // UNESCO's does; a wide cell stands in for them
+    await page
+      .locator('.labels-scroll td')
+      .first()
+      .evaluate((td) =>
+        td.insertAdjacentHTML(
+          'beforeend',
+          '<span style="display:inline-block;width:640px"></span>',
+        ),
+      );
+    await expectNoSidewaysScroll(page, 'a concept in edit mode on a phone');
+    expect(
+      await page.locator('.labels-scroll').evaluate((e) => e.scrollWidth > e.clientWidth),
+    ).toBe(true);
+  });
 });
