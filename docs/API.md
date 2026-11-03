@@ -1962,16 +1962,23 @@ for the ontology browser's pages, again from the store's indexes without reading
 whole ontology. `statements` are the entity's triples whose object is an IRI or a
 literal, each with its `property`, `value`, `graph` and the `annotations` that a
 reification of the triple (`owl:Axiom` with `owl:annotatedSource`) gives it, such as the
-sources of a definition. `axioms` are the axioms that the entity's triples, the blank
-nodes they reach and those reifications map to by the reverse mapping, in the forms the
-axiom listing uses. `mentions` lists the axioms of other entities that hold the entity
+sources of a definition. `xlLabels` gives the `skosxl:literalForm` of each SKOS-XL label
+the entity has, with the label's property and graph. `statementsTruncated` says whether a
+property had more than 500 values, or the entity's triples or the blank nodes they reach
+more than 20,000, so that the page and the downloads hold only the first ones. `axioms`
+are the axioms that the entity's triples, the blank nodes they reach and those
+reifications map to by the reverse mapping in the request's `mode`, in the forms the
+axiom listing uses. The types of the IRIs they use are read too, so the mapping types
+them, but the axioms that those types alone give, such as another entity's class
+assertion, are left out. `mentions` lists the axioms of other entities that hold the entity
 inside a class expression, such as `SubClassOf(:envelope ObjectSomeValuesFrom(:partOf
 :mitochondrion))`, found by walking up from the blank nodes that point at it, at most
 `mentions` of them (200 by default, at most 2,000), with their `total` up to 5,000 and
-`truncated`. `incoming` lists the statements of named subjects that point at the entity
+`truncated`. A mention keeps the annotations of its reified axiom. `incoming` lists the statements of named subjects that point at the entity
 by predicate, such as its subclasses and instances, each with its `count` up to 10,000,
-`more`, and the first `incoming` subjects (20 by default, at most 200). `usage` does the
-same for the statements that use the entity as their predicate. `names` gives the
+`more`, and the first distinct `incoming` subjects (20 by default, at most 200) in index
+order. `usage` does the same for the statements that use the entity as their predicate,
+with `count` the number of distinct named subjects among the first 10,000 statements. `names` gives the
 label, short form, kinds and deprecation of every IRI the answer uses, so a page can
 link them without more requests. The answer also has the entity's own name members, its
 `types`, and the `ontologies` that the graphs read declare.
@@ -1980,7 +1987,8 @@ link them without more requests. The answer also has the entity's own name membe
 `jsonld` give the triples about the entity, the blank nodes they reach and the
 reifications of its annotated triples, and `ofn` gives its axioms in functional-style
 syntax. An IRI that the graphs read do not mention is `404`. The route takes `graph`,
-`imports`, `branch`, `at` and `lang`, and refuses `inferences`.
+`imports`, `mode`, `branch`, `at` and `lang`, answers with the commit as its entity tag,
+and refuses `inferences`.
 
 `GET /$/ontology/{ds}/entity?iri=IRI` answers what the ontology says about one entity.
 `kinds` lists the kinds the IRI has, and `labels` and `annotations` its `rdfs:label`

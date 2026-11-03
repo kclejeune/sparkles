@@ -182,7 +182,7 @@ The web UI is embedded in the server at `/ui/`. The first table shows what sets 
 apart: time travel, branch merges, forms generated from shapes, GraphRAG communities,
 questions in plain language, agent memory, path finding, inference, maps, validation,
 graph algorithms, facets, the embedding map, the visual query builder, the ontology
-editor and the app shell. The collapsed panel below it has more workflows and detail views.
+editor and browser and the app shell. The collapsed panel below it has more workflows and detail views.
 
 <table>
   <tr>
@@ -262,6 +262,14 @@ editor and the app shell. The collapsed panel below it has more workflows and de
   </tr>
   <tr>
     <td colspan="2" align="center">A DL query in Manchester syntax, labelled with the reasoning that answered it</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/browse-term.png" alt="The ontology browser's page of mitochondrion, with its lineage from cellular component on the left, its definition and sources, its subclass axioms with part of some cytoplasm as linked prose, its exact and related synonyms, and an infobox with its ID, subsets, ontology, hierarchy counts and downloads"></td>
+    <td><img src="docs/images/browse-landing.png" alt="The landing page of a cell organelle ontology in the ontology browser, with its title, version and description, a search that lists the classes matching mitoch, the top class with its definition and child count, and the counts of classes and properties"></td>
+  </tr>
+  <tr>
+    <td>The ontology browser: a page for each entity, with its lineage and linked axioms</td>
+    <td>An ontology's landing page with its search and top classes</td>
   </tr>
   <tr>
     <td><img src="docs/images/thesaurus-editor.png" alt="The thesaurus editor with the concept tree of an animals scheme, where Whales and Penguins appear under both Mammals and Marine animals marked 2 broader, and the label table of Whales with its English and French preferred labels and an English alternative label, each with buttons that edit it, remove it or turn it into a SKOS-XL label"></td>

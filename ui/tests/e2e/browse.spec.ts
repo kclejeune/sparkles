@@ -130,7 +130,8 @@ open('the downloads answer each format as an attachment', async ({ page }) => {
     const res = await page.request.get(href!);
     expect(res.status(), f).toBe(200);
     expect(res.headers()['content-disposition'], f).toContain('attachment');
-    expect(await res.text(), f).toContain(f === 'ofn' ? 'CELLO_0000005' : CELLO(5));
+    // Turtle and functional-style syntax may write the IRI with the data's obo: prefix
+    expect(await res.text(), f).toContain('CELLO_0000005');
   }
 });
 

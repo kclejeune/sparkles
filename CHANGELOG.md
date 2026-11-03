@@ -45,6 +45,24 @@ pages. `/` focuses a page's own search where it has one, such as the ontology ed
 tree filter, and opens the palette elsewhere. The Query page opens a saved query from
 `?saved=NAME`.
 
+The web UI has an ontology browser (spec U12, roadmap item 616). `/ui/browse` gives each
+entity of a dataset's ontologies and thesauri a read-only page with its label, short form,
+IRI, definition and sources, synonyms by kind, notes, SKOS labels by language,
+cross-references, an infobox, a lineage tree with a graph view on the Explore canvas, its
+axioms as linked Manchester prose, what links here, its use in other datasets and
+downloads in Turtle, RDF/XML, OWL functional syntax and JSON-LD. Each ontology gets a
+landing page with its header, counts, top classes and search, and the top bar's search
+now opens these pages for every kind of entity, where it opened the editors and Explore
+before. Two routes serve the pages and read the store's indexes around one entity
+instead of the whole ontology. `GET /$/ontology/{ds}/hierarchy` answers one level of a
+class, property or concept hierarchy with child counts and, on request, the ancestors,
+and `GET /$/ontology/{ds}/term` answers an entity's statements, axioms, mentions,
+incoming statements and the names of every IRI it uses, or a download with `format=`.
+The Rust library, the wire dispatcher and the ontology handles of Python, Node.js and
+the JVM call them as `hierarchy` and `term`.
+The two calls of an entity page took 6.6 ms on GO and 8.9 ms on ChEBI lite at the 95th
+percentile over 500 random classes each.
+
 The web UI has one app shell and design system (roadmap item 632). A top bar on every
 page holds the dataset switcher and a search of the open dataset's entities through
 `GET /$/ontology/{ds}/search`, which `Ctrl+K`, `Cmd+K` and `/` focus, and the pages sit
