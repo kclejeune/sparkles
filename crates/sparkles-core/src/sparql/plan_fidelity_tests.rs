@@ -282,3 +282,141 @@ fn streamed_plans_have_ids_and_stopped_nodes() {
     assert_eq!(child["id"], "0.0");
     assert_eq!(child["operator"]["id"], "0.0");
 }
+
+/// People in teams of cities, who know some others, like people or teams and write
+/// documents, for recording estimates against actual rows. The authors are all among the
+/// people who know others, and only the teams that people like have a city, which the
+/// estimate from distinct values cannot tell.
+fn graph(n: usize) -> String {
+    let mut d = String::from("@prefix ex: <http://ex.org/> .\n");
+    d.push_str("ex:Person a ex:Kind . ex:Doc a ex:Kind . ex:Manager a ex:Kind .\n");
+    for t in 0..12 {
+        d.push_str(&format!(
+            "ex:t{t} ex:city ex:c{} ; ex:size {} .\n",
+            t % 4,
+            t * 3
+        ));
+    }
+    for i in 0..n {
+        d.push_str(&format!(
+            "ex:p{i} a ex:Person ; ex:age {} ; ex:name \"n{i}\" ; ex:team ex:t{} .\n",
+            i % 90,
+            i % 12
+        ));
+        if i % 3 == 0 {
+            d.push_str(&format!(
+                "ex:p{i} ex:knows ex:p{} , ex:p{} .\n",
+                (i + 3) % n,
+                (i * 7 + 3) % n
+            ));
+        }
+        if i % 15 == 0 {
+            d.push_str(&format!(
+                "ex:doc{i} a ex:Doc ; ex:author ex:p{i} ; ex:editor ex:p{i} ; ex:year {} .\n",
+                2000 + i % 20
+            ));
+        }
+        if i % 11 == 0 {
+            d.push_str(&format!(
+                "ex:p{i} a ex:Manager ; ex:manages ex:t{} .\n",
+                i % 12
+            ));
+        }
+        match i % 4 {
+            0 => d.push_str(&format!("ex:p{i} ex:likes ex:t{} .\n", i % 12)),
+            2 => d.push_str(&format!("ex:p{i} ex:likes ex:p{} .\n", (i * 5 + 1) % n)),
+            _ => {}
+        }
+    }
+    d
+}
+
+/// The largest q-error, `max(est, act) / min(est, act)` with both at least one row, of the
+/// joins of a plan that ran to completion.
+fn join_qerror(p: &PlanInfo) -> f64 {
+    let mut worst: f64 = 1.0;
+    for n in nodes(p) {
+        let f = n.fidelity();
+        if !n.operator.contains("Join")
+            || f.skipped.is_some()
+            || f.stopped_early
+            || f.incomplete
+            || f.reruns > 0
+            || n.actual_rows < 0
+            || n.estimated_rows < 0.0
+        {
+            continue;
+        }
+        let (e, a) = (n.estimated_rows.max(1.0), (n.actual_rows as f64).max(1.0));
+        worst = worst.max(e.max(a) / e.min(a));
+    }
+    worst
+}
+
+/// The plans of stars, object joins, chains, a triangle, joins on two keys, a join on a
+/// class variable and on a subquery's variable, and joins of small inputs, recorded with
+/// their estimated and actual rows: the correlation-aware estimates (the remainders of the
+/// sets, the node sets and the back-off of several keys) raise the error of no plan, and
+/// lower that of some (spec X15).
+#[test]
+fn correlation_estimates_raise_the_error_of_no_recorded_plan() {
+    let s = store_with(&graph(3000), StoreOptions::default());
+    let off = QueryOptions {
+        optimizations: Some(Optimizations {
+            set_remainders: false,
+            node_sets: false,
+            key_backoff: false,
+            ..Optimizations::ALL
+        }),
+        no_cache: true,
+        ..opts()
+    };
+    let on = QueryOptions {
+        no_cache: true,
+        ..opts()
+    };
+    let queries = [
+        "SELECT * WHERE { ?p ex:age ?a ; ex:name ?n ; ex:team ?t }",
+        "SELECT * WHERE { ?p ex:team ?t . ?t ex:city ?c }",
+        "SELECT * WHERE { ?p ex:team ?t . ?t ex:city ex:c1 }",
+        "SELECT * WHERE { ?d ex:author ?p . ?p ex:team ?t . ?t ex:size ?z }",
+        "SELECT * WHERE { ?d ex:author ?p . ?p ex:knows ?q }",
+        "SELECT * WHERE { ?a ex:knows ?b . ?c ex:knows ?b }",
+        "SELECT * WHERE { ?m ex:manages ?t . ?p ex:team ?t }",
+        "SELECT * WHERE { ?a ex:knows ?b . ?b ex:knows ?c . ?c ex:knows ?a }",
+        "SELECT * WHERE { ?m ex:manages ?t . ?m ex:team ?t }",
+        "SELECT * WHERE { ?p a ex:Manager ; ex:knows ?q . ?q a ex:Person }",
+        "SELECT * WHERE { VALUES ?t { ex:t1 ex:t2 } ?p ex:team ?t ; ex:age ?a }",
+        "SELECT * WHERE { ?p ex:team ex:t3 ; ex:knows ?q . ?q ex:age ?a }",
+        "SELECT * WHERE { ?d a ex:Doc ; ex:year 2005 ; ex:author ?p . ?p ex:name ?n }",
+        "SELECT * WHERE { ?p ex:likes ?x . ?x ex:city ?c }",
+        "SELECT * WHERE { ?p ex:likes ?x . ?x ex:knows ?y }",
+        "SELECT * WHERE { ?p ex:likes ?x . ?q ex:manages ?x }",
+        "SELECT * WHERE { ?d ex:author ?p . ?p ex:knows ?q . ?q ex:knows ?r }",
+        "SELECT * WHERE { ?d ex:author ?p . ?d ex:editor ?p }",
+        "SELECT * WHERE { ?c a ex:Kind . ?p a ?c ; ex:team ex:t1 }",
+        "SELECT * WHERE { ?q ex:likes ?x . ?x ex:size ?z { SELECT DISTINCT ?x WHERE { ?x ex:city ex:c1 } } }",
+        "SELECT * WHERE { ?q ex:likes ?x . ?x ex:city ex:c1 ; ex:size ?z }",
+    ];
+    let mut better = 0;
+    for q in queries {
+        // the first run reads the blocks that the planner's key probes then count
+        for o in [&off, &on] {
+            query(s.snapshot(), q, o).unwrap();
+        }
+        let a = query(s.snapshot(), q, &off).unwrap();
+        let b = query(s.snapshot(), q, &on).unwrap();
+        assert_eq!(a.len(), b.len(), "{q}");
+        let (ea, eb) = (join_qerror(&a.plan), join_qerror(&b.plan));
+        assert!(
+            eb <= ea * 1.0001,
+            "{q}: the largest join q-error rose from {ea:.3} to {eb:.3}\n{:#?}\n{:#?}",
+            a.plan,
+            b.plan
+        );
+        if eb < ea * 0.9 {
+            better += 1;
+        }
+    }
+    assert!(better >= 3, "{better} plans estimated better");
+}

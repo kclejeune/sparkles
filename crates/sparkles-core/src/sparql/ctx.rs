@@ -297,6 +297,16 @@ pub struct Optimizations {
     /// a join of a small input (VALUES, or a pattern of few rows) with a pattern is
     /// estimated by counting the pattern's rows for a sample of the input's values
     pub probed_keys: bool,
+    /// the characteristic sets estimate stars over the subjects of the sets the
+    /// statistics do not keep from their remainder, instead of using only the predicates
+    /// that the kept sets cover
+    pub set_remainders: bool,
+    /// joins on a variable that is the object of a pattern of its group are estimated
+    /// from the node sets of the statistics (incoming and outgoing predicates per node)
+    pub node_sets: bool,
+    /// a join on several keys combines their distinct counts by exponential back-off
+    /// instead of dividing by the largest alone
+    pub key_backoff: bool,
     /// index joins that a fused star reads together are costed for the keys of the
     /// star's input, which a fused star probes in every pattern
     pub fused_star_costs: bool,
@@ -338,7 +348,7 @@ pub struct Optimizations {
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 40] = [
+    pub const NAMES: [&str; 43] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -366,6 +376,9 @@ impl Optimizations {
         "sampled_filters",
         "characteristic_sets",
         "probed_keys",
+        "set_remainders",
+        "node_sets",
+        "key_backoff",
         "fused_star_costs",
         "prefetch_blocks",
         "text_subject_pushdown",
@@ -410,6 +423,9 @@ impl Optimizations {
         sampled_filters: true,
         characteristic_sets: true,
         probed_keys: true,
+        set_remainders: true,
+        node_sets: true,
+        key_backoff: true,
         fused_star_costs: true,
         prefetch_blocks: true,
         text_subject_pushdown: true,
@@ -454,6 +470,9 @@ impl Optimizations {
         sampled_filters: false,
         characteristic_sets: false,
         probed_keys: false,
+        set_remainders: false,
+        node_sets: false,
+        key_backoff: false,
         fused_star_costs: false,
         prefetch_blocks: false,
         text_subject_pushdown: false,
@@ -498,6 +517,9 @@ impl Optimizations {
             "sampled_filters" => &mut self.sampled_filters,
             "characteristic_sets" => &mut self.characteristic_sets,
             "probed_keys" => &mut self.probed_keys,
+            "set_remainders" => &mut self.set_remainders,
+            "node_sets" => &mut self.node_sets,
+            "key_backoff" => &mut self.key_backoff,
             "fused_star_costs" => &mut self.fused_star_costs,
             "prefetch_blocks" => &mut self.prefetch_blocks,
             "text_subject_pushdown" => &mut self.text_subject_pushdown,

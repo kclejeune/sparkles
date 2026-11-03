@@ -1182,7 +1182,16 @@ fn a_deep_plan_is_written_without_ids() {
     use sparkles::sparql::exec::{MAX_ID_DEPTH, PLAN_FORMAT};
     on_small_stack(|| {
         let ds = cyclic();
-        let opts = sparkles::sparql::QueryOptions::default();
+        // the node sets estimate every link of a chain, and the planner then joins its
+        // links in pairs into a shallow plan, so the chain is planned without them to stay
+        // as deep as it is long
+        let opts = sparkles::sparql::QueryOptions {
+            optimizations: Some(sparkles::sparql::Optimizations {
+                node_sets: false,
+                ..sparkles::sparql::Optimizations::ALL
+            }),
+            ..Default::default()
+        };
         let chain = |n: usize| {
             let body: String = (0..n)
                 .map(|i| format!("?a{i} <urn:p> ?a{} . ", i + 1))

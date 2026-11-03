@@ -287,6 +287,26 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+The planner estimates more joins from statistics of how predicates occur together (spec
+X15, roadmap item 454). A bulk load or compaction keeps 32,768 subject characteristic sets
+instead of 10,000 and counts the subjects outside them as a remainder, so a star whose
+predicates the kept sets cover poorly is estimated from the sets too. It also counts the
+characteristic sets of nodes over both directions, which estimate joins on an object and
+the links of chains. A join on several keys divides by the key tuples of the larger side,
+with exponential back-off between the largest count and the product of the counts, and a
+key sample that finds no rows is no longer taken as an empty join. Over the join nodes of
+the recorded plans, the geometric mean of the q-error falls from 8.80 to 3.98 on WatDiv
+at scale 100, from 4.84 to 1.96 on an 8.2M-triple DBpedia slice and from 3.52 to 1.81
+on LUBM(10), and answers are unchanged. The switches are `set_remainders`, `node_sets` and
+`key_backoff`. The statistics grow `stats.json`, from 5.0 MB to 44.3 MB on the DBpedia
+slice, and the node pass adds about 0.2 s to a WatDiv load and 0.7 s to the DBpedia
+load. On atlas, opening the DBpedia slice takes 0.30 s instead of 0.07 s and the server
+holds 214 MB instead of 133 MB once ready. The node pass keeps the same sets at any
+thread count. On forge, WatDiv's `C` queries run 2.2 to 4.9 times as fast, BSBM BI
+`q1-3` 4.4 times and LUBM `q2` 2.0 times. WatDiv `S4-2` and `S4-4` take 1.6 times as long
+after a plan change, and planning takes 1 to 90 microseconds longer on short queries and
+WatDiv `F4`.
+
 `sparkles ontology classify FILE` and `sparkles ontology check FILE` read a file of one
 graph into memory without a store and give the answers that a store of the loaded file
 gives (spec F24, roadmap item 649). RDF/XML, Turtle, N-Triples and functional-style
@@ -1584,6 +1604,14 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+The planner statistics in `gen-*/stats.json` gain the member `correlations`, which
+carries its own version, 1, and is registered as the derived kind `planner-statistics`.
+It holds the remainder of the subject characteristic sets and the node characteristic
+sets with their remainder. A member of another version is refused with a recorded reason,
+`sparkles check` reports it, and the planner estimates as it did before. Releases without
+it ignore the member, and stores loaded before it keep their estimates until the next
+bulk load or full compaction.
 
 The resource catalog is the server file `resources.json`, format 1, registered as a
 server settings file. A file of another format, or one that does not parse or breaks the

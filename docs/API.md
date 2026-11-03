@@ -893,8 +893,10 @@ most 1.25 times the blocks of a full rebuild. Only a delta that is large against
 dataset makes a full rebuild quicker. With `always` a compaction is partial whenever the
 delta adds no term, and with `off` every compaction rebuilds the whole index. The
 statistics are updated from the delta. They equal a rebuild's, except that a dataset with
-more than 10,000 distinct characteristic sets can keep a different selection of the rare
-ones. Terms that no quad uses any more stay in the vocabulary until a full compaction.
+more than 32,768 distinct subject or node characteristic sets keeps the sets it kept
+before and counts the nodes of new ones in the remainder, where a rebuild can keep a
+different selection of the rare ones. Terms that no quad uses any more stay in the
+vocabulary until a full compaction.
 The server flag `--auto-compact-partial` gives the default.
 
 **When not.** A due compaction waits while the previous one ended less than

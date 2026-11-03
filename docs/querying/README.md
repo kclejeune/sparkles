@@ -121,6 +121,14 @@ check them against the W3C suites and Jena's own answers.
 
 ### Planning and execution
 
+* The planner estimates joins from statistics that a bulk load or compaction counts:
+  the characteristic sets of subjects and of nodes over both directions, each with a
+  remainder for the nodes outside the 32,768 sets kept, and key probes of small inputs.
+  Stars, joins on an object, the links of chains and joins on several keys are estimated
+  from them, and other joins from distinct values
+  ([internals](../internals/OPTIMIZATIONS.md#further-scan-and-filter-optimizations)).
+  Statistics written before node sets existed keep the earlier estimates until the next
+  bulk load or full compaction.
 * The planner can move a small basic graph pattern into the branches of a pure UNION, so
   that each branch uses its bindings to choose a join order. It keeps duplicates and
   FILTER scope, and it keeps the ordinary plan when that plan is estimated to be cheaper.
@@ -355,6 +363,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * A template lookup that binds a blank node of the dataset writes a new node, and a JSON
   number with a fraction or an exponent loses its source form. Roadmap items 238 and 239.
 * Tables and databases are imported, not queried in place. Roadmap item 43.
+* Joins on a link whose far end is restricted, the object of `?x a ?c` and large inputs
+  that no statistic covers are estimated from distinct values. Roadmap items 454 and
+  697 to 699.
 
 * Incremental views are `table` views on `main`, maintained after the commit. There are
   no `graph` views, no maintenance inside the commit, no WebSocket or MCP access, no Node
@@ -403,7 +414,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 17](../ROADMAP.md), [item 20](../ROADMAP.md), [item 38](../ROADMAP.md), [item 43](../ROADMAP.md), [item 51](../ROADMAP.md), [item 69](../ROADMAP.md), [item 72](../ROADMAP.md), [item 221](../ROADMAP.md), [item 222](../ROADMAP.md), [item 223](../ROADMAP.md), [item 224](../ROADMAP.md), [item 227](../ROADMAP.md), [item 230](../ROADMAP.md), [item 231](../ROADMAP.md), [item 233](../ROADMAP.md), [item 234](../ROADMAP.md), [item 236](../ROADMAP.md), [item 237](../ROADMAP.md), [item 238](../ROADMAP.md), [item 239](../ROADMAP.md), [item 450](../ROADMAP.md), [item 293](../ROADMAP.md), [item 401](../ROADMAP.md).
+The remaining work described above refers to [item 17](../ROADMAP.md), [item 20](../ROADMAP.md), [item 38](../ROADMAP.md), [item 43](../ROADMAP.md), [item 51](../ROADMAP.md), [item 69](../ROADMAP.md), [item 72](../ROADMAP.md), [item 221](../ROADMAP.md), [item 222](../ROADMAP.md), [item 223](../ROADMAP.md), [item 224](../ROADMAP.md), [item 227](../ROADMAP.md), [item 230](../ROADMAP.md), [item 231](../ROADMAP.md), [item 233](../ROADMAP.md), [item 234](../ROADMAP.md), [item 236](../ROADMAP.md), [item 237](../ROADMAP.md), [item 238](../ROADMAP.md), [item 239](../ROADMAP.md), [item 450](../ROADMAP.md), [item 454](../ROADMAP.md), [item 293](../ROADMAP.md), [item 401](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.
