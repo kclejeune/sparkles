@@ -250,6 +250,9 @@ struct AssessmentJson {
     confidence: Option<ConfidenceJson>,
     #[serde(default)]
     scope: BTreeMap<String, Vec<String>>,
+    /// the records the evaluation consumed
+    #[serde(default)]
+    inputs: Vec<RefJson>,
 }
 
 fn record_key(field: &str, value: &str) -> ApiResult<RecordKey> {
@@ -605,6 +608,19 @@ fn input_of(r: ClaimsRequest) -> ApiResult<(EvidenceInput, Request)> {
                 .map(|c| confidence(&format!("{at}.confidence"), c))
                 .transpose()?,
             scope: scope(&at, &v.scope)?,
+            inputs: {
+                if v.inputs.len() > sparkles::evidence::MAX_ASSESSMENT_INPUTS {
+                    return Err(bad(
+                        format!("{at}.inputs"),
+                        "an assessment names at most 64 inputs",
+                    ));
+                }
+                v.inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(j, x)| reference(&format!("{at}.inputs[{j}]"), x))
+                    .collect::<ApiResult<Vec<_>>>()?
+            },
         });
     }
     for (i, v) in r.identities.iter().enumerate() {

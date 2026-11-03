@@ -41,6 +41,8 @@ use uuid::Uuid;
 
 pub use sparkles_core::evidence::review::{POLICY_PREFIX, policy_iri};
 
+#[path = "dependents.rs"]
+pub mod dependents;
 #[path = "identity.rs"]
 pub mod identity;
 
@@ -109,6 +111,22 @@ pub struct Changed {
     /// The new revision of a resolution map, when a review of identity proposals
     /// changed which decisions the map follows.
     pub map: Option<MapChange>,
+}
+
+impl Changed {
+    /// The record identities whose dependents may need review: the supports that
+    /// ended, and for a new map revision the revision it follows and the decisions
+    /// whose effect ended. Claims an operation withdrew and decisions it superseded are
+    /// named in its own result. The result is sorted and has no duplicates, ready for
+    /// [`dependents::dependents`].
+    pub fn identities(&self) -> Vec<NamedNode> {
+        let mut out: BTreeSet<NamedNode> = self.supports_ended.iter().cloned().collect();
+        if let Some(map) = &self.map {
+            out.extend(map.previous.iter().cloned());
+            out.extend(map.decisions_ended.iter().cloned());
+        }
+        out.into_iter().collect()
+    }
 }
 
 /// A new revision of a matching policy's resolution map.

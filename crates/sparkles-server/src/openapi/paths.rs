@@ -3310,11 +3310,19 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(POST, "/{ds}/claims/identities", "resolveIdentities", "SPARQL", "Resolve entities through a resolution map")
-            .doc("Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again.")
+            .doc("Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again or an identity graph the map was built from left the boundary.")
             .see("evidence-identities")
             .json_body(true, "EvidenceIdentities")
             .json("200", "The map's revision and each entity's resolution.", "EvidenceIdentitiesResult")
             .errors(&[400, 403, 404, 408, 413, 422, 503]),
+    );
+    p.add(
+        op(POST, "/{ds}/claims/dependents", "listEvidenceDependents", "SPARQL", "Find the assessments that depend on changed records")
+            .doc("Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read.")
+            .see("evidence-dependents")
+            .json_body(true, "EvidenceDependents")
+            .json("200", "The dependent assessments.", "EvidenceDependentsResult")
+            .errors(&[400, 403, 404, 408, 413, 422]),
     );
     p.add(
         op(POST, "/{ds}/sources", "registerSource", "SPARQL", "Register a source document")

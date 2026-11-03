@@ -415,6 +415,16 @@ operation retains at most 64 MiB of entity identifiers. The vocabulary and shape
 `ev:preferredEntity`, `ev:ResolutionMap`, `ev:mapRevision`, `ev:adds`, `ev:ends`,
 `ev:resolvesTo`, `ev:mapsProtection` and `ev:boundaryProtection`.
 
+Assessments name the records they consumed, and the assessments that depend on changed
+evidence can be found (spec C25 Phase 3, roadmap item 81). An assessment's `inputs`
+names up to 64 claims, assessments, identity proposals, source revisions, review
+decisions, acceptance supports or resolution map revisions, written as `prov:used`, and
+an assessment without them keeps its digests. `POST /{ds}/claims/dependents` and
+`sparkles::evidence::find_dependents` answer the authenticated assessments in readable
+proposal graphs whose target or inputs name a changed record, optionally transitively,
+and `Changed::identities` gathers what an operation changed. `capabilities.claims` lists
+the route.
+
 Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
 and `owl:sameAs` with closure operators instead of joins, and derives the same facts.
 An operator condenses a relation's strongly connected components and computes each

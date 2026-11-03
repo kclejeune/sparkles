@@ -7261,6 +7261,90 @@
         ],
         "type": "object"
       },
+      "EvidenceDependents": {
+        "additionalProperties": false,
+        "description": "Changed evidence records whose dependent assessments to find.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-dependents"
+        },
+        "properties": {
+          "changed": {
+            "description": "The record identities that changed, such as a withdrawn claim, an ended support or the revision a new map revision follows.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "type": "array"
+          },
+          "transitive": {
+            "description": "Also find the assessments that depend on a dependent. Defaults to `false`.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "changed"
+        ],
+        "type": "object"
+      },
+      "EvidenceDependentsResult": {
+        "additionalProperties": false,
+        "description": "The assessments that depend on the changed records, each once at its smallest depth.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-dependents"
+        },
+        "properties": {
+          "commit": {
+            "description": "The commit the records were read at.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "dependents": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "assessment": {
+                  "description": "An authenticated assessment.",
+                  "type": "string"
+                },
+                "dependence": {
+                  "enum": [
+                    "target",
+                    "used"
+                  ],
+                  "type": "string"
+                },
+                "depth": {
+                  "description": "How many assessments lie between it and a changed record, 0 for a direct dependent.",
+                  "type": "integer"
+                },
+                "graph": {
+                  "description": "Its proposal graph.",
+                  "type": "string"
+                },
+                "on": {
+                  "description": "The changed record it depends on, or for a transitive dependent the assessment it depends on.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "assessment",
+                "graph",
+                "on",
+                "dependence",
+                "depth"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "commit",
+          "dependents"
+        ],
+        "type": "object"
+      },
       "EvidenceDetach": {
         "additionalProperties": false,
         "description": "The graph to stop protecting.",
@@ -7615,6 +7699,28 @@
                 "evaluator": {
                   "description": "The attributed evaluator.",
                   "type": "string"
+                },
+                "inputs": {
+                  "description": "The records the evaluation consumed, each once, written as `prov:used`.",
+                  "items": {
+                    "additionalProperties": false,
+                    "description": "A claim, assessment, identity proposal, source revision, review decision, acceptance support or resolution map revision.",
+                    "maxProperties": 1,
+                    "minProperties": 1,
+                    "properties": {
+                      "iri": {
+                        "description": "An existing authenticated record, by its IRI.",
+                        "type": "string"
+                      },
+                      "key": {
+                        "description": "A record of this batch, by its key.",
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
                 },
                 "key": {
                   "description": "The record's key in this batch.",
@@ -47870,9 +47976,93 @@
         "x-sparkles-permission": "write"
       }
     },
+    "/{ds}/claims/dependents": {
+      "post": {
+        "description": "Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-dependents"
+        },
+        "operationId": "listEvidenceDependents",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceDependents"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceDependentsResult"
+                }
+              }
+            },
+            "description": "The dependent assessments."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Find the assessments that depend on changed records",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/{ds}/claims/identities": {
       "post": {
-        "description": "Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again.",
+        "description": "Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again or an identity graph the map was built from left the boundary.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-identities"
         },
