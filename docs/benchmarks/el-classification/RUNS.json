@@ -188,9 +188,9 @@
    "metadata_note": "A manual measurement record of el_classify and ELK 0.6.0 on GO and ChEBI lite on the benchmark host. Read the record for its method, results and checks."
   },
   {
-   "run_id": "sha256-9e42ab73bb8460e92084737a02fab2933c2b30189ddf57b787c9580fc5ead4f0",
+   "run_id": "sha256-963943fc1ae17187a5ca6bd68ce06d74d63c94893b6427abdcf2687c3db99308",
    "path": "runs/2026-11-03-el-speed-forge-80644aec/record.json",
-   "sha256": "9e42ab73bb8460e92084737a02fab2933c2b30189ddf57b787c9580fc5ead4f0",
+   "sha256": "963943fc1ae17187a5ca6bd68ce06d74d63c94893b6427abdcf2687c3db99308",
    "format": "legacy-assessment",
    "context": {
     "suite": "el-classification",

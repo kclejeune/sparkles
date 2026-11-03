@@ -97,10 +97,12 @@ The classifier is at least 2.5 times as fast as ELK on every ontology and thread
 and the closest case is `ore_ont_13482` on one thread, an ontology of 58,376 classes
 whose 689,540 axioms give 659,619 small contexts. On eight threads it is 3.0 times
 as fast on ChEBI lite and 5.1 to 13.3 times as fast on the ORE ontologies. Its peak
-resident set is below ELK's on every run. ChEBI lite on one thread took 2.1 s on forge
-against 1.1 s on `atlas`, a host of the same model, in five runs in one process each,
-while the other ontologies took the same time on both hosts. The cause is not known,
-and the table gives the forge figure. The taxonomies of both reasoners agree on every ontology and thread count, and
+resident set is below ELK's on every run. ChEBI lite on one thread took 2.1 s in this
+run against 1.1 s on `atlas`, a host of the same model, while the other ontologies took
+the same time on both hosts. A rerun on forge under the same lock took 1,158 and
+1,181 ms unpinned, 1,155 ms pinned to a performance core and 1,832 ms pinned to an
+efficient core, so the first process most likely ran on an efficient core. The table
+keeps the first figure, and the rerun gives ELK 5.7 times the classifier's time there. The taxonomies of both reasoners agree on every ontology and thread count, and
 each reasoner gives the same taxonomy on one and eight threads.
 
 ELK's resident memory follows its heap setting more than its live data, as the
