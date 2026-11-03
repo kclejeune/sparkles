@@ -2682,7 +2682,7 @@ impl<'a> Parser<'a> {
     /// The annotation assertions of the nodes outside RIND (Table 17's last step).
     fn annotation_assertions(&mut self) {
         let mut subjects: Vec<Key> = self.ann_triples.keys().cloned().collect();
-        subjects.sort_by_key(|k| k.to_string());
+        subjects.sort_by_cached_key(|k| k.to_string());
         for x in subjects {
             if self.onodes.contains(&x) {
                 continue;
