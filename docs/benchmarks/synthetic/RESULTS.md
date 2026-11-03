@@ -546,6 +546,34 @@ The same queries read at most 1.011 when streamed at 10.5M triples, and with `st
 most 1.02 in both modes at 1.05M triples. Item 682 holds the costs of 1% to 3%
 that remain in eager execution at 10.5M triples. The latency harness of X14's decision D4 passed every query under 0.3 ms
 except `star-lookup` at 1.019 in eager execution and 1.017 when streamed, and eager
-`types-grouped` at 1.186, about 1.1 and 1.3 µs, which items 681 and 679
-investigate. Streamed `expr-order-key` at 10.5M triples read 1.045 against the build
+`types-grouped` at 1.186, about 1.1 and 1.3 µs, which the
+[per-query costs after stage 4](#per-query-costs-after-stage-4) follow up. Streamed `expr-order-key` at 10.5M triples read 1.045 against the build
 before the mode-neutral kernels, which item 680 investigates.
+
+### Per-query costs after stage 4
+
+The forge check after stage 4 merged found the shortest queries 0.5 to 1.0 µs slower with
+one thread than 005df56d, the main before it, and eager `order-by-full` 3% slower with 12
+threads. [X14's outcome](../../specs/X14-unified-executor/SPEC.md#per-query-costs-after-stage-4)
+describes the five costs behind them and their fixes. Interleaved forge A/Bs of the fixed
+build, in rounds of A,B,B,A in each order, are kept in their own
+[run record](runs/2026-11-03-exec-overhead-ab-forge-b4d59853/summary.md) with their
+[commands](runs/2026-11-03-exec-overhead-ab-forge-b4d59853/run.sh.txt).
+
+With one thread at 1.05M triples, in the latency harness of X14's decision D4, the fixed
+build ran `count-all` at 0.924 of 005df56d, `distinct-obj` at 0.948, `path-plus` at 0.941,
+`predicate-counts` at 0.978 and `predicate-subjects` at 0.967. `types-grouped` read 1.054,
+0.38 µs more, which passes the D4 rule. `star-lookup` read 1.019 of 005df56d in two runs,
+1.1 µs more with an upper bound of 1.026, against 0.988 for the build before the last
+change, and item NEW-ITEM-1 follows the search loop whose alignment moved it. With 12
+threads at 1.05M triples, the fixed build
+ran the 30 queries at a geometric mean of 0.959 of 62d9cb53, the build that merged stage 4,
+with eager `order-by-full` at 0.643, 8.8 ms against 13.7 ms, and every other query within
+1.02 except `distinct-join` at 1.036, which item NEW-ITEM-1 follows. At 10.5M triples the
+eager costs of 2% to 4% that item 682 holds remained, with `subquery-agg` at 1.040 of
+005df56d, `lang-filter` at 1.026, `regex-iri` at 1.021 and `expr-bind-group` at 1.020.
+
+The batch that followed, 62d9cb53 to 125edd41, changed no executor code. With one thread at
+1.05M triples it ran `count-all` at 0.966 of 62d9cb53, `distinct-obj` at 0.996,
+`predicate-counts` at 0.958, `types-grouped` at 0.964 and `path-plus` at 1.020, 0.21 µs
+more, so it added no cost to the short queries that the Namespace screen flagged.
