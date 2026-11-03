@@ -152,6 +152,14 @@ pub struct CharSet {
 /// subjects of the others are counted in the remainder of [`Stats::correlations`].
 pub const MAX_CHARSETS: usize = 32_768;
 
+/// Experiment: the cap of kept subject and node sets, `SPARKLES_STATS_SET_CAP` when set.
+pub(crate) fn set_cap() -> usize {
+    std::env::var("SPARKLES_STATS_SET_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MAX_CHARSETS)
+}
+
 /// The item standing for class `class` (a base vocabulary id) in a characteristic set: its
 /// payload under a tag no term has, so that it sorts after every predicate.
 pub fn class_item(class: u64) -> Option<u64> {
@@ -1763,7 +1771,7 @@ impl StatsCollector {
                 let mut rest = std::mem::take(&mut self.cs_rest);
                 let sets = correlations::keep_top(
                     std::mem::take(&mut self.charsets),
-                    MAX_CHARSETS,
+                    set_cap(),
                     &mut rest,
                 );
                 stats.charsets = sets;
