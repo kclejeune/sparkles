@@ -3,19 +3,26 @@
 //! calculus in the style of ELK (Kazakov, Krötzsch and Simančík, *The Incredible ELK*,
 //! JAR 2014), and kept up to date incrementally as axioms are added and removed.
 //!
-//! The classifier reads the F21 axiom model only. An axiom outside OWL 2 EL is left out
-//! and reported, with the rule of the OWL 2 Profiles recommendation it breaks. An axiom
-//! inside the profile whose consequences the calculus may not all derive, such as one with
-//! an individual in a class expression, a data range or a negative property assertion,
-//! is used as far as the calculus goes and reported as partial. Every subsumption the
-//! classifier answers is entailed. It derives every entailed subsumption between named
-//! classes when no axiom is reported as partial or left out.
+//! The classifier reads the F21 axiom model only. It covers all of OWL 2 EL with the
+//! rules of EL++ (Baader, Brandt and Lutz, IJCAI 2005 and OWLED 2008): individuals in
+//! class expressions and assertions, ranges, the datatypes, literals and data ranges of
+//! the profile, functional data properties, keys, negative property assertions and the
+//! top and bottom properties. A class whose instances reach an individual through a
+//! context that holds only where the class has an instance is classified again in a
+//! world of its own. An axiom outside OWL 2 EL is left out and reported, with
+//! the rule of the OWL 2 Profiles recommendation it breaks. An axiom with a literal or a
+//! datatype that the classifier cannot compare, or with a property chain through the top
+//! property, is used as far as the calculus goes and reported as partial. Every
+//! subsumption the classifier answers is entailed. It derives every entailed subsumption
+//! between named classes when no axiom is reported as partial or left out.
 //!
 //! [`Saturation`] keeps the saturated contexts between runs over axioms that the caller
 //! keeps, such as those of an open ontology, and reads them in place on each run.
 //! [`Classifier`] holds its own copy of the axioms on top of one. A run after a change
 //! saturates again only the contexts that the changed axioms can reach, and a change to
-//! the role hierarchy, chains, reflexivity or ranges saturates everything.
+//! the role hierarchy, chains, reflexivity or ranges, to an axiom with an individual, a
+//! data property, a datatype or a key, and any change after a run that merged a context
+//! with an individual saturates everything.
 //!
 //! The profile check, the taxonomy and the saturation run on the threads of
 //! [`Limits`], and the answer is the same for every number of threads.
@@ -36,9 +43,11 @@
 //! assert!(out.taxonomy.is_subclass(&c("Nucleus"), &c("CellPart")));
 //! ```
 
+mod data;
 mod index;
 mod saturate;
 mod taxonomy;
+mod world;
 
 pub use index::Gap;
 pub use taxonomy::{Node as TaxonomyNode, Taxonomy};
@@ -179,6 +188,13 @@ pub struct Saturation {
     excluded: Vec<Excluded>,
     /// set when a run stopped part way, so that the next run starts again
     dirty: bool,
+    /// the subsumers of the classes that the last run classified in worlds of their own,
+    /// with whether each is unsatisfiable
+    worlds: FxHashMap<Ex, (bool, Vec<Ex>)>,
+    /// whether the last run's contexts depend on one another through individuals in ways
+    /// the invalidation does not follow: a context merged with an individual, a world, a
+    /// key or a fact of a universal role
+    entangled: bool,
 }
 
 impl Default for Saturation {
@@ -195,17 +211,21 @@ pub struct Changes<'a> {
 }
 
 /// Whether a change to the axiom needs a run that starts again: one that changes the
-/// role table, which a run builds once, or one with data, whose generated rules for
-/// literals and data ranges the invalidation does not follow.
+/// role table, which a run builds once, one with data, whose told subsumers the index
+/// derives from every data axiom at once, a key, or one with an individual, whose
+/// merges the invalidation does not follow.
 fn needs_full_run(ax: &AxiomKind) -> bool {
-    if role_axiom(ax) {
+    if role_axiom(ax) || matches!(ax, AxiomKind::HasKey(..)) {
         return true;
     }
     let mut sig = crate::model::Signature::default();
     sig.axiom(ax);
-    sig.0
-        .iter()
-        .any(|e| matches!(e, Entity::DataProperty(_) | Entity::Datatype(_)))
+    sig.0.iter().any(|e| {
+        matches!(
+            e,
+            Entity::DataProperty(_) | Entity::Datatype(_) | Entity::NamedIndividual(_)
+        )
+    })
 }
 
 /// Whether a change to the axiom affects the role table, which a run builds once.
@@ -219,6 +239,8 @@ fn role_axiom(ax: &AxiomKind) -> bool {
             | AxiomKind::ObjectPropertyRange(..)
             | AxiomKind::SubDataPropertyOf(..)
             | AxiomKind::EquivalentDataProperties(_)
+            | AxiomKind::DataPropertyRange(..)
+            | AxiomKind::FunctionalDataProperty(_)
     )
 }
 
@@ -436,6 +458,8 @@ impl Saturation {
             ctx: Vec::new(),
             excluded: Vec::new(),
             dirty: true,
+            worlds: FxHashMap::default(),
+            entangled: false,
         }
     }
 
@@ -495,6 +519,18 @@ impl Saturation {
         }
         // the classes the normalization meets are those of the signature
         self.interner.clear_met();
+        // the datatype definitions, which the data ranges that name them stand for
+        self.interner.ranges.definitions.clear();
+        for (i, &k) in axioms.iter().enumerate() {
+            if let AxiomKind::DatatypeDefinition(d, r) = k
+                && !is_outside[i]
+            {
+                self.interner
+                    .ranges
+                    .definitions
+                    .insert(d.clone(), r.clone());
+            }
+        }
         for (i, &k) in axioms.iter().enumerate() {
             if i % POLL_AXIOMS == 0 {
                 poll(limits)?;
@@ -560,19 +596,6 @@ impl Saturation {
                     index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
                 },
             )?;
-        // an individual that fills a property with a range has a context for each range,
-        // which nominal reasoning would merge
-        for (i, &k) in axioms.iter().enumerate() {
-            if let AxiomKind::ObjectPropertyAssertion(ObjectPropertyExpression::Property(p), ..) = k
-                && !is_outside[i]
-                && let Some(r) = self.interner.role_id(&index::RoleName::Object(p.clone()))
-                && ix.roles.range.get(r as usize).is_some_and(|c| c.is_some())
-            {
-                partial
-                    .entry(k)
-                    .or_insert("individuals that fill a property with a range");
-            }
-        }
         let mut excluded: Vec<Excluded> = Vec::new();
         for (i, (rule, message)) in outside {
             excluded.push(Excluded {
@@ -626,8 +649,9 @@ impl Saturation {
         // until the saturation ends, a stop leaves the state for a run that starts again
         self.dirty = true;
         let changes = changes.filter(|_| !again);
-        let full =
-            changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)));
+        let full = self.entangled
+            || changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)));
+        self.worlds.clear();
         if full {
             self.interner = Interner::new();
             self.ctx = Vec::new();
@@ -672,7 +696,10 @@ impl Saturation {
         }
         let mut roots: Vec<Ex> = ax.classes.clone();
         roots.push(TOP);
+        // every individual has an instance, whether an assertion or a class expression
+        // names it
         roots.extend(ax.individuals.iter().copied());
+        roots.extend(ix.nominals.iter().copied());
         roots.sort_unstable();
         roots.dedup();
         stats.index = start.elapsed();
@@ -706,27 +733,107 @@ impl Saturation {
             });
         }
         let t = Instant::now();
-        let totals = saturate::saturate(&ix, &self.ctx, &roots, &bounds);
-        stats.saturation = t.elapsed();
-        let totals = match totals {
-            Ok(t) => t,
-            Err(stop) => {
-                return Err(match stop {
-                    Stop::Cancelled => Error::Cancelled,
-                    Stop::Timeout => Error::Timeout,
-                    Stop::Memory { used } => Error::Memory {
-                        limit: limits.max_memory.unwrap_or(usize::MAX),
-                        used,
-                    },
-                });
-            }
+        let stopped = |stop: Stop| match stop {
+            Stop::Cancelled => Error::Cancelled,
+            Stop::Timeout => Error::Timeout,
+            Stop::Memory { used } => Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used,
+            },
         };
+        let mut totals =
+            saturate::saturate(&ix, &self.ctx, &roots, &[], &[], &bounds).map_err(stopped)?;
+        // the facts of universal roles and the merges of keys, between rounds of the
+        // saturation until none is new
+        let mut universal: Vec<Ex> = Vec::new();
+        let mut rounds = 0usize;
+        if ix.has_individuals() {
+            loop {
+                let view = world::Global(&self.ctx);
+                let facts = world::universal_facts(&ix, &view, &universal);
+                let merges = world::key_merges(&ix, &view);
+                if facts.is_empty() && merges.is_empty() {
+                    break;
+                }
+                rounds += 1;
+                let mut seeds: Vec<Ex> = Vec::new();
+                for (e, c) in self.ctx.iter().enumerate() {
+                    if facts.is_empty() {
+                        break;
+                    }
+                    let Some(c) = c.get() else { continue };
+                    if c.st.lock().init {
+                        c.todo
+                            .lock()
+                            .extend(facts.iter().map(|&x| saturate::Concl::Sub(x)));
+                        seeds.push(e as Ex);
+                    }
+                }
+                universal.extend_from_slice(&facts);
+                for (a, b) in merges {
+                    for (x, y) in [(a, b), (b, a)] {
+                        if let Some(c) = self.ctx[x as usize].get() {
+                            c.todo.lock().push(saturate::Concl::Sub(y));
+                            seeds.push(x);
+                        }
+                    }
+                }
+                poll(limits)?;
+                let round = Bounds {
+                    base_memory: totals.memory,
+                    ..bounds
+                };
+                let more = saturate::saturate(&ix, &self.ctx, &[], &seeds, &universal, &round)
+                    .map_err(stopped)?;
+                totals = saturate::Totals {
+                    conclusions: totals.conclusions + more.conclusions,
+                    memory: more.memory,
+                    peak: totals.peak.max(more.peak),
+                };
+            }
+        }
+        // the classes whose instances reach an individual through a context that is not
+        // real, each in a world of its own
+        let mut world_bytes = 0usize;
+        if ix.has_individuals() {
+            let witnesses = world::witnesses(&ix, &self.ctx, &universal);
+            let entangled = rounds > 0 || !witnesses.is_empty() || self.merged();
+            if !witnesses.is_empty() {
+                let classes = world::reaching(&ix, &self.ctx, &witnesses);
+                let real: Vec<Ex> = (0..self.ctx.len() as Ex)
+                    .filter(|&e| self.ctx[e as usize].get().is_some_and(|c| c.st.lock().real))
+                    .collect();
+                let found = par_map(&classes, threads, |_, chunk| {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for &d in chunk {
+                        if poll(limits).is_err() {
+                            break;
+                        }
+                        let w = world::World::new(&ix, &self.ctx, &universal, &real);
+                        out.push((d, w.classify(d)));
+                    }
+                    out
+                });
+                poll(limits)?;
+                for (d, f) in found.into_iter().flatten() {
+                    world_bytes += 48 + f.subs.len() * 4 + f.copied * saturate::CONTEXT_BYTES;
+                    self.worlds.insert(d, (f.bottom, f.subs));
+                }
+            }
+            self.entangled = entangled;
+        } else {
+            self.entangled = false;
+        }
+        stats.saturation = t.elapsed();
         stats.conclusions = totals.conclusions;
+        totals.memory += world_bytes;
+        totals.peak = totals.peak.max(totals.memory);
         // the saturated state is complete: a stop from here on keeps it for the next run
         self.dirty = false;
+        let ix_nominals = ix.nominals.clone();
         self.index = Some(ix);
         let t = Instant::now();
-        let consistent = self.consistent(&ax);
+        let consistent = self.consistent(&ax, &ix_nominals);
         let held = totals.memory - ax.bytes();
         drop(ax);
         let stop = || poll(limits).is_err();
@@ -770,14 +877,16 @@ impl Saturation {
         })
     }
 
-    fn consistent(&self, ax: &Axioms) -> bool {
+    fn consistent(&self, ax: &Axioms, nominals: &[Ex]) -> bool {
         let bottom = |e: Ex| {
             self.ctx
                 .get(e as usize)
                 .and_then(|c| c.get())
                 .is_some_and(|c| c.st.lock().bottom)
         };
-        !bottom(TOP) && !ax.individuals.iter().any(|&i| bottom(i))
+        !bottom(TOP)
+            && !ax.individuals.iter().any(|&i| bottom(i))
+            && !nominals.iter().any(|&i| bottom(i))
     }
 
     fn index_bytes(&self, ix: &Index) -> usize {
@@ -882,9 +991,25 @@ impl Saturation {
         cleared
     }
 
+    /// Whether a context other than an individual's own derived an individual, which ties
+    /// the contexts together beyond what the invalidation follows.
+    fn merged(&self) -> bool {
+        self.ctx
+            .iter()
+            .any(|c| c.get().is_some_and(|c| !c.st.lock().noms().is_empty()))
+    }
+
     /// The subsumers of a saturated context that are named classes, with their
     /// expressions.
     fn named_subsumers(&self, e: Ex) -> Option<(bool, Vec<Ex>)> {
+        if let Some((bottom, subs)) = self.worlds.get(&e) {
+            let named = subs
+                .iter()
+                .copied()
+                .filter(|&s| matches!(self.interner.nodes[s as usize], Node::Class(_) | Node::Top))
+                .collect();
+            return Some((*bottom, named));
+        }
         let c = self.ctx.get(e as usize)?.get()?;
         let st = c.st.lock();
         let named = st

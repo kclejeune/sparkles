@@ -12,7 +12,16 @@
 //! stack of its own and moves half of them to the shared queue when another worker is
 //! idle, so that the workers do not meet at one lock and one condition variable for each
 //! activation.
+//!
+//! Individuals add three rules. A context that derives `{a}` stands for `a`, so it takes
+//! every subsumer of `a` (it registers with `a`'s context, which sends them). A context
+//! that has an instance in every model, which `owl:Thing`, the individuals and every
+//! context they reach do and which is called real here, also gives `a` every subsumer it
+//! has. And a link by `r` from a context with `{a}` to one with `{a}` is a loop by `r`.
+//! What a context that is not real knows of an individual holds only where its root has
+//! an instance; [`super::world`] classifies the classes that reach such a context.
 
+use super::data::DataVal;
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use parking_lot::{Condvar, Mutex};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -23,8 +32,8 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicUsize, Ordering
 use std::time::Instant;
 
 /// A conclusion waiting in a context's to-do list.
-#[derive(Clone, Copy, Debug)]
-enum Concl {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Concl {
     /// the context's root is subsumed by the expression
     Sub(Ex),
     /// an instance of the source context has an instance of this context as an
@@ -35,10 +44,17 @@ enum Concl {
     Fwd(Role, Ex),
     /// every instance of this context is its own `r`-successor
     Loop(Role),
+    /// the source context's instance is this context's individual
+    Nom(Ex),
+    /// the context has an instance in every model
+    Real,
+    /// an instance of this context has the individual as an `r`-successor
+    LinkTo(Role, Ex),
 }
 
 /// A set kept as a list in the order of insertion, with a hash set beside it once it
 /// has more than a few members, so that a small set takes one allocation.
+#[derive(Clone)]
 pub struct Small<T> {
     pub list: Vec<T>,
     set: Option<FxHashSet<T>>,
@@ -89,6 +105,13 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
         true
     }
 
+    pub fn contains(&self, x: &T) -> bool {
+        match &self.set {
+            Some(set) => set.contains(x),
+            None => self.list.contains(x),
+        }
+    }
+
     pub fn retain(&mut self, keep: impl Fn(&T) -> bool) {
         self.list.retain(|x| keep(x));
         if let Some(set) = &mut self.set {
@@ -106,11 +129,13 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
 }
 
 /// The conclusions of one context.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct State {
     pub init: bool,
     pub subs: FxHashSet<Ex>,
     pub bottom: bool,
+    /// whether the context has an instance in every model
+    pub real: bool,
     /// the negative existential restrictions whose filler is a subsumer, which a new
     /// backward link propagates to its source
     pub props: Vec<(Role, Ex)>,
@@ -120,7 +145,45 @@ pub struct State {
     pub fwd: Small<(Role, Ex)>,
     /// the member of each disjointness set among the subsumers
     pub disj: FxHashMap<u32, Ex>,
-    loops: Vec<Role>,
+    pub loops: Vec<Role>,
+    /// what only contexts with individuals or functional data roles need
+    pub extra: Option<Box<Extra>>,
+}
+
+/// The conclusions of a context that only individuals and functional data roles give.
+#[derive(Default, Clone)]
+pub struct Extra {
+    /// the individuals among the subsumers, the root aside
+    pub noms: Vec<Ex>,
+    /// for an individual's context, the contexts whose instance it is
+    pub members: Small<Ex>,
+    /// the individuals that an instance has as `r`-successors, for the loops they close
+    pub links: Vec<(Role, Ex)>,
+    /// the data values that functional data roles make one
+    pub groups: Vec<Group>,
+}
+
+/// Data successors of a context that functional data roles make one value: the
+/// functional roles, the roles of the successors and the intersection of their ranges.
+#[derive(Clone)]
+pub struct Group {
+    pub funs: Vec<Role>,
+    pub roles: Vec<Role>,
+    pub val: DataVal,
+}
+
+impl Extra {
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Extra>()
+            + self.noms.capacity() * 4
+            + self.members.bytes()
+            + self.links.capacity() * 8
+            + self
+                .groups
+                .iter()
+                .map(|g| 96 + (g.funs.len() + g.roles.len() + g.val.opaque.len()) * 4)
+                .sum::<usize>()
+    }
 }
 
 impl State {
@@ -133,6 +196,33 @@ impl State {
             + self.fwd.bytes()
             + table_bytes(self.disj.capacity(), 8)
             + self.loops.capacity() * 4
+            + self.extra.as_ref().map_or(0, |x| x.bytes())
+    }
+
+    fn extra(&mut self) -> &mut Extra {
+        self.extra.get_or_insert_with(Box::default)
+    }
+
+    /// The individuals among the context's subsumers, its root aside.
+    pub fn noms(&self) -> &[Ex] {
+        self.extra.as_ref().map_or(&[], |x| x.noms.as_slice())
+    }
+
+    /// Whether the state already holds a conclusion, so that a world over it can drop
+    /// the conclusion: the rules have applied to it.
+    pub fn holds(&self, c: &Concl) -> bool {
+        match *c {
+            Concl::Sub(d) => self.bottom || self.subs.contains(&d),
+            Concl::Back(e, r) => self.back.iter().any(|(s, v)| *s == r && v.contains(&e)),
+            Concl::Fwd(r, f) => self.fwd.contains(&(r, f)),
+            Concl::Loop(r) => self.loops.contains(&r),
+            Concl::Nom(k) => self.extra.as_ref().is_some_and(|x| x.members.contains(&k)),
+            Concl::Real => self.real,
+            Concl::LinkTo(r, n) => self
+                .extra
+                .as_ref()
+                .is_some_and(|x| x.links.contains(&(r, n))),
+        }
     }
 
     /// Removes the backward links whose source is in `gone`.
@@ -176,7 +266,7 @@ impl State {
 #[derive(Default)]
 pub struct Ctx {
     active: AtomicBool,
-    todo: Mutex<Vec<Concl>>,
+    pub todo: Mutex<Vec<Concl>>,
     pub st: Mutex<State>,
 }
 
@@ -220,11 +310,14 @@ const ROOT_CHUNK: usize = 64;
 /// The roots a worker activates before the contexts they woke.
 const ROOTS_PER_ROUND: usize = 1024;
 /// The bytes counted for each context a saturation starts.
-const CONTEXT_BYTES: usize = 320;
+pub const CONTEXT_BYTES: usize = 320;
 
 struct Run<'a> {
     ix: &'a Index,
     ctx: &'a Contexts,
+    /// the subsumers that every context has beyond the index's: the facts of universal
+    /// roles found by earlier rounds
+    universal: &'a [Ex],
     /// the roots, which the workers take in chunks from `next_root` on
     roots: &'a [Ex],
     next_root: AtomicUsize,
@@ -265,16 +358,20 @@ pub struct Totals {
 }
 
 /// Saturates `roots` and every context they reach. Contexts already saturated keep their
-/// conclusions and take new ones.
+/// conclusions and take new ones: `seeds` are contexts with conclusions waiting in their
+/// to-do lists. `universal` are subsumers of every context beyond the index's.
 pub fn saturate(
     ix: &Index,
     ctx: &Contexts,
     roots: &[Ex],
+    seeds: &[Ex],
+    universal: &[Ex],
     bounds: &Bounds<'_>,
 ) -> Result<Totals, Stop> {
     let run = Run {
         ix,
         ctx,
+        universal,
         roots,
         next_root: AtomicUsize::new(0),
         queue: Mutex::new(Vec::new()),
@@ -288,6 +385,14 @@ pub fn saturate(
         applied: AtomicUsize::new(0),
         bounds,
     };
+    {
+        let mut q = run.queue.lock();
+        for &e in seeds {
+            if run.mark(run.get(e)) {
+                q.push(e);
+            }
+        }
+    }
     let threads = bounds.threads.max(1);
     if threads == 1 {
         run.worker();
@@ -326,7 +431,15 @@ struct Out<'r, 'a> {
     sent: usize,
 }
 
-impl Out<'_, '_> {
+/// Where the rules of a context send their conclusions.
+pub trait Sink {
+    /// sends a conclusion to a context, which may be the one the rules run in
+    fn send(&mut self, to: Ex, c: Concl);
+    /// a conclusion for the context the rules run in
+    fn me(&mut self, c: Concl);
+}
+
+impl Sink for Out<'_, '_> {
     #[inline]
     fn send(&mut self, to: Ex, c: Concl) {
         if to == self.me {
@@ -527,17 +640,12 @@ impl<'a> Run<'a> {
             sent: 0,
         };
         if !st.init {
-            st.init = true;
             tally.stored += CONTEXT_BYTES / CONCLUSION_BYTES;
-            out.me(Concl::Sub(me));
-            out.me(Concl::Sub(TOP));
-            for &r in &self.ix.roles.reflexive {
-                out.me(Concl::Loop(r));
-            }
+            init(self.ix, me, &mut st, self.universal, &mut out);
         }
         'outer: loop {
             while let Some(c) = out.local.pop() {
-                if self.apply(me, &mut st, c, &mut out) {
+                if apply(self.ix, me, &mut st, c, &mut out) {
                     tally.stored += 1;
                 }
                 tally.applied += 1;
@@ -570,134 +678,326 @@ impl<'a> Run<'a> {
             mine.push_back(me);
         }
     }
+}
 
-    /// Applies the rules to one conclusion. The answer says whether it was new.
-    fn apply(&self, me: Ex, st: &mut State, c: Concl, out: &mut Out<'_, 'a>) -> bool {
-        let ix = self.ix;
-        let roles = &ix.roles;
-        match c {
-            Concl::Sub(d) => {
-                if st.bottom || !st.subs.insert(d) {
-                    return false;
-                }
-                let h = ix.head(d);
-                match h.node {
-                    Node::Bottom => {
-                        st.bottom = true;
-                        for (_, srcs) in &st.back {
-                            for &e in &srcs.list {
-                                out.send(e, Concl::Sub(BOTTOM));
-                            }
-                        }
-                        return true;
-                    }
-                    Node::Conj(a, b) => {
-                        out.me(Concl::Sub(a));
-                        out.me(Concl::Sub(b));
-                    }
-                    Node::Exist(r, _) => {
-                        let succ = h.succ;
-                        out.send(succ, Concl::Back(me, r));
-                        if roles.keeps_forward(r) {
-                            out.me(Concl::Fwd(r, succ));
-                        }
-                    }
-                    Node::SelfLoop(r) => out.me(Concl::Loop(r)),
-                    _ => {}
-                }
-                for &t in ix.told_of(h) {
-                    out.me(Concl::Sub(t));
-                }
-                for &(p, k) in ix.conj_of(h) {
-                    if st.subs.contains(&p) {
-                        out.me(Concl::Sub(k));
-                    }
-                }
-                for &(s, x) in ix.exist_of(h) {
-                    st.props.push((s, x));
-                    for (r, srcs) in &st.back {
-                        if roles.sub(*r, s) {
-                            for &e in &srcs.list {
-                                out.send(e, Concl::Sub(x));
-                            }
-                        }
-                    }
-                }
-                for &set in ix.disjoint_of(h) {
-                    match st.disj.entry(set) {
-                        Entry::Vacant(v) => {
-                            v.insert(d);
-                        }
-                        Entry::Occupied(o) => {
-                            if *o.get() != d {
-                                out.me(Concl::Sub(BOTTOM));
-                            }
-                        }
-                    }
-                }
-                true
+/// Starts a context: its root, `owl:Thing`, the loops of the reflexive roles and the
+/// facts every context has, and for `owl:Thing` and an individual, that it is real.
+pub fn init<S: Sink>(ix: &Index, me: Ex, st: &mut State, universal: &[Ex], out: &mut S) {
+    st.init = true;
+    out.me(Concl::Sub(me));
+    out.me(Concl::Sub(TOP));
+    for &r in &ix.roles.reflexive {
+        out.me(Concl::Loop(r));
+    }
+    for &x in universal {
+        out.me(Concl::Sub(x));
+    }
+    if me == TOP || matches!(ix.head(me).node, Node::Nominal(_)) {
+        out.me(Concl::Real);
+    }
+}
+
+/// The individuals a context stands for: its root, when it is one, and the individuals
+/// among its subsumers.
+fn individuals(ix: &Index, me: Ex, st: &State, mut f: impl FnMut(Ex)) {
+    if matches!(ix.head(me).node, Node::Nominal(_)) {
+        f(me);
+    }
+    for &n in st.noms() {
+        f(n);
+    }
+}
+
+/// Applies the rules to one conclusion. The answer says whether it was new.
+pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S) -> bool {
+    let roles = &ix.roles;
+    match c {
+        Concl::Sub(d) => {
+            if st.bottom || !st.subs.insert(d) {
+                return false;
             }
-            Concl::Back(e, r) => {
-                if !st.back_by(r).insert(e) {
-                    return false;
-                }
-                if st.bottom {
-                    out.send(e, Concl::Sub(BOTTOM));
+            let h = ix.head(d);
+            match h.node {
+                Node::Bottom => {
+                    st.bottom = true;
+                    for (_, srcs) in &st.back {
+                        for &e in &srcs.list {
+                            out.send(e, Concl::Sub(BOTTOM));
+                        }
+                    }
+                    if let Some(x) = &st.extra {
+                        for &m in &x.members.list {
+                            out.send(m, Concl::Sub(BOTTOM));
+                        }
+                        if st.real {
+                            for &n in &x.noms {
+                                out.send(n, Concl::Sub(BOTTOM));
+                            }
+                        }
+                    }
                     return true;
                 }
-                for &(s, x) in &st.props {
-                    if roles.sub(r, s) {
-                        out.send(e, Concl::Sub(x));
+                Node::Conj(a, b) => {
+                    out.me(Concl::Sub(a));
+                    out.me(Concl::Sub(b));
+                }
+                Node::Exist(r, _) => {
+                    let succ = h.succ;
+                    out.send(succ, Concl::Back(me, r));
+                    if roles.keeps_forward(r) {
+                        out.me(Concl::Fwd(r, succ));
+                    }
+                    if st.real {
+                        out.send(succ, Concl::Real);
                     }
                 }
-                for &(r2, f) in &st.fwd.list {
-                    for &t in roles.comp(r, r2) {
-                        out.send(f, Concl::Back(e, t));
-                        if roles.keeps_forward(t) {
-                            out.send(e, Concl::Fwd(t, f));
-                        }
-                    }
+                Node::SelfLoop(r) => out.me(Concl::Loop(r)),
+                Node::Nominal(_) if d != me => nominal(ix, me, st, d, out),
+                Node::DataSome(r, _) if !roles.functional(r).is_empty() => {
+                    functional(ix, st, r, h.succ, out)
                 }
-                true
+                _ => {}
             }
-            Concl::Fwd(r2, f) => {
-                if !st.fwd.insert((r2, f)) {
-                    return false;
+            for &t in ix.told_of(h) {
+                out.me(Concl::Sub(t));
+            }
+            for &(p, k) in ix.conj_of(h) {
+                if st.subs.contains(&p) {
+                    out.me(Concl::Sub(k));
                 }
-                for (r1, srcs) in &st.back {
-                    for &t in roles.comp(*r1, r2) {
+            }
+            for &(s, x) in ix.exist_of(h) {
+                st.props.push((s, x));
+                for (r, srcs) in &st.back {
+                    if roles.sub(*r, s) {
                         for &e in &srcs.list {
-                            out.send(f, Concl::Back(e, t));
-                            if roles.keeps_forward(t) {
-                                out.send(e, Concl::Fwd(t, f));
-                            }
+                            out.send(e, Concl::Sub(x));
                         }
                     }
                 }
-                true
             }
-            Concl::Loop(r) => {
-                if st.loops.contains(&r) {
-                    return false;
-                }
-                st.loops.push(r);
-                // a loop is a link from the context to itself
-                out.me(Concl::Back(me, r));
-                if roles.keeps_forward(r) {
-                    out.me(Concl::Fwd(r, me));
-                }
-                for &(s, x) in &ix.selfs {
-                    if roles.sub(r, s) {
-                        out.me(Concl::Sub(x));
+            for &set in ix.disjoint_of(h) {
+                match st.disj.entry(set) {
+                    Entry::Vacant(v) => {
+                        v.insert(d);
+                    }
+                    Entry::Occupied(o) => {
+                        if *o.get() != d {
+                            out.me(Concl::Sub(BOTTOM));
+                        }
                     }
                 }
-                for &l in &st.loops {
-                    for &t in roles.comp(l, r).iter().chain(roles.comp(r, l)) {
-                        out.me(Concl::Loop(t));
+            }
+            if let Some(x) = &st.extra {
+                // an individual's subsumers go to the contexts that stand for it, and a
+                // real context's to its individuals
+                for &m in &x.members.list {
+                    out.send(m, Concl::Sub(d));
+                }
+                if st.real {
+                    for &n in &x.noms {
+                        out.send(n, Concl::Sub(d));
                     }
                 }
-                true
+            }
+            true
+        }
+        Concl::Back(e, r) => {
+            if !st.back_by(r).insert(e) {
+                return false;
+            }
+            if st.bottom {
+                out.send(e, Concl::Sub(BOTTOM));
+                return true;
+            }
+            for &(s, x) in &st.props {
+                if roles.sub(r, s) {
+                    out.send(e, Concl::Sub(x));
+                }
+            }
+            for &(r2, f) in &st.fwd.list {
+                for &t in roles.comp(r, r2) {
+                    compose(roles, e, t, f, out);
+                }
+            }
+            if ix.nominal_selfs {
+                individuals(ix, me, st, |n| out.send(e, Concl::LinkTo(r, n)));
+            }
+            true
+        }
+        Concl::Fwd(r2, f) => {
+            if !st.fwd.insert((r2, f)) {
+                return false;
+            }
+            for (r1, srcs) in &st.back {
+                for &t in roles.comp(*r1, r2) {
+                    for &e in &srcs.list {
+                        compose(roles, e, t, f, out);
+                    }
+                }
+            }
+            true
+        }
+        Concl::Loop(r) => {
+            if st.loops.contains(&r) {
+                return false;
+            }
+            st.loops.push(r);
+            if roles.is_empty_role(r) {
+                out.me(Concl::Sub(BOTTOM));
+            }
+            // a loop is a link from the context to itself, which meets the role's range
+            if let Some(c) = roles.range.get(r as usize).copied().flatten() {
+                out.me(Concl::Sub(c));
+            }
+            out.me(Concl::Back(me, r));
+            if roles.keeps_forward(r) {
+                out.me(Concl::Fwd(r, me));
+            }
+            for &(s, x) in &ix.selfs {
+                if roles.sub(r, s) {
+                    out.me(Concl::Sub(x));
+                }
+            }
+            for &l in &st.loops {
+                for &t in roles.comp(l, r).iter().chain(roles.comp(r, l)) {
+                    out.me(Concl::Loop(t));
+                }
+            }
+            true
+        }
+        Concl::Nom(k) => {
+            if k == me || !st.extra().members.insert(k) {
+                return false;
+            }
+            if st.bottom {
+                out.send(k, Concl::Sub(BOTTOM));
+            } else {
+                for &s in &st.subs {
+                    out.send(k, Concl::Sub(s));
+                }
+            }
+            true
+        }
+        Concl::Real => {
+            if st.real {
+                return false;
+            }
+            st.real = true;
+            if st.bottom {
+                if let Some(x) = &st.extra {
+                    for &n in &x.noms {
+                        out.send(n, Concl::Sub(BOTTOM));
+                    }
+                }
+                return true;
+            }
+            for &s in &st.subs {
+                if let Node::Exist(..) = ix.head(s).node {
+                    out.send(ix.head(s).succ, Concl::Real);
+                }
+            }
+            if let Some(x) = &st.extra {
+                for &n in &x.noms {
+                    for &s in &st.subs {
+                        out.send(n, Concl::Sub(s));
+                    }
+                }
+            }
+            true
+        }
+        Concl::LinkTo(r, n) => {
+            let x = st.extra();
+            if x.links.contains(&(r, n)) {
+                return false;
+            }
+            x.links.push((r, n));
+            if n == me || st.subs.contains(&n) {
+                out.me(Concl::Loop(r));
+            }
+            true
+        }
+    }
+}
+
+/// The link of a chain: an instance of `e` has an instance of `f` as a `t`-successor.
+#[inline]
+fn compose<S: Sink>(roles: &super::index::Roles, e: Ex, t: Role, f: Ex, out: &mut S) {
+    out.send(f, Concl::Back(e, t));
+    if roles.keeps_forward(t) {
+        out.send(e, Concl::Fwd(t, f));
+    }
+    if roles.is_empty_role(t) {
+        out.send(e, Concl::Sub(BOTTOM));
+    }
+}
+
+/// A context derives the individual `n`: it registers with `n` to take its subsumers,
+/// gives `n` its own when it is real, and closes the loops of links to `n`.
+fn nominal<S: Sink>(ix: &Index, me: Ex, st: &mut State, n: Ex, out: &mut S) {
+    out.send(n, Concl::Nom(me));
+    let real = st.real;
+    let x = st.extra.get_or_insert_with(Box::default);
+    x.noms.push(n);
+    if real {
+        for &s in &st.subs {
+            out.send(n, Concl::Sub(s));
+        }
+    }
+    if ix.nominal_selfs {
+        let x = st
+            .extra
+            .as_ref()
+            .map(|x| x.links.clone())
+            .unwrap_or_default();
+        for (r, m) in x {
+            if m == n {
+                out.me(Concl::Loop(r));
+            }
+        }
+        for (r, srcs) in &st.back {
+            for &e in &srcs.list {
+                out.send(e, Concl::LinkTo(*r, n));
             }
         }
     }
+}
+
+/// A context derives a data restriction by a role with functional superroles: its data
+/// successors by the roles under each of them are one value, in the intersection of
+/// their ranges.
+fn functional<S: Sink>(ix: &Index, st: &mut State, r: Role, w: Ex, out: &mut S) {
+    let fs = ix.roles.functional(r);
+    let x = st.extra.get_or_insert_with(Box::default);
+    let mut merged = Group {
+        funs: fs.to_vec(),
+        roles: vec![r],
+        val: ix.vals[w as usize].clone(),
+    };
+    let mut i = 0;
+    while i < x.groups.len() {
+        if x.groups[i].funs.iter().any(|f| merged.funs.contains(f)) {
+            let g = x.groups.swap_remove(i);
+            merged.funs.extend(g.funs);
+            merged.roles.extend(g.roles);
+            merged.val = merged.val.meet(&g.val);
+            // the merged group may now meet groups it did not before
+            i = 0;
+        } else {
+            i += 1;
+        }
+    }
+    merged.funs.sort_unstable();
+    merged.funs.dedup();
+    merged.roles.sort_unstable();
+    merged.roles.dedup();
+    if merged.val.is_empty() {
+        out.me(Concl::Sub(BOTTOM));
+    } else {
+        for &d in &merged.roles {
+            ix.data_matches(d, &merged.val, |x| out.me(Concl::Sub(x)));
+        }
+    }
+    x.groups.push(merged);
+    x.groups.sort_by(|a, b| a.funs.cmp(&b.funs));
 }

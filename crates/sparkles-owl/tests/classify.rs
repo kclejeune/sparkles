@@ -210,16 +210,12 @@ fn axioms_outside_el_are_reported() {
     // classes of axioms left out are still in the taxonomy
     assert!(out.taxonomy.node_of(&c("B")).is_some());
     let ex = k.excluded();
-    assert_eq!(ex.len(), 3, "{ex:#?}");
+    assert_eq!(ex.len(), 2, "{ex:#?}");
     let outside: Vec<&Excl> = ex
         .iter()
         .filter(|e| matches!(e.gap, Gap::Outside { .. }))
         .collect();
     assert_eq!(outside.len(), 2);
-    assert!(
-        ex.iter()
-            .any(|e| matches!(e.gap, Gap::Partial("individuals")))
-    );
 }
 
 type Excl = sparkles_owl::classify::Excluded;
@@ -353,7 +349,7 @@ fn a_change_to_a_data_axiom_runs_everything_again() {
 }
 
 #[test]
-fn assertions_on_a_property_with_a_range_are_partial() {
+fn assertions_on_properties_with_ranges_are_complete() {
     let i = |s: &str| Individual::named(format!("http://ex.org/{s}"));
     let mut k = Classifier::of(&[
         ax(AxiomKind::ObjectPropertyRange(ope("r"), ce("C"))),
@@ -364,22 +360,15 @@ fn assertions_on_a_property_with_a_range_are_partial() {
         ax(AxiomKind::ObjectPropertyAssertion(ope("r"), i("a"), i("b"))),
         ax(AxiomKind::ObjectPropertyAssertion(ope("s"), i("d"), i("b"))),
     ]);
-    k.classify(&Limits::default()).unwrap();
-    let partial = k
-        .excluded()
-        .iter()
-        .filter(|e| matches!(e.gap, Gap::Partial(_)))
-        .count();
-    assert_eq!(partial, 2, "{:#?}", k.excluded());
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.consistent);
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
 }
 
-// The four tests below state the classifier's behaviour today on ranges that meet
-// individuals, which ELK 0.6.0 shares. The calculus treats an individual as an atom and
-// gives each range of a property it fills a context of its own, so a range's conclusion
-// about the individual does not reach the individual's other contexts. Each missed
-// entailment is a known gap of roadmap item 587, which adds the nominal rules of EL++
-// and should turn these into positive tests. What they check now is that the classifier
-// reports the axioms it uses in part.
+// The four tests below are the ontologies of the agreement record of roadmap item 604
+// where a property's range meets an individual. HermiT, Konclude and Whelk agree on
+// them, and ELK 0.6.0 misses the first three, as the classifier did before item 587
+// added the rules for individuals.
 
 fn ind(s: &str) -> Individual {
     Individual::named(format!("http://ex.org/{s}"))
@@ -397,7 +386,7 @@ fn partial_reasons(k: &Classifier) -> BTreeMap<&'static str, usize> {
 }
 
 #[test]
-fn a_range_on_an_asserted_property_misses_a_subsumption_and_reports_it() {
+fn a_range_on_an_asserted_property_reaches_the_individual() {
     // range(r) = C and r(a, b) put b in C, so Y ⊑ ∃s.{b} ⊑ ∃s.C ≡ X
     let mut k = Classifier::of(&[
         ax(AxiomKind::ObjectPropertyRange(ope("r"), ce("C"))),
@@ -411,19 +400,12 @@ fn a_range_on_an_asserted_property_misses_a_subsumption_and_reports_it() {
     ]);
     let out = k.classify(&Limits::default()).unwrap();
     assert!(out.consistent);
-    // known gap of item 587: Y ⊑ X is entailed
-    assert!(!out.taxonomy.is_subclass(&c("Y"), &c("X")));
-    let why = partial_reasons(&k);
-    assert_eq!(
-        why.get("individuals that fill a property with a range"),
-        Some(&1),
-        "{why:?}"
-    );
-    assert_eq!(why.get("individuals"), Some(&1), "{why:?}");
+    assert!(out.taxonomy.is_subclass(&c("Y"), &c("X")));
+    assert!(partial_reasons(&k).is_empty());
 }
 
 #[test]
-fn a_range_reached_through_has_value_misses_a_subsumption_and_reports_it() {
+fn a_range_reached_through_has_value_reaches_the_individual() {
     // Z(a) and Z ⊑ ∃r.{b} give r(a, b), so b is in range(r) = C and Y ⊑ ∃s.{b} ⊑ X
     let mut k = Classifier::of(&[
         ax(AxiomKind::ObjectPropertyRange(ope("r"), ce("C"))),
@@ -440,14 +422,13 @@ fn a_range_reached_through_has_value_misses_a_subsumption_and_reports_it() {
     ]);
     let out = k.classify(&Limits::default()).unwrap();
     assert!(out.consistent);
-    // known gap of item 587: Y ⊑ X is entailed
-    assert!(!out.taxonomy.is_subclass(&c("Y"), &c("X")));
-    let why = partial_reasons(&k);
-    assert_eq!(why.get("individuals"), Some(&2), "{why:?}");
+    assert!(out.taxonomy.is_subclass(&c("Y"), &c("X")));
+    assert!(!out.taxonomy.is_subclass(&c("Z"), &c("X")));
+    assert!(partial_reasons(&k).is_empty());
 }
 
 #[test]
-fn two_disjoint_ranges_on_one_individual_miss_the_inconsistency_and_report_it() {
+fn two_disjoint_ranges_on_one_individual_are_inconsistent() {
     // r(a, b) and q(d, b) put b in C and in D, which are disjoint
     let mut k = Classifier::of(&[
         ax(AxiomKind::ObjectPropertyRange(ope("r"), ce("C"))),
@@ -467,14 +448,8 @@ fn two_disjoint_ranges_on_one_individual_miss_the_inconsistency_and_report_it() 
         )),
     ]);
     let out = k.classify(&Limits::default()).unwrap();
-    // known gap of item 587: the ontology is inconsistent
-    assert!(out.consistent);
-    let why = partial_reasons(&k);
-    assert_eq!(
-        why.get("individuals that fill a property with a range"),
-        Some(&2),
-        "{why:?}"
-    );
+    assert!(!out.consistent);
+    assert!(partial_reasons(&k).is_empty());
 }
 
 #[test]
@@ -494,26 +469,399 @@ fn one_range_that_clashes_with_an_assertion_is_inconsistent() {
     ]);
     let out = k.classify(&Limits::default()).unwrap();
     assert!(!out.consistent);
-    let why = partial_reasons(&k);
-    assert_eq!(
-        why.get("individuals that fill a property with a range"),
-        Some(&1),
-        "{why:?}"
-    );
+    assert!(partial_reasons(&k).is_empty());
 }
 
 #[test]
-fn axioms_on_the_top_and_bottom_properties_are_partial() {
+fn the_top_and_bottom_properties() {
     let top = ObjectPropertyExpression::from(ObjectProperty::top());
     let bottom = ObjectPropertyExpression::from(ObjectProperty::bottom());
+    // every element is a top-successor of every element, so a domain of the top
+    // property holds everywhere
     let mut k = Classifier::of(&[
-        ax(AxiomKind::ObjectPropertyDomain(top, ce("C"))),
-        ax(AxiomKind::ReflexiveObjectProperty(bottom)),
+        ax(AxiomKind::ObjectPropertyDomain(top.clone(), ce("C"))),
+        sub(c("A"), c("B")),
     ]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("C")));
+    assert!(out.taxonomy.is_subclass(&c("C"), &c("A")) == false);
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+    // a reflexive bottom property relates every element to itself, which it cannot
+    let out = run(&[ax(AxiomKind::ReflexiveObjectProperty(bottom.clone()))]);
+    assert!(!out.consistent);
+    // a subproperty of the bottom property relates nothing
+    let out = run(&[
+        ax(AxiomKind::SubObjectPropertyOf(
+            SubObjectPropertyExpression::Expression(ope("r")),
+            bottom,
+        )),
+        sub(c("A"), some("r", c("B"))),
+    ]);
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+    // once B has an instance, every element has a top-successor in B
+    let out = run(&[
+        ax(AxiomKind::ClassAssertion(ce("B"), ind("b"))),
+        Axiom::equivalent_classes([
+            ce("X"),
+            ClassExpression::some(ObjectProperty::top(), c("B")),
+        ]),
+        sub(c("A"), c("D")),
+    ]);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("X")));
+    // a chain through the top property is used in part
+    let mut k = Classifier::of(&[ax(AxiomKind::SubObjectPropertyOf(
+        SubObjectPropertyExpression::Chain(vec![top, ope("r")]),
+        ope("s"),
+    ))]);
     k.classify(&Limits::default()).unwrap();
-    let ex = k.excluded();
-    assert_eq!(ex.len(), 2, "{ex:#?}");
-    assert!(ex.iter().all(|e| matches!(e.gap, Gap::Partial(_))));
+    assert_eq!(
+        partial_reasons(&k).get("property chains through the top object property"),
+        Some(&1)
+    );
+}
+
+// Individuals: what a context that stands for an individual takes from it and gives it.
+
+fn one(s: &str) -> ClassExpression {
+    ClassExpression::ObjectOneOf([ind(s)].into_iter().collect())
+}
+fn value(r: &str, s: &str) -> ClassExpression {
+    ClassExpression::ObjectHasValue(ope(r), ind(s))
+}
+fn assert_(r: &str, a: &str, b: &str) -> Axiom {
+    ax(AxiomKind::ObjectPropertyAssertion(ope(r), ind(a), ind(b)))
+}
+fn is_a(c: &str, i: &str) -> Axiom {
+    ax(AxiomKind::ClassAssertion(ce(c), ind(i)))
+}
+fn range(r: &str, c: &str) -> Axiom {
+    ax(AxiomKind::ObjectPropertyRange(ope(r), ce(c)))
+}
+
+#[test]
+fn a_class_of_one_individual_takes_what_the_individual_has() {
+    let out = run(&[sub(c("C"), one("a")), is_a("B", "a")]);
+    assert!(out.taxonomy.is_subclass(&c("C"), &c("B")));
+    assert!(!out.taxonomy.is_subclass(&c("B"), &c("C")));
+}
+
+#[test]
+fn what_holds_where_a_class_has_an_instance_stays_in_its_world() {
+    // Y ⊑ ∃r.{b} with range(r) = C puts b in C only where Y has an instance: Z, below Y,
+    // reaches X, and W, which only links to b, does not
+    let out = run(&[
+        sub(c("Y"), value("r", "b")),
+        range("r", "C"),
+        Axiom::equivalent_classes([ce("X"), some("s", c("C"))]),
+        sub(c("W"), value("s", "b")),
+        sub(c("Z"), and([ce("Y"), value("s", "b")])),
+    ]);
+    let t = &out.taxonomy;
+    assert!(t.is_subclass(&c("Z"), &c("X")));
+    assert!(!t.is_subclass(&c("W"), &c("X")));
+    assert!(!t.is_subclass(&c("Y"), &c("X")));
+}
+
+#[test]
+fn a_world_follows_an_individual_back_to_the_class() {
+    // where C has an instance it is a, which is then in B, so c is in ∃r.B ⊑ E and C in
+    // ∃s.E ⊑ F; G, which reaches c alone, is not in F
+    let out = run(&[
+        sub(c("C"), one("a")),
+        sub(c("C"), c("B")),
+        assert_("r", "c", "a"),
+        sub(some("r", c("B")), c("E")),
+        sub(c("C"), value("s", "c")),
+        sub(some("s", c("E")), c("F")),
+        sub(c("G"), value("s", "c")),
+    ]);
+    let t = &out.taxonomy;
+    assert!(t.is_subclass(&c("C"), &c("F")));
+    assert!(!t.is_subclass(&c("G"), &c("F")));
+}
+
+#[test]
+fn same_and_different_individuals() {
+    let out = run(&[
+        ax(AxiomKind::SameIndividual(
+            [ind("a"), ind("b")].into_iter().collect(),
+        )),
+        is_a("B", "a"),
+        sub(c("Y"), value("r", "b")),
+        Axiom::equivalent_classes([ce("X"), some("r", c("B"))]),
+        ax(AxiomKind::DifferentIndividuals(
+            [ind("c"), ind("d")].into_iter().collect(),
+        )),
+        sub(c("U"), and([one("c"), one("d")])),
+    ]);
+    let t = &out.taxonomy;
+    assert!(out.consistent);
+    assert!(t.is_subclass(&c("Y"), &c("X")));
+    assert!(t.is_unsatisfiable(&c("U")));
+}
+
+#[test]
+fn a_link_from_an_individual_to_itself_is_a_loop() {
+    let selfish = ClassExpression::ObjectHasSelf(ope("r"));
+    let out = run(&[
+        assert_("r", "a", "a"),
+        Axiom::equivalent_classes([ce("X"), selfish.clone()]),
+        sub(c("C"), one("a")),
+        sub(c("Y"), value("s", "a")),
+        Axiom::equivalent_classes([ce("Z"), some("s", c("X"))]),
+        // a loop meets the range of its role
+        sub(c("L"), ClassExpression::ObjectHasSelf(ope("q"))),
+        range("q", "D"),
+    ]);
+    let t = &out.taxonomy;
+    assert!(t.is_subclass(&c("C"), &c("X")));
+    assert!(t.is_subclass(&c("Y"), &c("Z")));
+    assert!(t.is_subclass(&c("L"), &c("D")));
+}
+
+#[test]
+fn negative_property_assertions() {
+    let not = |r: &str, a: &str, b: &str| {
+        ax(AxiomKind::NegativeObjectPropertyAssertion(
+            ope(r),
+            ind(a),
+            ind(b),
+        ))
+    };
+    assert!(!run(&[assert_("r", "a", "b"), not("r", "a", "b")]).consistent);
+    // through a chain
+    let out = run(&[
+        ax(AxiomKind::SubObjectPropertyOf(
+            SubObjectPropertyExpression::Chain(vec![ope("r"), ope("s")]),
+            ope("t"),
+        )),
+        assert_("r", "a", "b"),
+        assert_("s", "b", "c"),
+        not("t", "a", "c"),
+    ]);
+    assert!(!out.consistent);
+    // a class whose instance would break one is unsatisfiable, and the ontology is not
+    let out = run(&[
+        sub(c("C"), and([one("a"), value("r", "b")])),
+        not("r", "a", "b"),
+    ]);
+    assert!(out.consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("C")));
+}
+
+// Data: the values of literals, the datatypes of OWL 2 EL, ranges and functional data
+// properties.
+
+fn xsd(l: &str) -> String {
+    format!("http://www.w3.org/2001/XMLSchema#{l}")
+}
+fn lit(v: &str, dt: &str) -> Literal {
+    Literal::typed(v, &xsd(dt))
+}
+fn dt(l: &str) -> DataRange {
+    DataRange::Datatype(Datatype::new(xsd(l)))
+}
+fn dsome(d: &str, r: DataRange) -> ClassExpression {
+    ClassExpression::DataSomeValuesFrom(vec![dp(d)], r)
+}
+fn dvalue(d: &str, l: Literal) -> ClassExpression {
+    ClassExpression::DataHasValue(dp(d), l)
+}
+
+#[test]
+fn literals_are_values() {
+    let out = run(&[
+        sub(c("C"), dvalue("d", lit("1", "integer"))),
+        Axiom::equivalent_classes([ce("X"), dvalue("d", lit("1.0", "decimal"))]),
+        Axiom::equivalent_classes([ce("Y"), dsome("d", dt("integer"))]),
+        sub(c("H"), dvalue("d", lit("1.5", "decimal"))),
+        Axiom::equivalent_classes([ce("S"), dsome("d", dt("string"))]),
+        sub(c("L"), dvalue("d", Literal::lang("x", "en").unwrap())),
+        Axiom::equivalent_classes([
+            ce("P"),
+            dsome(
+                "d",
+                DataRange::Datatype(Datatype::new(
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#PlainLiteral",
+                )),
+            ),
+        ]),
+    ]);
+    let t = &out.taxonomy;
+    assert!(t.is_subclass(&c("C"), &c("X")));
+    assert!(t.is_subclass(&c("C"), &c("Y")));
+    assert!(!t.is_subclass(&c("H"), &c("Y")));
+    assert!(!t.is_subclass(&c("L"), &c("S")));
+    assert!(t.is_subclass(&c("L"), &c("P")));
+    assert!(t.is_subclass(&c("S"), &c("P")));
+}
+
+#[test]
+fn data_ranges_and_definitions() {
+    let count = Datatype::new("http://ex.org/count");
+    let mut k = Classifier::of(&[
+        ax(AxiomKind::DataPropertyRange(dp("d"), dt("integer"))),
+        sub(c("C"), dsome("d", dt("decimal"))),
+        Axiom::equivalent_classes([ce("Y"), dsome("d", dt("integer"))]),
+        ax(AxiomKind::DataPropertyRange(dp("e"), dt("string"))),
+        sub(c("U"), dvalue("e", lit("1", "integer"))),
+        ax(AxiomKind::DatatypeDefinition(
+            count.clone(),
+            dt("nonNegativeInteger"),
+        )),
+        sub(c("N"), dsome("f", DataRange::Datatype(count))),
+        Axiom::equivalent_classes([ce("I"), dsome("f", dt("integer"))]),
+        sub(
+            c("E"),
+            dsome(
+                "f",
+                DataRange::IntersectionOf([dt("integer"), dt("string")].into_iter().collect()),
+            ),
+        ),
+    ]);
+    let out = k.classify(&Limits::default()).unwrap();
+    let t = &out.taxonomy;
+    assert!(t.is_subclass(&c("C"), &c("Y")));
+    assert!(t.is_unsatisfiable(&c("U")));
+    assert!(t.is_subclass(&c("N"), &c("I")));
+    assert!(t.is_unsatisfiable(&c("E")));
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+}
+
+#[test]
+fn functional_data_properties_make_one_value() {
+    let fun = |d: &str| ax(AxiomKind::FunctionalDataProperty(dp(d)));
+    let subd = |a: &str, b: &str| ax(AxiomKind::SubDataPropertyOf(dp(a), dp(b)));
+    let two = and([
+        dvalue("d", lit("1", "integer")),
+        dvalue("d", lit("2", "integer")),
+    ]);
+    assert!(
+        run(&[fun("d"), sub(c("C"), two.clone())])
+            .taxonomy
+            .is_unsatisfiable(&c("C"))
+    );
+    assert!(!run(&[sub(c("C"), two)]).taxonomy.is_unsatisfiable(&c("C")));
+    // the successors by two roles under one functional role are one value
+    let out = run(&[
+        fun("f"),
+        subd("d1", "f"),
+        subd("d2", "f"),
+        sub(
+            c("C"),
+            and([
+                dsome("d1", dt("integer")),
+                dvalue("d2", lit("3", "decimal")),
+            ]),
+        ),
+        Axiom::equivalent_classes([ce("X"), dvalue("d1", lit("3", "integer"))]),
+        sub(
+            c("U"),
+            and([
+                dsome("d1", dt("nonNegativeInteger")),
+                dvalue("d2", lit("-3", "integer")),
+            ]),
+        ),
+    ]);
+    assert!(out.taxonomy.is_subclass(&c("C"), &c("X")));
+    assert!(out.taxonomy.is_unsatisfiable(&c("U")));
+}
+
+#[test]
+fn data_on_individuals_and_the_top_data_property() {
+    let out = run(&[
+        ax(AxiomKind::DataPropertyAssertion(
+            dp("d"),
+            ind("a"),
+            Literal::simple("x"),
+        )),
+        sub(c("Y"), value("r", "a")),
+        Axiom::equivalent_classes([ce("X"), some("r", dvalue("d", Literal::simple("x")))]),
+        Axiom::equivalent_classes([
+            ce("T"),
+            ClassExpression::DataSomeValuesFrom(vec![DataProperty::top()], dt("integer")),
+        ]),
+        sub(c("A"), c("B")),
+        ax(AxiomKind::NegativeDataPropertyAssertion(
+            dp("e"),
+            ind("a"),
+            lit("1", "integer"),
+        )),
+        sub(c("Q"), and([one("a"), dvalue("e", lit("01", "integer"))])),
+    ]);
+    let t = &out.taxonomy;
+    assert!(out.consistent);
+    assert!(t.is_subclass(&c("Y"), &c("X")));
+    assert!(t.is_subclass(&c("A"), &c("T")));
+    assert!(t.is_unsatisfiable(&c("Q")));
+}
+
+#[test]
+fn keys_make_individuals_one() {
+    let key = |c: &str, ops: &[&str], dps: &[&str]| {
+        ax(AxiomKind::HasKey(
+            ce(c),
+            ops.iter().map(|p| ope(p)).collect(),
+            dps.iter().map(|p| dp(p)).collect(),
+        ))
+    };
+    let base = [
+        is_a("K", "a"),
+        is_a("K", "b"),
+        is_a("B", "a"),
+        sub(c("Y"), value("s", "b")),
+        Axiom::equivalent_classes([ce("X"), some("s", c("B"))]),
+    ];
+    let mut by_object = base.to_vec();
+    by_object.extend([
+        key("K", &["r"], &[]),
+        assert_("r", "a", "c"),
+        assert_("r", "b", "c"),
+    ]);
+    assert!(run(&by_object).taxonomy.is_subclass(&c("Y"), &c("X")));
+    let mut by_data = base.to_vec();
+    by_data.extend([
+        key("K", &[], &["d"]),
+        ax(AxiomKind::DataPropertyAssertion(
+            dp("d"),
+            ind("a"),
+            lit("1", "integer"),
+        )),
+        ax(AxiomKind::DataPropertyAssertion(
+            dp("d"),
+            ind("b"),
+            lit("01", "integer"),
+        )),
+    ]);
+    assert!(run(&by_data).taxonomy.is_subclass(&c("Y"), &c("X")));
+    // different values, or a value that is not named, keep them apart
+    let mut apart = base.to_vec();
+    apart.extend([key("K", &["r"], &[]), sub(c("K"), some("r", c("V")))]);
+    assert!(!run(&apart).taxonomy.is_subclass(&c("Y"), &c("X")));
+}
+
+#[test]
+fn opaque_literals_are_used_in_part() {
+    let mut k = Classifier::of(&[sub(
+        c("C"),
+        dvalue("d", Literal::typed("x", "http://ex.org/dt")),
+    )]);
+    k.classify(&Limits::default()).unwrap();
+    assert_eq!(partial_reasons(&k).len(), 1, "{:#?}", k.excluded());
+}
+
+#[test]
+fn a_change_with_an_individual_runs_everything_again() {
+    let mut k = Classifier::of(&[sub(c("Y"), value("r", "b")), range("r", "C")]);
+    k.classify(&Limits::default()).unwrap();
+    k.add([&is_a("D", "b")]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.stats.incremental);
+    k.add([&sub(c("Z"), c("Y"))]);
+    let out = k.classify(&Limits::default()).unwrap();
+    // the previous run merged a context with b, which the invalidation does not follow
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("Z"), &c("Y")));
 }
 
 #[test]
@@ -697,9 +1045,13 @@ fn removing_an_axiom_not_held_does_not_cancel_a_later_addition() {
 }
 
 // ---------------------------------------------------------------------------------
-// A naive completion procedure for EL++ without nominals or concrete domains (Baader,
-// Brandt and Lutz, "Pushing the EL Envelope", IJCAI 2005, with the range rule of their
-// 2008 follow-up), written independently of the classifier as an oracle.
+// A naive completion procedure for EL++ without concrete domains (Baader, Brandt and
+// Lutz, "Pushing the EL Envelope", IJCAI 2005, with the range rule of their 2008
+// follow-up), written independently of the classifier as an oracle. Nominals follow
+// rule CR6 with its reachability condition: each class is completed in its own world,
+// in which the basic concepts reachable from it, from owl:Thing and from the
+// individuals have instances, and those that share an individual share their
+// subsumers.
 
 #[derive(Default)]
 struct Naive {
@@ -716,6 +1068,8 @@ struct Naive {
     chains: Vec<(usize, usize, usize)>,
     reflexive: BTreeSet<usize>,
     ranges: Vec<(usize, usize)>,
+    /// the basic concepts of the individuals
+    nominals: BTreeSet<usize>,
 }
 
 const NTOP: usize = 0;
@@ -766,6 +1120,34 @@ impl Naive {
                 self.nf3.push((r, f, x));
                 x
             }
+            ClassExpression::ObjectOneOf(is) => match is.iter().next() {
+                Some(Individual::Named(i)) => self.individual(i.as_str()),
+                other => panic!("not in the generator: {other:?}"),
+            },
+            ClassExpression::ObjectHasValue(r, Individual::Named(i)) => {
+                let f = self.individual(i.as_str());
+                let r = self.role(r);
+                let x = self.fresh();
+                self.nf2.push((x, r, f));
+                self.nf3.push((r, f, x));
+                x
+            }
+            other => panic!("not in the generator: {other:?}"),
+        }
+    }
+    fn individual(&mut self, i: &str) -> usize {
+        let k = format!("{{{i}}}");
+        if let Some(&x) = self.names.get(&k) {
+            return x;
+        }
+        let x = self.fresh();
+        self.names.insert(k, x);
+        self.nominals.insert(x);
+        x
+    }
+    fn named(&mut self, i: &Individual) -> usize {
+        match i {
+            Individual::Named(n) => self.individual(n.as_str()),
             other => panic!("not in the generator: {other:?}"),
         }
     }
@@ -819,13 +1201,47 @@ impl Naive {
             AxiomKind::Declaration(Entity::Class(c)) => {
                 self.name(&c.clone().into());
             }
+            AxiomKind::ClassAssertion(c, i) => {
+                let (i, c) = (self.named(i), self.name(c));
+                self.nf1.push((vec![i], c));
+            }
+            AxiomKind::ObjectPropertyAssertion(r, a, b) => {
+                let (r, a, b) = (self.role(r), self.named(a), self.named(b));
+                self.nf2.push((a, r, b));
+            }
+            AxiomKind::NegativeObjectPropertyAssertion(r, a, b) => {
+                let (r, a, b) = (self.role(r), self.named(a), self.named(b));
+                let x = self.fresh();
+                self.nf3.push((r, b, x));
+                self.nf1.push((vec![a, x], NBOT));
+            }
             other => panic!("not in the generator: {other:?}"),
         }
     }
 
-    /// The subsumers of every basic concept.
-    #[allow(clippy::needless_range_loop)]
-    fn complete(mut self) -> (BTreeMap<String, usize>, Vec<BTreeSet<usize>>) {
+    /// The subsumers of every basic concept in the world of each named class, and of
+    /// owl:Thing in the world where only it and the individuals have instances. A world
+    /// is inconsistent when a concept with an instance there has ⊥.
+    fn complete(mut self) -> (BTreeMap<String, usize>, Vec<(bool, BTreeSet<usize>)>) {
+        let (sup, reflexive) = self.prepare();
+        let names = self.names.clone();
+        let mut out = vec![(false, BTreeSet::new()); self.n];
+        let classes: Vec<usize> = names
+            .iter()
+            .filter(|(k, _)| !k.starts_with('{'))
+            .map(|(_, &x)| x)
+            .chain([NTOP])
+            .collect();
+        for x in classes {
+            let (clash, s) = self.world(&sup, &reflexive, x);
+            out[x] = (clash || s[x].contains(&NBOT), s[x].clone());
+        }
+        (names, out)
+    }
+
+    /// The role closure and the reflexive roles, with the ranges pushed into the
+    /// fillers of existentials on the right.
+    fn prepare(&mut self) -> (Vec<BTreeSet<usize>>, BTreeSet<usize>) {
         let nr = self.roles.len();
         // the reflexive-transitive closure of the role hierarchy
         let mut sup = vec![BTreeSet::new(); nr];
@@ -871,15 +1287,28 @@ impl Naive {
                 self.nf1.push((vec![NTOP], c));
             }
         }
-        let n = self.n;
-        let mut s: Vec<BTreeSet<usize>> = (0..n).map(|x| BTreeSet::from([x, NTOP])).collect();
-        let mut rel: Vec<BTreeSet<(usize, usize)>> = vec![BTreeSet::new(); nr];
         let reflexive: BTreeSet<usize> = self
             .reflexive
             .iter()
             .flat_map(|&r| sup[r].iter().copied().collect::<Vec<_>>())
             .collect();
-        for &r in &reflexive {
+        (sup, reflexive)
+    }
+
+    /// The completion in the world of `root`: whether it is inconsistent, and the
+    /// subsumers of each basic concept.
+    #[allow(clippy::needless_range_loop)]
+    fn world(
+        &self,
+        sup: &[BTreeSet<usize>],
+        reflexive: &BTreeSet<usize>,
+        root: usize,
+    ) -> (bool, Vec<BTreeSet<usize>>) {
+        let nr = self.roles.len();
+        let n = self.n;
+        let mut s: Vec<BTreeSet<usize>> = (0..n).map(|x| BTreeSet::from([x, NTOP])).collect();
+        let mut rel: Vec<BTreeSet<(usize, usize)>> = vec![BTreeSet::new(); nr];
+        for &r in reflexive {
             for x in 0..n {
                 rel[r].insert((x, x));
             }
@@ -932,11 +1361,39 @@ impl Naive {
                     }
                 }
             }
+            // CR6: the concepts with instances in this world that share an individual
+            // are one element
+            let mut live: BTreeSet<usize> = [root, NTOP].into_iter().collect();
+            live.extend(self.nominals.iter().copied());
+            let mut stack: Vec<usize> = live.iter().copied().collect();
+            while let Some(x) = stack.pop() {
+                for edges in &rel {
+                    for &(a, b) in edges {
+                        if a == x && live.insert(b) {
+                            stack.push(b);
+                        }
+                    }
+                }
+            }
+            for &o in &self.nominals {
+                let group: Vec<usize> = live
+                    .iter()
+                    .copied()
+                    .filter(|&x| s[x].contains(&o))
+                    .collect();
+                let all: BTreeSet<usize> = group.iter().flat_map(|&x| s[x].clone()).collect();
+                for x in group {
+                    if s[x].len() < all.len() {
+                        s[x] = all.clone();
+                        changed = true;
+                    }
+                }
+            }
             if !changed {
-                break;
+                let clash = live.iter().any(|&x| s[x].contains(&NBOT));
+                return (clash, s);
             }
         }
-        (self.names, s)
     }
 }
 
@@ -946,19 +1403,17 @@ fn naive_subsumptions(axioms: &[Axiom]) -> BTreeSet<(String, String)> {
         nv.axiom(a);
     }
     let (names, s) = nv.complete();
-    let mut all: Vec<(String, usize)> = names.into_iter().collect();
+    let mut all: Vec<(String, usize)> = names
+        .into_iter()
+        .filter(|(k, _)| !k.starts_with('{'))
+        .collect();
     all.push((Class::thing().as_str().to_string(), NTOP));
     all.push((Class::nothing().as_str().to_string(), NBOT));
-    let inconsistent = s[NTOP].contains(&NBOT);
+    let inconsistent = s[NTOP].0;
     let mut out = BTreeSet::new();
     for (a, x) in &all {
         for (b, y) in &all {
-            if inconsistent
-                || s[*x].contains(y)
-                || s[*x].contains(&NBOT)
-                || *y == NTOP
-                || *x == NBOT
-            {
+            if inconsistent || s[*x].1.contains(y) || s[*x].0 || *y == NTOP || *x == NBOT {
                 out.insert((a.clone(), b.clone()));
             }
         }
@@ -984,18 +1439,26 @@ fn classifier_subsumptions(t: &sparkles_owl::classify::Taxonomy) -> BTreeSet<(St
 const CLASSES: usize = 6;
 const ROLES: usize = 4;
 
+const INDIVIDUALS: usize = 3;
+
+fn gen_ind() -> impl Strategy<Value = Individual> {
+    (0..INDIVIDUALS).prop_map(|i| ind(&format!("i{i}")))
+}
+
 fn gen_class() -> impl Strategy<Value = ClassExpression> {
     prop_oneof![
         8 => (0..CLASSES).prop_map(|i| ce(&format!("C{i}"))),
         1 => Just(ClassExpression::Class(Class::thing())),
+        1 => gen_ind().prop_map(|i| ClassExpression::ObjectOneOf([i].into_iter().collect())),
     ]
 }
 
 fn gen_expr() -> impl Strategy<Value = ClassExpression> {
     gen_class().prop_recursive(2, 8, 2, |inner| {
         prop_oneof![
-            (0..ROLES, inner.clone()).prop_map(|(r, f)| some(&format!("r{r}"), f)),
-            (inner.clone(), inner).prop_map(|(a, b)| and([a, b])),
+            3 => (0..ROLES, inner.clone()).prop_map(|(r, f)| some(&format!("r{r}"), f)),
+            3 => (inner.clone(), inner).prop_map(|(a, b)| and([a, b])),
+            1 => (0..ROLES, gen_ind()).prop_map(|(r, i)| ClassExpression::ObjectHasValue(ope(&format!("r{r}")), i)),
         ]
     })
 }
@@ -1039,7 +1502,10 @@ fn gen_axiom() -> impl Strategy<Value = Axiom> {
         1 => (2..ROLES).prop_map(|s| ax(AxiomKind::TransitiveObjectProperty(r(s)))),
         1 => (0..ROLES).prop_map(|s| ax(AxiomKind::ReflexiveObjectProperty(r(s)))),
         1 => ((0..ROLES), gen_class()).prop_map(|(s, c)| ax(AxiomKind::ObjectPropertyDomain(r(s), c))),
-        1 => ((0..2usize), gen_class()).prop_map(|(s, c)| ax(AxiomKind::ObjectPropertyRange(r(s), c))),
+        2 => ((0..2usize), gen_class()).prop_map(|(s, c)| ax(AxiomKind::ObjectPropertyRange(r(s), c))),
+        2 => (gen_expr(), gen_ind()).prop_map(|(c, i)| ax(AxiomKind::ClassAssertion(c, i))),
+        2 => ((0..ROLES), gen_ind(), gen_ind()).prop_map(|(s, a, b)| ax(AxiomKind::ObjectPropertyAssertion(r(s), a, b))),
+        1 => ((0..ROLES), gen_ind(), gen_ind()).prop_map(|(s, a, b)| ax(AxiomKind::NegativeObjectPropertyAssertion(r(s), a, b))),
     ]
 }
 
