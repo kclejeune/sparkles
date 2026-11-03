@@ -131,7 +131,7 @@ item 637 chains them in one process, and this comparison checks their output.
 On forge, the benchmark host, `robot reason` with ELK took a median of 14.0 s on GO and
 30.6 s on ChEBI lite over three runs, from the release's RDF/XML file to the written
 functional-style file, at peak resident sets of 3,597 MiB and 8,287 MiB with an 8 GiB
-heap. `sparkles ontology classify` took 4.3 s and 9.8 s on the same files, at 1,850 MiB
+heap. `sparkles ontology classify`, built before item 602 as below, took 4.3 s and 9.8 s on the same files, at 1,850 MiB
 and 3,587 MiB, so it is 3.3 times as fast on GO and 3.1 times on ChEBI lite. It writes
 the taxonomy only, while `robot reason` writes the whole ontology with the inferred
 axioms, so the comparison counts the larger output against ROBOT.
@@ -166,7 +166,9 @@ ontology. The times exclude reading the file. Konclude starts one process per ru
 its time is the total processing time of its log less its parse, so it includes writing
 the class hierarchy. Whelk and HermiT classify on one thread. Every taxonomy equals the
 classifier's, except that Konclude and HermiT both give the 7 GO edges that come from
-GO's inverse property, as [above](#whelk-and-konclude).
+GO's inverse property, as [above](#whelk-and-konclude). The classifier in this run was
+built from the sources of commit 1e0760c9, before item 602, so its times here are
+slower than the current classifier's in [Against ELK](#against-elk).
 
 | Ontology | Threads | Classifier | ELK | Konclude | Whelk | HermiT |
 |---|---:|---:|---:|---:|---:|---:|
@@ -192,8 +194,8 @@ Konclude's time is the target that roadmap item 603 sets. On these OWL 2 EL inpu
 classifies GO in 1.3 s, ChEBI lite in 4.2 s and the largest ORE ontology in 12.2 s, on
 one thread or eight, and its whole process takes 1.9 s, 6.8 s and 19.4 s with the parse.
 The classifier is ahead of Konclude on every ontology and thread count. ELK on eight
-threads is ahead of the classifier on ChEBI lite and the six largest ORE ontologies,
-which roadmap item 602 follows. On `ore_ont_14042` and `ore_ont_11395` ELK is slower on
+threads is ahead of this build on ChEBI lite and the six largest ORE ontologies, while
+the current classifier is ahead of ELK there, as [Against ELK](#against-elk) shows. On `ore_ont_14042` and `ore_ont_11395` ELK is slower on
 eight threads than on one. HermiT takes 29 s on GO, 112 s on ChEBI lite and up to 525 s on
 the ORE ontologies.
 
