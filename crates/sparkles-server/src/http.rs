@@ -4179,6 +4179,9 @@ async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<
                 "resolve": "/{ds}/claims/resolve",
                 "review": "/{ds}/claims/review",
                 "withdraw": "/{ds}/claims/withdraw",
+                // identity proposals are reviewed through `review` under a matching
+                // policy, and their resolution maps are read here
+                "identities": "/{ds}/claims/identities",
             },
         },
     });

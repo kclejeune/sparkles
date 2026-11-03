@@ -22,19 +22,21 @@ pub use primitives::{
 
 pub use model::{
     AssessmentInput, BlankAnchor, ClaimInput, ConfidenceFacets, EvidenceInput, EvidenceLinkInput,
-    EvidenceRefInput, EvidenceRefTarget, PassageInput, RecordRef, RenditionContent, RenditionInput,
-    Scope, SourceContent, SourceLineage, SourceMetadata, SourceRevisionInput, SourceTimes,
-    StoredFactRef,
+    EvidenceRefInput, EvidenceRefTarget, IdentityInput, IdentityRelation, PassageInput, RecordRef,
+    RenditionContent, RenditionInput, Scope, SourceContent, SourceLineage, SourceMetadata,
+    SourceRevisionInput, SourceTimes, StoredFactRef,
 };
 
 pub use prepare::{
-    MAX_CLAIMS, MAX_LINKS, NormalizedSourceTime, NormalizedSourceTimes, PreparedContent,
-    PreparedInput, ResolutionRequirement, prepare_input,
+    MAX_CLAIMS, MAX_IDENTITIES, MAX_IDENTITY_ENTITIES, MAX_LINKS, MIN_IDENTITY_ENTITIES,
+    NormalizedSourceTime, NormalizedSourceTimes, PreparedContent, PreparedInput,
+    ResolutionRequirement, prepare_input,
 };
 
 pub use settings::{
     CanonicalSettings, ConflictMode, MAX_POLICIES, MAX_POLICY_NAME_BYTES, MAX_POLICY_SCOPE,
-    MAX_SETTINGS_BYTES, MAX_SETTINGS_GRAPH_IRI_BYTES, MAX_SETTINGS_GRAPHS, Policy, Settings,
+    MAX_SETTINGS_BYTES, MAX_SETTINGS_GRAPH_IRI_BYTES, MAX_SETTINGS_GRAPHS, MatchingPolicy, Policy,
+    Settings,
 };
 
 pub use structured::{

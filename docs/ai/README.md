@@ -257,7 +257,7 @@ existing memory records. Rust applications select them with
 profile RDF with `sparkles shacl` and run the supplied queries with `sparkles query`.
 
 A dataset's [evidence settings](../API.md#evidence-settings) name the graphs of six
-roles and the named review policies. The roles hold source records, proposals, review
+roles, the named review policies and the named matching policies. The roles hold source records, proposals, review
 decisions, acceptance supports, identity records and dedicated projections. Each policy
 names its admitted claim kinds, required scope predicates, conflict mode, evidence
 boundary and the decisions, supports and projection graphs it uses. Administrators
@@ -330,8 +330,22 @@ and projected triples they changed. A detach and new protection of a projection'
 makes later reviews under its policy refuse with `projection-unavailable`, because its
 supports no longer authenticate. Readers of an output graph read it under their own
 grants, so an administrator gives them read access to the policy's evidence boundary.
-Identity proposals and reviewed resolution maps are
-not available, and neither are reviews through the bindings or MCP.
+
+[Evidence identities](../API.md#evidence-identities) are reviewed and reversible.
+An identity proposal in a claims batch names two or more exact entity IRIs as a possible
+match or as distinct entities, and asserts no `owl:sameAs`. A review under a matching
+policy decides proposals, and the policy's accepted matches join entities into clusters
+whose current resolution map is the policy's output graph, `<member> ev:resolvesTo
+<representative>`. An accepted separation keeps its entities apart, and a review that
+would join them refuses with `identity-conflict`. A split is a decision that supersedes
+the match's acceptance, and accepting the match again restores the earlier map. Every
+change of the decisions a map follows writes an immutable map revision that names its
+predecessor and the decisions it added and ended, and the review answers the entities
+whose selected entity changed. `POST /{ds}/claims/identities` and
+`sparkles::evidence::resolve_entities` read what the map selects for an entity, its
+cluster and the decisions that join it. Queries join the output graph explicitly and are
+never rewritten through a map. Reviews and resolutions are not available through the
+bindings or MCP.
 
 The Rust controlled permission helper can prepare graph, predicate and class masks
 and the built-in disclosure guard under one memory cap and `Control`. It explicitly

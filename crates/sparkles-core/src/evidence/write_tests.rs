@@ -64,6 +64,7 @@ fn plan_of(input: &EvidenceInput, settings: &Settings, key: Option<&str>) -> Res
             idempotency_key: key,
             source_graph: None,
             proposal_graph: None,
+            identity_graph: None,
         },
         &c,
     )
@@ -205,4 +206,59 @@ fn the_form_of_retained_content_is_part_of_a_record_digest() {
         da, db,
         "a metadata-only rendition never stands for one with text"
     );
+}
+
+fn identity(entities: &[&str], relation: crate::evidence::IdentityRelation) -> EvidenceInput {
+    EvidenceInput {
+        identities: vec![crate::evidence::IdentityInput {
+            version: RecordVersion::V1,
+            key: RecordKey::new("match").unwrap(),
+            occurrence_key: RecordKey::new("m1").unwrap(),
+            entities: entities.iter().map(|e| iri(e)).collect(),
+            relation,
+            preferred: None,
+            attributed_author: iri("urn:matcher"),
+            method: None,
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn identity_proposals_go_to_an_identity_graph_as_a_set_of_entities() {
+    use crate::evidence::IdentityRelation::{DistinctEntities, PossibleMatch};
+    let mut s = settings(&["urn:s"], &["urn:c"]);
+    // no identity graph is configured
+    assert!(plan_of(&identity(&["urn:a", "urn:b"], PossibleMatch), &s, None).is_err());
+    s.identity = vec!["urn:i".into()];
+    let a = plan_of(&identity(&["urn:a", "urn:b"], PossibleMatch), &s, Some("k")).unwrap();
+    assert_eq!(a.graphs, vec![iri("urn:i")]);
+    assert_eq!(a.records[0].graph.as_str(), "urn:i");
+    assert_eq!(a.records[0].kind, RecordKind::IdentityProposal);
+    // the entities are a set
+    let b = plan_of(&identity(&["urn:b", "urn:a"], PossibleMatch), &s, Some("k")).unwrap();
+    assert_eq!(a.records[0].iri, b.records[0].iri);
+    assert_eq!(a.records[0].digest, b.records[0].digest);
+    assert_eq!(a.payload_digest, b.payload_digest);
+    // the relation is content, the entities are identity
+    let c = plan_of(
+        &identity(&["urn:a", "urn:b"], DistinctEntities),
+        &s,
+        Some("k"),
+    )
+    .unwrap();
+    assert_eq!(a.records[0].iri, c.records[0].iri);
+    assert_ne!(a.records[0].digest, c.records[0].digest);
+    let d = plan_of(&identity(&["urn:a", "urn:c"], PossibleMatch), &s, Some("k")).unwrap();
+    assert_ne!(a.records[0].iri, d.records[0].iri);
+    // two identity graphs need a choice
+    s.identity.push("urn:j".into());
+    assert!(plan_of(&identity(&["urn:a", "urn:b"], PossibleMatch), &s, None).is_err());
+    // a batch without identity proposals keeps its payload digest whatever the
+    // identity role holds
+    let mut t = settings(&["urn:s"], &["urn:c"]);
+    let before = plan_of(&input("o", "urn:o"), &t, Some("k")).unwrap();
+    t.identity = vec!["urn:i".into()];
+    let after = plan_of(&input("o", "urn:o"), &t, Some("k")).unwrap();
+    assert_eq!(before.payload_digest, after.payload_digest);
 }

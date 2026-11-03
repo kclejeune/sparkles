@@ -189,6 +189,61 @@ pub struct AssessmentInput {
     pub scope: Scope,
 }
 
+/// The relation an identity proposal proposes between its entities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IdentityRelation {
+    /// The entities may denote one thing. Acceptance never asserts `owl:sameAs`.
+    PossibleMatch,
+    /// The entities denote different things.
+    DistinctEntities,
+}
+
+impl IdentityRelation {
+    /// The relation's local name in the profile vocabulary.
+    pub fn local(self) -> &'static str {
+        match self {
+            IdentityRelation::PossibleMatch => "PossibleMatch",
+            IdentityRelation::DistinctEntities => "DistinctEntities",
+        }
+    }
+
+    /// The request name, `possibleMatch` or `distinctEntities`.
+    pub fn name(self) -> &'static str {
+        match self {
+            IdentityRelation::PossibleMatch => "possibleMatch",
+            IdentityRelation::DistinctEntities => "distinctEntities",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<IdentityRelation> {
+        [
+            IdentityRelation::PossibleMatch,
+            IdentityRelation::DistinctEntities,
+        ]
+        .into_iter()
+        .find(|r| r.name() == name)
+    }
+}
+
+/// A proposed correspondence or separation of exact entity identifiers (spec C25 §6).
+/// It asserts no identity. A review under a matching policy decides it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityInput {
+    pub version: RecordVersion,
+    pub key: RecordKey,
+    pub occurrence_key: RecordKey,
+    /// Two to 64 distinct entity IRIs, in any order.
+    pub entities: Vec<NamedNode>,
+    pub relation: IdentityRelation,
+    /// The entity a match prefers as the stable identity of its cluster, one of
+    /// `entities`. Only a `PossibleMatch` names one.
+    pub preferred: Option<NamedNode>,
+    /// The attributed proposer, never an authenticated operation principal.
+    pub attributed_author: NamedNode,
+    /// The matching method that produced the proposal, when one did.
+    pub method: Option<MethodRef>,
+}
+
 /// A complete preparation input. It cannot carry an actor, receipt or owner token.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EvidenceInput {
@@ -199,4 +254,6 @@ pub struct EvidenceInput {
     pub claims: Vec<ClaimInput>,
     pub links: Vec<EvidenceLinkInput>,
     pub assessments: Vec<AssessmentInput>,
+    /// Identity proposals, written to an identity graph.
+    pub identities: Vec<IdentityInput>,
 }

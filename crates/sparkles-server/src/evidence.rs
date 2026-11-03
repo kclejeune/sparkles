@@ -44,6 +44,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/{ds}/claims", post(claims::propose))
         .route("/{ds}/claims/review", post(review::review))
         .route("/{ds}/claims/withdraw", post(review::withdraw))
+        .route("/{ds}/claims/identities", post(review::identities))
 }
 
 mod claims;

@@ -120,6 +120,9 @@ pub struct Options {
     pub source_graph: Option<NamedNode>,
     /// The proposal graph, needed when the settings name more than one.
     pub proposal_graph: Option<NamedNode>,
+    /// The identity graph of identity proposals, needed when the settings name more
+    /// than one.
+    pub identity_graph: Option<NamedNode>,
     /// The commit message.
     pub message: Option<Arc<str>>,
     /// Who makes the write, recorded with its changes in the change log.
@@ -141,6 +144,7 @@ impl Options {
             dry_run: false,
             source_graph: None,
             proposal_graph: None,
+            identity_graph: None,
             message: None,
             author: None,
             write: None,
@@ -492,6 +496,7 @@ pub fn propose(
             idempotency_key: options.idempotency_key.as_deref(),
             source_graph: options.source_graph.as_ref(),
             proposal_graph: options.proposal_graph.as_ref(),
+            identity_graph: options.identity_graph.as_ref(),
         },
         control,
     )
