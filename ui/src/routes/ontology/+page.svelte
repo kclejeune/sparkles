@@ -152,7 +152,10 @@
 
   const langs = typeof navigator === 'undefined' ? ['en'] : [...(navigator.languages ?? []), 'en'];
   const nameOf = (iri: string) => entityName(iri, labels, prefixes, langs);
-  const subOf = (iri: string) => (labels.get(iri)?.length ? iriName(iri, prefixes) : null);
+  /** The short forms the hierarchy route gives, such as GO:0008150, as the browse pages show them. */
+  let shortForms = $state<Map<string, string>>(new Map());
+  const subOf = (iri: string) =>
+    labels.get(iri)?.length ? (shortForms.get(iri) ?? iriName(iri, prefixes)) : null;
 
   async function loadAll() {
     const t = target;
@@ -287,6 +290,9 @@
           { '@value': n.label, ...(n.labelLang ? { '@language': n.labelLang } : {}) },
         ]);
     if (more.size) labels = withMissingLabels(labels, more);
+    const forms = nodes.filter((n) => n.shortForm && !shortForms.has(n.iri));
+    if (forms.length)
+      shortForms = new Map([...shortForms, ...forms.map((n) => [n.iri, n.shortForm!] as const)]);
   }
   const levelTrees = new Map<EntityKind, LevelTree>(
     Object.entries(LEVEL_KIND).map(([k, kind]) => [
