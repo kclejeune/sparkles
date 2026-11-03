@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Phase 3 gate of item 603 on the benchmark host: the base (783acbde) and lane el_classify on
+# GO and ChEBI lite, on one and eight threads, in alternating order over several rounds.
+# The script holds the bench and heavy locks for every process. Runs no other reasoner.
+# Usage: ab.sh DIR   (DIR holds bin/base, bin/lane and data/{go,chebi_lite}.ofn)
+set -euo pipefail
+D=$1
+cd "$D"
+exec 9> "$HOME/lanes/.bench.lock" 8> "$HOME/lanes/.heavy.lock"
+flock 9
+flock 8
+OUT=out-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT"
+{
+  echo "host=$(hostname)"
+  echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')"
+  echo "cpus=$(nproc)"
+  echo "kernel=$(uname -r)"
+  for b in bin/*; do echo "binary_sha256 $b=$(sha256sum "$b" | cut -d' ' -f1)"; done
+  for f in data/*; do echo "data_sha256 $f=$(sha256sum "$f" | cut -d' ' -f1)"; done
+  echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)"
+} > "$OUT/env.txt"
+for round in 1 2 3; do
+  for f in go chebi_lite; do
+    for t in 1 8; do
+      if [ $((round % 2)) = 1 ]; then order="base lane"; else order="lane base"; fi
+      for side in $order; do
+        systemd-run --user --scope --quiet -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+          bin/$side --threads $t --repeat 5 --taxonomy "$OUT/$f.$side.t$t.txt" "data/$f.ofn" |
+          python3 -c "import json,sys; r=json.load(sys.stdin); r.update(side='$side', round=$round); print(json.dumps(r))" \
+          >> "$OUT/runs.jsonl" 2>> "$OUT/err.txt" ||
+          echo "{\"side\":\"$side\",\"input\":\"$f\",\"threads\":$t,\"failed\":true}" >> "$OUT/runs.jsonl"
+      done
+    done
+  done
+done
+echo "ended=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OUT/env.txt"
+sha256sum "$OUT"/*.txt > "$OUT/taxonomy.sha256"
+echo "AB-DONE $OUT"

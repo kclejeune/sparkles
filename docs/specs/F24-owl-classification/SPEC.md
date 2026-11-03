@@ -75,8 +75,9 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 The OWL 2 EL classifier is delivered as roadmap item 580 and covers OWL 2 EL, apart
-from the literals and the chains that item 663 follows, since item 587. The other
-phases remain under [item 457](../../ROADMAP.md).
+from the literals and the chains that item 663 follows, since item 587. Item 603 extends
+it to Horn ontologies without individuals, as [the Horn rules](#the-horn-rules)
+describe. The other phases remain under [item 457](../../ROADMAP.md).
 
 ### The OWL 2 EL classifier
 
@@ -150,8 +151,8 @@ datatype map or a number past 128 bits, is an atom that only equals itself, and 
 axiom is reported as used in part. So is a property chain through the top object
 property, whose links the classifier does not compose. An axiom with an expression
 nested more than 256 deep takes no part, since no stand-in for a left-out expression is
-sound on both sides of a subsumption. Axioms outside OWL 2 EL are left out and reported
-with the rule the EL check names. Annotations and annotation axioms carry no logical
+sound on both sides of a subsumption. Axioms outside OWL 2 EL that the Horn rules do not
+take are left out and reported with the rule the EL check names. Annotations and annotation axioms carry no logical
 content. A classification can include the store's assertions, which makes it a
 consistency check of the individuals.
 
@@ -319,8 +320,10 @@ two subsumptions and an inconsistency. Since item 587 the classifier derives the
 HermiT, Konclude and Whelk do. Konclude 0.7.0-1138 gives the same taxonomy on all 298
 ORE ontologies and ChEBI lite, and on GO it entails 14 more subsumptions between named
 classes, with 7 more direct edges, all through
-`InverseObjectProperties(part_of has_part)`, the GO axiom outside OWL 2 EL that the
-classifier leaves out and reports. Whelk 1.2.1 agrees on GO, ChEBI lite and 296 ORE
+`InverseObjectProperties(part_of has_part)`, the GO axiom outside OWL 2 EL. Since item
+603 the classifier takes that axiom with the Horn rules and entails the same 14
+subsumptions, so its taxonomy of GO equals Konclude's and has 7 direct edges that ELK's
+and GO's release do not. Whelk 1.2.1 agrees on GO, ChEBI lite and 296 ORE
 ontologies and is incomplete on one. ROBOT 1.9.11's `reason`, `reduce`, `relax` and
 `materialize` with ELK assert the classifier's direct hierarchy on GO and ChEBI lite, and
 items 634 to 637 add ROBOT-compatible `sparkles ontology` commands for the
@@ -398,3 +401,51 @@ saturation's scaling and the cost of item 587 on GO were items 644, 645 and 665.
 Cheaper contexts remain item 648, integer class ids in the taxonomy item 647, the
 saturation's sensitivity to axiom order item 683 and the rest of the index stage
 on several threads item 684.
+
+### The Horn rules
+
+Item 603 classifies Horn ontologies outside OWL 2 EL with the consequence-based calculus
+for Horn-SHIQ of Kazakov (*Consequence-Driven Reasoning for Horn SHIQ Ontologies*, IJCAI
+2009), written from the paper over the EL classifier's contexts. It covers inverse
+properties, universal restrictions, at-most-one and at-least restrictions in Horn
+positions, functional and inverse-functional properties, self restrictions, property
+chains and transitive properties through the automata of Horrocks, Kutz and Sattler,
+disjoint, asymmetric and irreflexive properties, and complements, unions and universal
+restrictions that move to the other side of an axiom as their duals. An at-least
+restriction of up to 64 becomes that many existential restrictions with fresh, pairwise
+disjoint fillers, as the paper's Lemma 2 does. The rules run when one of them can fire
+and the ontology has no individuals, functional data properties or top properties. With
+any of these the axioms outside OWL 2 EL stay left out and reported, and Horn reasoning
+with individuals is item NEW-ITEM-1. So do axioms that are not Horn, property hierarchies
+that are not regular, automata of more than 65,536 states and data restrictions outside
+OWL 2 EL. `Stats::tier` says which rules a run needed, `Stats::outside_el` counts the
+axioms outside OWL 2 EL and those taken, and `Stats::conjunctions` counts the contexts
+the rules created.
+
+A universal restriction on a successor's property extends the successor to the
+conjunction of its classes and the restriction's filler, and at-most restrictions merge
+successors and identify a predecessor with a successor. These conjunctions get contexts
+of their own in a table beside the index, which the saturation's threads share. A context
+extends its successors once at the end of its activation, with every universal it holds
+by then, so that universals that arrive one after another create no context for each
+conjunction on the way. OWL 2 RL and QL ontologies create no such context, since QL has
+no universal or at-most restriction in a positive position and RL no existential one, so
+they stay polynomial. A test checks that their contexts grow linearly.
+
+The classifier's answers entail only what HermiT 1.4.5.519 entails on 640 generated and
+hand-written OWL 2 DL ontologies, are the same on one and four threads, and equal
+HermiT's on the 54 Horn ones that the rules take whole. On GO, whose
+`InverseObjectProperties(part_of has_part)` the rules take, it creates 2,577 contexts of
+conjunctions and derives 3.5 million conclusions where the EL rules derived 2.8 million.
+On the benchmark host GO classifies in 325 ms on one thread and 95 ms on eight, against
+278 and 81 ms for the EL rules alone, 17 to 18% slower, and its peak resident set rises
+from 195 to 248 MiB on one thread and from 288 to 331 MiB on eight
+([record](../../benchmarks/el-classification/runs/2026-11-03-horn-forge-8966216c/record.json)).
+ChEBI lite's one `InverseObjectProperties` axiom fires no Horn rule, so it runs the EL
+rules in the same time.
+Item NEW-ITEM-2 follows that cost. The taxonomies of the 298 ORE 2015 EL ontologies and
+ChEBI lite are byte for byte those of the EL rules on one and eight threads.
+
+The functional-syntax reader refuses a document with a SWRL rule. A read with
+`ofn_read::Options::skip_rules` passes over the rules and counts them, which the
+classification comparison uses to report them as left out.

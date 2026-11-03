@@ -452,7 +452,31 @@ milliseconds of the base.
 | `ore_ont_1559` | 1 | 1,195 | 1,202 | 1.01 |
 | | 8 | 764 | 754 | 0.99 |
 
+<a id="horn-cost"></a>
+
+GO's `InverseObjectProperties(part_of has_part)` takes the Horn rules of roadmap item
+603, which give GO's taxonomy the 14 subsumptions that Konclude entails. An interleaved
+A/B on forge ran the build item 603 started from, commit 783acbde, and commit 8966216c,
+three rounds of five classifications on one and eight threads with the bench and heavy
+locks held. GO takes 17 to 18% longer, since 2,577 contexts of conjunctions derive their
+members' conclusions again, 3.5 million conclusions against 2.8 million, and its peak
+resident set rises from 195 to 248 MiB on one thread and from 288 to 331 MiB on eight.
+Roadmap item NEW-ITEM-2 follows that cost. ChEBI lite's one `InverseObjectProperties`
+axiom fires no Horn rule, so it runs the EL rules, with the base's taxonomy and time and
+a peak resident set 16 to 26 MiB higher.
+
+| Ontology | Threads | Base ms | Item 603 ms | Ratio |
+|---|---:|---:|---:|---:|
+| GO | 1 | 278 | 325 | 1.17 |
+| | 8 | 81 | 95 | 1.18 |
+| ChEBI lite | 1 | 1,048 | 1,044 | 1.00 |
+| | 8 | 464 | 458 | 0.99 |
+
 ## Records
+
+The [record of item 603's A/B](runs/2026-11-03-horn-forge-8966216c/record.json) holds
+every classification time of both builds, the stage times, the conjunction contexts, the
+taxonomy hashes and the script that ran.
 
 The [record of item 587's A/B](runs/2026-11-03-el-complete-forge-c4df06fe/record.json)
 holds every classification time of both builds, the stage times, the taxonomy hashes and

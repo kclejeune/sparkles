@@ -1,0 +1,234 @@
+{
+ "suite": "el-classification",
+ "kind": "measurement",
+ "scale": "GO 2026-07-26 and ChEBI lite 256",
+ "host": {
+  "name": "forge",
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "ram_mib": 15620,
+  "kernel": "7.2.9"
+ },
+ "manifest": {
+  "commit": "8966216c",
+  "base_commit": "783acbde",
+  "binary": "crates/sparkles-owl/examples/el_classify.rs",
+  "binary_sha256": {
+   "bin/base": "a901bef0083c65822e8870b0f4fb41abc60b91f91813d5994ccea10c44b73af4",
+   "bin/lane": "19d1d7527163973c7f4cdbe11d5cd2d463a7bece6e36aeaaa41f48dcf0d956b4"
+  },
+  "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on stanley at 8966216c for the lane, and the release build of 783acbde for the base, copied to the benchmark host.",
+  "data": {
+   "chebi_lite": {
+    "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+   },
+   "go": {
+    "sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+   }
+  }
+ },
+ "settings": {
+  "repeat": 5,
+  "rounds": 3,
+  "threads": [
+   1,
+   8
+  ]
+ },
+ "method": "forge-ab.sh.txt holds the bench and heavy locks, and in each of three rounds runs el_classify of the base and of the lane, in alternating order, on each ontology on one and eight threads, one process each with five classifications, in a systemd scope with a 13 GiB cap. Each process reports the median of its five classifications. The table gives the median over the rounds. The load average was 0.18 when the run started.",
+ "started": "2026-11-03T14:38:18Z",
+ "ended": "2026-11-03T14:39:26Z",
+ "results": [
+  {
+   "ontology": "go",
+   "threads": 1,
+   "base": {
+    "rounds": 3,
+    "classifyMedianMs": [
+     277.8,
+     277.8,
+     278.9
+    ],
+    "medianOfMediansMs": 277.8,
+    "indexMs": 27.3,
+    "saturationMs": 223.8,
+    "taxonomyMs": 25.0,
+    "peakRssKib": 200648,
+    "conclusions": 2801981,
+    "conjunctions": null,
+    "tier": null,
+    "outsideTaken": null
+   },
+   "lane": {
+    "rounds": 3,
+    "classifyMedianMs": [
+     325.1,
+     323.1,
+     324.9
+    ],
+    "medianOfMediansMs": 324.9,
+    "indexMs": 28.2,
+    "saturationMs": 265.9,
+    "taxonomyMs": 26.4,
+    "peakRssKib": 254252,
+    "conclusions": 3506571,
+    "conjunctions": 2577,
+    "tier": "horn",
+    "outsideTaken": 1
+   }
+  },
+  {
+   "ontology": "go",
+   "threads": 8,
+   "base": {
+    "rounds": 3,
+    "classifyMedianMs": [
+     79.9,
+     80.7,
+     101.3
+    ],
+    "medianOfMediansMs": 80.7,
+    "indexMs": 22.4,
+    "saturationMs": 67.1,
+    "taxonomyMs": 11.5,
+    "peakRssKib": 295660,
+    "conclusions": 2801981,
+    "conjunctions": null,
+    "tier": null,
+    "outsideTaken": null
+   },
+   "lane": {
+    "rounds": 3,
+    "classifyMedianMs": [
+     93.5,
+     103.3,
+     95.5
+    ],
+    "medianOfMediansMs": 95.5,
+    "indexMs": 22.6,
+    "saturationMs": 52.0,
+    "taxonomyMs": 11.3,
+    "peakRssKib": 338976,
+    "conclusions": 3524848,
+    "conjunctions": 2673,
+    "tier": "horn",
+    "outsideTaken": 1
+   }
+  },
+  {
+   "ontology": "chebi_lite",
+   "threads": 1,
+   "base": {
+    "rounds": 3,
+    "classifyMedianMs": [
+     1043.9,
+     1048.0,
+     1049.8
+    ],
+    "medianOfMediansMs": 1048.0,
+    "indexMs": 115.9,
+    "saturationMs": 705.7,
+    "taxonomyMs": 224.6,
+    "peakRssKib": 670616,
+    "conclusions": 26995717,
+    "conjunctions": null,
+    "tier": null,
+    "outsideTaken": null
+   },
+   "lane": {
+    "rounds": 3,
+    "classifyMedianMs": [
+     1042.6,
+     1045.2,
+     1043.6
+    ],
+    "medianOfMediansMs": 1043.6,
+    "indexMs": 118.0,
+    "saturationMs": 695.3,
+    "taxonomyMs": 226.5,
+    "peakRssKib": 696656,
+    "conclusions": 26995717,
+    "conjunctions": 0,
+    "tier": "horn",
+    "outsideTaken": 1
+   }
+  },
+  {
+   "ontology": "chebi_lite",
+   "threads": 8,
+   "base": {
+    "rounds": 3,
+    "classifyMedianMs": [
+     486.9,
+     421.1,
+     463.9
+    ],
+    "medianOfMediansMs": 463.9,
+    "indexMs": 73.9,
+    "saturationMs": 292.8,
+    "taxonomyMs": 63.8,
+    "peakRssKib": 1001380,
+    "conclusions": 26995717,
+    "conjunctions": null,
+    "tier": null,
+    "outsideTaken": null
+   },
+   "lane": {
+    "rounds": 3,
+    "classifyMedianMs": [
+     458.4,
+     434.5,
+     476.6
+    ],
+    "medianOfMediansMs": 458.4,
+    "indexMs": 73.9,
+    "saturationMs": 339.3,
+    "taxonomyMs": 65.7,
+    "peakRssKib": 1016944,
+    "conclusions": 26995717,
+    "conjunctions": 0,
+    "tier": "horn",
+    "outsideTaken": 1
+   }
+  }
+ ],
+ "checks": [
+  {
+   "ontology": "go",
+   "threads": 1,
+   "taxonomy_sha256": {
+    "base": "b41aefe1503e32e1266391ca88f74e0555cbb3079599c861381fe82792ae9001",
+    "lane": "c5c09533e69db78153ec37ce93a333e7304b46cf6b0797863ebd04ec96059b03"
+   },
+   "same": false
+  },
+  {
+   "ontology": "go",
+   "threads": 8,
+   "taxonomy_sha256": {
+    "base": "b41aefe1503e32e1266391ca88f74e0555cbb3079599c861381fe82792ae9001",
+    "lane": "c5c09533e69db78153ec37ce93a333e7304b46cf6b0797863ebd04ec96059b03"
+   },
+   "same": false
+  },
+  {
+   "ontology": "chebi_lite",
+   "threads": 1,
+   "taxonomy_sha256": {
+    "base": "c909192b680de7c2dcc9bf7d68d9df1b08e554a34d3a1523f3378bdda6f29837",
+    "lane": "c909192b680de7c2dcc9bf7d68d9df1b08e554a34d3a1523f3378bdda6f29837"
+   },
+   "same": true
+  },
+  {
+   "ontology": "chebi_lite",
+   "threads": 8,
+   "taxonomy_sha256": {
+    "base": "c909192b680de7c2dcc9bf7d68d9df1b08e554a34d3a1523f3378bdda6f29837",
+    "lane": "c909192b680de7c2dcc9bf7d68d9df1b08e554a34d3a1523f3378bdda6f29837"
+   },
+   "same": true
+  }
+ ],
+ "notes": "GO's InverseObjectProperties(part_of has_part) takes the Horn rules of item 603, so its lane taxonomy differs from the base by the 14 subsumptions Konclude 0.7.0-1138 entails and the base does not (the closure of go-konclude-closure.json in runs/2026-11-02-reasoners-agreement-91a7b160). ChEBI lite's one InverseObjectProperties axiom is taken but fires no Horn rule, so it runs the EL rules and its taxonomy is the base's."
+}

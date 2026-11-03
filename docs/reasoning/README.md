@@ -242,8 +242,16 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   individual through a context that holds only where the class has an instance is
   classified again in a world of its own. An ontology where only an individual's own
   context derives the individual, and that has no keys or universal roles, skips that
-  step, and so does every ontology without individuals. An axiom outside OWL 2 EL is
-  left out and reported with its rule. An axiom with a literal or datatype that the
+  step, and so does every ontology without individuals. In an ontology without
+  individuals, functional data properties or top properties, the Horn rules of Kazakov's
+  calculus for Horn-SHIQ take the Horn axioms outside OWL 2 EL: inverse properties,
+  universal restrictions, at-most-one and at-least restrictions, functional and
+  inverse-functional properties, disjoint, asymmetric and irreflexive properties and
+  complements that move to the other side as their duals. Universal and at-most
+  restrictions create contexts for conjunctions of classes, which OWL 2 RL and QL
+  ontologies never need, so these stay polynomial. Any other axiom outside OWL 2 EL is
+  left out and reported with its rule, and Horn reasoning with individuals is item
+  NEW-ITEM-1. An axiom with a literal or datatype that the
   classifier cannot compare, such as an XML literal, an ill-typed literal or a datatype
   outside the OWL 2 datatype map, or with a property chain through the top object
   property, is used as far as the calculus goes and reported as partial. Every answer is entailed, and it is complete for named classes
@@ -251,7 +259,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   after added or removed axioms saturates again only the contexts that those axioms can
   reach. A change to the property hierarchy, chains, reflexivity or ranges, to an axiom
   with an individual, a data property, a datatype or a key, and any change after a run
-  that took that step, saturates everything again. A run stops at its deadline, its
+  that took that step or the Horn rules, saturates everything again. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
   closure, saturates and builds the taxonomy. A run of 16,384 axioms or more on several
   threads normalizes chunks of the axioms in parallel, with the same ids and taxonomy as
@@ -259,10 +267,13 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   the memory budget, and a run whose chunks would pass it normalizes on one thread. This
   and the saturation's message buffers raise the peak resident set on eight threads by
   up to 13% on some ontologies in exchange for the speed. On the benchmark host GO
-  classifies in 77 ms and ChEBI lite in 0.39 seconds on eight threads, and the
+  classifies in 95 ms and ChEBI lite in 0.39 seconds on eight threads, and the
   classifier is 3.1 to 20 times as fast as ELK on GO, ChEBI lite and the largest ORE
-  2015 EL ontologies on one and eight threads. The classifier's direct hierarchy equals the hierarchy that GO's release
-  publishes, and its taxonomy of ChEBI entails every subsumption ChEBI asserts and
+  2015 EL ontologies on one and eight threads. GO's `InverseObjectProperties(part_of
+  has_part)` takes the Horn rules, which add the 14 subsumptions that Konclude and HermiT
+  entail and ELK misses and make GO 17 to 18% slower to classify than with the EL rules
+  alone, item NEW-ITEM-2. The classifier's direct hierarchy of GO is the one GO's release
+  publishes with those 7 direct edges added, and its taxonomy of ChEBI entails every subsumption ChEBI asserts and
   gives no direct subsumption that ChEBI does not assert
   ([results](../benchmarks/el-classification/RESULTS.md)).
 * `ds.ontology().classify()`, `POST /$/ontology/{ds}/classify`, `sparkles ontology
@@ -540,6 +551,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   or a key saturates everything again, and so does any change after a run that merged
   a context with an individual.
   Roadmap item 664.
+* The classifier leaves out the Horn axioms outside OWL 2 EL in an ontology with
+  individuals, functional data properties or top properties. Roadmap item NEW-ITEM-1.
+* GO's inverse properties take the Horn rules, which classify it 17 to 18% slower than
+  the EL rules and raise its peak resident set. Roadmap item NEW-ITEM-2.
+* Axioms outside OWL 2 EL that are not Horn are left out, and an external DL reasoner
+  bridge is planned. Roadmap item 603.
 * No MCP tool classifies, roadmap item 586, and the entity accessors and the
   inferred reads do not answer from a classification, nor does any surface answer the
   subclasses of a class expression, roadmap item 588.

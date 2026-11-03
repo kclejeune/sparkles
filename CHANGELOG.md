@@ -137,6 +137,18 @@ lite and the ORE 2015 EL sample are unchanged. An incremental run after a change
 axiom with an individual or a key now saturates everything again, as one after a change
 to a data axiom already did.
 
+The classifier takes Horn axioms outside OWL 2 EL in ontologies without individuals
+(roadmap item 603), with Kazakov's consequence-based rules for Horn-SHIQ. It covers
+inverse properties, universal restrictions, at-most-one and at-least restrictions,
+functional and inverse-functional properties, self restrictions, disjoint, asymmetric
+and irreflexive properties and transitive properties and chains through automata, and
+creates contexts for the conjunctions that universal and at-most restrictions need.
+`Stats` reports the tier of rules a run needed, the axioms outside OWL 2 EL it took and
+the conjunctions it created. GO's taxonomy now has the 14 subsumptions that its inverse
+properties entail, as Konclude's does, and GO classifies 17 to 18% slower on the
+benchmark host. The functional-syntax reader can pass over SWRL rules and count them
+with `ofn_read::Options::skip_rules`, and refuses them otherwise as before.
+
 The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
 `dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and
 axioms, check profiles, edit axioms, remove entities and diff commits in the JSON forms
