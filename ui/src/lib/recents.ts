@@ -26,17 +26,31 @@ export function loadRecent(): RecentEntry[] {
   return Array.isArray(raw) ? raw.filter(valid).slice(0, RECENT_MAX) : [];
 }
 
-/** `list` with `entry` first and an earlier pick of the same item dropped. */
-export function addRecent(list: readonly RecentEntry[], entry: RecentEntry): RecentEntry[] {
-  return [
-    entry,
-    ...list.filter((e) => !(e.provider === entry.provider && e.id === entry.id)),
-  ].slice(0, RECENT_MAX);
+/**
+ * `list` with `entry` first and an earlier pick of the same item dropped. With `perDataset`
+ * the item is the same only on the same dataset, so a pick on one dataset keeps the pick of
+ * the same IRI or name on another.
+ */
+export function addRecent(
+  list: readonly RecentEntry[],
+  entry: RecentEntry,
+  perDataset = true,
+): RecentEntry[] {
+  const same = (e: RecentEntry) =>
+    e.provider === entry.provider && e.id === entry.id && (!perDataset || e.ds === entry.ds);
+  return [entry, ...list.filter((e) => !same(e))].slice(0, RECENT_MAX);
 }
 
-/** Remembers a pick and returns the new list. */
-export function recordRecent(entry: RecentEntry): RecentEntry[] {
-  const next = addRecent(loadRecent(), entry);
+/**
+ * Remembers a pick on top of `list`, the palette's own copy, and stores the result as far as
+ * storage allows. The returned list is the new copy, also when storage refuses it.
+ */
+export function recordRecent(
+  list: readonly RecentEntry[],
+  entry: RecentEntry,
+  perDataset = true,
+): RecentEntry[] {
+  const next = addRecent(list, entry, perDataset);
   save(RECENT_KEY, next);
   return next;
 }

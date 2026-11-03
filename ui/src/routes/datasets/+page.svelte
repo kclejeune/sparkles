@@ -2,7 +2,7 @@
   import { resolve } from '$app/paths';
   import { goto, replaceState } from '$app/navigation';
   import { page } from '$app/state';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { app } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
@@ -22,10 +22,12 @@
     refreshing = false;
   }
 
-  onMount(() => {
-    void refresh();
-    // `?new=1` (the palette's "New dataset…" from another page) opens the dialog once
-    if (page.url.searchParams.has('new')) {
+  onMount(refresh);
+
+  // `?new=1` (the palette's "New dataset…", from this page or another) opens the dialog once
+  $effect(() => {
+    if (!page.url.searchParams.has('new')) return;
+    untrack(() => {
       if (auth.hasServer('server-admin')) createOpen = true;
       const url = new URL(page.url);
       url.searchParams.delete('new');
@@ -34,18 +36,10 @@
       } catch {
         history.replaceState(history.state, '', url);
       }
-    }
+    });
   });
 
   useCommands(() => [
-    {
-      id: 'datasets.new',
-      label: 'New dataset…',
-      icon: 'plus',
-      keywords: ['create dataset', 'add dataset'],
-      active: () => auth.hasServer('server-admin'),
-      run: () => void (createOpen = true),
-    },
     {
       id: 'datasets.refresh',
       label: 'Refresh the dataset list',

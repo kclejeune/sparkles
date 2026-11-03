@@ -263,17 +263,21 @@
     const pid = g.from?.[j] ?? g.provider;
     const p = launcher.providers.find((x) => x.id === pid);
     if (!p || p.recent === false || it.query !== undefined) return;
-    recents = recordRecent({
-      provider: pid,
-      id: it.id,
-      title: it.title,
-      subtitle: it.subtitle,
-      tag: it.tag,
-      icon: it.icon,
-      href: it.href,
-      ds: ds,
-      at: Date.now(),
-    });
+    recents = recordRecent(
+      recents,
+      {
+        provider: pid,
+        id: it.id,
+        title: it.title,
+        subtitle: it.subtitle,
+        tag: it.tag,
+        icon: it.icon,
+        href: it.href,
+        ds: ds,
+        at: Date.now(),
+      },
+      p.perDataset !== false,
+    );
   }
 
   async function pick(g: LauncherGroup | undefined, j: number) {

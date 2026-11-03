@@ -141,8 +141,10 @@ class LauncherState {
   /** Whether the results are showing (and, on a phone, the field is expanded). */
   open = $state(false);
   query = $state('');
-  #providers = $state<LauncherProvider[]>([]);
-  #commands = $state<LauncherCommand[]>([]);
+  // raw: a deep proxy would wrap each provider and command, and an unregister compares
+  // the caller's own object with what the list holds
+  #providers = $state.raw<LauncherProvider[]>([]);
+  #commands = $state.raw<LauncherCommand[]>([]);
   #pageSearch = $state<(() => boolean | void) | null>(null);
   #focus: (() => void) | null = null;
 

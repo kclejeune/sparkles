@@ -28,7 +28,8 @@ async function onDataset(page: Page, ds: string) {
 
 async function visit(page: Page, url: string) {
   await page.goto(url);
-  await expect(page.locator('main h1')).toBeAttached();
+  // the first visit of a page compiles it in the dev server
+  await expect(page.locator('main h1')).toBeAttached({ timeout: 15_000 });
 }
 
 /** Opens the palette with Ctrl+K and types `text`. */
@@ -52,7 +53,7 @@ test.describe('at 1440 pixels', () => {
       ['/ui/similar?ds=uni', null],
       ['/ui/memory?ds=uni', null],
       ['/ui/embedding?ds=uni', null],
-      ['/ui/datasets', 'New dataset…'],
+      ['/ui/datasets', 'Refresh the dataset list'],
       ['/ui/datasets/uni', 'Show settings'],
       ['/ui/backups', null],
       ['/ui/server', null],
@@ -68,6 +69,39 @@ test.describe('at 1440 pixels', () => {
       await page.keyboard.press('Escape');
       await expect(list(page)).toHaveCount(0);
     }
+  });
+
+  test('a page takes its commands and branches with it when the shell navigates away', async ({
+    page,
+  }) => {
+    await onDataset(page, 'foaf');
+    await visit(page, '/ui/ontology?ds=foaf');
+    await palette(page, '#');
+    await expect(group(page, 'Branches of foaf')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await page.keyboard.press('Escape');
+    // a client-side navigation: the layout and its palette stay, the page goes
+    await page
+      .getByRole('navigation', { name: 'Pages' })
+      .getByRole('link', { name: 'Server', exact: true })
+      .click();
+    await expect(page).toHaveURL(/\/ui\/server$/);
+    await palette(page, '#');
+    await expect(group(page, 'Datasets')).toBeVisible();
+    await expect(group(page, /^Branches/)).toHaveCount(0);
+    await page.keyboard.press('Escape');
+    await page.keyboard.press('Escape');
+    await palette(page, '>new class');
+    await expect(option(page, 'New class')).toHaveCount(0);
+  });
+
+  test('New dataset opens the dialog on the Datasets page too', async ({ page }) => {
+    await visit(page, '/ui/datasets');
+    await palette(page, '>new dataset');
+    await expect(titles(page)).toHaveText(['New dataset…']);
+    await page.keyboard.press('Enter');
+    await expect(page.getByRole('dialog', { name: /dataset/i })).toBeVisible();
+    await expect(page).toHaveURL(/\/ui\/datasets$/);
   });
 
   test('`>form` lists only Format query and the dataset settings', async ({ page }) => {

@@ -198,7 +198,7 @@ describe('recent picks', () => {
     };
     vi.stubGlobal('localStorage', fake);
     expect(loadRecent()).toEqual([]);
-    recordRecent(entry('/a'));
+    recordRecent([], entry('/a'));
     expect(loadRecent().map((e) => e.id)).toEqual(['/a']);
     store.set(RECENT_KEY, '{not json');
     expect(loadRecent()).toEqual([]);
@@ -213,7 +213,28 @@ describe('recent picks', () => {
       },
     });
     expect(loadRecent()).toEqual([]);
-    expect(recordRecent(entry('/c')).map((e) => e.id)).toEqual(['/c']);
+    // the palette's own copy keeps every pick of the visit while storage refuses them
+    let list = recordRecent([], entry('/c'));
+    list = recordRecent(list, entry('/d'));
+    expect(list.map((e) => e.id)).toEqual(['/d', '/c']);
     vi.unstubAllGlobals();
+  });
+
+  it('keeps the same item picked on two datasets apart', () => {
+    const on = (ds: string, at: number): RecentEntry => ({
+      provider: 'entities',
+      id: 'http://example.org/Person',
+      title: 'Person',
+      ds,
+      at,
+    });
+    let list = addRecent([], on('a', 1));
+    list = addRecent(list, on('b', 2));
+    expect(list.map((e) => e.ds)).toEqual(['b', 'a']);
+    list = addRecent(list, on('a', 3));
+    expect(list.map((e) => `${e.ds}${e.at}`)).toEqual(['a3', 'b2']);
+    // a pick that belongs to no dataset is one item everywhere
+    list = addRecent(addRecent([], entry('/x', 1)), { ...entry('/x', 2), ds: 'other' }, false);
+    expect(list).toHaveLength(1);
   });
 });
