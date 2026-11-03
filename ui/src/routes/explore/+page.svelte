@@ -1719,6 +1719,9 @@
     modes: ['@'],
     recent: false,
     active: ({ ds: name }) => !!name,
+    // the Open row needs the prefixes and the Ask row the assistant's settings, which can
+    // arrive after the launcher asked
+    watch: () => [Object.keys(prefixes).length, canAsk],
     async search(raw, { ds: name, signal }) {
       const q = raw.trim();
       if (!name || q.length < 2) return [];
@@ -1731,7 +1734,13 @@
           icon: 'target',
           run: () => void focusOn(direct),
         });
-      const hits = await ex.search(name, q, signal);
+      // a failed label search leaves the Open and Ask rows, which need no answer
+      let hits: Awaited<ReturnType<typeof ex.search>> = [];
+      try {
+        hits = await ex.search(name, q, signal);
+      } catch (e) {
+        if (signal.aborted || (e instanceof DOMException && e.name === 'AbortError')) throw e;
+      }
       for (const h of hits)
         if (h.iri !== direct)
           out.push({
@@ -2595,9 +2604,10 @@
           >
             {#snippet header()}
               {#if facetSets.length > 1}
-                <label class="row facet-set"
+                <label class="row facet-set form-row"
                   >Count
                   <select
+                    class="select sm"
                     value={facetSet?.key ?? ''}
                     onchange={(e) => (facetSetKey = (e.currentTarget as HTMLSelectElement).value)}
                   >
@@ -3559,6 +3569,12 @@
      measured width rather than a container query, since a container's layout containment
      would hold the toolbar's fixed popovers */
   .gtools.narrow {
+    /* and a very narrow one, such as with Facets open as well, wraps its tools to more
+       rows rather than clipping them */
+    & .toolbar-group {
+      flex-wrap: wrap;
+      min-width: 0;
+    }
     & .lbl {
       position: absolute;
       width: 1px;

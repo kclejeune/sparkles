@@ -99,6 +99,56 @@ test.describe('at 1440 pixels', () => {
     await expect(page.getByRole('complementary', { name: 'Resource details' })).toBeVisible();
   });
 
+  test('the resource finder keeps Open when the label search fails, and offers it once late prefixes arrive', async ({
+    page,
+  }) => {
+    await onDataset(page, 'uni');
+    // the prefixes answer late, with one the mock does not otherwise know
+    let release = () => {};
+    const ready = new Promise<void>((r) => (release = r));
+    await page.route('**/$/prefixes/uni', async (route) => {
+      await ready;
+      await route.fulfill({ json: { prefixes: { late: UNI } } });
+    });
+    // and the label search fails
+    await page.route('**/uni/sparql*', async (route) => {
+      if (/LCASE/.test(route.request().postData() ?? '')) await route.fulfill({ status: 500 });
+      else await route.continue();
+    });
+    await visit(page, '/ui/explore?ds=uni');
+    await page.locator('body').click();
+    await page.keyboard.press('/');
+    const find = page.getByPlaceholder(/^Find a resource in uni/);
+    await find.fill(`<${UNI}Professor>`);
+    const hits = page.getByRole('group', { name: 'Resources in uni' });
+    await expect(hits.getByRole('option', { name: /^Open / })).toBeVisible();
+    // a prefixed name opens once its prefix is known, without typing again
+    await find.fill('late:Professor');
+    await expect(hits.getByRole('option', { name: /^Open / })).toHaveCount(0);
+    release();
+    await expect(hits.getByRole('option', { name: /^Open / })).toBeVisible();
+  });
+
+  test('the Options button says when a query leaves out the inferences', async ({ page }) => {
+    await onDataset(page, 'uni');
+    // uni reasons, as far as the page knows
+    await page.route('**/$/datasets', async (route) => {
+      const res = await route.fetch();
+      const body = await res.json();
+      for (const d of body.datasets ?? [])
+        if (d['ds.name'] === '/uni' || d.name === 'uni')
+          d.reasoning = { profile: 'rdfs', inferred: 12, at: new Date().toISOString() };
+      await route.fulfill({ response: res, json: body });
+    });
+    await visit(page, '/ui/query?ds=uni');
+    const options = page.getByRole('button', { name: /^Options\b/ });
+    await expect(options).not.toContainText('no inferences');
+    await options.click();
+    await page.getByRole('checkbox', { name: 'Use inferences' }).uncheck();
+    await page.keyboard.press('Escape');
+    await expect(options).toContainText('no inferences');
+  });
+
   test('Enter waits for the results of what the field now says', async ({ page }) => {
     await onDataset(page, 'uni');
     await visit(page, '/ui/datasets');

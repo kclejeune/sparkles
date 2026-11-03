@@ -196,16 +196,6 @@
   let formatMenuOpen = $state(false);
   /** On a phone: the branch, state, history and row limit, behind one button. */
   let optionsOpen = $state(false);
-  /** The run options that differ from their defaults, on the Options button. */
-  const optionsSummary = $derived(
-    [
-      app.queryBranch,
-      app.queryAt ? `at ${app.queryAt}` : '',
-      limit !== 10_000 ? `${fmtCompact(limit)} rows` : '',
-    ]
-      .filter(Boolean)
-      .join(' · '),
-  );
   let formatting = $state(false);
   /** Format the query before each Run (per viewer, off by default). */
   let formatOnRun = $state(load<boolean>(FORMAT_ON_RUN_KEY, false) === true);
@@ -348,6 +338,17 @@
   const prefixes = $derived(app.prefixes(outcome?.ds ?? ds));
   const kind = $derived(queryKind(active.query));
   const reasoningInfo = $derived(app.datasets.find((d) => d.name === ds)?.reasoning ?? null);
+  /** The run options that differ from their defaults, on the Options button. */
+  const optionsSummary = $derived(
+    [
+      reasoningInfo && kind !== 'UPDATE' && !inferences ? 'no inferences' : '',
+      app.queryBranch,
+      app.queryAt ? `at ${app.queryAt}` : '',
+      limit !== 10_000 ? `${fmtCompact(limit)} rows` : '',
+    ]
+      .filter(Boolean)
+      .join(' · '),
+  );
   /** The `at` field: a past state to read, or empty for the head. */
   const atOk = $derived(validAt(app.queryAt));
   // --- the time slider (docs/specs/U01-time-slider.md) ---------------------------------
@@ -4019,6 +4020,7 @@
                   <label class="row"
                     >Count the values of
                     <select
+                      class="select sm"
                       aria-label="The variable whose values the facets count"
                       value={facetVarShown}
                       onchange={(e) => (facetVar = (e.currentTarget as HTMLSelectElement).value)}

@@ -159,18 +159,25 @@ test('Tab reaches the controls with a visible focus ring', async ({ browser }) =
       const r = await page.evaluate(() => {
         const a = document.activeElement as HTMLElement | null;
         if (!a || a === document.body) return null;
-        const own = getComputedStyle(a);
-        // a field's ring is on the field around it (the top bar's search, the explorer's)
-        const ringed = (s: CSSStyleDeclaration) =>
-          (s.boxShadow && s.boxShadow !== 'none') ||
-          (s.outlineStyle !== 'none' && s.outlineWidth !== '0px');
-        const holders = [a.parentElement, a.parentElement?.parentElement].filter(
+        // a ring is what focus adds: the element's or its field's shadow or outline differs
+        // from the same element unfocused, so a static shadow such as the active link's
+        // border does not count
+        const els = [a, a.parentElement, a.parentElement?.parentElement].filter(
           (e): e is HTMLElement => !!e,
         );
-        const ok =
-          ringed(own) ||
-          holders.some((h) => ringed(getComputedStyle(h))) ||
-          a.closest('.cm-editor') != null;
+        // (a skip link counts by appearing: its box moves into view on focus)
+        const look = () => [
+          JSON.stringify(a.getBoundingClientRect()),
+          ...els.map((e) => {
+            const s = getComputedStyle(e);
+            return `${s.boxShadow}|${s.outlineStyle}|${s.outlineWidth}|${s.outlineColor}`;
+          }),
+        ];
+        const focused = look();
+        a.blur();
+        const unfocused = look();
+        a.focus({ focusVisible: true } as FocusOptions);
+        const ok = focused.some((f, i) => f !== unfocused[i]) || a.closest('.cm-editor') != null;
         const label = `${a.tagName.toLowerCase()} ${a.getAttribute('aria-label') ?? a.textContent?.trim().slice(0, 30) ?? ''}`;
         return { ok, label };
       });
@@ -179,4 +186,24 @@ test('Tab reaches the controls with a visible focus ring', async ({ browser }) =
     expect(missing, `${path}: focused without a ring`).toEqual([]);
   }
   await ctx.close();
+});
+
+test("Explore's graph tools stay inside a narrow canvas", async ({ browser }) => {
+  for (const width of [1100, 1440]) {
+    const ctx = await browser.newContext({ viewport: { width, height: 800 } });
+    const page = await ctx.newPage();
+    await load(page, `/ui/explore?ds=demo&iri=${encodeURIComponent('http://example.org/ns#City')}`);
+    for (const facets of [false, true]) {
+      if (facets) await page.getByRole('button', { name: 'Facets', exact: true }).click();
+      await page.waitForTimeout(300);
+      const clipped = await page.evaluate(() => {
+        const t = document.querySelector('.gtools')!.getBoundingClientRect();
+        return [...document.querySelectorAll<HTMLElement>('.gtools button, .gtools .note')]
+          .filter((e) => e.offsetParent && e.getBoundingClientRect().right > t.right + 0.5)
+          .map((e) => e.getAttribute('aria-label') ?? e.textContent?.trim());
+      });
+      expect(clipped, `${width} px${facets ? ' with Facets' : ''}`).toEqual([]);
+    }
+    await ctx.close();
+  }
 });
