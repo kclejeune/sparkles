@@ -297,6 +297,42 @@ async fn check_query_class_lookup_names_its_terms() {
     );
 }
 
+/// A class whose instances are blank nodes still gets a profile in a class-mismatch
+/// warning, since blank nodes cannot be written into the profile query.
+#[tokio::test(flavor = "multi_thread")]
+async fn check_query_class_profile_keeps_blank_instances() {
+    let cfg = McpConfig::default();
+    let mut st = AppState::standalone(StoreOptions::default(), cfg.max_timeout);
+    st.read_only = true;
+    st.limits.max_result_bytes = None;
+    let st = Arc::new(st);
+    let ds = st.attach("blank", DbType::Mem, None).unwrap();
+    load_trig(
+        &ds,
+        "@prefix ex: <http://example.org/> .\n_:r a ex:River ; ex:length 10 .\nex:c1 ex:location ex:China .\n",
+    );
+    let mut c = Client::start(McpServer::new(st, cfg));
+    let s = c
+        .structured(
+            "check_query",
+            json!({"query": "SELECT ?r WHERE { ?r a <http://example.org/River> ; <http://example.org/location> ?x }"}),
+        )
+        .await;
+    let issue = s["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["code"] == "class-mismatch")
+        .unwrap_or_else(|| panic!("{s}"));
+    assert!(
+        issue["suggestions"][0]["term"]
+            .as_str()
+            .unwrap()
+            .contains("length"),
+        "{s}"
+    );
+}
+
 /// The `mem` dataset of [`mem`] on a server whose tools read schema reports from the
 /// index statistics at any size (`--schema-statistics-above 0`), or never.
 fn mem_with_statistics(on: bool) -> McpServer {

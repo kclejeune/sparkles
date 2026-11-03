@@ -901,23 +901,31 @@ impl Tools<'_> {
             "SELECT DISTINCT ?s WHERE {{ {} }} LIMIT {PROFILE_SAMPLE}",
             r.quads(&format!("?s a {c}"), &[]),
         );
-        let subjects: Vec<String> = r
-            .rows(&sample, Vec::new())?
-            .into_iter()
+        let rows = r.rows(&sample, Vec::new())?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let subjects: Vec<String> = rows
+            .iter()
             .filter_map(|row| match row.first() {
                 Some(Some(Term::NamedNode(s))) => Some(s.to_string()),
                 _ => None,
             })
             .collect();
-        if subjects.is_empty() {
-            return Ok(Vec::new());
-        }
-        let q = format!(
-            "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{ VALUES ?s {{ {} }} {} FILTER(?p != <{RDF_TYPE}>) }} GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT {}",
-            subjects.join(" "),
-            r.quads_in("?s ?p ?o", &[], "h"),
-            max.max(PROFILE_PREDICATES),
-        );
+        let pattern = r.quads_in("?s ?p ?o", &[], "h");
+        let limit = max.max(PROFILE_PREDICATES);
+        // A blank node cannot be written into the query, so a sample that holds one is
+        // profiled through the subquery, which the caller's budget still bounds.
+        let q = if subjects.len() == rows.len() {
+            format!(
+                "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{ VALUES ?s {{ {} }} {pattern} FILTER(?p != <{RDF_TYPE}>) }} GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT {limit}",
+                subjects.join(" "),
+            )
+        } else {
+            format!(
+                "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{ {{ {sample} }} {pattern} FILTER(?p != <{RDF_TYPE}>) }} GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT {limit}",
+            )
+        };
         let mut found: Vec<(NamedNode, u64)> = r
             .rows(&q, Vec::new())?
             .into_iter()
@@ -970,11 +978,18 @@ fn finish(mut out: Value, issues: &[Issue], estimated: Option<u64>, terms: &Term
 /// The prefix name of the prefixed name at a 1-based line and column.
 pub(crate) fn prefix_at(q: &str, line: usize, col: usize) -> Option<String> {
     let l: Vec<char> = q.lines().nth(line.checked_sub(1)?)?.chars().collect();
-    let pn = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':');
+    // A character of a prefixed name, with `%` escapes and the backslash escapes of a
+    // local name such as `dbr:Mercury_\(planet\)`.
+    let pn = |i: usize| {
+        let c = l[i];
+        c.is_alphanumeric()
+            || matches!(c, '_' | '-' | '.' | ':' | '%' | '\\')
+            || (i > 0 && l[i - 1] == '\\')
+    };
     let at = col.checked_sub(1)?.min(l.len());
     // the prefixed name at the position, or the one that ends just before it
     let (mut start, mut end) = (at, at);
-    while end < l.len() && pn(l[end]) {
+    while end < l.len() && pn(end) {
         end += 1;
     }
     if start == end {
@@ -983,7 +998,7 @@ pub(crate) fn prefix_at(q: &str, line: usize, col: usize) -> Option<String> {
         }
         end = start;
     }
-    while start > 0 && pn(l[start - 1]) {
+    while start > 0 && pn(start - 1) {
         start -= 1;
     }
     let token: String = l[start..end].iter().collect();

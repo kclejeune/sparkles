@@ -380,6 +380,21 @@ mod tests {
             out.starts_with("PREFIX dbo: <http://dbpedia.org/ontology/>\n"),
             "{out}"
         );
+        // a local name with backslash or percent escapes still names its prefix
+        for q in [
+            r"SELECT * WHERE { dbr:Mercury_\(planet\) ?p ?o }",
+            "SELECT * WHERE { dbr:S%C3%A3o_Paulo ?p ?o }",
+        ] {
+            let out = complete_prefixes(q, &ds);
+            assert!(
+                out.starts_with("PREFIX dbr: <http://dbpedia.org/resource/>\n"),
+                "{out}"
+            );
+            assert!(
+                sparkles::sparql::parse_query(&out, None, &ds).is_ok(),
+                "{out}"
+            );
+        }
     }
     #[test]
     fn the_follow_up_form_repeats_the_first_draft() {
