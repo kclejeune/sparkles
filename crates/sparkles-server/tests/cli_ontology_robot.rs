@@ -443,4 +443,21 @@ SubClassOf(Annotation(rdfs:comment "x") :A :D)
     ] {
         assert!(a.contains(ax), "{ax}: {a:?}");
     }
+    // a graph the file does not have selects no axioms, as it does alone
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "relax",
+            "-i",
+            "n.ofn",
+            "--graph",
+            "http://ex.org/missing",
+            "-o",
+            "g.ofn",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let g = axioms(&dir.join("g.ofn"));
+    assert!(!g.iter().any(|l| l.starts_with("SubClassOf")), "{g:?}");
 }

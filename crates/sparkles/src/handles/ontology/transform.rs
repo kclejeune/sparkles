@@ -32,7 +32,8 @@ pub struct WorkingOntology {
 }
 
 impl WorkingOntology {
-    /// Read an ontology file. A functional-style document's axioms are kept as written,
+    /// Read an ontology file as `req` asks. A functional-style document read as one
+    /// default graph keeps its axioms as written,
     /// each with its annotations and an n-ary axiom as one, as OWL API reads them. A file
     /// of triples is read without a store when it is one graph ([`OntologyFile::read`]),
     /// else through a database in memory, as `ontology classify FILE` reads it.
@@ -42,8 +43,15 @@ impl WorkingOntology {
         threads: usize,
         opts: &QueryOptions,
     ) -> Result<WorkingOntology> {
+        req.validate()?;
         let source = crate::io::Source::from_path(path, None)?;
-        if source.format == crate::io::RdfSyntax::OwlFunctional {
+        // the native read answers the default graph of the file, leniently, at its only
+        // state; any other request goes through the readers that honour it
+        let plain = req.at.is_none()
+            && !req.inferences
+            && req.graphs() == [sparkles_reasoner::inputs::GraphRef::Default]
+            && req.mode == sparkles_owl::read::Mode::Lenient;
+        if plain && source.format == crate::io::RdfSyntax::OwlFunctional {
             let threads = match threads {
                 0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
                 n => n,
