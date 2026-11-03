@@ -772,7 +772,7 @@
 
 <svelte:head><title>Thesaurus{name ? ` · ${name}` : ''} | Sparkles</title></svelte:head>
 
-<div class="page page-container thes">
+<div class="page page-container fill thes">
   <header class="page-head">
     <div class="title">
       <h1>Thesaurus</h1>
@@ -780,96 +780,13 @@
         {#if head}
           {fmtInt(schemes.length)} schemes · {fmtInt(collections.length)} collections · commit {head.commit}
         {:else if !name}
-          Choose a dataset.
+          Choose a dataset in the top bar.
         {:else}
           Reading the thesaurus of {name}…
         {/if}
       </p>
     </div>
-    <span class="spacer"></span>
-    <div class="bar">
-      <label class="pick">
-        <span class="faint">Dataset</span>
-        <select
-          class="select"
-          value={name}
-          onchange={(e) =>
-            goto(`${resolve('/thesaurus')}?ds=${encodeURIComponent(e.currentTarget.value)}`)}
-        >
-          {#if !name}<option value="">Choose…</option>{/if}
-          {#each app.datasets as d (d.name)}<option value={d.name}>{d.name}</option>{/each}
-        </select>
-      </label>
-      <label class="pick">
-        <span class="faint">Graph</span>
-        <select
-          class="select"
-          value={graph ?? ''}
-          onchange={(e) => nav({ graph: e.currentTarget.value || null, iri: null, scheme: null })}
-        >
-          <option value="">default graph</option>
-          {#each graphs as g (g)}<option value={g}>{iriName(g, prefixes)}</option>{/each}
-          {#if graph && !graphs.includes(graph)}<option value={graph}>{graph}</option>{/if}
-        </select>
-      </label>
-      {#if branchList.length}
-        <label class="pick">
-          <span class="faint">Branch</span>
-          <select
-            class="select"
-            value={branch ?? MAIN}
-            onchange={(e) =>
-              nav({ branch: e.currentTarget.value === MAIN ? null : e.currentTarget.value })}
-          >
-            {#each branchList as b (b.name)}<option value={b.name}
-                >{b.name}{b.protected ? ' (protected)' : ''}</option
-              >{/each}
-          </select>
-        </label>
-      {/if}
-      <label class="pick">
-        <span class="faint">Labels in</span>
-        <select
-          class="select"
-          value={displayLang}
-          onchange={(e) => nav({ lang: e.currentTarget.value || null })}
-          aria-label="Label language"
-        >
-          <option value="">the browser's language</option>
-          {#each languages as l (l)}<option value={l}>{l}</option>{/each}
-        </select>
-      </label>
-      {#if canWrite && !branch}
-        <button
-          class="btn sm"
-          onclick={startSession}
-          title="Edit on a branch of your own, then merge it"
-          ><Icon name="branch" size={13} /> Start session</button
-        >
-      {/if}
-      {#if branch}
-        <a
-          class="btn sm"
-          href="{resolve('/datasets/[name]/merge', { name })}?source={encodeURIComponent(
-            branch,
-          )}&target={encodeURIComponent(currentBranch?.upstream ?? MAIN)}"
-          ><Icon name="merge" size={13} /> Merge</a
-        >
-      {/if}
-      <button
-        class="btn sm"
-        disabled={!session.done.length || readonly}
-        onclick={() => session.undoLast()}
-        title={session.done.at(-1) ? `Undo: ${session.done.at(-1)?.label}` : 'Nothing to undo'}
-        >Undo{session.done.length ? ` (${session.done.length})` : ''}</button
-      >
-      <button
-        class="btn sm"
-        disabled={!session.undone.length || readonly}
-        onclick={() => session.redoLast()}
-        title={session.undone.at(-1) ? `Redo: ${session.undone.at(-1)?.label}` : 'Nothing to redo'}
-        >Redo</button
-      >
+    <div class="page-actions">
       <span
         class="live"
         class:on={session.live === 'on'}
@@ -882,8 +799,82 @@
             ? 'Live updates stopped'
             : ''}</span
       >
+      <button
+        class="btn ghost"
+        disabled={!session.done.length || readonly}
+        onclick={() => session.undoLast()}
+        title={session.done.at(-1) ? `Undo: ${session.done.at(-1)?.label}` : 'Nothing to undo'}
+        >Undo{session.done.length ? ` (${session.done.length})` : ''}</button
+      >
+      <button
+        class="btn ghost"
+        disabled={!session.undone.length || readonly}
+        onclick={() => session.redoLast()}
+        title={session.undone.at(-1) ? `Redo: ${session.undone.at(-1)?.label}` : 'Nothing to redo'}
+        >Redo</button
+      >
+      {#if canWrite && !branch}
+        <button
+          class="btn"
+          onclick={startSession}
+          title="Edit on a branch of your own, then merge it"
+          ><Icon name="branch" size={14} /> Start session</button
+        >
+      {/if}
+      {#if branch}
+        <a
+          class="btn"
+          href="{resolve('/datasets/[name]/merge', { name })}?source={encodeURIComponent(
+            branch,
+          )}&target={encodeURIComponent(currentBranch?.upstream ?? MAIN)}"
+          ><Icon name="merge" size={14} /> Merge</a
+        >
+      {/if}
     </div>
   </header>
+  {#if name}
+    <div class="page-context">
+      <label class="form-row">
+        Graph
+        <select
+          class="select"
+          value={graph ?? ''}
+          onchange={(e) => nav({ graph: e.currentTarget.value || null, iri: null, scheme: null })}
+        >
+          <option value="">default graph</option>
+          {#each graphs as g (g)}<option value={g}>{iriName(g, prefixes)}</option>{/each}
+          {#if graph && !graphs.includes(graph)}<option value={graph}>{graph}</option>{/if}
+        </select>
+      </label>
+      {#if branchList.length}
+        <label class="form-row">
+          Branch
+          <select
+            class="select"
+            value={branch ?? MAIN}
+            onchange={(e) =>
+              nav({ branch: e.currentTarget.value === MAIN ? null : e.currentTarget.value })}
+          >
+            {#each branchList as b (b.name)}<option value={b.name}
+                >{b.name}{b.protected ? ' (protected)' : ''}</option
+              >{/each}
+          </select>
+        </label>
+      {/if}
+      <label class="form-row">
+        Labels in
+        <select
+          class="select"
+          value={displayLang}
+          onchange={(e) => nav({ lang: e.currentTarget.value || null })}
+          aria-label="Label language"
+        >
+          <option value="">the browser's language</option>
+          {#each languages as l (l)}<option value={l}>{l}</option>{/each}
+        </select>
+      </label>
+    </div>
+  {/if}
 
   {#if sessionError}<p class="error-box" role="alert">{sessionError}</p>{/if}
   {#if session.notice}
@@ -914,7 +905,7 @@
   {/if}
 
   {#if name && head}
-    <div class="panes">
+    <div class="panes split-view">
       <section class="panel side" aria-label="Thesaurus">
         <div class="scheme-bar">
           <label class="pick grow">
@@ -1490,18 +1481,6 @@
 </Modal>
 
 <style>
-  .thes {
-    gap: 12px;
-  }
-  .title h1 {
-    font-size: var(--fs-xl);
-  }
-  .bar {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    align-items: end;
-  }
   .pick {
     display: grid;
     gap: 2px;
@@ -1514,7 +1493,6 @@
     gap: 6px;
     font-size: var(--fs-xs);
     color: var(--text-3);
-    min-height: 26px;
   }
   .live .dot {
     width: 7px;
@@ -1535,17 +1513,26 @@
     font-size: var(--fs-sm);
   }
   .panes {
-    display: grid;
     grid-template-columns: minmax(260px, 2fr) minmax(0, 3fr);
-    gap: 12px;
-    align-items: start;
-    min-width: 0;
   }
-  .side,
+  .side {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .side > :global(*) {
+    flex: none;
+  }
+  .side > .tree-scroll,
+  .side > .results,
+  .side > :global(.plain-list),
+  .side > :global(.checks) {
+    flex: 1 1 auto;
+    min-height: 120px;
+    overflow: auto;
+  }
   .detail {
-    min-width: 0;
-    display: grid;
-    align-content: start;
+    overflow: auto;
   }
   .scheme-bar,
   .search-bar,
@@ -1572,8 +1559,6 @@
   }
   .tree-scroll,
   .results {
-    max-height: calc(100vh - 300px);
-    min-height: 200px;
     overflow: auto;
     padding: 0 6px 10px;
   }
@@ -1706,7 +1691,7 @@
     color: var(--danger);
     font-size: var(--fs-sm);
   }
-  @media (max-width: 900px) {
+  @media (max-width: 760px) {
     .panes {
       grid-template-columns: minmax(0, 1fr);
     }

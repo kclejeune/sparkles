@@ -2188,6 +2188,7 @@
 
 <svelte:head><title>Explore | Sparkles</title></svelte:head>
 
+<h1 class="sr-only">Explore</h1>
 <div class="page">
   <header class="bar">
     <div class="search">
@@ -4208,7 +4209,7 @@
     }
   }
   /* a phone: the search box on a row of its own, the tabs under it */
-  @media (max-width: 600px) {
+  @media (max-width: 760px) {
     .bar {
       flex-wrap: wrap;
     }

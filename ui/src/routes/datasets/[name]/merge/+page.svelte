@@ -296,18 +296,25 @@
 <svelte:head><title>Merge {source} into {target} | Sparkles</title></svelte:head>
 
 <div class="page page-container">
-  <nav class="crumbs">
-    <a href={resolve('/datasets')}>Datasets</a><Icon name="chevron" size={12} /><a
-      href={resolve('/datasets/[name]', { name })}>{name}</a
-    ><Icon name="chevron" size={12} /><span>Merge</span>
-  </nav>
-
-  <header class="head">
-    <h1><Icon name="merge" size={18} /> Merge</h1>
-    <label class="pick">
-      <span class="faint">Source</span>
+  <header class="page-head">
+    <nav class="breadcrumbs" aria-label="Breadcrumbs">
+      <a href={resolve('/datasets')}>Datasets</a><Icon name="chevron" size={12} /><a
+        href={resolve('/datasets/[name]', { name })}>{name}</a
+      ><Icon name="chevron" size={12} /><span aria-current="page">Merge</span>
+    </nav>
+    <h1>Merge {source || 'a branch'} into {target}</h1>
+    <div class="page-actions">
+      <button class="btn" onclick={load} disabled={loading} aria-label="Compare again">
+        {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={14} />{/if} Compare
+        again
+      </button>
+    </div>
+  </header>
+  <div class="page-context">
+    <label class="form-row">
+      Source
       <select
-        class="select sm mono"
+        class="select mono"
         aria-label="Source branch"
         value={source}
         onchange={(e) => choose('source', e.currentTarget.value)}
@@ -316,11 +323,10 @@
         {#each branchNames as b (b)}<option value={b} disabled={b === target}>{b}</option>{/each}
       </select>
     </label>
-    <Icon name="chevron" size={14} />
-    <label class="pick">
-      <span class="faint">Target</span>
+    <label class="form-row">
+      Target
       <select
-        class="select sm mono"
+        class="select mono"
         aria-label="Target branch"
         value={target}
         onchange={(e) => choose('target', e.currentTarget.value)}
@@ -329,18 +335,11 @@
         {#each branchNames as b (b)}<option value={b} disabled={b === source}>{b}</option>{/each}
       </select>
     </label>
-    <span class="spacer"></span>
-    <button class="btn sm ghost" onclick={load} disabled={loading} aria-label="Compare again">
-      {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={13} />{/if} Compare
-      again
-    </button>
-  </header>
-  <div class="row">
-    <label class="pick"
+    <label class="form-row"
       ><input type="checkbox" bind:checked={includeReasoning} /> Include reasoning changes</label
     >
-    {#if includeReasoning}<label class="pick"
-        >Program <select class="select sm" bind:value={analysisProfile}
+    {#if includeReasoning}<label class="form-row"
+        >Program <select class="select" bind:value={analysisProfile}
           ><option value="">Recorded target program</option><option value="rdfs-simple"
             >RDFS simple</option
           ><option value="rdfs">RDFS</option><option value="owl-rl">OWL 2 RL</option></select
@@ -658,40 +657,10 @@
 </div>
 
 <style>
-  .page {
-    padding: 18px 28px 40px;
-    gap: 16px;
+  .page-head .breadcrumbs {
+    flex-basis: 100%;
   }
-  .crumbs {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: var(--fs-sm);
-    color: var(--text-3);
-  }
-  .crumbs a {
-    color: var(--text-2);
-  }
-  .head {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 8px 12px;
-  }
-  .head h1 {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 22px;
-    margin: 0;
-  }
-  .pick {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: var(--fs-sm);
-  }
-  .pick .select {
+  .page-context .select {
     max-width: 200px;
   }
   .moved {
