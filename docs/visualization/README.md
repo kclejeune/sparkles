@@ -265,7 +265,9 @@ when it cannot read the commit its graph is at. The notes and members forms save
 the editing forms, which check the stored values of each field they change instead of the
 commit. They are editable only when the dataset keeps no graph but the one the page edits
 and their target is that graph, since a form's save could otherwise change another graph,
-and they are read-only for a caller whose grants cover only some graphs. The [API reference](../API.md#skos-shapes) lists the shapes'
+and they are read-only for a caller whose grants cover only some graphs. With
+authentication on, they are also read-only on branches other than main, whose grants the
+page cannot read, for every caller but a server administrator. The [API reference](../API.md#skos-shapes) lists the shapes'
 conditions.
 
 ## Known gaps
@@ -339,7 +341,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   without edit buttons.
 * The ontology editor decides whether the caller can write from the caller's level on the
   dataset, so a caller whose grants allow writes on a branch only sees the branch
-  read-only, 611. Undo and redo revert commits, which needs write access to the
+  read-only, 611. For the same reason the thesaurus editor's notes and members forms are
+  read-only on branches other than main when authentication is on. Undo and redo revert commits, which needs write access to the
   whole branch, so a caller whose grants cover some graphs only can edit but not undo.
 
 ## Configuration and usage

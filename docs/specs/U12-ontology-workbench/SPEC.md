@@ -235,7 +235,11 @@ members but not of its cells, so no narrower check could keep a save inside one 
 The check reads the stored default graph by its Jena name, `urn:x-arq:DefaultGraph`, so a
 stored copy of a named graph's triple counts as another graph, and a default graph that the
 server serves as the union of the named graphs does not. A caller whose grants cover only
-some graphs cannot see every graph the check needs, so the forms are read-only for it.
+some graphs or triples cannot see every graph the check needs, so the forms are read-only
+for it. `/$/whoami` reports these limits for a dataset's main branch only, so with
+authentication on, the forms are read-only on other branches for every caller but a local
+one or a server administrator, until roadmap item 611 answers a caller's access per
+branch.
 Until the head and its tag are read, the page and its undo and redo are read-only.
 
 **Label edits.** A SKOS-XL label resource that another resource still refers to stays when

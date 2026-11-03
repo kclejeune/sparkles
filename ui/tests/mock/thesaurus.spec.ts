@@ -344,3 +344,36 @@ test('the forms are read-only for a caller whose grants cover some graphs', asyn
   // the page's own edits stay, scoped to its graph by their updates
   await expect(page.getByRole('tab', { name: /Labels/ })).toBeVisible();
 });
+
+test('under auth the forms are read-only on a branch whose grants the page cannot read', async ({
+  page,
+  request,
+}) => {
+  await page.route('**/$/whoami', (route) =>
+    route.fulfill({
+      json: {
+        authEnabled: true,
+        principal: { kind: 'token', name: 'writer' },
+        method: 'bearer',
+        server: [],
+        datasets: { thes: 'write' },
+        canMintTokens: false,
+        logout: false,
+      },
+    }),
+  );
+  const branch = (await (await request.get('/$/branches/thes')).json()).branches
+    .map((b: { name: string }) => b.name)
+    .find((n: string) => n.startsWith('skos.'));
+  await page.goto(
+    `/ui/thesaurus?ds=thes&branch=${branch}&iri=${encodeURIComponent(TH + 'fish')}&view=notes`,
+  );
+  const details = page.getByRole('region', { name: 'Details' });
+  await expect(details.getByText(`your access covers on ${branch}`)).toBeVisible({
+    timeout: 30_000,
+  });
+  // on main, where whoami answers, the same caller may edit the forms
+  await page.goto(`/ui/thesaurus?ds=thes&iri=${encodeURIComponent(TH + 'fish')}&view=notes`);
+  await expect(details).toContainText('built-in SKOS shapes', { timeout: 30_000 });
+  await expect(details.getByText('your access covers')).toHaveCount(0);
+});

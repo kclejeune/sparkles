@@ -747,8 +747,10 @@
   const formLock = $derived.by(() => {
     if (readonly) return 'The page is read-only, so the form is too.';
     // the graphs a caller cannot read are hidden from the check below
-    if (graphRestricted(auth.who, name))
-      return 'Your access covers only some graphs of this dataset, so the page cannot tell whether a form’s save stays in the graph it edits, and the form is read-only.';
+    if (graphRestricted(auth.who, name, branch))
+      return branch && branch !== MAIN
+        ? `The page cannot read which graphs your access covers on ${branch}, so it cannot tell whether a form’s save stays in the graph it edits, and the form is read-only.`
+        : 'Your access covers only some graphs of this dataset, so the page cannot tell whether a form’s save stays in the graph it edits, and the form is read-only.';
     const fm = formModel?.key === formKey ? formModel.m : null;
     if (!fm) return null;
     const here = graph ?? null;
