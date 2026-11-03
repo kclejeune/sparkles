@@ -259,6 +259,7 @@
   }
   let graphView: GraphView | undefined = $state();
   let graphToolbar: HTMLDivElement | undefined = $state();
+  let gtoolsWidth = $state(0);
 
   // --- the validation overlay (docs/specs/U07-data-quality-and-schema-diagram.md §11) ---
   /**
@@ -2258,7 +2259,12 @@
     >
       <div class="canvas">
         {#if nodeCount > 0 || graphTimeOpen || pathsOpen}
-          <div class="toolbar gtools" bind:this={graphToolbar}>
+          <div
+            class="toolbar gtools"
+            class:narrow={gtoolsWidth > 0 && gtoolsWidth < 860}
+            bind:this={graphToolbar}
+            bind:clientWidth={gtoolsWidth}
+          >
             <div class="toolbar-group">
               <button
                 class="btn sm"
@@ -3547,6 +3553,20 @@
   .gtools {
     padding-top: 6px;
     padding-bottom: 6px;
+  }
+  /* a narrow canvas, such as beside the details panel on a laptop: every tool keeps its
+     icon and tooltip, so the tools stay on one row and the canvas keeps its height. A
+     measured width rather than a container query, since a container's layout containment
+     would hold the toolbar's fixed popovers */
+  .gtools.narrow {
+    & .lbl {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+    }
   }
   .view-menu {
     position: relative;
