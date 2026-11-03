@@ -1,11 +1,13 @@
 <script lang="ts">
   import { resolve } from '$app/paths';
-  import { goto } from '$app/navigation';
-  import { onMount } from 'svelte';
+  import { goto, replaceState } from '$app/navigation';
+  import { page } from '$app/state';
+  import { onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { app } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { fmtInt, fmtRelative } from '$lib/format';
+  import { useCommands } from '$lib/launcher.svelte';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
   import Icon from '$components/Icon.svelte';
   import TaskList from '$components/TaskList.svelte';
@@ -21,6 +23,30 @@
   }
 
   onMount(refresh);
+
+  // `?new=1` (the palette's "New dataset…", from this page or another) opens the dialog once
+  $effect(() => {
+    if (!page.url.searchParams.has('new')) return;
+    untrack(() => {
+      if (auth.hasServer('server-admin')) createOpen = true;
+      const url = new URL(page.url);
+      url.searchParams.delete('new');
+      try {
+        replaceState(url, page.state);
+      } catch {
+        history.replaceState(history.state, '', url);
+      }
+    });
+  });
+
+  useCommands(() => [
+    {
+      id: 'datasets.refresh',
+      label: 'Refresh the dataset list',
+      icon: 'refresh',
+      run: () => refresh(),
+    },
+  ]);
 
   const detail = (name: string) => resolve('/datasets/[name]', { name });
   const total = $derived(app.datasets.reduce((a, d) => a + d.quads, 0));

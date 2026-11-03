@@ -16,6 +16,8 @@
   import { branchParam, MAIN, onBranch } from '$lib/branches';
   import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
   import { fmtInt } from '$lib/format';
+  import { useCommands, usePageSearch, useProvider } from '$lib/launcher.svelte';
+  import { branchProvider } from '$lib/palette.svelte';
   import {
     ancestorsOf,
     annotationAssertion,
@@ -718,6 +720,69 @@
 
   onMount(() => session.keys(() => readonly));
 
+  // the command palette (ROADMAP item 631): `/` filters the tree, and this page's commands
+  let filterInput: HTMLInputElement | undefined = $state();
+  usePageSearch(() => {
+    if (!filterInput) return false;
+    filterInput.focus();
+    filterInput.select();
+  });
+  /** The parent a new entity of `kind` gets from the selection, as the tree's button does. */
+  const createParentFor = (kind: EntityKind) =>
+    selected && kind !== 'NamedIndividual' && trees.get(kind)?.nodes.has(selected)
+      ? selected
+      : kind === 'NamedIndividual' && selected && (trees.get('Class')?.nodes.has(selected) ?? false)
+        ? selected
+        : null;
+  useCommands(() => [
+    {
+      id: 'ontology.session',
+      label: 'Start session',
+      icon: 'branch',
+      keywords: ['edit', 'branch'],
+      subtitle: 'Edit on a branch of your own, then merge it',
+      active: () => !!name && canWrite && !branch,
+      run: startSession,
+    },
+    ...TREE_KINDS.map((k) => ({
+      id: `ontology.new.${k}`,
+      label: `New ${KIND_SINGULAR[k]}…`,
+      icon: 'plus',
+      keywords: ['create', 'add', 'entity'],
+      active: () => !!name && !readonly,
+      run: () => openCreate(k, createParentFor(k)),
+    })),
+    {
+      id: 'ontology.undo',
+      label: 'Undo',
+      icon: 'stepBack',
+      active: () => !readonly && session.done.length > 0,
+      run: () => void session.undoLast(),
+    },
+    {
+      id: 'ontology.redo',
+      label: 'Redo',
+      icon: 'stepForward',
+      active: () => !readonly && session.undone.length > 0,
+      run: () => void session.redoLast(),
+    },
+    {
+      id: 'ontology.dlquery',
+      label: 'Open DL query',
+      icon: 'query',
+      keywords: ['description logic', 'manchester'],
+      active: () => !!name && tab !== 'dlquery',
+      run: () => void nav({ tab: 'dlquery' }),
+    },
+  ]);
+  useProvider(
+    branchProvider({
+      list: () => branchList.map((b) => b.name),
+      current: () => branch ?? MAIN,
+      choose: (n) => void nav({ branch: n === MAIN ? null : n }),
+    }),
+  );
+
   const counts = $derived(
     Object.fromEntries(TREE_KINDS.map((k) => [k, entities.get(k)?.length ?? 0])),
   );
@@ -888,6 +953,7 @@
               type="search"
               placeholder="Filter {KIND_LABEL[kindTab].toLowerCase()}"
               aria-label="Filter"
+              bind:this={filterInput}
               bind:value={filter}
             />
             {#if !readonly}

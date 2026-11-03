@@ -30,6 +30,8 @@
   } from '$lib/shacl';
   import { readLang, validateLangKey, type ValidateLang } from '$lib/shex';
   import { load, save } from '$lib/storage';
+  import { useCommands, useProvider } from '$lib/launcher.svelte';
+  import { branchProvider } from '$lib/palette.svelte';
   import { cloneDetail, cloneMethodText, originSummary } from '$lib/clone';
   import { tableKind, tableProblem, UPLOAD_ACCEPT } from '$lib/upload';
   import BackupsPanel from '$components/BackupsPanel.svelte';
@@ -147,6 +149,25 @@
       noScroll: true,
     });
   }
+  // the command palette (ROADMAP item 631): the tabs and the branches
+  useCommands(() =>
+    TABS.map((t) => ({
+      id: `dataset.tab.${t.id}`,
+      label: `Show ${t.label.toLowerCase()}`,
+      icon: t.icon,
+      keywords: [t.label],
+      active: () => tab !== t.id,
+      run: () => setTab(t.id),
+    })),
+  );
+  useProvider(
+    branchProvider({
+      list: () => (branchList ?? []).map((b) => b.name),
+      current: () => branch ?? MAIN,
+      choose: selectBranch,
+    }),
+  );
+
   function onTabKey(e: KeyboardEvent, i: number) {
     const n = TABS.length;
     const to =
