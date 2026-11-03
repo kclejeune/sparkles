@@ -7,6 +7,7 @@ use crate::http::ontology::{
     AxiomQuery, ClassifyQuery, MAX_LIMIT, axiom_page, check_body, classify_body, edit_body,
     mentioned, page_body, summary_body,
 };
+use crate::ontology_chain;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use serde_json::{Value as J, json};
@@ -63,6 +64,12 @@ pub enum OntologyCmd {
         /// An ontology file to check without a database (Turtle, RDF/XML, OWL
         /// functional-style syntax, N-Triples, TriG, JSON-LD, … by its extension)
         file: Option<PathBuf>,
+        /// The ontology file, as FILE, which a chain of commands can follow
+        #[arg(short = 'i', long)]
+        input: Option<PathBuf>,
+        /// In a chain, write the ontology to this file after the command (repeatable)
+        #[arg(short = 'o', long)]
+        output: Vec<PathBuf>,
         #[command(flatten)]
         at: Target,
         #[command(flatten)]
@@ -79,6 +86,9 @@ pub enum OntologyCmd {
         /// text or json
         #[arg(long, default_value = "text")]
         format: String,
+        /// The commands that follow in a chain
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        rest: Vec<String>,
     },
     /// Classify by OWL 2 EL: the inferred class hierarchy and the unsatisfiable
     /// classes. Exits with status 1 when the ontology is inconsistent or has an
@@ -87,6 +97,12 @@ pub enum OntologyCmd {
         /// An ontology file to classify without a database (Turtle, RDF/XML, OWL
         /// functional-style syntax, … by its extension)
         file: Option<PathBuf>,
+        /// The ontology file, as FILE, which a chain of commands can follow
+        #[arg(short = 'i', long)]
+        input: Option<PathBuf>,
+        /// In a chain, write the ontology to this file after the command (repeatable)
+        #[arg(short = 'o', long)]
+        output: Vec<PathBuf>,
         #[command(flatten)]
         at: Target,
         #[command(flatten)]
@@ -114,7 +130,20 @@ pub enum OntologyCmd {
         /// ofn (the taxonomy as a functional-style document), json or text
         #[arg(long, default_value = "ofn")]
         format: String,
+        /// The commands that follow in a chain
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        rest: Vec<String>,
     },
+    /// Assert the inferred axioms in the ontology, as `robot reason` does, with its
+    /// options; other commands can follow in one chain. Exits with status 1 when the
+    /// ontology is inconsistent or has an unsatisfiable class or property
+    Reason(ontology_chain::ReasonArgs),
+    /// Remove the subclass axioms that other subclass axioms entail, as `robot reduce`
+    /// does, with its options; other commands can follow in one chain
+    Reduce(ontology_chain::ReduceArgs),
+    /// Add subclass axioms for the existentials and named conjuncts of equivalences, as
+    /// `robot relax` does, with its options; other commands can follow in one chain
+    Relax(ontology_chain::RelaxArgs),
     /// Add and remove axioms in one commit
     Edit {
         #[command(flatten)]
@@ -174,7 +203,7 @@ pub struct Read {
 }
 
 impl Read {
-    fn request(&self) -> Result<OntologyRequest> {
+    pub(crate) fn request(&self) -> Result<OntologyRequest> {
         let mut req = OntologyRequest::default();
         if !self.graph.is_empty() {
             req.graphs = self
@@ -315,13 +344,39 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
         }
         OntologyCmd::Check {
             file,
+            input,
+            output,
             at,
             read,
             profile,
             no_assertions,
             max_violations,
             format,
+            rest,
         } => {
+            if input.is_some() || !rest.is_empty() || !output.is_empty() {
+                if at.loc.is_some() || at.server.is_some() {
+                    bail!("a chain reads a FILE (--input): leave out --loc and --server");
+                }
+                let (input, rest) = chain_input(input, file, rest)?;
+                return ontology_chain::run(
+                    ontology_chain::Step::Check(ontology_chain::CheckStep {
+                        profile,
+                        no_assertions,
+                        max_violations,
+                        format,
+                        io: ontology_chain::Io {
+                            input: Some(input),
+                            loc: None,
+                            output,
+                            read,
+                            threads: 0,
+                            rest,
+                        },
+                    }),
+                    opts,
+                );
+            }
             let profiles = onto::parse_profiles(&profile)?;
             if profiles.is_empty() {
                 bail!("--profile names no profile: el, ql, rl, dl or all");
@@ -365,14 +420,15 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     remote_post(&at, "/check", &body)?
                 }
             };
-            print_check(&j, &format)?;
-            if !j["conforms"].as_bool().unwrap_or(false) {
+            if !finish_check(&j, &format)? {
                 std::process::exit(1);
             }
             Ok(())
         }
         OntologyCmd::Classify {
             file,
+            input,
+            output,
             at,
             read,
             assertions,
@@ -382,10 +438,38 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             threads,
             allow_unsatisfiable,
             format,
+            rest,
         } => {
             if !["ofn", "json", "text"].contains(&format.as_str()) {
                 bail!("unknown --format {format}: ofn, json or text");
             }
+            if input.is_some() || !rest.is_empty() || !output.is_empty() {
+                if at.loc.is_some() || at.server.is_some() || target.is_some() {
+                    bail!(
+                        "a chain reads a FILE (--input) and writes files: leave out --loc, --server and --target"
+                    );
+                }
+                let (input, rest) = chain_input(input, file, rest)?;
+                return ontology_chain::run(
+                    ontology_chain::Step::Classify(ontology_chain::ClassifyStep {
+                        about,
+                        allow_unsatisfiable,
+                        format,
+                        io: ontology_chain::Io {
+                            input: Some(input),
+                            loc: None,
+                            output,
+                            read,
+                            threads,
+                            rest,
+                        },
+                    }),
+                    opts,
+                );
+            }
+            let about = about
+                .as_deref()
+                .map(|a| a.trim_start_matches('<').trim_end_matches('>').to_string());
             let c = ClassifyRequest {
                 assertions,
                 threads,
@@ -397,14 +481,10 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     })
                     .transpose()?,
                 message: message.clone(),
-                about: about
-                    .as_deref()
-                    .map(|a| a.trim_start_matches('<').trim_end_matches('>').to_string()),
+                about: about.clone(),
             };
             let q = ClassifyQuery {
-                about: about
-                    .as_deref()
-                    .map(|a| a.trim_start_matches('<').trim_end_matches('>').to_string()),
+                about: about.clone(),
                 nodes: false,
                 limit: MAX_LIMIT,
                 offset: 0,
@@ -438,30 +518,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     let req = read.request()?;
                     match OntologyFile::read(&f, &req, 0)? {
                         // the file's axioms, read without a database
-                        Some(file) => {
-                            let out = file.classify(&c, &Default::default())?;
-                            let r = file.renderer();
-                            let view = file.view();
-                            let j = classification_body(
-                                &file.name,
-                                &ClassificationView {
-                                    read: &view,
-                                    classification: &out.classification,
-                                    excluded: &out.excluded,
-                                    reused: false,
-                                    written: None,
-                                },
-                                &req,
-                                &r,
-                                &q,
-                            )?;
-                            let doc = owl::ofn::document(
-                                &r,
-                                &owl::Header::default(),
-                                out.classification.taxonomy.axioms().iter(),
-                            );
-                            (j, doc)
-                        }
+                        Some(file) => classify_body_of_file(&file, &c, &read, about.clone())?,
                         None => {
                             let ds = sparkles::Dataset::memory();
                             let source = sparkles::io::Source::from_path(&f, None)
@@ -506,18 +563,14 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     (j, doc)
                 }
             };
-            match format.as_str() {
-                "ofn" => print!("{doc}"),
-                "json" => println!("{}", serde_json::to_string_pretty(&j)?),
-                _ => print_classify(&j),
-            }
-            let consistent = j["consistent"].as_bool().unwrap_or(false);
-            let unsat = j["unsatisfiableCount"].as_u64().unwrap_or(0);
-            if !consistent || (unsat > 0 && !allow_unsatisfiable) {
+            if !finish_classify(&j, &doc, &format, allow_unsatisfiable)? {
                 std::process::exit(1);
             }
             Ok(())
         }
+        OntologyCmd::Reason(a) => ontology_chain::run(ontology_chain::Step::Reason(a), opts),
+        OntologyCmd::Reduce(a) => ontology_chain::run(ontology_chain::Step::Reduce(a), opts),
+        OntologyCmd::Relax(a) => ontology_chain::run(ontology_chain::Step::Relax(a), opts),
         OntologyCmd::Edit {
             at,
             read,
@@ -587,6 +640,87 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The input of a chain that starts with `classify` or `check`: `--input`, with a FILE
+/// given beside it taken as the first word of the rest, or the FILE.
+fn chain_input(
+    input: Option<PathBuf>,
+    file: Option<PathBuf>,
+    mut rest: Vec<String>,
+) -> Result<(PathBuf, Vec<String>)> {
+    match (input, file) {
+        (Some(i), Some(f)) => {
+            rest.insert(0, f.to_string_lossy().into_owned());
+            Ok((i, rest))
+        }
+        (Some(i), None) | (None, Some(i)) => Ok((i, rest)),
+        (None, None) => bail!("name the ontology file: FILE or --input FILE"),
+    }
+}
+
+/// The classification of an ontology file read without a database, as the answer's
+/// JSON body and the taxonomy as a functional-style document.
+pub(crate) fn classify_body_of_file(
+    file: &OntologyFile,
+    c: &ClassifyRequest,
+    read: &Read,
+    about: Option<String>,
+) -> Result<(J, String)> {
+    let req = read.request()?;
+    let q = ClassifyQuery {
+        about,
+        nodes: false,
+        limit: MAX_LIMIT,
+        offset: 0,
+    };
+    let out = file.classify(c, &Default::default())?;
+    let r = file.renderer();
+    let view = file.view();
+    let j = classification_body(
+        &file.name,
+        &ClassificationView {
+            read: &view,
+            classification: &out.classification,
+            excluded: &out.excluded,
+            reused: false,
+            written: None,
+        },
+        &req,
+        &r,
+        &q,
+    )?;
+    let doc = owl::ofn::document(
+        &r,
+        &owl::Header::default(),
+        out.classification.taxonomy.axioms().iter(),
+    );
+    Ok((j, doc))
+}
+
+/// Print a classification; false when the exit status is 1: the ontology is
+/// inconsistent, or it has unsatisfiable classes and they are not allowed.
+pub(crate) fn finish_classify(
+    j: &J,
+    doc: &str,
+    format: &str,
+    allow_unsatisfiable: bool,
+) -> Result<bool> {
+    match format {
+        "ofn" => print!("{doc}"),
+        "json" => println!("{}", serde_json::to_string_pretty(j)?),
+        "text" => print_classify(j),
+        f => bail!("unknown --format {f}: ofn, json or text"),
+    }
+    let consistent = j["consistent"].as_bool().unwrap_or(false);
+    let unsat = j["unsatisfiableCount"].as_u64().unwrap_or(0);
+    Ok(consistent && (unsat == 0 || allow_unsatisfiable))
+}
+
+/// Print the profile reports; false when one does not conform.
+pub(crate) fn finish_check(j: &J, format: &str) -> Result<bool> {
+    print_check(j, format)?;
+    Ok(j["conforms"].as_bool().unwrap_or(false))
 }
 
 /// The database directory, or `None` for a server; one of them is needed.
