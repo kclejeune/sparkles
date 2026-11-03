@@ -384,28 +384,28 @@ impl KeyFilter {
     }
 
     /// The filter as this thread tests many keys with it, with the thread's copy of each
-    /// regular expression found once rather than for each key.
+    /// regular expression found once rather than for each key. Each copy is found at the
+    /// first search of its expression, as an unbound test finds it, so that a worker's
+    /// optional cache is admitted only after the storage the first key needed.
     pub(super) fn bind(&self) -> BoundKeyFilter<'_> {
+        let regexes = self
+            .0
+            .iter()
+            .filter(|t| matches!(t, Test::Regex { .. }))
+            .count();
         BoundKeyFilter {
             filter: self,
-            matchers: self
-                .0
-                .iter()
-                .filter_map(|t| match t {
-                    Test::Regex { re, .. } => Some(re.as_ref().map(|re| re.matcher())),
-                    _ => None,
-                })
-                .collect(),
+            matchers: (0..regexes).map(|_| std::cell::OnceCell::new()).collect(),
         }
     }
 
     /// [`KeyFilter::test`] with `regex(i, program, text)` matching the `i`th regular
     /// expression of the filter.
     #[inline]
-    fn test_with(
-        &self,
+    fn test_with<'s>(
+        &'s self,
         key: &[u8],
-        mut regex: impl FnMut(usize, &Option<super::query_regex::RegexHandle>, &str) -> bool,
+        mut regex: impl FnMut(usize, &'s Option<super::query_regex::RegexHandle>, &str) -> bool,
     ) -> bool {
         let key = split(key);
         let mut regexes = 0;
@@ -464,18 +464,22 @@ impl KeyFilter {
 /// A key filter as one thread tests many keys with it, from [`KeyFilter::bind`].
 pub(super) struct BoundKeyFilter<'a> {
     filter: &'a KeyFilter,
-    /// the thread's program of each regular expression of the filter, in order
-    matchers: Vec<Option<super::query_regex::Matcher<'a>>>,
+    /// the thread's program of each regular expression of the filter, in order, found
+    /// at its first search
+    matchers: Vec<std::cell::OnceCell<super::query_regex::Matcher<'a>>>,
 }
 
 impl BoundKeyFilter<'_> {
     /// [`KeyFilter::test`] on this thread.
     #[inline]
     pub(super) fn test(&self, key: &[u8]) -> bool {
-        self.filter.test_with(key, |i, _, s| {
+        self.filter.test_with(key, |i, re, s| {
             self.matchers[i]
-                .as_ref()
-                .expect("a tested filter has compiled its regular expressions")
+                .get_or_init(|| {
+                    re.as_ref()
+                        .expect("a tested filter has compiled its regular expressions")
+                        .matcher()
+                })
                 .is_match(s)
         })
     }
@@ -683,6 +687,43 @@ mod tests {
         };
         pool.install(check);
         check();
+    }
+
+    /// Binding a charged filter admits no worker cache: a worker's cache is optional and
+    /// is charged at the first search, after the storage the first key needed, as an
+    /// unbound test charges it.
+    #[test]
+    fn binding_a_filter_charges_its_worker_caches_at_the_first_search() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = super::super::ctx::Ctx::new(store.snapshot());
+        ctx.mem_limit = 256 << 20;
+        let ctx = Arc::new(ctx);
+        ctx.attach_owner();
+        let v = 0;
+        let expr = call(
+            Function::Regex,
+            vec![
+                call(Function::Str, vec![Expr::Var(v)]),
+                lit("bound-order-[0-9]$"),
+            ],
+        );
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let filter = KeyFilter::new_for(&ctx, &[expr], v).unwrap();
+            let before = ctx.live_bytes();
+            let bound = filter.bind();
+            assert_eq!(ctx.live_bytes(), before, "binding admits nothing");
+            assert!(bound.test(&key(
+                NamedNode::new_unchecked("http://x/bound-order-1").into()
+            )));
+            assert!(
+                ctx.live_bytes() > before,
+                "the first search charges the worker's cache"
+            );
+        });
     }
 
     #[test]
