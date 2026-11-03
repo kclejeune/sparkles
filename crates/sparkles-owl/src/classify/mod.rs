@@ -9,10 +9,21 @@
 //! the profile, functional data properties, keys, negative property assertions and the
 //! top and bottom properties. A class whose instances reach an individual through a
 //! context that holds only where the class has an instance is classified again in a
-//! world of its own. An axiom outside OWL 2 EL is left out and reported, with
-//! the rule of the OWL 2 Profiles recommendation it breaks, and the run's [`Stats`] count
-//! these axioms by whether they are Horn and give the [`Tier`] of rules the ontology
-//! needs. An axiom with a literal or a
+//! world of its own.
+//!
+//! Beyond OWL 2 EL, the classifier takes the Horn axioms of OWL 2 DL with the rules of
+//! Kazakov's calculus for Horn-SHIQ (IJCAI 2009), roadmap item 603's Tier H: inverse
+//! roles, universal restrictions, at-most-one and at-least restrictions, functional and
+//! inverse-functional roles, self restrictions, chains and transitivity under universals,
+//! and disjoint, asymmetric and irreflexive roles. The Horn rules run as their own
+//! instantiation of the saturation, which creates the contexts of conjunctions that the
+//! index does not hold, and only when the EL axioms need no rules of individuals,
+//! universal roles or functional data roles; otherwise the Horn axioms are left out too.
+//! A run with the Horn rules saturates everything again on its next run. An axiom the
+//! classifier does not take is left out and reported, with the rule of the OWL 2 Profiles
+//! recommendation it breaks, and the run's [`Stats`] count the axioms outside OWL 2 EL by
+//! whether they are Horn, give the [`Tier`] of rules the ontology needs and count the
+//! axioms the Horn rules take. An axiom with a literal or a
 //! datatype that the classifier cannot compare, or with a property chain through the top
 //! property, is used as far as the calculus goes and reported as partial. Every
 //! subsumption the classifier answers is entailed. It derives every entailed subsumption

@@ -477,3 +477,76 @@ fn an_incremental_change_after_a_horn_run_classifies_again() {
     let out = k.classify(&Limits::default()).unwrap();
     assert!(out.taxonomy.is_subclass(&c("A"), &c("C")));
 }
+
+/// A generated OWL 2 QL ontology: existential restrictions on roles and inverses on the
+/// right, domains and ranges of both, inclusions between roles and inverses, and
+/// disjoint classes.
+fn ql(n: usize) -> String {
+    let k = n / 10 + 1;
+    let mut s = String::new();
+    for i in 0..n {
+        let r = i % k;
+        s += &format!(
+            "SubClassOf(:A{i} ObjectSomeValuesFrom(:r{r} :A{}))\n",
+            (i * 7 + 1) % n
+        );
+        s += &format!(
+            "SubClassOf(:A{i} ObjectSomeValuesFrom(ObjectInverseOf(:r{r}) :A{}))\n",
+            (i * 3 + 2) % n
+        );
+        s += &format!("DisjointClasses(:A{i} :A{})\n", (i + 5) % n);
+    }
+    for j in 0..k {
+        s += &format!("ObjectPropertyDomain(:r{j} :A{j})\n");
+        s += &format!("ObjectPropertyRange(:r{j} :A{})\n", j + 1);
+        s += &format!("SubClassOf(ObjectSomeValuesFrom(ObjectInverseOf(:r{j}) owl:Thing) :B{j})\n");
+        s += &format!(
+            "SubObjectPropertyOf(:r{j} ObjectInverseOf(:r{}))\n",
+            (j + 1) % k
+        );
+    }
+    s
+}
+
+/// A generated OWL 2 RL ontology: universals and at-most restrictions on the right,
+/// existentials, unions and intersections on the left, inverses and transitive roles.
+fn rl(n: usize) -> String {
+    let k = n / 10 + 1;
+    let mut s = String::new();
+    for i in 0..n {
+        let r = i % k;
+        let (a, b, c) = ((i + 1) % n, (i * 7 + 3) % n, (i * 11 + 5) % n);
+        s += &format!("SubClassOf(:A{i} ObjectAllValuesFrom(:r{r} :A{a}))\n");
+        s += &format!("SubClassOf(:A{i} ObjectMaxCardinality(1 ObjectInverseOf(:r{r}) :A{b}))\n");
+        s += &format!("SubClassOf(ObjectSomeValuesFrom(:r{r} :A{b}) :A{c})\n");
+        s += &format!("SubClassOf(ObjectUnionOf(:A{a} ObjectIntersectionOf(:A{b} :A{c})) :B{i})\n");
+    }
+    for j in 0..k {
+        s += &format!("TransitiveObjectProperty(:t{j})\n");
+        s += &format!("SubObjectPropertyOf(:r{j} :t{j})\n");
+        s += &format!("SubClassOf(:B{j} ObjectAllValuesFrom(ObjectInverseOf(:t{j}) :A{j}))\n");
+        s += &format!("InverseObjectProperties(:r{j} :s{j})\n");
+    }
+    s
+}
+
+#[test]
+fn ql_and_rl_ontologies_create_no_conjunction_contexts() {
+    // Without positive universals or at-most restrictions, which OWL 2 QL lacks, and
+    // without positive existentials, which OWL 2 RL lacks without individuals, no rule
+    // creates a context, so the contexts are those of the classes and the existential
+    // restrictions and grow linearly.
+    for (name, make) in [("ql", ql as fn(usize) -> String), ("rl", rl)] {
+        let mut sizes = Vec::new();
+        for n in [100, 200, 400] {
+            let (out, ex) = run(&make(n));
+            assert!(ex.is_empty(), "{name} {n}: {ex:#?}");
+            assert_eq!(out.stats.conjunctions, 0, "{name} {n}");
+            sizes.push(out.stats.contexts);
+        }
+        // at most four contexts for each class of the ontology
+        for (n, c) in [100, 200, 400].iter().zip(&sizes) {
+            assert!(*c <= 4 * n + 4 * (n / 10 + 1), "{name}: {sizes:?}");
+        }
+    }
+}
