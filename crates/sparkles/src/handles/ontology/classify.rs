@@ -119,7 +119,7 @@ pub struct CacheEntry {
 }
 
 /// The logical axioms of an ontology, in its order.
-fn logical_axioms(o: &sparkles_owl::read::Ontology) -> Vec<&AxiomKind> {
+pub(crate) fn logical_axioms(o: &sparkles_owl::read::Ontology) -> Vec<&AxiomKind> {
     o.axioms
         .keys()
         .map(|a| &a.kind)
@@ -185,10 +185,8 @@ impl Ontologies {
             }
             let mut axioms = logical_axioms(&o.ontology);
             axioms.extend(assertions.iter().map(|a| &a.kind).filter(|k| logical(k)));
-            let mut s = Saturation::new();
-            let par = admit(c, &opts)?;
-            let out = run(&mut s, &axioms, None, par, &opts)?;
-            (Arc::new(out), Arc::new(s.excluded().to_vec()), false)
+            let (out, excluded) = classify_once(&axioms, c, &opts)?;
+            (Arc::new(out), Arc::new(excluded), false)
         };
         if let Some(about) = &c.about
             && classification
@@ -501,6 +499,20 @@ fn admit(c: &ClassifyRequest, opts: &QueryOptions) -> Result<Par> {
     let flag = opts.cancel.clone().unwrap_or_default();
     let ctl = Control::new(flag, opts.deadline, u64::MAX);
     Par::acquire(c.threads, &ctl)
+}
+
+/// A classification of `axioms` by a saturation of its own, on the threads `c` asks the
+/// algorithm pool for and under the deadline, cancellation and memory budget of `opts`,
+/// with the axioms it left out or used in part.
+pub(crate) fn classify_once(
+    axioms: &[&AxiomKind],
+    c: &ClassifyRequest,
+    opts: &QueryOptions,
+) -> Result<(Classification, Vec<Excluded>)> {
+    let mut s = Saturation::new();
+    let par = admit(c, opts)?;
+    let out = run(&mut s, axioms, None, par, opts)?;
+    Ok((out, s.excluded().to_vec()))
 }
 
 /// Runs a classification on the threads of `par` under the options' deadline,

@@ -221,10 +221,41 @@ pub struct Summary {
     pub errors: usize,
 }
 
+/// What an answer about a read of an ontology carries besides its axioms: the commit
+/// read, the graphs, the imports, the warnings and the inferences, for an [`Opened`]
+/// ontology or a [`file::OntologyFile`].
+#[derive(Clone, Copy, Debug)]
+pub struct ReadView<'a> {
+    pub commit: u64,
+    /// the graphs read: index `n` is graph `n` of [`read::Ontology::graph_of`]
+    pub graphs: &'a [GraphRef],
+    pub imports: &'a [Import],
+    pub warnings: &'a [String],
+    pub inferences: Option<&'a Inferences>,
+}
+
+impl ReadView<'_> {
+    /// The name of graph `n` of the read.
+    pub fn graph_name(&self, n: u32) -> &str {
+        self.graphs.get(n as usize).map_or("", |g| g.as_str())
+    }
+}
+
 impl Opened {
     /// The name of graph `n` of the ontology.
     pub fn graph_name(&self, n: u32) -> &str {
         self.graphs.get(n as usize).map_or("", |g| g.as_str())
+    }
+
+    /// The members of the read that answers carry.
+    pub fn view(&self) -> ReadView<'_> {
+        ReadView {
+            commit: self.snapshot.commit,
+            graphs: &self.graphs,
+            imports: &self.imports,
+            warnings: &self.warnings,
+            inferences: self.inferences.as_ref(),
+        }
     }
 
     /// The counts of the ontology's terminology.
@@ -2301,6 +2332,15 @@ pub fn report_json(
     r: &Report,
     render: &sparkles_owl::ofn::Renderer,
 ) -> serde_json::Value {
+    report_view_json(&o.view(), r, render)
+}
+
+/// [`report_json`] for the read `o` describes.
+pub fn report_view_json(
+    o: &ReadView<'_>,
+    r: &Report,
+    render: &sparkles_owl::ofn::Renderer,
+) -> serde_json::Value {
     let violations: Vec<serde_json::Value> = r
         .violations
         .iter()
@@ -2448,6 +2488,7 @@ pub fn rl_inspector(
 }
 
 pub mod classify;
+pub mod file;
 pub mod wire;
 
 #[cfg(test)]

@@ -12,8 +12,8 @@
 
 use super::classify::{Classified, ClassifyRequest};
 use super::{
-    CheckRequest, EditOutcome, EditRequest, OntologyDiff, OntologyRequest, Opened, check_opened,
-    parse_axiom_types, parse_profiles, report_json,
+    CheckRequest, EditOutcome, EditRequest, OntologyDiff, OntologyRequest, Opened, ReadView,
+    check_opened, parse_axiom_types, parse_profiles, report_view_json,
 };
 use crate::Dataset;
 use crate::error::{Error, Result};
@@ -56,16 +56,21 @@ fn header_json(h: &sparkles_owl::Header, r: &Renderer) -> J {
 /// the mode, the graphs read, the imports, the warnings of the read and, for an inferred
 /// view, the inferences read.
 pub fn opened_json(name: &str, o: &Opened, req: &OntologyRequest) -> J {
+    read_json(name, &o.view(), req)
+}
+
+/// [`opened_json`] for the read `o` describes.
+pub fn read_json(name: &str, o: &ReadView<'_>, req: &OntologyRequest) -> J {
     let mut j = json!({
         "dataset": name,
-        "commit": o.snapshot.commit,
+        "commit": o.commit,
         "mode": req.mode.as_str(),
         "graphs": o.graphs.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
         "imports": o.imports.iter().map(|i| json!({"iri": i.iri, "graph": i.graph})).collect::<Vec<_>>(),
         "warnings": o.warnings,
     });
     if req.inferences {
-        j["inferences"] = match &o.inferences {
+        j["inferences"] = match o.inferences {
             None => json!({ "included": false }),
             Some(i) => json!({
                 "included": true,
@@ -228,10 +233,22 @@ pub fn check_body(
     reports: &[Report],
     assertions: bool,
 ) -> J {
-    let mut j = opened_json(name, o, req);
+    reports_body(name, &o.view(), req, r, reports, assertions)
+}
+
+/// [`check_body`] for the read `o` describes.
+pub fn reports_body(
+    name: &str,
+    o: &ReadView<'_>,
+    req: &OntologyRequest,
+    r: &Renderer,
+    reports: &[Report],
+    assertions: bool,
+) -> J {
+    let mut j = read_json(name, o, req);
     j["conforms"] = json!(reports.iter().all(|r| r.conforms));
     j["assertions"] = json!(assertions);
-    j["reports"] = J::Array(reports.iter().map(|x| report_json(o, x, r)).collect());
+    j["reports"] = J::Array(reports.iter().map(|x| report_view_json(o, x, r)).collect());
     j
 }
 
@@ -1036,13 +1053,41 @@ pub fn classify_body(
     r: &Renderer,
     q: &ClassifyQuery,
 ) -> Result<J> {
+    let read = c.opened.view();
+    let view = ClassificationView {
+        read: &read,
+        classification: &c.classification,
+        excluded: &c.excluded,
+        reused: c.reused,
+        written: c.written.as_ref(),
+    };
+    classification_body(name, &view, req, r, q)
+}
+
+/// A classification and the read it classified, for [`classification_body`].
+pub struct ClassificationView<'a> {
+    pub read: &'a ReadView<'a>,
+    pub classification: &'a sparkles_owl::classify::Classification,
+    pub excluded: &'a [sparkles_owl::classify::Excluded],
+    pub reused: bool,
+    pub written: Option<&'a EditOutcome>,
+}
+
+/// [`classify_body`] for the classification `c` describes.
+pub fn classification_body(
+    name: &str,
+    c: &ClassificationView<'_>,
+    req: &OntologyRequest,
+    r: &Renderer,
+    q: &ClassifyQuery,
+) -> Result<J> {
     use sparkles_owl::classify::Gap;
     let t = &c.classification.taxonomy;
     let s = &c.classification.stats;
-    let mut j = opened_json(name, &c.opened, req);
+    let mut j = read_json(name, c.read, req);
     let unsat: Vec<&str> = t.unsatisfiable().map(|c| c.as_str()).collect();
     j["consistent"] = json!(c.classification.consistent);
-    j["complete"] = json!(c.complete());
+    j["complete"] = json!(c.excluded.is_empty());
     j["reused"] = json!(c.reused);
     j["classes"] = json!(t.classes().count());
     j["nodeCount"] = json!(t.nodes().len());
@@ -1119,7 +1164,7 @@ pub fn classify_body(
         );
         j["class"] = x;
     }
-    if let Some(w) = &c.written {
+    if let Some(w) = c.written {
         j["written"] = edit_body(w, r);
     }
     Ok(j)
