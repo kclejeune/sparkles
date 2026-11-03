@@ -120,7 +120,7 @@ def axioms_of(body, prefixes):
     j = 0
     while j < len(body):
         t = body[j]
-        if t[0] == "w" and j + 1 < len(body) and is_node(body[j + 1]):
+        if t[0] == "w" and ":" not in t[1] and j + 1 < len(body) and is_node(body[j + 1]):
             kind, args = t[1], body[j + 1]
             j += 2
             if kind not in ("Import", "Annotation"):
@@ -136,13 +136,18 @@ def is_node(x):
 
 
 def norm_items(items, prefixes):
-    """Normalize a list of tokens and groups: a word followed by a group is a
-    constructor applied to it."""
+    """Normalize a list of tokens and groups. A word without a colon followed by a
+    group is a constructor applied to it. Any other group, such as the property lists
+    of HasKey, is a list whose order does not matter."""
     out = []
     k = 0
     while k < len(items):
         t = items[k]
-        if t[0] == "w" and k + 1 < len(items) and is_node(items[k + 1]):
+        if is_node(t):
+            out.append("(" + " ".join(sorted(norm_items(t, prefixes))) + ")")
+            k += 1
+            continue
+        if t[0] == "w" and ":" not in t[1] and k + 1 < len(items) and is_node(items[k + 1]):
             out.append(norm_call(t[1], items[k + 1], prefixes))
             k += 2
             continue
@@ -177,8 +182,6 @@ def norm_call(name, args, prefixes):
         items = sorted(items)
     elif name == "DisjointUnion" and items:
         items = items[:1] + sorted(items[1:])
-    elif name == "HasKey":
-        pass
     return f"{name}({' '.join(items)})"
 
 

@@ -64,10 +64,8 @@ pub enum OntologyCmd {
         /// An ontology file to check without a database (Turtle, RDF/XML, OWL
         /// functional-style syntax, N-Triples, TriG, JSON-LD, … by its extension)
         file: Option<PathBuf>,
-        /// The ontology file, as FILE, which a chain of commands can follow
-        #[arg(short = 'i', long)]
-        input: Option<PathBuf>,
-        /// In a chain, write the ontology to this file after the command (repeatable)
+        /// In a chain from FILE, write the ontology to this file after the command
+        /// (repeatable)
         #[arg(short = 'o', long)]
         output: Vec<PathBuf>,
         #[command(flatten)]
@@ -97,10 +95,8 @@ pub enum OntologyCmd {
         /// An ontology file to classify without a database (Turtle, RDF/XML, OWL
         /// functional-style syntax, … by its extension)
         file: Option<PathBuf>,
-        /// The ontology file, as FILE, which a chain of commands can follow
-        #[arg(short = 'i', long)]
-        input: Option<PathBuf>,
-        /// In a chain, write the ontology to this file after the command (repeatable)
+        /// In a chain from FILE, write the ontology to this file after the command
+        /// (repeatable)
         #[arg(short = 'o', long)]
         output: Vec<PathBuf>,
         #[command(flatten)]
@@ -137,7 +133,7 @@ pub enum OntologyCmd {
     /// Assert the inferred axioms in the ontology, as `robot reason` does, with its
     /// options; other commands can follow in one chain. Exits with status 1 when the
     /// ontology is inconsistent or has an unsatisfiable class or property
-    Reason(ontology_chain::ReasonArgs),
+    Reason(Box<ontology_chain::ReasonArgs>),
     /// Remove the subclass axioms that other subclass axioms entail, as `robot reduce`
     /// does, with its options; other commands can follow in one chain
     Reduce(ontology_chain::ReduceArgs),
@@ -344,7 +340,6 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
         }
         OntologyCmd::Check {
             file,
-            input,
             output,
             at,
             read,
@@ -354,29 +349,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             format,
             rest,
         } => {
-            if input.is_some() || !rest.is_empty() || !output.is_empty() {
-                if at.loc.is_some() || at.server.is_some() {
-                    bail!("a chain reads a FILE (--input): leave out --loc and --server");
-                }
-                let (input, rest) = chain_input(input, file, rest)?;
-                return ontology_chain::run(
-                    ontology_chain::Step::Check(ontology_chain::CheckStep {
-                        profile,
-                        no_assertions,
-                        max_violations,
-                        format,
-                        io: ontology_chain::Io {
-                            input: Some(input),
-                            loc: None,
-                            output,
-                            read,
-                            threads: 0,
-                            rest,
-                        },
-                    }),
-                    opts,
-                );
-            }
+            let chain = chain_head(&file, &at, &rest, &output)?;
             let profiles = onto::parse_profiles(&profile)?;
             if profiles.is_empty() {
                 bail!("--profile names no profile: el, ql, rl, dl or all");
@@ -392,13 +365,16 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 local(&at)?
             };
             let j = match (file, loc) {
-                (Some(_), Some(_)) => bail!("check a FILE or a database (--loc), not both"),
+                (Some(f), Some(_)) => {
+                    not_a_chain(&f)?;
+                    bail!("check a FILE or a database (--loc), not both")
+                }
                 (Some(_), None) if at.server.is_some() => {
                     bail!("check a FILE or a dataset on --server, not both")
                 }
                 (Some(f), None) => check_file(&f, &read, &check)?,
                 (None, Some(loc)) => {
-                    let ds = crate::open_dataset(loc, opts)?;
+                    let ds = crate::open_dataset(loc, opts.clone())?;
                     let req = read.request()?;
                     let o = ds.ontology().open(&req, &Default::default())?;
                     let reports = check_opened(&o, &check, &Default::default())?;
@@ -420,14 +396,15 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     remote_post(&at, "/check", &body)?
                 }
             };
-            if !finish_check(&j, &format)? {
-                std::process::exit(1);
+            let ok = finish_check(&j, &format)?;
+            match chain {
+                Some(f) => ontology_chain::resume(&f, &read, 0, output, rest, ok, opts),
+                None if !ok => std::process::exit(1),
+                None => Ok(()),
             }
-            Ok(())
         }
         OntologyCmd::Classify {
             file,
-            input,
             output,
             at,
             read,
@@ -443,29 +420,9 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             if !["ofn", "json", "text"].contains(&format.as_str()) {
                 bail!("unknown --format {format}: ofn, json or text");
             }
-            if input.is_some() || !rest.is_empty() || !output.is_empty() {
-                if at.loc.is_some() || at.server.is_some() || target.is_some() {
-                    bail!(
-                        "a chain reads a FILE (--input) and writes files: leave out --loc, --server and --target"
-                    );
-                }
-                let (input, rest) = chain_input(input, file, rest)?;
-                return ontology_chain::run(
-                    ontology_chain::Step::Classify(ontology_chain::ClassifyStep {
-                        about,
-                        allow_unsatisfiable,
-                        format,
-                        io: ontology_chain::Io {
-                            input: Some(input),
-                            loc: None,
-                            output,
-                            read,
-                            threads,
-                            rest,
-                        },
-                    }),
-                    opts,
-                );
+            let chain = chain_head(&file, &at, &rest, &output)?;
+            if chain.is_some() && target.is_some() {
+                bail!("--target writes to a database: a chain from a FILE writes files");
             }
             let about = about
                 .as_deref()
@@ -507,7 +464,10 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 Ok((j, doc))
             };
             let (j, doc) = match (file, loc) {
-                (Some(_), Some(_)) => bail!("classify a FILE or a database (--loc), not both"),
+                (Some(f), Some(_)) => {
+                    not_a_chain(&f)?;
+                    bail!("classify a FILE or a database (--loc), not both")
+                }
                 (Some(_), None) if at.server.is_some() => {
                     bail!("classify a FILE or a dataset on --server, not both")
                 }
@@ -531,7 +491,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     }
                 }
                 (None, Some(loc)) => {
-                    let ds = crate::open_dataset(loc, opts)?;
+                    let ds = crate::open_dataset(loc, opts.clone())?;
                     local_run(&ds, &name_of(loc))?
                 }
                 (None, None) => {
@@ -563,14 +523,14 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     (j, doc)
                 }
             };
-            if !finish_classify(&j, &doc, &format, allow_unsatisfiable)? {
-                std::process::exit(1);
+            let ok = finish_classify(&j, &doc, &format, allow_unsatisfiable)?;
+            match chain {
+                Some(f) => ontology_chain::resume(&f, &read, threads, output, rest, ok, opts),
+                None if !ok => std::process::exit(1),
+                None => Ok(()),
             }
-            Ok(())
         }
-        OntologyCmd::Reason(a) => {
-            ontology_chain::run(ontology_chain::Step::Reason(Box::new(a)), opts)
-        }
+        OntologyCmd::Reason(a) => ontology_chain::run(ontology_chain::Step::Reason(a), opts),
         OntologyCmd::Reduce(a) => ontology_chain::run(ontology_chain::Step::Reduce(a), opts),
         OntologyCmd::Relax(a) => ontology_chain::run(ontology_chain::Step::Relax(a), opts),
         OntologyCmd::Edit {
@@ -644,21 +604,38 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
     }
 }
 
-/// The input of a chain that starts with `classify` or `check`: `--input`, with a FILE
-/// given beside it taken as the first word of the rest, or the FILE.
-fn chain_input(
-    input: Option<PathBuf>,
-    file: Option<PathBuf>,
-    mut rest: Vec<String>,
-) -> Result<(PathBuf, Vec<String>)> {
-    match (input, file) {
-        (Some(i), Some(f)) => {
-            rest.insert(0, f.to_string_lossy().into_owned());
-            Ok((i, rest))
-        }
-        (Some(i), None) | (None, Some(i)) => Ok((i, rest)),
-        (None, None) => bail!("name the ontology file: FILE or --input FILE"),
+/// The file a chain that starts with `classify FILE` or `check FILE` reads, or `None`
+/// when the command is alone. FILE is the first positional argument, and the next
+/// command of the chain is the second, so the boundary between them is exact.
+fn chain_head(
+    file: &Option<PathBuf>,
+    at: &Target,
+    rest: &[String],
+    output: &[PathBuf],
+) -> Result<Option<PathBuf>> {
+    if rest.is_empty() && output.is_empty() {
+        return Ok(None);
     }
+    match file {
+        Some(f) if at.loc.is_none() && at.server.is_none() => Ok(Some(f.clone())),
+        _ => bail!(
+            "a chain from classify or check starts with a FILE; a chain from a database starts with reason, reduce or relax and --loc"
+        ),
+    }
+}
+
+/// Refuse a command name where FILE stands beside `--loc`, which would start a chain from
+/// a database, with the commands that can.
+fn not_a_chain(f: &Path) -> Result<()> {
+    if matches!(
+        f.to_str(),
+        Some("reason" | "reduce" | "relax" | "classify" | "check")
+    ) {
+        bail!(
+            "a chain from a database starts with reason, reduce or relax and --loc, not with classify or check"
+        );
+    }
+    Ok(())
 }
 
 /// The classification of an ontology file read without a database, as the answer's

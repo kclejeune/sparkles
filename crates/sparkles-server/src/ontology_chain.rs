@@ -138,6 +138,9 @@ pub struct RelaxArgs {
 /// `classify` as a later command of a chain.
 #[derive(Args, Debug, Clone)]
 pub struct ClassifyStep {
+    /// Classify the assertions too: the types of each individual
+    #[arg(long)]
+    pub assertions: bool,
     /// Describe this class
     #[arg(long)]
     pub about: Option<String>,
@@ -202,22 +205,59 @@ impl Step {
 /// Run a chain from its first command.
 pub fn run(first: Step, opts: StoreOptions) -> Result<()> {
     let mut state: Option<WorkingOntology> = None;
-    let mut step = first;
-    loop {
-        let rest = step.io().rest.clone();
-        let ok = run_step(step, &mut state, &opts)?;
-        if !ok {
-            std::process::exit(1);
-        }
-        if rest.is_empty() {
-            return Ok(());
-        }
+    let rest = first.io().rest.clone();
+    if !run_step(first, &mut state, &opts)? {
+        std::process::exit(1);
+    }
+    follow(state, rest, &opts)
+}
+
+/// Continue a chain whose first command, `classify FILE` or `check FILE`, has answered
+/// from the file as it does alone (`ok` is its answer): read FILE as the working
+/// ontology, write it to `output`, and run the commands of `rest` on it.
+pub fn resume(
+    file: &Path,
+    read: &Read,
+    threads: usize,
+    output: Vec<PathBuf>,
+    rest: Vec<String>,
+    ok: bool,
+    opts: StoreOptions,
+) -> Result<()> {
+    for o in &output {
+        OutputFormat::of(o)?;
+    }
+    if !ok {
+        std::process::exit(1);
+    }
+    let q = QueryOptions::default();
+    let w = WorkingOntology::read(file, &read.request()?, threads, &q)
+        .with_context(|| format!("cannot read {}", file.display()))?;
+    for o in &output {
+        w.write(o)
+            .with_context(|| format!("cannot write {}", o.display()))?;
+    }
+    follow(Some(w), rest, &opts)
+}
+
+/// Run the commands of `rest` on the working ontology, one after another.
+fn follow(
+    mut state: Option<WorkingOntology>,
+    mut rest: Vec<String>,
+    opts: &StoreOptions,
+) -> Result<()> {
+    while !rest.is_empty() {
         let args = std::iter::once("sparkles ontology".to_string()).chain(rest);
-        step = match Next::try_parse_from(args) {
+        let step = match Next::try_parse_from(args) {
             Ok(n) => n.step,
             Err(e) => e.exit(),
         };
+        rest = step.io().rest.clone();
+        if !run_step(step, &mut state, opts)? {
+            std::process::exit(1);
+        }
     }
+    Ok(())
 }
 
 /// One command: false when it ends the chain with exit status 1, as a classification
@@ -279,6 +319,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
                 .map(|s| s.trim_start_matches('<').trim_end_matches('>').to_string());
             let c = ClassifyRequest {
                 about: about.clone(),
+                assertions: a.assertions,
                 ..c.clone()
             };
             let file = w.to_file()?;

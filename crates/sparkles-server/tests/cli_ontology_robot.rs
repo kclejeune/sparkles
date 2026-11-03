@@ -68,8 +68,20 @@ fn axioms(path: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+const ABOX: &str = r#"Prefix(:=<http://ex.org/>)
+Ontology(
+Declaration(Class(:A))
+Declaration(Class(:C))
+Declaration(NamedIndividual(:a))
+DisjointClasses(:A :C)
+ClassAssertion(:A :a)
+ClassAssertion(:C :a)
+)
+"#;
+
 fn setup() -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("abox.ofn"), ABOX).unwrap();
     std::fs::write(d.path().join("o.ofn"), ONTO).unwrap();
     std::fs::write(d.path().join("unsat.ofn"), UNSAT).unwrap();
     d
@@ -189,16 +201,76 @@ fn classify_and_check_in_a_chain() {
     assert!(s.contains("OWL 2 EL: conforms"), "{s}");
     assert!(s.contains("consistent: "), "{s}");
     assert!(dir.join("y.ofn").exists());
-    // a chain can start from classify, with --input or FILE
+    // a chain can start from classify FILE, and the -o after relax is relax's
     let o = sparkles(
         dir,
         &[
-            "ontology", "classify", "--input", "o.ofn", "--format", "text", "relax", "--output",
-            "z.ofn",
+            "ontology", "classify", "o.ofn", "--format", "text", "relax", "-o", "z.ofn",
         ],
     );
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
-    assert!(dir.join("z.ofn").exists());
+    assert!(out(&o).starts_with("consistent"), "{}", out(&o));
+    let z = axioms(&dir.join("z.ofn"));
+    assert!(
+        z.contains("SubClassOf(:CerebellarNeuron ObjectSomeValuesFrom(:partOf :Cerebellum))"),
+        "{z:?}"
+    );
+    // and from check FILE, whose diagnostics are those of check alone
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "check",
+            "o.ofn",
+            "--profile",
+            "el",
+            "-o",
+            "c.ofn",
+            "relax",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let alone = sparkles(dir, &["ontology", "check", "o.ofn", "--profile", "el"]);
+    assert_eq!(out(&o), out(&alone));
+    assert_eq!(axioms(&dir.join("c.ofn")), axioms(&dir.join("o.ofn")));
+    // a chain from a database starts with reason, reduce or relax
+    let o = sparkles(dir, &["ontology", "classify", "--loc", "db", "relax"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(
+        err(&o).contains("starts with reason, reduce or relax"),
+        "{}",
+        err(&o)
+    );
+    // a classify later in a chain classifies the assertions only with --assertions, as
+    // classify alone does: the assertions of abox.ofn are inconsistent
+    let first = |args: &[&str]| {
+        let mut a = vec!["ontology"];
+        a.extend_from_slice(args);
+        let o = sparkles(dir, &a);
+        let s = out(&o);
+        (o.status.code(), s.lines().next().unwrap_or("").to_string())
+    };
+    let without = first(&["relax", "-i", "abox.ofn", "classify", "--format", "text"]);
+    let with = first(&[
+        "relax",
+        "-i",
+        "abox.ofn",
+        "classify",
+        "--assertions",
+        "--format",
+        "text",
+    ]);
+    assert_eq!(
+        without,
+        first(&["classify", "abox.ofn", "--format", "text"])
+    );
+    assert_eq!(
+        with,
+        first(&["classify", "abox.ofn", "--assertions", "--format", "text"])
+    );
+    assert_eq!(without.0, Some(0), "{without:?}");
+    assert_eq!(with.0, Some(1), "{with:?}");
+    assert!(with.1.starts_with("inconsistent"), "{with:?}");
     // a failing classification ends the chain with status 1
     let o = sparkles(
         dir,
@@ -337,4 +409,38 @@ fn reason_from_rdf_xml_and_a_database() {
         axioms(&dir.join("r3.ofn"))
             .contains("SubClassOf(<http://ex.org/CerebellarNeuron> <http://ex.org/Neuron>)")
     );
+}
+
+#[test]
+fn functional_style_files_keep_n_ary_and_annotated_axioms() {
+    let d = setup();
+    let dir = d.path();
+    std::fs::write(
+        dir.join("n.ofn"),
+        r#"Prefix(:=<http://ex.org/>)
+Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)
+Ontology(
+EquivalentClasses(:A :B :C)
+SubClassOf(:A :D)
+SubClassOf(Annotation(rdfs:comment "x") :A :D)
+)
+"#,
+    )
+    .unwrap();
+    // through a gzipped functional-style file and back
+    let o = sparkles(dir, &["ontology", "relax", "-i", "n.ofn", "-o", "n.ofn.gz"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = sparkles(
+        dir,
+        &["ontology", "reduce", "-i", "n.ofn.gz", "-o", "m.ofn"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let a = axioms(&dir.join("m.ofn"));
+    for ax in [
+        "EquivalentClasses(:A :B :C)",
+        "SubClassOf(:A :D)",
+        "SubClassOf(Annotation(rdfs:comment \"x\") :A :D)",
+    ] {
+        assert!(a.contains(ax), "{ax}: {a:?}");
+    }
 }

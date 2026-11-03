@@ -307,12 +307,15 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   ontology with `--output` as functional-style syntax (`.ofn`), RDF/XML (`.owl`), Turtle
   (`.ttl`) or N-Triples (`.nt`), each optionally gzipped. They chain in one process as
   ROBOT's commands do, as in
-  `sparkles ontology reason --input x.owl relax reduce --output y.owl`, and `classify`
-  and `check` can join a chain to classify or check the ontology at that point. The
+  `sparkles ontology reason --input x.owl relax reduce --output y.owl`. `classify` and
+  `check` can join a chain to classify or check the ontology at that point, and a chain
+  can start from `classify FILE` or `check FILE`, which answer as they do alone. A chain
+  from a database starts with `reason`, `reduce` or `relax` and `--loc`. The
   classifier stands in for ELK, so `--reasoner` accepts ROBOT's other reasoners with a
   warning, and the queries ELK does not answer, such as the disjoint classes and the
   property hierarchy, add no axioms, as they add none in ROBOT. Errors and the exit
-  status 1 follow ROBOT's. The outputs equal ROBOT's axiom for axiom on GO and ChEBI lite
+  status 1 follow ROBOT's, and a malformed command line exits with status 2, as every
+  `sparkles` command does. The outputs equal ROBOT's axiom for axiom on GO and ChEBI lite
   ([ROBOT comparison](../benchmarks/el-classification/RESULTS.md#robot)). The commands
   read no `--server`, which item NEW-ITEM-1 follows, write no OWL/XML, Manchester, OBO
   or OBO Graphs JSON, item NEW-ITEM-2, and refuse `--prevent-invalid-references true`,
