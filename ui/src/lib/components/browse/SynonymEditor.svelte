@@ -66,7 +66,7 @@
   let eSources = $state<string[]>([]);
   let ePending = $state('');
   /** The synonym as editing began, kept when another writer's commit changes or removes it. */
-  let editBase: Stated | null = null;
+  let editBase = $state<Stated | null>(null);
   function begin(s: Stated) {
     editing = statementKey(s);
     editBase = s;
@@ -77,11 +77,19 @@
     eLang = p.lang;
     eSources = sourcesOf(s);
   }
-  const editRow = $derived(
+  const live = $derived(
     editing ? (synonyms.find((s) => statementKey(s) === editing) ?? null) : null,
   );
+  /**
+   * Whether another writer's commit changed or removed the synonym being edited. The row
+   * then stays open above the list with the whole draft, and its preview adds the draft
+   * with the annotations the synonym had, beside whatever the other writer left.
+   */
+  const gone = $derived(!!editing && !live);
+  const editRow = $derived(live ?? (editing ? editBase : null));
   const eDirty = $derived.by(() => {
     if (!editRow) return false;
+    if (gone) return true;
     const p = valueParts(editRow.value);
     return (
       eKind !== editRow.property ||
@@ -90,37 +98,28 @@
       withPending(eSources, ePending).join('\n') !== sourcesOf(editRow).join('\n')
     );
   });
-  // a commit by another writer that changes the synonym being edited ends the row, and the
-  // draft moves to the add row, so the typed text is not lost
-  $effect(() => {
-    if (!editing || editRow) return;
-    const base = untrack(() => editBase);
-    if (base) {
-      aKind = eKind;
-      aText = eText;
-      aLang = eLang;
-      aTouched = true;
-    }
-    editing = null;
-    editBase = null;
-  });
   function save() {
     if (!editRow || !eDirty || !eText.trim() || !validLang(eLang.trim())) return;
-    const op = statementOp(
-      'owl',
-      iri,
-      editRow,
-      {
-        property: eKind,
-        value: textLit(eText.trim(), eLang),
-        sources: withPending(eSources, ePending),
-      },
-      graph,
-    );
+    const draft = {
+      property: eKind,
+      value: textLit(eText.trim(), eLang),
+      sources: withPending(eSources, ePending),
+    };
+    const op = gone
+      ? statementOp('owl', iri, null, draft, graph, editBase)
+      : statementOp('owl', iri, editRow, draft, graph);
+    const was = valueParts(editRow.value).text;
     if (op)
-      onedit(op, `Change the synonym ${valueParts(editRow.value).text} of ${title}`, () => {
-        editing = null;
-      });
+      onedit(
+        op,
+        gone
+          ? `Add the synonym ${eText.trim()} to ${title}`
+          : `Change the synonym ${was} of ${title}`,
+        () => {
+          editing = null;
+          editBase = null;
+        },
+      );
   }
 
   // --- the add row --------------------------------------------------------------------------
@@ -158,45 +157,21 @@
   <h2 id="syn-edit-h">
     Synonyms {#if synonyms.length}<span class="count-badge">{synonyms.length}</span>{/if}
   </h2>
+  {#if gone && editBase}
+    <ul class="erows">
+      {@render editForm(editBase)}
+    </ul>
+    <p class="gone-note" role="status">
+      Another commit changed the synonym {valueParts(editBase.value).text}. Preview adds your
+      version beside what is there now.
+    </p>
+  {/if}
   {#if rows.length}
     <ul class="erows">
       {#each rows as s (statementKey(s))}
         {@const own = inGraph(s, graph)}
         {#if editing === statementKey(s)}
-          <li
-            class="erow editing"
-            data-edit-form
-            data-dirty={eDirty ? 'true' : 'false'}
-            aria-label="Edit the synonym {valueParts(s.value).text}"
-          >
-            <select class="select sm" bind:value={eKind} aria-label="Kind">
-              {#each offered as [p, k] (p)}<option value={p}>{k}</option>{/each}
-            </select>
-            <input class="input sm txt" bind:value={eText} aria-label="Synonym" />
-            <input
-              class="input sm lng"
-              bind:value={eLang}
-              aria-label="Language"
-              aria-invalid={!validLang(eLang.trim())}
-            />
-            <span class="srcs"
-              ><SourceChips
-                bind:sources={eSources}
-                bind:pending={ePending}
-                label="the synonym"
-              /></span
-            >
-            <span class="row-acts">
-              <button type="button" class="btn sm" onclick={() => (editing = null)}>Cancel</button>
-              <button
-                type="button"
-                class="btn sm primary"
-                data-preview
-                disabled={!eDirty || !eText.trim() || !validLang(eLang.trim())}
-                onclick={save}>Preview change</button
-              >
-            </span>
-          </li>
+          {@render editForm(s)}
         {:else}
           <li class="erow" class:ro={!own}>
             <span class="k">{kindName(s.property)}</span>
@@ -269,6 +244,39 @@
   {/if}
 </section>
 
+{#snippet editForm(s: Stated)}
+  <li
+    class="erow editing"
+    data-edit-form
+    data-dirty={eDirty ? 'true' : 'false'}
+    aria-label="Edit the synonym {valueParts(s.value).text}"
+  >
+    <select class="select sm" bind:value={eKind} aria-label="Kind">
+      {#each offered as [p, k] (p)}<option value={p}>{k}</option>{/each}
+    </select>
+    <input class="input sm txt" bind:value={eText} aria-label="Synonym" />
+    <input
+      class="input sm lng"
+      bind:value={eLang}
+      aria-label="Language"
+      aria-invalid={!validLang(eLang.trim())}
+    />
+    <span class="srcs"
+      ><SourceChips bind:sources={eSources} bind:pending={ePending} label="the synonym" /></span
+    >
+    <span class="row-acts">
+      <button type="button" class="btn sm" onclick={() => (editing = null)}>Cancel</button>
+      <button
+        type="button"
+        class="btn sm primary"
+        data-preview
+        disabled={!eDirty || !eText.trim() || !validLang(eLang.trim())}
+        onclick={save}>Preview change</button
+      >
+    </span>
+  </li>
+{/snippet}
+
 <style>
   .erows {
     list-style: none;
@@ -304,6 +312,11 @@
     display: flex;
     justify-content: flex-end;
     gap: 6px;
+  }
+  .gone-note {
+    margin: 4px 0 var(--sp-2);
+    font-size: var(--fs-sm);
+    color: var(--text-2);
   }
   .k {
     color: var(--text-2);

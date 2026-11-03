@@ -146,6 +146,51 @@ open(
 );
 
 open(
+  'an annotated SKOS definition without SKOS declarations keeps its source',
+  async ({ page, request }) => {
+    const c = 'http://example.org/e2e-thesaurus/fish';
+    const SKOS = 'http://www.w3.org/2004/02/skos/core#';
+    const seed = await request.post(`/${DS}/update`, {
+      headers: { 'Content-Type': 'application/sparql-update' },
+      data:
+        `PREFIX owl: <http://www.w3.org/2002/07/owl#> PREFIX skos: <${SKOS}> ` +
+        `INSERT DATA { <${c}> a skos:Concept ; skos:prefLabel "fish"@en ; skos:definition "A cold animal." . ` +
+        `[] a owl:Axiom ; owl:annotatedSource <${c}> ; owl:annotatedProperty skos:definition ; ` +
+        `owl:annotatedTarget "A cold animal." ; <${OIO}hasDbXref> "ISBN:1" . }`,
+    });
+    expect(seed.ok(), await seed.text()).toBe(true);
+    await page.goto(`/ui/browse?ds=${DS}&iri=${encodeURIComponent(c)}&edit=1`);
+    const def = page.getByRole('textbox', { name: 'Definition', exact: true });
+    await expect(def).toHaveValue('A cold animal.');
+    await def.fill('A cold-blooded animal of the water.');
+    await page
+      .getByRole('group', { name: /^Definition/ })
+      .getByRole('button', { name: 'Preview change' })
+      .click();
+    await commit(page);
+    const ask = async (q: string) =>
+      (
+        await (
+          await request.post(`/${DS}/query`, {
+            headers: {
+              'Content-Type': 'application/sparql-query',
+              Accept: 'application/sparql-results+json',
+            },
+            data: `PREFIX owl: <http://www.w3.org/2002/07/owl#> PREFIX skos: <${SKOS}> ASK { ${q} }`,
+          })
+        ).json()
+      ).boolean;
+    expect(await ask(`<${c}> skos:definition "A cold animal."`)).toBe(false);
+    expect(await ask(`?a owl:annotatedTarget "A cold animal."`)).toBe(false);
+    expect(
+      await ask(
+        `<${c}> skos:definition "A cold-blooded animal of the water." . ?a owl:annotatedSource <${c}> ; owl:annotatedTarget "A cold-blooded animal of the water." ; <${OIO}hasDbXref> "ISBN:1"`,
+      ),
+    ).toBe(true);
+  },
+);
+
+open(
   'a parent through the entity search and an axiom through the Manchester parser',
   async ({ page }) => {
     await openEdit(page, DS, 9);
@@ -228,6 +273,59 @@ open(
     await expect(page.getByRole('region', { name: /^Synonyms/ })).toContainText(
       'tonoplast compartment',
     );
+  },
+);
+
+open(
+  'drafts survive another writer changing the definition and synonym being edited',
+  async ({ page, request }) => {
+    const DEF = 'http://purl.obolibrary.org/obo/IAO_0000115';
+    const update = (sparql: string) =>
+      request.post(`/${DS}/update`, {
+        headers: { 'Content-Type': 'application/sparql-update' },
+        data: sparql,
+      });
+    await openEdit(page, DS, 5);
+    const def = page.getByRole('textbox', { name: 'Definition', exact: true });
+    await def.fill('My draft of the definition.');
+    const syn = page.getByRole('region', { name: /^Synonyms/ });
+    await syn.getByRole('button', { name: 'Edit the synonym powerhouse of the cell' }).click();
+    await syn.getByRole('textbox', { name: 'Synonym', exact: true }).fill('cell powerhouse');
+
+    // another writer replaces the definition and removes the synonym
+    const cur = await (
+      await request.get(`/$/ontology/${DS}/term?iri=${encodeURIComponent(CELLO(5))}&graph=default`)
+    ).json();
+    const text = cur.statements.find((s: { property: string }) => s.property === DEF).value[
+      '@value'
+    ];
+    expect(
+      (
+        await update(
+          `DELETE DATA { <${CELLO(5)}> <${DEF}> ${JSON.stringify(text)} . <${CELLO(5)}> <${OIO}hasRelatedSynonym> "powerhouse of the cell" . } ;\n` +
+            `INSERT DATA { <${CELLO(5)}> <${DEF}> "Another writer's definition." . }`,
+        )
+      ).ok(),
+    ).toBe(true);
+
+    // the page follows the commit; the definition draft stands as a definition of its own
+    const defs = page.getByRole('textbox', { name: 'Definition', exact: true });
+    await expect(defs.first()).toHaveValue("Another writer's definition.", { timeout: 20_000 });
+    await expect(
+      page.getByText('Another commit changed this definition while you typed'),
+    ).toBeVisible();
+    await expect(page.getByRole('textbox', { name: 'Definition', exact: true }).last()).toHaveValue(
+      'My draft of the definition.',
+    );
+    // the synonym's draft stays open above the list and adds the synonym when previewed
+    await expect(syn.getByRole('status')).toContainText('Another commit changed the synonym');
+    await expect(syn.getByRole('textbox', { name: 'Synonym', exact: true })).toHaveValue(
+      'cell powerhouse',
+    );
+    await syn.getByRole('button', { name: 'Preview change' }).click();
+    await expect(preview(page)).toContainText('Add the synonym cell powerhouse');
+    await commit(page);
+    await expect(syn.locator('li', { hasText: 'cell powerhouse' })).toContainText('Related');
   },
 );
 

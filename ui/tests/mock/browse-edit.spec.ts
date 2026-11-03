@@ -261,6 +261,46 @@ test('SKOS edits: a label, a definition and a broader concept', async ({ page, r
   });
 });
 
+test('SKOS label edits wait for the labels of the commit the page shows', async ({
+  page,
+  request,
+}) => {
+  await onSession(request, 'thes', async () => {
+    await open(page, term('thes', TH + 'fish', '&edit=1'));
+    const branch = await startSession(page, 'skos');
+    const add = page.getByRole('form', { name: 'Add a label' });
+    await add.getByRole('combobox', { name: 'Kind', exact: true }).selectOption('hidden');
+    await add.getByRole('textbox', { name: 'Label' }).fill('fishes');
+    await add.getByRole('combobox', { name: 'Language' }).fill('en');
+    // after this commit the labels are read again, and that read is held back
+    const held: (() => Promise<void>)[] = [];
+    await page.route('**/sparql**', (route) => {
+      const body = route.request().postData() ?? '';
+      if (body.includes(TH + 'fish') && body.includes('prefLabel'))
+        held.push(() => route.continue());
+      else void route.continue();
+    });
+    await add.getByRole('button', { name: 'Add' }).click();
+    await commit(page);
+    await expect.poll(() => held.length).toBeGreaterThan(0);
+    await add.getByRole('textbox', { name: 'Label' }).fill('fishies');
+    await add.getByRole('combobox', { name: 'Language' }).fill('en');
+    await add.getByRole('button', { name: 'Add' }).click();
+    await expect(page.getByText('Reading the labels again')).toBeVisible();
+    await expect(preview(page)).toHaveCount(0);
+    // the draft is still there, and once the labels arrive the edit goes through
+    await expect(add.getByRole('textbox', { name: 'Label' })).toHaveValue('fishies');
+    for (const go of held.splice(0)) await go().catch(() => {});
+    await page.unroute('**/sparql**');
+    await expect(async () => {
+      await add.getByRole('button', { name: 'Add' }).click();
+      await expect(preview(page)).toBeVisible({ timeout: 1000 });
+    }).toPass();
+    await preview(page).getByRole('button', { name: 'Cancel' }).click();
+    return branch;
+  });
+});
+
 test('a refused write and a stale read are explained in the preview', async ({ page }) => {
   await open(page, term('uni', UNI + 'Student', '&edit=1'));
   await expect(bar(page)).toBeVisible();

@@ -20,8 +20,9 @@ import {
   type HeaderValue,
   type Lit,
   type Op,
+  termSparql,
 } from './ontology';
-import { WELL_KNOWN } from './rdf';
+import { sparqlIri, WELL_KNOWN } from './rdf';
 
 const RDF = WELL_KNOWN.rdf;
 const RDFS = WELL_KNOWN.rdfs;
@@ -73,7 +74,19 @@ const bareKey = (a: AxiomJson) => {
   return axiomKey(bare);
 };
 
-/** The annotation assertions of `axioms` in `graph` that state `s` about `iri`. */
+/**
+ * An assertion as the annotation assertion of the same triple. A property with a literal
+ * that the ontology does not declare, such as `skos:definition` in a thesaurus without the
+ * SKOS vocabulary, maps to a data property assertion, which states the same triple.
+ */
+const asAnnotation = (a: AxiomJson): AxiomJson | null =>
+  a.type === 'AnnotationAssertion'
+    ? a
+    : a.type === 'DataPropertyAssertion'
+      ? annotationAssertion(a.property as string, a.source as string, a.value as AnnValue)
+      : null;
+
+/** The assertions of `axioms` in `graph` that state `s` about `iri`, of either kind. */
 export function assertionsOf(
   iri: string,
   s: Pick<Statement, 'property' | 'value'>,
@@ -82,8 +95,27 @@ export function assertionsOf(
 ): AxiomJson[] {
   const k = bareKey(annotationAssertion(s.property, iri, annValue(s.value)));
   return axioms
-    .filter((a) => a.type === 'AnnotationAssertion' && inGraph(a, graph) && bareKey(a.axiom) === k)
+    .filter((a) => {
+      const as = inGraph(a, graph) ? asAnnotation(a.axiom) : null;
+      return !!as && bareKey(as) === k;
+    })
     .map((a) => a.axiom);
+}
+
+/**
+ * The assertion that states `property` and `value` about `iri`: of the kind the store keeps
+ * for the statement it replaces when the property stays and the value is a literal, so
+ * an undeclared property's triple is written as the same kind it was read as.
+ */
+function assertionLike(
+  like: AxiomJson | undefined,
+  iri: string,
+  property: string,
+  value: Value,
+): AxiomJson {
+  if (like?.type === 'DataPropertyAssertion' && like.property === property && isLiteral(value))
+    return { type: 'DataPropertyAssertion', property, source: iri, value };
+  return annotationAssertion(property, iri, annValue(value));
 }
 
 /** The statements with the assertions that state them in `graph`. */
@@ -154,6 +186,9 @@ export const withPending = (sources: string[], pending: string) => {
   return p && !sources.includes(p) ? [...sources, p] : sources;
 };
 
+/** A definition form's draft: its text, language and sources. */
+export type DefinitionDraft = { text: string; lang: string; sources: string[] };
+
 /** A statement as a form edits it: a property, a value, and the sources of an OWL page. */
 export type Draft = { property: string; value: Value; sources: string[] };
 
@@ -186,9 +221,15 @@ export function statementOp(
   before: Stated | null,
   after: Draft | null,
   graph: string | null,
+  /** The statement a draft began from when it is gone, whose annotations an addition keeps. */
+  basis?: Stated | null,
 ): Op | null {
   // a SKOS statement with axiom annotations, such as a definition's sources, is changed as
   // an annotation assertion, so its reification follows the new value
+  // an annotated SKOS triple whose assertion the term route did not answer, such as one
+  // past its limits, is changed in place, its reifications retargeted to the new value
+  if (mode === 'skos' && before?.annotations.length && !before.asserted?.length)
+    return { kind: 'update', sparql: retarget(iri, before, after, graph) };
   if (mode === 'skos' && !before?.annotations.length) {
     const remove: HeaderTriple[] = before
       ? [{ s: iri, p: before.property, o: headerValue(before.value) }]
@@ -200,11 +241,13 @@ export function statementOp(
     return { kind: 'update', sparql: dataUpdate(remove, add, graph).sparql };
   }
   const remove = before ? removalsOf(iri, before) : [];
-  const anns = after ? annotationsFor(before, after.sources) : [];
+  // a draft whose statement another writer changed keeps that statement's annotations
+  const base = before ?? basis ?? null;
+  const anns = after ? annotationsFor(base, after.sources) : [];
   const add: AxiomJson[] = after
     ? [
         {
-          ...annotationAssertion(after.property, iri, annValue(after.value)),
+          ...assertionLike(base?.asserted?.[0], iri, after.property, after.value),
           ...(anns.length ? { annotations: anns } : {}),
         },
       ]
@@ -212,6 +255,32 @@ export function statementOp(
   const d = diffAxioms(remove, add);
   if (!d.add.length && !d.remove.length) return null;
   return { kind: 'axioms', add: d.add, remove: d.remove };
+}
+
+/**
+ * The update that replaces the triple of `before` with that of `after`, or removes it, and
+ * moves the reifications of the old triple to the new one or removes them with it.
+ */
+function retarget(iri: string, before: Statement, after: Draft | null, graph: string | null) {
+  const wrap = (b: string) => (graph ? `GRAPH ${sparqlIri(graph)} { ${b} }` : b);
+  const s = sparqlIri(iri);
+  const oldP = sparqlIri(before.property);
+  const oldO = termSparql(headerValue(before.value));
+  const reified = `?a <${OWL}annotatedSource> ${s} ; <${OWL}annotatedProperty> ${oldP} ; <${OWL}annotatedTarget> ${oldO} .`;
+  const del = `${s} ${oldP} ${oldO} .`;
+  if (!after)
+    return (
+      `DELETE DATA { ${wrap(del)} } ;\n` +
+      `DELETE { ${wrap('?a ?x ?y .')} } WHERE { ${wrap(`${reified} ?a ?x ?y .`)} }`
+    );
+  const newP = sparqlIri(after.property);
+  const newO = termSparql(headerValue(after.value));
+  return (
+    `DELETE DATA { ${wrap(del)} } ;\nINSERT DATA { ${wrap(`${s} ${newP} ${newO} .`)} } ;\n` +
+    `DELETE { ${wrap(`?a <${OWL}annotatedProperty> ${oldP} ; <${OWL}annotatedTarget> ${oldO} .`)} } ` +
+    `INSERT { ${wrap(`?a <${OWL}annotatedProperty> ${newP} ; <${OWL}annotatedTarget> ${newO} .`)} } ` +
+    `WHERE { ${wrap(reified)} }`
+  );
 }
 
 const tripleKey = (t: HeaderTriple) => JSON.stringify([t.s, t.p, t.o]);

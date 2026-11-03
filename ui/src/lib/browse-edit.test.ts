@@ -370,10 +370,23 @@ describe('the assertions the store keeps', () => {
       graph: 'default',
       annotations: [xref('ISBN:1')],
     };
+    // the assertion the term route answers for it, declared as an annotation property
+    const stated = {
+      ...d,
+      asserted: [
+        {
+          type: 'AnnotationAssertion',
+          property: SKOS + 'definition',
+          subject: c,
+          value: d.value,
+          annotations: [xref('ISBN:1')],
+        },
+      ],
+    };
     const op = statementOp(
       'skos',
       c,
-      d,
+      stated,
       { property: SKOS + 'definition', value: textLit('new', ''), sources: sourcesOf(d) },
       null,
     );
@@ -385,5 +398,71 @@ describe('the assertions the store keeps', () => {
     expect(withPending(['A'], ' B ')).toEqual(['A', 'B']);
     expect(withPending(['A'], 'A')).toEqual(['A']);
     expect(withPending(['A'], '')).toEqual(['A']);
+  });
+});
+
+describe('SKOS triples the mapper reads as data property assertions', () => {
+  const c = 'http://example.org/thesaurus/fish';
+  const xref = { property: OIO + 'hasDbXref', value: { '@value': 'ISBN:1' } };
+  const d: Statement = {
+    property: SKOS + 'definition',
+    value: { '@value': 'old' },
+    graph: 'default',
+    annotations: [xref],
+  };
+  const stored: AxiomItem = {
+    type: 'DataPropertyAssertion',
+    ofn: '',
+    graph: 'default',
+    axiom: {
+      type: 'DataPropertyAssertion',
+      property: SKOS + 'definition',
+      source: c,
+      value: { '@value': 'old' },
+      annotations: [xref],
+    },
+  };
+
+  it('removes the stored assertion and adds one of the same kind', () => {
+    const [s] = withAssertions(c, [d], [stored], null);
+    expect(s.asserted).toEqual([stored.axiom]);
+    const op = statementOp(
+      'skos',
+      c,
+      s,
+      { property: SKOS + 'definition', value: textLit('new', ''), sources: sourcesOf(s) },
+      null,
+    );
+    expect(op).toEqual({
+      kind: 'axioms',
+      remove: [stored.axiom],
+      add: [
+        {
+          type: 'DataPropertyAssertion',
+          property: SKOS + 'definition',
+          source: c,
+          value: { '@value': 'new' },
+          annotations: [xref],
+        },
+      ],
+    });
+  });
+
+  it('retargets the reifications when no assertion was answered', () => {
+    const op = statementOp(
+      'skos',
+      c,
+      d,
+      { property: SKOS + 'definition', value: textLit('new', ''), sources: [] },
+      'urn:g',
+    );
+    if (op?.kind !== 'update') throw new Error('expected an update');
+    expect(op.sparql).toContain(
+      `DELETE DATA { GRAPH <urn:g> { <${c}> <${SKOS}definition> "old" . } }`,
+    );
+    expect(op.sparql).toContain(
+      `INSERT DATA { GRAPH <urn:g> { <${c}> <${SKOS}definition> "new" . } }`,
+    );
+    expect(op.sparql).toContain('owl#annotatedTarget> "new"');
   });
 });

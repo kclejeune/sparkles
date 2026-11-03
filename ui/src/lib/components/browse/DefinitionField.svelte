@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   // One definition of an entity in edit mode (ROADMAP item 630): the text in the lede's
   // type, its language and, on an OWL page, its sources. Preview change hands the edit to
   // the page, which previews and commits it as the editors do. A definition that is new
@@ -14,6 +14,7 @@
     withPending,
     type EditMode,
     type OnEdit,
+    type DefinitionDraft,
     type Stated,
   } from '$lib/browse-edit';
   import { validLang } from '$lib/ontology';
@@ -31,6 +32,9 @@
     onedit,
     oncancel,
     autofocus = false,
+    initial,
+    onorphan,
+    note,
   }: {
     mode: EditMode;
     iri: string;
@@ -45,6 +49,12 @@
     /** Cancel on a new definition, which takes the field away. */
     oncancel?: () => void;
     autofocus?: boolean;
+    /** A draft to start from instead of `before`, such as one another writer's commit left. */
+    initial?: DefinitionDraft;
+    /** Hands over a typed draft when the field goes away without its change committing. */
+    onorphan?: (d: DefinitionDraft) => void;
+    /** Why the field holds a draft of its own, shown above it. */
+    note?: string;
   } = $props();
 
   const uid = Math.random().toString(36).slice(2, 8);
@@ -64,6 +74,11 @@
     sources = sourcesOf(before);
     pending = '';
     base = fields();
+    if (initial && !before) {
+      text = initial.text;
+      lang = initial.lang;
+      sources = initial.sources;
+    }
   }
   /** The fields as the form last showed the definition, so a typed draft is told apart. */
   let base = '';
@@ -93,6 +108,12 @@
       withPending(sources, pending).join('\n') !== original.sources.join('\n'),
   );
   const problem = $derived(!validLang(lang.trim()) ? 'The language tag is not valid.' : null);
+  // the page keys a field by its statement, so another writer's change to the text ends the
+  // field; a typed draft then goes to the page, which shows it as a definition of its own
+  onDestroy(() => {
+    if (!committed && fields() !== base)
+      onorphan?.({ text, lang, sources: withPending(sources, pending) });
+  });
 
   function preview() {
     if (!dirty || problem) return;
@@ -122,6 +143,7 @@
   }
 </script>
 
+{#if note}<p class="note" role="status">{note}</p>{/if}
 <div
   class="def"
   class:dirty
@@ -193,6 +215,11 @@
 </div>
 
 <style>
+  .note {
+    margin: 0 0 -4px;
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+  }
   .def {
     display: grid;
     gap: var(--sp-2);

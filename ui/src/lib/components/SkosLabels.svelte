@@ -48,7 +48,8 @@
     /** The language tags the thesaurus uses, offered first. */
     langs: string[];
     readonly: boolean;
-    onedit: (sparql: string, label: string) => void;
+    /** Previews an edit; `false` means the caller did not take it, so the form keeps its text. */
+    onedit: (sparql: string, label: string) => void | boolean;
     /** Whether the graph already uses an IRI, so a minted SKOS-XL label IRI is new. */
     isUsed?: (iri: string) => Promise<boolean>;
     /** What the page edits (target and graph): an edit read for another one is dropped. */
@@ -116,11 +117,11 @@
 
   function add() {
     if (!draft.value || draftProblem) return;
-    onedit(
+    const took = onedit(
       labelEdit(iri, [], [{ kind, label: draft }], graph),
       `Add the ${KIND_NAME[kind].toLowerCase()} label ${shown(draft)} to ${name}`,
     );
-    text = '';
+    if (took !== false) text = '';
   }
 
   function replacePreferred() {
@@ -170,7 +171,7 @@
       return;
     }
     const what = `Change the ${KIND_NAME[e.kind].toLowerCase()} label ${shown(e.label)} of ${name} to ${shown(editDraft)}`;
-    onedit(
+    const took = onedit(
       e.xl
         ? xlFormEdit(iri, e.kind, e.xl, e.label, editDraft, graph)
         : labelEdit(
@@ -181,7 +182,7 @@
           ),
       what,
     );
-    editing = null;
+    if (took !== false) editing = null;
   }
 
   function remove(e: LabelEntry) {

@@ -21,9 +21,9 @@
     parentRows,
     parentsEditable,
     toAnnotation,
-    valueParts,
+    statementKey,
     withAssertions,
-    type Stated,
+    type DefinitionDraft,
     type EditMode,
     type OnEdit,
   } from '$lib/browse-edit';
@@ -530,7 +530,8 @@
   // kept with the target, graph and entity it was read for, so the forms never pair one
   // concept's labels with another's IRI and tag, and read again at each commit, dropping a
   // superseded answer; the forms stay mounted across a commit so their drafts survive
-  let read = $state<{ key: string; details: Details } | null>(null);
+  let read = $state<{ key: string; commit: number; details: Details } | null>(null);
+  let detailsTry = $state(0);
   const detailsKey = $derived(
     term && termTarget ? JSON.stringify([termTarget, graph, term.iri]) : '',
   );
@@ -541,11 +542,12 @@
     const t = termTarget!;
     const r = term.iri;
     const g = graph;
-    void term.commit;
+    const commit = term.commit;
+    void detailsTry;
     let live = true;
     api.select(t, detailsQuery(r, g), { nocache: true }).then(
       (rows) => {
-        if (live && key === detailsKey) read = { key, details: parseDetails(r, rows) };
+        if (live && key === detailsKey) read = { key, commit, details: parseDetails(r, rows) };
       },
       (e) => {
         if (live) toasts.error('Could not read the labels', e);
@@ -553,6 +555,23 @@
     );
     return () => (live = false);
   });
+  /**
+   * A SKOS edit built from the details, previewed only when they were read at the commit the
+   * page shows, so a label another writer changed is never replaced by its old reading.
+   */
+  function skosEdit(sparql: string, label: string) {
+    if (!read || !term || read.commit !== term.commit) {
+      toasts.push(
+        'info',
+        'Reading the labels again',
+        'Another commit changed this concept. Try again in a moment.',
+      );
+      detailsTry++;
+      return false;
+    }
+    onedit({ kind: 'update', sparql }, label);
+    return true;
+  }
   const skosLangs = $derived([
     ...new Set([
       ...(details?.labels ?? []).map((l) => l.label.lang).filter(Boolean),
@@ -572,15 +591,15 @@
       : (MAPPING_NAME[p] ?? p).toLowerCase();
   function addLink(property: string, other: string, picked?: string) {
     if (!term) return;
-    onedit(
-      { kind: 'update', sparql: linkEdit(term.iri, property, other, false, graph) },
+    skosEdit(
+      linkEdit(term.iri, property, other, false, graph),
       `Add ${picked ?? linker.name(other)} as ${linkWord(property)} of ${title}`,
     );
   }
   function removeLink(property: string, other: string) {
     if (!term) return;
-    onedit(
-      { kind: 'update', sparql: linkEdit(term.iri, property, other, true, graph) },
+    skosEdit(
+      linkEdit(term.iri, property, other, true, graph),
       `Remove ${linker.name(other)} as ${linkWord(property)} of ${title}`,
     );
   }
@@ -598,15 +617,19 @@
       : [],
   );
   /**
-   * A definition's place, by graph, property, language and order, so another writer's change
-   * to its text keeps the field and the draft it holds.
+   * Drafts of definitions that another writer's commit changed while they were typed, each
+   * shown as a definition of its own until it is previewed or cancelled.
    */
-  function definitionSlot(i: number) {
-    const slot = (d: Stated) =>
-      JSON.stringify([d.graph, d.property, valueParts(d.value).lang.toLowerCase()]);
-    const k = slot(definitions[i]);
-    return `${k}#${definitions.slice(0, i).filter((d) => slot(d) === k).length}`;
+  let orphans = $state<{ id: number; draft: DefinitionDraft }[]>([]);
+  let orphanId = 0;
+  function keepOrphan(draft: DefinitionDraft) {
+    if (editing && term?.iri === iri) orphans = [...orphans, { id: ++orphanId, draft }];
   }
+  const dropOrphan = (id: number) => (orphans = orphans.filter((o) => o.id !== id));
+  $effect(() => {
+    void iri;
+    if (!editing) untrack(() => (orphans = []));
+  });
   let addingDefinition = $state(false);
   const synonymStatements = $derived(
     stated.filter((s) => SYNONYM_KINDS.some(([p]) => p === s.property)),
@@ -1054,7 +1077,7 @@
           </TermHeader>
           {#if editing}
             <div class="defs" aria-label="Definitions" role="group">
-              {#each definitions as d, i (definitionSlot(i))}
+              {#each definitions as d (statementKey(d))}
                 {#if inGraph(d, graph)}
                   <DefinitionField
                     {mode}
@@ -1064,6 +1087,7 @@
                     {graph}
                     {readonly}
                     {onedit}
+                    onorphan={keepOrphan}
                   />
                 {:else}
                   <p class="def-ro">
@@ -1071,6 +1095,24 @@
                     <span class="from">from {d.graph}, not editable here</span>
                   </p>
                 {/if}
+              {/each}
+              {#each orphans as o (o.id)}
+                <DefinitionField
+                  {mode}
+                  iri={term.iri}
+                  {title}
+                  before={null}
+                  {graph}
+                  initial={o.draft}
+                  note="Another commit changed this definition while you typed. Preview adds your text as a definition of its own."
+                  {readonly}
+                  onedit={(op, label, after) =>
+                    onedit(op, label, () => {
+                      after?.();
+                      dropOrphan(o.id);
+                    })}
+                  oncancel={() => dropOrphan(o.id)}
+                />
               {/each}
               {#if addingDefinition || !definitions.some((d) => inGraph(d, graph))}
                 <DefinitionField
@@ -1081,7 +1123,11 @@
                   {graph}
                   lang={defaultLang}
                   {readonly}
-                  onedit={(op, label) => onedit(op, label, () => (addingDefinition = false))}
+                  onedit={(op, label, after) =>
+                    onedit(op, label, () => {
+                      after?.();
+                      addingDefinition = false;
+                    })}
                   oncancel={addingDefinition ? () => (addingDefinition = false) : undefined}
                   autofocus={addingDefinition}
                 />
@@ -1227,7 +1273,7 @@
                       {graph}
                       langs={skosLangs}
                       {readonly}
-                      onedit={(sparql, label) => onedit({ kind: 'update', sparql }, label)}
+                      onedit={skosEdit}
                       scope={`${target}|${graph ?? ''}`}
                       isUsed={async (i) => {
                         const r = await api.query(target, usedQuery(i, graph), { nocache: true });
