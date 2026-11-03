@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Time the classifier beside ELK, Whelk, Konclude, HermiT and ROBOT on forge, the
+# benchmark host, for roadmap items 604 and 606. Each run takes the bench lock and the
+# heavy lock for itself, so the lanes that share forge can run between runs.
+#
+# Usage: forge-measure.sh DIR
+#   DIR holds bin/el_classify, bin/sparkles, data/{go,chebi_lite}.{ofn,owl}, data/ore/*.owl,
+#   scripts/elk-compare, scripts/el-oracle.py, timed.py and paths.env, which names
+#   ELK_CLASSIFY, HERMIT_CLASSIFY, WHELK_CLASSIFY, KONCLUDE and ROBOT as store paths that
+#   were copied to forge's store (stage-forge.sh). Nothing is built here.
+#
+# GO and ChEBI lite run on 1 and 8 threads with 5 classifications per process. The 8 ORE
+# 2015 EL ontologies with the most classes run on 1 and 8 threads with 3. Whelk and HermiT
+# classify on one thread only. Konclude starts one process per classification. ROBOT
+# reason and `sparkles ontology classify` run 3 times each, end to end from the release
+# file. Every run has an explicit heap where it is a JVM, a timeout and a memory cap.
+set -uo pipefail
+D=$(cd "$1" && pwd) || exit 1
+cd "$D" || exit 1
+# shellcheck source=/dev/null
+. ./paths.env
+export ELK_CLASSIFY HERMIT_CLASSIFY WHELK_CLASSIFY KONCLUDE ROBOT
+for p in "$ELK_CLASSIFY" "$HERMIT_CLASSIFY" "$WHELK_CLASSIFY" "$KONCLUDE" "$ROBOT"; do
+  [ -x "$p" ] || {
+    echo "missing $p: copy the packages to forge first" >&2
+    exit 1
+  }
+done
+export ELK_WORK=$D/elk-work
+MEM=${MEM:-12G}
+OUT=$D/out-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT"
+ELK=scripts/elk-compare/elk.sh
+{
+  echo "host=$(hostname)"
+  echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')"
+  echo "cpus=$(nproc)"
+  echo "ram_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
+  echo "kernel=$(uname -r)"
+  echo "disk_free=$(df -h / | awk 'NR==2{print $4}')"
+  echo "el_classify_sha256=$(sha256sum bin/el_classify | cut -d' ' -f1)"
+  echo "sparkles_sha256=$(sha256sum bin/sparkles | cut -d' ' -f1)"
+  echo "harness_sha256=$(sha256sum scripts/elk-compare/ElkClassify.java | cut -d' ' -f1)"
+  echo "konclude_py_sha256=$(sha256sum scripts/elk-compare/konclude.py | cut -d' ' -f1)"
+  cat paths.env
+  for f in data/*.ofn data/*.owl data/ore/*.owl; do echo "data_sha256 $f=$(sha256sum "$f" | cut -d' ' -f1)"; done
+  echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$OUT/env.txt"
+
+# locked LABEL COMMAND...: one run under both locks, logged with the host's load
+locked() {
+  local label=$1
+  shift
+  (
+    flock 9
+    flock 8
+    echo "$label locked=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$OUT/env.txt"
+    "$@"
+  ) 9> "$HOME/lanes/.bench.lock" 8> "$HOME/lanes/.heavy.lock"
+}
+
+# one NAME INPUT REASONER THREADS REPEAT HEAP TIMEOUT: a reasoner's run, appended to its log
+one() {
+  local name=$1 input=$2 which=$3 t=$4 repeat=$5 heap=$6 limit=$7 line s
+  local tax=$OUT/$name.$which.t$t.ofn
+  if [ "$which" = ours ]; then
+    tax=$OUT/$name.ours.t$t.txt
+    line=$(locked "ours-$name-t$t" timeout "$limit" systemd-run --user --scope --quiet -p "MemoryMax=$MEM" \
+      -p MemorySwapMax=0 -p OOMPolicy=continue bin/el_classify --threads "$t" --repeat "$repeat" \
+      --taxonomy "$tax" "$input" 2>> "$OUT/ours.err")
+  else
+    line=$(locked "$which-$name-t$t" env ELK_HEAP="$heap" ELK_MEM_MAX="$MEM" timeout "$limit" "$ELK" run \
+      --reasoner "$which" --threads "$t" --repeat "$repeat" --taxonomy "$tax" "$input" 2>> "$OUT/$which.err")
+  fi
+  s=$?
+  if [ $s = 0 ]; then
+    echo "$line" >> "$OUT/$which.jsonl"
+  else
+    echo "{\"input\":\"$input\",\"reasoner\":\"$which\",\"threads\":$t,\"failed\":$s,\"timeout\":$([ $s = 124 ] && echo true || echo false)}" \
+      >> "$OUT/$which.jsonl"
+  fi
+}
+
+for o in go chebi_lite; do
+  for t in 1 8; do
+    one "$o" "data/$o.ofn" ours "$t" 5 - 1800
+    one "$o" "data/$o.ofn" elk "$t" 5 4g 1800
+    one "$o" "data/$o.ofn" konclude "$t" 5 - 3600
+  done
+  one "$o" "data/$o.ofn" whelk 1 5 8g 3600
+  one "$o" "data/$o.ofn" hermit 1 3 8g 3600
+done
+
+for f in data/ore/*.owl; do
+  n=$(basename "$f" .owl)
+  for t in 1 8; do
+    one "$n" "$f" ours "$t" 3 - 1800
+    one "$n" "$f" elk "$t" 3 8g 1800
+    one "$n" "$f" konclude "$t" 3 - 3600
+  done
+  one "$n" "$f" whelk 1 3 10g 3600
+  one "$n" "$f" hermit 1 1 10g 1800
+  # bound the disk: Konclude's raw hierarchy is converted and need not stay
+  rm -f "$OUT/$n".konclude.t*.ofn.konclude.owx
+done
+
+# ROBOT reason with ELK and Sparkles' classify, end to end from the release's RDF/XML file.
+export ROBOT_JAVA_ARGS="-Xms8g -Xmx8g -XX:+UseG1GC"
+for o in go chebi_lite; do
+  for i in 1 2 3; do
+    locked "robot-reason-$o-$i" systemd-run --user --scope --quiet -p "MemoryMax=$MEM" -p MemorySwapMax=0 \
+      -p OOMPolicy=continue python3 timed.py "$OUT/robot.jsonl" "$o-robot-reason" --timeout 3600 -- \
+      "$ROBOT" reason --reasoner ELK --input "data/$o.owl" --output "$OUT/$o.robot-reason.ofn" 2>> "$OUT/robot.err"
+    locked "sparkles-classify-$o-$i" systemd-run --user --scope --quiet -p "MemoryMax=$MEM" -p MemorySwapMax=0 \
+      -p OOMPolicy=continue python3 timed.py "$OUT/robot.jsonl" "$o-sparkles-classify" \
+      --stdout "$OUT/$o.sparkles-classify.ofn" --timeout 3600 -- \
+      bin/sparkles ontology classify "data/$o.owl" --allow-unsatisfiable --format ofn 2>> "$OUT/robot.err"
+  done
+done
+echo "ended=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OUT/env.txt"
+
+# Agreement of every taxonomy with the classifier's on one thread.
+for f in "$OUT"/*.t[18].ofn; do
+  b=$(basename "$f")
+  n=${b%%.*}
+  python3 scripts/el-oracle.py "$f" "$OUT/$n.ours.t1.txt" > "$OUT/${b%.ofn}.oracle.json" || true
+done
+for f in "$OUT"/*.ours.t8.txt; do
+  n=$(basename "$f" .ours.t8.txt)
+  cmp -s "$f" "$OUT/$n.ours.t1.txt" && echo "$n same" >> "$OUT/ours-threads.txt" || echo "$n differ" >> "$OUT/ours-threads.txt"
+done
+for o in go chebi_lite; do
+  python3 scripts/el-oracle.py --asserted "$OUT/$o.robot-reason.ofn" "$OUT/$o.ours.t1.txt" \
+    > "$OUT/$o.robot-reason.oracle.json" || true
+  python3 scripts/el-oracle.py "$OUT/$o.sparkles-classify.ofn" "$OUT/$o.ours.t1.txt" \
+    > "$OUT/$o.sparkles-classify.oracle.json" || true
+done
+sha256sum "$OUT"/*.t*.txt "$OUT"/*.t*.ofn > "$OUT/taxonomy.sha256"
+echo "FORGE-DONE $OUT"

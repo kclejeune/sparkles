@@ -127,9 +127,18 @@ the ontology, and its output equals `el_classify`'s on both files. Sparkles has 
 counterpart of the other commands. Roadmap items 634 to 636 add
 `sparkles ontology reason`, `reduce`, `relax` and `materialize` with ROBOT's options,
 item 637 chains them in one process, and this comparison checks their output.
-These times come from a loaded laptop, so they only show the scale and are not
-measurements. The benchmark host's times belong to roadmap items 604 and 606. Each
-is one end-to-end run in seconds, with the peak resident memory in MiB.
+
+On forge, the benchmark host, `robot reason` with ELK took a median of 14.0 s on GO and
+30.6 s on ChEBI lite over three runs, from the release's RDF/XML file to the written
+functional-style file, at peak resident sets of 3,597 MiB and 8,287 MiB with an 8 GiB
+heap. `sparkles ontology classify` took 4.3 s and 9.8 s on the same files, at 1,850 MiB
+and 3,587 MiB, so it is 3.3 times as fast on GO and 3.1 times on ChEBI lite. It writes
+the taxonomy only, while `robot reason` writes the whole ontology with the inferred
+axioms, so the comparison counts the larger output against ROBOT.
+
+The other commands ran once each on a loaded laptop, so their times only show the scale
+and are not measurements. Each is one end-to-end run in seconds, with the peak resident
+memory in MiB.
 
 | Run | GO time | GO peak RSS | ChEBI lite time | ChEBI lite peak RSS |
 |---|---:|---:|---:|---:|
@@ -144,6 +153,75 @@ is one end-to-end run in seconds, with the peak resident memory in MiB.
 
 ROBOT ran with an 8 GiB heap. The materialized property was part of, `BFO:0000050`, for
 GO and has role, `RO:0000087`, for ChEBI lite.
+
+## The reference reasoners on the benchmark host
+
+<a id="reference-reasoners"></a>
+
+The classifier, ELK 0.6.0, Konclude 0.7.0-1138, Whelk 1.2.1 and HermiT 1.4.5.519 ran on
+forge, one process at a time under the bench lock. Times are the median classification
+in seconds, of five runs in one process on GO and ChEBI lite and three on the ORE
+ontologies, and HermiT ran three times on GO and ChEBI lite and once on each ORE
+ontology. The times exclude reading the file. Konclude starts one process per run, and
+its time is the total processing time of its log less its parse, so it includes writing
+the class hierarchy. Whelk and HermiT classify on one thread. Every taxonomy equals the
+classifier's, except that Konclude and HermiT both give the 7 GO edges that come from
+GO's inverse property, as [above](#whelk-and-konclude).
+
+| Ontology | Threads | Classifier | ELK | Konclude | Whelk | HermiT |
+|---|---:|---:|---:|---:|---:|---:|
+| GO | 1 | 0.58 | 1.28 | 1.32 | 3.37 | 28.97 |
+|  | 8 | 0.36 | 0.57 | 1.34 |  |  |
+| ChEBI lite | 1 | 4.00 | 6.64 | 4.25 | 16.47 | 111.55 |
+|  | 8 | 2.84 | 2.54 | 4.21 |  |  |
+
+The ORE columns give the thread count after each tool's name.
+
+| Ontology | Classes | Classifier 1 | Classifier 8 | ELK 1 | ELK 8 | Konclude 1 | Konclude 8 | Whelk | HermiT |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `ore_ont_868` | 981,151 | 8.26 | 7.43 | 12.05 | 5.94 | 12.25 | 12.25 | 28.46 | 39.31 |
+| `ore_ont_10689` | 981,148 | 8.07 | 7.41 | 11.40 | 5.19 | 12.22 | 12.24 | 26.97 | 38.85 |
+| `ore_ont_9674` | 981,148 | 8.25 | 7.98 | 11.49 | 5.59 | 12.23 | 11.74 | 26.26 | 40.22 |
+| `ore_ont_8486` | 903,617 | 6.48 | 6.07 | 10.78 | 4.76 | 10.97 | 11.17 | 24.27 | 37.03 |
+| `ore_ont_14459` | 847,760 | 6.21 | 5.82 | 10.16 | 4.64 | 10.04 | 10.33 | 23.26 | 33.77 |
+| `ore_ont_16008` | 733,100 | 5.84 | 5.44 | 8.73 | 3.78 | 8.92 | 8.71 | 19.89 | 29.75 |
+| `ore_ont_14042` | 517,023 | 6.66 | 5.25 | 7.11 | 7.80 | 7.03 | 7.12 | 14.63 | 513.47 |
+| `ore_ont_11395` | 517,023 | 6.45 | 4.89 | 7.09 | 8.30 | 7.08 | 7.12 | 15.14 | 525.19 |
+
+Konclude's time is the target that roadmap item 603 sets. On these OWL 2 EL inputs it
+classifies GO in 1.3 s, ChEBI lite in 4.2 s and the largest ORE ontology in 12.2 s, on
+one thread or eight, and its whole process takes 1.9 s, 6.8 s and 19.4 s with the parse.
+The classifier is ahead of Konclude on every ontology and thread count. ELK on eight
+threads is ahead of the classifier on ChEBI lite and the six largest ORE ontologies,
+which roadmap item 602 follows. On `ore_ont_14042` and `ore_ont_11395` ELK is slower on
+eight threads than on one. HermiT takes 29 s on GO, 112 s on ChEBI lite and up to 525 s on
+the ORE ontologies.
+
+Peak memory is each process's peak resident set in MiB, on eight threads where the tool
+uses them. The JVMs ran with fixed heaps of 4 GiB for ELK on GO and ChEBI lite, 8 GiB on
+ORE, and 8 to 10 GiB for Whelk and HermiT, so their resident sets follow the heap more
+than their live data.
+
+| Ontology | Classifier | ELK | Konclude | Whelk | HermiT |
+|---|---:|---:|---:|---:|---:|
+| GO | 361 | 2,388 | 713 | 5,167 | 6,011 |
+| ChEBI lite | 1,648 | 4,519 | 2,230 | 8,372 | 7,351 |
+
+The ORE ontologies' peak memory follows.
+
+| Ontology | Classifier | ELK | Konclude | Whelk | HermiT |
+|---|---:|---:|---:|---:|---:|
+| `ore_ont_868` | 4,305 | 8,778 | 5,933 | 11,015 | 10,146 |
+| `ore_ont_10689` | 4,284 | 8,803 | 5,806 | 10,952 | 10,141 |
+| `ore_ont_9674` | 4,289 | 8,859 | 5,810 | 11,011 | 10,638 |
+| `ore_ont_8486` | 2,869 | 8,771 | 5,358 | 10,938 | 10,468 |
+| `ore_ont_14459` | 2,801 | 8,618 | 5,061 | 10,975 | 9,648 |
+| `ore_ont_16008` | 2,616 | 7,746 | 4,415 | 10,770 | 9,895 |
+| `ore_ont_14042` | 2,750 | 6,804 | 4,216 | 9,873 | 8,271 |
+| `ore_ont_11395` | 2,617 | 6,435 | 4,278 | 9,918 | 8,242 |
+
+The [forge run record](runs/2026-11-03-reasoners-forge-ea96e8f5/record.json) holds every
+output line, the oracle's reports, the taxonomy hashes and the script that ran.
 
 ## Against ELK
 
