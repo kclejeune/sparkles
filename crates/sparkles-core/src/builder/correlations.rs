@@ -711,24 +711,7 @@ fn count_piece(
         if let Some(f) = fill {
             f.add(sig_hash(&items));
         }
-        let kept = match acc.sets.get_mut(&items[..]) {
-            Some((n, t)) => {
-                *n += 1;
-                for (x, c) in t.iter_mut().zip(&counts) {
-                    *x += c;
-                }
-                true
-            }
-            None if admitted.admit(&items, worst) => {
-                acc.sets
-                    .insert(items.clone().into_boxed_slice(), (1, counts.clone()));
-                true
-            }
-            None => false,
-        };
-        if !kept {
-            acc.rest.add(1, &items, &counts, 1);
-        }
+        tally_node(admitted, worst, acc, &items, &counts);
     }
     Ok(())
 }
@@ -848,6 +831,8 @@ impl Admitted<'_> {
         let (fewer, hash) = self.rank.of(items);
         let below = |w: &Ranked| (fewer, hash, items) > (w.fewer, w.hash, &w.sig[..]);
         if worst.as_ref().is_some_and(below) {
+            self.overflowed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
         let mut st = self.state.lock();
@@ -881,6 +866,48 @@ impl Admitted<'_> {
             *worst = st.ranked.peek().cloned();
         }
         admit
+    }
+
+    /// Move the sets of `acc` that were pushed out since the thread admitted them into its
+    /// remainder. They never return, so a thread's sets stay within twice the cap however
+    /// often the admitted signatures change.
+    fn prune(&self, acc: &mut Piece) {
+        let st = self.state.lock();
+        let rest = &mut acc.rest;
+        acc.sets.retain(|k, (n, t)| {
+            let keep = st.sigs.contains(k);
+            if !keep {
+                rest.add(*n, k, t, 1);
+            }
+            keep
+        });
+    }
+}
+
+/// Count one node of signature `items`, with `counts` triples per item, into `acc`: into
+/// its set when the signature is admitted, and into the remainder otherwise.
+fn tally_node(
+    admitted: &Admitted,
+    worst: &mut Option<Ranked>,
+    acc: &mut Piece,
+    items: &[u64],
+    counts: &[u64],
+) {
+    if let Some((n, t)) = acc.sets.get_mut(items) {
+        *n += 1;
+        for (x, c) in t.iter_mut().zip(counts) {
+            *x += c;
+        }
+        return;
+    }
+    if !admitted.admit(items, worst) {
+        acc.rest.add(1, items, counts, 1);
+        return;
+    }
+    acc.sets
+        .insert(items.to_vec().into_boxed_slice(), (1, counts.to_vec()));
+    if acc.sets.len() >= admitted.cap.saturating_mul(2).max(2) {
+        admitted.prune(acc);
     }
 }
 
@@ -917,4 +944,69 @@ pub fn check(s: &super::Stats, c: &Correlations) -> Option<String> {
                 )
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn admitted(cap: usize) -> Admitted<'static> {
+        Admitted {
+            state: Mutex::new(AdmitState::default()),
+            cap,
+            rank: Rank::Hash,
+            overflowed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Distinct signatures, best-ranked by hash first.
+    fn by_rank(n: u64) -> Vec<Vec<u64>> {
+        let mut v: Vec<Vec<u64>> = (0..n).map(|i| vec![i + 1]).collect();
+        v.sort_by_key(|s| sig_hash(s));
+        v
+    }
+
+    #[test]
+    fn a_signature_turned_away_without_the_lock_is_an_overflow() {
+        let sigs = by_rank(2);
+        // the better-ranked one first: the other is turned away by the thread's cached
+        // worst rank, without the lock, and the pass must still see an overflow
+        for order in [[0, 1], [1, 0]] {
+            let a = admitted(1);
+            let (mut worst, mut acc) = (None, Piece::default());
+            for &i in &order {
+                tally_node(&a, &mut worst, &mut acc, &sigs[i], &[1]);
+            }
+            assert!(
+                a.overflowed.load(std::sync::atomic::Ordering::Relaxed),
+                "order {order:?}"
+            );
+            assert_eq!(acc.sets.len() as i64 + acc.rest.n, 2);
+            let kept: Vec<_> = a.state.lock().sigs.iter().cloned().collect();
+            assert_eq!(kept, vec![sigs[0].clone().into_boxed_slice()]);
+        }
+    }
+
+    #[test]
+    fn pushed_out_signatures_leave_the_thread_sets() {
+        // every signature ranks better than those before it, so each pushes one out
+        let sigs = by_rank(10_000);
+        let a = admitted(4);
+        let (mut worst, mut acc) = (None, Piece::default());
+        for s in sigs.iter().rev() {
+            tally_node(&a, &mut worst, &mut acc, s, &[2]);
+            assert!(acc.sets.len() <= 8, "{} sets held", acc.sets.len());
+        }
+        a.prune(&mut acc);
+        let st = a.state.lock();
+        assert_eq!(st.sigs.len(), 4);
+        assert!(acc.sets.keys().all(|k| st.sigs.contains(k)));
+        assert_eq!(acc.sets.len(), 4);
+        assert_eq!(acc.rest.n, 10_000 - 4);
+        let held: u64 = acc.sets.values().map(|(n, _)| n).sum();
+        assert_eq!(held, 4);
+        for s in &sigs[..4] {
+            assert!(st.sigs.contains(&s[..]));
+        }
+    }
 }
