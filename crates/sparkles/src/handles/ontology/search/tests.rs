@@ -680,6 +680,21 @@ fn hidden_iris_do_not_use_up_the_iri_prefix_cap() {
         .unwrap();
     assert_eq!(r.hits.len(), 100);
     assert!(!r.warnings.is_empty());
+    // the last page of the window says that further hits exist and that no page follows
+    let last = SearchRequest {
+        offset: query::MAX_IRI_PREFIX - 100,
+        limit: 100,
+        ..SearchRequest::new("http://ex.org/")
+    };
+    let r = ds
+        .ontology()
+        .search(&req, &last, &Default::default())
+        .unwrap();
+    assert_eq!(r.hits.len(), 100);
+    assert!(r.more);
+    let body = super::super::wire::search_body("t", &last, &r);
+    assert_eq!(body["more"], true);
+    assert!(body["next"].is_null(), "{}", body["next"]);
 }
 
 #[test]

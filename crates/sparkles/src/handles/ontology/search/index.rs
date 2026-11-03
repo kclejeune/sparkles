@@ -893,7 +893,11 @@ impl Index {
             check()?;
             quads.clear();
             snap.scan(Perm::Pos, &[rdf_type.0, tid.0], |c| {
+                let before = quads.len();
                 push_quads(Perm::Pos, c, &mut quads);
+                if before / 65_536 != quads.len() / 65_536 {
+                    check()?;
+                }
                 Ok(true)
             })?;
             for (i, q) in quads.iter().enumerate() {
@@ -936,7 +940,11 @@ impl Index {
             check()?;
             quads.clear();
             snap.scan(Perm::Pos, &[pid.0], |c| {
+                let before = quads.len();
                 push_quads(Perm::Pos, c, &mut quads);
+                if before / 65_536 != quads.len() / 65_536 {
+                    check()?;
+                }
                 Ok(true)
             })?;
             for (i, q) in quads.iter().enumerate() {

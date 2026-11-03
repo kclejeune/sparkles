@@ -827,7 +827,10 @@ pub(super) fn run_capped<'a>(
         r.close();
     }
     q.iri_truncated = truncated;
-    let more = r.out.len() > req.offset + req.limit;
+    // IRIs past the cap are further hits, which a full page reports; the page after it
+    // has fewer hits and ends the listing
+    let end = req.offset + req.limit;
+    let more = r.out.len() > end || (truncated && r.out.len() == end);
     let mut out = r.out;
     out.truncate(req.offset + req.limit);
     let out = out.split_off(req.offset.min(out.len()));
@@ -988,6 +991,73 @@ pub(super) fn highlight(text: &str, kind: MatchKind, whole: bool, q: &Query) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ranker_keeps_a_bounded_set_of_candidates() {
+        // many entities with one label, offered from the worst rank to the best, and
+        // then a better value of an entity the ranker dropped
+        let ds = crate::Dataset::memory();
+        let mut body = String::from(
+            "PREFIX : <http://ex.org/> PREFIX owl: <http://www.w3.org/2002/07/owl#> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> INSERT DATA {",
+        );
+        for i in 0..5000 {
+            body.push_str(&format!(
+                ":e{i:04} a owl:Class ; rdfs:label \"same\" ; rdfs:label \"same {i:04}\" ."
+            ));
+        }
+        body.push('}');
+        ds.update(&body).unwrap();
+        let ix = Index::build(&ds.store().snapshot(), &|| Ok(())).unwrap();
+        let scope = Scope::new(&ix, vec![true; ix.graphs.len()], 0, None);
+        let langs = language_ranks(&ix, &[]);
+        let mut r = Ranker {
+            scope: &scope,
+            langs: &langs,
+            need: 10,
+            bound: BinaryHeap::new(),
+            done: FxHashSet::default(),
+            out: Vec::new(),
+            tier: FxHashMap::default(),
+        };
+        let value = |iri: &str, text: &str| -> u32 {
+            let e = ix.by_iri[iri];
+            *ix.entities[e as usize]
+                .values
+                .iter()
+                .find(|&&v| &*ix.values[v as usize].text == text)
+                .unwrap()
+        };
+        let mut most = 0;
+        for i in (0..5000).rev() {
+            // the longer label first, so that each entity enters with a worse rank
+            r.offer(
+                value(&format!("http://ex.org/e{i:04}"), &format!("same {i:04}")),
+                1,
+                0,
+                MatchKind::Prefix,
+                false,
+            );
+            most = most.max(r.tier.len());
+        }
+        assert!(most <= 2 * 10 + 1024 + 1, "{most}");
+        // the exact label of a dropped entity still reaches the page
+        r.offer(
+            value("http://ex.org/e4999", "same"),
+            0,
+            0,
+            MatchKind::Exact,
+            false,
+        );
+        r.close();
+        let got: Vec<&str> = r
+            .out
+            .iter()
+            .map(|c| &*ix.entities[c.entity as usize].iri)
+            .collect();
+        let mut want = vec!["http://ex.org/e4999".to_string()];
+        want.extend((0..9).map(|i| format!("http://ex.org/e{i:04}")));
+        assert_eq!(got[..10], want);
+    }
 
     #[test]
     fn edits_grow_with_the_length() {
