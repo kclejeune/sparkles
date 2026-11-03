@@ -30,6 +30,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
@@ -53,8 +54,9 @@ def post(url, query, timeout):
         return json.loads(r.read())
 
 
-def flags(node):
-    """What makes a node's actual rows incomparable with its estimate."""
+def flags(node, outer=None):
+    """What makes a node's actual rows incomparable with its estimate. `outer` is the
+    cursor node around a streamed operator, whose completion flag counts too."""
     fid = node.get("fidelity") or {}
     out = []
     for k in ("skipped", "stoppedEarly", "incomplete"):
@@ -62,30 +64,35 @@ def flags(node):
             out.append(k)
     if node.get("runs") or fid.get("runs") or fid.get("reruns"):
         out.append("reruns")
-    if node.get("complete") is False:
-        out.append("incomplete")
+    if node.get("complete") is False or (outer is not None and outer.get("complete") is False):
+        if "incomplete" not in out:
+            out.append("incomplete")
     if node.get("cached"):
         out.append("cached")
     return out
 
 
 def walk(node, path="0", depth=0, out=None):
+    """The nodes of an eager plan or of a streamed one, whose cursor nodes hold the
+    operator's description, estimate and counts in `operator`."""
     if out is None:
         out = []
     op = node.get("operator")
     if isinstance(op, dict):
-        name = op.get("name") or op.get("operator") or ""
+        name = op.get("operator") or op.get("name") or ""
+        info, outer = op, node
     else:
         name = op or ""
+        info, outer = node, None
     out.append(
         {
-            "id": node.get("id", path),
+            "id": node.get("id", info.get("id", path)),
             "depth": depth,
             "op": name,
-            "desc": (node.get("description") or "")[:300],
-            "est": node.get("estimatedRows"),
-            "act": node.get("actualRows"),
-            "flags": flags(node),
+            "desc": (info.get("description") or "")[:300],
+            "est": info.get("estimatedRows"),
+            "act": info.get("actualRows"),
+            "flags": flags(info, outer),
         }
     )
     for i, c in enumerate(node.get("children") or []):
@@ -250,8 +257,11 @@ def compare(a):
             if qx is not None and qy is not None and qy > qx * 1.0001:
                 rose.append(f"{q}:{x['id']} {qx:.2f}->{qy:.2f}")
     w(f"join nodes of unchanged plan shapes whose q-error rose: {', '.join(rose) or 'none'}")
-    # the plan without the run-time notes in brackets
-    sig = lambda r: [(n["depth"], n["op"], n["desc"].split(" [")[0]) for n in r.get("nodes", [])]
+    # the plan without the run-time notes in brackets and with the generated names of
+    # aggregate variables, which differ from run to run, left out
+    hidden = re.compile(r"\?[0-9a-f]{24,32}\b")
+    sig = lambda r: [(n["depth"], n["op"], hidden.sub("?_", n["desc"].split(" [")[0]))
+                     for n in r.get("nodes", [])]
     changed = [q for q in sorted(set(b) & set(c)) if sig(b[q]) != sig(c[q])]
     w(f"queries whose plans changed: {' '.join(changed) or 'none'}")
     text = "\n".join(lines)
