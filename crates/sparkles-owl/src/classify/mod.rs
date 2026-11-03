@@ -777,8 +777,23 @@ impl Saturation {
         // The Horn rules take what they can of these (item 603) when the EL part needs
         // no rules of individuals, universal roles or functional data roles.
         let mut taken: FxHashSet<&AxiomKind> = FxHashSet::default();
+        let stop = || poll(limits).is_err();
+        let halt = |h: index::Halt| match h {
+            index::Halt::Memory(used) => Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used,
+            },
+            index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
+        };
         if !candidates.is_empty() && self.horn_allowed(&ax) {
-            let flags = horn::normalize(&candidates, &mut self.interner, &mut ax);
+            let flags = horn::normalize(
+                &candidates,
+                &mut self.interner,
+                &mut ax,
+                limits.max_memory,
+                &stop,
+            )
+            .map_err(halt)?;
             taken.extend(
                 candidates
                     .iter()
@@ -788,17 +803,7 @@ impl Saturation {
             );
         }
         ax.classes.extend(self.interner.met_classes());
-        let stop = || poll(limits).is_err();
-        let ix =
-            Index::build(&ax, &mut self.interner, limits.max_memory, &stop).map_err(
-                |h| match h {
-                    index::Halt::Memory(used) => Error::Memory {
-                        limit: limits.max_memory.unwrap_or(usize::MAX),
-                        used,
-                    },
-                    index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
-                },
-            )?;
+        let ix = Index::build(&ax, &mut self.interner, limits.max_memory, &stop).map_err(halt)?;
         let mut excluded: Vec<Excluded> = Vec::new();
         for (i, (rule, message)) in outside {
             if taken.contains(axioms[*i]) {
@@ -2076,5 +2081,40 @@ mod tests {
                 used: 1_100
             })
         );
+    }
+
+    #[test]
+    fn the_horn_closure_of_the_roles_counts_against_the_budget_and_stops() {
+        // a line of 3,000 properties, whose closure with the inverses holds about nine
+        // million pairs, under one universal
+        let p = |i: usize| {
+            ObjectPropertyExpression::Property(ObjectProperty::new(format!("http://ex.org/r{i}")))
+        };
+        let c = |n: &str| ClassExpression::Class(Class::new(format!("http://ex.org/{n}")));
+        let subs: Vec<AxiomKind> = (0..3000)
+            .map(|i| {
+                AxiomKind::SubObjectPropertyOf(
+                    SubObjectPropertyExpression::Expression(p(i)),
+                    p(i + 1),
+                )
+            })
+            .collect();
+        let all = AxiomKind::SubClassOf(
+            c("A"),
+            ClassExpression::ObjectAllValuesFrom(p(0), Box::new(c("B"))),
+        );
+        let horn = |limit: Option<usize>, stop: &dyn Fn() -> bool| {
+            let mut it = Interner::new();
+            let mut ax = index::Axioms::default();
+            for k in &subs {
+                assert!(index::normalize(k, &mut it, &mut ax).is_none());
+            }
+            horn::normalize(&[&all], &mut it, &mut ax, limit, stop)
+        };
+        assert!(
+            matches!(horn(Some(1 << 20), &|| false), Err(index::Halt::Memory(b)) if b <= (1 << 20) + 64 * 1024)
+        );
+        assert!(matches!(horn(None, &|| true), Err(index::Halt::Stopped)));
+        assert_eq!(horn(None, &|| false).ok(), Some(vec![true]));
     }
 }

@@ -1696,60 +1696,84 @@ fn horn_index(
     // ∃r.F ⊑ G is F ⊑ ∀r⁻.G, which the backward links propagate as for EL, and which the
     // successors of F's contexts by roles under r⁻ need too. A filler ⊤ is a domain, which
     // the role's inverse takes as a range.
+    // a universal on a role with an automaton is unfolded on its holder: on F itself for
+    // those of the negative existentials, and on the universal for the others
+    let mut unfold: Vec<(Ex, Role, Ex)> = Vec::new();
     let mut alls: Vec<(Ex, Ex)> = Vec::new();
     for &(f, (r, e)) in &b.exist {
         if f == TOP {
             continue;
         }
         let Some(i) = roles.inv(r) else { continue };
-        let reach = match h.autos.get(&i) {
-            Some(a) => a.trans.iter().any(|t| t.1.is_some_and(linked)),
-            None => linked(i),
-        };
-        if reach {
-            let fa = it.node(Node::Forall(i, e));
-            alls.push((f, fa));
+        match h.autos.get(&i) {
+            Some(a) if a.trans.iter().any(|t| t.1.is_some_and(linked)) => unfold.push((f, i, e)),
+            Some(_) => {}
+            None if linked(i) => {
+                let fa = it.node(Node::Forall(i, e));
+                alls.push((f, fa));
+            }
+            None => {}
         }
     }
     for (f, fa) in alls {
         told.push((f, fa));
         b.positive(fa, it, ix);
     }
+    for &(_, _, e) in &unfold {
+        b.positive(e, it, ix);
+    }
     // the universals on roles that chains reach, unfolded by the automata, each state a
     // fresh class; the universals the automata make are not unfolded again
-    let foralls: Vec<(Ex, Role, Ex)> = it
-        .nodes
-        .iter()
-        .enumerate()
-        .filter_map(|(e, n)| match *n {
-            Node::Forall(r, f) if h.autos.contains_key(&r) => Some((e as Ex, r, f)),
-            _ => None,
-        })
-        .collect();
-    for (e, r, f) in foralls {
-        let a = &h.autos[&r];
-        let states: Vec<Ex> = (0..a.states).map(|_| it.fresh_class()).collect();
-        told.push((e, states[a.start as usize]));
-        told.push((states[a.end as usize], f));
-        for &(p, l, q) in &a.trans {
-            let (p, q) = (states[p as usize], states[q as usize]);
-            match l {
-                None => told.push((p, q)),
-                Some(l) => {
-                    let x = it.node(Node::Forall(l, q));
-                    told.push((p, x));
-                }
-            }
+    let mut flags = vec![0u8; it.nodes.len()];
+    for (e, n) in it.nodes.iter().enumerate() {
+        if let Node::Forall(r, f) = *n
+            && h.autos.contains_key(&r)
+        {
+            flags[e] |= super::horn::HornIx::UNFOLDED;
+            unfold.push((e as Ex, r, f));
         }
     }
-    let mut filler = vec![false; it.nodes.len()];
+    // each state of an automaton without ε-transitions is a class: the holder for the
+    // start when no transition enters it, the filler for a final state that none leaves,
+    // and a fresh class otherwise
+    let mut autos: FxHashMap<Role, super::horn::EpsFree> = FxHashMap::default();
+    for (holder, r, f) in unfold {
+        let a = autos.entry(r).or_insert_with(|| h.autos[&r].eps_free());
+        let enters = |s: u32| a.trans.iter().any(|t| t.2 == s);
+        let leaves = |s: u32| a.trans.iter().any(|t| t.0 == s);
+        let states: Vec<Ex> = (0..a.states)
+            .map(|s| {
+                if s == a.start && !enters(s) {
+                    holder
+                } else if a.finals[s as usize] && !leaves(s) {
+                    f
+                } else {
+                    it.fresh_class()
+                }
+            })
+            .collect();
+        let start = states[a.start as usize];
+        if start != holder {
+            told.push((holder, start));
+        }
+        for (s, &x) in states.iter().enumerate() {
+            if a.finals[s] && x != f {
+                told.push((x, f));
+            }
+        }
+        for &(p, l, q) in &a.trans {
+            let x = it.node(Node::Forall(l, states[q as usize]));
+            told.push((states[p as usize], x));
+        }
+    }
+    flags.resize(it.nodes.len(), 0);
     for n in &it.nodes {
         if let Node::AtMost1(_, f) = *n {
-            filler[f as usize] = true;
+            flags[f as usize] |= super::horn::HornIx::FILLER;
         }
     }
     super::horn::HornIx {
-        filler,
+        flags,
         base: it.nodes.len() as Ex,
     }
 }
@@ -1879,7 +1903,7 @@ pub enum Halt {
 
 /// The steps of the property closure between two polls of the run's deadline and
 /// cancellation, where a step visits one edge or one entry.
-const POLL_WORK: usize = 65_536;
+pub(super) const POLL_WORK: usize = 65_536;
 
 fn roles(
     ax: &Axioms,
@@ -2066,10 +2090,19 @@ fn roles(
     }
     // with the Horn rules: the inverses, and the roles that clash with themselves, which
     // relate nothing
-    let (inv, clash) = match &ax.horn {
+    let (inv, mut clash) = match &ax.horn {
         Some(h) => (super::horn::inverses(it), h.clash.clone()),
         None => (Vec::new(), Vec::new()),
     };
+    // two roles that clash clash on their inverses too
+    let mirrored: Vec<(Role, Role)> = clash
+        .iter()
+        .filter_map(|&(s, t)| Some((*inv.get(s as usize)?, *inv.get(t as usize)?)))
+        .filter(|&(s, t)| s != NO_ROLE && t != NO_ROLE)
+        .collect();
+    clash.extend(mirrored);
+    clash.sort_unstable();
+    clash.dedup();
     let mut roles = Roles {
         sup,
         comp,

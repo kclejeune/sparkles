@@ -22,6 +22,7 @@
 //! an instance; [`super::world`] classifies the classes that reach such a context.
 
 use super::data::DataVal;
+use super::horn::HornIx;
 use super::horn_rules;
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use parking_lot::{Condvar, Mutex};
@@ -1125,12 +1126,20 @@ impl<'a> Run<'a> {
             }
             // the to-do list leaves the context with its buffer, so that a context keeps
             // no room for the messages it took
-            let mut batch = {
+            let batch = {
                 let mut t = ctx.todo.lock();
                 if t.is_empty() {
-                    break;
+                    None
+                } else {
+                    Some(std::mem::take(&mut *t))
                 }
-                std::mem::take(&mut *t)
+            };
+            let Some(mut batch) = batch else {
+                // R3 of the Horn rules waits for the activation's universals
+                if R::HORN && horn_rules::flush(self.ix, &mut st, &mut out) {
+                    continue;
+                }
+                break;
             };
             tally.queued -= batch.len() as isize;
             // apply the batch in the order it arrived
@@ -1264,7 +1273,11 @@ fn apply_rules<S: Sink, R: Rules>(
                         horn_rules::succ(ix, me, st, r, succ, true, out);
                     }
                 }
-                Node::Forall(s, a) if R::HORN => horn_rules::forall(ix, me, st, s, a, out),
+                Node::Forall(s, a)
+                    if R::HORN && !ix.horn.as_ref().is_some_and(|h| h.is(d, HornIx::UNFOLDED)) =>
+                {
+                    horn_rules::forall(ix, me, st, s, a, out)
+                }
                 Node::AtMost1(s, b) if R::HORN => horn_rules::at_most(ix, me, st, s, b, out),
                 Node::SelfLoop(r) => out.me(Concl::Loop(r)),
                 Node::Nominal(_) if R::FULL && d != me => nominal(ix, me, st, d, out),
@@ -1306,7 +1319,7 @@ fn apply_rules<S: Sink, R: Rules>(
             if R::FULL && st.extra.is_some() {
                 give(st, d, out);
             }
-            if R::HORN && ix.horn.as_ref().is_some_and(|h| h.is_filler(d)) && d != TOP {
+            if R::HORN && ix.horn.as_ref().is_some_and(|h| h.is(d, HornIx::FILLER)) && d != TOP {
                 horn_rules::fill(ix, me, st, d, out);
             }
             true

@@ -26,7 +26,8 @@
 //! simple roles, stays left out and reported, which is sound.
 
 use super::index::{
-    Axioms, BOTTOM, Ex, Interner, NO_ROLE, Node, Role, RoleName, TOP, class_expression,
+    Axioms, BOTTOM, Ex, Halt, Interner, NO_ROLE, Node, POLL_WORK, Role, RoleName, TOP,
+    class_expression,
 };
 use crate::model::*;
 use crate::vocab;
@@ -65,21 +66,27 @@ impl HornAx {
 
 /// What the Horn rules read in the index.
 pub struct HornIx {
-    /// for each expression, whether it is the filler of an at-most restriction, whose
-    /// holders the contexts tell their neighbours
-    pub filler: Vec<bool>,
+    /// for each expression, [`HornIx::FILLER`] and [`HornIx::UNFOLDED`]
+    pub flags: Vec<u8>,
     /// the first id of the contexts the saturation creates for conjunctions
     pub base: Ex,
 }
 
 impl HornIx {
+    /// The expression is the filler of an at-most restriction, whose holders the
+    /// contexts tell their neighbours.
+    pub const FILLER: u8 = 1;
+    /// The expression is a universal on a role with an automaton, whose told subsumer,
+    /// the automaton's first state, stands for it, so that the Horn rules pass over it.
+    pub const UNFOLDED: u8 = 2;
+
     #[inline]
-    pub fn is_filler(&self, e: Ex) -> bool {
-        self.filler.get(e as usize).copied().unwrap_or(false)
+    pub fn is(&self, e: Ex, flag: u8) -> bool {
+        self.flags.get(e as usize).is_some_and(|&f| f & flag != 0)
     }
 
     pub fn bytes(&self) -> usize {
-        self.filler.capacity()
+        self.flags.capacity()
     }
 }
 
@@ -90,6 +97,77 @@ pub struct Nfa {
     pub start: u32,
     pub end: u32,
     pub trans: Vec<(u32, Option<Role>, u32)>,
+}
+
+/// An automaton without ε-transitions and with only the states that its start reaches,
+/// which accepts from each state what the [`Nfa`] it comes from accepts there.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EpsFree {
+    pub states: u32,
+    pub start: u32,
+    pub finals: Vec<bool>,
+    pub trans: Vec<(u32, Role, u32)>,
+}
+
+impl Nfa {
+    /// The automaton with its ε-transitions closed over: a state takes the transitions of
+    /// the states its ε-transitions reach, and is final when one of them is the end.
+    pub fn eps_free(&self) -> EpsFree {
+        let n = self.states as usize;
+        let mut eps: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for &(p, l, q) in &self.trans {
+            if l.is_none() {
+                eps[p as usize].push(q);
+            }
+        }
+        let closure = |p: u32| -> Vec<u32> {
+            let mut seen = vec![false; n];
+            let mut stack = vec![p];
+            let mut out = Vec::new();
+            while let Some(x) = stack.pop() {
+                if std::mem::replace(&mut seen[x as usize], true) {
+                    continue;
+                }
+                out.push(x);
+                stack.extend(eps[x as usize].iter().copied());
+            }
+            out
+        };
+        // the states the start reaches, renumbered in the order they are found
+        let mut id: Vec<Option<u32>> = vec![None; n];
+        let mut order = vec![self.start];
+        id[self.start as usize] = Some(0);
+        let mut finals = Vec::new();
+        let mut trans = Vec::new();
+        let mut at = 0;
+        while at < order.len() {
+            let p = order[at];
+            let c = closure(p);
+            finals.push(c.contains(&self.end));
+            for x in c {
+                for &(a, l, q) in &self.trans {
+                    if a == x
+                        && let Some(l) = l
+                    {
+                        let q = *id[q as usize].get_or_insert_with(|| {
+                            order.push(q);
+                            order.len() as u32 - 1
+                        });
+                        trans.push((at as u32, l, q));
+                    }
+                }
+            }
+            at += 1;
+        }
+        trans.sort_unstable();
+        trans.dedup();
+        EpsFree {
+            states: order.len() as u32,
+            start: 0,
+            finals,
+            trans,
+        }
+    }
 }
 
 impl Nfa {
@@ -136,21 +214,40 @@ impl RoleBox {
         self.simple.get(r as usize).copied().unwrap_or(true)
     }
 
-    fn new(it: &Interner, role_subs: &[(Role, Role)], chains: &[(Vec<Role>, Role)]) -> RoleBox {
+    /// The role box, or why it stopped: its closure passed `limit` bytes, or `stop`
+    /// said the run's deadline or cancellation came, as the index's closure of the roles
+    /// checks.
+    fn new(
+        it: &Interner,
+        role_subs: &[(Role, Role)],
+        chains: &[(Vec<Role>, Role)],
+        limit: Option<usize>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<RoleBox, Halt> {
         let n = it.roles.len();
         let inv = inverses(it);
         let mut direct: Vec<Vec<Role>> = vec![Vec::new(); n];
         for &(r, s) in role_subs {
             direct[r as usize].push(s);
         }
+        let mut bytes = 0usize;
+        let mut work = 0usize;
         let mut sup: Vec<Vec<Role>> = Vec::with_capacity(n);
         for r in 0..n as Role {
             let mut seen: BTreeSet<Role> = BTreeSet::new();
             let mut stack = vec![r];
             while let Some(x) = stack.pop() {
+                work += 1;
+                if work.is_multiple_of(POLL_WORK) && stop() {
+                    return Err(Halt::Stopped);
+                }
                 if seen.insert(x) {
                     stack.extend(direct[x as usize].iter().copied());
                 }
+            }
+            bytes += 48 + seen.len() * 8;
+            if limit.is_some_and(|l| bytes > l) {
+                return Err(Halt::Memory(bytes));
             }
             sup.push(seen.into_iter().collect());
         }
@@ -174,13 +271,13 @@ impl RoleBox {
                 simple[s as usize] = false;
             }
         }
-        RoleBox {
+        Ok(RoleBox {
             sup,
             chains: all,
             simple,
             autos: FxHashMap::default(),
             states: 0,
-        }
+        })
     }
 
     /// The automaton of a role, whose words are the role paths that imply it, built as
@@ -612,7 +709,10 @@ impl Norm<'_> {
                         Box::new(C::ObjectComplementOf(f)),
                     )),
                     C::ObjectMaxCardinality(n, p, f) => {
-                        todo_r.push(C::ObjectMinCardinality(n + 1, p, f))
+                        let Some(m) = n.checked_add(1) else {
+                            return Err("a cardinality too large");
+                        };
+                        todo_r.push(C::ObjectMinCardinality(m, p, f))
                     }
                     C::ObjectMinCardinality(n, p, f) if n >= 2 => {
                         todo_r.push(C::ObjectMaxCardinality(n - 1, p, f))
@@ -850,9 +950,16 @@ impl Norm<'_> {
 
 /// Normalizes the axioms outside OWL 2 EL that the Horn rules can take, after the EL
 /// axioms are in `ax`. The answer says which were taken. Nothing is taken when the role
-/// inclusions are not regular or their automata are too large, and then `ax` is as it
-/// was, the interner aside.
-pub fn normalize(axioms: &[&AxiomKind], it: &mut Interner, ax: &mut Axioms) -> Vec<bool> {
+/// inclusions are not regular, their automata are too large or no axiom is Horn, and
+/// then `ax` is as it was, the interner aside. The closure of the roles counts against
+/// `limit` and polls `stop`, as the index's does.
+pub fn normalize(
+    axioms: &[&AxiomKind],
+    it: &mut Interner,
+    ax: &mut Axioms,
+    limit: Option<usize>,
+    stop: &dyn Fn() -> bool,
+) -> Result<Vec<bool>, Halt> {
     let mut taken = vec![false; axioms.len()];
     let mut h = HornAx::default();
     // every object property has its inverse
@@ -905,21 +1012,22 @@ pub fn normalize(axioms: &[&AxiomKind], it: &mut Interner, ax: &mut Axioms) -> V
     mirror(&mut role_subs);
     let mut chains = ax.chains.clone();
     chains.extend(roles.chains.iter().cloned());
-    let mut rb = RoleBox::new(it, &role_subs, &chains);
+    let mut rb = RoleBox::new(it, &role_subs, &chains, limit, stop)?;
     let nonsimple: Vec<Role> = (0..rb.simple.len() as Role)
         .filter(|&r| !rb.simple(r))
         .collect();
     for r in nonsimple {
         if rb.auto(r, &mut Vec::new()).is_none() {
-            return vec![false; axioms.len()];
+            return Ok(vec![false; axioms.len()]);
         }
     }
     for i in role_taken {
         taken[i] = true;
     }
     roles.role_subs = role_subs;
-    ax.role_subs.clear();
-    // the class axioms and the role axioms that need simple roles
+    // the class axioms and the role axioms that need simple roles, which go to `ax` only
+    // once one is taken
+    let mut class_out: Vec<Out> = Vec::new();
     for (i, k) in axioms.iter().enumerate() {
         if taken[i] {
             continue;
@@ -933,10 +1041,16 @@ pub fn normalize(axioms: &[&AxiomKind], it: &mut Interner, ax: &mut Axioms) -> V
             continue;
         }
         if n.axiom(k).is_ok() {
-            let o = n.out;
-            o.commit(ax, &mut h);
+            class_out.push(n.out);
             taken[i] = true;
         }
+    }
+    if !taken.contains(&true) {
+        return Ok(taken);
+    }
+    ax.role_subs.clear();
+    for o in class_out {
+        o.commit(ax, &mut h);
     }
     roles.commit(ax, &mut h);
     // a domain of r is a range of r⁻, which the successors of r⁻ take at once
@@ -964,5 +1078,5 @@ pub fn normalize(axioms: &[&AxiomKind], it: &mut Interner, ax: &mut Axioms) -> V
     h.taken = taken.iter().filter(|t| **t).count();
     h.autos = std::mem::take(&mut rb.autos);
     ax.horn = Some(Box::new(h));
-    taken
+    Ok(taken)
 }

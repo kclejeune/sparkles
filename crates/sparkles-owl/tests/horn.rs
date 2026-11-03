@@ -550,3 +550,59 @@ fn ql_and_rl_ontologies_create_no_conjunction_contexts() {
         }
     }
 }
+
+#[test]
+fn r6_runs_when_a_predecessor_that_holds_the_filler_links_again() {
+    // M is told E only after it tells N it holds B, through a second link to N by r
+    check(
+        "SubClassOf(:M :B)
+         SubClassOf(:M ObjectSomeValuesFrom(:q :N))
+         SubClassOf(:M ObjectSomeValuesFrom(:p :P))
+         SubClassOf(:P ObjectAllValuesFrom(ObjectInverseOf(:p) :E))
+         SubClassOf(:E ObjectSomeValuesFrom(:r :N))
+         SubClassOf(:N ObjectMaxCardinality(1 ObjectInverseOf(:r) :B))
+         SubClassOf(:N ObjectSomeValuesFrom(ObjectInverseOf(:r) ObjectIntersectionOf(:B :C)))",
+        &[("M", "C")],
+        &[("N", "C"), ("E", "C")],
+    );
+}
+
+#[test]
+fn r6_forces_a_loop_on_a_predecessor_in_the_same_context() {
+    // an A's r-successor is its own s-successor, and the A an s-successor too, so the A
+    // has an r-loop
+    unsat(
+        "SubClassOf(:A ObjectSomeValuesFrom(:r :A))
+         SubObjectPropertyOf(ObjectInverseOf(:r) :s)
+         SubClassOf(:A ObjectHasSelf(:s))
+         SubClassOf(:A ObjectMaxCardinality(1 :s))
+         IrreflexiveObjectProperty(:r)
+         SubClassOf(:B ObjectSomeValuesFrom(:s :B))",
+        &["A"],
+        &["B"],
+    );
+}
+
+#[test]
+fn disjoint_roles_are_disjoint_on_their_inverses() {
+    // the r⁻- and s⁻-successors of an A are one, which r and s relate both
+    unsat(
+        "FunctionalObjectProperty(:t)
+         SubObjectPropertyOf(ObjectInverseOf(:r) :t)
+         SubObjectPropertyOf(ObjectInverseOf(:s) :t)
+         DisjointObjectProperties(:r :s)
+         SubClassOf(:A ObjectSomeValuesFrom(ObjectInverseOf(:r) :B))
+         SubClassOf(:A ObjectSomeValuesFrom(ObjectInverseOf(:s) :C))
+         SubClassOf(:D ObjectSomeValuesFrom(ObjectInverseOf(:r) :B))",
+        &["A"],
+        &["D", "B", "C"],
+    );
+}
+
+#[test]
+fn a_maximum_whose_dual_overflows_is_left_out() {
+    let (out, ex) = run("SubClassOf(ObjectMaxCardinality(4294967295 :r :B) :A)
+         SubClassOf(:C :A)");
+    assert_eq!(ex.len(), 1, "{ex:#?}");
+    assert!(!out.taxonomy.is_subclass(&c("B"), &c("A")));
+}

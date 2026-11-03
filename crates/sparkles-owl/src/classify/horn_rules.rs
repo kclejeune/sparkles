@@ -47,6 +47,12 @@ pub struct HornSt {
     pub pred_in: Small<(Ex, Ex)>,
     /// the at-most fillers among the subsumers, `owl:Thing` aside
     pub fills: Vec<Ex>,
+    /// the successors that R3 has still to extend, which [`flush`] does at the end of
+    /// the context's activation
+    pub pending: Vec<(Role, Ex)>,
+    /// whether a universal came since the last [`flush`], which then extends every
+    /// successor
+    pub dirty: bool,
 }
 
 impl HornSt {
@@ -57,6 +63,7 @@ impl HornSt {
             + self.succ_in.bytes()
             + self.pred_in.bytes()
             + self.fills.capacity() * 4
+            + self.pending.capacity() * 8
     }
 }
 
@@ -159,7 +166,9 @@ pub fn succ<S: Sink>(ix: &Index, me: Ex, st: &mut State, r: Role, n: Ex, sent: b
     for &b in &h.fills {
         out.send(n, Concl::PredIn(me, b));
     }
-    extend(ix, st, r, n, out);
+    if !h.dirty && h.alls.iter().any(|&(s, _)| roles.sub(r, s)) {
+        h.pending.push((r, n));
+    }
     let atmost = hs(st).atmost.clone();
     for (s, b) in atmost {
         if roles.sub(r, s) && held_succ(st, n, b) {
@@ -170,7 +179,7 @@ pub fn succ<S: Sink>(ix: &Index, me: Ex, st: &mut State, r: Role, n: Ex, sent: b
 
 /// R3: the successor by `r` in `n` with the fillers of the universals on the superroles
 /// of `r`.
-fn extend<S: Sink>(ix: &Index, st: &mut State, r: Role, n: Ex, out: &mut S) {
+fn extend<S: Sink>(ix: &Index, st: &mut State, r: Role, n: Ex, out: &mut S) -> bool {
     let roles = &ix.roles;
     let fs: Vec<Ex> = hs(st)
         .alls
@@ -179,7 +188,7 @@ fn extend<S: Sink>(ix: &Index, st: &mut State, r: Role, n: Ex, out: &mut S) {
         .map(|&(_, a)| a)
         .collect();
     if fs.is_empty() {
-        return;
+        return false;
     }
     let mut core = Vec::new();
     out.core(ix, n, &mut core);
@@ -189,7 +198,7 @@ fn extend<S: Sink>(ix: &Index, st: &mut State, r: Role, n: Ex, out: &mut S) {
     core.sort_unstable();
     core.dedup();
     if core == before {
-        return;
+        return false;
     }
     let m = if core.len() == 1 {
         core[0]
@@ -197,6 +206,34 @@ fn extend<S: Sink>(ix: &Index, st: &mut State, r: Role, n: Ex, out: &mut S) {
         out.intern(&core)
     };
     out.me(Concl::Succ(r, m));
+    true
+}
+
+/// R3 at the end of an activation, over the successors that came since the last call, or
+/// over all of them when a universal came. Each successor is extended once with every
+/// universal the context holds by then, so that universals that come one after another
+/// create no context for each conjunction on the way. The answer is whether it sent a
+/// conclusion to the context.
+pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
+    let Some(x) = st.extra.as_mut() else {
+        return false;
+    };
+    let h = &mut x.horn;
+    if !h.dirty && h.pending.is_empty() {
+        return false;
+    }
+    let todo: Vec<(Role, Ex)> = if h.dirty {
+        h.pending.clear();
+        h.succ.list.to_vec()
+    } else {
+        std::mem::take(&mut h.pending)
+    };
+    h.dirty = false;
+    let mut sent = false;
+    for (r, n) in todo {
+        sent |= extend(ix, st, r, n, out);
+    }
+    sent
 }
 
 /// The context derives `∀s.a`: R4 to the predecessors, and R3 to the successors.
@@ -217,15 +254,8 @@ pub fn forall<S: Sink>(ix: &Index, _me: Ex, st: &mut State, s: Role, a: Ex, out:
         return;
     }
     h.alls.push((s, a));
-    let succs: Vec<(Role, Ex)> = h
-        .succ
-        .list
-        .iter()
-        .copied()
-        .filter(|&(r, _)| roles.sub(r, s))
-        .collect();
-    for (r, n) in succs {
-        extend(ix, st, r, n, out);
+    if h.succ.list.iter().any(|&(r, _)| roles.sub(r, s)) {
+        h.dirty = true;
     }
 }
 
@@ -322,11 +352,11 @@ fn identify<S: Sink>(ix: &Index, me: Ex, st: &State, m: Ex, r1: Role, x: Member,
             }
         }
         Member::Loop(l) => {
-            if m == me {
-                return;
+            // the instance is its own successor, so it is the predecessor's instance,
+            // which has the loops then, also when the predecessor's context is this one
+            if m != me {
+                send_core(ix, m, me, out);
             }
-            // the instance is its own successor, so it is the predecessor's instance
-            send_core(ix, m, me, out);
             out.send(m, Concl::Loop(l));
             out.send(m, Concl::Loop(r1));
         }
@@ -364,7 +394,8 @@ pub fn fill<S: Sink>(ix: &Index, me: Ex, st: &mut State, b: Ex, out: &mut S) {
 }
 
 /// A backward link from `e` by `r`: the source learns the fillers the context holds, and
-/// R6 runs for fillers the source holds by its nature, `owl:Thing`.
+/// R6 runs for the fillers the source holds, `owl:Thing` and those it told the context
+/// of through an earlier link.
 pub fn back<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, r: Role, out: &mut S) {
     let Some(x) = &st.extra else { return };
     for &b in &x.horn.fills {
@@ -373,7 +404,7 @@ pub fn back<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, r: Role, out: &m
     let roles = &ix.roles;
     let Some(i) = roles.inv(r) else { return };
     for &(s, b) in &x.horn.atmost {
-        if b == TOP && roles.sub(i, s) {
+        if roles.sub(i, s) && held_pred(st, e, b) {
             for y in members(ix, st, s, b) {
                 identify(ix, me, st, e, r, y, out);
             }
