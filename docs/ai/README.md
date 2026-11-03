@@ -531,7 +531,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   ([results](../benchmarks/natural-language/RESULTS.md#ask-across-providers)). The
   `openai` provider preset starts with Luna and the `anthropic` preset with Sonnet, the
   cheapest models per correct answer within the noise of the best one in the provider
-  comparison. A gold resource
+  comparison. When accuracy matters more than cost, choose GPT-6.1 Terra, which answers
+  about 74% of the held-out questions strictly, within the noise of Opus, at about 9
+  times Luna's cost. A gold resource
   missing from the prompt causes about half of the wrong answers, and wrong query shape
   most of the rest. Property path evaluation runs within Ask's query memory budget and
   timeout, so a generated query with a property path fails with the usual error rather

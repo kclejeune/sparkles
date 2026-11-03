@@ -463,7 +463,9 @@ Terra and Opus 3 each, Sol lost 4 and Luna lost 5, a net gain of 4 over the five
 and each model's paired interval against its earlier run contains zero. The robustness
 fixes stay because they remove failures of the check and the parser. Luna stays the
 model of the `openai` preset, since one run per model moved none of them beyond the noise
-of the provider comparison on which the preset was chosen.
+of the provider comparison on which the preset was chosen. When accuracy matters more
+than cost, choose Terra, which answers 74% of the held-out questions strictly, within the
+noise of Opus, at about 9 times Luna's cost.
 
 ##### Effort for the cheapest models
 
