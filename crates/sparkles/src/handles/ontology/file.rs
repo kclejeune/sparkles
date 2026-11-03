@@ -213,6 +213,52 @@ impl OntologyFile {
         })
     }
 
+    /// An ontology file of a document's axioms held in memory, as a chained command
+    /// hands it on: every axiom is read as a functional-style document's axioms are,
+    /// assertions included, with `prefixes` for the renderer. The imports of the header
+    /// do not resolve, as a file's do not.
+    pub fn from_document(
+        name: String,
+        doc: sparkles_owl::transform::Document,
+        prefixes: BTreeMap<String, String>,
+    ) -> Result<OntologyFile> {
+        let imports: Vec<String> = doc
+            .header
+            .imports
+            .iter()
+            .map(|i| i.as_str().to_string())
+            .collect();
+        let ontology = read::Ontology::from_axioms(doc.header, doc.axioms, Mode::Lenient);
+        OntologyFile::new(
+            name,
+            RdfSyntax::OwlFunctional,
+            ontology,
+            Vec::new(),
+            prefixes,
+            (imports, Vec::new()),
+            &OntologyRequest::default(),
+        )
+    }
+
+    /// The header and every axiom of the file, the terminology and the assertions that
+    /// map to axioms, as a document a command transforms. A triple that maps to no axiom
+    /// is left out, as the reverse mapping leaves it out of the ontology.
+    pub fn into_document(self, opts: &QueryOptions) -> Result<sparkles_owl::transform::Document> {
+        let mut axioms: Vec<Axiom> = Vec::new();
+        self.assertions(opts, |ax, _| {
+            if let Some(ax) = ax {
+                axioms.push(ax.into_owned());
+            }
+            Ok(true)
+        })?;
+        let (header, terminology): (_, Vec<Axiom>) = match Arc::try_unwrap(self.ontology) {
+            Ok(o) => (o.header, o.axioms.into_keys().collect()),
+            Err(o) => (o.header.clone(), o.axioms.keys().cloned().collect()),
+        };
+        axioms.extend(terminology);
+        Ok(sparkles_owl::transform::Document::new(header, axioms))
+    }
+
     /// The members of the read that answers carry, as a read of the loaded file gives them.
     pub fn view(&self) -> ReadView<'_> {
         const NO_INFERENCES: Option<&Inferences> = None;
