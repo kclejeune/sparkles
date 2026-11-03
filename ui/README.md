@@ -23,6 +23,34 @@ serves under `/ui/`, and `/` redirects to `/ui/`. Datasets live at the server ro
 | `/ui/tokens`                          | Lists the caller's API tokens, creates one with its scopes and expiry, and revokes them.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `/ui/cli/authorize`, `/ui/cli/device` | Approves or denies a `sparkles auth login` from the CLI, by browser loopback or by device code.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 
+## App shell and design system
+
+`routes/+layout.svelte` puts every page except sign-in and CLI approval in one shell:
+`TopBar.svelte` across the top, `NavLinks.svelte` in a rail beside the page, and on a
+phone a drawer that the top bar's menu button opens. The top bar's `ScopeSearch.svelte`
+is the dataset switcher (`DatasetMenu.svelte`) and the launcher's input. `Ctrl+K`,
+`Cmd+K` and `/` focus it, Escape gives the focus back, and on a phone it expands over the
+bar. `lib/launcher.svelte.ts` keeps the launcher's providers. A page registers one with
+`launcher.register({ id, label, order, search })` while it is mounted, and the shell
+registers the entity search of `lib/entity-search.ts`. The command palette of ROADMAP item
+631 adds its commands, pages and saved queries the same way.
+
+`src/app.css` defines the tokens for the light theme and both dark ones (by
+`prefers-color-scheme` and by `data-theme`), which must stay equal, as `lib/tokens.test.ts`
+checks together with WCAG AA contrast for every text colour. The breakpoints are 1200 px,
+where the rail narrows to icons and `--gutter` drops from 24 to 20 px, and 760 px, where
+the rail becomes the drawer and the gutter drops to 16 px. Use the spacing (`--sp-*`), control height
+(`--ctl-h`, `--ctl-h-sm`), radius and shadow tokens instead of literal values, and the
+shared classes for page heads (`.page-head`, `.page-actions`, `.page-context` with
+`.form-row`), panels, `.count-badge`, `table.data` in `.table-scroll`, and a list beside its
+detail (`.page-container.fill` with `.split-view`).
+
+`node scripts/seed-design.mjs` serves realistic data for layout work: the Gene Ontology,
+the UNESCO Thesaurus and the demo dataset with stored queries and branches, downloaded
+once into `~/.cache/sparkles-ui-seed`. `pnpm design:capture` then shoots every page at
+1440, 900 and 390 px in both themes with each page's sideways overflow, and
+`pnpm design:check` checks that the GO class tree shows labels.
+
 ## Ontology editor
 
 The **Ontology** page shows trees of classes, object, data and annotation properties and
@@ -279,7 +307,10 @@ iPhone SE's viewport and touch, in Chromium): every route, each result view, the
 explorer's tabs, and the dialogs and menus (the mock suite). It fails when the page, the
 layout's `main` or an open dialog scrolls sideways, and names the elements that stick out
 of the screen. Wide content such as tables, code and plans must scroll inside its own
-container instead. `tests/phone.ts` holds the check.
+container instead. `tests/phone.ts` holds the check. `shell.spec.ts`, also in both suites,
+covers the app shell: the search and its keys, the rail at 1440 and 900 px, the phone's
+expanding search and drawer at 390 px, keyboard focus, and no sideways scroll on any page
+at the three widths.
 
 ## Serving from the Rust server
 
@@ -292,7 +323,10 @@ container instead. `tests/phone.ts` holds the check.
 
 ```
 src/
-  app.css                  design tokens (light/dark), base controls
+  app.css                  design tokens (light/dark), shared controls, panels and page layout
+  lib/launcher.svelte.ts   the top bar's launcher: open state, keys, provider registry
+  lib/entity-search.ts     the entity search client and the launcher's entity provider
+  lib/shell.ts             the rail's pages and their links
   lib/api.ts               typed client for docs/API.md
   lib/app.svelte.ts        global state: datasets, current dataset, prefixes, theme, ping, toasts
   lib/fmt-wasm.ts          formatting in the browser (the WebAssembly formatter) or through /$/format
