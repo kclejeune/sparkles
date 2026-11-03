@@ -97,6 +97,33 @@ test.describe('at 1440 pixels', () => {
     );
   });
 
+  test('a pending Enter is dropped when the query changes or the search closes', async ({
+    page,
+  }) => {
+    await onDataset(page, 'uni');
+    await visit(page, '/ui/datasets');
+    await page.route('**/$/ontology/uni/search?*', async (r) => {
+      await new Promise((f) => setTimeout(f, 1200));
+      await r.continue();
+    });
+    await page.keyboard.press('Control+k');
+    await page.keyboard.type('stud');
+    await page.keyboard.press('Enter');
+    // an edit asks again, and its results wait for another Enter
+    await page.keyboard.type('ent');
+    await expect(page.getByRole('option', { name: /^Student\b/ })).toBeVisible();
+    await page.waitForTimeout(400);
+    await expect(page).toHaveURL(/\/ui\/datasets$/);
+
+    await search(page).fill('pers');
+    await page.keyboard.press('Enter');
+    // a click outside the search, away from its results
+    await page.mouse.click(1400, 860);
+    await expect(page.getByRole('listbox', { name: 'Search results' })).toHaveCount(0);
+    await page.waitForTimeout(1800);
+    await expect(page).toHaveURL(/\/ui\/datasets$/);
+  });
+
   test('the arrow keys keep the active result in view', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 340 });
     await onDataset(page, 'uni');
@@ -141,6 +168,15 @@ test.describe('at 1440 pixels', () => {
     await page.keyboard.type('ada love');
     await page.getByRole('option', { name: /^Ada Lovelace/ }).click();
     await expect(page).toHaveURL(/\/ui\/explore\?ds=uni&iri=/);
+    await expect(page.getByRole('tab', { name: /Graph/ })).toHaveAttribute('aria-selected', 'true');
+
+    // the same resource again, after a switch to Schema
+    await page.getByRole('tab', { name: /Schema/ }).click();
+    await expect(page).toHaveURL(/tab=schema/);
+    await page.keyboard.press('Control+k');
+    await page.keyboard.type('ada love');
+    await page.getByRole('option', { name: /^Ada Lovelace/ }).click();
+    await expect(page).not.toHaveURL(/tab=schema/);
     await expect(page.getByRole('tab', { name: /Graph/ })).toHaveAttribute('aria-selected', 'true');
   });
 

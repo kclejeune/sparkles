@@ -2058,10 +2058,11 @@
     const urlTab = page.url.searchParams.get('tab');
     void page.url.searchParams.get('ds');
     untrack(() => {
-      if (!iri || (focusId && nodes[focusId]?.iri === iri)) return;
-      // a link to a resource, such as a top bar search hit, shows it in the graph
-      if (!urlTab) tab = 'graph';
-      void focusOn(iri, undefined, true);
+      if (!iri) return;
+      // a link to a resource, such as a top bar search hit, shows it in the graph, also
+      // when it is the resource already focused; the page's own tabs keep `tab` in the URL
+      if (!urlTab && tab !== 'graph') tab = 'graph';
+      if (!focusId || nodes[focusId]?.iri !== iri) void focusOn(iri, undefined, true);
     });
   });
 

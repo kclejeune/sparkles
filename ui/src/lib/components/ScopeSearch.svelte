@@ -31,8 +31,11 @@
   let groupsFor = $state('');
   let active = $state(0);
   let busy = $state(false);
-  /** Enter was pressed before the results of the current query arrived. */
-  let pickPending = false;
+  /**
+   * The dataset and query of an Enter pressed before their results arrived. Their first row
+   * opens when they do, unless the query changes or the launcher closes first.
+   */
+  let pendingKey: string | null = null;
   /** Where the focus was before the keys opened the launcher. */
   let returnTo: HTMLElement | null = null;
   const mac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
@@ -95,6 +98,7 @@
     const q = launcher.query.trim();
     const d = ds;
     const key = searchKey;
+    if (pendingKey !== key) pendingKey = null;
     const providers = launcher.providers.filter((p) => !p.active || p.active({ ds: d }));
     if (!launcher.open && !q) {
       groups = [];
@@ -125,8 +129,8 @@
         groupsFor = key;
         active = 0;
         busy = false;
-        if (pickPending) {
-          pickPending = false;
+        if (pendingKey === key && launcher.open) {
+          pendingKey = null;
           pick(groups.flatMap((g) => g.items)[0]);
         }
       },
@@ -159,14 +163,18 @@
       e.preventDefault();
       // rows of an earlier query or dataset are not picked; the first row of this one is
       if (fresh) pick(items[active]);
-      else if (launcher.query.trim()) pickPending = true;
+      else if (launcher.query.trim()) pendingKey = searchKey;
     } else if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
-      pickPending = false;
       void close();
     }
   }
+
+  // a dismissed launcher forgets a pending Enter, whichever way it closed
+  $effect(() => {
+    if (!launcher.open) pendingKey = null;
+  });
 
   // the active row stays in view as the arrow keys move it
   $effect(() => {
