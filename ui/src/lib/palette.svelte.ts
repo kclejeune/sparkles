@@ -7,7 +7,6 @@
 import { goto } from '$app/navigation';
 import * as api from './api';
 import { app } from './app.svelte';
-import { rank } from './fuzzy';
 import {
   launcher,
   type LauncherCommand,
@@ -15,6 +14,9 @@ import {
   type LauncherProvider,
 } from './launcher.svelte';
 import { datasetSwitchHref, navItems, navLink } from './shell';
+
+/** The ranking, loaded with the first typed query rather than with the shell. */
+const ranking = () => import('./fuzzy').then((m) => m.rank);
 
 /** Rows of a group on an empty query outside a mode. */
 export const SUGGEST = 6;
@@ -54,6 +56,7 @@ export function commandProvider(group: 'page' | 'global'): LauncherProvider {
         if (mode === '>') return list.slice(0, LIST_MAX).map((c) => commandItem(c));
         return pageGroup ? list.slice(0, SUGGEST).map((c) => commandItem(c)) : [];
       }
+      const rank = await ranking();
       return rank(list, q, (c) => ({ id: c.id, title: c.label, keywords: c.keywords }), recent)
         .slice(0, 8)
         .map(({ item, match }) => commandItem(item, match.ranges));
@@ -101,6 +104,7 @@ export function pageProvider(base: string, backupsVisible: () => boolean): Launc
     async search(q, { ds, mode, recent }) {
       const all = pages(ds);
       if (!q) return mode === '>' ? all : mode ? [] : all.slice(0, 4);
+      const rank = await ranking();
       return rank(all, q, (p) => ({ id: p.id, title: p.title, keywords: p.keywords }), recent)
         .slice(0, 6)
         .map(({ item, match }) => ({ ...item, highlight: match.ranges }));
@@ -138,6 +142,7 @@ export function datasetProvider(): LauncherProvider {
     watch: () => app.datasets,
     async search(q, { mode, recent }) {
       if (!q) return mode === '#' ? app.datasets.slice(0, LIST_MAX).map((d) => item(d)) : [];
+      const rank = await ranking();
       return rank(app.datasets, q, (d) => ({ id: d.name, title: d.name }), recent)
         .slice(0, 6)
         .map(({ item: d, match }) => item(d, match.ranges));
@@ -175,6 +180,7 @@ export function savedQueryProvider(base: string): LauncherProvider {
     async search(q, { ds, mode, recent }) {
       if (!ds || (!q && mode !== '?')) return [];
       const all = await list(ds);
+      const rank = await ranking();
       const ranked = q
         ? rank(
             all,
@@ -217,6 +223,7 @@ export function branchProvider(opts: {
       if (!q && mode !== '#') return [];
       const names = await opts.list();
       const cur = opts.current();
+      const rank = await ranking();
       const ranked = q
         ? rank(names, q, (n) => ({ id: n, title: n })).slice(0, 6)
         : names.slice(0, LIST_MAX).map((n) => ({ item: n, match: { score: 0, ranges: [] } }));
