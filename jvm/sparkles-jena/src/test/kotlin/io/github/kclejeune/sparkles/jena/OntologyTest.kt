@@ -233,6 +233,12 @@ class OntologyTest {
             val sup = prof.get("class").asObject.get("superClasses").asArray[0].asObject
             assertEquals("ObjectSomeValuesFrom", sup.get("expression").asObject.getString("type"))
             assertThrows(SparklesNotFoundException::class.java) { onto.entity("http://ex.org/nothing", read) }
+            // roadmap item 616: the entity search, by the local name here
+            val found = SparklesOnt.search(ds, "prof", "http://ex.org/onto")
+            assertEquals("http://ex.org/Professor", found.get("results").asArray[0].asObject.getString("iri"))
+            val typo = onto.search("profesor", read, kinds = listOf("class")).get("results").asArray[0].asObject
+            assertEquals("http://ex.org/Professor", typo.getString("iri"))
+            assertEquals("fuzzy", typo.get("match").asObject.getString("kind"))
             val before = ds.headCommit().seq
             val done = SparklesOnt.edit(
                 ds,

@@ -343,14 +343,15 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<SearchResults> {
         req.validate()?;
-        if let Some(at) = &req.at {
-            return Err(Error::HistoryUnsupported(format!(
-                "the entity search reads the head, not {at:?}"
-            )));
+        // a search of a retained commit or of inferences is roadmap item NEW-ITEM-2
+        if req.at.is_some() {
+            return Err(Error::invalid(
+                "the entity search reads the head and does not take at",
+            ));
         }
         if req.inferences {
             return Err(Error::invalid(
-                "the entity search reads the asserted triples; inferences are not supported",
+                "the entity search reads the asserted triples and does not take inferences",
             ));
         }
         search.validate()?;

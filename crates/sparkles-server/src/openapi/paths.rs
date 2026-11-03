@@ -844,6 +844,60 @@ fn ontology(p: &mut Paths) {
             )
             .errors(&[400, 404, 408, 410]),
     );
+    p.add(
+        read(op(GET, "/$/ontology/{ds}/search", "searchOntology", "Ontology", "Search the entities of an ontology"))
+            .doc("The entities whose labels, synonyms, short forms, IRIs or definitions match `q`, in any language and with typo tolerance, ranked for a typeahead: a label equal to the query first, then labels that start with it, synonyms, short forms and IRIs equal to it or starting with it, labels and then synonyms that contain its words, matches within a few edits, and definitions that contain its words. Within each tier the order is the edits, the field, entities that are not deprecated first, the caller's language, the length of the matched text, the text and the IRI. The search reads the head of the branch from an entity index that each commit's changes keep current, and the caller sees only the graphs their grants allow. A query of 1 to 3 characters takes no edits as typed, 4 to 7 characters take one and longer queries two. `at` and `inferences` are refused.")
+            .see("ontology")
+            .query("q", s(), "The text searched for.")
+            .query("kind", s(), "Entity kinds, comma separated: `class`, `property` (every kind of property), `objectProperty`, `dataProperty`, `annotationProperty`, `individual`, `datatype`, `concept`, `conceptScheme` or `collection` (all kinds by default).")
+            .query("lang", s(), "The caller's languages, comma separated and most preferred first, as BCP 47 tags. `Accept-Language` is read when it is absent. Values in these languages rank first within a tier, then untagged values, then English, then the others.")
+            .query("limit", int(), "The most entities listed, from 1 to 100 (10 by default).")
+            .query("offset", int(), "The entities skipped. `offset` and `limit` together reach at most 10,000.")
+            .query("fuzzy", boolean(), "Rank the matches within a few edits (true by default).")
+            .query("definitions", boolean(), "Rank the matches in definitions (true by default).")
+            .resp(
+                "200",
+                "One page of ranked entities.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "properties": {
+                        "dataset": { "type": "string" },
+                        "commit": { "type": "integer" },
+                        "graphs": { "type": "array", "items": { "type": "string" } },
+                        "query": { "type": "string" },
+                        "results": { "type": "array", "items": {
+                            "type": "object",
+                            "description": "One entity. `type` is `entity`, so that lists which mix kinds of result tell them apart.",
+                            "properties": {
+                                "type": { "type": "string", "enum": ["entity"] },
+                                "iri": { "type": "string" },
+                                "kinds": { "type": "array", "items": { "type": "string" } },
+                                "label": { "type": ["string", "null"], "description": "The label in the caller's best language." },
+                                "labelLang": { "type": ["string", "null"] },
+                                "shortForm": { "type": ["string", "null"], "description": "The `oboInOwl:id`, `skos:notation`, prefixed name or local name." },
+                                "deprecated": { "type": "boolean" },
+                                "match": { "type": "object", "properties": {
+                                    "field": { "type": "string", "enum": ["label", "synonym", "shortForm", "definition"] },
+                                    "property": { "type": ["string", "null"], "description": "The property of the value, or null for the IRI and its local name." },
+                                    "text": { "type": "string" },
+                                    "lang": { "type": ["string", "null"] },
+                                    "kind": { "type": "string", "enum": ["exact", "prefix", "words", "fuzzy"] },
+                                    "distance": { "type": "integer" },
+                                    "tier": { "type": "integer" },
+                                    "highlight": { "type": "array", "description": "The matched ranges of `text` as `[start, end]` pairs in UTF-16 code units.", "items": { "type": "array", "items": { "type": "integer" } } }
+                                } }
+                            }
+                        } },
+                        "offset": { "type": "integer" },
+                        "limit": { "type": "integer" },
+                        "more": { "type": "boolean" },
+                        "next": { "type": ["integer", "null"] },
+                        "index": { "type": "string", "enum": ["current", "updated", "built"], "description": "Whether the index reflected the head, applied the changes of later commits or was built for this search." }
+                    }
+                } } })),
+            )
+            .errors(&[400, 404, 408, 409]),
+    );
     // an axiom an edit takes: its JSON form, or a string in functional-style syntax
     let axiom_in = json!({ "oneOf": [
         { "type": "object", "description": "The axiom's JSON form." },

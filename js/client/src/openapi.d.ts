@@ -2230,6 +2230,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ontology/{ds}/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search the entities of an ontology
+         * @description The entities whose labels, synonyms, short forms, IRIs or definitions match `q`, in any language and with typo tolerance, ranked for a typeahead: a label equal to the query first, then labels that start with it, synonyms, short forms and IRIs equal to it or starting with it, labels and then synonyms that contain its words, matches within a few edits, and definitions that contain its words. Within each tier the order is the edits, the field, entities that are not deprecated first, the caller's language, the length of the matched text, the text and the IRI. The search reads the head of the branch from an entity index that each commit's changes keep current, and the caller sees only the graphs their grants allow. A query of 1 to 3 characters takes no edits as typed, 4 to 7 characters take one and longer queries two. `at` and `inferences` are refused.
+         */
+        get: operations["searchOntology"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/openapi.json": {
         parameters: {
             query?: never;
@@ -17688,6 +17708,99 @@ export interface operations {
             412: components["responses"]["PreconditionFailed"];
             422: components["responses"]["Unprocessable"];
             507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    searchOntology: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The text searched for. */
+                q?: string;
+                /** @description Entity kinds, comma separated: `class`, `property` (every kind of property), `objectProperty`, `dataProperty`, `annotationProperty`, `individual`, `datatype`, `concept`, `conceptScheme` or `collection` (all kinds by default). */
+                kind?: string;
+                /** @description The caller's languages, comma separated and most preferred first, as BCP 47 tags. `Accept-Language` is read when it is absent. Values in these languages rank first within a tier, then untagged values, then English, then the others. */
+                lang?: string;
+                /** @description The most entities listed, from 1 to 100 (10 by default). */
+                limit?: number;
+                /** @description The entities skipped. `offset` and `limit` together reach at most 10,000. */
+                offset?: number;
+                /** @description Rank the matches within a few edits (true by default). */
+                fuzzy?: boolean;
+                /** @description Rank the matches in definitions (true by default). */
+                definitions?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of ranked entities. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        commit?: number;
+                        dataset?: string;
+                        graphs?: string[];
+                        /**
+                         * @description Whether the index reflected the head, applied the changes of later commits or was built for this search.
+                         * @enum {string}
+                         */
+                        index?: "current" | "updated" | "built";
+                        limit?: number;
+                        more?: boolean;
+                        next?: number | null;
+                        offset?: number;
+                        query?: string;
+                        results?: {
+                            deprecated?: boolean;
+                            iri?: string;
+                            kinds?: string[];
+                            /** @description The label in the caller's best language. */
+                            label?: string | null;
+                            labelLang?: string | null;
+                            match?: {
+                                distance?: number;
+                                /** @enum {string} */
+                                field?: "label" | "synonym" | "shortForm" | "definition";
+                                /** @description The matched ranges of `text` as `[start, end]` pairs in UTF-16 code units. */
+                                highlight?: number[][];
+                                /** @enum {string} */
+                                kind?: "exact" | "prefix" | "words" | "fuzzy";
+                                lang?: string | null;
+                                /** @description The property of the value, or null for the IRI and its local name. */
+                                property?: string | null;
+                                text?: string;
+                                tier?: number;
+                            };
+                            /** @description The `oboInOwl:id`, `skos:notation`, prefixed name or local name. */
+                            shortForm?: string | null;
+                            /** @enum {string} */
+                            type?: "entity";
+                        }[];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };
