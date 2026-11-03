@@ -972,3 +972,125 @@ async fn nested_children_lists_and_alternatives_over_http() {
     let r = send(&app, "GET", &format!("{uri}&nested=maybe"), "", "").await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
 }
+
+/// The built-in SKOS shapes (spec U12): `GET /$/skos/shapes` answers them, forms read them
+/// with `shapes=skos`, a check validates against them, `/{ds}/shacl` runs them, and the
+/// stored `forms` setting refuses them.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_built_in_skos_shapes_over_http() {
+    let (_d, st, app) = server().await;
+    let r = send(&app, "GET", "/$/skos/shapes", "", "").await;
+    assert_eq!(r.status, StatusCode::OK);
+    let shapes = String::from_utf8(r.body).unwrap();
+    assert!(shapes.contains("<urn:x-sparkles:skos:>"));
+    assert!(shapes.contains("sks:ConceptShape"));
+
+    st.create("thes", DbType::Persistent).unwrap();
+    let data = r#"PREFIX skos: <http://www.w3.org/2004/02/skos/core#> PREFIX ex: <http://example.org/>
+    INSERT DATA {
+      ex:animals a skos:Concept ; skos:prefLabel "Animals"@en ; skos:altLabel "Beasts"@en .
+      ex:birds a skos:Concept ; skos:prefLabel "Birds"@en ; skos:broader ex:animals ; skos:related ex:animals .
+    }"#;
+    let r = send(
+        &app,
+        "POST",
+        "/thes/update",
+        "application/sparql-update",
+        data,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+
+    let r = send(
+        &app,
+        "GET",
+        &format!(
+            "/$/forms/thes?focus={}&shapes=skos",
+            enc("http://example.org/animals")
+        ),
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let m = r.json();
+    assert_eq!(m["shapes"]["source"], "skos");
+    let def = field(&m, "Definition");
+    assert_eq!(def["group"], "urn:x-sparkles:skos:Notes");
+
+    // a check against the built-in shapes reports an S14 clash on the label field
+    let body = json!({
+        "focus": "http://example.org/animals",
+        "shapes": "skos",
+        "changes": [{
+            "field": "<http://www.w3.org/2004/02/skos/core#prefLabel>",
+            "add": [{ "type": "literal", "value": "Fauna", "xml:lang": "en" }]
+        }],
+        "expect": { "<http://www.w3.org/2004/02/skos/core#prefLabel>": [
+            { "type": "literal", "value": "Animals", "xml:lang": "en" }
+        ] }
+    });
+    let r = send(
+        &app,
+        "POST",
+        "/$/forms/thes/check",
+        "application/json",
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let c = r.json();
+    assert_eq!(c["validation"]["conforms"], false, "{c}");
+    assert!(c.to_string().contains("S14"), "{c}");
+
+    // the shapes over the whole dataset: S27 for the birds
+    let r = send(&app, "POST", "/thes/shacl", "text/turtle", &shapes).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let report = String::from_utf8_lossy(&r.body).to_string();
+    assert!(report.contains("S27"), "{report}");
+
+    // a stored setting cannot name them
+    let r = send(
+        &app,
+        "PATCH",
+        "/$/settings/thes/forms",
+        "application/json",
+        r#"{"shapes": "skos"}"#,
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    // and an unknown source is refused with the list of sources
+    let r = send(
+        &app,
+        "GET",
+        &format!(
+            "/$/forms/thes?focus={}&shapes=owl",
+            enc("http://example.org/animals")
+        ),
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&r.body).contains("skos"));
+}

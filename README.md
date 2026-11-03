@@ -258,6 +258,14 @@ editor. The collapsed panel below it has more workflows and detail views.
     <td>Asserted and inferred class hierarchies side by side</td>
   </tr>
   <tr>
+    <td><img src="docs/images/thesaurus-editor.png" alt="The thesaurus editor with the concept tree of an animals scheme, where Whales and Penguins appear under both Mammals and Marine animals marked 2 broader, and the label table of Whales with its English and French preferred labels and an English alternative label, each with buttons that edit it, remove it or turn it into a SKOS-XL label"></td>
+    <td><img src="docs/images/thesaurus-checks.png" alt="The checks of the thesaurus editor, listing the concept Owls as breaking S13 because one label is both preferred and alternative, with a button that enforces the SKOS rules on writes"></td>
+  </tr>
+  <tr>
+    <td>The thesaurus editor: a concept tree with polyhierarchy and multilingual labels</td>
+    <td>The SKOS Reference's integrity conditions checked by built-in shapes</td>
+  </tr>
+  <tr>
     <td><img src="docs/images/forms-nested.png" alt="The editing form of a SKOS concept with its SKOS-XL labels as nested forms, the stored label edited to All animals and a new French label added from the label shape's template, with the previewed commit listing the triples it adds and removes"></td>
     <td><img src="docs/images/forms-list.png" alt="The editing form of a SKOS collection, with its member chosen as a Concept among the alternatives of sh:or and its ordered member list after fish moved up, each member with buttons that move or remove it"></td>
   </tr>
@@ -345,11 +353,11 @@ editor. The collapsed panel below it has more workflows and detail views.
   </tr>
   <tr>
     <td><img src="docs/images/ontology-preview.png" alt="The preview of an ontology edit that creates the class teaching assistant, listing the declaration, label and subclass axioms it adds, the three triples it writes and the commit message"></td>
-    <td></td>
+    <td><img src="docs/images/thesaurus-move.png" alt="The preview of a drag in the thesaurus editor that moves Bats under Flying animals, removing the broader and narrower triples that linked it to Mammals and adding the two that link it to Flying animals, above the commit message"></td>
   </tr>
   <tr>
     <td>An ontology edit previewed as axioms and triples before it commits</td>
-    <td></td>
+    <td>A concept dragged to a new broader concept, previewed as one commit</td>
   </tr>
 </table>
 

@@ -42,6 +42,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // the OpenAPI description (`openapi`)
     ("/$/openapi.json", &["GET"]),
     ("/$/openapi.yaml", &["GET"]),
+    ("/$/skos/shapes", &["GET"]),
     ("/$/server", &["GET", "POST"]),
     ("/$/metrics", &["GET"]),
     ("/$/server/memory", &["GET"]),
@@ -344,6 +345,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/" | "/ui" | "/ui/" | "/ui/{*path}" | "/$/ping" | "/$/ready" | "/$/whoami" => Public,
         // describes the binary's API, not its data or configuration
         "/$/openapi.json" | "/$/openapi.yaml" => Public,
+        // the built-in SKOS shapes: text compiled into the binary, not data
+        "/$/skos/shapes" => Caller,
         // where MCP clients find the authorization server, before they hold a token
         "/.well-known/oauth-protected-resource" | "/.well-known/oauth-protected-resource/$/mcp" => {
             Public

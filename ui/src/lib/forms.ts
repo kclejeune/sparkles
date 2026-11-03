@@ -129,7 +129,7 @@ export type FormModel = {
   branch: string;
   editable: boolean;
   shapes: {
-    source: 'guard' | 'graphs' | 'drafted';
+    source: 'guard' | 'graphs' | 'drafted' | 'skos';
     nodeShapes: string[];
     missing?: string;
     unknownHints: string[];

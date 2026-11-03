@@ -9061,6 +9061,7 @@ need the `shacl` cargo feature, which is on by default, and return `501` without
 | `GET /$/forms/{ds}?focus=IRI` | `read` | The form model of a resource, or with `class=IRI` the empty form of a new instance. |
 | `POST /$/forms/{ds}/check` | `write` | A dry run of a change and its validation against the form's shapes. |
 | `POST /$/forms/{ds}/save` | `write` | The commit of a change, unless another commit changed its fields. |
+| `GET /$/skos/shapes` | any caller | The built-in SKOS shapes as Turtle. |
 
 Checks follow shape dependencies in the base and candidate states rather than a fixed
 number of graph hops. The allowance admits 500 additional distinct targets beyond the
@@ -9083,11 +9084,13 @@ cover its target selection and work, not all SHACL heap use or cold index decodi
 * **`class`** asks for the form of a new instance of that class instead, built from the
   node shapes that target the class or one of its superclasses, with no values and a
   `focus` of `null`. A request names `focus` or `class`, and a `class` form takes no `at`.
-* **`shapes`** is `guard`, `graphs` or `drafted` and overrides the `forms` setting's
-  source. `guard` reads the shapes of the dataset's write-time SHACL guard, `graphs` reads
-  the shapes graphs the setting names, and `drafted` drafts shapes from the data as the
-  schema report does. A dataset without a SHACL guard answers with no fields and
-  `shapes.missing` set, rather than an error.
+* **`shapes`** is `guard`, `graphs`, `drafted` or `skos` and overrides the `forms`
+  setting's source. `guard` reads the shapes of the dataset's write-time SHACL guard,
+  `graphs` reads the shapes graphs the setting names, and `drafted` drafts shapes from the
+  data as the schema report does. `skos` reads the built-in SKOS shapes that
+  [SKOS shapes](#skos-shapes) describes, which only a request can choose. A dataset
+  without a SHACL guard answers with no fields and `shapes.missing` set, rather than an
+  error.
 * **`branch`** opens the form on a branch, as on other routes. **`at`** opens the form at
   a past state, as the history routes take it, and such a form is never editable.
 * **`lang`** is the language whose `sh:name` and `sh:description` the labels prefer. The
@@ -9367,7 +9370,7 @@ kept in `<db>/forms.json`. Its fields are these.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `shapes` | `guard` | Where the shapes come from, which is `guard`, `graphs` or `drafted`. |
+| `shapes` | `guard` | Where the shapes come from, which is `guard`, `graphs` or `drafted`. A request can also name `skos`. |
 | `graphs` | `[]` | The shapes graphs that `shapes: "graphs"` reads. |
 | `saveTo` | `auto` | Where saves of a form on `main` go, which is `auto`, `main` or `branch`. |
 | `branchTemplate` | `edits.{user}.{date}` | The name of the session branch. It must hold `{user}`. |
@@ -9378,6 +9381,31 @@ kept in `<db>/forms.json`. Its fields are these.
 curl -X PATCH 'localhost:3030/$/settings/people/forms' \
   -H 'content-type: application/json' -d '{"saveTo": "branch"}'
 ```
+
+### SKOS shapes
+
+`GET /$/skos/shapes` answers the built-in SKOS shapes as Turtle. They lay out the forms of
+concept schemes, concepts, collections, ordered collections and SKOS-XL labels, and they
+check the integrity conditions of the
+[SKOS Reference](https://www.w3.org/TR/skos-reference/). The conditions are S9, S13,
+S14, S27, S37 and S46, with S51, S52 and S58 of the SKOS-XL appendix. The literal forms of
+SKOS-XL labels count for S13 and S14, as S55 to S57 imply. Each result's message names
+its condition. A linked concept, scheme or collection member without its `rdf:type` is
+reported at `sh:Info` severity, which a guard with the default threshold lets through.
+The shapes graph does not hold the SKOS vocabulary, so the checks name its consequences.
+`skos:OrderedCollection` counts as `skos:Collection`, the subjects and objects of the
+semantic and mapping relations count as concepts, and the properties of concept schemes
+and collections type their subjects and objects. S27 reads `skos:broadMatch`,
+`skos:narrowMatch` and `skos:relatedMatch` as the sub-properties of `skos:broader`,
+`skos:narrower` and `skos:related` they are, and S46 follows `skos:exactMatch` through
+its symmetry and transitivity. Each SPARQL constraint reads one property path or basic
+graph pattern from the focus node, so a form check with `shapes=skos` validates only the
+resources an edit affects. The results of S27, S46 and the clash of two SKOS-XL labels
+name the focus node without a value.
+
+Forms read the shapes with `shapes=skos`. `POST /{ds}/shacl` runs them over a graph, and
+`PUT /$/validation/{ds}` installs them as a write guard with `{"shapes": {"inline": …}}`.
+The `forms` setting refuses `shapes: "skos"`, so a stored setting never depends on them.
 
 ## ShEx validation
 

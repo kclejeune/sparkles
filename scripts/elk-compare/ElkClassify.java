@@ -1,20 +1,26 @@
-// Classifies an ontology with ELK through the OWL API, for the comparison in
-// docs/benchmarks/el-classification. scripts/elk-compare/elk.sh fetches the pinned jars,
-// compiles this file and runs it with explicit heap settings.
+// Classifies an ontology with an OWL API reasoner, for the comparison in
+// docs/benchmarks/el-classification. nix/reasoners/default.nix compiles this file against
+// each reasoner's pinned jars, and the packages' `elk-classify`, `hermit-classify` and
+// `whelk-classify` wrappers run it. scripts/elk-compare/elk.sh runs those wrappers with
+// explicit heap settings.
 //
-//   ElkClassify [--reasoner elk|hermit] [--threads N] [--repeat N] [--taxonomy FILE] INPUT
+//   ElkClassify [--reasoner elk|hermit|whelk] [--threads N] [--repeat N] [--taxonomy FILE] INPUT
 //
-// --reasoner hermit runs HermiT, a complete OWL 2 DL reasoner, in place of ELK, with its
-// default configuration and on one thread, which the JSON line reports as its threads.
+// --reasoner hermit runs HermiT, a complete OWL 2 DL reasoner, and --reasoner whelk runs
+// Whelk, an OWL 2 EL reasoner in Scala, in place of ELK. Both run with their default
+// configuration and on one thread, which the JSON line reports as their threads. The
+// reasoners are loaded by name, so the file compiles against the OWL API alone, version
+// 5 for ELK and HermiT and version 4.5 for Whelk, and it calls only the methods that both
+// versions have.
 //
-// Each of the N runs loads INPUT with a fresh OWL API manager, creates an ELK reasoner with
-// N worker threads and precomputes the class hierarchy. loadMs is the OWL API's parse of
-// the file, and classifyMs runs from the creation of the reasoner to the end of
-// precomputeInferences(CLASS_HIERARCHY), which includes ELK's own loading of the axioms
-// from the OWL API ontology and the construction of its taxonomy. After each run a full GC
-// with the reasoner and the ontology still alive gives retainedHeapMib, the live heap
-// they hold. A JSON line on standard output gives the times of every run, the counts, the
-// peak resident memory of the process and the heap settings.
+// Each of the N runs loads INPUT with a fresh OWL API manager, creates a reasoner, with N
+// worker threads for ELK, and precomputes the class hierarchy. loadMs is the OWL API's
+// parse of the file, and classifyMs runs from the creation of the reasoner to the end of
+// precomputeInferences(CLASS_HIERARCHY), which includes the reasoner's own loading of the
+// axioms from the OWL API ontology and the construction of its taxonomy. After each run a
+// full GC with the reasoner and the ontology still alive gives retainedHeapMib, the live
+// heap they hold. A JSON line on standard output gives the times of every run, the counts,
+// the peak resident memory of the process and the heap settings.
 //
 // --taxonomy writes the direct hierarchy of the last run in the form that
 // scripts/el-oracle.py reads: EquivalentClasses for each node of several classes, with the
@@ -40,9 +46,6 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
 
-import org.semanticweb.elk.owlapi.ElkReasonerConfiguration;
-import org.semanticweb.elk.owlapi.ElkReasonerFactory;
-import org.semanticweb.elk.reasoner.config.ReasonerConfiguration;
 import org.semanticweb.owlapi.apibinding.OWLManager;
 import org.semanticweb.owlapi.formats.FunctionalSyntaxDocumentFormat;
 import org.semanticweb.owlapi.io.FileDocumentSource;
@@ -56,6 +59,8 @@ import org.semanticweb.owlapi.reasoner.InconsistentOntologyException;
 import org.semanticweb.owlapi.reasoner.InferenceType;
 import org.semanticweb.owlapi.reasoner.Node;
 import org.semanticweb.owlapi.reasoner.OWLReasoner;
+import org.semanticweb.owlapi.reasoner.OWLReasonerConfiguration;
+import org.semanticweb.owlapi.reasoner.OWLReasonerFactory;
 
 public class ElkClassify {
     static final String THING = "http://www.w3.org/2002/07/owl#Thing";
@@ -73,11 +78,12 @@ public class ElkClassify {
                 case "--repeat": repeat = Integer.parseInt(args[++i]); break;
                 case "--taxonomy": taxonomy = args[++i]; break;
                 case "--reasoner": which = args[++i]; break;
+                case "--self-test": selfTest(); return;
                 default: input = args[i];
             }
         }
-        if (input == null || threads < 1 || repeat < 1 || !(which.equals("elk") || which.equals("hermit"))) {
-            System.err.println("usage: ElkClassify [--reasoner elk|hermit] [--threads N] [--repeat N] [--taxonomy FILE] INPUT");
+        if (input == null || threads < 1 || repeat < 1 || !java.util.Arrays.asList("elk", "hermit", "whelk").contains(which)) {
+            System.err.println("usage: ElkClassify [--reasoner elk|hermit|whelk] [--threads N] [--repeat N] [--taxonomy FILE] INPUT");
             System.exit(2);
         }
         File file = new File(input);
@@ -94,32 +100,31 @@ public class ElkClassify {
             (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
         for (int run = 0; run < repeat; run++) {
             OWLOntologyManager manager = OWLManager.createOWLOntologyManager();
-            manager.getOntologyConfigurator()
-                .setMissingImportHandlingStrategy(MissingImportHandlingStrategy.SILENT);
+            manager.setOntologyLoaderConfiguration(manager.getOntologyLoaderConfiguration()
+                .setMissingImportHandlingStrategy(MissingImportHandlingStrategy.SILENT));
             OWLOntologyDocumentSource source = functional
                 ? new FileDocumentSource(file, new FunctionalSyntaxDocumentFormat())
                 : new FileDocumentSource(file);
             long t0 = System.nanoTime();
             OWLOntology ontology = manager.loadOntologyFromOntologyDocument(source);
             long t1 = System.nanoTime();
-            if (ontology.importsDeclarations().findAny().isPresent()) {
+            if (!ontology.getImportsDeclarations().isEmpty()) {
                 System.err.println(input + " declares imports, which el_classify does not read");
                 System.exit(3);
             }
-            ReasonerConfiguration elk = ReasonerConfiguration.getConfiguration();
-            elk.setParameter(ReasonerConfiguration.NUM_OF_WORKING_THREADS, Integer.toString(threads));
-            ElkReasonerConfiguration config = new ElkReasonerConfiguration(
-                ElkReasonerConfiguration.getDefaultOwlReasonerConfiguration(), elk);
             long c0 = os.getProcessCpuTime();
             long t2 = System.nanoTime();
             OWLReasoner reasoner = which.equals("elk")
-                ? new ElkReasonerFactory().createReasoner(ontology, config)
-                : hermit().createReasoner(ontology);
+                ? elk(ontology, threads)
+                : factory(which).createReasoner(ontology);
             // ELK answers an inconsistent ontology with an exception once it has found the
             // inconsistency, which ends that classification.
             try {
                 reasoner.precomputeInferences(InferenceType.CLASS_HIERARCHY);
-                consistent = reasoner.isConsistent();
+                // Whelk can call an ontology consistent whose owl:Thing it finds
+                // unsatisfiable, which makes it inconsistent.
+                consistent = reasoner.isConsistent() && !reasoner.getUnsatisfiableClasses()
+                    .contains(ontology.getOWLOntologyManager().getOWLDataFactory().getOWLThing());
             } catch (InconsistentOntologyException e) {
                 consistent = false;
             }
@@ -131,27 +136,28 @@ public class ElkClassify {
             System.gc();
             Runtime rt = Runtime.getRuntime();
             retainedMib.add((rt.totalMemory() - rt.freeMemory()) / 1048576.0);
-            classes = (int) ontology.classesInSignature(Imports.INCLUDED).count();
+            classes = ontology.getClassesInSignature(Imports.INCLUDED).size();
             logicalAxioms = ontology.getLogicalAxiomCount(Imports.INCLUDED);
             // An inconsistent ontology makes every class unsatisfiable, owl:Thing included,
             // as the taxonomy below writes it.
             unsatisfiable = consistent
                 ? reasoner.getUnsatisfiableClasses().getEntitiesMinusBottom().size()
-                : (int) ontology.classesInSignature(Imports.INCLUDED)
+                : (int) ontology.getClassesInSignature(Imports.INCLUDED).stream()
                     .filter(c -> !c.isOWLNothing() && !c.isOWLThing()).count() + 1;
             if (run == repeat - 1 && taxonomy != null) {
                 writeTaxonomy(ontology, reasoner, consistent, new File(taxonomy));
             }
             reasoner.dispose();
-            manager.clearOntologies();
+            for (OWLOntology o : new ArrayList<>(manager.getOntologies())) {
+                manager.removeOntology(o);
+            }
         }
         StringBuilder out = new StringBuilder("{");
         field(out, "input", "\"" + input.replace("\\", "\\\\").replace("\"", "\\\"") + "\"");
-        Class<?> impl = which.equals("elk") ? ElkReasonerFactory.class : hermit().getClass();
-        field(out, "reasoner", "\"" + (which.equals("elk") ? "ELK " : "HermiT ")
-            + impl.getPackage().getImplementationVersion() + "\"");
+        field(out, "reasoner", "\"" + NAMES.get(which) + " "
+            + factory(which).getClass().getPackage().getImplementationVersion() + "\"");
         field(out, "java", "\"" + System.getProperty("java.vm.name") + " " + System.getProperty("java.version") + "\"");
-        // HermiT classifies on one thread whatever --threads asks for.
+        // HermiT and Whelk classify on one thread whatever --threads asks for.
         field(out, "threads", Integer.toString(which.equals("elk") ? threads : 1));
         field(out, "classes", Integer.toString(classes));
         field(out, "logicalAxioms", Integer.toString(logicalAxioms));
@@ -178,9 +184,29 @@ public class ElkClassify {
         System.out.println(out);
     }
 
-    static org.semanticweb.owlapi.reasoner.OWLReasonerFactory hermit() throws Exception {
-        return (org.semanticweb.owlapi.reasoner.OWLReasonerFactory)
-            Class.forName("org.semanticweb.HermiT.ReasonerFactory").getDeclaredConstructor().newInstance();
+    static final java.util.Map<String, String> NAMES = java.util.Map.of(
+        "elk", "ELK", "hermit", "HermiT", "whelk", "Whelk");
+    static final java.util.Map<String, String> FACTORIES = java.util.Map.of(
+        "elk", "org.semanticweb.elk.owlapi.ElkReasonerFactory",
+        "hermit", "org.semanticweb.HermiT.ReasonerFactory",
+        "whelk", "org.geneontology.whelk.owlapi.WhelkOWLReasonerFactory");
+
+    static OWLReasonerFactory factory(String which) throws Exception {
+        return (OWLReasonerFactory) Class.forName(FACTORIES.get(which)).getDeclaredConstructor().newInstance();
+    }
+
+    // ELK with N worker threads, through its configuration classes by name:
+    // new ElkReasonerConfiguration(getDefaultOwlReasonerConfiguration(), elk) where elk is
+    // ReasonerConfiguration.getConfiguration() with NUM_OF_WORKING_THREADS set.
+    static OWLReasoner elk(OWLOntology ontology, int threads) throws Exception {
+        Class<?> rc = Class.forName("org.semanticweb.elk.reasoner.config.ReasonerConfiguration");
+        Object elk = rc.getMethod("getConfiguration").invoke(null);
+        rc.getMethod("setParameter", String.class, String.class)
+            .invoke(elk, rc.getField("NUM_OF_WORKING_THREADS").get(null), Integer.toString(threads));
+        Class<?> erc = Class.forName("org.semanticweb.elk.owlapi.ElkReasonerConfiguration");
+        Object owl = erc.getMethod("getDefaultOwlReasonerConfiguration").invoke(null);
+        Object config = erc.getConstructor(OWLReasonerConfiguration.class, rc).newInstance(owl, elk);
+        return factory("elk").createReasoner(ontology, (OWLReasonerConfiguration) config);
     }
 
     static boolean startsFunctional(File file) throws Exception {
@@ -195,7 +221,7 @@ public class ElkClassify {
 
     static void writeTaxonomy(OWLOntology ontology, OWLReasoner reasoner, boolean consistent, File path)
             throws Exception {
-        Set<OWLClass> all = ontology.classesInSignature(Imports.INCLUDED).collect(Collectors.toSet());
+        Set<OWLClass> all = new HashSet<>(ontology.getClassesInSignature(Imports.INCLUDED));
         TreeSet<String> lines = new TreeSet<>();
         if (!consistent) {
             TreeSet<String> every = new TreeSet<>();
@@ -206,14 +232,27 @@ public class ElkClassify {
             }
             lines.add(equivalent(every));
         } else {
-            all.add(reasoner.getTopClassNode().getRepresentativeElement());
-            all.add(reasoner.getBottomClassNode().getRepresentativeElement());
+            OWLClass top = ontology.getOWLOntologyManager().getOWLDataFactory().getOWLThing();
+            OWLClass bottom = ontology.getOWLOntologyManager().getOWLDataFactory().getOWLNothing();
+            all.add(top);
+            all.add(bottom);
+            // A reasoner may answer a class's equivalents or its superclasses with an empty
+            // node, as Whelk does for owl:Nothing when no class is unsatisfiable, so every
+            // node holds its own class, the unsatisfiable classes join owl:Nothing's node and
+            // a class without a named superclass gets owl:Thing.
+            Set<OWLClass> unsatisfiable = new HashSet<>(reasoner.getUnsatisfiableClasses().getEntities());
+            unsatisfiable.add(bottom);
             Set<OWLClass> done = new HashSet<>();
             for (OWLClass c : all) {
                 if (done.contains(c)) {
                     continue;
                 }
-                Node<OWLClass> node = reasoner.getEquivalentClasses(c);
+                boolean isBottom = unsatisfiable.contains(c);
+                Set<OWLClass> node = new HashSet<>(reasoner.getEquivalentClasses(c).getEntities());
+                node.add(c);
+                if (isBottom) {
+                    node.addAll(unsatisfiable);
+                }
                 TreeSet<String> members = new TreeSet<>();
                 for (OWLClass m : node) {
                     members.add(m.getIRI().toString());
@@ -224,13 +263,19 @@ public class ElkClassify {
                 } else {
                     lines.add("Declaration(Class(<" + members.first() + ">))");
                 }
-                if (node.isBottomNode()) {
+                if (isBottom || node.contains(top)) {
                     continue;
                 }
                 String first = members.first();
+                TreeSet<String> parents = new TreeSet<>();
                 for (Node<OWLClass> parent : reasoner.getSuperClasses(c, true)) {
-                    String p = parent.entities().map(x -> x.getIRI().toString())
-                        .min(Comparator.naturalOrder()).get();
+                    parent.getEntities().stream().map(x -> x.getIRI().toString())
+                        .min(Comparator.naturalOrder()).ifPresent(parents::add);
+                }
+                if (parents.isEmpty()) {
+                    parents.add(THING);
+                }
+                for (String p : parents) {
                     lines.add("SubClassOf(<" + first + "> <" + p + ">)");
                 }
             }
@@ -242,6 +287,54 @@ public class ElkClassify {
                 w.newLine();
             }
         }
+    }
+
+    // Checks writeTaxonomy against a reasoner that answers every query with an empty node, as
+    // Whelk does for some, on an ontology of three classes with B under A. The nix packages
+    // run it when they compile this file.
+    static void selfTest() throws Exception {
+        OWLOntologyManager m = OWLManager.createOWLOntologyManager();
+        org.semanticweb.owlapi.model.OWLDataFactory f = m.getOWLDataFactory();
+        OWLOntology o = m.createOntology();
+        OWLClass a = f.getOWLClass(org.semanticweb.owlapi.model.IRI.create("urn:t:A"));
+        OWLClass b = f.getOWLClass(org.semanticweb.owlapi.model.IRI.create("urn:t:B"));
+        OWLClass u = f.getOWLClass(org.semanticweb.owlapi.model.IRI.create("urn:t:U"));
+        for (OWLClass c : new OWLClass[] {a, b, u}) {
+            m.addAxiom(o, f.getOWLDeclarationAxiom(c));
+        }
+        OWLReasoner r = (OWLReasoner) java.lang.reflect.Proxy.newProxyInstance(
+            OWLReasoner.class.getClassLoader(), new Class<?>[] {OWLReasoner.class}, (proxy, method, margs) -> {
+                switch (method.getName()) {
+                    case "getEquivalentClasses":
+                        return new org.semanticweb.owlapi.reasoner.impl.OWLClassNode();
+                    case "getUnsatisfiableClasses":
+                        return new org.semanticweb.owlapi.reasoner.impl.OWLClassNode(u);
+                    case "getSuperClasses":
+                        return margs[0].equals(b)
+                            ? new org.semanticweb.owlapi.reasoner.impl.OWLClassNodeSet(
+                                new org.semanticweb.owlapi.reasoner.impl.OWLClassNode(a))
+                            : new org.semanticweb.owlapi.reasoner.impl.OWLClassNodeSet(
+                                new org.semanticweb.owlapi.reasoner.impl.OWLClassNode());
+                    default:
+                        throw new UnsupportedOperationException(method.getName());
+                }
+            });
+        File out = File.createTempFile("taxonomy", ".ofn");
+        out.deleteOnExit();
+        writeTaxonomy(o, r, true, out);
+        List<String> got = Files.readAllLines(out.toPath());
+        List<String> want = java.util.Arrays.asList(
+            "Declaration(Class(<" + THING + ">))",
+            "Declaration(Class(<urn:t:A>))",
+            "Declaration(Class(<urn:t:B>))",
+            "EquivalentClasses(<" + NOTHING + "> <urn:t:U>)",
+            "SubClassOf(<urn:t:A> <" + THING + ">)",
+            "SubClassOf(<urn:t:B> <urn:t:A>)");
+        if (!got.equals(want)) {
+            System.err.println("self-test: got " + got + ", want " + want);
+            System.exit(1);
+        }
+        System.out.println("self-test passed");
     }
 
     static String equivalent(TreeSet<String> members) {

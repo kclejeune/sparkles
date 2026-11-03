@@ -1021,6 +1021,11 @@ python = "check_iri"
 jvm = "SparklesHelpers.checkIri"
 node = "checkIri"
 
+["skos.shapes"]
+python = "skos_shapes"
+jvm = "planned: SparklesHelpers.skosShapes, after the Python binding"
+node = "planned: skosShapes, after the Python binding"
+
 ["terms.check_langtag"]
 python = "check_langtag"
 jvm = "SparklesHelpers.checkLanguageTag"

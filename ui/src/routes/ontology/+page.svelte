@@ -11,18 +11,16 @@
   import { page } from '$app/state';
   import { onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
-  import { app, toasts } from '$lib/app.svelte';
+  import { app } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
-  import { branchParam, MAIN, onBranch, validBranchName } from '$lib/branches';
-  import { followCommits } from '$lib/changes-feed';
+  import { branchParam, MAIN, onBranch } from '$lib/branches';
+  import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
   import { fmtInt } from '$lib/format';
   import {
     ancestorsOf,
     annotationAssertion,
     buildTree,
-    changedAnything,
     classifyOntology,
-    committedSeq,
     declaration,
     entityName,
     filterTree,
@@ -42,11 +40,9 @@
     RDFS_LABEL,
     renameUpdate,
     savePolicy,
-    sessionBranchName,
     taxonomyTree,
     TREE_KINDS,
     underParent,
-    UndoStack,
     usedQuery,
     validIri,
     validLang,
@@ -59,7 +55,6 @@
     type IriPolicy,
     type Lit,
     type Op,
-    type OpAnswer,
     type OntologySummary,
     type Selection,
     type Tree,
@@ -208,12 +203,11 @@
     void graph;
     untrack(() => {
       // a preview belongs to the target and graph it ran on
-      previewOpen = false;
       summary = null;
       shown = 0;
       loadedTarget = null;
       classification = null;
-      undo = new UndoStack(`sparkles.onto.undo.${target}|${graph ?? ''}`);
+      session.reset(`sparkles.onto.undo.${target}|${graph ?? ''}`);
       void loadAll();
       void loadSide();
     });
@@ -404,17 +398,15 @@
   const readonly = $derived(!canWrite || protectedBranch);
   let sessionError = $state<string | null>(null);
   async function startSession() {
-    const n = sessionBranchName(auth.who?.principal?.name);
     sessionError = null;
-    if (!validBranchName(n)) return void (sessionError = `Cannot name a branch ${n}.`);
     try {
-      if (!branchList.some((b) => b.name === n))
-        await api.createBranch(name, {
-          name: n,
-          from: branch ?? MAIN,
-          note: 'ontology editing session',
-        });
-      toasts.push('success', `Editing on branch ${n}`);
+      const n = await startSessionBranch(name, {
+        from: branch,
+        branches: branchList,
+        user: auth.who?.principal?.name,
+        prefix: 'onto',
+        note: 'ontology editing session',
+      });
       await nav({ branch: n });
     } catch (e) {
       sessionError = api.errorMessage(e);
@@ -422,78 +414,18 @@
   }
 
   // --- edits, previews and the undo stack ---------------------------------------------------
-  let undo = $state(new UndoStack());
-  let stackTick = $state(0);
-  const done = $derived((void stackTick, undo.done));
-  const undone = $derived((void stackTick, undo.undone));
-  let previewOpen = $state(false);
-  let previewOp = $state<Op | null>(null);
-  let previewTitle = $state('');
-  let pending: { mode: 'edit' | 'undo' | 'redo'; label: string; after?: () => void } = {
-    mode: 'edit',
-    label: '',
-  };
-  /** The commits this page made, which live refresh does not announce. */
-  const ownCommits = new Set<number>();
-
-  function edit(op: Op, label: string, after?: () => void) {
-    pending = { mode: 'edit', label, after };
-    previewOp = op;
-    previewTitle = label;
-    previewOpen = true;
-  }
-
-  function undoLast() {
-    const top = undo.done.at(-1);
-    if (!top) return;
-    pending = { mode: 'undo', label: top.label };
-    previewOp = { kind: 'revert', commit: top.commit };
-    previewTitle = `Undo: ${top.label}`;
-    previewOpen = true;
-  }
-
-  function redoLast() {
-    const top = undo.undone.at(-1);
-    if (!top) return;
-    pending = { mode: 'redo', label: top.label };
-    previewOp = { kind: 'revert', commit: top.commit };
-    previewTitle = `Redo: ${top.label}`;
-    previewOpen = true;
-  }
-
-  async function committed(op: Op, a: OpAnswer) {
-    const seq = committedSeq(a);
-    if (seq != null) ownCommits.add(seq);
-    const p = pending;
-    if (p.mode === 'undo') undo.undid(seq);
-    else if (p.mode === 'redo') undo.redid(seq);
-    else if (seq != null) undo.push({ label: p.label, commit: seq });
-    stackTick++;
-    if (changedAnything(a)) {
-      toasts.push(
-        'success',
-        p.mode === 'edit' ? p.label : `${p.mode === 'undo' ? 'Undid' : 'Redid'}: ${p.label}`,
-        seq != null ? `Commit ${seq}` : undefined,
-      );
-    } else toasts.push('info', 'The edit changed nothing.');
-    p.after?.();
-    await loadAll();
-    await loadFrame();
-  }
-
-  async function stale() {
-    toasts.push(
-      'info',
-      'Another commit landed since the editor read the ontology.',
-      'The views now show the new state.',
-    );
-    await loadAll();
-    await loadFrame();
-  }
+  const session = new EditSession({
+    reload: async () => {
+      await loadAll();
+      await loadFrame();
+    },
+    staleText: 'Another commit landed since the editor read the ontology.',
+  });
+  const edit = (op: Op, label: string, after?: () => void) => session.edit(op, label, after);
 
   /** The labels the editor knows with those the previewed edit adds, for its axioms. */
   const previewLabels = $derived.by(() => {
-    const added = previewOp ? opAxioms(previewOp).add : [];
+    const added = session.previewOp ? opAxioms(session.previewOp).add : [];
     const extra = labelsOf(added.filter((a): a is AxiomJson => typeof a !== 'string'));
     if (!extra.size) return labels;
     const m = new Map(labels);
@@ -644,68 +576,17 @@
   }
 
   // --- live refresh ---------------------------------------------------------------------------
-  let live = $state<'off' | 'on' | 'stopped'>('off');
-  let notice = $state<string | null>(null);
-  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
     const t = target;
     if (!name) return;
-    const ctl = new AbortController();
-    const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
-    const run = async () => {
-      // wait for this target's first read, so the stream starts at the commit it shows
-      while (!ctl.signal.aborted && loadedTarget !== t) await pause(200);
-      let after = shown;
-      let first = true;
-      while (!ctl.signal.aborted) {
-        // a stream that ended, or that the server refused, is opened again after a pause
-        if (!first) await pause(1000);
-        first = false;
-        if (ctl.signal.aborted) return;
-        live = 'on';
-        try {
-          after = await followCommits(
-            t,
-            after,
-            (c) => {
-              if (c.seq <= shown) return;
-              if (!ownCommits.has(c.seq))
-                notice = `Commit ${c.seq}${c.message ? ` (${c.message})` : ''} by another writer`;
-              clearTimeout(refreshTimer);
-              refreshTimer = setTimeout(() => {
-                void loadAll().then(loadFrame);
-              }, 300);
-            },
-            ctl.signal,
-          );
-        } catch {
-          if (!ctl.signal.aborted) live = 'stopped';
-          return;
-        }
-      }
-    };
-    void run();
-    return () => {
-      ctl.abort();
-      clearTimeout(refreshTimer);
-      live = 'off';
-    };
+    return session.follow(
+      t,
+      () => shown,
+      () => loadedTarget === t,
+    );
   });
 
-  onMount(() => {
-    const key = (e: KeyboardEvent) => {
-      const el = e.target as HTMLElement | null;
-      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable))
-        return;
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !readonly) {
-        e.preventDefault();
-        if (e.shiftKey) redoLast();
-        else undoLast();
-      }
-    };
-    window.addEventListener('keydown', key);
-    return () => window.removeEventListener('keydown', key);
-  });
+  onMount(() => session.keys(() => readonly));
 
   const counts = $derived(
     Object.fromEntries(TREE_KINDS.map((k) => [k, entities.get(k)?.length ?? 0])),
@@ -799,24 +680,27 @@
       {/if}
       <button
         class="btn sm"
-        disabled={!done.length || readonly}
-        onclick={undoLast}
-        title={done.at(-1) ? `Undo: ${done.at(-1)?.label}` : 'Nothing to undo'}
-        >Undo{done.length ? ` (${done.length})` : ''}</button
+        disabled={!session.done.length || readonly}
+        onclick={() => session.undoLast()}
+        title={session.done.at(-1) ? `Undo: ${session.done.at(-1)?.label}` : 'Nothing to undo'}
+        >Undo{session.done.length ? ` (${session.done.length})` : ''}</button
       >
       <button
         class="btn sm"
-        disabled={!undone.length || readonly}
-        onclick={redoLast}
-        title={undone.at(-1) ? `Redo: ${undone.at(-1)?.label}` : 'Nothing to redo'}>Redo</button
+        disabled={!session.undone.length || readonly}
+        onclick={() => session.redoLast()}
+        title={session.undone.at(-1) ? `Redo: ${session.undone.at(-1)?.label}` : 'Nothing to redo'}
+        >Redo</button
       >
       <span
         class="live"
-        class:on={live === 'on'}
-        title={live === 'on' ? 'Following the change feed' : 'Not following the change feed'}
-        ><span class="dot"></span>{live === 'on'
+        class:on={session.live === 'on'}
+        title={session.live === 'on'
+          ? 'Following the change feed'
+          : 'Not following the change feed'}
+        ><span class="dot"></span>{session.live === 'on'
           ? 'Live'
-          : live === 'stopped'
+          : session.live === 'stopped'
             ? 'Live updates stopped'
             : ''}</span
       >
@@ -824,10 +708,10 @@
   </header>
 
   {#if sessionError}<p class="error-box" role="alert">{sessionError}</p>{/if}
-  {#if notice}
+  {#if session.notice}
     <p class="notice" role="status">
-      {notice}. The views show the new state.
-      <button class="btn ghost sm" onclick={() => (notice = null)} aria-label="Dismiss"
+      {session.notice}. The views show the new state.
+      <button class="btn ghost sm" onclick={() => (session.notice = null)} aria-label="Dismiss"
         ><Icon name="x" size={12} /></button
       >
     </p>
@@ -1100,16 +984,16 @@
 </div>
 
 <OntoPreview
-  bind:open={previewOpen}
-  title={previewTitle}
+  bind:open={session.previewOpen}
+  title={session.previewTitle}
   {target}
   {sel}
-  op={previewOp}
+  op={session.previewOp}
   {etag}
   head={summary?.commit ?? null}
   {describe}
-  oncommitted={(op, a) => void committed(op, a)}
-  onstale={() => void stale()}
+  oncommitted={(op, a) => void session.committed(op, a)}
+  onstale={() => void session.stale()}
 />
 
 <Modal bind:open={createOpen} title="New {KIND_SINGULAR[createKind]}" width={520}>

@@ -36,6 +36,18 @@ Rust library and Python's `ds.forms.model(…, nested=True)` expose the same mod
 bodies now accept blank node terms, a conflict on a child's field carries the child's
 `node`, and a form model's values carry a list's `items`.
 
+The web UI has a SKOS and SKOS-XL thesaurus editor, the **Thesaurus** page (spec U12,
+roadmap item 457). It shows the concept tree of a scheme one level at a time with its
+polyhierarchy, searches labels in any language, and edits multilingual and SKOS-XL
+labels, broader, narrower, related and mapping links, collections and ordered collections,
+and notes, each as a previewed commit with `If-Match`. Dragging a concept moves it under
+another or adds a broader concept. The page shares the ontology editor's session branches,
+undo by revert and live refresh. The built-in SKOS shapes check the integrity conditions
+of the SKOS Reference, S9, S13, S14, S27, S37 and S46 with S51, S52 and S58 of SKOS-XL.
+`GET /$/skos/shapes` serves them, forms read them with `shapes=skos`, and the Rust library
+exposes them as `sparkles::skos`, so a write guard can enforce them. The ontology editor's
+commit messages in other scripts are now sent percent-encoded as UTF-8 instead of failing.
+
 The web UI has an ontology editor, the **Ontology** page (spec U12, roadmap item 457). It
 shows trees of classes, object, data and annotation properties and individuals, an entity
 frame with its axioms in Manchester syntax, an annotation editor with language tags and

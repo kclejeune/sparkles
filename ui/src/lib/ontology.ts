@@ -301,11 +301,20 @@ async function previewOr<T>(go: () => Promise<Response>, dry: boolean): Promise<
   }
 }
 
+/**
+ * A commit message as the `Sparkles-Commit-Message` header carries it: as it is when it is
+ * printable ASCII, else percent-encoded UTF-8 after `utf-8''` (docs/API.md), since a
+ * header value cannot hold other characters.
+ */
+export function commitMessageHeader(message: string): string {
+  return /^[\x20-\x7e]*$/.test(message) ? message : `utf-8''${encodeURIComponent(message)}`;
+}
+
 function writeHeaders(o: WriteOpts, json: boolean): Record<string, string> {
   const h: Record<string, string> = { Accept: 'application/json' };
   if (json) h['Content-Type'] = 'application/json';
   if (o.etag) h['If-Match'] = o.etag;
-  if (o.message) h['Sparkles-Commit-Message'] = o.message;
+  if (o.message) h['Sparkles-Commit-Message'] = commitMessageHeader(o.message);
   return h;
 }
 
@@ -1412,12 +1421,16 @@ export function literalOf(value: string, lang: string, datatype: string): Lit {
   return { '@value': value };
 }
 
-/** The session branch's name for a user on a day: `onto.{user}.{yyyymmdd}`. */
-export function sessionBranchName(user: string | null | undefined, now = new Date()): string {
+/** The session branch's name for a user on a day: `{prefix}.{user}.{yyyymmdd}`. */
+export function sessionBranchName(
+  user: string | null | undefined,
+  now = new Date(),
+  prefix = 'onto',
+): string {
   const u =
     (user ?? 'anonymous').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-._]+/, '') || 'user';
   const d = now.toISOString().slice(0, 10).replace(/-/g, '');
-  return `onto.${u}.${d}`.slice(0, 64);
+  return `${prefix}.${u}.${d}`.slice(0, 64);
 }
 
 // --- running operations ----------------------------------------------------------------

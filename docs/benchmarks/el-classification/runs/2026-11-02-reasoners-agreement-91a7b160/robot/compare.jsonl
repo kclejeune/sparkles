@@ -1,0 +1,12 @@
+{"name":"go","command":"reason","report":{"asserted": 71353, "direct": 57456, "assertedNotEntailed": 0, "directNotAsserted": 0, "examples": {"missing": [], "extra": []}, "agree": true}}
+{"name":"go","command":"reason-ofn","report":{"asserted": 71353, "direct": 57456, "assertedNotEntailed": 0, "directNotAsserted": 0, "examples": {"missing": [], "extra": []}, "agree": true}}
+{"name":"go","command":"reduce","report":{"asserted": 57456, "direct": 57456, "assertedNotEntailed": 0, "directNotAsserted": 0, "examples": {"missing": [], "extra": []}, "agree": true}}
+{"name":"go","command":"relax","report":{"asserted": 65768, "direct": 57456, "assertedNotEntailed": 0, "directNotAsserted": 0, "examples": {"missing": [], "extra": []}, "agree": true}}
+{"name":"go","command":"materialize","report":{"asserted": 57456, "direct": 57456, "assertedNotEntailed": 0, "directNotAsserted": 0, "examples": {"missing": [], "extra": []}, "agree": true}}
+{"name":"go","command":"pipeline","report":{"asserted": 71353, "direct": 57456, "assertedNotEntailed": 0, "directNotAsserted": 0, "examples": {"missing": [], "extra": []}, "agree": true}}
+{"name":"chebi_lite","command":"reason","report":{"asserted": 315603, "direct": 296173, "assertedNotEntailed": 0, "directNotAsserted": 0, "examples": {"missing": [], "extra": []}, "agree": true}}
+{"name":"chebi_lite","command":"reason-ofn","report":{"asserted": 315603, "direct": 296173, "assertedNotEntailed": 0, "directNotAsserted": 0, "examples": {"missing": [], "extra": []}, "agree": true}}
+{"name":"chebi_lite","command":"reduce","report":{"asserted": 296173, "direct": 296173, "assertedNotEntailed": 0, "directNotAsserted": 0, "examples": {"missing": [], "extra": []}, "agree": true}}
+{"name":"chebi_lite","command":"relax","report":{"asserted": 300224, "direct": 296173, "assertedNotEntailed": 0, "directNotAsserted": 0, "examples": {"missing": [], "extra": []}, "agree": true}}
+{"name":"chebi_lite","command":"materialize","report":{"asserted": 300224, "direct": 296173, "assertedNotEntailed": 0, "directNotAsserted": 0, "examples": {"missing": [], "extra": []}, "agree": true}}
+{"name":"chebi_lite","command":"pipeline","report":{"asserted": 315603, "direct": 296173, "assertedNotEntailed": 0, "directNotAsserted": 0, "examples": {"missing": [], "extra": []}, "agree": true}}

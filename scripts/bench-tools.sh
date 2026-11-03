@@ -2,14 +2,15 @@
 # Package resolution shared by the benchmark runners. The caller sets ROOT and WORK.
 
 # Keep every resolved package alive for the whole run, including during store GC.
-# Engine packages always come from this flake, even when another version is on PATH.
+# Engine and reasoner packages always come from this flake, even when another version is
+# on PATH.
 # The build prints one store path per installed output, so a package such as zstd prints
 # its bin and man outputs on two lines. Nix roots the out output as gcroots/<package> and
 # every other output as gcroots/<package>-<output>. Use nixexe to find an executable.
 nixpkg() {
   local package=$1 installable
   case $package in
-    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree)
+    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree | robot | elk | hermit | whelk | konclude)
       installable="$ROOT#$package"
       ;;
     *) installable="nixpkgs#$package" ;;
@@ -36,11 +37,12 @@ nixexe() {
   return 1
 }
 
-# Auxiliary tools come from PATH when it has them, and engines always come from this flake.
+# Auxiliary tools come from PATH when it has them, and engines and reasoners always come
+# from this flake.
 nixbin() {
   local package=$1 binary=$2
   case $package in
-    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree) ;;
+    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree | robot | elk | hermit | whelk | konclude) ;;
     *)
       if command -v "$binary" > /dev/null; then
         command -v "$binary"

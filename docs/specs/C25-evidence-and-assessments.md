@@ -1168,7 +1168,7 @@ clusters before an operation are recomputed from the boundary, so a map whose ma
 are no longer read would otherwise keep stale triples for entities the operation does
 not reach. A graph added to the boundary is accepted, since no proposal in it was
 accepted under the policy while the map was built. Rebuilding a map after a boundary
-change is roadmap item NEW-ITEM-1. A split is a superseding rejection, and accepting the
+change is roadmap item 643. A split is a superseding rejection, and accepting the
 match again restores the earlier map. Proposals, decisions and earlier revisions are
 never edited, and the output graph's history serves the map of any retained commit.
 `Changed::map` and the answer's `changed.map` name the policy, the new revision and its
@@ -1280,10 +1280,10 @@ about the assessments. F22's maintained analyses, roadmap item 340, consume it.
 
 The rest of Phase 3 is planned as separate roadmap items. Recall and Ask citations of
 reviewed claims under their review state, identity resolution and access are
-NEW-ITEM-2. Ingestion of extracted facts as claim proposals with their sources is
-NEW-ITEM-3. Reports and community summaries that draw on accepted evidence are
-NEW-ITEM-4. MCP tools for proposals, reviews, withdrawals, resolution, identities and
-dependents are NEW-ITEM-5. The bindings remain item 509.
+NEW-ITEM-1. Ingestion of extracted facts as claim proposals with their sources is
+NEW-ITEM-2. Reports and community summaries that draw on accepted evidence are
+NEW-ITEM-3. MCP tools for proposals, reviews, withdrawals, resolution, identities and
+dependents are NEW-ITEM-4. The bindings remain item 509.
 
 Retained-reference resolution uses C29's bounded history and controlled permission
 preparation. Guarded Dataset queries and U02 readers still adopt them under item 395.

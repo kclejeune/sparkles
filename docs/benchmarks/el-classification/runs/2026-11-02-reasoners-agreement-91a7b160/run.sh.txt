@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# The runs of roadmap item 604 that start external reasoner code, for the maintainer to
+# start by hand on stanley. Each stage writes under out/ next to this script:
+#
+#   range    Whelk and Konclude on the four range test ontologies, each compared with
+#            HermiT's taxonomy of the same ontology and with the classifier's
+#   big      Whelk and Konclude on GO and ChEBI lite, compared with the classifier's
+#            taxonomy (Konclude on 8 threads)
+#   ore      Whelk and Konclude on all 298 ORE 2015 EL ontologies, smallest first,
+#            compared with the classifier's taxonomy
+#   robot    ROBOT reason, reduce, relax and materialize with ELK on GO and ChEBI lite,
+#            timed end to end and compared with the classifier, beside
+#            `sparkles ontology classify` timed the same way
+#
+# Usage: [ONLY=whelk|konclude] run-reasoners.sh [STAGE...]
+#   (all four stages by default, in that order). ONLY limits the range, big and ore
+#   stages to one reasoner's runs and replaces that reasoner's earlier results there,
+#   while the comparisons are made again for both from the files on disk.
+#
+# Every reasoner run has an explicit heap where it is a JVM, a timeout and a memory cap of
+# its own (scripts/elk-compare/elk.sh's systemd scope, MemoryMax=$MEM, no swap). A run
+# that fails or times out is recorded as such and the batch goes on. Agreement files are
+# out/<stage>/compare.jsonl. The last line of the log is REASONERS-DONE.
+set -uo pipefail
+L=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$L/../../.." && pwd)
+ORE=${ORE:-$ROOT/../sparkles-lane-el-classifier-580/.artifacts/lanes/el-580/data/ore-el}
+DATA=${DATA:-$ROOT/../sparkles-lane-el-classifier-580/.artifacts/lanes/el-580/data}
+OURS=$L/out/ours
+ELK=$ROOT/scripts/elk-compare/elk.sh
+ORACLE=$ROOT/scripts/el-oracle.py
+MEM=${MEM:-12G}
+export ELK_WORK=$L/elk-work
+# Resolve every package once, so the stages run the same store paths.
+WHELK_CLASSIFY=$("$ELK" path whelk) || exit 1
+KONCLUDE=$("$ELK" path konclude) || exit 1
+ROBOT=$("$ELK" path robot) || exit 1
+export WHELK_CLASSIFY KONCLUDE ROBOT
+SPARKLES=$ROOT/target/release/sparkles
+{
+  echo "host=$(hostname) started=$(date -u +%Y-%m-%dT%H:%M:%SZ) commit=$(git -C "$ROOT" rev-parse HEAD)"
+  echo "whelk=$WHELK_CLASSIFY"
+  echo "konclude=$KONCLUDE"
+  echo "robot=$ROBOT"
+  echo "sparkles_sha256=$(sha256sum "$SPARKLES" | cut -d' ' -f1)"
+} >> "$L/out/env.txt"
+
+# reason NAME STAGE REASONER INPUT HEAP TIMEOUT [ARGS...]: one run through elk.sh
+reason() {
+  local name=$1 stage=$2 which=$3 input=$4 heap=$5 limit=$6 out s
+  shift 6
+  out=$L/out/$stage
+  case " ${ONLY:-whelk konclude} " in
+    *" $which "*) ;;
+    *) return 0 ;;
+  esac
+  if line=$(ELK_HEAP=$heap ELK_MEM_MAX=$MEM timeout "$limit" "$ELK" run --reasoner "$which" "$@" \
+    --taxonomy "$out/$name.$which.ofn" "$input" 2> "$out/$name.$which.err"); then
+    echo "$line" >> "$out/$which.jsonl"
+  else
+    s=$?
+    echo "{\"input\":\"$input\",\"reasoner\":\"$which\",\"failed\":$s,\"timeout\":$([ $s = 124 ] && echo true || echo false)}" \
+      >> "$out/$which.jsonl"
+  fi
+}
+
+# fresh STAGE: empty the result logs of the reasoners that this run repeats
+fresh() {
+  local w
+  for w in ${ONLY:-whelk konclude}; do : > "$L/out/$1/$w.jsonl"; done
+}
+
+# compare STAGE NAME REASONER OTHER LABEL: the oracle's report of two taxonomies
+compare() {
+  local stage=$1 name=$2 which=$3 other=$4 label=$5 ref=$L/out/$1/$2.$3.ofn r
+  if [ -s "$ref" ] && [ -s "$other" ]; then
+    r=$(python3 "$ORACLE" "$ref" "$other")
+    echo "{\"name\":\"$name\",\"reasoner\":\"$which\",\"against\":\"$label\",\"report\":$r}" >> "$L/out/$stage/compare.jsonl"
+  else
+    echo "{\"name\":\"$name\",\"reasoner\":\"$which\",\"against\":\"$label\",\"missing\":true}" >> "$L/out/$stage/compare.jsonl"
+  fi
+}
+
+stage_range() {
+  mkdir -p "$L/out/range"
+  : > "$L/out/range/compare.jsonl"
+  fresh range
+  for c in range-assertion range-hasvalue two-ranges one-range; do
+    reason "$c" range whelk "$L/data/range/$c.ofn" 1g 600
+    reason "$c" range konclude "$L/data/range/$c.ofn" - 600 --threads 1
+    for w in whelk konclude; do
+      compare range "$c" "$w" "$L/data/range/$c.hermit.ofn" hermit
+      compare range "$c" "$w" "$OURS/range/$c.ours.txt" ours
+    done
+  done
+}
+
+stage_big() {
+  mkdir -p "$L/out/big"
+  : > "$L/out/big/compare.jsonl"
+  fresh big
+  for o in go chebi_lite; do
+    reason "$o" big whelk "$DATA/$o.ofn" 10g 3600
+    reason "$o" big konclude "$DATA/$o.ofn" - 3600 --threads 8
+    for w in whelk konclude; do
+      compare big "$o" "$w" "$OURS/$o.ours.txt" ours
+    done
+  done
+}
+
+stage_ore() {
+  mkdir -p "$L/out/ore"
+  : > "$L/out/ore/compare.jsonl"
+  fresh ore
+  local f n mb heap
+  for f in $(ls -Sr "$ORE"/*.owl); do
+    n=$(basename "$f" .owl)
+    mb=$(($(stat -c %s "$f") / 1048576))
+    heap=$((mb * 16 / 1024 + 2))
+    [ $heap -gt 10 ] && heap=10
+    reason "$n" ore whelk "$f" "${heap}g" 1800
+    reason "$n" ore konclude "$f" - 1800 --threads 4
+    for w in whelk konclude; do
+      compare ore "$n" "$w" "$OURS/ore/$n.ours.txt" ours
+    done
+    # Konclude's raw hierarchy is kept for small files only, to bound the disk used.
+    [ "$mb" -gt 20 ] && rm -f "$L/out/ore/$n.konclude.ofn.konclude.owx"
+  done
+}
+
+# timed LABEL STDOUT TIMEOUT COMMAND...: one end-to-end run under a memory cap
+timed() {
+  local label=$1 stdout=$2 limit=$3
+  shift 3
+  systemd-run --user --scope --quiet -p "MemoryMax=$MEM" -p MemorySwapMax=0 -p OOMPolicy=continue \
+    python3 "$L/timed.py" "$L/out/robot/runs.jsonl" "$label" ${stdout:+--stdout "$stdout"} --timeout "$limit" -- "$@" \
+    2>> "$L/out/robot/$label.err"
+}
+
+stage_robot() {
+  local o out in term
+  mkdir -p "$L/out/robot"
+  : > "$L/out/robot/runs.jsonl"
+  : > "$L/out/robot/compare.jsonl"
+  export ROBOT_JAVA_ARGS="-Xms8g -Xmx8g -XX:+UseG1GC"
+  for o in go chebi_lite; do
+    out=$L/out/robot/$o
+    in=$DATA/$o.owl
+    case $o in
+      go) term=BFO:0000050 ;;
+      chebi_lite) term=RO:0000087 ;;
+    esac
+    # From the release's RDF/XML file to the written output, each command on its own.
+    timed "$o-reason" "" 3600 "$ROBOT" reason --reasoner ELK --input "$in" --output "$out.reason.ofn"
+    timed "$o-reason-ofn" "" 3600 "$ROBOT" reason --reasoner ELK --input "$DATA/$o.ofn" --output "$out.reason-ofn.ofn"
+    timed "$o-reduce" "" 3600 "$ROBOT" reduce --reasoner ELK --input "$in" --output "$out.reduce.ofn"
+    timed "$o-relax" "" 3600 "$ROBOT" relax --input "$in" --output "$out.relax.ofn"
+    timed "$o-materialize" "" 3600 "$ROBOT" materialize --reasoner ELK --term "$term" --input "$in" \
+      --output "$out.materialize.ofn"
+    # The release pipeline in one ROBOT process, as OBO release workflows chain it.
+    timed "$o-reason-relax-reduce" "" 3600 "$ROBOT" reason --reasoner ELK --input "$in" relax \
+      reduce --reasoner ELK --output "$out.pipeline.ofn"
+    # Sparkles: the taxonomy from the same files, end to end.
+    timed "$o-sparkles-classify" "$out.sparkles.ofn" 3600 "$SPARKLES" ontology classify "$in" \
+      --allow-unsatisfiable --format ofn
+    timed "$o-sparkles-classify-ofn" "$out.sparkles-ofn.ofn" 3600 "$SPARKLES" ontology classify \
+      "$DATA/$o.ofn" --allow-unsatisfiable --format ofn
+    for v in reason reason-ofn reduce relax materialize pipeline; do
+      if [ -s "$out.$v.ofn" ]; then
+        r=$(python3 "$ORACLE" --asserted "$out.$v.ofn" "$OURS/$o.ours.txt")
+        echo "{\"name\":\"$o\",\"command\":\"$v\",\"report\":$r}" >> "$L/out/robot/compare.jsonl"
+      fi
+    done
+    for v in sparkles sparkles-ofn; do
+      if [ -s "$out.$v.ofn" ]; then
+        r=$(python3 "$ORACLE" "$out.$v.ofn" "$OURS/$o.ours.txt")
+        echo "{\"name\":\"$o\",\"command\":\"$v\",\"report\":$r}" >> "$L/out/robot/compare.jsonl"
+      fi
+    done
+  done
+}
+
+stages=("$@")
+[ ${#stages[@]} = 0 ] && stages=(range big ore robot)
+for s in "${stages[@]}"; do
+  echo "stage $s started=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$L/out/env.txt"
+  "stage_$s"
+  echo "stage $s ended=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$L/out/env.txt"
+done
+echo REASONERS-DONE
