@@ -335,6 +335,8 @@ struct Run<'a> {
     /// the most memory counted so far, which the pool's grant covers
     peak: AtomicUsize,
     applied: AtomicUsize,
+    /// whether a context derived an individual other than its root
+    merged: AtomicBool,
     bounds: &'a Bounds<'a>,
 }
 
@@ -355,6 +357,8 @@ pub struct Totals {
     pub memory: usize,
     /// the most memory counted, waiting messages included
     pub peak: usize,
+    /// whether a context derived an individual other than its root
+    pub merged: bool,
 }
 
 /// Saturates `roots` and every context they reach. Contexts already saturated keep their
@@ -383,6 +387,7 @@ pub fn saturate(
         queued: AtomicIsize::new(0),
         peak: AtomicUsize::new(bounds.base_memory),
         applied: AtomicUsize::new(0),
+        merged: AtomicBool::new(false),
         bounds,
     };
     {
@@ -415,6 +420,7 @@ pub fn saturate(
             conclusions: run.applied.load(Ordering::Relaxed),
             memory,
             peak: run.peak.load(Ordering::Relaxed).max(memory),
+            merged: run.merged.load(Ordering::Relaxed),
         }),
     }
 }
@@ -437,6 +443,8 @@ pub trait Sink {
     fn send(&mut self, to: Ex, c: Concl);
     /// a conclusion for the context the rules run in
     fn me(&mut self, c: Concl);
+    /// the context the rules run in derived an individual other than its root
+    fn merged(&mut self) {}
 }
 
 impl Sink for Out<'_, '_> {
@@ -457,6 +465,12 @@ impl Sink for Out<'_, '_> {
     #[inline]
     fn me(&mut self, c: Concl) {
         self.local.push(c);
+    }
+
+    fn merged(&mut self) {
+        if !self.run.merged.load(Ordering::Relaxed) {
+            self.run.merged.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -681,7 +695,9 @@ impl<'a> Run<'a> {
 }
 
 /// Starts a context: its root, `owl:Thing`, the loops of the reflexive roles and the
-/// facts every context has, and for `owl:Thing` and an individual, that it is real.
+/// facts every context has. Which contexts are real is found after a first saturation,
+/// and only when a context derived an individual, so that an ontology without such a
+/// context sends no message for it.
 pub fn init<S: Sink>(ix: &Index, me: Ex, st: &mut State, universal: &[Ex], out: &mut S) {
     st.init = true;
     out.me(Concl::Sub(me));
@@ -691,9 +707,6 @@ pub fn init<S: Sink>(ix: &Index, me: Ex, st: &mut State, universal: &[Ex], out: 
     }
     for &x in universal {
         out.me(Concl::Sub(x));
-    }
-    if me == TOP || matches!(ix.head(me).node, Node::Nominal(_)) {
-        out.me(Concl::Real);
     }
 }
 
@@ -936,6 +949,7 @@ fn compose<S: Sink>(roles: &super::index::Roles, e: Ex, t: Role, f: Ex, out: &mu
 /// gives `n` its own when it is real, and closes the loops of links to `n`.
 fn nominal<S: Sink>(ix: &Index, me: Ex, st: &mut State, n: Ex, out: &mut S) {
     out.send(n, Concl::Nom(me));
+    out.merged();
     let real = st.real;
     let x = st.extra.get_or_insert_with(Box::default);
     x.noms.push(n);

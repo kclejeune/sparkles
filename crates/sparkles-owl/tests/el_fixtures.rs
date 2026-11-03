@@ -4,7 +4,9 @@
 //! Konclude 0.7.0-1138 into `case-NNN.hermit.ofn` and `case-NNN.konclude.ofn` (the batch
 //! of the lane's run record). The classifier must entail exactly the subsumptions
 //! between named classes that HermiT entails, and Konclude must agree with HermiT where
-//! it classified the case.
+//! it classified the case, except on the cases of [`KONCLUDE_DIFFERS`]. Konclude stopped
+//! with a segmentation fault on ten cases (059, 090, 141, 153, 168, 229, 237, 260, 292
+//! and 302), which have no Konclude file.
 
 use sparkles_owl::classify::{Classifier, Limits};
 use sparkles_owl::model::*;
@@ -14,6 +16,31 @@ use std::path::{Path, PathBuf};
 
 const THING: &str = "http://www.w3.org/2002/07/owl#Thing";
 const NOTHING: &str = "http://www.w3.org/2002/07/owl#Nothing";
+
+/// The cases where Konclude's taxonomy differs from HermiT's, with the reason that
+/// HermiT's is the right one. The classifier agrees with HermiT on each.
+const KONCLUDE_DIFFERS: &[(&str, &str)] = &[
+    (
+        "case-074",
+        "Konclude misses C3 below C2, where C3 has an xsd:token value of d0 and C2 is \
+         every class with a d0 value",
+    ),
+    (
+        "case-075",
+        "Konclude puts owl:Thing below C0 = some d1 xsd:nonNegativeInteger, where the only \
+         d1 value known is the owl:rational 3/2",
+    ),
+    (
+        "case-124",
+        "Konclude misses owl:Thing below C2, where some owl:topObjectProperty {a0} is below \
+         C2 and every individual reaches a0 through the top property",
+    ),
+    (
+        "case-261",
+        "Konclude puts C4 below C0 = some d1 xsd:integer, where C4 has the owl:rational \
+         3/2 as a d1 value",
+    ),
+];
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/el587")
@@ -57,13 +84,11 @@ fn reference(text: &str, classes: &BTreeSet<String>) -> BTreeSet<(String, String
         }
         seen
     };
-    let bottom = above(NOTHING);
     let inconsistent = above(THING).contains(NOTHING);
     let mut out = BTreeSet::new();
     for a in classes {
         let s = above(a);
-        let unsat =
-            inconsistent || s.contains(NOTHING) || bottom.contains(a.as_str()) && a != NOTHING;
+        let unsat = inconsistent || s.contains(NOTHING);
         for b in classes {
             if unsat || s.contains(b) || b == THING || a == NOTHING {
                 out.insert((a.clone(), b.clone()));
@@ -89,6 +114,7 @@ fn the_classifier_entails_what_a_complete_reasoner_entails() {
     assert!(cases.len() >= 100, "{} cases", cases.len());
     let mut checked = 0;
     let mut konclude = 0;
+    let mut differs = Vec::new();
     let mut failures = Vec::new();
     for case in &cases {
         let hermit = case.with_extension("hermit.ofn");
@@ -136,10 +162,23 @@ fn the_classifier_entails_what_a_complete_reasoner_entails() {
         {
             konclude += 1;
             if reference(&other, &classes) != want {
-                failures.push(format!("{}: Konclude and HermiT differ", case.display()));
+                let stem = case
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                differs.push(stem.to_string());
             }
         }
         checked += 1;
+    }
+    let known: Vec<String> = KONCLUDE_DIFFERS
+        .iter()
+        .map(|(c, _)| c.to_string())
+        .collect();
+    if differs != known {
+        failures.push(format!(
+            "Konclude differs from HermiT on {differs:?}, not {known:?}"
+        ));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     eprintln!("{checked} cases against HermiT, {konclude} against Konclude");

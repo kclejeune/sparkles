@@ -743,61 +743,66 @@ impl Saturation {
         };
         let mut totals =
             saturate::saturate(&ix, &self.ctx, &roots, &[], &[], &bounds).map_err(stopped)?;
-        // the facts of universal roles and the merges of keys, between rounds of the
-        // saturation until none is new
+        // Which contexts are real matters only when a context derived an individual, for
+        // keys and for universal roles. Then owl:Thing and the individuals become real,
+        // and so does what they reach, between rounds of the saturation, with the facts
+        // of universal roles and the merges of keys, until none is new.
         let mut universal: Vec<Ex> = Vec::new();
-        let mut rounds = 0usize;
-        if ix.has_individuals() {
+        let entangled = ix.has_individuals()
+            && (totals.merged || !ix.universal.is_empty() || !ix.keys.is_empty());
+        if entangled {
+            let mut seeds: Vec<(Ex, saturate::Concl)> = std::iter::once(TOP)
+                .chain(ix.nominals.iter().copied())
+                .map(|e| (e, saturate::Concl::Real))
+                .collect();
             loop {
+                poll(limits)?;
+                let mut woken: Vec<Ex> = Vec::with_capacity(seeds.len());
+                for (e, c) in seeds.drain(..) {
+                    if let Some(x) = self.ctx.get(e as usize).and_then(|x| x.get()) {
+                        x.todo.lock().push(c);
+                        woken.push(e);
+                    }
+                }
+                woken.sort_unstable();
+                woken.dedup();
+                let round = Bounds {
+                    base_memory: totals.memory,
+                    ..bounds
+                };
+                let more = saturate::saturate(&ix, &self.ctx, &[], &woken, &universal, &round)
+                    .map_err(stopped)?;
+                totals = saturate::Totals {
+                    conclusions: totals.conclusions + more.conclusions,
+                    memory: more.memory,
+                    peak: totals.peak.max(more.peak),
+                    merged: totals.merged || more.merged,
+                };
                 let view = world::Global(&self.ctx);
                 let facts = world::universal_facts(&ix, &view, &universal);
                 let merges = world::key_merges(&ix, &view);
                 if facts.is_empty() && merges.is_empty() {
                     break;
                 }
-                rounds += 1;
-                let mut seeds: Vec<Ex> = Vec::new();
-                for (e, c) in self.ctx.iter().enumerate() {
-                    if facts.is_empty() {
-                        break;
-                    }
-                    let Some(c) = c.get() else { continue };
-                    if c.st.lock().init {
-                        c.todo
-                            .lock()
-                            .extend(facts.iter().map(|&x| saturate::Concl::Sub(x)));
-                        seeds.push(e as Ex);
+                if !facts.is_empty() {
+                    for (e, c) in self.ctx.iter().enumerate() {
+                        if c.get().is_some_and(|c| c.st.lock().init) {
+                            seeds.extend(facts.iter().map(|&x| (e as Ex, saturate::Concl::Sub(x))));
+                        }
                     }
                 }
                 universal.extend_from_slice(&facts);
                 for (a, b) in merges {
-                    for (x, y) in [(a, b), (b, a)] {
-                        if let Some(c) = self.ctx[x as usize].get() {
-                            c.todo.lock().push(saturate::Concl::Sub(y));
-                            seeds.push(x);
-                        }
-                    }
+                    seeds.push((a, saturate::Concl::Sub(b)));
+                    seeds.push((b, saturate::Concl::Sub(a)));
                 }
-                poll(limits)?;
-                let round = Bounds {
-                    base_memory: totals.memory,
-                    ..bounds
-                };
-                let more = saturate::saturate(&ix, &self.ctx, &[], &seeds, &universal, &round)
-                    .map_err(stopped)?;
-                totals = saturate::Totals {
-                    conclusions: totals.conclusions + more.conclusions,
-                    memory: more.memory,
-                    peak: totals.peak.max(more.peak),
-                };
             }
         }
         // the classes whose instances reach an individual through a context that is not
         // real, each in a world of its own
         let mut world_bytes = 0usize;
-        if ix.has_individuals() {
+        if entangled {
             let witnesses = world::witnesses(&ix, &self.ctx, &universal);
-            let entangled = rounds > 0 || !witnesses.is_empty() || self.merged();
             if !witnesses.is_empty() {
                 let classes = world::reaching(&ix, &self.ctx, &witnesses);
                 let real: Vec<Ex> = (0..self.ctx.len() as Ex)
@@ -989,14 +994,6 @@ impl Saturation {
             }
         }
         cleared
-    }
-
-    /// Whether a context other than an individual's own derived an individual, which ties
-    /// the contexts together beyond what the invalidation follows.
-    fn merged(&self) -> bool {
-        self.ctx
-            .iter()
-            .any(|c| c.get().is_some_and(|c| !c.st.lock().noms().is_empty()))
     }
 
     /// The subsumers of a saturated context that are named classes, with their
