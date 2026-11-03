@@ -13,9 +13,28 @@ const OUT = resolve(
 );
 const ONLY = process.env.SPARKLES_DESIGN_PAGES?.split(',');
 
-export const PAGES: { name: string; path: string; ready?: string }[] = [
+const LUMEN = encodeURIComponent('http://example.org/org/lumen-university');
+
+export const PAGES: {
+  name: string;
+  path: string;
+  ready?: string;
+  act?: (page: Page) => Promise<void>;
+}[] = [
   { name: 'query', path: '/ui/query?ds=demo' },
+  {
+    name: 'query-results',
+    path: '/ui/query?ds=demo',
+    act: async (page) => {
+      await page.locator('.cm-content').first().click();
+      await page.keyboard.press('ControlOrMeta+Enter');
+      await page.waitForTimeout(1500);
+    },
+  },
   { name: 'explore', path: '/ui/explore?ds=demo' },
+  { name: 'explore-entity', path: `/ui/explore?ds=demo&iri=${LUMEN}` },
+  { name: 'explore-search', path: '/ui/explore?ds=demo&tab=search&q=university' },
+  { name: 'explore-schema', path: '/ui/explore?ds=demo&tab=schema' },
   { name: 'ontology', path: '/ui/ontology?ds=go' },
   { name: 'thesaurus', path: '/ui/thesaurus?ds=unesco' },
   { name: 'browse-go', path: '/ui/browse?ds=go' },
@@ -54,15 +73,24 @@ export const PAGES: { name: string; path: string; ready?: string }[] = [
   },
   { name: 'browse-demo', path: '/ui/browse?ds=demo' },
   { name: 'similar', path: '/ui/similar?ds=demo' },
+  { name: 'similar-entity', path: `/ui/similar?ds=demo&iri=${LUMEN}` },
   { name: 'memory', path: '/ui/memory?ds=demo' },
+  { name: 'memory-inbox', path: '/ui/memory?ds=demo&tab=inbox' },
   { name: 'embedding', path: '/ui/embedding?ds=demo' },
   { name: 'datasets', path: '/ui/datasets' },
   { name: 'dataset', path: '/ui/datasets/demo' },
+  { name: 'dataset-communities', path: '/ui/datasets/demo?tab=communities' },
+  { name: 'dataset-settings', path: '/ui/datasets/demo?tab=settings' },
+  { name: 'dataset-edit', path: `/ui/datasets/demo/edit?iri=${LUMEN}` },
+  { name: 'review', path: '/ui/datasets/demo/review/draft-places' },
   { name: 'merge', path: '/ui/datasets/demo/merge?source=draft-places' },
   { name: 'backups', path: '/ui/backups' },
+  { name: 'backups-repositories', path: '/ui/backups?tab=repositories' },
+  { name: 'backups-policies', path: '/ui/backups?tab=policies' },
   { name: 'server', path: '/ui/server' },
   { name: 'tokens', path: '/ui/tokens' },
   { name: 'login', path: '/ui/login' },
+  { name: 'cli-device', path: '/ui/cli/device' },
 ];
 
 const WIDTHS = { large: [1440, 900], medium: [900, 1000], phone: [390, 844] } as const;
@@ -101,6 +129,7 @@ for (const p of PAGES) {
         await page.goto(BASE + p.path);
         await page.waitForLoadState('networkidle', { timeout: 20_000 }).catch(() => {});
         await page.waitForTimeout(800);
+        if (p.act) await p.act(page);
         const dir = join(OUT, wname);
         mkdirSync(dir, { recursive: true });
         await page.screenshot({ path: join(dir, `${p.name}-${theme}.png`), fullPage: false });

@@ -12,7 +12,8 @@ The SvelteKit UI is embedded in the server binary.
 
 * Every page sits in one shell. A top bar holds the brand, a search field whose first
   segment switches the dataset and names the branch a page has open, the connection
-  status, the theme and the account. A rail beside the page lists the working pages and,
+  status, the theme and the account. The search field stays in the middle of the
+  viewport on large and medium screens. A rail beside the page lists the working pages and,
   below a rule, the administration pages. From 1200 pixels the rail shows labels, below
   that it shows icons with their names as tooltips, and from 760 pixels down it moves into
   a drawer that the menu button opens, together with the dataset switcher, the status,
@@ -21,8 +22,8 @@ The SvelteKit UI is embedded in the server binary.
 * The search field is also the command palette. `Ctrl+K` or `Cmd+K` opens it from
   anywhere, including the query editor, and pressing it again closes it. `/` opens it
   outside a text field, except on a page with a search of its own, where `/` focuses that
-  search instead, such as the class tree filter of the ontology editor and the label
-  search of the thesaurus editor. Escape gives the focus back to where it was, and a
+  search instead, such as the class tree filter of the ontology editor, the label search
+  of the thesaurus editor and the field of Explore's text-search tab. Escape gives the focus back to where it was, and a
   command that runs in place returns the focus there before it runs. On a phone the bar
   shows a search button, and the button or the keys expand the field over the whole bar
   with a back button ([screenshot](../images/palette-phone.png)).
@@ -34,7 +35,10 @@ The SvelteKit UI is embedded in the server binary.
   Thesaurus and dataset pages, the dataset's branches. Enter opens a class or property in
   the ontology editor, a concept in the thesaurus editor, any other entity in Explore and
   a saved query in a new tab of the Query page
-  ([screenshot](../images/shell-search.png)).
+  ([screenshot](../images/shell-search.png)). On Explore the field is also the resource
+  finder. Its placeholder says so, and its first group lists the dataset's resources by
+  label or IRI, an **Open** row for a typed IRI or prefixed name and **Ask a question…**
+  when the dataset answers questions. A pick focuses the resource in the graph.
 * A prefix shows one kind of item. `>` lists commands and pages, `@` entities, `#`
   datasets and branches, and `?` saved queries, and a row of chips above the results sets
   the same prefixes by touch. Escape on a prefix with nothing after it returns to every
@@ -67,11 +71,25 @@ The SvelteKit UI is embedded in the server binary.
   page head and context row styles, and a list beside its detail ends both panes on the
   same line ([medium width](../images/shell-medium.png),
   [phone](../images/shell-phone.png)).
+* Every page's content starts at the gutter. A workspace page's tools are one
+  `.toolbar` row with the primary action at its end, and where the row does not fit the
+  end group takes a row of its own, flush right. On a phone, buttons in a toolbar or a
+  page head keep their icons and drop their labels, which stay their accessible names.
+  Panels side by side in a `.panel-grid` are as tall as the tallest in their row,
+  headline numbers share one `.figures` grid, a choice of two to four values is one
+  `.segmented` control, and the menus under a button share `.dropdown-menu`. At 760
+  pixels and below a dialog docks at the bottom of the screen as a sheet whose body
+  scrolls under a fixed head and footer.
 
 ### Query page
 
 * The query page has an editor with completion of declared prefixes, linting and
   formatting in the browser, and results as a table, graph or plan.
+* The toolbar holds the query's kind and endpoint, **Examples**, **Saved** and
+  **Options**, then the pattern pane, **Format**, **Explain** and **Run** at its end.
+  **Options** holds the branch, the past state to read, the history slider, the row
+  limit and the inferences toggle, and its button names any of them that differ from
+  the default.
 * The **Saved** menu lists the dataset's stored queries, shows a form for a query's
   parameters and runs it. An admin can save the editor's query with parameters picked from
   its variables, or delete one.
@@ -103,7 +121,8 @@ The SvelteKit UI is embedded in the server binary.
 
 * The explorer shows an entity's properties, its nearest vector neighbours, ranked
   `text:query` search and a map card with Nearby. The Similar page searches from an entity
-  or a pasted vector.
+  or a pasted vector. The top bar's search finds the resource to start from, and the
+  graph toolbar's **View** menu shows literals and hides `rdf:type` edges.
 * Explore opens on an overview of the dataset's classes and the predicates between them,
   drawn with sigma.js on WebGL and laid out with ForceAtlas2 in a web worker
   ([U06](../specs/U06-large-graph-rendering.md), [USAGE.md](../USAGE.md#the-explore-overview),
