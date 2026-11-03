@@ -17730,7 +17730,7 @@ export interface operations {
                 lang?: string;
                 /** @description The most entities listed, from 1 to 100 (10 by default). */
                 limit?: number;
-                /** @description The entities skipped. `offset` and `limit` together reach at most 10,000. */
+                /** @description The entities skipped. `offset` and `limit` together reach at most 10,000, and `next` is null when no later page fits in that window although `more` is true. */
                 offset?: number;
                 /** @description Rank the matches within a few edits (true by default). */
                 fuzzy?: boolean;

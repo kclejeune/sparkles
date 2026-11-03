@@ -73,7 +73,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub use index::{Field, Kind, MAX_ENTITIES};
 pub use query::max_edits;
@@ -256,9 +256,14 @@ pub struct SearchSlot {
 
 impl SearchSlot {
     /// The index at the head of `store`, brought up to date, and the snapshot it reflects.
+    ///
+    /// `check` fails the call when it is cancelled or past its deadline. It runs while
+    /// the call waits for another caller's update and during a build, and a failed build
+    /// leaves the slot as it was.
     fn current(
         &self,
         store: &Store,
+        check: &dyn Fn() -> Result<()>,
     ) -> Result<(RwLockReadGuard<'_, Option<Index>>, Arc<Snapshot>, IndexUse)> {
         let snap = store.snapshot();
         {
@@ -267,16 +272,25 @@ impl SearchSlot {
                 return Ok((g, snap, IndexUse::Current));
             }
         }
-        let _u = self.update.lock();
+        check()?;
+        let _u = loop {
+            if let Some(u) = self.update.try_lock_for(Duration::from_millis(50)) {
+                break u;
+            }
+            check()?;
+        };
         let snap = store.snapshot();
         let seq = self.index.read().as_ref().map(|ix| ix.seq);
+        if seq != Some(snap.commit) {
+            check()?;
+        }
         let (snap, used) = match seq {
             Some(s) if s == snap.commit => (snap, IndexUse::Current),
             Some(s) if s < snap.commit => match self.update_from(store, s) {
                 Some(snap) => (snap, IndexUse::Updated),
-                None => (self.build(&snap)?, IndexUse::Built),
+                None => (self.build(&snap, check)?, IndexUse::Built),
             },
-            _ => (self.build(&snap)?, IndexUse::Built),
+            _ => (self.build(&snap, check)?, IndexUse::Built),
         };
         Ok((self.index.read(), snap, used))
     }
@@ -304,9 +318,9 @@ impl SearchSlot {
         }
     }
 
-    fn build(&self, snap: &Arc<Snapshot>) -> Result<Arc<Snapshot>> {
+    fn build(&self, snap: &Arc<Snapshot>, check: &dyn Fn() -> Result<()>) -> Result<Arc<Snapshot>> {
         let started = Instant::now();
-        let ix = Index::build(snap)?;
+        let ix = Index::build(snap, check)?;
         let ms = started.elapsed().as_millis() as u64;
         tracing::debug!(
             "entity search index at commit {}: {} entities, {} values in {ms} ms",
@@ -357,7 +371,9 @@ impl Ontologies {
         search.validate()?;
         let opts = self.anchored(opts)?;
         let state = self.ds.state();
-        let (guard, snap, used) = state.entity_search.current(self.ds.store())?;
+        let (guard, snap, used) = state
+            .entity_search
+            .current(self.ds.store(), &|| super::check(&opts))?;
         let Some(ix) = guard.as_ref() else {
             return Err(Error::invalid("the entity search index is not available"));
         };
@@ -400,13 +416,20 @@ impl Ontologies {
             .iter()
             .map(|c| hit(&scope, &langs, &prefixes, c, &q))
             .collect();
+        let mut warnings = resolved.warnings;
+        if q.iri_truncated {
+            warnings.push(format!(
+                "the IRI prefix matches more than {} IRIs, and the first {0} in IRI order are ranked",
+                query::MAX_IRI_PREFIX
+            ));
+        }
         Ok(SearchResults {
             commit: snap.commit,
             hits,
             more,
             graphs: resolved.graphs,
             imports: resolved.imports,
-            warnings: resolved.warnings,
+            warnings,
             index: used,
         })
     }
@@ -509,7 +532,7 @@ fn hit(
                 distance: 0,
                 tier: c.rank.tier,
                 highlight: if ent.iri.starts_with(iri) && !iri.is_empty() {
-                    vec![0..iri.len()]
+                    std::iter::once(0..iri.len()).collect()
                 } else {
                     Vec::new()
                 },

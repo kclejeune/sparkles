@@ -1892,11 +1892,13 @@ then the others, and without a preference untagged and English texts rank alike.
 `kind` keeps some kinds, comma separated: `class`, `property` (every kind of property),
 `objectProperty`, `dataProperty`, `annotationProperty`, `individual`, `datatype`,
 `concept`, `conceptScheme` and `collection`. `limit` is 10 by default and at most 100,
-`offset` and `limit` reach at most 10,000 hits, and `more` and `next` say whether a
-later page exists. `fuzzy=false` and `definitions=false` leave out those tiers. The
+`offset` and `limit` reach at most 10,000 hits. `more` says whether further hits exist,
+and `next` gives the offset of the next page, or null when no page can start there
+because the window ends. `fuzzy=false` and `definitions=false` leave out those tiers. The
 graphs, imports and branch are chosen as for the other routes, and the caller sees only
 the graphs and triples their grants allow. The search reads the head, so `at` and
-`inferences` are refused.
+`inferences` are refused. An IRI prefix ranks at most the first 10,000 matching IRIs
+that the caller can see, in IRI order, and the answer warns when it matched more.
 
 ```json
 { "dataset": "chebi", "commit": 3, "graphs": ["default"], "query": "glucos",

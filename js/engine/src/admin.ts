@@ -318,10 +318,10 @@ export interface OntologySearchHit {
     lang: string | null;
     /** `exact`, `prefix`, `words` or `fuzzy` */
     kind: string;
-    distance: bigint;
-    tier: bigint;
+    distance: number;
+    tier: number;
     /** `[start, end)` ranges of `text` in UTF-16 code units */
-    highlight: [bigint, bigint][];
+    highlight: [number, number][];
   };
 }
 /** One page of an ontology search. */
@@ -333,8 +333,8 @@ export interface OntologySearchPage {
   warnings: string[];
   query: string;
   results: OntologySearchHit[];
-  offset: bigint;
-  limit: bigint;
+  offset: number;
+  limit: number;
   more: boolean;
   next: bigint | null;
   /** `current`, `updated` or `built` */

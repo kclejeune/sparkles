@@ -1,21 +1,20 @@
 //! A search over the entity index: the tiers in order, each ranked, until the page is full.
 
-use super::index::{ANY_GRAPH, Field, Index, LOCAL_NAME, PROPS, TYPES};
-use super::text::{chars, normalize, normalize_mapped, source_ranges, words};
+use super::index::{ANY_GRAPH, Field, Index, LOCAL_NAME, PROPS, TYPES, Texts};
+use super::text::{chars, name_words, normalize, normalize_mapped, source_ranges, words};
 use super::{MatchKind, SearchRequest};
 use crate::id::Id;
 use crate::store::Snapshot;
 use levenshtein_automata::{DFA, Distance, LevenshteinAutomatonBuilder, SINK_STATE};
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::ops::{Bound, Range};
 use std::sync::OnceLock;
 
-/// The most IRIs an IRI-prefix query ranks.
-const MAX_IRI_PREFIX: usize = 10_000;
+/// The most IRIs the caller can see that an IRI-prefix query ranks, in IRI order.
+pub(super) const MAX_IRI_PREFIX: usize = 10_000;
 
 /// The edits a query word may take: none up to 2 characters, one up to 5 and two from 6
 /// for a whole word, and for a word typed so far (a prefix), none up to 3 characters, one
@@ -160,6 +159,10 @@ pub(super) struct Rank<'a> {
     pub len: u32,
     pub text: &'a str,
     pub iri: &'a str,
+    /// the property's place in the table and the language tag, so that an entity's
+    /// equal values rank alike whatever order the index met them in
+    pub prop: u8,
+    pub tag: &'a str,
 }
 
 /// One ranked hit: its entity, the value that matched (`None` for the IRI) and how.
@@ -295,6 +298,15 @@ impl<'a> Scope<'a> {
         if !x.live() || !self.graph(x.graph) {
             return false;
         }
+        // a SKOS-XL label's text is the node's literal form, which another graph may hold
+        if x.node != super::index::NO_NODE
+            && !self.ix.nodes[x.node as usize]
+                .forms
+                .iter()
+                .any(|f| *f.0 == *x.text && f.1 == x.lang && f.2 == x.datatype && self.graph(f.3))
+        {
+            return false;
+        }
         let Some(view) = self.view else {
             return true;
         };
@@ -417,6 +429,8 @@ pub(super) struct Query {
     pub fuzzy: Vec<FxHashSet<Box<[u8]>>>,
     /// the IRI the query names, as a full IRI or a prefixed name
     pub iri: Option<String>,
+    /// whether the IRI prefix matched more visible IRIs than were ranked
+    pub iri_truncated: bool,
 }
 
 /// The IRI a query names: `<iri>`, an absolute IRI with `://` or `urn:`, or a prefixed
@@ -474,6 +488,8 @@ impl<'a, 's> Ranker<'a, 's> {
             len: x.text.len() as u32,
             text: &x.text,
             iri: "",
+            prop: x.prop,
+            tag: &ix.langs[x.lang as usize],
         };
         // the best rank the value can have, before the entity is read
         if self.beyond(&rank) {
@@ -512,6 +528,8 @@ impl<'a, 's> Ranker<'a, 's> {
             len: iri.len() as u32,
             text: iri,
             iri,
+            prop: u8::MAX,
+            tag: "",
         };
         if self.beyond(&rank) || self.done.contains(&e) || !self.scope.entity_ok(e) {
             return;
@@ -537,7 +555,27 @@ impl<'a, 's> Ranker<'a, 's> {
                     self.bound.pop();
                 }
                 self.tier.insert(c.entity, c);
+                if self.tier.len() > 2 * want + 1024 {
+                    self.compact(want);
+                }
             }
+        }
+    }
+
+    /// Keep the `want` best candidates of the pass. A dropped entity that another value
+    /// ranks better later comes back as a new candidate, so the page is the same.
+    fn compact(&mut self, want: usize) {
+        let mut c: Vec<Candidate<'a>> = self.tier.drain().map(|(_, c)| c).collect();
+        if want < c.len() {
+            if want > 0 {
+                c.select_nth_unstable_by(want - 1, |a, b| a.rank.cmp(&b.rank));
+            }
+            c.truncate(want);
+        }
+        self.bound.clear();
+        for c in c {
+            self.bound.push(c.rank);
+            self.tier.insert(c.entity, c);
         }
     }
 
@@ -649,9 +687,15 @@ fn word_candidates(ix: &Index, terms: &[String], last_prefix: bool) -> Vec<u32> 
         if small {
             return intersect(&cands, &prefix_postings(ix, p));
         }
+        // the words the index holds for each value, local names' parts included
         cands.retain(|&v| {
-            let n = normalize(&ix.values[v as usize].text);
+            let x = &ix.values[v as usize];
+            let n = normalize(&x.text);
             words(&n).any(|w| w.starts_with(last.as_str()))
+                || (x.prop == LOCAL_NAME
+                    && name_words(&x.text)
+                        .iter()
+                        .any(|w| w.starts_with(last.as_str())))
         });
         cands
     } else {
@@ -670,7 +714,20 @@ pub(super) fn run<'a>(
     langs: &[u8],
     prefixes: &BTreeMap<String, String>,
 ) -> (Vec<Candidate<'a>>, bool, Query) {
+    run_capped(scope, req, langs, prefixes, MAX_IRI_PREFIX)
+}
+
+/// [`run`] with at most `iri_cap` visible IRIs ranked for an IRI prefix.
+pub(super) fn run_capped<'a>(
+    scope: &Scope<'a>,
+    req: &SearchRequest,
+    langs: &[u8],
+    prefixes: &BTreeMap<String, String>,
+    iri_cap: usize,
+) -> (Vec<Candidate<'a>>, bool, Query) {
     let ix = scope.ix;
+    // whether an IRI prefix matched more visible IRIs than the cap
+    let mut truncated = false;
     let norm = normalize(&req.query);
     let terms: Vec<String> = words(&norm).map(str::to_string).collect();
     let last_prefix = terms.last().is_some_and(|t| chars(t) >= 2);
@@ -680,6 +737,7 @@ pub(super) fn run<'a>(
         terms,
         last_prefix,
         iri: query_iri(&req.query, prefixes),
+        iri_truncated: false,
     };
     let need = req.offset + req.limit + 1;
     let mut r = Ranker {
@@ -693,9 +751,7 @@ pub(super) fn run<'a>(
     };
     // tiers 0 and 1: a label equals the query or starts with it; then tiers 2 and 3,
     // the same for synonyms and short forms
-    let whole = |r: &mut Ranker<'a, '_>,
-                 map: &'a BTreeMap<Box<[u8]>, SmallVec<[u32; 2]>>,
-                 tier: u8| {
+    let whole = |r: &mut Ranker<'a, '_>, map: &'a Texts, tier: u8| {
         let p = q.norm.as_bytes();
         let hi = successor(p);
         let range = match &hi {
@@ -725,14 +781,23 @@ pub(super) fn run<'a>(
         if let Some(&e) = ix.by_iri.get(iri.as_str()) {
             r.offer_iri(e, 2, MatchKind::Exact);
         }
+        // the first IRIs the caller sees, so that hidden ones do not use up the cap
+        let mut seen = 0;
         for (k, &e) in ix
             .by_iri
             .range::<str, _>((Bound::Excluded(iri.as_str()), Bound::Unbounded))
-            .take(MAX_IRI_PREFIX)
         {
             if !k.starts_with(iri.as_str()) {
                 break;
             }
+            if !scope.entity_ok(e) {
+                continue;
+            }
+            if seen == iri_cap {
+                truncated = true;
+                break;
+            }
+            seen += 1;
             r.offer_iri(e, 3, MatchKind::Prefix);
         }
     }
@@ -761,6 +826,7 @@ pub(super) fn run<'a>(
         }
         r.close();
     }
+    q.iri_truncated = truncated;
     let more = r.out.len() > req.offset + req.limit;
     let mut out = r.out;
     out.truncate(req.offset + req.limit);

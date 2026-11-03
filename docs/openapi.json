@@ -37462,7 +37462,7 @@
             }
           },
           {
-            "description": "The entities skipped. `offset` and `limit` together reach at most 10,000.",
+            "description": "The entities skipped. `offset` and `limit` together reach at most 10,000, and `next` is null when no later page fits in that window although `more` is true.",
             "in": "query",
             "name": "offset",
             "schema": {

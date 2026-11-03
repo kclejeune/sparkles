@@ -852,7 +852,7 @@ fn ontology(p: &mut Paths) {
             .query("kind", s(), "Entity kinds, comma separated: `class`, `property` (every kind of property), `objectProperty`, `dataProperty`, `annotationProperty`, `individual`, `datatype`, `concept`, `conceptScheme` or `collection` (all kinds by default).")
             .query("lang", s(), "The caller's languages, comma separated and most preferred first, as BCP 47 tags. `Accept-Language` is read when it is absent. Values in these languages rank first within a tier, then untagged values, then English, then the others.")
             .query("limit", int(), "The most entities listed, from 1 to 100 (10 by default).")
-            .query("offset", int(), "The entities skipped. `offset` and `limit` together reach at most 10,000.")
+            .query("offset", int(), "The entities skipped. `offset` and `limit` together reach at most 10,000, and `next` is null when no later page fits in that window although `more` is true.")
             .query("fuzzy", boolean(), "Rank the matches within a few edits (true by default).")
             .query("definitions", boolean(), "Rank the matches in definitions (true by default).")
             .resp(

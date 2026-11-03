@@ -217,7 +217,8 @@ builds it from the head, and a later search reads the commits since its own thro
 change ring or the change feed and applies their added and removed triples. A change
 record that is not available, more than 500,000 changed triples, or a head behind the
 index, as after a restore, rebuild it. An aborted transaction leaves no commit and so no
-change. Commits do not touch the index, so the write path is
+change. The search's deadline and cancellation stop a build or a wait for another
+caller's update, and a stopped build leaves the previous index in place. Commits do not touch the index, so the write path is
 unchanged. Nothing is persisted, so there is no format to version, and a restart
 rebuilds the index at the first search. Tests compare the index after random commits, SKOS-XL relinks, writes
 on a branch, a merge, its revert and a reopen with one built from scratch.

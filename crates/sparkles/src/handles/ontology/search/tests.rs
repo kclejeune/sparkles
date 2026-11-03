@@ -1,3 +1,5 @@
+#![allow(clippy::single_range_in_vec_init)]
+
 use super::*;
 use crate::Dataset;
 use crate::access::{GraphAccess, GraphRule, Graphs};
@@ -61,7 +63,9 @@ fn dump(ds: &Dataset) -> Vec<String> {
 
 /// The dump of a fresh index of the dataset's head.
 fn rebuilt(ds: &Dataset) -> Vec<String> {
-    Index::build(&ds.store().snapshot()).unwrap().dump()
+    Index::build(&ds.store().snapshot(), &|| Ok(()))
+        .unwrap()
+        .dump()
 }
 
 #[test]
@@ -541,4 +545,198 @@ fn many_changes_at_once_keep_the_index_right() {
     update(&ds, "DELETE WHERE { ?c a owl:Class ; rdfs:label ?l }");
     assert!(search(&ds, "anchor").hits.is_empty());
     assert_eq!(dump(&ds), rebuilt(&ds));
+}
+
+#[test]
+fn a_skos_xl_form_in_a_hidden_graph_stays_hidden() {
+    // the link is in the default graph, the literal form in :secret
+    let ds = dataset(
+        ":c a skos:Concept ; skosxl:prefLabel :l ; rdfs:label \"public\" .
+         GRAPH :secret { :l skosxl:literalForm \"classified\" }",
+    );
+    let req = |graphs: Vec<GraphRef>| OntologyRequest {
+        graphs,
+        ..Default::default()
+    };
+    let default_only = req(vec![GraphRef::Default]);
+    let r = ds
+        .ontology()
+        .search(
+            &default_only,
+            &SearchRequest::new("classified"),
+            &Default::default(),
+        )
+        .unwrap();
+    assert!(r.hits.is_empty(), "{:?}", r.hits);
+    let r = ds
+        .ontology()
+        .search(
+            &default_only,
+            &SearchRequest::new("public"),
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(r.hits[0].label.as_deref(), Some("public"));
+    // a caller whose grants hide the graph, with every graph asked for
+    let both = req(vec![
+        GraphRef::Default,
+        GraphRef::parse("http://ex.org/secret").unwrap(),
+    ]);
+    let g = Graphs::Only(GraphRule::new(["default"], &[]));
+    let o = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::graphs(g.clone(), g))),
+        ..Default::default()
+    };
+    let r = ds
+        .ontology()
+        .search(&both, &SearchRequest::new("classified"), &o)
+        .unwrap();
+    assert!(r.hits.is_empty(), "{:?}", r.hits);
+    // with both graphs readable the form is found
+    let r = ds
+        .ontology()
+        .search(
+            &both,
+            &SearchRequest::new("classified"),
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(iris(&r), ["c"]);
+}
+
+#[test]
+fn a_node_linked_twice_is_released_once() {
+    let ds = dataset(
+        ":c a skos:Concept ; skosxl:prefLabel :l ; skosxl:altLabel :l .
+         :l skosxl:literalForm \"twice\" .",
+    );
+    assert_eq!(iris(&search(&ds, "twice")), ["c"]);
+    update(&ds, "DELETE DATA { :c a skos:Concept }");
+    assert!(search(&ds, "twice").hits.is_empty());
+    // two new nodes must not share the freed slot
+    update(
+        &ds,
+        "INSERT DATA { :d a skos:Concept ; skosxl:prefLabel :m . :m skosxl:literalForm \"first\" .
+                       :e a skos:Concept ; skosxl:prefLabel :n . :n skosxl:literalForm \"second\" . }",
+    );
+    assert_eq!(iris(&search(&ds, "first")), ["d"]);
+    assert_eq!(iris(&search(&ds, "second")), ["e"]);
+    update(&ds, "DELETE DATA { :m skosxl:literalForm \"first\" }");
+    assert!(search(&ds, "first").hits.is_empty());
+    assert_eq!(iris(&search(&ds, "second")), ["e"]);
+    assert_eq!(dump(&ds), rebuilt(&ds));
+}
+
+#[test]
+fn local_name_parts_match_past_the_postings_shortcut() {
+    // `has` narrows the candidates to hasPart, while many words start with `pa`
+    let mut body = String::from(":hasPart a owl:ObjectProperty .\n");
+    for i in 0..200 {
+        body.push_str(&format!(":c{i} a owl:Class ; rdfs:label \"pa{i:03}x\" .\n"));
+    }
+    let ds = dataset(&body);
+    let r = search_with(
+        &ds,
+        &SearchRequest {
+            fuzzy: false,
+            ..SearchRequest::new("has pa")
+        },
+    );
+    assert_eq!(iris(&r), ["hasPart"]);
+}
+
+#[test]
+fn hidden_iris_do_not_use_up_the_iri_prefix_cap() {
+    // more hidden IRIs than the cap sort before the one the caller may see
+    let mut body = String::from("GRAPH :hidden {\n");
+    for i in 0..query::MAX_IRI_PREFIX {
+        body.push_str(&format!(":a{i:05} a owl:Class .\n"));
+    }
+    body.push_str("}\n:b a owl:Class .\n");
+    let ds = dataset(&body);
+    let g = Graphs::Only(GraphRule::new(["default"], &[]));
+    let o = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::graphs(g.clone(), g))),
+        ..Default::default()
+    };
+    let req = OntologyRequest {
+        graphs: vec![
+            GraphRef::Default,
+            GraphRef::parse("http://ex.org/hidden").unwrap(),
+        ],
+        ..Default::default()
+    };
+    let r = ds
+        .ontology()
+        .search(&req, &SearchRequest::new("http://ex.org/"), &o)
+        .unwrap();
+    assert_eq!(iris(&r), ["b"]);
+    assert!(!r.more);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    // a reader of every graph sees the cap and a warning
+    let r = ds
+        .ontology()
+        .search(&req, &top("http://ex.org/", 100), &Default::default())
+        .unwrap();
+    assert_eq!(r.hits.len(), 100);
+    assert!(!r.warnings.is_empty());
+}
+
+#[test]
+fn many_equal_labels_keep_the_page_bounded_and_ordered() {
+    let mut body = String::new();
+    for i in 0..3000 {
+        body.push_str(&format!(":e{i:04} a owl:Class ; rdfs:label \"same\" .\n"));
+    }
+    let ds = dataset(&body);
+    let ten = search_with(&ds, &top("same", 10));
+    let hundred = search_with(&ds, &top("same", 100));
+    assert_eq!(iris(&ten), iris(&hundred)[..10]);
+    let want: Vec<String> = (0..100).map(|i| format!("e{i:04}")).collect();
+    assert_eq!(iris(&hundred), want);
+    // a later page continues the same order
+    let page = search_with(
+        &ds,
+        &SearchRequest {
+            offset: 2990,
+            limit: 20,
+            ..SearchRequest::new("same")
+        },
+    );
+    let want: Vec<String> = (2990..3000).map(|i| format!("e{i:04}")).collect();
+    assert_eq!(iris(&page), want);
+    assert!(!page.more);
+}
+
+#[test]
+fn a_search_past_its_deadline_builds_nothing() {
+    let ds = dataset(":a a owl:Class ; rdfs:label \"anchor\" .");
+    let o = QueryOptions {
+        deadline: Some(std::time::Instant::now() - std::time::Duration::from_millis(1)),
+        ..Default::default()
+    };
+    let r = ds.ontology().search(
+        &OntologyRequest::default(),
+        &SearchRequest::new("anchor"),
+        &o,
+    );
+    assert!(matches!(r, Err(Error::Timeout)), "{r:?}");
+    assert_eq!(ds.ontology().search_stats().builds, 0);
+    assert_eq!(iris(&search(&ds, "anchor")), ["a"]);
+}
+
+#[test]
+fn equal_values_of_one_entity_rank_as_a_rebuild_does() {
+    let ds = dataset(":w a owl:Class ; rdfs:label \"water\" .");
+    assert_eq!(iris(&search(&ds, "water")), ["w"]);
+    update(&ds, "INSERT DATA { :w skos:prefLabel \"water\" }");
+    let updated = search(&ds, "water");
+    assert_eq!(updated.index, IndexUse::Updated);
+    let fresh = Dataset::memory();
+    update(
+        &fresh,
+        "INSERT DATA { :w a owl:Class ; rdfs:label \"water\" ; skos:prefLabel \"water\" }",
+    );
+    let built = search(&fresh, "water");
+    assert_eq!(updated.hits, built.hits);
 }

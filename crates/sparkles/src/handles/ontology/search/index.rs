@@ -241,6 +241,9 @@ pub(super) struct Node {
     pub links: Vec<(u32, u8, u32)>,
 }
 
+/// Normalized whole texts and the values that have them.
+pub(super) type Texts = BTreeMap<Box<[u8]>, SmallVec<[u32; 2]>>;
+
 /// The entity index of one state of a branch.
 #[derive(Default)]
 pub(super) struct Index {
@@ -261,9 +264,9 @@ pub(super) struct Index {
     pub values: Vec<Value>,
     pub dead_values: usize,
     /// the normalized whole text of label values
-    pub labels: BTreeMap<Box<[u8]>, SmallVec<[u32; 2]>>,
+    pub labels: Texts,
     /// the normalized whole text of synonym and short-form values
-    pub alts: BTreeMap<Box<[u8]>, SmallVec<[u32; 2]>>,
+    pub alts: Texts,
     /// the words of every value, each with the sorted ids of the values that have it
     pub words: BTreeMap<Box<[u8]>, Vec<u32>>,
     pub nodes: Vec<Node>,
@@ -502,7 +505,11 @@ impl Index {
         for v in ent.values {
             self.kill_value(v);
         }
-        for (_, _, n) in ent.links {
+        // an entity can link one node through several properties or graphs
+        let mut nodes: Vec<u32> = ent.links.iter().map(|l| l.2).collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        for n in nodes {
             let node = &mut self.nodes[n as usize];
             node.links.retain(|(le, _, _)| *le != e);
             self.release_node(n);
@@ -561,7 +568,7 @@ impl Index {
     }
 
     /// The map of whole texts of a field's values (none for definitions).
-    fn texts_of(&mut self, f: Field) -> Option<&mut BTreeMap<Box<[u8]>, SmallVec<[u32; 2]>>> {
+    fn texts_of(&mut self, f: Field) -> Option<&mut Texts> {
         match f {
             Field::Label => Some(&mut self.labels),
             Field::Synonym | Field::ShortForm => Some(&mut self.alts),
@@ -656,7 +663,8 @@ impl Index {
     }
 
     fn release_node(&mut self, n: u32) {
-        if !self.nodes[n as usize].links.is_empty() {
+        // a released slot has no key, and goes on the free list once
+        if !self.nodes[n as usize].links.is_empty() || self.nodes[n as usize].key.is_empty() {
             return;
         }
         let node = std::mem::take(&mut self.nodes[n as usize]);
@@ -858,7 +866,9 @@ impl Index {
     }
 
     /// The index of `snap`, read from its type facts and then the watched properties.
-    pub(super) fn build(snap: &Snapshot) -> Result<Index> {
+    /// The index of `snap`. `check` runs between the scans and every 65,536 facts, and
+    /// its error ends the build.
+    pub(super) fn build(snap: &Snapshot, check: &dyn Fn() -> Result<()>) -> Result<Index> {
         let mut ix = Index::empty();
         ix.seq = snap.commit;
         let voc = Vocab::of(snap);
@@ -880,12 +890,16 @@ impl Index {
         types.sort_by_key(|(_, t)| *t);
         let mut quads: Vec<[Id; 4]> = Vec::new();
         for (tid, t) in types {
+            check()?;
             quads.clear();
             snap.scan(Perm::Pos, &[rdf_type.0, tid.0], |c| {
                 push_quads(Perm::Pos, c, &mut quads);
                 Ok(true)
             })?;
-            for q in &quads {
+            for (i, q) in quads.iter().enumerate() {
+                if i % 65_536 == 65_535 {
+                    check()?;
+                }
                 let e = match ids.get(&q[0]) {
                     Some(&e) => e,
                     None => {
@@ -919,12 +933,16 @@ impl Index {
         });
         let mut fresh = FxHashSet::default();
         for (pid, w) in preds {
+            check()?;
             quads.clear();
             snap.scan(Perm::Pos, &[pid.0], |c| {
                 push_quads(Perm::Pos, c, &mut quads);
                 Ok(true)
             })?;
-            for q in &quads {
+            for (i, q) in quads.iter().enumerate() {
+                if i % 65_536 == 65_535 {
+                    check()?;
+                }
                 if let Some(&e) = ids.get(&q[0]) {
                     ix.fact(snap, &mut g, &voc, q, w, e, true, &mut fresh);
                 }

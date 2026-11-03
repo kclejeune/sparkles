@@ -148,6 +148,7 @@ pub(crate) fn source_ranges(map: &[Range<usize>], n: &[Range<usize>]) -> Vec<Ran
 }
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
 
@@ -167,6 +168,13 @@ mod tests {
         assert_eq!(normalize("Ærø"), "aero");
         assert_eq!(normalize("CHEBI:15377"), "chebi 15377");
         assert_eq!(normalize("水分子"), "水分子");
+        // composed and decomposed letters of any script fold alike
+        assert_eq!(normalize("ёлка"), "елка");
+        assert_eq!(normalize("е\u{308}лка"), "елка");
+        assert_eq!(normalize("Ἀθῆναι"), "αθηναι");
+        // kana voicing marks and Hangul syllables are not diacritics
+        assert_eq!(normalize("がっこう"), "がっこう");
+        assert_eq!(normalize("한국어"), "한국어");
         assert_eq!(normalize("--"), "");
     }
 

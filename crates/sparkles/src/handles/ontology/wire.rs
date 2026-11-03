@@ -1125,7 +1125,8 @@ pub fn search_body(name: &str, s: &search::SearchRequest, r: &search::SearchResu
         "offset": s.offset,
         "limit": s.limit,
         "more": r.more,
-        "next": if r.more { json!(next) } else { J::Null },
+        // a page starts below the window's end
+        "next": if r.more && next < search::MAX_WINDOW { json!(next) } else { J::Null },
         "index": match r.index {
             search::IndexUse::Current => "current",
             search::IndexUse::Updated => "updated",

@@ -990,10 +990,13 @@ test('the ontology handle searches entities with typos', async (t) => {
   assert.equal(prefix.results[0].iri, 'http://ex.org/Glucose');
   assert.equal(prefix.results[0].type, 'entity');
   assert.equal(prefix.results[0].match.kind, 'prefix');
-  assert.deepEqual(
-    prefix.results[0].match.highlight.map((r) => r.map(Number)),
-    [[0, 4]],
-  );
+  assert.deepEqual(prefix.results[0].match.highlight, [[0, 4]]);
+  // the commit and the next offset are bigints, the other numbers plain numbers
+  assert.equal(typeof prefix.commit, 'bigint');
+  assert.equal(typeof prefix.offset, 'number');
+  assert.equal(typeof prefix.limit, 'number');
+  assert.equal(typeof prefix.results[0].match.distance, 'number');
+  assert.equal(typeof prefix.results[0].match.tier, 'number');
   const typo = await onto.search('glucoes');
   assert.equal(typo.results[0].iri, 'http://ex.org/Glucose');
   assert.equal(typo.results[0].match.kind, 'fuzzy');
