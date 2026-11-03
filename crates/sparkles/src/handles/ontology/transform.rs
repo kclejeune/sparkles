@@ -32,15 +32,29 @@ pub struct WorkingOntology {
 }
 
 impl WorkingOntology {
-    /// Read an ontology file: its axioms without a store when the file is one graph
-    /// ([`OntologyFile::read`]), else through a database in memory, as `ontology
-    /// classify FILE` reads it.
+    /// Read an ontology file. A functional-style document's axioms are kept as written,
+    /// each with its annotations and an n-ary axiom as one, as OWL API reads them. A file
+    /// of triples is read without a store when it is one graph ([`OntologyFile::read`]),
+    /// else through a database in memory, as `ontology classify FILE` reads it.
     pub fn read(
         path: &Path,
         req: &OntologyRequest,
         threads: usize,
         opts: &QueryOptions,
     ) -> Result<WorkingOntology> {
+        let source = crate::io::Source::from_path(path, None)?;
+        if source.format == crate::io::RdfSyntax::OwlFunctional {
+            let threads = match threads {
+                0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+                n => n,
+            };
+            let (doc, _) = crate::io::read_ofn(&source, threads)?;
+            return Ok(WorkingOntology {
+                name: path.display().to_string(),
+                doc: Document::new(doc.header, doc.axioms),
+                prefixes: doc.prefixes.into_iter().collect(),
+            });
+        }
         if let Some(file) = OntologyFile::read(path, req, threads)? {
             let prefixes = file.prefixes();
             let name = file.name.clone();
@@ -52,7 +66,6 @@ impl WorkingOntology {
             });
         }
         let ds = Dataset::memory();
-        let source = crate::io::Source::from_path(path, None)?;
         ds.store().load(&[source])?;
         let opened = ds.ontology().open(req, opts)?;
         WorkingOntology::from_opened(path.display().to_string(), &opened, ds.prefixes(), opts)
@@ -204,44 +217,54 @@ pub fn write_axioms<'a>(
     let file = std::fs::File::create(path)
         .map_err(|e| Error::invalid(format!("cannot write {}: {e}", path.display())))?;
     let io = |e: std::io::Error| Error::invalid(format!("cannot write {}: {e}", path.display()));
-    let mut out: Box<dyn Write> = if gz {
-        Box::new(flate2::write::GzEncoder::new(
-            std::io::BufWriter::with_capacity(1 << 20, file),
-            flate2::Compression::default(),
-        ))
+    let buf = std::io::BufWriter::with_capacity(1 << 20, file);
+    // each layer is finished and flushed by hand, so that an error writing the gzip
+    // trailer or the last buffer fails the command
+    let buf = if gz {
+        let mut enc = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
+        write_body(&mut enc, format, prefixes, header, axioms).map_err(io)?;
+        enc.finish().map_err(io)?
     } else {
-        Box::new(std::io::BufWriter::with_capacity(1 << 20, file))
+        let mut buf = buf;
+        write_body(&mut buf, format, prefixes, header, axioms).map_err(io)?;
+        buf
     };
-    match format {
-        OutputFormat::Functional => {
-            let r = Renderer::new(prefixes.clone());
-            write_functional(&mut out, &r, header, axioms).map_err(io)?;
-        }
-        _ => {
-            let rdf = match format {
-                OutputFormat::RdfXml => oxrdfio::RdfFormat::RdfXml,
-                OutputFormat::Turtle => oxrdfio::RdfFormat::Turtle,
-                _ => oxrdfio::RdfFormat::NTriples,
-            };
-            let mut fresh = sparkles_owl::write::counter("genid");
-            let triples = sparkles_owl::write::ontology_triples(header, axioms, &mut fresh);
-            // the input's prefixes and the standard ones, as the renderer has them
-            let r = Renderer::new(prefixes.clone());
-            let ser = crate::io::with_prefixes(
-                oxrdfio::RdfSerializer::from_format(rdf),
-                r.prefixes()
-                    .into_iter()
-                    .map(|(p, n)| (p.to_string(), n.to_string())),
-            );
-            let mut w = ser.for_writer(&mut out);
-            for t in &triples {
-                w.serialize_triple(t).map_err(io)?;
-            }
-            w.finish().map_err(io)?;
-        }
+    let file = buf.into_inner().map_err(|e| io(e.into_error()))?;
+    file.sync_all().map_err(io)?;
+    Ok(())
+}
+
+/// The document in the syntax `format` names.
+fn write_body<'a>(
+    out: &mut dyn Write,
+    format: OutputFormat,
+    prefixes: &BTreeMap<String, String>,
+    header: &sparkles_owl::Header,
+    axioms: impl IntoIterator<Item = &'a Axiom>,
+) -> std::io::Result<()> {
+    let r = Renderer::new(prefixes.clone());
+    if format == OutputFormat::Functional {
+        return write_functional(out, &r, header, axioms);
     }
-    out.flush().map_err(io)?;
-    drop(out);
+    let rdf = match format {
+        OutputFormat::RdfXml => oxrdfio::RdfFormat::RdfXml,
+        OutputFormat::Turtle => oxrdfio::RdfFormat::Turtle,
+        _ => oxrdfio::RdfFormat::NTriples,
+    };
+    let mut fresh = sparkles_owl::write::counter("genid");
+    let triples = sparkles_owl::write::ontology_triples(header, axioms, &mut fresh);
+    // the input's prefixes and the standard ones, as the renderer has them
+    let ser = crate::io::with_prefixes(
+        oxrdfio::RdfSerializer::from_format(rdf),
+        r.prefixes()
+            .into_iter()
+            .map(|(p, n)| (p.to_string(), n.to_string())),
+    );
+    let mut w = ser.for_writer(out);
+    for t in &triples {
+        w.serialize_triple(t)?;
+    }
+    w.finish()?;
     Ok(())
 }
 

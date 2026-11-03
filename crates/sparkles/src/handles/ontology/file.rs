@@ -214,9 +214,11 @@ impl OntologyFile {
     }
 
     /// An ontology file of a document's axioms held in memory, as a chained command
-    /// hands it on: every axiom is read as a functional-style document's axioms are,
-    /// assertions included, with `prefixes` for the renderer. The imports of the header
-    /// do not resolve, as a file's do not.
+    /// hands it on, with `prefixes` for the renderer. The axioms are split as a read of a
+    /// functional-style document splits them: an assertion that a store would stream
+    /// becomes its triples, which `assertions` options then include or leave out, and
+    /// every other axiom is in the terminology as it is. The imports of the header do not
+    /// resolve, as a file's do not.
     pub fn from_document(
         name: String,
         doc: sparkles_owl::transform::Document,
@@ -228,12 +230,41 @@ impl OntologyFile {
             .iter()
             .map(|i| i.as_str().to_string())
             .collect();
-        let ontology = read::Ontology::from_axioms(doc.header, doc.axioms, Mode::Lenient);
+        let declared: FxHashSet<String> = doc
+            .axioms
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AxiomKind::Declaration(Entity::AnnotationProperty(p)) => {
+                    Some(p.as_str().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut fresh = sparkles_owl::write::counter("file");
+        let mut terminology = Vec::with_capacity(doc.axioms.len());
+        let mut assertions = Vec::new();
+        for ax in doc.axioms {
+            if streamed(&ax, &declared) {
+                assertions.extend(sparkles_owl::write::axiom_triples(&ax, &mut fresh));
+            } else {
+                terminology.push(ax);
+            }
+        }
+        let order = StoreOrder::new(&assertions);
+        assertions.par_sort_by_cached_key(|t| {
+            (
+                order.key(&t.subject.clone().into()),
+                order.key(&Term::NamedNode(t.predicate.clone())),
+                order.key(&t.object),
+            )
+        });
+        assertions.dedup();
+        let ontology = read::Ontology::from_axioms(doc.header, terminology, Mode::Lenient);
         OntologyFile::new(
             name,
             RdfSyntax::OwlFunctional,
             ontology,
-            Vec::new(),
+            assertions,
             prefixes,
             (imports, Vec::new()),
             &OntologyRequest::default(),
