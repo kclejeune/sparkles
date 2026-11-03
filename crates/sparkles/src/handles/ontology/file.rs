@@ -704,6 +704,21 @@ fn from_document(
             pairwise(ax, &mut terminology);
         }
     }
+    // an annotated axiom's main triple is also the triple of the same axiom without
+    // annotations, which a store then reads only once
+    let annotated: FxHashSet<&AxiomKind> = terminology
+        .iter()
+        .filter(|a| !a.annotations.is_empty())
+        .map(|a| &a.kind)
+        .collect();
+    if !annotated.is_empty()
+        && terminology
+            .iter()
+            .any(|a| a.annotations.is_empty() && annotated.contains(&a.kind))
+    {
+        return None;
+    }
+    drop(annotated);
     // the main triple of an annotated assertion is read with the terminology, and the
     // store streams it no more
     let mains: FxHashSet<Triple> = terminology
@@ -741,8 +756,10 @@ fn from_document(
 /// declaration or one that Table 6 of the mapping implies, or built in, no
 /// IRI declared both as two kinds of property or as a class and a datatype, no entity of
 /// the reserved vocabulary that is not built in, no mention of the ontology's IRI or
-/// version IRI in an axiom, and every n-ary axiom with at least two operands, an
-/// equivalence of three or more with named operands only.
+/// version IRI in an axiom, no `ObjectInverseOf` but in a property assertion without
+/// annotations, no two annotations of one subject with the same property and value, and
+/// every n-ary axiom with at least two operands, an equivalence of three or more with
+/// named operands only. The header's annotations are held to the same rules.
 fn round_trips(doc: &sparkles_owl::ofn_read::Document) -> bool {
     use sparkles_owl::{EntityKind, ObjectPropertyExpression as Ope};
     let bit = |k: EntityKind| 1u8 << (k as u8);
@@ -794,20 +811,45 @@ fn round_trips(doc: &sparkles_owl::ofn_read::Document) -> bool {
             _ => true,
         }
     };
+    let typed = |e: &Entity| {
+        let iri = e.iri().as_str();
+        match read::builtin_kind(iri) {
+            Some(k) => k == e.kind(),
+            None => {
+                !vocab::is_reserved(iri) && kinds.get(iri).is_some_and(|&k| k & bit(e.kind()) != 0)
+            }
+        }
+    };
+    // the header's annotations, whose triples the store reads as the header's only when
+    // their properties are annotation properties
+    let mut header_signature = sparkles_owl::Axiom::from(AxiomKind::Declaration(Entity::Class(
+        sparkles_owl::Class::new(vocab::OWL_THING),
+    )));
+    header_signature.annotations = doc.header.annotations.clone();
+    if collapses(&doc.header.annotations) || !header_signature.signature().iter().all(typed) {
+        return false;
+    }
     doc.axioms.par_iter().with_min_len(4096).all(|a| {
+        let (signature, inverses) = a.signature_and_inverses();
+        // an inverse property only in a plain property assertion, which maps to the
+        // triple of the named property
+        let plain_assertion =
+            a.annotations.is_empty() && matches!(a.kind, AxiomKind::ObjectPropertyAssertion(..));
         operands(&a.kind)
+            && (!inverses || plain_assertion)
+            && !collapses(&a.annotations)
             && !header.iter().any(|i| a.mentions(i))
-            && a.signature().iter().all(|e| {
-                let iri = e.iri().as_str();
-                match read::builtin_kind(iri) {
-                    Some(k) => k == e.kind(),
-                    None => {
-                        !vocab::is_reserved(iri)
-                            && kinds.get(iri).is_some_and(|&k| k & bit(e.kind()) != 0)
-                    }
-                }
-            })
+            && signature.iter().all(typed)
     })
+}
+
+/// Whether two of the annotations, or two annotations of one of them, at any depth, have
+/// the same property and value, which the mapping writes as one triple.
+fn collapses(annotations: &BTreeSet<sparkles_owl::Annotation>) -> bool {
+    let mut seen = FxHashSet::default();
+    annotations
+        .iter()
+        .any(|a| !seen.insert((&a.property, &a.value)) || collapses(&a.annotations))
 }
 
 /// Add the axiom to `out` as the reverse mapping reads its triples back: an equivalence

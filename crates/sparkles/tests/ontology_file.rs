@@ -427,6 +427,26 @@ fn what_the_triples_could_read_otherwise_is_left_to_the_store() {
         ),
         // an equivalence that the set of operands makes one class
         format!("{OFN_HEAD}{declared} EquivalentClasses(:A :A)\n)\n"),
+        // an annotated assertion of an inverse property, which its triple reads forward
+        format!(
+            "{OFN_HEAD}{declared} Declaration(ObjectProperty(:p))\n Declaration(NamedIndividual(:j))\n ObjectPropertyDomain(:p :A)\n SubClassOf(:A owl:Nothing)\n ObjectPropertyAssertion(Annotation(rdfs:comment \"inverse\") ObjectInverseOf(:p) :j :i)\n)\n"
+        ),
+        // an equivalence that an annotated one shares a triple with
+        format!(
+            "{OFN_HEAD}{declared} EquivalentClasses(:A :B :C)\n EquivalentClasses(Annotation(rdfs:comment \"x\") :A :B)\n)\n"
+        ),
+        // a header annotation with an undeclared property
+        format!(
+            "{OFN_HEAD} Annotation(<http://ex.org/note> \"note\")\n{declared} SubClassOf(:A :B)\n)\n"
+        ),
+        // two annotations that the mapping writes as one triple
+        format!(
+            "{OFN_HEAD}{declared} SubClassOf(Annotation(rdfs:comment \"x\") Annotation(Annotation(rdfs:label \"nested\") rdfs:comment \"x\") :A ObjectUnionOf(:B :C))\n)\n"
+        ),
+        // inverse properties with an inverse, whose blank subject the mapping refuses
+        format!(
+            "{OFN_HEAD}{declared} Declaration(ObjectProperty(:p))\n Declaration(ObjectProperty(:q))\n InverseObjectProperties(ObjectInverseOf(:p) :q)\n)\n"
+        ),
     ];
     for (i, c) in cases.iter().enumerate() {
         compare_or_refuse(&format!("case{i}.ofn"), c, true);

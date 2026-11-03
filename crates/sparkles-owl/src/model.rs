@@ -863,6 +863,17 @@ impl Axiom {
         s.0
     }
 
+    /// The entities of the axiom's signature, as [`Axiom::signature`] gives them, and
+    /// whether the axiom has an `ObjectInverseOf` anywhere.
+    pub fn signature_and_inverses(&self) -> (BTreeSet<Entity>, bool) {
+        let mut s = Signature::default();
+        s.axiom(&self.kind);
+        for a in &self.annotations {
+            s.annotation(a);
+        }
+        (s.0, s.1)
+    }
+
     /// The IRIs the axiom mentions in any position, annotations and their values
     /// included.
     pub fn mentions(&self, iri: &str) -> bool {
@@ -931,15 +942,17 @@ impl Axiom {
     }
 }
 
-/// The signature of a structure, collected by walking it.
+/// The signature of a structure, collected by walking it, and whether the structure has
+/// an `ObjectInverseOf`.
 #[derive(Default)]
-pub(crate) struct Signature(pub(crate) BTreeSet<Entity>);
+pub(crate) struct Signature(pub(crate) BTreeSet<Entity>, pub(crate) bool);
 
 impl Signature {
     fn class(&mut self, c: &Class) {
         self.0.insert(Entity::Class(c.clone()));
     }
     fn ope(&mut self, p: &ObjectPropertyExpression) {
+        self.1 |= matches!(p, ObjectPropertyExpression::InverseOf(_));
         self.0.insert(Entity::ObjectProperty(p.named().clone()));
     }
     fn dp(&mut self, p: &DataProperty) {
