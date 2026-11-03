@@ -1028,3 +1028,8 @@ export const INCOMING_WORDS: Record<string, string> = {
   [SKOS + 'hasTopConcept']: 'Top concept of',
   [OBO + 'IAO_0100001']: 'Replaces',
 };
+
+/** The SPARQL of the named graphs that hold an ontology or a concept scheme. */
+export function headGraphsQuery(): string {
+  return `SELECT DISTINCT ?g WHERE { GRAPH ?g { ?o a ?t . VALUES ?t { <${OWL}Ontology> <${SKOS}ConceptScheme> } } } ORDER BY ?g LIMIT 200`;
+}

@@ -6,6 +6,7 @@
   // entity and never the whole ontology. The landing page reads the header and counts by
   // SPARQL and the roots from the hierarchy route. The components come from
   // lib/components/browse, and this page only lays them out.
+  import { goto } from '$app/navigation';
   import { base } from '$app/paths';
   import { page } from '$app/state';
   import * as api from '$lib/api';
@@ -22,6 +23,7 @@
     editHref,
     fetchHierarchy,
     fetchTerm,
+    headGraphsQuery,
     incomingQuery,
     kindWord,
     mentionGroups,
@@ -328,6 +330,7 @@
   let rootItems = $state<TreeNode[]>([]);
   let rootDefs = $state<Map<string, string>>(new Map());
   let rootBusy = $state(false);
+  let headGraphs = $state<string[]>([]);
   let landingError = $state<string | null>(null);
   let landingLoading = $state(false);
 
@@ -350,11 +353,16 @@
     landingLoading = true;
     const opts = { at: s.at ?? undefined, signal };
     try {
-      const [h, c] = await Promise.all([
+      const [h, c, g] = await Promise.all([
         ontologyHead(t, s, langs, signal),
         api.select(t, countsQuery(s.graph), opts).then((rows) => parseCounts(rows as never)),
+        api
+          .select(t, headGraphsQuery(), opts)
+          .then((rows) => rows.flatMap((r) => (r.g?.type === 'uri' ? [r.g.value] : [])))
+          .catch(() => [] as string[]),
       ]);
       if (signal.aborted) return;
+      headGraphs = g;
       head = h;
       counts = c;
       const has = (k: string) => c.some((x) => x.kind === k);
@@ -662,6 +670,28 @@
         <div class="title-row">
           <h1 class="term-title">{landingTitle}</h1>
           <div class="actions">
+            {#if headGraphs.length}
+              <label class="form-row">
+                Graph
+                <select
+                  class="select"
+                  value={graph ?? ''}
+                  onchange={(e) =>
+                    goto(
+                      browseHref(base, name, null, {
+                        ...keep,
+                        graph: e.currentTarget.value || null,
+                      }),
+                    )}
+                >
+                  <option value="">default graph</option>
+                  {#each headGraphs as g (g)}<option value={g}>{iriName(g, prefixes)}</option
+                    >{/each}
+                  {#if graph && !headGraphs.includes(graph)}<option value={graph}>{graph}</option
+                    >{/if}
+                </select>
+              </label>
+            {/if}
             <a
               class="btn sm"
               href="{base}/{head?.scheme ? 'thesaurus' : 'ontology'}?{new URLSearchParams({
