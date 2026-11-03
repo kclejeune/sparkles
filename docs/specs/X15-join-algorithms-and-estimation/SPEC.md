@@ -105,8 +105,11 @@ phases are not. [Item 454](../../ROADMAP.md) tracks the remaining work.
   join over its outgoing items alone is estimated from the subject sets, which take the
   restriction to be independent, and other joins keep the estimate from distinct values.
   This is the characteristic-pair idea reduced to the join node. Pairs keyed by both ends' sets are not built.
-* **Same sets at any thread count.** A load writes the same `stats.json` at any thread
-  count. When the data has at most 2^20 distinct node signatures, the node pass counts
+* **Same sets at any thread count.** The node pass keeps the same sets at any thread
+  count, so a load of data without blank nodes writes the same `stats.json` at any
+  thread count. A load numbers blank nodes in the order its parser threads meet them, so
+  their identifiers in the statistics can differ between loads, as they did before.
+  When the data has at most 2^20 distinct node signatures, the node pass counts
   them all exactly. Otherwise its first pass also fills a count-min sketch of the nodes
   per signature, and a second pass counts exactly the 2^20 signatures with the most nodes
   by the sketch, with ties broken by a stable hash of the signature. None of the

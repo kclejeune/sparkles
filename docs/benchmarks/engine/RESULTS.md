@@ -343,7 +343,7 @@ the smaller caps give up much of the gain.
 The 90th percentile is lower at 16,384 sets than at 32,768 because the plans, and so the
 joins measured, differ. Against 32,768 sets, the largest join error of WatDiv `F1-2` rises
 from 17 to 49 at 8,192 sets and that of `F4-2` from 9 to 58, and at 16,384 sets that of
-`F4-1` rises from 2.1 to 7.0. A load writes the same statistics at any thread count.
+`F4-1` rises from 2.1 to 7.0. The node pass keeps the same sets at any thread count.
 
 ### Estimation timing on forge
 

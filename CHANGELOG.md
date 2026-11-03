@@ -243,7 +243,7 @@ on LUBM(10), and answers are unchanged. The switches are `set_remainders`, `node
 `key_backoff`. The statistics grow `stats.json`, from 5.0 MB to 44.3 MB on the DBpedia
 slice, and the node pass adds about 0.2 s to a WatDiv load and 0.7 s to the DBpedia
 load. On atlas, opening the DBpedia slice takes 0.30 s instead of 0.07 s and the server
-holds 214 MB instead of 133 MB once ready. A load writes the same statistics at any
+holds 214 MB instead of 133 MB once ready. The node pass keeps the same sets at any
 thread count. On forge, WatDiv's `C` queries run 2.3 to 5 times as fast, BSBM BI `q1-3` 4.4 times
 and LUBM `q2` 1.9 times. WatDiv `S4-2` and `S4-4` take 1.6 times as long after a plan
 change, and planning takes 1 to 75 microseconds longer on short queries.
