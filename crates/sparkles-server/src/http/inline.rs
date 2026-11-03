@@ -33,6 +33,15 @@
 //! of the text is known. The fastest runs, not the last ones, decide, so that one slow run
 //! of the faster mode, as a busy moment gives, does not hold the text in the slower mode.
 //!
+//! The first run of a text in each mode is cold, since it meets that mode's code and data
+//! for the first time. On atlas the first cursor run of the synthetic `expr-bind-group`
+//! took 0.94 to 1.16 ms of server time and the later ones 0.58 ms, and the first eager
+//! run 1.07 to 1.18 ms and the later ones 0.77 ms. Comparing the cold cursor run with the
+//! eager run after it left about one server process in two answering that query eagerly
+//! for its whole life. A text whose two modes are both quick therefore settles only once
+//! the slower mode has run twice, and until then its next run goes to the mode that lost
+//! with a single run. That costs a text at most two runs in its slower mode.
+//!
 //! The blocking pool costs a first request about 2 ms more on an idle machine. On forge
 //! at 10.5M triples, a fresh server answered its first `path-plus` in a median of 6.5 ms
 //! through the pool and 4.3 ms in place, and a text it had not seen in 0.72 and 0.50 ms.
@@ -185,15 +194,22 @@ pub enum QuickExecution {
 }
 
 /// What is remembered of one text: its [`History`], its fastest eager run and its fastest
-/// whole cursor run in milliseconds (infinite: none yet), and the token of the request that
-/// holds its eager trial (0: none).
+/// whole cursor run in milliseconds (infinite: none yet), how many timed runs of each
+/// kind it has had, up to two, and the token of the request that holds its eager trial
+/// (0: none).
 #[derive(Clone, Copy, Debug)]
 struct Seen {
     history: History,
     eager_best: f64,
     cursor_best: f64,
+    eager_runs: u8,
+    cursor_runs: u8,
     trial: u64,
 }
+
+/// The runs of each mode that a text whose two modes are both quick needs before it
+/// settles in the faster one, so that a cold first run does not decide it alone.
+const SETTLING_RUNS: u8 = 2;
 
 /// The query texts (per dataset) whose last run is remembered, quick or not.
 #[derive(Default)]
@@ -328,8 +344,17 @@ impl QuickQueries {
         let seen = set.get(&key).copied();
         let mut eager_best = seen.map_or(f64::INFINITY, |seen| seen.eager_best);
         let mut cursor_best = seen.map_or(f64::INFINITY, |seen| seen.cursor_best);
+        let mut eager_runs = seen.map_or(0, |seen| seen.eager_runs);
+        let mut cursor_runs = seen.map_or(0, |seen| seen.cursor_runs);
         let trial = seen.map_or(0, |seen| seen.trial);
-        let history = match run {
+        if ms.is_finite() {
+            match run {
+                Run::Eager => eager_runs = (eager_runs + 1).min(SETTLING_RUNS),
+                Run::Cursor => cursor_runs = (cursor_runs + 1).min(SETTLING_RUNS),
+                Run::Ask | Run::EagerFailed => {}
+            }
+        }
+        let mut history = match run {
             _ if !ms.is_finite() => History::Slow,
             Run::Ask if ms < QUICK_QUERY_MS => History::Quick(QuickExecution::PreserveAuto),
             Run::Ask => History::Slow,
@@ -380,12 +405,34 @@ impl QuickQueries {
                 }
             }
         };
+        // A quick run of a text whose two modes are both quick goes on to the mode that
+        // lost with fewer than SETTLING_RUNS runs, which a cold first run gives, and
+        // otherwise to the faster mode as above.
+        if matches!(run, Run::Eager | Run::Cursor)
+            && ms < QUICK_QUERY_MS
+            && eager_best < QUICK_QUERY_MS
+            && cursor_best < QUICK_QUERY_MS
+        {
+            let cursor_faster = match run {
+                Run::Eager => cursor_best < eager_best,
+                _ => eager_best >= cursor_best,
+            };
+            history = if cursor_faster && eager_runs < SETTLING_RUNS {
+                History::Quick(QuickExecution::Eager)
+            } else if !cursor_faster && cursor_runs < SETTLING_RUNS {
+                History::Quick(QuickExecution::PreserveAuto)
+            } else {
+                history
+            };
+        }
         set.insert(
             key,
             Seen {
                 history,
                 eager_best,
                 cursor_best,
+                eager_runs,
+                cursor_runs,
                 trial,
             },
         );
@@ -537,6 +584,66 @@ mod tests {
         assert_eq!(q.claim_trial(99), None, "an unseen text has no trial");
         q.end_trial(99, a);
         assert_eq!(q.history(99), History::Unseen);
+    }
+
+    /// A text whose two modes are both quick settles only once the slower mode has run
+    /// twice, so that the cold first run of a mode does not decide it alone. The times
+    /// are those of `expr-bind-group` on atlas, whose first cursor run took about as long
+    /// as the first eager run and whose later cursor runs were the fastest.
+    #[test]
+    fn a_cold_first_run_does_not_settle_a_quick_text() {
+        let q = QuickQueries::default();
+        let a = 1;
+        // the cold first cursor run, then the first eager run, slightly faster
+        q.record_cursor(a, 1.12);
+        assert_eq!(q.history(a), History::Quick(QuickExecution::Eager));
+        q.record(a, 1.10);
+        assert_eq!(
+            q.history(a),
+            History::Quick(QuickExecution::PreserveAuto),
+            "the cursor, which lost with one run, runs again"
+        );
+        q.record_cursor(a, 0.58);
+        assert_eq!(
+            q.history(a),
+            History::Quick(QuickExecution::Eager),
+            "eager, which now lost with one run, runs again"
+        );
+        q.record(a, 0.77);
+        assert_eq!(q.history(a), History::Quick(QuickExecution::PreserveAuto));
+        // settled: a slower cursor run or a slow eager run changes nothing
+        q.record_cursor(a, 0.9);
+        assert_eq!(q.history(a), History::Quick(QuickExecution::PreserveAuto));
+        q.record(a, 0.8);
+        assert_eq!(q.history(a), History::Quick(QuickExecution::PreserveAuto));
+        // a text whose eager runs are faster settles eagerly after a second cursor run
+        let b = 2;
+        q.record_cursor(b, 1.0);
+        q.record(b, 0.5);
+        assert_eq!(q.history(b), History::Quick(QuickExecution::PreserveAuto));
+        q.record_cursor(b, 0.9);
+        assert_eq!(q.history(b), History::Quick(QuickExecution::Eager));
+        q.record(b, 0.45);
+        assert_eq!(q.history(b), History::Quick(QuickExecution::Eager));
+        // a slow mode needs no second run: the earlier rules decide
+        let c = 3;
+        q.record_cursor(c, 1.0);
+        q.record(c, QUICK_QUERY_MS * 2.0);
+        assert_eq!(q.history(c), History::Quick(QuickExecution::PreserveAuto));
+        // and after a run that is not quick the earlier rules decide too
+        let d = 4;
+        q.record_cursor(d, 1.0);
+        q.record(d, 0.5);
+        q.record(d, QUICK_QUERY_MS * 2.0);
+        assert_eq!(q.history(d), History::TryEager);
+        q.record_cursor(d, QUICK_QUERY_MS * 2.0);
+        assert_eq!(q.history(d), History::Quick(QuickExecution::Eager));
+        // failed runs are not counted
+        let e = 5;
+        q.record_cursor(e, 1.0);
+        q.record(e, f64::INFINITY);
+        q.record(e, 0.5);
+        assert_eq!(q.history(e), History::Quick(QuickExecution::PreserveAuto));
     }
 
     /// A trial whose text was forgotten and claimed again by another request stays held
