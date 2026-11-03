@@ -359,6 +359,23 @@ FILTER, BIND and ORDER BY columns choose their algorithms by the size of their i
 both execution modes, so an eager table of up to 16,384 rows runs them as a cursor batch
 does, and an eager top-k scan reads its pieces in morsels into one heap.
 
+Short queries no longer pay the fixed costs that the charged query state added to every
+request (spec X14, roadmap items 679 and 681). A query makes its regular-expression map
+and the 64 shards of its value cache only when it uses them, so a query without patterns
+neither replaces nor frees a map, and FILTER, BIND and ORDER BY skip the checks of their
+larger-input paths on a few rows. A small sort's key column takes its payload charge a step
+of at most 64 KiB ahead, exactly when the step is refused, instead of once per row. The
+whole request of `count-all`, `distinct-obj` and `path-plus` now takes fewer instructions
+than before the charged query state, and `types-grouped` about 1,200 more. With one thread
+`star-lookup` runs 1.9% longer than before stage 4, since the build places the index join's
+unchanged search loop 16 bytes into its cache line, and roadmap item 696 follows the
+alignment of the join loops. A sort of more
+than 4,096 distinct dictionary terms decodes them in one parallel pass that admits each
+value before it builds it, and a large sorted key column is freed on the pool, which takes
+eager `order-by-full` at 1.05M triples with 12 threads from 13.1 ms to 8.9 ms on the
+benchmark host. Each decoding piece and each key column can hold up to one step of
+charged memory above its values until the sort ends.
+
 `sparkles ask` takes its question argument as optional, since `--questions FILE` reads
 questions from a batch file instead. A command line that passes a question parses and
 behaves as before, and one that gives neither a question nor `--questions` is refused.

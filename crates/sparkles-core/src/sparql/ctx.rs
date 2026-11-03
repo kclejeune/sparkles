@@ -138,7 +138,9 @@ const VALUE_CACHE_BYTES: u64 = 64 << 20;
 /// shard that reaches its share of that is cleared and freed. The reservation is kept
 /// until the context drops.
 pub(super) struct ValueCache {
-    shards: Box<[RwLock<ValueShard>]>,
+    /// Made on the first value cached or looked up. Most short queries decode nothing
+    /// through the cache and skip the 64 shards' allocation, setup and drop.
+    shards: std::sync::OnceLock<Box<[RwLock<ValueShard>]>>,
     /// the estimated bytes of the entries held now
     used: AtomicU64,
     /// the bytes charged for the cache, never fewer than `used`
@@ -161,7 +163,7 @@ thread_local! {
 impl Default for ValueCache {
     fn default() -> Self {
         Self {
-            shards: (0..VALUE_SHARDS).map(|_| Default::default()).collect(),
+            shards: std::sync::OnceLock::new(),
             used: AtomicU64::new(0),
             charge: Default::default(),
         }
@@ -191,13 +193,22 @@ impl ValueCache {
     }
 
     #[inline]
+    fn index(id: Id) -> usize {
+        (id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % VALUE_SHARDS
+    }
+
+    #[inline]
     fn shard(&self, id: Id) -> &RwLock<ValueShard> {
-        &self.shards[(id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % VALUE_SHARDS]
+        let shards = self
+            .shards
+            .get_or_init(|| (0..VALUE_SHARDS).map(|_| Default::default()).collect());
+        &shards[Self::index(id)]
     }
 
     #[inline]
     fn get(&self, id: Id) -> Option<Value> {
-        self.shard(id).read().map.get(&id).cloned()
+        let shards = self.shards.get()?;
+        shards[Self::index(id)].read().map.get(&id).cloned()
     }
 
     /// The bytes charged for the cache.
@@ -2400,6 +2411,15 @@ impl Ctx {
     /// takes exactly what it needs, while an optional cache declines, so that it never
     /// takes the last room an operator needs. The charge stays with the context until it
     /// drops. A refusal changes nothing.
+    /// The step in which state charged a value at a time grows its reservation:
+    /// [`EAGER_STEP`], or a sixty-fourth of a smaller memory budget and at least 256
+    /// bytes. A small budget takes small steps, so that the slack of the steps never
+    /// holds more than a sixty-fourth of it.
+    #[inline]
+    pub(super) fn reservation_step(&self) -> u64 {
+        (self.mem_limit / 64).clamp(256, EAGER_STEP)
+    }
+
     #[cold]
     #[inline(never)]
     pub(crate) fn grow_reservation(
@@ -2416,9 +2436,7 @@ impl Ctx {
         if used <= reserved {
             return Ok(());
         }
-        // A small budget takes small steps, so that the slack of the steps never holds
-        // more than a sixty-fourth of it.
-        let step = (self.mem_limit / 64).clamp(256, EAGER_STEP);
+        let step = self.reservation_step();
         let ahead = used.next_multiple_of(step).min(cap).max(used);
         let (charge, admitted) = match self.charge(ahead - reserved) {
             Ok(charge) => (charge, ahead),
@@ -2651,6 +2669,11 @@ impl RetainedCharge {
         self.bytes
     }
     pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+        // A size that does not change takes neither the owner nor an account. A sort key
+        // column of numbers resized its charge on every row this way.
+        if bytes == self.bytes {
+            return Ok(());
+        }
         let ctx = self
             .owner
             .upgrade()
@@ -2673,6 +2696,50 @@ impl RetainedCharge {
             self.id = None;
         }
         Ok(())
+    }
+
+    /// Grow the charge to cover `bytes`, `step` bytes ahead when the budget and the pool
+    /// allow it and exactly otherwise, so that state admitted one value at a time takes a
+    /// charge once per step rather than once per value. The charge never falls below what
+    /// it covers and holds at most `step` bytes more. A refusal changes nothing.
+    pub(super) fn cover(&mut self, bytes: u64, step: u64) -> Result<()> {
+        if bytes <= self.bytes {
+            return Ok(());
+        }
+        match self.resize(bytes.saturating_add(step)) {
+            Err(Error::BudgetExceeded(_)) if step > 0 => self.resize(bytes),
+            result => result,
+        }
+    }
+
+    /// An empty charge on this charge's owner in `ctx`, the context the charge belongs
+    /// to, which a parallel piece of work grows on its own thread and
+    /// [`RetainedCharge::absorb`] takes back.
+    pub(super) fn part<'a>(&self, ctx: &'a Ctx) -> Charge<'a> {
+        debug_assert!(
+            std::ptr::eq(self.owner.as_ptr(), ctx),
+            "the charge's context"
+        );
+        Charge {
+            ctx,
+            bytes: std::cell::Cell::new(0),
+            owner: std::cell::Cell::new(self.id),
+        }
+    }
+
+    /// Keep the bytes of `part`, a charge made by [`RetainedCharge::part`], with this
+    /// charge, without releasing and charging them again.
+    pub(super) fn absorb(&mut self, part: Charge<'_>) {
+        let bytes = part.bytes.get();
+        let id = part.disarm();
+        if bytes == 0 {
+            return;
+        }
+        debug_assert!(self.id.is_none() || self.id == id, "one owner of a charge");
+        if self.id.is_none() {
+            self.id = id;
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
     }
 }
 impl Drop for RetainedCharge {
@@ -2877,6 +2944,56 @@ mod charge_tests {
         let weak = Arc::downgrade(&context);
         drop(context);
         assert!(weak.upgrade().is_none());
+        drop(retained);
+    }
+
+    /// A retained charge resized to its own size touches neither its owner nor an
+    /// account, and one that covers values a step at a time grows a step ahead, takes the
+    /// exact bytes when the step does not fit, and changes nothing when even those do not.
+    #[test]
+    fn retained_charges_cover_values_in_steps() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut context = Ctx::new(store.snapshot());
+        context.mem_limit = 1 << 20;
+        let context = Arc::new(context);
+        context.attach_owner();
+        let step = context.reservation_step();
+        assert_eq!(step, (1 << 20) / 64);
+        let base = context.live_bytes();
+        let mut retained = context.retained_charge(100).unwrap().unwrap();
+        retained.cover(60, step).unwrap();
+        assert_eq!(retained.bytes(), 100);
+        retained.cover(200, step).unwrap();
+        assert_eq!(retained.bytes(), 200 + step);
+        assert_eq!(context.live_bytes(), base + 200 + step);
+        retained.cover(200 + step, step).unwrap();
+        assert_eq!(retained.bytes(), 200 + step);
+        // without room for the step, the exact bytes
+        let room = context.memory_remaining();
+        let storage = context.charge(room - 1000).unwrap();
+        let held = retained.bytes();
+        retained.cover(held + 500, step).unwrap();
+        assert_eq!(retained.bytes(), held + 500);
+        // without room for those, nothing changes
+        assert!(matches!(
+            retained.cover(held + 2000, step),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(retained.bytes(), held + 500);
+        drop(storage);
+        // a part grown on another charge joins it without a second charge
+        let part = retained.part(&context);
+        part.add(300).unwrap();
+        let live = context.live_bytes();
+        retained.absorb(part);
+        assert_eq!(retained.bytes(), held + 800);
+        assert_eq!(context.live_bytes(), live);
+        // the same size needs no owner, even one that is gone
+        let bytes = retained.bytes();
+        let weak = Arc::downgrade(&context);
+        drop(context);
+        assert!(weak.upgrade().is_none());
+        retained.resize(bytes).unwrap();
         drop(retained);
     }
 

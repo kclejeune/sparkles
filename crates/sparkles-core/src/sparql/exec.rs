@@ -95,6 +95,13 @@ const BATCH_PAR_NANOS: u128 = 200_000;
 /// Rows per parallel piece of a cursor batch.
 const BATCH_PAR_PIECE: usize = 256;
 
+/// Whether [`map_batch`] may spread a batch of `n` rows over the pool: the rows after its
+/// timed sample fill at least two pieces.
+#[inline]
+pub(super) fn batch_may_split(n: usize) -> bool {
+    n >= BATCH_SAMPLE_ROWS + 2 * BATCH_PAR_PIECE
+}
+
 /// [`map_rows`] for a batch of at most [`PAR_THRESHOLD`] rows, such as one of a cursor,
 /// whose rows are too few for the row count alone to say whether the pool pays. The first [`BATCH_SAMPLE_ROWS`] rows are mapped
 /// on this thread and timed, and the rest are mapped in parallel when `par` allows it
@@ -112,11 +119,12 @@ pub(super) fn map_batch<T: Send>(
     let rest = n - sample;
     let mut out = Vec::with_capacity(n);
     ctx.check()?;
-    let t0 = Instant::now();
+    // Only a batch whose rest may go to the pool is timed. A small one, such as the few
+    // rows of an aggregate's BIND, would pay a clock read for nothing.
+    let may_split = par && batch_may_split(n) && rayon::current_num_threads() > 1;
+    let t0 = may_split.then(Instant::now);
     out.extend((0..sample).map(&f));
-    if par
-        && rest >= 2 * BATCH_PAR_PIECE
-        && rayon::current_num_threads() > 1
+    if let Some(t0) = t0
         && t0.elapsed().as_nanos() * rest as u128 >= BATCH_PAR_NANOS * sample as u128
     {
         // Each piece of the rest is its own vector until it is appended to `out`, which
@@ -5790,11 +5798,13 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
         };
         exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
     };
-    let parallel = exprs.iter().all(Expr::parallel);
+    // Whether the rows may go to the pool is asked only of an input that can split,
+    // since walking the expressions is wasted on the few rows of a small query.
     let keep = if t.len() <= PAR_THRESHOLD {
+        let parallel = batch_may_split(t.len()) && exprs.iter().all(Expr::parallel);
         map_batch(ctx, t.len(), parallel, test)?
     } else {
-        map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && parallel, test)?
+        map_rows(ctx, t.len(), exprs.iter().all(Expr::parallel), test)?
     };
     tracing::debug!(target: "sparkles::sparql::exec", "filter evaluated {} rows in {:?}", t.len(), t0.elapsed());
     Ok(keep)
@@ -5943,9 +5953,9 @@ fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
         Err(_) => Id::UNDEF,
     };
     if t.len() <= PAR_THRESHOLD {
-        return map_batch(ctx, t.len(), e.parallel(), f);
+        return map_batch(ctx, t.len(), batch_may_split(t.len()) && e.parallel(), f);
     }
-    map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && e.parallel(), f)
+    map_rows(ctx, t.len(), e.parallel(), f)
 }
 
 type Candidates = (Vec<usize>, Option<super::ctx::RetainedCharge>);
@@ -6453,6 +6463,9 @@ fn key_rows_charged(
     let map = t.var_map(ctx.nvars());
     let mut bytes = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
     let mut charge = ctx.retained_charge(bytes)?;
+    // Each payload is admitted before the column keeps it, with the charge a step ahead,
+    // so that short strings take a charge once per step rather than once per row.
+    let step = ctx.reservation_step();
     let mut values = Vec::with_capacity(t.len());
     for i in 0..t.len() {
         if i.is_multiple_of(1024) {
@@ -6476,7 +6489,7 @@ fn key_rows_charged(
         };
         bytes = bytes.saturating_add(key_payload(&value));
         if let Some(charge) = &mut charge {
-            charge.resize(bytes)?;
+            charge.cover(bytes, step)?;
         }
         values.push(value);
     }
@@ -6499,6 +6512,10 @@ fn key_per_value(
     // from a sort up to `PAR_THRESHOLD` rows. A variable's values are decoded once each
     // in key order at any size, so that the sort holds one value per distinct term, and
     // another key of a larger input evaluates each distinct value once, in parallel.
+    // None of them takes fewer than `MIN_ROWS` rows, which return here.
+    if t.len() < super::exprcache::MIN_ROWS {
+        return Ok(None);
+    }
     if let Some(values) =
         super::exprcache::cursor_numeric_values(ctx, t, e, report, |v| key_rows(ctx, v, e, None))?
     {
@@ -6611,7 +6628,12 @@ fn order_by_rows(
     }
     ctx.check()?;
     ctx.check_output(idx.len(), t.width())?;
-    Ok(t.take_rows(&idx))
+    let sorted = t.take_rows(&idx);
+    // A large key column's decoded values are freed on the pool, not on this thread.
+    key_vals
+        .into_iter()
+        .for_each(super::exprcache::Column::drop_in_parallel);
+    Ok(sorted)
 }
 
 fn distinct(t: Table) -> Table {

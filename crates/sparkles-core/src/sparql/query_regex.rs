@@ -155,7 +155,10 @@ type Entries = FxHashMap<Arc<str>, FxHashMap<Arc<str>, Arc<Entry>>>;
 /// without a lock, and an insert replaces the whole map, which holds at most
 /// [`MAX_PATTERNS`] entries.
 pub(super) struct RegexCache {
-    entries: ArcSwap<Entries>,
+    /// Made on the first lookup. Most queries compile no pattern, and they neither
+    /// allocate a map nor, when the context drops, pay the debts of every thread that
+    /// ever read one.
+    entries: std::sync::OnceLock<ArcSwap<Entries>>,
     /// serializes compilations, so that each pattern compiles once
     insert: Mutex<()>,
 }
@@ -163,7 +166,7 @@ pub(super) struct RegexCache {
 impl Default for RegexCache {
     fn default() -> Self {
         Self {
-            entries: ArcSwap::from_pointee(Entries::default()),
+            entries: std::sync::OnceLock::new(),
             insert: Mutex::new(()),
         }
     }
@@ -178,7 +181,22 @@ struct Entry {
 impl RegexCache {
     pub(super) fn clear(&self) {
         let _insert = self.insert.lock();
-        self.entries.store(Arc::default());
+        // Every query clears its cache when it is shared and when its work ends, and
+        // most queries never compile a pattern. Replacing the map pays the debts of every
+        // thread that ever read one, about a thousand instructions, so an empty map stays.
+        // Inserts take the same lock, so none can land between the check and the store.
+        let Some(entries) = self.entries.get() else {
+            return;
+        };
+        if entries.load().is_empty() {
+            return;
+        }
+        entries.store(Arc::default());
+    }
+
+    fn entries(&self) -> &ArcSwap<Entries> {
+        self.entries
+            .get_or_init(|| ArcSwap::from_pointee(Entries::default()))
     }
 
     /// Run `f` on the program of `pattern` and `flags`, compiling and charging it on
@@ -191,8 +209,8 @@ impl RegexCache {
         flags: &str,
         f: impl FnOnce(&RegexState) -> R,
     ) -> Result<Option<R>> {
-        {
-            let entries = self.entries.load();
+        if let Some(entries) = self.entries.get() {
+            let entries = entries.load();
             if let Some(entry) = entries.get(pattern).and_then(|e| e.get(flags)) {
                 return Ok(entry.state.as_deref().map(f));
             }
@@ -207,12 +225,13 @@ impl RegexCache {
         pattern: &str,
         flags: &str,
     ) -> Result<Option<Arc<RegexState>>> {
-        if let Some(entry) = self.entries.load().get(pattern).and_then(|e| e.get(flags)) {
+        let entries = self.entries();
+        if let Some(entry) = entries.load().get(pattern).and_then(|e| e.get(flags)) {
             return Ok(entry.state.clone());
         }
         ctx.check()?;
         let _insert = self.insert.lock();
-        let current = self.entries.load_full();
+        let current = entries.load_full();
         if let Some(entry) = current.get(pattern).and_then(|e| e.get(flags)) {
             return Ok(entry.state.clone());
         }
@@ -220,7 +239,7 @@ impl RegexCache {
         // programs' charges go once no search holds them.
         let mut next = if current.values().map(FxHashMap::len).sum::<usize>() >= MAX_PATTERNS {
             drop(current);
-            self.entries.store(Arc::default());
+            entries.store(Arc::default());
             Entries::default()
         } else {
             (*current).clone()
@@ -237,7 +256,7 @@ impl RegexCache {
                 _charge: charge,
             }),
         );
-        self.entries.store(Arc::new(next));
+        entries.store(Arc::new(next));
         Ok(state)
     }
 }
@@ -865,5 +884,28 @@ mod tests {
         let mut after: Vec<usize> = slots(&state).into_iter().map(Option::unwrap).collect();
         after.sort_unstable();
         assert_eq!(after, expected);
+    }
+
+    /// A cache makes no map until a lookup, clearing one that holds no pattern keeps its
+    /// map, which every query does twice, and clearing one that holds a pattern gives the
+    /// map and its charge back.
+    #[test]
+    fn clearing_an_empty_cache_keeps_its_map() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let ctx = Arc::new(Ctx::new(store.snapshot()));
+        ctx.attach_owner();
+        let cache = RegexCache::default();
+        cache.clear();
+        assert!(cache.entries.get().is_none());
+        let empty = cache.entries().load_full();
+        cache.clear();
+        assert!(Arc::ptr_eq(&empty, &cache.entries().load_full()));
+        let before = ctx.live_bytes();
+        assert!(cache.get(&ctx, "^kept-[a-z]+$", "").unwrap().is_some());
+        assert!(ctx.live_bytes() > before);
+        cache.clear();
+        assert!(cache.entries().load().is_empty());
+        assert!(!Arc::ptr_eq(&empty, &cache.entries().load_full()));
+        assert_eq!(ctx.live_bytes(), before);
     }
 }
