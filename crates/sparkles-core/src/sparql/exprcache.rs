@@ -222,6 +222,18 @@ pub struct PerValue<T> {
 }
 
 impl<T> PerValue<T> {
+    /// Charge `bytes` more to these values until they are dropped, such as the heap
+    /// payloads of their results.
+    pub(super) fn retain(&mut self, ctx: &Ctx, bytes: u64) -> Result<()> {
+        match &mut self._charge {
+            Some(charge) => charge.resize(charge.bytes().saturating_add(bytes)),
+            None => {
+                self._charge = ctx.retained_charge(bytes)?;
+                Ok(())
+            }
+        }
+    }
+
     #[inline]
     pub fn get(&self, row: usize) -> &T {
         match &self.slot {
@@ -326,22 +338,46 @@ pub fn per_value<T: Send>(
     report: &mut Report,
     eval: impl FnOnce(&Table) -> Result<Vec<T>>,
 ) -> Result<Option<PerValue<T>>> {
-    let Some(d) = distinct(ctx, t, exprs, always, report, false)? else {
+    let Some(d) = distinct(ctx, t, exprs, always, report)? else {
+        return Ok(None);
+    };
+    // The slots, the distinct values and their results live until the caller has
+    // expanded or read them, so they stay charged until then in both accounting modes.
+    let held = (d.slot.as_ref().map_or(0, Vec::capacity) as u64)
+        .saturating_mul(4)
+        .saturating_add(d.values.mem_bytes());
+    let size = std::mem::size_of::<T>() as u64;
+    // Reuse is optional, so a charge that does not fit, before or after the evaluation,
+    // leaves the rows to the caller instead of failing the query.
+    let Ok(mut charge) =
+        ctx.retained_charge(held.saturating_add((d.values.len() as u64).saturating_mul(size)))
+    else {
         return Ok(None);
     };
     let vals = eval(&d.values)?;
     debug_assert_eq!(vals.len(), d.values.len());
+    if let Some(charge) = &mut charge
+        && charge
+            .resize(held.saturating_add((vals.capacity() as u64).saturating_mul(size)))
+            .is_err()
+    {
+        return Ok(None);
+    }
     ctx.check()?;
     Ok(Some(PerValue {
         vals,
         slot: d.slot,
-        _charge: None,
+        _charge: charge,
     }))
 }
 
 /// Fixed-size numeric ORDER keys can reuse input IDs without retaining decoded
 /// strings or populating the eager value cache. Own the reservation with the
 /// returned values/slots; it must survive until the sort has finished.
+///
+/// An input of more than [`super::exec::PAR_THRESHOLD`] rows takes this path only when
+/// its integers span a dense range, which [`cursor_integer_distinct`] reads in parallel,
+/// and leaves other inputs to [`per_value`].
 pub(super) fn cursor_numeric_values(
     ctx: &Ctx,
     t: &Table,
@@ -384,12 +420,19 @@ pub(super) fn cursor_numeric_values(
     {
         return Ok(None);
     }
-    let bytes = (t.len() as u64).saturating_mul(256).saturating_add(4096);
+    let large = t.len() > super::exec::PAR_THRESHOLD;
+    // A large input holds its slots and at most one position of each value in the range.
+    let bytes = if large {
+        (t.len() as u64 * 4).saturating_add(DENSE_SPAN as u64 * 64 + 4096)
+    } else {
+        (t.len() as u64).saturating_mul(256).saturating_add(4096)
+    };
     let Ok(mut charge) = ctx.retained_charge(bytes) else {
         return Ok(None);
     };
     let d = match cursor_integer_distinct(ctx, t, &[e], v, report)? {
         Some(d) => Some(d),
+        None if large => None,
         None => cursor_key_distinct(ctx, t, &[e], v, false, report)?,
     };
     let Some(d) = d else {
@@ -411,11 +454,17 @@ pub(super) fn cursor_numeric_values(
     }))
 }
 
-/// Cursor BIND reuse keeps only IDs and slots, with a conservative reservation
-/// covering the temporary distinct set/map, table, slots and expanded output.
-/// The reservation lives until the output is expanded; no entries cross batches.
-/// Unlike general value-key caching, this does not retain decoded heap values.
-pub(super) fn cursor_column(
+/// BIND reuse in both accounting modes: the value of `e` on every row, evaluated once per
+/// distinct input value, or `None` when reuse is not admitted.
+///
+/// The input's size chooses the algorithm. A batch of at most
+/// [`super::exec::PAR_THRESHOLD`] rows, which holds a cursor's batches, keeps only ids and
+/// slots under a conservative reservation that covers the distinct set, the table, the
+/// slots and the expanded output until the output is expanded, finds its distinct inputs
+/// from a dense integer range or one sort, and expands on the calling thread. A larger
+/// table estimates its distinct inputs before it collects them and expands in parallel.
+/// Neither retains decoded heap values.
+pub(super) fn column(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
@@ -428,6 +477,9 @@ pub(super) fn cursor_column(
     if !ctx.opt.expr_cache || t.len() < MIN_ROWS {
         return Ok(None);
     }
+    if t.len() > super::exec::PAR_THRESHOLD {
+        return Ok(per_value(ctx, t, &[e], false, report, eval)?.map(|p| p.rows(t.len())));
+    }
     let bytes = (t.len() as u64).saturating_mul(128).saturating_add(1024);
     let Ok(_held) = ctx.charge(bytes) else {
         // Optional reuse may decline without consuming the remaining allowance.
@@ -438,7 +490,7 @@ pub(super) fn cursor_column(
             Some(d) => Some(d),
             None => cursor_key_distinct(ctx, t, &[e], v, false, report)?,
         },
-        None => distinct(ctx, t, &[e], false, report, true)?,
+        None => distinct(ctx, t, &[e], false, report)?,
     };
     let Some(d) = d else {
         return Ok(None);
@@ -446,8 +498,8 @@ pub(super) fn cursor_column(
     let vals = eval(&d.values)?;
     debug_assert_eq!(vals.len(), d.values.len());
     ctx.check()?;
-    // A cursor batch is small enough that scheduling the expansion on Rayon
-    // costs more than the ID copies. Keep the eager large-table path separate.
+    // A batch is small enough that scheduling the expansion on Rayon costs more than
+    // the id copies.
     let rows = match d.slot {
         Some(slot) => slot.iter().map(|&i| vals[i as usize]).collect(),
         None => vec![vals[0]; t.len()],
@@ -476,10 +528,9 @@ fn distinct(
     exprs: &[&Expr],
     always: bool,
     report: &mut Report,
-    cursor_reserved: bool,
 ) -> Result<Option<Distinct>> {
     let n = t.len();
-    if !ctx.opt.expr_cache || (ctx.is_cursor() && !cursor_reserved) || n < MIN_ROWS {
+    if !ctx.opt.expr_cache || n < MIN_ROWS {
         return Ok(None);
     }
     let v = match input(exprs) {
@@ -622,6 +673,10 @@ fn estimate_distinct(col: &[Id]) -> usize {
 /// The FILTER conjuncts that run per distinct value: pure conjuncts over one variable,
 /// grouped by it. Returns the mask of those groups and the conjuncts left for
 /// row-by-row evaluation (on the rows that pass), or `None` when no group ran per value.
+///
+/// A batch of at most [`super::exec::PAR_THRESHOLD`] rows, which holds a cursor's
+/// batches, whose conjuncts all read one variable runs them together under one
+/// reservation (see [`batch_filter`]). Other inputs group their conjuncts by variable.
 pub fn filter(
     ctx: &Ctx,
     t: &Table,
@@ -631,8 +686,9 @@ pub fn filter(
     if !ctx.opt.expr_cache || t.len() < MIN_ROWS {
         return Ok(None);
     }
-    if ctx.is_cursor() {
-        return cursor_filter(ctx, t, exprs, report);
+    if t.len() <= super::exec::PAR_THRESHOLD && eligible(&exprs.iter().collect::<Vec<_>>()).is_ok()
+    {
+        return batch_filter(ctx, t, exprs, report);
     }
     let mut groups: Vec<(Option<VarId>, Vec<&Expr>)> = Vec::new();
     let mut rest: Vec<&Expr> = Vec::new();
@@ -674,11 +730,11 @@ pub fn filter(
     Ok(keep.map(|k| (k, rest.into_iter().cloned().collect())))
 }
 
-/// Batch-local FILTER reuse stores only IDs, slots and booleans. A conservative
-/// reservation covers distinct construction and key-test scratch until expansion.
-/// Mixed/impure conjuncts stay row-by-row; no decoded-value cache survives a batch.
+/// Batch-local FILTER reuse stores only ids, slots and booleans. A conservative
+/// reservation covers distinct construction and key-test scratch until expansion, and no
+/// decoded value outlives the batch.
 #[inline(never)]
-fn cursor_filter(
+fn batch_filter(
     ctx: &Ctx,
     t: &Table,
     exprs: &[Expr],
@@ -702,22 +758,24 @@ fn cursor_filter(
     };
     let d = match (key_bytes, v) {
         (Some(_), Some(v)) => cursor_key_distinct(ctx, t, &refs, v, true, report)?,
-        _ => distinct(ctx, t, &refs, false, report, true)?,
+        _ => distinct(ctx, t, &refs, false, report)?,
     };
     let Some(d) = d else {
         drop(_held);
         return if key_bytes.is_none() {
-            cursor_numeric_filter(ctx, t, exprs).map(|keep| keep.map(|keep| (keep, Vec::new())))
+            numeric_filter(ctx, t, exprs).map(|keep| keep.map(|keep| (keep, Vec::new())))
         } else {
             Ok(None)
         };
     };
     let vals = match (key_bytes, v) {
-        (Some(_), Some(v)) => {
-            let kf = super::keyfilter::KeyFilter::new_for(ctx, exprs, v)
-                .expect("cursor key-test admission matches compilation");
-            key_filter_mask(ctx, &kf, &d.values.cols[0], v, exprs)?
-        }
+        // The shape admits key tests, but a pattern that does not compile or a charge
+        // that does not fit leaves the values to the general evaluator, where an
+        // invalid pattern is an error and so fails the filter.
+        (Some(_), Some(v)) => match super::keyfilter::KeyFilter::new_for(ctx, exprs, v) {
+            Some(kf) => key_filter_mask(ctx, &kf, &d.values.cols[0], v, exprs)?,
+            None => super::exec::filter_mask(ctx, &d.values, exprs)?,
+        },
         _ => super::exec::filter_mask(ctx, &d.values, exprs)?,
     };
     ctx.check()?;
@@ -733,10 +791,10 @@ fn cursor_filter(
 }
 
 /// Batch-local numeric dictionary evaluation after ordinary distinct reuse was
-/// declined. Shared eager row evaluation stays unchanged; optional memory failure
-/// returns to scalar filtering and no decoded dictionary crosses a batch.
+/// declined. An optional memory failure returns to scalar filtering, and no decoded
+/// dictionary outlives the batch.
 #[inline(never)]
-fn cursor_numeric_filter(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<Vec<bool>>> {
+fn numeric_filter(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<Vec<bool>>> {
     fn numeric(e: &Expr) -> bool {
         match e {
             Expr::Var(_) => true,
@@ -769,7 +827,7 @@ fn cursor_numeric_filter(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<
             _ => false,
         }
     }
-    if !ctx.is_cursor() || !ctx.opt.expr_cache || t.len() < 4096 || !exprs.iter().all(numeric) {
+    if !ctx.opt.expr_cache || t.len() < 4096 || !exprs.iter().all(numeric) {
         return Ok(None);
     }
     let bytes = t.len() as u64 * (std::mem::size_of::<Option<super::value::Value>>() as u64 + 2)
@@ -843,6 +901,13 @@ fn cursor_numeric_filter(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<
 
 /// The caller holds the cursor reservation through expansion. Keep this batch
 /// algorithm separate from eager distinct admission and its reuse estimator.
+/// The widest range of integers that [`cursor_integer_distinct`] maps directly.
+const DENSE_SPAN: usize = 1 << 16;
+/// The rows above which [`cursor_integer_distinct`] maps in parallel. Mapping takes about
+/// a nanosecond a row, which a cursor's batches of a few tens of thousands of rows do not
+/// amortize on the pool.
+const DENSE_PAR_ROWS: usize = 1 << 18;
+
 fn cursor_integer_distinct(
     ctx: &Ctx,
     t: &Table,
@@ -853,6 +918,9 @@ fn cursor_integer_distinct(
     let Some(column) = t.col_of(v) else {
         return Ok(None);
     };
+    if t.len() > DENSE_PAR_ROWS {
+        return par_integer_distinct(ctx, t, exprs, v, column, report);
+    }
     let mut lo = u64::MAX;
     let mut hi = 0;
     for (row, id) in t.cols[column].iter().enumerate() {
@@ -866,7 +934,7 @@ fn cursor_integer_distinct(
         hi = hi.max(id.payload());
     }
     let span = hi.saturating_sub(lo).saturating_add(1);
-    if span > (t.len() / 2).min(1 << 16) as u64 {
+    if span > (t.len() / 2).min(DENSE_SPAN) as u64 {
         return Ok(None);
     }
     let mut positions = vec![u32::MAX; span as usize];
@@ -903,6 +971,75 @@ fn cursor_integer_distinct(
     }))
 }
 
+/// [`cursor_integer_distinct`] for an input of more than [`super::exec::PAR_THRESHOLD`]
+/// rows, whose range, observed values and slots are found in parallel pieces.
+fn par_integer_distinct(
+    ctx: &Ctx,
+    t: &Table,
+    exprs: &[&Expr],
+    v: VarId,
+    column: usize,
+    report: &mut Report,
+) -> Result<Option<Distinct>> {
+    const PIECE: usize = 1 << 16;
+    let col = &t.cols[column];
+    ctx.check()?;
+    let range = col
+        .par_chunks(PIECE)
+        .map(|piece| {
+            piece.iter().try_fold((u64::MAX, 0), |(lo, hi), id| {
+                (id.tag() == Tag::Int).then(|| (lo.min(id.payload()), hi.max(id.payload())))
+            })
+        })
+        .try_reduce(|| (u64::MAX, 0), |a, b| Some((a.0.min(b.0), a.1.max(b.1))));
+    let Some((lo, hi)) = range else {
+        return Ok(None);
+    };
+    let span = hi.saturating_sub(lo).saturating_add(1);
+    if span > (t.len() / 2).min(DENSE_SPAN) as u64 {
+        return Ok(None);
+    }
+    let span = span as usize;
+    ctx.check()?;
+    let seen = col
+        .par_chunks(PIECE)
+        .map(|piece| {
+            let mut seen = vec![false; span];
+            for id in piece {
+                seen[(id.payload() - lo) as usize] = true;
+            }
+            seen
+        })
+        .reduce(
+            || vec![false; span],
+            |mut a, b| {
+                a.iter_mut().zip(b).for_each(|(a, b)| *a |= b);
+                a
+            },
+        );
+    ctx.check()?;
+    let mut values = Table::new(vec![v]);
+    let mut positions = vec![u32::MAX; span];
+    for (offset, seen) in seen.into_iter().enumerate() {
+        if seen {
+            positions[offset] = values.len as u32;
+            values.push_row(&[Id::new(Tag::Int, lo + offset as u64)]);
+        }
+    }
+    let slot: Vec<u32> = col
+        .par_iter()
+        .with_min_len(super::exec::PAR_MIN_LEN)
+        .map(|id| positions[(id.payload() - lo) as usize])
+        .collect();
+    ctx.check()?;
+    values.sorted = vec![v];
+    report.push(ctx, exprs, t.len(), Ok(values.len));
+    Ok(Some(Distinct {
+        values,
+        slot: Some(slot),
+    }))
+}
+
 fn cursor_key_distinct(
     ctx: &Ctx,
     t: &Table,
@@ -912,10 +1049,10 @@ fn cursor_key_distinct(
     report: &mut Report,
 ) -> Result<Option<Distinct>> {
     let Some(c) = t.col_of(v) else {
-        return distinct(ctx, t, exprs, always, report, true);
+        return distinct(ctx, t, exprs, always, report);
     };
     if t.sorted.first() == Some(&v) {
-        return distinct(ctx, t, exprs, always, report, true);
+        return distinct(ctx, t, exprs, always, report);
     }
     let n = t.len();
     if n > u32::MAX as usize {
@@ -1032,9 +1169,9 @@ pub(super) fn key_filter_mask(
         rest_hit = tail;
         at = e;
     }
-    if ctx.is_cursor() && uniq.len() <= 4096 {
-        // Ordinary cursor batches do not amortize task scheduling or a fresh
-        // regex worker cache. Search with the already admitted query cache.
+    if uniq.len() <= 4096 {
+        // A few thousand values, such as those of a cursor's batch, do not amortize
+        // scheduling tasks on Rayon.
         for (h, ids) in read {
             let _payload_charge = ctx.charge(ids.len() as u64 * 8 + 64)?;
             let payloads: Vec<u64> = ids.iter().map(|id| id.payload()).collect();
@@ -1075,30 +1212,27 @@ pub(super) fn key_filter_mask(
                         }
                         h[j] = kf.test(k);
                     };
-                    if ctx.is_cursor() {
-                        let scratch = ctx.charge(0)?;
-                        let mut reserved = 0;
-                        let mut examined = 0usize;
-                        vocab.get_sorted_checked(
-                            &payloads,
-                            |need| {
-                                let bytes = (need as u64).saturating_mul(2);
-                                scratch.add(bytes.saturating_sub(reserved))?;
-                                reserved = bytes;
-                                Ok::<_, crate::error::Error>(())
-                            },
-                            |p, k| {
-                                if examined.is_multiple_of(1024) {
-                                    ctx.check()?;
-                                }
-                                examined += 1;
-                                test(p, k);
-                                Ok::<_, crate::error::Error>(())
-                            },
-                        )?;
-                    } else {
-                        vocab.get_sorted(&payloads, test);
-                    }
+                    // Decoding a block reserves its keys in both accounting modes.
+                    let scratch = ctx.charge(0)?;
+                    let mut reserved = 0;
+                    let mut examined = 0usize;
+                    vocab.get_sorted_checked(
+                        &payloads,
+                        |need| {
+                            let bytes = (need as u64).saturating_mul(2);
+                            scratch.add(bytes.saturating_sub(reserved))?;
+                            reserved = bytes;
+                            Ok::<_, crate::error::Error>(())
+                        },
+                        |p, k| {
+                            if examined.is_multiple_of(1024) {
+                                ctx.check()?;
+                            }
+                            examined += 1;
+                            test(p, k);
+                            Ok::<_, crate::error::Error>(())
+                        },
+                    )?;
                     Ok::<_, crate::error::Error>(())
                 },
             )?;
@@ -1106,26 +1240,19 @@ pub(super) fn key_filter_mask(
     let mut rest = Table::new(vec![v]);
     let mut rest_at = Vec::new();
     for (i, id) in uniq.iter().enumerate().filter(|(i, _)| *i < lo || *i >= hi) {
-        if ctx.is_cursor() {
-            let test = match id.tag() {
-                Tag::Delta => ctx
-                    .snap
-                    .generation
-                    .dvocab
-                    .with(|vocab| vocab.get(id.payload()).map(|key| kf.test(key))),
-                Tag::Local => ctx.with_local_key(id.payload(), |key| kf.test(key)),
-                _ => None,
-            };
-            if let Some(test) = test {
-                hit[i] = test;
-                continue;
-            }
-            rest.push_row(&[*id]);
-            rest_at.push(i);
-            continue;
-        }
-        match ctx.snap.key(*id) {
-            Some(k) => hit[i] = kf.test(&k),
+        // Terms added by updates and query-local terms are tested on their keys without
+        // copying them, and the rest by the general evaluator.
+        let test = match id.tag() {
+            Tag::Delta => ctx
+                .snap
+                .generation
+                .dvocab
+                .with(|vocab| vocab.get(id.payload()).map(|key| kf.test(key))),
+            Tag::Local => ctx.with_local_key(id.payload(), |key| kf.test(key)),
+            _ => None,
+        };
+        match test {
+            Some(test) => hit[i] = test,
             None => {
                 rest.push_row(&[*id]);
                 rest_at.push(i);
@@ -1199,6 +1326,11 @@ fn cursor_values(
             )
         })
     {
+        // A large inline column keeps a value per row here, where per-value reuse keeps one
+        // per distinct value.
+        if table.len > super::exec::PAR_THRESHOLD {
+            return Ok(None);
+        }
         let bytes = table.len as u64
             * (std::mem::size_of::<Option<super::value::Value>>() as u64 * 2 + 8)
             + 4096;
@@ -1415,8 +1547,16 @@ fn cursor_values(
             Tag::Undef | Tag::Special | Tag::Int | Tag::Double | Tag::Decimal | Tag::Bool
         ) {
             bytes = bytes.saturating_add(ctx.decoded_bytes(unique[row])?);
-            if let Some(charge) = &mut charge {
-                charge.resize(bytes)?;
+            if let Some(charge) = &mut charge
+                && let Err(error) = charge.resize(bytes)
+            {
+                // A large input's caller falls back to per-value reuse, which keeps one value
+                // per distinct term, so the refusal declines this optional decoding there. A
+                // smaller input's caller retries with a smaller trial and needs the refusal.
+                if table.len > super::exec::PAR_THRESHOLD {
+                    return Ok(None);
+                }
+                return Err(error);
             }
         }
         vals[row] = ctx.cursor_value_checked(unique[row])?;
@@ -1426,6 +1566,17 @@ fn cursor_values(
     drop(unique);
     drop(payloads);
     drop(scratch);
+    // The sort keeps the slots, one value per distinct term and the values' payload, and
+    // the construction's pairs and distinct ids are gone.
+    if let Some(charge) = &mut charge {
+        let kept = slots.capacity() as u64 * 4
+            + vals.capacity() as u64 * std::mem::size_of::<Option<super::value::Value>>() as u64
+            + bytes.saturating_sub(base)
+            + 4096;
+        if kept < bytes {
+            charge.resize(kept)?;
+        }
+    }
     Ok(Some(PerValue {
         vals,
         slot: Some(slots),
@@ -1439,6 +1590,177 @@ mod tests {
 
     fn ids(v: &[i64]) -> Vec<Id> {
         v.iter().map(|&i| Id::from_i64(i).unwrap()).collect()
+    }
+
+    /// The parallel mapping of a dense range of integers, over several pieces, finds the
+    /// distinct values in order and a slot for every row, and declines a range wider than
+    /// it maps or a column with another kind of id.
+    #[test]
+    fn the_parallel_dense_mapping_finds_every_value_and_slot() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let ctx = Ctx::new(store.snapshot());
+        let v = ctx.var("k");
+        let n = DENSE_PAR_ROWS + 2 * (1 << 16) + 123;
+        let vals: Vec<i64> = (0..n).map(|i| 1000 + ((i * 7919) % 97) as i64).collect();
+        let mut t = Table::new(vec![v]);
+        t.cols[0] = ids(&vals);
+        t.len = n;
+        let e = Expr::Var(v);
+        let mut report = Report::default();
+        let d = cursor_integer_distinct(&ctx, &t, &[&e], v, &mut report)
+            .unwrap()
+            .expect("a dense range maps directly");
+        let mut uniq = vals.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        let found: Vec<i64> = d.values.cols[0].iter().map(|id| id.as_i64()).collect();
+        assert_eq!(found, uniq);
+        let slot = d.slot.expect("every row has a slot");
+        assert_eq!(slot.len(), n);
+        for (row, &x) in vals.iter().enumerate() {
+            assert_eq!(uniq[slot[row] as usize], x, "row {row}");
+        }
+        t.cols[0][n - 1] = Id::from_i64(1000 + DENSE_SPAN as i64).unwrap();
+        assert!(
+            cursor_integer_distinct(&ctx, &t, &[&e], v, &mut report)
+                .unwrap()
+                .is_none()
+        );
+        t.cols[0][n - 1] = Id::UNDEF;
+        assert!(
+            cursor_integer_distinct(&ctx, &t, &[&e], v, &mut report)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn owned(
+        store: &crate::store::Store,
+        limit: u64,
+        values: &[&str],
+    ) -> (std::sync::Arc<Ctx>, Vec<Id>) {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = limit;
+        let ids = values
+            .iter()
+            .map(|v| ctx.intern_value(&super::super::value::Value::Str((*v).into())))
+            .collect();
+        let ctx = std::sync::Arc::new(ctx);
+        ctx.attach_owner();
+        (ctx, ids)
+    }
+
+    fn column(ctx: &Ctx, ids: Vec<Id>) -> (Table, VarId) {
+        let v = ctx.var("k");
+        let mut t = Table::new(vec![v]);
+        t.len = ids.len();
+        t.cols[0] = ids;
+        (t, v)
+    }
+
+    /// The decoded values of a large column keep a charge for their slots, one value per
+    /// distinct term and its payload, not the reservation that building them took.
+    #[test]
+    fn decoded_keys_keep_only_what_the_sort_holds() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let (ctx, terms) = owned(&store, 1 << 30, &["a", "b"]);
+        let n = 4 * super::super::exec::PAR_THRESHOLD;
+        let (t, v) = column(&ctx, (0..n).map(|i| terms[i % 2]).collect());
+        let before = ctx.memory_remaining();
+        let values = cursor_variable_values(&ctx, &t, &Expr::Var(v))
+            .unwrap()
+            .expect("a column of local terms decodes per term");
+        assert_eq!(values.vals.len(), 2);
+        let held = before - ctx.memory_remaining();
+        assert!(
+            held <= n as u64 * 4 + (64 << 10),
+            "{held} bytes kept for {n} rows"
+        );
+    }
+
+    /// A large column of inline values is left to per-value reuse, which keeps one value
+    /// per distinct value rather than one per row.
+    #[test]
+    fn a_large_inline_column_is_left_to_per_value_reuse() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let (ctx, _) = owned(&store, 1 << 30, &[]);
+        let n = 2 * super::super::exec::PAR_THRESHOLD;
+        let (t, v) = column(
+            &ctx,
+            ids(&(0..n).map(|i| [-1, 1][i % 2]).collect::<Vec<_>>()),
+        );
+        assert!(
+            cursor_variable_values(&ctx, &t, &Expr::Var(v))
+                .unwrap()
+                .is_none()
+        );
+        let small = super::super::exec::PAR_THRESHOLD / 2;
+        let (t, v) = column(&ctx, t.cols[0][..small].to_vec());
+        assert!(
+            cursor_variable_values(&ctx, &t, &Expr::Var(v))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The least memory room in which `cursor_variable_values` decodes the column, which is
+    /// the peak of its construction, since the built column shrinks its charge.
+    fn least_room(ctx: &Ctx, table: &Table) -> u64 {
+        let decodes_in = |room: u64| {
+            let storage = ctx.charge(ctx.memory_room() - room).unwrap();
+            let column = cursor_variable_values(ctx, table, &Expr::Var(table.vars[0]));
+            drop(storage);
+            matches!(column, Ok(Some(_)))
+        };
+        let (mut low, mut high) = (0, ctx.memory_room());
+        assert!(decodes_in(high));
+        while low + 1 < high {
+            let mid = low + (high - low) / 2;
+            if decodes_in(mid) {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        high
+    }
+
+    /// A refused payload charge of query-local terms in a large input declines the
+    /// decoding, which is optional, instead of failing the query.
+    #[test]
+    fn a_refused_local_payload_declines_the_decoding() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let n = 2 * super::super::exec::PAR_THRESHOLD;
+        let fixture = || {
+            let (ctx, terms) = owned(&store, 1 << 30, &["local"]);
+            // the cursor's value cache holds the term, so the payload is the last charge
+            assert!(ctx.value(terms[0]).is_some());
+            let (t, _) = column(&ctx, vec![terms[0]; n]);
+            (ctx, t)
+        };
+        let (measure, measured) = fixture();
+        let peak = least_room(&measure, &measured);
+        drop(measure);
+
+        let (ctx, t) = fixture();
+        let payload = ctx.decoded_bytes(t.cols[0][0]).unwrap();
+        assert!(payload > 0);
+        // the reservation for building the values fits, and the payload does not
+        let storage = ctx.charge(ctx.memory_room() - (peak - 1)).unwrap();
+        let before = ctx.live_bytes();
+        assert!(
+            cursor_variable_values(&ctx, &t, &Expr::Var(t.vars[0]))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(ctx.live_bytes(), before, "the refusal kept its charge");
+        assert!(ctx.check_memory_failure().is_ok());
+        drop(storage);
+        assert!(
+            cursor_variable_values(&ctx, &t, &Expr::Var(t.vars[0]))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1513,7 +1835,7 @@ mod tests {
         let var = ctx.var("key");
         ctx.enable_cursor_accounting().unwrap();
         let ctx = std::sync::Arc::new(ctx);
-        ctx.attach_cursor_owner();
+        ctx.attach_owner();
         let mut table = Table::new(vec![var]);
         table.cols[0] = vec![short; MIN_ROWS];
         table.cols[0][MIN_ROWS - 1] = long;
@@ -1531,15 +1853,7 @@ mod tests {
         assert!(measure.value(long).is_some());
         let increment = measure.live_bytes() - before_long;
         assert_eq!(increment, 24);
-        let column = cursor_variable_values(
-            &measure,
-            &measured_table,
-            &Expr::Var(measured_table.vars[0]),
-        )
-        .unwrap()
-        .unwrap();
-        let column_bytes = column._charge.as_ref().unwrap().bytes();
-        drop(column);
+        let column_bytes = least_room(&measure, &measured_table);
         drop(measure);
 
         let (ctx, table, [short, _]) = cursor_with_late_longer_local_key();
@@ -1556,7 +1870,7 @@ mod tests {
             "refused column leaked trial ownership"
         );
         assert!(
-            ctx.check_cursor_memory().is_ok(),
+            ctx.check_memory_failure().is_ok(),
             "recoverable ORDER decoding poisoned the cursor before its smaller trial"
         );
         drop(trial_storage);
@@ -1572,7 +1886,7 @@ mod tests {
         }
         drop(values);
         drop(input);
-        assert!(ctx.check_cursor_memory().is_ok());
+        assert!(ctx.check_memory_failure().is_ok());
         assert!(ctx.mem_peak() <= 16 << 20);
     }
 
@@ -1583,12 +1897,12 @@ mod tests {
         let storage = ctx.charge(ctx.memory_room() - 8).unwrap();
         assert!(ctx.value(long).is_none());
         assert!(
-            matches!(ctx.check_cursor_memory(), Err(crate::Error::BudgetExceeded(b))
+            matches!(ctx.check_memory_failure(), Err(crate::Error::BudgetExceeded(b))
             if b.kind == crate::BudgetKind::Memory)
         );
         drop(storage);
         assert!(
-            matches!(ctx.check_cursor_memory(), Err(crate::Error::BudgetExceeded(b))
+            matches!(ctx.check_memory_failure(), Err(crate::Error::BudgetExceeded(b))
             if b.kind == crate::BudgetKind::Memory)
         );
     }

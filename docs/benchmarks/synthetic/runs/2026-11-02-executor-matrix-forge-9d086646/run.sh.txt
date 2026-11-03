@@ -1,0 +1,18 @@
+# Run on forge alone under ~/lanes/.bench.lock and ~/lanes/.heavy.lock, with the scripts of
+# commit e52937ca copied from a clean export, so the manifest says "scripts commit: unknown".
+# The binary is a release build of 9d086646, the commit that completed the mode-neutral
+# kernels of item 453 stage 4, made off forge inside `nix develop` with the
+# same compilers as e52937ca's record and with learned incremental reuse turned off. The
+# matrix was started with `--commit final`, the binary's label on forge, so the manifest
+# says "binary commit: final". Only the 12-thread cells ran.
+#   MBX_LEARNED_INCREMENTAL=false nix develop -c mbx sparkles-task -- mbx build --release -p sparkles-server --bin sparkles
+#   python3 scripts/bench-gate.py build-config --cargo 'build --release -p sparkles-server --bin sparkles'
+L=~/lanes/exec-453; M=final-noinc
+flock ~/lanes/.bench.lock flock ~/lanes/.heavy.lock $L/src-e52937ca/scripts/bench-executors.sh \
+  --out $L/runs/m12-$M --commit final --threads 12 --data-dir $L/data \
+  --build-config "$(cat $L/bin/sparkles-$M.build-config.json)" $L/bin/sparkles-$M
+P1=docs/benchmarks/synthetic/runs/2026-11-02-executor-matrix-forge-e52937ca/record.json
+python3 scripts/bench-gate.py compare --threshold 0.05 --keys '12t/.*/exec$' --allow-different \
+  $P1 record.json > compare-exec.md
+python3 scripts/bench-gate.py compare --threshold 0.05 --floor 5 --keys '12t/.*/wall$' --allow-different \
+  $P1 record.json > compare-wall.md

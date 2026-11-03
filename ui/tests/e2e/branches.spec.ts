@@ -51,7 +51,7 @@ open(
     // the query page writes to and reads from the branch
     await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'branchy'));
     await page.goto('/ui/query');
-    await page.getByRole('combobox', { name: 'Branch' }).selectOption('feature');
+    await page.getByRole('combobox', { name: 'Branch', exact: true }).selectOption('feature');
     const editor = page.locator('.cm-content');
     await editor.click();
     await page.keyboard.press('ControlOrMeta+a');
@@ -159,13 +159,15 @@ open(
     const id = (await made.json()).id;
     await update(request, 'branchy-memory@draft', 'INSERT DATA { <urn:memory-branch> <urn:p> 1 }');
     await page.goto('/ui/datasets/branchy-memory?branch=draft');
-    await expect(page.getByRole('combobox', { name: 'Branch' })).toHaveValue('draft');
+    await expect(page.getByRole('combobox', { name: 'Branch', exact: true })).toHaveValue('draft');
     await row(page, 'draft').getByRole('button', { name: 'Rename branch draft' }).click();
     const dialog = page.getByRole('dialog');
     await dialog.getByRole('textbox', { name: 'New name' }).fill('renamed');
     await dialog.getByRole('button', { name: 'Rename', exact: true }).click();
     await expect(page).toHaveURL(/\?branch=renamed$/);
-    await expect(page.getByRole('combobox', { name: 'Branch' })).toHaveValue('renamed');
+    await expect(page.getByRole('combobox', { name: 'Branch', exact: true })).toHaveValue(
+      'renamed',
+    );
     expect((await (await request.get('/$/branches/branchy-memory/renamed')).json()).id).toBe(id);
     const ask = await request.get('/branchy-memory/sparql', {
       params: { query: 'ASK { <urn:memory-branch> <urn:p> 1 }' },
@@ -174,7 +176,7 @@ open(
     expect((await ask.json()).boolean).toBe(false);
     await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'branchy-memory'));
     await page.goto('/ui/query');
-    await page.getByRole('combobox', { name: 'Branch' }).selectOption('renamed');
+    await page.getByRole('combobox', { name: 'Branch', exact: true }).selectOption('renamed');
     await page.locator('.cm-content').click();
     await page.keyboard.press('ControlOrMeta+a');
     await page.keyboard.insertText('ASK { <urn:memory-branch> <urn:p> 1 }');

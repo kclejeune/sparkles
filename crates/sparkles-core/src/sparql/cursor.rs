@@ -1594,7 +1594,7 @@ pub fn query_execution_with_plan(
                 && options.initial_bindings.is_empty()
                 && retryable(&prepared.node)
                 && !matches!(&parsed, spargebra::Query::Select { pattern, .. } if calls_service(pattern));
-            if prepared.ctx.is_cursor() {
+            if prepared.ctx.streams() {
                 if kind == QueryKind::Ask {
                     orient_filtered_ask(&mut prepared.node, &prepared.ctx, cursor);
                 }
@@ -4233,7 +4233,7 @@ mod tests {
         ctx.mem_limit = 16 << 20;
         ctx.enable_cursor_accounting().unwrap();
         let ctx = Arc::new(ctx);
-        ctx.attach_cursor_owner();
+        ctx.attach_owner();
         let join = ctx.var("join");
         let key = ctx.var("key");
         let value = ctx.var("value");
@@ -4625,6 +4625,7 @@ mod tests {
             assert!(!filtered_ask_admitted(&p.ctx, &p.node), "{text}");
         }
         let mut effects = prepare(text, 1024);
+        effects.ctx.detach_owner_for_tests();
         Arc::get_mut(&mut effects.ctx).unwrap().calls_extensions = true;
         assert!(!filtered_ask_admitted(&effects.ctx, &effects.node));
         // A retained immutable context stays eligible; a new delta keeps the

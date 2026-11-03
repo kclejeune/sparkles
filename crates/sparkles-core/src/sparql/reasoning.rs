@@ -851,6 +851,7 @@ fn seed_values(
     sub.share_local(ctx);
     sub.local_facts = view.has_locals();
     let sub = Arc::new(sub);
+    sub.attach_owner();
     let mut planner = Planner::new(&sub);
     let node = planner.plan(&gp, &ActiveGraph::Default, Vec::new())?;
     let (table, _) = exec::execute(&sub, &node)?;

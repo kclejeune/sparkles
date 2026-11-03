@@ -1,0 +1,6 @@
+18:32:08 matrix of 31 queries into /home/kclejeune/lanes/exec-453/runs/m12-final-noinc
+18:32:09 people-100000-threads-12: start, load 1.80 2.76 3.21
+18:53:11 people-100000-threads-12: done
+18:53:12 people-1000000-threads-12: start, load 1.09 1.14 1.63
+20:02:01 people-1000000-threads-12: done
+20:02:01 finished: /home/kclejeune/lanes/exec-453/runs/m12-final-noinc/summary.md and /home/kclejeune/lanes/exec-453/runs/m12-final-noinc/record.json

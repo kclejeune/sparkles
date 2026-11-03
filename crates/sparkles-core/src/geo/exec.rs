@@ -341,7 +341,7 @@ fn load(ctx: &Ctx, id: Id, src: &Src) -> Option<GeomRef> {
             let v = ctx.value(id)?;
             let max = max_vertices(ctx);
             ctx.geo
-                .get_or_parse(MemoKey::Id(id), || parse_value(&v, max))
+                .get_or_parse_charged(ctx, MemoKey::Id(id), || parse_value(&v, max))
         }
     }?;
     note_crs(ctx, &g);

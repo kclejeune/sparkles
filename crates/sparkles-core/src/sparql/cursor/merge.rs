@@ -1303,7 +1303,7 @@ mod tests {
         ctx.spill = spill.map(|s| Arc::new(s.query(None)));
         ctx.enable_cursor_accounting().unwrap();
         let ctx = Arc::new(ctx);
-        ctx.attach_cursor_owner();
+        ctx.attach_owner();
         ctx
     }
 
@@ -1912,7 +1912,7 @@ mod tests {
                         ctx.spill = Some(Arc::new(spill.query(None)));
                         ctx.enable_cursor_accounting().unwrap();
                         let ctx = Arc::new(ctx);
-                        ctx.attach_cursor_owner();
+                        ctx.attach_owner();
                         ctx
                     };
                     let mut op =

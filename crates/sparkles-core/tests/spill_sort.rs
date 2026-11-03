@@ -206,8 +206,12 @@ fn a_batch_too_large_to_buffer_spills_as_its_own_run() {
     let spill = spill(tmp.path());
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o) ?s";
     let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    // The query's decoded value cache holds up to an eighth of its budget, which this
+    // sort's 20,000-row batch leaves no room for at MEMORY, so the budget leaves an
+    // eighth of itself for the cache on top of what the batch needs.
+    let memory = MEMORY + MEMORY / 4;
     let opts = QueryOptions {
-        max_memory_bytes: Some(MEMORY),
+        max_memory_bytes: Some(memory),
         spill: Some(spill.clone()),
         ..Default::default()
     };
@@ -222,7 +226,7 @@ fn a_batch_too_large_to_buffer_spills_as_its_own_run() {
             rows.push(b.row(i).unwrap());
         }
     }
-    assert!(c.stats().mem_peak_bytes <= MEMORY);
+    assert!(c.stats().mem_peak_bytes <= memory);
     drop(c);
     assert_eq!(rows, expected);
     assert_eq!(spill.reserved_bytes(), 0);

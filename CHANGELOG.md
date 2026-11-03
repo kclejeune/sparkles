@@ -24,6 +24,20 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+The web UI has one app shell and design system (roadmap item 632). A top bar on every
+page holds the dataset switcher and a search of the open dataset's entities through
+`GET /$/ontology/{ds}/search`, which `Ctrl+K`, `Cmd+K` and `/` focus, and the pages sit
+in a rail that shows labels from 1200 pixels, icons below that and a drawer from 760
+pixels down, where the search expands over the bar. The search is the launcher that
+the command palette of item 631 extends. Light and dark tokens for colour, type,
+spacing, control heights, radii and shadows replace one-off styles, every text colour
+meets WCAG AA contrast, and the pages share panels, buttons, count badges, tables, form
+rows and list and detail panes of equal height. The Ontology and Thesaurus pages lose
+their own dataset menus to the top bar, their graph, branch and language choices move
+to a row under the title, the query page's branch, state, history and row limit fold
+behind an Options button on a phone, and the ontology editor's trees show labels on
+ontologies larger than the 50,000 axioms it lists, such as the Gene Ontology.
+
 Ontologies and thesauri have a typo-tolerant entity search for typeahead (spec U12,
 roadmap item 616). `GET /$/ontology/{ds}/search?q=` matches the labels, synonyms, short
 forms and definitions of OWL, RDFS and SKOS entities in any language, with up to two
@@ -261,6 +275,23 @@ questions Haiku answers 102 and Luna 101, within the noise of GPT-6.1 Sol and sh
 Ask declares the well-known vocabulary prefixes that a draft uses without declaring,
 such as `dbo` and `dbr`, before the check, unless the query or the dataset defines them.
 A draft that used one of them failed the check with a syntax error and needed a repair.
+
+Eager queries now count against their memory budget the query state that only cursors
+counted before. The decoded value cache, which holds at most 64 MiB or an eighth of the
+budget, the decoding of dictionary keys, the terms that expressions compute, the memos of
+blank nodes, callback terms, geometries and EXISTS, retained scratch and the programs of
+regular expressions are charged in both execution modes. An eager query close to its
+memory budget can therefore fail with the memory budget where it used to answer. Regular
+expressions no longer stay in a process-wide cache of up to 1,000 programs with their
+search caches. Their compiled programs are kept in a table of at most 64 programs and 16
+MiB, each query charges the bounded search caches it uses, and the workers' warm caches
+of a kept program wait in the table for the next query, up to another 16 MiB. A cursor's
+account reserves from the query pool in steps of 64 KiB and can hold about 1 MiB of the
+pool above its live bytes, and cursors keep their decoded values across batches (spec X14
+stage 4). Per-value reuse in BIND and FILTER, ORDER BY keys, top k and the pre-decode of
+FILTER, BIND and ORDER BY columns choose their algorithms by the size of their input in
+both execution modes, so an eager table of up to 16,384 rows runs them as a cursor batch
+does, and an eager top-k scan reads its pieces in morsels into one heap.
 
 `sparkles ask` takes its question argument as optional, since `--questions FILE` reads
 questions from a batch file instead. A command line that passes a question parses and

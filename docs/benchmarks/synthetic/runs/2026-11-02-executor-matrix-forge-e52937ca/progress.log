@@ -1,0 +1,12 @@
+03:37:45 matrix of 31 queries into /home/kclejeune/lanes/exec-453/runs/p1-e52937ca/executors
+03:37:45 generating 100000 people
+03:37:46 people-100000-threads-12: start, load 2.10 2.95 2.04
+03:59:00 people-100000-threads-12: done
+03:59:00 people-100000-threads-1: start, load 1.08 1.07 1.29
+04:12:19 people-100000-threads-1: done
+04:12:19 generating 1000000 people
+04:12:30 people-1000000-threads-12: start, load 3.10 3.08 2.46
+05:21:14 people-1000000-threads-12: done
+05:21:15 people-1000000-threads-1: start, load 1.02 1.14 1.12
+06:03:02 people-1000000-threads-1: done
+06:03:02 finished: /home/kclejeune/lanes/exec-453/runs/p1-e52937ca/executors/summary.md and /home/kclejeune/lanes/exec-453/runs/p1-e52937ca/executors/record.json

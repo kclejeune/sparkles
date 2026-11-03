@@ -1002,7 +1002,7 @@ mod tests {
         ctx.mem_limit = 16 << 20;
         ctx.enable_cursor_accounting().unwrap();
         let ctx = Arc::new(ctx);
-        ctx.attach_cursor_owner();
+        ctx.attach_owner();
         for len in [65_536, 65_537] {
             let mut build = Table::new(vec![0]);
             for row in 0..len {

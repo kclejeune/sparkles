@@ -1484,6 +1484,10 @@ export async function handleOntology(req, res, url, seg, ctx) {
     send(res, 200, body, 'application/json', { ETag: etag(ds, head()) });
     return true;
   }
+  if (req.method === 'GET' && sub === 'search') {
+    send(res, 200, searchEntities(ds, graph, p));
+    return true;
+  }
   if (req.method === 'GET' && sub === 'entities') {
     const o = readOntology(ds, graph);
     const want = p.get('kind')?.split(',');
@@ -2104,4 +2108,122 @@ async function revert(req, res, url, seg, ctx) {
     conflicts: { found: 0, resolved: 0 },
   });
   return true;
+}
+
+// --- entity search ---------------------------------------------------------------------
+
+const ENTITY_KINDS = {
+  [OWL + 'Class']: 'class',
+  [RDFS + 'Class']: 'class',
+  [OWL + 'ObjectProperty']: 'objectProperty',
+  [OWL + 'DatatypeProperty']: 'dataProperty',
+  [OWL + 'AnnotationProperty']: 'annotationProperty',
+  [RDF + 'Property']: 'objectProperty',
+  [OWL + 'NamedIndividual']: 'individual',
+  [RDFS + 'Datatype']: 'datatype',
+  [SKOS + 'Concept']: 'concept',
+  [SKOS + 'ConceptScheme']: 'conceptScheme',
+  [SKOS + 'Collection']: 'collection',
+};
+const LABELS = { [RDFS + 'label']: 'label', [SKOS + 'prefLabel']: 'label' };
+const SYNONYMS = { [SKOS + 'altLabel']: 'synonym', [SKOS + 'hiddenLabel']: 'synonym' };
+const fold = (t) =>
+  t
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+
+/**
+ * `GET /$/ontology/{ds}/search` (docs/API.md, "Entity search"), in brief: the labels and
+ * synonyms of the typed entities that equal, start with or contain the query, in that
+ * order, without the fuzzy and definition tiers.
+ */
+function searchEntities(ds, graph, p) {
+  const q = (p.get('q') ?? '').trim();
+  const limit = Math.min(Number(p.get('limit') ?? 10), 100);
+  const offset = Number(p.get('offset') ?? 0);
+  const want = p.get('kind')?.split(',');
+  const quads = ds.store.match(null, null, null, graphTerm(graph));
+  const kinds = new Map();
+  const texts = new Map();
+  for (const x of quads) {
+    if (x.subject.termType !== 'NamedNode') continue;
+    const s = x.subject.value;
+    const pr = x.predicate.value;
+    if (pr === TYPE && ENTITY_KINDS[x.object.value]) {
+      const k = kinds.get(s) ?? new Set();
+      k.add(ENTITY_KINDS[x.object.value]);
+      kinds.set(s, k);
+    } else if ((LABELS[pr] || SYNONYMS[pr]) && x.object.termType === 'Literal') {
+      const l = texts.get(s) ?? [];
+      l.push({
+        field: LABELS[pr] ?? SYNONYMS[pr],
+        property: pr,
+        text: x.object.value,
+        lang: x.object.language || null,
+      });
+      texts.set(s, l);
+    }
+  }
+  const fq = fold(q);
+  const hits = [];
+  for (const [iri, ks] of kinds) {
+    const kindList = [...ks];
+    if (
+      want &&
+      !kindList.some(
+        (k) => want.includes(k) || (want.includes('property') && k.endsWith('Property')),
+      )
+    )
+      continue;
+    const all = texts.get(iri) ?? [];
+    const labels = all.filter((t) => t.field === 'label');
+    const label = labels.find((t) => !t.lang || t.lang.startsWith('en')) ?? labels[0] ?? null;
+    let best = null;
+    for (const t of all) {
+      const f = fold(t.text);
+      const at = f.indexOf(fq);
+      if (!fq || at < 0) continue;
+      const tier = (f === fq ? 0 : at === 0 ? 1 : 4) + (t.field === 'synonym' ? 2 : 0);
+      if (!best || tier < best.tier) best = { ...t, tier, at };
+    }
+    if (!best) continue;
+    hits.push({
+      type: 'entity',
+      iri,
+      kinds: kindList,
+      label: label?.text ?? null,
+      labelLang: label?.lang ?? null,
+      shortForm: iri.replace(/^.*[#/]/, ''),
+      deprecated: false,
+      match: {
+        field: best.field,
+        property: best.property,
+        text: best.text,
+        lang: best.lang,
+        kind: best.tier % 2 === 0 && best.tier < 4 ? 'exact' : best.at === 0 ? 'prefix' : 'words',
+        distance: 0,
+        tier: best.tier,
+        highlight: [[best.at, best.at + q.length]],
+      },
+    });
+  }
+  hits.sort(
+    (a, b) => a.match.tier - b.match.tier || (a.label ?? a.iri).localeCompare(b.label ?? b.iri),
+  );
+  const page = hits.slice(offset, offset + limit);
+  const more = offset + limit < hits.length;
+  return {
+    dataset: ds.name,
+    commit: 0,
+    graphs: [graph],
+    imports: [],
+    query: q,
+    results: page,
+    offset,
+    limit,
+    more,
+    next: more ? offset + limit : null,
+    index: 'current',
+  };
 }

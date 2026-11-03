@@ -105,7 +105,8 @@ fn rewrite(n: &Node, ctx: &Ctx) -> Option<Node> {
             .map(|v| format!("?{}", ctx.var_name(*v)))
             .collect::<Vec<_>>()
             .join(" "),
-        ctx.term(pred).map_or_else(|| "?".into(), |t| t.to_string()),
+        ctx.plan_term(pred)
+            .map_or_else(|| "?".into(), |t| t.to_string()),
         metric.name(),
         query.len(),
     );

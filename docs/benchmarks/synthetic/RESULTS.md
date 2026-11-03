@@ -489,3 +489,63 @@ of the time goes to writing the rows. It is faster on the grouped aggregates
 threads and at 10.5M triples on `minus` and `not-exists`. Item 534 covers the
 streamed response's fixed cost and its losses on large answers, which the merged executor
 must not inherit.
+
+### Forge record after stages 1 and 3
+
+Items 474 to 478 and 480 to 483 were screened on Namespace only, so the matrix ran again
+on forge alone with a release build of e52937ca and the scripts of that commit. Its
+[run record](runs/2026-11-02-executor-matrix-forge-e52937ca/record.json),
+[summary](runs/2026-11-02-executor-matrix-forge-e52937ca/summary.md) and
+[commands](runs/2026-11-02-executor-matrix-forge-e52937ca/run.sh.txt) are kept beside the
+baseline's, and it is the baseline of stage 4. Both modes returned the same answers in
+every cell, and no answer fingerprint changed against the baseline. The comparison of
+execution times with `bench-gate.py compare` flagged 70 of 248 metrics at the 5% threshold
+([execution times](runs/2026-11-02-executor-matrix-forge-e52937ca/compare-exec.md),
+[wall times](runs/2026-11-02-executor-matrix-forge-e52937ca/compare-wall.md)). Sixty-one
+of them are queries under 0.3 ms, which a single matrix cannot time to that precision, and
+item 524 measures them with the latency harness of X14's decision D4.
+
+Interleaved forge A/Bs of the two builds reran the flags above 0.3 ms in eight or ten
+rounds of A,B,B,A in each order. `order-by-full` at 10.5M triples with 12 threads read
+1.012 in eager execution time and 0.956 in wall time, and 1.000 and 0.994 when streamed. `expr-bind-group` and `lang-filter` at 1.05M read 0.988 and 0.997,
+`range-topk` and `subquery-agg` at 10.5M read 1.005 and 1.011, and `optional-chain` at
+10.5M with one thread read 0.978. The flags were therefore noise of the single matrix
+run.
+
+### Forge record after stage 4
+
+The 12-thread cells of the matrix ran again on forge alone with a release build of
+9d086646, the build with stage 4's mode-neutral kernels, and the scripts of e52937ca. Its
+[run record](runs/2026-11-02-executor-matrix-forge-9d086646/record.json),
+[summary](runs/2026-11-02-executor-matrix-forge-9d086646/summary.md) and
+[commands](runs/2026-11-02-executor-matrix-forge-9d086646/run.sh.txt) are kept beside the
+record of e52937ca. Both modes returned the same answers in every cell, and no answer
+fingerprint changed. Against the record of e52937ca, `bench-gate.py compare` flagged 34 of
+124 execution times
+([execution times](runs/2026-11-02-executor-matrix-forge-9d086646/compare-exec.md),
+[wall times](runs/2026-11-02-executor-matrix-forge-9d086646/compare-wall.md)). Twenty-seven
+of them are queries under 0.3 ms. The other seven are eager `lang-filter`, `regex-iri`,
+`star-join` and `subquery-agg` and streamed `lang-filter` at 10.5M triples, and six wall
+times of large eager answers, such as `export-500k` at 1.13.
+
+Interleaved A/Bs on forge then compared the stage with main at the commit it merged,
+58bbfca5, in rounds of A,B,B,A in each order with 12 threads. The samples, answers and
+settings of the A/Bs after the fixes are kept in their own
+[run record](runs/2026-11-03-executor-stage4-ab-forge-815822db/summary.md) with their
+[commands](runs/2026-11-03-executor-stage4-ab-forge-815822db/run.sh.txt). They traced the flags to
+three costs, which the stage removed. The `application/x-sparkles+json` writer rebuilt
+each eager cell's key on the checked path, which made eager `export-500k` 1.248 times as
+slow in wall time. Each key of a regular-expression filter looked up its thread's copy of
+the program, which made eager `regex-iri` at 1.05M triples 1.058 times as slow. A
+parallel map took pieces of at least 4,096 rows, which left the FILTER of eager
+`subquery-agg` at 10.5M triples on five of twelve threads and made it 1.12 times as slow.
+After the fixes, eager `export-500k` read 1.0085 in wall time, and eager execution at
+10.5M triples read 1.029 for `subquery-agg`, 1.023 for `expr-bind-group`, 1.020 for
+`regex-iri`, 1.011 for `lang-filter`, 0.995 for `expr-agg-arg` and 0.998 for `group-avg`.
+The same queries read at most 1.011 when streamed at 10.5M triples, and with `star-join` at
+most 1.02 in both modes at 1.05M triples. Item 682 holds the costs of 1% to 3%
+that remain in eager execution at 10.5M triples. The latency harness of X14's decision D4 passed every query under 0.3 ms
+except `star-lookup` at 1.019 in eager execution and 1.017 when streamed, and eager
+`types-grouped` at 1.186, about 1.1 and 1.3 µs, which items 681 and 679
+investigate. Streamed `expr-order-key` at 10.5M triples read 1.045 against the build
+before the mode-neutral kernels, which item 680 investigates.
