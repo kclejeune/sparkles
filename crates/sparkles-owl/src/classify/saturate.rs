@@ -1358,7 +1358,7 @@ fn apply_rules<S: Sink, R: Rules>(
                 Node::Exist(r, _) => {
                     let succ = h.succ;
                     out.send(succ, Concl::Back(me, r));
-                    if !R::DISJ && roles.keeps_forward(r) {
+                    if roles.keeps_forward(r) {
                         out.me(Concl::Fwd(r, succ));
                     }
                     if R::FULL && st.real {
@@ -1477,7 +1477,7 @@ fn apply_rules<S: Sink, R: Rules>(
                 out.me(Concl::Sub(c));
             }
             out.me(Concl::Back(me, r));
-            if !R::DISJ && roles.keeps_forward(r) {
+            if roles.keeps_forward(r) {
                 out.me(Concl::Fwd(r, me));
             }
             for &(s, x) in &ix.selfs {
