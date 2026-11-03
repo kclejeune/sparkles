@@ -926,6 +926,9 @@
     }
   }
 
+  /** `key` in the pieces between its soft break points: after `_` or `-` and in camelCase. */
+  const keyParts = (key: string) => key.split(/(?<=[_-])|(?<=[a-z])(?=[A-Z])/);
+
   /** Labels for the header's properties and IRI values, so they read as words, not IDs. */
   async function loadAboutNames(
     t: string,
@@ -1623,8 +1626,12 @@
               <div class="panel-body">
                 <dl class="about">
                   {#each head.head.annotations.slice(0, 12) as a, i (i)}
+                    {@const key =
+                      aboutNames.get(a.property) ?? displayName(a.property, undefined, prefixes)}
+                    <!-- a long key breaks only between words: at a space, after _ or -, or
+                         between the words of a camelCase name -->
                     <dt title={a.property}>
-                      {aboutNames.get(a.property) ?? displayName(a.property, undefined, prefixes)}
+                      {#each keyParts(key) as part, j (j)}{#if j}<wbr />{/if}{part}{/each}
                     </dt>
                     <dd>
                       {#if isLiteral(a.value)}{a.value['@value']}{:else if aboutNames.has(a.value)}
@@ -1949,12 +1956,13 @@
     padding-left: var(--sp-3);
   }
   .about {
-    grid-template-columns: minmax(6rem, 2fr) minmax(0, 3fr);
+    grid-template-columns: minmax(8rem, 1fr) minmax(0, 1.4fr);
   }
-  /* a long key such as hasOBOFormatVersion wraps inside its column */
+  /* a long key such as hasOBOFormatVersion wraps at its soft break points, never inside a word */
   .about dt {
     min-width: 0;
-    overflow-wrap: anywhere;
+    overflow-wrap: normal;
+    word-break: normal;
     color: var(--text-3);
     font-size: var(--fs-sm);
   }
