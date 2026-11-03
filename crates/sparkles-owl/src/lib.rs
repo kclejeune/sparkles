@@ -4,8 +4,9 @@
 //! triples to axioms by the reverse mapping of the OWL 2 Mapping to RDF Graphs, in a
 //! lenient or a strict mode, and [`write`] maps axioms to triples by the forward
 //! mapping. [`profiles`] checks an ontology against OWL 2 EL, QL, RL and the OWL 2 DL
-//! restrictions. [`ofn`] writes the functional-style syntax and [`json`] the JSON form
-//! of axioms that the HTTP API uses.
+//! restrictions. [`ofn`] writes the functional-style syntax, [`manchester`] reads and
+//! writes the Manchester syntax, and [`json`] writes the JSON form of axioms that the
+//! HTTP API uses.
 //!
 //! The crate depends on `oxrdf` and not on the store, so it reads files as well as
 //! datasets.
@@ -44,6 +45,7 @@ pub mod classify;
 pub mod datatypes;
 pub mod entities;
 pub mod json;
+pub mod manchester;
 pub mod model;
 pub mod ofn;
 pub mod ofn_read;

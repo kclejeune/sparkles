@@ -2089,19 +2089,101 @@ between is `409`. A write takes the parameters of the other writes, such as
     "indexMs": 453.1, "saturationMs": 402.7, "taxonomyMs": 251.8 } }
 ```
 
+`POST /$/ontology/{ds}/parse` reads `text` in the OWL 2 Manchester Syntax as the value
+that `as` names, which is `classExpression` by default or `dataRange`, `individual`,
+`literal` or `axiom`. It takes `graph`, `imports` and `mode` as the other routes do. A
+name is a full IRI in angle brackets, a prefixed name with the dataset's prefixes, a
+local name, or a label, which takes single quotes when it holds a space or a keyword.
+Names resolve against the entities of the ontology read and their `rdfs:label` and
+`skos:prefLabel` values, so a caller reads only the names its grants show. A name the
+ontology does not have is looked for again among the entities of the assertions the
+caller can read, such as an individual that only a property assertion names. That search
+follows the same rules of case and quoting, and keeps at most 256 entities for one name,
+so a local name that more assertion entities share reads as ambiguous among the first
+256. An axiom is
+written as one frame line such as `Professor SubClassOf teaches some Course`. The reader
+takes the keywords `SubClassOf`, `EquivalentTo`, `DisjointWith`, `SubPropertyOf`,
+`InverseOf`, `Domain`, `Range`, `Types`, `SameAs`, `DifferentFrom` and
+`SubPropertyChain`, a chain such as `partOf o partOf SubPropertyOf partOf`, a
+characteristic such as `Transitive partOf`, and a fact such as `ada teaches logic`.
+The answer gives the value in its JSON form under `value`, its functional-style text
+under `ofn` and the Manchester text the editor writes for it under `manchester`, which
+reads back as the same value. Text that does not read is `400` with `code`
+`invalid-manchester`, a `reason` of `syntax`, `unknown`, `ambiguous` or `kind`, and the
+span `start` and `end` in UTF-16 code units. A name that several entities share is
+`ambiguous` and lists each entity under `candidates` with its IRI, kind and label.
+
+```json
+{ "error": "'Course' names 2 entities: :Course (class, labelled 'Course'), <http://ex.org/old/Course> (class, labelled 'Course'); write a prefixed name or an IRI",
+  "code": "invalid-manchester", "reason": "ambiguous",
+  "start": 13, "end": 21,
+  "candidates": [{ "iri": "http://ex.org/Course", "kind": "Class", "label": "Course" },
+                 { "iri": "http://ex.org/old/Course", "kind": "Class", "label": "Course" }] }
+```
+
+`POST /$/ontology/{ds}/dl-query` answers a class expression as Protégé's DL Query tab
+does, with its equivalent classes, its direct and inferred superclasses and subclasses,
+and its instances. `expression` is Manchester text, functional-style text with
+`syntax: "functional"`, or the JSON form as an object. `answers` names the lists wanted,
+from `equivalents`, `superclasses`, `directSuperclasses`, `subclasses`,
+`directSubclasses` and `instances`, and every one is answered by default. Each list holds
+at most `limit` IRIs, 1,000 by default and at most 10,000, and `counts` gives the full
+number. The lists leave out `owl:Nothing` and the unsatisfiable classes, and a named
+class asked about is among its own equivalents.
+
+`reasoning` chooses the engine. `auto`, the default, uses the EL classifier when the
+expression and every logical axiom of the ontology are in OWL 2 EL, and the OWL 2 RL rules
+otherwise. `el` keeps to the classifier, which leaves out the axioms outside EL and lists
+them, and refuses an expression outside EL. `rl` asks for the rules. The classifier
+answers by reading `EquivalentClasses(urn:x-sparkles:dl-query C)` beside the ontology's
+axioms in the dataset's kept classification, saturating again only what that axiom and
+any change since the last run reach, and reading the answer from the saturated contexts
+without a taxonomy. The next run over the kept state lets the axiom go, the kept
+taxonomy stays as it was, and `incremental` is true when the kept state answered. Its class answers read the
+terminology, and its instances come from a classification with the assertions, which the
+dataset does not keep. Inside EL its answers are complete. The RL rules answer by demand
+reasoning over a copy in memory of the terminology, the defining axioms and the
+assertions, and derive only what the query's patterns need. Their instances are complete
+when the ontology and the expression are in OWL 2 RL, and their class answers can miss
+entailed subsumptions, since the RL rules are incomplete for classification.
+
+The answer's `reasoning` names the `engine` and its `title`, says `why` it was chosen,
+whether the class answers are `complete` and whether the instances are
+(`instancesComplete`), and lists under `gaps` the axioms outside the engine's profile or
+used in part, at most `limit` of `gapCount`, with notes on what the engine cannot tell.
+`satisfiable` and `consistent` come from the classifier and are null under the rules. A
+caller whose grants limit endpoints needs the `query` endpoint.
+
+```json
+{ "dataset": "uni", "commit": 4, "graphs": ["default"], "mode": "lenient",
+  "expression": { "manchester": "Person and (teaches some Course)",
+    "ofn": "ObjectIntersectionOf(:Person ObjectSomeValuesFrom(:teaches :Course))", "json": {} },
+  "reasoning": { "engine": "el", "title": "OWL 2 EL classifier",
+    "why": "the expression and the ontology are inside OWL 2 EL", "complete": true,
+    "instancesComplete": true, "gapCount": 0, "gaps": [], "notes": [] },
+  "satisfiable": true, "consistent": true, "incremental": true, "elapsedMs": 1.8,
+  "equivalents": ["http://ex.org/Teacher"], "directSuperclasses": ["http://ex.org/Person"],
+  "subclasses": ["http://ex.org/Professor"], "instances": ["http://ex.org/ada"],
+  "counts": { "equivalents": 1, "directSuperclasses": 1, "subclasses": 1, "instances": 1 } }
+```
+
 The library's `sparkles::handles::ontology::wire::call` answers the same operations
 in the same JSON forms, and the bindings call it. Python's `Dataset.ontology` has
-`summary`, `axioms`, `entities`, `entity`, `check`, `edit`, `remove_entity`, `diff` and
-`classify`, with the members as keyword arguments, and `Axiom` reads and writes one
+`summary`, `axioms`, `entities`, `entity`, `check`, `edit`, `remove_entity`, `diff`,
+`classify`, `parse` and `dl_query`, with the members as keyword arguments and `as_` for
+`as`, and `Axiom` reads and writes one
 axiom with structural equality. Node.js's `dataset.ontology` has `summary`, `axiomPage`,
 `axioms` (an async iterable in batches), `entities`, `entity`, `check`, `edit`,
-`removeEntity`, `diff` and `classify`. On the JVM, `DatasetGraphSparkles.ontology()` has
-the same operations, with `classify` taking a `ClassifyQuery`,
+`removeEntity`, `diff`, `classify`, `parse` and `dlQuery`. On the JVM,
+`DatasetGraphSparkles.ontology()` has the same operations, with `classify` taking a
+`ClassifyQuery` and `dlQuery` a `DlQuery`,
 `SparklesOnt` has them over one graph, and `SparklesOnt.model` returns a `jena-ontapi`
 `OntModel` over a Sparkles graph
 ([integrations](integrations/README.md#libraries-and-bindings)). An axiom given to an
 edit is its JSON form or a string in functional-style syntax with the dataset's
-prefixes.
+prefixes. Manchester text that `parse` or `dl_query` cannot read raises Python's
+`InvalidInputError`, a `ValueError`, with `reason`, `start`, `end` and `candidates` as
+attributes, and Node.js's `InvalidInputError` with them under `details`.
 
 Typed constructors build axioms without writing their syntax. Python's `sparkles.owl`
 and Node.js's `owl` namespace have one constructor per axiom type and per expression,

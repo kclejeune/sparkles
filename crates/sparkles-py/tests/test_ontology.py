@@ -347,6 +347,33 @@ def test_classify(ds: sparkles.Dataset) -> None:
     ]
 
 
+def test_manchester_and_dl_query(ds: sparkles.Dataset) -> None:
+    ds.update(f'{PREFIXES} INSERT DATA {{ :Course rdfs:label "Course unit" . }}')
+    p = ds.ontology.parse("teaches some 'Course unit'")
+    assert p["value"] == {
+        "type": "ObjectSomeValuesFrom",
+        "property": EX + "teaches",
+        "class": EX + "Course",
+    }
+    ax = ds.ontology.parse("Professor SubClassOf teaches some Course", as_="axiom")
+    assert ax["value"]["type"] == "SubClassOf"
+    with pytest.raises(sparkles.InvalidInputError, match="Lecture") as e:
+        ds.ontology.parse("teaches some Lecture")
+    assert isinstance(e.value, ValueError)
+    assert (e.value.reason, e.value.start, e.value.end) == ("unknown", 13, 20)
+    assert e.value.candidates == []
+    r = ds.ontology.dl_query("teaches some Course", answers=["subclasses", "instances"])
+    assert r["reasoning"]["engine"] == "el" and r["reasoning"]["complete"]
+    assert r["subclasses"] == [EX + "Professor"]
+    assert r["instances"] == [EX + "ann"]
+    j = ds.ontology.dl_query(
+        {"type": "ObjectSomeValuesFrom", "property": EX + "teaches", "class": EX + "Course"},
+        reasoning="rl",
+        answers=["subclasses"],
+    )
+    assert j["reasoning"]["engine"] == "rl"
+
+
 def test_search_ranks_entities_with_typos() -> None:
     d = sparkles.Dataset()
     d.update(

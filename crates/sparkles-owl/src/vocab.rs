@@ -53,6 +53,9 @@ iris! {
 
     XSD_STRING = XSD "string";
     XSD_BOOLEAN = XSD "boolean";
+    XSD_INTEGER = XSD "integer";
+    XSD_DECIMAL = XSD "decimal";
+    XSD_FLOAT = XSD "float";
     XSD_NON_NEGATIVE_INTEGER = XSD "nonNegativeInteger";
 
     OWL_ONTOLOGY = OWL "Ontology";

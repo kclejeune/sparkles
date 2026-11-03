@@ -771,10 +771,20 @@ python = "Dataset.ontology.diff"
 jvm = "SparklesOnt.diff"
 node = "Dataset.ontology.diff"
 
+["ontology.dl_query"]
+python = "Dataset.ontology.dl_query"
+jvm = "SparklesOnt.dlQuery"
+node = "Dataset.ontology.dlQuery"
+
 ["ontology.edit"]
 python = "Dataset.ontology.edit"
 jvm = "SparklesOnt.edit"
 node = "Dataset.ontology.edit"
+
+["ontology.parse"]
+python = "Dataset.ontology.parse"
+jvm = "SparklesOnt.parse"
+node = "Dataset.ontology.parse"
 
 ["ontology.remove_entity"]
 python = "Dataset.ontology.remove_entity"

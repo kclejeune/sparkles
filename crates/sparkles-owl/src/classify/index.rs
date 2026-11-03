@@ -127,6 +127,26 @@ impl Interner {
         self.node(Node::Class(id))
     }
 
+    /// The expression of a class, if the interner has it.
+    pub fn class_ex(&self, c: &Class) -> Option<Ex> {
+        match c.as_str() {
+            vocab::OWL_THING => Some(TOP),
+            vocab::OWL_NOTHING => Some(BOTTOM),
+            _ => self
+                .class_ids
+                .get(c)
+                .and_then(|&id| self.get(&Node::Class(id))),
+        }
+    }
+
+    /// Whether the run's normalization met the class `id`, which makes it a class of
+    /// the signature.
+    pub fn in_signature(&self, c: &Class) -> bool {
+        self.class_ids
+            .get(c)
+            .is_some_and(|&id| self.met[id as usize])
+    }
+
     /// Forgets which classes the normalization met, before a run normalizes the axioms.
     pub fn clear_met(&mut self) {
         self.met.iter_mut().for_each(|m| *m = false);
@@ -732,7 +752,7 @@ pub fn class_expression(
                     partial = partial.or(p);
                     Ok(e)
                 })
-                .collect::<Result<_, _>>()?;
+                .collect::<Result<_, &'static str>>()?;
             es.sort_unstable();
             es.dedup();
             es.retain(|&e| e != TOP);

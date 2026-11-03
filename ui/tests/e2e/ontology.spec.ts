@@ -109,7 +109,7 @@ open(
       `${UNI}TeachingAssistant`,
     );
     await create.getByRole('button', { name: 'Preview' }).click();
-    await expect(preview(page)).toContainText('teaching assistant SubClassOf Employee');
+    await expect(preview(page)).toContainText("'teaching assistant' SubClassOf Employee");
     await commitPreview(page);
     await expect(page).toHaveURL(/TeachingAssistant/);
     const ta = `<${UNI}TeachingAssistant> ?p ?o`;

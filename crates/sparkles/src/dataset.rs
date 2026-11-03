@@ -1602,7 +1602,7 @@ pub struct Solution {
 }
 
 impl Solutions {
-    fn from_result(r: &QueryResult) -> Solutions {
+    pub(crate) fn from_result(r: &QueryResult) -> Solutions {
         let vars: Arc<[String]> = r.vars.clone().into();
         let rows = r
             .rows()

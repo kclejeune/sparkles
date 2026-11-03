@@ -1010,6 +1010,12 @@ impl OntologyScope {
         self.handle.classify(&self.req, c, &self.opts)
     }
 
+    /// [`Ontologies::dl_query`].
+    pub fn dl_query(&self, q: &dl_query::DlQueryRequest) -> Result<dl_query::DlQueryAnswer> {
+        self.ready()?;
+        self.handle.dl_query(&self.req, q, &self.opts)
+    }
+
     /// Edit the ontology in one commit (spec F21 §2.1): `f` names the axioms to add and
     /// remove on an [`Editor`], and [`Ontologies::edit`] then applies them under the
     /// writer lock. `f` runs before the lock is taken, so it cannot see the head the
@@ -2448,6 +2454,7 @@ pub fn rl_inspector(
 }
 
 pub mod classify;
+pub mod dl_query;
 pub mod search;
 pub mod wire;
 

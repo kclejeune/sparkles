@@ -317,8 +317,10 @@ taxonomy.
 individuals and datatypes was item 587, with item 605. The literals and datatypes the
 classifier cannot compare and chains through the top property are item NEW-ITEM-1, and
 incremental runs that follow merges, keys and worlds are item NEW-ITEM-2. Reads that
-answer from the classification
-and DL Query are item 588. Durable and automatic classification is item
+answer from the classification are item 588. DL queries answer from the kept classifier
+through `Classifier::saturate` and `Classifier::describe`, as
+[U12's DL Query outcome](../U12-ontology-workbench/SPEC.md#dl-query) describes.
+Durable and automatic classification is item
 589, after item 339. A kept classification with assertions is item 590,
 the comparison and measurements against ELK were item 591, the speed and memory work
 against ELK were items 602 and 592, and normalization and interning on several threads

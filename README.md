@@ -258,6 +258,12 @@ editor. The collapsed panel below it has more workflows and detail views.
     <td>Asserted and inferred class hierarchies side by side</td>
   </tr>
   <tr>
+    <td colspan="2" align="center"><img width="50%" src="docs/images/ontology-dl-query.png" alt="The DL Query tab of the ontology editor answering Person and (teaches some Course), labelled as answered completely by the OWL 2 EL classifier, with Teacher as its equivalent class, Person and Agent above it, Professor below it and Ada Lovelace as its instance, beside the frame of Professor"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">A DL query in Manchester syntax, labelled with the reasoning that answered it</td>
+  </tr>
+  <tr>
     <td><img src="docs/images/thesaurus-editor.png" alt="The thesaurus editor with the concept tree of an animals scheme, where Whales and Penguins appear under both Mammals and Marine animals marked 2 broader, and the label table of Whales with its English and French preferred labels and an English alternative label, each with buttons that edit it, remove it or turn it into a SKOS-XL label"></td>
     <td><img src="docs/images/thesaurus-checks.png" alt="The checks of the thesaurus editor, listing the concept Owls as breaking S13 because one label is both preferred and alternative, with a button that enforces the SKOS rules on writes"></td>
   </tr>

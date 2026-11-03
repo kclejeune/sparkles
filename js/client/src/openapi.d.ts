@@ -2186,6 +2186,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ontology/{ds}/dl-query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Answer a DL query
+         * @description Answers the class expression `expression` with its equivalent classes, its direct and inferred superclasses and subclasses, and its instances, as `answers` selects (every one by default). When the expression and every logical axiom of the ontology are in OWL 2 EL, the EL classifier answers it completely by classifying the expression as a fresh class with the dataset's kept classification, incrementally, and leaves the kept taxonomy as it was. Otherwise the OWL 2 RL rules answer it by demand reasoning over a copy of the terminology and the assertions, which can miss class answers. `reasoning` (`auto`, `el` or `rl`) chooses the engine, and `el` keeps to the classifier outside EL, leaving out the axioms it cannot use. The answer's `reasoning` names the engine, why it was chosen, whether the answers are complete, and the axioms outside the profile that can make them incomplete. `syntax` reads a text expression as Manchester syntax (the default) or functional-style syntax, and an object expression is read as the JSON form. A Manchester expression that does not read is `400` as `POST /$/ontology/{ds}/parse` answers it. A caller whose grants limit endpoints needs the `query` endpoint.
+         */
+        post: operations["dlQueryOntology"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/ontology/{ds}/entities": {
         parameters: {
             query?: never;
@@ -2225,6 +2245,26 @@ export interface paths {
          * @description Removes an entity in one commit: its declarations, the axioms of the graphs read that mention it and the assertions about it that the store holds there. The ontology is read from the head under the writer lock. The answer is an edit's, and `removedAxioms` lists what the removal took. An IRI the ontology does not mention removes nothing and makes no commit.
          */
         delete: operations["removeOntologyEntity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ontology/{ds}/parse": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Manchester syntax
+         * @description Reads `text` in OWL 2 Manchester syntax as `as` (`classExpression` by default, or `dataRange`, `individual`, `literal` or `axiom`) and answers its JSON form, its functional-style text and its Manchester rendering. Names are full IRIs in angle brackets, prefixed names with the dataset's prefixes, local names, and labels in single quotes when they hold a space. They resolve against the entities and the `rdfs:label` and `skos:prefLabel` values of the ontology. Text that does not read is `400` with `code` `invalid-manchester`, `reason` (`syntax`, `unknown`, `ambiguous` or `kind`), the span `start` and `end` in UTF-16 code units, and for an ambiguous name the `candidates` with their IRIs, kinds and labels.
+         */
+        post: operations["parseManchester"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -17705,6 +17745,71 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    dlQueryOntology: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The ontology, the expression and the answers. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    answers?: ("equivalents" | "superclasses" | "directSuperclasses" | "subclasses" | "directSubclasses" | "instances")[];
+                    /** @description The class expression: Manchester or functional-style text, or the JSON form. */
+                    expression: unknown;
+                    /** @description A graph IRI or `default`, or a list of them. */
+                    graph?: unknown;
+                    imports?: boolean;
+                    /** @description The most IRIs each answer and the gaps list (1,000 by default). */
+                    limit?: number;
+                    /** @description The most facts the classifier derives before the run stops with `507`. */
+                    maxDerived?: number;
+                    /** @enum {string} */
+                    mode?: "lenient" | "strict";
+                    /**
+                     * @description The engine (`auto` by default).
+                     * @enum {string}
+                     */
+                    reasoning?: "auto" | "el" | "rl";
+                    /**
+                     * @description The syntax of a text expression (`manchester` by default). An object is read as the JSON form.
+                     * @enum {string}
+                     */
+                    syntax?: "manchester" | "functional";
+                    /** @description The worker threads of the EL classifier, within the algorithm pool's grant (0 for the grant). */
+                    threads?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description The answers, each a list of IRIs with its count, and the reasoning that found them. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
     listOntologyEntities: {
         parameters: {
             query?: {
@@ -17894,6 +17999,56 @@ export interface operations {
             412: components["responses"]["PreconditionFailed"];
             422: components["responses"]["Unprocessable"];
             507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    parseManchester: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The ontology and the text. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * @description What the text is (`classExpression` by default).
+                     * @enum {string}
+                     */
+                    as?: "classExpression" | "dataRange" | "individual" | "literal" | "axiom";
+                    /** @description A graph IRI or `default`, or a list of them. */
+                    graph?: unknown;
+                    imports?: boolean;
+                    /** @enum {string} */
+                    mode?: "lenient" | "strict";
+                    /** @description The Manchester text. */
+                    text: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The value in its JSON form, `ofn` and `manchester`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
             default: components["responses"]["Error"];
         };
     };
