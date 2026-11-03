@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# clieq-rerun.sh A B: rerun, one input at a time with a 12 GiB cap, every input that a
+# comparison of clieq.sh flagged, and write the new lines to work/clieq-A-B.rerun
+set -uo pipefail
+cd ~/lanes/el-perf-649
+A=$1 B=$2 W=work/clieq-$1-$2
+export A B W CLIEQ_MEM=12G
+grep DIFF $W.results | awk '{print $2}' | sort -u | while read -r f; do bash clieq-one.sh "$f"; done > $W.rerun
+echo "RERUN-DONE $(grep -c . $W.rerun) compared, $(grep -c DIFF $W.rerun) differing"

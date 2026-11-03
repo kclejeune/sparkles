@@ -1,0 +1,27 @@
+2026-11-03T06:46:29Z
+ 01:46:29  up 11 days  9:32,  0 users,  load average: 0.85, 3.81, 4.44
+               total        used        free      shared  buff/cache   available
+Mem:              15           1          10           0           3          14
+Swap:              7           0           7
+20
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           46 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  20
+On-line CPU(s) list:                     0-19
+Vendor ID:                               GenuineIntel
+Model name:                              13th Gen Intel(R) Core(TM) i5-13500
+CPU family:                              6
+Model:                                   191
+Thread(s) per core:                      2
+Core(s) per socket:                      14
+Socket(s):                               1
+Stepping:                                2
+Microcode version:                       0x3e
+CPU(s) scaling MHz:                      20%
+0411a65e421f3e0b231e0cda0893ffdbb72425247fc1bd9fb3da2e8a51153130  bin/main-el_classify
+760eb1bd19557cb02634497678a068ae4608dd9e79b22dbf8d644688dcdad13a  bin/main-sparkles
+0c50507d8c9ad64fcb18e433488f10712bcb7735856fa507fbcff85eab92346f  bin/l4-el_classify
+fb8f4a462e84af45814dbe5fd65067228297cf6413c7712e7d1e9f740764b94d  bin/l4-prof-sparkles
+5ae00aa0f634b52c0daed5ba3b3f81cce2899a6ba654e8a5e081d0e89dbeea98  bin/l4-sparkles

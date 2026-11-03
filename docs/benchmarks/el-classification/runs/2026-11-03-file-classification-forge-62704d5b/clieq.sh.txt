@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# clieq.sh A B (CLIEQ_JOBS files at once, default 12): `sparkles ontology classify` (ofn at 1 and 8 threads, json at 8) and
+# `ontology check --format json` of bin/A-sparkles and bin/B-sparkles on GO, ChEBI lite
+# and the ORE ontologies, each from OFN, RDF/XML and Turtle, compared byte for byte
+# after the timings are removed; differences to clieq-A-B.txt
+set -uo pipefail
+cd ~/lanes/el-perf-649
+A=$1; B=$2
+C=work/conv; W=work/clieq-$A-$B
+mkdir -p $C $W
+R=clieq-$A-$B.txt; : > $R
+cap() { timeout 900 systemd-run --user --scope -q -p MemoryMax=10G -p MemorySwapMax=0 -p OOMPolicy=continue "$@"; }
+# inputs: every ontology in OFN, RDF/XML and Turtle; conversions by bin/A (main)
+files=()
+for f in data/go data/chebi_lite; do
+  b=$(basename $f)
+  [ -s $C/$b.ttl ] || cap bin/$A-sparkles convert $f.owl -o $C/$b.ttl > /dev/null 2>&1
+  files+=("$f.ofn" "$f.owl" "$C/$b.ttl")
+done
+for f in data/ore/*.owl; do
+  b=$(basename $f .owl)
+  ln -sf "$PWD/$f" $C/$b.ofn
+  [ -s $C/$b.ttl ] || cap bin/$A-sparkles query --data $C/$b.ofn --results ttl 'CONSTRUCT WHERE { ?s ?p ?o }' > $C/$b.ttl 2>/dev/null || rm -f $C/$b.ttl
+  [ -s $C/$b.rdf ] || cap bin/$A-sparkles query --data $C/$b.ofn --results rdfxml 'CONSTRUCT WHERE { ?s ?p ?o }' > $C/$b.rdf 2>/dev/null || rm -f $C/$b.rdf
+  files+=("$C/$b.ofn")
+  [ -s $C/$b.ttl ] && files+=("$C/$b.ttl")
+  [ -s $C/$b.rdf ] && files+=("$C/$b.rdf")
+done
+# malformed files: cut documents, large enough to parse in pieces
+head -c 5000000 data/chebi_lite.ofn > $C/cut.ofn
+head -c 5000000 data/chebi_lite.owl > $C/cut.owl
+head -c 5000000 $C/chebi_lite.ttl > $C/cut.ttl
+{ head -c 3000000 data/go.ofn; printf '\nSubClassOf(:A\n'; tail -c 3000000 data/go.ofn; } > $C/junk.ofn
+files+=("$C/cut.ofn" "$C/cut.owl" "$C/cut.ttl" "$C/junk.ofn")
+echo "inputs=${#files[@]}" >> $R
+# CLIEQ_SKIP: a results file of an earlier run whose inputs are done
+if [ -n "${CLIEQ_SKIP:-}" ]; then
+  done_files=$(grep '^SAME' "$CLIEQ_SKIP" | awk '{print $2}' | sort | uniq -c | awk '$1 == 4 {print $2}')
+  kept=()
+  for f in "${files[@]}"; do grep -qxF "$f" <<< "$done_files" || kept+=("$f"); done
+  echo "skipped=$(( ${#files[@]} - ${#kept[@]} )) from $CLIEQ_SKIP" >> $R
+  files=("${kept[@]}")
+fi
+export A B W
+printf '%s\n' "${files[@]}" | xargs -P ${CLIEQ_JOBS:-12} -I{} bash clieq-one.sh {} > $W.results
+grep -c . $W.results | sed 's/^/compared=/' >> $R
+grep DIFF $W.results >> $R
+echo "differing=$(grep -c DIFF $W.results)" >> $R
+echo "CLIEQ-DONE $(tail -1 $R)"

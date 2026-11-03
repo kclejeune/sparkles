@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# abtax.sh ROUNDS LABEL...: interleaved el_classify runs (--repeat 3) on the largest
+# ontologies at 1 and 8 threads; JSON lines with the label to abtax-<stamp>.jsonl
+set -uo pipefail
+cd ~/lanes/el-perf-649
+R=$1; shift
+OUT=abtax-$(date -u +%Y%m%dT%H%M%SZ).jsonl
+for r in $(seq 1 "$R"); do
+  for f in ore/ore_ont_868.owl ore/ore_ont_9674.owl ore/ore_ont_1559.owl ore/ore_ont_13482.owl chebi_lite.ofn go.ofn; do
+    for t in 8 1; do
+      for L in "$@"; do
+        j=$(bin/$L-el_classify --threads $t --repeat 3 data/$f 2>/dev/null)
+        echo "{\"label\":\"$L\",\"round\":$r,\"run\":$j}" >> $OUT
+      done
+    done
+  done
+done
+echo "ABTAX-DONE $OUT"

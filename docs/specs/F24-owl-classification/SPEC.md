@@ -99,7 +99,11 @@ reduction, by greedy minimization or, for a class with more than 32 direct super
 by marking the classes above each candidate. The subsumers, the equivalence classes and
 the direct superclasses are computed in parallel chunks from the saturated contexts
 alone, with the classes numbered in IRI order, so the taxonomy is the same for every
-number of threads.
+number of threads. The classes are gathered in parallel chunks and put in IRI order by a
+parallel sample sort, the nodes are numbered in one pass and filled in parallel chunks,
+and the lookup from a class to its node is a table in IRI order that a binary search
+reads, in place of a hash map. The IRIs are distinct, so every number of threads gives
+one order (roadmap item 646).
 
 `Saturation` keeps the contexts over axioms that the caller keeps, reads them in place
 on every run and takes the axioms added and removed since the last run. `Classifier`
@@ -166,6 +170,37 @@ that differ between the two. The threads are taken before that, so a run that ti
 while it waits for them leaves the kept state as it was. The kept state is dropped after
 a run whose estimated size passes one gigabyte, and it costs memory while the dataset is
 open, about 74 MB estimated for GO.
+
+**Files without a store.** `sparkles ontology classify FILE` and `sparkles ontology check
+FILE` read a file of one graph straight into memory as `OntologyFile`
+(`sparkles::handles::ontology::file`), with no store, and answer with the JSON, the
+taxonomy, the diagnostics and the excluded axioms that a store read of the loaded file
+gives (roadmap item 649). A file of triples in RDF/XML, Turtle, N-Triples or N3 is parsed
+on several threads. Turtle and N-Triples are cut as the loader cuts them, and an RDF/XML
+document whose root is `rdf:RDF` is cut between its top-level elements, each piece
+parsed with the prolog and the root's start tag. A document with an `rdf:ID` or anything
+the cut does not expect parses whole, and so does one with a piece that fails, so the
+triples and the errors are those of a sequential parse. The triples are deduplicated as
+a store's set is, the terminology is selected as an open ontology selects it, and the
+triples go to the reverse mapping in the order of a store's scans, with the blank node
+labels a store gives them. A functional-style document is parsed on several threads, cut
+at the starts of its axioms, and its axioms stay as written without a mapping to
+triples, but for the n-ary equivalences that the mapping writes as pairs. Its assertions
+become the triples a store would stream. The file path answers only when it reproduces
+the store's answer. A file that holds named graphs, a strict read of a functional-style
+document, a request for an earlier commit or for inferences, and a file that fails to
+parse go to the store path, which keeps reporting its errors. So do the triple files whose
+answers depend on a store's own blank node labels or scan order, and the functional-style
+documents whose triples the reverse mapping could read otherwise, such as one with an
+anonymous individual, an undeclared entity, an `ObjectInverseOf` or two annotations that
+the mapping writes as one triple. Library tests compare both paths on Turtle, RDF/XML and
+functional-style files and on every case that goes to the store, and the
+[file classification results](../../benchmarks/el-classification/RESULTS.md#file-classification)
+compare the command line's answers on GO, ChEBI lite and the ORE 2015 sample.
+`OntologyFile` holds the terminology, the assertions, the imports and the prefixes in
+memory, so the ROBOT-style commands of items 634 to 637 can read their input through it,
+and `read::Ontology::from_axioms` makes a command's output the next command's input
+without a file.
 
 **Writing the taxonomy.** A run with `target` writes the taxonomy to a named graph that it
 does not read, through the handle's edit, in one commit. It adds the taxonomy's axioms

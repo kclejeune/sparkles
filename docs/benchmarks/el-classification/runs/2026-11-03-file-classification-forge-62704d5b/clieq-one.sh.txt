@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# clieq-one.sh FILE: the comparisons of clieq.sh for one input, with A, B and W from the
+# environment; one line per comparison, DIFF or SAME
+set -uo pipefail
+f=$1
+cap() { timeout 900 systemd-run --user --scope -q -p MemoryMax=${CLIEQ_MEM:-6G} -p MemorySwapMax=0 -p OOMPolicy=continue "$@"; }
+strip='import json,sys
+def s(j):
+    if isinstance(j,dict): return {k:s(v) for k,v in j.items() if k!="stats"}
+    if isinstance(j,list): return [s(v) for v in j]
+    return j
+t=sys.stdin.read()
+try: print(json.dumps(s(json.loads(t)),sort_keys=True))
+except Exception: print(t)'
+k=$(echo "$f" | tr / _)
+for run in "ofn 1" "ofn 8" "json 8" "check 8"; do
+  set -- $run
+  for L in $A $B; do
+    o=$W/$k.$1.t$2.$L
+    if [ $1 = check ]; then
+      cap bin/$L-sparkles ontology check "$f" --format json > $o.raw 2> $o.err; echo "rc=$?" >> $o.err
+    else
+      cap bin/$L-sparkles ontology classify "$f" --format $1 --threads $2 --allow-unsatisfiable > $o.raw 2> $o.err; echo "rc=$?" >> $o.err
+    fi
+    if [ $1 = ofn ]; then mv $o.raw $o; else python3 -c "$strip" < $o.raw > $o; rm -f $o.raw; fi
+  done
+  if cmp -s $W/$k.$1.t$2.$A $W/$k.$1.t$2.$B && cmp -s $W/$k.$1.t$2.$A.err $W/$k.$1.t$2.$B.err; then
+    echo "SAME $f $1 t$2"; rm -f $W/$k.$1.t$2.$A $W/$k.$1.t$2.$A.err $W/$k.$1.t$2.$B $W/$k.$1.t$2.$B.err
+  else
+    echo "DIFF $f $1 t$2"
+  fi
+done
