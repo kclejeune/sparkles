@@ -88,6 +88,19 @@ Ontology(<http://ex.org/el>
   Declaration(Class(:Course))
   Declaration(ObjectProperty(:teaches))
   Declaration(AnnotationProperty(:note))
+  Declaration(Class(:Teacher))
+  Declaration(Class(:Rock))
+  Declaration(ObjectProperty(:taughtBy))
+  Declaration(DataProperty(:hours))
+  Declaration(NamedIndividual(:earth))
+  Declaration(NamedIndividual(:ann))
+  Declaration(NamedIndividual(:anne))
+  Declaration(NamedIndividual(:bob))
+  Declaration(NamedIndividual(:robert))
+  Declaration(NamedIndividual(:bobby))
+  Declaration(NamedIndividual(:logic))
+  Declaration(NamedIndividual(:stone))
+  Declaration(NamedIndividual(:pebble))
   TransitiveObjectProperty(:partOf)
   SubClassOf(:Professor ObjectSomeValuesFrom(:teaches :Course))
   EquivalentClasses(:Teacher ObjectSomeValuesFrom(:teaches :Course))
@@ -97,7 +110,6 @@ Ontology(<http://ex.org/el>
   SubClassOf(:Course DataHasValue(:hours \"3\"^^xsd:integer))
   InverseObjectProperties(:teaches :taughtBy)
   AnnotationAssertion(:note :Professor \"kept\")
-  AnnotationAssertion(:other :Professor \"streamed\")
   AnnotationAssertion(rdfs:label :Professor \"professor\")
   ClassAssertion(:Professor :ann)
   ClassAssertion(:Professor :ann)
@@ -111,6 +123,8 @@ Ontology(<http://ex.org/el>
   NegativeObjectPropertyAssertion(:teaches :bob :logic)
   ObjectPropertyAssertion(ObjectInverseOf(:taughtBy) :logic :bob)
   SameIndividual(:bob :robert :bobby)
+  SameIndividual(Annotation(rdfs:comment \"three\") :ann :anne :robert)
+  EquivalentClasses(:Rock :Teacher :Course)
   ClassAssertion(:Rock :pebble)
 )
 ";
@@ -201,6 +215,12 @@ fn timeless(mut j: J) -> J {
 }
 
 fn compare(name: &str, text: &str) {
+    compare_or_refuse(name, text, false)
+}
+
+/// Compare the answers of the file and the store, or, with `refused`, check that the
+/// file path leaves every read of the file to the store.
+fn compare_or_refuse(name: &str, text: &str, refused: bool) {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join(name);
     std::fs::write(&path, text).unwrap();
@@ -235,6 +255,10 @@ fn compare(name: &str, text: &str) {
                 ..Default::default()
             };
             let file = OntologyFile::read(&path, &req, 4).unwrap();
+            if refused {
+                assert!(file.is_none(), "{name} {mode:?} is read");
+                continue;
+            }
             let Some(file) = file else {
                 assert!(
                     name.ends_with(".ofn") && mode == Mode::Strict,
@@ -289,25 +313,31 @@ fn a_functional_style_file_answers_as_a_loaded_one() {
 }
 
 #[test]
-fn a_functional_style_file_keeps_its_axioms_as_written() {
+fn a_functional_style_file_reads_as_its_triples_do() {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("nary.ofn");
     std::fs::write(
         &path,
-        "Prefix(:=<http://ex.org/>)\nOntology(\n EquivalentClasses(:A :B :C)\n SubClassOf(:C :D)\n)\n",
+        "Prefix(:=<http://ex.org/>)\nOntology(\n Declaration(Class(:A))\n Declaration(Class(:B))\n Declaration(Class(:C))\n Declaration(Class(:D))\n EquivalentClasses(:A :B :C)\n SubClassOf(:C :D)\n)\n",
     )
     .unwrap();
     let file = OntologyFile::read(&path, &OntologyRequest::default(), 2)
         .unwrap()
         .unwrap();
-    let axioms: Vec<String> = file
+    let mut axioms: Vec<String> = file
         .ontology
         .axiom_set()
+        .filter(|a| !matches!(a.kind, sparkles::owl::AxiomKind::Declaration(_)))
         .map(|a| file.renderer().axiom(a))
         .collect();
+    axioms.sort();
     assert_eq!(
         axioms,
-        ["SubClassOf(:C :D)", "EquivalentClasses(:A :B :C)"],
+        [
+            "EquivalentClasses(:A :B)",
+            "EquivalentClasses(:B :C)",
+            "SubClassOf(:C :D)"
+        ],
         "{axioms:?}"
     );
     let out = file
@@ -358,4 +388,59 @@ fn what_the_store_reads_is_left_to_it() {
             .unwrap()
             .is_none()
     );
+}
+
+const OFN_HEAD: &str = "Prefix(:=<http://ex.org/>)\nPrefix(xsd:=<http://www.w3.org/2001/XMLSchema#>)\nOntology(<http://ex.org/o>\n";
+
+#[test]
+fn an_equivalence_of_named_classes_splits_as_its_triples_do() {
+    // the pairs keep the inconsistency of A and B, where a whole axiom with an operand
+    // outside OWL 2 EL would be left out
+    let text = format!(
+        "{OFN_HEAD} Declaration(Class(:A))\n Declaration(Class(:B))\n Declaration(Class(:C))\n Declaration(NamedIndividual(:i))\n EquivalentClasses(:A :B :C)\n SubClassOf(:B owl:Nothing)\n ClassAssertion(:A :i)\n)\n"
+    );
+    compare("pairs.ofn", &text);
+}
+
+#[test]
+fn what_the_triples_could_read_otherwise_is_left_to_the_store() {
+    let declared = " Declaration(Class(:A))\n Declaration(Class(:B))\n Declaration(Class(:C))\n Declaration(Class(:D))\n Declaration(NamedIndividual(:i))\n Declaration(NamedIndividual(:x))\n";
+    let cases = [
+        // an equivalence of three with a union, which the pairs of its triples keep in part
+        format!(
+            "{OFN_HEAD}{declared} EquivalentClasses(:A :B ObjectUnionOf(:C :D))\n SubClassOf(:B owl:Nothing)\n ClassAssertion(:A :i)\n)\n"
+        ),
+        // an undeclared data property, whose domain triple maps to no axiom
+        format!(
+            "{OFN_HEAD}{declared} DataPropertyDomain(:p :D)\n DataPropertyAssertion(:p :i \"x\")\n)\n"
+        ),
+        // an undeclared property of an assertion about a class
+        format!("{OFN_HEAD}{declared} SubClassOf(:A :B)\n ObjectPropertyAssertion(:p :A :x)\n)\n"),
+        // an undeclared annotation property, and an assertion about the ontology
+        format!("{OFN_HEAD}{declared} AnnotationAssertion(:other :A \"streamed\")\n)\n"),
+        format!(
+            "{OFN_HEAD}{declared} Declaration(AnnotationProperty(:note))\n AnnotationAssertion(:note <http://ex.org/o> \"about\")\n)\n"
+        ),
+        // a property declared as two kinds
+        format!(
+            "{OFN_HEAD}{declared} Declaration(ObjectProperty(:p))\n Declaration(DataProperty(:p))\n SubClassOf(:A ObjectSomeValuesFrom(:p :B))\n)\n"
+        ),
+        // an equivalence that the set of operands makes one class
+        format!("{OFN_HEAD}{declared} EquivalentClasses(:A :A)\n)\n"),
+    ];
+    for (i, c) in cases.iter().enumerate() {
+        compare_or_refuse(&format!("case{i}.ofn"), c, true);
+    }
+    let ttl = [
+        // a reified axiom with two sources
+        "@prefix : <http://ex.org/> .\n@prefix owl: <http://www.w3.org/2002/07/owl#> .\n@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n:p a owl:ObjectProperty .\n:x :p :z .\n:y :p :z .\n[] a owl:Axiom ; owl:annotatedSource :y, :x ; owl:annotatedProperty :p ; owl:annotatedTarget :z ; rdfs:comment \"two\" .\n",
+        // two imports that are literals, and an import that is a blank node
+        "@prefix : <http://ex.org/> .\n@prefix owl: <http://www.w3.org/2002/07/owl#> .\n:a a owl:Ontology ; owl:imports \"x\" .\n:b owl:imports \"x\" .\n",
+        "@prefix : <http://ex.org/> .\n@prefix owl: <http://www.w3.org/2002/07/owl#> .\n:a a owl:Ontology ; owl:imports _:i .\n:b owl:imports _:i .\n",
+        // a composite literal that names a blank node
+        "@prefix : <http://ex.org/> .\n_:s :p \"[_:s]\"^^<http://w3id.org/awslabs/neptune/SPARQL-CDTs/List> .\n",
+    ];
+    for (i, c) in ttl.iter().enumerate() {
+        compare_or_refuse(&format!("case{i}.ttl"), c, true);
+    }
 }

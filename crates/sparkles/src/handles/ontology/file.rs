@@ -121,7 +121,9 @@ impl OntologyFile {
                     .iter()
                     .map(|i| i.as_str().to_string())
                     .collect();
-                let (ontology, assertions) = from_document(doc, req.mode);
+                let Some((ontology, assertions)) = from_document(doc, req.mode) else {
+                    return Ok(None);
+                };
                 OntologyFile::new(
                     name,
                     src.format,
@@ -136,9 +138,24 @@ impl OntologyFile {
                 let Ok((triples, prefixes)) = crate::io::parse_triples(&src, threads) else {
                     return Ok(None);
                 };
+                // the store's labels for blank nodes in triple terms and composite
+                // literals, and its warnings for imports that are not IRIs, which name
+                // its labels, are left to it
+                let nested = |t: &Term| match t {
+                    Term::Triple(_) => true,
+                    Term::Literal(l) => crate::sparql::cdt::may_name_bnodes(l),
+                    _ => false,
+                };
+                if triples.par_iter().any(|t| nested(&t.object)) {
+                    return Ok(None);
+                }
                 let triples = distinct(triples, threads);
-                let imports = imports_of(&triples);
-                let (ontology, assertions) = from_triples(triples, req.mode, threads);
+                let Some(imports) = imports_of(&triples) else {
+                    return Ok(None);
+                };
+                let Some((ontology, assertions)) = from_triples(triples, req.mode, threads) else {
+                    return Ok(None);
+                };
                 OntologyFile::new(
                     name, src.format, ontology, assertions, prefixes, imports, req,
                 )?
@@ -343,11 +360,12 @@ fn distinct(triples: Vec<Triple>, threads: usize) -> Vec<Triple> {
         .collect()
 }
 
-/// The `owl:imports` IRIs of the triples, sorted, and the warnings for the objects that
-/// are not IRIs, as the store's resolution of the default graph's imports gives them.
-fn imports_of(triples: &[Triple]) -> (Vec<String>, Vec<String>) {
+/// The `owl:imports` IRIs of the triples, sorted, and the store's warning for one import
+/// that is a literal, or `None` when imports that are not IRIs need the store's labels or
+/// order: a blank node, or more than one literal.
+fn imports_of(triples: &[Triple]) -> Option<(Vec<String>, Vec<String>)> {
     let mut iris = BTreeSet::new();
-    let mut other = BTreeSet::new();
+    let mut warnings = Vec::new();
     for t in triples {
         if t.predicate.as_str() != vocab::OWL_IMPORTS {
             continue;
@@ -356,21 +374,24 @@ fn imports_of(triples: &[Triple]) -> (Vec<String>, Vec<String>) {
             Term::NamedNode(n) => {
                 iris.insert(n.as_str().to_string());
             }
-            o => {
-                other.insert(o.to_string());
+            Term::Literal(l) if warnings.is_empty() => {
+                warnings.push(format!("owl:imports {l} is not an IRI and was ignored"))
             }
+            _ => return None,
         }
     }
-    let warnings = other
-        .into_iter()
-        .map(|t| format!("owl:imports {t} is not an IRI and was ignored"))
-        .collect();
-    (iris.into_iter().collect(), warnings)
+    Some((iris.into_iter().collect(), warnings))
 }
 
 /// The terminology of a file's triples and its other triples, the assertions, selected
-/// as an open ontology selects them from a store.
-fn from_triples(triples: Vec<Triple>, mode: Mode, threads: usize) -> (read::Ontology, Vec<Triple>) {
+/// as an open ontology selects them from a store, or `None` when a reified axiom names
+/// two sources, properties or targets, of which the store's read takes the one its scan
+/// meets last.
+fn from_triples(
+    triples: Vec<Triple>,
+    mode: Mode,
+    threads: usize,
+) -> Option<(read::Ontology, Vec<Triple>)> {
     let structural: FxHashSet<&str> = vocab::STRUCTURAL_PREDICATES
         .iter()
         .chain(vocab::FACETS.iter())
@@ -444,7 +465,11 @@ fn from_triples(triples: Vec<Triple>, mode: Mode, threads: usize) -> (read::Onto
             vocab::OWL_ANNOTATED_TARGET => 2,
             _ => continue,
         };
-        parts.entry(&t.subject).or_default()[slot] = Some(&t.object);
+        let part = &mut parts.entry(&t.subject).or_default()[slot];
+        if part.is_some_and(|o| o != &t.object) {
+            return None;
+        }
+        *part = Some(&t.object);
     }
     let mains: FxHashSet<(&Term, &str, &Term)> = parts
         .values()
@@ -582,7 +607,7 @@ fn from_triples(triples: Vec<Triple>, mode: Mode, threads: usize) -> (read::Onto
             max_diagnostics: 0,
         },
     );
-    (o, assertions)
+    Some((o, assertions))
 }
 
 /// The order of a store's ids, for the order of its scans: inline literals by their
@@ -650,11 +675,15 @@ impl StoreOrder {
 }
 
 /// The terminology of a functional-style document and the assertions a store would
-/// stream, each once.
+/// stream, each once, or `None` when the reverse mapping of the document's triples could
+/// read them otherwise (see [`round_trips`]).
 fn from_document(
     doc: sparkles_owl::ofn_read::Document,
     mode: Mode,
-) -> (read::Ontology, Vec<Triple>) {
+) -> Option<(read::Ontology, Vec<Triple>)> {
+    if !round_trips(&doc) {
+        return None;
+    }
     let declared: FxHashSet<String> = doc
         .axioms
         .iter()
@@ -672,8 +701,23 @@ fn from_document(
         if streamed(&ax, &declared) {
             assertions.extend(sparkles_owl::write::axiom_triples(&ax, &mut fresh));
         } else {
-            terminology.push(ax);
+            pairwise(ax, &mut terminology);
         }
+    }
+    // the main triple of an annotated assertion is read with the terminology, and the
+    // store streams it no more
+    let mains: FxHashSet<Triple> = terminology
+        .iter()
+        .filter(|a| !a.annotations.is_empty())
+        .filter_map(|a| {
+            let plain = Axiom::from(a.kind.clone());
+            streamed(&plain, &declared)
+                .then(|| sparkles_owl::write::axiom_triples(&plain, &mut fresh))
+        })
+        .flatten()
+        .collect();
+    if !mains.is_empty() {
+        assertions.retain(|t| !mains.contains(t));
     }
     // the store's set of triples, in the order it scans them
     let order = StoreOrder::new(&assertions);
@@ -685,10 +729,129 @@ fn from_document(
         )
     });
     assertions.dedup();
-    (
+    Some((
         read::Ontology::from_axioms(doc.header, terminology, mode),
         assertions,
-    )
+    ))
+}
+
+/// Whether the reverse mapping of a functional-style document's triples gives its
+/// axioms back as they are written, but for the n-ary axioms that [`pairwise`] splits.
+/// That needs every entity declared with the kind its position gives it, by a
+/// declaration or one that Table 6 of the mapping implies, or built in, no
+/// IRI declared both as two kinds of property or as a class and a datatype, no entity of
+/// the reserved vocabulary that is not built in, no mention of the ontology's IRI or
+/// version IRI in an axiom, and every n-ary axiom with at least two operands, an
+/// equivalence of three or more with named operands only.
+fn round_trips(doc: &sparkles_owl::ofn_read::Document) -> bool {
+    use sparkles_owl::{EntityKind, ObjectPropertyExpression as Ope};
+    let bit = |k: EntityKind| 1u8 << (k as u8);
+    let mut kinds: FxHashMap<&str, u8> = FxHashMap::default();
+    for a in &doc.axioms {
+        match &a.kind {
+            AxiomKind::Declaration(e) => {
+                *kinds.entry(e.iri().as_str()).or_default() |= bit(e.kind());
+            }
+            // the declarations that Table 6 of the mapping implies
+            AxiomKind::TransitiveObjectProperty(Ope::Property(p))
+            | AxiomKind::SymmetricObjectProperty(Ope::Property(p))
+            | AxiomKind::InverseFunctionalObjectProperty(Ope::Property(p)) => {
+                *kinds.entry(p.as_str()).or_default() |= bit(EntityKind::ObjectProperty);
+            }
+            _ => {}
+        }
+    }
+    let properties = bit(EntityKind::ObjectProperty)
+        | bit(EntityKind::DataProperty)
+        | bit(EntityKind::AnnotationProperty);
+    let class_datatype = bit(EntityKind::Class) | bit(EntityKind::Datatype);
+    let ambiguous = kinds
+        .values()
+        .any(|&k| (k & properties).count_ones() > 1 || k & class_datatype == class_datatype);
+    if ambiguous {
+        return false;
+    }
+    let header: Vec<&str> = [&doc.header.iri, &doc.header.version_iri]
+        .into_iter()
+        .flatten()
+        .map(|i| i.as_str())
+        .collect();
+    let operands = |k: &AxiomKind| -> bool {
+        match k {
+            AxiomKind::EquivalentClasses(cs) => {
+                cs.len() == 2
+                    || cs.len() > 2 && cs.iter().all(|c| matches!(c, ClassExpression::Class(_)))
+            }
+            AxiomKind::EquivalentObjectProperties(ps) => {
+                ps.len() == 2 || ps.len() > 2 && ps.iter().all(|p| matches!(p, Ope::Property(_)))
+            }
+            AxiomKind::EquivalentDataProperties(ps) => ps.len() >= 2,
+            AxiomKind::SameIndividual(is) | AxiomKind::DifferentIndividuals(is) => is.len() >= 2,
+            AxiomKind::DisjointClasses(cs) => cs.len() >= 2,
+            AxiomKind::DisjointUnion(_, cs) => cs.len() >= 2,
+            AxiomKind::DisjointObjectProperties(ps) => ps.len() >= 2,
+            AxiomKind::DisjointDataProperties(ps) => ps.len() >= 2,
+            _ => true,
+        }
+    };
+    doc.axioms.par_iter().with_min_len(4096).all(|a| {
+        operands(&a.kind)
+            && !header.iter().any(|i| a.mentions(i))
+            && a.signature().iter().all(|e| {
+                let iri = e.iri().as_str();
+                match read::builtin_kind(iri) {
+                    Some(k) => k == e.kind(),
+                    None => {
+                        !vocab::is_reserved(iri)
+                            && kinds.get(iri).is_some_and(|&k| k & bit(e.kind()) != 0)
+                    }
+                }
+            })
+    })
+}
+
+/// Add the axiom to `out` as the reverse mapping reads its triples back: an equivalence
+/// or an annotated `SameIndividual` of three or more operands as one axiom for each two
+/// operands next to each other in its order, which the mapping writes as one triple.
+fn pairwise(ax: Axiom, out: &mut Vec<Axiom>) {
+    use std::collections::BTreeSet;
+    fn pairs<T: Ord + Clone>(xs: &BTreeSet<T>) -> Option<Vec<BTreeSet<T>>> {
+        if xs.len() <= 2 {
+            return None;
+        }
+        let v: Vec<&T> = xs.iter().collect();
+        Some(
+            v.windows(2)
+                .map(|w| [w[0].clone(), w[1].clone()].into())
+                .collect(),
+        )
+    }
+    let split: Option<Vec<AxiomKind>> = match &ax.kind {
+        AxiomKind::EquivalentClasses(cs) => {
+            pairs(cs).map(|ps| ps.into_iter().map(AxiomKind::EquivalentClasses).collect())
+        }
+        AxiomKind::EquivalentObjectProperties(ps) => pairs(ps).map(|ps| {
+            ps.into_iter()
+                .map(AxiomKind::EquivalentObjectProperties)
+                .collect()
+        }),
+        AxiomKind::EquivalentDataProperties(ps) => pairs(ps).map(|ps| {
+            ps.into_iter()
+                .map(AxiomKind::EquivalentDataProperties)
+                .collect()
+        }),
+        AxiomKind::SameIndividual(is) => {
+            pairs(is).map(|ps| ps.into_iter().map(AxiomKind::SameIndividual).collect())
+        }
+        _ => None,
+    };
+    match split {
+        Some(kinds) => out.extend(kinds.into_iter().map(|kind| Axiom {
+            kind,
+            annotations: ax.annotations.clone(),
+        })),
+        None => out.push(ax),
+    }
 }
 
 /// Whether a store that loaded the axiom streams it as an assertion: its triple is not
