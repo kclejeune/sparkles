@@ -1257,9 +1257,10 @@ changed record identities and answer the authenticated assessments in the propos
 graphs the caller can read whose `ev:target` or `prov:used` names one of them, each once
 at its smallest depth with how it depends on its record. With `transitive` the
 assessments that depend on a dependent are found too. A graph the caller cannot read is
-not searched, and in the caller's view a record with hidden triples does not
-authenticate, so nothing hidden is reported. More than 10,000 candidates answer
-`incomplete-evidence`. `Changed::identities` gathers the changed identities of an
+not searched. Authentication reads only a record's receipt and protection, so an
+assessment any of whose triples the caller's view hides is neither reported nor
+followed, and nothing hidden is reported. More than 10,000 target and input triples in
+the caller's view answer `incomplete-evidence`. `Changed::identities` gathers the changed identities of an
 operation's `changed`: the ended supports, and for a new map revision the revision it
 follows and the decisions whose effect ended. Withdrawn claims and superseded decisions
 are in the operation's own result. The answer marks nothing stale and decides nothing
@@ -1274,9 +1275,9 @@ about the assessments. F22's maintained analyses, roadmap item 340, consume it.
 3. **Find, not mark.** Dependents are an answer computed from authenticated records, not
    stored staleness, so a reversal that restores an earlier state needs no cleanup.
    Whether a dependent is stale belongs to the F22 analysis that consumes it.
-4. **Caller-scoped search.** Only readable proposal graphs are searched, and masked
-   records do not authenticate, which follows the claims rule that a hidden record
-   answers as a missing one.
+4. **Caller-scoped search.** Only readable proposal graphs are searched, and a masked
+   assessment is left out, which follows the claims rule that a hidden record answers
+   as a missing one.
 
 The rest of Phase 3 is planned as separate roadmap items. Recall and Ask citations of
 reviewed claims under their review state, identity resolution and access are

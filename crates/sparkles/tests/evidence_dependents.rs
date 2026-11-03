@@ -289,7 +289,10 @@ fn a_withdrawn_claim_finds_its_assessments() {
         (evaluates.clone(), c.0.clone(), Dependence::Target, 0),
         (uses.clone(), c.0.clone(), Dependence::Used, 0),
     ]);
-    assert_eq!(dependents(&ds, &[c.0.clone()], false, all()), expected);
+    assert_eq!(
+        dependents(&ds, std::slice::from_ref(&c.0), false, all()),
+        expected
+    );
 }
 
 /// An ended support and a superseded map revision are among an operation's changed
@@ -380,14 +383,14 @@ fn transitive_dependents_are_found_at_their_smallest_depth() {
     // the third evaluates the second and also used the claim directly
     let third = assess(&ds, "third", &second, &[&c.0]);
     assert_eq!(
-        dependents(&ds, &[c.0.clone()], false, all()),
+        dependents(&ds, std::slice::from_ref(&c.0), false, all()),
         sorted(vec![
             (first.clone(), c.0.clone(), Dependence::Target, 0),
             (third.clone(), c.0.clone(), Dependence::Used, 0),
         ])
     );
     assert_eq!(
-        dependents(&ds, &[c.0.clone()], true, all()),
+        dependents(&ds, std::slice::from_ref(&c.0), true, all()),
         sorted(vec![
             (first.clone(), c.0.clone(), Dependence::Target, 0),
             (third.clone(), c.0.clone(), Dependence::Used, 0),
@@ -408,10 +411,13 @@ fn unreadable_graphs_are_not_searched() {
         Graphs::All,
     )));
     assert_eq!(
-        dependents(&ds, &[c.0.clone()], true, limited),
+        dependents(&ds, std::slice::from_ref(&c.0), true, limited),
         vec![(visible, c.0.clone(), Dependence::Target, 0)]
     );
-    assert_eq!(dependents(&ds, &[c.0.clone()], false, all()).len(), 2);
+    assert_eq!(
+        dependents(&ds, std::slice::from_ref(&c.0), false, all()).len(),
+        2
+    );
 }
 
 /// Inputs name existing authenticated records of the allowed kinds, each once.
@@ -499,7 +505,7 @@ fn batch_local_inputs_resolve_in_order() {
     let a = record(&p, "first").0;
     let b = record(&p, "second").0;
     assert_eq!(
-        dependents(&ds, &[a.clone()], false, all()),
+        dependents(&ds, std::slice::from_ref(&a), false, all()),
         vec![(b, a, Dependence::Used, 0)]
     );
     let mut x = assessment("x", &c.0, vec![RecordRef::Local(key("y"))]);
@@ -517,4 +523,55 @@ fn batch_local_inputs_resolve_in_order() {
     )
     .unwrap_err();
     assert_eq!(e.code(), "invalid", "{e:?}");
+}
+
+/// A caller whose view hides `predicate` in the analyses graph.
+fn masking(predicate: &str) -> Option<Arc<GraphAccess>> {
+    use sparkles::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+    Some(Arc::new(GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::All,
+        TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(Protection {
+                    name: "masked".into(),
+                    predicates: Some(vec![predicate.to_string()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: Some(Graphs::Only(GraphRule::new([ANALYSES], &[]))),
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Caller::default(),
+            limits: Limits::default(),
+        },
+    )))
+}
+
+/// An assessment whose triples the caller's view partly hides is neither reported nor
+/// followed, whichever of its triples is hidden.
+#[test]
+fn masked_assessments_are_neither_reported_nor_followed() {
+    let ds = configured();
+    let c = claim(&ds, "advisory");
+    let visible = assess_in(&ds, CLAIMS, "visible", &c.0, &[]);
+    let masked = assess(&ds, "masked", &c.0, &[]);
+    let after = assess_in(&ds, CLAIMS, "after", &masked, &[]);
+    let full = dependents(&ds, std::slice::from_ref(&c.0), true, all());
+    assert!(full.contains(&(after.clone(), masked.clone(), Dependence::Target, 1)));
+    for predicate in [
+        "urn:x-sparkles:evidence:conclusion".to_string(),
+        "urn:x-sparkles:evidence:availabilityReceipt".to_string(),
+        "urn:x-sparkles:evidence:target".to_string(),
+    ] {
+        assert_eq!(
+            dependents(&ds, std::slice::from_ref(&c.0), true, masking(&predicate)),
+            vec![(visible.clone(), c.0.clone(), Dependence::Target, 0)],
+            "{predicate}"
+        );
+    }
 }

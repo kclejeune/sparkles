@@ -67,9 +67,10 @@ pub struct Dependents {
 /// depend on any of `changed`, at the head of `logical`, which is `main` or one of its
 /// branches. With `transitive`, assessments that depend on a dependent are found too.
 /// `access` is what the caller may read there, `None` for everything. A graph the
-/// caller cannot read is not searched, and a record whose triples it cannot see is not
-/// reported, so the answer discloses nothing hidden. Each dependent is reported once,
-/// at its smallest depth, sorted by depth and IRI.
+/// caller cannot read is not searched, and a record any of whose triples it cannot see
+/// is neither reported nor followed, so the answer discloses nothing hidden. The bound
+/// counts only the target and input triples the caller's view shows. Each dependent is
+/// reported once, at its smallest depth, sorted by depth and IRI.
 ///
 /// Refusals: invalid input, `unsupported-profile` when the profile is not enabled, and
 /// `incomplete-evidence` when more than [`MAX_EVIDENCE`] candidates would be read.
@@ -113,10 +114,13 @@ pub fn dependents(
     let head = logical.store().snapshot();
     let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
     let view = caller_view(access.as_ref(), &head, &preparation)?;
-    let snap = view.as_ref().map_or(&*head, |v| v.snapshot());
+    // Records authenticate at the unmasked head, and a record the caller's view hides any
+    // triple of is left out, since authentication reads only its receipt and protection.
     let mut state = State {
-        reads: Reads::new(&preparation, snap),
-        seen: None,
+        reads: Reads::new(&preparation, &head),
+        seen: view
+            .as_ref()
+            .map(|v| Reads::new(&preparation, v.snapshot())),
         claim_graphs: Vec::new(),
         superseded: BTreeSet::new(),
         withdrawn: BTreeSet::new(),
@@ -132,13 +136,22 @@ pub fn dependents(
                 (super::ev("target"), Dependence::Target),
                 (PROV_USED.to_string(), Dependence::Used),
             ] {
-                let (candidates, more) = state.candidates(&p, &Term::NamedNode(on.clone()), g)?;
+                // Candidates come from the caller's view, so the bound counts only triples
+                // the caller can read.
+                let o = Term::NamedNode(on.clone());
+                let (candidates, more) = match state.seen.as_mut() {
+                    Some(seen) => seen.subjects_up_to(&p, &o, g.0.as_str(), MAX_EVIDENCE)?,
+                    None => state.candidates(&p, &o, g)?,
+                };
                 read += candidates.len();
                 if more || read > MAX_EVIDENCE {
                     return Err(super::incomplete("the dependents of the changed records"));
                 }
                 for a in candidates {
-                    if found.contains_key(&a) || !state.typed(&a, g, RecordKind::Assessment)? {
+                    if found.contains_key(&a)
+                        || state.masked(&a, &g.0)?
+                        || !state.typed(&a, g, RecordKind::Assessment)?
+                    {
                         continue;
                     }
                     found.insert(

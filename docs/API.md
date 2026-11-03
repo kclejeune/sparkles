@@ -12899,7 +12899,7 @@ graph, on, dependence, depth}`, where `on` is the changed record or, for a trans
 dependent, the assessment it depends on, `dependence` is `target` or `used`, and `depth`
 is 0 for a direct dependent. Each assessment is reported once, at its smallest depth,
 sorted by depth and IRI. Only the proposal graphs the caller can read are searched, and a
-record whose triples the caller's view hides does not authenticate and is not reported.
+record any of whose triples the caller's view hides is neither reported nor followed.
 
 | Status and code | Meaning |
 |---|---|
