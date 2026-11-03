@@ -112,11 +112,12 @@ pub(super) fn map_batch<T: Send>(
     let rest = n - sample;
     let mut out = Vec::with_capacity(n);
     ctx.check()?;
-    let t0 = Instant::now();
+    // Only a batch whose rest may go to the pool is timed. A small one, such as the few
+    // rows of an aggregate's BIND, would pay a clock read for nothing.
+    let may_split = par && rest >= 2 * BATCH_PAR_PIECE && rayon::current_num_threads() > 1;
+    let t0 = may_split.then(Instant::now);
     out.extend((0..sample).map(&f));
-    if par
-        && rest >= 2 * BATCH_PAR_PIECE
-        && rayon::current_num_threads() > 1
+    if let Some(t0) = t0
         && t0.elapsed().as_nanos() * rest as u128 >= BATCH_PAR_NANOS * sample as u128
     {
         // Each piece of the rest is its own vector until it is appended to `out`, which
@@ -6453,6 +6454,9 @@ fn key_rows_charged(
     let map = t.var_map(ctx.nvars());
     let mut bytes = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
     let mut charge = ctx.retained_charge(bytes)?;
+    // Each payload is admitted before the column keeps it, with the charge a step ahead,
+    // so that short strings take a charge once per step rather than once per row.
+    let step = ctx.reservation_step();
     let mut values = Vec::with_capacity(t.len());
     for i in 0..t.len() {
         if i.is_multiple_of(1024) {
@@ -6476,7 +6480,7 @@ fn key_rows_charged(
         };
         bytes = bytes.saturating_add(key_payload(&value));
         if let Some(charge) = &mut charge {
-            charge.resize(bytes)?;
+            charge.cover(bytes, step)?;
         }
         values.push(value);
     }
@@ -6611,7 +6615,12 @@ fn order_by_rows(
     }
     ctx.check()?;
     ctx.check_output(idx.len(), t.width())?;
-    Ok(t.take_rows(&idx))
+    let sorted = t.take_rows(&idx);
+    // A large key column's decoded values are freed on the pool, not on this thread.
+    key_vals
+        .into_iter()
+        .for_each(super::exprcache::Column::drop_in_parallel);
+    Ok(sorted)
 }
 
 fn distinct(t: Table) -> Table {

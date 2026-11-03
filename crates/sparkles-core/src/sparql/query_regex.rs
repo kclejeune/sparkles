@@ -178,6 +178,13 @@ struct Entry {
 impl RegexCache {
     pub(super) fn clear(&self) {
         let _insert = self.insert.lock();
+        // Every query clears its cache when it is shared and when its work ends, and
+        // most queries never compile a pattern. Replacing the map pays the debts of every
+        // thread that ever read one, about a thousand instructions, so an empty map stays.
+        // Inserts take the same lock, so none can land between the check and the store.
+        if self.entries.load().is_empty() {
+            return;
+        }
         self.entries.store(Arc::default());
     }
 
@@ -865,5 +872,25 @@ mod tests {
         let mut after: Vec<usize> = slots(&state).into_iter().map(Option::unwrap).collect();
         after.sort_unstable();
         assert_eq!(after, expected);
+    }
+
+    /// Clearing a cache that holds no pattern keeps its map, which every query does twice,
+    /// and clearing one that holds a pattern gives the map and its charge back.
+    #[test]
+    fn clearing_an_empty_cache_keeps_its_map() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let ctx = Arc::new(Ctx::new(store.snapshot()));
+        ctx.attach_owner();
+        let cache = RegexCache::default();
+        let empty = cache.entries.load_full();
+        cache.clear();
+        assert!(Arc::ptr_eq(&empty, &cache.entries.load_full()));
+        let before = ctx.live_bytes();
+        assert!(cache.get(&ctx, "^kept-[a-z]+$", "").unwrap().is_some());
+        assert!(ctx.live_bytes() > before);
+        cache.clear();
+        assert!(cache.entries.load().is_empty());
+        assert!(!Arc::ptr_eq(&empty, &cache.entries.load_full()));
+        assert_eq!(ctx.live_bytes(), before);
     }
 }
