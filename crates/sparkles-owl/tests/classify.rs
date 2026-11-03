@@ -9,6 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Whether a concept is unsatisfiable, and its subsumers, in the naive completion.
+type Subsumers = (bool, BTreeSet<usize>);
+
 fn c(s: &str) -> Class {
     Class::new(format!("http://ex.org/{s}"))
 }
@@ -484,7 +487,7 @@ fn the_top_and_bottom_properties() {
     ]);
     let out = k.classify(&Limits::default()).unwrap();
     assert!(out.taxonomy.is_subclass(&c("A"), &c("C")));
-    assert!(out.taxonomy.is_subclass(&c("C"), &c("A")) == false);
+    assert!(!out.taxonomy.is_subclass(&c("C"), &c("A")));
     assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
     // a reflexive bottom property relates every element to itself, which it cannot
     let out = run(&[ax(AxiomKind::ReflexiveObjectProperty(bottom.clone()))]);
@@ -1232,7 +1235,7 @@ impl Naive {
     /// The subsumers of every basic concept in the world of each named class, and of
     /// owl:Thing in the world where only it and the individuals have instances. A world
     /// is inconsistent when a concept with an instance there has ⊥.
-    fn complete(mut self) -> (BTreeMap<String, usize>, Vec<(bool, BTreeSet<usize>)>) {
+    fn complete(mut self) -> (BTreeMap<String, usize>, Vec<Subsumers>) {
         let (sup, reflexive) = self.prepare();
         let names = self.names.clone();
         let mut out = vec![(false, BTreeSet::new()); self.n];
