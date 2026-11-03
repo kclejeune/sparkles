@@ -7261,6 +7261,90 @@
         ],
         "type": "object"
       },
+      "EvidenceDependents": {
+        "additionalProperties": false,
+        "description": "Changed evidence records whose dependent assessments to find.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-dependents"
+        },
+        "properties": {
+          "changed": {
+            "description": "The record identities that changed, such as a withdrawn claim, an ended support or the revision a new map revision follows.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "type": "array"
+          },
+          "transitive": {
+            "description": "Also find the assessments that depend on a dependent. Defaults to `false`.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "changed"
+        ],
+        "type": "object"
+      },
+      "EvidenceDependentsResult": {
+        "additionalProperties": false,
+        "description": "The assessments that depend on the changed records, each once at its smallest depth.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-dependents"
+        },
+        "properties": {
+          "commit": {
+            "description": "The commit the records were read at.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "dependents": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "assessment": {
+                  "description": "An authenticated assessment.",
+                  "type": "string"
+                },
+                "dependence": {
+                  "enum": [
+                    "target",
+                    "used"
+                  ],
+                  "type": "string"
+                },
+                "depth": {
+                  "description": "How many assessments lie between it and a changed record, 0 for a direct dependent.",
+                  "type": "integer"
+                },
+                "graph": {
+                  "description": "Its proposal graph.",
+                  "type": "string"
+                },
+                "on": {
+                  "description": "The changed record it depends on, or for a transitive dependent the assessment it depends on.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "assessment",
+                "graph",
+                "on",
+                "dependence",
+                "depth"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "commit",
+          "dependents"
+        ],
+        "type": "object"
+      },
       "EvidenceDetach": {
         "additionalProperties": false,
         "description": "The graph to stop protecting.",
@@ -7436,9 +7520,117 @@
         ],
         "type": "object"
       },
+      "EvidenceIdentities": {
+        "additionalProperties": false,
+        "description": "Entities to resolve through a matching policy's current resolution map.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-identities"
+        },
+        "properties": {
+          "entities": {
+            "description": "The entity IRIs to resolve.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "type": "array"
+          },
+          "policy": {
+            "description": "The name of a matching policy of the evidence settings.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "policy",
+          "entities"
+        ],
+        "type": "object"
+      },
+      "EvidenceIdentitiesResult": {
+        "additionalProperties": false,
+        "description": "What the current resolution map selects for each entity.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-identities"
+        },
+        "properties": {
+          "commit": {
+            "description": "The commit the map was read at.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "entities": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "decisions": {
+                  "description": "The current accepted decisions that join the cluster.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "entity": {
+                  "type": "string"
+                },
+                "members": {
+                  "description": "The members of its cluster, sorted, at most 1,000.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "membersComplete": {
+                  "type": "boolean"
+                },
+                "representative": {
+                  "description": "The entity the map selects, the entity itself when the map does not name it.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "entity",
+                "representative",
+                "members",
+                "membersComplete",
+                "decisions"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "number": {
+            "description": "Its number, 0 before the first.",
+            "type": "integer"
+          },
+          "policy": {
+            "description": "The matching policy.",
+            "type": "string"
+          },
+          "revision": {
+            "description": "The latest resolution map revision, `null` before the first.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "policy",
+          "revision",
+          "number",
+          "commit",
+          "entities"
+        ],
+        "type": "object"
+      },
       "EvidenceProposal": {
         "additionalProperties": false,
-        "description": "One batch of evidence records. At most 1,000 claims, 10,000 links and 16 MiB of decoded input.",
+        "description": "One batch of evidence records. At most 1,000 claims, 10,000 links, 1,000 identity proposals and 16 MiB of decoded input.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-proposals"
         },
@@ -7508,6 +7700,28 @@
                   "description": "The attributed evaluator.",
                   "type": "string"
                 },
+                "inputs": {
+                  "description": "The records the evaluation consumed, each once, written as `prov:used`.",
+                  "items": {
+                    "additionalProperties": false,
+                    "description": "A claim, assessment, identity proposal, source revision, review decision, acceptance support or resolution map revision.",
+                    "maxProperties": 1,
+                    "minProperties": 1,
+                    "properties": {
+                      "iri": {
+                        "description": "An existing authenticated record, by its IRI.",
+                        "type": "string"
+                      },
+                      "key": {
+                        "description": "A record of this batch, by its key.",
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
+                },
                 "key": {
                   "description": "The record's key in this batch.",
                   "maxLength": 256,
@@ -7552,7 +7766,7 @@
                 },
                 "target": {
                   "additionalProperties": false,
-                  "description": "A claim or assessment.",
+                  "description": "A claim, assessment or identity proposal.",
                   "maxProperties": 1,
                   "minProperties": 1,
                   "properties": {
@@ -7809,6 +8023,82 @@
             "minLength": 1,
             "type": "string"
           },
+          "identities": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "author": {
+                  "description": "The attributed proposer.",
+                  "type": "string"
+                },
+                "entities": {
+                  "description": "The exact entity IRIs, distinct, in any order.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 64,
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "key": {
+                  "description": "The record's key in this batch.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "method": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "method": {
+                      "description": "The method's IRI.",
+                      "type": "string"
+                    },
+                    "version": {
+                      "description": "The method's version.",
+                      "maxLength": 256,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "method",
+                    "version"
+                  ],
+                  "type": "object"
+                },
+                "occurrenceKey": {
+                  "description": "The proposal's key within its set of entities.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "preferredEntity": {
+                  "description": "For a possible match, the entity it prefers as its cluster's selected entity, one of `entities`.",
+                  "type": "string"
+                },
+                "relation": {
+                  "enum": [
+                    "possibleMatch",
+                    "distinctEntities"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "occurrenceKey",
+                "entities",
+                "relation",
+                "author"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "identityGraph": {
+            "description": "The identity graph of the batch's identity proposals, needed when the settings name more than one.",
+            "type": "string"
+          },
           "ifHead": {
             "description": "Publish only while this commit is the branch head, else `409 head-changed`.",
             "minimum": 0,
@@ -7861,7 +8151,7 @@
                 },
                 "target": {
                   "additionalProperties": false,
-                  "description": "A claim or assessment.",
+                  "description": "A claim, assessment or identity proposal.",
                   "maxProperties": 1,
                   "minProperties": 1,
                   "properties": {
@@ -8458,7 +8748,8 @@
                     "IdentityProposal",
                     "AcceptanceSupport",
                     "Withdrawal",
-                    "Projection"
+                    "Projection",
+                    "ResolutionMap"
                   ],
                   "type": "string"
                 },
@@ -8545,7 +8836,8 @@
                           "IdentityProposal",
                           "AcceptanceSupport",
                           "Withdrawal",
-                          "Projection"
+                          "Projection",
+                          "ResolutionMap"
                         ],
                         "type": "string"
                       },
@@ -8675,7 +8967,8 @@
                         "IdentityProposal",
                         "AcceptanceSupport",
                         "Withdrawal",
-                        "Projection"
+                        "Projection",
+                        "ResolutionMap"
                       ],
                       "type": "string"
                     },
@@ -8868,7 +9161,7 @@
                   "type": "string"
                 },
                 "target": {
-                  "description": "The reviewed claim or assessment.",
+                  "description": "The reviewed claim or assessment, or under a matching policy the reviewed identity proposal.",
                   "type": "string"
                 },
                 "targetDigest": {
@@ -8907,7 +9200,7 @@
             "type": "string"
           },
           "policy": {
-            "description": "The name of a review policy of the evidence settings.",
+            "description": "The name of a review policy or a matching policy of the evidence settings.",
             "type": "string"
           },
           "policyVersion": {
@@ -8937,7 +9230,7 @@
           },
           "changed": {
             "additionalProperties": false,
-            "description": "The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay.",
+            "description": "The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay.",
             "properties": {
               "inserted": {
                 "items": {
@@ -8959,6 +9252,63 @@
                   "type": "object"
                 },
                 "type": "array"
+              },
+              "map": {
+                "additionalProperties": false,
+                "description": "A review under a matching policy that changed which accepted decisions its resolution map follows.",
+                "properties": {
+                  "decisionsAdded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "decisionsEnded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "entities": {
+                    "description": "The entities whose selected entity changed.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "number": {
+                    "type": "integer"
+                  },
+                  "policy": {
+                    "description": "The matching policy.",
+                    "type": "string"
+                  },
+                  "previous": {
+                    "description": "The revision it follows, whose consumers may need review.",
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "revision": {
+                    "description": "The resolution map revision the operation published.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "policy",
+                  "revision",
+                  "number",
+                  "previous",
+                  "decisionsAdded",
+                  "decisionsEnded",
+                  "entities"
+                ],
+                "type": "object"
               },
               "removed": {
                 "items": {
@@ -9117,6 +9467,17 @@
             ],
             "type": "object"
           },
+          "mapRevision": {
+            "description": "The resolution map revision a review under a matching policy published, also for a replay.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "operation": {
             "description": "The operation, every decision's availability receipt.",
             "type": "string"
@@ -9163,6 +9524,51 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "matchingPolicies": {
+            "additionalProperties": {
+              "additionalProperties": false,
+              "properties": {
+                "boundary": {
+                  "description": "The identity, sourceRecords and proposals graphs whose records the policy's reviews may use. At least one is an identity graph.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "decisions": {
+                  "description": "The decisions graph the policy's reviews append to.",
+                  "type": "string"
+                },
+                "maps": {
+                  "description": "The identity graph that holds the policy's resolution map revisions.",
+                  "type": "string"
+                },
+                "output": {
+                  "description": "The projection graph that holds the current resolution map.",
+                  "type": "string"
+                },
+                "version": {
+                  "description": "Raised whenever the policy's meaning changes.",
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "version",
+                "boundary",
+                "decisions",
+                "maps",
+                "output"
+              ],
+              "type": "object"
+            },
+            "description": "Named matching policies of identity proposals. Their names are distinct from the review policies' names, and the two kinds together hold at most 64 policies.",
+            "maxProperties": 64,
+            "propertyNames": {
+              "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+            },
+            "type": "object"
           },
           "policies": {
             "additionalProperties": {
@@ -9231,7 +9637,7 @@
               ],
               "type": "object"
             },
-            "description": "Named review policies.",
+            "description": "Named review policies of claims and assessments.",
             "maxProperties": 64,
             "propertyNames": {
               "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
@@ -9403,7 +9809,7 @@
           },
           "changed": {
             "additionalProperties": false,
-            "description": "The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay.",
+            "description": "The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay.",
             "properties": {
               "inserted": {
                 "items": {
@@ -9425,6 +9831,63 @@
                   "type": "object"
                 },
                 "type": "array"
+              },
+              "map": {
+                "additionalProperties": false,
+                "description": "A review under a matching policy that changed which accepted decisions its resolution map follows.",
+                "properties": {
+                  "decisionsAdded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "decisionsEnded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "entities": {
+                    "description": "The entities whose selected entity changed.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "number": {
+                    "type": "integer"
+                  },
+                  "policy": {
+                    "description": "The matching policy.",
+                    "type": "string"
+                  },
+                  "previous": {
+                    "description": "The revision it follows, whose consumers may need review.",
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "revision": {
+                    "description": "The resolution map revision the operation published.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "policy",
+                  "revision",
+                  "number",
+                  "previous",
+                  "decisionsAdded",
+                  "decisionsEnded",
+                  "entities"
+                ],
+                "type": "object"
               },
               "removed": {
                 "items": {
@@ -30626,14 +31089,15 @@
             }
           },
           {
-            "description": "Where the shapes come from, when not the dataset's `forms` setting.",
+            "description": "Where the shapes come from, when not the dataset's `forms` setting. `skos` names the built-in SKOS shapes of `GET /$/skos/shapes`, which only a request can choose.",
             "in": "query",
             "name": "shapes",
             "schema": {
               "enum": [
                 "guard",
                 "graphs",
-                "drafted"
+                "drafted",
+                "skos"
               ],
               "type": "string"
             }
@@ -30644,6 +31108,14 @@
             "name": "lang",
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Also answer the blank-node children that fields declaring `sh:node` reach (`nestedNodes`) and the empty forms of new children (`templates`). A nested model past its allowances answers the flat form with `nested.refused`.",
+            "in": "query",
+            "name": "nested",
+            "schema": {
+              "type": "boolean"
             }
           },
           {
@@ -30677,7 +31149,7 @@
                     },
                     "fields": {
                       "items": {
-                        "description": "`{id, path, inverse, editable, reason?, label, description?, group, order, widget, editor?, viewer?, constraints, sources, values}`, where each value is `{term, graph, label?, readOnly?}`.",
+                        "description": "`{id, path, inverse, editable, reason?, label, description?, group, order, widget, editor?, viewer?, constraints, sources, values}`, where each value is `{term, graph, label?, readOnly?, items?}` and `items` lists the members of a list field's `rdf:List`. `constraints.list` holds a list field's lengths and member constraints, and `constraints.or` the options of `sh:or` or `sh:xone` over value shapes.",
                         "type": "object"
                       },
                       "type": "array"
@@ -30715,6 +31187,17 @@
                         "null"
                       ]
                     },
+                    "nested": {
+                      "description": "`{refused}`: why the nested model was refused, when it was.",
+                      "type": "object"
+                    },
+                    "nestedNodes": {
+                      "description": "With `nested=true`: `{id, term, anchors, …}` of each stored child, with the fields of a form model. Each anchor is `{parent, field, graph, inverse}`, where `parent` is `root` or another child's `id`.",
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
                     "other": {
                       "items": {
                         "description": "`{predicate, values}`.",
@@ -30729,6 +31212,13 @@
                     "shapes": {
                       "description": "`{source, nodeShapes, missing?, unknownHints}`.",
                       "type": "object"
+                    },
+                    "templates": {
+                      "description": "With `nested=true`: `{node, …}`, the empty form of a new child under a field whose `constraints.node` is `node`.",
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
                     },
                     "types": {
                       "items": {
@@ -30789,7 +31279,7 @@
     },
     "/$/forms/{ds}/check": {
       "post": {
-        "description": "Turns the changes into one update of `DELETE DATA` and `INSERT DATA`, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.",
+        "description": "Turns the changes, with those of nested children, into the quads one update deletes and inserts, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#editing-forms"
         },
@@ -30813,8 +31303,9 @@
                     "items": {
                       "properties": {
                         "add": {
+                          "description": "Values to add. A blank node is a new child that `nested` describes.",
                           "items": {
-                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
                             "type": "object"
                           },
                           "type": "array"
@@ -30823,9 +31314,18 @@
                           "description": "The field's id, its path in SPARQL syntax.",
                           "type": "string"
                         },
-                        "remove": {
+                        "list": {
+                          "description": "For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty.",
                           "items": {
-                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "remove": {
+                          "description": "Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it.",
+                          "items": {
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
                             "type": "object"
                           },
                           "type": "array"
@@ -30845,12 +31345,12 @@
                   "expect": {
                     "additionalProperties": {
                       "items": {
-                        "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                        "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
                         "type": "object"
                       },
                       "type": "array"
                     },
-                    "description": "The values the form loaded, by field id, for every changed field.",
+                    "description": "The values the form loaded, by field id, for every changed field, and for a list field the members of its list in order.",
                     "type": "object"
                   },
                   "focus": {
@@ -30861,12 +31361,89 @@
                     "description": "The commit message.",
                     "type": "string"
                   },
+                  "nested": {
+                    "description": "Changes to nested blank-node children, committed atomically with `changes`. Each entry names its `node`, the `parent` it hangs from (absent for the root, else another entry's node) and the parent's `field`. A stored child must be a visible value of that field now, and every node between it and the root needs an entry.",
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "changes": {
+                          "items": {
+                            "properties": {
+                              "add": {
+                                "description": "Values to add. A blank node is a new child that `nested` describes.",
+                                "items": {
+                                  "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "field": {
+                                "description": "The field's id, its path in SPARQL syntax.",
+                                "type": "string"
+                              },
+                              "list": {
+                                "description": "For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty.",
+                                "items": {
+                                  "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "remove": {
+                                "description": "Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it.",
+                                "items": {
+                                  "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "required": [
+                              "field"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "expect": {
+                          "additionalProperties": {
+                            "items": {
+                              "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "description": "For a stored child, the values the form loaded for every changed field.",
+                          "type": "object"
+                        },
+                        "field": {
+                          "description": "The parent's field id.",
+                          "type": "string"
+                        },
+                        "node": {
+                          "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                          "type": "object"
+                        },
+                        "parent": {
+                          "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "node",
+                        "field"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
                   "shapes": {
-                    "description": "The shapes the form was built from, when not the setting's.",
+                    "description": "The shapes the form was built from, when not the setting's. `skos` names the built-in SKOS shapes.",
                     "enum": [
                       "guard",
                       "graphs",
-                      "drafted"
+                      "drafted",
+                      "skos"
                     ],
                     "type": "string"
                   }
@@ -30891,7 +31468,7 @@
                       "type": "string"
                     },
                     "conflicts": {
-                      "description": "`{id, now}` of each changed field whose stored values differ from `expect`.",
+                      "description": "`{id, node?, now}` of each changed field whose stored values differ from `expect`, with the nested `node` it belongs to, and of each parent field a stored child no longer hangs from.",
                       "items": {
                         "type": "object"
                       },
@@ -30968,7 +31545,7 @@
     },
     "/$/forms/{ds}/save": {
       "post": {
-        "description": "Commits the changes as one update with the message, when the stored values of every changed field are still those `expect` names, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.",
+        "description": "Commits the changes, with those of nested children, as one update with the message, when the stored values of every changed field are still those `expect` names and every stored child still hangs from its parent, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now` and nested `node`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#editing-forms"
         },
@@ -30992,8 +31569,9 @@
                     "items": {
                       "properties": {
                         "add": {
+                          "description": "Values to add. A blank node is a new child that `nested` describes.",
                           "items": {
-                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
                             "type": "object"
                           },
                           "type": "array"
@@ -31002,9 +31580,18 @@
                           "description": "The field's id, its path in SPARQL syntax.",
                           "type": "string"
                         },
-                        "remove": {
+                        "list": {
+                          "description": "For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty.",
                           "items": {
-                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "remove": {
+                          "description": "Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it.",
+                          "items": {
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
                             "type": "object"
                           },
                           "type": "array"
@@ -31024,12 +31611,12 @@
                   "expect": {
                     "additionalProperties": {
                       "items": {
-                        "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                        "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
                         "type": "object"
                       },
                       "type": "array"
                     },
-                    "description": "The values the form loaded, by field id, for every changed field.",
+                    "description": "The values the form loaded, by field id, for every changed field, and for a list field the members of its list in order.",
                     "type": "object"
                   },
                   "focus": {
@@ -31040,12 +31627,89 @@
                     "description": "The commit message.",
                     "type": "string"
                   },
+                  "nested": {
+                    "description": "Changes to nested blank-node children, committed atomically with `changes`. Each entry names its `node`, the `parent` it hangs from (absent for the root, else another entry's node) and the parent's `field`. A stored child must be a visible value of that field now, and every node between it and the root needs an entry.",
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "changes": {
+                          "items": {
+                            "properties": {
+                              "add": {
+                                "description": "Values to add. A blank node is a new child that `nested` describes.",
+                                "items": {
+                                  "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "field": {
+                                "description": "The field's id, its path in SPARQL syntax.",
+                                "type": "string"
+                              },
+                              "list": {
+                                "description": "For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty.",
+                                "items": {
+                                  "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "remove": {
+                                "description": "Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it.",
+                                "items": {
+                                  "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "required": [
+                              "field"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "expect": {
+                          "additionalProperties": {
+                            "items": {
+                              "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "description": "For a stored child, the values the form loaded for every changed field.",
+                          "type": "object"
+                        },
+                        "field": {
+                          "description": "The parent's field id.",
+                          "type": "string"
+                        },
+                        "node": {
+                          "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                          "type": "object"
+                        },
+                        "parent": {
+                          "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`. A blank node `{\"type\": \"bnode\", \"value\": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes.",
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "node",
+                        "field"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
                   "shapes": {
-                    "description": "The shapes the form was built from, when not the setting's.",
+                    "description": "The shapes the form was built from, when not the setting's. `skos` names the built-in SKOS shapes.",
                     "enum": [
                       "guard",
                       "graphs",
-                      "drafted"
+                      "drafted",
+                      "skos"
                     ],
                     "type": "string"
                   }
@@ -35618,6 +36282,9 @@
             "$ref": "#/components/parameters/ds"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
             "in": "query",
             "name": "graph",
@@ -35710,6 +36377,9 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
@@ -35845,7 +36515,7 @@
         "x-sparkles-permission": "read"
       },
       "post": {
-        "description": "Adds and removes axioms in their JSON form as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.",
+        "description": "Adds and removes axioms, each in its JSON form or in functional-style syntax with the dataset's prefixes, as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
         },
@@ -35970,7 +36640,16 @@
                 "properties": {
                   "add": {
                     "items": {
-                      "type": "object"
+                      "oneOf": [
+                        {
+                          "description": "The axiom's JSON form.",
+                          "type": "object"
+                        },
+                        {
+                          "description": "The axiom in functional-style syntax with the dataset's prefixes.",
+                          "type": "string"
+                        }
+                      ]
                     },
                     "type": "array"
                   },
@@ -35995,7 +36674,16 @@
                   },
                   "remove": {
                     "items": {
-                      "type": "object"
+                      "oneOf": [
+                        {
+                          "description": "The axiom's JSON form.",
+                          "type": "object"
+                        },
+                        {
+                          "description": "The axiom in functional-style syntax with the dataset's prefixes.",
+                          "type": "string"
+                        }
+                      ]
                     },
                     "type": "array"
                   },
@@ -36026,6 +36714,28 @@
                     "added": {
                       "type": "integer"
                     },
+                    "addedAxioms": {
+                      "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                      "items": {
+                        "properties": {
+                          "axiom": {
+                            "type": "object"
+                          },
+                          "ofn": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "axiomsTruncated": {
+                      "description": "Whether `addedAxioms` or `removedAxioms` was cut at 10,000.",
+                      "type": "boolean"
+                    },
                     "committed": {
                       "type": "boolean"
                     },
@@ -36049,6 +36759,24 @@
                     },
                     "removed": {
                       "type": "integer"
+                    },
+                    "removedAxioms": {
+                      "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                      "items": {
+                        "properties": {
+                          "axiom": {
+                            "type": "object"
+                          },
+                          "ofn": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
                     }
                   },
                   "type": "object"
@@ -36120,6 +36848,9 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "$ref": "#/components/parameters/timeout"
@@ -36504,6 +37235,9 @@
             "$ref": "#/components/parameters/ds"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
             "in": "query",
             "name": "graph",
@@ -36621,6 +37355,163 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/$/ontology/{ds}/dl-query": {
+      "post": {
+        "description": "Answers the class expression `expression` with its equivalent classes, its direct and inferred superclasses and subclasses, and its instances, as `answers` selects (every one by default). When the expression and every logical axiom of the ontology are in OWL 2 EL, the EL classifier answers it completely by classifying the expression as a fresh class with the dataset's kept classification, incrementally, and leaves the kept taxonomy as it was. Otherwise the OWL 2 RL rules answer it by demand reasoning over a copy of the terminology and the assertions, which can miss class answers. `reasoning` (`auto`, `el` or `rl`) chooses the engine, and `el` keeps to the classifier outside EL, leaving out the axioms it cannot use. The answer's `reasoning` names the engine, why it was chosen, whether the answers are complete, and the axioms outside the profile that can make them incomplete. `syntax` reads a text expression as Manchester syntax (the default) or functional-style syntax, and an object expression is read as the JSON form. A Manchester expression that does not read is `400` as `POST /$/ontology/{ds}/parse` answers it. A caller whose grants limit endpoints needs the `query` endpoint.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "dlQueryOntology",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "answers": {
+                    "items": {
+                      "enum": [
+                        "equivalents",
+                        "superclasses",
+                        "directSuperclasses",
+                        "subclasses",
+                        "directSubclasses",
+                        "instances"
+                      ],
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "expression": {
+                    "description": "The class expression: Manchester or functional-style text, or the JSON form."
+                  },
+                  "graph": {
+                    "description": "A graph IRI or `default`, or a list of them."
+                  },
+                  "imports": {
+                    "type": "boolean"
+                  },
+                  "limit": {
+                    "description": "The most IRIs each answer and the gaps list (1,000 by default).",
+                    "maximum": 10000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "maxDerived": {
+                    "description": "The most facts the classifier derives before the run stops with `507`.",
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "mode": {
+                    "enum": [
+                      "lenient",
+                      "strict"
+                    ],
+                    "type": "string"
+                  },
+                  "reasoning": {
+                    "description": "The engine (`auto` by default).",
+                    "enum": [
+                      "auto",
+                      "el",
+                      "rl"
+                    ],
+                    "type": "string"
+                  },
+                  "syntax": {
+                    "description": "The syntax of a text expression (`manchester` by default). An object is read as the JSON form.",
+                    "enum": [
+                      "manchester",
+                      "functional"
+                    ],
+                    "type": "string"
+                  },
+                  "threads": {
+                    "description": "The worker threads of the EL classifier, within the algorithm pool's grant (0 for the grant).",
+                    "maximum": 1024,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "expression"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The ontology, the expression and the answers.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The answers, each a list of IRIs with its count, and the reasoning that found them."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Answer a DL query",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/ontology/{ds}/entities": {
       "get": {
         "description": "The entities the ontology declares or, in a lenient read, types by their use, with their kinds, in IRI order and one page at a time.",
@@ -36631,6 +37522,9 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
@@ -36734,6 +37628,266 @@
       }
     },
     "/$/ontology/{ds}/entity": {
+      "delete": {
+        "description": "Removes an entity in one commit: its declarations, the axioms of the graphs read that mention it and the assertions about it that the store holds there. The ontology is read from the head under the writer lock. The answer is an edit's, and `removedAxioms` lists what the removal took. An IRI the ontology does not mention removes nothing and makes no commit.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "removeOntologyEntity",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/dryRun"
+          },
+          {
+            "$ref": "#/components/parameters/changes"
+          },
+          {
+            "$ref": "#/components/parameters/receipt"
+          },
+          {
+            "$ref": "#/components/parameters/validate"
+          },
+          {
+            "$ref": "#/components/parameters/commitMessage"
+          },
+          {
+            "$ref": "#/components/parameters/dryRunHeader"
+          },
+          {
+            "description": "The most validation results reported when a write is rejected.",
+            "in": "query",
+            "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          },
+          {
+            "description": "The entity's IRI.",
+            "in": "query",
+            "name": "iri",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The commit message, as the `Sparkles-Commit-Message` header gives it.",
+            "in": "query",
+            "name": "message",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "axiomsTruncated": {
+                      "type": "boolean"
+                    },
+                    "committed": {
+                      "type": "boolean"
+                    },
+                    "deleted": {
+                      "type": "integer"
+                    },
+                    "kept": {
+                      "type": "integer"
+                    },
+                    "removed": {
+                      "type": "integer"
+                    },
+                    "removedAxioms": {
+                      "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                      "items": {
+                        "properties": {
+                          "axiom": {
+                            "type": "object"
+                          },
+                          "ofn": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "What the removal did, with the receipt when asked for."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Remove an entity",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "write"
+      },
       "get": {
         "description": "What the ontology says about one entity: its kinds, labels and annotations, and for each kind the superclasses, subclasses, equivalent and disjoint classes, keys and instances of a class, the domains, ranges, hierarchy, inverses and characteristics of a property, the definitions of a datatype, and the types, equalities and property assertions of an individual. Each expression comes in functional-style syntax and in its JSON form. With `assertions=true`, the instances of a class and the types and property assertions of an individual also come from the assertions the store holds, at most `limit` of each. An IRI that the ontology neither declares nor uses as an entity, or as the `kind` asked for, is `404`.",
         "externalDocs": {
@@ -36743,6 +37897,9 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
@@ -36847,6 +38004,403 @@
           }
         },
         "summary": "Ontology entity",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/ontology/{ds}/parse": {
+      "post": {
+        "description": "Reads `text` in OWL 2 Manchester syntax as `as` (`classExpression` by default, or `dataRange`, `individual`, `literal` or `axiom`) and answers its JSON form, its functional-style text and its Manchester rendering. Names are full IRIs in angle brackets, prefixed names with the dataset's prefixes, local names, and labels in single quotes when they hold a space. They resolve against the entities and the `rdfs:label` and `skos:prefLabel` values of the ontology. Text that does not read is `400` with `code` `invalid-manchester`, `reason` (`syntax`, `unknown`, `ambiguous` or `kind`), the span `start` and `end` in UTF-16 code units, and for an ambiguous name the `candidates` with their IRIs, kinds and labels.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "parseManchester",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "as": {
+                    "description": "What the text is (`classExpression` by default).",
+                    "enum": [
+                      "classExpression",
+                      "dataRange",
+                      "individual",
+                      "literal",
+                      "axiom"
+                    ],
+                    "type": "string"
+                  },
+                  "graph": {
+                    "description": "A graph IRI or `default`, or a list of them."
+                  },
+                  "imports": {
+                    "type": "boolean"
+                  },
+                  "mode": {
+                    "enum": [
+                      "lenient",
+                      "strict"
+                    ],
+                    "type": "string"
+                  },
+                  "text": {
+                    "description": "The Manchester text.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The ontology and the text.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The value in its JSON form, `ofn` and `manchester`."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Read Manchester syntax",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/ontology/{ds}/search": {
+      "get": {
+        "description": "The entities whose labels, synonyms, short forms, IRIs or definitions match `q`, in any language and with typo tolerance, ranked for a typeahead: a label equal to the query first, then labels that start with it, synonyms, short forms and IRIs equal to it or starting with it, labels and then synonyms that contain its words, matches within a few edits, and definitions that contain its words. Within each tier the order is the edits, the field, entities that are not deprecated first, the caller's language, the length of the matched text, the text and the IRI. The search reads the head of the branch from an entity index that each commit's changes keep current, and the caller sees only the graphs their grants allow. A query of 1 to 3 characters takes no edits as typed, 4 to 7 characters take one and longer queries two. `at` and `inferences` are refused.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "searchOntology",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The text searched for.",
+            "in": "query",
+            "name": "q",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Entity kinds, comma separated: `class`, `property` (every kind of property), `objectProperty`, `dataProperty`, `annotationProperty`, `individual`, `datatype`, `concept`, `conceptScheme` or `collection` (all kinds by default).",
+            "in": "query",
+            "name": "kind",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The caller's languages, comma separated and most preferred first, as BCP 47 tags. `Accept-Language` is read when it is absent. Values in these languages rank first within a tier, then untagged values, then English, then the others.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most entities listed, from 1 to 100 (10 by default).",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The entities skipped. `offset` and `limit` together reach at most 10,000, and `next` is null when no later page fits in that window although `more` is true.",
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Rank the matches within a few edits (true by default).",
+            "in": "query",
+            "name": "fuzzy",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Rank the matches in definitions (true by default).",
+            "in": "query",
+            "name": "definitions",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "dataset": {
+                      "type": "string"
+                    },
+                    "graphs": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "index": {
+                      "description": "Whether the index reflected the head, applied the changes of later commits or was built for this search.",
+                      "enum": [
+                        "current",
+                        "updated",
+                        "built"
+                      ],
+                      "type": "string"
+                    },
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "more": {
+                      "type": "boolean"
+                    },
+                    "next": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "offset": {
+                      "type": "integer"
+                    },
+                    "query": {
+                      "type": "string"
+                    },
+                    "results": {
+                      "items": {
+                        "description": "One entity. `type` is `entity`, so that lists which mix kinds of result tell them apart.",
+                        "properties": {
+                          "deprecated": {
+                            "type": "boolean"
+                          },
+                          "iri": {
+                            "type": "string"
+                          },
+                          "kinds": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "label": {
+                            "description": "The label in the caller's best language.",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "labelLang": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "match": {
+                            "properties": {
+                              "distance": {
+                                "type": "integer"
+                              },
+                              "field": {
+                                "enum": [
+                                  "label",
+                                  "synonym",
+                                  "shortForm",
+                                  "definition"
+                                ],
+                                "type": "string"
+                              },
+                              "highlight": {
+                                "description": "The matched ranges of `text` as `[start, end]` pairs in UTF-16 code units.",
+                                "items": {
+                                  "items": {
+                                    "type": "integer"
+                                  },
+                                  "type": "array"
+                                },
+                                "type": "array"
+                              },
+                              "kind": {
+                                "enum": [
+                                  "exact",
+                                  "prefix",
+                                  "words",
+                                  "fuzzy"
+                                ],
+                                "type": "string"
+                              },
+                              "lang": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "property": {
+                                "description": "The property of the value, or null for the IRI and its local name.",
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "text": {
+                                "type": "string"
+                              },
+                              "tier": {
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "shortForm": {
+                            "description": "The `oboInOwl:id`, `skos:notation`, prefixed name or local name.",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "type": {
+                            "enum": [
+                              "entity"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "One page of ranked entities."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Search the entities of an ontology",
         "tags": [
           "Ontology"
         ],
@@ -42315,6 +43869,59 @@
         "x-sparkles-permission": "admin"
       }
     },
+    "/$/skos/shapes": {
+      "get": {
+        "description": "The SHACL shapes that lay out the forms of concept schemes, concepts, collections, ordered collections and SKOS-XL labels and check the integrity conditions of the SKOS Reference: S9, S13, S14, S27, S37 and S46, with S51, S52 and S58 of SKOS-XL and the literal forms of SKOS-XL labels counted for S13 and S14. Each result's message names its condition. Forms read them with `shapes=skos`, and `POST /{ds}/shacl` and `PUT /$/validation/{ds}` take the text as shapes.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#skos-shapes"
+        },
+        "operationId": "getSkosShapes",
+        "responses": {
+          "200": {
+            "content": {
+              "text/turtle": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The shapes."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "The built-in SKOS shapes",
+        "tags": [
+          "Validation"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
     "/$/snapshots/{ds}": {
       "get": {
         "externalDocs": {
@@ -46923,6 +48530,177 @@
         "x-sparkles-permission": "write"
       }
     },
+    "/{ds}/claims/dependents": {
+      "post": {
+        "description": "Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-dependents"
+        },
+        "operationId": "listEvidenceDependents",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceDependents"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceDependentsResult"
+                }
+              }
+            },
+            "description": "The dependent assessments."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Find the assessments that depend on changed records",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/claims/identities": {
+      "post": {
+        "description": "Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again or an identity graph the map was built from left the boundary.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-identities"
+        },
+        "operationId": "resolveIdentities",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceIdentities"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceIdentitiesResult"
+                }
+              }
+            },
+            "description": "The map's revision and each entity's resolution."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Resolve entities through a resolution map",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/{ds}/claims/resolve": {
       "post": {
         "description": "Needs `read` on the dataset through the query endpoint, and counts as a query. Verifies each reference in order: a stored fact at the exact commit of the branch its identities name, read through the caller's view of that dataset and branch, and a record as an authenticated record of the dataset's protected evidence graphs at the request branch's current state. The first reference that does not verify is answered with its `code` and `reference` key: `422 evidence-unavailable` for a missing, unretained or unreadable reference alike, `422 incomplete-evidence` when the 64 MiB resolution limit or the caller's access policy stops verification, `422 unanchored-evidence`, `422 span-mismatch`, `422 origin-not-reproduced` and `409 immutable-record-conflict`. A malformed reference is a `400` that names its field.",
@@ -47012,7 +48790,7 @@
     },
     "/{ds}/claims/review": {
       "post": {
-        "description": "Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.",
+        "description": "Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Under a matching policy the targets are identity proposals and the policy's resolution map follows the decisions: an operation that changes which accepted decisions it follows writes one immutable map revision in the policy's maps graph and rewrites the clusters it changed in the output graph, and needs update and read grants on the decisions, maps and output graphs and read access to every effective proposal of those clusters. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 identity-conflict` when an accepted separation would share a cluster, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
         },

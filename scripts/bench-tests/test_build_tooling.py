@@ -198,6 +198,67 @@ class BoxingtonContracts(unittest.TestCase):
         self.mbx("sparkles-task", "--", MBX, "build", "--offline", "--target-dir", "target")
         self.assertTrue((self.workspace / "target/debug").is_dir())
 
+    def dangle_target(self):
+        """Leave `target` as a link to a collected view, as a collection that removed the
+        view and its record before the link does."""
+        self.mbx("build", "--offline")
+        link = self.workspace / "target"
+        view = Path(os.readlink(link))
+        shutil.rmtree(view)
+        view.with_suffix(".json").unlink()
+        self.assertTrue(link.is_symlink() and not link.exists(), "target is not dangling")
+
+    def crash_harness_step(self):
+        """The crash-harness step of mise.toml's test:bench-scripts, as a script run from
+        the contract workspace."""
+        command = tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]["test:bench-scripts"]["run"][1]
+        self.assertIn("crash-harness.rs", command)
+        (self.workspace / "scripts").mkdir(exist_ok=True)
+        shutil.copy2(ROOT / "scripts/crash-harness.rs", self.workspace / "scripts/crash-harness.rs")
+        step = self.workspace / "crash-step.sh"
+        # A checkout path with a space, which the command must quote.
+        self.config_root = self.root / "spaced checkout"
+        step.write_text("set -e\n" + command.replace("{{config_root}}", str(self.config_root)) + "\n")
+        return step
+
+    def test_crash_harness_step_survives_a_dangling_target(self):
+        # The step's test binary is scratch output under .artifacts, so a collected target
+        # cannot fail its mkdir, which once failed with "File exists".
+        step = self.crash_harness_step()
+        self.dangle_target()
+        result = subprocess.run(["bash", str(step)], cwd=self.workspace, env=self.env,
+                                capture_output=True, text=True, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.config_root / ".artifacts/crash-harness/crash-harness-test").is_file())
+
+    def test_premerge_repairs_a_dangling_target(self):
+        step = self.crash_harness_step()
+        for name in ("premerge.sh", "cargo-sparkles-task"):
+            shutil.copy2(ROOT / "scripts" / name, self.workspace / "scripts" / name)
+        bin_dir = self.root / "premerge-bin"
+        bin_dir.mkdir()
+        # A mise stand-in that runs only the crash-harness step of test:bench-scripts.
+        frontend = bin_dir / "mise"
+        frontend.write_text(
+            "#!/bin/sh\n"
+            f'[ "$*" = "run test:bench-scripts" ] && exec bash "{step}"\n'
+            "exit 8\n"
+        )
+        frontend.chmod(0o755)
+        env = dict(self.env, PATH=str(bin_dir) + os.pathsep + self.env["PATH"])
+        self.dangle_target()
+        result = subprocess.run(["bash", "scripts/premerge.sh", "bench-scripts"], cwd=self.workspace,
+                                env=env, capture_output=True, text=True, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("premerge: target links to a collected directory", result.stdout)
+        self.assertRegex(result.stdout, r"PASS bench-scripts")
+        self.assertTrue((self.workspace / "target").is_dir(), "premerge did not place a fresh target")
+        # A target that is in place is left alone, without the message.
+        again = subprocess.run(["bash", "scripts/premerge.sh", "bench-scripts"], cwd=self.workspace,
+                               env=env, capture_output=True, text=True, timeout=300)
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertNotIn("collected directory", again.stdout)
+
     def test_container_checksum_failure_stops_even_in_conditional_source(self):
         fake = self.root / "fake-bin"
         fake.mkdir()

@@ -700,6 +700,18 @@ impl Asking<'_, '_> {
         sparkles::sparql::parse_query(q, None, &pv).ok()
     }
 
+    /// `q` with a declaration of each well-known prefix that it uses without declaring
+    /// and that the dataset does not define ([`prompts::complete_prefixes`]).
+    fn declare_prefixes(&self, q: &str) -> String {
+        let Ok(ds) = self.server.dataset(self.principal, Some(&self.o.dataset)) else {
+            return q.to_string();
+        };
+        let pv: Vec<(String, String)> = crate::mcp::tools::dataset_prefixes(&ds)
+            .into_iter()
+            .collect();
+        prompts::complete_prefixes(q, &pv)
+    }
+
     /// The complexity score of a query, when it parses.
     fn score(&self, q: &str) -> Option<u32> {
         self.parse(q).map(|p| complexity::of(&p).score())
@@ -1489,7 +1501,8 @@ impl Asking<'_, '_> {
         }
         let mut signatures = Vec::with_capacity(drafted.len());
         for x in &mut drafted {
-            let d = normalize(&x.0);
+            let mut d = normalize(&x.0);
+            d.query = self.declare_prefixes(&d.query);
             let parsed = (!d.query.is_empty())
                 .then(|| self.parse(&d.query))
                 .flatten();
@@ -1614,7 +1627,8 @@ impl Asking<'_, '_> {
                     ));
                 }
             }
-            let d = normalize(&value);
+            let mut d = normalize(&value);
+            d.query = self.declare_prefixes(&d.query);
             self.answered_by = Some((role, pair.clone()));
             let mut record = json!({
                 "attempt": attempt,

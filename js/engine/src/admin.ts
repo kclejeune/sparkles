@@ -300,6 +300,46 @@ export interface OntologyEntityPage extends OntologyState {
   offset: number;
   next: bigint | null;
 }
+/** One entity an ontology search found, as `GET /$/ontology/{ds}/search` lists it. */
+export interface OntologySearchHit {
+  type: 'entity';
+  iri: string;
+  /** `class`, `objectProperty`, `concept` and the other kinds the search filters by */
+  kinds: string[];
+  label: string | null;
+  labelLang: string | null;
+  shortForm: string | null;
+  deprecated: boolean;
+  match: {
+    /** `label`, `synonym`, `shortForm` or `definition` */
+    field: string;
+    property: string | null;
+    text: string;
+    lang: string | null;
+    /** `exact`, `prefix`, `words` or `fuzzy` */
+    kind: string;
+    distance: number;
+    tier: number;
+    /** `[start, end)` ranges of `text` in UTF-16 code units */
+    highlight: [number, number][];
+  };
+}
+/** One page of an ontology search. */
+export interface OntologySearchPage {
+  dataset: string;
+  commit: bigint;
+  graphs: string[];
+  imports: { iri: string; graph: string | null }[];
+  warnings: string[];
+  query: string;
+  results: OntologySearchHit[];
+  offset: number;
+  limit: number;
+  more: boolean;
+  next: bigint | null;
+  /** `current`, `updated` or `built` */
+  index: string;
+}
 /** An expression of an entity answer: its functional-style form and its JSON form. */
 export interface OntologyExpression {
   ofn: string;
@@ -423,6 +463,56 @@ export interface OntologyClassification extends OntologyState {
     superClasses: string[];
   };
   written?: OntologyEdit;
+}
+/** What `ontology.parse` reads Manchester text as. */
+export type ManchesterAs = 'classExpression' | 'dataRange' | 'individual' | 'literal' | 'axiom';
+/** Manchester text read against the ontology (spec F21, item 608). */
+export interface ManchesterParsed extends OntologyState {
+  as: ManchesterAs;
+  /** the value in its JSON form */
+  value: unknown;
+  ofn: string;
+  manchester: string | null;
+}
+/** The answers a DL query can ask for. */
+export type DlAnswer =
+  | 'equivalents'
+  | 'superclasses'
+  | 'directSuperclasses'
+  | 'subclasses'
+  | 'directSubclasses'
+  | 'instances';
+/** An axiom outside the profile of the engine that answered a DL query. */
+export interface DlGap extends Partial<OntologyAxiom> {
+  message: string;
+  rule: string | null;
+  partial: boolean;
+  manchester?: string | null;
+}
+/** A DL query's answers and the reasoning that found them (spec U12). */
+export interface DlQueryAnswer extends OntologyState {
+  expression: { manchester: string; ofn: string; json: unknown };
+  reasoning: {
+    engine: 'el' | 'rl';
+    title: string;
+    why: string;
+    complete: boolean;
+    instancesComplete: boolean | null;
+    gapCount: number;
+    gaps: DlGap[];
+    notes: string[];
+  };
+  satisfiable: boolean | null;
+  consistent: boolean | null;
+  incremental: boolean;
+  elapsedMs: number;
+  counts: Partial<Record<DlAnswer, number>>;
+  equivalents?: string[];
+  superclasses?: string[];
+  directSuperclasses?: string[];
+  subclasses?: string[];
+  directSubclasses?: string[];
+  instances?: string[];
 }
 export class Administration {
   readonly snapshots;
@@ -680,6 +770,40 @@ export class Administration {
           o,
           false,
         ),
+      /**
+       * Search the entities by label, synonym, short form and definition, with typos
+       * tolerated, ranked as `GET /$/ontology/{ds}/search` ranks them. `lang` lists the
+       * preferred languages, most preferred first.
+       */
+      search: (
+        q: string,
+        o: Pick<OntologyRead, 'graph' | 'imports' | 'mode'> &
+          OperationOptions & {
+            kind?: string | string[];
+            lang?: string | string[];
+            limit?: number;
+            offset?: number;
+            fuzzy?: boolean;
+            definitions?: boolean;
+          } = {},
+      ) =>
+        call<OntologySearchPage>(
+          'ontology.search',
+          {
+            graph: o.graph,
+            imports: o.imports,
+            mode: o.mode,
+            q,
+            kind: Array.isArray(o.kind) ? o.kind.join(',') : o.kind,
+            lang: Array.isArray(o.lang) ? o.lang.join(',') : o.lang,
+            limit: o.limit,
+            offset: o.offset,
+            fuzzy: o.fuzzy,
+            definitions: o.definitions,
+          },
+          o,
+          false,
+        ),
       /** One report per profile (`el`, `ql`, `rl`, `dl`; `dl` by default). */
       check: (
         o: OntologyRead &
@@ -775,6 +899,54 @@ export class Administration {
           },
           o,
           o.target !== undefined,
+        ),
+      /**
+       * Read Manchester text against the ontology's names and labels as `as`
+       * (`classExpression` by default). Text that does not read throws an
+       * `InvalidInputError` whose details carry the reason, the span in UTF-16 code
+       * units and the candidates of an ambiguous name.
+       */
+      parse: (text: string, o: OntologySelection & OperationOptions & { as?: ManchesterAs } = {}) =>
+        call<ManchesterParsed>(
+          'ontology.parse',
+          { graph: o.graph, imports: o.imports, mode: o.mode, text, as: o.as },
+          o,
+          false,
+        ),
+      /**
+       * A DL query (spec U12): the equivalents, superclasses, subclasses and instances
+       * of a class expression in Manchester syntax, functional-style syntax
+       * (`syntax: 'functional'`) or the JSON form. The EL classifier answers inside
+       * OWL 2 EL and the RL rules outside it, and `reasoning` names the engine used.
+       */
+      dlQuery: (
+        expression: string | Record<string, unknown>,
+        o: OntologySelection &
+          OperationOptions & {
+            syntax?: 'manchester' | 'functional';
+            reasoning?: 'auto' | 'el' | 'rl';
+            answers?: DlAnswer[];
+            limit?: number;
+            threads?: number;
+            maxDerived?: number;
+          } = {},
+      ) =>
+        call<DlQueryAnswer>(
+          'ontology.dlQuery',
+          {
+            graph: o.graph,
+            imports: o.imports,
+            mode: o.mode,
+            expression,
+            syntax: o.syntax,
+            reasoning: o.reasoning,
+            answers: o.answers,
+            limit: o.limit,
+            threads: o.threads,
+            maxDerived: o.maxDerived,
+          },
+          o,
+          false,
         ),
     };
     this.mappings = {

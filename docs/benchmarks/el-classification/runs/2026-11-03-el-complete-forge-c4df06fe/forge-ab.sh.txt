@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# forge-ab.sh ROUNDS: interleaved el_classify runs of bin/base-el_classify (the lane's base,
+# commit c9b6ebff) and bin/lane-el_classify on the benchmark host, on one and eight
+# threads, three classifications per process, then one taxonomy of each build per
+# ontology on four threads with their hashes. The script takes the bench lock and the
+# heavy lock once and holds them for every process. Never build on this host: the
+# binaries come from atlas.
+set -uo pipefail
+D=~/lanes/el-complete-587
+cd "$D"
+exec 9> "$HOME/lanes/.bench.lock" 8> "$HOME/lanes/.heavy.lock"
+flock 9
+flock 8
+R=$1
+OUT=out-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT/tax" "$OUT/bin"
+# the run uses its own copies, so that a later copy to bin/ cannot change it midway
+cp bin/base-el_classify bin/lane-el_classify "$OUT/bin/"
+FILES=${FILES:-"go.ofn chebi_lite.ofn ore_ont_13482.owl ore_ont_868.owl ore_ont_9674.owl ore_ont_10689.owl ore_ont_1559.owl ore_ont_15059.owl ore_ont_3524.owl ore_ont_3836.owl ore_ont_10242.owl ore_ont_10749.owl ore_ont_13035.owl ore_ont_13621.owl ore_ont_6226.owl ore_ont_1481.owl ore_ont_2453.owl"}
+{
+  echo "host=$(hostname)"
+  echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')"
+  echo "cpus=$(nproc)"
+  echo "ram_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
+  echo "kernel=$(uname -r)"
+  for b in "$OUT"/bin/base-el_classify "$OUT"/bin/lane-el_classify; do echo "binary_sha256 $b=$(sha256sum $b | cut -d' ' -f1)"; done
+  for f in $FILES; do echo "data_sha256 $f=$(sha256sum data/$f | cut -d' ' -f1)"; done
+  echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)"
+} > "$OUT/env.txt"
+for r in $(seq 1 "$R"); do
+  echo "round $r load=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$OUT/env.txt"
+  for f in $FILES; do
+    for th in 1 8; do
+      for L in base lane; do
+        line=$(systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 "$OUT"/bin/$L-el_classify --threads $th --repeat 3 data/$f 2>>"$OUT/err.txt")
+        echo "{\"label\":\"$L\",\"round\":$r,\"file\":\"$f\",\"threads\":$th,\"run\":${line:-null}}" >> "$OUT/ab.jsonl"
+      done
+    done
+  done
+done
+for f in $FILES; do
+  for L in base lane; do
+    systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 "$OUT"/bin/$L-el_classify --threads 4 --taxonomy "$OUT/tax/${f%.*}.$L.txt" data/$f > /dev/null 2>>"$OUT/err.txt"
+  done
+done
+(cd "$OUT/tax" && sha256sum *.txt) > "$OUT/taxonomy.sha256"
+echo "ended=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$OUT/env.txt"
+cp "$0" "$OUT/forge-ab.sh.txt"
+rm -r "$OUT/bin"
+echo "FORGE-AB-DONE $OUT"

@@ -1,13 +1,16 @@
 // The README's screenshots of branches, of the agent pages and of the Explore overview
 // grouped by the GraphRAG communities, in the dark theme, against
-// the mock backend that playwright.screenshots-mock.config.ts starts. The `org` dataset
+// the mock backend that playwright.screenshots-mock.config.ts starts. The SKOS editing forms
+// use a `thesaurus` dataset and the SKOS layouts of mock/forms.mjs. The `org` dataset
 // gets a branch whose changes clash with main, so that the dataset page shows branches and
 // the commit graph and the merge page shows conflicts. The Ask bar runs the scripted
 // pipeline of mock/assistant.mjs, and a handoff link stands in for an agent's
 // `share_query`. The maps of relations, the communities, the Pattern pane, the diff graph
 // and the path finder on a query's graph use the `world` showcase dataset of
 // mock/world.mjs. The model configuration form uses the declared configuration of
-// mock/models.mjs. Run with `mise run docs:screenshots`.
+// mock/models.mjs. The ontology editor uses the `uni` dataset of mock/ontology.mjs, and the
+// thesaurus editor the `thes` dataset of mock/skos.mjs. Run
+// with `mise run docs:screenshots`.
 
 import { test as base, expect, type APIRequestContext, type Page } from '@playwright/test';
 import { encodeHandoff } from '../../src/lib/handoff';
@@ -1039,6 +1042,70 @@ test('forms-branch', async ({ page, request }) => {
   }
 });
 
+const THESAURUS = 'thesaurus';
+const TH = 'http://example.org/thesaurus/';
+
+/** A thesaurus of the mock's SKOS shapes (mock/forms.mjs), made once. */
+async function thesaurus(request: APIRequestContext) {
+  const r = await request.post('/$/datasets', {
+    data: { dbName: THESAURUS, dbType: 'persistent' },
+  });
+  if (r.status() === 409) return;
+  expect(r.ok()).toBe(true);
+  const u = await request.post(`/${THESAURUS}/update`, {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: `PREFIX ex: <${TH}> PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+      PREFIX skosxl: <http://www.w3.org/2008/05/skos-xl#>
+      INSERT DATA {
+        ex:animals a skos:Concept ; skos:prefLabel "Animals"@en , "Animaux"@fr ;
+          skosxl:prefLabel [ skosxl:literalForm "Animals"@en ] .
+        ex:mammals a skos:Concept ; skos:prefLabel "Mammals"@en ; skos:broader ex:animals .
+        ex:birds a skos:Concept ; skos:prefLabel "Birds"@en ; skos:broader ex:animals .
+        ex:fish a skos:Concept ; skos:prefLabel "Fish"@en ; skos:broader ex:animals .
+        ex:pets a skos:Collection ; skos:prefLabel "Pets"@en ; skos:member ex:mammals ;
+          skos:memberList ( ex:mammals ex:birds ex:fish ) .
+      }`,
+  });
+  expect(u.ok()).toBe(true);
+}
+
+async function thesaurusForm(page: Page, local: string, heading: RegExp) {
+  await page.addInitScript((ds) => localStorage.setItem('sparkles.dataset', ds), THESAURUS);
+  await page.goto(`/ui/datasets/${THESAURUS}/edit?iri=${encodeURIComponent(TH + local)}`);
+  const form = page.getByRole('region', { name: heading });
+  await expect(form.locator('.ff').first()).toBeVisible({ timeout: 30_000 });
+  return form;
+}
+
+test('forms-nested', async ({ page, request }) => {
+  // a SKOS concept's SKOS-XL labels as nested forms: the stored label edited and a new
+  // label added from the template, both saved in one commit
+  await thesaurus(request);
+  const form = await thesaurusForm(page, 'animals', /^Edit Anima/);
+  const labels = form.locator('[data-field$="skos-xl#prefLabel>"]');
+  await labels.getByLabel('Literal form', { exact: true }).fill('All animals');
+  await labels.getByRole('button', { name: '+ Add XL labels' }).click();
+  await labels.getByLabel('Literal form', { exact: true }).nth(1).fill('Tous les animaux');
+  await labels.getByLabel('Language of Literal form').nth(1).fill('fr');
+  await form.getByRole('button', { name: 'Preview' }).click();
+  await expect(form.getByRole('region', { name: 'Preview' })).toContainText(
+    'The save would commit.',
+  );
+  await labels.evaluate((e) => e.scrollIntoView({ block: 'center' }));
+  await shoot(page, 'forms-nested');
+});
+
+test('forms-list', async ({ page, request }) => {
+  // an ordered collection: its members chosen among the alternatives of `sh:or`, and its
+  // `skos:memberList` reordered with the list editor
+  await thesaurus(request);
+  const form = await thesaurusForm(page, 'pets', /^Edit .*pets/);
+  const list = form.getByRole('list', { name: 'Ordered members members' });
+  await list.getByRole('button', { name: 'Move Ordered members member 3 up' }).click();
+  await list.evaluate((e) => e.scrollIntoView({ block: 'center' }));
+  await shoot(page, 'forms-list');
+});
+
 /** The server page's model configuration form, scrolled to the row of `field`. */
 async function modelsForm(page: Page, request: APIRequestContext, field: string) {
   await request.delete('/$/server/settings/models');
@@ -1212,4 +1279,113 @@ test('reasoning-support-preview', async ({ page }) => {
   await expect(modal).toContainText('1 changed quad');
   await expect(modal).toContainText('1 removed');
   await shoot(page, 'reasoning-support-preview');
+});
+
+// The ontology editor on the mock's `uni` dataset (mock/ontology.mjs): the class tree with
+// the frame of Professor, the asserted and inferred class trees side by side, a DL query
+// with its answers, and the preview of a new subclass, which is cancelled so the mock
+// keeps its ontology.
+const UNI = 'http://example.org/uni#';
+
+test('ontology-editor', async ({ page }) => {
+  await page.goto(`/ui/ontology?ds=uni&tab=Class&iri=${encodeURIComponent(`${UNI}Professor`)}`);
+  const classes = page.getByRole('tree', { name: 'Classes (asserted)' });
+  await expect(classes.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
+  // the selection opens Professor's ancestors, and the shot opens two more branches
+  await expect(classes.getByRole('treeitem', { name: 'Professor' })).toBeVisible();
+  for (const n of ['Organization', 'Student'])
+    await classes.getByRole('button', { name: `Expand ${n}` }).click();
+  await expect(page.locator('.frame [data-section="sub"]')).toContainText('teaches some Course');
+  await shoot(page, 'ontology-editor');
+});
+
+test('ontology-inferred', async ({ page }) => {
+  await page.goto(
+    `/ui/ontology?ds=uni&tab=Class&inferred=1&iri=${encodeURIComponent(`${UNI}Teacher`)}`,
+  );
+  const asserted = page.getByRole('tree', { name: 'Classes (asserted)' });
+  const inferred = page.getByRole('tree', { name: 'Classes (inferred)' });
+  await expect(inferred).toBeVisible({ timeout: 30_000 });
+  for (const n of ['Agent', 'Person', 'Employee'])
+    await asserted.getByRole('button', { name: `Expand ${n}` }).click();
+  await inferred.getByRole('button', { name: 'Expand Teacher' }).click();
+  await expect(inferred.getByRole('button', { name: 'Professor', exact: true })).toBeVisible();
+  await shoot(page, 'ontology-inferred');
+});
+
+test('ontology-dl-query', async ({ page }) => {
+  // the DL Query tab with the answers of a definition-shaped expression, the reasoning
+  // label, and the frame of the instance the answers link to
+  const q = 'Person and (teaches some Course)';
+  await page.goto(
+    `/ui/ontology?ds=uni&tab=dlquery&dl=${encodeURIComponent(q)}&iri=${encodeURIComponent(`${UNI}Professor`)}`,
+  );
+  const answers = page.getByRole('region', { name: 'DL query answers' });
+  await expect(answers.getByRole('region', { name: 'Equivalent classes' })).toContainText(
+    'Teacher',
+    { timeout: 30_000 },
+  );
+  await expect(page.locator('.frame [data-section="sub"]')).toContainText('teaches some Course');
+  await shoot(page, 'ontology-dl-query');
+});
+
+test('ontology-preview', async ({ page }) => {
+  await page.goto(`/ui/ontology?ds=uni&tab=Class&iri=${encodeURIComponent(`${UNI}Employee`)}`);
+  await expect(page.locator('.frame')).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('button', { name: 'New', exact: true }).click();
+  const create = page.getByRole('dialog', { name: 'New class' });
+  await create.getByRole('textbox', { name: 'Label', exact: true }).fill('teaching assistant');
+  await create.getByRole('button', { name: 'Preview' }).click();
+  const preview = page.getByRole('dialog');
+  await expect(preview.locator('[data-outcome]')).toHaveAttribute('data-outcome', 'commit');
+  await shoot(page, 'ontology-preview');
+  await preview.getByRole('button', { name: 'Cancel' }).click();
+});
+
+// The thesaurus editor on the mock's `thes` dataset (mock/skos.mjs): the concept tree with
+// the polyhierarchy of Whales and its multilingual labels, the checks of the built-in SKOS
+// shapes, and the preview of a drag that moves Bats under Flying animals, which is
+// cancelled so the mock keeps its thesaurus.
+const THES = 'http://example.org/thesaurus/';
+const thesTree = (page: Page) => page.getByRole('tree', { name: 'Concepts' });
+
+test('thesaurus-editor', async ({ page }) => {
+  await page.goto(`/ui/thesaurus?ds=thes&iri=${encodeURIComponent(`${THES}whales`)}`);
+  const tree = thesTree(page);
+  await expect(page.getByRole('heading', { name: 'Whales' })).toBeVisible({ timeout: 30_000 });
+  await expect(tree.getByRole('button', { name: 'Collapse Vertebrates' })).toBeVisible();
+  const marine = tree.getByRole('button', { name: 'Expand Marine animals' });
+  if (await marine.count()) await marine.first().click();
+  await expect(tree.getByRole('button', { name: 'Whales', exact: true })).toHaveCount(2);
+  await expect(
+    page.getByRole('region', { name: 'Labels' }).locator('tr[data-lang="fr"]'),
+  ).toContainText('Baleines');
+  await shoot(page, 'thesaurus-editor');
+});
+
+test('thesaurus-checks', async ({ page }) => {
+  await page.goto('/ui/thesaurus?ds=thes');
+  await expect(
+    thesTree(page).getByRole('button', { name: 'Vertebrates', exact: true }),
+  ).toBeVisible({
+    timeout: 30_000,
+  });
+  await page.getByRole('tab', { name: 'Checks' }).click();
+  await expect(page.getByRole('list', { name: 'Check results' })).toContainText('S13');
+  await shoot(page, 'thesaurus-checks');
+});
+
+test('thesaurus-move', async ({ page }) => {
+  await page.goto(`/ui/thesaurus?ds=thes&iri=${encodeURIComponent(`${THES}bats`)}`);
+  const tree = thesTree(page);
+  await expect(page.getByRole('heading', { name: 'Bats' })).toBeVisible({ timeout: 30_000 });
+  const node = (name: string) => tree.getByRole('button', { name, exact: true }).first();
+  await node('Bats').dragTo(node('Flying animals'));
+  const preview = page.getByRole('dialog');
+  await expect(preview).toContainText('Move Bats under Flying animals');
+  await expect(preview.locator('[data-outcome]')).toHaveAttribute('data-outcome', 'commit');
+  await shoot(page, 'thesaurus-move');
+  await preview.getByRole('button', { name: 'Cancel' }).click();
 });

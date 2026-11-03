@@ -3,7 +3,7 @@
 
 import { ApiError, json } from './api';
 import { onBranch } from './branches';
-import type { FieldChange, FieldResult, FormModel } from './forms';
+import type { FieldChange, FieldResult, FormModel, NodeChange } from './forms';
 import type { Term, Receipt } from './api';
 import type { WritePreview } from './validation-overlay';
 
@@ -17,9 +17,11 @@ export type FormOptions = {
   /** The language labels prefer. */
   lang?: string;
   /** Where the shapes come from, overriding the dataset's setting. */
-  shapes?: 'guard' | 'graphs' | 'drafted';
+  shapes?: 'guard' | 'graphs' | 'drafted' | 'skos';
   /** The form of a new instance of this class instead of a resource's. */
   class?: string;
+  /** Also read the blank-node children and the templates of new ones (`nested=true`). */
+  nested?: boolean;
   signal?: AbortSignal;
 };
 
@@ -32,6 +34,7 @@ export function getForm(ds: string, focus: string, opts: FormOptions = {}): Prom
   if (opts.at) p.set('at', opts.at);
   if (opts.lang) p.set('lang', opts.lang);
   if (opts.shapes) p.set('shapes', opts.shapes);
+  if (opts.nested) p.set('nested', 'true');
   return json<FormModel>(`/$/forms/${enc(onBranch(ds, opts.branch))}?${p}`, {
     signal: opts.signal,
     cache: 'no-store',
@@ -44,9 +47,11 @@ export type FormChangeBody = {
   focus?: string;
   class?: string;
   branch?: string;
-  shapes?: 'guard' | 'graphs' | 'drafted';
+  shapes?: 'guard' | 'graphs' | 'drafted' | 'skos';
   changes: FieldChange[];
   expect: Record<string, Term[]>;
+  /** Changes to nested children, committed with `changes`. */
+  nested?: NodeChange[];
   message?: string;
 };
 
@@ -73,7 +78,7 @@ export type FormSaveAnswer = Receipt & {
 };
 
 /** The current values of the fields another commit changed since the form loaded them. */
-export type FieldConflict = { id: string; now: Term[] };
+export type FieldConflict = { id: string; now: Term[]; node?: Term };
 
 const post = (body: FormChangeBody, signal?: AbortSignal): RequestInit => ({
   method: 'POST',

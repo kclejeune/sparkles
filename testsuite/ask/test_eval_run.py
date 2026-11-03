@@ -73,7 +73,7 @@ class LoadRun(unittest.TestCase):
     def test_a_real_run_names_the_pilot_carryover_and_stays_under_the_hard_cap(self):
         for change in (
             {"carryover": None},
-            {"localCapNanodollars": 50_000_000_000},
+            {"localCapNanodollars": 105_000_000_000},
             {"localCapNanodollars": 0},
             {"clarifications": "guess"},
             {"contextTokens": 0},

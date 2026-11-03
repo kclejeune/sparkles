@@ -123,8 +123,8 @@ MCP entity linking exposes bounded, versioned candidate evidence and can order l
 matches by use. Ask uses it for full choice identities and conservative ordering while
 retaining required clarification. Ask also grounds each question with the predicates
 that its entities and best-matching classes use in the data. GPT-6 Luna, the `openai`
-preset's model, answers 106 of 150 held-out QALD-9-plus questions at $0.0021 each,
-within the noise of the best model measured.
+preset's model, answers 101 of 150 held-out QALD-9-plus questions at $0.0019 each,
+within the noise of GPT-6.1 Sol, while Opus 5.5 answers 114.
 
 [Ask stage diagnostics](ai/README.md#ask-stage-diagnostics) separate grounding, tool
 and execution timings while the remaining accuracy and latency work stays open.
@@ -143,7 +143,25 @@ the stable start of each prompt, and budgets price cache writes and reads apart.
 Use the [web UI](visualization/README.md#web-ui) to edit queries and inspect result
 tables, graphs and plans. [Explore](visualization/README.md#explore),
 [maps](visualization/README.md#maps), history views and validation tools support
-connected graph inspection and editing.
+connected graph inspection and editing. The
+[ontology editor](visualization/README.md#ontology-editor) edits OWL classes, properties,
+individuals and annotations as previewed commits beside the asserted and inferred class
+trees, and its DL Query tab answers Manchester class expressions with the reasoning used.
+The [thesaurus editor](visualization/README.md#thesaurus-editor) edits SKOS concept
+schemes, concepts, collections and SKOS-XL labels in a concept tree, and checks them
+against the integrity conditions of the SKOS Reference.
+
+![The ontology editor with the class tree and the frame of Professor](images/ontology-editor.png)
+
+![The DL Query tab with the answers of a class expression and the frame of a subclass](images/ontology-dl-query.png)
+
+![The thesaurus editor with the concept tree of an animals scheme and the labels of Whales](images/thesaurus-editor.png)
+
+[Editing forms](visualization/README.md#nested-form-read-models) generated from SHACL
+shapes edit a resource with its nested blank-node children, ordered lists and value
+alternatives, and save each form as one previewed commit.
+
+![A SKOS concept's form with its stored SKOS-XL label edited and a new label added as nested forms](images/forms-nested.png)
 
 <a id="libraries-and-bindings"></a>
 
@@ -206,10 +224,13 @@ implementation status.
 |---|---|---|
 | [Reasoning](reasoning/README.md#reasoning) | Partially complete. | RDFS, a documented OWL 2 RL subset and Jena rules are available with incremental materialization and demand derivation. Automatic cost selection, a separate derived layer and canonical equality remain planned. |
 | [Explanations](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | Why, bounded why-not, entailment diffs and minimal supports are available. The reasoner can keep bounded witnesses per fact. Inferred visibility and review protections that read them remain planned. |
-| [Validation and forms](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | SHACL, ShEx, write guards and generated forms are available, including nested read models in the Rust library. Form checks use bounded shape-dependent targets and refuse incomplete discovery. Atomic nested editing, remaining editors and producer admission remain planned. |
+| [Validation and forms](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | SHACL, ShEx, write guards and generated forms are available, and forms edit nested children, lists and value alternatives in one commit. Form checks refuse incomplete discovery. Node-level alternatives, complex nested paths and some target producers remain. |
 | [Schema discovery](reasoning/README.md#reasoning-validation-and-schema) | Complete within the documented discovery scope. | Class and predicate profiles, schema diffs and constrained shape drafts are available. Drafts retain the limits in the compatibility boundaries. |
-| [OWL 2 ontology API](reasoning/README.md#owl-2-ontologies) | Partially complete. | The axiom model, RDF mappings, profile checks and axiom diffs are available in Rust, Python, Node.js, the JVM through `jena-ontapi`, HTTP, MCP and the CLI. Reads with inferences are available in all of them except MCP and the CLI. Entity accessors, typed axiom constructors and the literal rules of OWL 2 DL are included. A read budget, fetched imports, and inferred reads and entity reports over MCP and the CLI remain in items 539, 559, 565 and 578. |
-| [OWL 2 EL classification](reasoning/README.md#owl-2-ontologies) | Partially complete. | An incremental, concurrent EL classifier computes the inferred class hierarchy and the unsatisfiable classes in Rust, Python, Node.js, the JVM, HTTP and the CLI, and can write the taxonomy to a graph with provenance. Complete reasoning with individuals and datatypes, an MCP tool, reads with the classification, durable runs, the reference-reasoner comparison and lower memory remain in items 586 to 592. |
+| [OWL 2 ontology API](reasoning/README.md#owl-2-ontologies) | Partially complete. | The axiom model, RDF mappings, profile checks and axiom diffs are available in Rust, Python, Node.js, the JVM through `jena-ontapi`, HTTP, MCP and the CLI. Reads with inferences and the Manchester reader are available in all of them except MCP and the CLI. Entity accessors, typed axiom constructors and the literal rules of OWL 2 DL are included. A read budget, fetched imports, and inferred reads and entity reports over MCP and the CLI remain in items 539, 559, 565 and 578. |
+| [OWL 2 EL classification](reasoning/README.md#owl-2-ontologies) | Partially complete. | An incremental, concurrent EL classifier computes the inferred class hierarchy and the unsatisfiable classes in Rust, Python, Node.js, the JVM, HTTP and the CLI, and can write the taxonomy to a graph with provenance. It covers OWL 2 EL with individuals, datatypes, keys and negative assertions, and uses only literals it cannot compare and chains through the top property in part, item 663. Its taxonomies equal ELK's on GO and ELK's and Konclude's on ChEBI lite and the ORE 2015 EL sample, and it classifies them 2.5 to 13 times as fast as ELK on one and eight threads and faster than Konclude on the benchmark host. DL queries reuse the kept classification incrementally in the same languages over HTTP and the bindings, and over MCP and the CLI in item 661. An MCP tool, reads with the classification, durable runs and ROBOT-compatible commands remain in items 586, 588 to 590 and 634 to 637. |
+| [Ontology editor](visualization/README.md#ontology-editor) | Partially complete. | The web UI edits classes, properties, individuals, annotations and the ontology header as previewed commits in Manchester or functional-style syntax, on session branches with undo, beside the asserted and inferred class trees. Its DL Query tab answers class expressions through the EL classifier or the OWL 2 RL rules and labels each answer with the reasoning used. The editable schema diagram remains in item 457, and large-ontology trees, inferred property trees, a server-side IRI policy and branch write grants in items 607 and 609 to 611. |
+| [Thesaurus editor](visualization/README.md#thesaurus-editor) | Complete. | The web UI edits SKOS concept schemes, concepts, collections, multilingual and SKOS-XL labels, hierarchy and mapping links as previewed commits, with drag to re-parent. Built-in SKOS shapes check the SKOS Reference's integrity conditions and can guard writes. Larger trees and search, foreign mapping labels, label relations, combined guards and graph-scoped forms are items 638 to 642. |
+| [Ontology browser](search/README.md#entity-search) | Partially complete. | A typo-tolerant search over the labels, synonyms, short forms and definitions of an ontology's entities is available in Rust, Python, Node.js, the JVM and HTTP. It is kept current at each commit on every branch and answers typeahead on ChEBI lite within 8.3 ms at the 99th percentile. The browser's entity pages remain in item 616. |
 
 ### Server and security
 
@@ -235,7 +256,7 @@ implementation status.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections and withdrawals are available with protected records and retained source holds. Identity decisions and application integration remain under item 81. |
+| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections, withdrawals, reviewed, reversible identity resolution maps, assessment inputs and the dependents of changed records are available with protected records and retained source holds. Recall and Ask citations, ingestion into proposals, reports, MCP tools and maintained analyses are planned under items 650 to 653 and 340. |
 | [Shared entity representation](ai/README.md#shared-entity-representation) | Partially complete. | Versioned resources, fixed fixtures and a bounded private offline resolver are available. Authenticated managed integration remains under item 396. |
 | [Durable jobs and delivery](specs/C26-durable-jobs-and-delivery.md) | Planned. | Item 339 specifies checkpointed jobs, fenced workers and a transactional outbox. Current tasks and notifications do not provide that recovery contract. |
 | [Maintained analysis results](specs/F22-analysis-lifecycle.md) | Planned. | Item 340 specifies reproducible runs, dependency checks, freshness and guarded publication. |

@@ -1,0 +1,11 @@
+loaded 1994673 quads in 2.7 s
+218723 label and synonym texts
+built the index in 1325 ms: 238190 entities, 731179 values, 324140 words, ~233 MiB, RSS +291 MiB
+1560 queries
+overall {"max_ms":18.257562,"n":7800,"p50_ms":1.067404,"p95_ms":6.180931,"p99_ms":8.342058}
+--- go
+loaded 1445043 quads in 1.9 s
+125303 label and synonym texts
+built the index in 637 ms: 52057 entities, 326642 values, 83432 words, ~98 MiB, RSS +115 MiB
+1560 queries
+overall {"max_ms":6.765015,"n":7800,"p50_ms":0.9941559999999999,"p95_ms":4.066139,"p99_ms":4.872946000000001}

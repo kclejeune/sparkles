@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Run HermiT 1.4.5.519 through scripts/elk-compare/elk.sh on the four range test
+# ontologies and the 36 ORE 2015 EL ontologies with nominals, SameIndividual, ranges with
+# assertions or top-property axioms, then compare each HermiT taxonomy with ELK's and the
+# classifier's. Each HermiT run has a 30-minute timeout, recorded as a timeout.
+# Usage: run-hermit.sh   (from anywhere; writes out/hermit/)
+set -uo pipefail
+L=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$L/../../.." && pwd)
+ORE=$ROOT/../sparkles-lane-el-classifier-580/.artifacts/lanes/el-580/data/ore-el
+CASES=/tmp/claude-1000/-home-kclejeune-repositories-github-com-kclejeune-sparkles/f0932073-737a-43a8-9caf-f45603aa509c/scratchpad/rangecase
+OUT=$L/out/hermit
+mkdir -p "$OUT"
+: > "$OUT/hermit.jsonl"
+run() {
+  local name=$1 input=$2 heap=$3
+  if out=$(ELK_HEAP=$heap ELK_MEM_MAX=14G timeout 1800 "$ROOT/scripts/elk-compare/elk.sh" run \
+    --reasoner hermit --taxonomy "$OUT/$name.hermit.ofn" "$input" 2> "$OUT/$name.hermit.err"); then
+    echo "$out" >> "$OUT/hermit.jsonl"
+  else
+    s=$?
+    echo "{\"input\":\"$name\",\"failed\":$s,\"timeout\":$([ $s = 124 ] && echo true || echo false)}" \
+      >> "$OUT/hermit.jsonl"
+  fi
+}
+for c in range-assertion range-hasvalue two-ranges one-range; do
+  run "$c" "$CASES/$c.ofn" 1g
+done
+for n in 10242 1034 10413 10749 10833 11526 11866 11978 13035 13066 13621 13772 14273 1481 \
+  1555 16777 1793 2195 2228 2237 2453 2557 3259 338 3349 3770 5164 6024 6226 6720 7418 \
+  8462 8730 7455 6722 1579; do
+  run "ore_ont_$n" "$ORE/ore_ont_$n.owl" 8g
+done
+: > "$OUT/compare.jsonl"
+for f in "$OUT"/ore_ont_*.hermit.ofn; do
+  n=$(basename "$f" .hermit.ofn)
+  [ -s "$f" ] || continue
+  ours=$(python3 "$ROOT/scripts/el-oracle.py" "$f" "$L/out/ore/$n.ours.txt")
+  elk=$(python3 "$ROOT/scripts/el-oracle.py" "$f" "$L/out/ore/$n.elk.ofn")
+  echo "{\"name\":\"$n\",\"hermitVsOurs\":$ours,\"hermitVsElk\":$elk}" >> "$OUT/compare.jsonl"
+done
+echo HERMIT-DONE

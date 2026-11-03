@@ -1730,6 +1730,42 @@ mod classification {
     }
 
     #[test]
+    fn a_run_stopped_before_it_starts_keeps_the_classification_it_had() {
+        let ds = dataset(ONTO);
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let cr = ClassifyRequest::default();
+        let a = h.classify(&req, &cr, &opts()).unwrap();
+        assert!(
+            a.classification
+                .taxonomy
+                .is_subclass(&c("Nucleus"), &c("Organelle"))
+        );
+        ds.update(&format!(
+            "{PREFIXES} DELETE DATA {{ :Nucleus rdfs:subClassOf :Organelle . }}"
+        ))
+        .unwrap();
+        // a run whose wait for threads ends at the deadline gives the saturation nothing
+        crate::handles::ontology::classify::REFUSE_ADMISSION.with(|r| r.set(true));
+        assert!(matches!(
+            h.classify(&req, &cr, &opts()),
+            Err(Error::Timeout)
+        ));
+        let b = h.classify(&req, &cr, &opts()).unwrap();
+        assert!(!b.reused);
+        assert!(
+            !b.classification
+                .taxonomy
+                .is_subclass(&c("Nucleus"), &c("Organelle"))
+        );
+        assert!(
+            b.classification
+                .taxonomy
+                .is_subclass(&c("Nucleus"), &c("CellPart"))
+        );
+    }
+
+    #[test]
     fn refuses_inferences_and_a_target_it_reads() {
         let ds = dataset(ONTO);
         let h = ds.ontology();

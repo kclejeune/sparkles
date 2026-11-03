@@ -1814,7 +1814,9 @@ defaults to the default graph, with the imports that resolve to graphs of the da
 unless `imports=false`. `mode=strict` keeps every triple outside the mapping unmapped,
 and the default `mode=lenient` types undeclared entities from their use and says so in
 the diagnostics. The routes read with the caller's grants. An import of a graph the
-caller cannot read is not followed.
+caller cannot read is not followed. Every route takes `branch` and reads or edits that
+branch, as [Choosing a branch](#choosing-a-branch) describes, and the grants are checked on
+it.
 
 `inferences=true` on the summary and the axioms, and `inferences` in the body of a check,
 also read the materialized inferences in `urn:x-sparkles:inferred` while the dataset has
@@ -1862,6 +1864,59 @@ document of the page, as `text/owl-functional`.
 read, types by their use, as `{kind, iri}` in IRI order, 100 at a time by default and at
 most 10,000 (`limit`, `offset`, and `next` in the answer). `kind` keeps the kinds it
 lists, comma separated, such as `Class,ObjectProperty`.
+
+`GET /$/ontology/{ds}/search?q=TEXT` searches the entities of the ontology for a
+typeahead or a results page. An entity is an IRI that some graph types as an OWL class,
+property, named individual or datatype, an RDFS class, property or datatype, or a SKOS
+concept, concept scheme or collection. The search matches its labels (`rdfs:label`,
+`skos:prefLabel` and SKOS-XL preferred labels), synonyms (`skos:altLabel`,
+`skos:hiddenLabel`, their SKOS-XL forms and the oboInOwl synonym properties), short forms
+(`oboInOwl:id`, `skos:notation` and the local name of the IRI) and definitions
+(`skos:definition` and `IAO_0000115`), in any language, in a form with case, diacritics
+and punctuation folded. A query that is an IRI, or a prefixed name with one of the
+dataset's prefixes, also matches the IRIs it equals or begins.
+
+The hits come in eight tiers. A label that equals the query comes first, then labels
+that start with it, then synonyms, short forms and IRIs that equal it, then those that
+start with it, then labels and then synonyms that contain every word of the query, the
+last word as a prefix. Matches within a few edits follow, and then definitions that
+contain the query's words. A word typed so far takes no edit up to 3 characters, one up
+to 7 and two beyond, and a whole word takes one from 3 characters and two from 6, with a
+transposition as one edit. Within a tier, hits are ordered by the edits, the field,
+entities that are not deprecated first, the language of the matched text, its length,
+the text and the IRI, so the same request on the same commit gives the same page.
+`lang` names the caller's languages, most preferred first, and defaults to the tags of
+`Accept-Language`. Texts in those languages rank first, then untagged ones, then English,
+then the others, and without a preference untagged and English texts rank alike.
+
+`kind` keeps some kinds, comma separated: `class`, `property` (every kind of property),
+`objectProperty`, `dataProperty`, `annotationProperty`, `individual`, `datatype`,
+`concept`, `conceptScheme` and `collection`. `limit` is 10 by default and at most 100,
+`offset` and `limit` reach at most 10,000 hits. `more` says whether further hits exist,
+and `next` gives the offset of the next page, or null when no page can start there
+because the window ends. `fuzzy=false` and `definitions=false` leave out those tiers. The
+graphs, imports and branch are chosen as for the other routes, and the caller sees only
+the graphs and triples their grants allow. The search reads the head, so `at` and
+`inferences` are refused. An IRI prefix ranks at most the first 10,000 matching IRIs
+that the caller can see, in IRI order, and the answer warns when it matched more.
+
+```json
+{ "dataset": "chebi", "commit": 3, "graphs": ["default"], "query": "glucos",
+  "results": [{ "type": "entity", "iri": "http://purl.obolibrary.org/obo/CHEBI_17234",
+    "kinds": ["class"], "label": "glucose", "labelLang": null, "shortForm": "CHEBI:17234",
+    "deprecated": false,
+    "match": { "field": "label", "property": "http://www.w3.org/2000/01/rdf-schema#label",
+      "text": "glucose", "lang": null, "kind": "prefix", "distance": 0, "tier": 1,
+      "highlight": [[0, 6]] } }],
+  "offset": 0, "limit": 10, "more": true, "next": 10, "index": "current" }
+```
+
+`highlight` gives the matched ranges of `match.text` in UTF-16 code units, the offsets
+of JavaScript and Java strings. Every result has `type` set to `entity`, so a list that
+mixes them with other kinds of result can tell them apart. `index` says whether the
+branch's entity index already reflected the head, applied the changes of later commits,
+or was built for this request, which the first search of a branch after the server
+starts does.
 
 `GET /$/ontology/{ds}/entity?iri=IRI` answers what the ontology says about one entity.
 `kinds` lists the kinds the IRI has, and `labels` and `annotations` its `rdfs:label`
@@ -1921,7 +1976,8 @@ facets and values from its datatype's facet space (§7.5), and a datatype that a
 definition introduces cannot type a literal or be restricted (§9.4).
 
 `POST /$/ontology/{ds}/axioms` adds the axioms of `add` and removes those of `remove` in
-one commit. A removed axiom takes its triples with it, including the blank nodes of its
+one commit. Each axiom is its JSON form or a string in functional-style syntax with the
+dataset's prefixes. A removed axiom takes its triples with it, including the blank nodes of its
 class expressions and lists, except those another axiom or triple still uses. Removing an
 axiom that the ontology does not hold is not an error, and the answer lists it under
 `absent`. A removal edits the graphs `graph` names and the graph `target` names. An
@@ -1929,11 +1985,26 @@ axiom read only from an imported graph is `400` until `target` names that graph.
 added axiom goes to the graph `target` names, the first graph read by default. The edit also declares the entities the added axioms use that the ontology does
 not declare, unless `declare` is false. Named individuals are not declared. The answer
 counts the axioms added, already present and removed, and the triples inserted, deleted
-and kept. The route takes the parameters of the other writes, such as `dryRun` and
+and kept. `addedAxioms` lists the axioms the edit wrote, declarations included, and
+`removedAxioms` those it removed, at most 10,000 of each with `axiomsTruncated` when a
+list is cut. Each entry has the `type`, `ofn` and `axiom` of a listing. An added axiom of
+several classes or individuals, such as an `EquivalentClasses`, is listed whole when part
+of it was already present, so the lists do not always undo the edit. A revert of the
+edit's commit through `POST /$/revert/{ds}` undoes it exactly. The route takes the parameters of the other writes, such as `dryRun` and
 `receipt`, and an `If-Match` with the summary's tag. An axiom the forward mapping cannot
 write, such as a `DisjointClasses` of one class, is `400` with code `invalid-axiom`.
 Writing needs write access to the target graph, and a removal needs it on the graphs the
 removed triples are in.
+
+`DELETE /$/ontology/{ds}/entity?iri=IRI` removes an entity in one commit. It removes the
+entity's declarations, the axioms of the graphs read that mention it and the assertions
+about it that the store holds there, with the blank nodes of their expressions as an
+edit's removals do. The graphs, imports and mode are chosen as for the other routes, and
+`message` gives the commit message. The answer is an edit's, and its `removedAxioms`
+lists what the removal took, so adding them back with `declare: false` undoes it. An IRI
+the ontology does not mention removes nothing and makes no commit. The route takes the
+parameters of the other writes, such as `dryRun` and `receipt`, and an `If-Match` with
+the summary's tag, and it needs write access to the graphs the removed triples are in.
 
 `GET /$/ontology/{ds}/diff` lists the axioms that differ between the commits `from` and
 `to`, which take the forms of `at` and default to the head for `to`. The graphs, imports
@@ -2018,19 +2089,101 @@ between is `409`. A write takes the parameters of the other writes, such as
     "indexMs": 453.1, "saturationMs": 402.7, "taxonomyMs": 251.8 } }
 ```
 
+`POST /$/ontology/{ds}/parse` reads `text` in the OWL 2 Manchester Syntax as the value
+that `as` names, which is `classExpression` by default or `dataRange`, `individual`,
+`literal` or `axiom`. It takes `graph`, `imports` and `mode` as the other routes do. A
+name is a full IRI in angle brackets, a prefixed name with the dataset's prefixes, a
+local name, or a label, which takes single quotes when it holds a space or a keyword.
+Names resolve against the entities of the ontology read and their `rdfs:label` and
+`skos:prefLabel` values, so a caller reads only the names its grants show. A name the
+ontology does not have is looked for again among the entities of the assertions the
+caller can read, such as an individual that only a property assertion names. That search
+follows the same rules of case and quoting, and keeps at most 256 entities for one name,
+so a local name that more assertion entities share reads as ambiguous among the first
+256. An axiom is
+written as one frame line such as `Professor SubClassOf teaches some Course`. The reader
+takes the keywords `SubClassOf`, `EquivalentTo`, `DisjointWith`, `SubPropertyOf`,
+`InverseOf`, `Domain`, `Range`, `Types`, `SameAs`, `DifferentFrom` and
+`SubPropertyChain`, a chain such as `partOf o partOf SubPropertyOf partOf`, a
+characteristic such as `Transitive partOf`, and a fact such as `ada teaches logic`.
+The answer gives the value in its JSON form under `value`, its functional-style text
+under `ofn` and the Manchester text the editor writes for it under `manchester`, which
+reads back as the same value. Text that does not read is `400` with `code`
+`invalid-manchester`, a `reason` of `syntax`, `unknown`, `ambiguous` or `kind`, and the
+span `start` and `end` in UTF-16 code units. A name that several entities share is
+`ambiguous` and lists each entity under `candidates` with its IRI, kind and label.
+
+```json
+{ "error": "'Course' names 2 entities: :Course (class, labelled 'Course'), <http://ex.org/old/Course> (class, labelled 'Course'); write a prefixed name or an IRI",
+  "code": "invalid-manchester", "reason": "ambiguous",
+  "start": 13, "end": 21,
+  "candidates": [{ "iri": "http://ex.org/Course", "kind": "Class", "label": "Course" },
+                 { "iri": "http://ex.org/old/Course", "kind": "Class", "label": "Course" }] }
+```
+
+`POST /$/ontology/{ds}/dl-query` answers a class expression as Protégé's DL Query tab
+does, with its equivalent classes, its direct and inferred superclasses and subclasses,
+and its instances. `expression` is Manchester text, functional-style text with
+`syntax: "functional"`, or the JSON form as an object. `answers` names the lists wanted,
+from `equivalents`, `superclasses`, `directSuperclasses`, `subclasses`,
+`directSubclasses` and `instances`, and every one is answered by default. Each list holds
+at most `limit` IRIs, 1,000 by default and at most 10,000, and `counts` gives the full
+number. The lists leave out `owl:Nothing` and the unsatisfiable classes, and a named
+class asked about is among its own equivalents.
+
+`reasoning` chooses the engine. `auto`, the default, uses the EL classifier when the
+expression and every logical axiom of the ontology are in OWL 2 EL, and the OWL 2 RL rules
+otherwise. `el` keeps to the classifier, which leaves out the axioms outside EL and lists
+them, and refuses an expression outside EL. `rl` asks for the rules. The classifier
+answers by reading `EquivalentClasses(urn:x-sparkles:dl-query C)` beside the ontology's
+axioms in the dataset's kept classification, saturating again only what that axiom and
+any change since the last run reach, and reading the answer from the saturated contexts
+without a taxonomy. The next run over the kept state lets the axiom go, the kept
+taxonomy stays as it was, and `incremental` is true when the kept state answered. Its class answers read the
+terminology, and its instances come from a classification with the assertions, which the
+dataset does not keep. Inside EL its answers are complete. The RL rules answer by demand
+reasoning over a copy in memory of the terminology, the defining axioms and the
+assertions, and derive only what the query's patterns need. Their instances are complete
+when the ontology and the expression are in OWL 2 RL, and their class answers can miss
+entailed subsumptions, since the RL rules are incomplete for classification.
+
+The answer's `reasoning` names the `engine` and its `title`, says `why` it was chosen,
+whether the class answers are `complete` and whether the instances are
+(`instancesComplete`), and lists under `gaps` the axioms outside the engine's profile or
+used in part, at most `limit` of `gapCount`, with notes on what the engine cannot tell.
+`satisfiable` and `consistent` come from the classifier and are null under the rules. A
+caller whose grants limit endpoints needs the `query` endpoint.
+
+```json
+{ "dataset": "uni", "commit": 4, "graphs": ["default"], "mode": "lenient",
+  "expression": { "manchester": "Person and (teaches some Course)",
+    "ofn": "ObjectIntersectionOf(:Person ObjectSomeValuesFrom(:teaches :Course))", "json": {} },
+  "reasoning": { "engine": "el", "title": "OWL 2 EL classifier",
+    "why": "the expression and the ontology are inside OWL 2 EL", "complete": true,
+    "instancesComplete": true, "gapCount": 0, "gaps": [], "notes": [] },
+  "satisfiable": true, "consistent": true, "incremental": true, "elapsedMs": 1.8,
+  "equivalents": ["http://ex.org/Teacher"], "directSuperclasses": ["http://ex.org/Person"],
+  "subclasses": ["http://ex.org/Professor"], "instances": ["http://ex.org/ada"],
+  "counts": { "equivalents": 1, "directSuperclasses": 1, "subclasses": 1, "instances": 1 } }
+```
+
 The library's `sparkles::handles::ontology::wire::call` answers the same operations
 in the same JSON forms, and the bindings call it. Python's `Dataset.ontology` has
-`summary`, `axioms`, `entities`, `entity`, `check`, `edit`, `remove_entity`, `diff` and
-`classify`, with the members as keyword arguments, and `Axiom` reads and writes one
+`summary`, `axioms`, `entities`, `entity`, `check`, `edit`, `remove_entity`, `diff`,
+`classify`, `parse` and `dl_query`, with the members as keyword arguments and `as_` for
+`as`, and `Axiom` reads and writes one
 axiom with structural equality. Node.js's `dataset.ontology` has `summary`, `axiomPage`,
 `axioms` (an async iterable in batches), `entities`, `entity`, `check`, `edit`,
-`removeEntity`, `diff` and `classify`. On the JVM, `DatasetGraphSparkles.ontology()` has
-the same operations, with `classify` taking a `ClassifyQuery`,
+`removeEntity`, `diff`, `classify`, `parse` and `dlQuery`. On the JVM,
+`DatasetGraphSparkles.ontology()` has the same operations, with `classify` taking a
+`ClassifyQuery` and `dlQuery` a `DlQuery`,
 `SparklesOnt` has them over one graph, and `SparklesOnt.model` returns a `jena-ontapi`
 `OntModel` over a Sparkles graph
 ([integrations](integrations/README.md#libraries-and-bindings)). An axiom given to an
 edit is its JSON form or a string in functional-style syntax with the dataset's
-prefixes.
+prefixes. Manchester text that `parse` or `dl_query` cannot read raises Python's
+`InvalidInputError`, a `ValueError`, with `reason`, `start`, `end` and `candidates` as
+attributes, and Node.js's `InvalidInputError` with them under `details`.
 
 Typed constructors build axioms without writing their syntax. Python's `sparkles.owl`
 and Node.js's `owl` namespace have one constructor per axiom type and per expression,
@@ -4173,7 +4326,7 @@ they must agree, and a request that names two different branches gets `400` with
 
 The admin routes `/$/commits`, `/$/snapshots`, `/$/history`, `/$/compaction`,
 `/$/compact`, `/$/stats`, `/$/schema`, `/$/reason`, `/$/validation`, `/$/prefixes`,
-`/$/describe`, `/$/text`, `/$/geo`, `/$/vector`, `/$/rdfs`, `/$/cache` and
+`/$/describe`, `/$/text`, `/$/geo`, `/$/vector`, `/$/rdfs`, `/$/cache`, `/$/ontology` and
 `/$/datasets/{ds}/clone` take `branch` as a query parameter. Other admin routes refuse
 a branch other than `main`.
 
@@ -9032,8 +9185,10 @@ The design and its rationale are in
 The form routes turn a dataset's SHACL shapes into an editing form for one resource. The
 server reads the shapes, chooses the node shapes that target the resource, merges their
 property shapes into fields and reads the resource's values under the caller's grants. A
-form's changes go back as terms, and the server writes them as one update of
-`DELETE DATA` and `INSERT DATA`, so a client never writes SPARQL text for a save. The routes
+form's changes go back as terms, and the server writes the quads they delete and insert
+as one update, so a client never writes SPARQL text for a save. A change can also edit
+the blank-node children of fields that declare `sh:node`, replace the `rdf:List` of a
+list field, and pick among the options of `sh:or` and `sh:xone`. The routes
 need the `shacl` cargo feature, which is on by default, and return `501` without it.
 
 | Route | Permission | Use |
@@ -9041,6 +9196,7 @@ need the `shacl` cargo feature, which is on by default, and return `501` without
 | `GET /$/forms/{ds}?focus=IRI` | `read` | The form model of a resource, or with `class=IRI` the empty form of a new instance. |
 | `POST /$/forms/{ds}/check` | `write` | A dry run of a change and its validation against the form's shapes. |
 | `POST /$/forms/{ds}/save` | `write` | The commit of a change, unless another commit changed its fields. |
+| `GET /$/skos/shapes` | any caller | The built-in SKOS shapes as Turtle. |
 
 Checks follow shape dependencies in the base and candidate states rather than a fixed
 number of graph hops. The allowance admits 500 additional distinct targets beyond the
@@ -9063,16 +9219,20 @@ cover its target selection and work, not all SHACL heap use or cold index decodi
 * **`class`** asks for the form of a new instance of that class instead, built from the
   node shapes that target the class or one of its superclasses, with no values and a
   `focus` of `null`. A request names `focus` or `class`, and a `class` form takes no `at`.
-* **`shapes`** is `guard`, `graphs` or `drafted` and overrides the `forms` setting's
-  source. `guard` reads the shapes of the dataset's write-time SHACL guard, `graphs` reads
-  the shapes graphs the setting names, and `drafted` drafts shapes from the data as the
-  schema report does. A dataset without a SHACL guard answers with no fields and
-  `shapes.missing` set, rather than an error.
+* **`shapes`** is `guard`, `graphs`, `drafted` or `skos` and overrides the `forms`
+  setting's source. `guard` reads the shapes of the dataset's write-time SHACL guard,
+  `graphs` reads the shapes graphs the setting names, and `drafted` drafts shapes from the
+  data as the schema report does. `skos` reads the built-in SKOS shapes that
+  [SKOS shapes](#skos-shapes) describes, which only a request can choose. A dataset
+  without a SHACL guard answers with no fields and `shapes.missing` set, rather than an
+  error.
 * **`branch`** opens the form on a branch, as on other routes. **`at`** opens the form at
   a past state, as the history routes take it, and such a form is never editable.
 * **`lang`** is the language whose `sh:name` and `sh:description` the labels prefer. The
   server falls back to English, then to untagged text, then to the predicate's
   `rdfs:label` and similar labels in the data, and then to its prefixed name.
+* **`nested=true`** also answers the blank-node children of the resource, as
+  [Nested children](#nested-children) describes.
 
 The answer is the model. Its `ETag` and `Sparkles-Commit` headers name the commit read.
 
@@ -9103,13 +9263,14 @@ type FormField = {
   path: string;                     // the predicate IRI, or the SPARQL path of a complex path
   inverse: boolean;
   editable: boolean;
-  reason?: "readOnly" | "protected" | "graph" | "complex-path" | "too-many" | "state";
+  reason?: "readOnly" | "protected" | "graph" | "complex-path" | "too-many" | "list" | "state";
   label: string;
   description?: string;
   group: string | null;             // the sh:PropertyGroup IRI
   order: number | null;
   widget: string;                   // radio, select, checkbox, boolean-select, date, datetime,
-                                    // number, text-lang, textarea, text, entity, nested, term
+                                    // number, text-lang, textarea, text, entity, nested, list,
+                                    // term
   editor?: string;                  // dash:editor
   viewer?: string;                  // dash:viewer
   constraints: Constraints;         // the merged constraints of every shape on this path
@@ -9117,7 +9278,13 @@ type FormField = {
   values: FormValue[];
   truncated?: boolean;              // more than 200 values, so the field is read-only
 };
-type FormValue = { term: Term; graph: string | null; label?: string; readOnly?: boolean };
+type FormValue = {
+  term: Term;
+  graph: string | null;
+  label?: string;
+  readOnly?: boolean;
+  items?: FormValue[];              // the members of a list field's rdf:List, in order
+};
 ```
 
 A field's `id` is its path written in SPARQL syntax, so two node shapes that constrain the
@@ -9127,6 +9294,20 @@ constraints the browser can check, which are `minCount`, `maxCount`, `datatype`,
 `pattern` with its `flags`, `languageIn`, `uniqueLang`, `singleLine` and `defaultValue`.
 `node` lists the shapes of `sh:node`, and `server` names the other components the check
 evaluates, such as `sh:qualifiedValueShape` or a SHACL-SPARQL constraint.
+
+A field whose shapes have SHACL 1.2 list constraints (`sh:memberShape`, `sh:minListLength`,
+`sh:maxListLength` or `sh:uniqueMembers`) is a list field with the widget `list`.
+`constraints.list` holds `minLength`, `maxLength`, `unique`, the `memberShapes`, the value
+constraints of the members in `member` and their widget in `memberWidget`. Its value lists
+its members in `items`. A list field that holds more than one list, or a list that is not
+well formed, is read-only with `reason: "list"`. A well-formed list has a blank node with
+one `rdf:first` and one `rdf:rest` for each cell, no cycle and at most 200 members.
+
+An `sh:or` or `sh:xone` whose members constrain values only, with no path and no property
+shapes of their own, gives the field `constraints.or`, which is `{kind, options}`. `kind`
+is `or` or `xone`, and each option is `{shape, label, widget, constraints}`. The label is
+the member's `sh:name`, else the local name of its class, datatype or node kind. Other
+`sh:or` and `sh:xone` constraints stay in `server`.
 
 A predicate path and an inverse path are editable. Sequence, alternative and repetition
 paths are read-only with `reason: "complex-path"` and show no values. A field is also
@@ -9142,6 +9323,36 @@ graphs alone make a field `protected`, and a protection scoped by classes or a p
 enforced by the save itself. Shapes read from shapes graphs leave out the triples that the
 caller's protections hide. A focus that no shape targets answers `200` with no fields.
 
+### Nested children
+
+With `nested=true` the model also lists the stored blank-node children that fields
+declaring `sh:node` reach, and the empty forms that new children take.
+
+```ts
+type NestedFormModel = FormModel & {
+  nestedNodes: (NodeModel & {
+    id: string;                     // n0, n1, … in this answer only
+    term: Term;                     // the child's stored blank node
+    anchors: { parent: string; field: string; graph: string | null; inverse: boolean }[];
+  })[];
+  templates: (NodeModel & { node: string[] })[];  // node: the shapes as constraints.node names them
+};
+```
+
+Each child keeps its stored blank node, every visible edge it hangs from and a layout built
+from every `sh:node` declaration that reaches it. An anchor's `parent` is `root` or another
+child's `id`. Shared children appear once, and a cycle refers to a child already listed.
+The model admits at most 64 children, 512 field views, 512 anchors and a first-discovery
+depth of 16, and its preparation shares 65,536 units, as
+[the design](specs/U02-shape-driven-forms/SPEC.md#231-nested-read-models-in-the-rust-library)
+describes. Past one of them, and for complex nested paths or blank-named graph contexts,
+the answer is the flat model with `nested: {refused}` set to the reason. A template is the
+empty form of a new child under a field whose `constraints.node` is its `node`, one
+for each distinct set that the root, the children and the templates declare.
+
+A child's term grants no write authority. A change that edits a stored child names it with
+the parent it hangs from, and the save checks that edge again under the writer lock.
+
 ### Checks and saves
 
 `check` and `save` take the same JSON body.
@@ -9152,18 +9363,54 @@ type FormChangeBody = {
   class?: string;                   // or the class of a new instance, instead of focus
   branch?: string;                  // the branch the form was opened on, main by default
   shapes?: "guard" | "graphs" | "drafted";
-  changes: { field: string; remove?: Term[]; add?: Term[] }[];
+  changes: FieldChange[];
   expect: { [field: string]: Term[] };  // the values the form loaded, for every changed field
+  nested?: NodeChange[];            // changes to nested children, committed with changes
   message?: string;                 // the commit message
+};
+type FieldChange = {
+  field: string;
+  remove?: Term[];
+  add?: Term[];
+  list?: Term[];                    // a list field's members, which replace its list
+};
+type NodeChange = {
+  node: Term;                       // a blank node: a stored child, or a new one
+  parent?: Term;                    // the node it hangs from, absent for the root
+  field: string;                    // the parent's field
+  changes?: FieldChange[];
+  expect?: { [field: string]: Term[] };  // a stored child's loaded values
 };
 ```
 
 The server checks each change before it writes anything. A field that is not in the form,
-a blank node, or a literal on an inverse path is a `400`, because the change could not
-name its triple. A change to a
+or a literal on an inverse path, is a `400`, because the change could not name its triple.
+A blank node may be removed only from a field that declares `sh:node`, and added only as a
+new child that a `nested` entry describes under that field. A label that a field's `add`
+names is always a new child, even when it spells a stored blank node, and the server gives
+it a new node.
+
+A `nested` entry for a stored child must name a current visible value of its parent's
+field, and every node between it and the root needs an entry, which may have no changes.
+A stored child that no longer hangs from its parent answers a conflict on the parent's
+field. Its fields are those of its nested model, and its `expect` names every changed
+field as the root's does. A new child takes the fields of its parent field's `sh:node`
+shapes, and its values and its edge go to its parent's target graph. A stored child takes
+new values into its own target graph, and with `targetGraph: "type"` a child without a
+type uses the graph of its edge. Removing a stored child deletes its edges and, when no
+other quad refers to it once they are gone, its visible quads, and so on through their
+blank objects, which removes the cells of its lists too. Hidden quads stay. A seen quad in
+a graph the caller cannot write refuses the change with `403`. A change cannot both remove
+and edit a child.
+
+A list change replaces the field's stored lists with a new list of `list`'s members, which
+are IRIs or literals, at most 200. An empty `list` writes `rdf:nil`. For a list field,
+`expect` holds the loaded members in order, so an edit of one cell in place conflicts. A change to a
 read-only field is a `403`. A change of more than 1,000 terms is a `400`. A removed value is
 deleted from every graph that holds it, and an added value goes to the model's `graph`.
 `expect` must name every changed field. It may be empty for a field that had no values.
+A change of nested children counts their terms and the quads it removes with them toward
+the same limits.
 A change with `class` makes a new instance. The server mints its IRI from the setting's
 `newIri`, refuses an IRI that already describes a resource, and adds its `rdf:type`.
 The middleware admits a check or a save on any branch the caller can see, and the handler
@@ -9184,8 +9431,8 @@ session branch that does not exist yet previews its first commit on `main`'s hea
 type FormCheckAnswer = {
   branch: string;
   preview: WritePreview;            // as POST /{ds}/update?dryRun=true answers
-  update: string;                   // the SPARQL Update the save would run
-  conflicts: { id: string; now: Term[] }[];  // fields another commit changed, as save's 409 lists them
+  update: string;                   // the update the save would run, as SPARQL text
+  conflicts: { id: string; node?: Term; now: Term[] }[];  // as save's 409 lists them
   validation: {
     checked: boolean;
     withheld: boolean;              // the caller's grants hide part of the dataset
@@ -9198,18 +9445,23 @@ type FormCheckAnswer = {
 
 Each result carries the `field` it belongs to, which is the field whose path is the
 result's `sh:resultPath` on the focus node, or `null` for a result on another node. A
+result on a nested child of the change carries that child's field and the child as
+`node`. The `update` text names stored blank nodes by their labels and new ones by plan
+labels, so a change with blank nodes is shown but cannot be run as SPARQL. A
 caller whose grants limit the graphs or triples it reads gets `withheld: true` and no
 results, as the validation routes withhold reports from such callers.
 
 The Rust library gives the same answers through `ds.forms().model`, `check` and `save`.
-Python binds them as `ds.forms.model(focus, class_=…, settings=…, at=…)`,
+Python binds them as `ds.forms.model(focus, class_=…, settings=…, at=…, nested=…)`,
 `ds.forms.check(change, settings=…)` and `ds.forms.save(change, settings=…)`, which
 return dicts with the members above. A conflicting save raises `ConflictError` with the
 code `form-conflict` and the fields in `fields`. The Node.js and JVM bindings do not expose forms.
 
 `save` compares `expect` with the stored values of the changed fields while it holds the
-writer lock. When one differs, it answers `409` with code `form-conflict` and the current
-values, and writes nothing. When the values are the same but another commit moved one of
+writer lock, and checks that every stored child still hangs from its parent. When one
+differs, it answers `409` with code `form-conflict` and the current values, with the
+nested `node` of a child's field, and writes nothing. When the quads under a removed child
+changed meanwhile, the save plans again on the new head. When the values are the same but another commit moved one of
 them to another graph while the save waited, the save plans its update again on the new
 head, up to three times.
 
@@ -9253,7 +9505,7 @@ kept in `<db>/forms.json`. Its fields are these.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `shapes` | `guard` | Where the shapes come from, which is `guard`, `graphs` or `drafted`. |
+| `shapes` | `guard` | Where the shapes come from, which is `guard`, `graphs` or `drafted`. A request can also name `skos`. |
 | `graphs` | `[]` | The shapes graphs that `shapes: "graphs"` reads. |
 | `saveTo` | `auto` | Where saves of a form on `main` go, which is `auto`, `main` or `branch`. |
 | `branchTemplate` | `edits.{user}.{date}` | The name of the session branch. It must hold `{user}`. |
@@ -9264,6 +9516,31 @@ kept in `<db>/forms.json`. Its fields are these.
 curl -X PATCH 'localhost:3030/$/settings/people/forms' \
   -H 'content-type: application/json' -d '{"saveTo": "branch"}'
 ```
+
+### SKOS shapes
+
+`GET /$/skos/shapes` answers the built-in SKOS shapes as Turtle. They lay out the forms of
+concept schemes, concepts, collections, ordered collections and SKOS-XL labels, and they
+check the integrity conditions of the
+[SKOS Reference](https://www.w3.org/TR/skos-reference/). The conditions are S9, S13,
+S14, S27, S37 and S46, with S51, S52 and S58 of the SKOS-XL appendix. The literal forms of
+SKOS-XL labels count for S13 and S14, as S55 to S57 imply. Each result's message names
+its condition. A linked concept, scheme or collection member without its `rdf:type` is
+reported at `sh:Info` severity, which a guard with the default threshold lets through.
+The shapes graph does not hold the SKOS vocabulary, so the checks name its consequences.
+`skos:OrderedCollection` counts as `skos:Collection`, the subjects and objects of the
+semantic and mapping relations count as concepts, and the properties of concept schemes
+and collections type their subjects and objects. S27 reads `skos:broadMatch`,
+`skos:narrowMatch` and `skos:relatedMatch` as the sub-properties of `skos:broader`,
+`skos:narrower` and `skos:related` they are, and S46 follows `skos:exactMatch` through
+its symmetry and transitivity. Each SPARQL constraint reads one property path or basic
+graph pattern from the focus node, so a form check with `shapes=skos` validates only the
+resources an edit affects. The results of S27, S46 and the clash of two SKOS-XL labels
+name the focus node without a value.
+
+Forms read the shapes with `shapes=skos`. `POST /{ds}/shacl` runs them over a graph, and
+`PUT /$/validation/{ds}` installs them as a write guard with `{"shapes": {"inline": …}}`.
+The `forms` setting refuses `shapes: "skos"`, so a stored setting never depends on them.
 
 ## ShEx validation
 
@@ -12242,7 +12519,8 @@ new entity. A client without elicitation, or of an older revision, gets the
 ### Evidence settings
 
 A dataset's evidence settings declare the graphs of the
-[evidence profile](ai/README.md#evidence-profile) and its named review policies. They are
+[evidence profile](ai/README.md#evidence-profile), its named review policies and its
+named matching policies. They are
 kept in `<db>/evidence.json` as format 1 and profile 1, and in the process for an
 in-memory dataset. The design is in
 [C25 §7](specs/C25-evidence-and-assessments.md#7-configuration-access-and-retention).
@@ -12255,7 +12533,7 @@ in-memory dataset. The design is in
   "decisions": ["https://example.org/ev/decisions"],
   "supports": ["https://example.org/ev/supports"],
   "identity": ["https://example.org/ev/identity"],
-  "projections": ["https://example.org/ev/accepted"],
+  "projections": ["https://example.org/ev/accepted", "https://example.org/ev/people"],
   "policies": {
     "advisories": {
       "version": 1, "admittedKinds": ["reported", "observation"],
@@ -12265,12 +12543,21 @@ in-memory dataset. The design is in
       "supports": "https://example.org/ev/supports",
       "output": "https://example.org/ev/accepted"
     }
+  },
+  "matchingPolicies": {
+    "people": {
+      "version": 1,
+      "boundary": ["https://example.org/ev/identity", "https://example.org/ev/claims"],
+      "decisions": "https://example.org/ev/decisions",
+      "maps": "https://example.org/ev/identity",
+      "output": "https://example.org/ev/people"
+    }
   }
 }
 ```
 
-Each role is a set of absolute graph IRIs, and the roles together name at most 1,024
-graphs. Enabled settings need `sourceRecords` and `proposals`. A graph may have several
+The `projections` role lists the output graphs of both policies. Each role is a set of
+absolute graph IRIs, and the roles together name at most 1,024 graphs. Enabled settings need `sourceRecords` and `proposals`. A graph may have several
 roles, except that a `projections` graph has no other role. The members after
 `proposals` may be left out and then default to empty. A policy name uses `a-z`, `0-9`
 and `-`, with at most 64 policies. A policy's `version` starts at 1, and
@@ -12280,7 +12567,12 @@ predicates an admitted claim must carry. `conflicts` is `refuse` or `admitLabell
 `boundary` lists the `sourceRecords` and `proposals` graphs whose records the
 policy's reviews may use. `decisions`, `supports` and `output` name one graph of the
 `decisions`, `supports` and `projections` roles, and each projection graph is the output
-of one policy. Anything else, including an unknown member, is a `400`. A `format` or
+of one policy. A matching policy decides [identity proposals](#evidence-identities). Its
+`boundary` lists the `identity`, `sourceRecords` and `proposals` graphs whose records its
+reviews may use, with at least one `identity` graph. `decisions`, `maps` and `output`
+name one graph of the `decisions`, `identity` and `projections` roles, the last owned by
+no other policy of either kind. Review and matching policies share one namespace of
+names and the bound of 64. Anything else, including an unknown member, is a `400`. A `format` or
 `profile` other than 1 is a `409` with the code `unsupported-profile`.
 
 `GET /$/evidence/{ds}/settings` needs `admin` and answers the canonical settings with
@@ -12439,7 +12731,8 @@ folded in may answer `incomplete-evidence`.
 
 `POST /{ds}/claims` publishes one batch of [evidence profile](ai/README.md#evidence-profile)
 records as one commit: source revisions, renditions and passages, evidence references,
-claim occurrences, evidence links and assessments. Claims describe their propositions
+claim occurrences, evidence links, assessments and
+[identity proposals](#evidence-identities). Claims describe their propositions
 and never assert them. The route needs `write` on the dataset or branch through the
 update endpoint and counts as an update. The design is in
 [C25 §5 and §7](specs/C25-evidence-and-assessments.md#5-writes-review-and-accepted-projections).
@@ -12469,13 +12762,23 @@ record as `{"iri"}`. Content is `{"text"}`, `{"base64"}` or the `{"digest"}` of 
 that is not retained. A proposition, scope value, rights term and conclusion is an
 N-Triples term without blank nodes. A stored fact has the form of
 [evidence resolution](#evidence-resolution). `ifHead`, `dryRun` and `message` have their
-usual meanings, and `sourceGraph` and `proposalGraph` choose among the settings' graphs
-when a role has more than one. A batch holds at most 1,000 claims, 10,000 links and
-16 MiB of decoded input, in a body of at most 24 MiB.
+usual meanings, and `sourceGraph`, `proposalGraph` and `identityGraph` choose among the
+settings' graphs when a role has more than one. A batch holds at most 1,000 claims,
+10,000 links, 1,000 identity proposals and 16 MiB of decoded input, in a body of at most
+24 MiB.
+
+An assessment's `inputs` names up to 64 records the evaluation consumed, each once, as
+`{"key"}` or `{"iri"}`: claims, assessments, identity proposals, source revisions,
+review decisions, acceptance supports and resolution map revisions. They are written as
+`prov:used` and verified as authenticated records of those kinds before publication, and
+an assessment without them keeps the record digest it would have had before the field
+existed. Inputs and targets of the batch's assessments may not form a cycle.
+[Evidence dependents](#evidence-dependents) finds the assessments that used a record
+after it changed.
 
 Source revisions, renditions and passages go to the
-[evidence settings'](#evidence-settings) source-record graph, and the other records to
-the proposal graph. The caller needs update grants on every graph the batch writes, and
+[evidence settings'](#evidence-settings) source-record graph, identity proposals to an
+identity graph, and the other records to the proposal graph. The caller needs update grants on every graph the batch writes, and
 read access to every record and stored fact it references, decided as evidence
 resolution decides it. A reference the caller cannot read answers as a missing one.
 Record IRIs are `urn:uuid:` identities derived from the dataset, the authenticated
@@ -12525,7 +12828,8 @@ lists the profile versions this build serves.
 
 `POST /{ds}/claims/review` appends review decisions under one named review policy of
 the [evidence settings](#evidence-settings), and `POST /{ds}/claims/withdraw` withdraws
-claim occurrences. Both need `write` on the dataset or branch through the update
+claim occurrences. A review under a matching policy decides
+[identity proposals](#evidence-identities) instead. Both need `write` on the dataset or branch through the update
 endpoint, count as updates and publish one commit of the evidence owner. Neither edits
 a record in place. The design is in
 [C25 §5 and §6](specs/C25-evidence-and-assessments.md#5-writes-review-and-accepted-projections).
@@ -12611,6 +12915,7 @@ results that depend on them. A replay answers the first receipt with an empty
 | `409 decision-superseded` | `supersedes` is not the target's current decision under the policy. |
 | `409 target-withdrawn` | An acceptance names a withdrawn claim. |
 | `409 evidence-conflict` | An acceptance meets contrary evidence under a policy that refuses conflicts. |
+| `409 identity-conflict` | Under a matching policy, the final decisions would put two entities of an accepted separation in one cluster. |
 | `409 idempotency-conflict` | The key was used with a different payload. |
 | `422 evidence-unavailable` | A target, or evidence that an acceptance must read, is missing, unreadable or outside the policy's boundary. |
 | `422 incomplete-evidence` | The acceptances need more than 10,000 evidence records. |
@@ -12618,6 +12923,127 @@ results that depend on them. A replay answers the first receipt with an empty
 | `503 authority-changed` | The caller's credential or the access policy changed before the commit published. |
 
 A refusal writes nothing. `GET /$/server` lists both routes in `capabilities.claims`.
+
+### Evidence identities
+
+An identity proposal names two to 64 exact entity IRIs and proposes that they may denote
+one thing, `possibleMatch`, or that they denote different things, `distinctEntities`.
+Neither the proposal nor its acceptance asserts `owl:sameAs`. Proposals are records of a
+[claims proposal](#evidence-proposals) batch, in its `identities` member, and go to an
+`identity` graph of the [evidence settings](#evidence-settings). The design is in
+[C25 §6](specs/C25-evidence-and-assessments.md#6-identity-validity-and-correction).
+
+```json
+{
+  "identityGraph": "https://example.org/ev/identity",
+  "identities": [{"key": "p1", "occurrenceKey": "crm-import-7",
+                  "entities": ["https://example.org/crm/1042", "https://example.org/hr/ana"],
+                  "relation": "possibleMatch",
+                  "preferredEntity": "https://example.org/hr/ana",
+                  "author": "https://example.org/matcher",
+                  "method": {"method": "https://example.org/names", "version": "3"}}]
+}
+```
+
+A [review](#evidence-reviews) that names a matching policy decides proposals under it,
+with the same request, preconditions, supersession and replay as a review of claims. The
+policy's accepted possible matches join entities into clusters, the connected components
+of the entities they name, and its output graph holds the current resolution map as
+`<member> ev:resolvesTo <representative>` for every member of every cluster of two or
+more entities, the representative included. The representative is the smallest IRI
+among the preferred entities of the cluster's accepted matches, or the smallest member
+when none names one. An accepted separation keeps its entities in different clusters,
+and a review whose final decisions would join them is a `409 identity-conflict` that
+writes nothing. A split rejects the match that joined the entities, with a decision that
+supersedes its acceptance, and may accept the separation in the same request.
+
+Every review that adds an acceptance or supersedes one writes an immutable
+`ev:ResolutionMap` revision in the policy's `maps` graph. It records its number, the
+revision it follows as `prov:wasRevisionOf`, the decisions it `ev:adds` and `ev:ends`,
+the output graph, the protection nonces of the policy's graphs and, as
+`ev:boundaryProtection`, the nonce and IRI of each identity graph of the boundary whose
+proposals the map was built from. Accepting a reversed
+match again restores the earlier map, and no proposal, decision or revision is edited.
+The review answer adds `mapRevision` and `changed.map`, which names the policy, the new
+revision and its predecessor, the decisions added and ended, and the entities whose
+selected entity changed, so that consumers of the earlier revision can be found. The
+resolvesTo triples written and removed are in `changed.inserted` and `changed.removed`.
+
+A review under a matching policy needs update and read grants on its decisions, maps and
+output graphs, read grants on every identity graph of its boundary, read access to each
+target, and for an acceptance read access to the target's evidence links. It also needs
+read access to every accepted proposal of each cluster it reads, before and after its
+decisions, and one whose triples the caller's view hides answers as an unavailable
+target. A proposal no decision accepts takes no part in a cluster and is not counted
+when the caller cannot read it. More than 10,000 proposals naming one entity answer
+`422 incomplete-evidence` when the caller's view shows that many, and otherwise answer
+as an unavailable target, so no refusal reports a count that includes a hidden record.
+One review reads at most 10,000 entities and proposals for its clusters in each state
+and retains at most 64 MiB of the identifiers of its targets and clusters, beyond which
+it answers `422 incomplete-evidence`.
+
+A map follows the matches of the identity graphs it was built from. When one of them
+leaves the boundary, or is detached and protected again so that its proposals no longer
+authenticate, reviews and reads under the policy answer `503 projection-unavailable`
+until the boundary is restored. A graph added to the boundary keeps the map available.
+No operation rebuilds a map from its decisions after such a change, so a new matching
+policy with its own maps and output graphs starts a new map.
+
+`POST /{ds}/claims/identities` with `{"policy", "entities"}` reads the current map. It
+needs `read` on the dataset or branch through the query endpoint and read grants on the
+policy's decisions, maps and output graphs and on the identity graphs of its boundary,
+and counts as a query. The answer is `{policy, revision, number, commit, entities}`, and
+each entity is `{entity, representative, members, membersComplete, decisions}`, with at
+most 1,000 members and the current accepted decisions that join the cluster as far as
+the caller's view reaches from the entity, whatever else the request names. A proposal
+or decision whose triples the caller's view hides in part takes no part in the cluster
+the read traverses and is not reported. The map's latest revision is checked against
+the store as written, and a caller whose view hides part of it is refused with `503
+projection-unavailable`. An entity
+the map does not name resolves to itself. A request names 1 to 100 entities. Queries
+read the map by joining the output graph explicitly, and no query is rewritten through
+it.
+
+| Status and code | Meaning |
+|---|---|
+| `400` | The body is malformed or the policy is unknown. |
+| `403` | The caller may not read a graph of the policy. |
+| `422 incomplete-evidence` | A cluster's records exceed 10,000. |
+| `503 projection-unavailable` | A graph of the policy was detached and protected again, an identity graph the map was built from left the boundary, or the output holds a map without a revision. |
+
+`GET /$/server` lists the route in `capabilities.claims.identities`.
+
+### Evidence dependents
+
+`POST /{ds}/claims/dependents` with `{"changed", "transitive"}` finds the authenticated
+assessments whose `ev:target` or `prov:used` names one of 1 to 1,000 changed record
+identities, so that a maintained analysis built on them can be reviewed or recomputed.
+It decides nothing about the assessments, whose conclusions may still hold. With
+`transitive: true` it also finds the assessments that depend on a dependent. It needs
+`read` on the dataset or branch through the query endpoint and counts as a query. The
+design is in [C25 §6](specs/C25-evidence-and-assessments.md#6-identity-validity-and-correction).
+
+```json
+{"changed": ["urn:uuid:5c0e…"], "transitive": true}
+```
+
+The changed identities of an operation are the claims it withdrew, the decisions it
+superseded, the supports in `changed.supportsEnded`, and for a new resolution map
+revision the revision in `changed.map.previous` and the decisions in
+`changed.map.decisionsEnded`. `sparkles::evidence::Changed::identities` gathers those of
+`changed`. The answer is `{commit, dependents}`, and each dependent is `{assessment,
+graph, on, dependence, depth}`, where `on` is the changed record or, for a transitive
+dependent, the assessment it depends on, `dependence` is `target` or `used`, and `depth`
+is 0 for a direct dependent. Each assessment is reported once, at its smallest depth,
+sorted by depth and IRI. Only the proposal graphs the caller can read are searched, and a
+record any of whose triples the caller's view hides is neither reported nor followed.
+
+| Status and code | Meaning |
+|---|---|
+| `400` | The body is malformed or names no identity. |
+| `422 incomplete-evidence` | More than 10,000 candidate records would be read. |
+
+`GET /$/server` lists the route in `capabilities.claims.dependents`.
 
 ### Suggested examples
 

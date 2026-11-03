@@ -1033,3 +1033,194 @@ async fn claims_are_reviewed_and_withdrawn_over_http() {
         "/{ds}/claims/withdraw"
     );
 }
+
+/// Identity proposals through `POST /{ds}/claims`, their reviews under a matching
+/// policy through `POST /{ds}/claims/review` and the resolution read through `POST
+/// /{ds}/claims/identities`, with each refusal's status and code.
+#[tokio::test]
+async fn identities_are_proposed_reviewed_and_resolved_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state.attach("d", DbType::Persistent, None).unwrap();
+    let app = router(state.clone());
+    let ds = state.get("d").unwrap();
+    let post = |path: &'static str, body: J| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                path,
+                Some("application/json"),
+                &body.to_string(),
+            )
+            .await
+        }
+    };
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &json!({"format": 1, "profile": 1, "enabled": true,
+                "sourceRecords": ["urn:ev:sources"], "proposals": ["urn:ev:claims"],
+                "decisions": ["urn:ev:decisions"],
+                "identity": ["urn:ev:identity", "urn:ev:maps"],
+                "projections": ["urn:ev:map"],
+                "matchingPolicies": {"people": {"version": 1,
+                    "boundary": ["urn:ev:identity", "urn:ev:claims"],
+                    "decisions": "urn:ev:decisions", "maps": "urn:ev:maps",
+                    "output": "urn:ev:map"}}})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert!(
+        j["settings"]["matchingPolicies"]["people"].is_object(),
+        "{j}"
+    );
+    let propose = |occurrence: &str, entities: J, relation: &str| {
+        json!({"identityGraph": "urn:ev:identity",
+               "identities": [{"key": "p", "occurrenceKey": occurrence, "entities": entities,
+                               "relation": relation, "author": "urn:matcher",
+                               "method": {"method": "urn:method:names", "version": "1"}}]})
+    };
+    let (status, p) = post(
+        "/d/claims",
+        propose("ab", json!(["urn:a", "urn:b"]), "possibleMatch"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{p}");
+    let ab = p["records"][0].clone();
+    assert_eq!(ab["kind"], "IdentityProposal", "{p}");
+    assert_eq!(ab["graph"], "urn:ev:identity");
+    let (status, j) = post(
+        "/d/claims",
+        propose("bad", json!(["urn:a"]), "possibleMatch"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{j}");
+    let (status, j) = post(
+        "/d/claims",
+        propose("bad", json!(["urn:a", "urn:b"]), "sameAs"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{j}");
+    let (_, d) = post(
+        "/d/claims",
+        propose("ab-apart", json!(["urn:a", "urn:b"]), "distinctEntities"),
+    )
+    .await;
+    let apart = d["records"][0].clone();
+    let review = |target: &J, disposition: &str, supersedes: J| {
+        json!({"policy": "people", "policyVersion": 1, "ifHead": ds.store.head_commit().seq,
+               "decisions": [{"key": "x", "target": target["iri"],
+                              "targetDigest": target["recordDigest"],
+                              "disposition": disposition, "supersedes": supersedes}]})
+    };
+    let (status, r) = post("/d/claims/review", review(&ab, "accepted", J::Null)).await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(r["changed"]["map"]["number"], 1, "{r}");
+    assert_eq!(r["mapRevision"], r["changed"]["map"]["revision"]);
+    assert_eq!(r["changed"]["inserted"].as_array().unwrap().len(), 2, "{r}");
+    assert!(ds.dataset.ask(
+        "ASK { GRAPH <urn:ev:map> { <urn:b> <urn:x-sparkles:evidence:resolvesTo> <urn:a> } }"
+    ).unwrap());
+    // a separation of a cluster conflicts and writes nothing
+    let head = ds.store.head_commit().seq;
+    let (status, j) = post("/d/claims/review", review(&apart, "accepted", J::Null)).await;
+    assert_eq!(
+        (status, j["code"].as_str()),
+        (StatusCode::CONFLICT, Some("identity-conflict")),
+        "{j}"
+    );
+    assert_eq!(ds.store.head_commit().seq, head);
+    // the read
+    let (status, read) = post(
+        "/d/claims/identities",
+        json!({"policy": "people", "entities": ["urn:b", "urn:z"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(read["number"], 1);
+    assert_eq!(read["entities"][0]["representative"], "urn:a");
+    assert_eq!(read["entities"][0]["members"], json!(["urn:a", "urn:b"]));
+    assert_eq!(
+        read["entities"][0]["decisions"],
+        json!([r["decisions"][0]["iri"]])
+    );
+    assert_eq!(read["entities"][1]["representative"], "urn:z");
+    let (status, _) = post(
+        "/d/claims/identities",
+        json!({"policy": "nobody", "entities": ["urn:b"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = post(
+        "/d/claims/identities",
+        json!({"policy": "people", "entities": ["urn:b"], "extra": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // an analysis that used the map's revision
+    let (status, a) = post(
+        "/d/claims",
+        json!({"proposalGraph": "urn:ev:claims",
+               "assessments": [{"key": "a", "occurrenceKey": "a1", "target": {"iri": ab["iri"]},
+                                "conclusion": "<urn:conclusion:plausible>",
+                                "method": {"method": "urn:method:review", "version": "1"},
+                                "configurationDigest": format!("sha256:{}", "0".repeat(64)),
+                                "evaluatedAt": "2026-01-02T00:00:00Z",
+                                "evaluator": "urn:analyst",
+                                "inputs": [{"iri": r["mapRevision"]}]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{a}");
+    let analysis = a["records"][0]["iri"].clone();
+    // a split reverses the match, and the map is empty again
+    let (status, s) = post(
+        "/d/claims/review",
+        review(&ab, "rejected", r["decisions"][0]["iri"].clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{s}");
+    assert_eq!(s["changed"]["map"]["previous"], r["mapRevision"], "{s}");
+    assert_eq!(s["changed"]["removed"].as_array().unwrap().len(), 2, "{s}");
+    assert!(
+        !ds.dataset
+            .ask("ASK { GRAPH <urn:ev:map> { ?s ?p ?o } }")
+            .unwrap()
+    );
+    // the split's predecessor finds the analysis that used it
+    let (status, found) = post(
+        "/d/claims/dependents",
+        json!({"changed": [s["changed"]["map"]["previous"]], "transitive": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    assert_eq!(
+        found["dependents"],
+        json!([{"assessment": analysis, "graph": "urn:ev:claims",
+                "on": r["mapRevision"], "dependence": "used", "depth": 0}]),
+        "{found}"
+    );
+    for bad in [
+        json!({"changed": []}),
+        json!({"changed": ["not an iri"]}),
+        json!({"changed": ["urn:a"], "extra": 1}),
+    ] {
+        let (status, j) = post("/d/claims/dependents", bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{j}");
+    }
+    let (_, server) = call(&app, "GET", "/$/server", None, "").await;
+    assert_eq!(
+        server["capabilities"]["claims"]["identities"],
+        "/{ds}/claims/identities"
+    );
+    assert_eq!(
+        server["capabilities"]["claims"]["dependents"],
+        "/{ds}/claims/dependents"
+    );
+}

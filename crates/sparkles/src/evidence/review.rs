@@ -41,6 +41,11 @@ use uuid::Uuid;
 
 pub use sparkles_core::evidence::review::{POLICY_PREFIX, policy_iri};
 
+#[path = "dependents.rs"]
+pub mod dependents;
+#[path = "identity.rs"]
+pub mod identity;
+
 const EV: &str = "urn:x-sparkles:evidence:";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDF_REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
@@ -100,8 +105,45 @@ pub struct Changed {
     pub supports_ended: Vec<NamedNode>,
     /// Triples projected into an output graph.
     pub inserted: Vec<ProjectionChange>,
-    /// Triples removed from an output graph because no live support owns them.
+    /// Triples removed from an output graph because no live support owns them, or
+    /// because a resolution map no longer maps an entity so.
     pub removed: Vec<ProjectionChange>,
+    /// The new revision of a resolution map, when a review of identity proposals
+    /// changed which decisions the map follows.
+    pub map: Option<MapChange>,
+}
+
+impl Changed {
+    /// The record identities whose dependents may need review: the supports that
+    /// ended, and for a new map revision the revision it follows and the decisions
+    /// whose effect ended. Claims an operation withdrew and decisions it superseded are
+    /// named in its own result. The result is sorted and has no duplicates, ready for
+    /// [`dependents::dependents`].
+    pub fn identities(&self) -> Vec<NamedNode> {
+        let mut out: BTreeSet<NamedNode> = self.supports_ended.iter().cloned().collect();
+        if let Some(map) = &self.map {
+            out.extend(map.previous.iter().cloned());
+            out.extend(map.decisions_ended.iter().cloned());
+        }
+        out.into_iter().collect()
+    }
+}
+
+/// A new revision of a matching policy's resolution map.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MapChange {
+    pub policy: NamedNode,
+    pub revision: NamedNode,
+    /// The revision's number, from 1.
+    pub number: u64,
+    /// The revision it follows, whose consumers may need review.
+    pub previous: Option<NamedNode>,
+    /// The accepted decisions that became effective.
+    pub decisions_added: Vec<NamedNode>,
+    /// The accepted decisions whose effect ended.
+    pub decisions_ended: Vec<NamedNode>,
+    /// The entities whose selected entity changed, sorted.
+    pub entities: Vec<NamedNode>,
 }
 
 /// One recorded decision.
@@ -131,6 +173,8 @@ pub struct Reviewed {
     pub decisions: Vec<Decided>,
     /// What changed. A replay reports nothing here.
     pub changed: Changed,
+    /// The resolution map revision the operation published, also for a replay.
+    pub map_revision: Option<NamedNode>,
     pub preview: Option<Box<crate::preview::Preview>>,
 }
 
@@ -233,15 +277,20 @@ impl State<'_> {
     /// Refuse as `key`'s unavailable target unless every triple of `s` in `g` is in the
     /// caller's view, which hides none when its access has no triple protections.
     fn visible(&mut self, key: &str, s: &NamedNode, g: &NamedNode) -> Result<()> {
-        let Some(seen) = self.seen.as_mut() else {
-            return Ok(());
-        };
-        const LIMIT: usize = 1 << 20;
-        let all = self.reads.subject_triples(s.as_str(), g.as_str(), LIMIT)?;
-        if seen.subject_triples(s.as_str(), g.as_str(), LIMIT)? != all {
+        if self.masked(s, g)? {
             return Err(unavailable(key));
         }
         Ok(())
+    }
+
+    /// Whether the caller's view hides a triple of `s` in `g`.
+    fn masked(&mut self, s: &NamedNode, g: &NamedNode) -> Result<bool> {
+        let Some(seen) = self.seen.as_mut() else {
+            return Ok(false);
+        };
+        const LIMIT: usize = 1 << 20;
+        let all = self.reads.subject_triples(s.as_str(), g.as_str(), LIMIT)?;
+        Ok(seen.subject_triples(s.as_str(), g.as_str(), LIMIT)? != all)
     }
 
     fn iri(&mut self, s: &NamedNode, p: &str, g: &G) -> Result<Option<NamedNode>> {
@@ -1036,6 +1085,26 @@ pub fn review(
             "the evidence profile is not enabled in this dataset",
         ));
     }
+    if let Some(matching) = settings.matching_policies.get(policy_name) {
+        return identity::review(
+            catalog,
+            main,
+            logical,
+            identity::Request {
+                name: policy_name,
+                policy: matching,
+                settings: &settings,
+                settings_bytes: &settings_bytes,
+                version: policy_version,
+                if_head,
+                candidates: MAX_EVIDENCE,
+            },
+            decisions,
+            options,
+            read,
+            control,
+        );
+    }
     let Some(policy) = settings.policies.get(policy_name) else {
         return Err(Error::invalid(format!(
             "policy: the evidence settings name no review policy {policy_name}"
@@ -1161,6 +1230,7 @@ pub fn review(
                 branch: recorded_branch.unwrap_or(branch),
                 decisions: out,
                 changed: Changed::default(),
+                map_revision: None,
                 preview: None,
             });
         }
@@ -1487,6 +1557,7 @@ pub fn review(
         branch,
         decisions: decided,
         changed,
+        map_revision: None,
         preview: committed.preview,
     })
 }

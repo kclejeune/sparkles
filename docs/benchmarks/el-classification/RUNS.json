@@ -57,6 +57,522 @@
     }
    },
    "metadata_note": "A manual measurement record of el_classify. Read the record for its method, results and checks."
+  },
+  {
+   "run_id": "sha256-16553a77cb499da2e310e0b15f3f4c11d24183bd88b9c6cbc0b6c73d2e6dad70",
+   "path": "runs/2026-11-02-ore-elk-agreement-aa0a41a6/record.json",
+   "sha256": "16553a77cb499da2e310e0b15f3f4c11d24183bd88b9c6cbc0b6c73d2e6dad70",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "ORE 2015 EL classification sample, 298 ontologies",
+    "manifest": {
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": "0bba3629a057ea5077a9ac61a3d4dd711d239504aa1ff4008e292bd5f988458d",
+     "build": "mbx build --release -p sparkles-owl --example el_classify on stanley",
+     "commit": "aa0a41a6",
+     "data": {
+      "ore2015_sample": {
+       "files": "pool_sample/el/classification/fileorder.txt",
+       "md5_published": "109f04cf8f124eb551d33c100e549730",
+       "url": "https://zenodo.org/records/18578/files/ore2015_sample.zip",
+       "zip_sha256": "775064eb6dfee404d8f0b0e8500974eb420006b656f5cf413e05a9b33c2252e7"
+      }
+     },
+     "harness_note": "297 ELK runs used the harness of commit 3b5131ed or 3d8fd876, whose taxonomy output is the same for a consistent ontology. ore_ont_6720, which is inconsistent, ran with 3d8fd876, since the earlier harness stopped on ELK's exception.",
+     "reference": "ELK 0.6.0 with OWL API 5.1.20 through scripts/elk-compare (pins in scripts/elk-compare/pins.tsv), Temurin 17.0.20"
+    },
+    "settings": {
+     "elk_heap": "16 MiB per MiB of input plus 1 GiB, at most 12 GiB",
+     "threads": 4,
+     "timeout_s": {
+      "elk": 900,
+      "sparkles": 600
+     }
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "stanley",
+      "role": "laptop, loaded by other work, so the times are not measurements"
+     },
+     "method": "Each ontology classified once by el_classify --threads 4 --taxonomy and once by scripts/elk-compare/elk.sh run --threads 4 --taxonomy, then scripts/el-oracle.py ELK.ofn OURS.txt. compare.jsonl holds the oracle's report for each ontology, ours.jsonl and elk.jsonl the two tools' JSON lines, elk-incompleteness.json the axiom types ELK reported as possible causes of incompleteness, and taxonomy.sha256 the hashes of both taxonomies.",
+     "kind": "agreement"
+    }
+   },
+   "metadata_note": "A manual agreement record of el_classify against ELK 0.6.0 on the ORE 2015 EL sample. Read the record for its method and checks."
+  },
+  {
+   "run_id": "sha256-3e2d5e1c2ecd834611bfa04df44bca51b8c79d138132b2de878d8947f006b9cb",
+   "path": "runs/2026-11-02-hermit-agreement-aa0a41a6/record.json",
+   "sha256": "3e2d5e1c2ecd834611bfa04df44bca51b8c79d138132b2de878d8947f006b9cb",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "36 ORE 2015 EL ontologies with nominals, SameIndividual, ranges with assertions or top-property axioms, and four range test ontologies",
+    "manifest": {
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": "0bba3629a057ea5077a9ac61a3d4dd711d239504aa1ff4008e292bd5f988458d",
+     "commit": "aa0a41a6",
+     "companion": "runs/2026-11-02-ore-elk-agreement-aa0a41a6 holds the classifier's and ELK's taxonomies of the same ontologies",
+     "reference": "HermiT 1.4.5.519 on OWL API 5.1.20 through scripts/elk-compare/elk.sh run --reasoner hermit (pins in scripts/elk-compare/hermit-pins.tsv), Temurin 17.0.20, the harness of commit 995e8d6f"
+    },
+    "settings": {
+     "heap": {
+      "cases": "1g",
+      "ore": "8g"
+     },
+     "repeat": 1,
+     "timeout_s": 1800
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "stanley",
+      "role": "laptop, loaded by other work, so the times are a rough screen and not measurements"
+     },
+     "method": "run.sh.txt ran HermiT once on each input. Its comparison step passed ELK's taxonomy to el-oracle.py in the wrong form, so oracle.sh.txt made the retained comparisons again from the same taxonomies without running HermiT: scripts/el-oracle.py HERMIT.ofn OURS.txt against the classifier, and ref-compare.py.txt HERMIT.ofn ELK.ofn, which reads two reference files with el-oracle's own reader and counts the classes either side names alone. compare.jsonl holds both reports, hermit.jsonl HermiT's JSON lines and cases/ the four test ontologies with each tool's taxonomy. HermiT ran on one thread; the threads field of hermit.jsonl gives the unused --threads default of that harness version.",
+     "kind": "agreement"
+    }
+   },
+   "metadata_note": "A manual agreement record of HermiT 1.4.5.519 against the classifier and ELK on the ORE ontologies whose axioms either EL reasoner uses in part, and on four range test ontologies. Read the record for its method and checks."
+  },
+  {
+   "run_id": "sha256-bf4b54770e6cf14d250ade1a70867b02f689e4746596d0a826314308a6229e44",
+   "path": "runs/2026-11-02-elk-forge-aa0a41a6/record.json",
+   "sha256": "bf4b54770e6cf14d250ade1a70867b02f689e4746596d0a826314308a6229e44",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26 and ChEBI lite 256",
+    "manifest": {
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": "0bba3629a057ea5077a9ac61a3d4dd711d239504aa1ff4008e292bd5f988458d",
+     "build": "mbx build --release -p sparkles-owl --example el_classify on stanley, copied to the benchmark host",
+     "commit": "aa0a41a6",
+     "data": {
+      "chebi_lite": {
+       "ofn_sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+      },
+      "go": {
+       "ofn_sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+      }
+     },
+     "ended": "2026-11-02T20:50:54Z",
+     "lock_note": "Each process took the bench lock and the heavy lock for itself. env.txt gives the time and load average when each took them. Another lane's benchmark jobs ran between the processes and never beside them.",
+     "reference": "ELK 0.6.0 with OWL API 5.1.20, the harness of commit 3d8fd876 (ElkClassify.java sha256 036a7224…, pins.tsv sha256 4d470f93…), Temurin 17.0.20+8",
+     "started": "2026-11-02T17:11:55Z"
+    },
+    "settings": {
+     "elk_heap": "4g for -Xms and -Xmx, with 1g for GO and 2g for ChEBI lite in the smaller-heap runs on eight threads",
+     "gc": "G1",
+     "repeat": 5,
+     "threads": [
+      1,
+      8
+     ]
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "kernel": "7.2.9",
+      "name": "forge",
+      "ram_mib": 15620
+     },
+     "method": "One process per tool, ontology and thread count, each run five times. el_classify's classifyMs holds each classification by a fresh classifier with the axioms in memory, and readMs the parse of the file. ElkClassify's loadMs holds each OWL API load and classifyMs the time from the creation of the reasoner to the end of precomputeInferences, with a fresh OWL API manager and reasoner each run. peakRssKib is each process's peak resident memory, and retainedHeapMib ELK's live heap after a full collection with the reasoner open. The oracle files compare each ELK taxonomy with the classifier's of the same thread count.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual measurement record of el_classify and ELK 0.6.0 on GO and ChEBI lite on the benchmark host. Read the record for its method, results and checks."
+  },
+  {
+   "run_id": "sha256-e9b51a1640397f8486c3a682dffd9425cbf9e909dfb2116338495cfc42e31ff4",
+   "path": "runs/2026-11-02-reasoners-agreement-91a7b160/record.json",
+   "sha256": "e9b51a1640397f8486c3a682dffd9425cbf9e909dfb2116338495cfc42e31ff4",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "Four range test ontologies, GO 2026-07-26, ChEBI lite 256 and the 298 ORE 2015 EL classification ontologies",
+    "manifest": {
+     "binary": "crates/sparkles-owl/examples/el_classify.rs and the sparkles CLI, built with mbx build --release at 6ae55297, whose sparkles-owl sources equal 1e0760c9",
+     "binary_sha256": {
+      "el_classify": "e778dfa719ec8c66164ebab1fd8ea52eb42a916a68312610208d6022c3c3b2cb",
+      "sparkles": "a41dc0bc4ca2f643921ef2cd86488e5f87336dbb39636f3aef3da5300b135671"
+     },
+     "commit": "91a7b160",
+     "data": {
+      "chebi_lite": {
+       "ofn_sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4",
+       "rdfxml_sha256": "ebea75e0500818e319245a1bf605a684b2e22a2069680290b5dda638d5d25b16"
+      },
+      "go": {
+       "ofn_sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375",
+       "rdfxml_sha256": "653ce47cd7b02304e67eb67c54d3be02ec5b0ba5e00eb7384dfa0da00f9682ec"
+      },
+      "ore": "ore2015_sample.zip of Zenodo record 18578, pool_sample/el/classification"
+     },
+     "reference": {
+      "hermit": "HermiT 1.4.5.519 taxonomies of the range cases from runs/2026-11-02-hermit-agreement-aa0a41a6",
+      "konclude": "Konclude 0.7.0-1138, the flake's .#konclude /nix/store/wdpc7cr8as4kscxmaxlf7wh9rhayd0r6-konclude-0.7.0-1138, through scripts/elk-compare/konclude.py",
+      "robot": "ROBOT 1.9.11 with its bundled ELK 0.6.0, the flake's .#robot /nix/store/lxh315ayg2wpmwbgw97zkigr4r8prrgy-robot-1.9.11, OpenJDK 17.0.20.1",
+      "whelk": "Whelk 1.2.1 on OWL API 4.5.22, the flake's .#whelk /nix/store/3d5mrs612arm3p4ky514b5s5qgvf714a-whelk-1.2.1 (ElkClassify of commit 91a7b160), OpenJDK 17.0.20.1"
+     }
+    },
+    "settings": {
+     "konclude_threads": {
+      "big": 8,
+      "ore": 4,
+      "range": 1
+     },
+     "memory_cap": "MemoryMax=12G and no swap per run",
+     "repeat": 1,
+     "robot_java": "-Xms8g -Xmx8g -XX:+UseG1GC",
+     "timeout_s": {
+      "big": 3600,
+      "ore": 1800,
+      "range": 600,
+      "robot": 3600
+     },
+     "whelk_heap": "1g for the range cases, 10g for GO and ChEBI lite, 16 MiB of heap per MiB of file plus 2 GiB, at most 10g, for ORE"
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "stanley",
+      "role": "laptop, loaded by other work, so the times are a rough screen and not measurements"
+     },
+     "method": "run.sh.txt ran each reasoner once per input and compared its taxonomy with the classifier's (gen-ours.sh.txt wrote those) and, for the range cases, with HermiT's, through scripts/el-oracle.py. The first range and big pass of Whelk failed in the harness, which commit 91a7b160 fixed, and the batch then ran Whelk again with ONLY=whelk, so env.txt lists three starts. The robot stage timed each ROBOT command with timed.py.txt from the release's RDF/XML file, or from the functional-style file for the -ofn rows, to the written functional-style output, and checked each output's asserted named hierarchy with el-oracle.py --asserted against the classifier's taxonomy. The batch's sparkles runs failed because the release binary had been removed from the build directory, so the four sparkles-classify rows of robot/runs.jsonl after the failed ones ran afterwards with the same binary under the same cap. closure.py.txt counts the subsumptions between named classes that two taxonomies entail, with each class's equivalent classes and the classes above its node, after el-oracle.py's normalization. The Whelk package of these runs is the build of commit 91a7b160 that env.txt names. Commit ea96e8f5 later made the harness treat an unsatisfiable owl:Thing as inconsistent, which changes none of these results, since Whelk reported the inconsistent ontologies here as inconsistent itself.",
+     "kind": "agreement"
+    }
+   },
+   "metadata_note": "A manual agreement record of Whelk, Konclude and ROBOT against the classifier on a loaded laptop. Read the agreement checks and treat the times as a screen only."
+  },
+  {
+   "run_id": "sha256-963943fc1ae17187a5ca6bd68ce06d74d63c94893b6427abdcf2687c3db99308",
+   "path": "runs/2026-11-03-el-speed-forge-80644aec/record.json",
+   "sha256": "963943fc1ae17187a5ca6bd68ce06d74d63c94893b6427abdcf2687c3db99308",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26, ChEBI lite 256 and the eight largest ORE 2015 EL ontologies",
+    "manifest": {
+     "commit": "80644aec",
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": "21ea154f772d48d70c60026e67bd5c8db20845f73d3cb3ee9472634efc7c7c06",
+     "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on wally, copied to the benchmark host",
+     "reference": "ELK 0.6.0 with OWL API 5.1.20 through scripts/elk-compare/elk.sh (ElkClassify.java sha256 8bc9178d…, pins.tsv sha256 4d470f93…), openjdk version \"17.0.20\" 2026-07-21 OpenJDK Runtime Environment Temurin-17.0.20+8 (build 17.0.20+8) OpenJDK 64-Bit Server VM Temurin-17.0.20+8 (build 17.0.20+8, mixed mode, sharing)",
+     "data": {
+      "chebi_lite": {
+       "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+      },
+      "go": {
+       "sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+      },
+      "ore_ont_10689": {
+       "sha256": "7f8292bea124fb29e961b40226d491453c453d95ff1bd7058a776f1d8b709e8d"
+      },
+      "ore_ont_13482": {
+       "sha256": "f732cc7d4ebdb45099e421d062e05d64837b22e60b53d6848a723aa8f0e8d971"
+      },
+      "ore_ont_15059": {
+       "sha256": "903db098c81789f0359b659b0d1c854626d46b3ab4b9d11f8fe56ffdcd3d07fb"
+      },
+      "ore_ont_1559": {
+       "sha256": "1e65b8add2b5a38441e832dd090922a05cd89cbb5198c8a481a2e2991b9b30b4"
+      },
+      "ore_ont_3524": {
+       "sha256": "00c1b5dd0106e077813b8998eff80f14bc4b43ac1a83a95ccc4ad5a216ad85a2"
+      },
+      "ore_ont_3836": {
+       "sha256": "fc559045f566b2837188505b707480dc3416b3e699c5188632fa5be3d4cf2473"
+      },
+      "ore_ont_868": {
+       "sha256": "21f1849747854eae7692beb53bdc9801c9387e3765cf1644914dfba864558d6b"
+      },
+      "ore_ont_9674": {
+       "sha256": "8a33686cd3ecc033851652d43f0ac4f07a9022682e165ef06cad6c96bfa85a02"
+      }
+     },
+     "started": "2026-11-03T00:02:26Z",
+     "ended": "2026-11-03T00:24:08Z",
+     "lock_note": "Each process took the bench lock and the heavy lock for itself. env.txt gives the time and load average when each took them. Other lanes' benchmark jobs ran between the processes and never beside them."
+    },
+    "settings": {
+     "repeat": {
+      "go and chebi_lite": 5,
+      "ore": 3
+     },
+     "threads": [
+      1,
+      8
+     ],
+     "elk_heap": "4g for GO, ChEBI lite, ore_ont_13482, ore_ont_868, ore_ont_9674 and ore_ont_10689, 7g for ore_ont_3836 and ore_ont_1559, 6g for ore_ont_3524 and 10g for ore_ont_15059, as -Xms and -Xmx",
+     "gc": "G1"
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "forge",
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "ram_mib": 15620,
+      "kernel": "7.2.9"
+     },
+     "method": "One process per tool, ontology and thread count. el_classify's classifyMs holds each classification by a Saturation that reads the axioms in place, with addMs the collection of the axioms' references and readMs the parse of the file. ElkClassify's loadMs holds each OWL API load and classifyMs the time from the creation of the reasoner to the end of precomputeInferences, with a fresh OWL API manager and reasoner each run. peakRssKib is each process's peak resident memory, and retainedHeapMib ELK's live heap after a full collection with the reasoner open. The oracle files compare each ELK taxonomy with the classifier's of the same thread count.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual measurement record of el_classify and ELK 0.6.0 on GO, ChEBI lite and the largest ORE 2015 EL ontologies on the benchmark host. Read the record for its method, results and checks."
+  },
+  {
+   "run_id": "sha256-4f36a4d4b7843112ea097acab579bf2d8dc084cd9abe03b9a44a9a8e8d88d46a",
+   "path": "runs/2026-11-03-reasoners-forge-ea96e8f5/record.json",
+   "sha256": "4f36a4d4b7843112ea097acab579bf2d8dc084cd9abe03b9a44a9a8e8d88d46a",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26, ChEBI lite 256 and the 8 ORE 2015 EL ontologies with the most classes",
+    "manifest": {
+     "binary": "crates/sparkles-owl/examples/el_classify.rs and the sparkles CLI, built with mbx build --release on stanley at 6ae55297, whose sparkles-owl and sparkles-server sources equal 1e0760c9, and copied to the benchmark host",
+     "binary_sha256": {
+      "el_classify": "e778dfa719ec8c66164ebab1fd8ea52eb42a916a68312610208d6022c3c3b2cb",
+      "sparkles": "a41dc0bc4ca2f643921ef2cd86488e5f87336dbb39636f3aef3da5300b135671"
+     },
+     "commit": "ea96e8f5",
+     "ended": "2026-11-03T05:17:36Z",
+     "first_run": "2026-11-03T00:02:21Z",
+     "lock_note": "Each run took ~/lanes/.bench.lock and ~/lanes/.heavy.lock for itself, and env.txt gives the time and the load average when it took them. Other lanes' benchmark jobs ran between the runs and never beside them, so the load averages at the lock include their tail.",
+     "reference": {
+      "elk": "ELK 0.6.0 on OWL API 5.1.20, /nix/store/fh54341f5710vg4pl7w8h6k4mn487nf1-elk-0.6.0",
+      "harness": "ElkClassify.java sha256 5f879733... and konclude.py sha256 42eb3da4... of commit ea96e8f5, built into the packages on stanley and copied to forge's store with nix copy",
+      "hermit": "HermiT 1.4.5.519 on OWL API 5.1.20, /nix/store/r0l9qni556kvw6vliqmif0pdrjkrdsx6-hermit-1.4.5.519",
+      "java": "OpenJDK 17.0.20.1 from nixpkgs, named by each package's wrapper",
+      "konclude": "Konclude 0.7.0-1138, /nix/store/wdpc7cr8as4kscxmaxlf7wh9rhayd0r6-konclude-0.7.0-1138",
+      "robot": "ROBOT 1.9.11 with its bundled ELK 0.6.0, /nix/store/lxh315ayg2wpmwbgw97zkigr4r8prrgy-robot-1.9.11",
+      "whelk": "Whelk 1.2.1 on OWL API 4.5.22, /nix/store/76hri8i15r8x8vzxhnxgfn4ql42hyh12-whelk-1.2.1"
+     },
+     "started": "2026-11-02T22:41:23Z"
+    },
+    "settings": {
+     "gc": "G1",
+     "heap": {
+      "elk": "4g on GO and ChEBI lite, 8g on ORE",
+      "hermit": "8g on GO and ChEBI lite, 10g on ORE",
+      "robot": "8g",
+      "whelk": "8g on GO and ChEBI lite, 10g on ORE"
+     },
+     "memory_cap": "MemoryMax=12G and no swap per run",
+     "repeat": {
+      "end_to_end": 3,
+      "go_chebi": 5,
+      "hermit_go_chebi": 3,
+      "hermit_ore": 1,
+      "ore": 3
+     },
+     "single_thread_reasoners": [
+      "whelk",
+      "hermit"
+     ],
+     "threads": [
+      1,
+      8
+     ],
+     "timeout_s": {
+      "classifier": 1800,
+      "elk": 1800,
+      "end_to_end": 3600,
+      "hermit_go_chebi": 3600,
+      "hermit_ore": 1800,
+      "konclude": 3600,
+      "whelk": 3600
+     }
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "kernel": "7.2.9",
+      "name": "forge",
+      "ram_mib": 15620
+     },
+     "method": "run.sh.txt ran one process per tool, ontology and thread count. el_classify's classifyMs holds each classification of a fresh classifier with the axioms in memory and readMs the parse. ElkClassify's classifyMs runs from the creation of the reasoner to the end of precomputeInferences with a fresh OWL API manager and reasoner each run, and loadMs holds the OWL API's load. Konclude ran one process per classification. Its classifyMs is the total processing time of its log minus its parse time, so it includes the writing of the class hierarchy, and wallMs is the whole process. The end-to-end rows of robot.jsonl time robot reason --reasoner ELK and sparkles ontology classify --format ofn from the release's RDF/XML file to the written functional-style file, with timed.py.txt. oracle/ compares each reference taxonomy with the classifier's on one thread, and robot-reason with el-oracle.py --asserted. ours-threads.txt compares the classifier's taxonomies on one and eight threads.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual measurement record of the classifier beside ELK, Whelk, Konclude, HermiT and ROBOT on the benchmark host. Read the method with each time."
+  },
+  {
+   "run_id": "sha256-9c9d05b5a9431e4cbf8ea1a614838264bd424bc780b4264e80f865b601a168e6",
+   "path": "runs/2026-11-03-el-complete-forge-c4df06fe/record.json",
+   "sha256": "9c9d05b5a9431e4cbf8ea1a614838264bd424bc780b4264e80f865b601a168e6",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26, ChEBI lite 256, the eight largest ORE 2015 EL ontologies and seven ORE 2015 EL ontologies with individuals",
+    "manifest": {
+     "commit": "c4df06fe",
+     "base_commit": "c9b6ebff",
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": {
+      "out-20261103T033904Z/bin/base-el_classify": "0411a65e421f3e0b231e0cda0893ffdbb72425247fc1bd9fb3da2e8a51153130",
+      "out-20261103T033904Z/bin/lane-el_classify": "5248b22645201a13e0d924e1e96114f3f3378fbf8c70bdeed3ca3e7af04e33ee"
+     },
+     "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on atlas at c4df06fe for the lane and c9b6ebff for the base, copied to the benchmark host. Commits after c4df06fe change only tests and docs.",
+     "data": {
+      "chebi_lite": {
+       "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+      },
+      "go": {
+       "sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+      },
+      "ore_ont_10242": {
+       "sha256": "f96f51b735f6d031cfc93d9134d10bdfa61c0bfe682c2bf17525c12d865caa82"
+      },
+      "ore_ont_10689": {
+       "sha256": "7f8292bea124fb29e961b40226d491453c453d95ff1bd7058a776f1d8b709e8d"
+      },
+      "ore_ont_10749": {
+       "sha256": "97fea7f29aa689ee27b5f6f09117b8e16688c4fcb87cdf2ef467b849ab869be1"
+      },
+      "ore_ont_13035": {
+       "sha256": "928d80b509e864f90623c554d047db091af777710187fed00ed82e3f0d65b509"
+      },
+      "ore_ont_13482": {
+       "sha256": "f732cc7d4ebdb45099e421d062e05d64837b22e60b53d6848a723aa8f0e8d971"
+      },
+      "ore_ont_13621": {
+       "sha256": "f1f6bb14b8ce323c692880283a15401a91612e79d4db7d74d5d1c774a9516dbb"
+      },
+      "ore_ont_1481": {
+       "sha256": "10768871c06f7bac78cc8b5cf02da037fbc0474f3738a216919f4026e465fa6e"
+      },
+      "ore_ont_15059": {
+       "sha256": "903db098c81789f0359b659b0d1c854626d46b3ab4b9d11f8fe56ffdcd3d07fb"
+      },
+      "ore_ont_1559": {
+       "sha256": "1e65b8add2b5a38441e832dd090922a05cd89cbb5198c8a481a2e2991b9b30b4"
+      },
+      "ore_ont_2453": {
+       "sha256": "7349e934d400490d2455800b3f1dbb744eed12a8cc7427e2c7c115f2c5a95d05"
+      },
+      "ore_ont_3524": {
+       "sha256": "00c1b5dd0106e077813b8998eff80f14bc4b43ac1a83a95ccc4ad5a216ad85a2"
+      },
+      "ore_ont_3836": {
+       "sha256": "fc559045f566b2837188505b707480dc3416b3e699c5188632fa5be3d4cf2473"
+      },
+      "ore_ont_6226": {
+       "sha256": "7121672c2308782df6175656e76ea65685bed8619b4c72c095ef1c92c77a9f15"
+      },
+      "ore_ont_868": {
+       "sha256": "21f1849747854eae7692beb53bdc9801c9387e3765cf1644914dfba864558d6b"
+      },
+      "ore_ont_9674": {
+       "sha256": "8a33686cd3ecc033851652d43f0ac4f07a9022682e165ef06cad6c96bfa85a02"
+      }
+     },
+     "started": "2026-11-03T03:39:06Z",
+     "ended": "2026-11-03T03:54:09Z",
+     "lock_note": "forge-ab.sh took the bench lock and the heavy lock once and held them for every process of the run, so no other job ran during it. env.txt gives the load average at the start, at each round and at the end. The script's last step, rm -r of its copies of the binaries, waited at a prompt for about 15 minutes after the end while it still held the locks, and no measurement ran then. The copy kept here as forge-ab.sh.txt is the script as it ran."
+    },
+    "settings": {
+     "repeat": 3,
+     "rounds": 5,
+     "threads": [
+      1,
+      8
+     ],
+     "taxonomy_threads": 4
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "forge",
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "ram_mib": 15620,
+      "kernel": "7.2.9"
+     },
+     "method": "Each round runs el_classify of the base and of the lane, interleaved, on each ontology on one and eight threads, one process each with three classifications by a fresh classifier with the axioms in memory. classifyMedianMs is the median of the three, and medianOfMediansMs the median over the rounds. Stage times are medians over the rounds of the last classification's stages. After the rounds each build writes its taxonomy of each ontology on four threads, and taxonomy.sha256 holds their hashes.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual record of item 587. Read the record for its method, results and checks."
+  },
+  {
+   "run_id": "sha256-3c9bc67ca6387258a8433ee3897124959367126c729210370952b78724ccdb27",
+   "path": "runs/2026-11-03-el-complete-agreement-c4df06fe/record.json",
+   "sha256": "3c9bc67ca6387258a8433ee3897124959367126c729210370952b78724ccdb27",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26, ChEBI lite 256, the 298 ORE 2015 EL ontologies and the 400 fixtures of tests/fixtures/el587",
+    "manifest": {
+     "commit": "c4df06fe",
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on stanley for the lane (sha256 c90be03d...), and the base build of the forge record (sha256 0411a65e...), both run on stanley",
+     "references": {
+      "base": "the taxonomies that the build of commit c9b6ebff, where the item started, writes with the same el_classify settings, whose equality with ELK 0.6.0's runs/2026-11-03-el-speed-forge-80644aec and the earlier records establish",
+      "konclude": "Konclude 0.7.0-1138 taxonomies of the same record",
+      "fixtures": "HermiT 1.4.5.519 and Konclude 0.7.0-1138 on the 400 fixtures, run by run-references.sh from the nix/reasoners packages"
+     }
+    },
+    "settings": {
+     "threads": 4,
+     "timeout_s": 900
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "method": "agree.sh classifies each ontology on four threads, writes the taxonomy and compares it with Konclude's with scripts/el-oracle.py. The base build wrote its taxonomies with the same script and settings, and taxonomy-base.sha256 and taxonomy-lane.sha256 hold the hashes of both sets, which are compared byte for byte. tests/el_fixtures.rs compares the classifier's subsumptions between named classes on each fixture with HermiT's and Konclude's, read from the reasoners' direct hierarchies.",
+     "kind": "agreement"
+    }
+   },
+   "metadata_note": "A manual record of item 587. Read the record for its method, results and checks."
+  },
+  {
+   "run_id": "sha256-4661035e92ce93487dd918e85ddb93e204ba0fb846f2cac90526e7edd86795ab",
+   "path": "runs/2026-11-03-el-inline-atlas-68a683b5/record.json",
+   "sha256": "4661035e92ce93487dd918e85ddb93e204ba0fb846f2cac90526e7edd86795ab",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26, ChEBI lite 256 and the eight largest ORE 2015 EL ontologies",
+    "manifest": {
+     "commit": "68a683b5",
+     "base_commit": "c9b6ebff",
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": {
+      "base": "0411a65e421f3e0b231e0cda0893ffdbb72425247fc1bd9fb3da2e8a51153130",
+      "inline": "44d05f93a55f865014aa89037183341fedad29fec79db65cc8a424735727a400"
+     },
+     "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on atlas",
+     "lock_note": "ab.sh held ~/lanes/.heavy.lock for the run, which was stopped after four or five rounds once the cause was clear."
+    },
+    "settings": {
+     "repeat": 3,
+     "threads": [
+      1,
+      8
+     ],
+     "labels": {
+      "base": "c9b6ebff",
+      "lane": "68a683b5, with the rules for individuals inline in the saturation"
+     }
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "atlas",
+      "note": "a gate and build host identical to the benchmark host"
+     },
+     "method": "Interleaved el_classify runs of both builds on each ontology on one and eight threads, three classifications per process. Times are medians over the rounds of the median classification and of the last classification's saturation stage.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual record of item 587's first build. Read the record for its method and results."
   }
  ]
 }

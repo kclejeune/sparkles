@@ -177,6 +177,45 @@ async fn edits_need_write_on_the_graph() {
 }
 
 #[tokio::test]
+async fn removing_an_entity_needs_write_on_its_graphs() {
+    let (_dir, app) = server();
+    let b = format!("/$/ontology/ont/entity?{OPEN}&imports=false&iri=http%3A%2F%2Fex%2FB");
+    let r = as_user(&app, "oread", "DELETE", &b, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    let r = as_user(
+        &app,
+        "oread",
+        "DELETE",
+        &format!("{b}&dryRun=true"),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    // a writer limited to the open graph removes the entity there
+    let r = as_user(&app, "oopen", "DELETE", &b, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["removed"], 1, "{}", r.text());
+    // but not where the removal would delete a triple of a graph it cannot write
+    let a = "/$/ontology/ont/entity?graph=http%3A%2F%2Fex%2Fsecret&imports=false&iri=http%3A%2F%2Fex%2FA";
+    let r = as_user(&app, "oopen", "DELETE", a, &json!(null)).await;
+    assert!(
+        r.status == StatusCode::FORBIDDEN || r.json()["removed"] == 0,
+        "{}: {}",
+        r.status,
+        r.text()
+    );
+    let r = as_user(
+        &app,
+        "ofull",
+        "GET",
+        "/$/ontology/ont/axioms?graph=http%3A%2F%2Fex%2Fsecret&imports=false&type=SubClassOf",
+        &json!(null),
+    )
+    .await;
+    assert_eq!(r.json()["total"], 1, "{}", r.text());
+}
+
+#[tokio::test]
 async fn classify_reads_the_callers_view_and_writes_need_write() {
     let (_dir, app) = server();
     let about = json!({"graph": "http://ex/open", "about": "http://ex/A"});
@@ -207,4 +246,57 @@ async fn classify_reads_the_callers_view_and_writes_need_write() {
     let r = as_user(&app, "ofull", "POST", "/$/ontology/ont/classify", &write).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["written"]["committed"], true, "{}", r.text());
+}
+
+#[tokio::test]
+async fn dl_query_and_parse_read_the_callers_view() {
+    let (_dir, app) = server();
+    let q = json!({"graph": "http://ex/open", "expression": "A", "answers": ["superclasses"]});
+    let r = as_user(&app, "ofull", "POST", "/$/ontology/ont/dl-query", &q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains("Hidden"), "{}", r.text());
+    // a reader limited to one graph queries what it reads, without the import it cannot read
+    let r = as_user(&app, "oopen", "POST", "/$/ontology/ont/dl-query", &q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(!r.text().contains("Hidden"), "{}", r.text());
+    // and the names it cannot read do not resolve
+    let p = json!({"graph": "http://ex/open", "text": "Hidden"});
+    let r = as_user(&app, "oopen", "POST", "/$/ontology/ont/parse", &p).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(r.json()["reason"], "unknown", "{}", r.text());
+    let r = as_user(&app, "oread", "POST", "/$/ontology/ont/parse", &p).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+#[tokio::test]
+async fn the_entity_search_holds_only_what_the_caller_reads() {
+    let (_dir, app) = server();
+    let uri = format!("/$/ontology/ont/search?{OPEN}&q=hidd");
+    let r = as_user(&app, "ofull", "GET", &uri, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        r.json()["results"][0]["iri"],
+        "http://ex/Hidden",
+        "{}",
+        r.text()
+    );
+    // the import the caller cannot read is not searched
+    let r = as_user(&app, "oopen", "GET", &uri, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["results"], json!([]), "{}", r.text());
+    assert!(!r.text().contains("Hidden"), "{}", r.text());
+    let r = as_user(
+        &app,
+        "oopen",
+        "GET",
+        &format!("/$/ontology/ont/search?{OPEN}&q=A"),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(r.json()["results"][0]["iri"], "http://ex/A", "{}", r.text());
+    // a reader may search, and a caller without credentials may not
+    let r = as_user(&app, "oread", "GET", &uri, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = call(&app, "GET", &uri, &[], "").await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
 }

@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""Compare two reference-form taxonomies, such as HermiT's and ELK's functional-style
+output from scripts/elk-compare, with scripts/el-oracle.py's own reader and normalization.
+
+    ref-compare.py A.ofn B.ofn [PATH/TO/el-oracle.py]
+
+The classes either side names alone count against agreement, as do the classes whose
+nodes differ and the missing and extra edges over the classes both name."""
+import importlib.util
+import json
+import sys
+
+spec = importlib.util.spec_from_file_location(
+    "oracle", sys.argv[3] if len(sys.argv) > 3 else "scripts/el-oracle.py")
+o = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(o)
+an, ae = o.normalize(*o.read_reference(sys.argv[1]))
+bn, be = o.normalize(*o.read_reference(sys.argv[2]))
+common = set(an) & set(bn)
+only_a = sorted(set(an) - common)
+only_b = sorted(set(bn) - common)
+an, ae = o.restrict(an, ae, common)
+bn, be = o.restrict(bn, be, common)
+nodes = sum(1 for c in common if an[c] != bn[c])
+unsat_a = {c for c in common if o.NOTHING in an[c] and c != o.NOTHING}
+unsat_b = {c for c in common if o.NOTHING in bn[c] and c != o.NOTHING}
+r = {"classes": len(common), "onlyA": len(only_a), "onlyB": len(only_b),
+     "nodeDifferences": nodes, "unsatisfiableDifferences": len(unsat_a ^ unsat_b),
+     "missingEdges": len(ae - be), "extraEdges": len(be - ae), "unsatisfiable": len(unsat_a),
+     "examples": {"onlyA": only_a[:5], "onlyB": only_b[:5]}}
+r["agree"] = not (only_a or only_b or nodes or ae ^ be)
+print(json.dumps(r))

@@ -1,0 +1,150 @@
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Class inclusions may be incomplete because ontology satisfiability cannot be checked!
+[main] WARN org.semanticweb.elk.reasoner.completeness.Incompleteness - Ontology satisfiability cannot be checked! Enable INFO for details.
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - Potential incompleteness due to occurrences of InverseObjectProperties
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - 1 occurrence of InverseObjectProperties found in the current ontology. Enable DEBUG for details
+[main] INFO org.semanticweb.elk.reasoner.completeness.Incompleteness - ... 1 incompleteness problem type detected

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Rerun ChEBI lite on one thread: unpinned, on a performance core and on an efficient core.
+set -uo pipefail
+cd ~/lanes/el-speed-602
+O=out-20261103T000224Z/chebi-t1-rerun.jsonl
+: > $O
+exec 9> "$HOME/lanes/.bench.lock" 8> "$HOME/lanes/.heavy.lock"
+flock 9; flock 8
+echo "locked=$(date -u +%FT%TZ) load=$(cut -d" " -f1-3 /proc/loadavg)" > out-20261103T000224Z/chebi-t1-rerun.env
+for how in none none p e; do
+  case $how in none) pre=();; p) pre=(taskset -c 2);; e) pre=(taskset -c 14);; esac
+  l=$(systemd-run --user --scope --quiet -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue "${pre[@]}" bin/el_classify --threads 1 --repeat 5 data/chebi_lite.ofn 2>/dev/null)
+  echo "{\"pin\":\"$how\",${l#\{}" >> $O
+done
+echo "ended=$(date -u +%FT%TZ)" >> out-20261103T000224Z/chebi-t1-rerun.env
+echo RERUN-DONE

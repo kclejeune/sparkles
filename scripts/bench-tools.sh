@@ -2,14 +2,15 @@
 # Package resolution shared by the benchmark runners. The caller sets ROOT and WORK.
 
 # Keep every resolved package alive for the whole run, including during store GC.
-# Engine packages always come from this flake, even when another version is on PATH.
+# Engine and reasoner packages always come from this flake, even when another version is
+# on PATH.
 # The build prints one store path per installed output, so a package such as zstd prints
 # its bin and man outputs on two lines. Nix roots the out output as gcroots/<package> and
 # every other output as gcroots/<package>-<output>. Use nixexe to find an executable.
 nixpkg() {
   local package=$1 installable
   case $package in
-    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree)
+    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree | robot | elk | hermit | whelk | konclude)
       installable="$ROOT#$package"
       ;;
     *) installable="nixpkgs#$package" ;;
@@ -36,11 +37,12 @@ nixexe() {
   return 1
 }
 
-# Auxiliary tools come from PATH when it has them, and engines always come from this flake.
+# Auxiliary tools come from PATH when it has them, and engines and reasoners always come
+# from this flake.
 nixbin() {
   local package=$1 binary=$2
   case $package in
-    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree) ;;
+    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree | robot | elk | hermit | whelk | konclude) ;;
     *)
       if command -v "$binary" > /dev/null; then
         command -v "$binary"
@@ -109,4 +111,43 @@ gnu_time() {
   type -P gtime && return
   [ -x "$system" ] && echo "$system" && return
   nixexe time time
+}
+
+# Print a path to run the binary $1 from for the rest of a run. A binary inside this
+# checkout's managed target is copied under $WORK/bin first, because Boxington can collect
+# the whole target once the build that made it has exited, and a run that starts the binary
+# again later would then find nothing. Any other path is printed unchanged.
+stage_binary() {
+  local bin=$1 target abs real tmp hash dest
+  [ -n "$bin" ] && [ -f "$bin" ] || {
+    printf '%s\n' "$bin"
+    return
+  }
+  target=$ROOT/target
+  case $bin in
+    /*) abs=$bin ;;
+    *) abs=$PWD/$bin ;;
+  esac
+  real=$(readlink -f -- "$bin")
+  if [[ $abs != "$target"/* ]] && { [ ! -e "$target" ] || [[ $real != "$(readlink -f -- "$target")"/* ]]; }; then
+    printf '%s\n' "$bin"
+    return
+  fi
+  mkdir -p "$WORK/bin" || return
+  # Once cp has opened the file, a collection that removes it cannot cut the copy short.
+  # A collection before that leaves nothing to copy, and the run stops here.
+  tmp=$WORK/bin/.staging.$$
+  cp -- "$real" "$tmp" || {
+    rm -f -- "$tmp"
+    echo "stage_binary: cannot copy $bin, which a collection of the managed target may have removed; build it again" >&2
+    return 1
+  }
+  # The copy's directory is named by its contents, so two runs that share WORK with
+  # different builds never run each other's binary.
+  # sha256sum, or shasum on macOS.
+  hash=$(sha256sum -- "$tmp" 2> /dev/null || shasum -a 256 -- "$tmp") || return
+  hash=${hash:0:16}
+  dest=$WORK/bin/$hash/$(basename -- "$bin")
+  mkdir -p "$WORK/bin/$hash" && mv -f -- "$tmp" "$dest" || return
+  printf '%s\n' "$dest"
 }

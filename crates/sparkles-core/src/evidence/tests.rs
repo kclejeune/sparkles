@@ -115,7 +115,9 @@ fn sample() -> EvidenceInput {
             attributed_evaluator: node("urn:analyst"),
             confidence: None,
             scope: Scope::default(),
+            inputs: Vec::new(),
         }],
+        identities: Vec::new(),
     }
 }
 

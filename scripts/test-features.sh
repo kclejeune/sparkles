@@ -12,7 +12,7 @@
 # non-zero when any set failed. The sets share the workspace target directory, so
 # dependencies compile once, and CARGO_BUILD_JOBS limits the jobs as for any cargo run.
 # The tests run under cargo-nextest when it is installed and under cargo test otherwise.
-# Each set's output is in target/test-features/<set>.log.
+# Each set's output is in .artifacts/test-features/<set>.log.
 # `mise run test:features`.
 set -euo pipefail
 
@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 sets=("$@")
 [ ${#sets[@]} -gt 0 ] || sets=(none auth mcp memory graphql shacl)
 
-logs=target/test-features
+logs=.artifacts/test-features
 mkdir -p "$logs"
 
 # cargo-nextest when it is installed, as `mise run test` uses it: a test that hangs, such

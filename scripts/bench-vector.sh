@@ -41,6 +41,10 @@ SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 PRED=urn:x-bench:emb
 mkdir -p "$WORK/${N}x${DIM}/results"
 WORK=$(cd "$WORK/${N}x${DIM}" && pwd)
+# A binary in the managed target runs as a copy, which collection cannot remove.
+# shellcheck source=scripts/bench-tools.sh
+source "$ROOT/scripts/bench-tools.sh"
+SPARKLES=$(stage_binary "$SPARKLES")
 cd "$WORK"
 echo "== vector benchmark: $N x $DIM in $WORK"
 

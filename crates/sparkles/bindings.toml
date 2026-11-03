@@ -441,6 +441,11 @@ python = "planned: evidence settings in the bindings with the typed evidence ope
 jvm = "planned: evidence settings in the bindings with the typed evidence operations"
 node = "planned: evidence settings in the bindings with the typed evidence operations"
 
+["evidence.find_dependents"]
+python = "planned: evidence dependents in the bindings with the typed evidence operations"
+jvm = "planned: evidence dependents in the bindings with the typed evidence operations"
+node = "planned: evidence dependents in the bindings with the typed evidence operations"
+
 ["evidence.holds"]
 python = "planned: evidence holds in the bindings with the typed evidence operations"
 jvm = "planned: evidence holds in the bindings with the typed evidence operations"
@@ -460,6 +465,11 @@ node = "planned: evidence holds in the bindings with the typed evidence operatio
 python = "planned: evidence resolution in the bindings with the typed evidence operations"
 jvm = "planned: evidence resolution in the bindings with the typed evidence operations"
 node = "planned: evidence resolution in the bindings with the typed evidence operations"
+
+["evidence.resolve_entities"]
+python = "planned: identity resolution in the bindings with the typed evidence operations"
+jvm = "planned: identity resolution in the bindings with the typed evidence operations"
+node = "planned: identity resolution in the bindings with the typed evidence operations"
 
 ["evidence.review"]
 python = "planned: evidence reviews in the bindings with the typed evidence operations"
@@ -761,15 +771,30 @@ python = "Dataset.ontology.diff"
 jvm = "SparklesOnt.diff"
 node = "Dataset.ontology.diff"
 
+["ontology.dl_query"]
+python = "Dataset.ontology.dl_query"
+jvm = "SparklesOnt.dlQuery"
+node = "Dataset.ontology.dlQuery"
+
 ["ontology.edit"]
 python = "Dataset.ontology.edit"
 jvm = "SparklesOnt.edit"
 node = "Dataset.ontology.edit"
 
+["ontology.parse"]
+python = "Dataset.ontology.parse"
+jvm = "SparklesOnt.parse"
+node = "Dataset.ontology.parse"
+
 ["ontology.remove_entity"]
 python = "Dataset.ontology.remove_entity"
 jvm = "SparklesOnt.removeEntity"
 node = "Dataset.ontology.removeEntity"
+
+["ontology.search"]
+python = "Dataset.ontology.search"
+jvm = "SparklesOnt.search"
+node = "Dataset.ontology.search"
 
 ["ontology.summary"]
 python = "Dataset.ontology.summary"
@@ -1010,6 +1035,11 @@ node = "parseUpdate"
 python = "check_iri"
 jvm = "SparklesHelpers.checkIri"
 node = "checkIri"
+
+["skos.shapes"]
+python = "skos_shapes"
+jvm = "planned: SparklesHelpers.skosShapes, after the Python binding"
+node = "planned: skosShapes, after the Python binding"
 
 ["terms.check_langtag"]
 python = "check_langtag"

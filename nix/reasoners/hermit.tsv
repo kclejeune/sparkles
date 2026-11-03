@@ -1,0 +1,12 @@
+# The jars of HermiT 1.4.5.519, the release for OWL API 5, that classification needs:
+# HermiT itself, dk.brics.automaton, Trove 3 and commons-logging. HermiT runs on the OWL API
+# 5.1.20 jars of elk.tsv in place of the owlapi-distribution 5.1.9 its POM names, and its
+# XML and command-line dependencies are left out. nix/reasoners/default.nix fetches each
+# from Maven Central under this path and checks it against its SHA-256 here, which was
+# checked against Maven Central's SHA-1 when it was pinned. HermiT is licensed under
+# LGPL-3.0, and the jars are never committed.
+# path	sha256
+commons-logging/commons-logging/1.1.3/commons-logging-1.1.3.jar	70903f6fc82e9908c8da9f20443f61d90f0870a312642991fe8462a0b9391784
+dk/brics/automaton/automaton/1.11-8/automaton-1.11-8.jar	a24475f6ccfe1cc7a4fe9e34e05ce687b0ce0c6e8cb781e0eced3b186482c61e
+net/sf/trove4j/trove4j/3.0.3/trove4j-3.0.3.jar	3c8616203d61a12a7e3487e8b34f3c198c2b5ba9e90da0c7ea32d99cd4958012
+net/sourceforge/owlapi/org.semanticweb.hermit/1.4.5.519/org.semanticweb.hermit-1.4.5.519.jar	722e79b4d1e11dd08ecc90b1bf65a7c7342cd25ca7ec2664e3a18235bfc6f278

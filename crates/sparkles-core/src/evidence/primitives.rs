@@ -169,6 +169,8 @@ pub enum RecordKind {
     Withdrawal,
     /// A policy's projection under one policy version and its protections.
     Projection,
+    /// One revision of a matching policy's resolution map.
+    ResolutionMap,
 }
 
 impl RecordKind {
@@ -189,6 +191,7 @@ impl RecordKind {
             Self::AcceptanceSupport => 13,
             Self::Withdrawal => 14,
             Self::Projection => 15,
+            Self::ResolutionMap => 16,
         }
     }
 }

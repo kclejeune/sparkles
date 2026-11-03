@@ -29,6 +29,10 @@ oxilangtag.workspace = true
 # the satellites behind the features of the same names
 sparkles-reasoner = { workspace = true, optional = true }
 sparkles-owl = { workspace = true, optional = true }
+# the typo-tolerant entity search of the ontology (feature `ontology`): the term automata
+# the full-text index uses for fuzzy terms, and the inline lists of its postings
+levenshtein_automata = { version = "0.2.1", optional = true }
+smallvec = { workspace = true, optional = true }
 sparkles-shacl = { workspace = true, optional = true }
 sparkles-shex = { workspace = true, optional = true }
 sparkles-graphql = { workspace = true, optional = true }
@@ -39,6 +43,10 @@ tokio = { workspace = true, optional = true }
 toml = { version = "1", optional = true }
 chrono = { workspace = true, optional = true }
 zeroize = { version = "=1.9.0", optional = true }
+
+[[example]]
+name = "entity_search_bench"
+required-features = ["ontology"]
 
 [dev-dependencies]
 toml = "1"
@@ -60,7 +68,7 @@ failpoints = ["sparkles-core/failpoints"]
 # the reasoner's closure cache, and later its handle (RDFS on read needs no feature)
 reasoning = ["dep:sparkles-reasoner"]
 # the OWL 2 ontology of a dataset: `ds.ontology()` and `sparkles::owl` (spec F21)
-ontology = ["dep:sparkles-owl", "reasoning"]
+ontology = ["dep:sparkles-owl", "reasoning", "dep:levenshtein_automata", "dep:smallvec"]
 # SHACL write guards
 shacl = ["dep:sparkles-shacl"]
 # ShEx write guards

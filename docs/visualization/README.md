@@ -145,6 +145,10 @@ The SvelteKit UI is embedded in the server binary.
   conflict view. Checks follow shape dependencies beyond a fixed graph radius and
   report all current violations on the affected targets. Incomplete discovery refuses
   the check, and a failed recheck invalidates earlier browser approval.
+  Blank-node values of `sh:node` fields are nested forms, SHACL 1.2 list fields are
+  ordered list editors, and `sh:or` or `sh:xone` value alternatives offer a choice for
+  each value (screenshots of [nested forms](../images/forms-nested.png) and
+  [lists](../images/forms-list.png)).
   `Dataset::forms()` and Python's `Dataset.forms` expose the same forms.
 * The Memory page shows what memory holds about an entity with each fact's source, quote
   and history, and its Inbox tab reviews facts with **Accept all that pass**. The
@@ -160,28 +164,123 @@ The SvelteKit UI is embedded in the server binary.
   a refusal from the server shows under the field it names, and the JSON view under
   **Advanced** shares the form's unsaved change.
 
-### Nested form read models
+<a id="nested-form-read-models"></a>
 
-The Rust library exposes `dataset.forms().nested_model(&request, &options)` for
-applications that need declared blank-node child layouts. The result retains the
-ordinary root form and a `nested_nodes` pool. Shared children keep one RDF identity,
-cycles reference that identity, and parent anchors and field values retain their graph
-provenance. The target-graph policy resolves independently for each child's focus.
-The request uses the same shapes settings, visibility, historical-state
-selection and cancellation controls as an ordinary form.
+### Nested forms, lists and alternatives
 
-One request admits at most 64 nested identities, 512 generated field views, 512 parent
-anchors and 16 levels of first discovery. A shared preparation allowance refuses a
-larger or unfinished model. Complex nested paths, visible blank-named graph contexts
-and matching composite range bounds also refuse until their representation or producers
-have controlled admission. The allowance covers adapter preparation and retention.
-Source-shape and prefix preparation remain under item 21, while physical reader and
-mask preparation depend on [item 395](../ROADMAP.md). The
+A field whose property shape names `sh:node` shows each blank-node value as a nested form,
+built from every `sh:node` declaration that reaches the child. The form reads them from the
+nested model, which keeps each child's RDF identity, the visible edges it hangs from and
+the graphs of its values. Shared children appear once, and a cycle refers to the child
+already shown. **Add** starts a new child from the empty form of the field's shapes.
+Removing a child deletes its edge and, when nothing else refers to it, its visible triples
+and those of the blank nodes under it. One save commits the changes to the resource and
+to every child, after the same guard, access and conflict checks as a flat form. Under the
+writer lock the save checks that each stored child still hangs from its parent, and a
+child removed meanwhile shows a conflict on the parent's field.
+
+A field with SHACL 1.2 list constraints edits its `rdf:List` in order, with buttons that
+move, remove and add members, and checks `sh:minListLength`, `sh:maxListLength`,
+`sh:uniqueMembers` and the member shape in the browser. A save replaces the stored list.
+A field whose `sh:or` or `sh:xone` names value shapes without paths offers a **Kind of**
+select for each value. The choice selects the alternative's widget and constraints, and
+the browser reports a value that matches none of the alternatives, or for `sh:xone` more
+than one.
+
+![A SKOS concept's form with its stored SKOS-XL label edited and a new label added as nested forms](../images/forms-nested.png)
+
+![A SKOS collection's form with a member chosen among the sh:or alternatives and the ordered member list after a move](../images/forms-list.png)
+
+The Rust library exposes the same model as `dataset.forms().nested_model(&request,
+&options)`, with the ordinary root form, a `nested_nodes` pool and `templates`. HTTP
+takes `nested=true` on the model route and `nested` entries in check and save bodies, and
+Python takes `nested=True`. One request admits at most 64 nested identities, 512
+generated field views, 512 parent anchors and 16 levels of first discovery. A shared
+preparation allowance refuses a larger or unfinished model, and the form then falls back
+to the flat model with nested values read-only. Complex nested paths, visible
+blank-named graph contexts and matching composite range bounds also refuse until their
+representation or producers have controlled admission. The allowance covers adapter
+preparation and retention, while physical reader and mask preparation depend on
+[item 395](../ROADMAP.md). The
 [specification](../specs/U02-shape-driven-forms/SPEC.md#231-nested-read-models-in-the-rust-library)
 explains the unit calculation.
 
-The HTTP forms and browser still use the existing flat model. Atomic nested changes,
-fresh children and nested check/save and browser consumers remain under item 21.
+### Ontology editor
+
+The **Ontology** page, `/ui/ontology`, browses and edits the OWL ontology of one graph
+and its imports
+([U12](../specs/U12-ontology-workbench/SPEC.md#outcome),
+[reasoning guide](../reasoning/README.md#owl-2-ontologies),
+[screenshot](../images/ontology-editor.png)). Trees of classes, object, data and
+annotation properties and individuals sit beside the selected entity's frame, which
+lists its annotations, characteristics and axioms and adds and removes them. The frame's
+add fields take class expressions and whole axioms in Manchester syntax, with
+completion of entity names and labels and an underline under the part the server could
+not read, or in functional-style syntax. One strip of tabs holds the entity kinds, the
+DL Query tab and the header, and it wraps onto a second line in a narrow window.
+
+The **DL Query** tab answers a Manchester class expression with its equivalent classes,
+its direct and inferred superclasses and subclasses, and its instances
+([screenshot](../images/ontology-dl-query.png)). Each answer opens the entity's frame
+beside the query, and the query is kept in the page's address. A label above the
+answers names the reasoning that found them, the EL classifier inside OWL 2 EL or the
+OWL 2 RL rules outside it, says whether they are complete, and lists the axioms outside
+the profile that can leave them incomplete. The
+header tab edits the ontology IRI, version IRI, imports and header annotations, and the
+usage tab lists every axiom that mentions the entity. **Inferred** shows the EL
+classifier's taxonomy beside the asserted class tree
+([screenshot](../images/ontology-inferred.png)). Every edit is previewed as a dry run and
+committed with the commit it was previewed against
+([screenshot](../images/ontology-preview.png)), on the current branch or on a session
+branch that **Start session** creates. Undo and redo are previewed commits too, and
+another writer's commit reloads the page through the change feed.
+
+### Thesaurus editor
+
+The **Thesaurus** page, `/ui/thesaurus`, edits the SKOS concept schemes, concepts and
+collections of one graph, with their SKOS-XL labels
+([U12](../specs/U12-ontology-workbench/SPEC.md#thesaurus-editor),
+[screenshot](../images/thesaurus-editor.png)). The concept tree of the chosen scheme
+starts at its top concepts and reads one level of `skos:broader` and `skos:narrower` at a
+time, in both directions. A concept with several broader concepts appears under each of
+them with a count of its broader concepts, and a concept of the scheme without a broader
+one is marked when it is not a top concept. The search finds concepts by any preferred,
+alternative or hidden label, SKOS-XL labels included, in every language or in one, and the
+tree can show its labels in a chosen language.
+
+Dragging a concept onto another moves it there, and holding Ctrl or Alt adds the new
+broader concept and keeps the old one. Each move writes both directions of the hierarchy
+and is previewed as a commit before it is written
+([screenshot](../images/thesaurus-move.png)). Dropping a concept on the top zone makes it a
+top concept of the scheme. The page refuses a move under one of the concept's own
+narrower concepts.
+
+The **Labels** tab lists a resource's preferred, alternative and hidden labels by language,
+marks the SKOS-XL ones and converts a label between its plain and SKOS-XL forms. It
+refuses a second preferred label in one language and a label that is both preferred and
+alternative, and it lists the clashes the data already has. The **Relations** tab edits
+broader, narrower, related and mapping links, with a picker that searches concepts by
+label in another scheme or another dataset. A link written in one direction only is
+marked, and its repair adds the other direction. The **Members** tab edits a collection's members and an
+ordered collection's `skos:memberList` with the list editor of the
+[editing forms](#nested-forms-lists-and-alternatives), and the **Notes** tab edits notes
+and documentation through a form of the built-in SKOS shapes.
+
+The **Checks** tab runs the built-in SKOS shapes over the graph
+([screenshot](../images/thesaurus-checks.png)), which check the integrity conditions of the
+SKOS Reference, and an administrator can install them as the dataset's write guard. The
+page shares the session model of the [ontology editor](#ontology-editor). Every edit of
+the tree, labels and links is a dry run with `If-Match` before it commits, undo and redo
+revert commits, **Start session** creates a `skos.<user>.<date>` branch, another writer's
+commit reloads the page, and a protected branch is read-only. The page is also read-only
+when it cannot read the commit its graph is at. The notes and members forms save through
+the editing forms, which check the stored values of each field they change instead of the
+commit. They are editable only when the dataset keeps no graph but the one the page edits
+and their target is that graph, since a form's save could otherwise change another graph,
+and they are read-only for a caller whose grants cover only some graphs. With
+authentication on, they are also read-only on branches other than main, whose grants the
+page cannot read, for every caller but a server administrator. The [API reference](../API.md#skos-shapes) lists the shapes'
+conditions.
 
 ## Known gaps
 
@@ -190,16 +289,19 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 ### Web UI
 
-* Forms edit predicate and inverse paths with literal and IRI values. Blank node values
-  with `dash:DetailsEditor`, list editors for `sh:memberShape` and choices for `sh:or` and
-  `sh:xone` remain planned, and ShEx schemas do not drive forms. Checks admit up to 500
+* Forms edit predicate and inverse paths with literal and IRI values, nested blank-node
+  children, lists and value alternatives. Node-level `sh:or` and `sh:xone` alternatives
+  with their own properties are not offered as sub-forms (612), nested values
+  reached through complex paths are read-only (613), and blank-named graph
+  contexts refuse the nested model (614). List members are IRIs or literals, so a
+  list of blank nodes is read-only. ShEx schemas do not drive forms. Checks admit up to 500
   additional distinct affected targets beyond the directly touched resources, shared
   across shapes and snapshots. They refuse a larger or unfinished discovery instead of
   returning partial conformance. Forms admit graph-free target-node expressions made
   from constants, lists, focus variables, basic list operators, conditionals and simple
   aggregates. Target filters that inspect only their input node are admitted. Graph-reading
   target filters and other target-node expression producers are refused before evaluation and
-  remain under roadmap item 21. Directly anchored SPARQL triple and path dependencies are
+  remain under roadmap item 615. Directly anchored SPARQL triple and path dependencies are
   admitted. Property functions, computed predicates and indirect query-dependency producers
   refuse an incomplete check until bounded
   localization is available, while genuinely global queries enumerate bounded targets.
@@ -228,6 +330,40 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   roadmap item 120. Under an incremental guard with other results in the dataset, a
   preview cannot say whether a fix resolves its result, item 121. Callers whose grants
   cover only some graphs get no overlay, item 75.
+* The ontology editor reads every entity and hierarchy axiom of a graph to draw its
+  trees, up to 50,000 of each, 607. Only the class tree has an inferred view, 609, and
+  the IRI policy is kept in the browser per dataset, 610. Rename covers the graph the
+  page reads and not IRIs inside triple terms, under item 457's refactoring phase. The
+  editable schema diagram is a further U12 phase of item 457.
+* The DL Query tab's instances come from a classification with the assertions, which
+  the dataset does not keep, so each instance query classifies the ontology again, and
+  a query outside OWL 2 EL copies the ontology into memory for the RL rules, item
+  662. Class answers under the RL rules can miss entailed subsumptions, and the
+  label marks them as possibly incomplete.
+* The thesaurus editor reads at most 2,000 narrower concepts of a concept and 5,000 roots
+  of a scheme, and the label search scans the labels for a substring and answers
+  its first 100 matches, 638. A mapping's target in another dataset is named by its
+  IRI, and the page lists only the mappings a concept states itself, 639.
+  `skosxl:labelRelation` links between SKOS-XL labels are not edited, 640. The
+  SKOS rules become a write guard only by replacing the dataset's guard, so a dataset
+  cannot keep its own shapes and the SKOS shapes together, 641. Editing forms
+  read every graph and have no graph or commit precondition of a request's own, so the
+  thesaurus editor's notes and members forms are read-only in a dataset with more than one
+  graph and their saves do not name the commit the page shows. A form finds a resource's
+  shapes through the default graph, so a resource kept only in a named graph gets no
+  editable form, 642. Blank-node SKOS-XL labels of
+  one kind with the same literal form cannot be told apart by an update and are shown
+  without edit buttons.
+* The ontology editor decides whether the caller can write from the caller's level on the
+  dataset, so a caller whose grants allow writes on a branch only sees the branch
+  read-only, 611. For the same reason the thesaurus editor's notes and members forms are
+  read-only on branches other than main when authentication is on. Undo and redo revert commits, which needs write access to the
+  whole branch, so a caller whose grants cover some graphs only can edit but not undo.
+* The ontology browser has no pages in the web UI. Its typo-tolerant typeahead runs on
+  the server as the [entity search](../search/README.md#entity-search), and the entity
+  pages, hierarchy and graph views and the browser's search box remain in item 616. The
+  ontology editor's tree filter matches the names it has loaded and does not call the
+  entity search, item 660.
 
 ## Configuration and usage
 
@@ -247,7 +383,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 21](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
+The remaining work described above refers to [item 616](../ROADMAP.md), [item 612](../ROADMAP.md), [item 613](../ROADMAP.md), [item 614](../ROADMAP.md), [item 615](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

@@ -120,6 +120,8 @@ The first matching row chooses the widget, unless `dash:editor` names one (Phase
 | `sh:datatype xsd:string` with `dash:singleLine false`, or `sh:maxLength` above 200 | A text area. |
 | `sh:datatype` other | A text input checked against the datatype's lexical form. |
 | `sh:class C` or `sh:nodeKind sh:IRI` | An entity picker that searches instances of `C` by label, and accepts a pasted IRI or prefixed name. |
+| SHACL 1.2 list constraints such as `sh:memberShape` | An ordered list editor whose members use the member shape's widget (Phase 3). |
+| `sh:or` or `sh:xone` of value shapes without paths | A **Kind of** select for each value, which picks the alternative's widget and checks (Phase 3). |
 | `sh:node S` with a blank node value | A nested form for `S` (Phase 2). |
 | none | A term input that takes an IRI, a prefixed name or a literal in SPARQL syntax. |
 
@@ -156,12 +158,49 @@ This admission covers layout preparation and adapter-owned traversal and retenti
 Raw scan work consumes units even when the caller's view filters out a row. Physical
 column and dictionary decoding and permission mask preparation need controlled-reader
 adoption through item 395. Source-shape parsing and prefix metadata admission also
-remain under item 21. The preparation allowance is not a total model heap bound.
+remain under item 614. The preparation allowance is not a total model heap bound.
 
-The nested model is a Rust library read primitive. The existing HTTP model, check/save
-bodies and browser editors retain their flat contract. Atomic nested changes, fresh
-child allocation, graph-specific conflict expectations and browser editing remain
-under item 21. A read model or a request-local child id grants no write authority.
+`GET /$/forms/{ds}?nested=true` and Python's `ds.forms.model(…, nested=True)` return the
+same model. A refused nested model answers the flat model with `nested.refused` set to
+the reason, so the browser still edits the root's other fields. The nested model also
+lists `templates`, the empty form of a new child for each distinct set of `sh:node`
+shapes that the root, its children and the templates declare. A read model or a
+request-local child id grants no write authority.
+
+### 2.3.2 Nested, list and alternative changes
+
+A check or save body takes `nested`, a list of node changes. Each names a child `node`,
+the `parent` it hangs from (absent for the root) and the parent's `field`, with the
+child's own `changes` and `expect`. A stored child must be a current visible value of its
+parent's field, and every node between it and the root needs an entry. A new child is a
+blank node whose label the request chooses and which the parent field's `add` names.
+The server gives it a fresh node whose label cannot be confused with a stored one, takes
+its fields from the parent field's `sh:node` shapes and writes its values and its edge
+to the parent's target graph. A stored child writes new values to its own target graph,
+and a child without a type under `targetGraph: "type"` uses the graph of its edge.
+
+Removing a stored child's term from its parent field deletes the edge. When no other
+quad of the unmasked state refers to the child once its edges are gone, the save also
+deletes its visible quads and, recursively, those of the blank nodes they reach, which
+removes the cells of its lists. A visible quad in a graph the caller cannot write refuses
+the change, and hidden quads stay. A change cannot both remove and edit a child.
+
+A list field replaces its stored lists with a new `rdf:List` of the change's `list`
+members, at most 200 IRIs or literals, and an empty `list` writes `rdf:nil`. Its `expect`
+holds the loaded members in order. A list that is not well formed, with a cell that is not
+a blank node, a cell with several `rdf:first` or `rdf:rest` values, a cycle or more than
+200 members, is read-only. Value-level `sh:or` and `sh:xone` alternatives
+reach the model as `constraints.or` with each option's constraints and widget, and the
+browser checks that a value matches one alternative, or exactly one for `sh:xone`.
+
+The plan turns every change into quad deletions and insertions on one write transaction,
+so the commit enforces graph grants and triple protections as any update does. The guard
+runs under the writer lock. It checks that each stored child still hangs from its parent,
+that each changed field's stored values equal `expect`, that the target graph of the root
+is unchanged and that the quads under a removed child are the ones the plan read. A lost
+anchor answers a conflict on the parent's field, and a moved value or a changed subtree
+plans again on the new head up to three times. Validation and conflict results on a child
+carry its `node`.
 
 ### 2.4 Checks
 
@@ -451,10 +490,14 @@ hints, new instances and entity search. Checks use shape dependencies beyond a f
 graph radius and refuse incomplete discovery. The [delivery record](OUTCOME.md)
 describes the affected-target contract and the initial implementation history.
 
-The feature remains partially complete. The Rust library also exposes pooled nested
-read models with visible graph anchors, shared identities, cyclic references and cumulative preparation admission. Atomic
-nested edits, HTTP and browser consumers, list and alternative editors, and early
-admission for the remaining target-node expression producers remain
-under [roadmap item 21](../../ROADMAP.md). Strict physical reader admission uses the
-bounded-read preparation work of item 395; the discovery allowance is not a total
-SHACL heap limit.
+Forms also edit nested blank-node children from pooled nested read models, SHACL 1.2
+lists and value-level `sh:or` and `sh:xone` alternatives, and save each form's changes
+as one guarded commit, as §2.3.2 describes. HTTP, the Rust library and Python share the
+nested model and change entries. The [delivery record](OUTCOME.md#nested-list-and-alternative-editing)
+describes this phase.
+
+Node-level alternatives with their own properties, nested values through complex paths,
+blank-named graph contexts with model-source admission and the remaining target and
+query producers are follow-ups under roadmap items 612 to 615. Strict
+physical reader admission uses the bounded-read preparation work of item 395, and the
+discovery allowance is not a total SHACL heap limit.

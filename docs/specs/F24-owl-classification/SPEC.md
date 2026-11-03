@@ -74,8 +74,9 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-The OWL 2 EL classifier is delivered as roadmap item 580. The other phases remain under
-[item 457](../../ROADMAP.md).
+The OWL 2 EL classifier is delivered as roadmap item 580 and covers OWL 2 EL, apart
+from the literals and the chains that item 663 follows, since item 587. The other
+phases remain under [item 457](../../ROADMAP.md).
 
 ### The OWL 2 EL classifier
 
@@ -86,30 +87,102 @@ instance of its root expression and holds the root's subsumers, the backward lin
 contexts with an existential restriction it fills, the forward links that property
 chains need and the role loops of `ObjectHasSelf` and reflexive properties. Each rule
 reads the state of the context it runs in and sends conclusions to other contexts as
-messages. Worker threads take active contexts from a shared queue, and a context is
-processed by one worker at a time. Property chains are binarized, and transitivity is the
+messages. Each worker takes root contexts in chunks from a shared cursor, activates up
+to 1,024 of them in a round and then processes the contexts that its messages woke, in
+the order they woke, before it takes more roots. A context is processed by one worker at
+a time, and workers count their conclusions and memory locally and add them to the
+shared totals in batches. Property chains are binarized, and transitivity is the
 chain of a property with itself. A range is pushed into the filler of each existential
 restriction on the property, which is complete under the range restriction of OWL 2 EL
 (Profiles §2.2.6). A chain that breaks that restriction is left out. The taxonomy groups
 the classes by mutual subsumption and computes direct superclasses by transitive
 reduction, by greedy minimization or, for a class with more than 32 direct superclasses,
-by marking the classes above each candidate.
+by marking the classes above each candidate. The subsumers, the equivalence classes and
+the direct superclasses are computed in parallel chunks from the saturated contexts
+alone, with the classes numbered in IRI order, so the taxonomy is the same for every
+number of threads.
 
-**Scope of the reasoning.** The classifier covers `owl:Thing`, `owl:Nothing`,
-intersections, existential restrictions, equivalences, disjointness, the object and data
-property hierarchies, chains, transitive and reflexive properties, domains, ranges and
-`ObjectHasSelf`. Individuals in class expressions, data ranges and literals are treated
-as atoms, which is sound and incomplete, so such axioms are reported as partial. So are
-assertions on a property with a range, since each range gives the individual a context
-of its own that nominal reasoning would merge, and axioms on the top and bottom object
-and data properties, which the classifier treats as ordinary properties. Keys, negative
-property assertions, functional data properties, data property ranges, datatype
-definitions and axioms with an expression nested more than 256 deep take no part and
-are reported as partial too. No stand-in for a left-out expression is sound on both
-sides of a subsumption, so the whole axiom goes. Axioms outside OWL 2
-EL are left out and reported with the rule the EL check names. Annotations and
-annotation axioms carry no logical content. A classification can include the store's
-assertions, which makes it a consistency check of the individuals.
+`Saturation` keeps the contexts over axioms that the caller keeps, reads them in place
+on every run and takes the axioms added and removed since the last run. `Classifier`
+keeps a copy of the axioms on top of it, for callers that add and remove axioms one at a
+time. The classes of the signature come from the run's normalization, which marks each
+class it interns, and a signature walk covers only the axioms that the normalization
+leaves out. The index holds one record per expression, with the told subsumers, the
+conjunctions and the existential restrictions that use the expression as spans of flat
+arrays.
+
+**Scope of the reasoning.** The classifier covers OWL 2 EL, apart from the literals,
+datatypes and chains this paragraph names last. Besides `owl:Thing`,
+`owl:Nothing`, intersections, existential restrictions, equivalences, disjointness, the
+object and data property hierarchies, chains, transitive and reflexive properties,
+domains, ranges and `ObjectHasSelf`, it reasons with individuals in class expressions
+and assertions, the datatypes, literals and data ranges of the profile, functional data
+properties, data property ranges, datatype definitions, keys, negative property
+assertions and the top and bottom properties, with the rules of EL++ (Baader, Brandt and
+Lutz, IJCAI 2005 and OWLED 2008) written from the papers. Item 587 added them, as the
+next three paragraphs describe. A literal or a datatype that the classifier cannot
+compare, which is an XML literal, an ill-typed literal, a datatype outside the OWL 2
+datatype map or a number past 128 bits, is an atom that only equals itself, and its
+axiom is reported as used in part. So is a property chain through the top object
+property, whose links the classifier does not compose. An axiom with an expression
+nested more than 256 deep takes no part, since no stand-in for a left-out expression is
+sound on both sides of a subsumption. Axioms outside OWL 2 EL are left out and reported
+with the rule the EL check names. Annotations and annotation axioms carry no logical
+content. A classification can include the store's assertions, which makes it a
+consistency check of the individuals.
+
+**Individuals.** A context stands for an instance of its root, and its conclusions hold
+wherever the root has an instance. Named individuals, `owl:Thing` and every context they
+reach through existential links have an instance in every model, and these contexts are
+real. A context that derives `{a}` registers with `a`'s context and
+takes every subsumer `a` has and gets later. A real context that derives `{a}` also gives
+`a` every subsumer it has, which merges the two. A link by `r` from a context with `{a}`
+to one with `{a}` is a loop by `r`, a loop meets the range of its role, and a link by a
+role under the bottom property derives `owl:Nothing`. What a context that is not real
+knows of `a` holds only where its root has an instance. This is the reachability
+condition of the completion rule CR6 of EL++, which Kazakov, Krötzsch and Simančík (KR
+2012) show breaks goal-directed EL procedures. After the saturation, a context that is not
+real, derives an individual and has a subsumer other than an intersection that the
+individual lacks is a witness. A class whose instances reach no witness is classified
+completely by the saturation, since merging a context with an individual whose
+subsumers it already has changes no subsumer, link or loop of any context. Each named
+class whose context reaches a witness through links is classified again in a world of
+its own. A world is a copy-on-write layer over the saturated contexts in which the class
+has an instance and every context it reaches is real. It keeps only the conclusions that
+the saturated state lacks, runs on one thread and reaches the same fixpoint in any
+order, and the worlds of different classes run in parallel. The classifier marks the
+real contexts, in a second round of the saturation, and looks for witnesses only when a
+context other than an individual's own derived the individual or the ontology has
+individuals and keys or a universal role. Other ontologies, which include every one
+without individuals, skip these steps and pay only for the rules of the first round. A
+world is also where item 603's case
+analysis can assume a disjunct over the same shared state, and the classes it needs come
+from the same closure over links.
+
+**Data.** The datatypes of OWL 2 EL form chains under `rdfs:Literal`, from `owl:real`
+down to `xsd:nonNegativeInteger`, from `rdf:PlainLiteral` down to `xsd:NCName`, and
+`xsd:dateTime` over `xsd:dateTimeStamp`, while `xsd:anyURI`, `xsd:hexBinary`,
+`xsd:base64Binary` and `rdf:XMLLiteral` stand alone, and datatypes on different chains
+have disjoint value spaces. Every value space is infinite, so a data range of the profile
+is empty, one datatype or one value, and the classifier keeps it as an element of that
+lattice. A literal's value is canonical. It is an exact rational for a number, a string,
+a string with a lower-case language tag, decoded binary data, or for a date-time its
+instant with its offset, since two date-times with different offsets are different
+values (Structural Specification §4.7). Data values have no successors, so a data
+restriction needs no context. The index gives a positive `∃d.E` the told subsumer
+`owl:Nothing` when `E` meets an empty range of `d`, and every negative `∃g.F` with `d`
+under `g` whose range `F` holds the value. A context keeps the meet of the ranges of its
+data successors under each functional data property, and derives `owl:Nothing` when it
+is empty and the negative restrictions it meets otherwise. The top data property links
+every individual to every literal.
+
+**Keys and negative assertions.** `NegativeObjectPropertyAssertion(p a b)` is `{a} ⊓
+∃p.{b} ⊑ ⊥`, and the data form is `{a} ⊓ ∃d.{v} ⊑ ⊥`, which the rules above complete.
+Keys (Structural Specification §9.5) apply between rounds of the saturation. Two named
+instances of a key's class that share a named individual for each of its object
+properties and a value for each of its data properties become one, and the saturation
+resumes until no key merge and no fact of a universal role is new. Worlds apply them
+too.
 
 **Incremental runs.** The classifier keeps its contexts between runs. A run after
 additions and removals clears the contexts that derived the left side of a changed
@@ -118,18 +191,25 @@ can use, and every context that links to a cleared one, and saturates those agai
 other contexts drop their links from cleared contexts and recompute what they take from
 the index, which is rebuilt from the axioms on every run. A change to the property
 hierarchy, chains, reflexivity or ranges saturates everything again, and so does a
-change to an axiom with a data property or datatype, whose generated rules for literals
-and data ranges the invalidation does not follow, and a run after a run that stopped
-before its saturation ended. A run that stops later keeps its saturated contexts. Property tests check that an incremental run after random
+change to an axiom with an individual, a data property, a datatype or a key. So does any
+change after a run that marked the real contexts, which merges, worlds, keys and the
+facts of universal roles tie together in ways the invalidation does not follow, and a
+run after a run that stopped before its saturation ended. A run that stops later keeps
+its saturated contexts. Property tests check that an incremental run after random
 additions and removals gives the taxonomy of a full run.
 
 **Bounds.** A run stops at its deadline, at a cancellation and when the estimated memory
 passes the budget. The deadline and the cancellation are checked while the axioms are
 normalized, while the property closure is built, between the stages and while the
-taxonomy is built, as well as during the saturation. The estimate counts the classifier's copy of the axioms, the index with
-the property closure, which stops as soon as it passes the budget, the stored
-conclusions and the messages waiting in the contexts' to-do lists, and the memory
-pool is charged for the growth of its peak. A run that stops before its saturation ends
+taxonomy is built, as well as during the saturation and in the worlds. The estimate
+counts the classifier's copy of the axioms, the normalized axioms, the index with
+the property closure, which stops as soon as it passes the budget, the context slots and
+roots, the stored conclusions, the messages waiting in the contexts' to-do lists and
+the taxonomy with its links, which the budget checks before the taxonomy is built and
+again before the links are stored. The worlds count their copies, stored conclusions and
+waiting messages while they run, and the subsumers they keep once they end. The memory pool is charged for the growth of the peak.
+A counting allocator measured each run's peak heap within 14% of the estimate on GO,
+ChEBI lite and the largest ORE 2015 EL ontologies. A run that stops before its saturation ends
 drops its contexts, since the next run starts again. In the handle the threads come from the
 algorithm pool, the budget from the query's memory budget and the server's memory pool
 grant, and a run past the budget answers `507` with `budget: "memory"`.
@@ -142,9 +222,12 @@ keeps its last classification of an ontology for callers who read every graph, w
 assertions, keyed by the graphs, imports and mode. A classification at the same commit
 answers from it, and one at a later commit gives the kept classifier the axioms that
 changed. One kept classification runs at a time, and a second caller waits for it under
-its own deadline. The kept state is dropped after a run whose estimated size passes one
-gigabyte, and it costs memory while the dataset is open, about 115 MB estimated and
-190 MB resident for GO.
+its own deadline. The dataset keeps the saturation and the ontology it read, whose axioms
+the open ontology shares, and at the next commit it passes the saturation the axioms
+that differ between the two. The threads are taken before that, so a run that times out
+while it waits for them leaves the kept state as it was. The kept state is dropped after
+a run whose estimated size passes one gigabyte, and it costs memory while the dataset is
+open, about 74 MB estimated for GO.
 
 **Writing the taxonomy.** A run with `target` writes the taxonomy to a named graph that it
 does not read, through the handle's edit, in one commit. It adds the taxonomy's axioms
@@ -165,23 +248,65 @@ GO's pipeline computes with ELK and reduces, with 57,456 direct subsumptions on 
 side and no difference. On ChEBI lite (release 256, 238,150 classes) every asserted
 subsumption between named classes is entailed and every direct subsumption the
 classifier gives is asserted. `scripts/el-oracle.py --asserted` makes these
-comparisons. All 298 ontologies of the ORE 2015 EL classification sample classify.
-ELK itself has not been run beside the classifier, so a comparison with ELK 0.4.3 on
-GO, ChEBI and the ORE sample, and the measurements against ELK, remain in roadmap item
-591. SNOMED CT is not available to the project and was not used.
+comparisons. ELK 0.6.0, run through the OWL API by `scripts/elk-compare/elk.sh`, gives
+the same taxonomy as the classifier on GO, ChEBI lite and all 298 ontologies of the ORE
+2015 EL classification sample, with the same unsatisfiable classes and the same
+inconsistent ontology. `scripts/el-oracle.py` found no difference to explain, including
+on the 18 ORE ontologies with axioms the classifier uses in part and the 31 where ELK
+reports possible incompleteness. HermiT 1.4.5.519, a complete OWL 2 DL reasoner, gives
+the same taxonomy on the 36 ORE ontologies where either EL reasoner uses axioms in part.
+Four test ontologies show what ELK misses when a property's range meets an individual,
+two subsumptions and an inconsistency. Since item 587 the classifier derives them, as
+HermiT, Konclude and Whelk do. Konclude 0.7.0-1138 gives the same taxonomy on all 298
+ORE ontologies and ChEBI lite, and on GO it entails 14 more subsumptions between named
+classes, with 7 more direct edges, all through
+`InverseObjectProperties(part_of has_part)`, the GO axiom outside OWL 2 EL that the
+classifier leaves out and reports. Whelk 1.2.1 agrees on GO, ChEBI lite and 296 ORE
+ontologies and is incomplete on one. ROBOT 1.9.11's `reason`, `reduce`, `relax` and
+`materialize` with ELK assert the classifier's direct hierarchy on GO and ChEBI lite, and
+items 634 to 637 add ROBOT-compatible `sparkles ontology` commands for the
+outputs that Sparkles does not write. The
+reasoners are packaged in `nix/reasoners` from checksum-pinned releases and run through
+`scripts/elk-compare/elk.sh`. On the benchmark host the classifier classifies GO, ChEBI
+lite and the 8 largest ORE ontologies faster than Konclude and Whelk, and HermiT confirms
+the 7 GO edges that come from the inverse property. Konclude takes 1.3 s on GO, 4.2 s on
+ChEBI lite and 12.2 s on the largest ORE ontology, and `sparkles ontology classify` runs
+3.1 to 3.3 times as fast as `robot reason` end to end
+([results](../../benchmarks/el-classification/RESULTS.md#reference-reasoners)). SNOMED CT is not available to the project and was not used, so the acceptance
+gate's SNOMED CT comparison remains open.
 
-**Measurements.** On forge, GO classifies in 410 ms and ChEBI lite in 2.97 s on four
-threads, at peak resident sets of 438 MiB and 1.66 GiB that include the axioms read.
-Saturation scales with the threads, and indexing and the taxonomy, which run on one
-thread, take most of the time from four threads on. Keeping each worker's activations
-on a stack of its own instead of a shared queue took ChEBI on eight threads from 6.0 s
-to 2.8 s. The [benchmark report](../../benchmarks/el-classification/RESULTS.md) has the
-numbers and the records.
+**Measurements.** On forge, beside ELK 0.6.0 and with the harness of item 591, the
+classifier classifies GO in 280 ms on one thread and 83 ms on eight, against ELK's
+1,216 and 608 ms, and ChEBI lite in 2.1 s and 0.84 s, against 6.7 s and 2.5 s. On the
+largest ORE 2015 EL ontologies it is 2.5 to 11.5 times as fast as ELK on one thread and
+5.1 to 13.3 times as fast on eight, and `ore_ont_868`, of 981,151 classes, classifies in
+1.9 s and 1.0 s against 11.7 s and 5.5 s. Its peak resident set is below ELK's on every
+run, 252 MiB for GO and 930 MiB for ChEBI lite on eight threads. Items 602 and 592 made
+these changes. Before them the classifier copied each axiom twice on the way in and once
+more for its signature, built the taxonomy on one thread with hash maps keyed by
+expression, sent every activation through a shared queue and left out the taxonomy from
+its estimate. An interleaved A/B on `atlas` against the build of commit aa0a41a6 took
+ChEBI lite on eight threads from 2,955 to 1,009 ms, `ore_ont_868` from 8,226 to 1,393 ms
+and `ore_ont_1559` from 8,099 to 781 ms, and the peak resident set from 1,337 to 804 MiB,
+3,514 to 1,686 MiB and 3,593 to 1,773 MiB. Normalization and interning still run on one
+thread and take most of a run on eight threads on the ORE ontologies, which item
+644 follows. Item 587's rules left the largest ORE ontologies within 3% of the build
+before, on either side, and ChEBI lite within 3%, and cost GO 2 to 3%, which item
+665 follows. The rules for individuals run in functions of their own, outside the
+saturation's loop, since a first build that kept them inline, commit 68a683b5, made the
+saturation of ontologies without individuals 3 to 19% slower on one thread in an
+interleaved A/B on `atlas` ([record](../../benchmarks/el-classification/runs/2026-11-03-el-inline-atlas-68a683b5/record.json)). The [benchmark
+report](../../benchmarks/el-classification/RESULTS.md) has the numbers and the records.
 
 **Testing.** Tests in `crates/sparkles-owl/tests/classify.rs` cover worked examples of
 each construct, the reports of excluded axioms, the bounds, incremental runs, a
 comparison with an independent naive completion procedure for EL++ on random ontologies
-of up to twenty axioms, and incremental against full runs on random changes. The library
+of up to twenty axioms, incremental against full runs on random changes for both
+`Classifier` and `Saturation`, the same taxonomy on one, two and eight threads for an
+ontology of 3,000 classes, and an estimate that bounds a run with its taxonomy. Unit
+tests of the taxonomy check that the estimate counts every link of a wide hierarchy,
+that an inconsistent ontology's taxonomy asks the budget and that every stage polls the
+deadline. The library
 tests cover the kept classification, the refusals, the taxonomy write with its
 provenance and its replacement, the budgets, assertions and the JSON operation. Route
 tests cover the answer, the functional-style form, dry runs and the caller's grants, a
@@ -189,9 +314,14 @@ CLI test classifies a file and a database, and each binding's tests classify and
 taxonomy.
 
 **Roadmap follow-ups.** An MCP tool is item 586. Complete reasoning with
-individuals and datatypes is item 587. Reads that answer from the classification
-and DL Query are item 588. Durable and automatic classification is item
+individuals and datatypes was item 587, with item 605. The literals and datatypes the
+classifier cannot compare and chains through the top property are item 663, and
+incremental runs that follow merges, keys and worlds are item 664. Reads that
+answer from the classification are item 588. DL queries answer from the kept classifier
+through `Classifier::saturate` and `Classifier::describe`, as
+[U12's DL Query outcome](../U12-ontology-workbench/SPEC.md#dl-query) describes.
+Durable and automatic classification is item
 589, after item 339. A kept classification with assertions is item 590,
-the comparison and measurements against ELK are item 591, and a classifier that
-shares the ontology's axioms and builds its index and taxonomy in parallel is item
-592.
+the comparison and measurements against ELK were item 591, the speed and memory work
+against ELK were items 602 and 592, and normalization and interning on several threads
+are item 644.

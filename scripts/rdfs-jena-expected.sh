@@ -12,7 +12,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-WORK=$ROOT/target/rdfs-jena
+WORK=$ROOT/.artifacts/rdfs-jena
 # shellcheck source=scripts/bench-tools.sh
 source "$ROOT/scripts/bench-tools.sh"
 jena=${JENA_HOME:-$(nixpkg apache-jena)}

@@ -16,7 +16,7 @@
 mod assert;
 pub(crate) use assert::{date_time, now_ms, principal_iri};
 mod brief;
-mod check;
+pub(crate) mod check;
 mod communities;
 mod diagnose;
 mod evidence_budget;

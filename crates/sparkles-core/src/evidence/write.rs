@@ -144,6 +144,9 @@ pub struct ProposalOptions<'a> {
     pub source_graph: Option<&'a NamedNode>,
     /// The proposal graph, required when the settings name more than one.
     pub proposal_graph: Option<&'a NamedNode>,
+    /// The identity graph of identity proposals, required when the settings name more
+    /// than one.
+    pub identity_graph: Option<&'a NamedNode>,
 }
 
 /// One record of a plan.
@@ -382,8 +385,14 @@ pub fn plan<'i>(
         && input.claims.is_empty()
         && input.links.is_empty()
         && input.assessments.is_empty());
-    if !sources_used && !proposals_used {
+    let identities_used = !input.identities.is_empty();
+    if !sources_used && !proposals_used && !identities_used {
         return Err(Error::invalid("a proposal holds at least one record"));
+    }
+    if options.identity_graph.is_some() && !identities_used {
+        return Err(Error::invalid(
+            "identityGraph: the proposal has no identity proposal",
+        ));
     }
     if options.source_graph.is_some() && !sources_used {
         return Err(Error::invalid(
@@ -401,6 +410,9 @@ pub fn plan<'i>(
     let proposal_graph = proposals_used
         .then(|| choose("proposal", &settings.proposals, options.proposal_graph))
         .transpose()?;
+    let identity_graph = identities_used
+        .then(|| choose("identity", &settings.identity, options.identity_graph))
+        .transpose()?;
     if let Some(k) = options.idempotency_key
         && (k.is_empty() || k.len() > 256)
     {
@@ -414,6 +426,11 @@ pub fn plan<'i>(
     payload.field(12, prepared.body_digest().as_bytes())?;
     for g in [&source_graph, &proposal_graph] {
         payload.field(13, g.as_ref().map_or("", |g| g.as_str()).as_bytes())?;
+    }
+    // only a batch with identity proposals frames its identity graph, so that the
+    // payload digests of other batches stay as they were
+    if let Some(g) = &identity_graph {
+        payload.field(14, g.as_str().as_bytes())?;
     }
     let payload_digest = payload.finish()?;
 
@@ -703,6 +720,44 @@ pub fn plan<'i>(
             pg.expect("proposal graph"),
         )?;
     }
+    // Identity proposals are scoped by their set of entities.
+    if let Some(ig) = identity_graph.as_ref() {
+        for identity in &input.identities {
+            control.check()?;
+            let mut entities: Vec<&NamedNode> = identity.entities.iter().collect();
+            entities.sort();
+            let mut scope = FrameHash::new(b"sparkles-evidence-identity-scope-v1", control)?;
+            for e in &entities {
+                scope.field(13, e.as_str().as_bytes())?;
+            }
+            let scope = scope.finish()?.to_string();
+            let iri = b.mint(
+                RecordKind::IdentityProposal,
+                &scope,
+                &identity.occurrence_key,
+            )?;
+            let mut r = Record::new(&iri, RecordKind::IdentityProposal);
+            for e in entities {
+                r.add(ev("entity"), e.clone());
+            }
+            r.add(ev("relation"), ev(identity.relation.local()));
+            if let Some(p) = &identity.preferred {
+                r.add(ev("preferredEntity"), p.clone());
+            }
+            r.add(prov("wasAttributedTo"), identity.attributed_author.clone());
+            if let Some(method) = &identity.method {
+                r.method(method);
+            }
+            b.local.insert(identity.key.as_str(), iri);
+            push(
+                &mut records,
+                identity.key.as_str(),
+                RecordKind::IdentityProposal,
+                r,
+                ig,
+            )?;
+        }
+    }
     // An assessment's identity is scoped by its target, which may be another
     // assessment of the batch, so they are minted once their targets are known.
     let mut pending: Vec<&super::AssessmentInput> = input.assessments.iter().collect();
@@ -712,6 +767,15 @@ pub fn plan<'i>(
         let mut later = Vec::new();
         for assessment in pending {
             let Ok(target) = b.resolve(&assessment.target) else {
+                later.push(assessment);
+                continue;
+            };
+            let Ok(inputs) = assessment
+                .inputs
+                .iter()
+                .map(|i| b.resolve(i))
+                .collect::<Result<std::collections::BTreeSet<NamedNode>>>()
+            else {
                 later.push(assessment);
                 continue;
             };
@@ -736,6 +800,9 @@ pub fn plan<'i>(
             );
             r.confidence("analystConfidence", assessment.confidence.as_ref());
             r.scope("assessments", &assessment.scope)?;
+            for input in inputs {
+                r.add(prov("used"), input);
+            }
             b.local.insert(assessment.key.as_str(), iri);
             push(
                 &mut records,
@@ -747,7 +814,7 @@ pub fn plan<'i>(
         }
         if later.len() == before {
             return Err(Error::invalid(
-                "assessments: the batch's assessments target each other in a cycle",
+                "assessments: the batch's assessments target or use each other in a cycle",
             ));
         }
         pending = later;
@@ -796,6 +863,7 @@ pub fn plan<'i>(
     let mut graphs: Vec<NamedNode> = source_graph
         .iter()
         .chain(&proposal_graph)
+        .chain(&identity_graph)
         .cloned()
         .collect();
     graphs.sort();
@@ -973,7 +1041,8 @@ pub(super) fn publish_quads(
     Ok(out)
 }
 
-pub(super) fn unprotected(g: &NamedNode) -> Error {
+/// The refusal of a write to a graph the evidence owner does not protect.
+pub fn unprotected(g: &NamedNode) -> Error {
     crate::managed::ManagedError::error(
         crate::managed::ManagedErrorKind::UnsupportedProfile,
         format!(

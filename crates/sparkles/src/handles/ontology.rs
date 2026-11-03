@@ -832,6 +832,11 @@ pub struct EditOutcome {
     pub deleted: usize,
     /// triples of removed axioms kept because another axiom or triple uses them
     pub kept: usize,
+    /// the axioms the edit wrote, declarations included, in the order written
+    pub added_axioms: Vec<Axiom>,
+    /// the axioms the edit removed, each once, as asked for or as an entity removal
+    /// selected them
+    pub removed_axioms: Vec<Axiom>,
 }
 
 /// The ontology handle of a dataset.
@@ -1003,6 +1008,12 @@ impl OntologyScope {
     pub fn classify(&self, c: &classify::ClassifyRequest) -> Result<classify::Classified> {
         self.ready()?;
         self.handle.classify(&self.req, c, &self.opts)
+    }
+
+    /// [`Ontologies::dl_query`].
+    pub fn dl_query(&self, q: &dl_query::DlQueryRequest) -> Result<dl_query::DlQueryAnswer> {
+        self.ready()?;
+        self.handle.dl_query(&self.req, q, &self.opts)
     }
 
     /// Edit the ontology in one commit (spec F21 §2.1): `f` names the axioms to add and
@@ -1477,6 +1488,7 @@ impl Ontologies {
             }
             if found {
                 outcome.removed += 1;
+                outcome.removed_axioms.push((*ax).clone());
             } else {
                 outcome.absent.push((*ax).clone());
             }
@@ -1614,6 +1626,8 @@ impl Ontologies {
             inserted,
             deleted: count_deleted,
             kept: outcome.kept,
+            added_axioms: adding,
+            removed_axioms: outcome.removed_axioms,
         })
     }
 }
@@ -1637,6 +1651,7 @@ struct Plan {
     absent: Vec<Axiom>,
     declared: Vec<Entity>,
     kept: usize,
+    removed_axioms: Vec<Axiom>,
 }
 
 /// The id of a term an edit writes: a fresh blank node of the forward mapping, or a
@@ -2439,6 +2454,8 @@ pub fn rl_inspector(
 }
 
 pub mod classify;
+pub mod dl_query;
+pub mod search;
 pub mod wire;
 
 #[cfg(test)]

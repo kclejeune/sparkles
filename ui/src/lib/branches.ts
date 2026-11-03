@@ -64,6 +64,7 @@ const BRANCH_ROUTES = new Set([
   'cache',
   'backups',
   'forms',
+  'ontology',
 ]);
 
 /**

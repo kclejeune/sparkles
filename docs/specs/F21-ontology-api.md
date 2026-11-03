@@ -861,6 +861,21 @@ message goes to the commit. A target that
 declares a PROV-O property as an object or data property refuses the write with a
 conflict, as the MCP tool refuses provenance, so the header stays in OWL 2 DL.
 
+### Routes for the ontology editor
+
+The ontology editor of [U12](U12-ontology-workbench/SPEC.md#outcome) added four things to
+the HTTP surface. The `/$/ontology/{ds}` routes take `?branch=` and the `/{ds}@{branch}`
+form, as the other admin routes on the branch list do, so reads and edits work on a
+branch with its own `ETag`. `DELETE /$/ontology/{ds}/entity?iri=` removes an entity with
+its declarations, axioms and assertions, with `dryRun`, `If-Match`, a commit message and
+`receipt`, and needs write access to the graphs it reads. An edit's `add` and `remove`
+take strings in functional-style syntax with the dataset's prefixes beside the JSON form,
+as the MCP tool and the bindings already did. An edit's answer, and so the answer of every
+binding, lists the axioms it added and removed as `addedAxioms` and `removedAxioms`, up to
+10,000 of each with `axiomsTruncated`. An added n-ary axiom of which part was present is
+listed whole, so the lists are not an exact inverse, and the editor undoes a commit by
+reverting it instead.
+
 ### Decisions and departures from the design
 
 **Shared expressions in strict mode.** The first design made a blank node structure used
@@ -982,7 +997,7 @@ These phases belong to [ROADMAP](../ROADMAP.md) item 457, the ontology workbench
 
 **The F21 axiom model as the workbench base.** Item 71 built the F21 Phase 1 axiom model, the reverse and forward mappings, the profile checks and `/$/ontology/{ds}` in the `sparkles-owl` crate. Almost every ontology editing, refactoring, diff, documentation and classification phase depends on it, so it is the root of this workstream.
 
-**Functional, Manchester, OWL/XML, OBO and OBO Graphs JSON syntaxes.** Add readers and writers for OFN, Manchester, OWL/XML, OBO 1.4 and OBO Graphs JSON in sparkles-owl, registered with the loader, formatter, linter and LSP, with a Manchester class-expression editor mode. Ontologies are distributed in these formats and Protégé users write Manchester. Manchester is only rendered today (`schema/expressions.rs`). It depends on item 71.
+**Functional, Manchester, OWL/XML, OBO and OBO Graphs JSON syntaxes.** Add readers and writers for OFN, Manchester, OWL/XML, OBO 1.4 and OBO Graphs JSON in sparkles-owl, registered with the loader, formatter, linter and LSP, with a Manchester class-expression editor mode. Ontologies are distributed in these formats and Protégé users write Manchester. `sparkles_owl::manchester` reads Manchester class expressions and one-line axioms against an ontology's names and labels for the ontology editor and `POST /$/ontology/{ds}/parse`, and whole Manchester documents remain. It depends on item 71.
 
 **SSSOM mapping sets.** Import and export SSSOM TSV as RDF and review mapping sets in the UI. Crosswalks between vocabularies have no support.
 

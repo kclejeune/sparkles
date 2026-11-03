@@ -1,0 +1,911 @@
+{
+ "checks": [
+  {
+   "detail": "p99 8.34 ms over 7800 timed searches",
+   "name": "chebi_lite/p99-within-20ms",
+   "ok": true
+  },
+  {
+   "detail": "50 updates and 1 build over 50 commits",
+   "name": "chebi_lite/incremental-maintenance",
+   "ok": true
+  },
+  {
+   "detail": "p99 4.87 ms over 7800 timed searches",
+   "name": "go/p99-within-20ms",
+   "ok": true
+  },
+  {
+   "detail": "50 updates and 1 build over 50 commits",
+   "name": "go/incremental-maintenance",
+   "ok": true
+  }
+ ],
+ "host": {
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "kernel": "7.2.9",
+  "name": "atlas",
+  "ram_mib": 15620
+ },
+ "kind": "measurement",
+ "manifest": {
+  "binary": "crates/sparkles/examples/entity_search_bench.rs",
+  "binary_sha256": "09f20ede3c4f17eba493c986c9fa5246bad93c895a001621410f17e03c7ced2c",
+  "build": "mbx build --release -p sparkles --features ontology --example entity_search_bench on atlas, in a clone at the commit",
+  "build_note": "Built from a git checkout of the commit on atlas.",
+  "commit": "e3056dda",
+  "data": {
+   "chebi_lite": {
+    "rdfxml_sha256": "ebea75e0500818e319245a1bf605a684b2e22a2069680290b5dda638d5d25b16",
+    "release": "256",
+    "url": "http://purl.obolibrary.org/obo/chebi/256/chebi_lite.owl"
+   },
+   "go": {
+    "rdfxml_sha256": "653ce47cd7b02304e67eb67c54d3be02ec5b0ba5e00eb7384dfa0da00f9682ec",
+    "release": "2026-07-26",
+    "url": "http://purl.obolibrary.org/obo/go/releases/2026-07-26/go.owl"
+   }
+  },
+  "ended": "2026-11-03T04:48:15Z",
+  "harness_sha256": "bd2ea1b0d0787c78081ed39a0dc8a55bec53586610600faa01be6ae047dc76f8",
+  "host_load_after": "0.54 0.20 1.39",
+  "host_load_before": "0.01 0.06 1.40",
+  "started": "2026-11-03T04:47:33Z"
+ },
+ "method": "entity_search_bench ONTOLOGY.owl --per-bucket 60 --rounds 5 --seed 1 --commits 50, one process per ontology under the host's heavy-work lock with no other build, test or benchmark running. The ontology is loaded into a persistent dataset, the first search builds the index, and 60 seeded queries per bucket of prefix length 1 to 12 and 0 to 2 typos run five times each after a warm-up pass through wire::call(ds, \"search\"), the call of the HTTP route, JSON answer included. Fifty commits then each add a labelled class or remove a label, with the search after each one timed.",
+ "results": {
+  "chebi_lite": {
+   "by_bucket": [
+    {
+     "length": 1,
+     "max_ms": 0.671569,
+     "n": 300,
+     "p50_ms": 0.199161,
+     "p95_ms": 0.452275,
+     "p99_ms": 0.6698989999999999,
+     "source_in_top10": 0.0,
+     "typos": 0
+    },
+    {
+     "length": 2,
+     "max_ms": 0.5460769999999999,
+     "n": 300,
+     "p50_ms": 0.093551,
+     "p95_ms": 0.407277,
+     "p99_ms": 0.536705,
+     "source_in_top10": 0.016666666666666666,
+     "typos": 0
+    },
+    {
+     "length": 3,
+     "max_ms": 0.37936000000000003,
+     "n": 300,
+     "p50_ms": 0.059662,
+     "p95_ms": 0.36852,
+     "p99_ms": 0.377294,
+     "source_in_top10": 0.11666666666666667,
+     "typos": 0
+    },
+    {
+     "length": 4,
+     "max_ms": 2.3783290000000004,
+     "n": 300,
+     "p50_ms": 0.07324900000000001,
+     "p95_ms": 1.4063299999999999,
+     "p99_ms": 2.1195570000000004,
+     "source_in_top10": 0.2,
+     "typos": 0
+    },
+    {
+     "length": 4,
+     "max_ms": 3.564303,
+     "n": 300,
+     "p50_ms": 0.5976049999999999,
+     "p95_ms": 1.385767,
+     "p99_ms": 3.340025,
+     "source_in_top10": 0.13333333333333333,
+     "typos": 1
+    },
+    {
+     "length": 5,
+     "max_ms": 1.448034,
+     "n": 300,
+     "p50_ms": 0.064592,
+     "p95_ms": 0.7217150000000001,
+     "p99_ms": 1.3365289999999999,
+     "source_in_top10": 0.21666666666666667,
+     "typos": 0
+    },
+    {
+     "length": 5,
+     "max_ms": 5.916348,
+     "n": 300,
+     "p50_ms": 0.747908,
+     "p95_ms": 2.074914,
+     "p99_ms": 5.800649,
+     "source_in_top10": 0.16666666666666666,
+     "typos": 1
+    },
+    {
+     "length": 6,
+     "max_ms": 4.665272,
+     "n": 300,
+     "p50_ms": 0.07385699999999999,
+     "p95_ms": 1.2984850000000001,
+     "p99_ms": 4.589946,
+     "source_in_top10": 0.35,
+     "typos": 0
+    },
+    {
+     "length": 6,
+     "max_ms": 5.096762,
+     "n": 300,
+     "p50_ms": 1.0256079999999999,
+     "p95_ms": 2.1413439999999997,
+     "p99_ms": 4.966759000000001,
+     "source_in_top10": 0.4,
+     "typos": 1
+    },
+    {
+     "length": 7,
+     "max_ms": 4.431747,
+     "n": 300,
+     "p50_ms": 0.074663,
+     "p95_ms": 1.3912900000000001,
+     "p99_ms": 4.410971,
+     "source_in_top10": 0.5166666666666667,
+     "typos": 0
+    },
+    {
+     "length": 7,
+     "max_ms": 5.678153,
+     "n": 300,
+     "p50_ms": 1.146607,
+     "p95_ms": 4.7283029999999995,
+     "p99_ms": 5.282127999999999,
+     "source_in_top10": 0.36666666666666664,
+     "typos": 1
+    },
+    {
+     "length": 8,
+     "max_ms": 6.664295,
+     "n": 300,
+     "p50_ms": 0.175721,
+     "p95_ms": 5.949812,
+     "p99_ms": 6.331376,
+     "source_in_top10": 0.6333333333333333,
+     "typos": 0
+    },
+    {
+     "length": 8,
+     "max_ms": 6.26337,
+     "n": 300,
+     "p50_ms": 3.37168,
+     "p95_ms": 5.58918,
+     "p99_ms": 6.068706,
+     "source_in_top10": 0.6,
+     "typos": 1
+    },
+    {
+     "length": 8,
+     "max_ms": 6.540175,
+     "n": 300,
+     "p50_ms": 1.53515,
+     "p95_ms": 5.584747,
+     "p99_ms": 6.172403,
+     "source_in_top10": 0.36666666666666664,
+     "typos": 2
+    },
+    {
+     "length": 9,
+     "max_ms": 8.258825,
+     "n": 300,
+     "p50_ms": 0.11909700000000001,
+     "p95_ms": 5.688503,
+     "p99_ms": 7.708232,
+     "source_in_top10": 0.6,
+     "typos": 0
+    },
+    {
+     "length": 9,
+     "max_ms": 9.093403,
+     "n": 300,
+     "p50_ms": 4.0110600000000005,
+     "p95_ms": 6.421235,
+     "p99_ms": 8.672726,
+     "source_in_top10": 0.65,
+     "typos": 1
+    },
+    {
+     "length": 9,
+     "max_ms": 7.205015,
+     "n": 300,
+     "p50_ms": 4.15341,
+     "p95_ms": 5.971319,
+     "p99_ms": 6.606601,
+     "source_in_top10": 0.43333333333333335,
+     "typos": 2
+    },
+    {
+     "length": 10,
+     "max_ms": 9.987478,
+     "n": 300,
+     "p50_ms": 0.107646,
+     "p95_ms": 6.35348,
+     "p99_ms": 9.056509,
+     "source_in_top10": 0.6333333333333333,
+     "typos": 0
+    },
+    {
+     "length": 10,
+     "max_ms": 11.059951,
+     "n": 300,
+     "p50_ms": 4.762519,
+     "p95_ms": 7.4514309999999995,
+     "p99_ms": 10.197268000000001,
+     "source_in_top10": 0.6666666666666666,
+     "typos": 1
+    },
+    {
+     "length": 10,
+     "max_ms": 8.493797,
+     "n": 300,
+     "p50_ms": 4.773956,
+     "p95_ms": 6.671665,
+     "p99_ms": 8.064162999999999,
+     "source_in_top10": 0.5333333333333333,
+     "typos": 2
+    },
+    {
+     "length": 11,
+     "max_ms": 10.302206,
+     "n": 300,
+     "p50_ms": 2.070605,
+     "p95_ms": 7.272499,
+     "p99_ms": 9.615279,
+     "source_in_top10": 0.7333333333333333,
+     "typos": 0
+    },
+    {
+     "length": 11,
+     "max_ms": 7.649376999999999,
+     "n": 300,
+     "p50_ms": 4.690302,
+     "p95_ms": 6.197687,
+     "p99_ms": 7.321648,
+     "source_in_top10": 0.6833333333333333,
+     "typos": 1
+    },
+    {
+     "length": 11,
+     "max_ms": 18.257562,
+     "n": 300,
+     "p50_ms": 4.735169,
+     "p95_ms": 7.675305000000001,
+     "p99_ms": 9.841728,
+     "source_in_top10": 0.6,
+     "typos": 2
+    },
+    {
+     "length": 12,
+     "max_ms": 10.882467,
+     "n": 300,
+     "p50_ms": 3.1594230000000003,
+     "p95_ms": 7.03258,
+     "p99_ms": 10.585080999999999,
+     "source_in_top10": 0.7,
+     "typos": 0
+    },
+    {
+     "length": 12,
+     "max_ms": 9.406718,
+     "n": 300,
+     "p50_ms": 4.9932680000000005,
+     "p95_ms": 7.994315,
+     "p99_ms": 9.218686,
+     "source_in_top10": 0.6333333333333333,
+     "typos": 1
+    },
+    {
+     "length": 12,
+     "max_ms": 10.248956,
+     "n": 300,
+     "p50_ms": 4.854678000000001,
+     "p95_ms": 7.221014,
+     "p99_ms": 10.037443999999999,
+     "source_in_top10": 0.55,
+     "typos": 2
+    }
+   ],
+   "by_typos": [
+    {
+     "max_ms": 10.882467,
+     "n": 3600,
+     "p50_ms": 0.092747,
+     "p95_ms": 5.765417,
+     "p99_ms": 7.5890439999999995,
+     "source_in_top10": 0.39305555555555555,
+     "typos": 0
+    },
+    {
+     "max_ms": 11.059951,
+     "n": 2700,
+     "p50_ms": 1.7101790000000001,
+     "p95_ms": 6.164257999999999,
+     "p99_ms": 8.508467000000001,
+     "source_in_top10": 0.4777777777777778,
+     "typos": 1
+    },
+    {
+     "max_ms": 18.257562,
+     "n": 1500,
+     "p50_ms": 4.3071150000000005,
+     "p95_ms": 6.679606000000001,
+     "p99_ms": 8.915244,
+     "source_in_top10": 0.49666666666666665,
+     "typos": 2
+    }
+   ],
+   "file": "chebi_lite.owl",
+   "index": {
+    "build_ms": 1324.979084,
+    "entities": 238190,
+    "estimated_bytes": 244536692,
+    "rss_after_kib": 589900,
+    "rss_before_kib": 291088,
+    "rss_delta_kib": 298812,
+    "texts": 456243,
+    "values": 731179,
+    "words": 324140
+   },
+   "load_s": 2.716233306,
+   "maintenance": {
+    "builds": 1,
+    "commit": {
+     "max_ms": 11.006639999999999,
+     "n": 50,
+     "p50_ms": 0.743954,
+     "p95_ms": 1.3615000000000002,
+     "p99_ms": 11.006639999999999
+    },
+    "search_after_commit": {
+     "max_ms": 2.186271,
+     "n": 50,
+     "p50_ms": 1.098746,
+     "p95_ms": 1.9533150000000001,
+     "p99_ms": 2.186271
+    },
+    "updates": 50
+   },
+   "overall": {
+    "max_ms": 18.257562,
+    "n": 7800,
+    "p50_ms": 1.067404,
+    "p95_ms": 6.180931,
+    "p99_ms": 8.342058
+   },
+   "quads": 1994673,
+   "queries": 1560,
+   "settings": {
+    "commits": 50,
+    "per_bucket": 60,
+    "rounds": 5,
+    "seed": 1
+   },
+   "slowest": [
+    {
+     "ms": 18.257562,
+     "q": "1-pwxmitole"
+    },
+    {
+     "ms": 11.85343,
+     "q": "L-arhinxine,"
+    },
+    {
+     "ms": 11.059951,
+     "q": "4,4,4-turif"
+    },
+    {
+     "ms": 10.882467,
+     "q": "3,7R,11R,15-"
+    },
+    {
+     "ms": 10.491594,
+     "q": "4,4,4-turif"
+    },
+    {
+     "ms": 10.302206,
+     "q": "paraquat di"
+    },
+    {
+     "ms": 10.248956,
+     "q": "CID 9184681n"
+    },
+    {
+     "ms": 10.234191000000001,
+     "q": "paraquat di"
+    },
+    {
+     "ms": 10.197268000000001,
+     "q": "4,4,4-turif"
+    },
+    {
+     "ms": 10.181153,
+     "q": "CID 9184681n"
+    },
+    {
+     "ms": 10.154486,
+     "q": "4,4,4-turif"
+    },
+    {
+     "ms": 10.139434,
+     "q": "CID 9184681n"
+    },
+    {
+     "ms": 10.072485,
+     "q": "PEq(20:2(11"
+    },
+    {
+     "ms": 10.037443999999999,
+     "q": "CID 9184681n"
+    },
+    {
+     "ms": 9.987478,
+     "q": "labdane di"
+    },
+    {
+     "ms": 9.982141,
+     "q": "PEq(20:2(11"
+    },
+    {
+     "ms": 9.854615,
+     "q": "Methyzl4-me"
+    },
+    {
+     "ms": 9.835749,
+     "q": "PEq(20:2(11"
+    },
+    {
+     "ms": 9.826098,
+     "q": "Methyzl4-me"
+    },
+    {
+     "ms": 9.802166,
+     "q": "labdane di"
+    }
+   ],
+   "texts": 218723
+  },
+  "go": {
+   "by_bucket": [
+    {
+     "length": 1,
+     "max_ms": 0.369125,
+     "n": 300,
+     "p50_ms": 0.082737,
+     "p95_ms": 0.19901000000000002,
+     "p99_ms": 0.359995,
+     "source_in_top10": 0.0,
+     "typos": 0
+    },
+    {
+     "length": 2,
+     "max_ms": 0.976321,
+     "n": 300,
+     "p50_ms": 0.06469699999999999,
+     "p95_ms": 0.359836,
+     "p99_ms": 0.955883,
+     "source_in_top10": 0.0,
+     "typos": 0
+    },
+    {
+     "length": 3,
+     "max_ms": 0.390796,
+     "n": 300,
+     "p50_ms": 0.055732000000000004,
+     "p95_ms": 0.337647,
+     "p99_ms": 0.378023,
+     "source_in_top10": 0.18333333333333332,
+     "typos": 0
+    },
+    {
+     "length": 4,
+     "max_ms": 1.1768569999999998,
+     "n": 300,
+     "p50_ms": 0.07121899999999999,
+     "p95_ms": 0.44927900000000004,
+     "p99_ms": 1.149407,
+     "source_in_top10": 0.18333333333333332,
+     "typos": 0
+    },
+    {
+     "length": 4,
+     "max_ms": 2.525604,
+     "n": 300,
+     "p50_ms": 1.085041,
+     "p95_ms": 2.320472,
+     "p99_ms": 2.4906569999999997,
+     "source_in_top10": 0.08333333333333333,
+     "typos": 1
+    },
+    {
+     "length": 5,
+     "max_ms": 1.159904,
+     "n": 300,
+     "p50_ms": 0.070227,
+     "p95_ms": 0.7586620000000001,
+     "p99_ms": 1.047211,
+     "source_in_top10": 0.18333333333333332,
+     "typos": 0
+    },
+    {
+     "length": 5,
+     "max_ms": 2.458009,
+     "n": 300,
+     "p50_ms": 0.9816239999999999,
+     "p95_ms": 2.16216,
+     "p99_ms": 2.4215730000000004,
+     "source_in_top10": 0.16666666666666666,
+     "typos": 1
+    },
+    {
+     "length": 6,
+     "max_ms": 1.5265520000000001,
+     "n": 300,
+     "p50_ms": 0.074158,
+     "p95_ms": 1.1689610000000001,
+     "p99_ms": 1.490755,
+     "source_in_top10": 0.26666666666666666,
+     "typos": 0
+    },
+    {
+     "length": 6,
+     "max_ms": 3.188687,
+     "n": 300,
+     "p50_ms": 0.9777440000000001,
+     "p95_ms": 2.472976,
+     "p99_ms": 3.063179,
+     "source_in_top10": 0.21666666666666667,
+     "typos": 1
+    },
+    {
+     "length": 7,
+     "max_ms": 2.339788,
+     "n": 300,
+     "p50_ms": 0.15918400000000002,
+     "p95_ms": 1.180768,
+     "p99_ms": 2.0029190000000003,
+     "source_in_top10": 0.26666666666666666,
+     "typos": 0
+    },
+    {
+     "length": 7,
+     "max_ms": 4.484375,
+     "n": 300,
+     "p50_ms": 1.299117,
+     "p95_ms": 3.5753019999999998,
+     "p99_ms": 4.273283999999999,
+     "source_in_top10": 0.21666666666666667,
+     "typos": 1
+    },
+    {
+     "length": 8,
+     "max_ms": 3.9128760000000002,
+     "n": 300,
+     "p50_ms": 0.10151400000000001,
+     "p95_ms": 2.977314,
+     "p99_ms": 3.453099,
+     "source_in_top10": 0.3333333333333333,
+     "typos": 0
+    },
+    {
+     "length": 8,
+     "max_ms": 5.019099,
+     "n": 300,
+     "p50_ms": 2.9467999999999996,
+     "p95_ms": 4.484685000000001,
+     "p99_ms": 4.988463,
+     "source_in_top10": 0.3333333333333333,
+     "typos": 1
+    },
+    {
+     "length": 8,
+     "max_ms": 5.059346000000001,
+     "n": 300,
+     "p50_ms": 2.821053,
+     "p95_ms": 4.596162,
+     "p99_ms": 4.933261000000001,
+     "source_in_top10": 0.18333333333333332,
+     "typos": 2
+    },
+    {
+     "length": 9,
+     "max_ms": 4.271509,
+     "n": 300,
+     "p50_ms": 0.175519,
+     "p95_ms": 3.2883489999999997,
+     "p99_ms": 3.84205,
+     "source_in_top10": 0.4,
+     "typos": 0
+    },
+    {
+     "length": 9,
+     "max_ms": 5.147104,
+     "n": 300,
+     "p50_ms": 3.0720080000000003,
+     "p95_ms": 4.644336,
+     "p99_ms": 4.841505000000001,
+     "source_in_top10": 0.36666666666666664,
+     "typos": 1
+    },
+    {
+     "length": 9,
+     "max_ms": 4.068397,
+     "n": 300,
+     "p50_ms": 2.905009,
+     "p95_ms": 3.609036,
+     "p99_ms": 3.8887370000000003,
+     "source_in_top10": 0.36666666666666664,
+     "typos": 2
+    },
+    {
+     "length": 10,
+     "max_ms": 3.6541289999999997,
+     "n": 300,
+     "p50_ms": 0.115633,
+     "p95_ms": 3.237879,
+     "p99_ms": 3.5298450000000003,
+     "source_in_top10": 0.55,
+     "typos": 0
+    },
+    {
+     "length": 10,
+     "max_ms": 5.211839,
+     "n": 300,
+     "p50_ms": 3.022496,
+     "p95_ms": 4.2963949999999995,
+     "p99_ms": 4.710634,
+     "source_in_top10": 0.5,
+     "typos": 1
+    },
+    {
+     "length": 10,
+     "max_ms": 4.635394,
+     "n": 300,
+     "p50_ms": 3.072319,
+     "p95_ms": 3.8216639999999997,
+     "p99_ms": 4.2529710000000005,
+     "source_in_top10": 0.4666666666666667,
+     "typos": 2
+    },
+    {
+     "length": 11,
+     "max_ms": 4.624411,
+     "n": 300,
+     "p50_ms": 0.168575,
+     "p95_ms": 3.708888,
+     "p99_ms": 4.432335,
+     "source_in_top10": 0.45,
+     "typos": 0
+    },
+    {
+     "length": 11,
+     "max_ms": 6.765015,
+     "n": 300,
+     "p50_ms": 3.507369,
+     "p95_ms": 5.959033,
+     "p99_ms": 6.204051000000001,
+     "source_in_top10": 0.4666666666666667,
+     "typos": 1
+    },
+    {
+     "length": 11,
+     "max_ms": 6.323139,
+     "n": 300,
+     "p50_ms": 3.035265,
+     "p95_ms": 5.65673,
+     "p99_ms": 6.218783999999999,
+     "source_in_top10": 0.4666666666666667,
+     "typos": 2
+    },
+    {
+     "length": 12,
+     "max_ms": 4.066139,
+     "n": 300,
+     "p50_ms": 0.17307,
+     "p95_ms": 3.410462,
+     "p99_ms": 3.679718,
+     "source_in_top10": 0.45,
+     "typos": 0
+    },
+    {
+     "length": 12,
+     "max_ms": 5.2659270000000005,
+     "n": 300,
+     "p50_ms": 3.2752440000000003,
+     "p95_ms": 4.726064,
+     "p99_ms": 4.97511,
+     "source_in_top10": 0.4,
+     "typos": 1
+    },
+    {
+     "length": 12,
+     "max_ms": 4.872946000000001,
+     "n": 300,
+     "p50_ms": 3.1331,
+     "p95_ms": 4.4342,
+     "p99_ms": 4.585077,
+     "source_in_top10": 0.35,
+     "typos": 2
+    }
+   ],
+   "by_typos": [
+    {
+     "max_ms": 4.624411,
+     "n": 3600,
+     "p50_ms": 0.09202199999999999,
+     "p95_ms": 2.8828069999999997,
+     "p99_ms": 3.575404,
+     "source_in_top10": 0.2722222222222222,
+     "typos": 0
+    },
+    {
+     "max_ms": 6.765015,
+     "n": 2700,
+     "p50_ms": 2.319057,
+     "p95_ms": 4.465593999999999,
+     "p99_ms": 5.75298,
+     "source_in_top10": 0.3055555555555556,
+     "typos": 1
+    },
+    {
+     "max_ms": 6.323139,
+     "n": 1500,
+     "p50_ms": 2.992599,
+     "p95_ms": 4.378428,
+     "p99_ms": 5.65673,
+     "source_in_top10": 0.36666666666666664,
+     "typos": 2
+    }
+   ],
+   "file": "go.owl",
+   "index": {
+    "build_ms": 637.083084,
+    "entities": 52057,
+    "estimated_bytes": 103387698,
+    "rss_after_kib": 303036,
+    "rss_before_kib": 184720,
+    "rss_delta_kib": 118316,
+    "texts": 215205,
+    "values": 326642,
+    "words": 83432
+   },
+   "load_s": 1.920587329,
+   "maintenance": {
+    "builds": 1,
+    "commit": {
+     "max_ms": 9.809988,
+     "n": 50,
+     "p50_ms": 0.330692,
+     "p95_ms": 0.996734,
+     "p99_ms": 9.809988
+    },
+    "search_after_commit": {
+     "max_ms": 1.389876,
+     "n": 50,
+     "p50_ms": 0.251467,
+     "p95_ms": 1.2729620000000001,
+     "p99_ms": 1.389876
+    },
+    "updates": 50
+   },
+   "overall": {
+    "max_ms": 6.765015,
+    "n": 7800,
+    "p50_ms": 0.9941559999999999,
+    "p95_ms": 4.066139,
+    "p99_ms": 4.872946000000001
+   },
+   "quads": 1445043,
+   "queries": 1560,
+   "settings": {
+    "commits": 50,
+    "per_bucket": 60,
+    "rounds": 5,
+    "seed": 1
+   },
+   "slowest": [
+    {
+     "ms": 6.765015,
+     "q": "positie re"
+    },
+    {
+     "ms": 6.323139,
+     "q": "oitive re"
+    },
+    {
+     "ms": 6.255321,
+     "q": "positie re"
+    },
+    {
+     "ms": 6.218783999999999,
+     "q": "obsolext re"
+    },
+    {
+     "ms": 6.2160779999999995,
+     "q": "oitive re"
+    },
+    {
+     "ms": 6.204615,
+     "q": "positie re"
+    },
+    {
+     "ms": 6.204051000000001,
+     "q": "ositive re"
+    },
+    {
+     "ms": 6.198399,
+     "q": "positnve re"
+    },
+    {
+     "ms": 6.1554340000000005,
+     "q": "ositive re"
+    },
+    {
+     "ms": 6.1221499999999995,
+     "q": "positnve re"
+    },
+    {
+     "ms": 6.099773,
+     "q": "negatbive re"
+    },
+    {
+     "ms": 6.0975969999999995,
+     "q": "oitive re"
+    },
+    {
+     "ms": 6.089266,
+     "q": "positnve re"
+    },
+    {
+     "ms": 6.063723,
+     "q": "negatbive re"
+    },
+    {
+     "ms": 6.0374859999999995,
+     "q": "positnve re"
+    },
+    {
+     "ms": 6.015776,
+     "q": "negaaiev re"
+    },
+    {
+     "ms": 6.001946,
+     "q": "psoitive re"
+    },
+    {
+     "ms": 5.987671,
+     "q": "positie re"
+    },
+    {
+     "ms": 5.974805,
+     "q": "obsolext re"
+    },
+    {
+     "ms": 5.969729,
+     "q": "negaaiev re"
+    }
+   ],
+   "texts": 125303
+  }
+ },
+ "scale": "ChEBI lite 256 and GO 2026-07-26",
+ "settings": {
+  "commits": 50,
+  "per_bucket": 60,
+  "rounds": 5,
+  "seed": 1
+ },
+ "suite": "entity-search"
+}

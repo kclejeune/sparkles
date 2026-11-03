@@ -51,6 +51,7 @@ fn err(e: EngineError) -> napi::Error {
         EngineError::Locked { .. } => "DatasetLockedError",
         EngineError::Rejected(_) | EngineError::GuardMissing(_) => "WriteRejectedError",
         EngineError::Service(_) => "ServiceError",
+        EngineError::Component(c) if c.code == "invalid-manchester" => "InvalidInputError",
         _ => "StorageError",
     };
     let details = match &e {
@@ -61,6 +62,17 @@ fn err(e: EngineError) -> napi::Error {
             "requested": b.requested.to_string(),
         }),
         EngineError::Locked { path, pid } => json!({ "path": path, "pid": pid }),
+        // Manchester text that does not read: its reason, its span in UTF-16 code units
+        // and the candidates of an ambiguous name, as HTTP answers them
+        #[cfg(feature = "ontology")]
+        EngineError::Component(c) if c.code == "invalid-manchester" => c
+            .source
+            .as_ref()
+            .and_then(|s| {
+                s.downcast_ref::<sparkles::handles::ontology::dl_query::ManchesterFailure>()
+            })
+            .map(|f| f.json())
+            .unwrap_or_else(|| json!({})),
         EngineError::Io(io) => json!({
             "errno": io.raw_os_error(),
             "code": if io.kind() == std::io::ErrorKind::NotFound {"ENOENT"} else {"EIO"},

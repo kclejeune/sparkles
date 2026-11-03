@@ -50,6 +50,8 @@ import { handleProjection } from './projection.mjs';
 import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
 import { WORLD, worldTurtle } from './world.mjs';
 import { handleForms } from './forms.mjs';
+import { handleOntology, UNI_PREFIXES, UNI_TURTLE } from './ontology.mjs';
+import { handleSkos, isSkosShapes, skosReport, THES_PREFIXES, THES_TURTLE } from './skos.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
 
 const PORT = Number(process.env.PORT ?? 3030);
@@ -234,6 +236,20 @@ function seedHistory(ds) {
   world.baseQuads = world.store.size;
   addCommit(world, 'upload', world.store.size, 0, { bulk: true });
   seedVectors(datasets);
+  // the ontology editor's university ontology (mock/ontology.mjs)
+  const uni = makeDataset('uni', 'persistent');
+  uni.prefixes = { ...UNI_PREFIXES };
+  uni.store.load(UNI_TURTLE, { format: 'text/turtle' });
+  uni.baseQuads = uni.store.size;
+  addCommit(uni, 'upload', uni.store.size, 0, { bulk: true });
+  // the thesaurus editor's thesaurus (mock/skos.mjs)
+  const thes = makeDataset('thes', 'persistent');
+  thes.prefixes = { ...THES_PREFIXES };
+  // no shapes of its own: its forms read the built-in SKOS shapes
+  thes.noFormShapes = true;
+  thes.store.load(THES_TURTLE, { format: 'text/turtle' });
+  thes.baseQuads = thes.store.size;
+  addCommit(thes, 'upload', thes.store.size, 0, { bulk: true });
   // a branch of foaf two commits ahead of main
   const dev = createBranch(foaf, { name: 'dev', note: 'schema migration' }).branch;
   for (const u of [
@@ -1527,10 +1543,42 @@ function handleOverlayShacl(res, ds, p) {
   send(res, 200, { conforms: !results.length, results });
 }
 
+/**
+ * The refusal of an `If-Match` that names another commit than the head, or null. A tag
+ * names a commit as `W/"<datasetId>:<seq>:<format>"`, in any serialization.
+ */
+function ifMatchFails(req, ds) {
+  const tag = req.headers['if-match'];
+  if (!tag || tag === '*') return null;
+  const want = `${ds.branchId ?? ds.id}:${headCommit(ds).seq}:`;
+  const ok = String(tag)
+    .split(',')
+    .some((t) => t.trim().replace(/^W\//, '').replace(/^"/, '').startsWith(want));
+  return ok ? null : `If-Match: the dataset is at commit ${headCommit(ds).seq} now`;
+}
+
 /** A dry run of an update (C15): the changes and the guard's summary, then rolled back. */
-function handleDryRun(res, ds, p) {
+function handleDryRun(req, res, ds, p) {
   const update = p.get('update');
   if (!update) return fail(res, 400, 'Missing update parameter');
+  const precondition = ifMatchFails(req, ds);
+  if (precondition)
+    return send(
+      res,
+      412,
+      {
+        dryRun: true,
+        dataset: ds.name,
+        committed: false,
+        wouldCommit: false,
+        outcome: 'precondition-failed',
+        head: headCommit(ds).seq,
+        error: precondition,
+        code: 'precondition-failed',
+      },
+      'application/json',
+      { 'Sparkles-Dry-Run': 'true' },
+    );
   const before = ds.store.match();
   const dump = ds.store.dump({ format: 'application/n-quads' });
   try {
@@ -1582,9 +1630,18 @@ function handleDryRun(res, ds, p) {
   send(res, rejected ? 422 : 200, body, 'application/json', { 'Sparkles-Dry-Run': 'true' });
 }
 
+/** The `Sparkles-Commit-Message` of a request, decoded from `utf-8''` percent-encoding. */
+function commitMessageOf(req) {
+  const raw = req.headers['sparkles-commit-message'];
+  if (!raw) return undefined;
+  return /^utf-8''/i.test(raw) ? decodeURIComponent(raw.slice(7)) : raw;
+}
+
 function handleUpdate(req, res, ds, p) {
   const update = p.get('update');
   if (!update) return fail(res, 400, 'Missing update parameter');
+  const precondition = ifMatchFails(req, ds);
+  if (precondition) return fail(res, 412, precondition, { code: 'precondition-failed' });
   const t0 = performance.now();
   const before = quadSet(ds);
   try {
@@ -1593,7 +1650,7 @@ function handleUpdate(req, res, ds, p) {
     return send(res, 400, parseErr(e));
   }
   const receipt = commitWrite(ds, 'update', before, {
-    message: req.headers['sparkles-commit-message'] || undefined,
+    message: commitMessageOf(req) || undefined,
   });
   ds.deltaInserts += receipt.committed ? receipt.commit.inserted : 0;
   ds.deltaDeletes += receipt.committed ? receipt.commit.deleted : 0;
@@ -2426,6 +2483,22 @@ const server = http.createServer(async (req, res) => {
       })
     )
       return;
+    // the built-in SKOS shapes (mock/skos.mjs)
+    if (handleSkos(req, res, seg, { send })) return;
+    // the ontology editor's routes and the change feed (mock/ontology.mjs)
+    if (
+      await handleOntology(req, res, url, seg, {
+        datasets,
+        send,
+        fail,
+        readBody,
+        headCommit,
+        quadSet,
+        commitWrite,
+        allCommits,
+      })
+    )
+      return;
     // editing forms generated from shapes (mock/forms.mjs)
     if (
       await handleForms(req, res, url, seg, {
@@ -3070,8 +3143,9 @@ const server = http.createServer(async (req, res) => {
       return handleQuery(req, res, ds, p);
     }
     if (op === 'update' && ['true', ''].includes(String(p.get('dryRun') ?? 'x')))
-      return handleDryRun(res, ds, p);
+      return handleDryRun(req, res, ds, p);
     if (op === 'update') return handleUpdate(req, res, ds, p);
+    if (op === 'shacl' && isSkosShapes(p.get('__body'))) return send(res, 200, skosReport(ds));
     if (op === 'shacl') return handleOverlayShacl(res, ds, p);
     if (op === 'explain') {
       const query = p.get('query');
@@ -3088,6 +3162,13 @@ const server = http.createServer(async (req, res) => {
     if (op === 'data' || op === 'get') {
       if (req.method === 'GET' || req.method === 'HEAD') {
         const graph = url.searchParams.get('graph');
+        // the tag a write's If-Match names (mock: by commit, as the server does)
+        const tagged = {
+          ...commitHeaders(ds),
+          ETag: `W/"${ds.branchId ?? ds.id}:${headCommit(ds).seq}:ttl"`,
+        };
+        if (req.method === 'HEAD' && (graph || url.searchParams.has('default')))
+          return send(res, 200, '', 'text/turtle', tagged);
         if (graph || url.searchParams.has('default')) {
           const from = graph ? ox.namedNode(graph) : ox.defaultGraph();
           return send(
@@ -3095,6 +3176,7 @@ const server = http.createServer(async (req, res) => {
             200,
             ds.store.dump({ format: 'text/turtle', from_graph_name: from }),
             'text/turtle',
+            tagged,
           );
         }
         return send(

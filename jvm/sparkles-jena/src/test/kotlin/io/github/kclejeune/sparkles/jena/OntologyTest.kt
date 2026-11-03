@@ -233,6 +233,12 @@ class OntologyTest {
             val sup = prof.get("class").asObject.get("superClasses").asArray[0].asObject
             assertEquals("ObjectSomeValuesFrom", sup.get("expression").asObject.getString("type"))
             assertThrows(SparklesNotFoundException::class.java) { onto.entity("http://ex.org/nothing", read) }
+            // roadmap item 616: the entity search, by the local name here
+            val found = SparklesOnt.search(ds, "prof", "http://ex.org/onto")
+            assertEquals("http://ex.org/Professor", found.get("results").asArray[0].asObject.getString("iri"))
+            val typo = onto.search("profesor", read, kinds = listOf("class")).get("results").asArray[0].asObject
+            assertEquals("http://ex.org/Professor", typo.getString("iri"))
+            assertEquals("fuzzy", typo.get("match").asObject.getString("kind"))
             val before = ds.headCommit().seq
             val done = SparklesOnt.edit(
                 ds,
@@ -283,6 +289,32 @@ class OntologyTest {
             assertEquals(before + 1, ds.headCommit().seq)
             val tax = SparklesOnt.axioms(ds, "http://ex.org/taxonomy", AxiomQuery(types = listOf("SubClassOf")))
             assertTrue(tax.getNumber("total").toInt() >= 1)
+        }
+    }
+
+    /** Items 608 and 457: Manchester text read against the graph, and a DL query of it. */
+    @Test fun the_native_handle_reads_manchester_and_answers_dl_queries() {
+        SparklesDatasets.memory().use { ds ->
+            a1(ds)
+            UpdateAction.parseExecute(
+                """$prefixes
+                INSERT DATA { GRAPH <http://ex.org/onto> { :ann a :Professor . :Course rdfs:label "Course unit" } }""",
+                ds,
+            )
+            val p = SparklesOnt.parse(ds, "teaches some 'Course unit'", graphIri = "http://ex.org/onto")
+            assertEquals("http://ex.org/Course", p.get("value").asObject.getString("class"))
+            val e = assertThrows(RuntimeException::class.java) {
+                SparklesOnt.parse(ds, "teaches some Lecture", graphIri = "http://ex.org/onto")
+            }
+            assertTrue(e is SparklesError && "Lecture" in e.engineMessage, e.toString())
+            val r = SparklesOnt.dlQuery(
+                ds,
+                DlQuery("teaches some Course", answers = listOf("subclasses", "instances")),
+                "http://ex.org/onto",
+            )
+            assertEquals("el", r.get("reasoning").asObject.getString("engine"))
+            assertEquals(listOf("http://ex.org/Professor"), r.get("subclasses").asArray.map { it.asString.value() })
+            assertEquals(listOf("http://ex.org/ann"), r.get("instances").asArray.map { it.asString.value() })
         }
     }
 }

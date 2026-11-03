@@ -116,6 +116,23 @@ build community reports.
   stayed within the baseline's spread, and type hints lowered it to 22.7. Voting costs
   63% more per question. The
   [results](../benchmarks/natural-language/RESULTS.md#ask-repair-options) give each run.
+* The draft rules ask for only the variables that answer the question, without label,
+  predicate or helper columns unless the question asks for them. With them, answers
+  with columns beyond the gold's fell from 27 to 8 for Haiku 5.5 and from 59 to 10 for
+  GPT-6 Luna over three runs of 51 validation questions.
+* A draft often uses a common vocabulary prefix without declaring it. Before the check,
+  Ask declares each of these that the query uses and neither the query nor the dataset
+  defines: `dbo`, `dbr`, `dbp` and `dbc` for DBpedia's ontology, resources, properties
+  and categories, `yago` for DBpedia's YAGO classes, `dct` for Dublin Core terms, `geo`
+  for the W3C WGS84 vocabulary, and `wd`, `wdt` and `wikibase` for Wikidata. A prefix
+  that the dataset binds to another namespace keeps the dataset's binding, and any other
+  unknown prefix is still reported by the check.
+* The check of a draft reports a typed variable whose class has no instance with the
+  predicate the draft uses. That lookup names the class and the predicate in its query,
+  and a lookup that passes the query memory budget leaves the pattern unjudged instead
+  of failing the check. Its suggestions are the predicates that a sample of 200
+  instances uses, those in the namespace of the draft's predicate first, ranked by
+  their share of the sample and how rare they are in the dataset.
 * The extra kind preference recognizes the English words film, movie, book, novel,
   song, album, city, town, country, river and person through supported DBpedia,
   schema.org and FOAF class IRIs. Unknown class namespaces and incomplete or competing
@@ -257,7 +274,7 @@ existing memory records. Rust applications select them with
 profile RDF with `sparkles shacl` and run the supplied queries with `sparkles query`.
 
 A dataset's [evidence settings](../API.md#evidence-settings) name the graphs of six
-roles and the named review policies. The roles hold source records, proposals, review
+roles, the named review policies and the named matching policies. The roles hold source records, proposals, review
 decisions, acceptance supports, identity records and dedicated projections. Each policy
 names its admitted claim kinds, required scope predicates, conflict mode, evidence
 boundary and the decisions, supports and projection graphs it uses. Administrators
@@ -330,8 +347,30 @@ and projected triples they changed. A detach and new protection of a projection'
 makes later reviews under its policy refuse with `projection-unavailable`, because its
 supports no longer authenticate. Readers of an output graph read it under their own
 grants, so an administrator gives them read access to the policy's evidence boundary.
-Identity proposals and reviewed resolution maps are
-not available, and neither are reviews through the bindings or MCP.
+
+[Evidence identities](../API.md#evidence-identities) are reviewed and reversible.
+An identity proposal in a claims batch names two or more exact entity IRIs as a possible
+match or as distinct entities, and asserts no `owl:sameAs`. A review under a matching
+policy decides proposals, and the policy's accepted matches join entities into clusters
+whose current resolution map is the policy's output graph, `<member> ev:resolvesTo
+<representative>`. An accepted separation keeps its entities apart, and a review that
+would join them refuses with `identity-conflict`. A split is a decision that supersedes
+the match's acceptance, and accepting the match again restores the earlier map. Every
+change of the decisions a map follows writes an immutable map revision that names its
+predecessor and the decisions it added and ended, and the review answers the entities
+whose selected entity changed. `POST /{ds}/claims/identities` and
+`sparkles::evidence::resolve_entities` read what the map selects for an entity, its
+cluster and the decisions that join it. Queries join the output graph explicitly and are
+never rewritten through a map. Reviews and resolutions are not available through the
+bindings or MCP.
+
+An assessment names the records it consumed in `inputs`, written as `prov:used`, and
+[evidence dependents](../API.md#evidence-dependents) find the assessments whose target or
+inputs changed. A review or withdrawal names what it changed, such as withdrawn claims,
+ended supports and the map revision a split follows, and `POST /{ds}/claims/dependents`
+or `sparkles::evidence::find_dependents` answers the authenticated assessments in the
+proposal graphs the caller can read that depend on them, optionally transitively. The
+answer marks nothing stale by itself. Maintained analyses that act on it are item 340.
 
 The Rust controlled permission helper can prepare graph, predicate and class masks
 and the built-in disclosure guard under one memory cap and `Control`. It explicitly
@@ -502,15 +541,21 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   ([C18](../specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12),
   [BENCHMARKS.md](../benchmarks/natural-language/RESULTS.md#ask-grounding-from-predicate-use)).
   With the current build, on 150 held-out QALD-9-plus training questions that no tuning
-  step read, GPT-6.1 Sol answers 113, Opus 5.5 111, GPT-6.1 Terra 108, GPT-6 Luna and
-  Sonnet 5.5 106 and Haiku 5.5 95 under projected-column scoring, against 41 to 72 for
-  the build before predicate-use grounding. Luna costs $0.0021 per question, Sonnet
-  $0.029 and Opus $0.062. On the 107 retained QALD-9-plus test questions, which Ask
+  step read, Opus 5.5 answers 114, GPT-6.1 Terra 111, GPT-6.1 Sol 109, Haiku 5.5 102
+  and GPT-6 Luna 101 under projected-column scoring, against 41 to 72 for the build
+  before predicate-use grounding. Sonnet 5.5 answered 106 with the build before the check
+  fixes and the projection rule. Luna and Haiku are within the noise of Sol but not of
+  Opus ([results](../benchmarks/natural-language/RESULTS.md#ask-on-the-cheapest-models)).
+  Luna costs $0.0019 per question, Sonnet $0.029 and Opus $0.060. With the earlier
+  build, on the 107 retained QALD-9-plus test questions, which Ask
   grounding was tuned on, Opus answers 60, Sonnet 55 and Luna 47, and on the 74 retained
   Text2SPARQL'25 DBpedia questions 46, 45 and 40
   ([results](../benchmarks/natural-language/RESULTS.md#ask-across-providers)). The
   `openai` provider preset starts with Luna and the `anthropic` preset with Sonnet, the
-  cheapest models per correct answer within the noise of the best one. A gold resource
+  cheapest models per correct answer within the noise of the best one in the provider
+  comparison. When accuracy matters more than cost, choose GPT-6.1 Terra, which answers
+  about 74% of the held-out questions strictly, within the noise of Opus, at about 9
+  times Luna's cost. A gold resource
   missing from the prompt causes about half of the wrong answers, and wrong query shape
   most of the rest. Property path evaluation runs within Ask's query memory budget and
   timeout, so a generated query with a property path fails with the usual error rather

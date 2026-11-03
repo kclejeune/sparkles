@@ -459,6 +459,12 @@ fn entries() -> Vec<(&'static str, Entry)> {
             let _ = sparkles::evidence::resolve::Resolution::new(any())
                 .and_then(|mut r| r.all(None, ds, ds, &[], &mut |_, _| None));
         }),
+        op!("resolveIdentities", "evidence.resolve_entities", |ds| {
+            let _ = sparkles::evidence::resolve_entities(ds, ds, "", &[], None, &any());
+        }),
+        op!("listEvidenceDependents", "evidence.find_dependents", |ds| {
+            let _ = sparkles::evidence::find_dependents(ds, ds, &[], false, None, &any());
+        }),
         op!("getGeoIndex", "indexes.geo.status", |ds| {
             ds.indexes().geo().status();
         }),
@@ -515,8 +521,32 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op_if!("ontology", "editOntology", "ontology.edit", |ds| {
             ds.ontology().edit(&any(), &any(), &any());
         }),
+        op_if!(
+            "ontology",
+            "removeOntologyEntity",
+            "ontology.remove_entity",
+            |ds| {
+                ds.ontology().remove_entity(&any(), "i", &any());
+            }
+        ),
         op_if!("ontology", "classifyOntology", "ontology.classify", |ds| {
             ds.ontology().classify(&any(), &any(), &any());
+        }),
+        op_if!("ontology", "parseManchester", "ontology.parse", |ds| {
+            if let Ok(o) = ds.ontology().open(&any(), &any()) {
+                let _ = ds.ontology().parse_manchester(
+                    &o,
+                    "",
+                    sparkles::owl::manchester::What::ClassExpression,
+                    &any(),
+                );
+            }
+        }),
+        op_if!("ontology", "dlQueryOntology", "ontology.dl_query", |ds| {
+            let _ = ds.ontology().dl_query(&any(), &any(), &any());
+        }),
+        op_if!("ontology", "searchOntology", "ontology.search", |ds| {
+            ds.ontology().search(&any(), &any(), &any());
         }),
         op_if!("ontology", "diffOntology", "ontology.diff", |ds| {
             ds.ontology().diff(
@@ -752,6 +782,9 @@ fn entries() -> Vec<(&'static str, Entry)> {
         }),
         op_if!("shacl", "saveForm", "forms.save", |ds| {
             ds.forms().save(&any(), &any());
+        }),
+        op!("getSkosShapes", "skos.shapes", |_| {
+            let _ = sparkles::skos::SHAPES;
         }),
         // ------------------------------------------------------------------ backups
         op!("backupNquads", "dataset.backup", |ds| {
@@ -1114,7 +1147,6 @@ const EXTRA_KEYS: &[&str] = &[
     "dataset.branch",
     "dataset.run_mapping",
     "history.wait_for_commit",
-    "ontology.remove_entity",
     "history.prune",
     "history.tick",
     "indexes.vector.embed_until_idle",
@@ -1165,7 +1197,6 @@ fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
         .embed_until_idle(std::time::Duration::ZERO);
     #[cfg(feature = "ontology")]
     {
-        ds.ontology().remove_entity(&any(), "i", &any());
         let scope = ds.ontology().graph("default");
         scope.open();
         scope.edit(|e| e.add(any()).map(|_| ()));

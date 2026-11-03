@@ -1118,7 +1118,7 @@ export interface paths {
         put?: never;
         /**
          * Check a form's changes
-         * @description Turns the changes into one update of `DELETE DATA` and `INSERT DATA`, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.
+         * @description Turns the changes, with those of nested children, into the quads one update deletes and inserts, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.
          */
         post: operations["checkForm"];
         delete?: never;
@@ -1138,7 +1138,7 @@ export interface paths {
         put?: never;
         /**
          * Save a form's changes
-         * @description Commits the changes as one update with the message, when the stored values of every changed field are still those `expect` names, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.
+         * @description Commits the changes, with those of nested children, as one update with the message, when the stored values of every changed field are still those `expect` names and every stored child still hangs from its parent, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now` and nested `node`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.
          */
         post: operations["saveForm"];
         delete?: never;
@@ -2117,7 +2117,7 @@ export interface paths {
         put?: never;
         /**
          * Add and remove axioms
-         * @description Adds and removes axioms in their JSON form as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.
+         * @description Adds and removes axioms, each in its JSON form or in functional-style syntax with the dataset's prefixes, as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.
          */
         post: operations["editOntology"];
         delete?: never;
@@ -2186,6 +2186,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ontology/{ds}/dl-query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Answer a DL query
+         * @description Answers the class expression `expression` with its equivalent classes, its direct and inferred superclasses and subclasses, and its instances, as `answers` selects (every one by default). When the expression and every logical axiom of the ontology are in OWL 2 EL, the EL classifier answers it completely by classifying the expression as a fresh class with the dataset's kept classification, incrementally, and leaves the kept taxonomy as it was. Otherwise the OWL 2 RL rules answer it by demand reasoning over a copy of the terminology and the assertions, which can miss class answers. `reasoning` (`auto`, `el` or `rl`) chooses the engine, and `el` keeps to the classifier outside EL, leaving out the axioms it cannot use. The answer's `reasoning` names the engine, why it was chosen, whether the answers are complete, and the axioms outside the profile that can make them incomplete. `syntax` reads a text expression as Manchester syntax (the default) or functional-style syntax, and an object expression is read as the JSON form. A Manchester expression that does not read is `400` as `POST /$/ontology/{ds}/parse` answers it. A caller whose grants limit endpoints needs the `query` endpoint.
+         */
+        post: operations["dlQueryOntology"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/ontology/{ds}/entities": {
         parameters: {
             query?: never;
@@ -2218,6 +2238,50 @@ export interface paths {
          * @description What the ontology says about one entity: its kinds, labels and annotations, and for each kind the superclasses, subclasses, equivalent and disjoint classes, keys and instances of a class, the domains, ranges, hierarchy, inverses and characteristics of a property, the definitions of a datatype, and the types, equalities and property assertions of an individual. Each expression comes in functional-style syntax and in its JSON form. With `assertions=true`, the instances of a class and the types and property assertions of an individual also come from the assertions the store holds, at most `limit` of each. An IRI that the ontology neither declares nor uses as an entity, or as the `kind` asked for, is `404`.
          */
         get: operations["getOntologyEntity"];
+        put?: never;
+        post?: never;
+        /**
+         * Remove an entity
+         * @description Removes an entity in one commit: its declarations, the axioms of the graphs read that mention it and the assertions about it that the store holds there. The ontology is read from the head under the writer lock. The answer is an edit's, and `removedAxioms` lists what the removal took. An IRI the ontology does not mention removes nothing and makes no commit.
+         */
+        delete: operations["removeOntologyEntity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ontology/{ds}/parse": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Manchester syntax
+         * @description Reads `text` in OWL 2 Manchester syntax as `as` (`classExpression` by default, or `dataRange`, `individual`, `literal` or `axiom`) and answers its JSON form, its functional-style text and its Manchester rendering. Names are full IRIs in angle brackets, prefixed names with the dataset's prefixes, local names, and labels in single quotes when they hold a space. They resolve against the entities and the `rdfs:label` and `skos:prefLabel` values of the ontology. Text that does not read is `400` with `code` `invalid-manchester`, `reason` (`syntax`, `unknown`, `ambiguous` or `kind`), the span `start` and `end` in UTF-16 code units, and for an ambiguous name the `candidates` with their IRIs, kinds and labels.
+         */
+        post: operations["parseManchester"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ontology/{ds}/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search the entities of an ontology
+         * @description The entities whose labels, synonyms, short forms, IRIs or definitions match `q`, in any language and with typo tolerance, ranked for a typeahead: a label equal to the query first, then labels that start with it, synonyms, short forms and IRIs equal to it or starting with it, labels and then synonyms that contain its words, matches within a few edits, and definitions that contain its words. Within each tier the order is the edits, the field, entities that are not deprecated first, the caller's language, the length of the matched text, the text and the IRI. The search reads the head of the branch from an entity index that each commit's changes keep current, and the caller sees only the graphs their grants allow. A query of 1 to 3 characters takes no edits as typed, 4 to 7 characters take one and longer queries two. `at` and `inferences` are refused.
+         */
+        get: operations["searchOntology"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3274,6 +3338,26 @@ export interface paths {
         patch: operations["patchSettings"];
         trace?: never;
     };
+    "/$/skos/shapes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The built-in SKOS shapes
+         * @description The SHACL shapes that lay out the forms of concept schemes, concepts, collections, ordered collections and SKOS-XL labels and check the integrity conditions of the SKOS Reference: S9, S13, S14, S27, S37 and S46, with S51, S52 and S58 of SKOS-XL and the literal forms of SKOS-XL labels counted for S13 and S14. Each result's message names its condition. Forms read them with `shapes=skos`, and `POST /{ds}/shacl` and `PUT /$/validation/{ds}` take the text as shapes.
+         */
+        get: operations["getSkosShapes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/snapshots/{ds}": {
         parameters: {
             query?: never;
@@ -3929,6 +4013,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/claims/dependents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Find the assessments that depend on changed records
+         * @description Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read.
+         */
+        post: operations["listEvidenceDependents"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/{ds}/claims/identities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resolve entities through a resolution map
+         * @description Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again or an identity graph the map was built from left the boundary.
+         */
+        post: operations["resolveIdentities"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/claims/resolve": {
         parameters: {
             query?: never;
@@ -3960,7 +4084,7 @@ export interface paths {
         put?: never;
         /**
          * Review claims under a policy
-         * @description Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.
+         * @description Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Under a matching policy the targets are identity proposals and the policy's resolution map follows the decisions: an operation that changes which accepted decisions it follows writes one immutable map revision in the policy's maps graph and rewrites the clusters it changed in the output graph, and needs update and read grants on the decisions, maps and output graphs and read access to every effective proposal of those clusters. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 identity-conflict` when an accepted separation would share a cluster, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.
          */
         post: operations["reviewClaims"];
         delete?: never;
@@ -6414,6 +6538,30 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** @description Changed evidence records whose dependent assessments to find. */
+        EvidenceDependents: {
+            /** @description The record identities that changed, such as a withdrawn claim, an ended support or the revision a new map revision follows. */
+            changed: string[];
+            /** @description Also find the assessments that depend on a dependent. Defaults to `false`. */
+            transitive?: boolean;
+        };
+        /** @description The assessments that depend on the changed records, each once at its smallest depth. */
+        EvidenceDependentsResult: {
+            /** @description The commit the records were read at. */
+            commit: number;
+            dependents: {
+                /** @description An authenticated assessment. */
+                assessment: string;
+                /** @enum {string} */
+                dependence: "target" | "used";
+                /** @description How many assessments lie between it and a changed record, 0 for a direct dependent. */
+                depth: number;
+                /** @description Its proposal graph. */
+                graph: string;
+                /** @description The changed record it depends on, or for a transitive dependent the assessment it depends on. */
+                on: string;
+            }[];
+        };
         /** @description The graph to stop protecting. */
         EvidenceDetach: {
             /** @description A protected graph of the settings' roles. */
@@ -6479,7 +6627,35 @@ export interface components {
              */
             id?: string;
         };
-        /** @description One batch of evidence records. At most 1,000 claims, 10,000 links and 16 MiB of decoded input. */
+        /** @description Entities to resolve through a matching policy's current resolution map. */
+        EvidenceIdentities: {
+            /** @description The entity IRIs to resolve. */
+            entities: string[];
+            /** @description The name of a matching policy of the evidence settings. */
+            policy: string;
+        };
+        /** @description What the current resolution map selects for each entity. */
+        EvidenceIdentitiesResult: {
+            /** @description The commit the map was read at. */
+            commit: number;
+            entities: {
+                /** @description The current accepted decisions that join the cluster. */
+                decisions: string[];
+                entity: string;
+                /** @description The members of its cluster, sorted, at most 1,000. */
+                members: string[];
+                membersComplete: boolean;
+                /** @description The entity the map selects, the entity itself when the map does not name it. */
+                representative: string;
+            }[];
+            /** @description Its number, 0 before the first. */
+            number: number;
+            /** @description The matching policy. */
+            policy: string;
+            /** @description The latest resolution map revision, `null` before the first. */
+            revision: string | null;
+        };
+        /** @description One batch of evidence records. At most 1,000 claims, 10,000 links, 1,000 identity proposals and 16 MiB of decoded input. */
         EvidenceProposal: {
             assessments?: {
                 /** @description An N-Triples term. */
@@ -6507,6 +6683,13 @@ export interface components {
                 evaluatedAt: string;
                 /** @description The attributed evaluator. */
                 evaluator: string;
+                /** @description The records the evaluation consumed, each once, written as `prov:used`. */
+                inputs?: {
+                    /** @description An existing authenticated record, by its IRI. */
+                    iri?: string;
+                    /** @description A record of this batch, by its key. */
+                    key?: string;
+                }[];
                 /** @description The record's key in this batch. */
                 key: string;
                 method: {
@@ -6521,7 +6704,7 @@ export interface components {
                 scope?: {
                     [key: string]: string[];
                 };
-                /** @description A claim or assessment. */
+                /** @description A claim, assessment or identity proposal. */
                 target: {
                     /** @description An existing authenticated record, by its IRI. */
                     iri?: string;
@@ -6602,6 +6785,28 @@ export interface components {
             dryRun?: boolean;
             /** @description Makes a retry with the same payload answer the first receipt. The operation IRI is derived from the dataset, the caller and the key. */
             idempotencyKey?: string;
+            identities?: {
+                /** @description The attributed proposer. */
+                author: string;
+                /** @description The exact entity IRIs, distinct, in any order. */
+                entities: string[];
+                /** @description The record's key in this batch. */
+                key: string;
+                method?: {
+                    /** @description The method's IRI. */
+                    method: string;
+                    /** @description The method's version. */
+                    version: string;
+                };
+                /** @description The proposal's key within its set of entities. */
+                occurrenceKey: string;
+                /** @description For a possible match, the entity it prefers as its cluster's selected entity, one of `entities`. */
+                preferredEntity?: string;
+                /** @enum {string} */
+                relation: "possibleMatch" | "distinctEntities";
+            }[];
+            /** @description The identity graph of the batch's identity proposals, needed when the settings name more than one. */
+            identityGraph?: string;
             /** @description Publish only while this commit is the branch head, else `409 head-changed`. */
             ifHead?: number;
             links?: {
@@ -6620,7 +6825,7 @@ export interface components {
                 occurrenceKey: string;
                 /** @enum {string} */
                 relation: "supports" | "contradicts" | "mentions";
-                /** @description A claim or assessment. */
+                /** @description A claim, assessment or identity proposal. */
                 target: {
                     /** @description An existing authenticated record, by its IRI. */
                     iri?: string;
@@ -6814,7 +7019,7 @@ export interface components {
                 iri: string;
                 key: string;
                 /** @enum {string} */
-                kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection";
+                kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection" | "ResolutionMap";
                 /** @description The digest of the record's immutable content. */
                 recordDigest: string;
             }[];
@@ -6833,7 +7038,7 @@ export interface components {
                     /** @description The record's IRI. */
                     iri: string;
                     /** @description The kinds the record may have. Any profile kind when absent. */
-                    kinds?: ("SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection")[];
+                    kinds?: ("SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection" | "ResolutionMap")[];
                 };
                 storedFact?: {
                     /**
@@ -6870,7 +7075,7 @@ export interface components {
                     graph: string;
                     iri: string;
                     /** @enum {string} */
-                    kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection";
+                    kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection" | "ResolutionMap";
                     receipt: {
                         /**
                          * Format: uuid
@@ -6929,7 +7134,7 @@ export interface components {
                 key: string;
                 /** @description The target's current decision under the policy, required when it has one, else `409 decision-superseded`. */
                 supersedes?: string;
-                /** @description The reviewed claim or assessment. */
+                /** @description The reviewed claim or assessment, or under a matching policy the reviewed identity proposal. */
                 target: string;
                 /** @description The target's record digest as the reviewer saw it, else `409 target-changed`. */
                 targetDigest: string;
@@ -6942,7 +7147,7 @@ export interface components {
             ifHead: number;
             /** @description The commit message. */
             message?: string;
-            /** @description The name of a review policy of the evidence settings. */
+            /** @description The name of a review policy or a matching policy of the evidence settings. */
             policy: string;
             /** @description The policy version the reviewer saw, else `409 policy-changed`. */
             policyVersion: number;
@@ -6954,7 +7159,7 @@ export interface components {
              * @description The branch the commit published on.
              */
             branchId: string;
-            /** @description The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay. */
+            /** @description The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay. */
             changed: {
                 inserted: {
                     /** @description The output graph. */
@@ -6962,6 +7167,20 @@ export interface components {
                     /** @description The projected triple in N-Triples. */
                     triple: string;
                 }[];
+                /** @description A review under a matching policy that changed which accepted decisions its resolution map follows. */
+                map?: {
+                    decisionsAdded: string[];
+                    decisionsEnded: string[];
+                    /** @description The entities whose selected entity changed. */
+                    entities: string[];
+                    number: number;
+                    /** @description The matching policy. */
+                    policy: string;
+                    /** @description The revision it follows, whose consumers may need review. */
+                    previous: string | null;
+                    /** @description The resolution map revision the operation published. */
+                    revision: string;
+                };
                 removed: {
                     /** @description The output graph. */
                     output: string;
@@ -6995,6 +7214,8 @@ export interface components {
                 inserted: number;
                 wouldCommit: boolean;
             };
+            /** @description The resolution map revision a review under a matching policy published, also for a replay. */
+            mapRevision?: string | null;
             /** @description The operation, every decision's availability receipt. */
             operation: string;
             /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
@@ -7009,7 +7230,22 @@ export interface components {
             format: 1;
             /** @description Graphs of identity proposals and resolution maps. */
             identity?: string[];
-            /** @description Named review policies. */
+            /** @description Named matching policies of identity proposals. Their names are distinct from the review policies' names, and the two kinds together hold at most 64 policies. */
+            matchingPolicies?: {
+                [key: string]: {
+                    /** @description The identity, sourceRecords and proposals graphs whose records the policy's reviews may use. At least one is an identity graph. */
+                    boundary: string[];
+                    /** @description The decisions graph the policy's reviews append to. */
+                    decisions: string;
+                    /** @description The identity graph that holds the policy's resolution map revisions. */
+                    maps: string;
+                    /** @description The projection graph that holds the current resolution map. */
+                    output: string;
+                    /** @description Raised whenever the policy's meaning changes. */
+                    version: number;
+                };
+            };
+            /** @description Named review policies of claims and assessments. */
             policies?: {
                 [key: string]: {
                     /** @description The claim kinds the policy can admit. Only positive claims are admitted. */
@@ -7079,7 +7315,7 @@ export interface components {
              * @description The branch the commit published on.
              */
             branchId: string;
-            /** @description The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay. */
+            /** @description The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay. */
             changed: {
                 inserted: {
                     /** @description The output graph. */
@@ -7087,6 +7323,20 @@ export interface components {
                     /** @description The projected triple in N-Triples. */
                     triple: string;
                 }[];
+                /** @description A review under a matching policy that changed which accepted decisions its resolution map follows. */
+                map?: {
+                    decisionsAdded: string[];
+                    decisionsEnded: string[];
+                    /** @description The entities whose selected entity changed. */
+                    entities: string[];
+                    number: number;
+                    /** @description The matching policy. */
+                    policy: string;
+                    /** @description The revision it follows, whose consumers may need review. */
+                    previous: string | null;
+                    /** @description The resolution map revision the operation published. */
+                    revision: string;
+                };
                 removed: {
                     /** @description The output graph. */
                     output: string;
@@ -14747,10 +14997,12 @@ export interface operations {
                 focus?: string;
                 /** @description The class of a new instance. */
                 class?: string;
-                /** @description Where the shapes come from, when not the dataset's `forms` setting. */
-                shapes?: "guard" | "graphs" | "drafted";
+                /** @description Where the shapes come from, when not the dataset's `forms` setting. `skos` names the built-in SKOS shapes of `GET /$/skos/shapes`, which only a request can choose. */
+                shapes?: "guard" | "graphs" | "drafted" | "skos";
                 /** @description The language labels are picked in, then English, then untagged. */
                 lang?: string;
+                /** @description Also answer the blank-node children that fields declaring `sh:node` reach (`nestedNodes`) and the empty forms of new children (`templates`). A nested model past its allowances answers the flat form with `nested.refused`. */
+                nested?: boolean;
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
@@ -14788,11 +15040,17 @@ export interface operations {
                         groups: Record<string, never>[];
                         /** @description `{language, mode}` of the write guard. */
                         guard?: Record<string, never> | null;
+                        /** @description `{refused}`: why the nested model was refused, when it was. */
+                        nested?: Record<string, never>;
+                        /** @description With `nested=true`: `{id, term, anchors, …}` of each stored child, with the fields of a form model. Each anchor is `{parent, field, graph, inverse}`, where `parent` is `root` or another child's `id`. */
+                        nestedNodes?: Record<string, never>[];
                         other: Record<string, never>[];
                         /** @description `{to, branch, exists, mainProtected}`: `to` is `main` or `branch`. */
                         save: Record<string, never>;
                         /** @description `{source, nodeShapes, missing?, unknownHints}`. */
                         shapes: Record<string, never>;
+                        /** @description With `nested=true`: `{node, …}`, the empty form of a new child under a field whose `constraints.node` is `node`. */
+                        templates?: Record<string, never>[];
                         types: string[];
                     };
                 };
@@ -14823,14 +15081,18 @@ export interface operations {
                     /** @description The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch. */
                     branch?: string;
                     changes: {
+                        /** @description Values to add. A blank node is a new child that `nested` describes. */
                         add?: Record<string, never>[];
                         /** @description The field's id, its path in SPARQL syntax. */
                         field: string;
+                        /** @description For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty. */
+                        list?: Record<string, never>[];
+                        /** @description Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it. */
                         remove?: Record<string, never>[];
                     }[];
                     /** @description The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`. */
                     class?: string;
-                    /** @description The values the form loaded, by field id, for every changed field. */
+                    /** @description The values the form loaded, by field id, for every changed field, and for a list field the members of its list in order. */
                     expect?: {
                         [key: string]: Record<string, never>[];
                     };
@@ -14838,11 +15100,34 @@ export interface operations {
                     focus?: string;
                     /** @description The commit message. */
                     message?: string;
+                    /** @description Changes to nested blank-node children, committed atomically with `changes`. Each entry names its `node`, the `parent` it hangs from (absent for the root, else another entry's node) and the parent's `field`. A stored child must be a visible value of that field now, and every node between it and the root needs an entry. */
+                    nested?: {
+                        changes?: {
+                            /** @description Values to add. A blank node is a new child that `nested` describes. */
+                            add?: Record<string, never>[];
+                            /** @description The field's id, its path in SPARQL syntax. */
+                            field: string;
+                            /** @description For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty. */
+                            list?: Record<string, never>[];
+                            /** @description Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it. */
+                            remove?: Record<string, never>[];
+                        }[];
+                        /** @description For a stored child, the values the form loaded for every changed field. */
+                        expect?: {
+                            [key: string]: Record<string, never>[];
+                        };
+                        /** @description The parent's field id. */
+                        field: string;
+                        /** @description A term in the SPARQL JSON results form: `{"type": "uri", "value": …}` or `{"type": "literal", "value": …, "datatype"?: …, "xml:lang"?: …}`. A blank node `{"type": "bnode", "value": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes. */
+                        node: Record<string, never>;
+                        /** @description A term in the SPARQL JSON results form: `{"type": "uri", "value": …}` or `{"type": "literal", "value": …, "datatype"?: …, "xml:lang"?: …}`. A blank node `{"type": "bnode", "value": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes. */
+                        parent?: Record<string, never>;
+                    }[];
                     /**
-                     * @description The shapes the form was built from, when not the setting's.
+                     * @description The shapes the form was built from, when not the setting's. `skos` names the built-in SKOS shapes.
                      * @enum {string}
                      */
-                    shapes?: "guard" | "graphs" | "drafted";
+                    shapes?: "guard" | "graphs" | "drafted" | "skos";
                 };
             };
         };
@@ -14855,7 +15140,7 @@ export interface operations {
                 content: {
                     "application/json": {
                         branch: string;
-                        /** @description `{id, now}` of each changed field whose stored values differ from `expect`. */
+                        /** @description `{id, node?, now}` of each changed field whose stored values differ from `expect`, with the nested `node` it belongs to, and of each parent field a stored child no longer hangs from. */
                         conflicts: Record<string, never>[];
                         /** @description The dry run, as a write preview answers it. */
                         preview: Record<string, never>;
@@ -14890,14 +15175,18 @@ export interface operations {
                     /** @description The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch. */
                     branch?: string;
                     changes: {
+                        /** @description Values to add. A blank node is a new child that `nested` describes. */
                         add?: Record<string, never>[];
                         /** @description The field's id, its path in SPARQL syntax. */
                         field: string;
+                        /** @description For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty. */
+                        list?: Record<string, never>[];
+                        /** @description Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it. */
                         remove?: Record<string, never>[];
                     }[];
                     /** @description The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`. */
                     class?: string;
-                    /** @description The values the form loaded, by field id, for every changed field. */
+                    /** @description The values the form loaded, by field id, for every changed field, and for a list field the members of its list in order. */
                     expect?: {
                         [key: string]: Record<string, never>[];
                     };
@@ -14905,11 +15194,34 @@ export interface operations {
                     focus?: string;
                     /** @description The commit message. */
                     message?: string;
+                    /** @description Changes to nested blank-node children, committed atomically with `changes`. Each entry names its `node`, the `parent` it hangs from (absent for the root, else another entry's node) and the parent's `field`. A stored child must be a visible value of that field now, and every node between it and the root needs an entry. */
+                    nested?: {
+                        changes?: {
+                            /** @description Values to add. A blank node is a new child that `nested` describes. */
+                            add?: Record<string, never>[];
+                            /** @description The field's id, its path in SPARQL syntax. */
+                            field: string;
+                            /** @description For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty. */
+                            list?: Record<string, never>[];
+                            /** @description Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it. */
+                            remove?: Record<string, never>[];
+                        }[];
+                        /** @description For a stored child, the values the form loaded for every changed field. */
+                        expect?: {
+                            [key: string]: Record<string, never>[];
+                        };
+                        /** @description The parent's field id. */
+                        field: string;
+                        /** @description A term in the SPARQL JSON results form: `{"type": "uri", "value": …}` or `{"type": "literal", "value": …, "datatype"?: …, "xml:lang"?: …}`. A blank node `{"type": "bnode", "value": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes. */
+                        node: Record<string, never>;
+                        /** @description A term in the SPARQL JSON results form: `{"type": "uri", "value": …}` or `{"type": "literal", "value": …, "datatype"?: …, "xml:lang"?: …}`. A blank node `{"type": "bnode", "value": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes. */
+                        parent?: Record<string, never>;
+                    }[];
                     /**
-                     * @description The shapes the form was built from, when not the setting's.
+                     * @description The shapes the form was built from, when not the setting's. `skos` names the built-in SKOS shapes.
                      * @enum {string}
                      */
-                    shapes?: "guard" | "graphs" | "drafted";
+                    shapes?: "guard" | "graphs" | "drafted" | "skos";
                 };
             };
         };
@@ -17015,6 +17327,8 @@ export interface operations {
     getOntology: {
         parameters: {
             query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
                 /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
                 graph?: string;
                 /** @description Follow `owl:imports` to graphs of the dataset (the default). */
@@ -17065,6 +17379,8 @@ export interface operations {
     getOntologyAxioms: {
         parameters: {
             query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
                 /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
                 graph?: string;
                 /** @description Follow `owl:imports` to graphs of the dataset (the default). */
@@ -17169,7 +17485,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
-                    add?: Record<string, never>[];
+                    add?: (Record<string, never> | string)[];
                     declare?: boolean;
                     /** @description A graph IRI or `default`, or a list of them. */
                     graph?: unknown;
@@ -17177,7 +17493,7 @@ export interface operations {
                     message?: string;
                     /** @enum {string} */
                     mode?: "lenient" | "strict";
-                    remove?: Record<string, never>[];
+                    remove?: (Record<string, never> | string)[];
                     /** @description The graph that takes the added axioms. */
                     target?: string;
                 };
@@ -17193,6 +17509,14 @@ export interface operations {
                     "application/json": {
                         absent?: string[];
                         added?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        addedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
+                        /** @description Whether `addedAxioms` or `removedAxioms` was cut at 10,000. */
+                        axiomsTruncated?: boolean;
                         committed?: boolean;
                         declared?: string[];
                         deleted?: number;
@@ -17200,6 +17524,12 @@ export interface operations {
                         kept?: number;
                         present?: number;
                         removed?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        removedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
                     };
                 };
             };
@@ -17217,6 +17547,8 @@ export interface operations {
     checkOntology: {
         parameters: {
             query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
             };
@@ -17366,6 +17698,8 @@ export interface operations {
     diffOntology: {
         parameters: {
             query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
                 /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
                 graph?: string;
                 /** @description Follow `owl:imports` to graphs of the dataset (the default). */
@@ -17411,9 +17745,76 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    dlQueryOntology: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The ontology, the expression and the answers. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    answers?: ("equivalents" | "superclasses" | "directSuperclasses" | "subclasses" | "directSubclasses" | "instances")[];
+                    /** @description The class expression: Manchester or functional-style text, or the JSON form. */
+                    expression: unknown;
+                    /** @description A graph IRI or `default`, or a list of them. */
+                    graph?: unknown;
+                    imports?: boolean;
+                    /** @description The most IRIs each answer and the gaps list (1,000 by default). */
+                    limit?: number;
+                    /** @description The most facts the classifier derives before the run stops with `507`. */
+                    maxDerived?: number;
+                    /** @enum {string} */
+                    mode?: "lenient" | "strict";
+                    /**
+                     * @description The engine (`auto` by default).
+                     * @enum {string}
+                     */
+                    reasoning?: "auto" | "el" | "rl";
+                    /**
+                     * @description The syntax of a text expression (`manchester` by default). An object is read as the JSON form.
+                     * @enum {string}
+                     */
+                    syntax?: "manchester" | "functional";
+                    /** @description The worker threads of the EL classifier, within the algorithm pool's grant (0 for the grant). */
+                    threads?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description The answers, each a list of IRIs with its count, and the reasoning that found them. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
     listOntologyEntities: {
         parameters: {
             query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
                 /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
                 graph?: string;
                 /** @description Follow `owl:imports` to graphs of the dataset (the default). */
@@ -17460,6 +17861,8 @@ export interface operations {
     getOntologyEntity: {
         parameters: {
             query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
                 /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
                 graph?: string;
                 /** @description Follow `owl:imports` to graphs of the dataset (the default). */
@@ -17502,6 +17905,243 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    removeOntologyEntity: {
+        parameters: {
+            query?: {
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Run the write as a preview and roll it back. `dryRun` with no value means true. */
+                dryRun?: components["parameters"]["dryRun"];
+                /** @description With `dryRun`: list up to this many changed quads. */
+                changes?: components["parameters"]["changes"];
+                /** @description Add a commit receipt to the body. */
+                receipt?: components["parameters"]["receipt"];
+                /** @description `false` skips write-time validation when the server allows it (`--allow-unvalidated-writes`). */
+                validate?: components["parameters"]["validate"];
+                /** @description The most validation results reported when a write is rejected. */
+                validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
+                /** @description The entity's IRI. */
+                iri?: string;
+                /** @description The commit message, as the `Sparkles-Commit-Message` header gives it. */
+                message?: string;
+            };
+            header?: {
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+                /** @description `true` runs the write as a preview. */
+                "Sparkles-Dry-Run"?: components["parameters"]["dryRunHeader"];
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What the removal did, with the receipt when asked for. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        axiomsTruncated?: boolean;
+                        committed?: boolean;
+                        deleted?: number;
+                        kept?: number;
+                        removed?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        removedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            412: components["responses"]["PreconditionFailed"];
+            422: components["responses"]["Unprocessable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    parseManchester: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The ontology and the text. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * @description What the text is (`classExpression` by default).
+                     * @enum {string}
+                     */
+                    as?: "classExpression" | "dataRange" | "individual" | "literal" | "axiom";
+                    /** @description A graph IRI or `default`, or a list of them. */
+                    graph?: unknown;
+                    imports?: boolean;
+                    /** @enum {string} */
+                    mode?: "lenient" | "strict";
+                    /** @description The Manchester text. */
+                    text: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The value in its JSON form, `ofn` and `manchester`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    searchOntology: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The text searched for. */
+                q?: string;
+                /** @description Entity kinds, comma separated: `class`, `property` (every kind of property), `objectProperty`, `dataProperty`, `annotationProperty`, `individual`, `datatype`, `concept`, `conceptScheme` or `collection` (all kinds by default). */
+                kind?: string;
+                /** @description The caller's languages, comma separated and most preferred first, as BCP 47 tags. `Accept-Language` is read when it is absent. Values in these languages rank first within a tier, then untagged values, then English, then the others. */
+                lang?: string;
+                /** @description The most entities listed, from 1 to 100 (10 by default). */
+                limit?: number;
+                /** @description The entities skipped. `offset` and `limit` together reach at most 10,000, and `next` is null when no later page fits in that window although `more` is true. */
+                offset?: number;
+                /** @description Rank the matches within a few edits (true by default). */
+                fuzzy?: boolean;
+                /** @description Rank the matches in definitions (true by default). */
+                definitions?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of ranked entities. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        commit?: number;
+                        dataset?: string;
+                        graphs?: string[];
+                        /**
+                         * @description Whether the index reflected the head, applied the changes of later commits or was built for this search.
+                         * @enum {string}
+                         */
+                        index?: "current" | "updated" | "built";
+                        limit?: number;
+                        more?: boolean;
+                        next?: number | null;
+                        offset?: number;
+                        query?: string;
+                        results?: {
+                            deprecated?: boolean;
+                            iri?: string;
+                            kinds?: string[];
+                            /** @description The label in the caller's best language. */
+                            label?: string | null;
+                            labelLang?: string | null;
+                            match?: {
+                                distance?: number;
+                                /** @enum {string} */
+                                field?: "label" | "synonym" | "shortForm" | "definition";
+                                /** @description The matched ranges of `text` as `[start, end]` pairs in UTF-16 code units. */
+                                highlight?: number[][];
+                                /** @enum {string} */
+                                kind?: "exact" | "prefix" | "words" | "fuzzy";
+                                lang?: string | null;
+                                /** @description The property of the value, or null for the IRI and its local name. */
+                                property?: string | null;
+                                text?: string;
+                                tier?: number;
+                            };
+                            /** @description The `oboInOwl:id`, `skos:notation`, prefixed name or local name. */
+                            shortForm?: string | null;
+                            /** @enum {string} */
+                            type?: "entity";
+                        }[];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };
@@ -20082,6 +20722,29 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getSkosShapes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The shapes. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/turtle": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
     listSnapshots: {
         parameters: {
             query?: never;
@@ -22105,6 +22768,77 @@ export interface operations {
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
             409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listEvidenceDependents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceDependents"];
+            };
+        };
+        responses: {
+            /** @description The dependent assessments. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceDependentsResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    resolveIdentities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceIdentities"];
+            };
+        };
+        responses: {
+            /** @description The map's revision and each entity's resolution. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceIdentitiesResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
             413: components["responses"]["PayloadTooLarge"];
             422: components["responses"]["Unprocessable"];
             503: components["responses"]["Unavailable"];

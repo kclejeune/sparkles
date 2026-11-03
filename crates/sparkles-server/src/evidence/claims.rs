@@ -28,10 +28,10 @@ use serde::Deserialize;
 use serde_json::{Value as J, json};
 use sparkles::evidence::{
     AssessmentInput, ClaimInput, ClaimKind, Confidence, ConfidenceFacets, EvidenceInput,
-    EvidenceLinkInput, EvidenceRefInput, EvidenceRefTarget, EvidenceRelation, MethodRef,
-    PassageInput, Polarity, ProposeOptions, RecordKey, RecordRef, RecordVersion, RenditionContent,
-    RenditionInput, Scope, Sha256Digest, SourceContent, SourceLineage, SourceMetadata,
-    SourceRevisionInput, SourceTimes,
+    EvidenceLinkInput, EvidenceRefInput, EvidenceRefTarget, EvidenceRelation, IdentityInput,
+    IdentityRelation, MethodRef, PassageInput, Polarity, ProposeOptions, RecordKey, RecordRef,
+    RecordVersion, RenditionContent, RenditionInput, Scope, Sha256Digest, SourceContent,
+    SourceLineage, SourceMetadata, SourceRevisionInput, SourceTimes,
 };
 use sparkles::task::Control;
 use std::collections::BTreeMap;
@@ -54,6 +54,7 @@ struct ClaimsRequest {
     idempotency_key: Option<String>,
     source_graph: Option<String>,
     proposal_graph: Option<String>,
+    identity_graph: Option<String>,
     message: Option<String>,
     #[serde(default)]
     revisions: Vec<RevisionJson>,
@@ -69,6 +70,21 @@ struct ClaimsRequest {
     links: Vec<LinkJson>,
     #[serde(default)]
     assessments: Vec<AssessmentJson>,
+    #[serde(default)]
+    identities: Vec<IdentityJson>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IdentityJson {
+    key: String,
+    occurrence_key: String,
+    entities: Vec<String>,
+    /// `possibleMatch` or `distinctEntities`
+    relation: String,
+    preferred_entity: Option<String>,
+    author: String,
+    method: Option<MethodJson>,
 }
 
 /// A record of the batch (`{"key"}`) or an existing record (`{"iri"}`).
@@ -234,6 +250,9 @@ struct AssessmentJson {
     confidence: Option<ConfidenceJson>,
     #[serde(default)]
     scope: BTreeMap<String, Vec<String>>,
+    /// the records the evaluation consumed
+    #[serde(default)]
+    inputs: Vec<RefJson>,
 }
 
 fn record_key(field: &str, value: &str) -> ApiResult<RecordKey> {
@@ -589,6 +608,56 @@ fn input_of(r: ClaimsRequest) -> ApiResult<(EvidenceInput, Request)> {
                 .map(|c| confidence(&format!("{at}.confidence"), c))
                 .transpose()?,
             scope: scope(&at, &v.scope)?,
+            inputs: {
+                if v.inputs.len() > sparkles::evidence::MAX_ASSESSMENT_INPUTS {
+                    return Err(bad(
+                        format!("{at}.inputs"),
+                        "an assessment names at most 64 inputs",
+                    ));
+                }
+                v.inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(j, x)| reference(&format!("{at}.inputs[{j}]"), x))
+                    .collect::<ApiResult<Vec<_>>>()?
+            },
+        });
+    }
+    for (i, v) in r.identities.iter().enumerate() {
+        let at = format!("identities[{i}]");
+        if v.entities.len() > sparkles::evidence::MAX_IDENTITY_ENTITIES {
+            return Err(bad(
+                format!("{at}.entities"),
+                "a proposal names 2 to 64 entities",
+            ));
+        }
+        input.identities.push(IdentityInput {
+            version: RecordVersion::V1,
+            key: record_key(&format!("{at}.key"), &v.key)?,
+            occurrence_key: record_key(&format!("{at}.occurrenceKey"), &v.occurrence_key)?,
+            entities: v
+                .entities
+                .iter()
+                .enumerate()
+                .map(|(j, e)| named(&format!("{at}.entities[{j}]"), e))
+                .collect::<ApiResult<_>>()?,
+            relation: IdentityRelation::from_name(&v.relation).ok_or_else(|| {
+                bad(
+                    format!("{at}.relation"),
+                    "use possibleMatch or distinctEntities",
+                )
+            })?,
+            preferred: v
+                .preferred_entity
+                .as_deref()
+                .map(|e| named(&format!("{at}.preferredEntity"), e))
+                .transpose()?,
+            attributed_author: named(&format!("{at}.author"), &v.author)?,
+            method: v
+                .method
+                .as_ref()
+                .map(|m| method(&format!("{at}.method"), m))
+                .transpose()?,
         });
     }
     if let Some(k) = &r.idempotency_key
@@ -610,6 +679,11 @@ fn input_of(r: ClaimsRequest) -> ApiResult<(EvidenceInput, Request)> {
             .as_deref()
             .map(|g| named("proposalGraph", g))
             .transpose()?,
+        identity_graph: r
+            .identity_graph
+            .as_deref()
+            .map(|g| named("identityGraph", g))
+            .transpose()?,
         message: r.message,
     };
     Ok((input, request))
@@ -621,6 +695,7 @@ struct Request {
     idempotency_key: Option<String>,
     source_graph: Option<NamedNode>,
     proposal_graph: Option<NamedNode>,
+    identity_graph: Option<NamedNode>,
     message: Option<String>,
 }
 
@@ -740,6 +815,7 @@ pub(super) async fn propose(
         options.dry_run = request.dry_run;
         options.source_graph = request.source_graph;
         options.proposal_graph = request.proposal_graph;
+        options.identity_graph = request.identity_graph;
         options.message = request.message.map(Arc::from);
         options.author = crate::http::author(&p);
         options.write = opts.graphs.clone();

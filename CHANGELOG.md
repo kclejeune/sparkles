@@ -24,6 +24,75 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+Ontologies and thesauri have a typo-tolerant entity search for typeahead (spec U12,
+roadmap item 616). `GET /$/ontology/{ds}/search?q=` matches the labels, synonyms, short
+forms and definitions of OWL, RDFS and SKOS entities in any language, with up to two
+edits in longer words, and ranks exact labels, label prefixes, synonyms and short forms,
+word matches, matches with edits and definitions in that order. Each result carries the
+matched field, text and highlight, the preferred label and the entity's kinds. The
+ontology handles of Python, Node.js and the JVM call it as `search`. Each branch keeps
+the index in memory and applies later commits at its next search, about 292 MiB
+resident for ChEBI lite.
+
+Editing forms edit nested blank-node children, SHACL 1.2 lists and `sh:or` or `sh:xone`
+value alternatives (spec U02, roadmap item 21). `GET /$/forms/{ds}?nested=true` returns
+the children that `sh:node` fields reach and the empty forms of new ones, and check and
+save bodies take `nested` node changes and `list` field changes, which commit with the
+root's changes in one guarded update. The save rechecks every child's anchor under the
+writer lock and answers a conflict on the parent field when a child is gone. Removing a
+child deletes its triples when nothing else refers to it. The browser shows nested forms
+with **Add**, an ordered list editor and a **Kind of** select for alternatives, and the
+Rust library and Python's `ds.forms.model(…, nested=True)` expose the same model. Change
+bodies now accept blank node terms, a conflict on a child's field carries the child's
+`node`, and a form model's values carry a list's `items`.
+
+The web UI has a SKOS and SKOS-XL thesaurus editor, the **Thesaurus** page (spec U12,
+roadmap item 457). It shows the concept tree of a scheme one level at a time with its
+polyhierarchy, searches labels in any language, and edits multilingual and SKOS-XL
+labels, broader, narrower, related and mapping links, collections and ordered collections,
+and notes, each as a previewed commit with `If-Match`. Dragging a concept moves it under
+another or adds a broader concept. The page shares the ontology editor's session branches,
+undo by revert and live refresh. The built-in SKOS shapes check the integrity conditions
+of the SKOS Reference, S9, S13, S14, S27, S37 and S46 with S51, S52 and S58 of SKOS-XL.
+`GET /$/skos/shapes` serves them, forms read them with `shapes=skos`, and the Rust library
+exposes them as `sparkles::skos`, so a write guard can enforce them. The ontology editor's
+commit messages in other scripts are now sent percent-encoded as UTF-8 instead of failing.
+
+The web UI has an ontology editor, the **Ontology** page (spec U12, roadmap item 457). It
+shows trees of classes, object, data and annotation properties and individuals, an entity
+frame with its axioms in Manchester syntax, an annotation editor with language tags and
+annotations of axioms, a header editor, an axiom-level usage view and the EL classifier's
+inferred class tree beside the asserted one. It creates entities with IRIs from a
+per-dataset IRI policy, renames and deletes them, and previews every edit as a dry run
+before committing it with `If-Match`. **Start session** edits on a branch of its own, an
+undo stack undoes and redoes commits by reverting them, and the change feed reloads the
+views after another writer's commit. For the editor, the `/$/ontology/{ds}` routes take `?branch=` and
+the `/{ds}@{branch}` form, `DELETE /$/ontology/{ds}/entity` removes an entity with its
+axioms, edits accept axioms in functional-style syntax over HTTP, and an edit's answer
+lists the axioms it added and removed as `addedAxioms` and `removedAxioms` in every
+surface that answers the edit body. The OpenAPI description of an edit's `add` and
+`remove` takes functional-style strings beside the JSON form.
+
+The ontology editor has a **DL Query** tab (spec U12, roadmap item 457). It answers a
+class expression in Manchester syntax with its equivalent classes, direct and inferred
+superclasses and subclasses, and instances, as Protégé's DL Query does. Inside OWL 2 EL
+the dataset's kept EL classification answers the query incrementally and is left as it
+was, and outside EL the OWL 2 RL rules answer it by demand reasoning. Every answer says
+which reasoning gave it, whether it is complete and which axioms lie outside the
+profile. `ds.ontology().dl_query()`, `POST /$/ontology/{ds}/dl-query` and the Python,
+Node.js and JVM bindings' `dl_query` or `dlQuery` run it.
+
+The ontology editor's add fields take Manchester syntax with completion of entity names
+and labels, and an axiom field takes whole axioms (roadmap item 608). The new reader,
+`sparkles_owl::manchester`, reads class expressions, data ranges, individuals, literals
+and one-line axioms against an ontology's prefixes, local names and labels. A name that
+several entities share is an error that lists them, and every error carries its span.
+`POST /$/ontology/{ds}/parse` and the bindings' `parse` read text with the caller's
+grants. The editor's Manchester rendering now quotes labels that hold a space or a
+keyword, such as `'teaching assistant'`, so it reads back as the same expression. The
+entity-kind tabs, DL Query and Header share one strip that wraps in a narrow window
+instead of cutting off a label.
+
 An OWL 2 EL classifier computes the inferred class hierarchy and the unsatisfiable
 classes of an ontology (spec F24, roadmap item 580). `sparkles_owl::classify` follows
 ELK's consequence-based calculus on several threads, keeps its state so that a run after
@@ -33,6 +102,26 @@ leaves out as outside OWL 2 EL or uses only in part. `ds.ontology().classify()`,
 and JVM bindings run it. A run can write the taxonomy to a named graph in one commit with
 PROV-O provenance on the graph's header, and the dataset keeps its last classification
 so that the next one is incremental.
+
+The OWL 2 EL classifier's taxonomies equal those of ELK 0.6.0 on GO, ChEBI lite and the
+298 ontologies of the ORE 2015 EL classification sample, and those of HermiT 1.4.5.519 on
+the 36 ORE ontologies with individuals (roadmap item 591). `scripts/elk-compare/elk.sh`
+runs ELK or HermiT through the OWL API from pinned Maven Central jars, and the EL
+classification report gives times and memory beside ELK's on the benchmark host.
+
+The OWL 2 EL classifier covers OWL 2 EL (roadmap items 587 and 605). It reasons
+with individuals in class expressions and assertions, ranges that meet them, the
+datatypes, literals and data ranges of the profile, functional data properties, data
+property ranges, datatype definitions, keys, negative property assertions and the top
+and bottom properties, with the rules of EL++. A class whose instances reach an
+individual through a context that holds only where the class has an instance is
+classified again in a copy-on-write world of its own. The classifier no longer reports
+these axioms as used in part, and it reports only literals and datatypes it cannot
+compare and property chains through the top object property. On 400 random OWL 2 EL
+ontologies its subsumptions equal HermiT 1.4.5.519's, and its taxonomies of GO, ChEBI
+lite and the ORE 2015 EL sample are unchanged. An incremental run after a change to an
+axiom with an individual or a key now saturates everything again, as one after a change
+to a data axiom already did.
 
 The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
 `dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and
@@ -117,6 +206,29 @@ view's rows against its query and records a forge baseline.
 CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
+
+The OWL 2 EL classifier classifies GO, ChEBI lite and the largest ORE 2015 EL ontologies 2.5 to 13.3 times as fast as ELK 0.6.0 on forge on one and eight threads, where ELK had been faster on ChEBI lite on eight threads and on the ORE ontologies of a million classes (roadmap items 602 and 592). A
+`Saturation` reads the caller's axioms in place, so the dataset's kept classification
+shares the open ontology's axioms instead of copying them. The profile check and the
+taxonomy run on several threads and give the same taxonomy for every thread count, the
+index keeps one record per expression in flat arrays, and saturation workers take roots
+in rounds from a shared cursor and batch their shared counters. The memory estimate now
+counts the taxonomy and its links and comes within 14% of a counted peak heap, and
+`Stats::peak_memory` gives the peak. `el_classify` uses the server's mimalloc allocator,
+reads the axioms in place unless `--owned` is given and counts the heap with `--heap`.
+
+Ask's draft rules tell the model to select only the variables that answer the question,
+without label, predicate or helper columns unless the question asks for them, and never
+to add a variable only to fill the draft's `graph` member. Over three runs of 51
+QALD-9-plus validation questions the mean strict score rose from 27.0 to 28.7 with Haiku
+5.5 and from 29.0 to 29.7 with GPT-6 Luna, and answers with columns beyond the gold's
+fell from 27 to 8 and from 59 to 10 over the three runs. On 150 held-out QALD-9-plus
+questions Haiku answers 102 and Luna 101, within the noise of GPT-6.1 Sol and short of
+70%, and no model moved beyond the noise of its run with the earlier build.
+
+Ask declares the well-known vocabulary prefixes that a draft uses without declaring,
+such as `dbo` and `dbr`, before the check, unless the query or the dataset defines them.
+A draft that used one of them failed the check with a syntax error and needed a repair.
 
 Eager queries now count against their memory budget the query state that only cursors
 counted before. The decoded value cache, which holds at most 64 MiB or an eighth of the
@@ -354,6 +466,40 @@ read of a review is made at its required `ifHead`. The codes `409 policy-changed
 `capabilities.claims` lists both routes. The vocabulary and shapes add
 `ev:supersedes`, `ev:AcceptanceSupport`, `ev:Withdrawal`, `ev:Projection` and their
 properties (spec C25 Phase 2).
+
+Identity proposals are reviewed into reversible resolution maps (spec C25 §6, roadmap
+item 81). A claims batch takes `identities`, which name two to 64 entity IRIs as a
+possible match or as distinct entities and assert no `owl:sameAs`, and `identityGraph`.
+Evidence settings take `matchingPolicies`, each with its version, boundary, decisions,
+maps and output graphs, as an additive amendment of `evidence.json` format 1 that a
+build without it refuses as unreadable settings. `POST /{ds}/claims/review` under a
+matching policy decides proposals, and the policy's output graph holds the current map
+as `ev:resolvesTo` triples from each member of a cluster to its representative. An
+accepted separation keeps entities apart, and joining them is the new `409
+identity-conflict`. A split is a superseding decision, and every change of the
+decisions a map follows writes an immutable `ev:ResolutionMap` revision with the
+decisions it added and ended. The review answer adds `mapRevision` and `changed.map`
+with the entities whose selected entity changed. `POST /{ds}/claims/identities` and
+`sparkles::evidence::resolve_entities` read the current map, and `capabilities.claims`
+lists the route. Evidence links and assessments may target identity proposals. A
+revision records the identity graphs of the boundary it was built from, and a map one of
+them has left, or whose graph was protected again, answers `projection-unavailable`.
+Identity reviews need read grants on every identity graph of the boundary, and one
+operation retains at most 64 MiB of entity identifiers. The resolution read leaves out
+a proposal or decision whose triples the caller's view hides in part, so it neither joins
+a cluster nor reveals its decision. The vocabulary and shapes add
+`ev:preferredEntity`, `ev:ResolutionMap`, `ev:mapRevision`, `ev:adds`, `ev:ends`,
+`ev:resolvesTo`, `ev:mapsProtection` and `ev:boundaryProtection`.
+
+Assessments name the records they consumed, and the assessments that depend on changed
+evidence can be found (spec C25 Phase 3, roadmap item 81). An assessment's `inputs`
+names up to 64 claims, assessments, identity proposals, source revisions, review
+decisions, acceptance supports or resolution map revisions, written as `prov:used`, and
+an assessment without them keeps its digests. `POST /{ds}/claims/dependents` and
+`sparkles::evidence::find_dependents` answer the authenticated assessments in readable
+proposal graphs whose target or inputs name a changed record, optionally transitively,
+and `Changed::identities` gathers what an operation changed. `capabilities.claims` lists
+the route.
 
 Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
 and `owl:sameAs` with closure operators instead of joins, and derives the same facts.
@@ -1142,6 +1288,26 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 (X14, item 478).
 
 ### Fixed
+
+`check_query` no longer fails with `budget-memory` when a draft uses a predicate that no
+instance of its typed variable's class has. On the DBpedia 2022.12.01 database the
+class lookup's estimate passed the 2 GiB query memory budget, which failed the whole
+check, so Ask lost the draft instead of repairing it. The lookup now writes its terms
+into the query and leaves the pattern unjudged when a lookup still passes the budget.
+Its suggestions profile a sample of the class through the index and rank the sample's
+predicates by their share of it and their rarity in the dataset, with the namespace of
+the draft's predicate first, so that a link every page has ranks below a predicate of
+the class.
+
+`scripts/premerge.sh` and the development tasks no longer fail when Boxington has
+collected a checkout's managed target and left `target` as a dangling link. Premerge now
+places a fresh target with `mbx sparkles-task` before its checks, with a one-line
+message. The crash harness's test binary, the feature-test logs, the fetched test
+suites, the GeoSPARQL benchmark checkout, the Graphalytics results and the JVM Nix
+dependency script now live under `.artifacts`, where collection does not reach them.
+`mise run ui:wasm` runs inside a target lease, so the module that wasm-bindgen reads
+cannot be collected after the build. The benchmark and probe scripts copy a binary that
+lies in the managed target to their work directory before they start it.
 
 A rename or delete of a persistent dataset no longer fails with `409` and "still has
 live handles" because the dataset's own views worker started a round at the wrong

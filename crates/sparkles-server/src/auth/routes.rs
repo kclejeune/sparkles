@@ -42,6 +42,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // the OpenAPI description (`openapi`)
     ("/$/openapi.json", &["GET"]),
     ("/$/openapi.yaml", &["GET"]),
+    ("/$/skos/shapes", &["GET"]),
     ("/$/server", &["GET", "POST"]),
     ("/$/metrics", &["GET"]),
     ("/$/server/memory", &["GET"]),
@@ -71,10 +72,13 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ontology/{ds}", &["GET"]),
     ("/$/ontology/{ds}/axioms", &["GET", "POST"]),
     ("/$/ontology/{ds}/entities", &["GET"]),
-    ("/$/ontology/{ds}/entity", &["GET"]),
+    ("/$/ontology/{ds}/entity", &["GET", "DELETE"]),
     ("/$/ontology/{ds}/check", &["POST"]),
     ("/$/ontology/{ds}/classify", &["POST"]),
+    ("/$/ontology/{ds}/parse", &["POST"]),
+    ("/$/ontology/{ds}/dl-query", &["POST"]),
     ("/$/ontology/{ds}/diff", &["GET"]),
+    ("/$/ontology/{ds}/search", &["GET"]),
     ("/$/graph/{ds}/groups", &["POST"]),
     ("/$/graph/{ds}/facets", &["POST"]),
     // editing forms (U02): the check and the save check write on the branch they name
@@ -286,6 +290,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // review decisions, accepted projections and withdrawals (C25 §5 and §6)
     ("/{ds}/claims/review", &["POST"]),
     ("/{ds}/claims/withdraw", &["POST"]),
+    // resolution maps of identity reviews (C25 §6)
+    ("/{ds}/claims/identities", &["POST"]),
+    ("/{ds}/claims/dependents", &["POST"]),
     // `register_source` and `list_sources` over HTTP (C18 Phase 3m-b)
     ("/{ds}/sources", &["GET", "POST"]),
     ("/{ds}/text", &["GET", "POST"]),
@@ -341,6 +348,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/" | "/ui" | "/ui/" | "/ui/{*path}" | "/$/ping" | "/$/ready" | "/$/whoami" => Public,
         // describes the binary's API, not its data or configuration
         "/$/openapi.json" | "/$/openapi.yaml" => Public,
+        // the built-in SKOS shapes: text compiled into the binary, not data
+        "/$/skos/shapes" => Caller,
         // where MCP clients find the authorization server, before they hold a token
         "/.well-known/oauth-protected-resource" | "/.well-known/oauth-protected-resource/$/mcp" => {
             Public
@@ -412,6 +421,9 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // the axioms of the ontology are read with read access and edited with write
         "/$/ontology/{ds}/axioms" if get => Dataset(Read),
         "/$/ontology/{ds}/axioms" => Dataset(Write),
+        // an entity is read with read access and removed with write
+        "/$/ontology/{ds}/entity" if get => Dataset(Read),
+        "/$/ontology/{ds}/entity" => Dataset(Write),
         "/$/assistant/{ds}" => Dataset(Admin),
         "/$/graphrag/{ds}"
         | "/$/graphrag/{ds}/communities"
@@ -478,11 +490,13 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/schema/{ds}/diff"
         | "/$/ontology/{ds}"
         | "/$/ontology/{ds}/entities"
-        | "/$/ontology/{ds}/entity"
         | "/$/ontology/{ds}/check"
         // a run that writes its taxonomy checks write in the handler
         | "/$/ontology/{ds}/classify"
+        | "/$/ontology/{ds}/parse"
+        | "/$/ontology/{ds}/dl-query"
         | "/$/ontology/{ds}/diff"
+        | "/$/ontology/{ds}/search"
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
         | "/$/forms/{ds}"
@@ -508,6 +522,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/claims/resolve"
+        | "/{ds}/claims/identities"
+        | "/{ds}/claims/dependents"
         | "/{ds}/sparql/diagnose"
         | "/{ds}/sparql/diff"
         | "/{ds}/sparql/explain"
@@ -647,6 +663,8 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/claims/resolve"
+        | "/{ds}/claims/identities"
+        | "/{ds}/claims/dependents"
         | "/{ds}/sparql/diagnose"
         | "/{ds}/sparql/diff"
         | "/{ds}/sparql/explain"
@@ -664,10 +682,14 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/$/reason/{ds}/justify"
         | "/$/forms/{ds}" => Endpoint::Query,
         "/$/forms/{ds}/check" | "/$/forms/{ds}/save" => Endpoint::Update,
+        "/$/ontology/{ds}/entity" if !get => Endpoint::Update,
         "/$/ontology/{ds}"
         | "/$/ontology/{ds}/check"
         | "/$/ontology/{ds}/classify"
+        | "/$/ontology/{ds}/parse"
+        | "/$/ontology/{ds}/dl-query"
         | "/$/ontology/{ds}/entities"
+        | "/$/ontology/{ds}/search"
         | "/$/ontology/{ds}/entity" => Endpoint::Query,
         "/$/ontology/{ds}/axioms" if get => Endpoint::Query,
         "/$/ontology/{ds}/axioms" => Endpoint::Update,

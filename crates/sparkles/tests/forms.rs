@@ -155,6 +155,7 @@ fn change(field: &str, remove: Vec<Term>, add: Vec<Term>, expect: Vec<Term>) -> 
             field: id.clone(),
             remove,
             add,
+            list: None,
         }],
         expect: BTreeMap::from([(id, expect)]),
         message: Some("fix email".into()),
@@ -416,6 +417,7 @@ fn a_new_instance_takes_a_minted_iri_its_type_and_its_values() {
         field: format!("<{EX}worksFor>"),
         remove: vec![],
         add: vec![iri("acme")],
+        list: None,
     });
     c.expect.insert(format!("<{EX}worksFor>"), vec![]);
     let check = ds.forms().check(&c, &Default::default()).unwrap();

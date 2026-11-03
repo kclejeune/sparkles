@@ -941,6 +941,39 @@ test('the ontology handle classifies by OWL 2 EL and writes the taxonomy', async
   assert.ok(Number(tax.total) >= 1);
 });
 
+test('the ontology handle reads Manchester syntax and answers DL queries', async (t) => {
+  const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
+  await ds.update(`PREFIX : <http://ex.org/>
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    INSERT DATA { :o a owl:Ontology . :A a owl:Class . :B a owl:Class . :C a owl:Class .
+      :p a owl:ObjectProperty . :A rdfs:subClassOf :B . :B rdfs:label "Big thing" .
+      :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :B ] .
+      :a a :A . }`);
+  const onto = ds.ontology;
+  const p = await onto.parse("p some 'Big thing'");
+  assert.deepEqual(p.value, {
+    type: 'ObjectSomeValuesFrom',
+    property: 'http://ex.org/p',
+    class: 'http://ex.org/B',
+  });
+  await assert.rejects(onto.parse('p some Nothing2'), (e) => {
+    assert.equal(e.name, 'InvalidInputError');
+    assert.match(e.message, /Nothing2/);
+    assert.equal(e.details.reason, 'unknown');
+    assert.deepEqual([e.details.start, e.details.end], [7, 15]);
+    assert.deepEqual(e.details.candidates, []);
+    return true;
+  });
+  const r = await onto.dlQuery('p some B', { answers: ['subclasses', 'instances'] });
+  assert.equal(r.reasoning.engine, 'el');
+  assert.equal(r.reasoning.complete, true);
+  assert.deepEqual(r.subclasses, ['http://ex.org/A']);
+  assert.deepEqual(r.instances, ['http://ex.org/a']);
+  const rl = await onto.dlQuery('p some B', { reasoning: 'rl', answers: ['subclasses'] });
+  assert.equal(rl.reasoning.engine, 'rl');
+});
+
 test('the ontology handle lists entities and answers entity accessors', async (t) => {
   const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
   await ds.update(`PREFIX : <http://ex.org/>
@@ -974,6 +1007,39 @@ test('the ontology handle lists entities and answers entity accessors', async (t
     ['http://ex.org/A'],
   );
   await assert.rejects(onto.entity('http://ex.org/nothing'), NotFoundError);
+});
+
+test('the ontology handle searches entities with typos', async (t) => {
+  const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
+  await ds.update(`PREFIX : <http://ex.org/>
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+    INSERT DATA { :Glucose a owl:Class ; rdfs:label "glucose" .
+      :Galactose a owl:Class ; rdfs:label "galactose" .
+      :sweet a skos:Concept ; skos:prefLabel "sweet"@en ; skos:altLabel "sugary"@en . }`);
+  const onto = ds.ontology;
+  const prefix = await onto.search('gluc');
+  assert.equal(prefix.results[0].iri, 'http://ex.org/Glucose');
+  assert.equal(prefix.results[0].type, 'entity');
+  assert.equal(prefix.results[0].match.kind, 'prefix');
+  assert.deepEqual(prefix.results[0].match.highlight, [[0, 4]]);
+  // the commit and the next offset are bigints, the other numbers plain numbers
+  assert.equal(typeof prefix.commit, 'bigint');
+  assert.equal(typeof prefix.offset, 'number');
+  assert.equal(typeof prefix.limit, 'number');
+  assert.equal(typeof prefix.results[0].match.distance, 'number');
+  assert.equal(typeof prefix.results[0].match.tier, 'number');
+  const typo = await onto.search('glucoes');
+  assert.equal(typo.results[0].iri, 'http://ex.org/Glucose');
+  assert.equal(typo.results[0].match.kind, 'fuzzy');
+  const concepts = await onto.search('sugary', { kind: 'concept', lang: ['en'] });
+  assert.deepEqual(
+    concepts.results.map((h) => [h.iri, h.match.field]),
+    [['http://ex.org/sweet', 'synonym']],
+  );
+  const none = await onto.search('gluc', { kind: ['concept'] });
+  assert.deepEqual(none.results, []);
 });
 
 test('owl literals of numbers take XML Schema lexical forms', () => {

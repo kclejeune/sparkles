@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# The oracle step of run-hermit.sh as it produced the record: HermiT against the classifier
+# with scripts/el-oracle.py, and HermiT against ELK with ref-compare.py, which reads two
+# reference files. HermiT itself does not run again.
+set -uo pipefail
+L=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$L/../../.." && pwd)
+OUT=$L/out/hermit
+: > "$OUT/compare.jsonl"
+for f in "$OUT"/ore_ont_*.hermit.ofn; do
+  n=$(basename "$f" .hermit.ofn)
+  ours=$(python3 "$ROOT/scripts/el-oracle.py" "$f" "$L/out/ore/$n.ours.txt")
+  elk=$(python3 "$L/ref-compare.py" "$f" "$L/out/ore/$n.elk.ofn" "$ROOT/scripts/el-oracle.py")
+  echo "{\"name\":\"$n\",\"hermitVsOurs\":$ours,\"hermitVsElk\":$elk}" >> "$OUT/compare.jsonl"
+done

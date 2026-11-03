@@ -1,0 +1,8 @@
+Declaration(Class(<http://example.org/t#C>))
+Declaration(Class(<http://example.org/t#X>))
+Declaration(Class(<http://example.org/t#Y>))
+Declaration(Class(<http://www.w3.org/2002/07/owl#Nothing>))
+Declaration(Class(<http://www.w3.org/2002/07/owl#Thing>))
+SubClassOf(<http://example.org/t#C> <http://www.w3.org/2002/07/owl#Thing>)
+SubClassOf(<http://example.org/t#X> <http://www.w3.org/2002/07/owl#Thing>)
+SubClassOf(<http://example.org/t#Y> <http://example.org/t#X>)

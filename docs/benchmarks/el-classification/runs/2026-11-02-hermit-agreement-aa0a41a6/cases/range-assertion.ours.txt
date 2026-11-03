@@ -1,0 +1,3 @@
+SUB http://example.org/t#C http://www.w3.org/2002/07/owl#Thing
+SUB http://example.org/t#X http://www.w3.org/2002/07/owl#Thing
+SUB http://example.org/t#Y http://www.w3.org/2002/07/owl#Thing

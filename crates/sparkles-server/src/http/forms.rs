@@ -9,7 +9,7 @@ use super::*;
 use crate::auth::{Endpoint, on_branch};
 use sparkles::branch::{BranchOptions, MAIN};
 use sparkles::forms::{
-    FieldChange, FormChange, FormRequest, FormSaved, FormSettings, SaveTo, ShapesSource,
+    FieldChange, FormChange, FormRequest, FormSaved, FormSettings, NodeChange, SaveTo, ShapesSource,
 };
 use sparkles::history::At;
 
@@ -20,7 +20,7 @@ fn settings(st: &AppState, main: &Dataset, shapes: Option<&str>) -> ApiResult<Fo
         s.shapes = ShapesSource::parse(v).ok_or_else(|| {
             err(
                 StatusCode::BAD_REQUEST,
-                format!("shapes must be guard, graphs or drafted, not '{v}'"),
+                format!("shapes must be guard, graphs, drafted or skos, not '{v}'"),
             )
         })?;
         if s.shapes == ShapesSource::Graphs && s.graphs.is_empty() {
@@ -131,6 +131,16 @@ pub(super) async fn model(
     let mut wq = QueryOptions::default();
     crate::auth::restrict(&mut wq, &p, &on_branch(&name, &target), Endpoint::Update);
     let lang = params.get("lang").map(str::to_string);
+    let nested = match params.get("nested") {
+        None | Some("false") | Some("0") => false,
+        Some("true") | Some("1") | Some("") => true,
+        Some(v) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("nested must be true or false, not '{v}'"),
+            ));
+        }
+    };
     if class.is_some() && at.is_some() {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -146,12 +156,26 @@ pub(super) async fn model(
         req.lang = lang;
         req.writable = writable;
         req.write_graphs = Some(wq.graphs);
-        let m = ds
-            .dataset
-            .forms()
-            .model(&req, &opts)
-            .map_err(|e| with_timeout(e.into(), Some(timeout)))?;
-        let mut j = serde_json::to_value(&m).unwrap_or(J::Null);
+        let forms = ds.dataset.forms();
+        // the nested model refuses as a whole past its allowances: the flat form remains
+        let (mut j, commit) = match nested.then(|| forms.nested_model(&req, &opts)) {
+            Some(Ok(m)) => (serde_json::to_value(&m).unwrap_or(J::Null), m.root.commit),
+            Some(Err(sparkles::Error::Invalid(reason))) => {
+                let m = forms
+                    .model(&req, &opts)
+                    .map_err(|e| with_timeout(e.into(), Some(timeout)))?;
+                let mut j = serde_json::to_value(&m).unwrap_or(J::Null);
+                j["nested"] = json!({ "refused": reason });
+                (j, m.commit)
+            }
+            Some(Err(e)) => return Err(with_timeout(e.into(), Some(timeout))),
+            None => {
+                let m = forms
+                    .model(&req, &opts)
+                    .map_err(|e| with_timeout(e.into(), Some(timeout)))?;
+                (serde_json::to_value(&m).unwrap_or(J::Null), m.commit)
+            }
+        };
         j["save"] = json!({
             "to": if target == MAIN { "main" } else { "branch" },
             "branch": target,
@@ -159,7 +183,7 @@ pub(super) async fn model(
             "mainProtected": main.store.branch_protected(),
         });
         j["guard"] = guard_json(&main);
-        Ok(with_commit(Json(j).into_response(), &ds, m.commit))
+        Ok(with_commit(Json(j).into_response(), &ds, commit))
     })
     .await
 }
@@ -184,6 +208,7 @@ struct Body {
     changes: Vec<FieldChange>,
     expect: std::collections::BTreeMap<String, Vec<oxrdf::Term>>,
     message: Option<String>,
+    nested: Vec<NodeChange>,
 }
 
 fn body(bytes: &[u8]) -> ApiResult<Body> {
@@ -195,11 +220,11 @@ fn body(bytes: &[u8]) -> ApiResult<Body> {
     if let Some(k) = o.keys().find(|k| {
         !matches!(
             k.as_str(),
-            "focus" | "class" | "branch" | "shapes" | "changes" | "expect" | "message"
+            "focus" | "class" | "branch" | "shapes" | "changes" | "expect" | "message" | "nested"
         )
     }) {
         return Err(bad(format!(
-            "unknown member '{k}': focus, class, branch, shapes, changes, expect and message"
+            "unknown member '{k}': focus, class, branch, shapes, changes, expect, message and nested"
         )));
     }
     let string = |k: &str| -> ApiResult<Option<String>> {
@@ -209,48 +234,12 @@ fn body(bytes: &[u8]) -> ApiResult<Body> {
             Some(_) => Err(bad(format!("{k}: a string"))),
         }
     };
-    let terms = |v: Option<&J>, what: &str| -> ApiResult<Vec<oxrdf::Term>> {
-        match v {
-            None | Some(J::Null) => Ok(Vec::new()),
-            Some(J::Array(a)) => a
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    sparkles::overview::rdf_term_from_json(t, &format!("{what}[{i}]"))
-                        .map_err(|e| bad(e.to_string()))
-                })
-                .collect(),
-            Some(_) => Err(bad(format!("{what}: an array of terms"))),
-        }
-    };
-    let mut changes = Vec::new();
-    match o.get("changes") {
-        Some(J::Array(a)) => {
-            for (i, c) in a.iter().enumerate() {
-                let field = c
-                    .get("field")
-                    .and_then(J::as_str)
-                    .ok_or_else(|| bad(format!("changes[{i}].field: a field id")))?
-                    .to_string();
-                changes.push(FieldChange {
-                    field,
-                    remove: terms(c.get("remove"), &format!("changes[{i}].remove"))?,
-                    add: terms(c.get("add"), &format!("changes[{i}].add"))?,
-                });
-            }
-        }
-        _ => return Err(bad("changes: an array of {field, remove, add}".into())),
-    }
-    let mut expect = std::collections::BTreeMap::new();
-    match o.get("expect") {
-        None | Some(J::Null) => {}
-        Some(J::Object(m)) => {
-            for (k, v) in m {
-                expect.insert(k.clone(), terms(Some(v), &format!("expect[{k}]"))?);
-            }
-        }
-        Some(_) => return Err(bad("expect: an object of field ids to terms".into())),
-    }
+    let changes = sparkles::forms::field_changes_from_json(o.get("changes"), "changes")
+        .map_err(|e| bad(e.to_string()))?;
+    let expect = sparkles::forms::expect_from_json(o.get("expect"), "expect")
+        .map_err(|e| bad(e.to_string()))?;
+    let nested =
+        sparkles::forms::nested_from_json(o.get("nested")).map_err(|e| bad(e.to_string()))?;
     let focus = string("focus")?.filter(|f| !f.is_empty());
     let class = string("class")?.filter(|c| !c.is_empty());
     if focus.is_some() == class.is_some() {
@@ -267,6 +256,7 @@ fn body(bytes: &[u8]) -> ApiResult<Body> {
         changes,
         expect,
         message: string("message")?,
+        nested,
     })
 }
 
@@ -397,6 +387,7 @@ async fn prepare(
             expect: b.expect,
             message: b.message,
             settings: s,
+            nested: b.nested,
         },
         opts,
         restricted,

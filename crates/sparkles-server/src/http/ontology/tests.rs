@@ -659,3 +659,564 @@ async fn classify_answers_the_taxonomy_and_writes_it() {
     .json();
     assert!(j["total"].as_u64().unwrap() >= 1, "{j}");
 }
+
+/// Every quad of dataset `t`, as sorted N-Quads lines.
+async fn quads(app: &Router, ds: &str) -> Vec<String> {
+    let r = send(
+        app,
+        "GET",
+        &format!("/{ds}/data"),
+        &[("accept", "application/n-quads")],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let mut l: Vec<String> = r
+        .text()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    l.sort();
+    l
+}
+
+/// The inverse of an edit's answer: add back what it removed, remove what it wrote.
+fn inverse(j: &J) -> J {
+    let axioms = |k: &str| -> Vec<J> {
+        j[k].as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["axiom"].clone())
+            .collect()
+    };
+    json!({"add": axioms("removedAxioms"), "remove": axioms("addedAxioms"), "declare": false})
+}
+
+const UNRELATED: &str = "@prefix : <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix dct: <http://purl.org/dc/terms/> .
+:o dct:creator \"Ada\" .
+:Professor rdfs:comment \"teaches\"@en ; :note [ :about :Course ] .
+:logic :credits 6 .
+[] a owl:Restriction ; owl:onProperty :teaches .
+";
+
+#[tokio::test]
+async fn edits_list_what_they_wrote_and_their_inverse_restores_the_graph() {
+    let s = server();
+    let r = send(
+        &s.app,
+        "POST",
+        "/t/data?default",
+        &[("content-type", "text/turtle")],
+        UNRELATED,
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let before = quads(&s.app, "t").await;
+    // a new class under Person: the subclass axiom and the declaration it needs
+    let added = sub("http://ex.org/Lecturer", json!("http://ex.org/Person"));
+    let present = sub("http://ex.org/Professor", json!("http://ex.org/Person"));
+    let r = post(
+        &s.app,
+        "/$/ontology/t/axioms",
+        json!({"add": [added, present]}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    let types: Vec<&str> = j["addedAxioms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, ["SubClassOf", "Declaration"], "{j}");
+    assert_eq!(j["present"], 1, "{j}");
+    assert_eq!(j["removedAxioms"], json!([]));
+    assert_eq!(j["axiomsTruncated"], false);
+    assert_eq!(j["addedAxioms"][0]["ofn"], "SubClassOf(:Lecturer :Person)");
+    // the inverse removes the two axioms and nothing else
+    let r = post(&s.app, "/$/ontology/t/axioms", inverse(&j)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["removed"], 2, "{}", r.text());
+    assert_eq!(quads(&s.app, "t").await, before);
+
+    // annotating an axiom replaces it: the plain axiom out, the annotated one in
+    let annotated = json!({"type": "SubClassOf", "subClass": "http://ex.org/Professor",
+        "superClass": "http://ex.org/Person",
+        "annotations": [{"property": "http://www.w3.org/2000/01/rdf-schema#comment",
+                         "value": {"@value": "by definition", "@language": "en"}}]});
+    let r = post(
+        &s.app,
+        "/$/ontology/t/axioms",
+        json!({"remove": [present], "add": [annotated]}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["removedAxioms"][0]["axiom"], present, "{j}");
+    assert_eq!(
+        j["addedAxioms"][0]["axiom"]["annotations"][0]["value"]["@language"],
+        "en"
+    );
+    // every quad from before is still there, and the new ones describe the owl:Axiom node
+    let after = quads(&s.app, "t").await;
+    for q in &before {
+        assert!(after.contains(q), "lost {q}");
+    }
+    let new: Vec<&String> = after.iter().filter(|q| !before.contains(q)).collect();
+    assert_eq!(new.len(), 5, "{new:?}");
+    let node = new[0].split(' ').next().unwrap();
+    assert!(node.starts_with("_:"), "{new:?}");
+    assert!(new.iter().all(|q| q.starts_with(node)), "{new:?}");
+    // and its inverse restores the graph exactly
+    let r = post(&s.app, "/$/ontology/t/axioms", inverse(&j)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(quads(&s.app, "t").await, before);
+}
+
+#[tokio::test]
+async fn entities_are_removed_with_their_axioms() {
+    let s = server();
+    let course = "/$/ontology/t/entity?iri=http%3A%2F%2Fex.org%2FCourse";
+    let before = quads(&s.app, "t").await;
+    let r = send(
+        &s.app,
+        "DELETE",
+        &format!("{course}&dryRun=true&changes=20"),
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["dryRun"], true, "{}", r.text());
+    assert!(
+        r.json()["changes"]["total"].as_u64().unwrap() > 0,
+        "{}",
+        r.text()
+    );
+    assert_eq!(quads(&s.app, "t").await, before);
+    // a stale tag removes nothing
+    let r = send(
+        &s.app,
+        "DELETE",
+        course,
+        &[(
+            "if-match",
+            "W/\"00000000-0000-0000-0000-000000000000:0:owl\"",
+        )],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.text());
+    let tag = get(&s.app, "/$/ontology/t").await.headers[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let r = send(
+        &s.app,
+        "DELETE",
+        &format!("{course}&message=drop%20courses"),
+        &[("if-match", &tag)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    let removed: Vec<&str> = j["removedAxioms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["ofn"].as_str().unwrap())
+        .collect();
+    assert!(removed.contains(&"Declaration(Class(:Course))"), "{j}");
+    assert!(
+        removed.contains(&"SubClassOf(:Professor ObjectSomeValuesFrom(:teaches :Course))"),
+        "{j}"
+    );
+    assert_eq!(get(&s.app, course).await.status, StatusCode::NOT_FOUND);
+    let c = get(&s.app, "/$/commits/t?limit=1").await.json();
+    assert_eq!(c["commits"][0]["message"], "drop courses", "{c}");
+    // adding back what it removed restores the graph's axioms
+    let back = json!({"add": j["removedAxioms"].as_array().unwrap().iter().map(|a| a["axiom"].clone()).collect::<Vec<_>>(), "declare": false});
+    let r = post(&s.app, "/$/ontology/t/axioms", back).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(get(&s.app, course).await.status, StatusCode::OK);
+    assert_eq!(quads(&s.app, "t").await.len(), before.len());
+    // an IRI the ontology does not mention removes nothing
+    let r = send(
+        &s.app,
+        "DELETE",
+        "/$/ontology/t/entity?iri=http%3A%2F%2Fex.org%2FNone",
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["removed"], 0);
+    assert_eq!(r.json()["committed"], false);
+    let r = send(&s.app, "DELETE", "/$/ontology/t/entity", &[], "").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = send(
+        &s.app,
+        "DELETE",
+        &format!("{course}&inferences=true"),
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+#[tokio::test]
+async fn the_ontology_routes_work_on_a_branch() {
+    let s = persistent();
+    s._state
+        .get("h")
+        .unwrap()
+        .dataset
+        .create_branch("dev", &Default::default())
+        .unwrap();
+    let main_tag = get(&s.app, "/$/ontology/h").await.headers[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let r = get(&s.app, "/$/ontology/h?branch=dev").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.headers["sparkles-branch"], "dev");
+    let dev_tag = r.headers[header::ETAG].to_str().unwrap().to_string();
+    assert_ne!(dev_tag, main_tag);
+    let body =
+        json!({"add": [sub("http://ex.org/Lecturer", json!("http://ex.org/Person"))]}).to_string();
+    let ct = (header::CONTENT_TYPE.as_str(), "application/json");
+    // main's tag does not name the branch's head
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/axioms?branch=dev",
+        &[ct, ("if-match", &main_tag)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.text());
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/axioms?branch=dev",
+        &[ct, ("if-match", &dev_tag)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let lecturer = "iri=http%3A%2F%2Fex.org%2FLecturer";
+    let r = get(
+        &s.app,
+        &format!("/$/ontology/h/entity?branch=dev&{lecturer}"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        get(&s.app, &format!("/$/ontology/h/entity?{lecturer}"))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    for uri in [
+        "/$/ontology/h/entities?branch=dev&kind=Class",
+        "/$/ontology/h/axioms?branch=dev&type=SubClassOf",
+    ] {
+        let r = get(&s.app, uri).await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+        assert!(r.text().contains("Lecturer"), "{uri}: {}", r.text());
+    }
+    let r = post(
+        &s.app,
+        "/$/ontology/h/classify?branch=dev",
+        json!({"about": "http://ex.org/Lecturer"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = post(&s.app, "/$/ontology/h/check?branch=dev", json!({})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = send(
+        &s.app,
+        "DELETE",
+        &format!("/$/ontology/h/entity?branch=dev&{lecturer}"),
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["removed"], 2, "{}", r.text());
+    // a protected branch takes changes through merges only
+    s._state
+        .get("h")
+        .unwrap()
+        .dataset
+        .set_branch_protected("dev", true)
+        .unwrap();
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/axioms?branch=dev",
+        &[ct],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert_eq!(r.json()["code"], "branch-protected", "{}", r.text());
+    let r = get(&s.app, "/$/ontology/h?branch=nope").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+}
+
+#[tokio::test]
+async fn edits_take_functional_syntax() {
+    let s = server();
+    let r = post(
+        &s.app,
+        "/$/ontology/t/axioms",
+        json!({"add": ["SubClassOf(<http://ex.org/Tutor> ObjectSomeValuesFrom(<http://ex.org/teaches> <http://ex.org/Course>))"]}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        r.json()["addedAxioms"][0]["type"],
+        "SubClassOf",
+        "{}",
+        r.text()
+    );
+    let r = post(
+        &s.app,
+        "/$/ontology/t/axioms",
+        json!({"add": ["SubClassOf(<http://ex.org/Tutor>"]}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(r.json()["code"], "invalid-axiom", "{}", r.text());
+}
+
+#[tokio::test]
+async fn parse_reads_manchester_and_reports_the_span() {
+    let s = server();
+    let r = post(
+        &s.app,
+        "/$/ontology/t/parse",
+        json!({"text": "Person and teaches some Course"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["as"], "classExpression", "{j}");
+    // the dataset's prefixes write the names, which read back as they are written
+    assert_eq!(
+        j["manchester"], ":Person and (:teaches some :Course)",
+        "{j}"
+    );
+    assert_eq!(j["value"]["type"], "ObjectIntersectionOf", "{j}");
+    assert_eq!(
+        j["ofn"], "ObjectIntersectionOf(:Person ObjectSomeValuesFrom(:teaches :Course))",
+        "{j}"
+    );
+    let r = post(
+        &s.app,
+        "/$/ontology/t/parse",
+        json!({"text": "Professor SubClassOf Person", "as": "axiom"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["value"]["type"], "SubClassOf");
+    // the span counts UTF-16 code units: the emoji before the name takes two
+    let r = post(
+        &s.app,
+        "/$/ontology/t/parse",
+        json!({"text": "'😀' or Robot"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["code"], "invalid-manchester", "{j}");
+    assert_eq!(j["reason"], "unknown", "{j}");
+    assert_eq!(
+        (j["start"].as_u64(), j["end"].as_u64()),
+        (Some(0), Some(4)),
+        "{j}"
+    );
+    let r = post(
+        &s.app,
+        "/$/ontology/t/parse",
+        json!({"text": "x", "as": "frame"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = post(&s.app, "/$/ontology/t/parse", json!({"txt": "x"})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+#[tokio::test]
+async fn dl_query_answers_with_the_reasoning_used() {
+    let s = server();
+    let r = post(
+        &s.app,
+        "/$/ontology/t/dl-query",
+        json!({"expression": "teaches some Course"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.headers.contains_key("sparkles-commit"), "{:?}", r.headers);
+    let j = r.json();
+    assert_eq!(j["reasoning"]["engine"], "el", "{j}");
+    assert_eq!(j["reasoning"]["complete"], true, "{j}");
+    assert_eq!(j["subclasses"], json!(["http://ex.org/Professor"]), "{j}");
+    assert_eq!(
+        j["directSubclasses"],
+        json!(["http://ex.org/Professor"]),
+        "{j}"
+    );
+    assert_eq!(j["instances"], json!(["http://ex.org/ada"]), "{j}");
+    assert_eq!(
+        j["superclasses"],
+        json!(["http://www.w3.org/2002/07/owl#Thing"]),
+        "{j}"
+    );
+    assert_eq!(j["counts"]["subclasses"], 1, "{j}");
+    // the functional-style and JSON forms, and the RL engine by name
+    let r = post(
+        &s.app,
+        "/$/ontology/t/dl-query",
+        json!({
+            "expression": "ObjectSomeValuesFrom(<http://ex.org/teaches> <http://ex.org/Course>)",
+            "syntax": "functional",
+            "reasoning": "rl",
+            "answers": ["subclasses", "instances"],
+        }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["reasoning"]["engine"], "rl", "{j}");
+    assert_eq!(j["instances"], json!(["http://ex.org/ada"]), "{j}");
+    assert!(j.get("superclasses").is_none(), "{j}");
+    let r = post(
+        &s.app,
+        "/$/ontology/t/dl-query",
+        json!({"expression": {"type": "ObjectSomeValuesFrom", "property": "http://ex.org/teaches", "class": "http://ex.org/Course"}, "answers": "subclasses"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // an expression that does not read, an answer and an engine the route does not know
+    let r = post(
+        &s.app,
+        "/$/ontology/t/dl-query",
+        json!({"expression": "teaches some"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(r.json()["code"], "invalid-manchester", "{}", r.text());
+    for body in [
+        json!({"expression": "Course", "answers": ["cousins"]}),
+        json!({"expression": "Course", "reasoning": "dl"}),
+        json!({}),
+    ] {
+        let r = post(&s.app, "/$/ontology/t/dl-query", body).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    }
+}
+
+#[tokio::test]
+async fn the_entity_search_ranks_typeahead_hits() {
+    let s = server();
+    let r = get(&s.app, "/$/ontology/t/search?q=prof").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.headers.contains_key("sparkles-commit"));
+    let j = r.json();
+    assert_eq!(j["results"][0]["iri"], "http://ex.org/Professor", "{j}");
+    assert_eq!(j["results"][0]["type"], "entity");
+    assert_eq!(j["results"][0]["kinds"], json!(["class"]));
+    assert_eq!(j["results"][0]["match"]["field"], "shortForm");
+    assert_eq!(j["results"][0]["match"]["highlight"], json!([[0, 4]]));
+    assert_eq!(j["index"], "built");
+    // a typo, a kind filter, a page and the languages of Accept-Language
+    let j = get(&s.app, "/$/ontology/t/search?q=Profesor").await.json();
+    assert_eq!(j["results"][0]["match"]["kind"], "fuzzy", "{j}");
+    assert_eq!(j["index"], "current");
+    let j = get(&s.app, "/$/ontology/t/search?q=teach&kind=property")
+        .await
+        .json();
+    assert_eq!(j["results"][0]["iri"], "http://ex.org/teaches", "{j}");
+    assert_eq!(
+        get(&s.app, "/$/ontology/t/search?q=teach&kind=class")
+            .await
+            .json()["results"],
+        json!([])
+    );
+    let r = send(
+        &s.app,
+        "GET",
+        "/$/ontology/t/search?q=teaching",
+        &[("accept-language", "fr-CH, fr;q=0.9, en;q=0.5, *;q=0.1")],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // a commit is searched at once
+    let r = send(
+        &s.app,
+        "POST",
+        "/t/update",
+        &[(header::CONTENT_TYPE.as_str(), "application/sparql-update")],
+        "INSERT DATA { <http://ex.org/Lecturer> a <http://www.w3.org/2002/07/owl#Class> ; <http://www.w3.org/2000/01/rdf-schema#label> \"lecturer\"@en }",
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let j = get(&s.app, "/$/ontology/t/search?q=lect&limit=1")
+        .await
+        .json();
+    assert_eq!(j["results"][0]["label"], "lecturer", "{j}");
+    assert_eq!(j["results"][0]["labelLang"], "en", "{j}");
+    assert_ne!(j["index"], "current", "{j}");
+    // bad requests
+    for uri in [
+        "/$/ontology/t/search",
+        "/$/ontology/t/search?q=x&limit=0",
+        "/$/ontology/t/search?q=x&limit=101",
+        "/$/ontology/t/search?q=x&kind=planet",
+        "/$/ontology/t/search?q=x&lang=not_a_tag!",
+        "/$/ontology/t/search?q=x&at=1",
+        "/$/ontology/t/search?q=x&offset=10000",
+    ] {
+        let r = get(&s.app, uri).await;
+        assert!(
+            r.status.is_client_error(),
+            "{uri}: {} {}",
+            r.status,
+            r.text()
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_entity_search_reads_the_branch_asked_for() {
+    let s = persistent();
+    s._state
+        .get("h")
+        .unwrap()
+        .dataset
+        .create_branch("dev", &Default::default())
+        .unwrap();
+    let r = post(
+        &s.app,
+        "/$/ontology/h/axioms?branch=dev",
+        json!({"add": [sub("http://ex.org/Lecturer", json!("http://ex.org/Person"))]}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = get(&s.app, "/$/ontology/h/search?q=lectur&branch=dev").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.headers["sparkles-branch"], "dev");
+    assert_eq!(r.json()["results"][0]["iri"], "http://ex.org/Lecturer");
+    let j = get(&s.app, "/$/ontology/h/search?q=lectur").await.json();
+    assert_eq!(j["results"], json!([]), "{j}");
+}

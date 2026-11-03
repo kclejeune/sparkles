@@ -7,7 +7,11 @@
 //! for an acceptance, to the target's evidence, decided as `POST /{ds}/claims/resolve`
 //! decides it. A withdrawal needs update grants on each claim's graph and on the output
 //! graph, and read grants on the decisions, supports and output graphs, of every review
-//! policy. A record the caller cannot read answers
+//! policy. A review under a matching policy decides identity proposals and needs the
+//! same grants on the policy's decisions, maps and output graphs. `POST
+//! /{ds}/claims/identities` reads a resolution map and needs `read` through the query
+//! endpoint and read grants on the policy's graphs. A record the caller cannot read
+//! answers
 //! as a missing one. The caller's credential is checked again right before the commit
 //! publishes, as for `POST /{ds}/claims`.
 
@@ -133,12 +137,30 @@ fn changed_json(c: &Changed) -> J {
             .collect::<Vec<_>>()
             .into()
     };
-    json!({
-        "supportsAdded": c.supports_added.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        "supportsEnded": c.supports_ended.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    let names = |v: &[oxrdf::NamedNode]| -> J {
+        v.iter()
+            .map(|n| J::from(n.as_str()))
+            .collect::<Vec<_>>()
+            .into()
+    };
+    let mut out = json!({
+        "supportsAdded": names(&c.supports_added),
+        "supportsEnded": names(&c.supports_ended),
         "inserted": change(&c.inserted),
         "removed": change(&c.removed),
-    })
+    });
+    if let Some(m) = &c.map {
+        out["map"] = json!({
+            "policy": m.policy.as_str(),
+            "revision": m.revision.as_str(),
+            "number": m.number,
+            "previous": m.previous.as_ref().map(|p| p.as_str()),
+            "decisionsAdded": names(&m.decisions_added),
+            "decisionsEnded": names(&m.decisions_ended),
+            "entities": names(&m.entities),
+        });
+    }
+    out
 }
 
 fn preview_json(out: &mut J, preview: Option<&sparkles::preview::Preview>) {
@@ -289,6 +311,7 @@ pub(super) async fn review(
                 "conflicts": d.conflicts.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
             "changed": changed_json(&reviewed.changed),
+            "mapRevision": reviewed.map_revision.as_ref().map(|m| m.as_str()),
         });
         preview_json(&mut out, reviewed.preview.as_deref());
         Ok(Json(out).into_response())
@@ -356,6 +379,179 @@ pub(super) async fn withdraw(
         });
         preview_json(&mut out, withdrawn.preview.as_deref());
         Ok(Json(out).into_response())
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IdentitiesRequest {
+    policy: String,
+    entities: Vec<String>,
+}
+
+/// `POST /{ds}/claims/identities`: what the current resolution map of a matching
+/// policy selects for each entity. `200` with the map's revision and, for each entity,
+/// its representative, its cluster's members and the accepted decisions that join it.
+/// `400` for a malformed request or an unknown policy, `403` for a graph of the policy
+/// the caller may not read, `422` for `incomplete-evidence` and `503` for
+/// `projection-unavailable`.
+pub(super) async fn identities(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    AdminBody(bytes): AdminBody,
+) -> ApiResult {
+    if bytes.len() > MAX_BYTES {
+        return Err(err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("an identity resolution holds at most {MAX_BYTES} bytes"),
+        ));
+    }
+    let r: IdentitiesRequest =
+        serde_json::from_slice(&bytes).map_err(|e| invalid("identity resolution", e))?;
+    if r.entities.len() > sparkles::evidence::MAX_RESOLVE {
+        return Err(bad(
+            "entities".into(),
+            format!(
+                "a resolution names 1 to {} entities",
+                sparkles::evidence::MAX_RESOLVE
+            ),
+        ));
+    }
+    let entities = r
+        .entities
+        .iter()
+        .enumerate()
+        .map(|(i, e)| named(&format!("entities[{i}]"), e))
+        .collect::<ApiResult<Vec<_>>>()?;
+    let branch =
+        crate::http::branches::current().unwrap_or_else(|| sparkles::branch::MAIN.to_string());
+    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
+    blocking(move || {
+        use crate::auth::{Endpoint, on_branch};
+        let logical = dataset(&st, &name)?;
+        let main = if branch == sparkles::branch::MAIN {
+            logical.clone()
+        } else {
+            crate::http::main_dataset(&st, &name)?
+        };
+        let here = on_branch(&main.name, &branch);
+        let caller = crate::http::caller::CallerContext::for_caller(&st, &logical, &p);
+        let opts = caller.options_on(&crate::http::Params::empty(), &here, Endpoint::Query);
+        let control = Control {
+            deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
+            ..Control::with_cancel(cancel)
+        };
+        let resolved = sparkles::evidence::resolve_entities(
+            &main.dataset,
+            &logical.dataset,
+            &r.policy,
+            &entities,
+            opts.graphs.clone(),
+            &control,
+        )?;
+        fn names(v: &[oxrdf::NamedNode]) -> Vec<&str> {
+            v.iter().map(|n| n.as_str()).collect()
+        }
+        Ok(Json(json!({
+            "policy": resolved.policy.as_str(),
+            "revision": resolved.revision.as_ref().map(|r| r.as_str()),
+            "number": resolved.number,
+            "commit": resolved.commit,
+            "entities": resolved.entities.iter().map(|e| json!({
+                "entity": e.entity.as_str(),
+                "representative": e.representative.as_str(),
+                "members": names(&e.members),
+                "membersComplete": e.members_complete,
+                "decisions": names(&e.decisions),
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response())
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DependentsRequest {
+    changed: Vec<String>,
+    #[serde(default)]
+    transitive: bool,
+}
+
+/// `POST /{ds}/claims/dependents`: the authenticated assessments in the proposal graphs
+/// the caller can read whose `ev:target` or `prov:used` names one of the changed record
+/// identities, and with `transitive` the assessments that depend on those. `200` with
+/// the commit read and each dependent's assessment, graph, the record it depends on, how
+/// and at what depth. `400` for a malformed request, `422 incomplete-evidence` beyond the
+/// bound. Needs `read` through the query endpoint and counts as a query.
+pub(super) async fn dependents(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    AdminBody(bytes): AdminBody,
+) -> ApiResult {
+    if bytes.len() > MAX_BYTES {
+        return Err(err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("a dependents request holds at most {MAX_BYTES} bytes"),
+        ));
+    }
+    let r: DependentsRequest =
+        serde_json::from_slice(&bytes).map_err(|e| invalid("dependents request", e))?;
+    if r.changed.is_empty() || r.changed.len() > sparkles::evidence::MAX_CHANGED {
+        return Err(bad(
+            "changed".into(),
+            format!(
+                "a request names 1 to {} identities",
+                sparkles::evidence::MAX_CHANGED
+            ),
+        ));
+    }
+    let changed = r
+        .changed
+        .iter()
+        .enumerate()
+        .map(|(i, e)| named(&format!("changed[{i}]"), e))
+        .collect::<ApiResult<Vec<_>>>()?;
+    let branch =
+        crate::http::branches::current().unwrap_or_else(|| sparkles::branch::MAIN.to_string());
+    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
+    blocking(move || {
+        use crate::auth::{Endpoint, on_branch};
+        let logical = dataset(&st, &name)?;
+        let main = if branch == sparkles::branch::MAIN {
+            logical.clone()
+        } else {
+            crate::http::main_dataset(&st, &name)?
+        };
+        let here = on_branch(&main.name, &branch);
+        let caller = crate::http::caller::CallerContext::for_caller(&st, &logical, &p);
+        let opts = caller.options_on(&crate::http::Params::empty(), &here, Endpoint::Query);
+        let control = Control {
+            deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
+            ..Control::with_cancel(cancel)
+        };
+        let found = sparkles::evidence::find_dependents(
+            &main.dataset,
+            &logical.dataset,
+            &changed,
+            r.transitive,
+            opts.graphs.clone(),
+            &control,
+        )?;
+        Ok(Json(json!({
+            "commit": found.commit,
+            "dependents": found.dependents.iter().map(|d| json!({
+                "assessment": d.assessment.as_str(),
+                "graph": d.graph.as_str(),
+                "on": d.on.as_str(),
+                "dependence": d.dependence.name(),
+                "depth": d.depth,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response())
     })
     .await
 }

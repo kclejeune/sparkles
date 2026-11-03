@@ -188,7 +188,9 @@ fn batch(ds: &Dataset, fact_commit: u64) -> EvidenceInput {
             attributed_evaluator: iri("urn:analyst"),
             confidence: None,
             scope: Default::default(),
+            inputs: Vec::new(),
         }],
+        identities: Vec::new(),
     }
 }
 
@@ -740,6 +742,7 @@ fn a_record_reference_is_checked_even_when_a_batch_key_spells_its_iri() {
         attributed_evaluator: iri("urn:analyst"),
         confidence: None,
         scope: Default::default(),
+        inputs: Vec::new(),
     }];
     assert_eq!(
         code(propose(&ds, &twice, &options())),
