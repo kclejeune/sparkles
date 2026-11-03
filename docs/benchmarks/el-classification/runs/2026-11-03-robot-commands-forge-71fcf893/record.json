@@ -1,0 +1,162 @@
+{
+ "checks": [
+  {
+   "detail": "The outputs of reason, reduce, relax and the chain reason relax reduce equal ROBOT 1.9.11's with ELK 0.6.0 axiom for axiom, annotations included, on GO and ChEBI lite (robot-compare.txt): 622,357, 608,460, 617,214 and 622,357 axioms on GO and 1,682,146, 1,658,143, 1,666,767 and 1,677,573 on ChEBI lite.",
+   "name": "robot parity",
+   "ok": true
+  },
+  {
+   "detail": "Every forge output is byte-identical to the compared output of the same build on stanley (outputs-sha256.txt).",
+   "name": "outputs",
+   "ok": true
+  },
+  {
+   "detail": "All 30 processes exited with status 0 (runs.jsonl).",
+   "name": "exit status",
+   "ok": true
+  }
+ ],
+ "host": {
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "kernel": "7.2.9",
+  "name": "forge",
+  "ram_mib": 15620
+ },
+ "kind": "measurement",
+ "manifest": {
+  "binary": "The sparkles CLI built with mbx build --release -p sparkles-server on stanley at commit 71fcf893 and copied to the benchmark host",
+  "binary_sha256": {
+   "sparkles": "899b4b2054e93106a80a9a8f7d73f18c9a1bf74c38d4179416dd54fc9fbf3548"
+  },
+  "commit": "71fcf893",
+  "data": {
+   "chebi_lite": {
+    "rdfxml_sha256": "ebea75e0500818e319245a1bf605a684b2e22a2069680290b5dda638d5d25b16"
+   },
+   "go": {
+    "rdfxml_sha256": "653ce47cd7b02304e67eb67c54d3be02ec5b0ba5e00eb7384dfa0da00f9682ec"
+   }
+  },
+  "ended": "2026-11-03T13:50:19Z",
+  "host_load_after": "1.52 2.76 2.53",
+  "host_load_before": "3.86 3.70 2.72",
+  "lock_note": "The lock passed from the post-push benchmark check, so the first round includes that run's tail and is the slowest in every row. The tables use medians.",
+  "reference": {
+   "robot": "robot reason with ELK from runs/2026-11-03-reasoners-forge-ea96e8f5 on the same host and files, median of three, 14.04 s at 3,597 MiB on GO and 30.63 s at 8,287 MiB on ChEBI lite. ROBOT's reduce, relax and chain have no figures from this host."
+  },
+  "started": "2026-11-03T13:47:18Z"
+ },
+ "method": "forge-sparkles.sh.txt took ~/lanes/.bench.lock once and ran three interleaved rounds. Each round timed, on GO and ChEBI lite from the release's RDF/XML file, sparkles ontology reason, reduce and relax with --input and --output to a functional-style file, the chain reason --input FILE relax reduce --output FILE, and sparkles ontology classify FILE --format ofn --allow-unsatisfiable, each through timed.py.txt, which records the wall time, the peak resident set and the exit status in runs.jsonl. robot-compare.txt is scripts/elk-compare/ofn-axioms.py --all between lane 604's ROBOT 1.9.11 outputs with ELK 0.6.0 and the same build's outputs on stanley, and outputs-sha256.txt shows the forge outputs are byte-identical to those.",
+ "results": [
+  {
+   "command": "chain",
+   "exit_status": [
+    0
+   ],
+   "median_peak_rss_mib": 2516,
+   "median_s": 10.27,
+   "ontology": "chebi_lite",
+   "rounds": 3
+  },
+  {
+   "command": "classify",
+   "exit_status": [
+    0
+   ],
+   "median_peak_rss_mib": 2563,
+   "median_s": 5.61,
+   "ontology": "chebi_lite",
+   "rounds": 3
+  },
+  {
+   "command": "reason",
+   "exit_status": [
+    0
+   ],
+   "median_peak_rss_mib": 2516,
+   "median_s": 7.74,
+   "ontology": "chebi_lite",
+   "rounds": 3
+  },
+  {
+   "command": "reduce",
+   "exit_status": [
+    0
+   ],
+   "median_peak_rss_mib": 2508,
+   "median_s": 8.3,
+   "ontology": "chebi_lite",
+   "rounds": 3
+  },
+  {
+   "command": "relax",
+   "exit_status": [
+    0
+   ],
+   "median_peak_rss_mib": 2499,
+   "median_s": 5.7,
+   "ontology": "chebi_lite",
+   "rounds": 3
+  },
+  {
+   "command": "chain",
+   "exit_status": [
+    0
+   ],
+   "median_peak_rss_mib": 1527,
+   "median_s": 3.87,
+   "ontology": "go",
+   "rounds": 3
+  },
+  {
+   "command": "classify",
+   "exit_status": [
+    0
+   ],
+   "median_peak_rss_mib": 1374,
+   "median_s": 2.77,
+   "ontology": "go",
+   "rounds": 3
+  },
+  {
+   "command": "reason",
+   "exit_status": [
+    0
+   ],
+   "median_peak_rss_mib": 1525,
+   "median_s": 3.45,
+   "ontology": "go",
+   "rounds": 3
+  },
+  {
+   "command": "reduce",
+   "exit_status": [
+    0
+   ],
+   "median_peak_rss_mib": 1521,
+   "median_s": 3.49,
+   "ontology": "go",
+   "rounds": 3
+  },
+  {
+   "command": "relax",
+   "exit_status": [
+    0
+   ],
+   "median_peak_rss_mib": 1492,
+   "median_s": 3.04,
+   "ontology": "go",
+   "rounds": 3
+  }
+ ],
+ "scale": "GO 2026-07-26 and ChEBI lite 256, RDF/XML releases",
+ "settings": {
+  "build": "release profile",
+  "memory_cap": "MemoryMax=12G, MemorySwapMax=0 per process",
+  "repeat": 3,
+  "threads": "0 (the classifier's default)",
+  "timeout_s": 1800
+ },
+ "suite": "el-classification"
+}

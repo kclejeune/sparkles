@@ -148,8 +148,8 @@
 
 <svelte:head><title>Review {branch} | Sparkles</title></svelte:head>
 
-<div class="page">
-  <header class="head">
+<div class="page page-container">
+  <header class="page-head head">
     <div>
       <h1>
         <Icon name="branch" size={18} />
@@ -164,11 +164,12 @@
         {#if data?.note}· {data.note}{/if}
       </p>
     </div>
-    <span class="spacer"></span>
-    <button class="btn sm" onclick={load} disabled={loading}
-      ><Icon name="refresh" size={13} /> Refresh</button
-    >
-    <a class="btn primary sm" href={mergeHref}><Icon name="merge" size={13} /> Merge</a>
+    <div class="page-actions">
+      <button class="btn" onclick={load} disabled={loading}
+        ><Icon name="refresh" size={14} /> Refresh</button
+      >
+      <a class="btn primary" href={mergeHref}><Icon name="merge" size={14} /> Merge</a>
+    </div>
   </header>
 
   {#if loading && !data}
@@ -375,27 +376,12 @@
 </div>
 
 <style>
-  .page {
-    padding: 16px;
-    display: grid;
-    gap: 14px;
-    align-content: start;
-    min-width: 0;
-    overflow: auto;
-  }
-  .head {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    align-items: center;
-  }
   .head h1 {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     gap: 8px;
     margin: 0;
-    font-size: var(--fs-lg);
     overflow-wrap: anywhere;
   }
   .head p {
@@ -404,12 +390,12 @@
   .cols {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
-    gap: 14px;
+    gap: var(--gap);
     align-items: start;
   }
   .col {
     display: grid;
-    gap: 14px;
+    gap: var(--gap);
     min-width: 0;
   }
   .facts {

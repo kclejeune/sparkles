@@ -753,6 +753,10 @@ sparkles ontology edit    --loc db --add new.json --remove old.json   # JSON axi
 sparkles ontology classify --loc db --format text   # OWL 2 EL taxonomy (exit 1 when unsatisfiable)
 sparkles ontology classify go.ofn > go-taxonomy.ofn  # classify a file without a database
 sparkles ontology classify --loc db --target http://ex.org/taxonomy   # write the taxonomy to a graph
+sparkles ontology reason --input go.owl --output go-reasoned.ofn   # robot reason: the ontology with its inferred axioms
+sparkles ontology reduce --input x.owl --output y.ofn   # robot reduce: without the entailed subclass axioms
+sparkles ontology relax  --input x.owl --output y.owl   # robot relax: subclass axioms from equivalences
+sparkles ontology reason --input x.owl relax reduce --output y.owl   # a chain in one process, as ROBOT runs it
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --language en|all,
                                               #   --language fr=french-light (a tag with an analyzer),
                                               #   --rebuild, --status, --disable, --text-dicts DIR

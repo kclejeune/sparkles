@@ -37,15 +37,16 @@
         total
       </p>
     </div>
-    <span class="spacer"></span>
-    <button class="btn" onclick={refresh} disabled={refreshing}>
-      <Icon name="refresh" size={14} /> Refresh
-    </button>
-    {#if auth.hasServer('server-admin')}
-      <button class="btn primary" onclick={() => (createOpen = true)}
-        ><Icon name="plus" size={14} /> New dataset</button
-      >
-    {/if}
+    <div class="page-actions">
+      <button class="btn" onclick={refresh} disabled={refreshing}>
+        <Icon name="refresh" size={14} /> Refresh
+      </button>
+      {#if auth.hasServer('server-admin')}
+        <button class="btn primary" onclick={() => (createOpen = true)}
+          ><Icon name="plus" size={14} /> New dataset</button
+        >
+      {/if}
+    </div>
   </header>
 
   {#if app.datasetsError}
@@ -65,74 +66,82 @@
           {/if}
         </div>
       {:else}
-        <table class="data">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Storage</th>
-              <th class="num">Quads</th>
-              <th title="Head commit and when it was made">Head</th>
-              <th>Reasoning</th>
-              <th>Endpoint</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each app.datasets as d (d.name)}
-              <tr class:current={d.name === app.current}>
-                <td>
-                  <a class="name" href={detail(d.name)}>{d.name}</a>
-                  {#if d.name === app.current}<span class="badge spark">selected</span>{/if}
-                  {#if d.declared}<span class="badge" title={api.DECLARED_TEXT}>declared</span>{/if}
-                </td>
-                <td><span class="badge">{d.type === 'mem' ? 'in-memory' : 'persistent'}</span></td>
-                <td class="num">{fmtInt(d.quads)}</td>
-                <td>
-                  {#if d.head != null}
-                    <span class="mono" title={d.modified}>commit {d.head}</span>
-                    {#if d.modified}<span class="faint">, {fmtRelative(d.modified)}</span>{/if}
-                  {:else}
-                    <span class="faint">—</span>
-                  {/if}
-                </td>
-                <td>
-                  {#if d.reasoning}
-                    <span class="badge ok">{d.reasoning.profile}</span>
-                    <span class="faint"
-                      >+{fmtInt(d.reasoning.inferred)} inferred, {fmtRelative(d.reasoning.at)}</span
-                    >
-                  {:else}
-                    <span class="faint">off</span>
-                  {/if}
-                </td>
-                <td><span class="mono faint">{d.endpoints?.query ?? `/${d.name}/sparql`}</span></td>
-                <td class="actions">
-                  <div class="cell-actions">
-                    <button
-                      class="btn sm"
-                      onclick={() => {
-                        app.setDataset(d.name);
-                        goto(resolve('/query'));
-                      }}><Icon name="query" size={13} /> Query</button
-                    >
-                    <a class="btn sm" href={detail(d.name)}>Details</a>
-                    {#if auth.can(d.name, 'admin')}
-                      <button
-                        class="btn sm icon danger"
-                        aria-label="Delete {d.name}"
-                        title={d.declared ? api.DECLARED_TEXT : `Delete ${d.name}`}
-                        disabled={d.declared === true}
-                        onclick={() => (deleteTarget = d.name)}
-                      >
-                        <Icon name="trash" size={13} />
-                      </button>
-                    {/if}
-                  </div>
-                </td>
+        <div class="table-scroll">
+          <table class="data">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Storage</th>
+                <th class="num">Quads</th>
+                <th title="Head commit and when it was made">Head</th>
+                <th>Reasoning</th>
+                <th class="endpoint">Endpoint</th>
+                <th></th>
               </tr>
-            {/each}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {#each app.datasets as d (d.name)}
+                <tr class:current={d.name === app.current}>
+                  <td>
+                    <a class="name" href={detail(d.name)}>{d.name}</a>
+                    {#if d.name === app.current}<span class="badge spark">selected</span>{/if}
+                    {#if d.declared}<span class="badge" title={api.DECLARED_TEXT}>declared</span
+                      >{/if}
+                  </td>
+                  <td><span class="badge">{d.type === 'mem' ? 'in-memory' : 'persistent'}</span></td
+                  >
+                  <td class="num">{fmtInt(d.quads)}</td>
+                  <td>
+                    {#if d.head != null}
+                      <span class="mono" title={d.modified}>commit {d.head}</span>
+                      {#if d.modified}<span class="faint">, {fmtRelative(d.modified)}</span>{/if}
+                    {:else}
+                      <span class="faint">—</span>
+                    {/if}
+                  </td>
+                  <td>
+                    {#if d.reasoning}
+                      <span class="badge ok">{d.reasoning.profile}</span>
+                      <span class="faint"
+                        >+{fmtInt(d.reasoning.inferred)} inferred, {fmtRelative(
+                          d.reasoning.at,
+                        )}</span
+                      >
+                    {:else}
+                      <span class="faint">off</span>
+                    {/if}
+                  </td>
+                  <td class="endpoint"
+                    ><span class="mono faint">{d.endpoints?.query ?? `/${d.name}/sparql`}</span></td
+                  >
+                  <td class="actions">
+                    <div class="cell-actions">
+                      <button
+                        class="btn sm"
+                        onclick={() => {
+                          app.setDataset(d.name);
+                          goto(resolve('/query'));
+                        }}><Icon name="query" size={13} /> Query</button
+                      >
+                      <a class="btn sm" href={detail(d.name)}>Details</a>
+                      {#if auth.can(d.name, 'admin')}
+                        <button
+                          class="btn sm icon danger"
+                          aria-label="Delete {d.name}"
+                          title={d.declared ? api.DECLARED_TEXT : `Delete ${d.name}`}
+                          disabled={d.declared === true}
+                          onclick={() => (deleteTarget = d.name)}
+                        >
+                          <Icon name="trash" size={13} />
+                        </button>
+                      {/if}
+                    </div>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
       {/if}
     </section>
   {/if}
@@ -161,15 +170,18 @@
   table.data td {
     height: 40px;
   }
+  /* the endpoint follows from the name; below 1000 px the row keeps its actions instead */
+  @media (max-width: 1000px) {
+    .endpoint {
+      display: none;
+    }
+  }
   @media (max-width: 760px) {
     table.data th:nth-child(5),
     table.data td:nth-child(5),
     table.data th:nth-child(4),
     table.data td:nth-child(4) {
       display: none;
-    }
-    section.panel {
-      overflow-x: auto;
     }
   }
 </style>

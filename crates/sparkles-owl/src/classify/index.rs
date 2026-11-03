@@ -25,6 +25,8 @@ pub type Role = u32;
 
 pub const TOP: Ex = 0;
 pub const BOTTOM: Ex = 1;
+/// No expression, in the tables of expressions by class and by individual.
+const NO_EX: Ex = Ex::MAX;
 
 /// One interned class expression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -42,7 +44,169 @@ pub enum Node {
     /// [`Interner::vals`]. A data value has no successors, so it needs no context: the
     /// index gives a positive restriction its consequences as told subsumers.
     DataSome(Role, u32),
+    /// Only in the interner of a chunk of a parallel normalization: an intersection, by
+    /// its index in [`Interner::ands`]. Its binary form depends on the order of the
+    /// operands' ids, so it waits for the ids of the merged interner.
+    And(u32),
 }
+
+/// Entities named by an IRI, which a [`Names`] table keys by the IRI.
+pub trait Named: Clone + Eq {
+    fn name(&self) -> &str;
+}
+
+impl Named for Class {
+    fn name(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Named for NamedIndividual {
+    fn name(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// The hash of an IRI that [`Names`] keys by.
+#[inline]
+pub fn name_hash(s: &str) -> u64 {
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one(s)
+}
+
+/// Named entities numbered in the order they are added, each held once, with the hash
+/// of each IRI kept beside it, so that a table grows without hashing an IRI again and a
+/// merge can look up an IRI that a chunk hashed.
+#[derive(Clone, Debug)]
+pub struct Names<T> {
+    items: Vec<T>,
+    hashes: Vec<u64>,
+    table: hashbrown::HashTable<u32>,
+    /// the bytes of the IRIs, each counted with a pointer and a length
+    name_bytes: usize,
+}
+
+impl<T> Default for Names<T> {
+    fn default() -> Names<T> {
+        Names {
+            items: Vec::new(),
+            hashes: Vec::new(),
+            table: hashbrown::HashTable::new(),
+            name_bytes: 0,
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Names<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.items
+    }
+}
+
+impl<T: Named> Names<T> {
+    pub fn get(&self, x: &T) -> Option<u32> {
+        let h = name_hash(x.name());
+        self.table
+            .find(h, |&i| self.items[i as usize].name() == x.name())
+            .copied()
+    }
+
+    /// The id of an entity, which is added when it is new.
+    pub fn id(&mut self, x: &T) -> u32 {
+        let h = name_hash(x.name());
+        match self.find(h, x) {
+            Ok(id) => id,
+            Err(()) => self.push(h, x.clone()),
+        }
+    }
+
+    /// The id of an entity whose hash the caller has, which moves in when it is new.
+    #[inline]
+    fn id_hashed(&mut self, h: u64, x: T) -> u32 {
+        match self.find(h, &x) {
+            Ok(id) => id,
+            Err(()) => self.push(h, x),
+        }
+    }
+
+    #[inline]
+    fn find(&self, h: u64, x: &T) -> Result<u32, ()> {
+        self.table
+            .find(h, |&i| self.items[i as usize].name() == x.name())
+            .copied()
+            .ok_or(())
+    }
+
+    #[inline]
+    fn push(&mut self, h: u64, x: T) -> u32 {
+        let id = self.items.len() as u32;
+        let hashes = &self.hashes;
+        self.table.insert_unique(h, id, |&i| hashes[i as usize]);
+        self.name_bytes += x.name().len() + 16;
+        self.items.push(x);
+        self.hashes.push(h);
+        id
+    }
+
+    /// The bytes of the IRIs, each counted with a pointer and a length.
+    pub fn name_bytes(&self) -> usize {
+        self.name_bytes
+    }
+
+    /// The bytes the table takes beyond the entities, roughly.
+    pub fn bytes(&self) -> usize {
+        self.items.capacity() * std::mem::size_of::<T>()
+            + self.hashes.capacity() * 8
+            + self.table.capacity() * 5
+    }
+
+    /// Takes the entities and their hashes out, leaving the table empty.
+    pub fn take(&mut self) -> (Vec<T>, Vec<u64>) {
+        self.table.clear();
+        self.name_bytes = 0;
+        (
+            std::mem::take(&mut self.items),
+            std::mem::take(&mut self.hashes),
+        )
+    }
+
+    /// Adds the names of chunks, each a list of distinct names with their hashes, in
+    /// order, and answers each chunk's ids, which are those that adding the names one
+    /// at a time would give. `poll` is called every [`POLL_MERGE`] names and stops the
+    /// merge with its error.
+    pub fn merge_chunks<E>(
+        &mut self,
+        chunks: Vec<(Vec<T>, Vec<u64>)>,
+        poll: &mut dyn FnMut() -> Result<(), E>,
+    ) -> Result<Vec<Vec<u32>>, E> {
+        let n: usize = chunks.iter().map(|(xs, _)| xs.len()).sum();
+        let hashes = &self.hashes;
+        self.table.reserve(n, |&i| hashes[i as usize]);
+        self.items.reserve(n);
+        self.hashes.reserve(n);
+        let mut done = 0usize;
+        let mut out = Vec::with_capacity(chunks.len());
+        for (xs, hs) in chunks {
+            let mut ids = Vec::with_capacity(xs.len());
+            for (x, h) in xs.into_iter().zip(hs) {
+                done += 1;
+                if done.is_multiple_of(POLL_MERGE) {
+                    poll()?;
+                }
+                ids.push(self.id_hashed(h, x));
+            }
+            out.push(ids);
+        }
+        Ok(out)
+    }
+}
+
+/// A chunk's expressions and roles by their ids in the merged interner.
+pub type Mapped = (Vec<Ex>, Vec<Role>);
+
+/// The names and expressions a merge of chunks takes between two calls of its poll.
+pub const POLL_MERGE: usize = if cfg!(test) { 64 } else { 65_536 };
 
 /// The name of a role.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -58,14 +222,17 @@ pub enum RoleName {
 #[derive(Default)]
 pub struct Interner {
     pub nodes: Vec<Node>,
+    /// the compound expressions; a class's and an individual's are in
+    /// [`Interner::class_nodes`] and [`Interner::individual_nodes`]
     map: FxHashMap<Node, Ex>,
-    pub classes: Vec<Class>,
-    class_ids: FxHashMap<Class, u32>,
+    /// the expression of each class and individual by id, [`NO_EX`] before it has one
+    class_nodes: Vec<Ex>,
+    individual_nodes: Vec<Ex>,
+    pub classes: Names<Class>,
     /// for each class, whether the run's normalization met it, which makes it a class of
     /// the signature
     pub met: Vec<bool>,
-    pub individuals: Vec<NamedIndividual>,
-    individual_ids: FxHashMap<NamedIndividual, u32>,
+    pub individuals: Names<NamedIndividual>,
     /// the data ranges, as lattice elements
     pub vals: Vec<DataVal>,
     val_ids: FxHashMap<DataVal, u32>,
@@ -74,6 +241,15 @@ pub struct Interner {
     pub roles: Vec<RoleName>,
     role_ids: FxHashMap<RoleName, Role>,
     fresh: u32,
+    /// whether this is the interner of a chunk of a parallel normalization, which keeps
+    /// intersections whole as [`Node::And`]
+    chunk: bool,
+    /// a chunk's intersections: the operands, and whether it is the binary intersection
+    /// of [`Interner::conj`] rather than that of a class expression
+    pub ands: Vec<(Vec<Ex>, bool)>,
+    and_ids: FxHashMap<(Vec<Ex>, bool), u32>,
+    /// the operands of [`Interner::ands`], counted twice, once for the table's key
+    and_ops: usize,
 }
 
 impl Interner {
@@ -82,6 +258,176 @@ impl Interner {
         i.node(Node::Top);
         i.node(Node::Bottom);
         i
+    }
+
+    /// The interner of a chunk of a parallel normalization, with the datatype
+    /// definitions of the run.
+    pub fn chunk(definitions: &FxHashMap<Datatype, DataRange>) -> Interner {
+        let mut i = Interner::new();
+        i.chunk = true;
+        i.ranges.definitions = definitions.clone();
+        i
+    }
+
+    /// The bytes the interner takes, roughly: each expression with its entry in the
+    /// table, the names with their IRIs, and a chunk's intersections.
+    pub fn bytes(&self) -> usize {
+        self.nodes.capacity() * 40
+            + self.classes.bytes()
+            + self.classes.name_bytes()
+            + self.met.capacity()
+            + self.class_nodes.capacity() * 4
+            + self.individuals.bytes()
+            + self.individuals.name_bytes()
+            + self.individual_nodes.capacity() * 4
+            + self.roles.capacity() * 48
+            + self.ands.len() * 80
+            + self.and_ops * 4
+    }
+
+    /// Whether a chunk met data ranges or literals, whose ids its merge does not map, so
+    /// that the run normalizes on one thread instead.
+    pub fn chunk_has_data(&self) -> bool {
+        !self.vals.is_empty() || !self.ranges.opaque.is_empty()
+    }
+
+    /// An intersection kept whole in a chunk's interner.
+    fn and(&mut self, ops: Vec<Ex>, binary: bool) -> Ex {
+        let key = (ops, binary);
+        let id = match self.and_ids.get(&key) {
+            Some(&id) => id,
+            None => {
+                let id = self.ands.len() as u32;
+                self.and_ops += 2 * key.0.len();
+                self.ands.push(key.clone());
+                self.and_ids.insert(key, id);
+                id
+            }
+        };
+        self.node(Node::And(id))
+    }
+
+    /// The binary form of the intersection of distinct expressions other than
+    /// `owl:Thing` and `owl:Nothing`, nested in the order of their ids.
+    fn fold_conj(&mut self, es: &mut [Ex]) -> Ex {
+        es.sort_unstable();
+        let mut acc = es[0];
+        for &e in &es[1..] {
+            acc = self.conj(acc, e);
+        }
+        acc
+    }
+
+    /// Takes in the interners of chunks, which normalized consecutive runs of axioms
+    /// that follow those this interner has met, and answers the ids here of each
+    /// chunk's expressions and roles. Each name and expression gets the id the chunk's
+    /// first occurrence would have given it in a normalization on one thread: a chunk
+    /// lists them in the order it met them, and those this interner has keep their ids.
+    /// `poll` is told the bytes of this interner every [`POLL_MERGE`] names, roles,
+    /// expressions and operands, counted over all the chunks, and stops the merge with
+    /// its error.
+    pub fn merge<E>(
+        &mut self,
+        mut chunks: Vec<Interner>,
+        poll: &mut dyn FnMut(usize) -> Result<(), E>,
+    ) -> Result<Vec<Mapped>, E> {
+        debug_assert!(chunks.iter().all(|c| !c.chunk_has_data() && c.fresh == 0));
+        let before = self.bytes();
+        let classes = self.classes.merge_chunks(
+            chunks.iter_mut().map(|c| c.classes.take()).collect(),
+            &mut || poll(before),
+        )?;
+        for ids in &classes {
+            for &id in ids {
+                self.mark_met(id);
+            }
+        }
+        let before = self.bytes();
+        let individuals = self.individuals.merge_chunks(
+            chunks.iter_mut().map(|c| c.individuals.take()).collect(),
+            &mut || poll(before),
+        )?;
+        // the work since the last poll, over all the chunks
+        let mut work = 0usize;
+        let mut out = Vec::with_capacity(chunks.len());
+        for ((chunk, classes), individuals) in chunks.into_iter().zip(classes).zip(individuals) {
+            let mut roles: Vec<Role> = Vec::with_capacity(chunk.roles.len());
+            for r in &chunk.roles {
+                work += 1;
+                if work >= POLL_MERGE {
+                    work = 0;
+                    poll(self.bytes())?;
+                }
+                roles.push(self.role(r.clone()));
+            }
+            self.map.reserve(chunk.map.len());
+            let mut map: Vec<Ex> = Vec::with_capacity(chunk.nodes.len());
+            let mut ops: Vec<Ex> = Vec::new();
+            for n in &chunk.nodes {
+                work += match *n {
+                    Node::And(j) => 1 + chunk.ands[j as usize].0.len(),
+                    _ => 1,
+                };
+                if work >= POLL_MERGE {
+                    work = 0;
+                    poll(self.bytes())?;
+                }
+                let e = match *n {
+                    Node::Top => TOP,
+                    Node::Bottom => BOTTOM,
+                    Node::Class(k) => self.node(Node::Class(classes[k as usize])),
+                    Node::Nominal(k) => self.node(Node::Nominal(individuals[k as usize])),
+                    Node::Conj(a, b) => self.conj(map[a as usize], map[b as usize]),
+                    Node::Exist(r, f) => self.node(Node::Exist(roles[r as usize], map[f as usize])),
+                    Node::SelfLoop(r) => self.node(Node::SelfLoop(roles[r as usize])),
+                    Node::DataSome(..) => unreachable!("a chunk with data merges on one thread"),
+                    Node::And(j) => {
+                        let (xs, binary) = &chunk.ands[j as usize];
+                        ops.clear();
+                        ops.extend(xs.iter().map(|&x| map[x as usize]));
+                        // operands that the chunk kept apart can be one expression here,
+                        // and the normalization on one thread takes each once
+                        ops.sort_unstable();
+                        ops.dedup();
+                        match ops.len() {
+                            1 => ops[0],
+                            _ if *binary => self.conj(ops[0], ops[1]),
+                            _ => self.fold_conj(&mut ops),
+                        }
+                    }
+                };
+                map.push(e);
+            }
+            out.push((map, roles));
+        }
+        poll(self.bytes())?;
+        Ok(out)
+    }
+
+    /// The bytes that merging this chunk's interner can add to the merged one, roughly:
+    /// its own and a binary intersection for each operand of its intersections, twice
+    /// over, since the merged interner's lists and tables grow by doubling.
+    pub fn merge_bytes(&self) -> usize {
+        2 * self.bytes() + self.and_ops * 40
+    }
+
+    /// The id of a class, which the run's normalization meets.
+    fn class_id(&mut self, c: &Class) -> u32 {
+        let id = self.classes.id(c);
+        self.mark_met(id);
+        id
+    }
+
+    #[inline]
+    fn mark_met(&mut self, id: u32) {
+        if self.met.len() <= id as usize {
+            self.met.resize(id as usize + 1, false);
+        }
+        self.met[id as usize] = true;
+    }
+
+    fn individual_id(&mut self, i: &NamedIndividual) -> u32 {
+        self.individuals.id(i)
     }
 
     /// The role of a name, if the interner has it.
@@ -94,6 +440,24 @@ impl Interner {
     }
 
     pub fn node(&mut self, n: Node) -> Ex {
+        let slot = match n {
+            Node::Class(id) => Some((&mut self.class_nodes, id)),
+            Node::Nominal(id) => Some((&mut self.individual_nodes, id)),
+            _ => None,
+        };
+        if let Some((by_id, id)) = slot {
+            let id = id as usize;
+            if by_id.len() <= id {
+                by_id.resize(id + 1, NO_EX);
+            }
+            if by_id[id] != NO_EX {
+                return by_id[id];
+            }
+            let e = self.nodes.len() as Ex;
+            by_id[id] = e;
+            self.nodes.push(n);
+            return e;
+        }
         if let Some(&e) = self.map.get(&n) {
             return e;
         }
@@ -104,7 +468,15 @@ impl Interner {
     }
 
     pub fn get(&self, n: &Node) -> Option<Ex> {
-        self.map.get(n).copied()
+        let by_id = match *n {
+            Node::Class(id) => Some((&self.class_nodes, id)),
+            Node::Nominal(id) => Some((&self.individual_nodes, id)),
+            _ => None,
+        };
+        match by_id {
+            Some((v, id)) => v.get(id as usize).copied().filter(|&e| e != NO_EX),
+            None => self.map.get(n).copied(),
+        }
     }
 
     pub fn class(&mut self, c: &Class) -> Ex {
@@ -113,17 +485,7 @@ impl Interner {
             vocab::OWL_NOTHING => return BOTTOM,
             _ => {}
         }
-        let id = match self.class_ids.get(c) {
-            Some(&id) => id,
-            None => {
-                let id = self.classes.len() as u32;
-                self.classes.push(c.clone());
-                self.class_ids.insert(c.clone(), id);
-                self.met.push(false);
-                id
-            }
-        };
-        self.met[id as usize] = true;
+        let id = self.class_id(c);
         self.node(Node::Class(id))
     }
 
@@ -133,18 +495,16 @@ impl Interner {
             vocab::OWL_THING => Some(TOP),
             vocab::OWL_NOTHING => Some(BOTTOM),
             _ => self
-                .class_ids
+                .classes
                 .get(c)
-                .and_then(|&id| self.get(&Node::Class(id))),
+                .and_then(|id| self.get(&Node::Class(id))),
         }
     }
 
     /// Whether the run's normalization met the class `id`, which makes it a class of
     /// the signature.
     pub fn in_signature(&self, c: &Class) -> bool {
-        self.class_ids
-            .get(c)
-            .is_some_and(|&id| self.met[id as usize])
+        self.classes.get(c).is_some_and(|id| self.met[id as usize])
     }
 
     /// Forgets which classes the normalization met, before a run normalizes the axioms.
@@ -162,15 +522,7 @@ impl Interner {
     }
 
     pub fn nominal(&mut self, i: &NamedIndividual) -> Ex {
-        let id = match self.individual_ids.get(i) {
-            Some(&id) => id,
-            None => {
-                let id = self.individuals.len() as u32;
-                self.individuals.push(i.clone());
-                self.individual_ids.insert(i.clone(), id);
-                id
-            }
-        };
+        let id = self.individual_id(i);
         self.node(Node::Nominal(id))
     }
 
@@ -213,6 +565,9 @@ impl Interner {
             return a;
         }
         let (a, b) = if a < b { (a, b) } else { (b, a) };
+        if self.chunk {
+            return self.and(vec![a, b], true);
+        }
         self.node(Node::Conj(a, b))
     }
 }
@@ -351,6 +706,70 @@ pub struct Axioms {
 }
 
 impl Axioms {
+    /// Appends a chunk's normalized axioms to these, with the chunk's ids of
+    /// expressions and roles mapped to the merged interner's. The disjointness sets are
+    /// sorted by id, as the normalization sorts them.
+    pub fn append_mapped(&mut self, chunk: Axioms, nodes: &[Ex], roles: &[Role]) {
+        let n = |e: Ex| nodes[e as usize];
+        let r = |x: Role| roles[x as usize];
+        debug_assert!(chunk.data_ranges.is_empty());
+        self.subs
+            .extend(chunk.subs.into_iter().map(|(a, b)| (n(a), n(b))));
+        for mut d in chunk.disjoint {
+            for e in &mut d {
+                *e = n(*e);
+            }
+            d.sort_unstable();
+            // two operands that the chunk kept apart and that are one expression here
+            // make it unsatisfiable, as the normalization on one thread finds
+            for w in d.windows(2) {
+                if w[0] == w[1] {
+                    self.subs.push((w[0], BOTTOM));
+                }
+            }
+            d.dedup();
+            if d.len() >= 2 {
+                self.disjoint.push(d);
+            }
+        }
+        self.role_subs
+            .extend(chunk.role_subs.into_iter().map(|(a, b)| (r(a), r(b))));
+        self.chains.extend(
+            chunk
+                .chains
+                .into_iter()
+                .map(|(rs, s)| (rs.into_iter().map(r).collect(), r(s))),
+        );
+        self.reflexive.extend(chunk.reflexive.into_iter().map(r));
+        self.functional.extend(chunk.functional.into_iter().map(r));
+        self.ranges
+            .extend(chunk.ranges.into_iter().map(|(x, c)| (r(x), n(c))));
+        self.keys.extend(chunk.keys.into_iter().map(|k| Key {
+            class: n(k.class),
+            objects: k.objects.into_iter().map(r).collect(),
+            data: k.data.into_iter().map(r).collect(),
+        }));
+        self.individuals
+            .extend(chunk.individuals.into_iter().map(n));
+        self.classes.extend(chunk.classes.into_iter().map(n));
+    }
+
+    /// The bytes the normalized axioms take, roughly, from the lengths of the lists
+    /// alone, so that a normalization can ask often.
+    pub fn rough_bytes(&self) -> usize {
+        self.subs.capacity() * 8
+            + self.disjoint.capacity() * 40
+            + self.role_subs.capacity() * 8
+            + self.chains.capacity() * 48
+            + self.reflexive.capacity() * 4
+            + self.ranges.capacity() * 8
+            + self.data_ranges.capacity() * 8
+            + self.functional.capacity() * 4
+            + self.keys.capacity() * 72
+            + self.individuals.capacity() * 4
+            + self.classes.capacity() * 4
+    }
+
     /// The bytes the normalized axioms take.
     pub fn bytes(&self) -> usize {
         self.subs.capacity() * 8
@@ -759,14 +1178,12 @@ pub fn class_expression(
             if es.contains(&BOTTOM) {
                 return Ok((BOTTOM, partial));
             }
-            let mut acc = match es.first() {
-                None => return Ok((TOP, partial)),
-                Some(&e) => e,
-            };
-            for &e in &es[1..] {
-                acc = it.conj(acc, e);
+            match es.len() {
+                0 => (TOP, partial),
+                1 => (es[0], partial),
+                _ if it.chunk => (it.and(es, false), partial),
+                _ => (it.fold_conj(&mut es), partial),
             }
-            (acc, partial)
         }
         C::ObjectSomeValuesFrom(p, f) => {
             let (f, partial) = class_expression(f, it, depth + 1)?;
@@ -1162,11 +1579,27 @@ impl Index {
     }
 }
 
+/// A set of expressions, as a flag for each.
+#[derive(Default)]
+struct Seen(Vec<bool>);
+
+impl Seen {
+    /// Adds an expression, and says whether it is new.
+    #[inline]
+    fn insert(&mut self, e: Ex) -> bool {
+        let i = e as usize;
+        if self.0.len() <= i {
+            self.0.resize((i + 1).max(2 * self.0.len()), false);
+        }
+        !std::mem::replace(&mut self.0[i], true)
+    }
+}
+
 /// The occurrences an index build collects before it groups them by expression.
 #[derive(Default)]
 struct Builder {
-    neg_seen: FxHashSet<Ex>,
-    pos_seen: FxHashSet<Ex>,
+    neg_seen: Seen,
+    pos_seen: Seen,
     conj: Vec<(Ex, (Ex, Ex))>,
     exist: Vec<(Ex, (Role, Ex))>,
     selfs: Vec<(Role, Ex)>,

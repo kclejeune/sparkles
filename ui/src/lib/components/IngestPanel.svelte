@@ -3,6 +3,7 @@
   // confirm a large estimate, approve a preview, and open the review page. A CSV or TSV
   // file gets a mapping draft, which a dry run and then an upload apply. A workbook gets one
   // draft for each sheet, and uploads the sheet as CSV.
+  import Icon from './Icon.svelte';
   import { base } from '$app/paths';
   import * as api from '$lib/api';
   import { toasts } from '$lib/app.svelte';
@@ -198,17 +199,21 @@
           : ''}
       </p>
       <div class="row">
-        <input
-          bind:this={input}
-          type="file"
-          accept={ACCEPT}
-          aria-label="Document to ingest"
-          onchange={(e) => (file = e.currentTarget.files?.[0] ?? null)}
-        />
+        <label class="btn file-btn">
+          <Icon name="upload" size={14} /> Choose a document
+          <input
+            bind:this={input}
+            type="file"
+            accept={ACCEPT}
+            aria-label="Document to ingest"
+            onchange={(e) => (file = e.currentTarget.files?.[0] ?? null)}
+          />
+        </label>
+        <span class="faint small">{file ? file.name : 'No document chosen'}</span>
       </div>
       <div class="row small">
         <label
-          >Mode <select class="input sm" bind:value={mode} aria-label="Review mode">
+          >Mode <select class="select sm" bind:value={mode} aria-label="Review mode">
             <option value="branch">Review branch</option>
             <option value="preview">Preview, then approve</option>
             {#if canAdmin}<option value="auto">Automatic when every check passes</option>{/if}

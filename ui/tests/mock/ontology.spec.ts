@@ -248,9 +248,17 @@ test('a stale edit is refused and another writer’s commit refreshes the views'
   await expect(page.getByRole('button', { name: 'uni:Seminar' })).toBeVisible();
 
   // after a visit to another dataset, the feed follows uni again from the commit it shows
-  await page.getByRole('combobox', { name: 'Dataset' }).selectOption('foaf');
+  // the top bar's switcher reopens the page on the dataset it chooses
+  const choose = async (ds: string) => {
+    await page.locator('.ds-button').click();
+    await page
+      .getByRole('listbox', { name: 'Datasets' })
+      .getByRole('option', { name: new RegExp(`^${ds} `) })
+      .click();
+  };
+  await choose('foaf');
   await expect(page).toHaveURL(/ds=foaf/);
-  await page.getByRole('combobox', { name: 'Dataset' }).selectOption('uni');
+  await choose('uni');
   // Course stays open from before
   await expect(page.getByRole('button', { name: 'Collapse Course' })).toBeVisible();
   await expect(page.locator('.live')).toContainText('Live');

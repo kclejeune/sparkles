@@ -53,7 +53,11 @@ test('the query page, each result view and its menus', async ({ page }) => {
   await expectNoSidewaysScroll(page, 'the save dialog');
   await page.keyboard.press('Escape');
   await open(page, 'Format options');
-  await page.locator('.ds-button').click();
+  await open(page, /^Options$/);
+  await expect(page.getByRole('combobox', { name: 'Branch' })).toBeVisible();
+  // on a phone the dataset switcher is in the drawer
+  await page.getByRole('button', { name: 'Menu' }).click();
+  await page.getByRole('dialog', { name: 'Menu' }).locator('.ds-button').click();
   await expect(page.getByRole('listbox', { name: 'Datasets' })).toBeVisible();
   await expectNoSidewaysScroll(page, 'the dataset switcher');
 });
@@ -134,6 +138,7 @@ test('a branch: the selector, the Branches panel and its dialogs', async ({ page
   }
   await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'foaf'));
   await visit(page, '/ui/query');
+  await open(page, /^Options$/);
   await expect(page.getByRole('combobox', { name: 'Branch' })).toBeVisible();
 });
 

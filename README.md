@@ -181,8 +181,8 @@ The [benchmark reports](docs/benchmarks/README.md) give the full results, method
 The web UI is embedded in the server at `/ui/`. The first table shows what sets Sparkles
 apart: time travel, branch merges, forms generated from shapes, GraphRAG communities,
 questions in plain language, agent memory, path finding, inference, maps, validation,
-graph algorithms, facets, the embedding map, the visual query builder and the ontology
-editor. The collapsed panel below it has more workflows and detail views.
+graph algorithms, facets, the embedding map, the visual query builder, the ontology
+editor and the app shell. The collapsed panel below it has more workflows and detail views.
 
 <table>
   <tr>
@@ -278,6 +278,14 @@ editor. The collapsed panel below it has more workflows and detail views.
   <tr>
     <td>Nested blank-node children edited in one form and one commit</td>
     <td>An ordered list editor and a choice among sh:or alternatives</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/shell-search.png" alt="The top bar's search listing the demo dataset's classes and properties that match org, with the matched text highlighted and the kind of each entity"></td>
+    <td><img src="docs/images/shell-phone.png" alt="The web UI on a phone, with the drawer open over a dataset page, holding the dataset switcher, the pages, the connection status and the theme"></td>
+  </tr>
+  <tr>
+    <td>One top bar on every page: Ctrl+K or / searches the open dataset's entities</td>
+    <td>On a phone the pages move into a drawer and the search expands over the bar</td>
   </tr>
 </table>
 

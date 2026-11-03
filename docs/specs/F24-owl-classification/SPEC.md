@@ -37,7 +37,7 @@ representation.
 
 **External OWL DL reasoner bridge.** Run HermiT, Openllet or Konclude as a sandboxed child process or through the P04 JVM binding on an exported ontology, and write back inferred axioms and unsatisfiable classes with provenance. It gives DL classification and consistency without building a tableau reasoner, as Protégé's reasoner plug-ins do. It depends on items 71 and 339.
 
-**Inferred-axiom export and redundancy removal.** Export inferred subclass and equivalence axioms only, annotated as inferred, and remove redundant asserted subclass axioms. Every OBO release uses these ROBOT reason options.
+**Inferred-axiom export and redundancy removal (items 634, 635 and 637, delivered).** Export inferred subclass and equivalence axioms only, annotated as inferred, and remove redundant asserted subclass axioms. Every OBO release uses these ROBOT reason options.
 
 **Justifications for any entailed axiom.** Compute minimal and laconic justifications for entailed axioms, not only for findings and unsatisfiable classes, rendered in Manchester syntax. Sparkles' explanations are strong but limited to facts and RL findings. It depends on item 18.
 
@@ -75,8 +75,10 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 The OWL 2 EL classifier is delivered as roadmap item 580 and covers OWL 2 EL, apart
-from the literals and the chains that item 663 follows, since item 587. The other
-phases remain under [item 457](../../ROADMAP.md).
+from the literals and the chains that item 663 follows, since item 587. The export of
+inferred axioms and the removal of redundant ones are delivered as the ROBOT-compatible
+commands of items 634, 635 and 637. The other phases remain under
+[item 457](../../ROADMAP.md).
 
 ### The OWL 2 EL classifier
 
@@ -105,6 +107,26 @@ parallel sample sort, the nodes are numbered in one pass and filled in parallel 
 and the lookup from a class to its node is a table in IRI order that a binary search
 reads, in place of a hash map. The IRIs are distinct, so every number of threads gives
 one order (roadmap item 646).
+
+**Normalization and messages on several threads.** A run of 16,384 axioms or more on
+several threads normalizes chunks of the axioms in parallel, each into an interner of
+its own that keeps an intersection whole until the operands have their final ids. The
+chunks then merge in order into the run's interner, so that each name and expression
+gets the id a normalization on one thread gives it, the binary intersections are folded
+from the final ids and every thread count gives the same ids and taxonomy (roadmap
+item 644). A run whose chunks meet data ranges or literals, whose ids sit inside their
+values, normalizes on one thread. Each IRI is hashed once, held once in a table that
+keeps its hash, and a class's or an individual's expression is found by its id in an
+array (item 647). On several threads a worker buffers the messages it sends to other
+contexts and delivers them grouped by destination with a radix sort, taking each
+destination's lock once per batch, when the buffer fills, when another worker is idle
+and before it waits, and a long activation shares the contexts it woke with idle
+workers as it goes (item 645). The count of pending work is the shared queue's entries
+plus the busy workers, so a context marked active costs no shared counter. A context's
+subsumers stay a list of up to 12 members, searched eight at a time, before they become
+a hash set (item 648). The rules are compiled twice, and a run whose index has no
+individuals, universal roles, nominal self restrictions or functional data roles uses
+the copy without their checks (item 665).
 
 `Saturation` keeps the contexts over axioms that the caller keeps, reads them in place
 on every run and takes the axioms added and removed since the last run. `Classifier`
@@ -211,8 +233,12 @@ the property closure, which stops as soon as it passes the budget, the context s
 roots, the stored conclusions, the messages waiting in the contexts' to-do lists and
 the taxonomy with its links, which the budget checks before the taxonomy is built and
 again before the links are stored. The worlds count their copies, stored conclusions and
-waiting messages while they run, and the subsumers they keep once they end. The memory pool is charged for the growth of the peak.
-A counting allocator measured each run's peak heap within 14% of the estimate on GO,
+waiting messages while they run, and the subsumers they keep once they end. The chunks
+of a parallel normalization count their interners and axioms with room for what their
+merge adds, the merge counts what it adds past that room, and a run whose chunks pass
+the budget or a refused grant normalizes on one thread instead. The memory pool is
+charged for the growth of the peak, once, from the normalization on.
+A counting allocator measured each run's peak heap within 15% of the estimate on GO,
 ChEBI lite and the largest ORE 2015 EL ontologies. A run that stops before its saturation ends
 drops its contexts, since the next run starts again. In the handle the threads come from the
 algorithm pool, the budget from the query's memory budget and the server's memory pool
@@ -260,8 +286,8 @@ functional-style files and on every case that goes to the store, and the
 [file classification results](../../benchmarks/el-classification/RESULTS.md#file-classification)
 compare the command line's answers on GO, ChEBI lite and the ORE 2015 sample.
 `OntologyFile` holds the terminology, the assertions, the imports and the prefixes in
-memory, so the ROBOT-style commands of items 634 to 637 can read their input through it,
-and `read::Ontology::from_axioms` makes a command's output the next command's input
+memory, so the ROBOT-compatible commands read their input through it, and
+`read::Ontology::from_axioms` makes a command's output the next command's input
 without a file.
 
 **Writing the taxonomy.** A run with `target` writes the taxonomy to a named graph that it
@@ -299,8 +325,8 @@ classes, with 7 more direct edges, all through
 classifier leaves out and reports. Whelk 1.2.1 agrees on GO, ChEBI lite and 296 ORE
 ontologies and is incomplete on one. ROBOT 1.9.11's `reason`, `reduce`, `relax` and
 `materialize` with ELK assert the classifier's direct hierarchy on GO and ChEBI lite, and
-items 634 to 637 add ROBOT-compatible `sparkles ontology` commands for the
-outputs that Sparkles does not write. The
+`sparkles ontology reason`, `reduce` and `relax` write the same outputs, as the
+section below describes. The
 reasoners are packaged in `nix/reasoners` from checksum-pinned releases and run through
 `scripts/elk-compare/elk.sh`. On the benchmark host the classifier classifies GO, ChEBI
 lite and the 8 largest ORE ontologies faster than Konclude and Whelk, and HermiT confirms
@@ -323,11 +349,22 @@ expression, sent every activation through a shared queue and left out the taxono
 its estimate. An interleaved A/B on `atlas` against the build of commit aa0a41a6 took
 ChEBI lite on eight threads from 2,955 to 1,009 ms, `ore_ont_868` from 8,226 to 1,393 ms
 and `ore_ont_1559` from 8,099 to 781 ms, and the peak resident set from 1,337 to 804 MiB,
-3,514 to 1,686 MiB and 3,593 to 1,773 MiB. Normalization and interning still run on one
-thread and take most of a run on eight threads on the ORE ontologies, which item
-644 follows. Item 587's rules left the largest ORE ontologies within 3% of the build
-before, on either side, and ChEBI lite within 3%, and cost GO 2 to 3%, which item
-665 follows. The rules for individuals run in functions of their own, outside the
+3,514 to 1,686 MiB and 3,593 to 1,773 MiB. Item 587's rules left the largest ORE ontologies within 3% of the build
+before, on either side, and ChEBI lite within 3%, and cost GO 2 to 3%. Items 644, 645,
+648 and 665 then took ChEBI lite on eight threads from 912 to 393 ms, `ore_ont_868`
+from 862 to 599 ms, `ore_ont_13482` from 588 to 368 ms and GO from 88 to 77 ms, and GO
+on one thread from 288 to 279 ms, on forge against the build of commit 790cffae with the
+same taxonomy. On eight threads ChEBI lite's saturation fell from 737 to 273 ms and
+`ore_ont_868`'s index stage from 495 to 263 ms. The parallel normalization holds each
+chunk's names until the merge and the outboxes hold up to 4,096 messages per worker,
+which raises the peak resident set on eight threads from 911 to 988 MiB on ChEBI lite
+and from 279 to 295 MiB on GO, while that of the ORE ontologies falls, 1,739 to
+1,688 MiB on `ore_ont_868`. The chunks count against the memory budget, and a run whose
+chunks would pass it normalizes on one thread. Three variants measured no faster and
+are in [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md), the outboxes on
+one thread, outboxes that sort and drop repeated messages, and subsumer lists of up to
+32 members, and so is a merge of the chunks' names through sharded tables, commit
+208b8efc, reverted in 9ea7a425. The rules for individuals run in functions of their own, outside the
 saturation's loop, since a first build that kept them inline, commit 68a683b5, made the
 saturation of ontologies without individuals 3 to 19% slower on one thread in an
 interleaved A/B on `atlas` ([record](../../benchmarks/el-classification/runs/2026-11-03-el-inline-atlas-68a683b5/record.json)). The [benchmark
@@ -358,5 +395,81 @@ through `Classifier::saturate` and `Classifier::describe`, as
 Durable and automatic classification is item
 589, after item 339. A kept classification with assertions is item 590,
 the comparison and measurements against ELK were item 591, the speed and memory work
-against ELK were items 602 and 592, and normalization and interning on several threads
-are item 644.
+against ELK were items 602 and 592, and normalization on several threads, the
+saturation's scaling and the cost of item 587 on GO were items 644, 645 and 665.
+Cheaper contexts remain item 648, integer class ids in the taxonomy item 647, the
+saturation's sensitivity to axiom order item 683 and the rest of the index stage
+on several threads item 684.
+
+### ROBOT-compatible commands
+
+**The commands.** `sparkles ontology reason`, `reduce` and `relax` (items 634 and 635)
+follow ROBOT 1.9.11's `ReasonOperation`, `ReduceOperation` and `RelaxOperation` as their
+source is written, with the inferred axiom generators of OWL API 4.5.29 that ROBOT calls,
+so that a release pipeline gets the same axioms. The options take ROBOT's names, short
+names, values and defaults. `reason` and `reduce` read a boolean as ROBOT's
+`OptionsHelper` does, where `true` or `yes` in any case is true and any other value is
+false, and `relax` takes exactly `true` or `false`, as ROBOT's `getBooleanValue` does.
+ROBOT's error messages and its exit status 1 are kept. The transformations live in
+`sparkles_owl::transform` and work on a `Document` of a header and a set of axioms, with
+the classification passed in as a function, so they use the classifier without changing
+it. `sparkles::handles::ontology::transform::WorkingOntology` reads a file through
+`OntologyFile` or a database with `--loc`, runs the classifier with the caller's
+threads, deadline and budgets, and writes functional-style syntax, RDF/XML, Turtle and
+N-Triples, gzipped when the name ends in `.gz`.
+
+**What each command does.** `reason` validates as ROBOT's `ReasonerHelper.validate` does.
+An inconsistent ontology, an unsatisfiable class or an unsatisfiable object property
+fails, and the last is found with ROBOT's probe for ELK, a fresh class under
+`ObjectSomeValuesFrom(p owl:Thing)` for each property, added to the same classification
+and left out of every answer. `--dump-unsatisfiable` writes the syntactic bottom-locality
+module of the unsatisfiable classes, which holds every justification, as ROBOT's `BOT`
+extraction does. The subclass, equivalence and class assertion generators work over the
+classes and individuals of the ontology's signature. A class the taxonomy does not hold,
+such as a declared obsolete class, is a direct subclass of `owl:Thing`, as ELK answers,
+and class assertions come from a second classification with a fresh class equivalent to
+`ObjectOneOf(a)` for each individual. The generators whose queries ELK does not answer
+add nothing and log a warning, as in ROBOT. The duplicate, `owl:Thing`, external-entity
+and tautology exclusions, the `is_inferred` annotation, the new ontology modes and the
+removal of redundant subclass axioms follow ROBOT, which removes only the unannotated
+form of an axiom. For the axioms between named entities that the generators write, the
+axioms the empty ontology entails are exactly ROBOT's structural tautologies, so
+`--exclude-tautologies all` needs no other reasoner. `reduce` by default classifies the
+subclass axioms and the property characteristics alone, with each anonymous class
+expression of a subclass axiom named by a fresh class equivalent to it, as ROBOT does,
+so it removes redundant existential axioms with the classifier's taxonomy of named
+classes and needs none of the existential subsumers that item 636 exposes.
+`--named-classes-only` keeps the subclass axioms between named classes that are direct
+edges of the whole ontology's taxonomy. `relax` adds the subclass axioms for the
+existential restrictions, cardinality restrictions above zero and named conjuncts of
+equivalences, and of complex superclasses with `--include-subclass-of`.
+
+**Chains.** Each command ends in a hidden list of the arguments that follow it, which is
+parsed again as the next command, so that `sparkles ontology reason --input x.owl relax
+reduce --output y.owl` runs in one process with the ontology in memory (item 637).
+`classify` and `check` can join a chain and end it with status 1 where they would exit
+with it alone. A chain can also start from `classify FILE` or `check FILE`, which answer
+from the file as they do alone before the rest of the chain reads it. FILE is their
+first positional argument and the next command is the second, so the options after the
+next command belong to it. A chain from a database starts with `reason`, `reduce` or
+`relax` and `--loc`. `--input` on a later command is ROBOT's chained input error, and
+`--output` on any command writes the ontology after it. A malformed command line exits
+with status 2, as every `sparkles` command does, where ROBOT documents only a non-zero
+status.
+
+**Comparison with ROBOT.** `scripts/elk-compare/ofn-axioms.py` compares two
+functional-style files after expanding prefixes and sorting the operands of n-ary
+constructors. On GO and ChEBI lite the outputs of `reason`, `reduce`, `relax` and the
+chain `reason relax reduce` equal ROBOT 1.9.11's with ELK 0.6.0 axiom for axiom,
+annotations included: 622,357 axioms of GO's reasoned ontology and 1,682,146 of ChEBI
+lite's, of which 96,847 and 424,904 are logical. On the benchmark host `reason` took 3.45 s
+on GO and 7.74 s on ChEBI lite from the RDF/XML release, against `robot reason`'s 14.04 s
+and 30.63 s, and the chain took 3.87 s and 10.27 s. The run record of the
+[ROBOT comparison](../../benchmarks/el-classification/RESULTS.md#robot) keeps the
+comparison and the timings.
+
+**Limits.** The commands read no dataset on a server (item 685), write no OWL/XML,
+Manchester, OBO or OBO Graphs JSON (item 686), and refuse
+`--prevent-invalid-references true` (item 687). `reason --reasoner emr` asserts
+named superclasses only, as ELK does, not the class expressions that ROBOT's expression
+materializing reasoner adds. `robot materialize` is item 636.
