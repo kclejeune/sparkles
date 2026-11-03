@@ -138,6 +138,7 @@ ev:AssessmentShape a sh:NodeShape ;
   sh:property [ sh:path ev:evaluatedAt ; sh:datatype xsd:dateTime ; sh:pattern "(Z|[+-][0-9]{2}:[0-9]{2})$" ; sh:maxCount 1 ; sh:minCount 1 ] ;
   sh:property [ sh:path prov:wasGeneratedBy ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
   sh:property [ sh:path prov:wasAttributedTo ; sh:nodeKind sh:IRI ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:used ; sh:nodeKind sh:IRI ; sh:maxCount 64 ] ;
   sh:message "Evidence profile version 1 requires the documented record structure." .
 
 ev:ConfidenceShape a sh:NodeShape ;

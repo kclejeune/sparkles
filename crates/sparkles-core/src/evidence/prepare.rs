@@ -17,6 +17,18 @@ pub const MAX_IDENTITIES: usize = 1_000;
 /// The fewest and most entities one identity proposal names.
 pub const MIN_IDENTITY_ENTITIES: usize = 2;
 pub const MAX_IDENTITY_ENTITIES: usize = 64;
+/// The most records one assessment names as its inputs.
+pub const MAX_ASSESSMENT_INPUTS: usize = 64;
+/// The record kinds an assessment may name as an input.
+pub const ASSESSMENT_INPUT_KINDS: &[RecordKind] = &[
+    RecordKind::Claim,
+    RecordKind::Assessment,
+    RecordKind::IdentityProposal,
+    RecordKind::SourceRevision,
+    RecordKind::ReviewDecision,
+    RecordKind::AcceptanceSupport,
+    RecordKind::ResolutionMap,
+];
 
 /// Work that a typed runtime resolver must complete before publishing any record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -645,7 +657,28 @@ impl Preparation<'_> {
         self.frame.literal(&assessment.evaluated_at)?;
         self.node(&assessment.attributed_evaluator)?;
         self.confidence(assessment.confidence.as_ref(), false)?;
-        self.scope(&assessment.scope)
+        self.scope(&assessment.scope)?;
+        // Inputs are framed only when present, so an assessment without them keeps the
+        // digest it had before they existed. The number field cannot be read as the
+        // start of the next record.
+        let inputs = &assessment.inputs;
+        if inputs.len() > MAX_ASSESSMENT_INPUTS {
+            return Err(Error::invalid(format!(
+                "assessments.inputs: an assessment names at most {MAX_ASSESSMENT_INPUTS} inputs"
+            )));
+        }
+        if (1..inputs.len()).any(|i| inputs[..i].contains(&inputs[i])) {
+            return Err(Error::invalid(
+                "assessments.inputs: an assessment names an input twice",
+            ));
+        }
+        if !inputs.is_empty() {
+            self.number(inputs.len() as u64)?;
+            for input in inputs {
+                self.reference(input, ASSESSMENT_INPUT_KINDS)?;
+            }
+        }
+        Ok(())
     }
 }
 

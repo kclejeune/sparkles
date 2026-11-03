@@ -53,6 +53,7 @@ DEFERRED = {
     "evidence.acquire_hold",
     "evidence.configure",
     "evidence.detach",
+    "evidence.find_dependents",
     "evidence.holds",
     "evidence.propose",
     "evidence.release_hold",

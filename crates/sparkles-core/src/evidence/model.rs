@@ -187,6 +187,9 @@ pub struct AssessmentInput {
     pub attributed_evaluator: NamedNode,
     pub confidence: Option<Confidence>,
     pub scope: Scope,
+    /// The records the evaluation consumed, written as `prov:used`. A dependent of a
+    /// changed record is found through them.
+    pub inputs: Vec<RecordRef>,
 }
 
 /// The relation an identity proposal proposes between its entities.

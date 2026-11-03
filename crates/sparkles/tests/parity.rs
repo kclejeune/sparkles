@@ -462,6 +462,9 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("resolveIdentities", "evidence.resolve_entities", |ds| {
             let _ = sparkles::evidence::resolve_entities(ds, ds, "", &[], None, &any());
         }),
+        op!("listEvidenceDependents", "evidence.find_dependents", |ds| {
+            let _ = sparkles::evidence::find_dependents(ds, ds, &[], false, None, &any());
+        }),
         op!("getGeoIndex", "indexes.geo.status", |ds| {
             ds.indexes().geo().status();
         }),

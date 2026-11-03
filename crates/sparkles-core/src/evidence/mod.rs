@@ -28,9 +28,9 @@ pub use model::{
 };
 
 pub use prepare::{
-    MAX_CLAIMS, MAX_IDENTITIES, MAX_IDENTITY_ENTITIES, MAX_LINKS, MIN_IDENTITY_ENTITIES,
-    NormalizedSourceTime, NormalizedSourceTimes, PreparedContent, PreparedInput,
-    ResolutionRequirement, prepare_input,
+    ASSESSMENT_INPUT_KINDS, MAX_ASSESSMENT_INPUTS, MAX_CLAIMS, MAX_IDENTITIES,
+    MAX_IDENTITY_ENTITIES, MAX_LINKS, MIN_IDENTITY_ENTITIES, NormalizedSourceTime,
+    NormalizedSourceTimes, PreparedContent, PreparedInput, ResolutionRequirement, prepare_input,
 };
 
 pub use settings::{

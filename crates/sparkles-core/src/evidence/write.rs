@@ -770,6 +770,15 @@ pub fn plan<'i>(
                 later.push(assessment);
                 continue;
             };
+            let Ok(inputs) = assessment
+                .inputs
+                .iter()
+                .map(|i| b.resolve(i))
+                .collect::<Result<std::collections::BTreeSet<NamedNode>>>()
+            else {
+                later.push(assessment);
+                continue;
+            };
             no_blank("assessments.conclusion", &assessment.conclusion)?;
             let iri = b.mint(
                 RecordKind::Assessment,
@@ -791,6 +800,9 @@ pub fn plan<'i>(
             );
             r.confidence("analystConfidence", assessment.confidence.as_ref());
             r.scope("assessments", &assessment.scope)?;
+            for input in inputs {
+                r.add(prov("used"), input);
+            }
             b.local.insert(assessment.key.as_str(), iri);
             push(
                 &mut records,
@@ -802,7 +814,7 @@ pub fn plan<'i>(
         }
         if later.len() == before {
             return Err(Error::invalid(
-                "assessments: the batch's assessments target each other in a cycle",
+                "assessments: the batch's assessments target or use each other in a cycle",
             ));
         }
         pending = later;

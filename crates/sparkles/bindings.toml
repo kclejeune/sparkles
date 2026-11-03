@@ -441,6 +441,11 @@ python = "planned: evidence settings in the bindings with the typed evidence ope
 jvm = "planned: evidence settings in the bindings with the typed evidence operations"
 node = "planned: evidence settings in the bindings with the typed evidence operations"
 
+["evidence.find_dependents"]
+python = "planned: evidence dependents in the bindings with the typed evidence operations"
+jvm = "planned: evidence dependents in the bindings with the typed evidence operations"
+node = "planned: evidence dependents in the bindings with the typed evidence operations"
+
 ["evidence.holds"]
 python = "planned: evidence holds in the bindings with the typed evidence operations"
 jvm = "planned: evidence holds in the bindings with the typed evidence operations"

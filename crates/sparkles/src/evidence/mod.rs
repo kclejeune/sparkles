@@ -97,6 +97,9 @@ pub use propose::{
     AuthorityFence, Options as ProposeOptions, Proposed, ProposedRecord, operation_recorded,
     propose, reconcile_operation_holds,
 };
+pub use review::dependents::{
+    self, Dependence, Dependent, Dependents, MAX_CHANGED, dependents as find_dependents,
+};
 pub use review::identity::{
     self, EntityResolution, MAX_MEMBERS, MAX_RESOLVE, RESOLVES_TO, ResolvedEntity,
     resolve as resolve_entities,
@@ -107,13 +110,16 @@ pub use review::{
 };
 pub use sparkles_core::evidence::review::{DecisionInput, Disposition, WithdrawalInput};
 pub use sparkles_core::evidence::{
+    ASSESSMENT_INPUT_KINDS, MAX_ASSESSMENT_INPUTS, MAX_IDENTITIES, MAX_IDENTITY_ENTITIES,
+    MIN_IDENTITY_ENTITIES,
+};
+pub use sparkles_core::evidence::{
     AssessmentInput, ClaimInput, Confidence, ConfidenceFacets, EvidenceInput, EvidenceLinkInput,
     EvidenceRefInput, EvidenceRefTarget, EvidenceRelation, JSON_LEXICAL_UTF8_V1,
     JSON_LEXICAL_UTF8_VERSION, MethodRef, PassageInput, Polarity, RecordKey, RecordRef,
     RecordVersion, RenditionContent, RenditionInput, Scope, SourceContent, SourceLineage,
     SourceMetadata, SourceRevisionInput, SourceTimes,
 };
-pub use sparkles_core::evidence::{MAX_IDENTITIES, MAX_IDENTITY_ENTITIES, MIN_IDENTITY_ENTITIES};
 
 // ------------------------------------------------------------ settings ------------
 

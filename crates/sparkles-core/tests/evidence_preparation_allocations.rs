@@ -156,6 +156,7 @@ fn input(kind: &str) -> EvidenceInput {
             attributed_evaluator: node("urn:evaluator"),
             confidence: None,
             scope: BTreeMap::new(),
+            inputs: Vec::new(),
         }),
         _ => unreachable!(),
     }
