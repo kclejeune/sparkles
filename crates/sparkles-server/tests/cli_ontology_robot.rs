@@ -461,3 +461,70 @@ SubClassOf(Annotation(rdfs:comment "x") :A :D)
     let g = axioms(&dir.join("g.ofn"));
     assert!(!g.iter().any(|l| l.starts_with("SubClassOf")), "{g:?}");
 }
+
+/// GO's pattern: part of is transitive and the inverse of has part, which OWL 2 EL lacks.
+const INVERSE: &str = r#"Prefix(:=<http://ex.org/>)
+Ontology(<http://ex.org/go>
+Declaration(Class(:FilopodiumMembrane))
+Declaration(Class(:Membrane))
+Declaration(Class(:Filopodium))
+Declaration(Class(:Cytoskeleton))
+Declaration(Class(:Organelle))
+Declaration(Class(:MembraneBounded))
+Declaration(Class(:OrganelleMembrane))
+Declaration(ObjectProperty(:part_of))
+Declaration(ObjectProperty(:has_part))
+TransitiveObjectProperty(:part_of)
+InverseObjectProperties(:part_of :has_part)
+SubClassOf(:FilopodiumMembrane :Membrane)
+SubClassOf(:FilopodiumMembrane ObjectSomeValuesFrom(:part_of :Filopodium))
+SubClassOf(:Filopodium ObjectSomeValuesFrom(:part_of :Cytoskeleton))
+SubClassOf(:Cytoskeleton :Organelle)
+EquivalentClasses(:MembraneBounded ObjectIntersectionOf(:Organelle ObjectSomeValuesFrom(:has_part :Membrane)))
+EquivalentClasses(:OrganelleMembrane ObjectIntersectionOf(:Membrane ObjectSomeValuesFrom(:part_of :MembraneBounded)))
+)
+"#;
+
+#[test]
+fn reasoner_elk_runs_the_el_rules_and_the_default_the_horn_rules() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("go.ofn"), INVERSE).unwrap();
+    // the same ontology without the inverse, which the EL rules alone classify
+    let el: String = INVERSE
+        .lines()
+        .filter(|l| !l.starts_with("InverseObjectProperties("))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(dir.join("el.ofn"), el).unwrap();
+    let inferred = "SubClassOf(:FilopodiumMembrane :OrganelleMembrane)";
+    for (cmd, out_name) in [("reason", "r"), ("reduce", "d")] {
+        let elk = format!("{out_name}.elk.ofn");
+        let o = sparkles(
+            dir,
+            &["ontology", cmd, "-i", "go.ofn", "-r", "ELK", "-o", &elk],
+        );
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        let base = format!("{out_name}.el.ofn");
+        let o = sparkles(dir, &["ontology", cmd, "-i", "el.ofn", "-o", &base]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        let mut elk_axioms = axioms(&dir.join(&elk));
+        elk_axioms.retain(|l| !l.starts_with("InverseObjectProperties("));
+        assert_eq!(elk_axioms, axioms(&dir.join(&base)), "{cmd}");
+        let def = format!("{out_name}.default.ofn");
+        let o = sparkles(dir, &["ontology", cmd, "-i", "go.ofn", "-o", &def]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        if cmd == "reason" {
+            assert!(!axioms(&dir.join(&elk)).contains(inferred));
+            assert!(axioms(&dir.join(&def)).contains(inferred), "{}", err(&o));
+            let o = sparkles(
+                dir,
+                &[
+                    "ontology", cmd, "-i", "go.ofn", "-r", "hermit", "-o", "h.ofn",
+                ],
+            );
+            assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+            assert!(axioms(&dir.join("h.ofn")).contains(inferred));
+        }
+    }
+}

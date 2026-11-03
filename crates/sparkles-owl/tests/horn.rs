@@ -651,3 +651,91 @@ fn an_incremental_change_after_a_horn_normalization_without_horn_rules_classifie
     let out = k.classify(&Limits::default()).unwrap();
     assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
 }
+
+#[test]
+fn the_el_only_mode_gives_the_el_answer_and_the_default_the_horn_one() {
+    // GO's pattern: part of is transitive and the inverse of has part, and a
+    // membrane-bounded organelle is an organelle with a membrane part
+    let body = "TransitiveObjectProperty(:part_of)
+         InverseObjectProperties(:part_of :has_part)
+         SubClassOf(:FilopodiumMembrane :Membrane)
+         SubClassOf(:FilopodiumMembrane ObjectSomeValuesFrom(:part_of :Filopodium))
+         SubClassOf(:Filopodium ObjectSomeValuesFrom(:part_of :Cytoskeleton))
+         SubClassOf(:Cytoskeleton :Organelle)
+         EquivalentClasses(:MembraneBounded ObjectIntersectionOf(:Organelle ObjectSomeValuesFrom(:has_part :Membrane)))
+         EquivalentClasses(:OrganelleMembrane ObjectIntersectionOf(:Membrane ObjectSomeValuesFrom(:part_of :MembraneBounded)))";
+    let ax = axioms(body);
+    let mut answers = Vec::new();
+    for el_only in [true, false] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                el_only,
+                ..Limits::default()
+            })
+            .unwrap();
+        answers.push((out, k.excluded()));
+    }
+    let (el, el_ex) = &answers[0];
+    let (horn, horn_ex) = &answers[1];
+    // the ELK mode leaves the inverse out, as ELK does, and misses the subsumption
+    assert_eq!(el_ex.len(), 1, "{el_ex:#?}");
+    assert!(
+        !el.taxonomy
+            .is_subclass(&c("FilopodiumMembrane"), &c("OrganelleMembrane"))
+    );
+    assert_eq!(el.stats.conjunctions, 0);
+    // the default takes it with the Horn rules
+    assert!(horn_ex.is_empty(), "{horn_ex:#?}");
+    assert!(
+        horn.taxonomy
+            .is_subclass(&c("FilopodiumMembrane"), &c("OrganelleMembrane"))
+    );
+    // only the cytoskeleton the membrane is part of has it as a part
+    assert!(
+        !horn
+            .taxonomy
+            .is_subclass(&c("Cytoskeleton"), &c("MembraneBounded"))
+    );
+    // the ELK mode is the EL classification of the ontology without the inverse
+    let el_part: Vec<Axiom> = ax
+        .iter()
+        .filter(|a| !matches!(a.kind, AxiomKind::InverseObjectProperties(..)))
+        .cloned()
+        .collect();
+    let mut k = Classifier::of(&el_part);
+    let plain = k.classify(&Limits::default()).unwrap();
+    assert!(k.excluded().is_empty());
+    let pairs = |o: &Classification| -> Vec<(String, String)> {
+        let t = &o.taxonomy;
+        let cs: Vec<Class> = t.classes().cloned().collect();
+        let mut v = Vec::new();
+        for x in &cs {
+            for y in &cs {
+                if t.is_subclass(x, y) {
+                    v.push((x.as_str().to_string(), y.as_str().to_string()));
+                }
+            }
+        }
+        v.sort();
+        v
+    };
+    assert_eq!(pairs(el), pairs(&plain));
+    // a kept classifier that changes mode classifies again
+    let mut k = Classifier::of(&ax);
+    let elk = Limits {
+        el_only: true,
+        ..Limits::default()
+    };
+    k.classify(&elk).unwrap();
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(
+        out.taxonomy
+            .is_subclass(&c("FilopodiumMembrane"), &c("OrganelleMembrane"))
+    );
+    let out = k.classify(&elk).unwrap();
+    assert!(
+        !out.taxonomy
+            .is_subclass(&c("FilopodiumMembrane"), &c("OrganelleMembrane"))
+    );
+}

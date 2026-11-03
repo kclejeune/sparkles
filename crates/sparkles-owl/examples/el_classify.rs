@@ -79,6 +79,7 @@ fn main() {
     let mut tax_out = None;
     let mut repeat = 1usize;
     let mut heap = false;
+    let mut el_only = false;
     let mut owned = false;
     let mut input = None;
     while let Some(a) = args.next() {
@@ -89,11 +90,14 @@ fn main() {
             "--repeat" => repeat = args.next().and_then(|v| v.parse().ok()).unwrap_or(1),
             "--heap" => heap = true,
             "--owned" => owned = true,
+            "--el-only" => el_only = true,
             _ => input = Some(a),
         }
     }
     let Some(input) = input else {
-        eprintln!("usage: el_classify [--threads N] [--ofn-out FILE] [--taxonomy FILE] INPUT");
+        eprintln!(
+            "usage: el_classify [--threads N] [--el-only] [--ofn-out FILE] [--taxonomy FILE] INPUT"
+        );
         std::process::exit(2);
     };
     let t = Instant::now();
@@ -141,6 +145,7 @@ fn main() {
     let rss_read = peak_rss_kib();
     let limits = Limits {
         threads,
+        el_only,
         ..Limits::default()
     };
     let mut times = Vec::new();

@@ -1035,6 +1035,7 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 target: string(a, "target")?.map(graph_ref).transpose()?,
                 message: string(a, "message")?.map(str::to_string),
                 about: about.clone(),
+                el_only: false,
             };
             let q = ClassifyQuery {
                 about,

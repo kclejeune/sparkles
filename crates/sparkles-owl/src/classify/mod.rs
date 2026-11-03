@@ -86,9 +86,13 @@ use std::time::{Duration, Instant};
 const CHAIN_RANGE_RULE: &str = "OWL 2 Profiles §2.2.6";
 
 /// What bounds a run: the worker threads, a deadline, a memory budget and a cancellation
-/// check.
+/// check, and the rules it may use.
 #[derive(Clone, Default)]
 pub struct Limits {
+    /// classify by the OWL 2 EL rules alone, as ELK does: the Horn rules of item 603
+    /// never run, and every axiom outside OWL 2 EL is left out and reported, so the
+    /// taxonomy is ELK's. The default takes the Horn axioms outside OWL 2 EL.
+    pub el_only: bool,
     /// worker threads; 0 takes the machine's available parallelism
     pub threads: usize,
     pub deadline: Option<Instant>,
@@ -785,7 +789,7 @@ impl Saturation {
             },
             index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
         };
-        if !candidates.is_empty() && self.horn_allowed(&ax) {
+        if !candidates.is_empty() && !limits.el_only && self.horn_allowed(&ax) {
             let flags = horn::normalize(
                 &candidates,
                 &mut self.interner,
