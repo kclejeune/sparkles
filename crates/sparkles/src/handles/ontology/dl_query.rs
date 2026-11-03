@@ -48,6 +48,7 @@ use crate::error::{Error, Result};
 use crate::reasoning::{Demand, ReasoningMode};
 use crate::sparql::QueryOptions;
 use oxrdf::{GraphName, Quad, Term};
+use sparkles_core::algo::pool::Par;
 use sparkles_owl::classify::{Changes, Description, Excluded, Gap, Saturation};
 use sparkles_owl::manchester::{self, Parsed, Vocabulary, What};
 use sparkles_owl::profiles::{self, Profile};
@@ -529,9 +530,9 @@ impl Ontologies {
         // the threads of the request
         let describe = |s: &mut Saturation,
                         axioms: &[&AxiomKind],
-                        changes: Option<Changes<'_>>|
+                        changes: Option<Changes<'_>>,
+                        par: Par|
          -> Result<(bool, Description, Vec<Excluded>, u64)> {
-            let par = admit(q.threads, opts)?;
             let r = saturate(s, axioms, changes, par, opts)?;
             let d = s.describe(&qc).ok_or_else(|| {
                 Error::invalid("the classifier holds no saturation of the query class")
@@ -550,16 +551,26 @@ impl Ontologies {
                 // the kept saturation reads the defining axiom beside the ontology's, and
                 // the next run over it lets the axiom go
                 self.with_kept(req, opts, |e| {
+                    // the threads come first: a wait that ends at the deadline leaves the
+                    // kept state as it was
+                    let par = admit(q.threads, opts)?;
                     let (c, d, ex, memory) =
                         e.run_over(o, vec![ax.kind.clone()], |s, axioms, changes| {
-                            describe(s, axioms, changes)
+                            describe(s, axioms, changes, par)
                         })?;
-                    Ok(((c, d, ex), memory as usize <= CACHE_MAX_BYTES))
+                    // the kept taxonomy counts with the saturation against the bound, and
+                    // goes first when both do not fit
+                    let memory = memory as usize;
+                    if e.taxonomy_memory() + memory > CACHE_MAX_BYTES {
+                        e.drop_taxonomy();
+                    }
+                    Ok(((c, d, ex), memory <= CACHE_MAX_BYTES))
                 })?
             } else {
                 let mut axioms = logical_axioms(&o.ontology);
                 axioms.push(&ax.kind);
-                let (c, d, ex, _) = describe(&mut Saturation::new(), &axioms, None)?;
+                let par = admit(q.threads, opts)?;
+                let (c, d, ex, _) = describe(&mut Saturation::new(), &axioms, None, par)?;
                 (c, d, ex)
             };
             answer.consistent = Some(consistent);
@@ -612,7 +623,9 @@ impl Ontologies {
                     .filter(|k| sparkles_owl::classify::logical(k)),
             );
             axioms.push(&ax.kind);
-            let (consistent, d, excluded, _) = describe(&mut Saturation::new(), &axioms, None)?;
+            let par = admit(q.threads, opts)?;
+            let (consistent, d, excluded, _) =
+                describe(&mut Saturation::new(), &axioms, None, par)?;
             answer.consistent = Some(consistent);
             if answer.satisfiable.is_none() {
                 answer.satisfiable = Some(d.satisfiable);

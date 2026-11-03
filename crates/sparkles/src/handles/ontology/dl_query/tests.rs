@@ -596,3 +596,63 @@ fn a_name_many_assertions_share_reads_as_ambiguous_within_a_bound() {
     let n = j["candidates"].as_array().unwrap().len();
     assert!((2..=256).contains(&n), "{n} candidates");
 }
+
+#[test]
+fn a_query_refused_threads_leaves_the_kept_state_as_it_was() {
+    let ds = dataset(
+        "Declaration(Class(:A)) Declaration(Class(:B)) Declaration(Class(:Z)) SubClassOf(:A :B)",
+    );
+    let h = ds.ontology();
+    let req = OntologyRequest::default();
+    let c = |s: &str| Class::new(format!("http://ex.org/{s}"));
+    let a = h
+        .classify(&req, &ClassifyRequest::default(), &Default::default())
+        .unwrap();
+    assert!(a.classification.taxonomy.is_subclass(&c("A"), &c("B")));
+    ds.update(
+        "PREFIX : <http://ex.org/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+         DELETE DATA { :A rdfs:subClassOf :B }",
+    )
+    .unwrap();
+    // a query whose wait for threads ends at the deadline gives the saturation nothing
+    crate::handles::ontology::classify::REFUSE_ADMISSION.with(|r| r.set(true));
+    let Err(e) = query_with(
+        &ds,
+        "Z",
+        DlReasoning::Auto,
+        &["subclasses"],
+        &Default::default(),
+    ) else {
+        panic!("a refused query answered");
+    };
+    assert!(matches!(e, Error::Timeout), "{e}");
+    let b = h
+        .classify(&req, &ClassifyRequest::default(), &Default::default())
+        .unwrap();
+    assert!(!b.classification.taxonomy.is_subclass(&c("A"), &c("B")));
+    let q = query(&ds, "B");
+    assert_eq!(q.subclasses, Some(vec![]));
+}
+
+#[test]
+fn the_kept_taxonomy_counts_beside_a_query_saturation() {
+    let ds = dataset(UNI);
+    let h = ds.ontology();
+    h.classify(
+        &OntologyRequest::default(),
+        &ClassifyRequest::default(),
+        &Default::default(),
+    )
+    .unwrap();
+    let kept = || {
+        ds.state()
+            .classify_cache
+            .lock()
+            .as_ref()
+            .map(|e| e.taxonomy_memory())
+    };
+    let before = kept().unwrap();
+    assert!(before > 0);
+    query(&ds, "teaches some Course");
+    assert_eq!(kept(), Some(before));
+}

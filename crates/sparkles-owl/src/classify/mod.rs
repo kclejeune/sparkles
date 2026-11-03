@@ -115,6 +115,9 @@ pub struct Stats {
     /// the estimated bytes the run keeps: the index, the contexts, the taxonomy and a
     /// classifier's copy of the axioms
     pub memory: usize,
+    /// the part of [`memory`](Stats::memory) that the taxonomy takes, 0 for a run
+    /// without one
+    pub taxonomy_memory: usize,
     /// the most estimated bytes the run held at once, which a memory budget bounds:
     /// [`memory`](Stats::memory) and, while the saturation ran, the messages waiting in
     /// the contexts' to-do lists
@@ -834,6 +837,7 @@ impl Saturation {
                 },
             })?;
         stats.memory = held + tax_bytes;
+        stats.taxonomy_memory = tax_bytes;
         stats.peak_memory = totals.peak.max(stats.memory);
         stats.taxonomy = t.elapsed();
         stats.contexts = self.ctx.iter().filter(|c| c.get().is_some()).count();

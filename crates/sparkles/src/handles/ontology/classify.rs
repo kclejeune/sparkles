@@ -124,6 +124,18 @@ pub struct CacheEntry {
 }
 
 impl CacheEntry {
+    /// The estimated bytes of the kept taxonomy, 0 when none is kept.
+    pub(super) fn taxonomy_memory(&self) -> usize {
+        self.result
+            .as_ref()
+            .map_or(0, |(cl, _)| cl.stats.taxonomy_memory)
+    }
+
+    /// Lets the kept taxonomy go, so that the next classification builds it again.
+    pub(super) fn drop_taxonomy(&mut self) {
+        self.result = None;
+    }
+
     /// Runs `go` on the kept saturation over the logical axioms of `o` and `extra`, with
     /// the changes since the axioms it last read, so that it saturates again only what
     /// they reach. The saturation holds the new axioms afterwards whether the run ends
