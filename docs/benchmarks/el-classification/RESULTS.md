@@ -131,9 +131,13 @@ on `wally` on four threads.
 | `ore_ont_1559` | 1 | 785 | 269 | 139 | 388 | 422 |
 | | 8 | 576 | 70 | 84 | | |
 
-Saturation and the taxonomy scale with the threads. Normalization and interning run on
-one thread and take most of a run on eight threads on the ORE ontologies, which roadmap
-item NEW-ITEM-1 follows. The estimate comes within 14% of the counted heap on each
+Normalization and interning run on one thread and take most of a run on eight threads
+on the ORE ontologies, which roadmap item NEW-ITEM-1 follows. On `ore_ont_868` the
+taxonomy's sort, node construction and lookup also run on one thread, item NEW-ITEM-3.
+ChEBI lite's saturation scales least. A stage trace on `atlas` shows its workers
+spending 4.8 s in all on eight threads on the work that one thread does in 0.72 s, and
+one activation of a hub context taking 422 ms after the roots run out, which item
+NEW-ITEM-2 follows. `ore_ont_13482` pays for 659,619 small contexts, item NEW-ITEM-5. The estimate comes within 14% of the counted heap on each
 ontology, so a memory budget bounds what it states. The classifier reads the axioms in
 place, as the server's kept classification reads those of the open ontology, so the
 peak resident set above holds one copy of the axioms.
