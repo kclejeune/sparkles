@@ -1,0 +1,4891 @@
+{
+ "suite": "el-classification",
+ "kind": "measurement",
+ "scale": "GO 2026-07-26, ChEBI lite 256 and 13 of the largest ORE 2015 EL ontologies",
+ "host": {
+  "name": "forge",
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "ram_mib": 15620,
+  "kernel": "7.2.9"
+ },
+ "manifest": {
+  "commit": "65a7591d",
+  "base_commit": "790cffae",
+  "binary": "crates/sparkles-owl/examples/el_classify.rs",
+  "binary_sha256": {
+   "bin/base-el_classify": "e84c94840f98663f6e8360bfb6b3a2c950d66cd1715f4038aa6eb0e50031c47f",
+   "bin/lane-el_classify": "38d1c3c4ebb6ae1e2edb467bff1a1811660dcb5aaf83dc93cc0520cf79a30823"
+  },
+  "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on the laptop at 65a7591d for the lane and 790cffae for the base, copied to the benchmark host. The commit after 65a7591d, 82d64aed, changes only the memory reserved for a parallel normalization's merge and tests, and heap-nsc.txt measures its estimate.",
+  "reference": "ELK 0.6.0 and Konclude 0.7.0-1138 through scripts/elk-compare/elk.sh (ElkClassify.java sha256 5f879733…, konclude.py sha256 42eb3da4…) from the store paths in env.txt",
+  "data": {
+   "chebi_lite": {
+    "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+   },
+   "go": {
+    "sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+   },
+   "ore_ont_10689": {
+    "sha256": "7f8292bea124fb29e961b40226d491453c453d95ff1bd7058a776f1d8b709e8d"
+   },
+   "ore_ont_11395": {
+    "sha256": "f7aeeb87b0f15e0ef96ee6c87fa1faf2275b9175949c4ec5b3ff10f4a2a8e362"
+   },
+   "ore_ont_13482": {
+    "sha256": "f732cc7d4ebdb45099e421d062e05d64837b22e60b53d6848a723aa8f0e8d971"
+   },
+   "ore_ont_14042": {
+    "sha256": "70c3bac7570384fb2a0c6f3d085a93ac779e1e3980979496a95bf331af07ad4a"
+   },
+   "ore_ont_14459": {
+    "sha256": "9c7e687cf7c77af414dc41dfc4f7baeef4f782f51d6bc186f6e9d60cca34ce0e"
+   },
+   "ore_ont_15059": {
+    "sha256": "903db098c81789f0359b659b0d1c854626d46b3ab4b9d11f8fe56ffdcd3d07fb"
+   },
+   "ore_ont_1559": {
+    "sha256": "1e65b8add2b5a38441e832dd090922a05cd89cbb5198c8a481a2e2991b9b30b4"
+   },
+   "ore_ont_16008": {
+    "sha256": "0208050f1b294436ed401f624366f655129fdf78a360dc7107925c8bca26927c"
+   },
+   "ore_ont_3524": {
+    "sha256": "00c1b5dd0106e077813b8998eff80f14bc4b43ac1a83a95ccc4ad5a216ad85a2"
+   },
+   "ore_ont_3836": {
+    "sha256": "fc559045f566b2837188505b707480dc3416b3e699c5188632fa5be3d4cf2473"
+   },
+   "ore_ont_8486": {
+    "sha256": "cc9ce7ea79a3bc6492087abbed3e3fec26d622a38e75aad3e3310745999e31c3"
+   },
+   "ore_ont_868": {
+    "sha256": "21f1849747854eae7692beb53bdc9801c9387e3765cf1644914dfba864558d6b"
+   },
+   "ore_ont_9674": {
+    "sha256": "8a33686cd3ecc033851652d43f0ac4f07a9022682e165ef06cad6c96bfa85a02"
+   }
+  },
+  "started": "2026-11-03T10:15:57Z",
+  "ended": "2026-11-03T11:20:39Z",
+  "lock_note": "run.sh.txt took the bench lock and the heavy lock once and held them for every process of the run, so nothing else ran beside it. env.txt gives the time and load average when each process started."
+ },
+ "settings": {
+  "repeat": {
+   "go and chebi_lite": 5,
+   "ore": 3
+  },
+  "threads": [
+   1,
+   8
+  ],
+  "elk_heap": "4g for GO and ChEBI lite, 10g for the ORE ontologies, as -Xms and -Xmx",
+  "memory_max": "12G per process through systemd-run"
+ },
+ "method": "One process per build or reasoner, ontology and thread count, the base build first and then the lane build, ELK and Konclude. el_classify's classifyMs holds each classification by a Saturation that reads the axioms in place, with indexMs, saturationMs and taxonomyMs the stages of the last one. ElkClassify's classifyMs runs from the creation of the reasoner to the end of precomputeInferences. Konclude's classifyMs is its log's total processing time less its parse. peakRssKib is each process's peak resident set. checks.txt compares the lane's taxonomies with the base's on both thread counts and the lane's on eight threads with one, byte for byte, and oracle/ compares each ELK and Konclude taxonomy with the lane's on one thread. taxonomy-sweep-atlas.txt compares the lane's taxonomies of GO, ChEBI lite and the 298 ORE 2015 EL ontologies on one and eight threads with the base's on atlas. heap-nsc.txt holds el_classify --heap on four threads on a Namespace instance for the base and commit 82d64aed, with the estimate and the counted heap.",
+ "results": [
+  {
+   "addMs": 1.019117,
+   "axioms": 135031,
+   "classes": 51986,
+   "classifyMedianMs": 288.08913800000005,
+   "classifyMs": [
+    292.70539299999996,
+    288.08913800000005,
+    287.926828,
+    296.418632,
+    288.024184
+   ],
+   "conclusions": 2801981,
+   "consistent": true,
+   "contexts": 51987,
+   "estimatedBytes": 70021880,
+   "indexMs": 34.068808,
+   "input": "data/go.ofn",
+   "nodes": 51988,
+   "outside": 1,
+   "partial": {},
+   "peakEstimatedBytes": 70021880,
+   "peakHeapBytes": null,
+   "peakRssKib": 204156,
+   "peakRssKibAfterRead": 108024,
+   "readMs": 85.453136,
+   "saturationMs": 225.744172,
+   "taxonomyMs": 27.008983999999998,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 0.989512,
+   "axioms": 135031,
+   "classes": 51986,
+   "classifyMedianMs": 87.61704300000001,
+   "classifyMs": [
+    84.28115799999999,
+    87.61704300000001,
+    87.696335,
+    73.595589,
+    94.177125
+   ],
+   "conclusions": 2801981,
+   "consistent": true,
+   "contexts": 51987,
+   "estimatedBytes": 70021880,
+   "indexMs": 25.483372,
+   "input": "data/go.ofn",
+   "nodes": 51988,
+   "outside": 1,
+   "partial": {},
+   "peakEstimatedBytes": 70021880,
+   "peakHeapBytes": null,
+   "peakRssKib": 285212,
+   "peakRssKibAfterRead": 107964,
+   "readMs": 84.606735,
+   "saturationMs": 55.891667,
+   "taxonomyMs": 11.619902,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 4.705166,
+   "axioms": 647721,
+   "classes": 238150,
+   "classifyMedianMs": 1139.150097,
+   "classifyMs": [
+    1139.150097,
+    1133.5759839999998,
+    1137.756126,
+    1140.344339,
+    1152.010776
+   ],
+   "conclusions": 26995717,
+   "consistent": true,
+   "contexts": 238151,
+   "estimatedBytes": 464493122,
+   "indexMs": 183.569115,
+   "input": "data/chebi_lite.ofn",
+   "nodes": 238152,
+   "outside": 1,
+   "partial": {},
+   "peakEstimatedBytes": 464493122,
+   "peakHeapBytes": null,
+   "peakRssKib": 685244,
+   "peakRssKibAfterRead": 413164,
+   "readMs": 378.197056,
+   "saturationMs": 730.45678,
+   "taxonomyMs": 232.50821,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 4.682778,
+   "axioms": 647721,
+   "classes": 238150,
+   "classifyMedianMs": 911.5935109999999,
+   "classifyMs": [
+    982.83534,
+    754.858158,
+    833.758454,
+    911.5935109999999,
+    955.6684560000001
+   ],
+   "conclusions": 26995717,
+   "consistent": true,
+   "contexts": 238151,
+   "estimatedBytes": 464493122,
+   "indexMs": 138.54453999999998,
+   "input": "data/chebi_lite.ofn",
+   "nodes": 238152,
+   "outside": 1,
+   "partial": {},
+   "peakEstimatedBytes": 464493122,
+   "peakHeapBytes": null,
+   "peakRssKib": 932740,
+   "peakRssKibAfterRead": 413256,
+   "readMs": 376.31337199999996,
+   "saturationMs": 736.626522,
+   "taxonomyMs": 75.04274099999999,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 5.1626959999999995,
+   "axioms": 689540,
+   "classes": 58376,
+   "classifyMedianMs": 1086.311665,
+   "classifyMs": [
+    1162.5035500000001,
+    1086.311665,
+    1045.310776
+   ],
+   "conclusions": 15130982,
+   "consistent": true,
+   "contexts": 659619,
+   "estimatedBytes": 593138200,
+   "indexMs": 411.59968499999997,
+   "input": "data/ore/ore_ont_13482.owl",
+   "nodes": 58378,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 593138200,
+   "peakHeapBytes": null,
+   "peakRssKib": 1384504,
+   "peakRssKibAfterRead": 869944,
+   "readMs": 949.641615,
+   "saturationMs": 604.777522,
+   "taxonomyMs": 21.731995,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 5.058438,
+   "axioms": 689540,
+   "classes": 58376,
+   "classifyMedianMs": 587.91176,
+   "classifyMs": [
+    638.200179,
+    587.91176,
+    505.79148399999997
+   ],
+   "conclusions": 15130982,
+   "consistent": true,
+   "contexts": 659619,
+   "estimatedBytes": 593138200,
+   "indexMs": 327.18494,
+   "input": "data/ore/ore_ont_13482.owl",
+   "nodes": 58378,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 593138200,
+   "peakHeapBytes": null,
+   "peakRssKib": 1554880,
+   "peakRssKibAfterRead": 869884,
+   "readMs": 970.214463,
+   "saturationMs": 153.00843799999998,
+   "taxonomyMs": 18.450436,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 12.949513,
+   "axioms": 1962297,
+   "classes": 981151,
+   "classifyMedianMs": 1771.6451749999999,
+   "classifyMs": [
+    1850.224954,
+    1771.6451749999999,
+    1762.102158
+   ],
+   "conclusions": 16771347,
+   "consistent": true,
+   "contexts": 981152,
+   "estimatedBytes": 1244692437,
+   "indexMs": 551.396849,
+   "input": "data/ore/ore_ont_868.owl",
+   "nodes": 981153,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1244692437,
+   "peakHeapBytes": null,
+   "peakRssKib": 1776224,
+   "peakRssKibAfterRead": 1002964,
+   "readMs": 1003.4893430000001,
+   "saturationMs": 497.82401799999997,
+   "taxonomyMs": 697.1666720000001,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 14.225264,
+   "axioms": 1962297,
+   "classes": 981151,
+   "classifyMedianMs": 862.01112,
+   "classifyMs": [
+    877.915451,
+    831.408598,
+    862.01112
+   ],
+   "conclusions": 16771347,
+   "consistent": true,
+   "contexts": 981152,
+   "estimatedBytes": 1244692437,
+   "indexMs": 495.304358,
+   "input": "data/ore/ore_ont_868.owl",
+   "nodes": 981153,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1244692437,
+   "peakHeapBytes": null,
+   "peakRssKib": 1780996,
+   "peakRssKibAfterRead": 1002928,
+   "readMs": 989.381803,
+   "saturationMs": 104.615256,
+   "taxonomyMs": 245.079653,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 14.583686,
+   "axioms": 1962292,
+   "classes": 981148,
+   "classifyMedianMs": 1844.948839,
+   "classifyMs": [
+    1844.948839,
+    1851.684847,
+    1813.102168
+   ],
+   "conclusions": 16771341,
+   "consistent": true,
+   "contexts": 981149,
+   "estimatedBytes": 1244689469,
+   "indexMs": 566.933125,
+   "input": "data/ore/ore_ont_9674.owl",
+   "nodes": 981150,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1244689469,
+   "peakHeapBytes": null,
+   "peakRssKib": 1754180,
+   "peakRssKibAfterRead": 1002880,
+   "readMs": 1214.966384,
+   "saturationMs": 512.516921,
+   "taxonomyMs": 716.2780560000001,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 14.169268,
+   "axioms": 1962292,
+   "classes": 981148,
+   "classifyMedianMs": 872.577427,
+   "classifyMs": [
+    874.935922,
+    872.577427,
+    857.091817
+   ],
+   "conclusions": 16771341,
+   "consistent": true,
+   "contexts": 981149,
+   "estimatedBytes": 1244689469,
+   "indexMs": 451.806424,
+   "input": "data/ore/ore_ont_9674.owl",
+   "nodes": 981150,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1244689469,
+   "peakHeapBytes": null,
+   "peakRssKib": 1762516,
+   "peakRssKibAfterRead": 1002960,
+   "readMs": 1001.607147,
+   "saturationMs": 105.24006,
+   "taxonomyMs": 283.18332899999996,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 14.710324,
+   "axioms": 1962292,
+   "classes": 981148,
+   "classifyMedianMs": 1827.074793,
+   "classifyMs": [
+    1827.074793,
+    1820.463145,
+    1865.1902059999998
+   ],
+   "conclusions": 16771341,
+   "consistent": true,
+   "contexts": 981149,
+   "estimatedBytes": 1244689391,
+   "indexMs": 625.7934590000001,
+   "input": "data/ore/ore_ont_10689.owl",
+   "nodes": 981150,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1244689391,
+   "peakHeapBytes": null,
+   "peakRssKib": 1756312,
+   "peakRssKibAfterRead": 1002952,
+   "readMs": 1170.717568,
+   "saturationMs": 507.88212799999997,
+   "taxonomyMs": 714.361091,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 14.299857,
+   "axioms": 1962292,
+   "classes": 981148,
+   "classifyMedianMs": 878.486622,
+   "classifyMs": [
+    910.2428259999999,
+    829.570529,
+    878.486622
+   ],
+   "conclusions": 16771341,
+   "consistent": true,
+   "contexts": 981149,
+   "estimatedBytes": 1244689391,
+   "indexMs": 503.577325,
+   "input": "data/ore/ore_ont_10689.owl",
+   "nodes": 981150,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1244689391,
+   "peakHeapBytes": null,
+   "peakRssKib": 1781352,
+   "peakRssKibAfterRead": 1002860,
+   "readMs": 987.044031,
+   "saturationMs": 106.179462,
+   "taxonomyMs": 252.03206900000004,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 13.314436,
+   "axioms": 1807230,
+   "classes": 903617,
+   "classifyMedianMs": 1614.0273650000001,
+   "classifyMs": [
+    1639.433127,
+    1614.0273650000001,
+    1573.9897780000001
+   ],
+   "conclusions": 15646240,
+   "consistent": true,
+   "contexts": 903618,
+   "estimatedBytes": 1150409071,
+   "indexMs": 465.849626,
+   "input": "data/ore/ore_ont_8486.owl",
+   "nodes": 903619,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1150409071,
+   "peakHeapBytes": null,
+   "peakRssKib": 1576748,
+   "peakRssKibAfterRead": 959916,
+   "readMs": 967.3390509999999,
+   "saturationMs": 428.553182,
+   "taxonomyMs": 663.867762,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 13.173959,
+   "axioms": 1807230,
+   "classes": 903617,
+   "classifyMedianMs": 700.7398350000001,
+   "classifyMs": [
+    793.970689,
+    689.429198,
+    700.7398350000001
+   ],
+   "conclusions": 15646240,
+   "consistent": true,
+   "contexts": 903618,
+   "estimatedBytes": 1150409071,
+   "indexMs": 378.103899,
+   "input": "data/ore/ore_ont_8486.owl",
+   "nodes": 903619,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1150409071,
+   "peakHeapBytes": null,
+   "peakRssKib": 1583064,
+   "peakRssKibAfterRead": 959828,
+   "readMs": 912.414343,
+   "saturationMs": 82.35551600000001,
+   "taxonomyMs": 224.56450999999998,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 13.214883,
+   "axioms": 1695515,
+   "classes": 847760,
+   "classifyMedianMs": 1526.322874,
+   "classifyMs": [
+    1546.5876409999998,
+    1526.322874,
+    1496.127768
+   ],
+   "conclusions": 14809825,
+   "consistent": true,
+   "contexts": 847761,
+   "estimatedBytes": 1082088726,
+   "indexMs": 447.827578,
+   "input": "data/ore/ore_ont_14459.owl",
+   "nodes": 847762,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1082088726,
+   "peakHeapBytes": null,
+   "peakRssKib": 1486944,
+   "peakRssKibAfterRead": 918896,
+   "readMs": 980.9909879999999,
+   "saturationMs": 410.83014099999997,
+   "taxonomyMs": 621.578251,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 12.257132,
+   "axioms": 1695515,
+   "classes": 847760,
+   "classifyMedianMs": 678.617265,
+   "classifyMs": [
+    720.4066270000001,
+    678.617265,
+    641.2259809999999
+   ],
+   "conclusions": 14809825,
+   "consistent": true,
+   "contexts": 847761,
+   "estimatedBytes": 1082088726,
+   "indexMs": 331.376851,
+   "input": "data/ore/ore_ont_14459.owl",
+   "nodes": 847762,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1082088726,
+   "peakHeapBytes": null,
+   "peakRssKib": 1529044,
+   "peakRssKibAfterRead": 918812,
+   "readMs": 870.4122199999999,
+   "saturationMs": 76.79934,
+   "taxonomyMs": 218.428341,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 10.938932,
+   "axioms": 1466198,
+   "classes": 733100,
+   "classifyMedianMs": 1332.061457,
+   "classifyMs": [
+    1350.610814,
+    1312.405791,
+    1332.061457
+   ],
+   "conclusions": 13148675,
+   "consistent": true,
+   "contexts": 733101,
+   "estimatedBytes": 942137935,
+   "indexMs": 392.044863,
+   "input": "data/ore/ore_ont_16008.owl",
+   "nodes": 733102,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 942137935,
+   "peakHeapBytes": null,
+   "peakRssKib": 1371308,
+   "peakRssKibAfterRead": 847216,
+   "readMs": 820.33973,
+   "saturationMs": 380.852264,
+   "taxonomyMs": 546.1358120000001,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 11.420332,
+   "axioms": 1466198,
+   "classes": 733100,
+   "classifyMedianMs": 604.086646,
+   "classifyMs": [
+    613.7355610000001,
+    589.805111,
+    604.086646
+   ],
+   "conclusions": 13148675,
+   "consistent": true,
+   "contexts": 733101,
+   "estimatedBytes": 942137935,
+   "indexMs": 323.485144,
+   "input": "data/ore/ore_ont_16008.owl",
+   "nodes": 733102,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 942137935,
+   "peakHeapBytes": null,
+   "peakRssKib": 1383600,
+   "peakRssKibAfterRead": 847332,
+   "readMs": 749.363273,
+   "saturationMs": 79.73338000000001,
+   "taxonomyMs": 187.398617,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 9.096998000000001,
+   "axioms": 1169399,
+   "classes": 517023,
+   "classifyMedianMs": 1301.424558,
+   "classifyMs": [
+    1314.633292,
+    1297.4146950000002,
+    1301.424558
+   ],
+   "conclusions": 25792503,
+   "consistent": true,
+   "contexts": 517024,
+   "estimatedBytes": 621732407,
+   "indexMs": 407.857977,
+   "input": "data/ore/ore_ont_14042.owl",
+   "nodes": 517025,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 621732407,
+   "peakHeapBytes": null,
+   "peakRssKib": 1162724,
+   "peakRssKibAfterRead": 828904,
+   "readMs": 925.267955,
+   "saturationMs": 791.362398,
+   "taxonomyMs": 91.56814800000001,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 9.149147,
+   "axioms": 1169399,
+   "classes": 517023,
+   "classifyMedianMs": 799.2406530000001,
+   "classifyMs": [
+    828.223978,
+    764.7495560000001,
+    799.2406530000001
+   ],
+   "conclusions": 25792503,
+   "consistent": true,
+   "contexts": 517024,
+   "estimatedBytes": 621732407,
+   "indexMs": 334.716408,
+   "input": "data/ore/ore_ont_14042.owl",
+   "nodes": 517025,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 621732407,
+   "peakHeapBytes": null,
+   "peakRssKib": 1257872,
+   "peakRssKibAfterRead": 828848,
+   "readMs": 894.207726,
+   "saturationMs": 383.397796,
+   "taxonomyMs": 70.185231,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 9.132375,
+   "axioms": 1169399,
+   "classes": 517023,
+   "classifyMedianMs": 1316.2124,
+   "classifyMs": [
+    1316.2124,
+    1299.970245,
+    1318.452366
+   ],
+   "conclusions": 25792503,
+   "consistent": true,
+   "contexts": 517024,
+   "estimatedBytes": 621732407,
+   "indexMs": 418.957538,
+   "input": "data/ore/ore_ont_11395.owl",
+   "nodes": 517025,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 621732407,
+   "peakHeapBytes": null,
+   "peakRssKib": 1189448,
+   "peakRssKibAfterRead": 843136,
+   "readMs": 1035.100872,
+   "saturationMs": 794.787485,
+   "taxonomyMs": 93.784172,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 9.239872,
+   "axioms": 1169399,
+   "classes": 517023,
+   "classifyMedianMs": 785.394938,
+   "classifyMs": [
+    760.104875,
+    785.394938,
+    841.341507
+   ],
+   "conclusions": 25792503,
+   "consistent": true,
+   "contexts": 517024,
+   "estimatedBytes": 621732407,
+   "indexMs": 344.54218,
+   "input": "data/ore/ore_ont_11395.owl",
+   "nodes": 517025,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 621732407,
+   "peakHeapBytes": null,
+   "peakRssKib": 1277728,
+   "peakRssKibAfterRead": 843196,
+   "readMs": 938.534898,
+   "saturationMs": 410.428064,
+   "taxonomyMs": 74.32799399999999,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 20.529973,
+   "axioms": 2513931,
+   "classes": 264022,
+   "classifyMedianMs": 1206.695307,
+   "classifyMs": [
+    1206.695307,
+    1205.8839779999998,
+    1214.419175
+   ],
+   "conclusions": 6560549,
+   "consistent": true,
+   "contexts": 264023,
+   "estimatedBytes": 384579912,
+   "indexMs": 793.895552,
+   "input": "data/ore/ore_ont_1559.owl",
+   "nodes": 264024,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 384579912,
+   "peakHeapBytes": null,
+   "peakRssKib": 1818348,
+   "peakRssKibAfterRead": 1805800,
+   "readMs": 2486.256451,
+   "saturationMs": 273.394743,
+   "taxonomyMs": 125.53258100000001,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 20.022365999999998,
+   "axioms": 2513931,
+   "classes": 264022,
+   "classifyMedianMs": 749.5832839999999,
+   "classifyMs": [
+    750.225306,
+    710.914795,
+    749.5832839999999
+   ],
+   "conclusions": 6560549,
+   "consistent": true,
+   "contexts": 264023,
+   "estimatedBytes": 384579912,
+   "indexMs": 598.045518,
+   "input": "data/ore/ore_ont_1559.owl",
+   "nodes": 264024,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 384579912,
+   "peakHeapBytes": null,
+   "peakRssKib": 1828692,
+   "peakRssKibAfterRead": 1805756,
+   "readMs": 2132.998294,
+   "saturationMs": 70.363674,
+   "taxonomyMs": 60.036097,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 25.650012999999998,
+   "axioms": 3280784,
+   "classes": 142884,
+   "classifyMedianMs": 1340.4491890000002,
+   "classifyMs": [
+    1341.4850430000001,
+    1340.4491890000002,
+    1321.425496
+   ],
+   "conclusions": 6561568,
+   "consistent": true,
+   "contexts": 142885,
+   "estimatedBytes": 262812386,
+   "indexMs": 982.8863650000001,
+   "input": "data/ore/ore_ont_15059.owl",
+   "nodes": 142886,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 262812386,
+   "peakHeapBytes": null,
+   "peakRssKib": 2088228,
+   "peakRssKibAfterRead": 2088228,
+   "readMs": 3422.232998,
+   "saturationMs": 255.553291,
+   "taxonomyMs": 55.777815000000004,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 25.037502,
+   "axioms": 3280784,
+   "classes": 142884,
+   "classifyMedianMs": 870.846223,
+   "classifyMs": [
+    893.625392,
+    870.846223,
+    855.88664
+   ],
+   "conclusions": 6561568,
+   "consistent": true,
+   "contexts": 142885,
+   "estimatedBytes": 262812386,
+   "indexMs": 747.909822,
+   "input": "data/ore/ore_ont_15059.owl",
+   "nodes": 142886,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 262812386,
+   "peakHeapBytes": null,
+   "peakRssKib": 2120532,
+   "peakRssKibAfterRead": 2092444,
+   "readMs": 3055.3869489999997,
+   "saturationMs": 59.227914999999996,
+   "taxonomyMs": 26.626730000000002,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 15.078927,
+   "axioms": 2097631,
+   "classes": 123311,
+   "classifyMedianMs": 611.44071,
+   "classifyMs": [
+    610.833609,
+    616.552003,
+    611.44071
+   ],
+   "conclusions": 14653180,
+   "consistent": true,
+   "contexts": 123312,
+   "estimatedBytes": 167831382,
+   "indexMs": 372.70780199999996,
+   "input": "data/ore/ore_ont_3524.owl",
+   "nodes": 123313,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 167831382,
+   "peakHeapBytes": null,
+   "peakRssKib": 1455904,
+   "peakRssKibAfterRead": 1426944,
+   "readMs": 1667.403617,
+   "saturationMs": 124.460169,
+   "taxonomyMs": 98.750822,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 16.361839999999997,
+   "axioms": 2097631,
+   "classes": 123311,
+   "classifyMedianMs": 340.457104,
+   "classifyMs": [
+    340.457104,
+    330.02557,
+    343.849969
+   ],
+   "conclusions": 14653180,
+   "consistent": true,
+   "contexts": 123312,
+   "estimatedBytes": 167831382,
+   "indexMs": 260.771765,
+   "input": "data/ore/ore_ont_3524.owl",
+   "nodes": 123313,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 167831382,
+   "peakHeapBytes": null,
+   "peakRssKib": 1558556,
+   "peakRssKibAfterRead": 1426832,
+   "readMs": 1547.3911460000002,
+   "saturationMs": 21.301219,
+   "taxonomyMs": 44.991094000000004,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 14.449669,
+   "axioms": 1928386,
+   "classes": 58887,
+   "classifyMedianMs": 599.878836,
+   "classifyMs": [
+    595.660061,
+    603.0412,
+    599.878836
+   ],
+   "conclusions": 3819091,
+   "consistent": true,
+   "contexts": 58888,
+   "estimatedBytes": 125318137,
+   "indexMs": 436.897322,
+   "input": "data/ore/ore_ont_3836.owl",
+   "nodes": 58889,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 126690281,
+   "peakHeapBytes": null,
+   "peakRssKib": 1216352,
+   "peakRssKibAfterRead": 1193380,
+   "readMs": 1942.971839,
+   "saturationMs": 131.618143,
+   "taxonomyMs": 16.682344,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 13.437744,
+   "axioms": 1928386,
+   "classes": 58887,
+   "classifyMedianMs": 351.97441000000003,
+   "classifyMs": [
+    351.97441000000003,
+    344.467244,
+    362.931873
+   ],
+   "conclusions": 3819091,
+   "consistent": true,
+   "contexts": 58888,
+   "estimatedBytes": 125318137,
+   "indexMs": 299.783979,
+   "input": "data/ore/ore_ont_3836.owl",
+   "nodes": 58889,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 126690281,
+   "peakHeapBytes": null,
+   "peakRssKib": 1216260,
+   "peakRssKibAfterRead": 1193380,
+   "readMs": 1807.223411,
+   "saturationMs": 37.342676999999995,
+   "taxonomyMs": 12.131499999999999,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "base"
+  },
+  {
+   "addMs": 1.026137,
+   "axioms": 135031,
+   "classes": 51986,
+   "classifyMedianMs": 278.642137,
+   "classifyMs": [
+    284.572131,
+    276.15588099999997,
+    276.76665099999997,
+    283.422347,
+    278.642137
+   ],
+   "conclusions": 2801981,
+   "consistent": true,
+   "contexts": 51987,
+   "estimatedBytes": 65283670,
+   "indexMs": 27.508564999999997,
+   "input": "data/go.ofn",
+   "nodes": 51988,
+   "outside": 1,
+   "partial": {},
+   "peakEstimatedBytes": 65283670,
+   "peakHeapBytes": null,
+   "peakRssKib": 200648,
+   "peakRssKibAfterRead": 108436,
+   "readMs": 89.94515899999999,
+   "saturationMs": 224.823165,
+   "taxonomyMs": 25.096896,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 1.015344,
+   "axioms": 135031,
+   "classes": 51986,
+   "classifyMedianMs": 76.527666,
+   "classifyMs": [
+    78.99651100000001,
+    76.527666,
+    79.52100700000001,
+    74.95797,
+    68.53752200000001
+   ],
+   "conclusions": 2801981,
+   "consistent": true,
+   "contexts": 51987,
+   "estimatedBytes": 67744822,
+   "indexMs": 21.620005000000003,
+   "input": "data/go.ofn",
+   "nodes": 51988,
+   "outside": 1,
+   "partial": {},
+   "peakEstimatedBytes": 67744822,
+   "peakHeapBytes": null,
+   "peakRssKib": 301876,
+   "peakRssKibAfterRead": 108252,
+   "readMs": 92.620146,
+   "saturationMs": 36.471161,
+   "taxonomyMs": 9.287180000000001,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 4.691737,
+   "axioms": 647721,
+   "classes": 238150,
+   "classifyMedianMs": 1048.974719,
+   "classifyMs": [
+    1049.314104,
+    1046.665118,
+    1048.974719,
+    1043.318428,
+    1100.031992
+   ],
+   "conclusions": 26995717,
+   "consistent": true,
+   "contexts": 238151,
+   "estimatedBytes": 442172507,
+   "indexMs": 115.88525800000001,
+   "input": "data/chebi_lite.ofn",
+   "nodes": 238152,
+   "outside": 1,
+   "partial": {},
+   "peakEstimatedBytes": 442172507,
+   "peakHeapBytes": null,
+   "peakRssKib": 665904,
+   "peakRssKibAfterRead": 413500,
+   "readMs": 406.719091,
+   "saturationMs": 741.492781,
+   "taxonomyMs": 237.425633,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 4.686420999999999,
+   "axioms": 647721,
+   "classes": 238150,
+   "classifyMedianMs": 393.00941900000004,
+   "classifyMs": [
+    407.862183,
+    379.13971499999997,
+    393.00941900000004,
+    387.760175,
+    417.66488499999997
+   ],
+   "conclusions": 26995717,
+   "consistent": true,
+   "contexts": 238151,
+   "estimatedBytes": 451783675,
+   "indexMs": 71.53134399999999,
+   "input": "data/chebi_lite.ofn",
+   "nodes": 238152,
+   "outside": 1,
+   "partial": {},
+   "peakEstimatedBytes": 451783675,
+   "peakHeapBytes": null,
+   "peakRssKib": 1011876,
+   "peakRssKibAfterRead": 413596,
+   "readMs": 413.992414,
+   "saturationMs": 272.817297,
+   "taxonomyMs": 68.071509,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 5.1573139999999995,
+   "axioms": 689540,
+   "classes": 58376,
+   "classifyMedianMs": 897.291839,
+   "classifyMs": [
+    892.921014,
+    903.0232139999999,
+    897.291839
+   ],
+   "conclusions": 15130982,
+   "consistent": true,
+   "contexts": 659619,
+   "estimatedBytes": 587542093,
+   "indexMs": 328.092637,
+   "input": "data/ore/ore_ont_13482.owl",
+   "nodes": 58378,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 587542093,
+   "peakHeapBytes": null,
+   "peakRssKib": 1325316,
+   "peakRssKibAfterRead": 870172,
+   "readMs": 1049.770966,
+   "saturationMs": 543.81383,
+   "taxonomyMs": 18.561238,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 4.892695,
+   "axioms": 689540,
+   "classes": 58376,
+   "classifyMedianMs": 367.71283500000004,
+   "classifyMs": [
+    403.783825,
+    325.594187,
+    367.71283500000004
+   ],
+   "conclusions": 15130982,
+   "consistent": true,
+   "contexts": 659619,
+   "estimatedBytes": 592484941,
+   "indexMs": 201.7187,
+   "input": "data/ore/ore_ont_13482.owl",
+   "nodes": 58378,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 592484941,
+   "peakHeapBytes": null,
+   "peakRssKib": 1526808,
+   "peakRssKibAfterRead": 870284,
+   "readMs": 1049.3794890000001,
+   "saturationMs": 138.568242,
+   "taxonomyMs": 20.370093999999998,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 15.112077,
+   "axioms": 1962297,
+   "classes": 981151,
+   "classifyMedianMs": 1405.414577,
+   "classifyMs": [
+    1405.414577,
+    1386.70615,
+    1409.766824
+   ],
+   "conclusions": 16771347,
+   "consistent": true,
+   "contexts": 981152,
+   "estimatedBytes": 1146989339,
+   "indexMs": 356.187772,
+   "input": "data/ore/ore_ont_868.owl",
+   "nodes": 981153,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1146989339,
+   "peakHeapBytes": null,
+   "peakRssKib": 1572032,
+   "peakRssKibAfterRead": 956016,
+   "readMs": 1212.770738,
+   "saturationMs": 375.091839,
+   "taxonomyMs": 661.712948,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 14.248565,
+   "axioms": 1962297,
+   "classes": 981151,
+   "classifyMedianMs": 599.002674,
+   "classifyMs": [
+    613.8149269999999,
+    586.0839110000001,
+    599.002674
+   ],
+   "conclusions": 16771347,
+   "consistent": true,
+   "contexts": 981152,
+   "estimatedBytes": 1187911547,
+   "indexMs": 262.541725,
+   "input": "data/ore/ore_ont_868.owl",
+   "nodes": 981153,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1187911547,
+   "peakHeapBytes": null,
+   "peakRssKib": 1728372,
+   "peakRssKibAfterRead": 960092,
+   "readMs": 1172.342242,
+   "saturationMs": 54.00083600000001,
+   "taxonomyMs": 266.627195,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 14.381502,
+   "axioms": 1962292,
+   "classes": 981148,
+   "classifyMedianMs": 1397.229715,
+   "classifyMs": [
+    1397.229715,
+    1369.344494,
+    1401.530023
+   ],
+   "conclusions": 16771341,
+   "consistent": true,
+   "contexts": 981149,
+   "estimatedBytes": 1146986762,
+   "indexMs": 348.641205,
+   "input": "data/ore/ore_ont_9674.owl",
+   "nodes": 981150,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1146986762,
+   "peakHeapBytes": null,
+   "peakRssKib": 1572048,
+   "peakRssKibAfterRead": 960140,
+   "readMs": 1170.421059,
+   "saturationMs": 374.383449,
+   "taxonomyMs": 662.405276,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 14.180661,
+   "axioms": 1962292,
+   "classes": 981148,
+   "classifyMedianMs": 574.0150269999999,
+   "classifyMs": [
+    598.574767,
+    559.478065,
+    574.0150269999999
+   ],
+   "conclusions": 16771341,
+   "consistent": true,
+   "contexts": 981149,
+   "estimatedBytes": 1187908746,
+   "indexMs": 264.298588,
+   "input": "data/ore/ore_ont_9674.owl",
+   "nodes": 981150,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1187908746,
+   "peakHeapBytes": null,
+   "peakRssKib": 1695664,
+   "peakRssKibAfterRead": 956100,
+   "readMs": 1181.966917,
+   "saturationMs": 51.732566,
+   "taxonomyMs": 242.339112,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 14.482959,
+   "axioms": 1962292,
+   "classes": 981148,
+   "classifyMedianMs": 1379.155968,
+   "classifyMs": [
+    1398.212219,
+    1379.155968,
+    1362.513747
+   ],
+   "conclusions": 16771341,
+   "consistent": true,
+   "contexts": 981149,
+   "estimatedBytes": 1146986710,
+   "indexMs": 330.83502999999996,
+   "input": "data/ore/ore_ont_10689.owl",
+   "nodes": 981150,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1146986710,
+   "peakHeapBytes": null,
+   "peakRssKib": 1574232,
+   "peakRssKibAfterRead": 953948,
+   "readMs": 1185.158723,
+   "saturationMs": 366.40711799999997,
+   "taxonomyMs": 650.533422,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 14.073407,
+   "axioms": 1962292,
+   "classes": 981148,
+   "classifyMedianMs": 587.235063,
+   "classifyMs": [
+    632.8788920000001,
+    587.235063,
+    567.751865
+   ],
+   "conclusions": 16771341,
+   "consistent": true,
+   "contexts": 981149,
+   "estimatedBytes": 1187908694,
+   "indexMs": 261.842512,
+   "input": "data/ore/ore_ont_10689.owl",
+   "nodes": 981150,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1187908694,
+   "peakHeapBytes": null,
+   "peakRssKib": 1761900,
+   "peakRssKibAfterRead": 960184,
+   "readMs": 1170.6106849999999,
+   "saturationMs": 53.609265,
+   "taxonomyMs": 236.563387,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 13.502076,
+   "axioms": 1807230,
+   "classes": 903617,
+   "classifyMedianMs": 1238.167768,
+   "classifyMs": [
+    1281.882242,
+    1234.421711,
+    1238.167768
+   ],
+   "conclusions": 15646240,
+   "consistent": true,
+   "contexts": 903618,
+   "estimatedBytes": 1059281353,
+   "indexMs": 296.983765,
+   "input": "data/ore/ore_ont_8486.owl",
+   "nodes": 903619,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1059281353,
+   "peakHeapBytes": null,
+   "peakRssKib": 1522268,
+   "peakRssKibAfterRead": 933536,
+   "readMs": 1099.547831,
+   "saturationMs": 311.254353,
+   "taxonomyMs": 614.739916,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 13.043127,
+   "axioms": 1807230,
+   "classes": 903617,
+   "classifyMedianMs": 553.643226,
+   "classifyMs": [
+    558.545566,
+    553.643226,
+    523.781379
+   ],
+   "conclusions": 15646240,
+   "consistent": true,
+   "contexts": 903618,
+   "estimatedBytes": 1099707817,
+   "indexMs": 239.75279999999998,
+   "input": "data/ore/ore_ont_8486.owl",
+   "nodes": 903619,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1099707817,
+   "peakHeapBytes": null,
+   "peakRssKib": 1562944,
+   "peakRssKibAfterRead": 941376,
+   "readMs": 1079.113588,
+   "saturationMs": 51.911936,
+   "taxonomyMs": 218.145273,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 13.081168,
+   "axioms": 1695515,
+   "classes": 847760,
+   "classifyMedianMs": 1161.0745670000001,
+   "classifyMs": [
+    1214.1804760000002,
+    1156.999634,
+    1161.0745670000001
+   ],
+   "conclusions": 14809825,
+   "consistent": true,
+   "contexts": 847761,
+   "estimatedBytes": 999003664,
+   "indexMs": 279.666231,
+   "input": "data/ore/ore_ont_14459.owl",
+   "nodes": 847762,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 999003664,
+   "peakHeapBytes": null,
+   "peakRssKib": 1437796,
+   "peakRssKibAfterRead": 919076,
+   "readMs": 1017.2924409999999,
+   "saturationMs": 300.290346,
+   "taxonomyMs": 566.738161,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 12.365774,
+   "axioms": 1695515,
+   "classes": 847760,
+   "classifyMedianMs": 460.339944,
+   "classifyMs": [
+    505.299928,
+    454.318047,
+    460.339944
+   ],
+   "conclusions": 14809825,
+   "consistent": true,
+   "contexts": 847761,
+   "estimatedBytes": 1026548912,
+   "indexMs": 196.679436,
+   "input": "data/ore/ore_ont_14459.owl",
+   "nodes": 847762,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 1026548912,
+   "peakHeapBytes": null,
+   "peakRssKib": 1523900,
+   "peakRssKibAfterRead": 902292,
+   "readMs": 1076.8402640000002,
+   "saturationMs": 47.822823,
+   "taxonomyMs": 202.064932,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 11.509202,
+   "axioms": 1466198,
+   "classes": 733100,
+   "classifyMedianMs": 1073.0463770000001,
+   "classifyMs": [
+    1073.0463770000001,
+    1073.1657910000001,
+    1015.6608339999999
+   ],
+   "conclusions": 13148675,
+   "consistent": true,
+   "contexts": 733101,
+   "estimatedBytes": 875532494,
+   "indexMs": 240.80033,
+   "input": "data/ore/ore_ont_16008.owl",
+   "nodes": 733102,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 875532494,
+   "peakHeapBytes": null,
+   "peakRssKib": 1241536,
+   "peakRssKibAfterRead": 847420,
+   "readMs": 945.651923,
+   "saturationMs": 263.641612,
+   "taxonomyMs": 498.351178,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 10.969876999999999,
+   "axioms": 1466198,
+   "classes": 733100,
+   "classifyMedianMs": 429.943683,
+   "classifyMs": [
+    451.289582,
+    403.699134,
+    429.943683
+   ],
+   "conclusions": 13148675,
+   "consistent": true,
+   "contexts": 733101,
+   "estimatedBytes": 895502702,
+   "indexMs": 169.029507,
+   "input": "data/ore/ore_ont_16008.owl",
+   "nodes": 733102,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 895502702,
+   "peakHeapBytes": null,
+   "peakRssKib": 1326716,
+   "peakRssKibAfterRead": 847320,
+   "readMs": 889.083869,
+   "saturationMs": 61.559087999999996,
+   "taxonomyMs": 187.058436,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 9.157606000000001,
+   "axioms": 1169399,
+   "classes": 517023,
+   "classifyMedianMs": 1095.778468,
+   "classifyMs": [
+    1125.819688,
+    1095.778468,
+    1091.25036
+   ],
+   "conclusions": 25792503,
+   "consistent": true,
+   "contexts": 517024,
+   "estimatedBytes": 571231014,
+   "indexMs": 246.74625699999999,
+   "input": "data/ore/ore_ont_14042.owl",
+   "nodes": 517025,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 571231014,
+   "peakHeapBytes": null,
+   "peakRssKib": 1059032,
+   "peakRssKibAfterRead": 828992,
+   "readMs": 919.174434,
+   "saturationMs": 757.823724,
+   "taxonomyMs": 76.381483,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 9.11539,
+   "axioms": 1169399,
+   "classes": 517023,
+   "classifyMedianMs": 467.889771,
+   "classifyMs": [
+    485.25796399999996,
+    445.214377,
+    467.889771
+   ],
+   "conclusions": 25792503,
+   "consistent": true,
+   "contexts": 517024,
+   "estimatedBytes": 594021222,
+   "indexMs": 165.248533,
+   "input": "data/ore/ore_ont_14042.owl",
+   "nodes": 517025,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 594021222,
+   "peakHeapBytes": null,
+   "peakRssKib": 1416528,
+   "peakRssKibAfterRead": 829020,
+   "readMs": 897.3950600000001,
+   "saturationMs": 230.606469,
+   "taxonomyMs": 62.232308,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 9.126629000000001,
+   "axioms": 1169399,
+   "classes": 517023,
+   "classifyMedianMs": 1092.218822,
+   "classifyMs": [
+    1110.022754,
+    1092.218822,
+    1087.881616
+   ],
+   "conclusions": 25792503,
+   "consistent": true,
+   "contexts": 517024,
+   "estimatedBytes": 571231014,
+   "indexMs": 249.85962,
+   "input": "data/ore/ore_ont_11395.owl",
+   "nodes": 517025,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 571231014,
+   "peakHeapBytes": null,
+   "peakRssKib": 1076428,
+   "peakRssKibAfterRead": 843296,
+   "readMs": 997.738598,
+   "saturationMs": 751.574115,
+   "taxonomyMs": 76.285532,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 9.297621000000001,
+   "axioms": 1169399,
+   "classes": 517023,
+   "classifyMedianMs": 489.755569,
+   "classifyMs": [
+    524.07293,
+    489.755569,
+    462.31135
+   ],
+   "conclusions": 25792503,
+   "consistent": true,
+   "contexts": 517024,
+   "estimatedBytes": 594021222,
+   "indexMs": 170.654957,
+   "input": "data/ore/ore_ont_11395.owl",
+   "nodes": 517025,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 594021222,
+   "peakHeapBytes": null,
+   "peakRssKib": 1439612,
+   "peakRssKibAfterRead": 843340,
+   "readMs": 1004.565004,
+   "saturationMs": 218.382579,
+   "taxonomyMs": 63.115507,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 23.397394,
+   "axioms": 2513931,
+   "classes": 264022,
+   "classifyMedianMs": 993.427285,
+   "classifyMs": [
+    1032.3090459999999,
+    969.64829,
+    993.427285
+   ],
+   "conclusions": 6560549,
+   "consistent": true,
+   "contexts": 264023,
+   "estimatedBytes": 366025786,
+   "indexMs": 628.9454850000001,
+   "input": "data/ore/ore_ont_1559.owl",
+   "nodes": 264024,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 366025786,
+   "peakHeapBytes": null,
+   "peakRssKib": 1818660,
+   "peakRssKibAfterRead": 1806172,
+   "readMs": 2397.641405,
+   "saturationMs": 227.235543,
+   "taxonomyMs": 112.825473,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 19.538115,
+   "axioms": 2513931,
+   "classes": 264022,
+   "classifyMedianMs": 425.326191,
+   "classifyMs": [
+    432.169548,
+    405.871145,
+    425.326191
+   ],
+   "conclusions": 6560549,
+   "consistent": true,
+   "contexts": 264023,
+   "estimatedBytes": 378439450,
+   "indexMs": 307.123114,
+   "input": "data/ore/ore_ont_1559.owl",
+   "nodes": 264024,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 408994386,
+   "peakHeapBytes": null,
+   "peakRssKib": 1897700,
+   "peakRssKibAfterRead": 1805936,
+   "readMs": 2342.455648,
+   "saturationMs": 47.500149,
+   "taxonomyMs": 50.398911,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 25.32437,
+   "axioms": 3280784,
+   "classes": 142884,
+   "classifyMedianMs": 1131.876498,
+   "classifyMs": [
+    1121.18935,
+    1131.876498,
+    1141.0352859999998
+   ],
+   "conclusions": 6561568,
+   "consistent": true,
+   "contexts": 142885,
+   "estimatedBytes": 251730137,
+   "indexMs": 822.808937,
+   "input": "data/ore/ore_ont_15059.owl",
+   "nodes": 142886,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 251730137,
+   "peakHeapBytes": null,
+   "peakRssKib": 2088392,
+   "peakRssKibAfterRead": 2088392,
+   "readMs": 3370.018828,
+   "saturationMs": 243.918655,
+   "taxonomyMs": 48.665977,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 24.959227000000002,
+   "axioms": 3280784,
+   "classes": 142884,
+   "classifyMedianMs": 467.228031,
+   "classifyMs": [
+    545.7926,
+    467.228031,
+    438.589729
+   ],
+   "conclusions": 6561568,
+   "consistent": true,
+   "contexts": 142885,
+   "estimatedBytes": 267132825,
+   "indexMs": 326.66347,
+   "input": "data/ore/ore_ont_15059.owl",
+   "nodes": 142886,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 323523814,
+   "peakHeapBytes": null,
+   "peakRssKib": 2270132,
+   "peakRssKibAfterRead": 2088564,
+   "readMs": 3403.564202,
+   "saturationMs": 59.412776,
+   "taxonomyMs": 22.625172999999997,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 16.594068,
+   "axioms": 2097631,
+   "classes": 123311,
+   "classifyMedianMs": 563.114011,
+   "classifyMs": [
+    562.8798029999999,
+    563.114011,
+    564.0755859999999
+   ],
+   "conclusions": 14653180,
+   "consistent": true,
+   "contexts": 123312,
+   "estimatedBytes": 152869045,
+   "indexMs": 322.268327,
+   "input": "data/ore/ore_ont_3524.owl",
+   "nodes": 123313,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 152869045,
+   "peakHeapBytes": null,
+   "peakRssKib": 1456240,
+   "peakRssKibAfterRead": 1427008,
+   "readMs": 1625.42504,
+   "saturationMs": 129.27498100000003,
+   "taxonomyMs": 95.69559699999999,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 16.685268,
+   "axioms": 2097631,
+   "classes": 123311,
+   "classifyMedianMs": 249.72341,
+   "classifyMs": [
+    263.738031,
+    244.030686,
+    249.72341
+   ],
+   "conclusions": 14653180,
+   "consistent": true,
+   "contexts": 123312,
+   "estimatedBytes": 167137109,
+   "indexMs": 172.724851,
+   "input": "data/ore/ore_ont_3524.owl",
+   "nodes": 123313,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 205308700,
+   "peakHeapBytes": null,
+   "peakRssKib": 1575924,
+   "peakRssKibAfterRead": 1427020,
+   "readMs": 1633.7267020000002,
+   "saturationMs": 20.773453,
+   "taxonomyMs": 39.26999,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 15.064171,
+   "axioms": 1928386,
+   "classes": 58887,
+   "classifyMedianMs": 568.7104830000001,
+   "classifyMs": [
+    568.7104830000001,
+    555.341852,
+    573.342747
+   ],
+   "conclusions": 3819091,
+   "consistent": true,
+   "contexts": 58888,
+   "estimatedBytes": 119267928,
+   "indexMs": 400.94721599999997,
+   "input": "data/ore/ore_ont_3836.owl",
+   "nodes": 58889,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 120640072,
+   "peakHeapBytes": null,
+   "peakRssKib": 1210028,
+   "peakRssKibAfterRead": 1193552,
+   "readMs": 1984.738662,
+   "saturationMs": 141.411741,
+   "taxonomyMs": 16.552228,
+   "threads": 1,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "addMs": 13.785229,
+   "axioms": 1928386,
+   "classes": 58887,
+   "classifyMedianMs": 225.39920999999998,
+   "classifyMs": [
+    265.335753,
+    225.39920999999998,
+    219.31897
+   ],
+   "conclusions": 3819091,
+   "consistent": true,
+   "contexts": 58888,
+   "estimatedBytes": 123031384,
+   "indexMs": 172.50016000000002,
+   "input": "data/ore/ore_ont_3836.owl",
+   "nodes": 58889,
+   "outside": 0,
+   "partial": {},
+   "peakEstimatedBytes": 134658560,
+   "peakHeapBytes": null,
+   "peakRssKib": 1230900,
+   "peakRssKibAfterRead": 1193576,
+   "readMs": 2000.900595,
+   "saturationMs": 22.070916,
+   "taxonomyMs": 10.800528,
+   "threads": 8,
+   "unsatisfiable": 0,
+   "build": "lane"
+  },
+  {
+   "input": "data/go.ofn",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 51986,
+   "logicalAxioms": 82950,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    1223.6,
+    872.1,
+    752.4,
+    746.7,
+    730.4
+   ],
+   "classifyMs": [
+    1689.2,
+    1181.6,
+    1384.9,
+    1161.3,
+    1177.7
+   ],
+   "classifyCpuMs": [
+    8670.0,
+    2110.0,
+    1530.0,
+    1280.0,
+    1280.0
+   ],
+   "medianLoadMs": 752.4,
+   "medianClassifyMs": 1181.6,
+   "medianLoadAndClassifyMs": 2053.7,
+   "retainedHeapMib": [
+    142.0,
+    151.1,
+    150.6,
+    150.2,
+    150.2
+   ],
+   "maxHeapMib": 4096,
+   "jvmArgs": [
+    "-Xms4g",
+    "-Xmx4g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 2459600,
+   "build": "elk"
+  },
+  {
+   "input": "data/go.ofn",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 51986,
+   "logicalAxioms": 82950,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    1205.6,
+    909.2,
+    707.8,
+    726.8,
+    730.7
+   ],
+   "classifyMs": [
+    1163.6,
+    693.1,
+    544.8,
+    579.4,
+    526.1
+   ],
+   "classifyCpuMs": [
+    12970.0,
+    4410.0,
+    2650.0,
+    2540.0,
+    2510.0
+   ],
+   "medianLoadMs": 730.7,
+   "medianClassifyMs": 579.4,
+   "medianLoadAndClassifyMs": 1306.2,
+   "retainedHeapMib": [
+    142.2,
+    152.3,
+    150.2,
+    150.2,
+    150.3
+   ],
+   "maxHeapMib": 4096,
+   "jvmArgs": [
+    "-Xms4g",
+    "-Xmx4g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 2455552,
+   "build": "elk"
+  },
+  {
+   "input": "data/chebi_lite.ofn",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 238150,
+   "logicalAxioms": 409525,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    3294.2,
+    3571.1,
+    3485.8,
+    3612.4,
+    3466.8
+   ],
+   "classifyMs": [
+    7136.6,
+    6611.3,
+    6485.2,
+    6564.8,
+    6770.3
+   ],
+   "classifyCpuMs": [
+    13820.0,
+    10760.0,
+    10410.0,
+    10340.0,
+    10660.0
+   ],
+   "medianLoadMs": 3485.8,
+   "medianClassifyMs": 6611.3,
+   "medianLoadAndClassifyMs": 10182.4,
+   "retainedHeapMib": [
+    648.0,
+    687.6,
+    687.2,
+    688.0,
+    688.2
+   ],
+   "maxHeapMib": 4096,
+   "jvmArgs": [
+    "-Xms4g",
+    "-Xmx4g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 4564292,
+   "build": "elk"
+  },
+  {
+   "input": "data/chebi_lite.ofn",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 238150,
+   "logicalAxioms": 409525,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    3371.5,
+    3636.0,
+    3665.6,
+    3534.4,
+    3532.7
+   ],
+   "classifyMs": [
+    3104.7,
+    2591.2,
+    2673.5,
+    2525.3,
+    2518.5
+   ],
+   "classifyCpuMs": [
+    21480.0,
+    14830.0,
+    15950.0,
+    14040.0,
+    13950.0
+   ],
+   "medianLoadMs": 3534.4,
+   "medianClassifyMs": 2591.2,
+   "medianLoadAndClassifyMs": 6227.1,
+   "retainedHeapMib": [
+    649.5,
+    688.5,
+    687.6,
+    688.6,
+    688.8
+   ],
+   "maxHeapMib": 4096,
+   "jvmArgs": [
+    "-Xms4g",
+    "-Xmx4g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 4558916,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_13482.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 58376,
+   "logicalAxioms": 631131,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    5914.7,
+    7722.5,
+    7162.5
+   ],
+   "classifyMs": [
+    3118.5,
+    2713.5,
+    2765.9
+   ],
+   "classifyCpuMs": [
+    9330.0,
+    6450.0,
+    5780.0
+   ],
+   "medianLoadMs": 7162.5,
+   "medianClassifyMs": 2765.9,
+   "medianLoadAndClassifyMs": 9928.4,
+   "retainedHeapMib": [
+    545.0,
+    556.1,
+    555.1
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 5385896,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_13482.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 58376,
+   "logicalAxioms": 631131,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    6177.7,
+    7388.1,
+    7162.6
+   ],
+   "classifyMs": [
+    3009.0,
+    3498.4,
+    3244.3
+   ],
+   "classifyCpuMs": [
+    11360.0,
+    5270.0,
+    7360.0
+   ],
+   "medianLoadMs": 7162.6,
+   "medianClassifyMs": 3244.3,
+   "medianLoadAndClassifyMs": 10406.9,
+   "retainedHeapMib": [
+    545.4,
+    553.8,
+    556.1
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 8176412,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_868.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 981152,
+   "logicalAxioms": 981146,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    9431.0,
+    10941.1,
+    11394.2
+   ],
+   "classifyMs": [
+    12005.6,
+    11622.4,
+    11772.1
+   ],
+   "classifyCpuMs": [
+    26140.0,
+    23140.0,
+    20540.0
+   ],
+   "medianLoadMs": 10941.1,
+   "medianClassifyMs": 11772.1,
+   "medianLoadAndClassifyMs": 22563.5,
+   "retainedHeapMib": [
+    1721.0,
+    1890.8,
+    1891.2
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 9857716,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_868.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 981152,
+   "logicalAxioms": 981146,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    9698.0,
+    11320.0,
+    11382.4
+   ],
+   "classifyMs": [
+    5562.6,
+    5436.7,
+    5531.9
+   ],
+   "classifyCpuMs": [
+    32820.0,
+    27870.0,
+    25050.0
+   ],
+   "medianLoadMs": 11320.0,
+   "medianClassifyMs": 5531.9,
+   "medianLoadAndClassifyMs": 16756.7,
+   "retainedHeapMib": [
+    1719.1,
+    1891.9,
+    1891.4
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 9405856,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_9674.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 981148,
+   "logicalAxioms": 981144,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    9494.0,
+    11297.6,
+    11338.7
+   ],
+   "classifyMs": [
+    11994.9,
+    11176.8,
+    11530.0
+   ],
+   "classifyCpuMs": [
+    25570.0,
+    21880.0,
+    20810.0
+   ],
+   "medianLoadMs": 11297.6,
+   "medianClassifyMs": 11530.0,
+   "medianLoadAndClassifyMs": 22474.5,
+   "retainedHeapMib": [
+    1717.5,
+    1894.5,
+    1891.2
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 9571228,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_9674.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 981148,
+   "logicalAxioms": 981144,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    9439.9,
+    11340.4,
+    11139.0
+   ],
+   "classifyMs": [
+    5631.8,
+    4772.4,
+    5141.5
+   ],
+   "classifyCpuMs": [
+    33240.0,
+    25990.0,
+    26170.0
+   ],
+   "medianLoadMs": 11139.0,
+   "medianClassifyMs": 5141.5,
+   "medianLoadAndClassifyMs": 16112.8,
+   "retainedHeapMib": [
+    1722.3,
+    1894.6,
+    1892.4
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 9932364,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_10689.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 981148,
+   "logicalAxioms": 981144,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    9512.4,
+    11369.7,
+    11378.6
+   ],
+   "classifyMs": [
+    11753.9,
+    11259.2,
+    11206.5
+   ],
+   "classifyCpuMs": [
+    26670.0,
+    21020.0,
+    21870.0
+   ],
+   "medianLoadMs": 11369.7,
+   "medianClassifyMs": 11259.2,
+   "medianLoadAndClassifyMs": 22585.2,
+   "retainedHeapMib": [
+    1720.3,
+    1889.8,
+    1891.0
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 9932500,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_10689.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 981148,
+   "logicalAxioms": 981144,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    9484.1,
+    11135.3,
+    12371.2
+   ],
+   "classifyMs": [
+    5616.3,
+    5146.9,
+    4939.8
+   ],
+   "classifyCpuMs": [
+    33420.0,
+    26950.0,
+    24550.0
+   ],
+   "medianLoadMs": 11135.3,
+   "medianClassifyMs": 5146.9,
+   "medianLoadAndClassifyMs": 16282.2,
+   "retainedHeapMib": [
+    1719.4,
+    1891.3,
+    1888.8
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 9705868,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_8486.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 903617,
+   "logicalAxioms": 903613,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    8677.3,
+    10133.1,
+    11510.3
+   ],
+   "classifyMs": [
+    11154.7,
+    10711.5,
+    10863.2
+   ],
+   "classifyCpuMs": [
+    24350.0,
+    20980.0,
+    19820.0
+   ],
+   "medianLoadMs": 10133.1,
+   "medianClassifyMs": 10863.2,
+   "medianLoadAndClassifyMs": 20844.6,
+   "retainedHeapMib": [
+    1611.7,
+    1765.5,
+    1766.0
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 10242464,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_8486.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 903617,
+   "logicalAxioms": 903613,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    8723.6,
+    10286.0,
+    10799.1
+   ],
+   "classifyMs": [
+    5146.0,
+    4487.3,
+    4631.7
+   ],
+   "classifyCpuMs": [
+    31870.0,
+    25460.0,
+    22880.0
+   ],
+   "medianLoadMs": 10286.0,
+   "medianClassifyMs": 4631.7,
+   "medianLoadAndClassifyMs": 14773.3,
+   "retainedHeapMib": [
+    1607.7,
+    1767.4,
+    1767.5
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 9192348,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_14459.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 847760,
+   "logicalAxioms": 847755,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    8297.5,
+    9806.2,
+    10010.1
+   ],
+   "classifyMs": [
+    10554.5,
+    9730.9,
+    9747.8
+   ],
+   "classifyCpuMs": [
+    23900.0,
+    19140.0,
+    18700.0
+   ],
+   "medianLoadMs": 9806.2,
+   "medianClassifyMs": 9747.8,
+   "medianLoadAndClassifyMs": 19537.1,
+   "retainedHeapMib": [
+    1530.3,
+    1677.9,
+    1676.2
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 9906572,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_14459.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 847760,
+   "logicalAxioms": 847755,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    8235.2,
+    9793.5,
+    10028.0
+   ],
+   "classifyMs": [
+    4891.2,
+    4281.5,
+    4289.4
+   ],
+   "classifyCpuMs": [
+    28640.0,
+    23890.0,
+    21400.0
+   ],
+   "medianLoadMs": 9793.5,
+   "medianClassifyMs": 4289.4,
+   "medianLoadAndClassifyMs": 14075.0,
+   "retainedHeapMib": [
+    1530.1,
+    1676.3,
+    1677.9
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 8378920,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_16008.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 733100,
+   "logicalAxioms": 733098,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    7038.3,
+    8143.5,
+    8286.7
+   ],
+   "classifyMs": [
+    8922.8,
+    8361.4,
+    8409.6
+   ],
+   "classifyCpuMs": [
+    20300.0,
+    15530.0,
+    15860.0
+   ],
+   "medianLoadMs": 8143.5,
+   "medianClassifyMs": 8409.6,
+   "medianLoadAndClassifyMs": 16504.9,
+   "retainedHeapMib": [
+    1246.7,
+    1369.2,
+    1368.2
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 9037092,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_16008.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 733100,
+   "logicalAxioms": 733098,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    7160.4,
+    8366.5,
+    8344.4
+   ],
+   "classifyMs": [
+    4171.0,
+    3626.9,
+    3629.6
+   ],
+   "classifyCpuMs": [
+    26130.0,
+    20380.0,
+    21050.0
+   ],
+   "medianLoadMs": 8344.4,
+   "medianClassifyMs": 3629.6,
+   "medianLoadAndClassifyMs": 11974.0,
+   "retainedHeapMib": [
+    1246.3,
+    1371.4,
+    1370.1
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 7842388,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_14042.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 517023,
+   "logicalAxioms": 652361,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    6295.1,
+    7842.4,
+    7913.0
+   ],
+   "classifyMs": [
+    6503.3,
+    6960.8,
+    10227.4
+   ],
+   "classifyCpuMs": [
+    17520.0,
+    12850.0,
+    17180.0
+   ],
+   "medianLoadMs": 7842.4,
+   "medianClassifyMs": 6960.8,
+   "medianLoadAndClassifyMs": 14803.3,
+   "retainedHeapMib": [
+    1151.0,
+    1235.2,
+    1233.3
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 7456576,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_14042.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 517023,
+   "logicalAxioms": 652361,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    6431.3,
+    7921.0,
+    7864.5
+   ],
+   "classifyMs": [
+    5035.4,
+    8091.9,
+    16256.9
+   ],
+   "classifyCpuMs": [
+    27590.0,
+    25150.0,
+    29200.0
+   ],
+   "medianLoadMs": 7864.5,
+   "medianClassifyMs": 8091.9,
+   "medianLoadAndClassifyMs": 16012.9,
+   "retainedHeapMib": [
+    1147.2,
+    1233.9,
+    1233.1
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 7398724,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_11395.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 517023,
+   "logicalAxioms": 652361,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    6518.9,
+    8235.1,
+    8212.6
+   ],
+   "classifyMs": [
+    6527.0,
+    6956.5,
+    10348.7
+   ],
+   "classifyCpuMs": [
+    17350.0,
+    13200.0,
+    17610.0
+   ],
+   "medianLoadMs": 8212.6,
+   "medianClassifyMs": 6956.5,
+   "medianLoadAndClassifyMs": 15191.6,
+   "retainedHeapMib": [
+    1148.6,
+    1235.4,
+    1234.7
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 6723932,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_11395.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 517023,
+   "logicalAxioms": 652361,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    6471.4,
+    8425.8,
+    8198.4
+   ],
+   "classifyMs": [
+    5180.3,
+    7032.9,
+    16373.6
+   ],
+   "classifyCpuMs": [
+    28400.0,
+    22780.0,
+    32190.0
+   ],
+   "medianLoadMs": 8198.4,
+   "medianClassifyMs": 7032.9,
+   "medianLoadAndClassifyMs": 15458.7,
+   "retainedHeapMib": [
+    1148.0,
+    1235.9,
+    1232.9
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 6804036,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_1559.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 264023,
+   "logicalAxioms": 2249889,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    17637.6,
+    17971.5,
+    16953.6
+   ],
+   "classifyMs": [
+    9692.9,
+    8097.0,
+    8165.5
+   ],
+   "classifyCpuMs": [
+    17810.0,
+    12310.0,
+    14950.0
+   ],
+   "medianLoadMs": 17637.6,
+   "medianClassifyMs": 8165.5,
+   "medianLoadAndClassifyMs": 26068.5,
+   "retainedHeapMib": [
+    1289.3,
+    1340.3,
+    1331.9
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 10415324,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_1559.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 264023,
+   "logicalAxioms": 2249889,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    18061.8,
+    17853.2,
+    17153.0
+   ],
+   "classifyMs": [
+    8049.9,
+    6812.1,
+    6872.8
+   ],
+   "classifyCpuMs": [
+    22490.0,
+    15040.0,
+    17540.0
+   ],
+   "medianLoadMs": 17853.2,
+   "medianClassifyMs": 6872.8,
+   "medianLoadAndClassifyMs": 24665.3,
+   "retainedHeapMib": [
+    1288.0,
+    1341.5,
+    1332.8
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 10715788,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_15059.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 142884,
+   "logicalAxioms": 3137899,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    17041.6,
+    22070.2,
+    21913.0
+   ],
+   "classifyMs": [
+    9885.4,
+    8996.3,
+    9336.1
+   ],
+   "classifyCpuMs": [
+    17470.0,
+    12990.0,
+    12960.0
+   ],
+   "medianLoadMs": 21913.0,
+   "medianClassifyMs": 9336.1,
+   "medianLoadAndClassifyMs": 31066.5,
+   "retainedHeapMib": [
+    1128.0,
+    1150.6,
+    1153.4
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 6844388,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_15059.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 142884,
+   "logicalAxioms": 3137899,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    16978.4,
+    22569.6,
+    22387.9
+   ],
+   "classifyMs": [
+    9389.7,
+    8162.4,
+    7761.4
+   ],
+   "classifyCpuMs": [
+    21540.0,
+    16730.0,
+    14810.0
+   ],
+   "medianLoadMs": 22387.9,
+   "medianClassifyMs": 8162.4,
+   "medianLoadAndClassifyMs": 30149.4,
+   "retainedHeapMib": [
+    1129.4,
+    1150.1,
+    1152.3
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 9078448,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_3524.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 123313,
+   "logicalAxioms": 1974320,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    7703.9,
+    10259.2,
+    10596.6
+   ],
+   "classifyMs": [
+    7931.1,
+    7192.3,
+    7562.8
+   ],
+   "classifyCpuMs": [
+    13870.0,
+    9820.0,
+    10650.0
+   ],
+   "medianLoadMs": 10259.2,
+   "medianClassifyMs": 7562.8,
+   "medianLoadAndClassifyMs": 17451.6,
+   "retainedHeapMib": [
+    714.9,
+    739.3,
+    739.9
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 6946616,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_3524.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 123313,
+   "logicalAxioms": 1974320,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    7547.2,
+    10454.8,
+    10150.7
+   ],
+   "classifyMs": [
+    5627.5,
+    5073.3,
+    4951.8
+   ],
+   "classifyCpuMs": [
+    18440.0,
+    12840.0,
+    13700.0
+   ],
+   "medianLoadMs": 10150.7,
+   "medianClassifyMs": 5073.3,
+   "medianLoadAndClassifyMs": 15102.6,
+   "retainedHeapMib": [
+    714.7,
+    744.1,
+    738.1
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 6250372,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_3836.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 1,
+   "classes": 58887,
+   "logicalAxioms": 1869498,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    8811.5,
+    11724.5,
+    11694.4
+   ],
+   "classifyMs": [
+    5259.4,
+    4668.6,
+    4829.4
+   ],
+   "classifyCpuMs": [
+    11450.0,
+    7330.0,
+    6740.0
+   ],
+   "medianLoadMs": 11694.4,
+   "medianClassifyMs": 4829.4,
+   "medianLoadAndClassifyMs": 16393.1,
+   "retainedHeapMib": [
+    585.0,
+    593.4,
+    595.6
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 5677912,
+   "build": "elk"
+  },
+  {
+   "input": "data/ore/ore_ont_3836.owl",
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20.1",
+   "threads": 8,
+   "classes": 58887,
+   "logicalAxioms": 1869498,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "loadMs": [
+    9272.6,
+    12110.3,
+    12211.0
+   ],
+   "classifyMs": [
+    4792.4,
+    4621.1,
+    4406.1
+   ],
+   "classifyCpuMs": [
+    13990.0,
+    9230.0,
+    8640.0
+   ],
+   "medianLoadMs": 12110.3,
+   "medianClassifyMs": 4621.1,
+   "medianLoadAndClassifyMs": 16617.2,
+   "retainedHeapMib": [
+    585.1,
+    594.0,
+    594.5
+   ],
+   "maxHeapMib": 10240,
+   "jvmArgs": [
+    "-Xms10g",
+    "-Xmx10g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "peakRssKib": 5987832,
+   "build": "elk"
+  },
+  {
+   "input": "data/go.ofn",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 51986,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    1864.9,
+    1869.1,
+    1867.9,
+    1848.9,
+    1886.1
+   ],
+   "parseMs": [
+    459.0,
+    458.0,
+    468.0,
+    450.0,
+    463.0
+   ],
+   "totalMs": [
+    1775.0,
+    1787.0,
+    1791.0,
+    1772.0,
+    1808.0
+   ],
+   "classifyMs": [
+    1316.0,
+    1329.0,
+    1323.0,
+    1322.0,
+    1345.0
+   ],
+   "medianWallMs": 1867.9,
+   "medianParseMs": 459.0,
+   "medianClassifyMs": 1323.0,
+   "peakRssKib": [
+    725320,
+    724840,
+    726828,
+    724968,
+    726620
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/go.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/go.ofn",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 51986,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    1862.8,
+    1857.1,
+    1857.3,
+    1860.8,
+    1860.3
+   ],
+   "parseMs": [
+    464.0,
+    457.0,
+    460.0,
+    462.0,
+    456.0
+   ],
+   "totalMs": [
+    1784.0,
+    1784.0,
+    1780.0,
+    1784.0,
+    1783.0
+   ],
+   "classifyMs": [
+    1320.0,
+    1327.0,
+    1320.0,
+    1322.0,
+    1327.0
+   ],
+   "medianWallMs": 1860.3,
+   "medianParseMs": 460.0,
+   "medianClassifyMs": 1322.0,
+   "peakRssKib": [
+    729716,
+    729640,
+    728884,
+    730288,
+    729404
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/go.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/chebi_lite.ofn",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 238150,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    6824.7,
+    6758.2,
+    6685.3,
+    6734.5,
+    8433.3
+   ],
+   "parseMs": [
+    2242.0,
+    2203.0,
+    2210.0,
+    2197.0,
+    3925.0
+   ],
+   "totalMs": [
+    6509.0,
+    6457.0,
+    6357.0,
+    6434.0,
+    8130.0
+   ],
+   "classifyMs": [
+    4267.0,
+    4254.0,
+    4147.0,
+    4237.0,
+    4205.0
+   ],
+   "medianWallMs": 6758.2,
+   "medianParseMs": 2210.0,
+   "medianClassifyMs": 4237.0,
+   "peakRssKib": [
+    2266080,
+    2279224,
+    2270744,
+    2285504,
+    2263084
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/chebi_lite.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/chebi_lite.ofn",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 238150,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    6658.1,
+    6698.0,
+    6647.8,
+    6715.3,
+    6654.7
+   ],
+   "parseMs": [
+    2209.0,
+    2192.0,
+    2202.0,
+    2220.0,
+    2193.0
+   ],
+   "totalMs": [
+    6352.0,
+    6389.0,
+    6339.0,
+    6409.0,
+    6353.0
+   ],
+   "classifyMs": [
+    4143.0,
+    4197.0,
+    4137.0,
+    4189.0,
+    4160.0
+   ],
+   "medianWallMs": 6658.1,
+   "medianParseMs": 2202.0,
+   "medianClassifyMs": 4160.0,
+   "peakRssKib": [
+    2272184,
+    2271312,
+    2266240,
+    2273104,
+    2286780
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/chebi_lite.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_13482.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 58376,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    17150.3,
+    17259.2,
+    17324.8
+   ],
+   "parseMs": [
+    5328.0,
+    5294.0,
+    5314.0
+   ],
+   "totalMs": [
+    16543.0,
+    16640.0,
+    16708.0
+   ],
+   "classifyMs": [
+    11215.0,
+    11346.0,
+    11394.0
+   ],
+   "medianWallMs": 17259.2,
+   "medianParseMs": 5314.0,
+   "medianClassifyMs": 11346.0,
+   "peakRssKib": [
+    4515588,
+    4516440,
+    4516136
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_13482.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_13482.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 58376,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    12468.2,
+    12608.8,
+    12011.7
+   ],
+   "parseMs": [
+    5343.0,
+    5331.0,
+    5298.0
+   ],
+   "totalMs": [
+    11785.0,
+    11960.0,
+    11373.0
+   ],
+   "classifyMs": [
+    6442.0,
+    6629.0,
+    6075.0
+   ],
+   "medianWallMs": 12468.2,
+   "medianParseMs": 5331.0,
+   "medianClassifyMs": 6442.0,
+   "peakRssKib": [
+    4774016,
+    4762716,
+    4763776
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_13482.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_868.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 981151,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    19711.9,
+    19501.1,
+    19922.8
+   ],
+   "parseMs": [
+    6370.0,
+    6282.0,
+    6479.0
+   ],
+   "totalMs": [
+    18623.0,
+    18671.0,
+    18915.0
+   ],
+   "classifyMs": [
+    12253.0,
+    12389.0,
+    12436.0
+   ],
+   "medianWallMs": 19711.9,
+   "medianParseMs": 6370.0,
+   "medianClassifyMs": 12389.0,
+   "peakRssKib": [
+    6095920,
+    6028872,
+    6091412
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_868.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_868.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 981151,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    19417.5,
+    19608.3,
+    19810.9
+   ],
+   "parseMs": [
+    6334.0,
+    6346.0,
+    6583.0
+   ],
+   "totalMs": [
+    18560.0,
+    18822.0,
+    18810.0
+   ],
+   "classifyMs": [
+    12226.0,
+    12476.0,
+    12227.0
+   ],
+   "medianWallMs": 19608.3,
+   "medianParseMs": 6346.0,
+   "medianClassifyMs": 12227.0,
+   "peakRssKib": [
+    6053380,
+    6054012,
+    6094960
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_868.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_9674.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 981148,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    19208.9,
+    18905.3,
+    19364.9
+   ],
+   "parseMs": [
+    6098.0,
+    6214.0,
+    6183.0
+   ],
+   "totalMs": [
+    18284.0,
+    18010.0,
+    18418.0
+   ],
+   "classifyMs": [
+    12186.0,
+    11796.0,
+    12235.0
+   ],
+   "medianWallMs": 19208.9,
+   "medianParseMs": 6183.0,
+   "medianClassifyMs": 12186.0,
+   "peakRssKib": [
+    5936824,
+    5946960,
+    5919964
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_9674.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_9674.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 981148,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    19370.6,
+    19661.7,
+    19550.1
+   ],
+   "parseMs": [
+    6180.0,
+    6366.0,
+    6288.0
+   ],
+   "totalMs": [
+    18415.0,
+    18712.0,
+    18608.0
+   ],
+   "classifyMs": [
+    12235.0,
+    12346.0,
+    12320.0
+   ],
+   "medianWallMs": 19550.1,
+   "medianParseMs": 6288.0,
+   "medianClassifyMs": 12320.0,
+   "peakRssKib": [
+    5930728,
+    5948764,
+    5925896
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_9674.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_10689.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 981148,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    18789.1,
+    19264.6,
+    19351.7
+   ],
+   "parseMs": [
+    6166.0,
+    6289.0,
+    6206.0
+   ],
+   "totalMs": [
+    17926.0,
+    18391.0,
+    18411.0
+   ],
+   "classifyMs": [
+    11760.0,
+    12102.0,
+    12205.0
+   ],
+   "medianWallMs": 19264.6,
+   "medianParseMs": 6206.0,
+   "medianClassifyMs": 12102.0,
+   "peakRssKib": [
+    5942964,
+    5946056,
+    5924808
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_10689.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_10689.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 981148,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    19196.9,
+    19155.3,
+    19244.3
+   ],
+   "parseMs": [
+    6302.0,
+    6294.0,
+    6289.0
+   ],
+   "totalMs": [
+    18244.0,
+    18191.0,
+    18278.0
+   ],
+   "classifyMs": [
+    11942.0,
+    11897.0,
+    11989.0
+   ],
+   "medianWallMs": 19196.9,
+   "medianParseMs": 6294.0,
+   "medianClassifyMs": 11942.0,
+   "peakRssKib": [
+    5926528,
+    5949972,
+    5949772
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_10689.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_8486.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 903617,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    17557.7,
+    17473.8,
+    17723.7
+   ],
+   "parseMs": [
+    5786.0,
+    5737.0,
+    5805.0
+   ],
+   "totalMs": [
+    16676.0,
+    16585.0,
+    16841.0
+   ],
+   "classifyMs": [
+    10890.0,
+    10848.0,
+    11036.0
+   ],
+   "medianWallMs": 17557.7,
+   "medianParseMs": 5786.0,
+   "medianClassifyMs": 10890.0,
+   "peakRssKib": [
+    5502244,
+    5503184,
+    5482052
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_8486.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_8486.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 903617,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    17665.4,
+    17537.5,
+    17627.8
+   ],
+   "parseMs": [
+    5644.0,
+    5786.0,
+    5744.0
+   ],
+   "totalMs": [
+    16843.0,
+    16632.0,
+    16819.0
+   ],
+   "classifyMs": [
+    11199.0,
+    10846.0,
+    11075.0
+   ],
+   "medianWallMs": 17627.8,
+   "medianParseMs": 5744.0,
+   "medianClassifyMs": 11075.0,
+   "peakRssKib": [
+    5500564,
+    5501996,
+    5484760
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_8486.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_14459.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 847760,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    16692.4,
+    16689.2,
+    16553.6
+   ],
+   "parseMs": [
+    5496.0,
+    5517.0,
+    5286.0
+   ],
+   "totalMs": [
+    15852.0,
+    15853.0,
+    15728.0
+   ],
+   "classifyMs": [
+    10356.0,
+    10336.0,
+    10442.0
+   ],
+   "medianWallMs": 16689.2,
+   "medianParseMs": 5496.0,
+   "medianClassifyMs": 10356.0,
+   "peakRssKib": [
+    5170716,
+    5169716,
+    5150460
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_14459.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_14459.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 847760,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    16856.7,
+    17382.6,
+    16431.6
+   ],
+   "parseMs": [
+    5480.0,
+    5741.0,
+    5448.0
+   ],
+   "totalMs": [
+    16026.0,
+    16552.0,
+    15610.0
+   ],
+   "classifyMs": [
+    10546.0,
+    10811.0,
+    10162.0
+   ],
+   "medianWallMs": 16856.7,
+   "medianParseMs": 5480.0,
+   "medianClassifyMs": 10546.0,
+   "peakRssKib": [
+    5151564,
+    5173592,
+    5181756
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_14459.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_16008.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 733100,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    14379.4,
+    14200.1,
+    13960.3
+   ],
+   "parseMs": [
+    4747.0,
+    4684.0,
+    4718.0
+   ],
+   "totalMs": [
+    13643.0,
+    13490.0,
+    13234.0
+   ],
+   "classifyMs": [
+    8896.0,
+    8806.0,
+    8516.0
+   ],
+   "medianWallMs": 14200.1,
+   "medianParseMs": 4718.0,
+   "medianClassifyMs": 8806.0,
+   "peakRssKib": [
+    4510812,
+    4520200,
+    4518940
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_16008.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_16008.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 733100,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    14433.2,
+    14272.7,
+    14322.9
+   ],
+   "parseMs": [
+    4781.0,
+    4655.0,
+    4648.0
+   ],
+   "totalMs": [
+    13708.0,
+    13561.0,
+    13599.0
+   ],
+   "classifyMs": [
+    8927.0,
+    8906.0,
+    8951.0
+   ],
+   "medianWallMs": 14322.9,
+   "medianParseMs": 4655.0,
+   "medianClassifyMs": 8927.0,
+   "peakRssKib": [
+    4513168,
+    4517680,
+    4518556
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_16008.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_14042.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 517023,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    12792.3,
+    12778.9,
+    12591.7
+   ],
+   "parseMs": [
+    4995.0,
+    4994.0,
+    5011.0
+   ],
+   "totalMs": [
+    12146.0,
+    12103.0,
+    11923.0
+   ],
+   "classifyMs": [
+    7151.0,
+    7109.0,
+    6912.0
+   ],
+   "medianWallMs": 12778.9,
+   "medianParseMs": 4995.0,
+   "medianClassifyMs": 7109.0,
+   "peakRssKib": [
+    4302328,
+    4311968,
+    4299324
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_14042.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_14042.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 517023,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    12675.3,
+    12559.8,
+    12583.0
+   ],
+   "parseMs": [
+    5006.0,
+    4855.0,
+    4905.0
+   ],
+   "totalMs": [
+    12007.0,
+    11895.0,
+    11929.0
+   ],
+   "classifyMs": [
+    7001.0,
+    7040.0,
+    7024.0
+   ],
+   "medianWallMs": 12583.0,
+   "medianParseMs": 4905.0,
+   "medianClassifyMs": 7024.0,
+   "peakRssKib": [
+    4303180,
+    4313096,
+    4312708
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_14042.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_11395.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 517023,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    12962.7,
+    12814.2,
+    12938.7
+   ],
+   "parseMs": [
+    5201.0,
+    5102.0,
+    5146.0
+   ],
+   "totalMs": [
+    12295.0,
+    12158.0,
+    12274.0
+   ],
+   "classifyMs": [
+    7094.0,
+    7056.0,
+    7128.0
+   ],
+   "medianWallMs": 12938.7,
+   "medianParseMs": 5146.0,
+   "medianClassifyMs": 7094.0,
+   "peakRssKib": [
+    4374872,
+    4375696,
+    4368300
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_11395.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_11395.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 517023,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    12945.6,
+    12838.9,
+    12909.4
+   ],
+   "parseMs": [
+    5175.0,
+    5207.0,
+    5151.0
+   ],
+   "totalMs": [
+    12284.0,
+    12186.0,
+    12246.0
+   ],
+   "classifyMs": [
+    7109.0,
+    6979.0,
+    7095.0
+   ],
+   "medianWallMs": 12909.4,
+   "medianParseMs": 5175.0,
+   "medianClassifyMs": 7095.0,
+   "peakRssKib": [
+    4381380,
+    4385560,
+    4375984
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_11395.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_1559.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 264022,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    21254.3,
+    21183.5,
+    21260.5
+   ],
+   "parseMs": [
+    11892.0,
+    11921.0,
+    11869.0
+   ],
+   "totalMs": [
+    19893.0,
+    19884.0,
+    19987.0
+   ],
+   "classifyMs": [
+    8001.0,
+    7963.0,
+    8118.0
+   ],
+   "medianWallMs": 21254.3,
+   "medianParseMs": 11892.0,
+   "medianClassifyMs": 8001.0,
+   "peakRssKib": [
+    6204056,
+    6202616,
+    6205892
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_1559.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_1559.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 264022,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    20901.2,
+    20668.6,
+    21266.5
+   ],
+   "parseMs": [
+    11971.0,
+    11783.0,
+    11837.0
+   ],
+   "totalMs": [
+    19625.0,
+    19366.0,
+    19966.0
+   ],
+   "classifyMs": [
+    7654.0,
+    7583.0,
+    8129.0
+   ],
+   "medianWallMs": 20901.2,
+   "medianParseMs": 11837.0,
+   "medianClassifyMs": 7654.0,
+   "peakRssKib": [
+    6209940,
+    6211556,
+    6204028
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_1559.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_15059.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 142884,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    25165.7,
+    24796.6,
+    25042.3
+   ],
+   "parseMs": [
+    16403.0,
+    16423.0,
+    16247.0
+   ],
+   "totalMs": [
+    23592.0,
+    23180.0,
+    23421.0
+   ],
+   "classifyMs": [
+    7189.0,
+    6757.0,
+    7174.0
+   ],
+   "medianWallMs": 25042.3,
+   "medianParseMs": 16403.0,
+   "medianClassifyMs": 7174.0,
+   "peakRssKib": [
+    7391856,
+    7391252,
+    7392100
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_15059.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_15059.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 142884,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    24718.9,
+    25281.9,
+    24902.2
+   ],
+   "parseMs": [
+    15972.0,
+    16373.0,
+    16292.0
+   ],
+   "totalMs": [
+    23113.0,
+    23614.0,
+    23400.0
+   ],
+   "classifyMs": [
+    7141.0,
+    7241.0,
+    7108.0
+   ],
+   "medianWallMs": 24902.2,
+   "medianParseMs": 16292.0,
+   "medianClassifyMs": 7141.0,
+   "peakRssKib": [
+    7394880,
+    7398256,
+    7396940
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_15059.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_3524.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 123311,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    14116.5,
+    14156.4,
+    14330.0
+   ],
+   "parseMs": [
+    8117.0,
+    8131.0,
+    8129.0
+   ],
+   "totalMs": [
+    13249.0,
+    13278.0,
+    13443.0
+   ],
+   "classifyMs": [
+    5132.0,
+    5147.0,
+    5314.0
+   ],
+   "medianWallMs": 14156.4,
+   "medianParseMs": 8129.0,
+   "medianClassifyMs": 5147.0,
+   "peakRssKib": [
+    4097068,
+    4095104,
+    4101260
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_3524.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_3524.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 123311,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    14228.5,
+    13994.6,
+    14203.6
+   ],
+   "parseMs": [
+    8149.0,
+    7876.0,
+    8166.0
+   ],
+   "totalMs": [
+    13346.0,
+    13020.0,
+    13313.0
+   ],
+   "classifyMs": [
+    5197.0,
+    5144.0,
+    5147.0
+   ],
+   "medianWallMs": 14203.6,
+   "medianParseMs": 8149.0,
+   "medianClassifyMs": 5147.0,
+   "peakRssKib": [
+    4095316,
+    4104080,
+    4095672
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_3524.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_3836.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 1,
+   "classes": 58887,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    13670.6,
+    13733.6,
+    13377.5
+   ],
+   "parseMs": [
+    9354.0,
+    9343.0,
+    9220.0
+   ],
+   "totalMs": [
+    12767.0,
+    12811.0,
+    12512.0
+   ],
+   "classifyMs": [
+    3413.0,
+    3468.0,
+    3292.0
+   ],
+   "medianWallMs": 13670.6,
+   "medianParseMs": 9343.0,
+   "medianClassifyMs": 3413.0,
+   "peakRssKib": [
+    4227752,
+    4228268,
+    4227012
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_3836.konclude.t1.ofn.konclude.owx",
+   "build": "konclude"
+  },
+  {
+   "input": "data/ore/ore_ont_3836.owl",
+   "reasoner": "Konclude 0.7.0-1138",
+   "threads": 8,
+   "classes": 58887,
+   "consistent": true,
+   "unsatisfiable": 0,
+   "wallMs": [
+    13856.4,
+    13581.8,
+    13737.8
+   ],
+   "parseMs": [
+    9448.0,
+    9336.0,
+    9300.0
+   ],
+   "totalMs": [
+    12937.0,
+    12694.0,
+    12813.0
+   ],
+   "classifyMs": [
+    3489.0,
+    3358.0,
+    3513.0
+   ],
+   "medianWallMs": 13737.8,
+   "medianParseMs": 9336.0,
+   "medianClassifyMs": 3489.0,
+   "peakRssKib": [
+    4229704,
+    4230884,
+    4230888
+   ],
+   "raw": "/home/kclejeune/lanes/el-speed-645/out-20261103T101555Z/ore_ont_3836.konclude.t8.ofn.konclude.owx",
+   "build": "konclude"
+  }
+ ],
+ "checks": [
+  {
+   "name": "lane taxonomies equal the base's and are the same on one and eight threads",
+   "passed": true,
+   "detail": [
+    "chebi_lite.lane.t1.txt same-as-base",
+    "chebi_lite.lane.t8.txt same-as-base",
+    "go.lane.t1.txt same-as-base",
+    "go.lane.t8.txt same-as-base",
+    "ore_ont_10689.lane.t1.txt same-as-base",
+    "ore_ont_10689.lane.t8.txt same-as-base",
+    "ore_ont_11395.lane.t1.txt same-as-base",
+    "ore_ont_11395.lane.t8.txt same-as-base",
+    "ore_ont_13482.lane.t1.txt same-as-base",
+    "ore_ont_13482.lane.t8.txt same-as-base",
+    "ore_ont_14042.lane.t1.txt same-as-base",
+    "ore_ont_14042.lane.t8.txt same-as-base",
+    "ore_ont_14459.lane.t1.txt same-as-base",
+    "ore_ont_14459.lane.t8.txt same-as-base",
+    "ore_ont_15059.lane.t1.txt same-as-base",
+    "ore_ont_15059.lane.t8.txt same-as-base",
+    "ore_ont_1559.lane.t1.txt same-as-base",
+    "ore_ont_1559.lane.t8.txt same-as-base",
+    "ore_ont_16008.lane.t1.txt same-as-base",
+    "ore_ont_16008.lane.t8.txt same-as-base",
+    "ore_ont_3524.lane.t1.txt same-as-base",
+    "ore_ont_3524.lane.t8.txt same-as-base",
+    "ore_ont_3836.lane.t1.txt same-as-base",
+    "ore_ont_3836.lane.t8.txt same-as-base",
+    "ore_ont_8486.lane.t1.txt same-as-base",
+    "ore_ont_8486.lane.t8.txt same-as-base",
+    "ore_ont_868.lane.t1.txt same-as-base",
+    "ore_ont_868.lane.t8.txt same-as-base",
+    "ore_ont_9674.lane.t1.txt same-as-base",
+    "ore_ont_9674.lane.t8.txt same-as-base",
+    "chebi_lite.lane.t8.txt same-as-t1",
+    "go.lane.t8.txt same-as-t1",
+    "ore_ont_10689.lane.t8.txt same-as-t1",
+    "ore_ont_11395.lane.t8.txt same-as-t1",
+    "ore_ont_13482.lane.t8.txt same-as-t1",
+    "ore_ont_14042.lane.t8.txt same-as-t1",
+    "ore_ont_14459.lane.t8.txt same-as-t1",
+    "ore_ont_15059.lane.t8.txt same-as-t1",
+    "ore_ont_1559.lane.t8.txt same-as-t1",
+    "ore_ont_16008.lane.t8.txt same-as-t1",
+    "ore_ont_3524.lane.t8.txt same-as-t1",
+    "ore_ont_3836.lane.t8.txt same-as-t1",
+    "ore_ont_8486.lane.t8.txt same-as-t1",
+    "ore_ont_868.lane.t8.txt same-as-t1",
+    "ore_ont_9674.lane.t8.txt same-as-t1"
+   ]
+  },
+  {
+   "name": "ELK and Konclude taxonomies against the lane's",
+   "passed": true,
+   "detail": {
+    "chebi_lite.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "chebi_lite.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "chebi_lite.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "chebi_lite.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "go.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "go.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "go.konclude.t1": {
+     "agree": false,
+     "nodeDifferences": 0,
+     "missingEdges": 7,
+     "extraEdges": 2,
+     "unsatisfiableDifferences": 0
+    },
+    "go.konclude.t8": {
+     "agree": false,
+     "nodeDifferences": 0,
+     "missingEdges": 7,
+     "extraEdges": 2,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_10689.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_10689.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_10689.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_10689.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_11395.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_11395.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_11395.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_11395.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_13482.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_13482.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_13482.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_13482.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_14042.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_14042.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_14042.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_14042.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_14459.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_14459.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_14459.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_14459.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_15059.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_15059.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_15059.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_15059.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_1559.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_1559.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_1559.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_1559.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_16008.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_16008.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_16008.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_16008.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_3524.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_3524.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_3524.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_3524.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_3836.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_3836.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_3836.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_3836.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_8486.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_8486.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_8486.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_8486.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_868.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_868.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_868.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_868.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_9674.elk.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_9674.elk.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_9674.konclude.t1": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    },
+    "ore_ont_9674.konclude.t8": {
+     "agree": true,
+     "nodeDifferences": 0,
+     "missingEdges": 0,
+     "extraEdges": 0,
+     "unsatisfiableDifferences": 0
+    }
+   },
+   "note": "Konclude's GO taxonomy differs by the same 7 and 2 direct edges as in the earlier reference run, which come from GO's inverse property, as RESULTS.md describes. Every other comparison agrees."
+  },
+  {
+   "name": "taxonomy sweep on atlas",
+   "passed": true,
+   "detail": "taxonomy-sweep-atlas.txt"
+  }
+ ]
+}

@@ -601,3 +601,36 @@ fn decorrelation_can_be_disabled_by_name() {
     assert!(!o.decorrelate_exists);
     assert!(o.range_pushdown);
 }
+
+/// An EXISTS evaluated per row in eager execution charges the entries of its memo, as a
+/// cursor does, so a pattern with a distinct key on every row peaks above one whose rows
+/// share a key by at least the memo's entries (item 453 stage 4).
+#[test]
+fn an_eager_exists_memo_is_charged() {
+    const N: usize = 20_000;
+    let data = |distinct: bool| {
+        let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
+        for i in 0..N {
+            let o = if distinct { i } else { 0 };
+            ttl.push_str(&format!("ex:s{i} ex:p ex:o{o} .\n"));
+            if i % 2 == 0 {
+                ttl.push_str(&format!("ex:o{i} ex:q ex:z .\n"));
+            }
+        }
+        store(&ttl)
+    };
+    let q =
+        format!("{PREFIXES}SELECT ?x WHERE {{ ?x ex:p ?y FILTER NOT EXISTS {{ ?y ex:q ?z }} }}");
+    let peak = |distinct: bool| {
+        let r = query(data(distinct).snapshot(), &q, &opts(without())).unwrap();
+        assert!(!decorrelated(&r.plan), "{:#?}", r.plan);
+        let answers = if distinct { N / 2 } else { 0 };
+        assert_eq!(r.rows().len(), answers);
+        r.mem_peak_bytes
+    };
+    let (shared, distinct) = (peak(false), peak(true));
+    assert!(
+        distinct >= shared + N as u64 * 64,
+        "{distinct} bytes with distinct keys against {shared} with one"
+    );
+}

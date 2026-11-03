@@ -448,7 +448,7 @@ mod on {
         let how = match index_pred {
             Some(p) => format!(
                 "index nested loop on {}",
-                ctx.term(p).map_or_else(|| "?".into(), |t| short(&t))
+                ctx.plan_term(p).map_or_else(|| "?".into(), |t| short(&t))
             ),
             None => "tree join".into(),
         };
@@ -874,7 +874,7 @@ mod on {
             .ok_or_else(|| format!("{} is not the object of a scan", name(ctx, w)))?;
         if view.predicate_slot(shape.pred).is_none() {
             let p = ctx
-                .term(shape.pred)
+                .plan_term(shape.pred)
                 .map_or_else(|| "?".into(), |t| short(&t));
             return Err(format!("{p} is not an indexed predicate"));
         }

@@ -2055,9 +2055,14 @@
   // Focus only after initial time controls have reconciled, preserving a past-state URL.
   $effect(() => {
     const iri = page.url.searchParams.get('iri');
+    const urlTab = page.url.searchParams.get('tab');
     void page.url.searchParams.get('ds');
     untrack(() => {
-      if (iri && (!focusId || nodes[focusId]?.iri !== iri)) void focusOn(iri, undefined, true);
+      if (!iri) return;
+      // a link to a resource, such as a top bar search hit, shows it in the graph, also
+      // when it is the resource already focused; the page's own tabs keep `tab` in the URL
+      if (!urlTab && tab !== 'graph') tab = 'graph';
+      if (!focusId || nodes[focusId]?.iri !== iri) void focusOn(iri, undefined, true);
     });
   });
 
@@ -2188,6 +2193,7 @@
 
 <svelte:head><title>Explore | Sparkles</title></svelte:head>
 
+<h1 class="sr-only">Explore</h1>
 <div class="page">
   <header class="bar">
     <div class="search">
@@ -4208,7 +4214,7 @@
     }
   }
   /* a phone: the search box on a row of its own, the tabs under it */
-  @media (max-width: 600px) {
+  @media (max-width: 760px) {
     .bar {
       flex-wrap: wrap;
     }

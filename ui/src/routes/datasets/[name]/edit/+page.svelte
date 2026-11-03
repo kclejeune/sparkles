@@ -57,10 +57,10 @@
 >
 
 <div class="page page-container">
-  <nav class="crumbs">
+  <nav class="breadcrumbs" aria-label="Breadcrumbs">
     <a href={resolve('/datasets')}>Datasets</a><Icon name="chevron" size={12} /><a
       href={resolve('/datasets/[name]', { name })}>{name}</a
-    ><Icon name="chevron" size={12} /><span>Edit</span>
+    ><Icon name="chevron" size={12} /><span aria-current="page">Edit</span>
   </nav>
   {#if !iri && !cls}
     <p class="empty">
@@ -84,27 +84,8 @@
 </div>
 
 <style>
-  .page {
-    padding: 18px 28px 40px;
-    gap: 16px;
-  }
-  .crumbs {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: var(--fs-sm);
-    color: var(--text-3);
-  }
-  .crumbs a {
-    color: var(--text-2);
-  }
   .form-wrap {
     max-width: 760px;
     min-width: 0;
-  }
-  @media (max-width: 600px) {
-    .page {
-      padding: 12px 16px 32px;
-    }
   }
 </style>

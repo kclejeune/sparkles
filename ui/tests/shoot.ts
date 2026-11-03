@@ -24,15 +24,15 @@ export async function settle(page: Page, target: Locator = page.locator('body'),
 
 /**
  * Writes docs/images/`name`.png once the page has settled, without a hover state (unless
- * `hover`) or a focus ring. `spinners` is the number of spinners the picture shows.
+ * `hover`) or a focus ring (unless `focus`, for a field whose popup needs the focus). `spinners` is the number of spinners the picture shows.
  */
 export async function shoot(
   page: Page,
   name: string,
-  o: { hover?: boolean; spinners?: number } = {},
+  o: { hover?: boolean; spinners?: number; focus?: boolean } = {},
 ) {
   if (!o.hover) await page.mouse.move(0, 0);
-  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+  if (!o.focus) await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
   await settle(page, page.locator('body'), o.spinners ?? 0);
   await page.screenshot({ path: join(OUT, `${name}.png`), animations: 'disabled' });
 }

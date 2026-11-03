@@ -250,6 +250,72 @@ pub struct Ontology {
 }
 
 impl Ontology {
+    /// The ontology of axioms that a structural syntax gives, as the functional-style
+    /// syntax does, read as one graph: the header in graph 0, each axiom once with an
+    /// origin that names no triple, and the declared typing. A read of the same axioms
+    /// as triples adds the declaration of an object property that Table 6 implies for a
+    /// transitive, symmetric or inverse-functional property, so this does too. Each use
+    /// of an entity names its kind, so no kind is inferred from the uses.
+    pub fn from_axioms(
+        header: Header,
+        axioms: impl IntoIterator<Item = Axiom>,
+        mode: Mode,
+    ) -> Ontology {
+        let origin = || Origin {
+            graph: 0,
+            triples: Vec::new(),
+            main: None,
+        };
+        let mut typing = Typing {
+            mode,
+            ..Typing::default()
+        };
+        let mut implied: Vec<ObjectProperty> = Vec::new();
+        let mut all = Vec::new();
+        for ax in axioms {
+            match &ax.kind {
+                AxiomKind::Declaration(e) => typing
+                    .declared
+                    .entry(e.iri().as_str().to_string())
+                    .or_default()
+                    .add(e.kind()),
+                AxiomKind::TransitiveObjectProperty(ObjectPropertyExpression::Property(p))
+                | AxiomKind::SymmetricObjectProperty(ObjectPropertyExpression::Property(p))
+                | AxiomKind::InverseFunctionalObjectProperty(ObjectPropertyExpression::Property(
+                    p,
+                )) => implied.push(p.clone()),
+                _ => {}
+            }
+            all.push((ax, vec![origin()]));
+        }
+        // a bulk build, which sorts the axioms once and keeps one of each
+        let mut map: BTreeMap<Axiom, Vec<Origin>> = all.into_iter().collect();
+        for p in implied {
+            let declared = typing
+                .declared
+                .get(p.as_str())
+                .is_some_and(|k| k.has(EntityKind::ObjectProperty));
+            if !declared {
+                typing
+                    .declared
+                    .entry(p.as_str().to_string())
+                    .or_default()
+                    .add(EntityKind::ObjectProperty);
+                map.entry(Axiom::declaration(Entity::ObjectProperty(p)))
+                    .or_insert_with(|| vec![origin()]);
+            }
+        }
+        Ontology {
+            header,
+            header_graph: Some(0),
+            axioms: map,
+            typing,
+            mode,
+            terminology_only: true,
+            ..Ontology::default()
+        }
+    }
+
     /// The axioms, in order.
     pub fn axiom_set(&self) -> impl Iterator<Item = &Axiom> {
         self.axioms.keys()
@@ -2616,7 +2682,7 @@ impl<'a> Parser<'a> {
     /// The annotation assertions of the nodes outside RIND (Table 17's last step).
     fn annotation_assertions(&mut self) {
         let mut subjects: Vec<Key> = self.ann_triples.keys().cloned().collect();
-        subjects.sort_by_key(|k| k.to_string());
+        subjects.sort_by_cached_key(|k| k.to_string());
         for x in subjects {
             if self.onodes.contains(&x) {
                 continue;

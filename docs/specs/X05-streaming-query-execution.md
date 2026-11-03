@@ -709,8 +709,9 @@ back to evaluating each row. REGEX and REPLACE programs owned by the query, with
 explicit bounded search caches, replace the thread-local state used by eager
 execution. They include estimates of capture products and checked growth of
 replacements. String and key filters borrow keys under charged scratch memory. Cursor
-evaluation avoids uncharged result, decoded-value and geometry caches, and geometry
-operation limits stay in force.
+evaluation keeps no result cache. Its decoded-value cache and geometry memo are charged
+to the query, as they are in eager execution, and geometry operation limits stay in
+force.
 
 CONSTRUCT instantiates its template for each solution, preserves fresh and shared blank
 nodes, and deduplicates quads globally under a charge. DESCRIBE exposes a budgeted

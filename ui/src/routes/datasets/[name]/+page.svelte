@@ -615,11 +615,12 @@ ex:PersonShape a sh:NodeShape ;
 <svelte:head><title>{name} | Sparkles</title></svelte:head>
 
 <div class="page page-container">
-  <nav class="crumbs">
-    <a href={resolve('/datasets')}>Datasets</a><Icon name="chevron" size={12} /><span>{name}</span>
-  </nav>
-
-  <header class="head">
+  <header class="page-head">
+    <nav class="breadcrumbs" aria-label="Breadcrumbs">
+      <a href={resolve('/datasets')}>Datasets</a><Icon name="chevron" size={12} /><span
+        aria-current="page">{name}</span
+      >
+    </nav>
     <div class="title">
       <div class="name row">
         <h1 class="mono">{name}</h1>
@@ -702,30 +703,31 @@ ex:PersonShape a sh:NodeShape ;
         </div>
       {/if}
     </div>
-    <span class="spacer"></span>
-    <button class="btn" onclick={refreshAll} disabled={loading}>
-      {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={14} />{/if} Refresh
-    </button>
-    <button class="btn" onclick={openQuery}><Icon name="query" size={14} /> Query</button>
-    <a class="btn" href={explore('')}><Icon name="explore" size={14} /> Explore</a>
-    {#if auth.can(name, 'admin')}
-      <button
-        class="btn"
-        onclick={() => (cloneOpen = true)}
-        disabled={readOnly || !info}
-        title={readOnly
-          ? 'The server is read-only'
-          : 'Copy this dataset into a new, independent dataset'}
-        ><Icon name="copy" size={14} /> Clone</button
-      >
-      <button
-        class="btn danger"
-        onclick={() => (deleteTarget = name)}
-        disabled={info?.declared === true}
-        title={info?.declared ? api.DECLARED_TEXT : 'Delete this dataset and its files'}
-        ><Icon name="trash" size={14} /> Delete</button
-      >
-    {/if}
+    <div class="page-actions">
+      <button class="btn" onclick={refreshAll} disabled={loading}>
+        {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={14} />{/if} Refresh
+      </button>
+      <button class="btn" onclick={openQuery}><Icon name="query" size={14} /> Query</button>
+      <a class="btn" href={explore('')}><Icon name="explore" size={14} /> Explore</a>
+      {#if auth.can(name, 'admin')}
+        <button
+          class="btn"
+          onclick={() => (cloneOpen = true)}
+          disabled={readOnly || !info}
+          title={readOnly
+            ? 'The server is read-only'
+            : 'Copy this dataset into a new, independent dataset'}
+          ><Icon name="copy" size={14} /> Clone</button
+        >
+        <button
+          class="btn danger"
+          onclick={() => (deleteTarget = name)}
+          disabled={info?.declared === true}
+          title={info?.declared ? api.DECLARED_TEXT : 'Delete this dataset and its files'}
+          ><Icon name="trash" size={14} /> Delete</button
+        >
+      {/if}
+    </div>
   </header>
 
   {#if cloned}
@@ -803,25 +805,26 @@ ex:PersonShape a sh:NodeShape ;
   {:else if stats}
     <!-- the state the figures describe -->
     <form
-      class="stats-at row"
+      class="stats-at page-context"
       onsubmit={(e) => {
         e.preventDefault();
         void loadStats();
       }}
     >
       <label
+        class="form-row"
         title="Show the figures of a past state: a commit number, commit:N, time:<RFC 3339> or snapshot:NAME"
       >
-        <span class="faint">State at</span>
+        State at
         <input
-          class="input sm mono"
+          class="input mono"
           class:invalid={!statsAtOk}
           placeholder="head"
           size="12"
           bind:value={statsAt}
         />
       </label>
-      <button class="btn sm" disabled={!statsAtOk || loading}>Show</button>
+      <button class="btn" disabled={!statsAtOk || loading}>Show</button>
       {#if stats.at}
         <span class="badge past" title="These figures describe a past state ({stats.at})"
           >commit {stats.commit}</span
@@ -1665,25 +1668,9 @@ ex:PersonShape a sh:NodeShape ;
   .review-link {
     text-decoration: none;
   }
-  .page {
-    padding: 18px 28px 40px;
-    gap: 16px;
-  }
-  .crumbs {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: var(--fs-sm);
-    color: var(--text-3);
-  }
-  .crumbs a {
-    color: var(--text-2);
-  }
-  .head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
+  /* the breadcrumbs take a row of their own above the title */
+  .page-head .breadcrumbs {
+    flex-basis: 100%;
   }
   .title {
     display: grid;
@@ -1694,7 +1681,7 @@ ex:PersonShape a sh:NodeShape ;
   }
   .title h1 {
     font-family: var(--font-mono);
-    font-size: 22px;
+    font-size: var(--fs-xl);
     letter-spacing: -0.03em;
     overflow-wrap: anywhere;
   }
@@ -1759,13 +1746,13 @@ ex:PersonShape a sh:NodeShape ;
   .cols {
     display: grid;
     grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
-    gap: 16px;
+    gap: var(--gap);
     align-items: start;
   }
   .col {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
-    gap: 16px;
+    gap: var(--gap);
     min-width: 0;
   }
   /* grid items default to their min-content width; keep wide tables inside the track */
@@ -2060,9 +2047,6 @@ ex:PersonShape a sh:NodeShape ;
     }
   }
   @media (max-width: 760px) {
-    .page {
-      padding: 14px 16px 32px;
-    }
     .figures {
       grid-template-columns: repeat(2, 1fr);
     }
@@ -2081,15 +2065,7 @@ ex:PersonShape a sh:NodeShape ;
     border-bottom: 1px solid var(--border);
   }
   .stats-at {
-    gap: 8px;
-    margin: 0 0 8px;
-    font-size: var(--fs-sm);
-    flex-wrap: wrap;
-  }
-  .stats-at label {
-    display: flex;
-    align-items: center;
-    gap: 6px;
+    gap: var(--sp-2);
   }
   .stats-at input.invalid {
     border-color: var(--danger);

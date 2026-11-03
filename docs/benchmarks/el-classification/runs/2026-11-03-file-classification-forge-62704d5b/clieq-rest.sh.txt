@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# clieq-rest.sh A B: the comparisons of clieq-one.sh for the inputs in work/rest.inputs, the
+# ones an earlier build compared, CLIEQ_JOBS at once, then a rerun at 12 GiB of what differs
+set -uo pipefail
+cd ~/lanes/el-perf-649
+A=$1 B=$2 W=work/clieq-$1-$2
+export A B W
+xargs -P ${CLIEQ_JOBS:-5} -I{} bash clieq-one.sh {} < work/rest.inputs > $W.rest.results
+echo "REST-DONE $(grep -c . $W.rest.results) compared, $(grep -c DIFF $W.rest.results) differing"
+export CLIEQ_MEM=12G
+grep DIFF $W.rest.results | awk "{print \$2}" | sort -u | while read -r f; do bash clieq-one.sh "$f"; done > $W.rest.rerun
+echo "REST-RERUN-DONE $(grep -c . $W.rest.rerun) compared, $(grep -c DIFF $W.rest.rerun) differing"

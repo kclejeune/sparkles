@@ -8,6 +8,37 @@ each stated scope.
 
 The SvelteKit UI is embedded in the server binary.
 
+### App shell
+
+* Every page sits in one shell. A top bar holds the brand, a search field whose first
+  segment switches the dataset and names the branch a page has open, the connection
+  status, the theme and the account. A rail beside the page lists the working pages and,
+  below a rule, the administration pages. From 1200 pixels the rail shows labels, below
+  that it shows icons with their names as tooltips, and from 760 pixels down it moves into
+  a drawer that the menu button opens, together with the dataset switcher, the status,
+  the theme and the account. Choosing a dataset on a page that names one in its address
+  reopens that page on the new dataset.
+* `Ctrl+K` or `Cmd+K` focuses the search field from anywhere, including the query
+  editor, and `/` does the same outside a text field. Escape gives the focus back to
+  where it was. On a phone the bar shows a search button, and the button or the keys
+  expand the field over the whole bar with a back button. The field searches the open
+  dataset's classes, properties, individuals and SKOS concepts through the
+  [entity search](../search/README.md#entity-search), with the matched text
+  highlighted, and Enter opens a class or property in the ontology editor, a concept in
+  the thesaurus editor and anything else in Explore
+  ([screenshot](../images/shell-search.png)).
+* The search is the launcher that item 631's command palette fills. A page or feature
+  registers a provider with `launcher.register` in `ui/src/lib/launcher.svelte.ts`, and
+  the field shows each provider's items as a group.
+* One set of design tokens in `ui/src/app.css` gives the colours of the light and dark
+  themes, a type scale, a 4-pixel spacing scale, the page gutter of 24, 20 and 16
+  pixels at large, medium and phone widths, control heights, radii and shadows. Every text
+  colour is at least 4.5:1 against the page and panel backgrounds in both themes, which
+  a unit test checks. Pages share the panel, button, count badge, table, tab, form row,
+  page head and context row styles, and a list beside its detail ends both panes on the
+  same line ([medium width](../images/shell-medium.png),
+  [phone](../images/shell-phone.png)).
+
 ### Query page
 
 * The query page has an editor with completion of declared prefixes, linting and
@@ -331,7 +362,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   preview cannot say whether a fix resolves its result, item 121. Callers whose grants
   cover only some graphs get no overlay, item 75.
 * The ontology editor reads every entity and hierarchy axiom of a graph to draw its
-  trees, up to 50,000 of each, 607. Only the class tree has an inferred view, 609, and
+  trees, up to 50,000 of each, 607. When that listing stops early, as on the Gene
+  Ontology, one SPARQL query reads the labels of the selected graph so the trees still
+  show labels, but the hierarchy above the cut is missing. Only the class tree has an inferred view, 609, and
   the IRI policy is kept in the browser per dataset, 610. Rename covers the graph the
   page reads and not IRIs inside triple terms, under item 457's refactoring phase. The
   editable schema diagram is a further U12 phase of item 457.

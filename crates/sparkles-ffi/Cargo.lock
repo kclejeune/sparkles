@@ -3134,6 +3134,7 @@ dependencies = [
  "oxrdf",
  "oxrdfio",
  "parking_lot",
+ "rayon",
  "regex",
  "rustc-hash 2.1.3",
  "serde",
@@ -3313,6 +3314,7 @@ dependencies = [
 name = "sparkles-owl"
 version = "0.1.0"
 dependencies = [
+ "hashbrown 0.16.1",
  "oxrdf",
  "oxsdatatypes",
  "parking_lot",

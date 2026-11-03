@@ -253,9 +253,14 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   with an individual, a data property, a datatype or a key, and any change after a run
   that took that step, saturates everything again. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
-  closure, saturates and builds the taxonomy. On the benchmark
-  host GO classifies in 83 ms and ChEBI lite in 0.84 seconds on eight threads, and the
-  classifier is 2.5 to 13 times as fast as ELK on GO, ChEBI lite and the largest ORE
+  closure, saturates and builds the taxonomy. A run of 16,384 axioms or more on several
+  threads normalizes chunks of the axioms in parallel, with the same ids and taxonomy as
+  on one thread. The chunks hold the names they meet until they merge and count against
+  the memory budget, and a run whose chunks would pass it normalizes on one thread. This
+  and the saturation's message buffers raise the peak resident set on eight threads by
+  up to 13% on some ontologies in exchange for the speed. On the benchmark host GO
+  classifies in 77 ms and ChEBI lite in 0.39 seconds on eight threads, and the
+  classifier is 3.1 to 20 times as fast as ELK on GO, ChEBI lite and the largest ORE
   2015 EL ontologies on one and eight threads. The classifier's direct hierarchy equals the hierarchy that GO's release
   publishes, and its taxonomy of ChEBI entails every subsumption ChEBI asserts and
   gives no direct subsumption that ChEBI does not assert
@@ -274,6 +279,20 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   matches, and it trades that memory for fast reclassification. `sparkles ontology classify FILE` classifies a file without a
   database and exits with status 1 when the ontology is inconsistent or has an
   unsatisfiable class.
+* `sparkles ontology classify FILE` and `sparkles ontology check FILE` read a file of one
+  graph straight into memory, with no store, and give the answers of a store that loaded
+  the file. RDF/XML, Turtle, N-Triples and N3 parse on several threads, and so does a
+  functional-style document, whose axioms the read keeps as written. A file that holds
+  named graphs, a strict read of a functional-style document and a file whose answer
+  depends on what only a store reproduces, such as its own blank node labels, go through
+  a store in memory, and so does a file that fails to parse, with the loader's
+  error. A functional-style document goes through the store when it has an anonymous
+  individual, an undeclared entity or an `ObjectInverseOf` outside a plain property
+  assertion, among the other cases that the
+  [F24 Outcome](../specs/F24-owl-classification/SPEC.md#outcome) lists. ChEBI lite
+  classifies from its functional-style file in 1.13 s on the benchmark host, and the
+  reverse mapping of the triples bounds a read of RDF/XML
+  ([results](../benchmarks/el-classification/RESULTS.md#file-classification)).
 * The Rust handle `ds.ontology()` opens a snapshot's ontology, checks it and edits it,
   and keeps the last four reads of up to two million triples each, keyed by commit, for
   callers who read every graph. `/$/ontology/{ds}` serves the summary, the axioms, the

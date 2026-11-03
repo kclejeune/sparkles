@@ -217,10 +217,13 @@ implementation and always apply. EXPLAIN shows which ones ran.
   repeat a value the operator runs row by row. EXPLAIN notes `[expr cache: …]` with the
   distinct count or the reason it ran row by row, and reports `exprCacheHits`,
   `exprCacheMisses` and `exprCacheSkipped`. A constant regular expression is compiled once
-  per thread and reuses its match cache. The planner counts the cost of sorting an
-  unsorted input column, so a single pattern under such a FILTER is read from the
-  permutation sorted on the filtered variable. A cursor BIND can retain results across
-  batches when at least a quarter of a bounded pilot repeats exact input IDs. It also
+  per query, or taken from the server's table of recently compiled programs, and each
+  thread that searches it gets its own charged match cache while the budget has room,
+  which the table keeps warm for the thread's next query.
+  The planner counts the cost of sorting an unsorted input column, so a single pattern
+  under such a FILTER is read from the permutation sorted on the filtered variable. A
+  cursor BIND can retain results across batches when at least a quarter of a bounded
+  pilot repeats exact input IDs. It also
   admits a repeated pilot when unchanged-snapshot predicate statistics put the input
   domain below four fifths of estimated rows. This optional profit hint walks at most
   64 plan nodes and declines on changed snapshots or unknown operators. The query owns the map,

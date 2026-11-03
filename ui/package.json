@@ -18,7 +18,10 @@
     "e2e": "playwright test",
     "e2e:mock": "playwright test --config playwright.mock.config.ts",
     "screenshots": "playwright test --config playwright.screenshots.config.ts",
-    "screenshots:mock": "playwright test --config playwright.screenshots-mock.config.ts"
+    "screenshots:mock": "playwright test --config playwright.screenshots-mock.config.ts",
+    "design:seed": "node scripts/seed-design.mjs",
+    "design:capture": "playwright test --config playwright.design.config.ts capture",
+    "design:check": "playwright test --config playwright.design.config.ts go-labels"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",

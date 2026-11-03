@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# ab.sh ROUNDS LABEL... : interleaved runs of bin/LABEL-sparkles ontology classify on the
+# GO and ChEBI lite files, 8 threads (default) and 1 thread; JSON lines to ab-<stamp>.jsonl
+set -uo pipefail
+cd ~/lanes/el-perf-649
+R=$1; shift
+OUT=ab-$(date -u +%Y%m%dT%H%M%SZ).jsonl
+mkdir -p out
+for r in $(seq 1 "$R"); do
+  for f in go.ofn chebi_lite.ofn go.owl chebi_lite.owl; do
+    for th in 0 1; do
+      for L in "$@"; do
+        python3 timed.py "$OUT" "$L $f t$th r$r" --stdout out/$L.$f.t$th.ofn -- \
+          bin/$L-sparkles ontology classify data/$f --format ofn --threads $th --allow-unsatisfiable
+      done
+    done
+  done
+done
+echo "AB-DONE $OUT"

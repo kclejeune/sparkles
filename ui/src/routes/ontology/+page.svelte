@@ -37,6 +37,8 @@
     ONTOLOGY_GRAPHS,
     ontologyAxioms,
     ontologyEntities,
+    ontologyLabels,
+    withMissingLabels,
     ontologyEntity,
     ontologySummary,
     RDFS_LABEL,
@@ -189,6 +191,14 @@
       labels = labelsOf(ax.axioms);
       truncated = ents.truncated || ax.truncated || types.truncated;
       loadError = null;
+      // The capped listing stops before most labels of a large ontology: one query reads
+      // them all and fills in those it left out.
+      if (ax.truncated)
+        void ontologyLabels(t, s)
+          .then((more) => {
+            if (my === loadSeq) labels = withMissingLabels(labels, more);
+          })
+          .catch(() => {});
     } catch (e) {
       if (my === loadSeq) loadError = e as Error;
     } finally {
@@ -722,96 +732,25 @@
 
 <svelte:head><title>Ontology{name ? ` · ${name}` : ''} | Sparkles</title></svelte:head>
 
-<div class="page page-container onto">
+<div class="page page-container fill onto">
   <header class="page-head">
     <div class="title">
       <h1>Ontology</h1>
-      <p class="muted">
+      <p class="meta">
         {#if summary}
-          <span class="mono">{headerTitle}</span>
-          · commit {summary.commit}
-          {#if summary.header.versionIri}· version <span class="mono"
-              >{iriName(summary.header.versionIri, prefixes)}</span
-            >{/if}
+          {headerTitle} · commit {summary.commit}
+          {#if summary.header.versionIri}· version {iriName(
+              summary.header.versionIri,
+              prefixes,
+            )}{/if}
         {:else if !name}
-          Choose a dataset.
+          Choose a dataset in the top bar.
         {:else}
           Reading the ontology of {name}…
         {/if}
       </p>
     </div>
-    <span class="spacer"></span>
-    <div class="bar">
-      <label class="pick">
-        <span class="faint">Dataset</span>
-        <select
-          class="select"
-          value={name}
-          onchange={(e) =>
-            goto(`${resolve('/ontology')}?ds=${encodeURIComponent(e.currentTarget.value)}`)}
-        >
-          {#if !name}<option value="">Choose…</option>{/if}
-          {#each app.datasets as d (d.name)}<option value={d.name}>{d.name}</option>{/each}
-        </select>
-      </label>
-      <label class="pick">
-        <span class="faint">Graph</span>
-        <select
-          class="select"
-          value={graph ?? ''}
-          onchange={(e) => nav({ graph: e.currentTarget.value || null, iri: null })}
-        >
-          <option value="">default graph</option>
-          {#each graphs as g (g)}<option value={g}>{iriName(g, prefixes)}</option>{/each}
-          {#if graph && !graphs.includes(graph)}<option value={graph}>{graph}</option>{/if}
-        </select>
-      </label>
-      {#if branchList.length}
-        <label class="pick">
-          <span class="faint">Branch</span>
-          <select
-            class="select"
-            value={branch ?? MAIN}
-            onchange={(e) =>
-              nav({ branch: e.currentTarget.value === MAIN ? null : e.currentTarget.value })}
-          >
-            {#each branchList as b (b.name)}<option value={b.name}
-                >{b.name}{b.protected ? ' (protected)' : ''}</option
-              >{/each}
-          </select>
-        </label>
-      {/if}
-      {#if canWrite && !branch}
-        <button
-          class="btn sm"
-          onclick={startSession}
-          title="Edit on a branch of your own, then merge it"
-          ><Icon name="branch" size={13} /> Start session</button
-        >
-      {/if}
-      {#if branch}
-        <a
-          class="btn sm"
-          href="{resolve('/datasets/[name]/merge', { name })}?source={encodeURIComponent(
-            branch,
-          )}&target={encodeURIComponent(currentBranch?.upstream ?? MAIN)}"
-          ><Icon name="merge" size={13} /> Merge</a
-        >
-      {/if}
-      <button
-        class="btn sm"
-        disabled={!session.done.length || readonly}
-        onclick={() => session.undoLast()}
-        title={session.done.at(-1) ? `Undo: ${session.done.at(-1)?.label}` : 'Nothing to undo'}
-        >Undo{session.done.length ? ` (${session.done.length})` : ''}</button
-      >
-      <button
-        class="btn sm"
-        disabled={!session.undone.length || readonly}
-        onclick={() => session.redoLast()}
-        title={session.undone.at(-1) ? `Redo: ${session.undone.at(-1)?.label}` : 'Nothing to redo'}
-        >Redo</button
-      >
+    <div class="page-actions">
       <span
         class="live"
         class:on={session.live === 'on'}
@@ -824,8 +763,70 @@
             ? 'Live updates stopped'
             : ''}</span
       >
+      <button
+        class="btn ghost"
+        disabled={!session.done.length || readonly}
+        onclick={() => session.undoLast()}
+        title={session.done.at(-1) ? `Undo: ${session.done.at(-1)?.label}` : 'Nothing to undo'}
+        >Undo{session.done.length ? ` (${session.done.length})` : ''}</button
+      >
+      <button
+        class="btn ghost"
+        disabled={!session.undone.length || readonly}
+        onclick={() => session.redoLast()}
+        title={session.undone.at(-1) ? `Redo: ${session.undone.at(-1)?.label}` : 'Nothing to redo'}
+        >Redo</button
+      >
+      {#if canWrite && !branch}
+        <button
+          class="btn"
+          onclick={startSession}
+          title="Edit on a branch of your own, then merge it"
+          ><Icon name="branch" size={14} /> Start session</button
+        >
+      {/if}
+      {#if branch}
+        <a
+          class="btn"
+          href="{resolve('/datasets/[name]/merge', { name })}?source={encodeURIComponent(
+            branch,
+          )}&target={encodeURIComponent(currentBranch?.upstream ?? MAIN)}"
+          ><Icon name="merge" size={14} /> Merge</a
+        >
+      {/if}
     </div>
   </header>
+  {#if name}
+    <div class="page-context">
+      <label class="form-row">
+        Graph
+        <select
+          class="select"
+          value={graph ?? ''}
+          onchange={(e) => nav({ graph: e.currentTarget.value || null, iri: null })}
+        >
+          <option value="">default graph</option>
+          {#each graphs as g (g)}<option value={g}>{iriName(g, prefixes)}</option>{/each}
+          {#if graph && !graphs.includes(graph)}<option value={graph}>{graph}</option>{/if}
+        </select>
+      </label>
+      {#if branchList.length}
+        <label class="form-row">
+          Branch
+          <select
+            class="select"
+            value={branch ?? MAIN}
+            onchange={(e) =>
+              nav({ branch: e.currentTarget.value === MAIN ? null : e.currentTarget.value })}
+          >
+            {#each branchList as b (b.name)}<option value={b.name}
+                >{b.name}{b.protected ? ' (protected)' : ''}</option
+              >{/each}
+          </select>
+        </label>
+      {/if}
+    </div>
+  {/if}
 
   {#if sessionError}<p class="error-box" role="alert">{sessionError}</p>{/if}
   {#if session.notice}
@@ -861,7 +862,7 @@
     <div class="tabs onto-tabs" role="tablist" aria-label="Ontology views">
       {#each TREE_KINDS as k (k)}
         <button class="tab" role="tab" aria-selected={tab === k} onclick={() => nav({ tab: k })}
-          >{KIND_LABEL[k]} <span class="count">{counts[k] || ''}</span></button
+          >{KIND_LABEL[k]} <span class="count">{counts[k] ? fmtInt(counts[k]) : ''}</span></button
         >
       {/each}
       <span class="tab-sep" aria-hidden="true"></span>
@@ -878,7 +879,7 @@
         onclick={() => nav({ tab: 'header', iri: null })}>Header</button
       >
     </div>
-    <div class="panes">
+    <div class="panes split-view">
       <section class="panel trees" aria-label="Entities">
         {#if kindTab && tree}
           <div class="tree-bar">
@@ -1431,30 +1432,15 @@
 {/snippet}
 
 <style>
-  .onto {
-    gap: 12px;
-  }
-  .title h1 {
-    font-size: var(--fs-xl);
-  }
-  .bar {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    align-items: end;
-  }
-  .pick {
-    display: grid;
-    gap: 2px;
-    font-size: var(--fs-xs);
-  }
   .live {
     display: inline-flex;
     align-items: center;
     gap: 6px;
     font-size: var(--fs-xs);
     color: var(--text-3);
-    min-height: 26px;
+  }
+  .live:empty {
+    display: none;
   }
   .live .dot {
     width: 7px;
@@ -1474,18 +1460,24 @@
     background: var(--spark-soft);
     font-size: var(--fs-sm);
   }
+  /* the trees take two fifths: the inferred tree sits beside the asserted one */
   .panes {
-    display: grid;
     grid-template-columns: minmax(260px, 2fr) minmax(0, 3fr);
-    gap: 12px;
-    align-items: start;
-    min-width: 0;
   }
-  .trees,
+  .trees {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
   .detail {
-    min-width: 0;
-    display: grid;
-    align-content: start;
+    overflow: auto;
+  }
+  .detail > :global(.panel-head) {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    background: var(--surface);
+    border-radius: var(--r-lg) var(--r-lg) 0 0;
   }
   .onto-tabs {
     flex-wrap: wrap;
@@ -1597,12 +1589,17 @@
     display: grid;
     grid-template-columns: minmax(0, 1fr);
     min-width: 0;
+    flex: 1;
+    min-height: 0;
   }
   .tree-cols.two {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
   .tree-col {
     min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
   }
   .tree-cols.two .tree-col + .tree-col {
     border-left: 1px solid var(--border);
@@ -1622,7 +1619,7 @@
     font-size: var(--fs-xs);
   }
   .tree-scroll {
-    max-height: calc(100vh - 240px);
+    flex: 1;
     min-height: 200px;
     overflow: auto;
     padding: 0 6px 10px;
@@ -1735,15 +1732,13 @@
     color: var(--danger);
     font-size: var(--fs-sm);
   }
-  @media (max-width: 900px) {
+  @media (max-width: 760px) {
     .panes {
       grid-template-columns: minmax(0, 1fr);
     }
     .tree-scroll {
       max-height: 50vh;
     }
-  }
-  @media (max-width: 600px) {
     .tree-cols.two {
       grid-template-columns: minmax(0, 1fr);
     }
