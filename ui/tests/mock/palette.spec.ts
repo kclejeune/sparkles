@@ -52,7 +52,7 @@ test.describe('at 1440 pixels', () => {
       ['/ui/thesaurus?ds=thes', 'New concept…'],
       ['/ui/similar?ds=uni', null],
       ['/ui/memory?ds=uni', null],
-      ['/ui/embedding?ds=uni', null],
+      ['/ui/similar/map?ds=uni', null],
       ['/ui/datasets', 'Refresh the dataset list'],
       ['/ui/datasets/uni', 'Show settings'],
       ['/ui/admin/backups', null],

@@ -67,7 +67,7 @@ test('an idle Backups page does not poll repositories or policies', async ({ pag
   await page.clock.install();
   const requests = countRequests(page);
   await page.goto('/ui/admin/backups');
-  await expect(page.getByRole('tab', { name: /Backups/ })).toBeVisible();
+  await expect(page.getByRole('tab', { name: /Snapshots/ })).toBeVisible();
   await page.clock.runFor(2000);
   requests.reset();
   await page.clock.runFor(10 * 60_000);

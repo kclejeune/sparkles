@@ -167,7 +167,7 @@ The SvelteKit UI is embedded in the server binary.
   ([USAGE.md](../USAGE.md#arcs-on-the-map)). Close markers and parallel arcs merge, and a
   list of markers and arcs serves keyboards and screen readers. A selection is shared by
   the maps and the graph canvases.
-* `/ui/embedding` draws a vector index's entities on a plane, placed by PCA or a force
+* `/ui/similar/map` draws a vector index's entities on a plane, placed by PCA or a force
   layout of the neighbour graph and coloured by class or a predicate's values
   ([USAGE.md](../USAGE.md#the-embedding-map), [API.md](../API.md#embedding-map),
   [screenshot](../images/embedding-map.png)). An index above 50,000 entities is sampled, a

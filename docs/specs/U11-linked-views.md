@@ -731,8 +731,8 @@ reports `sparkles_vector_projections` and `sparkles_vector_projection_bytes`. Bo
 need `read` and are on the `whole_dataset` list, so a caller whose access covers part of the
 dataset gets `403`. The rate limiter counts them as queries.
 
-**The map.** `/ui/embedding?ds=…&index=…&method=…&colour=…` is
-`ui/src/routes/embedding/+page.svelte`, and `ui/src/lib/components/EmbeddingMap.svelte`
+**The map.** `/ui/similar/map?ds=…&index=…&method=…&colour=…` is
+`ui/src/routes/similar/map/+page.svelte`, and `ui/src/lib/components/EmbeddingMap.svelte`
 draws the points with WebGL through sigma, as `LargeGraphView` does, over a canvas of the
 density shading and under a canvas that draws the lasso or the box. `ui/src/lib/embedding.ts`
 reads the binary format and holds the shape tests, the legend, the numeric ranges and the

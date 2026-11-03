@@ -94,8 +94,7 @@
 <div class="page-container">
   <header class="page-head">
     <div>
-      <!-- the Admin tab names the page -->
-      <h2 class="sr-only">API tokens</h2>
+      <h1>API tokens</h1>
       <p class="muted">
         Tokens let scripts and the <span class="mono">sparkles</span> CLI act as you. A token never has
         more access than you do, even if your access changes later.

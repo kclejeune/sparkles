@@ -347,7 +347,7 @@ test('explore-facets', async ({ page }) => {
 test('embedding-map', async ({ page, request }) => {
   // the 6,000 invented shipments of `world` projected by the server and coloured by cargo
   // class, with a lasso around one lobe of the largest class in the shared selection
-  await page.goto('/ui/embedding?ds=world&index=shipments');
+  await page.goto('/ui/similar/map?ds=world&index=shipments');
   const map = page.locator('.emap[data-ready="true"]');
   await expect(map).toHaveAttribute('data-points', '6000', { timeout: 30_000 });
   await expect(page.getByTestId('progress')).toHaveCount(0);

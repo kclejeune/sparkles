@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { routes } from '$lib/routes';
   // Similar: nearest neighbours by `spk:vectorSearch` (docs/API.md "Vector similarity").
   // Pick a vector index (or a predicate without one), then search from an entity's own
   // vector or from a pasted vector. The URL keeps the dataset, the index or predicate,
@@ -418,10 +419,10 @@
     {#if ds && chosenIndex}
       <a
         class="btn"
-        href="{resolve('/embedding')}?{new URLSearchParams({
-          ds: family!,
-          ...(selectedBranch ? { branch: selectedBranch } : {}),
-        })}&index={encodeURIComponent(chosenIndex.name)}">Embedding map</a
+        href={routes.similarMap(family, {
+          branch: selectedBranch,
+          index: chosenIndex.name,
+        })}><Icon name="map" size={14} /> Embedding map</a
       >
     {/if}
   </header>

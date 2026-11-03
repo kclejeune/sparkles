@@ -4,6 +4,7 @@
   import { page } from '$app/state';
   import { onDestroy, onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
+  import { routes } from '$lib/routes';
   import { assistantSettings } from '$lib/ask-api';
   import type { Term } from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
@@ -2302,9 +2303,7 @@
                   <a
                     class="btn sm"
                     title="The entities of the vector index {mapIndex} projected to two dimensions"
-                    href="{resolve('/embedding')}?ds={encodeURIComponent(
-                      ds,
-                    )}&index={encodeURIComponent(mapIndex)}">Embedding map</a
+                    href={routes.similarMap(ds, { index: mapIndex })}>Embedding map</a
                   >
                 {/if}
                 {#if canvasMode === 'graph'}

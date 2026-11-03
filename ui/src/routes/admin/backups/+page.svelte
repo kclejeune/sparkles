@@ -9,6 +9,7 @@
   import ActivityTab from '$components/ActivityTab.svelte';
   import BackupsTable from '$components/BackupsTable.svelte';
   import Icon from '$components/Icon.svelte';
+  import SubTabs from '$components/SubTabs.svelte';
   import PoliciesTab from '$components/PoliciesTab.svelte';
   import RepositoriesTab from '$components/RepositoriesTab.svelte';
   import { followTasks } from '$lib/tasks.svelte';
@@ -26,7 +27,7 @@
   const admin = $derived(auth.hasServer('server-admin'));
   const urlTab = $derived((page.url.searchParams.get('tab') ?? 'backups') as Tab);
   const tabs = $derived<{ id: Tab; label: string; icon: string }[]>([
-    { id: 'backups', label: 'Backups', icon: 'archive' },
+    { id: 'backups', label: 'Snapshots', icon: 'archive' },
     { id: 'repositories', label: 'Repositories', icon: 'database' },
     ...(admin ? [{ id: 'policies' as const, label: 'Policies', icon: 'clock' }] : []),
     { id: 'activity', label: 'Activity', icon: 'cycle' },
@@ -87,16 +88,6 @@
     });
   });
 
-  function onTabKey(e: KeyboardEvent, i: number) {
-    const n = tabs.length;
-    const to =
-      e.key === 'ArrowRight' ? (i + 1) % n : e.key === 'ArrowLeft' ? (i + n - 1) % n : null;
-    if (to == null) return;
-    e.preventDefault();
-    setTab(tabs[to].id);
-    document.getElementById(`tab-${tabs[to].id}`)?.focus();
-  }
-
   onMount(() => {
     void auth.ensure().then(loadRepositories);
     api.cachedServerInfo().then(
@@ -115,20 +106,7 @@
 <svelte:head><title>Backups | Sparkles</title></svelte:head>
 
 <div class="page-container">
-  <header class="page-head">
-    <div>
-      <!-- the Admin tab names the page -->
-      <h2 class="sr-only">Backups</h2>
-      <p class="muted">
-        {#if !loaded}Loading…{:else if unsupported}Not available on this server{:else}{repositories.length}
-          repositor{repositories.length === 1 ? 'y' : 'ies'}{repositories.length !== reachableCount
-            ? `, ${repositories.length - reachableCount} unreachable`
-            : ''}{admin ? '' : ' · showing datasets you administer'}{/if}
-      </p>
-    </div>
-    <span class="spacer"></span>
-    <button class="btn" onclick={reload}><Icon name="refresh" size={14} /> Refresh</button>
-  </header>
+  <header class="page-head"><h1>Backups</h1></header>
 
   {#if unsupported}
     <div class="empty panel">
@@ -148,28 +126,33 @@
       </div>
     {/if}
 
-    <div class="tabs" role="tablist" aria-label="Backups">
-      {#each tabs as t, i (t.id)}
-        <button
-          class="tab"
-          role="tab"
-          id="tab-{t.id}"
-          aria-selected={tab === t.id}
-          aria-controls="panel-{t.id}"
-          tabindex={tab === t.id ? 0 : -1}
-          onclick={() => setTab(t.id)}
-          onkeydown={(e) => onTabKey(e, i)}
+    <SubTabs
+      label="Backups"
+      items={tabs.map((t) => ({
+        ...t,
+        count:
+          t.id === 'repositories' && loaded
+            ? repositories.length
+            : t.id === 'policies' && policyNames.length
+              ? policyNames.length
+              : null,
+      }))}
+      value={tab}
+      onchange={setTab}
+    >
+      {#snippet end()}
+        <span class="summary">
+          {#if !loaded}Loading…{:else if unsupported}Not available on this server{:else}{repositories.length}
+            repositor{repositories.length === 1 ? 'y' : 'ies'}{repositories.length !==
+            reachableCount
+              ? `, ${repositories.length - reachableCount} unreachable`
+              : ''}{admin ? '' : ' · showing datasets you administer'}{/if}
+        </span>
+        <button class="btn" onclick={reload} aria-label="Refresh" title="Refresh"
+          ><Icon name="refresh" size={14} /><span class="lbl">Refresh</span></button
         >
-          <Icon name={t.icon} size={14} />
-          {t.label}
-          {#if t.id === 'repositories' && loaded}<span class="count">{repositories.length}</span
-            >{/if}
-          {#if t.id === 'policies' && policyNames.length}<span class="count"
-              >{policyNames.length}</span
-            >{/if}
-        </button>
-      {/each}
-    </div>
+      {/snippet}
+    </SubTabs>
 
     <div class="tabpanel" role="tabpanel" id="panel-{tab}" aria-labelledby="tab-{tab}">
       {#if tab === 'backups'}
@@ -194,9 +177,6 @@
 </div>
 
 <style>
-  .tabs {
-    border-bottom: 1px solid var(--border);
-  }
   .tabpanel {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
@@ -205,5 +185,14 @@
   }
   .small {
     font-size: var(--fs-sm);
+  }
+  /* the row's summary: on a phone the select's options carry the counts */
+  .summary {
+    white-space: nowrap;
+  }
+  @media (max-width: 760px) {
+    .summary {
+      display: none;
+    }
   }
 </style>

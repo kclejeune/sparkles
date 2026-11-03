@@ -88,7 +88,7 @@ export const PAGES: {
   { name: 'similar-entity', path: `/ui/similar?ds=demo&iri=${LUMEN}` },
   { name: 'memory', path: '/ui/memory?ds=demo' },
   { name: 'memory-inbox', path: '/ui/memory?ds=demo&tab=inbox' },
-  { name: 'embedding', path: '/ui/embedding?ds=demo' },
+  { name: 'embedding', path: '/ui/similar/map?ds=demo' },
   { name: 'datasets', path: '/ui/datasets' },
   { name: 'dataset', path: '/ui/datasets/demo' },
   { name: 'dataset-communities', path: '/ui/datasets/demo?tab=communities' },

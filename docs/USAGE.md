@@ -3233,7 +3233,7 @@ and a note says how many were left out.
 The embedding map draws the entities of a vector index as points on a plane, so that
 entities with alike vectors sit close together. **Embedding map** on an index's card on the
 dataset page, in Explore's graph toolbar and on the Similar page opens it at
-`/ui/embedding?ds=…&index=…`. The server computes the projection the first time the map is
+`/ui/similar/map?ds=…&index=…`. The server computes the projection the first time the map is
 opened and keeps it in memory, so later visits draw at once.
 
 **Layout** chooses how the points are placed. **PCA** projects every vector onto the two

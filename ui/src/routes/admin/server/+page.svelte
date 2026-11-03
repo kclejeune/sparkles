@@ -180,8 +180,7 @@
 <div class="page-container">
   <header class="page-head">
     <div>
-      <!-- the Admin tab names the page -->
-      <h2 class="sr-only">Server</h2>
+      <h1>Server</h1>
       <p class="muted">{origin}</p>
     </div>
     <span class="spacer"></span>

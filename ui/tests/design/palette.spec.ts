@@ -21,7 +21,7 @@ const PAGES = [
   ['thesaurus', '/ui/thesaurus?ds=unesco'],
   ['similar', '/ui/similar?ds=demo'],
   ['memory', '/ui/memory?ds=demo'],
-  ['embedding', '/ui/embedding?ds=demo'],
+  ['embedding', '/ui/similar/map?ds=demo'],
   ['datasets', '/ui/datasets'],
   ['dataset', '/ui/datasets/demo'],
   ['merge', '/ui/datasets/demo/merge?source=draft-places'],

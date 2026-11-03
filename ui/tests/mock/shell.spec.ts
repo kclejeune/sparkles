@@ -261,7 +261,12 @@ test.describe('at 1440 pixels', () => {
     const rail = page.getByRole('navigation', { name: 'Pages' });
     for (const name of ['Query', 'Explore', 'Ontology', 'Thesaurus', 'Similar', 'Memory'])
       await expect(rail.getByRole('link', { name, exact: true })).toBeVisible();
-    await expect(rail.getByRole('link', { name: 'Admin', exact: true })).toHaveAttribute(
+    // a group shows its pages while one of them is open, and marks that page
+    await expect(rail.getByRole('button', { name: 'Close Admin' })).toHaveAttribute(
+      'aria-expanded',
+      'true',
+    );
+    await expect(rail.getByRole('link', { name: 'Server', exact: true })).toHaveAttribute(
       'aria-current',
       'page',
     );
@@ -411,7 +416,7 @@ const PAGES = [
   '/ui/thesaurus?ds=uni',
   '/ui/similar?ds=foaf',
   '/ui/memory?ds=foaf',
-  '/ui/embedding?ds=foaf',
+  '/ui/similar/map?ds=foaf',
   '/ui/datasets',
   '/ui/datasets/foaf',
   '/ui/admin/backups',

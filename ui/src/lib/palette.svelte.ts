@@ -13,7 +13,7 @@ import {
   type LauncherItem,
   type LauncherProvider,
 } from './launcher.svelte';
-import { adminTabs, datasetSwitchHref, navItems, navLink } from './shell';
+import { datasetSwitchHref, navItems, navLink } from './shell';
 
 /** The ranking, loaded with the first typed query rather than with the shell. */
 const ranking = () => import('./fuzzy').then((m) => m.rank);
@@ -69,31 +69,28 @@ export function commandProvider(group: 'page' | 'global'): LauncherProvider {
 }
 
 /** The shell's pages, with the open dataset's own page. */
+/** Words a page answers to beside its name. */
+const KEYWORDS: Record<string, string[]> = {
+  '/similar/map': ['embedding map', 'vectors', 'projection', 'umap'],
+  '/admin/tokens': ['access tokens', 'api keys'],
+  '/admin/backups': ['backup', 'snapshots', 'restore'],
+};
+
 export function pageProvider(base: string, backupsVisible: () => boolean): LauncherProvider {
   const pages = (ds: string | null) => {
-    const out: (LauncherItem & { keywords?: string[] })[] = navItems().map((n) => ({
-      id: n.match ?? n.href,
-      title: n.label,
-      icon: n.icon,
-      href: navLink(base, n.href, ds),
-    }));
-    out.push({
-      id: '/embedding',
-      title: 'Embedding map',
-      icon: 'similar',
-      href: navLink(base, '/embedding', ds),
-      keywords: ['vectors', 'projection', 'umap'],
-    });
-    // the Admin page's tabs, each its own row
-    for (const t of adminTabs(backupsVisible()))
-      out.push({
-        id: t.href,
-        title: `Admin › ${t.label}`,
-        icon: t.icon,
-        href: `${base}${t.href}`,
-        keywords:
-          t.href === '/admin/tokens' ? ['access tokens', 'api keys'] : [t.label.toLowerCase()],
-      });
+    // the rail's pages, and each page of a group as its own row
+    const out: (LauncherItem & { keywords?: string[] })[] = navItems(backupsVisible()).flatMap(
+      (n) =>
+        n.children
+          ? n.children.map((c) => ({
+              id: c.href,
+              title: `${n.label} › ${c.label}`,
+              icon: c.icon,
+              href: navLink(base, c.href, ds),
+              keywords: [c.label.toLowerCase(), ...(KEYWORDS[c.href] ?? [])],
+            }))
+          : [{ id: n.href, title: n.label, icon: n.icon, href: navLink(base, n.href, ds) }],
+    );
     if (ds) {
       out.push({
         id: '/dataset',
