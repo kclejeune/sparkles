@@ -34,14 +34,21 @@ pub fn bottom_module<'a>(
     }
     let mut in_module = vec![false; axioms.len()];
     let mut queue: Vec<String> = sig.iter().cloned().collect();
-    // axioms with an empty signature are never local to a non-empty one
-    for (i, s) in signatures.iter().enumerate() {
-        if s.is_empty()
-            && crate::classify::logical(&axioms[i].kind)
-            && !matches!(axioms[i].kind, AxiomKind::Declaration(_))
-            && !local(&axioms[i].kind, &sig)
+    // every axiom that is not local for the seed, such as one about owl:Thing alone,
+    // and then the axioms of each entity that enters the signature, whose locality is
+    // the only one that can change
+    for (i, a) in axioms.iter().enumerate() {
+        if !crate::classify::logical(&a.kind)
+            || matches!(a.kind, AxiomKind::Declaration(_))
+            || local(&a.kind, &sig)
         {
-            in_module[i] = true;
+            continue;
+        }
+        in_module[i] = true;
+        for e in &signatures[i] {
+            if sig.insert(e.clone()) {
+                queue.push(e.clone());
+            }
         }
     }
     while let Some(iri) = queue.pop() {

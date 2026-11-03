@@ -554,3 +554,30 @@ fn reason_relax_reduce_in_turn() {
         )
     ));
 }
+
+#[test]
+fn the_module_holds_global_axioms() {
+    let global = sub(Class::thing(), c("B"));
+    let disjoint = Axiom::disjoint_classes([c("A").into(), c("B").into()]);
+    let mut d = doc([
+        global.clone(),
+        disjoint.clone(),
+        decl(&c("A")),
+        sub(c("X"), c("Y")),
+    ]);
+    let o = ReasonOptions {
+        dump_unsatisfiable: true,
+        ..Default::default()
+    };
+    match run_reason(&mut d, &o) {
+        Err(Error::UnsatisfiableClasses { classes, module }) => {
+            assert_eq!(classes, vec![c("A")]);
+            let module = module.unwrap();
+            assert!(module.contains(&global), "{module:?}");
+            assert!(module.contains(&disjoint), "{module:?}");
+            assert!(module.contains(&decl(&c("A"))));
+            assert!(!module.contains(&sub(c("X"), c("Y"))));
+        }
+        other => panic!("{other:?}"),
+    }
+}
