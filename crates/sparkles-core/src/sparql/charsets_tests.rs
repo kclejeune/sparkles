@@ -431,3 +431,53 @@ fn correlations_of_another_version_are_refused() {
     let j = serde_json::to_value(&snap.generation.stats).unwrap();
     assert!(j.get("correlations").is_none(), "{j}");
 }
+
+/// The node pass counts each signature in one place, its set or the remainder, whichever
+/// thread meets its nodes: with fewer sets admitted than there are, every set kept holds
+/// all the nodes of its signature, as without a limit, and the remainder the others.
+#[test]
+fn node_sets_past_the_limit_keep_whole_signatures() {
+    use crate::builder::correlations::node_sets_seen;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    // nodes with many distinct signatures: subject i has predicates p(j) for the bits j of
+    // i, so that signatures repeat across the id range the threads split
+    let mut t = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..4000u32 {
+        for j in 0..8 {
+            if (i % 97) >> j & 1 == 1 {
+                t.push_str(&format!("ex:s{i} ex:p{j} ex:o{} .\n", i % 13));
+            }
+        }
+        t.push_str(&format!("ex:s{i} ex:q {i} .\n"));
+    }
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    s.load(&[Source::from_bytes(t.into_bytes(), RdfFormat::Turtle, None)])
+        .unwrap();
+    drop(s);
+    // the data has no rdf:type, so no classes
+    let rdf_type = None;
+    let generation = gen_dir(&root);
+    let never = || Ok(());
+    let (all, all_rest) = node_sets_seen(&generation, rdf_type, 8, usize::MAX, &never).unwrap();
+    assert_eq!(all_rest.n, 0);
+    let full: std::collections::HashMap<Vec<u64>, (u64, Vec<u64>)> = all
+        .iter()
+        .map(|c| (c.preds.clone(), (c.subjects, c.triples.clone())))
+        .collect();
+    for seen in [3, 10, 40] {
+        let (kept, rest) = node_sets_seen(&generation, rdf_type, 8, seen, &never).unwrap();
+        assert!(kept.len() <= seen);
+        let mut nodes = rest.n;
+        for c in &kept {
+            assert_eq!(
+                full.get(&c.preds),
+                Some(&(c.subjects, c.triples.clone())),
+                "seen {seen}: a kept set lacks some of its nodes"
+            );
+            nodes += c.subjects;
+        }
+        let total: u64 = all.iter().map(|c| c.subjects).sum();
+        assert_eq!(nodes, total, "seen {seen}");
+    }
+}

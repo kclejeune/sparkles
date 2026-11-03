@@ -25,7 +25,8 @@ use super::{CharSet, MAX_CHARSETS, class_item};
 use crate::error::Result;
 use crate::id::{self, Id, Tag};
 use crate::index::{Perm, PermIndex};
-use rustc_hash::FxHashMap;
+use parking_lot::Mutex;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
@@ -37,8 +38,8 @@ pub const VERSION: u32 = 1;
 /// Node sets kept at most, those of the most nodes.
 pub const MAX_NODE_SETS: usize = MAX_CHARSETS;
 
-/// Distinct node sets counted while the pass runs, at most, over all its pieces. The nodes
-/// of sets found after that go to the remainder with their items.
+/// Distinct node sets counted while the pass runs, at most, over all its threads. The
+/// nodes of sets first met after that go to the remainder with their items.
 const MAX_NODE_SETS_SEEN: usize = 1 << 20;
 
 /// The tag of an in-item: no term has it, and it sorts after every predicate and before
@@ -347,39 +348,73 @@ pub(crate) fn node_set(
     items: &mut Vec<u64>,
     counts: &mut Vec<u64>,
 ) {
-    items.clear();
-    counts.clear();
-    let mut classes: Vec<(u64, u64)> = Vec::new();
+    let mut t = NodeTally::default();
     for (p, o) in out {
-        match items.last() {
-            Some(&x) if x == p => *counts.last_mut().unwrap() += 1,
+        t.out(p, o, rdf_type);
+    }
+    for (p, n) in inn {
+        t.inn(p, n);
+    }
+    t.finish(items, counts);
+}
+
+/// The items of one node counted row by row, so that a node with many rows holds one
+/// count per item and not its rows: its outgoing rows in SPO order, then its incoming
+/// rows in OPS order.
+#[derive(Default)]
+struct NodeTally {
+    items: Vec<u64>,
+    counts: Vec<u64>,
+    classes: Vec<(u64, u64)>,
+}
+
+impl NodeTally {
+    fn clear(&mut self) {
+        self.items.clear();
+        self.counts.clear();
+        self.classes.clear();
+    }
+
+    fn bump(&mut self, item: u64, n: u64) {
+        match self.items.last() {
+            Some(&x) if x == item => *self.counts.last_mut().unwrap() += n,
             _ => {
-                items.push(p);
-                counts.push(1);
+                self.items.push(item);
+                self.counts.push(n);
             }
         }
+    }
+
+    fn out(&mut self, p: u64, o: u64, rdf_type: Option<u64>) {
+        self.bump(p, 1);
         if Some(p) == rdf_type
             && let Some(c) = class_item(o)
         {
-            match classes.last_mut() {
+            match self.classes.last_mut() {
                 Some((x, n)) if *x == c => *n += 1,
-                _ => classes.push((c, 1)),
+                _ => self.classes.push((c, 1)),
             }
         }
     }
-    for (p, n) in inn {
-        let Some(i) = in_item(p) else { continue };
-        match items.last() {
-            Some(&x) if x == i => *counts.last_mut().unwrap() += n,
-            _ => {
-                items.push(i);
-                counts.push(n);
-            }
+
+    fn inn(&mut self, p: u64, n: u64) {
+        if let Some(i) = in_item(p) {
+            self.bump(i, n);
         }
     }
-    for (c, n) in classes {
-        items.push(c);
-        counts.push(n);
+
+    /// The items, sorted (predicates, then incoming items, then classes), with the
+    /// triples of each.
+    fn finish(&mut self, items: &mut Vec<u64>, counts: &mut Vec<u64>) {
+        items.clear();
+        counts.clear();
+        items.extend_from_slice(&self.items);
+        counts.extend_from_slice(&self.counts);
+        for &(c, n) in &self.classes {
+            items.push(c);
+            counts.push(n);
+        }
+        self.clear();
     }
 }
 
@@ -396,6 +431,17 @@ pub(crate) fn node_sets(
     dir: &Path,
     rdf_type: Option<u64>,
     threads: usize,
+    interrupted: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<(Vec<CharSet>, Rest)> {
+    node_sets_seen(dir, rdf_type, threads, MAX_NODE_SETS_SEEN, interrupted)
+}
+
+/// [`node_sets`] with at most `seen` distinct sets counted while the pass runs.
+pub(crate) fn node_sets_seen(
+    dir: &Path,
+    rdf_type: Option<u64>,
+    threads: usize,
+    seen: usize,
     interrupted: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<(Vec<CharSet>, Rest)> {
     let spo = PermIndex::open(dir, Perm::Spo)?;
@@ -420,7 +466,10 @@ pub(crate) fn node_sets(
         })
         .filter(|(lo, hi)| hi.is_none_or(|h| h > *lo))
         .collect();
-    let seen_per_piece = (MAX_NODE_SETS_SEEN / ranges.len().max(1)).max(1024);
+    let admitted = Admitted {
+        sigs: Mutex::new(FxHashSet::default()),
+        cap: seen,
+    };
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results: Vec<Result<Piece>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads.max(1).min(ranges.len().max(1)))
@@ -433,7 +482,7 @@ pub(crate) fn node_sets(
                             return Ok(acc);
                         };
                         interrupted()?;
-                        count_piece(&spo, &ops, lo, hi, rdf_type, seen_per_piece, &mut acc)?;
+                        count_piece(&spo, &ops, lo, hi, rdf_type, &admitted, &mut acc)?;
                     }
                 })
             })
@@ -525,13 +574,15 @@ impl<'a> Rows<'a> {
     }
 }
 
+/// Count the node sets of the nodes in `[lo, hi)` into `acc`, reading their outgoing
+/// rows from SPO and their incoming rows from OPS together, in node order.
 fn count_piece(
     spo: &PermIndex,
     ops: &PermIndex,
     lo: u64,
     hi: Option<u64>,
     rdf_type: Option<u64>,
-    seen: usize,
+    admitted: &Admitted,
     acc: &mut Piece,
 ) -> Result<()> {
     let inside = |x: u64| x >= lo && hi.is_none_or(|h| x < h);
@@ -552,8 +603,7 @@ fn count_piece(
     };
     let mut s_ok = adv(&mut s, &mut sr)?;
     let mut o_ok = adv(&mut o, &mut or)?;
-    let mut out: Vec<(u64, u64)> = Vec::new();
-    let mut inn: Vec<u64> = Vec::new();
+    let mut tally = NodeTally::default();
     let (mut items, mut counts) = (Vec::new(), Vec::new());
     while s_ok || o_ok {
         let node = match (s_ok, o_ok) {
@@ -561,42 +611,61 @@ fn count_piece(
             (true, false) => sr[0],
             _ => or[0],
         };
-        out.clear();
-        inn.clear();
         while s_ok && sr[0] == node {
-            out.push((sr[1], sr[2]));
+            tally.out(sr[1], sr[2], rdf_type);
             s_ok = adv(&mut s, &mut sr)?;
         }
         while o_ok && or[0] == node {
-            inn.push(or[1]);
+            tally.inn(or[1], 1);
             o_ok = adv(&mut o, &mut or)?;
         }
-        node_set(
-            out.iter().copied(),
-            inn.iter().map(|&p| (p, 1)),
-            rdf_type,
-            &mut items,
-            &mut counts,
-        );
+        tally.finish(&mut items, &mut counts);
         if items.is_empty() {
             continue;
         }
-        let room = acc.sets.len() < seen;
-        match acc.sets.get_mut(&items[..]) {
+        let kept = match acc.sets.get_mut(&items[..]) {
             Some((n, t)) => {
                 *n += 1;
                 for (x, c) in t.iter_mut().zip(&counts) {
                     *x += c;
                 }
+                true
             }
-            None if room => {
+            None if admitted.admit(&items) => {
                 acc.sets
                     .insert(items.clone().into_boxed_slice(), (1, counts.clone()));
+                true
             }
-            None => acc.rest.add(1, &items, &counts, 1),
+            None => false,
+        };
+        if !kept {
+            acc.rest.add(1, &items, &counts, 1);
         }
     }
     Ok(())
+}
+
+/// The signatures the node pass counts as sets, shared by its threads. A signature is
+/// admitted when it is first met while fewer than `cap` are, and never after, so all the nodes of a signature are counted in one place, its set or the
+/// remainder, whichever thread meets them. A partial compaction relies on that when it
+/// removes a node's old signature.
+struct Admitted {
+    sigs: Mutex<FxHashSet<Box<[u64]>>>,
+    cap: usize,
+}
+
+impl Admitted {
+    fn admit(&self, items: &[u64]) -> bool {
+        let mut sigs = self.sigs.lock();
+        if sigs.contains(items) {
+            return true;
+        }
+        if sigs.len() >= self.cap {
+            return false;
+        }
+        sigs.insert(items.to_vec().into_boxed_slice());
+        true
+    }
 }
 
 /// What is wrong with the shape of `c` among the statistics `s`, for `sparkles check`.
