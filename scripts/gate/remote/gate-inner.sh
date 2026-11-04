@@ -3,7 +3,7 @@
 # the worktree. Holds ~/gate/.lock, a symlink to ~/lanes/.heavy.lock, for the whole run, so
 # gates and lane heavy runs on the same host take turns.
 #
-# Usage: gate-inner.sh <full-sha> <name> <all|ci|conformance> <ci-jobs>
+# Usage: gate-inner.sh <full-sha> <name> <all|ci|conformance|link> <ci-jobs>
 #
 # A whole gate (part all) writes gate.exit. A half (part ci or conformance) writes
 # part.exit instead, and scripts/gate/gate.sh on the laptop merges both halves and writes
@@ -14,6 +14,10 @@
 # selection.txt, and the task cache of mise skips a check whose inputs already passed.
 # GATE_FULL=1 runs every check with --force, as the nightly gate does. A commit without
 # the selection script, or a run without a base, runs every check without --force.
+#
+# Part link runs one step, the server artifact link check, which builds the server in the
+# pinned manylinux_2_28 image with podman. It needs neither mise nor the selection, and the
+# nightly gate runs it beside the full gate (scripts/gate/nightly.sh).
 set -uo pipefail
 full=$1
 name=$2
@@ -51,7 +55,7 @@ trap 'kill $watcher 2> /dev/null' EXIT
 finish() {
   local code=$1
   date +%s > "$out/done_at"
-  if [ "$part" = all ]; then echo "$code" > "$out/gate.exit"; else echo "$code" > "$out/part.exit"; fi
+  if [ "$part" = all ] || [ "$part" = link ]; then echo "$code" > "$out/gate.exit"; else echo "$code" > "$out/part.exit"; fi
   exit "$code"
 }
 
@@ -68,6 +72,8 @@ test "$(git rev-parse HEAD)" = "$full" || {
 export PATH="$G/py-venv/bin:$HOME/.local/bin:$HOME/.cargo/bin:/run/wrappers/bin:$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin"
 export CARGO_BUILD_JOBS=${GATE_CARGO_JOBS:-4}
 export CARGO_INCREMENTAL=0
+# py:test fails, and does not skip, the stub test on the oldest supported Python without uv.
+export SPARKLES_PY_OLDEST=required
 set -a
 # shellcheck disable=SC1091
 source "$G/conformance.env"
@@ -84,6 +90,28 @@ step() {
   log "end $name exit=$c secs=$((SECONDS - t0))"
   printf '%-20s exit=%-3s %6ss  %s\n' "$name" "$c" "$((SECONDS - t0))" "$host" >> "$out/steps.txt"
 }
+
+if [ "$part" = link ]; then
+  echo "the server artifact link check only" > "$out/selection.txt"
+  {
+    echo "host=$host commit=$full part=$part"
+    podman --version 2> /dev/null
+    python3 --version
+  } > "$out/env.txt" 2>&1
+  step server-link scripts/server-artifact-link-check.sh
+  fail=0
+  [ "$(cat "$out/server-link.exit")" = 0 ] || fail=1
+  cat "$cg/memory.peak" > "$out/mempeak.final" 2> /dev/null
+  log "done fail=$fail peak=$(cat "$out/mempeak.final" 2> /dev/null)"
+  cd "$G" || finish 3
+  rm -rf "$wt/target" "$wt/.artifacts/server-link-check"
+  if [ $fail = 0 ]; then
+    git -C "$G/repo.git" worktree remove --force "$wt" && log "worktree removed"
+  else
+    log "worktree sources kept at $wt"
+  fi
+  finish $fail
+fi
 
 # The repo's mise tools (node, pnpm, java 17 and 21, gradle, nextest, shfmt and others).
 # A conformance half names its install step apart, so the merged out directory keeps both.

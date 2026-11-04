@@ -637,6 +637,19 @@ class ElfContracts(unittest.TestCase):
                 artifact.parse_elf(header, program, dynamic + extra, "GLIBC_2.28")
 
 
+    def test_audit_command_prints_the_report_and_refuses_a_newer_glibc(self):
+        report = {"interpreter": "/lib64/ld-linux-x86-64.so.2", "needed": ["libc.so.6"], "glibc": ["2.28"]}
+        out = io.StringIO()
+        with patch("sys.argv", ["server-artifact.py", "audit", "--binary", "sparkles"]), \
+                patch.object(artifact, "audit_elf", return_value=(report, {})), contextlib.redirect_stdout(out):
+            artifact.main()
+        self.assertEqual(json.loads(out.getvalue()), report)
+        with patch("sys.argv", ["server-artifact.py", "audit", "--binary", "sparkles"]), \
+                patch.object(artifact, "audit_elf", side_effect=ValueError("requires GLIBC outside 2.28 baseline")), \
+                self.assertRaises(ValueError):
+            artifact.main()
+
+
 class WorkflowContracts(unittest.TestCase):
     def builder_fixture(self, work):
         source = work / "checked out source"
