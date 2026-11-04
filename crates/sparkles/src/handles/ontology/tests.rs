@@ -2285,6 +2285,39 @@ mod classification {
     }
 
     #[test]
+    fn a_cancellation_stops_a_classification_waiting_for_threads() {
+        // every slot of the algorithm pool is taken, so the classification waits for one,
+        // and a cancellation source beside the options' flag, as the bindings give a
+        // partial classification, ends the wait
+        use sparkles_core::algo::{Control, pool};
+        let held: Vec<pool::Par> = (0..pool::capacity())
+            .map(|_| pool::Par::acquire(1, &Control::unlimited()).unwrap())
+            .collect();
+        let ds = dataset(ONTO);
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let o = QueryOptions {
+            cancel: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            cancellation: Some(crate::task::Cancellation::from_flags([flag.clone()])),
+            ..opts()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = ds
+                .ontology()
+                .classify(&OntologyRequest::default(), &partial_request(), &o);
+            let _ = tx.send(r.err());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = rx.recv_timeout(std::time::Duration::from_secs(20));
+        drop(held);
+        assert!(
+            matches!(r, Ok(Some(Error::Cancelled))),
+            "the cancellation did not end the wait for threads: {r:?}"
+        );
+    }
+
+    #[test]
     fn a_partial_answer_is_not_kept_and_does_not_write() {
         let body = cases(if cfg!(debug_assertions) { 120 } else { 400 }, false);
         let req = OntologyRequest::default();

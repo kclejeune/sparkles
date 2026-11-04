@@ -570,7 +570,7 @@ pub(super) fn admit(threads: usize, opts: &QueryOptions) -> Result<Par> {
         return Err(Error::Timeout);
     }
     let flag = opts.cancel.clone().unwrap_or_default();
-    let ctl = Control::new(flag, opts.deadline, u64::MAX);
+    let ctl = Control::with_cancellation(flag, opts.cancellation.clone(), opts.deadline, u64::MAX);
     Par::acquire(threads, &ctl)
 }
 

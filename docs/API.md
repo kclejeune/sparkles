@@ -2283,7 +2283,7 @@ classification's `partial` and `expansion` are keyword arguments in Python, opti
 Node.js and members of `ClassifyQuery` on the JVM. A partial run stops at the call's
 `timeout`, which is in milliseconds in Node.js and is the `SparklesOperation` timeout on the
 JVM, or when the caller cancels it with Python's `cancel` token, Node.js's `signal` or the
-JVM's `SparklesOperation.cancel()`. A dataset that closes during the call still fails it.
+JVM's `SparklesOperation.cancel()`. In Node.js, a dataset that closes before the caller stops the call still fails it.
 
 Typed constructors build axioms without writing their syntax. Python's `sparkles.owl`
 and Node.js's `owl` namespace have one constructor per axiom type and per expression,
