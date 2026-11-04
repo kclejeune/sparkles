@@ -1344,7 +1344,7 @@ async fn dropped_cursor_response_reports_cancelled_after_body_lifetime() {
             &after,
             r#"sparkles_requests_total{dataset="ds",operation="query",outcome="ok"}"#
         ),
-        None,
+        Some(0.0),
         "{after}"
     );
 }
