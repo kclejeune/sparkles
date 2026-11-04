@@ -75,11 +75,17 @@ export class Net {
     this.t0 = Date.now();
     this.lastActivity = Date.now();
     this.cdp.on('Network.requestWillBeSent', (e) => {
-      this.inflight++;
-      this.lastActivity = Date.now();
+      if (this.reqs.has(e.requestId)) return; // a redirect
+      const group = groupOf(e.request.url);
+      const poll = POLLING.has(group);
+      if (!poll) {
+        this.inflight++;
+        this.lastActivity = Date.now();
+      }
       this.reqs.set(e.requestId, {
         url: e.request.url,
-        group: groupOf(e.request.url),
+        group,
+        poll,
         start: e.timestamp,
         enc: 0,
         dec: 0,
