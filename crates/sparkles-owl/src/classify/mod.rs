@@ -112,8 +112,8 @@ fn drawing_on(
     })
 }
 
-/// The least number of conclusions a run of Tier D with counting derives, kept or
-/// redundant, before it passes its bound and the run starts again without counting.
+/// The most conclusions a run of Tier D with counting derives, kept or redundant, before
+/// it passes its bound and the run starts again without counting.
 /// Number restrictions can make a context derive millions of conclusions that subsumption
 /// discards, which the memory budget does not see. A run that counts over a real ontology
 /// either finishes in a few thousand conclusions or runs on past millions, so the bound
@@ -121,11 +121,13 @@ fn drawing_on(
 /// small ontology. Of the 150 counting fixtures all but three derive at most 190,000
 /// conclusions on one thread, one derives 1.0 million, which [`Limits::dl_work`] lets a
 /// caller allow, and two pass any bound.
-const DL_WORK_FLOOR: usize = 1 << 18;
+const DL_WORK_BOUND: usize = 1 << 18;
 
-/// The bound on Tier D's conclusions above the floor: one per this many bytes of the index
-/// and the axioms.
-const DL_WORK_DIVISOR: usize = 4;
+/// The bound on the conclusions of the run that starts again without counting once the run
+/// that counts has passed its bound. The ontology has shown that its case analysis is
+/// heavy, and without a bound such a run can go on for minutes where the Horn rules answer
+/// in seconds. Four million conclusions take a few seconds.
+const DL_RETRY_WORK: usize = 1 << 22;
 
 /// The least memory budget, in estimated bytes, of a saturation with the Horn rules. The
 /// largest Horn run of the ORE 2015 DL sample's development set peaks at 666 MB, 139 times
@@ -166,8 +168,8 @@ pub struct Limits {
     pub expansion: Expansion,
     /// the most conclusions, kept or redundant, that a run of Tier D with counting derives
     /// before the run starts again without counting. `None` takes a bound of
-    /// [`DL_WORK_FLOOR`] conclusions or the index's size over four, whichever is more. A
-    /// run of Tier D without counting has no such bound.
+    /// [`DL_WORK_BOUND`] conclusions. A run of Tier D without counting has no such bound,
+    /// except the run that starts again after this one passed it, whose bound is 4 million.
     pub dl_work: Option<usize>,
 }
 
@@ -1386,15 +1388,15 @@ impl Saturation {
         // The Horn rules' contexts of conjunctions can need far more memory than the EL
         // rules on the same ontology, so a run with them has a budget of its own, past
         // which it classifies by the EL rules alone (run_with).
-        if let Some(d) = &dl_run
-            && ax.dl.as_ref().is_some_and(|d| d.counting)
-        {
-            d.set_work_limit(
-                limits
-                    .dl_work
-                    .unwrap_or(DL_WORK_FLOOR.max(base / DL_WORK_DIVISOR))
-                    .max(1),
-            );
+        if let Some(d) = &dl_run {
+            // a run that counts has the bound of the limits, and the run that starts again
+            // without counting after it passed that bound has the larger one of a run that
+            // cannot expect to finish soon, before the Horn rules take over
+            if self.no_counting {
+                d.set_work_limit(DL_RETRY_WORK);
+            } else if ax.dl.as_ref().is_some_and(|d| d.counting) {
+                d.set_work_limit(limits.dl_work.unwrap_or(DL_WORK_BOUND).max(1));
+            }
         }
         let max_memory = if horn || disj {
             let own = HORN_MEMORY_FLOOR.max(base.saturating_mul(HORN_MEMORY_FACTOR));
