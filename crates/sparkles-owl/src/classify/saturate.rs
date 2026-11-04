@@ -645,7 +645,7 @@ pub fn saturate_counted(
 
 /// Where a context's rules send their conclusions: to itself, applied in the same pass,
 /// or to the worker's outbox, which delivers them to other contexts' to-do lists.
-struct Out<'r, 'a> {
+struct Out<'r, 'a, const F: bool> {
     run: &'r Run<'a>,
     me: Ex,
     local: &'r mut Vec<Concl>,
@@ -751,7 +751,9 @@ pub trait Sink {
     }
 }
 
-impl Sink for Out<'_, '_> {
+/// `F` says whether messages that their context already holds are dropped, which a
+/// congested run does (roadmap item 695).
+impl<const F: bool> Sink for Out<'_, '_, F> {
     #[inline]
     fn send(&mut self, to: Ex, c: Concl) {
         if to == self.me {
@@ -760,6 +762,9 @@ impl Sink for Out<'_, '_> {
             // one worker meets no other at a to-do list, and sorting costs more than it
             // saves
             let ctx = self.run.get(to);
+            if F && known(ctx, &c) {
+                return;
+            }
             ctx.todo.lock().push(c);
             self.sent += 1;
             if self.run.mark(ctx) {
@@ -1010,21 +1015,13 @@ impl<'a> Run<'a> {
         t.extend(
             msgs.iter()
                 .map(|&(_, c)| c)
-                .filter(|c| !(matches!(c, Concl::Sub(_) | Concl::Back(..)) && st.holds(c))),
+                .filter(|c| !(cheap(c) && st.holds(c))),
         );
         let dropped = msgs.len() - (t.len() - before);
         if dropped > 0 {
             self.queued.fetch_sub(dropped as isize, Ordering::Relaxed);
         }
         true
-    }
-
-    /// Whether the messages waiting in to-do lists and outboxes take more than the stored
-    /// conclusions and [`CONGESTED_BYTES`], as of the workers' last checks.
-    fn congested(&self) -> bool {
-        let waiting = self.queued.load(Ordering::Relaxed).max(0) as usize;
-        waiting * std::mem::size_of::<Concl>()
-            > self.memory.load(Ordering::Relaxed).max(CONGESTED_BYTES)
     }
 
     /// Moves half of a worker's queue to the shared queue when a worker waits for it.
@@ -1049,6 +1046,15 @@ impl<'a> Run<'a> {
 
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed) != STOP_NONE
+    }
+
+    /// Whether the messages waiting in to-do lists and outboxes take more than the stored
+    /// conclusions and [`CONGESTED_BYTES`], as of the workers' last checks.
+    #[inline]
+    fn congested(&self) -> bool {
+        let waiting = self.queued.load(Ordering::Relaxed).max(0) as usize;
+        waiting * std::mem::size_of::<Concl>()
+            > self.memory.load(Ordering::Relaxed).max(CONGESTED_BYTES)
     }
 
     fn halt(&self, why: u8) {
@@ -1120,6 +1126,7 @@ impl<'a> Run<'a> {
         }
         let began = others.map(|_| Instant::now());
         let mut activations = 0u32;
+        let mut congested = false;
         let mut mine: VecDeque<Ex> = VecDeque::new();
         let mut chunk: Vec<Ex> = Vec::new();
         let mut round = 0usize;
@@ -1186,15 +1193,23 @@ impl<'a> Run<'a> {
                 }
                 return;
             }
-            self.process::<R>(next, &mut mine, &mut tally, &mut local, &mut outbox);
-            if let Some(start) = others {
-                activations += 1;
-                if activations.is_multiple_of(LAZY_EVERY)
-                    && began.is_some_and(|b| b.elapsed() >= LAZY_START)
-                {
-                    others = None;
-                    start();
-                }
+            // a worker looks at the congestion every few activations, and a congested
+            // run takes the activation that drops what contexts already hold
+            if activations.is_multiple_of(LAZY_EVERY) {
+                congested = self.congested();
+            }
+            if congested {
+                self.process_congested::<R>(next, &mut mine, &mut tally, &mut local, &mut outbox);
+            } else {
+                self.process::<R, false>(next, &mut mine, &mut tally, &mut local, &mut outbox);
+            }
+            activations = activations.wrapping_add(1);
+            if let Some(start) = others
+                && activations.is_multiple_of(LAZY_EVERY)
+                && began.is_some_and(|b| b.elapsed() >= LAZY_START)
+            {
+                others = None;
+                start();
             }
             if !outbox.is_empty() && self.idle.load(Ordering::Relaxed) > 0 {
                 self.deliver(&mut outbox, &mut mine);
@@ -1243,11 +1258,26 @@ impl<'a> Run<'a> {
         ok
     }
 
+    /// [`Run::process`] for a congested run, out of line, so that the activation the
+    /// other runs take keeps its size (roadmap item 695).
+    #[cold]
+    #[inline(never)]
+    fn process_congested<R: Rules>(
+        &self,
+        me: Ex,
+        mine: &mut VecDeque<Ex>,
+        tally: &mut Tally,
+        local: &mut Vec<Concl>,
+        outbox: &mut Outbox,
+    ) {
+        self.process::<R, true>(me, mine, tally, local, outbox);
+    }
+
     /// Activates a context: applies the rules to what waits in its to-do list until none
     /// is left, with the rules that `R` holds. Its one call is in the worker of its rule
     /// set, which it inlines into.
     #[inline(always)]
-    fn process<R: Rules>(
+    fn process<R: Rules, const F: bool>(
         &self,
         me: Ex,
         mine: &mut VecDeque<Ex>,
@@ -1258,7 +1288,7 @@ impl<'a> Run<'a> {
         let ctx = self.get(me);
         let mut st = ctx.st.lock();
         local.clear();
-        let mut out = Out {
+        let mut out: Out<'_, '_, F> = Out {
             run: self,
             me,
             local,
@@ -1353,6 +1383,21 @@ impl<'a> Run<'a> {
             mine.push_back(me);
         }
     }
+}
+
+/// Whether a message is one that [`State::holds`] answers without a search of a list
+/// that grows with the context.
+#[inline]
+fn cheap(c: &Concl) -> bool {
+    matches!(c, Concl::Sub(_) | Concl::Back(..))
+}
+
+/// Whether a context already holds a message, so that sending it would change nothing.
+/// A context that another worker holds is not looked at (roadmap item 695).
+#[cold]
+#[inline(never)]
+fn known(ctx: &Ctx, c: &Concl) -> bool {
+    cheap(c) && ctx.st.try_lock().is_some_and(|st| st.init && st.holds(c))
 }
 
 /// Starts a context: its root, `owl:Thing`, the loops of the reflexive roles and the
