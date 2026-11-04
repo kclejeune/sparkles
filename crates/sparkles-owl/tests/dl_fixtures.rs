@@ -119,6 +119,8 @@ fn the_classifier_is_sound_everywhere_and_complete_on_what_it_takes_whole() {
         classes.insert(NOTHING.to_string());
         let want = reference(&want, &classes);
         let mut answers = Vec::new();
+        // whether each run fell back to the Horn rules or answered in part
+        let mut fell = Vec::new();
         let mut whole = true;
         // both expansion strategies of Tier D give one answer
         for (threads, expansion) in [
@@ -151,24 +153,29 @@ fn the_classifier_is_sound_everywhere_and_complete_on_what_it_takes_whole() {
                 }
             }
             answers.push(got);
+            fell.push(out.stats.dl_over_budget || !out.complete);
         }
-        if answers[0] != answers[1] {
-            failures.push(format!("{stem}: the answer depends on the threads"));
+        // the runs that stayed in Tier D's bound give one answer, and so do those that fell
+        // back: a schedule can decide which of the two a run gives near the bound, and the
+        // run that fell back says so
+        for k in 1..answers.len() {
+            if fell[k] == fell[0] && answers[k] != answers[0] {
+                failures.push(format!(
+                    "{stem}: the answer depends on the threads or the expansion strategy"
+                ));
+            }
         }
-        if answers[1] != answers[2] {
-            failures.push(format!(
-                "{stem}: the answer depends on the expansion strategy"
-            ));
-        }
-        let got = &answers[0];
-        let extra: Vec<_> = got.difference(&want).collect();
-        if !extra.is_empty() {
-            failures.push(format!("{stem}: not entailed {extra:?}"));
-        }
-        if whole {
-            let missing: Vec<_> = want.difference(got).collect();
-            if !missing.is_empty() {
-                failures.push(format!("{stem}: missing {missing:?}"));
+        // every run is sound, and one taken whole that did not fall back is complete
+        for (got, &fell) in answers.iter().zip(&fell) {
+            let extra: Vec<_> = got.difference(&want).collect();
+            if !extra.is_empty() {
+                failures.push(format!("{stem}: not entailed {extra:?}"));
+            }
+            if whole && !fell {
+                let missing: Vec<_> = want.difference(got).collect();
+                if !missing.is_empty() {
+                    failures.push(format!("{stem}: missing {missing:?}"));
+                }
             }
         }
         let c = counts.entry(family(stem).to_string()).or_default();
@@ -212,5 +219,57 @@ fn the_counting_cases_with_many_successor_equalities_finish_in_tier_d() {
                 "{stem} on {threads} threads, {expansion:?}: Tier D passed its bound"
             );
         }
+    }
+}
+
+/// The counting cases that pass Tier D's bound on derived conclusions: every run, on one
+/// thread or several and with either strategy, passes it and falls back to the Horn rules,
+/// so that the answer is the same for every schedule.
+#[test]
+fn the_cases_past_the_bound_fall_back_on_every_schedule() {
+    for stem in ["shq-041", "shiq-028"] {
+        let path = fixtures().join(format!("{stem}.ofn"));
+        let doc = ofn_read::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut classes: Vec<Class> = doc
+            .axioms
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AxiomKind::Declaration(Entity::Class(c)) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        classes.push(Class::new(THING));
+        classes.push(Class::new(NOTHING));
+        let mut answers = BTreeSet::new();
+        for threads in [1, 4, 8] {
+            for expansion in [Expansion::Cautious, Expansion::Eager] {
+                let mut k = Classifier::of(&doc.axioms);
+                let out = k
+                    .classify(&Limits {
+                        threads,
+                        expansion,
+                        ..Limits::default()
+                    })
+                    .unwrap();
+                assert!(
+                    out.stats.dl_over_budget,
+                    "{stem} on {threads} threads, {expansion:?}: Tier D stayed in its bound"
+                );
+                let mut got = BTreeSet::new();
+                for a in &classes {
+                    for b in &classes {
+                        if out.taxonomy.is_subclass(a, b) {
+                            got.insert((a.as_str().to_string(), b.as_str().to_string()));
+                        }
+                    }
+                }
+                answers.insert(got);
+            }
+        }
+        assert_eq!(
+            answers.len(),
+            1,
+            "{stem}: the answer depends on the schedule"
+        );
     }
 }
