@@ -1017,7 +1017,7 @@ impl Saturation {
         .flatten()
         .collect();
         poll(limits)?;
-        let (ax, ix, normalized_peak, outside_el) =
+        let (ax, mut ix, normalized_peak, outside_el) =
             self.build(axioms, &outside, threads, held_bytes, limits)?;
         drop(outside);
         stats.outside_el = outside_el;
@@ -1038,6 +1038,21 @@ impl Saturation {
             premises
         };
         self.ctx.resize_with(n, OnceLock::new);
+        if ix.horn.is_some() {
+            // the stop the pass saw, which a cancellation polled once does not repeat
+            let stopped = std::cell::RefCell::new(None);
+            horn::absorb(&mut ix, &|| {
+                let r = poll(limits);
+                let stop = r.is_err();
+                if let Err(e) = r {
+                    *stopped.borrow_mut() = Some(e);
+                }
+                stop
+            });
+            if let Some(e) = stopped.into_inner() {
+                return Err(e);
+            }
+        }
         let dynamic = ix.horn.as_ref().map(|h| {
             debug_assert_eq!(h.base as usize, n);
             saturate::Dynamic::new(n as Ex)
@@ -1743,6 +1758,130 @@ mod tests {
             );
             assert_eq!(out.stats.tier, Tier::Disjunctive);
         }
+    }
+
+    /// The run's index after classifying a functional-syntax body with the prefix `:`
+    /// for `http://ex.org/`, and the entailment of `A ⊑ C`.
+    fn horn_run(body: &str) -> (Index, bool) {
+        let doc = crate::ofn_read::parse(&format!(
+            "Prefix(:=<http://ex.org/>)\nOntology(\nSubClassOf(:X ObjectAllValuesFrom(:u :Y))\n{body}\n)"
+        ))
+        .unwrap();
+        let axioms: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let mut s = Saturation::default();
+        let out = s.classify(&axioms, None, &Limits::default()).unwrap();
+        assert_eq!(out.stats.tier, Tier::Horn);
+        let c = |n: &str| Class::new(format!("http://ex.org/{n}"));
+        let yes = out.taxonomy.is_subclass(&c("A"), &c("C"));
+        (s.index.take().unwrap(), yes)
+    }
+
+    #[test]
+    fn a_left_linear_chain_stays_composed_with_direct_right_operands() {
+        // regulates ∘ part of ⊑ regulates, with part of transitive: the negative
+        // existential over regulates stays on composed links, and part of's own chain
+        // is not composed, since the links of regulates take part of one link at a time
+        let (ix, yes) = horn_run(
+            "TransitiveObjectProperty(:part_of)
+             SubObjectPropertyOf(ObjectPropertyChain(:regulates :part_of) :regulates)
+             SubClassOf(:A ObjectSomeValuesFrom(:regulates ObjectSomeValuesFrom(:part_of ObjectSomeValuesFrom(:part_of :B))))
+             EquivalentClasses(:C ObjectSomeValuesFrom(:regulates :B))",
+        );
+        assert!(yes);
+        // one chain is composed, over the subroles of its operands
+        let results: std::collections::BTreeSet<index::Role> =
+            ix.roles.comp.values().flatten().copied().collect();
+        assert_eq!(results.len(), 1, "{:?}", ix.roles.comp);
+        let &(left, right) = ix.roles.comp.keys().next().unwrap();
+        // part of is a right operand, but no chain composes part of links
+        assert!(ix.roles.keeps_forward(right));
+        assert!(!results.contains(&right));
+        assert!(results.contains(&left));
+    }
+
+    #[test]
+    fn a_chain_of_three_falls_back_to_unfolding() {
+        let (ix, yes) = horn_run(
+            "SubObjectPropertyOf(ObjectPropertyChain(:p :q :s) :t)
+             SubClassOf(:A ObjectSomeValuesFrom(:p ObjectSomeValuesFrom(:q ObjectSomeValuesFrom(:s :B))))
+             EquivalentClasses(:C ObjectSomeValuesFrom(:t :B))",
+        );
+        assert!(yes);
+        assert!(ix.roles.comp.is_empty(), "{:?}", ix.roles.comp);
+        assert!(ix.roles.right.iter().all(|&r| !r));
+    }
+
+    #[test]
+    fn a_chain_that_is_not_left_linear_composes_its_right_operand_too() {
+        // negatively regulates ∘ negatively regulates ⊑ positively regulates: the right
+        // operand's links must be complete, so its own chain is composed as well
+        let (ix, yes) = horn_run(
+            "SubObjectPropertyOf(ObjectPropertyChain(:neg :neg) :C_pos)
+             SubObjectPropertyOf(ObjectPropertyChain(:neg :part_of) :neg)
+             TransitiveObjectProperty(:part_of)
+             SubClassOf(:A ObjectSomeValuesFrom(:neg ObjectSomeValuesFrom(:part_of ObjectSomeValuesFrom(:neg :B))))
+             EquivalentClasses(:C ObjectSomeValuesFrom(:C_pos :B))",
+        );
+        assert!(yes);
+        let results: std::collections::BTreeSet<index::Role> =
+            ix.roles.comp.values().flatten().copied().collect();
+        assert_eq!(results.len(), 2, "{:?}", ix.roles.comp);
+    }
+
+    /// The index of a Horn run over a functional-syntax body, before the saturation.
+    fn horn_index_of(body: &str) -> Index {
+        let doc =
+            crate::ofn_read::parse(&format!("Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n)"))
+                .unwrap();
+        let axioms: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let outside: Vec<(usize, (String, String))> = axioms
+            .iter()
+            .enumerate()
+            .filter_map(|(i, k)| {
+                let b = profiles::el_axiom(k).into_iter().next()?;
+                Some((i, (b.rule.to_string(), b.message)))
+            })
+            .collect();
+        let mut s = Saturation::default();
+        let (_, ix, _, _) = s
+            .build(&axioms, &outside, 1, 0, &Limits::default())
+            .unwrap();
+        assert!(ix.horn.is_some());
+        ix
+    }
+
+    #[test]
+    fn absorbed_fillers_take_linear_work_and_stop_when_asked() {
+        // C0 ⊑ C1 ⊑ … ⊑ Cn: every class is absorbed, unless Cn holds a universal, which
+        // rejects them all, one after another down the chain
+        let n = 50_000;
+        let chain: String = (0..n)
+            .map(|i| format!("SubClassOf(:C{i:05} :C{:05})\n", i + 1))
+            .collect();
+        let absorbed = |ix: &Index| {
+            let h = ix.horn.as_ref().unwrap();
+            (0..h.flags.len() as Ex)
+                .filter(|&e| h.is(e, horn::HornIx::ABSORBED))
+                .count()
+        };
+        let free = format!("{chain}SubClassOf(:X ObjectAllValuesFrom(:u :Y))");
+        let mut ix = horn_index_of(&free);
+        horn::absorb(&mut ix, &|| true);
+        assert_eq!(absorbed(&ix), 0, "a stopped pass marks nothing");
+        let mut ix = horn_index_of(&free);
+        horn::absorb(&mut ix, &|| false);
+        assert!(absorbed(&ix) > n, "{}", absorbed(&ix));
+        let held = format!("{chain}SubClassOf(:C{n:05} ObjectAllValuesFrom(:u :Y))");
+        let mut ix = horn_index_of(&held);
+        let polls = std::cell::Cell::new(0usize);
+        horn::absorb(&mut ix, &|| {
+            polls.set(polls.get() + 1);
+            false
+        });
+        // the universal's filler Y alone
+        assert_eq!(absorbed(&ix), 1);
+        // a pass per rejected class would poll thousands of times
+        assert!(polls.get() <= 16, "{}", polls.get());
     }
 
     /// Random axioms over a few hundred classes, with intersections whose operands come
