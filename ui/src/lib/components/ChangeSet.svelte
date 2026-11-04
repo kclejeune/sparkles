@@ -163,7 +163,7 @@
   }
   .graph {
     margin-left: var(--sp-1);
-    white-space: nowrap;
+    overflow-wrap: anywhere;
   }
   /* a name that opens its entity reads as a link, not a button */
   .link {

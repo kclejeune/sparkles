@@ -218,12 +218,19 @@ test('inferences follow an edit: a superclass made asserted leaves the inferred 
   await onSession(request, 'uni', async () => {
     await open(page, term('uni', UNI + 'Professor'));
     const axioms = page.getByRole('region', { name: 'Axioms' });
+    // the session starts first and the classification runs on its branch, so that the card
+    // stays mounted through the edit and only its commit prop says the state changed
+    await pageAction(page, 'Edit');
+    const branch = await startSession(page, 'onto');
+    await bar(page).getByRole('button', { name: /^Done/ }).click();
+    await expect(page).not.toHaveURL(/edit=1/);
     await axioms.getByRole('button', { name: 'Classify' }).click();
     const inferredSub = axioms.locator('[data-section="inferred-sub"]');
     await expect(inferredSub.getByRole('link', { name: 'Teacher' })).toBeVisible();
+    await axioms.evaluate((el) => el.setAttribute('data-mounted', 'first'));
 
     await pageAction(page, 'Edit');
-    const branch = await startSession(page, 'onto');
+    await expect(page).toHaveURL(/edit=1/);
     const tree = page.getByRole('complementary', { name: 'Hierarchy' });
     await tree.getByRole('combobox', { name: 'Add a parent class' }).fill('Teach');
     await tree
@@ -233,11 +240,16 @@ test('inferences follow an edit: a superclass made asserted leaves the inferred 
     await commit(page);
     await bar(page).getByRole('button', { name: /^Done/ }).click();
     await expect(page).not.toHaveURL(/edit=1/);
-    // the superclass is asserted now, so the card no longer lists it as inferred
+    // the superclass is asserted now, so the card no longer lists it as inferred, and it is
+    // the same card that listed it before the edit
     await expect(
       axioms.locator('[data-section="sub"]').getByRole('link', { name: 'Teacher' }),
     ).toBeVisible();
+    // and the classification was asked again, not forgotten
+    await expect(axioms).toContainText('infers nothing more than these axioms state');
+    await expect(axioms.getByRole('button', { name: 'Classify' })).toHaveCount(0);
     await expect(inferredSub.getByRole('link', { name: 'Teacher' })).toHaveCount(0);
+    await expect(axioms).toHaveAttribute('data-mounted', 'first');
     return branch;
   });
 });

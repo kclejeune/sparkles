@@ -9,6 +9,7 @@
 
 import { expect, test, type Page } from '@playwright/test';
 import { expectNoSidewaysScroll } from '../phone';
+import { pageAction } from '../page-actions';
 
 test.describe.configure({ mode: 'serial', timeout: 90_000 });
 
@@ -119,7 +120,7 @@ test('edits on a session branch: labels, XL, a move, a mapping', async ({ page, 
   await expect(preview(page)).toContainText('Add the alternative label “Pisces”@la to Fish');
   await commitPreview(page);
   await expect(labels(page).locator('tr[data-lang="la"]')).toContainText('Pisces');
-  await page.getByRole('button', { name: /^Undo/ }).click();
+  await pageAction(page, 'Undo');
   await expect(preview(page)).toContainText('Undo:');
   await commitPreview(page);
   await expect(labels(page).locator('tr[data-lang="la"]')).toHaveCount(0);
@@ -315,7 +316,10 @@ test('undo waits for the head tag', async ({ page }) => {
     await route.fallback();
   });
   await page.goto('/ui/workbench/thesaurus?ds=thes');
-  const undo = page.getByRole('button', { name: /^Undo/ });
+  const undo = page.getByRole('button', {
+    name: /^Undo/,
+    includeHidden: true,
+  });
   await expect(undo).toHaveText(/Undo \(1\)/);
   await expect(undo).toBeDisabled();
   release();

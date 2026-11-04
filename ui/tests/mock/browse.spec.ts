@@ -269,6 +269,21 @@ test('a rich OBO term keeps its paragraphs, sources and synonym types', async ({
   await expect(syn.locator('.syn-type')).toHaveText(['ABBREVIATION', 'plural']);
 });
 
+test('the labels of a synonym type are read at the state the page shows', async ({ page }) => {
+  const asked: string[] = [];
+  await page.route('**/cells/sparql**', (route) => {
+    const req = route.request();
+    if ((req.postData() ?? '').includes('ABBREVIATION')) asked.push(req.url());
+    return route.fallback();
+  });
+  await page.goto(
+    `/ui/browse?ds=cells&at=1&iri=${encodeURIComponent('http://purl.obolibrary.org/obo/CL_0000129')}`,
+  );
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible({ timeout: 30_000 });
+  await expect.poll(() => asked.length, { timeout: 15_000 }).toBeGreaterThan(0);
+  expect(asked[0]).toMatch(/[?&]at=1\b/);
+});
+
 test('downloads answer the entity in each format as an attachment', async ({ page }) => {
   await openTerm(page, 'Professor');
   const links = page.locator('[data-format]');

@@ -5,6 +5,8 @@
 // commit. The tests share the mock's state and run in order.
 
 import { expect, test, type Page } from '@playwright/test';
+import { pageAction } from '../page-actions';
+import { expectNoSidewaysScroll } from '../phone';
 
 test.describe.configure({ timeout: 90_000 });
 
@@ -128,6 +130,36 @@ INSERT DATA { <http://example.org/uni#Zebra> a owl:Class ; rdfs:label "Zebra"@en
   }
 });
 
+test('a long named graph in a history change set wraps on a phone', async ({ page, request }) => {
+  const long = 'http://example.org/graphs/' + 'a-named-graph-without-a-break-'.repeat(8) + 'end';
+  const made = await request.post('/$/branches/uni', { data: { name: 'dr-wrap' } });
+  expect(made.status()).toBe(201);
+  try {
+    const up = await request.post('/uni@dr-wrap/update', {
+      headers: {
+        'Content-Type': 'application/sparql-update',
+        'Sparkles-Commit-Message': 'Add to a long graph',
+      },
+      data: `PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+INSERT DATA { GRAPH <${long}> { <http://example.org/uni#Newt> rdfs:comment "in a long graph" } }`,
+    });
+    expect(up.ok()).toBe(true);
+    await page.addInitScript(() => localStorage.setItem('sparkles.iris', 'full'));
+    await page.setViewportSize({ width: 320, height: 700 });
+    await page.goto(
+      `/ui/workbench/ontology?ds=uni&branch=dr-wrap&tab=history&graph=${encodeURIComponent(long)}`,
+    );
+    await page
+      .getByRole('list', { name: 'Changes' })
+      .getByRole('button', { name: /Add to a long graph/ })
+      .click();
+    await expect(page.locator('.changeset').first()).toContainText(long, { timeout: 10_000 });
+    await expectNoSidewaysScroll(page, 'a history change set in a long named graph');
+  } finally {
+    await request.delete('/$/branches/uni/dr-wrap?force=true');
+  }
+});
+
 test('the history of the default graph leaves out what a commit changed in a named graph', async ({
   page,
   request,
@@ -217,7 +249,7 @@ test('edits on a session branch are previewed, committed, undone and redone', as
   expect(main).toBe(404);
 
   // undo takes the commit back, redo makes it again
-  await page.getByRole('button', { name: /^Undo/ }).click();
+  await pageAction(page, 'Undo');
   await expect(preview(page)).toContainText('Undo: Create class teaching assistant');
   await commitPreview(page);
   await expect(
@@ -295,7 +327,9 @@ test('edits on a session branch are previewed, committed, undone and redone', as
       .getByRole('button', { name: 'teaching assistant' }),
   ).toHaveCount(0);
   // the undo stack holds every edit of the session
-  await expect(page.getByRole('button', { name: /^Undo/ })).toHaveText('Undo (7)');
+  await expect(page.getByRole('button', { name: /^Undo/, includeHidden: true })).toHaveText(
+    'Undo (7)',
+  );
 });
 
 test('a stale edit is refused and another writer’s commit refreshes the views', async ({
@@ -362,7 +396,7 @@ test('a stale edit is refused and another writer’s commit refreshes the views'
   await create.getByRole('textbox', { name: 'Label', exact: true }).fill('Lab');
   await create.getByRole('button', { name: 'Preview' }).click();
   await commitPreview(page);
-  await page.getByRole('button', { name: /^Undo/ }).click();
+  await pageAction(page, 'Undo');
   await expect(preview(page)).toContainText('Reverts commit');
   // back past the new class's page, then to foaf
   await page.goBack();
@@ -372,7 +406,9 @@ test('a stale edit is refused and another writer’s commit refreshes the views'
   await expect(preview(page)).toBeHidden();
   await page.goForward();
   await expect(page).toHaveURL(/ds=uni$/);
-  await expect(page.getByRole('button', { name: /^Undo/ })).toHaveText('Undo (1)');
+  await expect(page.getByRole('button', { name: /^Undo/, includeHidden: true })).toHaveText(
+    'Undo (1)',
+  );
 });
 
 test('the mock revert keeps blank nodes and refuses a cell a later commit changed', async ({

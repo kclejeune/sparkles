@@ -13,7 +13,6 @@
   import { page } from '$app/state';
   import { onMount, tick, untrack } from 'svelte';
   import { balance } from '$lib/balance';
-  import { labels as exLabels } from '$lib/explore';
   import { fmtInt } from '$lib/format';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
@@ -330,16 +329,19 @@
       return;
     }
     let live = true;
-    const ds = target;
-    void exLabels(ds, want)
-      .then((m) => {
-        if (live) typeLabels = m;
+    // the labels of the graph and the state the page shows, as the other names are read
+    const ctl = new AbortController();
+    void api
+      .select(target, namesQuery(want, graph), { at: at ?? undefined, signal: ctl.signal })
+      .then((rows) => {
+        if (live) typeLabels = parseDefinitions(rows as never, langs);
       })
       .catch(() => {
         // the types keep their local names
       });
     return () => {
       live = false;
+      ctl.abort();
     };
   });
   const groups = $derived(term ? axiomGroups(term.iri, term.kinds, term.axioms) : []);

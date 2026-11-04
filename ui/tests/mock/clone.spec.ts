@@ -3,13 +3,14 @@
 // page say how each copy was made.
 
 import { expect, test, type Page } from '@playwright/test';
+import { pageAction } from '../page-actions';
 
 // the first page load compiles the UI in vite dev
 test.describe.configure({ timeout: 90_000 });
 
 async function openClone(page: Page, source: string) {
   await page.goto(`/ui/datasets/${source}`);
-  await page.getByRole('button', { name: 'Clone', exact: true }).click();
+  await pageAction(page, 'Clone');
   return page.getByRole('dialog');
 }
 
