@@ -282,3 +282,15 @@ export async function save(
   info.annotations.push({ type: 'result', description: file });
   return file;
 }
+
+/**
+ * Waits until the host is calm enough to measure: a one-minute load average under
+ * PERF_MAX_LOAD (default 8 on a 16-thread host) for at most PERF_CALM_MS (default 4 minutes).
+ * Other work on the laptop makes the timings noisy, so the load is recorded with each run.
+ */
+export async function calm() {
+  const max = Number(process.env.PERF_MAX_LOAD ?? 8);
+  const until = Date.now() + Number(process.env.PERF_CALM_MS ?? 240_000);
+  while (loadavg()[0] > max && Date.now() < until) await new Promise((r) => setTimeout(r, 5000));
+  return loadavg()[0];
+}

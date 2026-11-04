@@ -19,6 +19,7 @@ import {
   LONGTASK_INIT,
   LOAD_TIMEOUT,
   longTasks,
+  calm,
   median,
   need,
   Net,
@@ -66,6 +67,7 @@ test.describe('explore scale', () => {
   for (const target of TARGETS) {
     test(`explore-${target}`, async ({ browser }, info) => {
       for (let rep = 1; rep <= REPEAT; rep++) {
+        await calm();
         const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
         const page = await ctx.newPage();
         await page.addInitScript(LONGTASK_INIT);
@@ -136,6 +138,7 @@ test.describe('explore scale', () => {
 
   test('explore-fanout-20000', async ({ browser }, info) => {
     for (let rep = 1; rep <= REPEAT; rep++) {
+      await calm();
       const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
       const page = await ctx.newPage();
       await page.addInitScript(LONGTASK_INIT);

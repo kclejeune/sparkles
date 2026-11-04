@@ -28,6 +28,7 @@ import {
   LONGTASK_INIT,
   LOAD_TIMEOUT,
   longTasks,
+  calm,
   Net,
   need,
   REPEAT,
@@ -87,6 +88,7 @@ test.describe('workbench open', () => {
     if (only && !only.includes(c.name)) continue;
     test(c.name, async ({ browser }, info) => {
       for (let rep = 1; rep <= REPEAT; rep++) {
+        await calm();
         const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
         const page = await ctx.newPage();
         await page.addInitScript(LONGTASK_INIT);
@@ -111,16 +113,23 @@ test.describe('workbench open', () => {
           r.heap = await heap(cdp);
           r.rowsLoaded = await loadedRows(page);
           r.rowsInDom = await rowsInDom(page);
-          // after the load: how fast a click on a twisty answers
-          const tw = page.locator(FIRST_EXPANDABLE).first();
-          if (await tw.count()) {
-            const t = Date.now();
-            await tw.click();
-            await page
-              .locator(`${TREE_ROW}[aria-expanded="true"]`)
-              .first()
-              .waitFor({ timeout: 30_000 });
-            r.toggleLatencyMs = Date.now() - t;
+          // after the load: how fast a click on a twisty answers, with the row flipping
+          try {
+            const tw = page.locator(FIRST_EXPANDABLE).first();
+            if (await tw.count()) {
+              const li = await tw.locator('xpath=ancestor::li[1]').elementHandle();
+              const before = await li!.getAttribute('aria-expanded');
+              const t = Date.now();
+              await tw.click({ timeout: 30_000 });
+              await page.waitForFunction(
+                ([el, b]) => (el as Element).getAttribute('aria-expanded') !== b,
+                [li, before],
+                { timeout: 30_000 },
+              );
+              r.toggleLatencyMs = Date.now() - t;
+            }
+          } catch (e) {
+            r.toggleError = String(e).split('\n')[0];
           }
         } catch (e) {
           r.status = 'failed';
@@ -144,6 +153,7 @@ test.describe('workbench scroll', () => {
   test('scroll-taxon-10k', async ({ browser }, info) => {
     const hub = taxon!.hubs[0].iri;
     for (let rep = 1; rep <= REPEAT; rep++) {
+      await calm();
       const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
       const page = await ctx.newPage();
       await page.addInitScript(LONGTASK_INIT);
