@@ -1010,12 +1010,25 @@
     if (!useWebgl) return [];
     const colors = graphColors();
     const radius = 100 + Math.sqrt(gNodes.length) * 4;
+    // a picture of thousands of nodes has room for small dots only: at the default size the
+    // members of a hub run together into one disc that looks like a single large node
+    const dense = gNodes.length > WEBGL_FROM;
+    const dot = dense ? 1.8 : 3.5;
     return gNodes.map((g) => {
       const p = seed(g.id, undefined, radius);
       return {
         key: g.id,
         label: g.label,
-        size: g.kind === 'group' ? 6.5 : g.kind === 'literal' ? 2.5 : g.focus ? 5.5 : 3.5,
+        size:
+          g.kind === 'group'
+            ? 6.5
+            : g.kind === 'literal'
+              ? dot * 0.7
+              : g.focus
+                ? 5.5
+                : g.expanded && dense
+                  ? 4
+                  : dot,
         color:
           g.change === 'added'
             ? colors.added
@@ -4606,8 +4619,19 @@
     }
   }
   @media (max-width: 760px) {
+    /* the counts are in the filter panel and the list, so the end group's buttons share the
+       last row of the tools and the canvas keeps the height the counts would take */
     .gtools .note {
-      margin-right: auto;
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+    }
+    .gtools .toolbar-end {
+      flex: 1 1 auto;
+      flex-wrap: nowrap;
     }
     /* taps need 44 px targets */
     .graph-control {
