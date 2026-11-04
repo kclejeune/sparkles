@@ -13,7 +13,9 @@
 # Results go to <main checkout>/.artifacts/gates/nightly/: one log per run, last-pass with
 # the last commit that passed and, after a failure, FAILED with the commit range between
 # the last pass and the failing commit and the steps that failed, or NOT-STARTED when the
-# gate could not start. A later pass removes both. The gate's own results are in
+# gate could not start. A later pass removes both. github-runs.txt holds the newest finished
+# run of each GitHub workflow on main (scripts/gate/github-runs.py), and GITHUB-FAILED is a
+# copy of it while one of them failed. The gate's own results are in
 # .artifacts/gates/main-gate-<short>-nightly-<host>/.
 # docs/DEVELOPMENT.md (Nightly gate) describes the bisect and fix-forward that a failure
 # starts.
@@ -84,6 +86,15 @@ rev=$(git rev-parse origin/main)
 short=${rev:0:8}
 mkdir -p "$state"
 last=$(cat "$state/last-pass" 2> /dev/null || true)
+# The GitHub workflows of main, which the gate does not run, refreshed every night even
+# when the commit already passed. A failure is recorded beside the gate's own result and
+# does not change it.
+if python3 "$here/github-runs.py" > "$state/github-runs.txt" 2>&1; then
+  rm -f "$state/GITHUB-FAILED"
+else
+  cp "$state/github-runs.txt" "$state/GITHUB-FAILED"
+  cat "$state/GITHUB-FAILED"
+fi
 if [ "${1:-}" = --dry-run ]; then
   echo "nightly: origin/main is $short, last pass ${last:-none}"
   exec "$here/gate.sh" --auto --full --tag nightly --dry-run "$rev"
@@ -95,7 +106,7 @@ fi
 
 log=$state/$(date -u +%Y%m%dT%H%M%SZ)-$short.log
 code=0
-"$here/gate.sh" --auto --full --tag nightly "$rev" > "$log" 2>&1 || code=$?
+GATE_GITHUB_RUNS=0 "$here/gate.sh" --auto --full --tag nightly "$rev" > "$log" 2>&1 || code=$?
 if [ "$code" = 0 ]; then
   echo "$rev" > "$state/last-pass"
   rm -f "$state/FAILED" "$state/NOT-STARTED"

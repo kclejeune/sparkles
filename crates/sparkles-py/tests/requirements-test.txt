@@ -1,0 +1,5 @@
+# The test dependencies of the Python bindings, pinned so that `mise run py:test` and the
+# wheel workflow (scripts/py-wheel-test.sh) run the same mypy stubtest and rdflib tests.
+mypy==2.4.1
+pytest==9.2.0
+rdflib==7.6.0

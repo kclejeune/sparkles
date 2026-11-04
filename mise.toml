@@ -1328,6 +1328,7 @@ flag "--write-rate <n>" default="0" help="pace the writers of writers and mixed 
 flag "--index <kind>" default="none" help="an index configured on every store after loading: none, text, geo or embed"
 flag "--views <spec>" default="none" help="views defined on every store after loading: none or async:N (commit:Q and graph:N wait for items 421 and 420)"
 flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
+flag "--build-host <host>" help="where revisions are built: local, auto or a host name (default auto with SPARKLES_NSC_BUILD_HOSTS set, else local)"
 flag "--duration <d>" default="2h" help="the instance's lifetime cap"
 flag "--out <dir>" help="results directory (default .artifacts/nsc-writes/<UTC time>)"
 '''
@@ -1337,6 +1338,7 @@ mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 scripts/nsc-writes.sh --people "$usage_people" --scenarios "$usage_scenarios" --rounds "$usage_rounds" \
   --changes "$usage_changes" --writer-changes "$usage_writer_changes" --mixed-changes "$usage_mixed_changes" \
   --write-rate "$usage_write_rate" --index "$usage_index" --views "$usage_views" --duration "$usage_duration" ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
+  ${usage_build_host:+--build-host "$usage_build_host"} \
   ${usage_out:+--out "$usage_out"} $usage_variants
 SPARKLES_TASK
 '''
@@ -1344,7 +1346,7 @@ SPARKLES_TASK
 [tasks."bench:nsc"]
 description = "Interleaved A/B query benchmark of two revisions or binaries on an ephemeral Namespace instance (nsc): fresh pinned servers in A,B,B,A rounds, medians, per-round ratios and the geometric mean"
 usage = '''
-arg "<a>" help="the baseline: a git revision (built locally and cached) or a sparkles binary"
+arg "<a>" help="the baseline: a git revision (built here or on a build host, and cached) or a sparkles binary"
 arg "<b>" help="the candidate: a git revision or a sparkles binary"
 flag "--people <n>" default="100000" help="dataset size in people (~10.5 triples each)"
 flag "--queries <list>" help="only these queries (default: all of bench.sh except export-500k)"
@@ -1357,6 +1359,7 @@ flag "--no-spin" help="no idle-priority busy loops on the server and client CPUs
 flag "--serve-args <flags>" help="extra sparkles serve flags for both servers"
 flag "--execution <mode>" help="execution=MODE with every query, or A_MODE,B_MODE per variant"
 flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
+flag "--build-host <host>" help="where revisions are built: local, auto or a host name (default auto with SPARKLES_NSC_BUILD_HOSTS set, else local)"
 flag "--duration <d>" default="2h" help="the instance's lifetime cap"
 flag "--out <dir>" help="results directory (default .artifacts/nsc-bench/<UTC time>)"
 flag "--flag-ratio <r>" default="1.10" help="flag a query whose execution-time ratio B/A is at least this"
@@ -1370,7 +1373,7 @@ scripts/nsc-bench.sh --people "$usage_people" --rounds "$usage_rounds" --reps "$
   --warmup "$usage_warmup" --rayon-threads "$usage_rayon_threads" --duration "$usage_duration" \
   ${usage_queries:+--queries "$usage_queries"} ${usage_query_dir:+--query-dir "$usage_query_dir"} \
   ${usage_serve_args:+--serve-args "$usage_serve_args"} ${usage_execution:+--execution "$usage_execution"} \
-  ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
+  ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} ${usage_build_host:+--build-host "$usage_build_host"} \
   --flag-ratio "$usage_flag_ratio" --rerun-rounds "$usage_rerun_rounds" --rerun-reps "$usage_rerun_reps" \
   ${usage_no_rerun:+--no-rerun} ${usage_out:+--out "$usage_out"} ${usage_no_spin:+--no-spin} "$usage_a" "$usage_b"
 SPARKLES_TASK

@@ -66,6 +66,10 @@
 # (default 30) for a ci half or a whole gate and GATE_NEED_CONF_GB (default 15) for a
 # conformance half. A host that is short runs `mbx gc` first, and the driver refuses to
 # start when it is still short.
+#
+# Before it starts, the driver also prints the newest finished run of each GitHub workflow
+# on main (scripts/gate/github-runs.py) and warns when one failed, since those workflows
+# run on GitHub and not in the gate. GATE_GITHUB_RUNS=0 skips the report.
 set -euo pipefail
 
 self=$(readlink -f "${BASH_SOURCE[0]}")
@@ -407,6 +411,14 @@ case $mode in
     exit 0
     ;;
 esac
+
+# The GitHub workflows (the server artifact link, the wheel tests, the CI shards) run on
+# GitHub and not in this gate, so a failure there on the last push is reported here before
+# the next batch goes out. GATE_GITHUB_RUNS=0 skips the report.
+if [ "${GATE_GITHUB_RUNS:-1}" != 0 ]; then
+  python3 "$here/github-runs.py" >&2 ||
+    echo "gate.sh: a GitHub workflow failed on main; fix it in this batch or say why it can wait" >&2
+fi
 
 # The merge base the gate host compares the commit with, and whether the batch needs the
 # conformance suites, from the same selection the host makes (scripts/gate/select-checks.py).

@@ -27,24 +27,35 @@ fn axioms(body: &str) -> Vec<Axiom> {
     .axioms
 }
 
-/// Every subsumption between the taxonomy's classes, owl:Thing and owl:Nothing included.
+/// Every subsumption between the taxonomy's classes, owl:Thing and owl:Nothing included,
+/// with an unsatisfiable class below the marker `⊥` alone, since it is below every class.
 fn pairs(t: &sparkles_owl::classify::Taxonomy, cs: &[Class]) -> BTreeSet<(String, String)> {
+    let names: BTreeSet<&str> = cs.iter().map(|c| c.as_str()).collect();
     let mut v = BTreeSet::new();
     for x in cs {
-        for y in cs {
-            if t.is_subclass(x, y) {
-                v.insert((x.as_str().to_string(), y.as_str().to_string()));
+        if t.is_unsatisfiable(x) {
+            v.insert((x.as_str().to_string(), "⊥".to_string()));
+            continue;
+        }
+        let Some(n) = t.node_of(x) else { continue };
+        for k in std::iter::once(n).chain(t.ancestors(n)) {
+            for y in &t.node(k).classes {
+                if names.contains(y.as_str()) {
+                    v.insert((x.as_str().to_string(), y.as_str().to_string()));
+                }
             }
         }
     }
     v
 }
 
+/// The classes of the axioms' signature, declared or not, with owl:Thing and owl:Nothing.
 fn classes(ax: &[Axiom]) -> Vec<Class> {
     let mut cs: BTreeSet<Class> = ax
         .iter()
-        .filter_map(|a| match &a.kind {
-            AxiomKind::Declaration(Entity::Class(c)) => Some(c.clone()),
+        .flat_map(|a| a.signature())
+        .filter_map(|e| match e {
+            Entity::Class(c) => Some(c),
             _ => None,
         })
         .collect();
@@ -274,7 +285,11 @@ fn many(n: usize, inconsistent: bool) -> String {
 fn check_partial(part: &Classification, full: &Classification, cs: &[Class]) {
     let got = pairs(&part.taxonomy, cs);
     let want = pairs(&full.taxonomy, cs);
-    let extra: Vec<_> = got.difference(&want).collect();
+    // a class that the full answer makes unsatisfiable is below every class
+    let extra: Vec<_> = got
+        .difference(&want)
+        .filter(|(x, _)| !want.contains(&(x.clone(), "⊥".to_string())))
+        .collect();
     assert!(extra.is_empty(), "a partial answer has {extra:?}");
     if part.complete {
         assert_eq!(got, want);
@@ -340,6 +355,8 @@ fn partial_answers(inconsistent: bool) {
         assert!(full.stats.dl_tests > 0, "the ontology tests no candidate");
     }
     let mut partial = 0;
+    // partial answers of the early stops that left the consistency unknown
+    let mut early_unknown = 0;
     let mut some_complete = 0;
     // partial answers that stopped after a round of tests
     let mut in_tests = 0;
@@ -364,6 +381,38 @@ fn partial_answers(inconsistent: bool) {
             .unwrap();
         assert_eq!(pairs(&again.taxonomy, &cs), pairs(&full.taxonomy, &cs));
         let total = polls.load(Ordering::Relaxed);
+        // the first stop that answers, and the stops right after it, which come before
+        // every root has a context of its own
+        let first = (0..total).find(|&k| {
+            Classifier::of(&ax)
+                .classify(&cancelled_at(k, threads, expansion))
+                .is_ok()
+        });
+        let early = first.map_or(0..0, |f| f..(f + 64).min(total));
+        for k in early.clone() {
+            let out = Classifier::of(&ax)
+                .classify(&cancelled_at(k, threads, expansion))
+                .unwrap();
+            check_partial(&out, &full, &cs);
+            if !out.complete {
+                partial += 1;
+                early_unknown += (out.consistency == Consistency::Unknown) as usize;
+            }
+        }
+        // deadlines from no time on, which stop before the saturation, in it before every
+        // root has a context, and later
+        for us in [0u64, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000] {
+            let limits = Limits {
+                threads,
+                expansion,
+                partial: true,
+                deadline: Some(Instant::now() + Duration::from_micros(us)),
+                ..Limits::default()
+            };
+            if let Ok(out) = Classifier::of(&ax).classify(&limits) {
+                check_partial(&out, &full, &cs);
+            }
+        }
         for k in (0..total).step_by((total / 32).max(1)) {
             let mut kl = Classifier::of(&ax);
             let Ok(out) = kl.classify(&cancelled_at(k, threads, expansion)) else {
@@ -406,6 +455,15 @@ fn partial_answers(inconsistent: bool) {
         }
     }
     assert!(partial > 0, "no stop gave a partial answer");
+    // The earliest stops leave the context of owl:Thing open, where an existential
+    // restriction on every element is still to be saturated. A consistent ontology's
+    // owl:Thing has no successor here and closes before any stop answers.
+    if inconsistent {
+        assert!(
+            early_unknown > 0,
+            "no early stop left the consistency unknown"
+        );
+    }
     if !inconsistent {
         assert!(some_complete > 0, "no partial answer had a complete class");
         assert!(in_tests > 0, "no partial answer stopped among the tests");
@@ -420,6 +478,55 @@ fn a_partial_answer_is_part_of_the_full_one_and_complete_where_it_says() {
 #[test]
 fn an_unresolved_inconsistency_leaves_every_class_open() {
     partial_answers(true);
+}
+
+/// The cases of [`many`] with the successors picked by arithmetic, as the surfaces' tests
+/// of the `sparkles` crate and the bindings write them.
+fn cases(n: usize) -> String {
+    let mut s = String::new();
+    for i in 0..n {
+        let (b, d) = ((7 * i + 3) % n, (13 * i + 5) % n);
+        s.push_str(&format!(
+            "SubClassOf(:C{i} ObjectUnionOf(:B{i} :E{i}))
+             SubClassOf(:B{i} :K{i}) SubClassOf(:B{i} :C{b}) SubClassOf(:E{i} :K{i})
+             SubClassOf(:K{i} ObjectSomeValuesFrom(:r :C{d}))
+             SubClassOf(:E{i} ObjectAllValuesFrom(ObjectInverseOf(:r) :F{d}))
+             SubClassOf(ObjectSomeValuesFrom(:r :F{i}) :G{b})\n"
+        ));
+    }
+    s
+}
+
+#[test]
+fn a_deadline_before_a_class_has_a_context_leaves_it_open() {
+    // A deadline can stop the saturation before it made the contexts of some classes,
+    // whose answers are then not complete, nor is the consistency known while the
+    // context of owl:Thing is not made.
+    let n = if cfg!(debug_assertions) { 120 } else { 400 };
+    let ax = axioms(&cases(n));
+    let cs = classes(&ax);
+    let one = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let t = Instant::now();
+    let full = Classifier::of(&ax).classify(&one).unwrap();
+    let took = t.elapsed();
+    let mut partial = 0;
+    let mut d = Duration::from_micros(10);
+    while d < took.mul_f64(1.5) {
+        let limits = Limits {
+            partial: true,
+            deadline: Some(Instant::now() + d),
+            ..one.clone()
+        };
+        if let Ok(out) = Classifier::of(&ax).classify(&limits) {
+            check_partial(&out, &full, &cs);
+            partial += (!out.complete) as usize;
+        }
+        d = d.mul_f64(1.1);
+    }
+    assert!(partial > 0, "no deadline gave a partial answer");
 }
 
 #[test]
