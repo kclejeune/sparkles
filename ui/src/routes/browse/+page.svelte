@@ -149,6 +149,23 @@
   const wantEdit = $derived(q.get('edit') === '1');
   const view = $derived(q.get('view') === 'graph' && !wantEdit ? 'graph' : 'tree');
   const sel = $derived<BrowseSelection>({ graph, at });
+  // Design exploration: `?layout=A0|A|B|C|D` picks the term page's arrangement and
+  // `?chips=pill|text` the style of the count chips. A0 is the page before the exploration.
+  // A has Download inside Metadata, B moves the hierarchy to the right rail, C reads like an
+  // article (no cards behind the main sections, one infobox) and D is C with the hierarchy in
+  // the rail.
+  const layout = $derived.by(() => {
+    const l = q.get('layout');
+    return l === 'A0' || l === 'B' || l === 'C' || l === 'D' ? l : 'A';
+  });
+  const flat = $derived(layout === 'C' || layout === 'D');
+  const railTree = $derived(layout === 'B' || layout === 'D');
+  const chipStyle = $derived(q.get('chips') ?? (layout === 'A0' ? 'pill' : 'text'));
+  const layoutKeep = $derived(q.get('layout'));
+  /** C and D only: `?refs=rail` puts References in the rail and `?ibox=left` left-aligns the
+   * infobox's title. */
+  const refsRail = $derived(flat && q.get('refs') === 'rail');
+  const iboxLeft = $derived(q.get('ibox') === 'left');
   const prefixes = $derived(app.prefixes(name));
   const langs: readonly string[] = typeof navigator === 'undefined' ? [] : [...navigator.languages];
 
@@ -158,7 +175,13 @@
     if (name) void app.loadPrefixes(name);
   });
 
-  const keep = $derived.by(() => ({ graph, branch, at, edit: editing ? '1' : null }));
+  const keep = $derived.by(() => ({
+    graph,
+    branch,
+    at,
+    edit: editing ? '1' : null,
+    layout: layoutKeep,
+  }));
   const hrefOf = (i: string | null, extra: Record<string, string | null> = {}) =>
     browseHref(base, name, i, { ...keep, ...extra });
 
@@ -1212,9 +1235,193 @@
           ondone={leaveEdit}
         />
       {/if}
+      <!-- the hierarchy is a card above the facts in the page's side column, and on a
+           phone a card that opens on request (ROADMAP item 633) -->
+      {#snippet treeHead()}
+        {#if !editing}
+          <button
+            type="button"
+            class="btn sm ghost icon tree-toggle"
+            aria-expanded={treeOpen}
+            aria-controls="tree-body"
+            aria-label={treeOpen ? 'Hide the hierarchy' : 'Show the hierarchy'}
+            onclick={() => (treeOpen = !treeOpen)}
+            ><Icon name={treeOpen ? 'chevronDown' : 'chevron'} size={16} /></button
+          >
+        {/if}
+        <h2 id="tree-h">Hierarchy</h2>
+        <span class="spacer"></span>
+        {#if !editing}
+          <span class="seg" role="group" aria-label="View">
+            <a
+              href={hrefOf(iri)}
+              aria-current={view === 'tree' ? 'true' : undefined}
+              data-sveltekit-noscroll>Tree</a
+            ><a
+              href={hrefOf(iri, { view: 'graph' })}
+              aria-current={view === 'graph' ? 'true' : undefined}
+              data-sveltekit-noscroll>Graph</a
+            >
+          </span>
+        {/if}
+      {/snippet}
+      {#snippet refsCard()}
+        <section
+          class="panel b-refs"
+          aria-labelledby="refs-h"
+          data-movable={layout === 'A0' || layout === 'A' ? '' : undefined}
+        >
+          <div class="panel-head"><h2 id="refs-h">References</h2></div>
+          <div class="panel-body ruled">
+            <TermXrefs
+              xrefs={sections.xrefs}
+              seeAlso={sections.seeAlso}
+              mappings={sections.mappings}
+              {linker}
+            />
+            <TermUsage
+              iri={term!.iri}
+              groups={mentions}
+              total={term!.mentions.total}
+              truncated={term!.mentions.truncated}
+              incoming={term!.incoming}
+              usage={term!.usage}
+              {linker}
+              {prefixes}
+              more={moreIncoming}
+              skip={skipIncoming}
+            />
+            <TermReuse
+              found={reuse.found}
+              checked={reuse.checked}
+              loading={reuse.loading}
+              href={(d) => browseHref(base, d, term?.iri ?? null)}
+            />
+            {#if !editing}
+              <SimilarTerms ds={target} iri={term!.iri} href={(i) => hrefOf(i)} />
+            {/if}
+            <!-- the statements no other section shows, folded away -->
+            {#if sections.other.length && !editing}
+              <section class="term-sec">
+                <details class="ann">
+                  <summary
+                    >All other statements <span class="count-badge"
+                      >{sections.other.reduce((n, o) => n + o.values.length, 0)}</span
+                    ></summary
+                  >
+                  <div class="table-scroll">
+                    <table class="data">
+                      <tbody>
+                        {#each sections.other as o (o.property)}
+                          <tr>
+                            <th scope="row" class="mono">{iriName(o.property, prefixes)}</th>
+                            <td>
+                              {#each o.values as v, i (i)}{#if i > 0}<br
+                                  />{/if}{#if isLiteral(v)}{v['@value']}{#if v['@language']}<span
+                                      class="lang-tag">{v['@language']}</span
+                                    >{/if}{:else if linker.href(v)}<a href={linker.href(v)}
+                                    >{linker.name(v)}</a
+                                  >{:else}<span class="mono">{v}</span>{/if}{/each}
+                            </td>
+                          </tr>
+                        {/each}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              </section>
+            {/if}
+          </div>
+        </section>
+      {/snippet}
+      {#snippet treeCard()}
+        <aside class="panel b-tree" class:shut={!treeOpen && !editing} aria-labelledby="tree-h">
+          {#if view === 'graph' && piece && !editing}
+            <TermGraph
+              ds={target}
+              {piece}
+              {linker}
+              {exploreHref}
+              onexpand={expand}
+              epoch={graphEpoch}
+              lead={treeHead}
+              shut={!treeOpen}
+            />
+          {:else}
+            <div class="panel-head">{@render treeHead()}</div>
+            <div class="tree-edit">
+              {#if editing && isSkos && treeKind === 'concept'}
+                <div class="skos-parents">
+                  <SkosLinks
+                    title="Broader"
+                    id="broader"
+                    links={details?.broader ?? []}
+                    name={(i) => linker.name(i)}
+                    sub={(i) => linker.short(i)}
+                    {readonly}
+                    paired
+                    {picker}
+                    onopen={(i) => void goto(hrefOf(i))}
+                    onadd={(i, n) => addLink('broader', i, n)}
+                    onremove={(i) => removeLink('broader', i)}
+                    onrepair={(l) => addLink('broader', l.iri)}
+                  />
+                  <SkosLinks
+                    title="Narrower"
+                    id="narrower"
+                    links={details?.narrower ?? []}
+                    name={(i) => linker.name(i)}
+                    sub={(i) => linker.short(i)}
+                    {readonly}
+                    paired
+                    {picker}
+                    onopen={(i) => void goto(hrefOf(i))}
+                    onadd={(i, n) => addLink('narrower', i, n)}
+                    onremove={(i) => removeLink('narrower', i)}
+                    onrepair={(l) => addLink('narrower', l.iri)}
+                  />
+                </div>
+              {:else if editing && parentsEditable(treeKind)}
+                <ParentEditor
+                  kind={treeKind!}
+                  iri={term!.iri}
+                  {title}
+                  rows={parents}
+                  {linker}
+                  {target}
+                  {graph}
+                  {prefixes}
+                  {readonly}
+                  {onedit}
+                />
+              {/if}
+            </div>
+            <div class="tree-body" id="tree-body" bind:this={treeBox}>
+              {#if tree}
+                <LineageTree
+                  {target}
+                  {sel}
+                  kind={treeKind!}
+                  iri={term!.iri}
+                  {title}
+                  answer={tree}
+                  href={(i) => hrefOf(i)}
+                />
+              {:else}
+                <p class="faint">Loading…</p>
+              {/if}
+            </div>
+          {/if}
+        </aside>
+      {/snippet}
       <div
         class="browse"
         use:balance
+        data-layout={layout}
+        data-chips={chipStyle}
+        class:flat
+        class:rail={railTree}
+        class:ibox-left={iboxLeft}
         class:graph={view === 'graph' && !treeKind}
         class:editing
         data-kind={treeKind ?? 'none'}
@@ -1589,198 +1796,38 @@
                 editor={editing ? axiomEditor : undefined}
               />
             {/if}
-            {#if treeKind}
-              <!-- the hierarchy is a card above the facts in the page's side column, and on a
-                 phone a card that opens on request (ROADMAP item 633) -->
-              {#snippet treeHead()}
-                {#if !editing}
-                  <button
-                    type="button"
-                    class="btn sm ghost icon tree-toggle"
-                    aria-expanded={treeOpen}
-                    aria-controls="tree-body"
-                    aria-label={treeOpen ? 'Hide the hierarchy' : 'Show the hierarchy'}
-                    onclick={() => (treeOpen = !treeOpen)}
-                    ><Icon name={treeOpen ? 'chevronDown' : 'chevron'} size={16} /></button
-                  >
-                {/if}
-                <h2 id="tree-h">Hierarchy</h2>
-                <span class="spacer"></span>
-                {#if !editing}
-                  <span class="seg" role="group" aria-label="View">
-                    <a
-                      href={hrefOf(iri)}
-                      aria-current={view === 'tree' ? 'true' : undefined}
-                      data-sveltekit-noscroll>Tree</a
-                    ><a
-                      href={hrefOf(iri, { view: 'graph' })}
-                      aria-current={view === 'graph' ? 'true' : undefined}
-                      data-sveltekit-noscroll>Graph</a
-                    >
-                  </span>
-                {/if}
-              {/snippet}
-              <aside
-                class="panel b-tree"
-                class:shut={!treeOpen && !editing}
-                aria-labelledby="tree-h"
-              >
-                {#if view === 'graph' && piece && !editing}
-                  <TermGraph
-                    ds={target}
-                    {piece}
-                    {linker}
-                    {exploreHref}
-                    onexpand={expand}
-                    epoch={graphEpoch}
-                    lead={treeHead}
-                    shut={!treeOpen}
-                  />
-                {:else}
-                  <div class="panel-head">{@render treeHead()}</div>
-                  <div class="tree-edit">
-                    {#if editing && isSkos && treeKind === 'concept'}
-                      <div class="skos-parents">
-                        <SkosLinks
-                          title="Broader"
-                          id="broader"
-                          links={details?.broader ?? []}
-                          name={(i) => linker.name(i)}
-                          sub={(i) => linker.short(i)}
-                          {readonly}
-                          paired
-                          {picker}
-                          onopen={(i) => void goto(hrefOf(i))}
-                          onadd={(i, n) => addLink('broader', i, n)}
-                          onremove={(i) => removeLink('broader', i)}
-                          onrepair={(l) => addLink('broader', l.iri)}
-                        />
-                        <SkosLinks
-                          title="Narrower"
-                          id="narrower"
-                          links={details?.narrower ?? []}
-                          name={(i) => linker.name(i)}
-                          sub={(i) => linker.short(i)}
-                          {readonly}
-                          paired
-                          {picker}
-                          onopen={(i) => void goto(hrefOf(i))}
-                          onadd={(i, n) => addLink('narrower', i, n)}
-                          onremove={(i) => removeLink('narrower', i)}
-                          onrepair={(l) => addLink('narrower', l.iri)}
-                        />
-                      </div>
-                    {:else if editing && parentsEditable(treeKind)}
-                      <ParentEditor
-                        kind={treeKind}
-                        iri={term.iri}
-                        {title}
-                        rows={parents}
-                        {linker}
-                        {target}
-                        {graph}
-                        {prefixes}
-                        {readonly}
-                        {onedit}
-                      />
-                    {/if}
-                  </div>
-                  <div class="tree-body" id="tree-body" bind:this={treeBox}>
-                    {#if tree}
-                      <LineageTree
-                        {target}
-                        {sel}
-                        kind={treeKind}
-                        iri={term.iri}
-                        {title}
-                        answer={tree}
-                        href={(i) => hrefOf(i)}
-                      />
-                    {:else}
-                      <p class="faint">Loading…</p>
-                    {/if}
-                  </div>
-                {/if}
-              </aside>
+            {#if treeKind && !(railTree && !(view === 'graph' && piece && !editing))}
+              {@render treeCard()}
             {/if}
-            <section class="panel b-refs" aria-labelledby="refs-h" data-movable>
-              <div class="panel-head"><h2 id="refs-h">References</h2></div>
-              <div class="panel-body ruled">
-                <TermXrefs
-                  xrefs={sections.xrefs}
-                  seeAlso={sections.seeAlso}
-                  mappings={sections.mappings}
-                  {linker}
-                />
-                <TermUsage
-                  iri={term.iri}
-                  groups={mentions}
-                  total={term.mentions.total}
-                  truncated={term.mentions.truncated}
-                  incoming={term.incoming}
-                  usage={term.usage}
-                  {linker}
-                  {prefixes}
-                  more={moreIncoming}
-                  skip={skipIncoming}
-                />
-                <TermReuse
-                  found={reuse.found}
-                  checked={reuse.checked}
-                  loading={reuse.loading}
-                  href={(d) => browseHref(base, d, term?.iri ?? null)}
-                />
-                {#if !editing}
-                  <SimilarTerms ds={target} iri={term.iri} href={(i) => hrefOf(i)} />
-                {/if}
-                <!-- the statements no other section shows, folded away -->
-                {#if sections.other.length && !editing}
-                  <section class="term-sec">
-                    <details class="ann">
-                      <summary
-                        >All other statements <span class="count-badge"
-                          >{sections.other.reduce((n, o) => n + o.values.length, 0)}</span
-                        ></summary
-                      >
-                      <div class="table-scroll">
-                        <table class="data">
-                          <tbody>
-                            {#each sections.other as o (o.property)}
-                              <tr>
-                                <th scope="row" class="mono">{iriName(o.property, prefixes)}</th>
-                                <td>
-                                  {#each o.values as v, i (i)}{#if i > 0}<br
-                                      />{/if}{#if isLiteral(v)}{v[
-                                        '@value'
-                                      ]}{#if v['@language']}<span class="lang-tag"
-                                          >{v['@language']}</span
-                                        >{/if}{:else if linker.href(v)}<a href={linker.href(v)}
-                                        >{linker.name(v)}</a
-                                      >{:else}<span class="mono">{v}</span>{/if}{/each}
-                                </td>
-                              </tr>
-                            {/each}
-                          </tbody>
-                        </table>
-                      </div>
-                    </details>
-                  </section>
-                {/if}
-              </div>
-            </section>
+            {#if !refsRail}
+              {@render refsCard()}
+            {/if}
           </div>
         {/if}
         <div class="b-side" data-col="side">
-          <div class="b-info"><TermInfobox rows={infoRows} {linker} heading="Metadata" /></div>
-          <section class="panel b-dl" aria-labelledby="dl-h" data-movable>
-            <div class="panel-head"><h2 id="dl-h">Download</h2></div>
-            <div class="panel-body">
-              <DownloadButtons
-                noun="this {kind}"
-                href={(f) => branchPath(downloadHref(target, sel, term!.iri, f))}
-              />
+          {#snippet downloads()}
+            <DownloadButtons
+              noun="this {kind}"
+              href={(f) => branchPath(downloadHref(target, sel, term!.iri, f))}
+            />
+          {/snippet}
+          {#if layout === 'A0'}
+            <div class="b-info"><TermInfobox rows={infoRows} {linker} heading="Metadata" /></div>
+            <section class="panel b-dl" aria-labelledby="dl-h" data-movable>
+              <div class="panel-head"><h2 id="dl-h">Download</h2></div>
+              <div class="panel-body">{@render downloads()}</div>
+            </section>
+          {:else}
+            <div class="b-info">
+              <TermInfobox rows={infoRows} {linker} heading="Metadata" footer={downloads} />
             </div>
-          </section>
+          {/if}
+          {#if treeKind && railTree && !(view === 'graph' && piece && !editing)}
+            {@render treeCard()}
+          {/if}
+          {#if refsRail}
+            {@render refsCard()}
+          {/if}
         </div>
       </div>
     {/if}
@@ -2114,7 +2161,7 @@
     /* the shorter column stays in view while the page scrolls */
     .b-side:global([data-stick]) {
       position: sticky;
-      top: var(--gutter);
+      top: var(--stick-top, var(--gutter));
     }
   }
   .b-tree h2 {
@@ -2187,6 +2234,119 @@
   }
   .iri-line {
     overflow-wrap: anywhere;
+  }
+
+  /* --- layout exploration (?layout=, ?chips=) -------------------------------------------- */
+  /* the counts as one line of text links under the identity row, split by dots */
+  .browse[data-chips='text'] .b-chips {
+    margin-top: 0;
+  }
+  .browse[data-chips='text'] :global(.stat-chips) {
+    gap: var(--sp-1) 0;
+  }
+  .browse[data-chips='text'] :global(.stat-chip) {
+    height: auto;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: none;
+    line-height: 1.3;
+  }
+  .browse[data-chips='text'] :global(.stat-chip:not(:last-child)::after) {
+    content: '·';
+    display: inline-block;
+    margin: 0 0.45em 0 0.3em;
+    color: var(--text-3);
+  }
+  .browse[data-chips='text'] :global(a.stat-chip:hover) {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  /* the phone order of an article: the definition, then the infobox, then the rest */
+  @container browse (max-width: 1099px) {
+    .browse.flat .b-info {
+      order: 2;
+    }
+  }
+  /* an article: headings with a hairline rule on the page's own background, running text,
+     and one boxed infobox */
+  .browse.flat {
+    row-gap: var(--sp-6);
+  }
+  .browse.flat .b-main {
+    gap: var(--sp-8);
+  }
+  .browse.flat :global(.panel:not(.info)) {
+    background: none;
+    border: 0;
+    border-radius: 0;
+  }
+  .browse.flat :global(.panel:not(.info) > .panel-head),
+  .browse.flat .b-tree :global(.canvas.card > .lead) {
+    padding: 0 0 var(--sp-1);
+    min-height: 0;
+    border-bottom: 1px solid var(--border-strong);
+  }
+  .browse.flat :global(.panel:not(.info) > .panel-head h2),
+  .browse.flat .b-tree :global(.lead h2) {
+    font-size: var(--fs-xl);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .browse.flat :global(.panel:not(.info) > .panel-body) {
+    padding: var(--sp-4) 0 0;
+  }
+  .browse.flat .tree-body,
+  .browse.flat .tree-edit:not(:empty) {
+    padding-left: 0;
+    padding-right: 0;
+  }
+  .browse.flat .tree-body {
+    margin-top: var(--sp-3);
+    padding: var(--sp-3);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    background: var(--surface);
+  }
+  .browse.flat .b-def :global(.entry) {
+    max-width: 75ch;
+  }
+  .browse.flat .b-info :global(.panel-head) {
+    justify-content: center;
+    background: var(--surface-2);
+    border-radius: var(--r-lg) var(--r-lg) 0 0;
+  }
+  .browse.flat.ibox-left .b-info :global(.panel-head) {
+    justify-content: flex-start;
+  }
+  /* References in the rail is a section of the rail's width */
+  .browse.flat .b-side > :global(.b-refs.panel > .panel-head h2) {
+    font-size: var(--fs-lg);
+  }
+  /* the hierarchy in the rail is a card of its own where the rail is a column */
+  @container browse (min-width: 1100px) {
+    .browse.flat .b-side > :global(.b-tree) {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r-lg);
+    }
+    .browse.flat .b-side > :global(.b-tree.panel > .panel-head),
+    .browse.flat .b-side > :global(.b-tree .canvas.card > .lead) {
+      padding: var(--sp-2) 14px;
+      min-height: var(--panel-head-h);
+    }
+    .browse.flat .b-side > :global(.b-tree.panel > .panel-head h2),
+    .browse.flat .b-side > :global(.b-tree .lead h2) {
+      font-size: var(--fs-md);
+      letter-spacing: normal;
+    }
+    .browse.flat .b-side > :global(.b-tree.panel .tree-body) {
+      margin-top: 0;
+      padding: var(--sp-3) 14px;
+      border: 0;
+      border-radius: 0;
+      background: none;
+    }
   }
 
   /* the landing page */
