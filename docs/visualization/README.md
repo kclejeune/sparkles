@@ -462,7 +462,8 @@ An entity's page leads with its label, short form, kind and IRI, and a line of c
 them as text links, its parents, children, incoming links, synonyms and the other datasets
 that mention it, each leading to its section. The IRI follows the **Prefixed** or **Full IRIs**
 switch with the dataset's prefixes, shows in full where no prefix fits, keeps the full IRI as its
-title and is always copied in full. A count of zero does not show, and with none left
+title and is always copied in full. The short form does not show beside a prefixed name that already
+ends in it. A count of zero does not show, and with none left
 the line does not render. The buttons that act on the page sit level with the title.
 **Open in Explore**, **Open in Ontology** or **Open in Thesaurus**, **Ask about this** and
 **Edit** show while they fit, and the rest fold into a **More** menu, so the title never

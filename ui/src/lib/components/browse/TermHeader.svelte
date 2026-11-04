@@ -8,7 +8,7 @@
   import Icon from '$components/Icon.svelte';
   import PageActions from '$components/PageActions.svelte';
   import LinkedText from './LinkedText.svelte';
-  import { valueText } from '$lib/browse';
+  import { shortFormRepeats, valueText } from '$lib/browse';
   import { displayIri, type PrefixMap } from '$lib/rdf';
 
   let {
@@ -65,7 +65,9 @@
   <h1 class="term-title" class:struck={name.deprecated}>{title}</h1>
   {#if actions}<PageActions small>{@render actions()}</PageActions>{/if}
   <div class="ids">
-    {#if name.shortForm && name.shortForm !== title}<span class="sf">{name.shortForm}</span>{/if}
+    {#if name.shortForm && name.shortForm !== title && !shortFormRepeats(name.shortForm, name.iri, shownIri)}<span
+        class="sf">{name.shortForm}</span
+      >{/if}
     <span class="badge iri">{kind}</span>
     {#if name.deprecated}<span class="badge danger">deprecated</span>{/if}
     <!-- the prefixed form is for the eye, and a screen reader hears the full IRI that it copies -->

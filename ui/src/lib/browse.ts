@@ -1280,6 +1280,15 @@ export function xrefsByDatabase(xrefs: Sections['xrefs']) {
   return [...by.entries()].map(([database, ids]) => ({ database, ids }));
 }
 
+/**
+ * Whether the short form beside a shown IRI says what that IRI already says: the IRI shows as a
+ * prefixed name, and its local part is the short form. An IRI in full leaves the chip its use.
+ */
+export function shortFormRepeats(shortForm: string, iri: string, shownIri: string): boolean {
+  if (shownIri === iri) return false;
+  return shownIri.slice(shownIri.indexOf(':') + 1) === shortForm;
+}
+
 /** A percent-decoded part of a reference, unchanged when decoding would not be faithful. */
 function decodedPart(s: string): string {
   try {

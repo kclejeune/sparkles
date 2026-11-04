@@ -750,14 +750,20 @@ test('the header writes the IRI as the switch says and copies it in full', async
   });
   await expect(iri).toHaveAttribute('title', full);
   await expect(iri.locator('.sr-only')).toHaveText(full);
+  // the short form would repeat the prefixed name, and the Metadata row keeps the id
+  const chip = page.locator('.term-head .sf');
+  await expect(chip).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Metadata' })).toContainText('CL:0009001');
   await page.getByRole('button', { name: 'Copy the IRI' }).click();
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(full);
   // who chose full IRIs sees the full form
   await page.getByRole('button', { name: 'Prefixed' }).click();
   await expect(iri).toHaveText(full);
   await expect(iri.locator('[aria-hidden="true"]')).toHaveCount(0);
+  await expect(chip).toHaveText('CL_0009001');
   await page.getByRole('button', { name: 'Full IRIs' }).click();
   await expect(iri.locator('[aria-hidden="true"]')).toHaveText('obo:CL_0009001');
+  await expect(chip).toHaveCount(0);
   // with no prefix the IRI is whole, and copying gives the same
   const none = 'http://example.org/no-prefix-here/Thing';
   await page.route(/\/\$\/ontology\/cells\/term\?/, async (route) => {
@@ -769,6 +775,7 @@ test('the header writes the IRI as the switch says and copies it in full', async
   await expect(iri).toHaveText(none, { timeout: 30_000 });
   await expect(iri).toHaveAttribute('title', none);
   await expect(iri.locator('.sr-only')).toHaveCount(0);
+  await expect(chip).toHaveText('CL_0009001');
   await page.getByRole('button', { name: 'Copy the IRI' }).click();
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(none);
 });

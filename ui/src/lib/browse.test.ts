@@ -26,6 +26,7 @@ import {
   leadDisclosures,
   labelKinds,
   hiddenRows,
+  shortFormRepeats,
   xrefName,
   xrefsByDatabase,
   oboIri,
@@ -1185,5 +1186,20 @@ describe('the name of a cross-reference', () => {
   });
   it('leaves an unsafe scheme as text and never reads it as an IRI', () => {
     expect(name('javascript:alert(1)', 'javascript', 'alert(1)', () => 'no')).toBe('alert(1)');
+  });
+});
+
+describe('the short form beside the header IRI', () => {
+  const OBO = 'http://purl.obolibrary.org/obo/CL_0009001';
+  it('repeats a prefixed name whose local part it is', () => {
+    expect(shortFormRepeats('CL_0009001', OBO, 'obo:CL_0009001')).toBe(true);
+    expect(shortFormRepeats('insects', 'http://x/insects', 'th:insects')).toBe(true);
+  });
+  it('stays beside an IRI in full, with no prefix or by the switch', () => {
+    expect(shortFormRepeats('CL_0009001', OBO, OBO)).toBe(false);
+  });
+  it('stays when it differs from the local part', () => {
+    expect(shortFormRepeats('CL:0009001', OBO, 'obo:CL_0009001')).toBe(false);
+    expect(shortFormRepeats('obo', OBO, 'obo:CL_0009001')).toBe(false);
   });
 });
