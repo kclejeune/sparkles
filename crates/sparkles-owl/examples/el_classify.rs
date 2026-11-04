@@ -81,6 +81,7 @@ fn main() {
     let mut heap = false;
     let mut el_only = false;
     let mut owned = false;
+    let mut eager = false;
     let mut input = None;
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -91,12 +92,13 @@ fn main() {
             "--heap" => heap = true,
             "--owned" => owned = true,
             "--el-only" => el_only = true,
+            "--eager" => eager = true,
             _ => input = Some(a),
         }
     }
     let Some(input) = input else {
         eprintln!(
-            "usage: el_classify [--threads N] [--el-only] [--ofn-out FILE] [--taxonomy FILE] INPUT"
+            "usage: el_classify [--threads N] [--el-only] [--eager] [--ofn-out FILE] [--taxonomy FILE] INPUT"
         );
         std::process::exit(2);
     };
@@ -146,6 +148,11 @@ fn main() {
     let limits = Limits {
         threads,
         el_only,
+        expansion: if eager {
+            sparkles_owl::classify::Expansion::Eager
+        } else {
+            sparkles_owl::classify::Expansion::Cautious
+        },
         ..Limits::default()
     };
     let mut times = Vec::new();

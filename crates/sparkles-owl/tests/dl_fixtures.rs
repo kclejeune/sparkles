@@ -134,7 +134,11 @@ fn the_classifier_is_sound_everywhere_and_complete_on_what_it_takes_whole() {
                     ..Limits::default()
                 })
                 .unwrap();
-            whole = k.excluded().is_empty();
+            let this = k.excluded().is_empty();
+            if !answers.is_empty() && this != whole {
+                failures.push(format!("{stem}: what is left out depends on the run"));
+            }
+            whole = this;
             let mut got = BTreeSet::new();
             for a in &classes {
                 for b in &classes {
@@ -178,4 +182,35 @@ fn the_classifier_is_sound_everywhere_and_complete_on_what_it_takes_whole() {
         .map(|f| counts.get(*f).map_or(0, |c| c.1))
         .sum();
     assert_eq!(horn, HORN_WHOLE, "{counts:?}");
+}
+
+/// The counting cases whose equalities of successor terms once grew past any bound: each is
+/// taken whole by Tier D, within its bound on derived conclusions, on one thread and on
+/// four with both strategies, with HermiT's answer, which the test above checks.
+#[test]
+fn the_counting_cases_with_many_successor_equalities_finish_in_tier_d() {
+    for stem in [
+        "shq-004", "shq-007", "shiq-013", "shiq-038", "shiq-046", "sriq-010",
+    ] {
+        let path = fixtures().join(format!("{stem}.ofn"));
+        let doc = ofn_read::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for (threads, expansion) in [
+            (1, Expansion::Cautious),
+            (4, Expansion::Cautious),
+            (4, Expansion::Eager),
+        ] {
+            let mut k = Classifier::of(&doc.axioms);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert!(
+                !out.stats.dl_over_budget,
+                "{stem} on {threads} threads, {expansion:?}: Tier D passed its bound"
+            );
+        }
+    }
 }

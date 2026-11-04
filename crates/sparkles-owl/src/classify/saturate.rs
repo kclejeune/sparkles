@@ -1139,6 +1139,7 @@ impl<'a> Run<'a> {
         let grown = used.saturating_sub(before);
         if b.max_memory.is_some_and(|m| used > m)
             || b.charge.is_some_and(|f| grown > 0 && !f(grown))
+            || b.dl.is_some_and(|d| d.over_work())
         {
             self.halt(STOP_MEMORY);
             return false;

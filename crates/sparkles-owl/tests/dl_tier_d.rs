@@ -867,3 +867,84 @@ fn waiting_case_analyses(ax: &[Axiom]) {
         }
     }
 }
+
+#[test]
+fn a_minimum_above_a_maximum_is_unsatisfiable() {
+    check(
+        &format!(
+            "SubClassOf(:A ObjectMinCardinality(2 :r :B)) SubClassOf(:A ObjectMaxCardinality(1 :r))
+             SubClassOf(:E ObjectMinCardinality(2 :r :B)) SubClassOf(:E ObjectMaxCardinality(2 :r))
+             SubClassOf(:D :Z) {UNION}"
+        ),
+        &[("A", "D"), ("A", "E")],
+        &[("E", "D"), ("E", "A")],
+    );
+}
+
+#[test]
+fn a_functional_role_merges_its_successors() {
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r :B)) SubClassOf(:A ObjectSomeValuesFrom(:r :C))
+             FunctionalObjectProperty(:r)
+             EquivalentClasses(:D ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :C))) {UNION}"
+        ),
+        &[("A", "D")],
+        &[("D", "A")],
+    );
+}
+
+#[test]
+fn an_inverse_functional_role_merges_a_successor_with_the_predecessor() {
+    // the r-successor of A has at most one r-predecessor, A itself, which is then an E
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r :C))
+             SubClassOf(:C ObjectSomeValuesFrom(ObjectInverseOf(:r) :E))
+             InverseFunctionalObjectProperty(:r) {UNION}"
+        ),
+        &[("A", "E")],
+        &[("C", "E"), ("E", "A")],
+    );
+}
+
+#[test]
+fn a_maximum_on_the_left_is_met_through_a_functional_role() {
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r :B)) FunctionalObjectProperty(:r)
+             SubClassOf(ObjectMaxCardinality(1 :r :B) :D) {UNION}"
+        ),
+        &[("A", "D")],
+        &[("D", "A")],
+    );
+}
+
+#[test]
+fn a_qualified_maximum_counts_only_its_filler() {
+    // two r-successors that are B and C: at most one B leaves both, at most one C too
+    check(
+        &format!(
+            "SubClassOf(:A ObjectMinCardinality(2 :r :B)) SubClassOf(:A ObjectMaxCardinality(1 :r :C))
+             DisjointClasses(:B :C)
+             SubClassOf(:F ObjectMinCardinality(2 :r :B)) SubClassOf(:F ObjectMaxCardinality(1 :r :G))
+             SubClassOf(:B :G) SubClassOf(:D :Z) {UNION}"
+        ),
+        &[("F", "D")],
+        &[("A", "D")],
+    );
+}
+
+#[test]
+fn disjoint_roles_with_a_common_edge_are_unsatisfiable() {
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r :B)) SubObjectPropertyOf(:r :s)
+             DisjointObjectProperties(:r :s)
+             SubClassOf(:E ObjectSomeValuesFrom(:t :B)) DisjointObjectProperties(:r :t)
+             SubClassOf(:D :Z) {UNION}"
+        ),
+        &[("A", "D")],
+        &[("E", "D")],
+    );
+}

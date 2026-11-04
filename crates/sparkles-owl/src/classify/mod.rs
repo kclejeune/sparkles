@@ -112,6 +112,16 @@ fn drawing_on(
     })
 }
 
+/// The least number of conclusions a run of Tier D derives, kept or redundant, before it
+/// passes its budget and the run starts again by the Horn rules. Number restrictions can
+/// make a context derive millions of conclusions that subsumption discards, which the
+/// memory budget does not see. The slowest fixture that finishes derives 2.2 million.
+const DL_WORK_FLOOR: usize = 1 << 22;
+
+/// The bound on Tier D's conclusions above the floor: one per this many bytes of the index
+/// and the axioms.
+const DL_WORK_DIVISOR: usize = 4;
+
 /// The least memory budget, in estimated bytes, of a saturation with the Horn rules. The
 /// largest Horn run of the ORE 2015 DL sample's development set peaks at 666 MB, 139 times
 /// its index and axioms, on a small ontology.
@@ -382,6 +392,8 @@ pub struct Saturation {
     dl_tried: bool,
     /// set while a run classifies again without Tier D, past Tier D's memory budget
     skip_dl: bool,
+    /// set by a run of Tier D that passed its bound on derived conclusions
+    dl_worked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// set when a partial answer of Tier D passed the budget, so that the run fails with
     /// the error instead of classifying again without Tier D
     partial_over: bool,
@@ -689,6 +701,7 @@ impl Saturation {
             horn_tried: false,
             dl_tried: false,
             skip_dl: false,
+            dl_worked: Default::default(),
             partial_over: false,
             partial: None,
         }
@@ -762,7 +775,43 @@ impl Saturation {
             }
             _ => limits,
         };
+        self.dl_worked.store(false, Ordering::Relaxed);
         let mut r = self.run(axioms, changes, held_bytes, first, with_taxonomy);
+        if let Err(Error::Memory { .. }) = r
+            && self.dl_tried
+            && limits.threads != 1
+            && !limits.el_only
+            && !self.partial_over
+            && self.dl_worked.load(Ordering::Relaxed)
+        {
+            // Tier D passed its bound on derived conclusions, and how many it derives
+            // depends on the order in which the threads delivered the contexts'
+            // conclusions: the run starts again on one thread, whose order is fixed, before
+            // it falls back to the Horn rules. A schedule that stays within the bound where
+            // one thread does not still answers in full, which the roadmap's item on a
+            // deterministic bound covers. Its charges draw first on what the pool admitted
+            // for the first run.
+            self.reset();
+            self.dl_worked.store(false, Ordering::Relaxed);
+            let a = admitted.clone();
+            let counting = limits.charge.clone().map(|f| {
+                let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
+                    std::sync::Arc::new(move |bytes: usize| {
+                        let ok = f(bytes);
+                        if ok {
+                            a.fetch_add(bytes, Ordering::Relaxed);
+                        }
+                        ok
+                    });
+                drawing_on(admitted.load(Ordering::Relaxed), f)
+            });
+            let one = Limits {
+                threads: 1,
+                charge: counting,
+                ..limits.clone()
+            };
+            r = self.run(axioms, None, held_bytes, &one, with_taxonomy);
+        }
         let mut dl_over = None;
         if let Err(Error::Memory { used, .. }) = r
             && self.dl_tried
@@ -1242,10 +1291,9 @@ impl Saturation {
             None if disj => Some(saturate::Dynamic::new(n as Ex)),
             None => None,
         };
-        let dl_run = ix
-            .dl
-            .as_ref()
-            .map(|_| dl_rules::DlRun::new(limits.expansion == Expansion::Eager));
+        let dl_run = ix.dl.as_ref().map(|_| {
+            dl_rules::DlRun::new(limits.expansion == Expansion::Eager, self.dl_worked.clone())
+        });
         if let Some(scratch) = premises {
             stats.incremental = true;
             stats.cleared = self.invalidate(&scratch, &ix);
@@ -1278,6 +1326,9 @@ impl Saturation {
         // The Horn rules' contexts of conjunctions can need far more memory than the EL
         // rules on the same ontology, so a run with them has a budget of its own, past
         // which it classifies by the EL rules alone (run_with).
+        if let Some(d) = &dl_run {
+            d.set_work_limit(DL_WORK_FLOOR.max(base / DL_WORK_DIVISOR));
+        }
         let max_memory = if horn || disj {
             let own = HORN_MEMORY_FLOOR.max(base.saturating_mul(HORN_MEMORY_FACTOR));
             Some(limits.max_memory.map_or(own, |m| m.min(own)))
