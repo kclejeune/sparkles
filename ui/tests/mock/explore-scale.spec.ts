@@ -198,7 +198,8 @@ test('communities of the memory store group the graph, and a group can be hidden
   const filters = page.getByTestId('explore-filters');
   await filters.getByRole('button', { name: 'Group by communities' }).click();
   const groups = filters.getByRole('list', { name: 'Communities' });
-  await expect(groups).toContainText('The payments team', { timeout: 15_000 });
+  // another spec of the shared mock can rename the community's report, so the name is matched loosely
+  await expect(groups).toContainText(/payments/i, { timeout: 15_000 });
   // the focus is never hidden, so a group without it is the one to hide
   await groups.getByRole('checkbox', { name: /no value/ }).uncheck();
   await expect.poll(nodesOf).toBeLessThan(before);
