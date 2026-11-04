@@ -154,6 +154,27 @@ The SvelteKit UI is embedded in the server binary.
   draw the GraphRAG communities instead, with a community's report beside the picture
   ([screenshot](../images/explore-communities.png)). A list view (`L`) is the accessible
   companion, and without WebGL the overview falls back to Cytoscape.
+* The drawn graph of a resource holds what the person has explored, up to 100,000 nodes, and
+  draws up to a budget of 5,000 of them. Past 1,000 visible nodes the canvas changes from
+  Cytoscape to the WebGL view that the overview uses, and it changes back under 700. Click,
+  double click to expand, a right click or a long press for the node menu, a click on an
+  edge for its derivation, the selection's highlight, the lenses and the path overlay work
+  in both. New nodes are placed beside their neighbours and stay where they are put until
+  **Re-run layout**. The WebGL view does not draw the time slider's fades, which colour
+  added and removed nodes instead, and its validation badges are drawn but not clickable.
+  A node with a large fan-out is expanded into one **N via predicate** group node for each
+  predicate that has more than 25 edges in a direction. The group's panel reads 100 members
+  at a time, filters them by name, splits them by class and draws the members or the page
+  that the person chooses, so the graph holds only what was drawn.
+  The **Filters** panel (`Shift+G`) chooses what is drawn and never reads from the server.
+  It toggles each edge type and each class, with the counts of the explored graph, sets a
+  minimum degree, hides leaves and sets the budget of drawn nodes. With communities from the
+  memory store, **Group by communities** colours nodes by community and the legend's entries
+  hide a community. The graph holds every node however it is filtered, and a chip in the
+  toolbar says how many the filters and the budget leave out. Holding the explored graph
+  costs memory in the page for each node, in exchange for filters and budgets that change the
+  picture at once, and drawing at most the budget bounds the cost of a frame
+  ([measurements](benchmarks/README.md)).
 * The **Paths** panel (`Shift+P`) finds the shortest path, every shortest path or the k
   shortest paths between two entities, with filters for length, direction, predicates and
   hubs and an optional weight from reifier properties

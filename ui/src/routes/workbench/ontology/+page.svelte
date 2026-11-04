@@ -16,7 +16,7 @@
   import { SvelteMap } from 'svelte/reactivity';
   import * as api from '$lib/api';
   import { markClassified } from '$lib/browse';
-  import { app } from '$lib/app.svelte';
+  import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { branchParam, MAIN, onBranch } from '$lib/branches';
   import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
@@ -443,12 +443,24 @@
   // of each other tree when its tab opens
   let levelEpoch = $state(0);
   const levelRead = new Map<EntityKind, number>();
+  // The tree reads at once, without waiting for the summary, which on a large ontology takes
+  // longer than the first level. A later commit reads the levels again.
+  let levelScope = '';
+  let levelCommit: number | null = null;
   $effect(() => {
-    void target;
-    void graph;
-    if (summary?.commit == null) return;
-    void summary.commit;
-    untrack(() => levelEpoch++);
+    const scope = `${target}\u0000${graph ?? ''}`;
+    const commit = summary?.commit ?? null;
+    untrack(() => {
+      if (scope !== levelScope) {
+        levelScope = scope;
+        levelCommit = commit;
+        levelEpoch++;
+      } else if (commit != null && commit !== levelCommit) {
+        const first = levelCommit == null;
+        levelCommit = commit;
+        if (!first) levelEpoch++;
+      }
+    });
   });
   $effect(() => {
     const epoch = levelEpoch;
@@ -841,7 +853,12 @@
     },
     staleText: 'Another commit landed since the editor read the ontology.',
   });
-  const edit = (op: Op, label: string, after?: () => void) => session.edit(op, label, after);
+  const edit = (op: Op, label: string, after?: () => void) => {
+    // an edit names the commit the summary read, which a large ontology's summary may still be reading
+    if (!etag)
+      return void toasts.push('info', 'The ontology is still being read', 'Try again in a moment.');
+    return session.edit(op, label, after);
+  };
 
   /** The labels the editor knows with those the previewed edit adds, for its axioms. */
   const previewLabels = $derived.by(() => {
@@ -1213,7 +1230,7 @@
     </p>
   {/if}
 
-  {#if name && summary}
+  {#if name && (summary || (tab === 'tree' && !loadError))}
     <div class="tabs onto-tabs" role="tablist" aria-label="Ontology views">
       {#each TAB_LABEL as [t, l] (t)}
         <button
@@ -1224,7 +1241,7 @@
         >
       {/each}
     </div>
-    {#if tab === 'header'}
+    {#if tab === 'header' && summary}
       <section class="panel" aria-label="Ontology header">
         <div class="panel-head"><h2>Ontology header</h2></div>
         <div class="panel-body">
@@ -1241,7 +1258,7 @@
           />
         </div>
       </section>
-    {:else if tab === 'history'}
+    {:else if tab === 'history' && summary}
       <section class="panel" aria-label="History">
         <div class="panel-body">
           <EditorHistory
@@ -1442,17 +1459,21 @@
           {#if !selected}
             <div class="panel-head"><h2>Ontology header</h2></div>
             <div class="panel-body">
-              <OntoHeader
-                {target}
-                {sel}
-                {summary}
-                name={nameOf}
-                {prefixes}
-                {annotationProperties}
-                {readonly}
-                onedit={(op, label) => edit(op, label)}
-                onrename={openRename}
-              />
+              {#if summary}
+                <OntoHeader
+                  {target}
+                  {sel}
+                  {summary}
+                  name={nameOf}
+                  {prefixes}
+                  {annotationProperties}
+                  {readonly}
+                  onedit={(op, label) => edit(op, label)}
+                  onrename={openRename}
+                />
+              {:else}
+                <p class="faint"><span class="spinner"></span> Reading the ontology…</p>
+              {/if}
             </div>
           {:else}
             <div class="panel-head entity-head">
