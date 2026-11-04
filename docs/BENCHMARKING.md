@@ -1026,10 +1026,10 @@ ranges over processes. The screen takes about half a minute on forge after its b
 Sparkles builds on an ephemeral [Namespace](https://namespace.so) instance, so a
 relative A/B comparison does not have to wait for a quiet local machine. It needs the
 `nsc` CLI, logged in to the workspace. A and B are git revisions or paths to `sparkles`
-binaries. The script builds each revision locally before it creates the instance,
-from a `git archive` of the revision, and caches the binary in `~/.cache/sparkles-nsc`
-(`SPARKLES_NSC_CACHE`). The build uses whatever compilers the shell provides, so run it
-inside `nix develop`. The dataset comes
+binaries. The script builds each revision before it creates the instance, from a
+`git archive` of the revision, either on this machine or on a build host, and caches the
+binary in `~/.cache/sparkles-nsc` (`SPARKLES_NSC_CACHE`). A local build uses whatever
+compilers the shell provides, so run it inside `nix develop`. The dataset comes
 from `scripts/gen-data.py` and is cached there as zstd. The queries are those of
 `scripts/bench.sh` except `export-500k`.
 
@@ -1050,6 +1050,31 @@ under `locks` serializes builds of the same entry, and a build that outlives a k
 run keeps the lock. A second run of the same commit and
 cargo arguments waits for the first build, then reuses the finished binary. Runs of
 different commits or arguments build at the same time. The script needs `flock`.
+
+The release link of the server takes about 10 GiB in one process, which can push a busy
+laptop out of memory. `--build-host` therefore moves the build to another machine over
+ssh. `--build-host local` builds on this machine, a host name builds on that host, and
+`auto` takes the first host listed in `SPARKLES_NSC_BUILD_HOSTS` that is reachable, whose
+`~/lanes/.heavy.lock` is free, that runs no gate unit and that has 20 GiB free
+(`SPARKLES_NSC_BUILD_MIN_FREE_GB`). When every such host is busy, the build waits for the
+heavy lock of the first one, and the message says that `--build-host local` builds here
+instead. When no listed host can be reached, the run stops. Without the option, the run
+uses `auto` when `SPARKLES_NSC_BUILD_HOSTS` is set and builds locally otherwise. The
+variable comes from the environment or from a `SPARKLES_NSC_BUILD_HOSTS=` line in
+`~/.config/sparkles/nsc-build.env` (`SPARKLES_NSC_BUILD_CONFIG`). The benchmark host never
+builds, so `auto` skips it and naming it is refused.
+
+A remote build copies the archive of the commit, with the same placeholder `ui/build` as a
+local build, to a scratch directory under `~/lanes/nsc-build` on the host. It builds there
+with `scripts/nsc-build.sh` under the host's own Boxington cache, inside a systemd user
+scope named `nsc-build-<commit>-<suffix>` with the gate's memory cap and 2 GiB of swap,
+while it holds the host's heavy lock. The host's `mbx` has to match the `mise.toml` pin.
+The binary comes back into the same cache entry after a SHA-256 check, and the scratch
+directory is removed when the build ends, also after a failure or Ctrl-C, which also stops
+the scope. A binary built on another host with the same pinned toolchain is comparable,
+since nothing is built for the native CPU, and the compiler check below still compares A
+with B. `build.txt` and `manifest.txt` name the host that built each binary, and an entry
+is reused wherever it was built.
 
 ```sh
 mise run bench:nsc main my-branch                                   # 1.05M triples, every query
@@ -1100,7 +1125,7 @@ removed before the revision is built again in the shell.
 A run of all 27 queries at 1.05M triples takes about five minutes from creation to
 destruction, of which the instance spends about 10 seconds receiving 224 MB of
 binaries and data. Namespace bills it as 40 to 48 vCPU-minutes, about 7 cents at the
-overage rate. Building the two revisions locally usually takes longer than the run.
+overage rate. Building the two revisions usually takes longer than the run.
 
 The instances are AMD EPYC (Zen 4) virtual machines with 4 cores and 8 threads, and
 they are noisier than a dedicated host. Within one server process, the interquartile
@@ -1119,7 +1144,10 @@ instance. Its revision builds use `SPARKLES_NSC_CACHE/writes-v1`, separately fro
 query harness. Each source commit and exact `--cargo-args` string has its own build key,
 target directory and cross-process lock. The lock covers publication, verification and
 compressed staging. Each staged revision binary has a `bin-<id>.build.json` recording its
-source, flags, original compiler information and binary hash. A cache hit reuses that
+source, flags, build host, original compiler information and binary hash. `--build-host`
+works as for the query screens. A revision built on a build host goes through
+`scripts/nsc-build.sh` and the host's Boxington cache instead of its own target
+directory, so it takes feature and dependency-resolution flags only. A cache hit reuses that
 original provenance. Missing or inconsistent receipts refuse reuse without deleting the
 entry.
 

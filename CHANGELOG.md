@@ -1040,6 +1040,12 @@ fewer instructions.
 `scripts/nsc-bench.sh` now records the compilers of each binary and refuses to compare
 two binaries built with different ones unless `--allow-mixed-compilers` is given.
 
+`mise run bench:nsc` and `bench:nsc-writes` take `--build-host local|auto|HOST` and can
+build their revisions on a build host over ssh, in a memory-capped scope that holds the
+host's heavy lock, so the release link no longer has to fit on the machine that runs the
+screen. Without `SPARKLES_NSC_BUILD_HOSTS` they build locally as before. `build.txt`,
+`build.json` and the run manifests name the host that built each binary.
+
 `scripts/nsc-bench.sh` reruns the queries it flags, at an execution-time ratio of 1.10 or
 more, on the same instance in 8 rounds of 40 timed requests, and reports both passes.
 `mise run test:partitioned` runs the nextest tests in shares on several machines from one
