@@ -732,9 +732,16 @@ Horn rules, leaves the axioms that need case analysis out and reports them, and 
 `Stats::dl_over_budget`. ore_ont_3215 of the ORE 2015 DL sample, with 18,323 unions over a
 transitive property, needs this, item 713.
 
-Counting is part of the same rules. A run counts when an axiom has a number restriction
-that the Horn rules cannot take, or has a functional or inverse functional property,
-disjoint properties or an asymmetric property. The terms of a clause then include
+Counting is part of the same rules and is off by default. `Limits::counting` turns it on,
+and `el_classify --counting` does the same. A run that does not count leaves the axioms
+that need counting out and reports them, and takes a minimum as the existential
+restriction it implies, so it costs what the classifier cost before counting. The reason
+is the cost on real ontologies, since no file of the ORE 2015 DL development set finishes
+with counting and the five that attempt it spend 2 to 30 times the time of the run
+without it before they give up where that run finishes, item NEW-ITEM-2. Turning counting on is the work of
+that item. A run that counts when asked takes a number restriction that the Horn rules
+cannot take, a functional or inverse functional property, disjoint properties or an
+asymmetric property. The terms of a clause then include
 equalities of the successor terms and of a successor with the predecessor, and the order
 puts the literals of one function symbol above those of any smaller one, with the role
 literal above the atom, the atom above an inequality and the inequality above an equality.
@@ -754,7 +761,7 @@ restriction on a role that is not simple declines the rules, as does an irreflex
 that is not simple. A minimum above 64 is left out and reported, as in the Horn tier.
 
 The equalities can make a context derive millions of conclusions that subsumption
-discards, which the memory budget does not see. A run that counts therefore has a bound
+discards, which the memory budget does not see. A run that counts when asked therefore has a bound
 of 262,144 derived conclusions, kept or redundant, which `Limits::dl_work` sets. A run
 that passes it on several threads starts again on one, since how many conclusions a
 parallel run derives depends on the order in which the threads deliver them. When that
@@ -775,14 +782,14 @@ left out and is never a different complete answer, so a caller learns from
 `dl_counting_over` whether counting finished. A deterministic bound is item NEW-ITEM-1.
 
 The generated `shq`, `shiq` and `sriq` fixtures equal HermiT 1.4.5.519 on every case that
-Tier D takes whole, on one and four threads and under both strategies. Of 50 cases each,
+Tier D takes whole with counting on, on one and four threads and under both strategies. Of 50 cases each,
 Tier D takes whole 49 of `shq`, 48 of `shiq` and 16 of `sriq`, where the others name
 individuals or pass the bound. Random tests of counting ontologies check that minimums of
 two answer as the existential restrictions they imply and that a functional property
-answers as a maximum of one on every class. No development file of the ORE 2015 DL sample
-is taken whole with counting. Its counting files fall back, ore_ont_6485 after 205 ms on
-one thread against 7 ms before counting, and ore_ont_6952 and ore_ont_10140 after 1.4 and
-1.7 s against 0.6 and 0.5 s. The cost is not counting alone, since the same ontologies
+answers as a maximum of one on every class. No development file of the ORE 2015 DL
+sample is taken whole with counting. Its counting files fall back when counting is on,
+ore_ont_6485 after 205 ms on one thread against 7 ms without counting, and ore_ont_6952
+and ore_ont_10140 after 1.4 and 1.7 s against 0.6 and 0.5 s. The cost is not counting alone, since the same ontologies
 with every exact cardinality read as an existential restriction do not finish on the base
 either, item NEW-ITEM-2. The normalization of a clause with a universal or a maximum
 beside a class or an existential restriction keeps the class in the clause's body, which
