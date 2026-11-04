@@ -1055,3 +1055,126 @@ fn disjoint_roles_with_a_common_edge_are_unsatisfiable() {
         &[("E", "D")],
     );
 }
+
+/// `body` with every existential restriction on the right of a subclass axiom read as a
+/// minimum of two. Without a maximum or a functional role over its role, a minimum of two
+/// has a model wherever the existential restriction has one, so the subsumptions agree.
+fn with_minimums(body: &str) -> String {
+    body.lines()
+        .map(|l| match l.split_once(' ') {
+            Some((head, rest))
+                if head.starts_with("SubClassOf(:A")
+                    && rest.starts_with("ObjectSomeValuesFrom(") =>
+            {
+                format!(
+                    "{head} ObjectMinCardinality(2 {}\n",
+                    &rest["ObjectSomeValuesFrom(".len()..]
+                )
+            }
+            _ => format!("{l}\n"),
+        })
+        .collect()
+}
+
+#[test]
+fn random_ontologies_answer_the_same_with_counting() {
+    // the counting run reads each minimum of two by two successors with disjoint fillers,
+    // and a functional role that nothing else names makes the run count
+    let seeds: u64 = std::env::var("DL_DIFF_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if cfg!(debug_assertions) { 60 } else { 300 });
+    let mut compared = 0;
+    for seed in 0..seeds {
+        let body = random_dl(seed);
+        let counted = with_minimums(&body);
+        if counted == body {
+            continue;
+        }
+        let d = axioms(&format!("{body}{UNION}"));
+        let n = axioms(&format!("{counted}{UNION}FunctionalObjectProperty(:q)\n"));
+        let cs: Vec<Class> = (0..6)
+            .map(|a| c(&format!("A{a}")))
+            .chain([Class::thing(), Class::nothing()])
+            .collect();
+        let mut kd = Classifier::of(&d);
+        let od = kd.classify(&Limits::default()).unwrap();
+        if !kd.excluded().is_empty() || od.stats.dl_over_budget {
+            continue;
+        }
+        let want = pairs(&od.taxonomy, &cs);
+        for (threads, expansion) in [
+            (1, Expansion::Cautious),
+            (4, Expansion::Cautious),
+            (4, Expansion::Eager),
+        ] {
+            let mut kn = Classifier::of(&n);
+            let on = kn
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    ..Limits::default()
+                })
+                .unwrap();
+            let got = pairs(&on.taxonomy, &cs);
+            let extra: Vec<_> = got.difference(&want).collect();
+            assert!(
+                extra.is_empty(),
+                "seed {seed}: counting adds {extra:?}\n{counted}"
+            );
+            if kn.excluded().is_empty() && !on.stats.dl_over_budget {
+                let missing: Vec<_> = want.difference(&got).collect();
+                assert!(
+                    missing.is_empty(),
+                    "seed {seed}: counting misses {missing:?}\n{counted}"
+                );
+                compared += 1;
+            }
+        }
+    }
+    assert!(compared > 0, "no case was compared");
+    eprintln!("compared {compared} runs");
+}
+
+#[test]
+fn a_functional_role_answers_as_a_maximum_of_one_on_every_class() {
+    // the role axiom and the class axiom state the same, and reach the at-most rule by
+    // different normalizations; both merge the successors of every random ontology's r0
+    let seeds: u64 = std::env::var("DL_DIFF_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if cfg!(debug_assertions) { 60 } else { 300 });
+    let mut compared = 0;
+    for seed in 0..seeds {
+        let body = with_minimums(&random_dl(seed));
+        let f = axioms(&format!("{body}{UNION}FunctionalObjectProperty(:r0)\n"));
+        let m = axioms(&format!(
+            "{body}{UNION}SubClassOf(owl:Thing ObjectMaxCardinality(1 :r0))\n"
+        ));
+        let cs: Vec<Class> = (0..6)
+            .map(|a| c(&format!("A{a}")))
+            .chain([Class::thing(), Class::nothing()])
+            .collect();
+        let mut kf = Classifier::of(&f);
+        let of = kf.classify(&Limits::default()).unwrap();
+        let mut km = Classifier::of(&m);
+        let om = km
+            .classify(&Limits {
+                threads: 4,
+                ..Limits::default()
+            })
+            .unwrap();
+        let whole = |k: &Classifier, o: &sparkles_owl::classify::Classification| {
+            k.excluded().is_empty() && !o.stats.dl_over_budget
+        };
+        if whole(&kf, &of) && whole(&km, &om) {
+            assert_eq!(
+                pairs(&of.taxonomy, &cs),
+                pairs(&om.taxonomy, &cs),
+                "seed {seed}\n{body}"
+            );
+            compared += 1;
+        }
+    }
+    assert!(compared > seeds / 2, "only {compared} cases were compared");
+}
