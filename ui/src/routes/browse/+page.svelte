@@ -329,10 +329,13 @@
       return;
     }
     let live = true;
-    // the labels of the graph and the state the page shows, as the other names are read
+    // the labels of the graphs and the state the page shows, imports included
     const ctl = new AbortController();
     void api
-      .select(target, namesQuery(want, graph), { at: at ?? undefined, signal: ctl.signal })
+      .select(target, namesQuery(want, graph, t?.graphs), {
+        at: at ?? undefined,
+        signal: ctl.signal,
+      })
       .then((rows) => {
         if (live) typeLabels = parseDefinitions(rows as never, langs);
       })

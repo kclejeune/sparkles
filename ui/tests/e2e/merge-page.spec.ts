@@ -118,7 +118,7 @@ open('the History graph draws the branches, their forks and merges', async ({ pa
   const panel = page.locator('section.panel', {
     has: page.getByRole('heading', { name: 'History', exact: true }),
   });
-  await panel.getByRole('button', { name: 'Graph' }).click();
+  await panel.getByRole('button', { name: 'Graph', exact: true }).click();
   await expect(panel).toContainText('commits of 3 branches');
   await expect(panel.locator('svg.lines path.edge.merge')).toHaveCount(1);
   await expect(panel.locator('svg.lines path.edge.fork')).toHaveCount(2);

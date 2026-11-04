@@ -19,6 +19,7 @@ import {
   logicalDefinitionOf,
   mentionGroups,
   mergePieces,
+  namesQuery,
   neighbourhood,
   oboIri,
   parseCounts,
@@ -818,6 +819,19 @@ describe('SPARQL of the landing page and the further reads', () => {
     expect(usageQuery(EX + 'p', ['default'], 50)).toBe(
       `SELECT DISTINCT ?s WHERE { { GRAPH <urn:x-arq:DefaultGraph> { ?s <${EX}p> ?o FILTER(isIRI(?s)) } } } ORDER BY ?s LIMIT 50 OFFSET 50`,
     );
+  });
+});
+
+describe('namesQuery', () => {
+  it('reads the labels in one graph, in the graphs a term answer read, or anywhere', () => {
+    expect(namesQuery([EX + 'a'], 'urn:g')).toContain('GRAPH <urn:g> { ?s ');
+    // a label may sit in a graph the one shown imports
+    const q = namesQuery([EX + 'a'], 'urn:g', ['default', 'urn:g', 'urn:imp']);
+    expect(q).toContain('VALUES ?g { <urn:g> <urn:imp> }');
+    expect(q).toContain('UNION');
+    expect(q).not.toContain('GRAPH <urn:g> { ?s ');
+    expect(namesQuery([EX + 'a'], 'urn:g', ['default'])).not.toContain('GRAPH');
+    expect(namesQuery([EX + 'a'], null)).not.toContain('GRAPH');
   });
 });
 

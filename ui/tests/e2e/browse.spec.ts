@@ -70,10 +70,13 @@ open(
       'href',
       'https://en.wikipedia.org/wiki/Mitochondrion',
     );
-    const facts = page.getByRole('complementary', { name: 'About this entity' });
+    const facts = page.getByRole('region', { name: 'Metadata' });
     await expect(facts).toContainText('CELLO:0000005');
     await expect(facts).toContainText('Cell organelle ontology');
-    await expect(facts).toContainText('2 parents, 1 subclass');
+    // the counts under the header carry the hierarchy
+    const counts = page.getByRole('navigation', { name: 'Counts' });
+    await expect(counts.getByRole('link', { name: '2 parents' })).toBeVisible();
+    await expect(counts.getByRole('link', { name: '1 subclass' })).toBeVisible();
   },
 );
 

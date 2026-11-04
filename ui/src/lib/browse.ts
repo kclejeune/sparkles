@@ -1431,10 +1431,26 @@ export function definitionsQuery(iris: readonly string[], graph: string | null) 
  * The SPARQL of the labels of `iris`, `rdfs:label` or `skos:prefLabel`, for names such as the
  * properties and values of an ontology's header. `parseDefinitions` reads its rows.
  */
-export function namesQuery(iris: readonly string[], graph: string | null) {
+export function namesQuery(
+  iris: readonly string[],
+  graph: string | null,
+  over?: readonly string[],
+) {
   const values = iris.map((i) => `<${i}>`).join(' ');
   const props = [RDFS + 'label', SKOS + 'prefLabel'].map((p) => `<${p}>`).join('|');
-  return `SELECT ?s ?d WHERE { VALUES ?s { ${values} } ${inGraph(graph, `?s ${props} ?d`)} FILTER(isLiteral(?d)) }`;
+  const body = `?s ${props} ?d`;
+  // `over` is the graphs a term answer read, imports included, which a name may be in. A
+  // label is read wherever the default graph reaches, so that part needs no graph pattern.
+  const named = (over ?? []).filter((g) => g !== 'default');
+  const where = over?.length
+    ? [
+        ...(over.includes('default') ? [`{ ${body} }`] : []),
+        ...(named.length
+          ? [`{ VALUES ?g { ${named.map((g) => `<${g}>`).join(' ')} } GRAPH ?g { ${body} } }`]
+          : []),
+      ].join(' UNION ')
+    : inGraph(graph, body);
+  return `SELECT ?s ?d WHERE { VALUES ?s { ${values} } ${where} FILTER(isLiteral(?d)) }`;
 }
 
 /** The best definition of each subject in `definitionsQuery`'s rows, in the caller's languages. */
