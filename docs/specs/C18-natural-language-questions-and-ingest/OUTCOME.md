@@ -2079,10 +2079,12 @@ second footprint
 of the guarded reports graphs with their protections, and the branch. `GET /$/asks/{ds}`
 returns the answer only when the caller may query that branch and its current view of
 it, built with the same grants and masking as a query, covers both footprints, and
-otherwise returns the record with `answerWithheld` and no answer. An ask at the head
-whose head moved while it ran, a pinned state that cannot be opened again, a branch that
-is gone and a view over more than 512 graphs of either kind all fail closed, so that
-only unrestricted readers see such an answer again. Pages lend their branch and state to
+otherwise returns the record with `answerWithheld` and no answer. An ask whose head
+moved while it ran, an ask pinned with `at` to any state other than the head's commit, a
+branch that is gone and a view over more than 512 graphs of either kind all fail closed,
+so that only unrestricted readers see such an answer again. Steps that take no `at` read
+the head, so the head is the one state a footprint can describe, and roadmap item
+NEW-ITEM-3 records each state the steps read instead. Pages lend their branch and state to
 the questions asked on them whether or not a resource is chosen, and the browser keeps
 one thread per person and dataset and drops responses that arrive after either
 changed. This is the

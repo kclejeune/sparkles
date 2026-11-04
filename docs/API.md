@@ -14124,9 +14124,9 @@ protections apart. `GET` lists the `answer` only while the caller may query the 
 the ask read and the caller's current view of it reads every one of those graphs with
 the same protections in force. Otherwise it lists the entry with `answerWithheld: true`
 and without the answer. A caller whose view is unrestricted sees it unless the branch is
-gone. An entry records no footprint when its ask read the head and the head moved while
-it ran, when its pinned state can no longer be opened, or when its view read more than
-512 named graphs or 512 reports graphs, and then only unrestricted callers see its
+gone. An entry records no footprint when the head moved while its ask ran, when the ask was
+pinned with `at` to a state other than the head's commit, or when its view read more
+than 512 named graphs or 512 reports graphs, and then only unrestricted callers see its
 answer. A global answer's text is also withheld while its reports graph is not
 proven for the caller. An entry of a branch other than `main` lists that `branch`.
 

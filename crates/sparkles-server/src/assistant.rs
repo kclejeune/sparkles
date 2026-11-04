@@ -1658,7 +1658,7 @@ fn reader_view(
     let target = st.branch_dataset(ds, b).ok()?;
     let snap = target.store.snapshot();
     #[cfg(feature = "auth")]
-    {
+    let view = {
         let name = format!("{}@{b}", ds.name);
         // an ungranted branch has no view, which is not an unrestricted one
         if st.auth.is_some()
@@ -1670,10 +1670,11 @@ fn reader_view(
         {
             return None;
         }
-        return Some((p.view(&name, crate::auth::Endpoint::Query), snap));
-    }
+        p.view(&name, crate::auth::Endpoint::Query)
+    };
     #[cfg(not(feature = "auth"))]
-    Some((opts.graphs.clone(), snap))
+    let view = opts.graphs.clone();
+    Some((view, snap))
 }
 
 async fn delete_asks(

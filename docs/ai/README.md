@@ -565,6 +565,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * A question asked with a context chip reaches the model as the question followed by
   `(about <IRI>)`, as a typed suffix would. Grounding does not yet seed entity linking or
   predicate use from the structured `about` resource, which roadmap item NEW-ITEM-2 adds.
+* A stored Ask answer records what it read only when every step read one head that did
+  not move. An ask pinned to an earlier state, or one during which the dataset changed,
+  keeps its answer for unrestricted readers only, so a reader with limited grants sees
+  such a turn without its answer when the thread reopens. Roadmap item NEW-ITEM-3
+  records each state the steps read.
 * ChatGPT-plan model access is planned in [C28](../specs/C28-chatgpt-model-access.md),
   roadmap item 344. The existing OpenAI-compatible provider uses Chat Completions with
   configured API credentials. It does not accept a ChatGPT subscription as model access.

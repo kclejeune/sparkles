@@ -892,9 +892,26 @@ async fn a_head_that_moves_during_an_ask_keeps_no_footprint() {
     write.store(true, std::sync::atomic::Ordering::SeqCst);
     let (s, _) = ask_json(&app, json!({ "question": "Which teams now?" })).await;
     assert_eq!(s, StatusCode::OK);
+    // a pinned earlier state, a time or a named snapshot keeps none either: steps that
+    // take no `at` read the head (round 3, finding 1)
+    write.store(false, std::sync::atomic::Ordering::SeqCst);
+    let first = raw_history(&st)["asks"][0]["commit"].as_u64().unwrap();
+    for (q, at) in [
+        ("At the first commit?", json!(format!("commit:{first}"))),
+        ("At a time?", json!("time:2999-01-01T00:00:00Z")),
+    ] {
+        let (s, out) = ask_json(&app, json!({ "question": q, "at": at })).await;
+        assert_eq!(s, StatusCode::OK, "{out}");
+    }
+    let (s, _) = ask_json(&app, json!({ "question": "At the head?", "at": "head" })).await;
+    assert_eq!(s, StatusCode::OK);
     let raw = raw_history(&st);
     let asks = raw["asks"].as_array().unwrap();
     let of = |q: &str| asks.iter().find(|r| r["question"] == q).unwrap().clone();
+    let none = |q: &str| of(q)["access"].get("footprint").is_none_or(|f| f.is_null());
+    assert!(none("At the first commit?"), "{raw}");
+    assert!(none("At a time?"), "{raw}");
+    assert!(!none("At the head?"), "{raw}");
     assert!(
         of("Which teams are there?")["access"]["footprint"].is_object(),
         "{raw}"

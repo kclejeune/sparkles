@@ -312,33 +312,28 @@ async fn ask_route(
     let server = crate::mcp::McpServer::new(st.clone(), cfg);
     // the ground event's linked entities and communities, for the stored answer
     let ground = Arc::new(parking_lot::Mutex::new(Value::Null));
-    // the state the ask reads: grounding, the query and reports all resolve `at` to it,
-    // or read the head, which must not move while they do (C18 §6.4)
+    // the state the ask reads: the head, which must not move while it runs, since steps
+    // that take no `at` read the head too; an `at` other than that head's commit, such as
+    // an earlier commit, a time or a named snapshot that can move, keeps no footprint
+    // (C18 §6.4)
     let target = o
         .branch
         .as_deref()
         .filter(|b| *b != sparkles::branch::MAIN)
         .and_then(|b| st.branch_dataset(&ds, b).ok())
         .unwrap_or_else(|| ds.clone());
-    let at_of = |v: &Value| -> Option<sparkles::history::At> {
-        match v {
-            Value::String(s) => s.parse().ok(),
-            Value::Number(n) => n.as_u64().map(sparkles::history::At::Commit),
-            _ => None,
-        }
+    let start = target.store.snapshot();
+    let pinned_to_head = match &o.at {
+        None => true,
+        Some(Value::String(s)) => match s.parse::<sparkles::history::At>() {
+            Ok(sparkles::history::At::Head) => true,
+            Ok(sparkles::history::At::Commit(c)) => c == start.commit,
+            _ => false,
+        },
+        Some(Value::Number(n)) => n.as_u64() == Some(start.commit),
+        Some(_) => false,
     };
-    let (start, moving) = match o.at.as_ref().map(at_of) {
-        None | Some(Some(sparkles::history::At::Head)) => (Some(target.store.snapshot()), true),
-        Some(Some(a)) => (
-            target
-                .store
-                .snapshot_at(&a, &Default::default())
-                .ok()
-                .map(|(s, _)| s),
-            false,
-        ),
-        Some(None) => (None, false),
-    };
+    let start = pinned_to_head.then_some(start);
     let finish = {
         let st = st.clone();
         let ds = ds.clone();
@@ -358,11 +353,11 @@ async fn ask_route(
                 Some(b) => format!("{}@{b}", ds.name),
                 None => ds.name.clone(),
             };
-            // one state for every read: the pinned one, or a head that did not move while
-            // the ask read it, and the result's commit, if any, is that state's; otherwise
-            // the record keeps no footprint
+            // one state for every read: a head that did not move while the ask read it,
+            // and the result's commit, if any, is that state's; otherwise the record keeps
+            // no footprint
             let read = start.clone().filter(|s| {
-                (!moving || target.store.snapshot().commit == s.commit)
+                target.store.snapshot().commit == s.commit
                     && out["result"]["commit"]
                         .as_u64()
                         .is_none_or(|c| c == s.commit)
