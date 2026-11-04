@@ -28,6 +28,10 @@ for (const d of dirs) {
   for (const f of readdirSync(d).filter((f) => f.endsWith('.json'))) {
     const j = JSON.parse(readFileSync(join(d, f), 'utf8'));
     const label = j.meta?.label ?? basename(d);
+    const sum = (j.requests ?? j.partial?.requests ?? []).find(
+      (r) => r.group === 'ontology/summary',
+    );
+    if (sum) j.summaryMs = sum.ms;
     if (!runs.has(j.name)) runs.set(j.name, new Map());
     const m = runs.get(j.name);
     m.set(label, [...(m.get(label) ?? []), j]);
@@ -64,6 +68,7 @@ for (const name of names) {
     console.log(row(name, 'First row visible (ms)', 'firstRowMs'));
     console.log(row(name, 'Interactive (ms)', 'interactiveMs'));
     console.log(row(name, 'Network quiet at (ms)', 'quietMs'));
+    console.log(row(name, 'Summary request (ms)', 'summaryMs'));
     console.log(row(name, 'API requests', 'network.api.count'));
     console.log(row(name, 'API bytes, decoded (MB)', 'network.api.decodedBytes', mb, 2));
     console.log(row(name, 'API bytes, transferred (MB)', 'network.api.encodedBytes', mb, 2));

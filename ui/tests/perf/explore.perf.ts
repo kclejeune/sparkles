@@ -75,6 +75,8 @@ test.describe('explore scale', () => {
         });
         const page = await ctx.newPage();
         await page.addInitScript(LONGTASK_INIT);
+        // the changed page installs window.__perfHook only when asked
+        await page.addInitScript("localStorage.setItem('sparkles.explore.perfHook', '1')");
         const cdp = await ctx.newCDPSession(page);
         const net = new Net(cdp);
         await net.start();
@@ -151,6 +153,8 @@ test.describe('explore scale', () => {
       });
       const page = await ctx.newPage();
       await page.addInitScript(LONGTASK_INIT);
+      // the changed page installs window.__perfHook only when asked
+      await page.addInitScript("localStorage.setItem('sparkles.explore.perfHook', '1')");
       const cdp = await ctx.newCDPSession(page);
       const net = new Net(cdp);
       await net.start();
