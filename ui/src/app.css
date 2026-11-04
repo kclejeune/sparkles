@@ -1404,6 +1404,53 @@ kbd,
 .term-sec h2 + h3 {
   margin-top: 0;
 }
+/* A section's title on the page background, with the actions beside it. */
+.term-head-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+.term-head-row h2 {
+  font-size: var(--fs-lg);
+}
+/* The compact rows of the synonyms: a muted kind on the left and the values on the right. */
+.term-rows {
+  display: grid;
+  grid-template-columns: 124px minmax(0, 1fr);
+  gap: var(--sp-2) var(--sp-4);
+  margin: 0;
+  min-width: 0;
+}
+.term-row {
+  display: contents;
+}
+.term-rows dt {
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  line-height: 1.35;
+  padding-top: 2px;
+  min-width: 0;
+}
+.term-rows dd {
+  margin: 0;
+  min-width: 0;
+  font-size: var(--fs-md);
+  line-height: 1.5;
+}
+/* on a phone the kind is one small line directly above the text */
+@container browse (max-width: 639px) {
+  .term-rows {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+  .term-rows dd {
+    margin-bottom: var(--sp-2);
+  }
+  .term-rows > :last-child dd {
+    margin-bottom: 0;
+  }
+}
 .term-links {
   list-style: none;
   padding: 0;

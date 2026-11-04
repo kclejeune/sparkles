@@ -140,8 +140,8 @@
     >{:else}<span class="builtin" title={i}>{nameOf(i)}</span>{/if}{/snippet}
 
 {#if shown}
-  <section class="panel b-ax" aria-labelledby="axioms-h">
-    <div class="panel-head">
+  <section class="b-ax" aria-labelledby="axioms-h">
+    <div class="term-head-row">
       <h2 id="axioms-h">Axioms</h2>
       <span class="spacer"></span>
       {#if !editor && frame.sections.length}
@@ -153,7 +153,7 @@
         >
       {/if}
     </div>
-    <div class="panel-body">
+    <div class="ax-body">
       {#if editor}
         {@render editor()}
       {:else}
@@ -244,7 +244,7 @@
   .b-ax {
     min-width: 0;
   }
-  .b-ax > .panel-body {
+  .ax-body {
     container-type: inline-size;
   }
   .frame {
@@ -252,7 +252,7 @@
     gap: var(--sp-3);
     margin: 0;
   }
-  /* the keyword beside its items, and above them in a narrow card */
+  /* the keyword beside its items, and above them in a narrow column */
   .clause {
     display: grid;
     grid-template-columns: minmax(0, 1fr);

@@ -22,6 +22,8 @@ import {
   namesQuery,
   neighbourhood,
   hierarchyOf,
+  leadRest,
+  leadRestSummary,
   hiddenRows,
   xrefsByDatabase,
   oboIri,
@@ -966,5 +968,63 @@ describe('the identifiers rows', () => {
     expect(hiddenRows(9, 8)).toBe(0);
     expect(hiddenRows(10, 8)).toBe(2);
     expect(hiddenRows(14, 8)).toBe(6);
+  });
+});
+
+describe('the texts after the lead', () => {
+  const v = (text: string, lang: string | null = 'en') =>
+    ({ value: { '@value': text }, lang, sources: [], types: [] }) as never;
+  const group = (kind: string, values: never[], translations: never[] = []) => ({
+    kind,
+    predicates: [`p:${kind}`],
+    values,
+    translations,
+  });
+  const lead = {
+    groups: [
+      group('Definition', [v('first'), v('second')], [v('fr', 'fr')]),
+      group('Description', [v('d')], [v('dfr', 'fr')]),
+      group('Comment', [v('c1'), v('c2')]),
+    ],
+  };
+  const notes = [{ kind: 'History note', property: 'p:h', values: [v('nfr', 'fr'), v('nen')] }];
+
+  it('leaves the lead and its translations out, and keeps every other value', () => {
+    const rows = leadRest(lead, notes, ['en']);
+    expect(rows.map((r) => [r.kind, r.values.length])).toEqual([
+      ['Definition', 1],
+      ['Description', 2],
+      ['Comment', 2],
+      ['History note', 2],
+    ]);
+  });
+  it('puts the reader’s language first in a note', () => {
+    const rows = leadRest({ groups: [] }, notes, ['en']);
+    expect(rows[0].values[0]).toEqual(v('nen'));
+  });
+  it('has no rows for a lone value', () => {
+    expect(
+      leadRest({ groups: [group('Definition', [v('only')], [v('fr', 'fr')])] }, [], []),
+    ).toEqual([]);
+  });
+  it('says what is there, with "more" for the kind that leads', () => {
+    expect(leadRestSummary(leadRest(lead, notes, ['en']), 'Definition')).toBe(
+      '1 more definition, 2 descriptions, 2 comments, 2 notes',
+    );
+    expect(
+      leadRestSummary(
+        leadRest({ groups: [group('Comment', [v('a'), v('b')])] }, [], []),
+        'Comment',
+      ),
+    ).toBe('1 more comment');
+    expect(
+      leadRestSummary(
+        [
+          { kind: 'Scope note', predicates: [], values: [v('a')] },
+          { kind: 'Example', predicates: [], values: [v('b')] },
+        ],
+        'Definition',
+      ),
+    ).toBe('2 notes');
   });
 });

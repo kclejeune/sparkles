@@ -288,9 +288,6 @@ export const LEAD_KINDS: [string, string][] = [
   [SKOS + 'scopeNote', 'Scope note'],
 ];
 
-/** How many values of a group in the reader's languages show before "N more". */
-export const LEAD_SHOWN = 3;
-
 /** One predicate of the lead block, or the predicates that state the same texts, under its
  * heading: its values in the reader's languages and its translations, which fold. */
 export type LeadGroup = {
@@ -303,6 +300,52 @@ export type LeadGroup = {
 
 /** The lead block of a page, its groups in priority order. The first group leads. */
 export type Lead = { groups: LeadGroup[] };
+
+/** The texts of an entity after the one that leads, one row per kind and predicate. */
+export type LeadRow = { kind: string; predicates: string[]; values: Sourced[] };
+
+/**
+ * Every definition, description, comment and note after the first text, by kind: the other values
+ * of the kind that leads, the other kinds with their translations, and the notes. The first kind's
+ * translations stay with the lead.
+ */
+export function leadRest(
+  lead: Lead,
+  notes: { kind: string; property: string; values: Sourced[] }[],
+  langs: readonly string[],
+): LeadRow[] {
+  const rows: LeadRow[] = [];
+  lead.groups.forEach((g, i) => {
+    const values = i === 0 ? g.values.slice(1) : [...g.values, ...g.translations];
+    if (values.length) rows.push({ kind: g.kind, predicates: g.predicates, values });
+  });
+  for (const n of notes) {
+    if (!n.values.length) continue;
+    const values = [...n.values].sort((a, b) => langRank(a.lang, langs) - langRank(b.lang, langs));
+    rows.push({ kind: n.kind, predicates: [n.property], values });
+  }
+  return rows;
+}
+
+const REST_WORDS: Record<string, string> = {
+  Definition: 'definition',
+  Description: 'description',
+  Comment: 'comment',
+};
+
+/**
+ * What the control over the other texts says, from what is there, such as "3 more definitions,
+ * 2 descriptions, 8 notes". Every kind without a word of its own counts as a note, and only the
+ * kind that leads is "more".
+ */
+export function leadRestSummary(rows: LeadRow[], leadKind: string): string {
+  const word = (kind: string) => REST_WORDS[kind] ?? 'note';
+  const counts = new Map<string, number>();
+  for (const r of rows) counts.set(word(r.kind), (counts.get(word(r.kind)) ?? 0) + r.values.length);
+  return [...counts]
+    .map(([w, n]) => `${n} ${w === word(leadKind) ? 'more ' : ''}${w}${n === 1 ? '' : 's'}`)
+    .join(', ');
+}
 
 /** Synonym properties, in display order, with their kind. */
 export const SYNONYM_KINDS: [string, string][] = [
@@ -462,7 +505,7 @@ const byLang = (langs: readonly string[]) => (a: Sourced, b: Sourced) =>
 export type Sections = {
   /** the value that leads the page: the best of the lead block, or else a note */
   definition: Sourced | null;
-  /** every definition, description, comment and scope note, as the Definition card shows them */
+  /** every definition, description, comment and scope note, as the top of the page shows them */
   lead: Lead;
   synonyms: { kind: string; values: Sourced[] }[];
   notes: { kind: string; property: string; values: Sourced[] }[];

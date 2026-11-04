@@ -56,12 +56,10 @@ test('an entity page shows its axioms as linked prose, its usage and its facts',
   await expect(page.getByRole('navigation', { name: 'Breadcrumbs' })).toContainText(
     'University ontology',
   );
-  // with no definition, the comment leads the Definition card, marked as a comment
+  // with no definition, the comment leads the page, marked as a comment after its text
   const lede = page.locator('.lede');
   await expect(lede).toContainText('An academic who leads research');
-  await expect(page.locator('.lead [data-kind]').first().locator('h3')).toHaveText(
-    /^Comment\s*·\s*rdfs:comment$/,
-  );
+  await expect(lede.locator('.source')).toHaveText(/^Comment\s*·\s*rdfs:comment$/);
   await expect(page.getByRole('region', { name: 'Comment' })).toHaveCount(0);
   // the frame in Manchester syntax: asserted clauses, then what the classification infers
   const logic = page.getByRole('region', { name: 'Axioms' });
@@ -102,29 +100,29 @@ test('an entity page shows its axioms as linked prose, its usage and its facts',
 test('a definition leads the page and a mention names its restriction', async ({ page }) => {
   await openTerm(page, 'Person');
   await expect(page.locator('.lede')).toContainText('A human being');
-  // the lead block lists each kind under its heading, and folds French under Definition
+  // one text leads with its predicate after it, and French folds under it
   const lead = page.locator('.lead');
-  await expect(lead.locator('[data-kind] > h3')).toHaveText([
-    /^Definition\s*·\s*skos:definition$/,
-    /^Comment\s*·\s*rdfs:comment$/,
-    /^Scope note\s*·\s*skos:scopeNote$/,
-  ]);
-  const comments = lead.getByRole('group', { name: 'Comment' });
-  await expect(comments.locator(':scope > .entry')).toHaveCount(2);
-  const def = lead.getByRole('group', { name: 'Definition' });
-  const fr = def.locator('details.fold');
+  await expect(lead.locator('.lede .source')).toHaveText('skos:definition');
+  const fr = lead.locator('details.fold').first();
   await expect(fr.locator('summary')).toHaveText('In 1 other language');
   await expect(fr.locator('.entry')).toBeHidden();
   await fr.locator('summary').click();
   await expect(fr.locator('.entry')).toContainText('Un être humain');
   await expect(fr.locator('.lang-tag')).toHaveText('fr');
-  // the notes keep their own kinds below
-  for (const k of ['Example', 'History note', 'Editorial note'])
-    await expect(page.getByRole('region', { name: k })).toBeVisible();
-  await expect(page.getByRole('region', { name: 'History note' }).locator('h2')).toContainText(
-    'skos:historyNote',
+  // everything else waits behind one control that says what it holds
+  const rest = lead.locator('details.rest');
+  await expect(rest.locator('summary')).toHaveText('2 comments, 4 notes');
+  await expect(rest.locator('li').first()).toBeHidden();
+  await rest.locator('summary').click();
+  await expect(rest.locator('li[data-kind="Comment"]')).toHaveCount(2);
+  for (const k of ['Scope note', 'Example', 'History note', 'Editorial note'])
+    await expect(rest.locator(`li[data-kind="${k}"]`)).toHaveCount(1);
+  // each row names its kind and predicate as text, and no row is a heading or a region
+  await expect(rest.locator('li[data-kind="History note"] .source')).toHaveText(
+    /^History note\s*·\s*skos:historyNote$/,
   );
-  await expect(page.getByRole('region', { name: 'Comment' })).toHaveCount(0);
+  await expect(rest.getByRole('heading')).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'History note' })).toHaveCount(0);
   await openTerm(page, 'Course');
   const usage = page.getByRole('region', { name: /What links here/ });
   await expect(usage.getByRole('heading', { name: /teaches some Course/ })).toBeVisible();
@@ -249,18 +247,14 @@ test('a rich OBO term keeps its paragraphs, sources and synonym types', async ({
     timeout: 30_000,
   });
   const lead = page.locator('.lead');
-  await expect(lead.locator('[data-kind] > h3')).toHaveText([
-    /^Definition\s*·\s*obo:IAO_0000115$/,
-    /^Description\s*·\s*dcterms:description$/,
-    /^Comment\s*·\s*rdfs:comment$/,
-  ]);
   // a predicate the ontology names links to its page, with its full IRI on hover
-  const pred = lead.locator('[data-kind] > h3 a').first();
+  const pred = lead.locator('.lede .source a');
   await expect(pred).toHaveAttribute('title', 'http://purl.obolibrary.org/obo/IAO_0000115');
   await expect(pred).toHaveAttribute('href', /IAO_0000115/);
   await expect(lead.locator('.lede')).toContainText('GOC:fixture');
   // the description's blank lines are paragraphs and its newlines line breaks
-  const desc = lead.getByRole('group', { name: 'Description' });
+  await lead.locator('details.rest > summary').click();
+  const desc = lead.locator('li[data-kind="Description"]');
   await expect(desc.locator('.para-gap')).toHaveCount(4);
   await expect(desc.locator('br')).toHaveCount(1);
   const syn = page.getByRole('region', { name: 'Synonyms' });
@@ -517,11 +511,11 @@ test('See also, What links here and In other datasets share References under str
   const text = await page.evaluate(() =>
     getComputedStyle(document.documentElement).getPropertyValue('--text').trim(),
   );
-  const title = await refs.locator('.panel-head h2').evaluate(style);
+  const title = await refs.locator('#refs-h').evaluate(style);
   const sub = await refs.locator('.term-sec > h2').first().evaluate(style);
   expect(title.size).toBe('17px');
-  // every card's title is the same size, the rail's too
-  for (const name of ['Definition', 'Metadata', 'Hierarchy']) {
+  // the rail's cards have the same size of title
+  for (const name of ['Axioms', 'Metadata', 'Hierarchy']) {
     const h = page.locator('.browse').getByRole('heading', { level: 2, name, exact: true });
     expect((await h.first().evaluate(style)).size, name).toBe('17px');
   }
@@ -530,10 +524,71 @@ test('See also, What links here and In other datasets share References under str
   const rgb = (hex: string) =>
     `rgb(${[1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16)).join(', ')})`;
   expect(sub.color).toBe(rgb(text));
-  // and the Definition card's sections read the same way
+  // and the definition block's sections read the same way
   const syn = await page.getByRole('region', { name: 'Synonyms' }).locator('h2').evaluate(style);
   expect(syn.size).toBe('14px');
   expect(syn.color).toBe(rgb(text));
+});
+
+test('one text leads, the others wait behind a control that counts them', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(HEAVY);
+  const lead = page.locator('.lead');
+  await expect(lead.locator('.lede')).toContainText('A macrophage that sits in the meninges', {
+    timeout: 30_000,
+  });
+  const rest = lead.locator('details.rest');
+  await expect(rest).not.toHaveAttribute('open');
+  await expect(rest.locator('summary')).toHaveText(
+    '1 more definition, 1 description, 3 comments, 6 notes',
+  );
+  await rest.locator('summary').click();
+  await expect(rest.locator('li')).toHaveCount(11);
+  await expect(rest.locator('li[data-kind="Definition"]')).toHaveCount(1);
+  await expect(rest.locator('li[data-kind="Description"]')).toHaveCount(1);
+  await expect(rest.locator('li[data-kind="Comment"]')).toHaveCount(3);
+  // the lead's text is not repeated
+  await expect(rest).not.toContainText('A macrophage that sits in the meninges');
+  // no card or heading stands for the block, which is still a named region
+  await expect(page.getByRole('heading', { name: 'Definition', exact: true })).toHaveCount(0);
+  await expect(page.locator('.b-def.panel, .b-ax.panel, .b-refs.panel')).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'About this class' })).toBeVisible();
+  // Logical definition and Synonyms stay in view without opening anything
+  await rest.locator('summary').click();
+  await expect(page.getByRole('heading', { level: 2, name: 'Logical definition' })).toBeVisible();
+  await expect(page.getByRole('heading', { level: 2, name: 'Synonyms' })).toBeVisible();
+  // the sections on the page background have no card behind them
+  const bg = await page.locator('.b-refs').evaluate((el) => getComputedStyle(el).backgroundColor);
+  expect(bg).toBe('rgba(0, 0, 0, 0)');
+  // a count of the counts line still reaches the synonyms
+  await expect(page.locator('#syn-h')).toHaveText('Synonyms');
+});
+
+test('a lone text has no control, and a term with no text says so', async ({ page }) => {
+  await page.route(/\/\$\/ontology\/uni\/term\?/, async (route) => {
+    const res = await route.fetch();
+    const t = await res.json();
+    t.statements = t.statements.filter(
+      (s: { property: string; value: { '@language'?: string } }) =>
+        s.property.endsWith('#definition') && s.value['@language'] !== 'fr',
+    );
+    await route.fulfill({ response: res, json: t });
+  });
+  await openTerm(page, 'Person');
+  await expect(page.locator('.lede')).toContainText('A human being');
+  await expect(page.locator('details.rest')).toHaveCount(0);
+  await expect(page.locator('.lead details')).toHaveCount(0);
+  await page.unrouteAll();
+  await openTerm(page, 'GraduateCourse');
+  await expect(page.locator('.lede')).toHaveText('No definition in this ontology.');
+  await expect(page.locator('.lead')).toHaveCount(0);
+});
+
+test('edit mode opens the other texts', async ({ page }) => {
+  await openTerm(page, 'Person', '&edit=1');
+  const rest = page.locator('details.rest');
+  await expect(rest).toHaveAttribute('open');
+  await expect(rest.locator('li[data-kind="History note"]')).toBeVisible();
 });
 
 test('the counts are one line of text links', async ({ page }) => {
@@ -574,8 +629,13 @@ test('the rail sticks, and one taller than the window stays by its bottom edge',
   const a = await measure();
   expect(a.height).toBeGreaterThan(a.box);
   expect(a.top).toBeCloseTo(a.box - a.height - 24, 0);
-  // far down the page the rail's bottom edge rests a gutter above the window's bottom
-  await page.evaluate(() => document.querySelector('main')!.scrollTo(0, 1200));
+  // far down the page, short of the column's end, the rail's bottom edge rests a gutter above the
+  // window's bottom, with the other texts open so that the main column outruns the rail
+  await page.locator('details.rest > summary').click();
+  await page.evaluate(() => {
+    const m = document.querySelector('main')!;
+    m.scrollTo(0, m.scrollHeight - m.clientHeight - 100);
+  });
   await expect.poll(async () => Math.abs((await measure()).bottom - (a.box - 24))).toBeLessThan(2);
   // a window tall enough for the rail holds it by its top
   await page.setViewportSize({ width: 1440, height: 1400 });

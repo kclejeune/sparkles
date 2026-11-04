@@ -123,7 +123,6 @@
   import StatChips from '$components/StatChips.svelte';
   import LeadBlock from '$components/browse/LeadBlock.svelte';
   import PageActions from '$components/PageActions.svelte';
-  import TermNotes from '$components/browse/TermNotes.svelte';
   import TermReuse from '$components/browse/TermReuse.svelte';
   import TermSynonyms from '$components/browse/TermSynonyms.svelte';
   import TermUsage from '$components/browse/TermUsage.svelte';
@@ -314,7 +313,7 @@
     short: (i) => term?.names[i]?.shortForm ?? (term?.iri === i ? term.shortForm : null),
   });
 
-  /** A predicate the Definition card's headings name links to its page when the ontology
+  /** A predicate the texts name links to its page when the ontology
    * names it, which the W3C vocabularies' terms never have. */
   const predicateHref = (i: string) => (term?.names[i] && !builtIn(i) ? hrefOf(i) : null);
 
@@ -364,7 +363,7 @@
   });
   const groups = $derived(term ? axiomGroups(term.iri, term.kinds, term.axioms) : []);
   /** A class's EquivalentTo class expressions, the OBO genus and differentia, which the
-   * Definition card also shows as its logical definition; the Axioms card holds every axiom. */
+   * definition block also shows as its logical definition; the Axioms section holds every axiom. */
   const logicalDefinition = $derived(
     term && editorKindOf(term.kinds) === 'Class' ? logicalDefinitionOf(groups) : [],
   );
@@ -1388,11 +1387,13 @@
           </div>
         {:else}
           <div class="b-main" data-col="main">
-            <section class="panel b-def" aria-labelledby="def-h">
-              <div class="panel-head"><h2 id="def-h">Definition</h2></div>
-              <div class="panel-body ruled">
-                {#if sections.lead.groups.length}<LeadBlock
+            <!-- the lead has no heading of its own, since the block also holds the other texts -->
+            <section class="b-def" aria-label="About this {kind}">
+              <div class="ruled" class:rows={!editing}>
+                {#if sections.lead.groups.length || sections.notes.length}<LeadBlock
                     lead={sections.lead}
+                    notes={sections.notes}
+                    open={editing}
                     {linker}
                     {langs}
                     {curieIri}
@@ -1533,14 +1534,6 @@
                     {linker}
                     typeName={(i) => typeLabels.get(i) ?? synonymTypeName(i, term?.names)}
                   />
-                  <TermNotes
-                    notes={sections.notes}
-                    {linker}
-                    {langs}
-                    {curieIri}
-                    {prefixes}
-                    {predicateHref}
-                  />
                   <TermLabels labels={sections.labels} />
                   {#if sections.related.length}
                     <section class="term-sec" aria-labelledby="rel-h">
@@ -1605,9 +1598,9 @@
                 editor={editing ? axiomEditor : undefined}
               />
             {/if}
-            <section class="panel b-refs" aria-labelledby="refs-h">
-              <div class="panel-head"><h2 id="refs-h">References</h2></div>
-              <div class="panel-body ruled">
+            <section class="b-refs" aria-labelledby="refs-h">
+              <div class="term-head-row"><h2 id="refs-h">References</h2></div>
+              <div class="ruled rows">
                 <TermXrefs seeAlso={sections.seeAlso} mappings={sections.mappings} {linker} />
                 <TermUsage
                   iri={term.iri}
@@ -2012,6 +2005,9 @@
     font-size: var(--fs-md);
     line-height: 1.5;
   }
+  .logic + .logic {
+    margin-top: var(--sp-1);
+  }
   .b-info {
     order: 4;
     min-width: 0;
@@ -2028,7 +2024,7 @@
     order: 6;
     min-width: 0;
   }
-  /* the cards' titles carry weight, and each section's heading under them is the text colour */
+  /* the titles carry weight, and each section's heading under them is the text colour */
   .browse :global(.panel > .panel-head h2),
   .browse :global(.b-tree .lead h2) {
     font-size: var(--fs-lg);
@@ -2046,7 +2042,7 @@
     order: 1;
     min-width: 0;
   }
-  /* on a phone the definition's lead sits close under its heading, and Metadata follows it */
+  /* on a phone Metadata follows the definition block */
   @container browse (max-width: 639px) {
     .browse .b-info {
       order: 3;
@@ -2054,11 +2050,13 @@
     .browse :global(.b-ax) {
       order: 4;
     }
-    .b-def :global(.panel-body) {
-      padding-top: var(--sp-3);
-    }
   }
-  /* a card's sections, split by rules as in the Workbench's details panel */
+  /* in one column the sections on the page background stand further apart than the cards */
+  .b-refs,
+  .browse :global(.b-ax) {
+    margin-top: var(--sp-4);
+  }
+  /* a section's parts: split by rules in the edit mode's forms */
   .ruled {
     display: grid;
   }
@@ -2086,13 +2084,25 @@
   .ruled > :global(.lead) {
     margin-bottom: var(--sp-3);
   }
+  /* the reading view: the parts are split by space and not by rules */
+  .ruled.rows {
+    gap: var(--sp-5);
+  }
+  .ruled.rows > :global(section),
+  .ruled.rows > :global(.lead + section) {
+    padding: 0;
+    border-top: 0;
+  }
+  .ruled.rows > :global(.lead) {
+    margin-bottom: 0;
+  }
   .ruled > .lede.none {
     margin: 0 0 var(--sp-3);
     color: var(--text-3, var(--text-2));
     font-size: var(--fs-md);
   }
-  /* one wide column at a medium size: the cards' text runs to their edges, so their padding
-     opens a little to keep the measure in hand */
+  /* one wide column at a medium size: the rail's cards run to the edges, so their padding opens
+     a little to keep the measure in hand */
   @container browse (min-width: 640px) and (max-width: 1099px) {
     .browse :global(.panel-head),
     .browse :global(.panel-body),
@@ -2123,6 +2133,13 @@
       gap: var(--gap);
       min-width: 0;
       align-content: start;
+    }
+    .b-main {
+      gap: var(--sp-8);
+    }
+    .b-refs,
+    .browse :global(.b-ax) {
+      margin-top: 0;
     }
     .b-main,
     .b-graph {
