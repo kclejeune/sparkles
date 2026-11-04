@@ -1,0 +1,378 @@
+{
+ "name": "open-chebi",
+ "rep": 1,
+ "meta": {
+  "label": "baseline",
+  "base": "http://127.0.0.1:18725",
+  "host": "stanley",
+  "date": "2026-11-04T13:53:19.996Z",
+  "uiDir": "/home/kclejeune/repositories/github.com/kclejeune/sparkles-lane-explore-scale-725-measure/ui/build",
+  "commit": "4ab93ecb/a199a8ae",
+  "server": "release-4ab93ecb",
+  "note": "laptop, synthetic taxon, software WebGL",
+  "browser": "153.0.8010.12",
+  "viewport": {
+   "width": 1440,
+   "height": 900
+  },
+  "webgl": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+  "loadavg": [
+   2.05,
+   2.74,
+   3.19
+  ]
+ },
+ "url": "/ui/workbench/ontology?ds=chebi",
+ "status": "ok",
+ "firstRowMs": 8916,
+ "quietMs": 9271,
+ "networkQuiet": true,
+ "longTasks": {
+  "count": 5,
+  "totalMs": 781,
+  "maxMs": 376,
+  "lastEndMs": 8397
+ },
+ "interactiveMs": 8916,
+ "network": {
+  "api": {
+   "count": 23,
+   "encodedBytes": 3972991,
+   "decodedBytes": 71626877,
+   "ms": 8910.892000072636
+  },
+  "total": {
+   "count": 91,
+   "encodedBytes": 4518424,
+   "decodedBytes": 73166219,
+   "ms": 10220.822000410408
+  },
+  "groups": {
+   "static": {
+    "count": 63,
+    "encodedBytes": 540905,
+    "decodedBytes": 1532208,
+    "ms": 1296.2570001836866
+   },
+   "$/prefixes": {
+    "count": 1,
+    "encodedBytes": 1206,
+    "decodedBytes": 647,
+    "ms": 3.488000016659498
+   },
+   "ontology/summary": {
+    "count": 1,
+    "encodedBytes": 1932,
+    "decodedBytes": 1837,
+    "ms": 6917.970999958925
+   },
+   "$/auth": {
+    "count": 1,
+    "encodedBytes": 859,
+    "decodedBytes": 17,
+    "ms": 3.506000037305057
+   },
+   "$/whoami": {
+    "count": 1,
+    "encodedBytes": 1072,
+    "decodedBytes": 259,
+    "ms": 3.585000056773424
+   },
+   "$/ping": {
+    "count": 1,
+    "encodedBytes": 831,
+    "decodedBytes": 20,
+    "ms": 3.2340000616386533
+   },
+   "$/datasets": {
+    "count": 1,
+    "encodedBytes": 1766,
+    "decodedBytes": 6838,
+    "ms": 3.347999998368323
+   },
+   "$/assistant": {
+    "count": 1,
+    "encodedBytes": 1061,
+    "decodedBytes": 259,
+    "ms": 1.6339999856427312
+   },
+   "$/memory": {
+    "count": 1,
+    "encodedBytes": 900,
+    "decodedBytes": 83,
+    "ms": 2.395999967120588
+   },
+   "sparql": {
+    "count": 3,
+    "encodedBytes": 3514072,
+    "decodedBytes": 52650553,
+    "ms": 337.1529998257756
+   },
+   "$/branches": {
+    "count": 1,
+    "encodedBytes": 1178,
+    "decodedBytes": 472,
+    "ms": 2.139999996870756
+   },
+   "ontology/entities": {
+    "count": 5,
+    "encodedBytes": 61970,
+    "decodedBytes": 3445516,
+    "ms": 582.3530001798645
+   },
+   "ontology/axioms": {
+    "count": 6,
+    "encodedBytes": 380579,
+    "decodedBytes": 15349880,
+    "ms": 897.3339999793097
+   },
+   "ontology/hierarchy": {
+    "count": 4,
+    "encodedBytes": 10093,
+    "decodedBytes": 177630,
+    "ms": 166.42300016246736
+   },
+   "changes": {
+    "count": 1,
+    "encodedBytes": 0,
+    "decodedBytes": 0,
+    "ms": 0
+   }
+  }
+ },
+ "requests": [
+  {
+   "url": "/$/prefixes/chebi",
+   "group": "$/prefixes",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 1206,
+   "decodedBytes": 647
+  },
+  {
+   "url": "/$/ontology/chebi?graph=default",
+   "group": "ontology/summary",
+   "status": 200,
+   "ms": 6918,
+   "encodedBytes": 1932,
+   "decodedBytes": 1837
+  },
+  {
+   "url": "/$/auth/config",
+   "group": "$/auth",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 859,
+   "decodedBytes": 17
+  },
+  {
+   "url": "/$/whoami",
+   "group": "$/whoami",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1072,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/ping",
+   "group": "$/ping",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 831,
+   "decodedBytes": 20
+  },
+  {
+   "url": "/$/datasets",
+   "group": "$/datasets",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 1766,
+   "decodedBytes": 6838
+  },
+  {
+   "url": "/$/assistant/chebi",
+   "group": "$/assistant",
+   "status": 200,
+   "ms": 2,
+   "encodedBytes": 1061,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/memory/chebi/maintenance",
+   "group": "$/memory",
+   "status": 200,
+   "ms": 2,
+   "encodedBytes": 900,
+   "decodedBytes": 83
+  },
+  {
+   "url": "/chebi/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1703,
+   "decodedBytes": 1974
+  },
+  {
+   "url": "/$/branches/chebi",
+   "group": "$/branches",
+   "status": 200,
+   "ms": 2,
+   "encodedBytes": 1178,
+   "decodedBytes": 472
+  },
+  {
+   "url": "/$/ontology/chebi/entities?graph=default&kind=Class%2CObjectProperty%2CDataProperty%2CAnnotationProperty%2CNamedIndividual%2CDatatype&limit=10000&offset=0",
+   "group": "ontology/entities",
+   "status": 200,
+   "ms": 120,
+   "encodedBytes": 10604,
+   "decodedBytes": 689086
+  },
+  {
+   "url": "/$/ontology/chebi/axioms?graph=default&type=SubClassOf%2CSubObjectPropertyOf%2CSubDataPropertyOf%2CSubAnnotationPropertyOf%2CAnnotationAssertion&limit=10000&offset=0",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 105,
+   "encodedBytes": 75507,
+   "decodedBytes": 3045028
+  },
+  {
+   "url": "/$/ontology/chebi/axioms?graph=default&type=ClassAssertion&assertions=true&limit=10000&offset=0",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 228,
+   "encodedBytes": 1037,
+   "decodedBytes": 140
+  },
+  {
+   "url": "/chebi/sparql",
+   "group": "sparql",
+   "status": 200,
+   "ms": 320,
+   "encodedBytes": 3510224,
+   "decodedBytes": 52645671
+  },
+  {
+   "url": "/$/ontology/chebi/axioms?graph=default&type=SubClassOf%2CSubObjectPropertyOf%2CSubDataPropertyOf%2CSubAnnotationPropertyOf%2CAnnotationAssertion&limit=10000&offset=10000",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 108,
+   "encodedBytes": 70895,
+   "decodedBytes": 3008197
+  },
+  {
+   "url": "/$/ontology/chebi/entities?graph=default&kind=Class%2CObjectProperty%2CDataProperty%2CAnnotationProperty%2CNamedIndividual%2CDatatype&limit=10000&offset=10000",
+   "group": "ontology/entities",
+   "status": 200,
+   "ms": 117,
+   "encodedBytes": 11699,
+   "decodedBytes": 689104
+  },
+  {
+   "url": "/$/ontology/chebi/axioms?graph=default&type=SubClassOf%2CSubObjectPropertyOf%2CSubDataPropertyOf%2CSubAnnotationPropertyOf%2CAnnotationAssertion&limit=10000&offset=20000",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 281,
+   "encodedBytes": 73956,
+   "decodedBytes": 3023817
+  },
+  {
+   "url": "/$/ontology/chebi/entities?graph=default&kind=Class%2CObjectProperty%2CDataProperty%2CAnnotationProperty%2CNamedIndividual%2CDatatype&limit=10000&offset=20000",
+   "group": "ontology/entities",
+   "status": 200,
+   "ms": 115,
+   "encodedBytes": 11959,
+   "decodedBytes": 689080
+  },
+  {
+   "url": "/$/ontology/chebi/axioms?graph=default&type=SubClassOf%2CSubObjectPropertyOf%2CSubDataPropertyOf%2CSubAnnotationPropertyOf%2CAnnotationAssertion&limit=10000&offset=30000",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 68,
+   "encodedBytes": 71642,
+   "decodedBytes": 3006237
+  },
+  {
+   "url": "/$/ontology/chebi/axioms?graph=default&type=SubClassOf%2CSubObjectPropertyOf%2CSubDataPropertyOf%2CSubAnnotationPropertyOf%2CAnnotationAssertion&limit=10000&offset=40000",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 106,
+   "encodedBytes": 87542,
+   "decodedBytes": 3266461
+  },
+  {
+   "url": "/$/ontology/chebi/entities?graph=default&kind=Class%2CObjectProperty%2CDataProperty%2CAnnotationProperty%2CNamedIndividual%2CDatatype&limit=10000&offset=30000",
+   "group": "ontology/entities",
+   "status": 200,
+   "ms": 124,
+   "encodedBytes": 13935,
+   "decodedBytes": 689164
+  },
+  {
+   "url": "/$/ontology/chebi/entities?graph=default&kind=Class%2CObjectProperty%2CDataProperty%2CAnnotationProperty%2CNamedIndividual%2CDatatype&limit=10000&offset=40000",
+   "group": "ontology/entities",
+   "status": 200,
+   "ms": 106,
+   "encodedBytes": 13773,
+   "decodedBytes": 689082
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 153,
+   "encodedBytes": 5610,
+   "decodedBytes": 170131
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=objectProperty&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 5,
+   "encodedBytes": 1480,
+   "decodedBytes": 2023
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=dataProperty&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 1183,
+   "decodedBytes": 227
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=annotationProperty&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 5,
+   "encodedBytes": 1820,
+   "decodedBytes": 5249
+  },
+  {
+   "url": "/chebi/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 14,
+   "encodedBytes": 2145,
+   "decodedBytes": 2908
+  },
+  {
+   "url": "/chebi/changes?limit=1&after=commit:1",
+   "group": "changes",
+   "status": 200,
+   "ms": 0,
+   "encodedBytes": 0,
+   "decodedBytes": 0
+  }
+ ],
+ "heap": {
+  "jsHeapUsedMB": 163.7,
+  "jsHeapTotalMB": 175.9,
+  "domNodes": 19589,
+  "layoutCount": 0
+ },
+ "rowsLoaded": 1001,
+ "rowsInDom": 1001,
+ "toggleLatencyMs": 30
+}

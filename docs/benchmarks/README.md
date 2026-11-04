@@ -26,6 +26,7 @@ The summary also records measurement coverage and the full loss table. The
 | Language bindings | [Read](bindings/README.md) | [Read](bindings/RESULTS.md) |
 | Natural-language questions | [Read](natural-language/README.md) | [Read](natural-language/RESULTS.md) |
 | Memory and disk | [Read](memory/README.md) | [Read](memory/RESULTS.md) |
+| Web UI at scale | [Read](web-ui-scale/README.md) | [Read](web-ui-scale/RESULTS.md) |
 
 ## Evidence and generated reports
 

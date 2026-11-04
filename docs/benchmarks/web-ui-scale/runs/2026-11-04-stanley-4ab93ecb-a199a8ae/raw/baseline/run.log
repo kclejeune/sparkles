@@ -1,0 +1,150 @@
+== baseline rep 0: workbench.perf -g open 08:53:08, load 2.06 2.76 3.20
+
+Running 3 tests using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › open-chebi (9.8s)
+  ✓  2 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › reveal-chebi-water (3.6s)
+  ✓  3 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › open-unesco-thesaurus (1.3s)
+
+  3 passed (15.2s)
+== baseline rep 0: explore.perf 08:53:25, load 2.13 2.74 3.19
+
+Running 4 tests using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-1000 (11.4s)
+  ✓  2 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-5000 (36.1s)
+  ✓  3 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-20000 (37.1s)
+  ✓  4 [chromium] › tests/perf/explore.perf.ts:147:3 › explore scale › explore-fanout-20000 (1.2s)
+
+  4 passed (1.4m)
+== baseline rep 0: workbench.perf -g open 08:54:53, load 4.40 3.42 3.39
+
+Running 3 tests using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › open-taxon300k (5.9s)
+  ✓  2 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › reveal-taxon300k-deepest (33.1s)
+  ✓  3 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › reveal-taxon300k-past-first-page (35.5s)
+
+  3 passed (1.3m)
+== baseline rep 0: workbench.perf -g scroll 08:56:09, load 2.84 3.21 3.32
+
+Running 1 test using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/workbench.perf.ts:176:3 › workbench scroll › scroll-taxon300k-10k (44.8s)
+
+  1 passed (45.3s)
+== baseline rep 1: workbench.perf -g open 08:59:07, load 5.81 4.06 3.61
+
+Running 3 tests using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › open-chebi (10.9s)
+  ✓  2 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › reveal-chebi-water (3.6s)
+  ✓  3 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › open-unesco-thesaurus (1.4s)
+
+  3 passed (16.4s)
+== baseline rep 1: explore.perf 08:59:25, load 5.68 4.11 3.63
+
+Running 4 tests using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-1000 (11.1s)
+  ✓  2 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-5000 (36.4s)
+  ✓  3 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-20000 (36.7s)
+  ✓  4 [chromium] › tests/perf/explore.perf.ts:147:3 › explore scale › explore-fanout-20000 (1.3s)
+
+  4 passed (1.4m)
+== baseline rep 1: workbench.perf -g open 09:00:52, load 4.87 4.18 3.70
+
+Running 3 tests using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › open-taxon300k (7.6s)
+  ✓  2 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › reveal-taxon300k-deepest (33.3s)
+  ✓  3 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › reveal-taxon300k-past-first-page (36.4s)
+
+  3 passed (1.3m)
+== baseline rep 1: workbench.perf -g scroll 09:02:12, load 4.15 4.19 3.75
+
+Running 1 test using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/workbench.perf.ts:176:3 › workbench scroll › scroll-taxon300k-10k (44.6s)
+
+  1 passed (45.1s)
+== baseline rep 2: workbench.perf -g open 09:05:16, load 8.93 5.41 4.25
+
+Running 3 tests using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › open-chebi (27.1s)
+  ✓  2 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › reveal-chebi-water (23.7s)
+  ✓  3 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › open-unesco-thesaurus (1.5s)
+
+  3 passed (53.3s)
+== baseline rep 2: explore.perf 09:06:12, load 7.01 5.57 4.38
+
+Running 4 tests using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-1000 (12.0s)
+  ✓  2 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-5000 (36.3s)
+  ✓  3 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-20000 (37.1s)
+  ✓  4 [chromium] › tests/perf/explore.perf.ts:147:3 › explore scale › explore-fanout-20000 (1.3s)
+
+  4 passed (1.5m)
+== baseline rep 2: workbench.perf -g open 09:07:41, load 7.79 6.24 4.72
+
+Running 3 tests using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › open-taxon300k (7.2s)
+  ✓  2 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › reveal-taxon300k-deepest (33.7s)
+  ✓  3 [chromium] › tests/perf/workbench.perf.ts:107:5 › workbench open › reveal-taxon300k-past-first-page (36.5s)
+
+  3 passed (1.3m)
+== baseline rep 2: workbench.perf -g scroll 09:09:00, load 5.07 5.76 4.68
+
+Running 1 test using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/workbench.perf.ts:176:3 › workbench scroll › scroll-taxon300k-10k (47.0s)
+
+  1 passed (47.6s)
+== baseline rep 0: explore.perf 09:13:04, load 4.27 5.33 4.77
+
+Running 4 tests using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-1000 (11.8s)
+  ✓  2 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-5000 (37.0s)
+  ✓  3 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-20000 (36.7s)
+  ✓  4 [chromium] › tests/perf/explore.perf.ts:147:3 › explore scale › explore-fanout-20000 (1.3s)
+
+  4 passed (1.5m)
+== baseline rep 1: explore.perf 09:20:50, load 7.62 8.91 6.71
+
+Running 4 tests using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-1000 (11.1s)
+  ✓  2 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-5000 (36.2s)
+  ✓  3 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-20000 (36.7s)
+  ✓  4 [chromium] › tests/perf/explore.perf.ts:147:3 › explore scale › explore-fanout-20000 (1.5s)
+
+  4 passed (1.4m)
+== baseline rep 2: explore.perf 09:28:50, load 8.00 9.56 7.68
+
+Running 4 tests using 1 worker
+
+Skipping host requirements validation logic because `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` env variable is set.
+  ✓  1 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-1000 (11.4s)
+  ✓  2 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-5000 (36.9s)
+  ✓  3 [chromium] › tests/perf/explore.perf.ts:69:5 › explore scale › explore-20000 (36.3s)
+  ✓  4 [chromium] › tests/perf/explore.perf.ts:147:3 › explore scale › explore-fanout-20000 (1.2s)
+
+  4 passed (1.4m)

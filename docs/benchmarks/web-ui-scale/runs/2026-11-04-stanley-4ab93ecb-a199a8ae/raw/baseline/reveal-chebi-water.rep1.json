@@ -1,0 +1,704 @@
+{
+ "name": "reveal-chebi-water",
+ "rep": 1,
+ "meta": {
+  "label": "baseline",
+  "base": "http://127.0.0.1:18725",
+  "host": "stanley",
+  "date": "2026-11-04T13:53:19.996Z",
+  "uiDir": "/home/kclejeune/repositories/github.com/kclejeune/sparkles-lane-explore-scale-725-measure/ui/build",
+  "commit": "4ab93ecb/a199a8ae",
+  "server": "release-4ab93ecb",
+  "note": "laptop, synthetic taxon, software WebGL",
+  "browser": "153.0.8010.12",
+  "viewport": {
+   "width": 1440,
+   "height": 900
+  },
+  "webgl": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+  "loadavg": [
+   2.13,
+   2.74,
+   3.19
+  ]
+ },
+ "url": "/ui/workbench/ontology?ds=chebi&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_15377",
+ "status": "ok",
+ "firstRowMs": 2619,
+ "quietMs": 2874,
+ "networkQuiet": true,
+ "longTasks": {
+  "count": 7,
+  "totalMs": 1283,
+  "maxMs": 733,
+  "lastEndMs": 2222
+ },
+ "interactiveMs": 2619,
+ "network": {
+  "api": {
+   "count": 63,
+   "encodedBytes": 4014306,
+   "decodedBytes": 71910596,
+   "ms": 4170.080999843776
+  },
+  "total": {
+   "count": 131,
+   "encodedBytes": 4559739,
+   "decodedBytes": 73449938,
+   "ms": 5537.061999551952
+  },
+  "groups": {
+   "static": {
+    "count": 63,
+    "encodedBytes": 540905,
+    "decodedBytes": 1532208,
+    "ms": 1345.6049996893853
+   },
+   "$/prefixes": {
+    "count": 1,
+    "encodedBytes": 1206,
+    "decodedBytes": 647,
+    "ms": 4.003999987617135
+   },
+   "ontology/summary": {
+    "count": 1,
+    "encodedBytes": 1930,
+    "decodedBytes": 1836,
+    "ms": 46.70199996326119
+   },
+   "$/auth": {
+    "count": 1,
+    "encodedBytes": 859,
+    "decodedBytes": 17,
+    "ms": 3.9549999637529254
+   },
+   "$/whoami": {
+    "count": 1,
+    "encodedBytes": 1072,
+    "decodedBytes": 259,
+    "ms": 3.99300002027303
+   },
+   "ontology/hierarchy": {
+    "count": 43,
+    "encodedBytes": 56980,
+    "decodedBytes": 437099,
+    "ms": 818.5499998508021
+   },
+   "ontology/entity": {
+    "count": 1,
+    "encodedBytes": 1873,
+    "decodedBytes": 7015,
+    "ms": 415.5940000200644
+   },
+   "ontology/axioms": {
+    "count": 7,
+    "encodedBytes": 382807,
+    "decodedBytes": 15370000,
+    "ms": 1480.3090000059456
+   },
+   "$/ping": {
+    "count": 1,
+    "encodedBytes": 831,
+    "decodedBytes": 20,
+    "ms": 4.880000022239983
+   },
+   "$/datasets": {
+    "count": 1,
+    "encodedBytes": 1766,
+    "decodedBytes": 6838,
+    "ms": 8.548000012524426
+   },
+   "sparql": {
+    "count": 2,
+    "encodedBytes": 3504401,
+    "decodedBytes": 52647669,
+    "ms": 506.82899996172637
+   },
+   "$/assistant": {
+    "count": 1,
+    "encodedBytes": 1061,
+    "decodedBytes": 259,
+    "ms": 2.7990000089630485
+   },
+   "$/memory": {
+    "count": 1,
+    "encodedBytes": 900,
+    "decodedBytes": 83,
+    "ms": 5.144999944604933
+   },
+   "ontology/entities": {
+    "count": 5,
+    "encodedBytes": 61970,
+    "decodedBytes": 3445516,
+    "ms": 717.0970001025125
+   },
+   "$/branches": {
+    "count": 1,
+    "encodedBytes": 1178,
+    "decodedBytes": 472,
+    "ms": 173.05199999827892
+   },
+   "changes": {
+    "count": 1,
+    "encodedBytes": 0,
+    "decodedBytes": 0,
+    "ms": 0
+   }
+  }
+ },
+ "requests": [
+  {
+   "url": "/$/prefixes/chebi",
+   "group": "$/prefixes",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1206,
+   "decodedBytes": 647
+  },
+  {
+   "url": "/$/ontology/chebi?graph=default",
+   "group": "ontology/summary",
+   "status": 200,
+   "ms": 47,
+   "encodedBytes": 1930,
+   "decodedBytes": 1836
+  },
+  {
+   "url": "/$/auth/config",
+   "group": "$/auth",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 859,
+   "decodedBytes": 17
+  },
+  {
+   "url": "/$/whoami",
+   "group": "$/whoami",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1072,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_15377&ancestors=true&limit=1&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 11,
+   "encodedBytes": 1845,
+   "decodedBytes": 6386
+  },
+  {
+   "url": "/$/ontology/chebi/entity?graph=default&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_15377",
+   "group": "ontology/entity",
+   "status": 200,
+   "ms": 416,
+   "encodedBytes": 1873,
+   "decodedBytes": 7015
+  },
+  {
+   "url": "/$/ontology/chebi/axioms?graph=default&about=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_15377&assertions=true&limit=5000&offset=0",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 324,
+   "encodedBytes": 2228,
+   "decodedBytes": 20120
+  },
+  {
+   "url": "/$/ping",
+   "group": "$/ping",
+   "status": 200,
+   "ms": 5,
+   "encodedBytes": 831,
+   "decodedBytes": 20
+  },
+  {
+   "url": "/$/datasets",
+   "group": "$/datasets",
+   "status": 200,
+   "ms": 9,
+   "encodedBytes": 1766,
+   "decodedBytes": 6838
+  },
+  {
+   "url": "/chebi/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 2,
+   "encodedBytes": 1708,
+   "decodedBytes": 1998
+  },
+  {
+   "url": "/$/assistant/chebi",
+   "group": "$/assistant",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 1061,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/memory/chebi/maintenance",
+   "group": "$/memory",
+   "status": 200,
+   "ms": 5,
+   "encodedBytes": 900,
+   "decodedBytes": 83
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 111,
+   "encodedBytes": 5610,
+   "decodedBytes": 170131
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33693&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 6,
+   "encodedBytes": 1481,
+   "decodedBytes": 2182
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_36902&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 7,
+   "encodedBytes": 1393,
+   "decodedBytes": 1276
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33242&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 7,
+   "encodedBytes": 1422,
+   "decodedBytes": 1655
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_24835&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 17,
+   "encodedBytes": 1988,
+   "decodedBytes": 6401
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_23367&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 13,
+   "encodedBytes": 1567,
+   "decodedBytes": 2633
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_24431&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 21,
+   "encodedBytes": 1372,
+   "decodedBytes": 1081
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33692&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 17,
+   "encodedBytes": 1356,
+   "decodedBytes": 918
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33608&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 19,
+   "encodedBytes": 1381,
+   "decodedBytes": 1090
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33674&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 19,
+   "encodedBytes": 1377,
+   "decodedBytes": 1154
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33579&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 22,
+   "encodedBytes": 1406,
+   "decodedBytes": 1344
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_37577&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 22,
+   "encodedBytes": 1490,
+   "decodedBytes": 1997
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_36357&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 25,
+   "encodedBytes": 1452,
+   "decodedBytes": 1667
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33304&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 25,
+   "encodedBytes": 1504,
+   "decodedBytes": 2293
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33675&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 26,
+   "encodedBytes": 1458,
+   "decodedBytes": 1730
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_37176&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 30,
+   "encodedBytes": 1798,
+   "decodedBytes": 6289
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_52625&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 30,
+   "encodedBytes": 1392,
+   "decodedBytes": 1092
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_24651&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 30,
+   "encodedBytes": 1402,
+   "decodedBytes": 1287
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_25806&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 40,
+   "encodedBytes": 1543,
+   "decodedBytes": 2194
+  },
+  {
+   "url": "/$/ontology/chebi/entities?graph=default&kind=Class%2CObjectProperty%2CDataProperty%2CAnnotationProperty%2CNamedIndividual%2CDatatype&limit=10000&offset=0",
+   "group": "ontology/entities",
+   "status": 200,
+   "ms": 271,
+   "encodedBytes": 10604,
+   "decodedBytes": 689086
+  },
+  {
+   "url": "/$/ontology/chebi/axioms?graph=default&type=SubClassOf%2CSubObjectPropertyOf%2CSubDataPropertyOf%2CSubAnnotationPropertyOf%2CAnnotationAssertion&limit=10000&offset=0",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 170,
+   "encodedBytes": 75507,
+   "decodedBytes": 3045028
+  },
+  {
+   "url": "/$/ontology/chebi/axioms?graph=default&type=ClassAssertion&assertions=true&limit=10000&offset=0",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 255,
+   "encodedBytes": 1037,
+   "decodedBytes": 140
+  },
+  {
+   "url": "/chebi/sparql",
+   "group": "sparql",
+   "status": 200,
+   "ms": 505,
+   "encodedBytes": 3502693,
+   "decodedBytes": 52645671
+  },
+  {
+   "url": "/$/branches/chebi",
+   "group": "$/branches",
+   "status": 200,
+   "ms": 173,
+   "encodedBytes": 1178,
+   "decodedBytes": 472
+  },
+  {
+   "url": "/$/ontology/chebi/axioms?graph=default&type=SubClassOf%2CSubObjectPropertyOf%2CSubDataPropertyOf%2CSubAnnotationPropertyOf%2CAnnotationAssertion&limit=10000&offset=10000",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 81,
+   "encodedBytes": 70895,
+   "decodedBytes": 3008197
+  },
+  {
+   "url": "/$/ontology/chebi/entities?graph=default&kind=Class%2CObjectProperty%2CDataProperty%2CAnnotationProperty%2CNamedIndividual%2CDatatype&limit=10000&offset=10000",
+   "group": "ontology/entities",
+   "status": 200,
+   "ms": 146,
+   "encodedBytes": 11699,
+   "decodedBytes": 689104
+  },
+  {
+   "url": "/$/ontology/chebi/axioms?graph=default&type=SubClassOf%2CSubObjectPropertyOf%2CSubDataPropertyOf%2CSubAnnotationPropertyOf%2CAnnotationAssertion&limit=10000&offset=20000",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 341,
+   "encodedBytes": 73956,
+   "decodedBytes": 3023817
+  },
+  {
+   "url": "/$/ontology/chebi/entities?graph=default&kind=Class%2CObjectProperty%2CDataProperty%2CAnnotationProperty%2CNamedIndividual%2CDatatype&limit=10000&offset=20000",
+   "group": "ontology/entities",
+   "status": 200,
+   "ms": 79,
+   "encodedBytes": 11959,
+   "decodedBytes": 689080
+  },
+  {
+   "url": "/$/ontology/chebi/entities?graph=default&kind=Class%2CObjectProperty%2CDataProperty%2CAnnotationProperty%2CNamedIndividual%2CDatatype&limit=10000&offset=30000",
+   "group": "ontology/entities",
+   "status": 200,
+   "ms": 117,
+   "encodedBytes": 13935,
+   "decodedBytes": 689164
+  },
+  {
+   "url": "/$/ontology/chebi/axioms?graph=default&type=SubClassOf%2CSubObjectPropertyOf%2CSubDataPropertyOf%2CSubAnnotationPropertyOf%2CAnnotationAssertion&limit=10000&offset=30000",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 246,
+   "encodedBytes": 71642,
+   "decodedBytes": 3006237
+  },
+  {
+   "url": "/$/ontology/chebi/entities?graph=default&kind=Class%2CObjectProperty%2CDataProperty%2CAnnotationProperty%2CNamedIndividual%2CDatatype&limit=10000&offset=40000",
+   "group": "ontology/entities",
+   "status": 200,
+   "ms": 103,
+   "encodedBytes": 13773,
+   "decodedBytes": 689082
+  },
+  {
+   "url": "/$/ontology/chebi/axioms?graph=default&type=SubClassOf%2CSubObjectPropertyOf%2CSubDataPropertyOf%2CSubAnnotationPropertyOf%2CAnnotationAssertion&limit=10000&offset=40000",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 63,
+   "encodedBytes": 87542,
+   "decodedBytes": 3266461
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 71,
+   "encodedBytes": 913,
+   "decodedBytes": 170131
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33693&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 6,
+   "encodedBytes": 913,
+   "decodedBytes": 2182
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_36902&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 5,
+   "encodedBytes": 913,
+   "decodedBytes": 1276
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33242&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 6,
+   "encodedBytes": 913,
+   "decodedBytes": 1655
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_24835&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 7,
+   "encodedBytes": 913,
+   "decodedBytes": 6401
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_23367&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 8,
+   "encodedBytes": 913,
+   "decodedBytes": 2633
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_24431&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 9,
+   "encodedBytes": 913,
+   "decodedBytes": 1081
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33692&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 10,
+   "encodedBytes": 913,
+   "decodedBytes": 918
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33608&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 11,
+   "encodedBytes": 913,
+   "decodedBytes": 1090
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33674&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 12,
+   "encodedBytes": 913,
+   "decodedBytes": 1154
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33579&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 13,
+   "encodedBytes": 913,
+   "decodedBytes": 1344
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_37577&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 14,
+   "encodedBytes": 913,
+   "decodedBytes": 1997
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_36357&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 15,
+   "encodedBytes": 913,
+   "decodedBytes": 1667
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33304&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 14,
+   "encodedBytes": 913,
+   "decodedBytes": 2293
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_33675&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 15,
+   "encodedBytes": 913,
+   "decodedBytes": 1730
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_37176&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 17,
+   "encodedBytes": 913,
+   "decodedBytes": 6289
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_52625&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 16,
+   "encodedBytes": 913,
+   "decodedBytes": 1092
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_24651&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 17,
+   "encodedBytes": 913,
+   "decodedBytes": 1287
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_25806&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 17,
+   "encodedBytes": 913,
+   "decodedBytes": 2194
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=objectProperty&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 6,
+   "encodedBytes": 1480,
+   "decodedBytes": 2023
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=dataProperty&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 8,
+   "encodedBytes": 1183,
+   "decodedBytes": 227
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=annotationProperty&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 8,
+   "encodedBytes": 1820,
+   "decodedBytes": 5249
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCHEBI_15377&ancestors=true&limit=1&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 17,
+   "encodedBytes": 913,
+   "decodedBytes": 6386
+  },
+  {
+   "url": "/chebi/changes?limit=1&after=commit:1",
+   "group": "changes",
+   "status": 200,
+   "ms": 0,
+   "encodedBytes": 0,
+   "decodedBytes": 0
+  }
+ ],
+ "heap": {
+  "jsHeapUsedMB": 196.8,
+  "jsHeapTotalMB": 205.3,
+  "domNodes": 226955,
+  "layoutCount": 0
+ },
+ "rowsLoaded": 1289,
+ "rowsInDom": 1289,
+ "toggleLatencyMs": 37
+}

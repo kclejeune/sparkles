@@ -1,0 +1,262 @@
+{
+ "name": "open-taxon1m",
+ "rep": 1,
+ "meta": {
+  "label": "after3",
+  "base": "http://127.0.0.1:18725",
+  "host": "stanley",
+  "date": "2026-11-04T14:38:37.146Z",
+  "uiDir": "/home/kclejeune/lanes-local/explore-scale-725/ui-after3/ui/build",
+  "commit": "4ab93ecb/a199a8ae",
+  "server": "release-4ab93ecb",
+  "note": "laptop, synthetic taxon, software WebGL",
+  "browser": "153.0.8010.12",
+  "viewport": {
+   "width": 1440,
+   "height": 900
+  },
+  "webgl": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+  "loadavg": [
+   5.81,
+   8.16,
+   7.91
+  ]
+ },
+ "url": "/ui/workbench/ontology?ds=taxon1m",
+ "status": "ok",
+ "firstRowMs": 886,
+ "quietMs": 14631,
+ "networkQuiet": true,
+ "longTasks": {
+  "count": 1,
+  "totalMs": 68,
+  "maxMs": 68,
+  "lastEndMs": 165
+ },
+ "interactiveMs": 886,
+ "network": {
+  "api": {
+   "count": 10,
+   "encodedBytes": 12336,
+   "decodedBytes": 6056,
+   "ms": 14318.570000003092
+  },
+  "total": {
+   "count": 78,
+   "encodedBytes": 561500,
+   "decodedBytes": 1556906,
+   "ms": 15844.303999328986
+  },
+  "groups": {
+   "static": {
+    "count": 63,
+    "encodedBytes": 544635,
+    "decodedBytes": 1543716,
+    "ms": 1509.7319993656129
+   },
+   "$/prefixes": {
+    "count": 2,
+    "encodedBytes": 2412,
+    "decodedBytes": 1294,
+    "ms": 7.457999978214502
+   },
+   "ontology/summary": {
+    "count": 1,
+    "encodedBytes": 1302,
+    "decodedBytes": 438,
+    "ms": 13705.864000017755
+   },
+   "$/auth": {
+    "count": 1,
+    "encodedBytes": 859,
+    "decodedBytes": 17,
+    "ms": 3.4069999819621444
+   },
+   "$/whoami": {
+    "count": 1,
+    "encodedBytes": 1072,
+    "decodedBytes": 259,
+    "ms": 3.3889999613165855
+   },
+   "ontology/hierarchy": {
+    "count": 1,
+    "encodedBytes": 1283,
+    "decodedBytes": 395,
+    "ms": 570.4139999579638
+   },
+   "$/ping": {
+    "count": 1,
+    "encodedBytes": 831,
+    "decodedBytes": 20,
+    "ms": 3.1380000291392207
+   },
+   "$/datasets": {
+    "count": 1,
+    "encodedBytes": 1767,
+    "decodedBytes": 6838,
+    "ms": 6.067999987863004
+   },
+   "sparql": {
+    "count": 3,
+    "encodedBytes": 4199,
+    "decodedBytes": 3111,
+    "ms": 24.57100001629442
+   },
+   "$/assistant": {
+    "count": 1,
+    "encodedBytes": 1061,
+    "decodedBytes": 259,
+    "ms": 4.19900007545948
+   },
+   "$/memory": {
+    "count": 1,
+    "encodedBytes": 902,
+    "decodedBytes": 85,
+    "ms": 4.246999975293875
+   },
+   "$/branches": {
+    "count": 1,
+    "encodedBytes": 1177,
+    "decodedBytes": 474,
+    "ms": 1.816999982111156
+   },
+   "changes": {
+    "count": 1,
+    "encodedBytes": 0,
+    "decodedBytes": 0,
+    "ms": 0
+   }
+  }
+ },
+ "requests": [
+  {
+   "url": "/$/prefixes/taxon1m",
+   "group": "$/prefixes",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 1206,
+   "decodedBytes": 647
+  },
+  {
+   "url": "/$/ontology/taxon1m?graph=default",
+   "group": "ontology/summary",
+   "status": 200,
+   "ms": 13706,
+   "encodedBytes": 1302,
+   "decodedBytes": 438
+  },
+  {
+   "url": "/$/auth/config",
+   "group": "$/auth",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 859,
+   "decodedBytes": 17
+  },
+  {
+   "url": "/$/whoami",
+   "group": "$/whoami",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 1072,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/ontology/taxon1m/hierarchy?graph=default&kind=class&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 570,
+   "encodedBytes": 1283,
+   "decodedBytes": 395
+  },
+  {
+   "url": "/$/ping",
+   "group": "$/ping",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 831,
+   "decodedBytes": 20
+  },
+  {
+   "url": "/$/datasets",
+   "group": "$/datasets",
+   "status": 200,
+   "ms": 6,
+   "encodedBytes": 1767,
+   "decodedBytes": 6838
+  },
+  {
+   "url": "/taxon1m/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 17,
+   "encodedBytes": 1709,
+   "decodedBytes": 2000
+  },
+  {
+   "url": "/$/prefixes/chebi",
+   "group": "$/prefixes",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1206,
+   "decodedBytes": 647
+  },
+  {
+   "url": "/$/assistant/taxon1m",
+   "group": "$/assistant",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1061,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/memory/taxon1m/maintenance",
+   "group": "$/memory",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 902,
+   "decodedBytes": 85
+  },
+  {
+   "url": "/$/branches/taxon1m",
+   "group": "$/branches",
+   "status": 200,
+   "ms": 2,
+   "encodedBytes": 1177,
+   "decodedBytes": 474
+  },
+  {
+   "url": "/taxon1m/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1522,
+   "decodedBytes": 1054
+  },
+  {
+   "url": "/taxon1m/sparql",
+   "group": "sparql",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 968,
+   "decodedBytes": 57
+  },
+  {
+   "url": "/taxon1m/changes?limit=1&after=commit:1",
+   "group": "changes",
+   "status": 200,
+   "ms": 0,
+   "encodedBytes": 0,
+   "decodedBytes": 0
+  }
+ ],
+ "heap": {
+  "jsHeapUsedMB": 4.8,
+  "jsHeapTotalMB": 5.3,
+  "domNodes": 1287,
+  "layoutCount": 0
+ },
+ "rowsLoaded": 1,
+ "rowsInDom": 1,
+ "toggleLatencyMs": 41
+}

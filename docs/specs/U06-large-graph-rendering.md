@@ -478,6 +478,17 @@ rate. Groups by named graph and on-demand community detection are not built, for
 reasons in §11. A picture of up to 30 nodes draws every label, and its fit makes room
 for the labels on screen.
 
+**Explore at scale.** The graph tab of Explore reuses the WebGL view of the overview.
+It holds up to 100,000 explored nodes and draws a budget of 5,000 of them, which the person
+can set from 1,000 to 20,000. The canvas changes from Cytoscape to WebGL past 1,000 visible
+nodes and back under 700, and new nodes are placed beside their neighbours so that the
+picture holds still. A resource with a large fan-out is expanded into one group node for each
+predicate of more than 25 edges, which opens a page of 100 members at a time. The filters of
+edge type, class, minimum degree, leaves and communities choose what is drawn and never read
+from the server. The [web UI at scale report](../benchmarks/web-ui-scale/RESULTS.md)
+measures it in software WebGL, where 5,000 drawn nodes take 350 ms a frame, so the frame
+rate on a graphics card is not measured here.
+
 ### Roadmap follow-ups
 
 #### Developer ecosystem and UI workstream

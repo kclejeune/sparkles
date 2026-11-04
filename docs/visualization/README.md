@@ -176,7 +176,7 @@ The SvelteKit UI is embedded in the server binary.
   toolbar says how many the filters and the budget leave out. Holding the explored graph
   costs memory in the page for each node, in exchange for filters and budgets that change the
   picture at once, and drawing at most the budget bounds the cost of a frame
-  ([measurements](benchmarks/README.md)).
+  ([measurements](../benchmarks/web-ui-scale/RESULTS.md)).
 * The **Paths** panel (`Shift+P`) finds the shortest path, every shortest path or the k
   shortest paths between two entities, with filters for length, direction, predicates and
   hubs and an optional weight from reifier properties
