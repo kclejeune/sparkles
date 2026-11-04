@@ -72,6 +72,8 @@ test "$(git rev-parse HEAD)" = "$full" || {
 export PATH="$G/py-venv/bin:$HOME/.local/bin:$HOME/.cargo/bin:/run/wrappers/bin:$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin"
 export CARGO_BUILD_JOBS=${GATE_CARGO_JOBS:-4}
 export CARGO_INCREMENTAL=0
+# py:test fails, and does not skip, the stub test on the oldest supported Python without uv.
+export SPARKLES_PY_OLDEST=required
 set -a
 # shellcheck disable=SC1091
 source "$G/conformance.env"

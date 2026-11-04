@@ -7,8 +7,15 @@
 # of crates/sparkles-py/tests/requirements-test.txt; otherwise with a virtual environment
 # in target/py-venv, where pip installs them. A missing mypy or rdflib fails the run.
 #
+# The stub test also runs on the oldest Python that the package supports, which
+# crates/sparkles-py/pyproject.toml gives as requires-python. uv makes a virtual
+# environment for it in target/py-venv-<version> with the same pinned dependencies.
+# Without uv the run prints a warning and goes on, unless SPARKLES_PY_OLDEST=required,
+# which the batch gate sets, and then it fails.
+#
 # Usage: scripts/py-test.sh [pytest args]
-# PY_PROFILE=release tests a release build.
+# PY_PROFILE=release tests a release build. The pytest args apply to the full suite and
+# not to the stub test on the oldest Python.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -60,5 +67,40 @@ if ! pinned_in "$python"; then
   fi
 fi
 
+# The oldest supported Python, from the package metadata.
+oldest=$(sed -n 's/^requires-python *= *">=\([0-9][0-9.]*\)".*/\1/p' "$crate/pyproject.toml")
+if [ -z "$oldest" ]; then
+  echo "py-test: no requires-python = \">=X.Y\" in $crate/pyproject.toml" >&2
+  exit 1
+fi
+
+# The stub test on the oldest Python. It found errors that appear only there, such as a
+# class whose __slots__ differ on CPython 3.10.
+stubtest_oldest() {
+  local current msg venv
+  current=$("$python" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+  if [ "$current" = "$oldest" ]; then
+    return 0
+  fi
+  if ! command -v uv > /dev/null; then
+    msg="uv is not installed, so the stub test on Python $oldest did not run. Install uv (https://docs.astral.sh/uv/)."
+    if [ "${SPARKLES_PY_OLDEST:-}" = required ]; then
+      echo "py-test: $msg" >&2
+      return 1
+    fi
+    echo "py-test: warning: $msg" >&2
+    return 0
+  fi
+  venv=target/py-venv-$oldest
+  echo "== stub test on Python $oldest ==" >&2
+  uv venv --quiet --allow-existing --python "$oldest" "$venv" &&
+    uv pip install --quiet --python "$venv/bin/python" -r "$reqs" &&
+    SPARKLES_PY_TEST_DEPS=required PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/$out" \
+      "$venv/bin/python" -m pytest -p no:cacheprovider "$crate/tests/test_stubs.py" -k test_stubtest
+}
+
 # no bytecode or pytest cache in the source tree
-SPARKLES_PY_TEST_DEPS=required PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/$out" exec "$python" -m pytest -p no:cacheprovider "$crate/tests" "$@"
+status=0
+SPARKLES_PY_TEST_DEPS=required PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/$out" "$python" -m pytest -p no:cacheprovider "$crate/tests" "$@" || status=$?
+stubtest_oldest || status=$?
+exit "$status"
