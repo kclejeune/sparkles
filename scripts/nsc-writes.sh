@@ -21,6 +21,10 @@
 # builds. Each commit and exact --cargo-args string has its own locked source, target
 # and binary entry. A verified build.json records the artifact's original build, also
 # on cache hits. This identifies source and flags, not a hermetic toolchain or environment.
+# With --build-host naming a build host (see scripts/nsc-build-host.sh), a revision is
+# built there instead, with scripts/nsc-build.sh under the host's Boxington cache, which
+# takes feature and dependency-resolution flags only. Its build.json names the host and
+# that command, and the entry is reused like any other.
 # The client is scripts/write-bench.rs, built with rustc. The remote script loads one store
 # per binary, then runs ROUNDS rounds in which every variant runs once, the order
 # reversed on every other round, each run in a fresh server process on a fresh copy of the
@@ -53,6 +57,9 @@
 #   --server-cpus L     the servers' CPU list (default 0-5)
 #   --client-cpus L     the client's CPU list (default 6-7)
 #   --cargo-args "..."  extra `cargo build` flags
+#   --build-host H      where revisions are built: local, auto (the first free host of
+#                       SPARKLES_NSC_BUILD_HOSTS) or a host name (default auto when
+#                       SPARKLES_NSC_BUILD_HOSTS is set, else local)
 #   --machine-type T    Namespace machine type (default linux/amd64:8x16)
 #   --duration D        instance lifetime cap, as nsc takes it (default 2h)
 #   --out DIR           new results directory; any existing path is refused
@@ -87,6 +94,8 @@ usage() {
   sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'
   exit "${1:-0}"
 }
+# shellcheck source=scripts/nsc-build-host.sh
+. "$ROOT/scripts/nsc-build-host.sh"
 ARGS=()
 while [ $# -gt 0 ]; do
   case $1 in
@@ -102,6 +111,7 @@ while [ $# -gt 0 ]; do
     --server-cpus) SERVER_CPUS=$2 ;;
     --client-cpus) CLIENT_CPUS=$2 ;;
     --cargo-args) CARGO_ARGS=$2 ;;
+    --build-host) BH_ARG=$2 ;;
     --machine-type) MACHINE=$2 ;;
     --duration) DURATION=$2 ;;
     --out) OUT=$2 ;;
@@ -117,6 +127,7 @@ while [ $# -gt 0 ]; do
   shift 2
 done
 [ ${#ARGS[@]} -ge 2 ] || usage 1
+bh_check_arg
 [[ $WRITE_RATE =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--write-rate needs a number of requests per second, not $WRITE_RATE"
 [[ $INDEX =~ ^(none|text|geo|embed)$ ]] || die "--index is none, text, geo or embed, not $INDEX"
 case $VIEWS in
@@ -158,7 +169,8 @@ binary() (
   local ref=$1 id=$2 bin sha src='' publish='' snapshot='' key entry target args_hash
   # All temporary paths are unique and owned by this invocation. The subshell keeps
   # its lock and cleanup independent of the eventual Namespace instance EXIT trap.
-  trap '[ -z "$src" ] || rm -rf -- "$src"; [ -z "$publish" ] || rm -rf -- "$publish"; [ -z "$snapshot" ] || rm -f -- "$snapshot"' EXIT
+  trap '[ -z "$src" ] || rm -rf -- "$src"; [ -z "$publish" ] || rm -rf -- "$publish"; [ -z "$snapshot" ] || rm -f -- "$snapshot"; bh_cleanup' EXIT
+  trap 'exit 130' INT TERM
   if [ -f "$ref" ]; then
     bin=$(realpath "$ref")
     snapshot=$(mktemp "$STAGE/.binary-$id.XXXXXXXX")
@@ -175,14 +187,49 @@ binary() (
     flock "$build_lock"
     # Recheck only after acquiring the lock. Old query builds use neither this
     # namespace nor these per-key targets and cannot replace a build's output.
+    if [ ! -e "$entry" ] && [ ! -L "$entry" ] && { bh_resolve && [ "$BH_HOST" != local ]; }; then
+      echo "building $ref ($sha) on $BH_HOST; log: $OUT/logs/build-$id.log"
+      src=$(mktemp -d "$WRITE_CACHE/src/$key.XXXXXXXX")
+      publish=$(mktemp -d "$WRITE_CACHE/bin/.$key.XXXXXXXX")
+      # shellcheck disable=SC2086 # CARGO_ARGS is a list of flags
+      bh_build "$BH_HOST" "$sha" "$src" $CARGO_ARGS > "$OUT/logs/build-$id.log" 2>&1 ||
+        die "build of $ref on $BH_HOST failed, see $OUT/logs/build-$id.log"
+      cp -- "$src/sparkles" "$publish/sparkles"
+      chmod 755 "$publish/sparkles"
+      python3 - "$publish" "$sha" "$CARGO_ARGS" "$args_hash" "$BH_HOST" "$src" << 'PY'
+import datetime, hashlib, json, pathlib, sys
+directory, revision, arguments, args_hash, host, received = sys.argv[1:]
+path, received = pathlib.Path(directory), pathlib.Path(received)
+environment = {}
+for line in (received / 'env.txt').read_text().splitlines():
+    name, _, value = line.partition('=')
+    environment[name] = value
+record = {
+    'schema': 1, 'revision': revision, 'cargo_args': arguments,
+    'cargo_args_sha256': args_hash,
+    'binary_sha256': hashlib.sha256((path / 'sparkles').read_bytes()).hexdigest(),
+    'built_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    'build_host': host,
+    'rustc': (received / 'rustc.txt').read_text(), 'cargo': (received / 'cargo.txt').read_text(),
+    'version_commands': 'rustc -vV and cargo -V in the extracted source directory on the build host',
+    'command': 'scripts/nsc-build.sh (mbx build --release -p sparkles-server $CARGO_ARGS) in a git archive on build host ' + host,
+    'artifact': {'manifest': 'crates/sparkles-server/Cargo.toml', 'name': 'sparkles', 'kind': ['bin']},
+    'environment': environment,
+}
+(path / 'build.json').write_text(json.dumps(record, indent=2) + '\n')
+PY
+      mv -T -- "$publish" "$entry"
+      publish=
+      rm -rf -- "$src"
+      src=
+    fi
     if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
       echo "building $ref ($sha); log: $OUT/logs/build-$id.log"
       src=$(mktemp -d "$WRITE_CACHE/src/$key.XXXXXXXX")
       publish=$(mktemp -d "$WRITE_CACHE/bin/.$key.XXXXXXXX")
       git -C "$ROOT" archive "$sha" | tar -x -m -C "$src"
-      mkdir -p "$src/ui/build" "$target/release"
-      echo '<!doctype html><title>Sparkles</title><p>The UI was not built for this benchmark binary.</p>' \
-        > "$src/ui/build/index.html"
+      mkdir -p "$target/release"
+      bh_ui_placeholder "$src"
       (cd "$src" && rustc -vV) > "$publish/rustc.txt"
       (cd "$src" && cargo -V) > "$publish/cargo.txt"
       # An option selecting another profile or target must not reuse stale output
@@ -225,6 +272,7 @@ record = {
     'cargo_args_sha256': args_hash,
     'binary_sha256': hashlib.sha256((path / 'sparkles').read_bytes()).hexdigest(),
     'built_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    'build_host': 'local (' + os.uname().nodename + ')',
     'rustc': (path / 'rustc.txt').read_text(), 'cargo': (path / 'cargo.txt').read_text(),
     'version_commands': 'rustc -vV and cargo -V in the extracted source directory',
     'command': 'cargo build --release -p sparkles-server --manifest-path <owned source>/Cargo.toml --target-dir <key target> --message-format=json-render-diagnostics $CARGO_ARGS',
@@ -270,7 +318,7 @@ except (AssertionError, OSError, ValueError, KeyError, TypeError) as error:
 PY
     [ -x "$bin" ] || die "cached binary is not executable: $bin"
     cp -- "$entry/build.json" "$STAGE/bin-$id.build.json"
-    note "binary $id: commit $sha ($ref), build key $key"
+    note "binary $id: commit $sha ($ref), build key $key, built on $(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("build_host") or "an unrecorded host")' "$entry/build.json")"
     note "binary $id provenance: stage/bin-$id.build.json (original build, not a fresh-build claim)"
   fi
   note "binary $id sha256: $(sha256sum "$bin" | cut -d' ' -f1)"

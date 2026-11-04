@@ -113,7 +113,8 @@ class RevisionBinaryCache(unittest.TestCase):
         self.root = Path(temporary.name)
         self.repo = self.root / "repo"
         (self.repo / "scripts").mkdir(parents=True)
-        for name in ("nsc-bench.sh", "nsc-build.sh"):
+        (self.repo / "scripts" / "gate").mkdir()
+        for name in ("nsc-bench.sh", "nsc-build.sh", "nsc-build-host.sh", "gate/config.sh"):
             shutil.copy(ROOT / "scripts" / name, self.repo / "scripts" / name)
         git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
                "-c", "commit.gpgsign=false"]
@@ -153,7 +154,11 @@ a=sys.argv[1:];shutil.copyfile([x for x in a if not x.startswith('-') and x!=a[a
             (self.bin / name).chmod(0o755)
         self.calls = self.root / "calls.jsonl"
         self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
-                        SPARKLES_NSC_CACHE=str(self.cache), CACHE_TEST_CALLS=str(self.calls))
+                        SPARKLES_NSC_CACHE=str(self.cache), CACHE_TEST_CALLS=str(self.calls),
+                        # These builds stay local whatever the machine's build-host settings.
+                        SPARKLES_NSC_BUILD_CONFIG=str(self.root / "no-build.env"),
+                        SPARKLES_GATE_CONFIG=str(self.root / "no-gate.env"))
+        self.env.pop("SPARKLES_NSC_BUILD_HOSTS", None)
         self.env.pop("CARGO_TARGET_DIR", None)
         self.env.pop("CARGO_BUILD_TARGET", None)
         self.runs = 0
