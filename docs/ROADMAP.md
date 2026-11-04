@@ -151,6 +151,21 @@ followed by checks and protected merges, linked-data publishing and git export.
 Fragment composition follows the storage consolidation of item 455. Wave C runs
 alongside Wave A2 on the policy plumbing of items 480 to 483.
 
+OWL classification continues in three streams once phase 4 of item 603 lands. Each
+stream is held to the same speed target, which is three to five times as fast as the
+fastest reference reasoner at the same reasoning level in every stratum, with a tie as
+the floor.
+1. Item 603's phases 5 to 8 run in order, as counting and data, then nominals, then the
+   engine half of phase 7, then the final speed gate. The surfaces of phase 7, which
+   expose `complete`, the incomplete classes and the consistency state, run beside them
+   because they need only phase 4's API.
+2. The cost of the Horn rules is worked as one piece. It covers the rest of item 693,
+   the conclusion growth of item 710 that reproduces it on 13 axioms, and the
+   individuals, functional data properties and top properties of item 692.
+3. The cost of the EL engine is worked as one piece. It covers the code layout of item
+   711 first, because its build setting affects every other measurement, then the cold
+   runs on small files of item 709 and the saturation memory of item 695.
+
 The workbench UI runs as one stream of about two lanes beside the engine work. After the
 DL Query tab, the SKOS editor and the web UI shell of item 632 come these, in order:
 1. The ontology browser's rendering preferences (625), metrics (621) and the editor's
@@ -211,6 +226,8 @@ Several workstreams have hard orderings.
   half of its shared publish tail.
 * Storage consolidation in X16 lands before fragment composition in X18.
 * The format cutoff of item 479 lands before the release artifacts of items 58 and 59.
+* The Horn-rule work of items 693, 710 and 692 lands before or between item 603's phases
+  5 to 8, since both change the classifier's index in `classify/index.rs`.
 * OWL classification in F24 stays separate from the reasoner core in F23. The two meet
   only through the F21 axiom model of item 71.
 
