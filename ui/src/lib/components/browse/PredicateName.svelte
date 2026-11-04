@@ -1,7 +1,7 @@
 <script lang="ts">
-  // The predicates a heading of the Definition card names, after its kind: each as the
-  // Full/Prefixed switch writes it, muted, with its full IRI on hover and a link to its page
-  // when it has one (ROADMAP item 633).
+  // The predicates that state a text, as small chips at its end: each as the Full/Prefixed switch
+  // writes it, with its full IRI on hover and a link to its page when it has one (ROADMAP item
+  // 633). A chip stays on one line unless it is a full IRI too long to fit a phone.
   import { displayIri, type PrefixMap } from '$lib/rdf';
 
   let {
@@ -13,36 +13,34 @@
     prefixes: PrefixMap;
     href?: (iri: string) => string | null;
   } = $props();
+  const LONG = 32;
 </script>
 
-<span class="preds"
-  ><span class="dot" aria-hidden="true">·</span
-  >{#each predicates as p, i (p)}{#if i > 0},{/if}{' '}{#if href?.(p)}<a href={href(p)} title={p}
-        >{displayIri(p, prefixes)}</a
-      >{:else}<span title={p}>{displayIri(p, prefixes)}</span>{/if}{/each}</span
->
+{#each predicates as p, i (p)}{#if i > 0}{' '}{/if}{@const shown = displayIri(
+    p,
+    prefixes,
+  )}{#if href?.(p)}<a class="pred" class:long={shown.length > LONG} href={href(p)} title={p}
+      >{shown}</a
+    >{:else}<span class="pred" class:long={shown.length > LONG} title={p}>{shown}</span>{/if}{/each}
 
 <style>
-  .preds {
-    margin-left: 0.4em;
-  }
-  /* a section heading spaces its parts with its own gap */
-  :global(.term-sec > h2) > .preds {
-    margin-left: calc(0.4em - var(--sp-2));
-  }
-  .preds {
-    font-weight: 400;
+  .pred {
+    padding: 0 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
     color: var(--text-3);
+    font: 400 11px var(--font-mono);
+    white-space: nowrap;
+    vertical-align: 1px;
+    text-decoration: none;
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
+  }
+  .pred.long {
+    white-space: normal;
     overflow-wrap: anywhere;
   }
-  .dot {
-    margin-right: 0.3em;
-  }
-  .preds a {
-    color: inherit;
-    text-decoration: none;
-  }
-  .preds a:hover {
+  a.pred:hover {
     color: var(--iri);
     text-decoration: underline;
   }

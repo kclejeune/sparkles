@@ -105,13 +105,14 @@ export const CELLS_PREFIXES = {
   owl: OWL,
   xsd: XSD,
   dcterms: DCT,
+  skos: SKOS,
   obo: 'http://purl.obolibrary.org/obo/',
   oboInOwl: 'http://www.geneontology.org/formats/oboInOwl#',
 };
 
 export const CELLS_TURTLE = `
 @prefix rdf: <${RDF}> . @prefix rdfs: <${RDFS}> . @prefix owl: <${OWL}> .
-@prefix xsd: <${XSD}> . @prefix dcterms: <${DCT}> .
+@prefix xsd: <${XSD}> . @prefix dcterms: <${DCT}> . @prefix skos: <${SKOS}> .
 @prefix obo: <http://purl.obolibrary.org/obo/> .
 @prefix oboInOwl: <http://www.geneontology.org/formats/oboInOwl#> .
 @prefix cl: <http://purl.obolibrary.org/obo/cl#> .
@@ -122,6 +123,8 @@ export const CELLS_TURTLE = `
 obo:IAO_0000115 a owl:AnnotationProperty ; rdfs:label "definition"@en .
 oboInOwl:hasExactSynonym a owl:AnnotationProperty . oboInOwl:hasRelatedSynonym a owl:AnnotationProperty .
 oboInOwl:hasDbXref a owl:AnnotationProperty . oboInOwl:hasSynonymType a owl:AnnotationProperty .
+cl:markerCount a owl:DatatypeProperty ; rdfs:label "marker count"@en .
+cl:firstSeen a owl:DatatypeProperty ; rdfs:label "first seen"@en .
 cl:PLURAL a owl:AnnotationProperty ; rdfs:label "plural"@en .
 cl:ABBREVIATION a owl:AnnotationProperty .
 obo:BFO_0000050 a owl:ObjectProperty ; rdfs:label "part of"@en .
@@ -164,6 +167,77 @@ Note: this text was written for a test fixture and is not taken from a published
   owl:annotatedTarget "microglia"@en ; oboInOwl:hasSynonymType cl:PLURAL .
 [] a owl:Axiom ; owl:annotatedSource obo:CL_0000129 ; owl:annotatedProperty oboInOwl:hasRelatedSynonym ;
   owl:annotatedTarget "MG.cns"@en ; oboInOwl:hasSynonymType cl:ABBREVIATION ; oboInOwl:hasDbXref "FIXTURE:panel" .
+
+# A heavy term for the layout review: several definitions from different
+# predicates, comments and notes of every kind, a logical definition, several restrictions, a
+# disjointness, many cross-references and entities that point at it. The text is invented.
+skos:definition a owl:AnnotationProperty . skos:scopeNote a owl:AnnotationProperty .
+skos:note a owl:AnnotationProperty . skos:example a owl:AnnotationProperty .
+skos:historyNote a owl:AnnotationProperty . skos:editorialNote a owl:AnnotationProperty .
+skos:changeNote a owl:AnnotationProperty .
+obo:RO_0002202 a owl:ObjectProperty ; rdfs:label "develops from"@en .
+obo:RO_0002215 a owl:ObjectProperty ; rdfs:label "capable of"@en .
+obo:RO_0002100 a owl:ObjectProperty ; rdfs:label "has soma location"@en .
+obo:CL_0000576 a owl:Class ; rdfs:subClassOf obo:CL_0000000 ; rdfs:label "monocyte"@en .
+obo:UBERON_0002360 a owl:Class ; rdfs:label "meninx"@en .
+obo:UBERON_0001891 a owl:Class ; rdfs:label "midbrain"@en .
+obo:GO_0006909 a owl:Class ; rdfs:label "phagocytosis"@en .
+obo:CL_0009001 a owl:Class ;
+  rdfs:label "border-associated macrophage"@en , "macrophage associé aux frontières"@fr ;
+  oboInOwl:id "CL:0009001" ;
+  oboInOwl:hasOBONamespace "cell" ;
+  rdfs:subClassOf obo:CL_0000235 ,
+    [ a owl:Restriction ; owl:onProperty obo:BFO_0000050 ; owl:someValuesFrom obo:UBERON_0002360 ] ,
+    [ a owl:Restriction ; owl:onProperty obo:BFO_0000050 ; owl:someValuesFrom obo:UBERON_0001017 ] ,
+    [ a owl:Restriction ; owl:onProperty obo:RO_0002202 ; owl:someValuesFrom obo:CL_0000576 ] ,
+    [ a owl:Restriction ; owl:onProperty obo:RO_0002215 ; owl:someValuesFrom obo:GO_0006909 ] ,
+    [ a owl:Restriction ; owl:onProperty obo:RO_0002100 ; owl:someValuesFrom obo:UBERON_0001891 ] ;
+  owl:equivalentClass [ owl:intersectionOf ( obo:CL_0000235
+    [ a owl:Restriction ; owl:onProperty obo:BFO_0000050 ; owl:someValuesFrom obo:UBERON_0002360 ] ) ] ;
+  owl:disjointWith obo:CL_0000129 , obo:CL_0000125 ;
+  obo:IAO_0000115 "A macrophage that sits in the meninges, the choroid plexus or around the blood vessels of the brain, where it samples the cerebrospinal fluid and the blood and takes up what they carry in."@en ,
+    "Un macrophage des méninges, du plexus choroïde ou des parois des vaisseaux du cerveau qui prélève le liquide céphalorachidien et le sang."@fr ;
+  skos:definition "A tissue macrophage of the barriers of the central nervous system, derived from embryonic progenitors and in part replaced by blood monocytes with age."@en ;
+  dcterms:description """Border-associated macrophages form a family of cells at the interfaces of the brain and the rest of the body.
+
+They are found in the meninges, in the choroid plexus and in the perivascular space. Each site has its own set of markers and its own rate of turnover.
+They take up antigens from the fluid around them and pass signals to the T cells that patrol the same spaces.
+
+During development they settle before birth, and in some sites they are slowly replaced by cells that come from the bone marrow.
+
+Note: this text was written for a test fixture and is not taken from a published ontology."""@en ;
+  rdfs:comment "Do not confuse with microglial cells, which live inside the tissue and not at its borders."@en ,
+    "The three sites differ enough that some sources split the class by site; this ontology keeps one class and records the site in the part of restriction."@en ,
+    "Markers vary by species. The mouse markers are the best known and do not all carry over to humans."@en ;
+  skos:scopeNote "Use for macrophages of the meninges, the choroid plexus and the perivascular space. Use microglial cell for cells inside the parenchyma."@en ;
+  skos:note "This class was added together with its three subclasses."@en ;
+  skos:example "A CD206-positive macrophage in the dura mater of a mouse."@en ;
+  skos:historyNote "Added in version 2026-10-01 after a request from a neuroimmunology group."@en ;
+  skos:editorialNote "Check the definition against the new review of brain macrophages."@en ;
+  skos:changeNote "The French label was added in the same release."@en ;
+  oboInOwl:hasExactSynonym "BAM"@en , "CNS border macrophage"@en , "central nervous system border macrophage"@en ;
+  oboInOwl:hasRelatedSynonym "meningeal macrophage"@en , "perivascular macrophage"@en , "choroid plexus macrophage"@en ;
+  oboInOwl:hasDbXref "PMID:00000011" , "PMID:00000012" , "FMA:00002" , "MESH:D000001" , "NCIT:C00001" , "Wikipedia:Border-associated_macrophage" ,
+    obo:CL_0009006 , <https://en.wikipedia.org/wiki/Foam_cell> ;
+  dcterms:created "2026-10-01"^^xsd:date ;
+  cl:reviewedOn "2026-10-02T09:30:00Z"^^xsd:dateTime ;
+  cl:reviewCount "5"^^xsd:integer ;
+  cl:reviewNote "a plain string"^^xsd:string ;
+  rdfs:subClassOf [ a owl:Restriction ; owl:onProperty cl:markerCount ; owl:hasValue "3"^^xsd:integer ] ,
+    [ a owl:Restriction ; owl:onProperty cl:firstSeen ; owl:hasValue "2026-10-01"^^xsd:date ] ;
+  rdfs:seeAlso <http://example.org/reviews/brain-macrophages> .
+obo:CL_0009002 a owl:Class ; rdfs:subClassOf obo:CL_0009001 ; rdfs:label "meningeal macrophage"@en .
+obo:CL_0009003 a owl:Class ; rdfs:subClassOf obo:CL_0009001 ; rdfs:label "choroid plexus macrophage"@en .
+obo:CL_0009004 a owl:Class ; rdfs:subClassOf obo:CL_0009001 ; rdfs:label "perivascular macrophage"@en .
+obo:CL_0009005 a owl:Class ; rdfs:subClassOf obo:CL_0009004 ; rdfs:label "pial perivascular macrophage"@en .
+obo:CL_0009006 a owl:Class ; rdfs:label "antigen-presenting border cell"@en ;
+  rdfs:subClassOf [ a owl:Restriction ; owl:onProperty obo:RO_0002202 ; owl:someValuesFrom obo:CL_0009001 ] .
+obo:CL_0009007 a owl:Class ; rdfs:label "dural dendritic cell"@en ;
+  rdfs:subClassOf [ a owl:Restriction ; owl:onProperty obo:RO_0002202 ; owl:someValuesFrom obo:CL_0009001 ] .
+obo:CL_0009008 a owl:Class ; rdfs:label "leptomeningeal cell"@en ;
+  rdfs:subClassOf [ a owl:Restriction ; owl:onProperty obo:BFO_0000050 ; owl:someValuesFrom obo:CL_0009001 ] .
+obo:CL_0009009 a owl:Class ; rdfs:label "choroid plexus epithelial cell"@en ;
+  rdfs:subClassOf [ a owl:Restriction ; owl:onProperty obo:RO_0002215 ; owl:someValuesFrom obo:CL_0009001 ] .
 `;
 
 // --- terms ---------------------------------------------------------------------------

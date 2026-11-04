@@ -458,59 +458,88 @@ and every name on a page links to the page of that entity. `/ui/browse?ds=NAME` 
 landing page of the default graph's ontology, and `&iri=IRI` opens an entity. `graph`,
 `branch` and `at` choose what the pages read, as on the other pages.
 
-An entity's page leads with its label, short form, kind and IRI, and a row of counts under
-them, its parents, children, incoming links, synonyms and the other datasets that mention
-it, each a link to its section. The buttons that act on the page sit level with the title.
+An entity's page leads with its label, short form, kind and IRI, and a line of counts under
+them as text links, its parents, children, incoming links, synonyms and the other datasets
+that mention it, each leading to its section. The IRI follows the **Prefixed** or **Full IRIs**
+switch with the dataset's prefixes, shows in full where no prefix fits, keeps the full IRI as its
+title and is always copied in full. The short form does not show beside a prefixed name that already
+ends in it. A count of zero does not show, and with none left
+the line does not render. The buttons that act on the page sit level with the title.
 **Open in Explore**, **Open in Ontology** or **Open in Thesaurus**, **Ask about this** and
 **Edit** show while they fit, and the rest fold into a **More** menu, so the title never
 shares a row with a wrapped column of buttons. A deprecated entity says so under its title and
-links its replacement. The rest of the page is cards. **Definition** leads with every
-definition, description, comment and scope note the entity has, in groups under a heading
-that names the kind and the predicate, such as "Definition · obo:IAO_0000115" and
-"Comment · rdfs:comment". The heading follows the **Prefixed** or **Full IRIs** switch and
-shows the full IRI as its title. A group shows its first three values with a count of the
-rest, folds the other languages behind "In N other languages", and keeps blank lines as
-paragraphs. The same text under two predicates is one entry. A note leads only when the entity
-has nothing else, and an entity with none says so. Synonyms follow by kind, each with its
-languages, sources and its synonym type as a chip. **Axioms** gives the entity's frame in
-Manchester syntax, with the names linked to their pages and a **Copy** button, and an
-**Inferred** section that a **Classify** button fills from the server's classification. A SKOS
-concept has no Axioms card, since SKOS statements are not axioms.
-**Hierarchy** gives the entity's place in its tree, and **References** its cross-references,
-what links here, the other datasets and, folded away under **All other statements**, every
-statement the other cards do not show. Beside them, in a column of the same width as on
-a dataset's page, **Metadata** lists the kind, status, identifiers, ontology and subsets,
-and **Download** downloads the entity in Turtle, RDF/XML, OWL functional syntax or JSON-LD.
-When one column grows longer than the other, References or Download moves to the shorter
-one so the two end close together, without moving a card that holds focus, and a shorter
-side column stays in view as the page scrolls.
+links its replacement. The rest of the page has two columns. The left holds the term's own
+sections on the page background, and the right is a rail of cards with its facts.
 
-The Hierarchy card scrolls on its own within half the window's height with the entity in
-view. It shows the lineage from a root to the entity on one line, the entity's other direct
-parents under it, its children with their counts and its siblings behind one row, and it
-reads each further level when it opens. **Graph** in the card's header draws the entity's
-neighbourhood in the card in place of the tree, on the Explore canvas with Explore's
-lenses. An entity outside any hierarchy has **Graph** beside its title, which shows the
-graph in place of the cards. The graph holds its parents, its first children, the entities
-its axioms relate it to and those whose axioms hold it, with each edge named by its
-property. Double-clicking a node adds that entity's neighbourhood, and **Open in Explore**
-opens the entity there. **Ask about this** opens the Ask drawer with the entity as its
+One text leads directly under the counts, with no heading. It is the entity's first definition
+by `obo:IAO_0000115` or `skos:definition`, or else its first description by `dcterms:description`,
+`dc:description` or `schema:description`, its first `rdfs:comment`, its first `skos:scopeNote` or
+its first `skos:note`. An entity with none of these shows no lead and generates no text. Every value
+ends with a small chip of the property that states it, such as `rdfs:comment`, which stays with
+the last word of its text, follows the **Prefixed** or **Full IRIs** switch, links to the
+property's page when it has one and shows the full IRI as its title. The same text under two
+predicates is one entry with two chips, and blank lines in a text are paragraphs. A typed literal
+anywhere on the page shows its exact lexical form with a small chip of its datatype, such as
+`xsd:date`, before any property chip, and strings and language-tagged texts have none. **Copy**
+still gives Manchester syntax, with `^^` where it needs it.
+
+Under the lead, one wrapping row of quiet disclosures holds what remains, one for each kind that
+has any, with its count and closed at first, such as "In 1 other language", "1 more definition",
+"1 description", "3 comments" and "6 notes". They open independently, and what they open falls
+below the row, so that the row keeps its place. **Notes** holds the scope, history, editorial and
+change notes, the plain notes and the examples, where the chip tells them apart and each row names
+its kind to a screen reader. A lone lead has no disclosures. Edit mode opens them all, so that
+every value can be reached. The sections after it are all headings of one size. A
+**Logical definition** and the **Synonyms** by kind stay in view
+under the row, each synonym with its languages, sources and its synonym type as a chip.
+**Axioms** gives the entity's frame in Manchester syntax, with the names linked to their pages and
+a **Copy** button beside its heading, and an **Inferred** section that a **Classify** button fills
+from the server's classification. A SKOS concept has no Axioms section, since SKOS statements are
+not axioms. **See also**, **Mappings**, **What links here** and **In other datasets** follow as
+sections of their own, and **All other statements** folds away every statement the other sections
+do not show.
+
+The rail has the width of the side column on a dataset's page. **Metadata** lists the kind,
+status, ontology and subsets, then **Identifiers**, the entity's cross-references by database,
+with a database's ids on one line and the first eight databases shown and the rest on request.
+The downloads in Turtle, RDF/XML, OWL functional syntax or JSON-LD end the card. **Hierarchy**
+follows it. The rail stays in view as the page scrolls when it is the shorter column, and one
+taller than the window scrolls with the page until its bottom edge is in view and stays there,
+so all of it can be reached.
+
+The Hierarchy card keeps its place in both of its views. **Tree** scrolls on its own within
+half the window's height with the entity in view. It shows the lineage from a root to the
+entity on one line, the entity's other direct parents under it, its children with their
+counts and its siblings behind one row, and it reads each further level when it opens.
+**Graph** draws the entity's parents and first six children in the card on the Explore canvas
+with Explore's lenses, and **Expand** opens the whole neighbourhood in a large dialog. The
+dialog's graph, and the graph that an entity outside any hierarchy shows in place of the sections
+through **Graph** beside its title, hold its parents, its first children, the entities its
+axioms relate it to and those whose axioms hold it, with each edge named by its property.
+Double-clicking a node there adds that entity's neighbourhood, and **Open in Explore** opens
+the entity there. **Ask about this** opens the Ask drawer with the entity as its
 context.
 
-A SKOS concept gets a table of its labels by language and its related concepts and
-mappings. Cross-references to well-known databases such as Wikipedia, PubMed and DOI are
-links. A class that is defined by an expression shows it as a **Logical definition**
-under its definition, and only class expressions count, never the other axioms.
-**What links here** lists the axioms of other entities that mention it, grouped by the
-restriction that holds it as in "part of some mitochondrion", then the other statements that
-point at it by property, with their counts and further pages. **In other datasets** asks
-every other dataset the caller can read, up to 20, whether it mentions the IRI, and links
-its page there. **Similar terms** lists the entity's nearest neighbours in the dataset's
+A SKOS concept gets its **Labels** as rows in the style of the synonyms, Preferred and Alternative,
+with every value in every language and its language tag, and its related concepts and mappings. Its
+hidden labels stay behind a **Show them** toggle that adds a Hidden row, and neither Synonyms nor the
+count of synonyms includes them. Identifiers in well-known databases such as Wikipedia, PubMed and DOI are links. An identifier says
+the label this dataset gives its target, or else its short id exactly, or for an IRI a prefixed name
+or its readable last part, and Wikipedia's names read as titles. Its title holds the exact value, and
+the page reads nothing from another host to name it. A class that is defined by an expression shows it as a **Logical definition**
+under its texts, and only class expressions count, never the other axioms.
+**What links here** lists the axioms of other entities that mention it, grouped under smaller
+headings by the restriction that holds it as in "part of some mitochondrion", then the other
+statements that point at it by property, such as Replaces, with their counts and further pages.
+**In other datasets** asks every other dataset the caller can read, up to 20, whether it mentions
+the IRI, and links its page there or says that none does. It shows once the answers are in, and a
+server with no other dataset has no such section. **Similar terms** lists the entity's nearest neighbours in the dataset's
 first ready vector index, through the same search as Similar's Search page, and links to
 that page for more. A dataset without a vector index or a term without a vector shows no
-such section. Below 1,100 pixels the cards are one column, in the order Definition, Axioms,
-Metadata, Hierarchy, References and Download, and on a phone the Hierarchy card opens on
-request ([screenshot](../images/browse-phone.png)).
+such section. Below 1,100 pixels the page is one column, in the order of the texts, Axioms,
+Metadata, Hierarchy and the sections of links. On a phone the order is the texts with the Logical
+definition and Synonyms, Metadata, Hierarchy, Axioms and the sections of links, and the Hierarchy
+card opens on request or when a view is chosen ([screenshot](../images/browse-phone.png)).
 
 A caller who can write to the dataset gets an **Edit** button beside the title, and `E`
 or the palette's **Edit this page** does the same. Edit mode changes the page in place
@@ -665,7 +694,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   a query outside OWL 2 EL copies the ontology into memory for the RL rules, item
   662. Class answers under the RL rules can miss entailed subsumptions, and the
   label marks them as possibly incomplete.
-* The Axioms card of a Browse term page shows inferred superclasses only after a
+* The Axioms section of a Browse term page shows inferred superclasses only after a
   **Classify** click, since no read-only route says whether a kept classification exists.
   Item 726 adds one.
 * The thesaurus editor reads at most 2,000 narrower concepts of a concept and 5,000 roots

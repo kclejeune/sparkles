@@ -17,7 +17,7 @@ import {
   type Lit,
   type ManchesterToken,
 } from './ontology';
-import { localName, WELL_KNOWN, type PrefixMap } from './rdf';
+import { localName, shorten, sparqlIri, WELL_KNOWN, type PrefixMap } from './rdf';
 import { browsePath, editorOf, workbenchPath } from './routes';
 
 const enc = encodeURIComponent;
@@ -277,19 +277,19 @@ export const DEFINITION_PROPS = [OBO + 'IAO_0000115', SKOS + 'definition'];
 
 /**
  * The properties of a page's lead block, in priority order, with the kind each is listed
- * under: the definitions, then descriptions, comments and scope notes.
+ * under: the definitions, then descriptions, comments and scope notes. A plain `skos:note` leads
+ * only when none of these is there.
  */
 export const LEAD_KINDS: [string, string][] = [
   [OBO + 'IAO_0000115', 'Definition'],
   [SKOS + 'definition', 'Definition'],
   [DCT + 'description', 'Description'],
   [DC + 'description', 'Description'],
+  ['http://schema.org/description', 'Description'],
+  ['https://schema.org/description', 'Description'],
   [RDFS + 'comment', 'Comment'],
   [SKOS + 'scopeNote', 'Scope note'],
 ];
-
-/** How many values of a group in the reader's languages show before "N more". */
-export const LEAD_SHOWN = 3;
 
 /** One predicate of the lead block, or the predicates that state the same texts, under its
  * heading: its values in the reader's languages and its translations, which fold. */
@@ -303,6 +303,77 @@ export type LeadGroup = {
 
 /** The lead block of a page, its groups in priority order. The first group leads. */
 export type Lead = { groups: LeadGroup[] };
+
+/** The texts of an entity after the one that leads, one row per kind and predicate. */
+export type LeadRow = { kind: string; predicates: string[]; values: Sourced[] };
+
+/**
+ * Every definition, description, comment and note after the first text, by kind: the other values
+ * of the kind that leads, the other kinds with their translations, and the notes. The first kind's
+ * translations stay with the lead.
+ */
+export function leadRest(
+  lead: Lead,
+  notes: { kind: string; property: string; values: Sourced[] }[],
+  langs: readonly string[],
+): LeadRow[] {
+  const rows: LeadRow[] = [];
+  lead.groups.forEach((g, i) => {
+    const values = i === 0 ? g.values.slice(1) : [...g.values, ...g.translations];
+    if (values.length) rows.push({ kind: g.kind, predicates: g.predicates, values });
+  });
+  for (const n of notes) {
+    if (!n.values.length) continue;
+    const values = [...n.values].sort((a, b) => langRank(a.lang, langs) - langRank(b.lang, langs));
+    rows.push({ kind: n.kind, predicates: [n.property], values });
+  }
+  return rows;
+}
+
+/** One disclosure of the texts after the lead: its word for the kind, its label and its rows. */
+export type LeadDisclosure = { word: string; label: string; rows: LeadRow[] };
+
+const REST_WORDS: Record<string, string> = {
+  Definition: 'definition',
+  Description: 'description',
+  Comment: 'comment',
+};
+
+/**
+ * The other texts as one disclosure per kind that has any, each with its count: definitions,
+ * descriptions, comments and notes. Every kind without a word of its own, such as a scope note or
+ * an example, is a note, and only the kind that leads is "more".
+ */
+export function leadDisclosures(rows: LeadRow[], leadKind: string): LeadDisclosure[] {
+  const word = (kind: string) => REST_WORDS[kind] ?? 'note';
+  return ['definition', 'description', 'comment', 'note'].flatMap((w) => {
+    const of = rows.filter((r) => word(r.kind) === w);
+    const n = of.reduce((sum, r) => sum + r.values.length, 0);
+    if (!n) return [];
+    const more = leadKind && word(leadKind) === w ? 'more ' : '';
+    return [{ word: w, label: `${n} ${more}${w}${n === 1 ? '' : 's'}`, rows: of }];
+  });
+}
+
+/** The labels of a SKOS resource by kind, with every value in each language, reader's first. */
+export function labelKinds(
+  labels: Sections['labels'],
+): { kind: string; values: { text: string; lang: string }[] }[] {
+  const kinds = [
+    ['Preferred', 'preferred'],
+    ['Alternative', 'alternative'],
+    ['Hidden', 'hidden'],
+  ] as const;
+  return kinds
+    .map(([kind, key]) => ({
+      kind,
+      // one row per language and text, however many rows of `labels` state it
+      values: labels
+        .flatMap((l) => l[key].map((text) => ({ text, lang: l.lang })))
+        .filter((v, i, all) => all.findIndex((o) => o.lang === v.lang && o.text === v.text) === i),
+    }))
+    .filter((g) => g.values.length > 0);
+}
 
 /** Synonym properties, in display order, with their kind. */
 export const SYNONYM_KINDS: [string, string][] = [
@@ -462,7 +533,7 @@ const byLang = (langs: readonly string[]) => (a: Sourced, b: Sourced) =>
 export type Sections = {
   /** the value that leads the page: the best of the lead block, or else a note */
   definition: Sourced | null;
-  /** every definition, description, comment and scope note, as the Definition card shows them */
+  /** every definition, description, comment and scope note, as the top of the page shows them */
   lead: Lead;
   synonyms: { kind: string; values: Sourced[] }[];
   notes: { kind: string; property: string; values: Sourced[] }[];
@@ -1116,7 +1187,14 @@ export function lineage(
 
 export type GraphPiece = {
   nodes: { id: string; label: string; focus?: boolean }[];
-  edges: { id: string; source: string; target: string; label: string }[];
+  edges: {
+    id: string;
+    source: string;
+    target: string;
+    label: string;
+    /** A subclass, subproperty or broader link itself, whatever the label says. */
+    hierarchy?: boolean;
+  }[];
 };
 
 /**
@@ -1131,7 +1209,7 @@ export function neighbourhood(
   maxChildren = 20,
 ): GraphPiece {
   const nodes = new Map<string, { id: string; label: string; focus?: boolean }>();
-  const edges = new Map<string, { id: string; source: string; target: string; label: string }>();
+  const edges = new Map<string, GraphPiece['edges'][number]>();
   const name = (iri: string) =>
     iri === t.iri && (t.label || t.shortForm)
       ? (t.label ?? t.shortForm)!
@@ -1139,15 +1217,17 @@ export function neighbourhood(
   const node = (iri: string, focus = false) => {
     if (!nodes.has(iri)) nodes.set(iri, { id: iri, label: name(iri), focus: focus || undefined });
   };
-  const edge = (s: string, o: string, label: string) => {
+  const edge = (s: string, o: string, label: string, hierarchy = false) => {
     node(s);
     node(o);
     const id = `${s} ${label} ${o}`;
-    edges.set(id, { id, source: s, target: o, label });
+    // a restriction whose property has the label of a hierarchy link can share this edge's id
+    const was = edges.get(id)?.hierarchy;
+    edges.set(id, { id, source: s, target: o, label, hierarchy: hierarchy || was || undefined });
   };
   node(t.iri, true);
   const relate = (sub: string, sup: unknown) => {
-    if (typeof sup === 'string') return edge(sub, sup, 'subclass of');
+    if (typeof sup === 'string') return edge(sub, sup, 'subclass of', true);
     const r = sup as Record<string, unknown> | null;
     const word = r && RESTRICTION_WORD[String(r.type)];
     const filler = r?.class ?? r?.individual;
@@ -1169,10 +1249,119 @@ export function neighbourhood(
     if (a.type === 'SubClassOf' && typeof a.subClass === 'string') relate(a.subClass, a.superClass);
   }
   const subs = t.incoming.find((i) => i.property === RDFS + 'subClassOf');
-  for (const s of (subs?.subjects ?? []).slice(0, maxChildren)) edge(s, t.iri, 'subclass of');
+  for (const s of (subs?.subjects ?? []).slice(0, maxChildren)) edge(s, t.iri, 'subclass of', true);
   const broader = t.incoming.find((i) => i.property === SKOS + 'broader');
-  for (const s of (broader?.subjects ?? []).slice(0, maxChildren)) edge(s, t.iri, 'broader');
+  for (const s of (broader?.subjects ?? []).slice(0, maxChildren)) edge(s, t.iri, 'broader', true);
   return { nodes: [...nodes.values()], edges: [...edges.values()] };
+}
+
+/**
+ * The entity's direct parents and its first children, which is what fits a narrow rail. An
+ * edge from the entity leads to a parent and an edge into it comes from a child. The edges
+ * between its neighbours, which expanding a node adds, stay out of this view.
+ */
+export function hierarchyOf(p: GraphPiece, kids = 6): GraphPiece {
+  const focus = p.nodes.find((n) => n.focus)?.id;
+  let children = 0;
+  const edges = p.edges.filter((e) => {
+    if (!e.hierarchy) return false;
+    if (e.source === focus) return true;
+    return e.target === focus && ++children <= kids;
+  });
+  const used = new Set(edges.flatMap((e) => [e.source, e.target]));
+  if (focus) used.add(focus);
+  return { nodes: p.nodes.filter((n) => used.has(n.id)), edges };
+}
+
+/** Cross-references by database, the databases in the order the references come in. */
+export function xrefsByDatabase(xrefs: Sections['xrefs']) {
+  const by = new Map<string, Sections['xrefs']>();
+  for (const x of xrefs) by.set(x.database, [...(by.get(x.database) ?? []), x]);
+  return [...by.entries()].map(([database, ids]) => ({ database, ids }));
+}
+
+/**
+ * Whether the short form beside a shown IRI says what that IRI already says: the IRI shows as a
+ * prefixed name, and its local part is the short form. An IRI in full leaves the chip its use.
+ */
+export function shortFormRepeats(shortForm: string, iri: string, shownIri: string): boolean {
+  if (shownIri === iri) return false;
+  return shownIri.slice(shownIri.indexOf(':') + 1) === shortForm;
+}
+
+/** A percent-decoded part of a reference, unchanged when decoding would not be faithful. */
+function decodedPart(s: string): string {
+  try {
+    const d = decodeURIComponent(s);
+    // an encoded slash or control character changes what the text says it is
+    return /[/\u0000-\u001f\u007f]/.test(d) ? s : d;
+  } catch {
+    return s;
+  }
+}
+
+/** A Wikipedia page's title from its name in a link, whose underscores stand for spaces. */
+const wikipediaTitle = (s: string) => decodedPart(s).replace(/_/g, ' ');
+
+const LINE_BREAK = /[\n\r\u2028\u2029]/;
+const WIKI = '/wiki/';
+
+/**
+ * A readable form of an http or https IRI: a Wikipedia title, a DOI whole, or else the fragment or
+ * last path segment. An IRI with a query or nothing after its host stays whole, since no part of
+ * it names what it points at. A value can be long, so this finds its parts by scanning.
+ */
+function readableIri(iri: string): string {
+  const start = iri.startsWith('https://') ? 8 : iri.startsWith('http://') ? 7 : -1;
+  if (start < 0) return iri;
+  const hash = iri.indexOf('#');
+  const beforeHash = hash < 0 ? iri : iri.slice(0, hash);
+  const fragment = hash < 0 ? '' : iri.slice(hash + 1);
+  const slash = beforeHash.indexOf('/', start);
+  const host = slash < 0 ? beforeHash.slice(start) : beforeHash.slice(start, slash);
+  const path = slash < 0 ? '' : beforeHash.slice(slash);
+  // a value with a line break in its fragment is no reference to name
+  if (!host || beforeHash.includes('?') || LINE_BREAK.test(fragment)) return iri;
+  if (
+    path.length > WIKI.length &&
+    path.startsWith(WIKI) &&
+    !fragment &&
+    !LINE_BREAK.test(path) &&
+    /(^|\.)wikipedia\.org$/i.test(host)
+  ) {
+    return wikipediaTitle(path.slice(WIKI.length));
+  }
+  if (!fragment && /(^|\.)doi\.org$/i.test(host) && path.length > 1) return path.slice(1);
+  if (fragment) return decodedPart(fragment);
+  const last = path.split('/').filter(Boolean).at(-1);
+  return last ? decodedPart(last) : iri;
+}
+
+/**
+ * What a cross-reference's link says: the label this dataset gives its target, or else its short
+ * id under the database's name, or for an IRI a prefixed name or `readableIri`. Only Wikipedia's
+ * names change, since its underscores are known to stand for spaces, and any other id stays exact.
+ */
+export function xrefName(
+  x: Pick<Sections['xrefs'][number], 'database' | 'id' | 'value'>,
+  label: (iri: string) => string | null | undefined,
+  prefixes: PrefixMap,
+): string {
+  // a string that only starts like an IRI is not one, and keeps its exact value
+  const iri = iriRef(x.value);
+  const known = iri && /^(https?|urn):/.test(x.value) ? label(x.value) : null;
+  if (known) return known;
+  if (iri && /^https?:/.test(x.value)) return shorten(x.value, prefixes) ?? readableIri(x.value);
+  if (x.database.toLowerCase() === 'wikipedia') return wikipediaTitle(x.id);
+  return x.id;
+}
+
+/**
+ * How many rows of a list to hide behind "and N more": all past `limit`, unless only one row
+ * would hide, which then takes the room the control would.
+ */
+export function hiddenRows(total: number, limit: number): number {
+  return total <= limit + 1 ? 0 : total - limit;
 }
 
 /** Merge `b` into `a`, keeping `a`'s focus. */
@@ -1180,7 +1369,10 @@ export function mergePieces(a: GraphPiece, b: GraphPiece): GraphPiece {
   const nodes = new Map(a.nodes.map((n) => [n.id, n]));
   for (const n of b.nodes) if (!nodes.has(n.id)) nodes.set(n.id, { ...n, focus: undefined });
   const edges = new Map(a.edges.map((e) => [e.id, e]));
-  for (const e of b.edges) edges.set(e.id, e);
+  for (const e of b.edges) {
+    const hierarchy = e.hierarchy || edges.get(e.id)?.hierarchy;
+    edges.set(e.id, hierarchy ? { ...e, hierarchy } : e);
+  }
   return { nodes: [...nodes.values()], edges: [...edges.values()] };
 }
 
@@ -1209,7 +1401,7 @@ const LICENSE_PROPS = [DCT + 'license', 'http://creativecommons.org/ns#license']
 /** The SPARQL of the headers of a graph: its ontologies and concept schemes with their annotations. */
 export function headQuery(graph: string | null): string {
   const body = `{ ?o a ?t . VALUES ?t { <${OWL}Ontology> <${SKOS}ConceptScheme> } ?o ?p ?v }`;
-  const g = graph ? `GRAPH <${graph}> ${body}` : body;
+  const g = graph ? `GRAPH ${sparqlIri(graph)} ${body}` : body;
   return `SELECT ?o ?t ?p ?v WHERE { ${g} } LIMIT 500`;
 }
 
@@ -1310,7 +1502,7 @@ export function countsQuery(graph: string | null): string {
   ].join(' ');
   const inner = `?s a ?t . VALUES ?t { ${types} }`;
   const dep = `?s a <${OWL}Class> ; <${OWL}deprecated> true .`;
-  const w = (b: string) => (graph ? `GRAPH <${graph}> { ${b} }` : b);
+  const w = (b: string) => (graph ? `GRAPH ${sparqlIri(graph)} { ${b} }` : b);
   return `SELECT ?t (COUNT(DISTINCT ?s) AS ?n) WHERE { { ${w(inner)} } UNION { ${w(dep)} BIND("deprecated" AS ?t) } } GROUP BY ?t`;
 }
 
@@ -1339,7 +1531,7 @@ export function parseCounts(rows: Row[]): { kind: string; label: string; count: 
 
 /** The SPARQL that finds where a dataset mentions `iri`: per graph, as subject or object. */
 export function reuseQuery(iri: string): string {
-  const x = `<${iri}>`;
+  const x = sparqlIri(iri);
   return `SELECT ?g (COUNT(*) AS ?n) (SAMPLE(?l) AS ?label) WHERE {
   { { ${x} ?p ?o } UNION { ?s ?p ${x} } BIND("" AS ?g) }
   UNION { GRAPH ?g { { ${x} ?p ?o } UNION { ?s ?p ${x} } } }
@@ -1380,7 +1572,7 @@ export const builtIn = (iri: string) => BUILT_IN.some((ns) => iri.startsWith(ns)
 
 /** Wrap a pattern in the page's graph, or leave it in the default graph. */
 const inGraph = (graph: string | null, body: string) =>
-  graph ? `GRAPH <${graph}> { ${body} }` : body;
+  graph ? `GRAPH ${sparqlIri(graph)} { ${body} }` : body;
 
 /**
  * A pattern over the graphs a term answer names, where `default` is the stored default
@@ -1392,7 +1584,7 @@ function overGraphs(graphs: readonly string[], body: string) {
   const parts = [
     ...(graphs.includes('default') ? [`{ GRAPH <urn:x-arq:DefaultGraph> { ${body} } }`] : []),
     ...(named.length
-      ? [`{ VALUES ?g { ${named.map((g) => `<${g}>`).join(' ')} } GRAPH ?g { ${body} } }`]
+      ? [`{ VALUES ?g { ${named.map(sparqlIri).join(' ')} } GRAPH ?g { ${body} } }`]
       : []),
   ];
   return parts.length ? parts.join(' UNION ') : `{ GRAPH <urn:x-arq:DefaultGraph> { ${body} } }`;
@@ -1412,17 +1604,76 @@ export function incomingQuery(
   offset: number,
   limit = PAGE,
 ) {
-  return `SELECT DISTINCT ?s WHERE { ${overGraphs(graphs, `?s <${property}> <${iri}> FILTER(isIRI(?s))`)} } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}`;
+  return `SELECT DISTINCT ?s WHERE { ${overGraphs(graphs, `?s ${sparqlIri(property)} ${sparqlIri(iri)} FILTER(isIRI(?s))`)} } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}`;
 }
 
 /** The SPARQL of a page of the named subjects that use the property `iri`, in IRI order. */
 export function usageQuery(iri: string, graphs: readonly string[], offset: number, limit = PAGE) {
-  return `SELECT DISTINCT ?s WHERE { ${overGraphs(graphs, `?s <${iri}> ?o FILTER(isIRI(?s))`)} } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}`;
+  return `SELECT DISTINCT ?s WHERE { ${overGraphs(graphs, `?s ${sparqlIri(iri)} ?o FILTER(isIRI(?s))`)} } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}`;
+}
+
+/** Whether a string is an absolute IRI by the IRIREF production of SPARQL. */
+function iriRef(s: string): boolean {
+  const colon = s.indexOf(':');
+  return (
+    colon > 0 &&
+    /[A-Za-z]/.test(s[0]) &&
+    !/[^A-Za-z0-9+.-]/.test(s.slice(0, colon)) &&
+    !/[<>"{}|^`\\\x00-\x20]/.test(s)
+  );
+}
+
+/**
+ * Whether a value from the data can stand as an IRI in a query as it is. The server's parser takes
+ * an IRIREF and then checks it against RFC 3987, and a value that fails fails the whole query, so
+ * this asks both. It can refuse a rare valid IRI, such as one with a bracketed host, which then
+ * only goes without a label. A value can be long, so every step here is a linear scan.
+ */
+function queryableIri(s: string): boolean {
+  if (!iriRef(s)) return false;
+  // controls, private use, surrogates and noncharacters
+  if (
+    /[\x7F-\x9F\uD800-\uDFFF\uE000-\uF8FF\uFDD0-\uFDEF\uFFF0-\uFFFF\u{E0000}-\u{E0FFF}\u{F0000}-\u{10FFFF}]/u.test(
+      s,
+    )
+  )
+    return false;
+  for (const c of s) if ((c.codePointAt(0)! & 0xfffe) === 0xfffe) return false;
+  if (/%(?![0-9A-Fa-f]{2})/.test(s) || s.includes('[') || s.includes(']')) return false;
+  // one fragment at most
+  const hash = s.indexOf('#');
+  if (hash >= 0 && s.indexOf('#', hash + 1) >= 0) return false;
+  const start = s.indexOf(':') + 1;
+  if (!s.startsWith('//', start)) return true;
+  // the authority: one user info at most, a host and a port of digits
+  const tail = s.slice(start + 2);
+  const end = tail.search(/[/?#]/);
+  const authority = end < 0 ? tail : tail.slice(0, end);
+  const at = authority.indexOf('@');
+  if (at !== authority.lastIndexOf('@')) return false;
+  const host = authority.slice(at + 1);
+  const port = host.indexOf(':');
+  return port < 0 || !/[^0-9]/.test(host.slice(port + 1));
+}
+
+/**
+ * Which of `values`, IRIs or cross-references that are only strings, a page should read labels
+ * for: each valid http, https or urn IRI once that `names` does not name.
+ */
+export function labelsWanted(
+  values: readonly string[],
+  names: Record<string, { label?: string | null } | undefined>,
+): string[] {
+  return [
+    ...new Set(
+      values.filter((i) => /^(https?|urn):/.test(i) && queryableIri(i) && !names[i]?.label),
+    ),
+  ];
 }
 
 /** The SPARQL of the definitions and labels of some IRIs, for lists such as the top classes. */
 export function definitionsQuery(iris: readonly string[], graph: string | null) {
-  const values = iris.map((i) => `<${i}>`).join(' ');
+  const values = iris.filter(queryableIri).map(sparqlIri).join(' ');
   const props = [...DEFINITION_PROPS, RDFS + 'comment'].map((p) => `<${p}>`).join('|');
   return `SELECT ?s ?d WHERE { VALUES ?s { ${values} } ${inGraph(graph, `?s ${props} ?d`)} }`;
 }
@@ -1436,7 +1687,7 @@ export function namesQuery(
   graph: string | null,
   over?: readonly string[],
 ) {
-  const values = iris.map((i) => `<${i}>`).join(' ');
+  const values = iris.filter(queryableIri).map(sparqlIri).join(' ');
   const props = [RDFS + 'label', SKOS + 'prefLabel'].map((p) => `<${p}>`).join('|');
   const body = `?s ${props} ?d`;
   // `over` is the graphs a term answer read, imports included, which a name may be in. A
@@ -1446,7 +1697,7 @@ export function namesQuery(
     ? [
         ...(over.includes('default') ? [`{ ${body} }`] : []),
         ...(named.length
-          ? [`{ VALUES ?g { ${named.map((g) => `<${g}>`).join(' ')} } GRAPH ?g { ${body} } }`]
+          ? [`{ VALUES ?g { ${named.map(sparqlIri).join(' ')} } GRAPH ?g { ${body} } }`]
           : []),
       ].join(' UNION ')
     : inGraph(graph, body);

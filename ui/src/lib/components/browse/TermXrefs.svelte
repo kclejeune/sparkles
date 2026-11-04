@@ -1,57 +1,47 @@
 <script lang="ts">
-  // Cross-references: `oboInOwl:hasDbXref` by database, with the well-known databases as
-  // links, then `rdfs:seeAlso` and `rdfs:isDefinedBy`, and the five SKOS mapping relations.
+  // The links of an entity that are not identifiers: `rdfs:seeAlso` and `rdfs:isDefinedBy`,
+  // and the five SKOS mapping relations. TermIdentifiers shows the `oboInOwl:hasDbXref` ones.
   import { valueText, isLiteral, type Linker, type Sections } from '$lib/browse';
+  import { literalDatatype } from '$lib/ontology';
+  import { WELL_KNOWN, type PrefixMap } from '$lib/rdf';
+  import DatatypeChip from './DatatypeChip.svelte';
 
   let {
-    xrefs,
     seeAlso,
     mappings,
     linker,
+    prefixes = WELL_KNOWN,
   }: {
-    xrefs: Sections['xrefs'];
     seeAlso: Sections['seeAlso'];
     mappings: Sections['mappings'];
     linker: Linker;
+    prefixes?: PrefixMap;
   } = $props();
   const external = (v: string) => /^https?:\/\//.test(v);
 </script>
 
-{#if xrefs.length || seeAlso.length}
-  <section class="term-sec" aria-labelledby="xref-h">
-    <h2 id="xref-h">Cross-references</h2>
-    {#if xrefs.length}
-      <div class="term-flow xrefs">
-        {#each xrefs as x (x.value)}
-          {#if x.href}
-            <a href={x.href} rel="noopener noreferrer" target="_blank"
-              >{#if x.database}<span class="db">{x.database}:</span>{/if}{x.id}</a
+{#if seeAlso.length}
+  <section class="term-sec" aria-labelledby="also-h">
+    <h2 id="also-h">See also</h2>
+    <ul class="term-links">
+      {#each seeAlso as s, i (i)}
+        {@const v = valueText(s.value)}
+        <li>
+          {#if !isLiteral(s.value) && linker.href(v) && !external(v)}
+            <a href={linker.href(v)}>{linker.name(v)}</a>
+          {:else if external(v)}
+            <a
+              class:lexical={!!literalDatatype(s.value)}
+              href={v}
+              rel="noopener noreferrer"
+              target="_blank">{v}</a
             >
           {:else}
-            <span
-              >{#if x.database}<span class="db">{x.database}:</span>{/if}{x.id}</span
-            >
-          {/if}
-        {/each}
-      </div>
-    {/if}
-    {#if seeAlso.length}
-      <h3>See also</h3>
-      <ul class="term-links">
-        {#each seeAlso as s, i (i)}
-          {@const v = valueText(s.value)}
-          <li>
-            {#if !isLiteral(s.value) && linker.href(v) && !external(v)}
-              <a href={linker.href(v)}>{linker.name(v)}</a>
-            {:else if external(v)}
-              <a href={v} rel="noopener noreferrer" target="_blank">{v}</a>
-            {:else}
-              <span>{v}</span>
-            {/if}
-          </li>
-        {/each}
-      </ul>
-    {/if}
+            <span class:lexical={!!literalDatatype(s.value)}>{v}</span>
+          {/if}<DatatypeChip iri={literalDatatype(s.value)} {prefixes} />
+        </li>
+      {/each}
+    </ul>
   </section>
 {/if}
 {#if mappings.length}
@@ -65,12 +55,3 @@
     {/each}
   </section>
 {/if}
-
-<style>
-  .db {
-    color: var(--text-3);
-  }
-  .xrefs a {
-    color: var(--iri);
-  }
-</style>

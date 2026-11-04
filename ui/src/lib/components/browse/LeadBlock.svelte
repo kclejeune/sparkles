@@ -1,16 +1,18 @@
 <script lang="ts">
-  // The lead of an entity's Definition card (ROADMAP item 633): every definition,
-  // description, comment and scope note, under a small heading per kind as the Notes under
-  // it have, without their quote bar. The Definition's text is a step larger. In each kind
-  // the first few values in the reader's languages show and the rest fold behind "N more",
-  // and the translations fold behind "In N other languages". A value in another language
-  // than the reader's best names it.
+  // The top of an entity's page: one text, the first definition or else the first description,
+  // comment or note, at a larger size. Under it one quiet disclosure for each kind of the other
+  // texts, its lead's translations, more definitions, descriptions, comments and notes, on one
+  // wrapping row with what each opens below the row. Every value ends with a chip of the property
+  // that states it, and the kind a chip does not spell out stays for a screen reader. A value in
+  // another language than the reader's best names it.
   import {
     langRank,
     languageCount,
-    LEAD_SHOWN,
+    leadDisclosures,
+    leadRest,
     type Lead,
     type Linker,
+    type Sections,
     type Sourced,
   } from '$lib/browse';
   import type { PrefixMap } from '$lib/rdf';
@@ -19,95 +21,143 @@
 
   let {
     lead,
+    notes = [],
     linker,
     langs,
     curieIri,
     prefixes,
     predicateHref,
+    open = false,
   }: {
     lead: Lead;
+    /** The notes, which wait behind their own disclosure. */
+    notes?: Sections['notes'];
     linker: Linker;
     langs: readonly string[];
     curieIri?: (curie: string) => string | null;
     prefixes: PrefixMap;
-    /** The page of a predicate the headings name, when it has one. */
+    /** The page of a predicate a text names, when it has one. */
     predicateHref?: (iri: string) => string | null;
+    /** The other texts start open, as they do in edit mode. */
+    open?: boolean;
   } = $props();
 
   const foreign = (v: Sourced) => !!v.lang && langRank(v.lang, langs) > 0;
+  const first = $derived(lead.groups[0]);
+  const more = $derived(leadDisclosures(leadRest(lead, notes, langs), first?.kind ?? ''));
 </script>
 
-{#snippet entry(v: Sourced, cls: string)}<p class={cls}>
-    <SourcedValue {v} {linker} {curieIri} showLang={foreign(v)} />
-  </p>{/snippet}
+<!-- the no-break space keeps a chip with the last word of its text, so that it never sits alone -->
+{#snippet value(v: Sourced, kind: string | null, predicates: string[])}
+  {#if kind}<span class="sr-only">{kind}: </span>{/if}<SourcedValue
+    {v}
+    {linker}
+    {curieIri}
+    {prefixes}
+    showLang={foreign(v)}
+  />&nbsp;<PredicateName {predicates} {prefixes} href={predicateHref} />
+{/snippet}
 
-{#if lead.groups.length}
+{#if first || more.length}
   <div class="lead">
-    {#each lead.groups as g, gi (g.predicates.join(' '))}
-      {@const cls = g.kind === 'Definition' ? 'entry big' : 'entry'}
-      <div class="group" role="group" aria-labelledby="lead-h-{gi}" data-kind={g.kind}>
-        <h3 id="lead-h-{gi}">
-          {g.kind}<PredicateName predicates={g.predicates} {prefixes} href={predicateHref} />
-        </h3>
-        {#each g.values.slice(0, LEAD_SHOWN) as v, i (i)}{@render entry(
-            v,
-            gi === 0 && i === 0 ? `${cls} lede` : cls,
-          )}{/each}
-        {#if g.values.length > LEAD_SHOWN}
-          <details class="fold">
-            <summary>{g.values.length - LEAD_SHOWN} more</summary>
-            {#each g.values.slice(LEAD_SHOWN) as v, i (i)}{@render entry(v, cls)}{/each}
-          </details>
-        {/if}
-        {#if g.translations.length}
-          {@const n = languageCount(g.translations)}
-          <details class="fold">
+    {#if first?.values.length}
+      <p class="lede">
+        {@render value(
+          first.values[0],
+          first.kind === 'Definition' ? null : first.kind,
+          first.predicates,
+        )}
+      </p>
+    {/if}
+    {#if first?.translations.length || more.length}
+      <div class="more">
+        {#if first?.translations.length}
+          {@const n = languageCount(first.translations)}
+          <details data-more="translations" {open}>
             <summary>In {n} other {n === 1 ? 'language' : 'languages'}</summary>
-            {#each g.translations as v, i (i)}{@render entry(v, cls)}{/each}
+            <ul>
+              {#each first.translations as v, i (i)}
+                <li>{@render value(v, null, first.predicates)}</li>
+              {/each}
+            </ul>
           </details>
         {/if}
+        {#each more as d (d.word)}
+          <details data-more={d.word} {open}>
+            <summary>{d.label}</summary>
+            <ul>
+              {#each d.rows as g (JSON.stringify([g.kind, g.predicates]))}
+                {#each g.values as v, i (i)}
+                  <li data-kind={g.kind}>
+                    {@render value(v, d.word === 'note' ? g.kind : null, g.predicates)}
+                  </li>
+                {/each}
+              {/each}
+            </ul>
+          </details>
+        {/each}
       </div>
-    {/each}
+    {/if}
   </div>
 {/if}
 
 <style>
-  /* the kinds stand apart by twice the gap that splits a kind's own values */
   .lead {
-    display: grid;
-    gap: var(--sp-4);
-    min-width: 0;
-  }
-  .group {
     display: grid;
     gap: var(--sp-2);
     min-width: 0;
   }
-  h3 {
+  .lede {
     margin: 0;
-    font-size: var(--fs-sm);
-    font-weight: 600;
-    color: var(--text-2);
-  }
-  .entry {
-    margin: 0;
-    font-size: var(--fs-md);
+    font-size: 16px;
     line-height: 1.55;
+    max-width: 75ch;
   }
-  .entry.big {
-    font-size: 15px;
-    line-height: 1.6;
+  /* The disclosures stack in a browser that cannot split one, and otherwise their summaries share
+     a wrapping row and stay in place while what they open falls below the row. */
+  .more {
+    display: flex;
+    flex-wrap: wrap;
+    column-gap: var(--sp-4);
+    min-width: 0;
   }
-  .fold summary {
+  .more details {
+    flex: 0 0 100%;
+    min-width: 0;
+  }
+  @supports selector(::details-content) {
+    .more details {
+      display: contents;
+    }
+    .more summary {
+      order: 0;
+    }
+    .more details::details-content {
+      order: 1;
+      flex: 0 0 100%;
+      min-width: 0;
+    }
+  }
+  summary {
     cursor: pointer;
     color: var(--text-2);
     font-size: var(--fs-sm);
     font-weight: 500;
   }
-  .fold[open] summary {
-    margin-bottom: var(--sp-2);
+  summary::marker {
+    color: var(--text-3);
   }
-  .fold .entry + .entry {
-    margin-top: var(--sp-2);
+  ul {
+    list-style: none;
+    margin: var(--sp-2) 0 var(--sp-1);
+    padding: 0;
+    display: grid;
+    gap: var(--sp-1);
+  }
+  li {
+    font-size: var(--fs-md);
+    line-height: 1.5;
+    max-width: 75ch;
+    min-width: 0;
   }
 </style>

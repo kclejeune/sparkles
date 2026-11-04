@@ -4,6 +4,9 @@
   // the rows, so another page can show the same box with rows of its own.
   import type { Snippet } from 'svelte';
   import { isLiteral, valueText, type InfoRow, type Linker } from '$lib/browse';
+  import { literalDatatype } from '$lib/ontology';
+  import { WELL_KNOWN, type PrefixMap } from '$lib/rdf';
+  import DatatypeChip from './DatatypeChip.svelte';
 
   let {
     rows,
@@ -11,6 +14,7 @@
     footer,
     heading,
     limit = 6,
+    prefixes = WELL_KNOWN,
   }: {
     rows: InfoRow[];
     linker: Linker;
@@ -18,6 +22,7 @@
     limit?: number;
     /** A panel heading, such as "Metadata" on a term page's card. */
     heading?: string;
+    prefixes?: PrefixMap;
   } = $props();
   let open = $state<Record<string, boolean>>({});
 </script>
@@ -34,7 +39,9 @@
           {#if r.badge}<span class="badge {r.badge}">{r.text}</span>{:else if r.text}{r.text}{/if}
           {#each all ? vs : vs.slice(0, limit) as v, i (i)}{#if i > 0 || r.text},{' '}{/if}{#if !isLiteral(v) && linker.href(v)}<a
                 href={linker.href(v)}>{linker.name(v)}</a
-              >{:else if !isLiteral(v)}{linker.name(v)}{:else}{valueText(v)}{/if}{/each}
+              >{:else if !isLiteral(v)}{linker.name(v)}{:else}<span
+                class:lexical={!!literalDatatype(v)}>{valueText(v)}</span
+              ><DatatypeChip iri={literalDatatype(v)} {prefixes} />{/if}{/each}
           {#if !all}
             <button class="more-btn" type="button" onclick={() => (open[r.label] = true)}
               >and {vs.length - limit} more</button

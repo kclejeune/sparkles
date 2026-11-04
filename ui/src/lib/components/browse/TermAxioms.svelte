@@ -5,6 +5,7 @@
   // functional-style syntax, and a copy of the whole frame as Manchester text. A class also
   // shows what the dataset's kept classification infers of it and no axiom asserts. A class
   // with neither asserted nor inferred axioms shows no card.
+  import DatatypeChip from './DatatypeChip.svelte';
   import {
     classifiedHere,
     classifyAbout,
@@ -133,15 +134,16 @@
           class="builtin"
           title={t.iri}>{linker.name(t.iri)}</span
         >{/if}{:else if t.role === 'kw'}<span class="kw">{t.text}</span
-      >{:else if t.role === 'lit'}<span class="lit">{t.text}</span
-      >{:else}{t.text}{/if}{/each}{/snippet}
+      >{:else if t.role === 'lit'}<span class="lit" class:lexical={!!t.datatype}
+        >{t.value ?? t.text}</span
+      ><DatatypeChip iri={t.datatype ?? null} {prefixes} />{:else}{t.text}{/if}{/each}{/snippet}
 
 {#snippet name(i: string)}{#if linker.href(i)}<a href={linker.href(i)} title={i}>{nameOf(i)}</a
     >{:else}<span class="builtin" title={i}>{nameOf(i)}</span>{/if}{/snippet}
 
 {#if shown}
-  <section class="panel b-ax" aria-labelledby="axioms-h">
-    <div class="panel-head">
+  <section class="b-ax" aria-labelledby="axioms-h">
+    <div class="term-head-row">
       <h2 id="axioms-h">Axioms</h2>
       <span class="spacer"></span>
       {#if !editor && frame.sections.length}
@@ -153,7 +155,7 @@
         >
       {/if}
     </div>
-    <div class="panel-body">
+    <div class="ax-body">
       {#if editor}
         {@render editor()}
       {:else}
@@ -244,7 +246,7 @@
   .b-ax {
     min-width: 0;
   }
-  .b-ax > .panel-body {
+  .ax-body {
     container-type: inline-size;
   }
   .frame {
@@ -252,7 +254,7 @@
     gap: var(--sp-3);
     margin: 0;
   }
-  /* the keyword beside its items, and above them in a narrow card */
+  /* the keyword beside its items, and above them in a narrow column */
   .clause {
     display: grid;
     grid-template-columns: minmax(0, 1fr);

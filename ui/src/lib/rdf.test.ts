@@ -98,6 +98,13 @@ describe('shorten / localName / sparqlIri', () => {
 
   it('percent-encodes characters that cannot appear in an IRIREF', () => {
     expect(sparqlIri('http://ex.org/a b>')).toBe('<http://ex.org/a%20b%3E>');
+    expect(sparqlIri('http://ex.org/a\nb\u0001c')).toBe('<http://ex.org/a%0Ab%01c>');
+  });
+
+  it('keeps white space that an IRIREF allows, since encoding it names another IRI', () => {
+    for (const c of ['\u00a0', '\u2003', '\u3000', '\ufeff', '\u2028']) {
+      expect(sparqlIri(`http://ex.org/a${c}b`)).toBe(`<http://ex.org/a${c}b>`);
+    }
   });
 });
 

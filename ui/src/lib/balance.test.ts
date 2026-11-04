@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { pickMove } from './balance';
+import { pickMove, stickTop } from './balance';
 
 const card = (height: number, inMain = true, locked = false) => ({ height, inMain, locked });
 
@@ -24,5 +24,18 @@ describe('pickMove', () => {
   it('counts the gap between cards', () => {
     expect(pickMove(1000, 700, [card(100)], 16, 64)).toBe(0);
     expect(pickMove(1000, 900, [card(100)], 16, 64)).toBe(-1);
+  });
+});
+
+describe('stickTop', () => {
+  it('is the gutter for a column that fits in the box', () => {
+    expect(stickTop(24, 900, 400)).toBe(24);
+    // exactly a gutter of room above and below
+    expect(stickTop(24, 900, 852)).toBe(24);
+  });
+  it('holds a taller column by its bottom edge, a gutter above the box bottom', () => {
+    expect(stickTop(24, 900, 860)).toBe(16);
+    expect(stickTop(24, 900, 1500)).toBe(-624);
+    expect(stickTop(16, 844, 2000)).toBe(-1172);
   });
 });

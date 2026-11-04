@@ -510,6 +510,23 @@ cards balance their heights. The Axioms card shows inferences only
 after a **Classify** click, since no read-only route says whether a kept classification
 exists, which item 726 adds.
 
+Item 734 reworked the term page's layout without a server change. A right rail of cards holds
+Metadata, with the cross-references as Identifiers by database and Download as the card's last
+part, and then Hierarchy, which keeps its place across Tree and Graph and no longer moves between
+the columns. Its Graph shows the parents and first children at the rail's width and Expand opens
+the whole neighbourhood in a dialog. The rail sticks even when it is taller than the window. The
+main column has no cards and no Definition heading. One text leads under the counts, and the other
+definitions, descriptions, comments and notes wait behind one disclosure per kind on a wrapping
+row, with a chip of the property at the end of every value. `schema:description` joined the
+properties that can lead. Logical definition, Synonyms, Labels, Axioms, See also, Mappings, What
+links here and In other datasets are sections on the page background with headings of one size,
+and Replaces stays a smaller group within What links here. In other datasets waits for the
+dataset list and for its answers, and a server with no other dataset has no such section. Counts of
+zero are hidden, a term with no text shows no line about it, and a concept's labels are rows by
+kind in place of a table, with hidden labels behind their toggle. Identifiers say the best name the
+page already has for them, and keep the exact value as their title. Typed literals show their exact value with a datatype chip,
+and copied Manchester text keeps its syntax. A phone puts Metadata and Hierarchy before Axioms.
+
 **Remaining work.** Inferred axioms and hierarchies beyond the card's click are items 622 and
 726, search at a past state item 658, rendering preferences item 625, metrics item 621
 and other servers' term pages item 461.
