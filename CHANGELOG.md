@@ -418,14 +418,18 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
-The web UI's Browse term page has a right rail (roadmap item 734). The rail holds Metadata, with
-the cross-references as Identifiers by database above the downloads, and then Hierarchy, whose
-place no longer changes between Tree and Graph. The graph in the rail shows the parents and
-first children, and **Expand** opens the whole neighbourhood in a dialog. References is the
-main column's one card for See also, the mappings, What links here, Replaces and In other
-datasets, under stronger sub-headings, and no card moves between the columns any more. The
-counts under the title are one line of text links, and a rail taller than the window sticks by
-its bottom edge.
+The web UI's Browse term page has a new layout (roadmap item 734). A right rail of cards holds
+Metadata, with the cross-references as Identifiers by database above the downloads, and then
+Hierarchy, whose place no longer changes between Tree and Graph. The graph in the rail shows the
+parents and first children, and **Expand** opens the whole neighbourhood in a dialog. A rail taller
+than the window sticks by its bottom edge. The main column has lost its cards and its Definition
+heading. One text leads under the counts, and the other definitions, descriptions, comments and
+notes wait behind one disclosure per kind, with the property as a chip at the end of each value.
+A `schema:description` can now lead the page. Axioms and References are headed sections on the
+page background, and References joins See also, the mappings, What links here, Replaces and In
+other datasets. The counts under the title are one line of text links that leave out zeros, a term
+with no text no longer says so, a concept's labels are rows by kind in place of a table, and a phone
+shows Metadata and Hierarchy before Axioms.
 
 Release builds compile `sparkles-owl` as one codegen unit, and each rule set of the EL
 classifier's saturation has a worker that inlines its own activation (roadmap items 711

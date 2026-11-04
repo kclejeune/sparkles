@@ -272,7 +272,7 @@ editor and browser and the app shell. The collapsed panel below it has more work
     <td colspan="2" align="center">A DL query in Manchester syntax, labelled with the reasoning that answered it</td>
   </tr>
   <tr>
-    <td><img src="docs/images/browse-term.png" alt="The ontology browser's page of mitochondrion, with a row of counts under its title, its definition and comment each under the predicate that states it, its exact and related synonyms, its axioms as Manchester prose with part of some cytoplasm linked, its hierarchy, and cards for its metadata, references and downloads"></td>
+    <td><img src="docs/images/browse-term.png" alt="The ontology browser's page of mitochondrion, with a line of counts under its title, one text that leads with its property as a chip, disclosures for its other texts, and a rail of cards with its metadata and hierarchy"></td>
     <td><img src="docs/images/browse-landing.png" alt="The landing page of a cell organelle ontology in the ontology browser, with its title, version and description, a search across the content that lists the classes matching mitoch, the top classes with their definitions and child counts, and the counts of classes and properties"></td>
   </tr>
   <tr>
