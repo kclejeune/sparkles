@@ -77,7 +77,7 @@
     turn.global?.reports.find((r) => r.iri === iri)?.title ?? iri;
   /** The graph of a CONSTRUCT or DESCRIBE result. */
   const tripleGraph = $derived(
-    res?.triples?.length ? triplesToGraph(res.triples, prefixes, { maxNodes: 120 }) : null,
+    res?.triples ? triplesToGraph(res.triples, prefixes, { maxNodes: 120 }) : null,
   );
 
   const graph = $derived.by(() => {
@@ -296,6 +296,9 @@
                 {#if rerunNote}<p class="small faint">{rerunNote}</p>{/if}
               {:else if res?.boolean != null}
                 <p>{res.boolean ? 'Yes' : 'No'}</p>
+              {:else if tripleGraph && !res?.triples?.length}
+                <p class="small faint">The query ran and made no triples.</p>
+                {#if rerunNote}<p class="small faint">{rerunNote}</p>{/if}
               {:else if tripleGraph}
                 <div class="graph-box">
                   <GraphView

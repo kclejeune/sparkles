@@ -25,6 +25,7 @@ import {
   turnFromRecord,
   turnKey,
   type AskContextChip,
+  type AskTarget,
   type Thread,
   type ThreadSummary,
   type ThreadTurn,
@@ -55,7 +56,7 @@ export interface AskSink {
 
 /** One thread per principal and dataset, so that a sign-in never shows another's. */
 const STORE_KEY = (principal: string | null, ds: string) =>
-  `sparkles.askThread.${encodeURIComponent(principal ?? '')}.${ds}`;
+  `sparkles.askThread:${JSON.stringify([principal ?? '', ds])}`;
 
 function loadSession(principal: string | null, ds: string): Thread | null {
   try {
@@ -100,6 +101,8 @@ class AskThreadState {
   thread = $state<Thread>({ turns: [] });
   /** What the page on screen lends, and whether its chip was removed. */
   pageContext = $state<AskContextChip | null>(null);
+  /** The branch and state of the page on screen, with or without a chip. */
+  pageTarget = $state<AskTarget | null>(null);
   chipRemoved = $state(false);
   /** The field's text, shared by the drawer and the page. */
   draft = $state('');
@@ -114,6 +117,11 @@ class AskThreadState {
   /** The principal whose preferences apply. */
   #principal: string | null | undefined = undefined;
   #controller: AbortController | null = null;
+  /**
+   * Which person and dataset the state belongs to: a response that comes back after
+   * either changed is dropped, so that one person's answers never land in another's.
+   */
+  #gen = 0;
   #sink: AskSink | null = null;
   /** Where the focus was before the drawer opened. */
   #returnFocus: HTMLElement | null = null;
@@ -146,6 +154,7 @@ class AskThreadState {
     }
     if (ds === this.ds && !someoneElse) return;
     // another dataset, or another person: nothing of the last one stays on screen
+    this.#gen++;
     this.stop();
     this.ds = ds;
     this.status = null;
@@ -154,11 +163,12 @@ class AskThreadState {
     this.draft = '';
     this.thread = (ds && loadSession(principal ?? null, ds)) || { turns: [] };
     if (!ds) return;
+    const gen = this.#gen;
     try {
       const s = await askApi.assistantSettings(ds);
-      if (this.ds === ds) this.status = s?.status ?? null;
+      if (gen === this.#gen) this.status = s?.status ?? null;
     } catch {
-      if (this.ds === ds) this.status = null;
+      if (gen === this.#gen) this.status = null;
     }
   }
 
@@ -249,7 +259,7 @@ class AskThreadState {
     // Query page cannot read asks nothing
     const extras: Partial<askApi.AskRequest> | null = this.#sink
       ? this.#sink.extras()
-      : pageTarget(o.retry ? o.retry.chip : this.pageContext);
+      : targetBody(o.retry ? { branch: o.retry.branch, at: o.retry.readAt } : this.pageTarget);
     if (!extras) return;
     this.stop();
     const chip = o.retry ? o.retry.chip : (this.chip ?? undefined);
@@ -268,6 +278,7 @@ class AskThreadState {
       trail: [],
       at: new Date().toISOString(),
       ...(extras.branch ? { branch: extras.branch } : {}),
+      ...(extras.at && !this.#sink ? { readAt: extras.at } : {}),
     };
     if (o.retry) {
       const i = this.thread.turns.indexOf(o.retry);
@@ -292,12 +303,13 @@ class AskThreadState {
       ...(o.tryHarder ? { tryHarder: o.tryHarder } : {}),
     };
     let error: unknown;
+    const gen = this.#gen;
     try {
       await askApi.askStream(
         ds,
         body,
         (e) => {
-          if (this.ds !== ds) return;
+          if (gen !== this.#gen) return;
           reduceTurn(t, e, { run, summary });
           if (e.event === 'usage' && e.data.threadId && !this.thread.id)
             this.thread.id = e.data.threadId;
@@ -318,8 +330,10 @@ class AskThreadState {
       if (t.status === 'running') t.status = t.failure ? 'failed' : 'done';
       t.step = undefined;
       sink?.end(error);
-      this.#persist();
-      if (this.status?.historyDays) void this.loadHistory();
+      if (gen === this.#gen) {
+        this.#persist();
+        if (this.status?.historyDays) void this.loadHistory();
+      }
     }
   }
 
@@ -330,14 +344,15 @@ class AskThreadState {
       this.history = null;
       return;
     }
+    const gen = this.#gen;
     try {
       const list = await askApi.askHistory(ds, undefined, { limit: 500 });
-      if (this.ds === ds) {
+      if (gen === this.#gen) {
         this.history = threadsFromRecords(list);
         this.historyError = null;
       }
     } catch (e) {
-      if (this.ds === ds) this.historyError = api.errorMessage(e);
+      if (gen === this.#gen) this.historyError = api.errorMessage(e);
     }
   }
 
@@ -346,8 +361,9 @@ class AskThreadState {
     const ds = this.ds;
     if (!ds) return;
     this.stop();
+    const gen = this.#gen;
     const list = await askApi.askHistory(ds, undefined, { thread: id, limit: 1000 });
-    if (this.ds !== ds) return;
+    if (gen !== this.#gen) return;
     this.thread = { id, turns: list.map(turnFromRecord) };
     this.chipRemoved = true;
     this.#persist();
@@ -413,11 +429,23 @@ function failureOf(err: api.ApiError | null, e: unknown): string {
 }
 
 /** The branch and state a page reads, which an ask from it reads too. */
-function pageTarget(c: AskContextChip | null | undefined): Partial<askApi.AskRequest> {
+function targetBody(c: AskTarget | null | undefined): Partial<askApi.AskRequest> {
   return {
     ...(c?.branch && c.branch !== MAIN ? { branch: c.branch } : {}),
     ...(c?.at ? { at: c.at } : {}),
   };
+}
+
+/** Lends the branch and state the page reads to questions asked while it is mounted. */
+export function useAskTarget(target: () => AskTarget) {
+  $effect(() => {
+    const t = target();
+    const prev = askThread.pageTarget;
+    if (!prev || prev.branch !== t.branch || prev.at !== t.at) askThread.pageTarget = t;
+  });
+  onMount(() => () => {
+    askThread.pageTarget = null;
+  });
 }
 
 export const askThread = new AskThreadState();

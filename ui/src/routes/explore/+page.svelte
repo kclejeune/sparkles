@@ -42,7 +42,7 @@
   import { selectionQuery, setQuery, VALUES_CAP, type Brush } from '$lib/facets';
   import type { FacetSetSpec } from '$lib/api';
   import { selection } from '$lib/selection.svelte';
-  import { useAskContext } from '$lib/ask-thread.svelte';
+  import { useAskContext, useAskTarget } from '$lib/ask-thread.svelte';
   import Icon from '$components/Icon.svelte';
   import SchemaDiffDialog from '$components/SchemaDiffDialog.svelte';
   import ShapesDraftDialog from '$components/ShapesDraftDialog.svelte';
@@ -119,11 +119,10 @@
       iri: n.iri,
       label: n.label ?? shortLabel(n.iri, prefixes),
       type: 'resource',
-      // the branch and the state the resource is read at
-      branch: overviewBranch,
-      ...(timeActive && exAt ? { at: exAt } : {}),
     };
   });
+  // the branch and the state the page reads
+  useAskTarget(() => ({ branch: overviewBranch, at: timeActive && exAt ? exAt : null }));
 
   type Tab = 'graph' | 'schema' | 'search';
   const urlTab = page.url.searchParams.get('tab');

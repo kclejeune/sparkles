@@ -6,7 +6,7 @@
   // entity and never the whole ontology. The landing page reads the header and counts by
   // SPARQL and the roots from the hierarchy route. The components come from
   // lib/components/browse, and this page only lays them out.
-  import { useAskContext } from '$lib/ask-thread.svelte';
+  import { useAskContext, useAskTarget } from '$lib/ask-thread.svelte';
   import { chipTypeOf } from '$lib/ask-thread';
   import { beforeNavigate, goto } from '$app/navigation';
   import { base } from '$app/paths';
@@ -308,11 +308,10 @@
           iri: term.iri,
           label: title,
           type: chipTypeOf(term.kinds),
-          branch,
-          ...(at ? { at } : {}),
         }
       : null,
   );
+  useAskTarget(() => ({ branch, at }));
   const isSkos = $derived(
     !!term?.kinds.some((k) => k === 'concept' || k === 'conceptScheme' || k === 'collection'),
   );

@@ -6,7 +6,7 @@
   // naming the commit the page shows. The session's undo stack undoes the editor's commits
   // by reverting them, which restores exactly the triples each commit changed, and the
   // change feed refreshes the views when a commit lands.
-  import { useAskContext } from '$lib/ask-thread.svelte';
+  import { useAskContext, useAskTarget } from '$lib/ask-thread.svelte';
   import { shortLabel } from '$lib/graph';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
@@ -113,10 +113,10 @@
           iri: selected,
           label: shortLabel(selected, prefixes),
           type: 'resource',
-          branch,
         }
       : null,
   );
+  useAskTarget(() => ({ branch }));
 
   function withParams(over: Record<string, string | null>) {
     const p = new URLSearchParams(page.url.searchParams);

@@ -60,7 +60,54 @@ describe('the live thread', () => {
     const keys = Object.keys(
       Object.fromEntries((sessionStorage as unknown as MemoryStorage).entries()),
     );
-    expect(keys).toEqual(['sparkles.askThread.alice.org']);
+    expect(keys).toEqual(['sparkles.askThread:["alice","org"]']);
+  });
+
+  it('keeps names with dots apart', async () => {
+    await askThread.setDataset('org', 'alice.team');
+    askThread.newThread();
+    askThread.thread = { id: 't1', turns: [turn()] };
+    askThread.newThread();
+    await askThread.setDataset('team.org', 'alice');
+    const keys = (sessionStorage as unknown as MemoryStorage).entries().map(([k]) => k);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(keys).toContain('sparkles.askThread:["alice.team","org"]');
+  });
+
+  it('drops a response that comes back after another person signs in', async () => {
+    await askThread.setDataset('org', 'alice');
+    let release: (v: askApi.AskRecord[]) => void = () => {};
+    vi.spyOn(askApi, 'askHistory').mockReturnValueOnce(
+      new Promise<askApi.AskRecord[]>((r) => (release = r)),
+    );
+    const pending = askThread.reopen('t1');
+    await askThread.setDataset('org', 'bob');
+    release([
+      {
+        id: 't1',
+        thread: 't1',
+        principal: 'alice',
+        at: '2026-11-03T10:00:00Z',
+        question: "Alice's question",
+        query: 'SELECT * {}',
+        result: 'answered',
+        outcome: 'none',
+      } as askApi.AskRecord,
+    ]);
+    await pending;
+    expect(askThread.thread.turns).toEqual([]);
+  });
+
+  it("asks on the page's branch and state without a chosen resource", async () => {
+    await askThread.setDataset('org', 'alice');
+    askThread.newThread();
+    askThread.pageContext = null;
+    askThread.pageTarget = { branch: 'dev', at: 'commit:3' };
+    const stream = vi.spyOn(askApi, 'askStream').mockResolvedValue(undefined as never);
+    await askThread.ask('What is here?');
+    expect(stream.mock.calls[0][1]).toMatchObject({ branch: 'dev', at: 'commit:3' });
+    expect(askThread.thread.turns[0]).toMatchObject({ branch: 'dev', readAt: 'commit:3' });
+    askThread.pageTarget = null;
   });
 
   it('reruns on the branch the turn read, and falls back only when the state is gone', async () => {

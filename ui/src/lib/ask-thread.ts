@@ -21,11 +21,8 @@ import { askFailure, MAX_TURNS, nextStep, type Turn } from './ask';
 import { fmtInt } from './format';
 
 /** What a page lends the questions asked from it, shown as a removable chip. */
-/**
- * What a page lends a question: the resource or query it shows, and the branch and state
- * (`at`) it reads, which the question reads too.
- */
-export type AskContextChip = { branch?: string | null; at?: string | null } & (
+/** What a page lends a question: the resource or query it shows. */
+export type AskContextChip =
   | {
       kind: 'entity';
       iri: string;
@@ -34,8 +31,10 @@ export type AskContextChip = { branch?: string | null; at?: string | null } & (
       type?: 'class' | 'property' | 'individual' | 'concept' | 'resource';
     }
   | { kind: 'query'; label: string; question?: string; query: string }
-  | { kind: 'commit'; label: string; commit: number }
-);
+  | { kind: 'commit'; label: string; commit: number };
+
+/** The branch and the state (`at`) a page reads, which a question asked on it reads too. */
+export type AskTarget = { branch?: string | null; at?: string | null };
 
 /** One step of the work as it lands, for the rail of a running turn. */
 export type TrailStep = { key: string; name: string; detail: string; ok: boolean };
@@ -51,6 +50,8 @@ export type ThreadTurn = {
   chip?: AskContextChip;
   /** The branch the turn read, when it was not main. */
   branch?: string;
+  /** The state a page pinned the turn to (`at`), for asking it again. */
+  readAt?: string;
   status: TurnStatus;
   /** The step the server is on while the turn runs. */
   step?: string;
