@@ -131,6 +131,20 @@ fn sample(text: &str, series: &str) -> Option<f64> {
         .map(|v| v.parse().unwrap())
 }
 
+/// The metrics once `series` reads `want`, for a report that a request's producer
+/// thread makes when it notices that the body is gone. Fails after ten seconds.
+async fn metrics_once(app: &Router, series: &str, want: f64) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let m = metrics(app).await;
+        if sample(&m, series) == Some(want) {
+            return m;
+        }
+        assert!(std::time::Instant::now() < deadline, "{series}: {m}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 fn is_generated_id(id: &str) -> bool {
     let b = id.as_bytes();
     id.len() == 21
@@ -1309,20 +1323,29 @@ async fn dropped_cursor_response_reports_cancelled_after_body_lifetime() {
         None
     );
     drop(res);
-    let after = metrics(&s.app).await;
+    // The response starts after the cursor's first batch, so the producer can still be
+    // running here. The request completes once it notices the dropped body.
+    let after = metrics_once(
+        &s.app,
+        r#"sparkles_request_duration_seconds_count{dataset="ds",operation="query"}"#,
+        1.0,
+    )
+    .await;
     assert_eq!(
         sample(
             &after,
             r#"sparkles_requests_total{dataset="ds",operation="query",outcome="cancelled"}"#
         ),
-        Some(1.0)
+        Some(1.0),
+        "{after}"
     );
     assert_eq!(
         sample(
             &after,
-            r#"sparkles_request_duration_seconds_count{dataset="ds",operation="query"}"#
+            r#"sparkles_requests_total{dataset="ds",operation="query",outcome="ok"}"#
         ),
-        Some(1.0)
+        None,
+        "{after}"
     );
 }
 
