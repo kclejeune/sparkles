@@ -6,6 +6,7 @@
 // branches that each test deletes, so the other suites see the mock's data unchanged.
 
 import { expect, test, type Page, type APIRequestContext } from '@playwright/test';
+import { pageAction } from '../page-actions';
 import { expectNoSidewaysScroll } from '../phone';
 
 test.describe.configure({ mode: 'serial', timeout: 120_000 });
@@ -95,7 +96,7 @@ test('OWL edits on a session branch: definition, synonym, annotation, parent and
 }) => {
   await onSession(request, 'uni', async () => {
     await open(page, term('uni', UNI + 'Professor'));
-    await page.getByRole('button', { name: 'Edit', exact: true }).click();
+    await pageAction(page, 'Edit');
     await expect(page).toHaveURL(/edit=1/);
     // on the protected main the fields wait for a session
     await expect(page.getByRole('textbox', { name: 'Definition', exact: true })).toBeDisabled();

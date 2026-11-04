@@ -51,6 +51,8 @@ import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector
 import { WORLD, worldTurtle } from './world.mjs';
 import { handleForms } from './forms.mjs';
 import {
+  CELLS_PREFIXES,
+  CELLS_TURTLE,
   DEEP_PREFIXES,
   deepTurtle,
   handleOntology,
@@ -254,6 +256,12 @@ function seedHistory(ds) {
   deep.store.load(deepTurtle(), { format: 'text/turtle' });
   deep.baseQuads = deep.store.size;
   addCommit(deep, 'upload', deep.store.size, 0, { bulk: true });
+  // a rich OBO-style term for the Browse page's layout (mock/ontology.mjs)
+  const cells = makeDataset('cells', 'persistent');
+  cells.prefixes = { ...CELLS_PREFIXES };
+  cells.store.load(CELLS_TURTLE, { format: 'text/turtle' });
+  cells.baseQuads = cells.store.size;
+  addCommit(cells, 'upload', cells.store.size, 0, { bulk: true });
   // the thesaurus editor's thesaurus (mock/skos.mjs)
   const thes = makeDataset('thes', 'persistent');
   thes.prefixes = { ...THES_PREFIXES };

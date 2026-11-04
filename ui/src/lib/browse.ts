@@ -17,7 +17,7 @@ import {
   type Lit,
   type ManchesterToken,
 } from './ontology';
-import { WELL_KNOWN, type PrefixMap } from './rdf';
+import { localName, WELL_KNOWN, type PrefixMap } from './rdf';
 import { browsePath, editorOf, workbenchPath } from './routes';
 
 const enc = encodeURIComponent;
@@ -276,37 +276,33 @@ export const LABEL_PROPS = [RDFS + 'label', SKOS + 'prefLabel'];
 export const DEFINITION_PROPS = [OBO + 'IAO_0000115', SKOS + 'definition'];
 
 /**
- * The properties of a page's lead block, in priority order, with the chip of each: the
- * definitions, then descriptions, comments and scope notes. Every value of them shows in the
- * block, and the best leads.
+ * The properties of a page's lead block, in priority order, with the kind each is listed
+ * under: the definitions, then descriptions, comments and scope notes.
  */
 export const LEAD_KINDS: [string, string][] = [
-  [OBO + 'IAO_0000115', 'OBO definition'],
-  [SKOS + 'definition', 'SKOS definition'],
+  [OBO + 'IAO_0000115', 'Definition'],
+  [SKOS + 'definition', 'Definition'],
   [DCT + 'description', 'Description'],
   [DC + 'description', 'Description'],
   [RDFS + 'comment', 'Comment'],
   [SKOS + 'scopeNote', 'Scope note'],
 ];
 
-/** The chips of a lead entry: the kind of each property that states its text, in order. */
-export function leadChips(v: Pick<Sourced, 'properties'>): string[] {
-  return [...new Set(LEAD_KINDS.filter(([p]) => v.properties.includes(p)).map(([, k]) => k))];
-}
-
-/** How many entries in the reader's languages the lead block shows before "N more". */
+/** How many values of a group in the reader's languages show before "N more". */
 export const LEAD_SHOWN = 3;
 
-/**
- * The lead block of a page: the entry that leads, the others in the reader's languages in
- * priority order, and the translations of each kind, which fold. A value states its
- * language and the chips of every property that states its text.
- */
-export type Lead = {
-  first: (Sourced & { chips: string[] }) | null;
-  more: (Sourced & { chips: string[] })[];
-  translations: { kind: string; values: (Sourced & { chips: string[] })[] }[];
+/** One predicate of the lead block, or the predicates that state the same texts, under its
+ * heading: its values in the reader's languages and its translations, which fold. */
+export type LeadGroup = {
+  kind: string;
+  /** the predicates the heading names, in priority order */
+  predicates: string[];
+  values: Sourced[];
+  translations: Sourced[];
 };
+
+/** The lead block of a page, its groups in priority order. The first group leads. */
+export type Lead = { groups: LeadGroup[] };
 
 /** Synonym properties, in display order, with their kind. */
 export const SYNONYM_KINDS: [string, string][] = [
@@ -395,6 +391,8 @@ export type Sourced = {
   property: string;
   /** every property that states this text, when several do */
   properties: string[];
+  /** the synonym types its axiom annotations name (`oboInOwl:hasSynonymType`) */
+  types: string[];
 };
 
 const SOURCE_PROPS = new Set([OIO + 'hasDbXref', DC + 'source', DCT + 'source', OIO + 'source']);
@@ -404,11 +402,39 @@ function sourced(s: Statement): Sourced {
     value: s.value,
     property: s.property,
     properties: [s.property],
+    types: s.annotations
+      .filter((a) => a.property === OIO + 'hasSynonymType' && typeof a.value === 'string')
+      .map((a) => a.value as string),
     lang: isLiteral(s.value) ? (s.value['@language'] ?? null) : null,
     sources: s.annotations
       .filter((a) => SOURCE_PROPS.has(a.property))
       .map((a) => valueText(a.value)),
   };
+}
+
+/** What a synonym type is called: its label when the page has one, else its local name. */
+export function synonymTypeName(
+  iri: string,
+  names: Record<string, Partial<Omit<Name, 'iri'>>> | undefined,
+): string {
+  return names?.[iri]?.label ?? localName(iri);
+}
+
+/**
+ * A text as its paragraphs, each a list of lines: blank lines split paragraphs and single
+ * newlines split lines. Each line loses the space at its ends and empty paragraphs go.
+ */
+export function textBlocks(text: string): string[][] {
+  return text
+    .replace(/\r\n?/g, '\n')
+    .split(/\n[ \t]*\n\s*/)
+    .map((p) =>
+      p
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l !== ''),
+    )
+    .filter((p) => p.length > 0);
 }
 
 /** Rank of a language among the caller's: theirs first, then none, then English, then the rest. */
@@ -434,7 +460,7 @@ export type Sections = {
   /** every definition, description, comment and scope note, as the Definition card shows them */
   lead: Lead;
   synonyms: { kind: string; values: Sourced[] }[];
-  notes: { kind: string; values: Sourced[] }[];
+  notes: { kind: string; property: string; values: Sourced[] }[];
   /** preferred, alternative and hidden labels by language, for SKOS resources */
   labels: { lang: string; preferred: string[]; alternative: string[]; hidden: string[] }[];
   xrefs: { database: string; id: string; href: string | null; value: string }[];
@@ -453,9 +479,16 @@ function uniqueSourced(list: Sourced[]): Sourced[] {
   for (const v of list) {
     const k = `${isLiteral(v.value) ? 'l' : 'i'}\u0000${valueText(v.value)}\u0000${v.lang ?? ''}`;
     const was = by.get(k);
-    if (!was) by.set(k, { ...v, sources: [...v.sources], properties: [...v.properties] });
+    if (!was)
+      by.set(k, {
+        ...v,
+        sources: [...v.sources],
+        properties: [...v.properties],
+        types: [...v.types],
+      });
     else {
       for (const src of v.sources) if (!was.sources.includes(src)) was.sources.push(src);
+      for (const t of v.types) if (!was.types.includes(t)) was.types.push(t);
       for (const p of v.properties) if (!was.properties.includes(p)) was.properties.push(p);
     }
   }
@@ -481,6 +514,7 @@ const groupsOf = (kinds: [string, string][], stmts: Statement[], langs: readonly
   kinds
     .map(([p, kind]) => ({
       kind,
+      property: p,
       values: uniqueSourced(stmts.filter((s) => s.property === p).map(sourced)).sort(byLang(langs)),
     }))
     .filter((g) => g.values.length > 0);
@@ -495,42 +529,43 @@ const XL_PLAIN: Record<string, string> = {
 };
 
 /**
- * The lead block of `stmts` in the reader's languages `langs`. Each text comes once with the
- * chips of every property that states it. Entries in the reader's languages, or with none,
- * show in priority order and the first leads. When none is, the best translation leads, and
- * the other translations fold by kind.
+ * The lead block of `stmts` in the reader's languages `langs`: every value of `LEAD_KINDS`
+ * once, grouped by the predicate that states it, or by the predicates that state the same
+ * text. In each group the values in the reader's languages, or with none, show and the
+ * translations fold. A group with only translations shows its best one.
  */
 export function leadOf(stmts: Statement[], langs: readonly string[]): Lead {
-  const rank = new Map(LEAD_KINDS.map(([p], i) => [p, i]));
-  const prio = (v: Sourced) => Math.min(...v.properties.map((p) => rank.get(p) ?? 99));
-  const all = uniqueSourced(stmts.filter((s) => rank.has(s.property)).map(sourced))
-    .map((v) => ({ ...v, chips: leadChips(v) }))
-    .sort(
-      (a, b) =>
-        prio(a) - prio(b) ||
-        langRank(a.lang, langs) - langRank(b.lang, langs) ||
-        valueText(a.value).localeCompare(valueText(b.value)),
-    );
-  const own = (v: Sourced) => langRank(v.lang, langs) <= langs.length;
-  const mine = all.filter(own);
-  let rest = all.filter((v) => !own(v));
-  let first = mine[0] ?? null;
-  if (!first && rest.length) {
-    first = [...rest].sort(
-      (a, b) => langRank(a.lang, langs) - langRank(b.lang, langs) || prio(a) - prio(b),
-    )[0];
-    rest = rest.filter((v) => v !== first);
+  const index = new Map(LEAD_KINDS.map(([p], i) => [p, i]));
+  const rank = (p: string) => index.get(p) ?? 99;
+  const all = uniqueSourced(stmts.filter((s) => index.has(s.property)).map(sourced));
+  const groups = new Map<string, LeadGroup>();
+  for (const v of all.sort(
+    (a, b) =>
+      langRank(a.lang, langs) - langRank(b.lang, langs) ||
+      valueText(a.value).localeCompare(valueText(b.value)),
+  )) {
+    const predicates = [...v.properties].sort((a, b) => rank(a) - rank(b));
+    const key = predicates.join(' ');
+    let g = groups.get(key);
+    if (!g)
+      groups.set(
+        key,
+        (g = {
+          kind: LEAD_KINDS[rank(predicates[0])][1],
+          predicates,
+          values: [],
+          translations: [],
+        }),
+      );
+    (langRank(v.lang, langs) <= langs.length ? g.values : g.translations).push(v);
   }
-  const translations: Lead['translations'] = [];
-  for (const v of rest) {
-    const kind = v.chips[0];
-    let g = translations.find((t) => t.kind === kind);
-    if (!g) translations.push((g = { kind, values: [] }));
-    g.values.push(v);
-  }
-  for (const g of translations)
-    g.values.sort((a, b) => langRank(a.lang, langs) - langRank(b.lang, langs));
-  return { first, more: mine.slice(1), translations };
+  const out = [...groups.values()].sort(
+    (a, b) =>
+      rank(a.predicates[0]) - rank(b.predicates[0]) || a.predicates.length - b.predicates.length,
+  );
+  for (const g of out)
+    if (!g.values.length && g.translations.length) g.values.push(g.translations.shift()!);
+  return { groups: out };
 }
 
 /**
@@ -612,15 +647,20 @@ export function termSections(
   // with nothing in the lead block a note leads it, and leaves the notes
   let notes = groupsOf(NOTE_KINDS, stmts, langs);
   const note = notes.find((g) => g.kind === 'Note');
-  if (!lead.first && note) {
+  if (!lead.groups.length && note) {
     const [first, ...rest] = note.values;
-    lead.first = { ...first, chips: ['Note'] };
+    lead.groups.push({
+      kind: 'Note',
+      predicates: [SKOS + 'note'],
+      values: [first],
+      translations: [],
+    });
     notes = notes
       .map((g) => (g === note ? { ...g, values: rest } : g))
       .filter((g) => g.values.length > 0);
   }
   return {
-    definition: lead.first,
+    definition: lead.groups[0]?.values[0] ?? null,
     lead,
     synonyms: groupsOf(SYNONYM_KINDS, stmts, langs),
     notes,

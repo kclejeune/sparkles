@@ -6,6 +6,7 @@
   // instead of a new one, **Edit value** replaces a fact's object, **Reject** retracts a
   // fact on the branch, and **Merge** opens the merge page, where the person merges. Each
   // action is a commit on the branch as the person, so the grants decide.
+  import PageActions from '$components/PageActions.svelte';
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
   import * as api from '$lib/api';
@@ -165,12 +166,12 @@
         {#if data?.note}· {data.note}{/if}
       </p>
     </div>
-    <div class="page-actions">
+    <PageActions>
       <button class="btn" onclick={load} disabled={loading}
         ><Icon name="refresh" size={14} /> Refresh</button
       >
-      <a class="btn primary" href={mergeHref}><Icon name="merge" size={14} /> Merge</a>
-    </div>
+      <a class="btn primary" data-primary href={mergeHref}><Icon name="merge" size={14} /> Merge</a>
+    </PageActions>
   </header>
 
   {#if loading && !data}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageActions from '$components/PageActions.svelte';
   import { routes } from '$lib/routes';
   // Similar: nearest neighbours by `spk:vectorSearch` (docs/API.md "Vector similarity").
   // Pick a vector index (or a predicate without one), then search from an entity's own
@@ -415,15 +416,17 @@
         {#if ds}in <span class="mono">{ds}</span>{/if}
       </p>
     </div>
-    <span class="spacer"></span>
     {#if ds && chosenIndex}
-      <a
-        class="btn"
-        href={routes.similarMap(family, {
-          branch: selectedBranch,
-          index: chosenIndex.name,
-        })}><Icon name="map" size={14} /> Embedding map</a
-      >
+      <PageActions>
+        <a
+          class="btn"
+          data-primary
+          href={routes.similarMap(family, {
+            branch: selectedBranch,
+            index: chosenIndex.name,
+          })}><Icon name="map" size={14} /> Embedding map</a
+        >
+      </PageActions>
     {/if}
   </header>
 

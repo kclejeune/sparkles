@@ -25,7 +25,9 @@ import {
   parseDefinitions,
   parseHead,
   parseReuse,
+  synonymTypeName,
   termSections,
+  textBlocks,
   treeKindOf,
   xrefHref,
   usageQuery,
@@ -69,39 +71,32 @@ const node = (iri: string, label: string, children = 0, deprecated = false): Tre
 });
 
 describe('the sections of a page', () => {
-  it('gathers every definition, description, comment and scope note in the lead block', () => {
+  it('lists every definition, description, comment and scope note under its predicate', () => {
     const DCT = 'http://purl.org/dc/terms/';
     const IAO = OBO + 'IAO_0000115';
-    const text = (v: { value: unknown } | null) => (v ? valueText(v.value as never) : null);
-    const of = (stmts: Statement[], langs = ['en']) => {
-      const l = termSections({ statements: stmts }, langs).lead;
-      return {
-        first: [text(l.first), l.first?.chips ?? []],
-        more: l.more.map((v) => [text(v), v.lang, v.chips]),
-        translations: l.translations.map((g) => [g.kind, g.values.map((v) => v.lang)]),
-      };
-    };
-    // two English definitions from different properties: the OBO one leads
+    const of = (stmts: Statement[], langs = ['en']) =>
+      termSections({ statements: stmts }, langs).lead.groups.map((g) => [
+        g.kind,
+        g.predicates,
+        g.values.map((v) => [valueText(v.value), v.lang]),
+        g.translations.map((v) => v.lang),
+      ]);
+    // two English definitions from different predicates: a group for each
     expect(
       of([st(SKOS + 'definition', lit('skos text', 'en')), st(IAO, lit('obo text', 'en'))]),
-    ).toEqual({
-      first: ['obo text', ['OBO definition']],
-      more: [['skos text', 'en', ['SKOS definition']]],
-      translations: [],
-    });
-    // English and French: the reader's language leads and the French one folds
-    expect(of([st(IAO, lit('texte', 'fr')), st(SKOS + 'definition', lit('text', 'en'))])).toEqual({
-      first: ['text', ['SKOS definition']],
-      more: [],
-      translations: [['OBO definition', ['fr']]],
-    });
-    // the same text from both properties is one entry with both chips
-    expect(of([st(SKOS + 'definition', lit('same', 'en')), st(IAO, lit('same', 'en'))])).toEqual({
-      first: ['same', ['OBO definition', 'SKOS definition']],
-      more: [],
-      translations: [],
-    });
-    // a definition, a comment and a scope note, in priority order
+    ).toEqual([
+      ['Definition', [IAO], [['obo text', 'en']], []],
+      ['Definition', [SKOS + 'definition'], [['skos text', 'en']], []],
+    ]);
+    // English and French of one predicate: the French value folds
+    expect(of([st(IAO, lit('texte', 'fr')), st(IAO, lit('text', 'en'))])).toEqual([
+      ['Definition', [IAO], [['text', 'en']], ['fr']],
+    ]);
+    // the same text from both predicates is one entry under a heading that names both
+    expect(of([st(SKOS + 'definition', lit('same', 'en')), st(IAO, lit('same', 'en'))])).toEqual([
+      ['Definition', [IAO, SKOS + 'definition'], [['same', 'en']], []],
+    ]);
+    // a definition, a description, a comment and a scope note, in priority order
     expect(
       of([
         st(SKOS + 'scopeNote', lit('scope')),
@@ -109,41 +104,39 @@ describe('the sections of a page', () => {
         st(DCT + 'description', lit('description')),
         st(IAO, lit('definition')),
       ]),
-    ).toEqual({
-      first: ['definition', ['OBO definition']],
-      more: [
-        ['description', null, ['Description']],
-        ['comment', null, ['Comment']],
-        ['scope', null, ['Scope note']],
-      ],
-      translations: [],
-    });
-    // nothing in the block: a note leads and leaves the notes, and else there is no lead
+    ).toEqual([
+      ['Definition', [IAO], [['definition', null]], []],
+      ['Description', [DCT + 'description'], [['description', null]], []],
+      ['Comment', [RDFS + 'comment'], [['comment', null]], []],
+      ['Scope note', [SKOS + 'scopeNote'], [['scope', null]], []],
+    ]);
+    // nothing in the block: a note leads it and leaves the notes, which name their predicate
     const n = termSections(
       { statements: [st(SKOS + 'note', lit('first')), st(SKOS + 'example', lit('e.g.'))] },
       ['en'],
     );
-    expect([text(n.lead.first), n.lead.first?.chips]).toEqual(['first', ['Note']]);
-    expect(n.notes.map((g) => g.kind)).toEqual(['Example']);
+    expect(n.lead.groups.map((g) => [g.kind, g.predicates])).toEqual([['Note', [SKOS + 'note']]]);
+    expect(n.notes.map((g) => [g.kind, g.property])).toEqual([['Example', SKOS + 'example']]);
     expect(
       termSections({ statements: [st(RDFS + 'label', lit('x'))] }, ['en']).definition,
     ).toBeNull();
   });
 
-  it('folds the translations of a UNESCO scope note behind one toggle', () => {
+  it('folds the translations of a UNESCO scope note under its heading', () => {
     const notes = ['en', 'fr', 'es', 'ru', 'ar'].map((l) =>
       st(SKOS + 'scopeNote', lit(`note ${l}`, l)),
     );
-    const l = termSections({ statements: notes }, ['en']).lead;
-    expect(valueText(l.first!.value)).toBe('note en');
-    expect(l.more).toEqual([]);
-    expect(l.translations).toHaveLength(1);
-    expect(l.translations[0].kind).toBe('Scope note');
-    expect(l.translations[0].values.map((v) => v.lang).sort()).toEqual(['ar', 'es', 'fr', 'ru']);
+    const [g] = termSections({ statements: notes }, ['en']).lead.groups;
+    expect([g.kind, g.predicates]).toEqual(['Scope note', [SKOS + 'scopeNote']]);
+    expect(g.values.map((v) => valueText(v.value))).toEqual(['note en']);
+    expect(g.translations.map((v) => v.lang).sort()).toEqual(['ar', 'es', 'fr', 'ru']);
     // a reader of French gets the French note first
-    expect(valueText(termSections({ statements: notes }, ['fr']).lead.first!.value)).toBe(
-      'note fr',
-    );
+    const [fr] = termSections({ statements: notes }, ['fr']).lead.groups;
+    expect(valueText(fr.values[0].value)).toBe('note fr');
+    // a kind with only translations shows its best one
+    const [only] = termSections({ statements: notes.slice(1) }, ['en']).lead.groups;
+    expect(only.values).toHaveLength(1);
+    expect(only.translations).toHaveLength(3);
   });
 
   it('takes only class expressions as a logical definition', () => {
@@ -164,6 +157,48 @@ describe('the sections of a page', () => {
       [item({ type: 'EquivalentClasses', classes: [iri, EX + 'Alias'] })],
     );
     expect(logicalDefinitionOf(alias)).toEqual([]);
+  });
+
+  it('keeps a description’s paragraphs and line breaks', () => {
+    expect(textBlocks('One line.')).toEqual([['One line.']]);
+    expect(
+      textBlocks('\n  First paragraph,\n  its second line.\n\n\nSecond.  \r\n\r\nThird.\n'),
+    ).toEqual([['First paragraph,', 'its second line.'], ['Second.'], ['Third.']]);
+    expect(textBlocks('   ')).toEqual([]);
+  });
+
+  it('names a synonym’s type by its label, else its local name', () => {
+    const CL = 'http://purl.obolibrary.org/obo/cl#';
+    const s = termSections(
+      {
+        statements: [
+          st(OIO + 'hasRelatedSynonym', lit('microglia'), [
+            { property: OIO + 'hasSynonymType', value: CL + 'PLURAL' },
+            { property: OIO + 'hasDbXref', value: lit('X:1') },
+          ]),
+          st(OIO + 'hasRelatedSynonym', lit('MG'), [
+            { property: OIO + 'hasSynonymType', value: CL + 'ABBREVIATION' },
+          ]),
+        ],
+      },
+      ['en'],
+    );
+    const vs = s.synonyms[0].values;
+    expect(vs.map((v) => [valueText(v.value), v.types, v.sources])).toEqual([
+      ['MG', [CL + 'ABBREVIATION'], []],
+      ['microglia', [CL + 'PLURAL'], ['X:1']],
+    ]);
+    const names = {
+      [CL + 'PLURAL']: {
+        label: 'plural',
+        labelLang: 'en',
+        shortForm: null,
+        kinds: [],
+        deprecated: false,
+      },
+    };
+    expect(synonymTypeName(CL + 'PLURAL', names)).toBe('plural');
+    expect(synonymTypeName(CL + 'ABBREVIATION', names)).toBe('ABBREVIATION');
   });
 
   it('keeps a SKOS concept’s facts with the other statements', () => {
@@ -219,9 +254,9 @@ describe('the sections of a page', () => {
     expect(s.definition?.value).toEqual(lit('A definition'));
     expect(s.definition?.sources).toEqual(['GOC:al']);
     // the comment joins the lead block and the French definition folds as a translation
-    expect(s.lead.more.map((v) => v.chips)).toEqual([['Comment']]);
-    expect(s.lead.translations.map((g) => [g.kind, g.values.map((v) => v.lang)])).toEqual([
-      ['OBO definition', ['fr']],
+    expect(s.lead.groups.map((g) => [g.kind, g.translations.map((v) => v.lang)])).toEqual([
+      ['Definition', ['fr']],
+      ['Comment', []],
     ]);
     expect(s.synonyms.map((g) => g.kind)).toEqual(['Exact', 'Related']);
     expect(s.notes).toEqual([]);
@@ -285,7 +320,7 @@ describe('the sections of a page', () => {
     );
     // the sources of every copy stay with the one value
     expect(s.definition?.sources).toEqual(['GOC:al']);
-    expect(s.lead.more).toEqual([]);
+    expect(s.lead.groups.map((g) => g.values.length)).toEqual([1]);
     expect(s.synonyms[0].values).toHaveLength(1);
     expect(s.xrefs).toHaveLength(1);
     expect(s.info[0].values).toHaveLength(1);

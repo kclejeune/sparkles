@@ -4,6 +4,7 @@
 // a page. tests/e2e/browse.spec.ts checks the server's answers on a real dataset.
 
 import { expect, test, type Page } from '@playwright/test';
+import { pageAction } from '../page-actions';
 
 test.describe.configure({ timeout: 90_000 });
 
@@ -58,7 +59,9 @@ test('an entity page shows its axioms as linked prose, its usage and its facts',
   // with no definition, the comment leads the Definition card, marked as a comment
   const lede = page.locator('.lede');
   await expect(lede).toContainText('An academic who leads research');
-  await expect(lede.locator('.lead-chip')).toHaveText('Comment');
+  await expect(page.locator('.lead [data-kind]').first().locator('h3')).toHaveText(
+    /^Comment\s*·\s*rdfs:comment$/,
+  );
   await expect(page.getByRole('region', { name: 'Comment' })).toHaveCount(0);
   // the frame in Manchester syntax: asserted clauses, then what the classification infers
   const logic = page.getByRole('region', { name: 'Axioms' });
@@ -98,17 +101,28 @@ test('an entity page shows its axioms as linked prose, its usage and its facts',
 test('a definition leads the page and a mention names its restriction', async ({ page }) => {
   await openTerm(page, 'Person');
   await expect(page.locator('.lede')).toContainText('A human being');
-  // the lead block holds the comment and the scope note with their chips, and folds French
+  // the lead block lists each kind under its heading, and folds French under Definition
   const lead = page.locator('.lead');
-  await expect(lead.locator('.lede .lead-chip')).toHaveText('SKOS definition');
-  await expect(lead.locator('.more').first()).toContainText('Staff and students');
-  await expect(lead.locator(':scope > .more .lead-chip')).toHaveText(['Comment', 'Scope note']);
-  const fr = lead.locator('details.fold');
-  await expect(fr.locator('summary')).toContainText('In 1 other language');
-  await expect(fr.locator('.more')).toBeHidden();
+  await expect(lead.locator('[data-kind] > h3')).toHaveText([
+    /^Definition\s*·\s*skos:definition$/,
+    /^Comment\s*·\s*rdfs:comment$/,
+    /^Scope note\s*·\s*skos:scopeNote$/,
+  ]);
+  const comments = lead.getByRole('group', { name: 'Comment' });
+  await expect(comments.locator(':scope > .entry')).toHaveCount(2);
+  const def = lead.getByRole('group', { name: 'Definition' });
+  const fr = def.locator('details.fold');
+  await expect(fr.locator('summary')).toHaveText('In 1 other language');
+  await expect(fr.locator('.entry')).toBeHidden();
   await fr.locator('summary').click();
-  await expect(fr.locator('.more')).toContainText('Un être humain');
+  await expect(fr.locator('.entry')).toContainText('Un être humain');
   await expect(fr.locator('.lang-tag')).toHaveText('fr');
+  // the notes keep their own kinds below
+  for (const k of ['Example', 'History note', 'Editorial note'])
+    await expect(page.getByRole('region', { name: k })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'History note' }).locator('h2')).toContainText(
+    'skos:historyNote',
+  );
   await expect(page.getByRole('region', { name: 'Comment' })).toHaveCount(0);
   await openTerm(page, 'Course');
   const usage = page.getByRole('region', { name: /What links here/ });
@@ -226,6 +240,35 @@ test('no section or card shows a heading without content', async ({ page }) => {
   await expect(page.getByRole('region', { name: 'Logical definition' })).toHaveCount(0);
 });
 
+test('a rich OBO term keeps its paragraphs, sources and synonym types', async ({ page }) => {
+  await page.goto(
+    `/ui/browse?ds=cells&iri=${encodeURIComponent('http://purl.obolibrary.org/obo/CL_0000129')}`,
+  );
+  await expect(page.getByRole('heading', { level: 1, name: 'microglial cell' })).toBeVisible({
+    timeout: 30_000,
+  });
+  const lead = page.locator('.lead');
+  await expect(lead.locator('[data-kind] > h3')).toHaveText([
+    /^Definition\s*·\s*obo:IAO_0000115$/,
+    /^Description\s*·\s*dcterms:description$/,
+    /^Comment\s*·\s*rdfs:comment$/,
+  ]);
+  // a predicate the ontology names links to its page, with its full IRI on hover
+  const pred = lead.locator('[data-kind] > h3 a').first();
+  await expect(pred).toHaveAttribute('title', 'http://purl.obolibrary.org/obo/IAO_0000115');
+  await expect(pred).toHaveAttribute('href', /IAO_0000115/);
+  await expect(lead.locator('.lede')).toContainText('GOC:fixture');
+  // the description's blank lines are paragraphs and its newlines line breaks
+  const desc = lead.getByRole('group', { name: 'Description' });
+  await expect(desc.locator('.para-gap')).toHaveCount(4);
+  await expect(desc.locator('br')).toHaveCount(1);
+  const syn = page.getByRole('region', { name: 'Synonyms' });
+  await expect(syn).toContainText('brain-resident macrophage');
+  await expect(syn).toContainText('PMID:00000002');
+  // a typed synonym names its type, by label when it has one
+  await expect(syn.locator('.syn-type')).toHaveText(['ABBREVIATION', 'plural']);
+});
+
 test('downloads answer the entity in each format as an attachment', async ({ page }) => {
   await openTerm(page, 'Professor');
   const links = page.locator('[data-format]');
@@ -247,7 +290,7 @@ test('an individual has no tree, shows its types and edits in place or in the on
     page.getByRole('region', { name: 'Axioms' }).locator('[data-section="types"] dt'),
   ).toHaveText('Types:');
   // Edit switches the page into edit mode (item 630), whose bar links the full editor
-  await page.getByRole('button', { name: 'Edit', exact: true }).click();
+  await pageAction(page, 'Edit');
   await expect(
     page.getByRole('toolbar', { name: 'Edit mode' }).getByRole('link', { name: 'Ontology editor' }),
   ).toHaveAttribute('href', /\/ui\/workbench\/ontology\?ds=uni&iri=.*ada&kind=NamedIndividual/);

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageActions from '$components/PageActions.svelte';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
@@ -709,14 +710,16 @@ ex:PersonShape a sh:NodeShape ;
         </div>
       {/if}
     </div>
-    <div class="page-actions">
+    <PageActions>
       <button class="btn" onclick={refreshAll} disabled={loading} aria-label="Refresh">
         {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={14} />{/if}<span
           class="lbl">Refresh</span
         >
       </button>
-      <button class="btn" onclick={openQuery}><Icon name="query" size={14} /> Query</button>
-      <a class="btn" href={explore('')}><Icon name="explore" size={14} /> Explore</a>
+      <button class="btn" data-primary onclick={openQuery}
+        ><Icon name="query" size={14} /> Query</button
+      >
+      <a class="btn" data-primary href={explore('')}><Icon name="explore" size={14} /> Explore</a>
       {#if auth.can(name, 'admin')}
         <button
           class="btn"
@@ -737,7 +740,7 @@ ex:PersonShape a sh:NodeShape ;
           ><Icon name="trash" size={14} /><span class="lbl">Delete</span></button
         >
       {/if}
-    </div>
+    </PageActions>
   </header>
 
   <!-- the state the page shows: a branch, and a past state of the figures -->
@@ -1696,10 +1699,6 @@ ex:PersonShape a sh:NodeShape ;
 <style>
   .review-link {
     text-decoration: none;
-  }
-  /* the breadcrumbs take a row of their own above the title */
-  .page-head .breadcrumbs {
-    flex-basis: 100%;
   }
   .title {
     display: grid;

@@ -74,6 +74,7 @@
     editHref,
     editorKindOf,
     logicalDefinitionOf,
+    synonymTypeName,
     fetchHierarchy,
     fetchTerm,
     headGraphsQuery,
@@ -120,6 +121,7 @@
   import TermAxioms from '$components/browse/TermAxioms.svelte';
   import StatChips from '$components/StatChips.svelte';
   import LeadBlock from '$components/browse/LeadBlock.svelte';
+  import PageActions from '$components/PageActions.svelte';
   import TermNotes from '$components/browse/TermNotes.svelte';
   import TermReuse from '$components/browse/TermReuse.svelte';
   import TermSynonyms from '$components/browse/TermSynonyms.svelte';
@@ -127,7 +129,7 @@
   import TermXrefs from '$components/browse/TermXrefs.svelte';
   import TopTerms from '$components/browse/TopTerms.svelte';
   import SimilarTerms from '$components/browse/SimilarTerms.svelte';
-  import { editorOf } from '$lib/routes';
+  import { editorOf, workbenchPath } from '$lib/routes';
 
   const RDFS = WELL_KNOWN.rdfs;
   const SKOS = WELL_KNOWN.skos;
@@ -296,6 +298,10 @@
     name: (i) => (term && i === term.iri ? title : displayName(i, term?.names, prefixes)),
     short: (i) => term?.names[i]?.shortForm ?? (term?.iri === i ? term.shortForm : null),
   });
+
+  /** A predicate the Definition card's headings name links to its page when the ontology
+   * names it, which the W3C vocabularies' terms never have. */
+  const predicateHref = (i: string) => (term?.names[i] && !builtIn(i) ? hrefOf(i) : null);
 
   /** CURIEs such as GO:0032047 link when they are in the entity's own OBO namespace. */
   const curieIri = $derived.by(() => {
@@ -1206,11 +1212,11 @@
                   >
                 {/if}
               {/if}
-              <a class="btn sm" href={exploreHref}
+              <a class="btn sm" data-primary href={exploreHref}
                 ><Icon name="explore" size={14} />Open in Explore</a
               >
               {#if canWrite && workbenchLink}
-                <a class="btn sm" href={workbenchLink}
+                <a class="btn sm" data-primary href={workbenchLink}
                   ><Icon name="pencil" size={14} />Open in {editorOf(term?.kinds ?? []) ===
                   'thesaurus'
                     ? 'Thesaurus'
@@ -1333,11 +1339,13 @@
             <section class="panel b-def" aria-labelledby="def-h">
               <div class="panel-head"><h2 id="def-h">Definition</h2></div>
               <div class="panel-body ruled">
-                {#if sections.lead.first}<LeadBlock
+                {#if sections.lead.groups.length}<LeadBlock
                     lead={sections.lead}
                     {linker}
                     {langs}
                     {curieIri}
+                    {prefixes}
+                    {predicateHref}
                   />{:else if !editing}<p class="lede none">No definition in this ontology.</p>{/if}
                 {#if editing}
                   {#if !isSkos && editorKind}
@@ -1468,8 +1476,19 @@
                       {/each}
                     </section>
                   {/if}
-                  <TermSynonyms synonyms={sections.synonyms} {linker} />
-                  <TermNotes notes={sections.notes} {linker} {langs} {curieIri} />
+                  <TermSynonyms
+                    synonyms={sections.synonyms}
+                    {linker}
+                    typeName={(i) => synonymTypeName(i, term?.names)}
+                  />
+                  <TermNotes
+                    notes={sections.notes}
+                    {linker}
+                    {langs}
+                    {curieIri}
+                    {prefixes}
+                    {predicateHref}
+                  />
                   <TermLabels labels={sections.labels} />
                   {#if sections.related.length}
                     <section class="term-sec" aria-labelledby="rel-h">
@@ -1730,46 +1749,43 @@
     {/if}
   {:else}
     <div class="landing">
-      <header class="term-head">
+      <header class="page-head term-head">
         <nav class="crumbs" aria-label="Breadcrumbs">
           <span>{name}</span><span aria-hidden="true">›</span><span>{graph ?? 'default graph'}</span
           >
         </nav>
-        <div class="title-row">
-          <h1 class="term-title">{landingTitle}</h1>
-          <div class="actions">
-            {#if headGraphs.length}
-              <label class="form-row">
-                Graph
-                <select
-                  class="select"
-                  value={graph ?? ''}
-                  onchange={(e) =>
-                    goto(
-                      browseHref(base, name, null, {
-                        ...keep,
-                        graph: e.currentTarget.value || null,
-                      }),
-                    )}
-                >
-                  <option value="">default graph</option>
-                  {#each headGraphs as g (g)}<option value={g}>{iriName(g, prefixes)}</option
-                    >{/each}
-                  {#if graph && !headGraphs.includes(graph)}<option value={graph}>{graph}</option
-                    >{/if}
-                </select>
-              </label>
-            {/if}
+        <h1 class="term-title">{landingTitle}</h1>
+        <PageActions small>
+          {#if headGraphs.length}
+            <label class="form-row">
+              Graph
+              <select
+                class="select"
+                value={graph ?? ''}
+                onchange={(e) =>
+                  goto(
+                    browseHref(base, name, null, {
+                      ...keep,
+                      graph: e.currentTarget.value || null,
+                    }),
+                  )}
+              >
+                <option value="">default graph</option>
+                {#each headGraphs as g (g)}<option value={g}>{iriName(g, prefixes)}</option>{/each}
+                {#if graph && !headGraphs.includes(graph)}<option value={graph}>{graph}</option
+                  >{/if}
+              </select>
+            </label>
+          {/if}
+          {#if canWrite}
             <a
               class="btn sm"
-              href="{base}/{head?.scheme ? 'thesaurus' : 'ontology'}?{new URLSearchParams({
-                ds: name,
-                ...(graph ? { graph } : {}),
-              })}"
-              ><Icon name="pencil" size={14} />Open in {head?.scheme ? 'Thesaurus' : 'Ontology'} editor</a
+              data-primary
+              href={workbenchPath(base, head?.scheme ? 'thesaurus' : 'ontology', name, { graph })}
+              ><Icon name="pencil" size={14} />Open in {head?.scheme ? 'Thesaurus' : 'Ontology'}</a
             >
-          </div>
-        </div>
+          {/if}
+        </PageActions>
         {#if head}
           <div class="ids">
             {#if head.head.iri}<span class="iri-text">{head.head.iri}</span>{/if}
@@ -2150,13 +2166,11 @@
     display: flex;
     gap: 6px;
     flex-wrap: wrap;
-    margin-bottom: var(--sp-2);
   }
-  .title-row {
-    display: flex;
-    align-items: flex-start;
-    gap: var(--sp-3);
-    flex-wrap: wrap;
+  @media (min-width: 640px) {
+    .landing .term-head > :global(.page-actions) {
+      margin-top: calc((var(--fs-display) * 1.12 - var(--ctl-h-sm)) / 2);
+    }
   }
   .term-title {
     font-size: var(--fs-display);
@@ -2167,18 +2181,11 @@
     overflow-wrap: anywhere;
     min-width: 0;
   }
-  .actions {
-    margin-left: auto;
-    display: flex;
-    gap: var(--sp-2);
-    flex-wrap: wrap;
-  }
   .ids {
     display: flex;
     align-items: center;
     gap: var(--sp-2) var(--sp-3);
     flex-wrap: wrap;
-    margin-top: var(--sp-2);
   }
   .iri-text {
     font: 12px var(--font-mono);
@@ -2208,10 +2215,6 @@
     }
   }
   @container browse (max-width: 639px) {
-    .actions {
-      margin-left: 0;
-      width: 100%;
-    }
     .lede {
       font-size: 14px;
     }

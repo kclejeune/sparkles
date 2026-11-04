@@ -52,8 +52,12 @@ uni:Agent a owl:Class ; rdfs:label "Agent"@en .
 uni:Person a owl:Class ; rdfs:subClassOf uni:Agent ; rdfs:label "Person"@en , "Personne"@fr ;
   skos:definition "A human being who takes part in university life."@en ,
     "Un être humain qui prend part à la vie universitaire."@fr ;
-  rdfs:comment "Staff and students are both persons."@en ;
-  skos:scopeNote "Use for people in any role; prefer Student or Employee when the role is known."@en .
+  rdfs:comment "Staff and students are both persons."@en ,
+    "A person is counted once however many roles they hold: someone who teaches a course while enrolled in another is one Person who is both an Employee and a Student. Departments and universities are agents too, but they are organizations, which are disjoint from persons in this ontology."@en ;
+  skos:scopeNote "Use for people in any role; prefer Student or Employee when the role is known."@en ;
+  skos:example "Ada Lovelace, a professor who teaches Logic 101."@en ;
+  skos:historyNote "Split from Agent in version 1.1, when organizations got a class of their own."@en ;
+  skos:editorialNote "Check whether visiting scholars need a subclass."@en .
 uni:Student a owl:Class ; rdfs:subClassOf uni:Person ; rdfs:label "Student"@en , "Étudiant"@fr .
 uni:GraduateStudent a owl:Class ; rdfs:subClassOf uni:Student ; rdfs:label "Graduate student"@en .
 uni:Employee a owl:Class ; rdfs:subClassOf uni:Person ; rdfs:label "Employee"@en .
@@ -90,6 +94,76 @@ uni:sparklesU a owl:NamedIndividual , uni:University ; rdfs:label "Sparkles Univ
 
 [] a owl:Axiom ; owl:annotatedSource uni:GraduateStudent ; owl:annotatedProperty rdfs:subClassOf ;
   owl:annotatedTarget uni:Student ; rdfs:comment "Every graduate student is a student."@en .
+`;
+
+/** The `cells` dataset: a few cell types in the manner of an OBO cell ontology, with a rich
+ * term for the Browse page's layout: a sourced definition, a description of several
+ * paragraphs, a comment, sourced and typed synonyms, and part-of restrictions. */
+export const CELLS_PREFIXES = {
+  rdf: RDF,
+  rdfs: RDFS,
+  owl: OWL,
+  xsd: XSD,
+  dcterms: DCT,
+  obo: 'http://purl.obolibrary.org/obo/',
+  oboInOwl: 'http://www.geneontology.org/formats/oboInOwl#',
+};
+
+export const CELLS_TURTLE = `
+@prefix rdf: <${RDF}> . @prefix rdfs: <${RDFS}> . @prefix owl: <${OWL}> .
+@prefix xsd: <${XSD}> . @prefix dcterms: <${DCT}> .
+@prefix obo: <http://purl.obolibrary.org/obo/> .
+@prefix oboInOwl: <http://www.geneontology.org/formats/oboInOwl#> .
+@prefix cl: <http://purl.obolibrary.org/obo/cl#> .
+
+<http://purl.obolibrary.org/obo/cells.owl> a owl:Ontology ;
+  rdfs:label "Cell types"@en ; owl:versionInfo "2026-10-01" .
+
+obo:IAO_0000115 a owl:AnnotationProperty ; rdfs:label "definition"@en .
+oboInOwl:hasExactSynonym a owl:AnnotationProperty . oboInOwl:hasRelatedSynonym a owl:AnnotationProperty .
+oboInOwl:hasDbXref a owl:AnnotationProperty . oboInOwl:hasSynonymType a owl:AnnotationProperty .
+cl:PLURAL a owl:AnnotationProperty ; rdfs:label "plural"@en .
+cl:ABBREVIATION a owl:AnnotationProperty .
+obo:BFO_0000050 a owl:ObjectProperty ; rdfs:label "part of"@en .
+
+obo:CL_0000000 a owl:Class ; rdfs:label "cell"@en .
+obo:CL_0000125 a owl:Class ; rdfs:subClassOf obo:CL_0000000 ; rdfs:label "glial cell"@en .
+obo:CL_0000235 a owl:Class ; rdfs:subClassOf obo:CL_0000000 ; rdfs:label "macrophage"@en .
+obo:UBERON_0001017 a owl:Class ; rdfs:label "central nervous system"@en .
+obo:UBERON_0000955 a owl:Class ; rdfs:label "brain"@en .
+
+obo:CL_0000129 a owl:Class ;
+  rdfs:label "microglial cell"@en ;
+  oboInOwl:id "CL:0000129" ;
+  oboInOwl:hasOBONamespace "cell" ;
+  rdfs:subClassOf obo:CL_0000125 , obo:CL_0000235 ,
+    [ a owl:Restriction ; owl:onProperty obo:BFO_0000050 ; owl:someValuesFrom obo:UBERON_0001017 ] ;
+  obo:IAO_0000115 "A resident immune cell of the central nervous system that descends from embryonic yolk-sac progenitors, surveys its surroundings with fine motile processes and clears debris and dying cells."@en ;
+  dcterms:description """Microglia settle in the developing brain early, before most other glia appear.
+
+They tile the tissue so that each cell watches its own territory, and their processes extend and retract over minutes.
+In a resting state they prune synapses and support the cells around them.
+
+After an injury they change shape, move towards the damage and take up what is left of dying cells.
+
+Their numbers are kept by local division rather than by cells arriving from the blood.
+
+Note: this text was written for a test fixture and is not taken from a published ontology."""@en ;
+  rdfs:comment "Cells of this type are easy to confuse with macrophages that line the meninges and the blood vessels of the brain; those border macrophages differ in origin, place and the markers they express, and are not covered by this class."@en ;
+  oboInOwl:hasExactSynonym "brain-resident macrophage"@en , "hortega cell"@en , "microgliocyte"@en ;
+  oboInOwl:hasRelatedSynonym "microglia"@en , "MG.cns"@en .
+
+[] a owl:Axiom ; owl:annotatedSource obo:CL_0000129 ; owl:annotatedProperty obo:IAO_0000115 ;
+  owl:annotatedTarget "A resident immune cell of the central nervous system that descends from embryonic yolk-sac progenitors, surveys its surroundings with fine motile processes and clears debris and dying cells."@en ;
+  oboInOwl:hasDbXref "PMID:00000001" , "GOC:fixture" .
+[] a owl:Axiom ; owl:annotatedSource obo:CL_0000129 ; owl:annotatedProperty oboInOwl:hasExactSynonym ;
+  owl:annotatedTarget "brain-resident macrophage"@en ; oboInOwl:hasDbXref "PMID:00000002" .
+[] a owl:Axiom ; owl:annotatedSource obo:CL_0000129 ; owl:annotatedProperty oboInOwl:hasExactSynonym ;
+  owl:annotatedTarget "hortega cell"@en ; oboInOwl:hasDbXref "FMA:00001" .
+[] a owl:Axiom ; owl:annotatedSource obo:CL_0000129 ; owl:annotatedProperty oboInOwl:hasRelatedSynonym ;
+  owl:annotatedTarget "microglia"@en ; oboInOwl:hasSynonymType cl:PLURAL .
+[] a owl:Axiom ; owl:annotatedSource obo:CL_0000129 ; owl:annotatedProperty oboInOwl:hasRelatedSynonym ;
+  owl:annotatedTarget "MG.cns"@en ; oboInOwl:hasSynonymType cl:ABBREVIATION ; oboInOwl:hasDbXref "FIXTURE:panel" .
 `;
 
 // --- terms ---------------------------------------------------------------------------
@@ -1639,6 +1713,8 @@ export async function handleOntology(req, res, url, seg, ctx) {
           property: x.property,
           value: x.value,
         }));
+        // a synonym's type is named on the page, so its label comes with the names
+        for (const x of annotations) if (typeof x.value === 'string') note(x.value);
         return { property: q.predicate.value, value, graph, annotations };
       });
     // as on the server, an axiom is about the entity when one of its triples has it as subject

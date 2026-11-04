@@ -8,6 +8,7 @@
 // history with one record of format 1.
 
 import { expect, test, type Page } from '@playwright/test';
+import { pageAction } from '../page-actions';
 import { phone } from '../phone';
 
 test.describe.configure({ timeout: 90_000 });
@@ -203,7 +204,7 @@ test.describe('the drawer on a Browse page', () => {
     await fresh(page, 'uni');
     await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + 'Professor')}`);
     await expect(page.locator('h1.term-title')).toBeVisible({ timeout: 30_000 });
-    await page.getByRole('button', { name: 'Ask about this' }).click();
+    await pageAction(page, 'Ask about this');
     const d = drawer(page);
     await expect(d).toBeVisible();
     await expect(d).toContainText('About Professor');

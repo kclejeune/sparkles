@@ -6,6 +6,7 @@
   // naming the commit the page shows. The session's undo stack undoes the editor's commits
   // by reverting them, which restores exactly the triples each commit changed, and the
   // change feed refreshes the views when a commit lands.
+  import PageActions from '$components/PageActions.svelte';
   import { useAskContext, useAskTarget } from '$lib/ask-thread.svelte';
   import { shortLabel } from '$lib/graph';
   import { goto } from '$app/navigation';
@@ -957,7 +958,7 @@
         {/if}
       </p>
     </div>
-    <div class="page-actions">
+    <PageActions>
       <FollowState live={session.live} onretry={() => followRun++} />
       {#if canWrite}
         <button
@@ -979,6 +980,7 @@
       {#if canWrite && !branch}
         <button
           class="btn"
+          data-primary
           onclick={startSession}
           title="Edit on a branch of your own, then merge it"
           ><Icon name="branch" size={14} /> Start session</button
@@ -987,13 +989,14 @@
       {#if branch}
         <a
           class="btn"
+          data-primary
           href="{resolve('/datasets/[name]/merge', { name })}?source={encodeURIComponent(
             branch,
           )}&target={encodeURIComponent(currentBranch?.upstream ?? MAIN)}"
           ><Icon name="merge" size={14} /> Merge</a
         >
       {/if}
-    </div>
+    </PageActions>
   </header>
   {#if name}
     <div class="page-context">

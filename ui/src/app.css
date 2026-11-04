@@ -586,16 +586,20 @@ label.field {
    a spacer and the page's actions at the end of the row. The row wraps, so the actions
    drop below the title on a phone instead of crowding it. Components that have a `.head`
    of their own keep it, because this class has a distinct name. */
+/* A page's head (ROADMAP item 633). From 640px it is two columns: the title block takes the
+   rest and the actions (PageActions.svelte, .page-actions) their own width, level with the
+   title's first line and never under it. Breadcrumbs take a row of their own above both.
+   PageActions folds the actions a page does not mark primary into a "More" menu when the
+   title column would fall under 60% of the head. Below 640px the head stacks: the title,
+   then the actions on a row of their own from the start. */
 .page-head {
   display: flex;
-  align-items: flex-start;
-  gap: var(--sp-2) var(--sp-4);
-  flex-wrap: wrap;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-2);
+  min-width: 0;
 }
-/* the title block takes the row's room, so the actions sit at its end until they no
-   longer fit beside a readable title */
-.page-head > :first-child {
-  flex: 1 1 20rem;
+.page-head > * {
   min-width: 0;
 }
 .page-head p {
@@ -607,8 +611,31 @@ label.field {
   color: var(--text-3);
   overflow-wrap: anywhere;
 }
-/* The page's actions at the end of its head, level with the title. On a phone they take a
-   row of their own under the title, from its start, so the title keeps the width. */
+@media (min-width: 640px) {
+  .page-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: var(--sp-4);
+    row-gap: var(--sp-2);
+    align-items: start;
+  }
+  .page-head > * {
+    grid-column: 1;
+  }
+  .page-head > .breadcrumbs,
+  .page-head > .crumbs {
+    grid-column: 1 / -1;
+  }
+  .page-head > .page-actions {
+    grid-column: 2;
+    grid-row: 1;
+    /* level with the middle of the title's first line */
+    margin-top: calc((var(--fs-xl) * var(--lh-tight) - var(--ctl-h)) / 2);
+  }
+  .page-head:has(> .breadcrumbs, > .crumbs) > .page-actions {
+    grid-row: 2;
+  }
+}
 /* a checkbox or a label in a page's actions stands as tall as the buttons beside it */
 .page-actions > .form-row {
   min-height: var(--ctl-h);
@@ -618,13 +645,17 @@ label.field {
   align-items: center;
   gap: var(--sp-2);
   flex-wrap: wrap;
-  margin-left: auto;
+  min-width: 0;
 }
-@media (max-width: 760px) {
+@media (min-width: 640px) {
   .page-actions {
-    margin-left: 0;
-    width: 100%;
+    flex-wrap: nowrap;
+    justify-content: flex-end;
   }
+}
+/* an action that PageActions folded into the More menu */
+.page-actions > [data-folded] {
+  display: none !important;
 }
 
 /* The row under a page's head with the controls that choose what the page shows, each a
