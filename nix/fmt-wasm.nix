@@ -7,7 +7,8 @@
 # wasm32-unknown-unknown with the `fmt-wasm` profile from the manifests and Cargo.lock
 # alone, then the script, which compiles the workspace crates and runs wasm-bindgen. The
 # script's source has every workspace crate stubbed but the formatter, its WebAssembly
-# crate and the vendored spargebra, so an edit to another crate changes neither layer.
+# crate, the SHACLC parser it calls and the vendored spargebra, so an edit to another
+# crate changes neither layer.
 {
   lib,
   craneLib,
@@ -72,6 +73,7 @@ let
       ../rust-toolchain.toml
       ../crates/sparkles-fmt
       ../crates/sparkles-fmt-wasm
+      ../crates/sparkles-shaclc
       ../vendor
       ../scripts/build-fmt-wasm.sh
     ];
@@ -83,8 +85,8 @@ let
     cargoLock = ../Cargo.lock;
     extraDummyScript = ''
       chmod -R u+w $out
-      rm -rf $out/Cargo.toml $out/crates/sparkles-fmt $out/crates/sparkles-fmt-wasm $out/vendor
-      cp -r --no-preserve=mode ${real}/crates/sparkles-fmt ${real}/crates/sparkles-fmt-wasm $out/crates/
+      rm -rf $out/Cargo.toml $out/crates/sparkles-fmt $out/crates/sparkles-fmt-wasm $out/crates/sparkles-shaclc $out/vendor
+      cp -r --no-preserve=mode ${real}/crates/sparkles-fmt ${real}/crates/sparkles-fmt-wasm ${real}/crates/sparkles-shaclc $out/crates/
       cp -r --no-preserve=mode ${real}/vendor $out/vendor
       mkdir -p $out/scripts
       cp --no-preserve=mode ${real}/Cargo.toml ${real}/rust-toolchain.toml $out/
