@@ -366,6 +366,9 @@ def main():
     assembly.add_argument("--source", type=Path, default=ROOT)
     assembly.add_argument("--out", type=Path, required=True)
     assembly.add_argument("--builder", required=True)
+    auditing = commands.add_parser(
+        "audit", help="check a built binary against the glibc 2.28 baseline and print the report")
+    auditing.add_argument("--binary", type=Path, required=True)
     checking = commands.add_parser("verify")
     checking.add_argument("--archive", type=Path, required=True)
     checking.add_argument("--checksums", type=Path, required=True)
@@ -374,6 +377,8 @@ def main():
     args = parser.parse_args()
     if args.command == "pack":
         pack(args.binary, args.source, args.out, args.builder)
+    elif args.command == "audit":
+        print(json.dumps(audit_elf(args.binary)[0], sort_keys=True))
     else:
         verify(args.archive, args.checksums, args.out, args.version)
 

@@ -569,8 +569,19 @@ and rdflib, and the wheel workflow's `scripts/py-wheel-test.sh` installs the sam
 so both run the same stubtest. The script uses the `python3` on PATH when it has those
 versions, and otherwise installs them into a virtual environment in `target/py-venv`.
 Both scripts set `SPARKLES_PY_TEST_DEPS=required`, which makes a missing mypy or rdflib
-fail the run. Without that variable, as under a bare `pytest`, those tests skip. Extra arguments go to pytest, as in
-`mise run py:test -- -k transaction`. `mise run py:lint` runs clippy on the crate with its
+fail the run. Without that variable, as under a bare `pytest`, those tests skip. Extra
+arguments go to pytest, as in `mise run py:test -- -k transaction`.
+
+`py:test` then runs the stub test again on the oldest Python that the package supports,
+which it reads from `requires-python` in `crates/sparkles-py/pyproject.toml`, since the
+stubs can differ there. The extension is built for the stable ABI, so the same build loads
+on that interpreter. `uv` makes the interpreter's virtual environment in
+`target/py-venv-<version>` with the same pinned dependencies, and only `test_stubtest`
+runs in it, which adds a few seconds. The extra arguments do not reach this run. When
+the interpreter on PATH is already the oldest one, it runs the stub test a second time with
+that interpreter and needs no `uv`. Without
+`uv` a plain run prints a warning and goes on. The batch gate sets
+`SPARKLES_PY_OLDEST=required`, and there a missing `uv` fails the run. `mise run py:lint` runs clippy on the crate with its
 default features and with none. Both tasks are part of `mise run ci`. The first run
 compiles the crate and the engine for the Python build, and later runs take seconds.
 
@@ -828,6 +839,7 @@ every step in sequence and its `progress.log` records the fallback.
 | `gate.sh --host atlas <rev>` | Runs ci on atlas, with the conformance half on a free helper. |
 | `gate.sh --host atlas --helper none <rev>` | Runs the whole gate on one host. |
 | `gate.sh --base origin/main~3 <rev>` | Selects the checks from the changes since the merge base of `origin/main~3` and the commit. The default base is `GATE_BASE` or `origin/main`. |
+| `gate.sh --host atlas --link-only <rev>` | Runs only the server artifact link check on atlas, which needs podman. The nightly gate uses it. |
 | `gate.sh --full <rev>` | Runs every check with `--force` and no selection, as the nightly gate does. |
 | `gate.sh --cargo-jobs 6 <rev>` | Sets `CARGO_BUILD_JOBS` to 6 on every host of the run. |
 | `gate.sh --auto <rev>` | Splits when both hosts are idle and otherwise runs the whole gate on the idle host that has the disk for it. With no idle host it puts ci on the shortest queue and splits only onto a helper whose queue is no longer. |
@@ -926,7 +938,9 @@ the ssh configuration names, so an agent socket at a fixed path, as with an
 `IdentityAgent` setting, works where a per-login agent does not.
 
 Each run writes a log to `.artifacts/gates/nightly/` in the main checkout, and the gate's
-results go to `.artifacts/gates/main-gate-<short>-nightly-<host>/`. A pass records the
+results go to `.artifacts/gates/main-gate-<short>-nightly-<host>/`. The server artifact link
+check, described below, writes its own log beside it and its results to
+`.artifacts/gates/main-gate-<short>-nightly-link-<host>/`. A pass records the
 commit in `last-pass`. A failure writes `FAILED`, with the range from the last passing
 commit to the failing one, the failed steps and the merges in that range. A failure is
 fixed forward. Bisect the range's merges with the failing step, for example with
@@ -936,14 +950,29 @@ broke it in a follow-up commit and gate that commit as usual. A batch whose sele
 skipped the failing check gets a rule in `scripts/gate/select-checks.py` when the miss is
 one the rules should have caught.
 
-The GitHub workflows run on GitHub and not in either gate. Among them are the server
-artifact build against glibc 2.28, the wheel tests on several CPython versions and the CI
-test shards. `scripts/gate/github-runs.py` prints the newest finished run of each
-workflow on `main` with the failed jobs of a failed run. `gate.sh` prints it before it
-starts and warns when a run failed, and `GATE_GITHUB_RUNS=0` skips it. The nightly gate
-writes it to `github-runs.txt` beside its log and copies it to `GITHUB-FAILED` while a
-run failed. A failed run does not change either gate's exit status. Fix it in the next
-batch, or say in the batch why it can wait.
+The nightly gate also runs the server artifact link check, which builds the release
+binary the way the server artifact workflow does and checks it against the glibc 2.28
+baseline. The check is `scripts/server-artifact-link-check.sh`. It builds `sparkles-server`
+in the pinned manylinux 2.28 image from `scripts/server-artifact-images.json` with
+rootless podman and a memory limit, then runs `scripts/server-artifact.py audit`, which
+applies the same `parse_elf` check as the packer. A call to a symbol from a newer glibc,
+such as `gettid` from 2.30, fails at the link or in that check. The build needs no UI or
+Wasm and takes about 12 minutes with the image pulled. `gate.sh --link-only --host H
+<rev>` runs it as a gate on one host. The nightly gate picks the first gate host that has
+podman, atlas first, or `GATE_LINK_HOST`, and runs the check before the full gate so
+that the full gate finds the host idle. A failure shows in `FAILED` as the `server-link`
+step, and a run where the check could not start counts as a failure while the full gate
+ran. The batch gate does not run the check.
+
+The other GitHub workflows run on GitHub and not in either gate. Among them are the wheel
+tests on several CPython versions and the CI test shards.
+`scripts/gate/github-runs.py` prints the newest finished run of each workflow on `main`
+with the failed jobs of a failed run. `gate.sh` prints it before it starts and warns when
+a run failed, and `GATE_GITHUB_RUNS=0` skips it. The nightly gate writes it to
+`github-runs.txt` beside its log and copies it to `GITHUB-FAILED` while a run failed. A
+failed run only warns and never changes either gate's exit status. A batch that fixes a
+red run has to pass the gate while `main` is still red, so a blocking check would stop
+the fix from landing. Fix the run in the next batch, or say in the batch why it can wait.
 
 ## Continuous integration
 
@@ -1187,6 +1216,9 @@ package or cryptographic attestation is published.
 The outer `server:artifact` task activates the same pinned wasm-bindgen CLI as
 `ui:wasm`, so the packer can record its version after the formatter task exits. A
 regression keeps both task pins equal to the wasm-bindgen version in Cargo.lock.
+
+The nightly gate builds the release binary in the same builder image and runs the same
+ELF audit, as [the nightly gate section](#nightly-gate) describes.
 
 The image digests in `scripts/server-artifact-images.json` identify the builder and
 clean runtimes. Update a digest only after reading its official registry metadata and
