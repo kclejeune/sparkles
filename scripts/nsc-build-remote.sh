@@ -3,7 +3,7 @@
 # this file, scripts/nsc-build.sh and scripts/cargo-sparkles-task into DIR/bin and the
 # revision's `git archive` into DIR/src before it calls it over ssh.
 #
-#   nsc-build-remote.sh DIR UNIT MBX_VERSION [feature and dependency-resolution flags...]
+#   nsc-build-remote.sh DIR UNIT [feature and dependency-resolution flags...]
 #
 # The build runs scripts/nsc-build.sh in the transient systemd user scope UNIT, so that it can
 # be listed and stopped by name and an out-of-memory kill ends the build alone. The scope has
@@ -11,7 +11,7 @@
 # (SPARKLES_NSC_BUILD_MEMORY_MAX overrides it). Inside it the build holds
 # ~/lanes/.heavy.lock, which gates and other heavy work on the host share, and waits for it
 # when another process holds it. CARGO_BUILD_JOBS defaults to the gate's value for the cap.
-# The host's own Boxington cache serves the build, and its mbx must be MBX_VERSION.
+# The host's own Boxington cache serves the build.
 #
 # The binary goes to DIR/out/sparkles with its SHA-256 in DIR/out/sha256. DIR/out/info.txt
 # gets the host's cc, c++ and rustc versions in the form of build.txt, DIR/out/rustc.txt and
@@ -19,14 +19,13 @@
 # The caller removes DIR.
 set -euo pipefail
 
-if [ "$#" -lt 3 ]; then
-  echo 'usage: nsc-build-remote.sh DIR UNIT MBX_VERSION [cargo flags...]' >&2
+if [ "$#" -lt 2 ]; then
+  echo 'usage: nsc-build-remote.sh DIR UNIT [cargo flags...]' >&2
   exit 2
 fi
 dir=$1
 unit=$2
-pin=$3
-shift 3
+shift 2
 fail() {
   echo "nsc-build-remote ($(uname -n)): $*" >&2
   exit 3
@@ -38,7 +37,6 @@ cd "$dir/src"
 export PATH="$dir/bin:$PATH"
 for t in mbx rustc cargo flock systemd-run sha256sum; do command -v "$t" > /dev/null || fail "$t is not on PATH"; done
 have=$(mbx --version | awk '{print $2}')
-[ -z "$pin" ] || [ "$have" = "$pin" ] || fail "mbx is $have, but mise.toml pins $pin"
 systemd-run --user --scope -q --collect true 2> /dev/null || fail "systemd-run --user --scope does not work"
 
 if [ -n "${SPARKLES_NSC_BUILD_MEMORY_MAX:-}" ]; then

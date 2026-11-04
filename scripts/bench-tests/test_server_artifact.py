@@ -350,7 +350,7 @@ class ArchiveContracts(unittest.TestCase):
                 captured.append((tree / artifact.DOC / "openapi.json").read_bytes())
                 raise ValueError("stop after capture")
             if words[-1] == "--version":
-                return "sparkles 0.1.0" if words[0] == str(binary) else "mbx 1.28.0"
+                return "sparkles 0.1.0" if words[0] == str(binary) else "mbx 1.29.1"
             raise AssertionError(words)
 
         with patch.object(artifact, "run", fake_run), patch.object(artifact, "ui_inputs", return_value={}), \
@@ -669,7 +669,7 @@ class WorkflowContracts(unittest.TestCase):
         (tools / "mbx").write_text('''#!/bin/bash
 echo "$*" >> "$BUILDER_CALLS"
 case "$1" in
-  --version) echo 'mbx 1.28.0';;
+  --version) echo 'mbx 1.29.1';;
   setup) exit 0;;
   sparkles-task) exit 42;;
   *) exit 99;;
