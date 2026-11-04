@@ -51,6 +51,10 @@ let tail = 0;
 frontier[tail++] = 1;
 let count = 1;
 const HUBS = [100000, 70000, 50000, 40000, 30000, 25000, 20000, 20000, 15000, 12000, 10000, 10000];
+// a smaller tree than 1 million classes gets proportionally smaller families, so that it
+// keeps its shape (the largest is about 18,750 children at 300,000 classes)
+const HUB_SCALE = N < 1_000_000 ? N / 1_600_000 : 1;
+for (let i = 0; i < HUBS.length; i++) HUBS[i] = Math.round(HUBS[i] * HUB_SCALE);
 let popped = 0;
 let hubNext = 0;
 

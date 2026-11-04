@@ -56,7 +56,9 @@ const sidecar = (classes: number): Sidecar | null => {
 const taxon = sidecar(2_600_000);
 /** The dataset of the scroll case: the 1 million class one opens in the baseline too. */
 const SCROLL_DS = process.env.PERF_SCROLL_DS ?? 'taxon1m';
-const scrollTaxon = sidecar(SCROLL_DS === 'taxon' ? 2_600_000 : 1_000_000);
+const scrollTaxon = sidecar(
+  { taxon: 2_600_000, taxon1m: 1_000_000, taxon300k: 300_000 }[SCROLL_DS] ?? 1_000_000,
+);
 
 const CHEBI_WATER = 'http://purl.obolibrary.org/obo/CHEBI_15377';
 
