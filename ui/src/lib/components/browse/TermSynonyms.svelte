@@ -32,11 +32,3 @@
     </dl>
   </section>
 {/if}
-
-<style>
-  .values {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px 14px;
-  }
-</style>

@@ -23,7 +23,8 @@ import {
   neighbourhood,
   hierarchyOf,
   leadRest,
-  leadRestSummary,
+  leadDisclosures,
+  labelKinds,
   hiddenRows,
   xrefsByDatabase,
   oboIri,
@@ -1007,24 +1008,57 @@ describe('the texts after the lead', () => {
       leadRest({ groups: [group('Definition', [v('only')], [v('fr', 'fr')])] }, [], []),
     ).toEqual([]);
   });
-  it('says what is there, with "more" for the kind that leads', () => {
-    expect(leadRestSummary(leadRest(lead, notes, ['en']), 'Definition')).toBe(
-      '1 more definition, 2 descriptions, 2 comments, 2 notes',
-    );
+  it('gives each kind that has values its own count, with "more" for the kind that leads', () => {
+    const labels = (rows: Parameters<typeof leadDisclosures>[0], kind: string) =>
+      leadDisclosures(rows, kind).map((d) => d.label);
+    expect(labels(leadRest(lead, notes, ['en']), 'Definition')).toEqual([
+      '1 more definition',
+      '2 descriptions',
+      '2 comments',
+      '2 notes',
+    ]);
     expect(
-      leadRestSummary(
-        leadRest({ groups: [group('Comment', [v('a'), v('b')])] }, [], []),
-        'Comment',
-      ),
-    ).toBe('1 more comment');
+      labels(leadRest({ groups: [group('Comment', [v('a'), v('b')])] }, [], []), 'Comment'),
+    ).toEqual(['1 more comment']);
     expect(
-      leadRestSummary(
-        [
-          { kind: 'Scope note', predicates: [], values: [v('a')] },
-          { kind: 'Example', predicates: [], values: [v('b')] },
+      labels(leadRest({ groups: [group('Definition', [v('a')])] }, [], []), 'Definition'),
+    ).toEqual([]);
+  });
+  it('counts every other kind as a note, with its property kept apart', () => {
+    const rows = [
+      { kind: 'Scope note', predicates: ['skos:scopeNote'], values: [v('a')] },
+      { kind: 'Example', predicates: ['skos:example'], values: [v('b')] },
+    ];
+    const [d] = leadDisclosures(rows, 'Definition');
+    expect(d.label).toBe('2 notes');
+    expect(d.rows.map((r) => r.predicates[0])).toEqual(['skos:scopeNote', 'skos:example']);
+    expect(leadDisclosures(rows, 'Scope note')[0].label).toBe('2 more notes');
+  });
+});
+
+describe('the labels by kind', () => {
+  it('keeps every language and leaves out a kind with none', () => {
+    expect(
+      labelKinds([
+        { lang: 'en', preferred: ['Fish'], alternative: ['Fishes'], hidden: [] },
+        { lang: 'fr', preferred: ['Poissons'], alternative: [], hidden: [] },
+        { lang: '', preferred: [], alternative: ['Pisces'], hidden: [] },
+      ]),
+    ).toEqual([
+      {
+        kind: 'Preferred',
+        values: [
+          { text: 'Fish', lang: 'en' },
+          { text: 'Poissons', lang: 'fr' },
         ],
-        'Definition',
-      ),
-    ).toBe('2 notes');
+      },
+      {
+        kind: 'Alternative',
+        values: [
+          { text: 'Fishes', lang: 'en' },
+          { text: 'Pisces', lang: '' },
+        ],
+      },
+    ]);
   });
 });

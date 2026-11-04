@@ -1414,7 +1414,7 @@ kbd,
 .term-head-row h2 {
   font-size: var(--fs-lg);
 }
-/* The compact rows of the synonyms: a muted kind on the left and the values on the right. */
+/* The compact rows of the synonyms and labels: a muted kind on the left and the values on the right. */
 .term-rows {
   display: grid;
   grid-template-columns: 124px minmax(0, 1fr);
@@ -1437,6 +1437,11 @@ kbd,
   min-width: 0;
   font-size: var(--fs-md);
   line-height: 1.5;
+}
+.term-rows dd.values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
 }
 /* on a phone the kind is one small line directly above the text */
 @container browse (max-width: 639px) {

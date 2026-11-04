@@ -277,13 +277,16 @@ export const DEFINITION_PROPS = [OBO + 'IAO_0000115', SKOS + 'definition'];
 
 /**
  * The properties of a page's lead block, in priority order, with the kind each is listed
- * under: the definitions, then descriptions, comments and scope notes.
+ * under: the definitions, then descriptions, comments and scope notes. A plain `skos:note` leads
+ * only when none of these is there.
  */
 export const LEAD_KINDS: [string, string][] = [
   [OBO + 'IAO_0000115', 'Definition'],
   [SKOS + 'definition', 'Definition'],
   [DCT + 'description', 'Description'],
   [DC + 'description', 'Description'],
+  ['http://schema.org/description', 'Description'],
+  ['https://schema.org/description', 'Description'],
   [RDFS + 'comment', 'Comment'],
   [SKOS + 'scopeNote', 'Scope note'],
 ];
@@ -327,6 +330,9 @@ export function leadRest(
   return rows;
 }
 
+/** One disclosure of the texts after the lead: its word for the kind, its label and its rows. */
+export type LeadDisclosure = { word: string; label: string; rows: LeadRow[] };
+
 const REST_WORDS: Record<string, string> = {
   Definition: 'definition',
   Description: 'description',
@@ -334,17 +340,36 @@ const REST_WORDS: Record<string, string> = {
 };
 
 /**
- * What the control over the other texts says, from what is there, such as "3 more definitions,
- * 2 descriptions, 8 notes". Every kind without a word of its own counts as a note, and only the
- * kind that leads is "more".
+ * The other texts as one disclosure per kind that has any, each with its count: definitions,
+ * descriptions, comments and notes. Every kind without a word of its own, such as a scope note or
+ * an example, is a note, and only the kind that leads is "more".
  */
-export function leadRestSummary(rows: LeadRow[], leadKind: string): string {
+export function leadDisclosures(rows: LeadRow[], leadKind: string): LeadDisclosure[] {
   const word = (kind: string) => REST_WORDS[kind] ?? 'note';
-  const counts = new Map<string, number>();
-  for (const r of rows) counts.set(word(r.kind), (counts.get(word(r.kind)) ?? 0) + r.values.length);
-  return [...counts]
-    .map(([w, n]) => `${n} ${w === word(leadKind) ? 'more ' : ''}${w}${n === 1 ? '' : 's'}`)
-    .join(', ');
+  return ['definition', 'description', 'comment', 'note'].flatMap((w) => {
+    const of = rows.filter((r) => word(r.kind) === w);
+    const n = of.reduce((sum, r) => sum + r.values.length, 0);
+    if (!n) return [];
+    const more = leadKind && word(leadKind) === w ? 'more ' : '';
+    return [{ word: w, label: `${n} ${more}${w}${n === 1 ? '' : 's'}`, rows: of }];
+  });
+}
+
+/** The labels of a SKOS resource by kind, with every value in each language, reader's first. */
+export function labelKinds(
+  labels: Sections['labels'],
+): { kind: string; values: { text: string; lang: string }[] }[] {
+  const kinds = [
+    ['Preferred', 'preferred'],
+    ['Alternative', 'alternative'],
+    ['Hidden', 'hidden'],
+  ] as const;
+  return kinds
+    .map(([kind, key]) => ({
+      kind,
+      values: labels.flatMap((l) => l[key].map((text) => ({ text, lang: l.lang }))),
+    }))
+    .filter((g) => g.values.length > 0);
 }
 
 /** Synonym properties, in display order, with their kind. */

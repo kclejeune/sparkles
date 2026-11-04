@@ -1,15 +1,15 @@
 <script lang="ts">
-  // The top of an entity's page: one text, the first definition or else the first
-  // description, comment or note, at a larger size with its predicate after it. Every other
-  // definition, description, comment and note waits behind one control that says what it holds,
-  // as tight rows of text by kind, each with its kind and predicate small after it. The lead's
-  // translations fold behind "In N other languages". A value in another language than the
-  // reader's best names it.
+  // The top of an entity's page: one text, the first definition or else the first description,
+  // comment or note, at a larger size. Under it one quiet disclosure for each kind of the other
+  // texts, its lead's translations, more definitions, descriptions, comments and notes, on one
+  // wrapping row with what each opens below the row. Every value ends with a chip of the property
+  // that states it, and the kind a chip does not spell out stays for a screen reader. A value in
+  // another language than the reader's best names it.
   import {
     langRank,
     languageCount,
+    leadDisclosures,
     leadRest,
-    leadRestSummary,
     type Lead,
     type Linker,
     type Sections,
@@ -30,7 +30,7 @@
     open = false,
   }: {
     lead: Lead;
-    /** The notes, which wait behind the control with the other texts. */
+    /** The notes, which wait behind their own disclosure. */
     notes?: Sections['notes'];
     linker: Linker;
     langs: readonly string[];
@@ -44,52 +44,58 @@
 
   const foreign = (v: Sourced) => !!v.lang && langRank(v.lang, langs) > 0;
   const first = $derived(lead.groups[0]);
-  const rows = $derived(leadRest(lead, notes, langs));
-  const summary = $derived(leadRestSummary(rows, first?.kind ?? ''));
+  const more = $derived(leadDisclosures(leadRest(lead, notes, langs), first?.kind ?? ''));
 </script>
 
-{#snippet source(kind: string | null, predicates: string[])}
-  <span class="source"
-    >{#if kind}{kind}{/if}<PredicateName
-      {predicates}
-      {prefixes}
-      href={predicateHref}
-      dot={!!kind}
-    /></span
-  >
+<!-- the no-break space keeps a chip with the last word of its text, so that it never sits alone -->
+{#snippet value(v: Sourced, kind: string | null, predicates: string[])}
+  {#if kind}<span class="sr-only">{kind}: </span>{/if}<SourcedValue
+    {v}
+    {linker}
+    {curieIri}
+    showLang={foreign(v)}
+  />&nbsp;<PredicateName {predicates} {prefixes} href={predicateHref} />
 {/snippet}
 
-{#if first || rows.length}
+{#if first || more.length}
   <div class="lead">
     {#if first?.values.length}
       <p class="lede">
-        <SourcedValue v={first.values[0]} {linker} {curieIri} showLang={foreign(first.values[0])} />
-        {@render source(first.kind === 'Definition' ? null : first.kind, first.predicates)}
+        {@render value(
+          first.values[0],
+          first.kind === 'Definition' ? null : first.kind,
+          first.predicates,
+        )}
       </p>
     {/if}
-    {#if first?.translations.length}
-      {@const n = languageCount(first.translations)}
-      <details class="fold">
-        <summary>In {n} other {n === 1 ? 'language' : 'languages'}</summary>
-        {#each first.translations as v, i (i)}
-          <p class="entry"><SourcedValue {v} {linker} {curieIri} showLang={foreign(v)} /></p>
+    {#if first?.translations.length || more.length}
+      <div class="more">
+        {#if first?.translations.length}
+          {@const n = languageCount(first.translations)}
+          <details data-more="translations" {open}>
+            <summary>In {n} other {n === 1 ? 'language' : 'languages'}</summary>
+            <ul>
+              {#each first.translations as v, i (i)}
+                <li>{@render value(v, null, first.predicates)}</li>
+              {/each}
+            </ul>
+          </details>
+        {/if}
+        {#each more as d (d.word)}
+          <details data-more={d.word} {open}>
+            <summary>{d.label}</summary>
+            <ul>
+              {#each d.rows as g (g.predicates.join(' ') + g.kind)}
+                {#each g.values as v, i (i)}
+                  <li data-kind={g.kind}>
+                    {@render value(v, d.word === 'note' ? g.kind : null, g.predicates)}
+                  </li>
+                {/each}
+              {/each}
+            </ul>
+          </details>
         {/each}
-      </details>
-    {/if}
-    {#if rows.length}
-      <details class="fold rest" {open}>
-        <summary>{summary}</summary>
-        <ul>
-          {#each rows as g (g.predicates.join(' ') + g.kind)}
-            {#each g.values as v, i (i)}
-              <li data-kind={g.kind} class:starts={i === 0}>
-                <SourcedValue {v} {linker} {curieIri} showLang={foreign(v)} />
-                {@render source(g.kind, g.predicates)}
-              </li>
-            {/each}
-          {/each}
-        </ul>
-      </details>
+      </div>
     {/if}
   </div>
 {/if}
@@ -106,32 +112,43 @@
     line-height: 1.55;
     max-width: 75ch;
   }
-  /* after the text, and on a line of its own when it does not fit, never split at its dot */
-  .source {
-    display: inline-block;
-    max-width: 100%;
-    margin-left: 0.25em;
-    font-size: var(--fs-xs);
-    color: var(--text-3);
+  /* The disclosures stack in a browser that cannot split one, and otherwise their summaries share
+     a wrapping row and stay in place while what they open falls below the row. */
+  .more {
+    display: flex;
+    flex-wrap: wrap;
+    column-gap: var(--sp-4);
+    min-width: 0;
   }
-  .lede .source {
-    font-size: var(--fs-sm);
+  .more details {
+    flex: 0 0 100%;
+    min-width: 0;
   }
-  .entry {
-    margin: var(--sp-1) 0 0;
-    font-size: var(--fs-md);
-    line-height: 1.5;
-    max-width: 75ch;
+  @supports selector(::details-content) {
+    .more details {
+      display: contents;
+    }
+    .more summary {
+      order: 0;
+    }
+    .more details::details-content {
+      order: 1;
+      flex: 0 0 100%;
+      min-width: 0;
+    }
   }
-  .fold summary {
+  summary {
     cursor: pointer;
     color: var(--text-2);
     font-size: var(--fs-sm);
     font-weight: 500;
   }
+  summary::marker {
+    color: var(--text-3);
+  }
   ul {
     list-style: none;
-    margin: var(--sp-2) 0 0;
+    margin: var(--sp-2) 0 var(--sp-1);
     padding: 0;
     display: grid;
     gap: var(--sp-1);
@@ -141,8 +158,5 @@
     line-height: 1.5;
     max-width: 75ch;
     min-width: 0;
-  }
-  li.starts:not(:first-child) {
-    margin-top: var(--sp-2);
   }
 </style>

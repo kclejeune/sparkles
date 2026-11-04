@@ -413,6 +413,13 @@
           : [],
   );
 
+  /** The synonym rows, leaving a SKOS resource's alternative and hidden labels to its Labels. */
+  const synonymRows = $derived(
+    (sections?.synonyms ?? []).filter(
+      (g) => !isSkos || (g.kind !== 'Alternative' && g.kind !== 'Hidden'),
+    ),
+  );
+
   /** The counts under a term's header, each a link to its section (ROADMAP item 633). */
   const termCounts = $derived.by(() => {
     if (!term || !sections) return [];
@@ -465,7 +472,7 @@
       one: 'synonym',
       many: 'synonyms',
       n: sections.synonyms.reduce((n, g) => n + g.values.length, 0),
-      href: '#syn-h',
+      href: synonymRows.length ? '#syn-h' : '#labels-h',
     });
     out.push({
       key: 'reuse',
@@ -476,7 +483,8 @@
       href: '#reuse-h',
       loading: reuse.loading,
     });
-    return out;
+    // a count of nothing says nothing, and with none left the line does not render
+    return out.filter((c) => c.n > 0);
   });
   const infoRows = $derived.by<InfoRow[]>(() => {
     if (!term || !sections) return [];
@@ -1363,17 +1371,19 @@
 
         <!-- the counts as one line of text links under the header, each to its section, then
              the term's cards in two columns: the term's own and a rail of facts (item 734) -->
-        <div class="b-chips">
-          <StatChips
-            plain
-            items={termCounts.map((c) => ({
-              key: c.key,
-              value: c.loading ? '…' : fmtInt(c.n),
-              label: c.n === 1 ? c.one : c.many,
-              href: c.href,
-            }))}
-          />
-        </div>
+        {#if termCounts.length}
+          <div class="b-chips">
+            <StatChips
+              plain
+              items={termCounts.map((c) => ({
+                key: c.key,
+                value: c.loading ? '…' : fmtInt(c.n),
+                label: c.n === 1 ? c.one : c.many,
+                href: c.href,
+              }))}
+            />
+          </div>
+        {/if}
         {#if view === 'graph' && piece && !treeKind}
           <div class="b-graph">
             <TermGraph
@@ -1399,7 +1409,7 @@
                     {curieIri}
                     {prefixes}
                     {predicateHref}
-                  />{:else if !editing}<p class="lede none">No definition in this ontology.</p>{/if}
+                  />{/if}
                 {#if editing}
                   {#if !isSkos && editorKind}
                     <SynonymEditor
@@ -1530,7 +1540,7 @@
                     </section>
                   {/if}
                   <TermSynonyms
-                    synonyms={sections.synonyms}
+                    synonyms={synonymRows}
                     {linker}
                     typeName={(i) => typeLabels.get(i) ?? synonymTypeName(i, term?.names)}
                   />
@@ -2042,13 +2052,16 @@
     order: 1;
     min-width: 0;
   }
-  /* on a phone Metadata follows the definition block */
+  /* on a phone Metadata follows the definition block, then Hierarchy, then Axioms */
   @container browse (max-width: 639px) {
     .browse .b-info {
       order: 3;
     }
-    .browse :global(.b-ax) {
+    .browse :global(.b-tree) {
       order: 4;
+    }
+    .browse :global(.b-ax) {
+      order: 5;
     }
   }
   /* in one column the sections on the page background stand further apart than the cards */
@@ -2071,8 +2084,7 @@
     border-top: 1px solid var(--border);
   }
   .ruled > :global(section:first-child),
-  .ruled > :global(.lead + section),
-  .ruled > .lede + :global(section) {
+  .ruled > :global(.lead + section) {
     border-top: 0;
   }
   .ruled > :global(section:first-child) {
@@ -2096,10 +2108,12 @@
   .ruled.rows > :global(.lead) {
     margin-bottom: 0;
   }
-  .ruled > .lede.none {
-    margin: 0 0 var(--sp-3);
-    color: var(--text-3, var(--text-2));
-    font-size: var(--fs-md);
+  /* a term with no text at all has no block, and the page goes on to what it has */
+  .b-def:not(:has(.ruled > *)) {
+    display: none;
+  }
+  .b-refs .term-head-row {
+    margin-bottom: var(--sp-4);
   }
   /* one wide column at a medium size: the rail's cards run to the edges, so their padding opens
      a little to keep the measure in hand */

@@ -60,7 +60,9 @@ open(
     await expect(logic.getByRole('link', { name: 'membrane-bounded organelle' })).toBeVisible();
     await expect(logic.locator('[data-section="sub"]')).toContainText('part of some cytoplasm');
 
-    // a CURIE of the ontology's own namespace in a comment links to its page
+    // a CURIE of the ontology's own namespace in a comment links to its page, and the comment
+    // waits behind its disclosure under the lead
+    await page.locator('details[data-more="comment"] > summary').click();
     await expect(page.getByRole('link', { name: 'CELLO:0000011' })).toHaveAttribute(
       'href',
       new RegExp(encodeURIComponent(CELLO(11))),
