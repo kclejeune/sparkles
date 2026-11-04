@@ -96,6 +96,8 @@ test.describe('workbench open', () => {
         const net = new Net(cdp);
         await net.start();
         const r: Record<string, unknown> = { url: c.url.replace(BASE, ''), status: 'ok' };
+        page.on('crash', () => (r.crashed = true));
+        page.on('pageerror', (e) => (r.pageError ??= String(e.message).slice(0, 200)));
         try {
           await page.goto(c.url, { waitUntil: 'commit' });
           await page.locator(c.wait).first().waitFor({ state: 'visible', timeout: LOAD_TIMEOUT });
