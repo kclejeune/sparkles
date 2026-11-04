@@ -1173,7 +1173,9 @@ fn at_most(
         Some(_) => choose(cands.len() - 1, k - 1),
         None => choose(cands.len(), k),
     };
-    if subsets > AT_MOST_SUBSETS {
+    // each subset's product holds its premise lists and the equalities of every pair
+    let payload = subsets.saturating_mul(k * (k - 1) / 2 + k + 1);
+    if k > AT_MOST_WIDEST || subsets > AT_MOST_SUBSETS || payload > AT_MOST_PAYLOAD {
         found.over = true;
         return;
     }
@@ -1215,6 +1217,15 @@ fn at_most(
 /// The most subsets one application of the at-most rule makes before the run passes its
 /// bound on derived conclusions instead.
 const AT_MOST_SUBSETS: usize = 1 << 14;
+
+/// The most literals and premise lists the products of one application of the at-most
+/// rule hold before the run passes its bound on derived conclusions instead.
+const AT_MOST_PAYLOAD: usize = 1 << 16;
+
+/// The most terms one application of the at-most rule equates: past it each conclusion has
+/// more than 66 equalities, whose Eq and Factor inferences no context finishes, and the
+/// run passes its bound on derived conclusions instead.
+const AT_MOST_WIDEST: usize = 12;
 
 /// The number of k-element subsets of n, saturating.
 fn choose(n: usize, k: usize) -> usize {

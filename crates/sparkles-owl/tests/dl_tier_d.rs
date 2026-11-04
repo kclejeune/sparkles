@@ -1230,3 +1230,33 @@ fn a_wide_maximum_passes_the_bound_instead_of_enumerating_its_subsets() {
     assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
     assert!(out.stats.dl_over_budget || out.complete);
 }
+
+#[test]
+fn a_maximum_of_many_passes_the_bound_instead_of_making_its_equalities() {
+    // one subset of a thousand successors has half a million equalities
+    let mut body = String::from("SubClassOf(:A :M) SubClassOf(:M ObjectMaxCardinality(999 :r))\n");
+    for i in 0..1001 {
+        body.push_str(&format!("SubClassOf(:A ObjectSomeValuesFrom(:r :B{i}))\n"));
+    }
+    body.push_str(UNION);
+    let ax = axioms(&body);
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
+    assert!(out.stats.dl_over_budget || out.complete);
+}
+
+#[test]
+fn a_maximum_of_a_hundred_passes_the_bound_instead_of_factoring_its_equalities() {
+    // one subset of a hundred successors has about five thousand equalities
+    let mut body = String::from("SubClassOf(:A :M) SubClassOf(:M ObjectMaxCardinality(99 :r))\n");
+    for i in 0..101 {
+        body.push_str(&format!("SubClassOf(:A ObjectSomeValuesFrom(:r :B{i}))\n"));
+    }
+    body.push_str(UNION);
+    let ax = axioms(&body);
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
+    assert!(out.stats.dl_over_budget || out.complete);
+}
