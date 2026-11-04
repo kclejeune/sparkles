@@ -10,8 +10,8 @@ Usage:
   github-runs.py [--branch BRANCH] [--repo OWNER/NAME]
 
 The workflows filter on paths, so a push runs only some of them. The report therefore
-takes, for each workflow, its newest finished run on the branch, whatever commit that run
-tested. It prints one line for each, with the commit and the failed jobs of a failed run,
+takes, for each active workflow, its newest finished run on the branch, from a push or a
+manual dispatch, whatever commit that run tested. It prints one line for each, with the commit and the failed jobs of a failed run,
 and exits 0 when none failed, 1 when one failed and 2 when `gh` cannot list the runs. A
 cancelled run is not a failure, and a run still in progress is left for the next report.
 """
@@ -63,10 +63,18 @@ def main():
     ap.add_argument("--repo", default="kclejeune/sparkles")
     args = ap.parse_args()
     try:
-        runs = json.loads(gh(
-            "run", "list", "--repo", args.repo, "--branch", args.branch, "--event", "push",
-            "--limit", "100", "--json", "databaseId,workflowName,status,conclusion,createdAt,headSha,url",
-        ))
+        # One query per workflow, so that a workflow that runs rarely is not crowded out
+        # by the runs of the others. Pushes and manual dispatches on the branch both count.
+        workflows = json.loads(gh("workflow", "list", "--repo", args.repo, "--json", "name,state"))
+        runs = []
+        for wf in workflows:
+            if wf["state"] != "active":
+                continue
+            runs += json.loads(gh(
+                "run", "list", "--repo", args.repo, "--workflow", wf["name"], "--branch", args.branch,
+                "--status", "completed", "--limit", "1",
+                "--json", "databaseId,workflowName,status,conclusion,createdAt,headSha,url",
+            ))
         failed_jobs = {}
         for run in latest_runs(runs):
             if run["conclusion"] in FAILED:

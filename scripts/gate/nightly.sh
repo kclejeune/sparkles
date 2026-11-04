@@ -86,6 +86,15 @@ rev=$(git rev-parse origin/main)
 short=${rev:0:8}
 mkdir -p "$state"
 last=$(cat "$state/last-pass" 2> /dev/null || true)
+# The GitHub workflows of main, which the gate does not run, refreshed every night even
+# when the commit already passed. A failure is recorded beside the gate's own result and
+# does not change it.
+if python3 "$here/github-runs.py" > "$state/github-runs.txt" 2>&1; then
+  rm -f "$state/GITHUB-FAILED"
+else
+  cp "$state/github-runs.txt" "$state/GITHUB-FAILED"
+  cat "$state/GITHUB-FAILED"
+fi
 if [ "${1:-}" = --dry-run ]; then
   echo "nightly: origin/main is $short, last pass ${last:-none}"
   exec "$here/gate.sh" --auto --full --tag nightly --dry-run "$rev"
@@ -96,14 +105,6 @@ if [ "$rev" = "$last" ]; then
 fi
 
 log=$state/$(date -u +%Y%m%dT%H%M%SZ)-$short.log
-# The GitHub workflows of main, which the gate does not run. A failure is recorded beside
-# the gate's own result and does not change it.
-if python3 "$here/github-runs.py" > "$state/github-runs.txt" 2>&1; then
-  rm -f "$state/GITHUB-FAILED"
-else
-  cp "$state/github-runs.txt" "$state/GITHUB-FAILED"
-  cat "$state/GITHUB-FAILED"
-fi
 code=0
 GATE_GITHUB_RUNS=0 "$here/gate.sh" --auto --full --tag nightly "$rev" > "$log" 2>&1 || code=$?
 if [ "$code" = 0 ]; then
