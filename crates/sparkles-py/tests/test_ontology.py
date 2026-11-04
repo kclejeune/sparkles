@@ -347,6 +347,88 @@ def test_classify(ds: sparkles.Dataset) -> None:
     ]
 
 
+def cases(n: int, inconsistent: bool) -> str:
+    """Item 603's cases, as the Rust tests write them: a classification that the
+    disjunctive rules take, long enough that a deadline stops it part way."""
+
+    def some(p: str, c: str) -> str:
+        return f"[ a owl:Restriction ; owl:onProperty {p} ; owl:someValuesFrom {c} ]"
+
+    out = [":r a owl:ObjectProperty . :s a owl:ObjectProperty ."]
+    for i in range(n):
+        b, d = (7 * i + 3) % n, (13 * i + 5) % n
+        out.append(
+            f":C{i} a owl:Class ; rdfs:subClassOf [ owl:unionOf ( :B{i} :E{i} ) ] . "
+            f":B{i} rdfs:subClassOf :K{i} , :C{b} . :E{i} rdfs:subClassOf :K{i} . "
+            f":K{i} rdfs:subClassOf {some(':r', f':C{d}')} . "
+            f":E{i} rdfs:subClassOf [ a owl:Restriction ; "
+            f"owl:onProperty [ owl:inverseOf :r ] ; owl:allValuesFrom :F{d} ] . "
+            f"{some(':r', f':F{i}')} rdfs:subClassOf :G{b} ."
+        )
+    if inconsistent:
+        out.append(
+            f"owl:Thing rdfs:subClassOf {some(':s', '[ owl:unionOf ( :N1 :N2 ) ]')} . "
+            ":N1 rdfs:subClassOf owl:Nothing . :N2 rdfs:subClassOf :N3 . "
+            ":N3 owl:disjointWith :N2 ."
+        )
+    return "\n".join(out)
+
+
+def partial_answers(inconsistent: bool) -> list[str]:
+    """Classify the cases under deadlines from a fraction of a full run's time upwards,
+    check every answer and return the consistencies of the partial ones."""
+    import time
+
+    body = f"{PREFIXES} INSERT DATA {{ {cases(300, inconsistent)} }}"
+    full_ds = sparkles.Dataset()
+    full_ds.update(body)
+    t = time.perf_counter()
+    full = full_ds.ontology.classify(partial=True, threads=1, limit=10000)
+    took = time.perf_counter() - t
+    want = "inconsistent" if inconsistent else "consistent"
+    assert full["complete"] and not full["partial"]
+    assert (full["consistency"], full["tier"]) == (want, "disjunctive")
+    assert full["incomplete"] == [] and full["incompleteCount"] == 0
+    d = sparkles.Dataset()
+    d.update(body)
+    seen = []
+    f = 0.02
+    while f < 1.5:
+        try:
+            r = d.ontology.classify(partial=True, threads=1, limit=10000, timeout=took * f)
+        except sparkles.QueryTimeoutError:
+            r = None
+        f *= 1.25
+        if r is None:
+            continue
+        assert r["classes"] == full["classes"]
+        if not r["partial"]:
+            assert r["complete"] and r["consistency"] == want
+            continue
+        assert not r["complete"], "a partial answer is presented as complete"
+        assert r["incompleteCount"] == len(r["incomplete"])
+        assert r["consistency"] in (want, "unknown")
+        if r["consistency"] == "unknown":
+            assert len(r["incomplete"]) + 2 >= r["classes"]
+        seen.append(r["consistency"])
+    return seen
+
+
+def test_classify_answers_in_part_under_a_deadline(ds: sparkles.Dataset) -> None:
+    assert partial_answers(False), "no deadline gave a partial answer"
+    r = ds.ontology.classify(partial=True, expansion="eager")
+    assert r["complete"] and not r["partial"] and r["consistency"] == "consistent"
+    assert r["tier"] == "el" and r["incomplete"] == []
+    with pytest.raises(ValueError):
+        ds.ontology.classify(partial=True, target=EX + "taxonomy")
+    with pytest.raises(ValueError):
+        ds.ontology.classify(expansion="greedy")
+
+
+def test_classify_leaves_the_consistency_unknown_when_stopped_early() -> None:
+    assert "unknown" in partial_answers(True)
+
+
 def test_manchester_and_dl_query(ds: sparkles.Dataset) -> None:
     ds.update(f'{PREFIXES} INSERT DATA {{ :Course rdfs:label "Course unit" . }}')
     p = ds.ontology.parse("teaches some 'Course unit'")

@@ -142,6 +142,7 @@ function wireObject(options: QueryOptions | UpdateOptions) {
   const { signal, ...rest } = options;
   const object: any = { ...rest };
   delete object.factory;
+  delete object.answersWhenStopped;
   if ('bindings' in options && options.bindings)
     object.bindings = Object.fromEntries(
       options.bindings instanceof Bindings
@@ -915,7 +916,11 @@ export class Dataset extends Queryable {
     const task = (async () => {
       try {
         const value = await operation(cancel!, controller?.signal as AbortSignal);
-        if (stopped) {
+        // a partial classification answers with what it proved when its timeout stops it
+        if (
+          stopped &&
+          !(timedOut && (options as { answersWhenStopped?: boolean }).answersWhenStopped)
+        ) {
           const handle = value as any;
           if (handle && typeof handle.end === 'function') await handle.end(false);
           else if (handle && typeof handle.close === 'function') await handle.close();
