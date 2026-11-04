@@ -1679,7 +1679,7 @@ export async function handleOntology(req, res, url, seg, ctx) {
     return true;
   }
   if (req.method === 'GET' && sub === 'hierarchy') {
-    const b = browseIndex(ds, graph);
+    const b = browseIndex(ds, graph, p.get('lang'));
     const kind = p.get('kind') ?? 'class';
     const iri = p.get('iri');
     const limit = Math.min(Number(p.get('limit') ?? 100), 1000);
@@ -1738,7 +1738,7 @@ export async function handleOntology(req, res, url, seg, ctx) {
     return true;
   }
   if (req.method === 'GET' && sub === 'term') {
-    const b = browseIndex(ds, graph);
+    const b = browseIndex(ds, graph, p.get('lang'));
     const iri = p.get('iri');
     if (!iri || !b.mentioned.has(iri))
       return (fail(res, 404, `the graphs do not mention <${iri}>`, { code: 'not-found' }), true);
@@ -2576,7 +2576,7 @@ function searchEntities(ds, graph, p) {
       continue;
     const all = texts.get(iri) ?? [];
     const labels = all.filter((t) => t.field === 'label');
-    const label = labels.find((t) => !t.lang || t.lang.startsWith('en')) ?? labels[0] ?? null;
+    const label = bestLabel(labels, p.get('lang'));
     let best = null;
     for (const t of all) {
       const f = fold(t.text);
@@ -2644,7 +2644,26 @@ const TOP = new Set([OWL + 'Thing', OWL + 'topObjectProperty', OWL + 'topDataPro
  * The names, kinds and hierarchies of a graph, in brief, for the mock's
  * `GET /$/ontology/{ds}/hierarchy` and `GET /$/ontology/{ds}/term`.
  */
-function browseIndex(ds, graph) {
+function bestLabel(labels, languages) {
+  const langs = (languages ?? 'en')
+    .split(',')
+    .filter(Boolean)
+    .map((l) => l.toLowerCase());
+  const rank = (tag) => {
+    const l = (tag ?? '').toLowerCase();
+    const i = langs.findIndex((w) => l === w || l.startsWith(w + '-'));
+    return i >= 0
+      ? i
+      : !l
+        ? langs.length
+        : l === 'en' || l.startsWith('en-')
+          ? langs.length + 1
+          : langs.length + 2;
+  };
+  return [...labels].sort((a, b) => rank(a.lang) - rank(b.lang))[0] ?? null;
+}
+
+function browseIndex(ds, graph, languages) {
   const quads = ds.store.match(null, null, null, graphTerm(graph));
   const kinds = new Map();
   const labels = new Map();
@@ -2667,7 +2686,7 @@ function browseIndex(ds, graph) {
   }
   const name = (iri) => {
     const ls = labels.get(iri) ?? [];
-    const l = ls.find((t) => t.lang?.startsWith('en')) ?? ls.find((t) => !t.lang) ?? ls[0] ?? null;
+    const l = bestLabel(ls, languages);
     return {
       iri,
       label: l?.text ?? null,

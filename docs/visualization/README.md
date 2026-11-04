@@ -402,6 +402,21 @@ the history tabs. Each subject is a block named by its label, with every added o
 property and value on a line of its own and a sign beside it, and the plain N-Quads are one
 tab away.
 
+### Rendering preferences
+
+The top bar's **Rendering preferences** button and the phone menu choose how entities
+appear in the editors, Browse and query results. Choose **Label**, **Prefixed name** or
+**Full IRI**, and enter language tags separated by commas in preference order. An empty
+list uses the browser's languages. Regional tags fall back to their primary language,
+then labels fall back to untagged values, English and another available language. A
+missing label uses a prefixed name, and an unknown namespace uses the complete IRI.
+The browser saves these preferences locally. The thesaurus editor's **Label language**
+field can override the language order for that page.
+
+Query tables read labels for visible rows in batches from the result's branch and commit.
+Graph results use label literals present in their triples. A failed label lookup leaves
+the IRI visible. Copying and navigation always keep the original IRI.
+
 ### Ontology editor
 
 The **Ontology** editor, `/ui/workbench/ontology`, browses and edits the OWL ontology of one graph
@@ -723,8 +738,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   ontology waits for the axioms route to open the whole ontology, 707. Its
   pages and hierarchy show asserted axioms only, and inferred ones are item 622. Its search reads
   the head of a branch, so a page at a past state has no search box, item 658. It shows
-  entities by label with the reader's languages first, and a choice of label, prefixed
-  name or IRI is item 625. Reuse is looked up in the other datasets of the same server,
+  entities using the shared rendering preferences. Reuse is looked up in the other datasets of the same server,
   and other servers' term pages are item 461. The landing page counts entities by kind
   without axiom counts or expressivity, item 621.
 * The ontology editor's tree filter matches the names it has loaded and does not call the
@@ -748,7 +762,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 607](../ROADMAP.md), [item 621](../ROADMAP.md), [item 622](../ROADMAP.md), [item 625](../ROADMAP.md), [item 630](../ROADMAP.md), [item 658](../ROADMAP.md), [item 461](../ROADMAP.md), [item 612](../ROADMAP.md), [item 613](../ROADMAP.md), [item 614](../ROADMAP.md), [item 615](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
+The remaining work described above refers to [item 607](../ROADMAP.md), [item 621](../ROADMAP.md), [item 622](../ROADMAP.md), [item 630](../ROADMAP.md), [item 658](../ROADMAP.md), [item 461](../ROADMAP.md), [item 612](../ROADMAP.md), [item 613](../ROADMAP.md), [item 614](../ROADMAP.md), [item 615](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

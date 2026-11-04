@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { iriForm } from '$lib/iri-form.svelte';
   // The ontology editor (docs/specs/U12-ontology-workbench/SPEC.md, "Ontology editor UI"):
   // the class, property and individual trees of a graph's ontology, an entity's frame and
   // its usage, the header, and the inferred class tree beside the asserted one. Every edit
@@ -210,7 +211,7 @@
   let frameSeq = 0;
   let classifySeq = 0;
 
-  const langs = typeof navigator === 'undefined' ? ['en'] : [...(navigator.languages ?? []), 'en'];
+  const langs = $derived(iriForm.languages);
   /** The name of `iri` as a tree draws it: the tree's own levels carry the labels. */
   const treeName = (iri: string) => entityName(iri, labels, prefixes, langs);
   /** Add the labels in `more` that the views do not have yet. */
@@ -223,13 +224,15 @@
   );
   /** The name of `iri`, reading its label when the views name it for the first time. */
   const nameOf = (iri: string) => {
-    if (!labels.get(iri)?.length) batch.want(iri);
+    if (iriForm.mode === 'label' && !labels.get(iri)?.length) batch.want(iri);
     return treeName(iri);
   };
   /** The short forms the hierarchy route gives, such as GO:0008150, as the browse pages show them. */
   let shortForms = $state<Map<string, string>>(new Map());
   const subOf = (iri: string) =>
-    labels.get(iri)?.length ? (shortForms.get(iri) ?? iriName(iri, prefixes)) : null;
+    iriForm.mode === 'label' && labels.get(iri)?.length
+      ? (shortForms.get(iri) ?? iriName(iri, prefixes))
+      : null;
 
   async function loadAll() {
     const t = target;
@@ -462,10 +465,13 @@
   let levelScope = '';
   let levelCommit: number | null = null;
   $effect(() => {
-    const scope = `${target}\u0000${graph ?? ''}`;
+    const scope = `${target}\u0000${graph ?? ''}\u0000${langs.join(',')}`;
     const commit = summary?.commit ?? null;
     untrack(() => {
       if (scope !== levelScope) {
+        batch.reset();
+        labels.clear();
+        for (const lt of levelTrees.values()) lt.drop();
         levelScope = scope;
         levelCommit = commit;
         levelEpoch++;
@@ -503,7 +509,7 @@
     // the scope is read here, where the effect tracks it, not in the timer below
     const scopeTarget = target;
     const scopeGraph = graph;
-    const scope = `${scopeTarget}\u0000${scopeGraph ?? ''}`;
+    const scope = `${scopeTarget}\u0000${scopeGraph ?? ''}\u0000${langs.join(',')}`;
     if (scope !== filteredIn) {
       // another dataset, branch or graph must not keep showing the last scope's hits
       filteredIn = scope;
@@ -1136,11 +1142,7 @@
     ),
   );
   const headerTitle = $derived(
-    summary?.header.iri
-      ? labels.get(summary.header.iri)?.length
-        ? nameOf(summary.header.iri)
-        : summary.header.iri
-      : 'Anonymous ontology',
+    summary?.header.iri ? nameOf(summary.header.iri) : 'Anonymous ontology',
   );
   // the ontology's own label is the one name the head asks for, once the summary is in
   $effect(() => {

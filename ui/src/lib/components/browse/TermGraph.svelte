@@ -65,7 +65,7 @@
   const nodes = $derived<GNode[]>(
     shown.nodes.map((n) => ({
       id: n.id,
-      label: n.label,
+      label: linker.name(n.id),
       kind: 'iri',
       title: n.id,
       focus: n.focus,
@@ -82,7 +82,7 @@
       nodes: nodes.map((n) => ({ id: n.id, term: n.term })),
       edges: edges.map((e) => ({ id: e.id, source: e.source, target: e.target })),
       reasoning: false,
-      label: (id) => shown.nodes.find((n) => n.id === id)?.label ?? id,
+      label: (id) => linker.name(id),
       short: (iri) => linker.short(iri) ?? linker.name(iri),
     });
   });
@@ -95,7 +95,7 @@
     <LensMenu {lenses} anchor={toolbar} short={(iri) => linker.short(iri) ?? linker.name(iri)} />
     <span class="spacer"></span>
     {#if pick && !compact && linker.href(pick.id)}
-      <a class="btn sm" href={linker.href(pick.id)}>Open {pick.label}</a>
+      <a class="btn sm" href={linker.href(pick.id)}>Open {linker.name(pick.id)}</a>
     {/if}
     <button class="btn sm" type="button" onclick={() => view?.fit()}
       ><Icon name="fit" size={14} />Fit</button

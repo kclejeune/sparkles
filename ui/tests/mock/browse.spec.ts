@@ -757,7 +757,7 @@ test('the header writes the IRI as the switch says and copies it in full', async
   await page.getByRole('button', { name: 'Copy the IRI' }).click();
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(full);
   // who chose full IRIs sees the full form
-  await page.getByRole('button', { name: 'Prefixed' }).click();
+  await page.getByRole('button', { name: 'Labels' }).click();
   await expect(iri).toHaveText(full);
   await expect(iri.locator('[aria-hidden="true"]')).toHaveCount(0);
   await expect(chip).toHaveText('CL_0009001');

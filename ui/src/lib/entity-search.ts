@@ -2,6 +2,8 @@
 // the launcher provider that shows its hits in the top bar.
 
 import { request } from './api';
+import { iriForm } from './iri-form.svelte';
+import { displayEntity, WELL_KNOWN, type PrefixMap } from './rdf';
 import type { LauncherItem, LauncherProvider } from './launcher.svelte';
 
 export type EntitySearchKind =
@@ -48,6 +50,7 @@ export async function searchEntities(
   ds: string,
   q: string,
   opts: {
+    lang?: readonly string[];
     limit?: number;
     offset?: number;
     kind?: EntitySearchKind[];
@@ -57,6 +60,8 @@ export async function searchEntities(
   } = {},
 ): Promise<EntitySearch> {
   const p = new URLSearchParams({ q, limit: String(opts.limit ?? 10) });
+  const languages = opts.lang ?? iriForm.languages;
+  if (languages.length) p.set('lang', languages.join(','));
   if (opts.offset) p.set('offset', String(opts.offset));
   if (opts.kind?.length) p.set('kind', opts.kind.join(','));
   if (opts.graph !== undefined) p.set('graph', opts.graph ?? 'default');
@@ -95,9 +100,14 @@ export function entityHref(base: string, ds: string, hit: Pick<EntityHit, 'iri' 
 }
 
 /** A hit as a launcher row: the label with its match, and what matched when not the label. */
-export function entityItem(base: string, ds: string, h: EntityHit): LauncherItem {
+export function entityItem(
+  base: string,
+  ds: string,
+  h: EntityHit,
+  prefixes: PrefixMap = WELL_KNOWN,
+): LauncherItem {
   const onLabel = h.match.field === 'label';
-  const title = h.label ?? h.shortForm ?? h.iri;
+  const title = displayEntity(h.iri, prefixes, h.label ? [{ '@value': h.label }] : undefined);
   const parts = [h.shortForm ?? h.iri];
   if (!onLabel) parts.push(`${FIELD_NAME[h.match.field] ?? h.match.field} "${h.match.text}"`);
   if (h.deprecated) parts.push('deprecated');
@@ -112,7 +122,10 @@ export function entityItem(base: string, ds: string, h: EntityHit): LauncherItem
 }
 
 /** The shell's provider: the open dataset's entities, eight at a time. */
-export function entityProvider(base: string): LauncherProvider {
+export function entityProvider(
+  base: string,
+  prefixes: (ds: string) => PrefixMap = () => WELL_KNOWN,
+): LauncherProvider {
   return {
     id: 'entities',
     label: ({ ds }) => (ds ? `Entities in ${ds}` : 'Entities'),
@@ -121,7 +134,7 @@ export function entityProvider(base: string): LauncherProvider {
     async search(q, { ds, signal }) {
       if (!ds || !q.trim()) return [];
       const r = await searchEntities(ds, q.trim(), { limit: 8, signal });
-      return r.results.map((h) => entityItem(base, ds, h));
+      return r.results.map((h) => entityItem(base, ds, h, prefixes(ds)));
     },
   };
 }

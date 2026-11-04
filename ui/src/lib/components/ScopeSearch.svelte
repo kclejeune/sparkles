@@ -84,7 +84,7 @@
     auth.hasServer('server-admin') || Object.values(auth.who?.datasets ?? {}).includes('admin');
 
   onMount(() => {
-    const entities = entityProvider(base);
+    const entities = entityProvider(base, (ds) => app.prefixes(ds));
     const offs = [
       launcher.register({
         ...entities,

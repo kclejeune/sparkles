@@ -3,7 +3,7 @@
   import TermView from './TermView.svelte';
   import {
     abbreviateVector,
-    displayIri,
+    displayEntity,
     isVectorLiteral,
     shorten,
     XSD_STRING,
@@ -16,8 +16,10 @@
     onopen,
     full = false,
     expandable = false,
+    labels,
   }: {
     term: Term | null | undefined;
+    labels?: ReadonlyMap<string, import('$lib/ontology').Lit[]>;
     prefixes: PrefixMap;
     onopen?: (iri: string) => void;
     /** Show the full IRI instead of the prefixed form. */
@@ -40,11 +42,11 @@
 {:else if term.type === 'uri'}
   {#if onopen}
     <button class="link t-iri" title={term.value} onclick={() => onopen(term.value)}>
-      {full ? term.value : displayIri(term.value, prefixes)}
+      {full ? term.value : displayEntity(term.value, prefixes, labels?.get(term.value))}
     </button>
   {:else}
     <span class="t-iri" title={term.value}
-      >{full ? term.value : displayIri(term.value, prefixes)}</span
+      >{full ? term.value : displayEntity(term.value, prefixes, labels?.get(term.value))}</span
     >
   {/if}
 {:else if term.type === 'bnode'}
@@ -70,9 +72,9 @@
     >{:else if dt}<span class="meta" title={term.datatype}>^^{dt}</span>{/if}
 {:else}
   <span class="quoted"
-    >«<TermView term={term.value.subject} {prefixes} {onopen} />
-    <TermView term={term.value.predicate} {prefixes} {onopen} />
-    <TermView term={term.value.object} {prefixes} {onopen} />»</span
+    >«<TermView term={term.value.subject} {prefixes} {onopen} {labels} {full} />
+    <TermView term={term.value.predicate} {prefixes} {onopen} {labels} {full} />
+    <TermView term={term.value.object} {prefixes} {onopen} {labels} {full} />»</span
   >
 {/if}
 

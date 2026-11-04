@@ -1,7 +1,10 @@
 <script lang="ts">
+  import { displayName } from '$lib/browse';
+  import { WELL_KNOWN, type PrefixMap } from '$lib/rdf';
   // The landing page's search: the entity search of the ontology as a list in the page,
   // by label, synonym, short form, IRI and definition, with kind chips and pages of 20.
   // While it is mounted, `/` focuses it in place of opening the command palette.
+  import { iriForm } from '$lib/iri-form.svelte';
   import * as api from '$lib/api';
   import { usePageSearch } from '$lib/launcher.svelte';
   import { kindWord } from '$lib/browse';
@@ -10,11 +13,13 @@
 
   let {
     target,
+    prefixes = WELL_KNOWN,
     graph,
     href,
     chips,
     placeholder = 'Search by label, synonym, ID or definition',
   }: {
+    prefixes?: PrefixMap;
     target: string;
     graph: string | null;
     href: (iri: string) => string;
@@ -75,6 +80,7 @@
     void kind;
     void target;
     void graph;
+    void iriForm.languages;
     clearTimeout(timer);
     timer = setTimeout(() => void search(0), 180);
     return () => clearTimeout(timer);
@@ -130,7 +136,9 @@
     <ul class="hits">
       {#each hits as h (h.iri)}
         <li>
-          <a href={href(h.iri)} class:dep={h.deprecated}>{h.label ?? h.shortForm ?? h.iri}</a>
+          <a href={href(h.iri)} class:dep={h.deprecated}
+            >{displayName(h.iri, { [h.iri]: h }, prefixes)}</a
+          >
           {#if h.shortForm && h.shortForm !== h.label}<span class="sfx">{h.shortForm}</span>{/if}
           <span class="badge iri">{kindWord(h.kinds)}</span>
           {#if h.deprecated}<span class="badge danger">deprecated</span>{/if}

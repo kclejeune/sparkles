@@ -8,13 +8,21 @@ const NUMERIC =
   /#(integer|decimal|double|float|long|int|short|byte|nonNegativeInteger|positiveInteger|unsignedInt|unsignedLong)$/;
 
 /** Sort key of a cell: numbers for numeric literals, display text otherwise, null if unbound. */
-export function sortKey(t: Term | null, prefixes: PrefixMap): number | string | null {
+export function sortKey(
+  t: Term | null,
+  prefixes: PrefixMap,
+  entity?: (iri: string) => string,
+): number | string | null {
   if (!t) return null;
   if (t.type === 'literal' && t.datatype && NUMERIC.test(t.datatype)) {
     const n = Number(t.value);
     if (!Number.isNaN(n)) return n;
   }
-  return t.type === 'uri' ? displayTerm(t, prefixes) : t.type === 'triple' ? toSparql(t) : t.value;
+  return t.type === 'uri'
+    ? displayTerm(t, prefixes, entity)
+    : t.type === 'triple'
+      ? toSparql(t)
+      : t.value;
 }
 
 /** Row indices in display order. Unbound cells sort last in both directions; ties keep row order. */
@@ -22,11 +30,12 @@ export function sortedOrder(
   rows: (Term | null)[][],
   sort: SortSpec | null,
   prefixes: PrefixMap,
+  entity?: (iri: string) => string,
 ): number[] {
   const idx = Array.from({ length: rows.length }, (_, i) => i);
   if (!sort) return idx;
   const { col, dir } = sort;
-  const keys = rows.map((r) => sortKey(r[col] ?? null, prefixes));
+  const keys = rows.map((r) => sortKey(r[col] ?? null, prefixes, entity));
   const coll = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
   idx.sort((a, b) => {
     const ka = keys[a];

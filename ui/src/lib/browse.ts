@@ -17,8 +17,12 @@ import {
   type Lit,
   type ManchesterToken,
 } from './ontology';
-import { localName, shorten, sparqlIri, WELL_KNOWN, type PrefixMap } from './rdf';
+import { displayEntity, localName, shorten, sparqlIri, WELL_KNOWN, type PrefixMap } from './rdf';
 import { browsePath, editorOf, workbenchPath } from './routes';
+
+import { iriForm } from './iri-form.svelte';
+import { langRank } from './rendering';
+export { langRank } from './rendering';
 
 const enc = encodeURIComponent;
 const RDF = WELL_KNOWN.rdf;
@@ -138,7 +142,7 @@ export async function fetchHierarchy(
     deprecated: q.deprecated === false ? false : undefined,
     limit: q.limit,
     offset: q.offset || undefined,
-    lang: q.lang?.length ? q.lang.join(',') : undefined,
+    lang: (q.lang ?? iriForm.languages).join(',') || undefined,
   });
   const res = await request(`/$/ontology/${enc(target)}/hierarchy?${p}`, {
     headers: { Accept: 'application/json' },
@@ -159,7 +163,7 @@ export async function fetchTerm(
     iri,
     mentions: q.mentions,
     incoming: q.incoming,
-    lang: q.lang?.length ? q.lang.join(',') : undefined,
+    lang: (q.lang ?? iriForm.languages).join(',') || undefined,
   });
   const res = await request(`/$/ontology/${enc(target)}/term?${p}`, {
     headers: { Accept: 'application/json' },
@@ -199,7 +203,7 @@ export function displayName(
   prefixes: PrefixMap,
 ): string {
   const n = names?.[iri];
-  return n?.label ?? n?.shortForm ?? iriName(iri, prefixes);
+  return displayEntity(iri, prefixes, n?.label ? [{ '@value': n.label }] : undefined);
 }
 
 const KIND_WORD: Record<string, string> = {
@@ -511,19 +515,6 @@ export function textBlocks(text: string): string[][] {
         .filter((l) => l !== ''),
     )
     .filter((p) => p.length > 0);
-}
-
-/** Rank of a language among the caller's: theirs first, then none, then English, then the rest. */
-export function langRank(lang: string | null, langs: readonly string[]): number {
-  const l = (lang ?? '').toLowerCase();
-  const i = langs.findIndex((x) => {
-    const w = x.toLowerCase();
-    return w === l || l.startsWith(w + '-') || w.split('-')[0] === l;
-  });
-  if (i >= 0) return i;
-  if (!l) return langs.length;
-  if (l === 'en' || l.startsWith('en-')) return langs.length + 1;
-  return langs.length + 2;
 }
 
 const byLang = (langs: readonly string[]) => (a: Sourced, b: Sourced) =>
@@ -962,7 +953,7 @@ export function manchesterFrame(
  * `name`. Axioms of a form the syntax has no clause for are left out.
  */
 export function frameText(frame: Frame, iri: string, name: (iri: string) => string): string {
-  const lines = [`${frame.word}: ${manchesterName(name(iri))}`];
+  const lines = [`${frame.word}: ${manchesterName(name(iri), iri)}`];
   for (const s of frame.sections) {
     if (s.id === 'keys') {
       // each key is its own clause, since one HasKey clause would join them into one key
@@ -1211,8 +1202,8 @@ export function neighbourhood(
   const nodes = new Map<string, { id: string; label: string; focus?: boolean }>();
   const edges = new Map<string, GraphPiece['edges'][number]>();
   const name = (iri: string) =>
-    iri === t.iri && (t.label || t.shortForm)
-      ? (t.label ?? t.shortForm)!
+    iri === t.iri
+      ? displayEntity(iri, prefixes, t.label ? [{ '@value': t.label }] : undefined)
       : displayName(iri, t.names, prefixes);
   const node = (iri: string, focus = false) => {
     if (!nodes.has(iri)) nodes.set(iri, { id: iri, label: name(iri), focus: focus || undefined });

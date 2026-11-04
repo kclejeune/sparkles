@@ -528,8 +528,35 @@ page already has for them, and keep the exact value as their title. Typed litera
 and copied Manchester text keeps its syntax. A phone puts Metadata and Hierarchy before Axioms.
 
 **Remaining work.** Inferred axioms and hierarchies beyond the card's click are items 622 and
-726, search at a past state item 658, rendering preferences item 625, metrics item 621
+726, search at a past state item 658, metrics item 621
 and other servers' term pages item 461.
+
+### Rendering preferences
+
+Item 625 adds a shared viewer setting for labels, prefixed names or complete IRIs in the
+ontology and thesaurus editors, browser pages and query results. The top bar and phone
+menu open the same preferences form. The browser keeps a versioned record of the mode
+and language order in local storage and migrates the earlier full-IRI setting. Invalid
+or unsupported records use the defaults, and unavailable storage leaves the choice usable
+for the page's lifetime.
+
+Labels use the ordered languages, with a regional tag followed by its primary language,
+then untagged values, English and another available language. Empty language preferences
+use the browser's languages. Missing labels use a matching dataset prefix and then the
+complete IRI. A prefixed-name choice also falls back to the complete IRI. The thesaurus
+editor's explicit language in its URL overrides the shared language list for that page.
+
+Changing the mode redraws names without reloading an editor or clearing its undo stack.
+Changing the language order reloads browser names and editor hierarchy levels. Query
+tables request only visible entities' labels, including those inside triple terms, in
+batches of 200 at the result's dataset, branch and commit. A replaced result cancels and
+ignores its old requests. Failed lookups leave prefixed names or complete IRIs visible.
+Graph results use label literals they already contain. Display choices leave navigation,
+RDF identity, copied IRIs and generated query syntax unchanged.
+
+Unit tests cover preference records, language ranking, all modes and fallbacks, unchanged
+RDF terms, result sorting and nested triple terms. Browser tests cover a change across
+the browser, editor and query results, reload persistence and the phone form.
 
 ### Ontology browser edit mode
 

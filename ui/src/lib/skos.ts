@@ -1,3 +1,4 @@
+import { preferredLabel } from './rendering';
 // The thesaurus editor (docs/specs/U12-ontology-workbench/SPEC.md, "SKOS and SKOS-XL
 // thesaurus editor"): the SPARQL that reads a graph's concept schemes, concepts and
 // collections one level of the hierarchy at a time, the details of one resource, label
@@ -131,17 +132,9 @@ export function addProblem(entries: LabelEntry[], kind: LabelKind, label: Label)
  * primary subtag matches too), then one without a language, then English, then the first.
  */
 export function displayLabel(lits: Label[] | undefined, langs: readonly string[]): string | null {
-  if (!lits?.length) return null;
-  for (const want of langs.map((l) => l.toLowerCase())) {
-    const hit =
-      lits.find((l) => l.lang === want) ??
-      lits.find((l) => l.lang.split('-')[0] === want.split('-')[0]);
-    if (hit) return hit.value;
-  }
-  return (
-    lits.find((l) => !l.lang)?.value ??
-    lits.find((l) => l.lang.startsWith('en'))?.value ??
-    lits[0].value
+  return preferredLabel(
+    lits?.map((l) => ({ '@value': l.value, '@language': l.lang })),
+    langs,
   );
 }
 

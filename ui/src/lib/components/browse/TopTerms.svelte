@@ -1,10 +1,13 @@
 <script lang="ts">
+  import { displayName } from '$lib/browse';
+  import { WELL_KNOWN, type PrefixMap } from '$lib/rdf';
   // The top of a hierarchy: the root terms an ontology names, or the roots the hierarchy
   // route computes, each with its definition and its number of children.
   import { countOf, treeWords, type Hierarchy, type TreeKind, type TreeNode } from '$lib/browse';
 
   let {
     title,
+    prefixes = WELL_KNOWN,
     roots,
     kind,
     definitions,
@@ -14,6 +17,7 @@
     more,
     busy = false,
   }: {
+    prefixes?: PrefixMap;
     title: string;
     roots: TreeNode[];
     kind: TreeKind;
@@ -25,7 +29,7 @@
     busy?: boolean;
   } = $props();
   const words = $derived(treeWords(kind));
-  const name = (n: TreeNode) => n.label ?? n.shortForm ?? n.iri;
+  const name = (n: TreeNode) => displayName(n.iri, { [n.iri]: n }, prefixes);
 </script>
 
 <section class="term-sec" aria-labelledby="roots-h">

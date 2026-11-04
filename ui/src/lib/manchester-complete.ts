@@ -59,7 +59,7 @@ export function manchesterCompletions(word: string, names: NameOption[]): Comple
     const lower = n.name.toLowerCase();
     const at = lower.indexOf(typed);
     if (typed && at < 0) continue;
-    const apply = manchesterName(n.name);
+    const apply = manchesterName(n.name, n.iri);
     const key = `${apply}|${n.iri}`;
     if (seen.has(key)) continue;
     seen.add(key);

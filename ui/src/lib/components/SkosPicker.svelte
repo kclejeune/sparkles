@@ -7,16 +7,17 @@
   import * as api from '$lib/api';
   import { app } from '$lib/app.svelte';
   import { iriName, validIri } from '$lib/ontology';
-  import type { PrefixMap } from '$lib/rdf';
+  import { displayEntity, type PrefixMap } from '$lib/rdf';
+  import { iriForm } from '$lib/iri-form.svelte';
   import {
     ANY_GRAPH,
-    displayLabel,
     labelMap,
     labelsQuery,
     schemesQuery,
     searchHits,
     searchQuery,
     type SearchHit,
+    type Label,
   } from '$lib/skos';
 
   let {
@@ -63,11 +64,16 @@
         const iris = rows.flatMap((r) => (r.s?.type === 'uri' ? [r.s.value] : []));
         const ls = iris.length
           ? labelMap(await api.select(t, labelsQuery(iris, gg), { nocache: true }))
-          : new Map();
+          : new Map<string, Label[]>();
         if (t === on)
           schemes = iris.map((i) => ({
             iri: i,
-            name: displayLabel(ls.get(i), langs) ?? iriName(i, prefixes),
+            name: displayEntity(
+              i,
+              prefixes,
+              ls.get(i)?.map((l) => ({ '@value': l.value, '@language': l.lang })),
+              langs,
+            ),
           }));
       } catch {
         schemes = [];
@@ -86,6 +92,8 @@
     const t = on;
     const gg = g;
     const sc = scheme || null;
+    void iriForm.mode;
+    void langs;
     clearTimeout(timer);
     if (q.length < 2 || validIri(q)) {
       hits = [];
@@ -103,14 +111,19 @@
         const iris = [...new Set(hs.map((h) => h.iri))];
         const ls = iris.length
           ? labelMap(await api.select(t, labelsQuery(iris, gg), { nocache: true }))
-          : new Map();
+          : new Map<string, Label[]>();
         if (my !== seq) return;
         const seen = new Set<string>();
         hits = hs
           .filter((h) => (seen.has(h.iri) ? false : (seen.add(h.iri), true)))
           .map((h) => ({
             ...h,
-            name: displayLabel(ls.get(h.iri), langs) ?? iriName(h.iri, prefixes),
+            name: displayEntity(
+              h.iri,
+              prefixes,
+              ls.get(h.iri)?.map((l) => ({ '@value': l.value, '@language': l.lang })),
+              langs,
+            ),
           }));
       } catch (e) {
         if (my === seq) error = api.errorMessage(e);

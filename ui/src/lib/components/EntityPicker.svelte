@@ -5,7 +5,7 @@
   import type { Term } from '$lib/api';
   import * as ex from '$lib/explore';
   import { shortLabel } from '$lib/graph';
-  import { displayIri } from '$lib/rdf';
+  import { displayEntity, displayIri } from '$lib/rdf';
 
   export type Picked = { term: Term; label: string };
 
@@ -75,7 +75,7 @@
       .filter((h) => !(direct?.term.type === 'uri' && direct.term.value === h.iri))
       .map((h) => ({
         term: { type: 'uri' as const, value: h.iri },
-        label: h.label ?? shortLabel(h.iri, prefixes),
+        label: displayEntity(h.iri, prefixes, h.label ? [{ '@value': h.label }] : undefined),
         iri: h.iri,
       })),
   ]);

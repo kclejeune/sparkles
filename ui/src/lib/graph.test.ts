@@ -17,7 +17,7 @@ describe('triplesToGraph', () => {
       ],
       WELL_KNOWN,
     );
-    expect(g.nodes.map((n) => n.label).sort()).toEqual(['Alice', 'b']);
+    expect(g.nodes.map((n) => n.label).sort()).toEqual(['Alice', 'http://ex.org/b']);
     expect(g.edges).toHaveLength(1);
   });
 
@@ -70,7 +70,7 @@ describe('triplesToGraph', () => {
     ];
     const g = triplesToGraph(triples, WELL_KNOWN, { marks: ['removed', 'added', 'kept'] });
     expect(g.edges.map((e) => e.change)).toEqual(['removed', 'added', 'kept']);
-    const by = (l: string) => g.nodes.find((n) => n.label === l)?.change;
+    const by = (l: string) => g.nodes.find((n) => n.label === 'http://ex.org/' + l)?.change;
     expect(by('bob')).toBe('removed');
     expect(by('carol')).toBe('added');
     // alice is in a kept triple, so she is neither
@@ -82,4 +82,24 @@ describe('triplesToGraph', () => {
     expect(g.nodes[0].change).toBeUndefined();
     expect(g.edges[0].change).toBeUndefined();
   });
+});
+
+it('applies entity rendering and language order to graph results', async () => {
+  const { iriForm } = await import('./iri-form.svelte');
+  const triples: Triple[] = [
+    [u('a'), label, { type: 'literal', value: 'English', 'xml:lang': 'en' }],
+    [u('a'), label, { type: 'literal', value: 'Français', 'xml:lang': 'fr' }],
+  ];
+  try {
+    iriForm.update('label', ['fr']);
+    expect(triplesToGraph(triples, { ex: 'http://ex.org/' }).nodes[0].label).toBe('Français');
+    iriForm.update('prefixed');
+    expect(triplesToGraph(triples, { ex: 'http://ex.org/' }).nodes[0].label).toBe('ex:a');
+    iriForm.update('iri');
+    expect(triplesToGraph(triples, { ex: 'http://ex.org/' }).nodes[0].label).toBe(
+      'http://ex.org/a',
+    );
+  } finally {
+    iriForm.update('label', []);
+  }
 });

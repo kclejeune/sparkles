@@ -1,13 +1,28 @@
 <script lang="ts">
+  import { select } from '$lib/api';
+  import { untrack } from 'svelte';
+  import { iriForm } from '$lib/iri-form.svelte';
+  import { LabelBatch } from '$lib/label-batch';
+  import { labelsOfBindings, type Lit } from '$lib/ontology';
+  import { resultLabelsQuery, termIris } from '$lib/result-labels';
   import type { Term } from '$lib/api';
   import { toasts } from '$lib/app.svelte';
-  import { displayIri, displayTerm, isVectorLiteral, toSparql, type PrefixMap } from '$lib/rdf';
+  import {
+    displayEntity,
+    displayIri,
+    displayTerm,
+    isVectorLiteral,
+    toSparql,
+    type PrefixMap,
+  } from '$lib/rdf';
   import { MARK_SIGN, MARK_WORD, type Mark } from '$lib/rowdiff';
   import { sortedOrder, type SortSpec } from '$lib/table';
   import Icon from './Icon.svelte';
   import TermView from './TermView.svelte';
 
   let {
+    target,
+    at,
     vars,
     rows,
     prefixes,
@@ -17,6 +32,9 @@
     onhover,
     marks,
   }: {
+    /** Dataset and branch, and immutable state of the result to label. */
+    target?: string;
+    at?: string;
     vars: string[];
     rows: (Term | null)[][];
     prefixes: PrefixMap;
@@ -35,6 +53,37 @@
     marks?: readonly Mark[];
   } = $props();
 
+  let labels = $state<ReadonlyMap<string, Lit[]>>(new Map());
+  let batch = $state.raw<LabelBatch | null>(null);
+  $effect(() => {
+    const t = target;
+    const state = at;
+    void rows;
+    const mode = iriForm.mode;
+    const ctl = new AbortController();
+    labels = new Map();
+    const b =
+      t && mode === 'label'
+        ? new LabelBatch(
+            async (iris) =>
+              labelsOfBindings(
+                (await select(t, resultLabelsQuery(iris), {
+                  at: state,
+                  signal: ctl.signal,
+                })) as never,
+              ),
+            (more) => {
+              labels = new Map([...labels, ...more]);
+            },
+          )
+        : null;
+    batch = b;
+    return () => {
+      ctl.abort();
+      b?.reset();
+    };
+  });
+
   const ROW_H = 26;
   const OVERSCAN = 12;
 
@@ -44,12 +93,16 @@
   let sort = $state<SortSpec | null>(null);
   let widths = $state<number[]>([]);
 
-  // Reset sort/widths whenever the result set changes.
+  const entityName = (iri: string) => displayEntity(iri, prefixes, labels.get(iri));
+
+  // Reset sorting and scroll only when the result changes, not when labels arrive.
   $effect(() => {
     void rows;
     sort = null;
     scrollTop = 0;
     if (scroller) scroller.scrollTop = 0;
+  });
+  $effect(() => {
     widths = vars.map((_, c) => {
       let max = vars[c].length + 2;
       const n = Math.min(rows.length, 300);
@@ -64,14 +117,14 @@
                 ? Math.ceil((displayIri(t.datatype, prefixes).length + 3) * 0.85)
                 : 0
             : 0;
-        const len = displayTerm(t, prefixes).length + suffix;
+        const len = displayTerm(t, prefixes, entityName).length + suffix;
         if (len > max) max = len;
       }
       return Math.round(Math.min(460, Math.max(90, max * 7.4 + 28)));
     });
   });
 
-  const order = $derived(sortedOrder(rows, sort, prefixes));
+  const order = $derived(sortedOrder(rows, sort, prefixes, entityName));
 
   // scroll a highlighted row into the middle of the view
   $effect(() => {
@@ -89,6 +142,13 @@
     Math.min(rows.length, Math.ceil((scrollTop + viewportH) / ROW_H) + OVERSCAN),
   );
   const visible = $derived(order.slice(start, end));
+  $effect(() => {
+    const b = batch;
+    const wanted = visible.flatMap((i) => rows[i].flatMap(termIris));
+    untrack(() => {
+      for (const iri of wanted) b?.want(iri);
+    });
+  });
   const rnWidth = $derived(Math.max(44, String(rows.length).length * 8 + 20));
   const CHG_W = 34;
   const chgWidth = $derived(marks ? CHG_W : 0);
@@ -230,7 +290,7 @@
           {/if}
           {#each row as term, c (c)}
             <div class="cell td" role="gridcell">
-              <span class="val"><TermView {term} {prefixes} {onopen} /></span>
+              <span class="val"><TermView {labels} {term} {prefixes} {onopen} /></span>
               {#if term}
                 <button
                   class="copy"

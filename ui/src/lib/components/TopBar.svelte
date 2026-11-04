@@ -1,4 +1,5 @@
 <script lang="ts">
+  import RenderingPreferences from './RenderingPreferences.svelte';
   import { iriForm } from '$lib/iri-form.svelte';
   // The shell's top bar (docs/visualization/README.md, "Web UI"): the brand, the scope and
   // search field, the connection status, the theme and the account. On a phone the status,
@@ -70,8 +71,11 @@
     aria-pressed={iriForm.full}
     title={iriForm.full
       ? 'IRIs are shown in full. Show prefixed names instead.'
-      : 'IRIs are shown as prefixed names. Show them in full instead.'}
-    onclick={() => iriForm.set(!iriForm.full)}>{iriForm.full ? 'Full IRIs' : 'Prefixed'}</button
+      : iriForm.mode === 'label'
+        ? 'Entities are shown by label. Show full IRIs instead.'
+        : 'IRIs are shown as prefixed names. Show them in full instead.'}
+    onclick={() => iriForm.set(!iriForm.full)}
+    >{iriForm.full ? 'Full IRIs' : iriForm.mode === 'label' ? 'Labels' : 'Prefixed'}</button
   >
 {/snippet}
 
@@ -89,7 +93,7 @@
 
   <div class="end">
     <span class="wide">{@render statusDot()}</span>
-    <span class="wide">{@render iriButton()}</span>
+    <span class="wide">{@render iriButton()}<RenderingPreferences /></span>
     <span class="wide">{@render themeButton()}</span>
     <span class="wide"><UserMenu /></span>
     <button
@@ -137,7 +141,7 @@
         <div class="row">
           {@render statusDot()}<span class="status-text">{status}</span>
           <span class="spacer"></span>
-          {@render iriButton()}
+          {@render iriButton()}<RenderingPreferences />
           {@render themeButton()}
         </div>
       </div>

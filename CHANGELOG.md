@@ -24,6 +24,12 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+The UI shares rendering preferences across the ontology and thesaurus editors, browser
+and query results. Viewers choose labels, prefixed names or complete IRIs and an ordered
+language list, saved in the browser. Query tables batch label lookups for visible rows
+at the result's branch and commit. Missing labels and failed lookups keep a prefixed
+name or the complete IRI visible, and copying keeps the original RDF term.
+
 The disjunctive classification rules can count, and `Limits::counting` turns it on. It is
 off by default, because counting finishes on no real ontology of the ORE 2015 DL
 development set and only delays the answer, so a default run leaves those axioms out and

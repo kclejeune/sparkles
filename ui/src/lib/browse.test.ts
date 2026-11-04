@@ -726,10 +726,10 @@ describe('links', () => {
     );
   });
 
-  it('names an IRI by its label, short form or prefixed name, and knows the built-in vocabularies', () => {
+  it('names an IRI by its label, prefixed name or full IRI, and knows the built-in vocabularies', () => {
     const names = { [EX + 'a']: { label: 'Alpha' }, [EX + 'b']: { label: null, shortForm: 'B:1' } };
     expect(displayName(EX + 'a', names, {})).toBe('Alpha');
-    expect(displayName(EX + 'b', names, {})).toBe('B:1');
+    expect(displayName(EX + 'b', names, {})).toBe(EX + 'b');
     expect(displayName(EX + 'c', names, { ex: EX })).toBe('ex:c');
     expect(builtIn(OWL + 'Thing')).toBe(true);
     expect(builtIn(RDF + 'type')).toBe(true);
