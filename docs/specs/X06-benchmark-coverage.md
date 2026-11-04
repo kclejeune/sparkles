@@ -1963,6 +1963,38 @@ record](../benchmarks/writes/runs/2026-11-02-hybrid-mixed-atlas/README.md) gives
 table. Request placement on hybrid processors other than the i5-13500, and threads that
 other code starts from a request thread on the performance cores, remain under item 576.
 
+### Query layout after the classification batch
+
+Item 733's pinned forge comparison reproduces the warm `regex-iri` loss between
+`ae8a6cd5` and `5b0acdf9` at 1.062 of the base's server time over eight rounds
+in each variant order. Its 95% interval is 1.061 to 1.063, and the same-binary
+control reads 1.001. Both builds execute 75.202 million user instructions per
+HTTP request. The slower build takes 1.059 times the cycles, without an
+established rise in generic cache misses.
+
+The cached build at `4ab93ecb`, after the EL and UI merges, reads 0.999 of the
+base. The only production changes between that midpoint and the end are
+`e951e2c3`'s classifier work and the ontology limit initializer. The other
+changes touch tests, workflows and documentation. None changes the query path.
+The six measured queries have the same answers and plans, after timings and
+random internal aggregate names are normalized. Four selected hot regex and
+key-filter functions retain their machine instructions and change their
+linked addresses.
+
+These results support a layout explanation without additional query work.
+They do not isolate a particular cache conflict or branch alias. A later
+compiler-matched rebuild of `e951e2c3` retains the same selected hot instructions
+and request counts. Its six-query comparison reads 1.014 of the base, against
+1.015 for the original candidate, while the unchanged base itself takes longer
+than in the initial run. The later checks therefore do not establish a stable
+six-percent latency change at that merge. The responsible cache or process
+state remains open. The small
+`types-grouped` loss does not recur with this diagnostic's Python HTTP client.
+Item 733's diagnosis makes no engine change and does not repair the remaining
+regex cost, whose recovery stays in the roadmap. The
+[manual report and raw records](../benchmarks/synthetic/runs/2026-11-04-item733-layout-forge/README.md)
+identify the binaries, host, protocol, counter checks and limitations.
+
 ### Changed-store reads and the write rows
 
 The changed-store `two-hop-count` loss came from the parallel block reads. Before this

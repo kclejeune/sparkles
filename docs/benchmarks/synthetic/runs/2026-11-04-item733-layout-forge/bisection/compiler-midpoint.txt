@@ -1,0 +1,4 @@
+clang version 21.1.8
+GCC: (GNU) 16.2.0
+Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145)
+rustc version 1.99.1 (58cf8f9c3 2026-10-13)

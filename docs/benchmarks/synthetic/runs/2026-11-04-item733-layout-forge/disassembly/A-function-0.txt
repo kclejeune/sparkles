@@ -1,0 +1,81 @@
+
+/home/kclejeune/.cache/sparkles-nsc/bin/ae8a6cd58299039e575e7802fc73347c7167b95c/sparkles:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+<_RINvMNtNtCskADBYZwJmSU_4core4cell4onceINtB3_8OnceCellNtNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex7MatcherE8try_initNCINvB2_11get_or_initNCNCNvMs1_NtBT_9keyfilterNtB2v_14BoundKeyFilter4test00E0zEBV_>:
+	push   %r15
+	push   %r14
+	push   %r12
+	push   %rbx
+	push   %rax
+	test   %rsi,%rsi
+	je     <_RINvMNtNtCskADBYZwJmSU_4core4cell4onceINtB3_8OnceCellNtNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex7MatcherE8try_initNCINvB2_11get_or_initNCNCNvMs1_NtBT_9keyfilterNtB2v_14BoundKeyFilter4test00E0zEBV_+0xa2>
+	lea    0x10(%rsi),%rbx
+	mov    $0xfffffffffffffe28,%rax
+	mov    %fs:(%rax),%rax
+	test   %rax,%rax
+	je     <_RINvMNtNtCskADBYZwJmSU_4core4cell4onceINtB3_8OnceCellNtNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex7MatcherE8try_initNCINvB2_11get_or_initNCNCNvMs1_NtBT_9keyfilterNtB2v_14BoundKeyFilter4test00E0zEBV_+0x10a>
+	mov    0x100(%rax),%r14
+	cmp    0x68(%rsi),%r14
+	jae    <_RINvMNtNtCskADBYZwJmSU_4core4cell4onceINtB3_8OnceCellNtNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex7MatcherE8try_initNCINvB2_11get_or_initNCNCNvMs1_NtBT_9keyfilterNtB2v_14BoundKeyFilter4test00E0zEBV_+0x10a>
+	shl    $0x6,%r14
+	add    0x60(%rsi),%r14
+	cmpb   $0x1,%fs:0xfffffffffffffe90
+	jne    <_RINvMNtNtCskADBYZwJmSU_4core4cell4onceINtB3_8OnceCellNtNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex7MatcherE8try_initNCINvB2_11get_or_initNCNCNvMs1_NtBT_9keyfilterNtB2v_14BoundKeyFilter4test00E0zEBV_+0xbb>
+	mov    %fs:0xfffffffffffffe88,%r15
+	mov    %r15,(%rsp)
+	mov    0x38(%r14),%eax
+	test   %eax,%eax
+	jne    <_RINvMNtNtCskADBYZwJmSU_4core4cell4onceINtB3_8OnceCellNtNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex7MatcherE8try_initNCINvB2_11get_or_initNCNCNvMs1_NtBT_9keyfilterNtB2v_14BoundKeyFilter4test00E0zEBV_+0xec>
+	cmp    %r15,0x20(%r14)
+	jne    <_RINvMNtNtCskADBYZwJmSU_4core4cell4onceINtB3_8OnceCellNtNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex7MatcherE8try_initNCINvB2_11get_or_initNCNCNvMs1_NtBT_9keyfilterNtB2v_14BoundKeyFilter4test00E0zEBV_+0x10a>
+	mov    0x28(%r14),%rax
+	add    $0x28,%r14
+	test   %rax,%rax
+	cmove  %rax,%r14
+	cmpq   $0x0,(%rdi)
+	je     <_RINvMNtNtCskADBYZwJmSU_4core4cell4onceINtB3_8OnceCellNtNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex7MatcherE8try_initNCINvB2_11get_or_initNCNCNvMs1_NtBT_9keyfilterNtB2v_14BoundKeyFilter4test00E0zEBV_+0x117>
+	lea    -0x4dfa75c(%rip),%rdi        # <anon.9c0d019417e7fd7003674c847d8ce2dd.189.llvm.8457981116275531857+0x137>
+	lea    0x27e9439(%rip),%rdx        # <anon.9c0d019417e7fd7003674c847d8ce2dd.180.llvm.8457981116275531857+0x270>
+	mov    $0x1d,%esi
+	call   *0x28a5cbe(%rip)        # <_DYNAMIC+0x240>
+	lea    -0x4df5aba(%rip),%rdi        # <anon.9c0d019417e7fd7003674c847d8ce2dd.2921.llvm.8457981116275531857+0xe8>
+	lea    0x27f3fb0(%rip),%rdx        # <anon.9c0d019417e7fd7003674c847d8ce2dd.2781.llvm.8457981116275531857+0x8d0>
+	mov    $0x34,%esi
+	call   *0x28a61a5(%rip)        # <_DYNAMIC+0x740>
+	mov    $0x1,%r15d
+	lock xadd %r15,0x28da5ce(%rip)        # <_RNvNvNvNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex6THREAD27___rust_std_internal_init_fn4NEXT>
+	mov    %r15,%fs:0xfffffffffffffe88
+	movb   $0x1,%fs:0xfffffffffffffe90
+	mov    %r15,(%rsp)
+	mov    0x38(%r14),%eax
+	test   %eax,%eax
+	je     <_RINvMNtNtCskADBYZwJmSU_4core4cell4onceINtB3_8OnceCellNtNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex7MatcherE8try_initNCINvB2_11get_or_initNCNCNvMs1_NtBT_9keyfilterNtB2v_14BoundKeyFilter4test00E0zEBV_+0x66>
+	mov    %rsp,%rdx
+	mov    %rdi,%r12
+	mov    %r14,%rdi
+	mov    %rbx,%rsi
+	call   <_RINvMNtNtCs8ZKwes1zzDd_3std4sync9once_lockINtB3_8OnceLockNtNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex6WorkerE10initializeNCINvB2_11get_or_initNCNvMs4_BV_NtBV_10RegexState6workers_0E0zEBZ_>
+	mov    %r12,%rdi
+	cmp    %r15,0x20(%r14)
+	je     <_RINvMNtNtCskADBYZwJmSU_4core4cell4onceINtB3_8OnceCellNtNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex7MatcherE8try_initNCINvB2_11get_or_initNCNCNvMs1_NtBT_9keyfilterNtB2v_14BoundKeyFilter4test00E0zEBV_+0x70>
+	xor    %r14d,%r14d
+	cmpq   $0x0,(%rdi)
+	jne    <_RINvMNtNtCskADBYZwJmSU_4core4cell4onceINtB3_8OnceCellNtNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex7MatcherE8try_initNCINvB2_11get_or_initNCNCNvMs1_NtBT_9keyfilterNtB2v_14BoundKeyFilter4test00E0zEBV_+0x89>
+	mov    %rbx,(%rdi)
+	mov    %r14,0x8(%rdi)
+	mov    %rdi,%rax
+	add    $0x8,%rsp
+	pop    %rbx
+	pop    %r12
+	pop    %r14
+	pop    %r15
+	ret
+
+Disassembly of section .init:
+
+Disassembly of section .fini:
+
+Disassembly of section .plt:

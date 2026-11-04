@@ -233,6 +233,11 @@ The [spec index](specs/README.md) records the phase boundaries, and the
 [roadmap](ROADMAP.md) describes the remaining work. Benchmark coverage is separate from
 implementation status.
 
+Benchmark results qualify the recorded host and executable. A pinned
+[instruction-count diagnostic](benchmarks/synthetic/RESULTS.md#query-layout-after-the-classification-batch)
+records query timing differences between executables with unchanged plans,
+answers and instruction counts, and the limits of attributing them to layout.
+
 ### Querying and storage
 
 | Capability | Status | Current scope and remaining work |

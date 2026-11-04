@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Round-paired summary and bootstrap of item 733's retained counter samples."""
+import argparse
+from collections import defaultdict
+import hashlib
+import json
+import math
+from pathlib import Path
+import random
+import re
+import statistics
+
+
+def gm(values):
+    return math.exp(statistics.mean(math.log(x) for x in values))
+
+
+def interval(values):
+    rng = random.Random(733)
+    boot = sorted(gm(rng.choices(values, k=len(values))) for _ in range(10000))
+    return [boot[250], boot[9749]]
+
+
+def plan_shape(plan):
+    names = {}
+
+    def collect(node):
+        if not isinstance(node, dict):
+            return
+        for column in node.get("columns", []):
+            if re.fullmatch(r"[0-9a-f]{16,32}", column):
+                names.setdefault(column, "generated" + str(len(names)))
+        for child in node.get("children", []):
+            collect(child)
+
+    def normalize(node):
+        if isinstance(node, dict):
+            return {k: normalize(v) for k, v in node.items() if k != "timeMs"}
+        if isinstance(node, list):
+            return [normalize(v) for v in node]
+        if isinstance(node, str):
+            if node in names:
+                return names[node]
+            return re.sub(r"\?([0-9a-f]{16,32})\b", lambda m: "?" + names.get(m[1], m[1]), node)
+        return node
+
+    collect(plan)
+    return normalize(plan)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("samples", nargs="+")
+    p.add_argument("--base", default="A")
+    p.add_argument("--out", required=True)
+    a = p.parse_args()
+    rows = []
+    offset = 0
+    for sample_path in a.samples:
+        part = [json.loads(x) for x in Path(sample_path).read_text().splitlines()]
+        rows.extend(dict(r, round=r["round"] + offset) for r in part)
+        offset += max(r["round"] for r in part) + 1
+    groups = defaultdict(list)
+    plans, answers, native = defaultdict(set), defaultdict(set), defaultdict(set)
+    mux, incomplete = [], []
+    for r in rows:
+        groups[r["query"], r["variant"], r["round"]].append(r)
+        answers[r["query"]].add(r["answer_sha256"])
+        native[r["query"]].add(r["native_sha256"])
+        for plan in r["plans"]:
+            canonical = json.dumps(plan_shape(plan), sort_keys=True).encode()
+            plans[r["query"]].add(hashlib.sha256(canonical).hexdigest())
+        m = r["metrics"]
+        if not m.get("complete", True):
+            incomplete.append([r["round"], r["position"], r["variant"], r["query"]])
+        for metric in ["instructions", "cycles", "cache_misses"]:
+            if m[metric + "_running_ns"] != m[metric + "_enabled_ns"]:
+                mux.append([r["round"], r["position"], r["variant"], r["query"], metric])
+    result = {"samples": len(rows), "multiplexed": mux, "incomplete": incomplete,
+              "answer_digests": {q: sorted(v) for q, v in answers.items()},
+              "native_digests": {q: sorted(v) for q, v in native.items()},
+              "plan_digests_without_timeMs_and_generated_variables": {q: sorted(v) for q, v in plans.items()},
+              "queries": {}}
+    queries = sorted({r["query"] for r in rows})
+    variants = sorted({r["variant"] for r in rows})
+    rounds = sorted({r["round"] for r in rows})
+    for q in queries:
+        result["queries"][q] = {}
+        for v in variants:
+            result["queries"][q][v] = {}
+            for metric in ["exec_ms", "instructions", "cycles", "cache_misses"]:
+                def value(row):
+                    return statistics.median(row["exec_ms"]) if metric == "exec_ms" else row["metrics"][metric]
+                vs = [gm([value(x) for x in groups[q, v, rnd]]) for rnd in rounds]
+                bs = [gm([value(x) for x in groups[q, a.base, rnd]]) for rnd in rounds]
+                ratios = [x / b for x, b in zip(vs, bs)]
+                result["queries"][q][v][metric] = dict(geomean=gm(vs), minimum=min(vs), maximum=max(vs),
+                                                          ratio=gm(ratios), ci95=interval(ratios), by_round=vs)
+            print(q, v, {k: (round(s["geomean"], 5), round(s["ratio"], 6), s["ci95"])
+                         for k, s in result["queries"][q][v].items()})
+    Path(a.out).write_text(json.dumps(result, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

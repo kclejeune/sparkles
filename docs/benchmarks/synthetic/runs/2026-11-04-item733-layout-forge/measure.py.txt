@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Item 733 diagnostic. Run under the forge bench lock, never during a build."""
+import argparse
+import ctypes
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import signal
+import statistics
+import struct
+import subprocess
+import time
+import urllib.parse
+
+
+def request(query=None, accept="application/x-sparkles+json"):
+    c = http.client.HTTPConnection("127.0.0.1", 45100, timeout=30)
+    try:
+        if query is None:
+            c.request("GET", "/$/ready")
+        else:
+            c.request("POST", "/bench/sparql", urllib.parse.urlencode({"query": query}),
+                      {"Accept": accept, "Content-Type": "application/x-www-form-urlencoded"})
+        r = c.getresponse()
+        body = r.read()
+        if r.status != 200:
+            raise RuntimeError((r.status, body))
+        return body
+    finally:
+        c.close()
+
+
+class Counters:
+    def __init__(self, pid):
+        self.fds = []
+        libc = ctypes.CDLL(None, use_errno=True)
+        pmu = int(Path("/sys/bus/event_source/devices/cpu_core/type").read_text())
+        self.tids = sorted(int(p.name) for p in Path(f"/proc/{pid}/task").iterdir())
+        self.pid = pid
+        for tid in self.tids:
+            for name, event in [("instructions", 1), ("cycles", 0), ("cache_misses", 3)]:
+                attr = ctypes.create_string_buffer(struct.pack(
+                    "IIQQQQQIIQ", 0, 64, (pmu << 32) | event,
+                    0, 0, 3, 1 | (1 << 5) | (1 << 6), 0, 0, 0))
+                fd = libc.syscall(298, ctypes.byref(attr), tid, -1, -1, 0)
+                if fd < 0:
+                    raise OSError(ctypes.get_errno(), f"perf_event_open {tid} {name}")
+                self.fds.append((name, tid, fd))
+
+    def read(self):
+        return {(name, tid): struct.unpack("QQQ", os.read(fd, 24))
+                for name, tid, fd in self.fds}
+
+    def start(self):
+        for _, _, fd in self.fds:
+            fcntl.ioctl(fd, 0x2400, 0)
+        self.before = self.read()
+
+    def stop(self, reps):
+        after = self.read()
+        for _, _, fd in self.fds:
+            fcntl.ioctl(fd, 0x2401, 0)
+        after_tids = sorted(int(p.name) for p in Path(f"/proc/{self.pid}/task").iterdir())
+        # An exited thread's open counter retains its final value. A new thread
+        # would be uncounted, so refuse that interval rather than undercounting.
+        result = {"threads_before": self.tids, "threads_after": after_tids,
+                  "complete": set(after_tids) <= set(self.tids)}
+        for name in ["instructions", "cycles", "cache_misses"]:
+            ds = [tuple(a - b for a, b in zip(after[(n, tid)], self.before[(n, tid)]))
+                  for n, tid, _ in self.fds if n == name]
+            result[name] = sum(x[0] for x in ds) / reps
+            result[name + "_enabled_ns"] = sum(x[1] for x in ds)
+            result[name + "_running_ns"] = sum(x[2] for x in ds)
+        return result
+
+    def close(self):
+        for _, _, fd in self.fds:
+            os.close(fd)
+
+
+def stop(p):
+    if p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(timeout=25)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+
+
+def main():
+    a = argparse.ArgumentParser()
+    a.add_argument("--rounds", type=int, default=8)
+    a.add_argument("--reps", type=int, default=100)
+    a.add_argument("--variants", default="A,M,B")
+    a.add_argument("--queries", default="regex-iri,exists-join,star-join,lang-filter,types-grouped,count-all")
+    a.add_argument("--out", required=True)
+    args = a.parse_args()
+    out = Path(args.out)
+    out.mkdir()
+    variants = args.variants.split(",")
+    queries = {q: Path("queries", q + ".rq").read_text() for q in args.queries.split(",")}
+    spinners = []
+    server = None
+    answers = {}
+    try:
+        for cpu in [2, 4]:
+            spinners.append(subprocess.Popen(["taskset", "-c", str(cpu), "chrt", "-i", "0",
+                                             "sh", "-c", "while :; do :; done"]))
+        with (out / "samples.jsonl").open("w", buffering=1) as f:
+            for rnd in range(args.rounds):
+                for pos, v in enumerate(variants + variants[::-1]):
+                    log = (out / f"server-{rnd}-{pos}-{v}.log").open("wb")
+                    server = subprocess.Popen(
+                        ["taskset", "-c", "2", "env", "RAYON_NUM_THREADS=1",
+                         str(Path("bin", v, "sparkles").resolve()), "--result-cache-mb", "0",
+                         "serve", "--data", str(out / f"srv-{rnd}-{pos}"),
+                         "--loc", f"bench=stores/{v}", "--port", "45100", "--timeout", "600",
+                         "--no-access-log"], stdout=log, stderr=log)
+                    end = time.monotonic() + 30
+                    while True:
+                        try:
+                            request()
+                            break
+                        except (OSError, http.client.HTTPException, RuntimeError):
+                            if server.poll() is not None or time.monotonic() > end:
+                                raise RuntimeError(f"server startup failed: {v}")
+                            time.sleep(.02)
+                    for q, query in queries.items():
+                        tsv = request(query, "text/tab-separated-values")
+                        canonical = b"\n".join(sorted(tsv.splitlines()))
+                        digest = hashlib.sha256(canonical).hexdigest()
+                        if q in answers:
+                            assert answers[q] == digest, (q, v, digest, answers[q])
+                        answers[q] = digest
+                        for _ in range(3):
+                            request(query)
+                        for attempt in range(20):
+                            counts = Counters(server.pid)
+                            try:
+                                counts.start()
+                                bodies = [request(query) for _ in range(args.reps)]
+                                metrics = counts.stop(args.reps)
+                            finally:
+                                counts.close()
+                            if metrics["complete"]:
+                                break
+                            with (out / "rejected.jsonl").open("a") as rejected:
+                                rejected.write(json.dumps(dict(round=rnd, position=pos, variant=v,
+                                                               query=q, attempt=attempt, metrics=metrics)) + "\n")
+                            print("retry uncounted new thread", rnd, pos, v, q, attempt, flush=True)
+                        else:
+                            raise RuntimeError("threads did not stabilize")
+                        exec_ms = []
+                        plans = []
+                        for body in bodies:
+                            r = json.loads(body)
+                            native = b"\n".join(sorted(json.dumps(row, sort_keys=True).encode() for row in r["rows"]))
+                            native_digest = hashlib.sha256(native).hexdigest()
+                            key = q + "-native"
+                            assert key not in answers or answers[key] == native_digest
+                            answers[key] = native_digest
+                            exec_ms.append(r["meta"]["timing"]["execMs"])
+                            plans.append(r["meta"]["plan"])
+                        row = dict(round=rnd, position=pos, variant=v, query=q, reps=args.reps,
+                                   exec_ms=exec_ms, metrics=metrics, answer_sha256=digest,
+                                   native_sha256=native_digest, plans=plans)
+                        f.write(json.dumps(row) + "\n")
+                        print(rnd, pos, v, q, statistics.median(exec_ms), metrics, flush=True)
+                    stop(server)
+                    log.close()
+                    server = None
+        (out / "answers.json").write_text(json.dumps(answers, indent=2) + "\n")
+        (out / "DONE").write_text("ok\n")
+    finally:
+        if server is not None:
+            stop(server)
+        for p in spinners:
+            stop(p)
+
+
+if __name__ == "__main__":
+    os.sched_setaffinity(0, {4})
+    main()

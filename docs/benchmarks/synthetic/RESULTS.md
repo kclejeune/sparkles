@@ -4,7 +4,41 @@ This report was imported from the manually maintained benchmark page. Its tables
 qualifications are preserved, and are not regenerated from the JSON records. Read the
 [reference setup and answer rules](../reference/README.md) with each result.
 
+## Query layout after the classification batch
+
+A pinned counter comparison of `ae8a6cd5` and `5b0acdf9` on forge, at 1.05M
+quads on one thread, reproduces the `regex-iri` loss at 1.062 of the base's
+server time, with a 95% interval of 1.061 to 1.063. The base takes 3.467 ms and
+the candidate 3.682 ms. Both execute 75.202 million user instructions per HTTP
+request, while the candidate uses 1.059 times the cycles. The same-binary
+control reads 1.001, with an interval of 0.999 to 1.002.
+
+The cached midpoint `4ab93ecb` reads 0.999 of the base, so the loss appears after
+the UI merge. All six checked queries keep their plans and answers. Four
+selected hot regex and key-filter functions keep their machine instructions
+while their linked addresses move. This supports a layout explanation,
+without identifying a particular cache or branch conflict. Generic cache misses
+do not establish an increase. The small `types-grouped` loss does not reproduce
+in this diagnostic, where its candidate time reads 0.981 of the base.
+
+Later checks with a compiler-matched build of classifier merge `e951e2c3`
+keep the instruction counts, but do not repeat the full initial contrast.
+With the six-query mix the original candidate reads 1.015 of the base and the
+rebuilt merge 1.014, while the unchanged base itself takes longer. The
+responsible cache or process state and a stable latency attribution to the
+merge remain unconfirmed.
+
+The [manual run record](runs/2026-11-04-item733-layout-forge/README.md) retains
+both comparison orders, the same-binary control, original compressed samples,
+counter coverage, compiler identities and method limitations. The investigation
+does not change the engine or recover the measured regex cost. Its recovery
+remains a roadmap follow-up.
+
 ## Summary
+
+The [query-layout diagnostic](#query-layout-after-the-classification-batch)
+qualifies the warm regex cost of a historical classification batch independently
+of the peer comparison tables.
 
 The synthetic suite has 28 queries over generated data at 1.05 million and 10.5 million
 triples. Medians are over the queries each engine completes.

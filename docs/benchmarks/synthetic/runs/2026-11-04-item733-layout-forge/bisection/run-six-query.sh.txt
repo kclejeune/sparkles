@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# The caller holds forge's bench lock in a 12G memory-capped named unit.
+python3 measure.py --rounds 4 --reps 100 --variants A,M,D,B --out matched-forward
+python3 measure.py --rounds 4 --reps 100 --variants B,D,M,A --out matched-reverse
+python3 analyze.py matched-forward/samples.jsonl matched-reverse/samples.jsonl --out summary-matched.json

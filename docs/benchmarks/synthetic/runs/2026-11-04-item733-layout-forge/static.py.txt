@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Compare selected hot instructions, preserving unnormalized objdump output."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--out", required=True)
+    p.add_argument("binaries", nargs="+", help="LABEL=path")
+    a = p.parse_args()
+    out = Path(a.out)
+    out.mkdir(exist_ok=True)
+    bins = dict(x.split("=", 1) for x in a.binaries)
+    symbols = {}
+    for v, path in bins.items():
+        symbols[v] = {}
+        text = subprocess.check_output(["nm", "-S", "--defined-only", path], text=True)
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 4 and "_13sparkles_core" in parts[3] and parts[2] in "tT":
+                symbols[v][parts[3]] = (int(parts[0], 16), int(parts[1], 16))
+    common = set.intersection(*(set(x) for x in symbols.values()))
+    selected = sorted(s for s in common if (
+        "query_regex" in s and ("6search" in s or "7is_match" in s)
+        or "keyfilter" in s and ("4test" in s or "9test_with" in s)))
+    result = {"binaries": bins, "core_function_counts": {v: len(s) for v, s in symbols.items()},
+              "common_functions": len(common), "selected": {}}
+    for i, sym in enumerate(selected):
+        shapes = {}
+        entry = {"symbols": {v: {"address": hex(symbols[v][sym][0]), "bytes": symbols[v][sym][1]}
+                             for v in bins}, "disassembly": {}}
+        for v, path in bins.items():
+            raw = subprocess.check_output(["objdump", "-d", "--no-show-raw-insn", "--no-addresses",
+                                           "--disassemble=" + sym, path], text=True)
+            fname = f"{v}-function-{i}.txt"
+            (out / fname).write_text(raw)
+            lines = [line.strip() for line in raw.splitlines() if line.startswith("\t")]
+            lines = [re.sub(r"-?0x[0-9a-f]+\(%rip\)", "DISPLACEMENT(%rip)", s) for s in lines]
+            lines = [re.sub(r"\.llvm\.[0-9]+", ".llvm.HASH", s.split("#")[0].strip()) for s in lines]
+            shapes[v] = lines
+            entry["disassembly"][v] = {"path": fname, "sha256": hashlib.sha256(raw.encode()).hexdigest(),
+                                       "normalized_instructions": len(lines)}
+        entry["identical_normalized_instructions"] = all(s == shapes["A"] for s in shapes.values())
+        result["selected"][sym] = entry
+    (out / "static.json").write_text(json.dumps(result, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

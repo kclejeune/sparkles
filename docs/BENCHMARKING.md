@@ -61,6 +61,12 @@ reuse once compiled one side of an A/B pair with a `.text` section about 2% smal
 that binary ran up to 12% to 19% slower on the same source. `scripts/nsc-build.sh` sets it
 for every binary the Namespace screen builds.
 
+Unrelated source changes can still move linked query code. Compare both variant
+orders, include a same-binary control, and count user instructions and cycles
+before attributing a timing change to added execution work. The
+[classification-batch diagnostic](benchmarks/synthetic/RESULTS.md#query-layout-after-the-classification-batch)
+retains the plans, answers, counters and selected disassemblies for such a case.
+
 Server ports belong below the kernel's range of ephemeral client ports, which is 32768 to
 60999 by default (`/proc/sys/net/ipv4/ip_local_port_range`). A client connection that
 happened to use a server's port as its own local port stays in TIME-WAIT for 60 s after it

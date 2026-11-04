@@ -1,0 +1,241 @@
+
+/home/kclejeune/.cache/sparkles-nsc/bin/4ab93ecbc605d50a0edde8872d2abb37f435fce2/sparkles:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+<_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search>:
+	push   %rbp
+	push   %r15
+	push   %r14
+	push   %rbx
+	sub    $0x88,%rsp
+	movl   $0x0,0x50(%rsp)
+	mov    %rdx,0x58(%rsp)
+	mov    %rcx,0x60(%rsp)
+	movq   $0x0,0x68(%rsp)
+	mov    %rcx,0x70(%rsp)
+	movb   $0x1,0x78(%rsp)
+	test   %rsi,%rsi
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0xf1>
+	mov    (%rsi),%rbx
+	mov    0x8(%rsi),%rsi
+	mov    0x50(%rsp),%eax
+	mov    0x54(%rsp),%ecx
+	mov    0x58(%rsp),%rdx
+	mov    0x60(%rsp),%rdi
+	mov    %rdi,0x30(%rsp)
+	mov    0x68(%rsp),%rdi
+	mov    %rdi,0x38(%rsp)
+	mov    0x70(%rsp),%rdi
+	mov    %rdi,0x40(%rsp)
+	mov    %eax,0x20(%rsp)
+	mov    %ecx,0x24(%rsp)
+	mov    %rdx,0x28(%rsp)
+	movb   $0x1,0x48(%rsp)
+	mov    0x38(%rsp),%rcx
+	mov    0x20(%rbx),%rax
+	mov    0xb8(%rax),%rax
+	test   %rcx,%rcx
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x9a>
+	testb  $0x1,0x3c(%rax)
+	jne    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0xe9>
+	mov    0x40(%rsp),%rdx
+	cmp    0x30(%rsp),%rdx
+	jae    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0xac>
+	testb  $0x2,0x40(%rax)
+	jne    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0xe9>
+	cmpl   $0x1,(%rax)
+	jne    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x12f>
+	xor    %r14d,%r14d
+	sub    %rcx,%rdx
+	mov    $0x0,%ecx
+	cmovae %rdx,%rcx
+	cmp    0x8(%rax),%rcx
+	jb     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x296>
+	cmpl   $0x0,0x20(%rsp)
+	jne    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0xd7>
+	testb  $0x1,0x3c(%rax)
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x12f>
+	testb  $0x2,0x40(%rax)
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x12f>
+	cmpl   $0x1,0x10(%rax)
+	jne    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x12f>
+	cmp    0x18(%rax),%rcx
+	jbe    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x12f>
+	xor    %r14d,%r14d
+	jmp    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x296>
+	lea    0x70(%rdi),%rbx
+	mov    $0x1,%dl
+	xor    %eax,%eax
+	lock cmpxchg %dl,0x70(%rdi)
+	jne    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x1f2>
+	mov    0x40(%rdi),%rax
+	mov    0x20(%rax),%rdx
+	cmpb   $0x2,0x9a(%rdx)
+	jne    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x221>
+	xor    %r14d,%r14d
+	xor    %ecx,%ecx
+	mov    $0x1,%al
+	lock cmpxchg %cl,(%rbx)
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x296>
+	jmp    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x2a7>
+	mov    $0xfffffffffffffe30,%rax
+	cmpb   $0x1,%fs:0x8(%rax)
+	jne    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x2b4>
+	mov    %fs:(%rax),%rdx
+	mov    0x28(%rsi),%rcx
+	cmp    %rcx,%rdx
+	jne    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x2e0>
+	movq   $0x1,0x28(%rsi)
+	mov    %rsi,0x10(%rsp)
+	movq   $0x1,(%rsp)
+	mov    %rdx,0x8(%rsp)
+	movb   $0x0,0x18(%rsp)
+	mov    0x10(%rbx),%rcx
+	mov    0x18(%rbx),%rax
+	mov    0x10(%rax),%rdx
+	dec    %rdx
+	and    $0xfffffffffffffff0,%rdx
+	lea    (%rcx,%rdx,1),%rdi
+	add    $0x10,%rdi
+	add    $0x30,%rsi
+	mov    $0x1,%bpl
+	lea    0x20(%rsp),%rdx
+	call   *0x60(%rax)
+	mov    %eax,%r14d
+	mov    0x8(%rsp),%rbx
+	mov    0x10(%rsp),%rdi
+	test   %bpl,%bpl
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x1c8>
+	mov    %rbx,0x80(%rsp)
+	cmp    $0x2,%rbx
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x31f>
+	mov    %rbx,0x28(%rdi)
+	jmp    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x296>
+	testb  $0x1,0x18(%rsp)
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x1e5>
+	mov    %rbx,%rdi
+	call   <_RINvNtCskADBYZwJmSU_4core3ptr9drop_glueNtNtNtCs3lM3HIkrSdE_14regex_automata4meta5regex5CacheECs4yeYYbwosrp_13sparkles_core>
+	mov    %rbx,%rdi
+	call   *0x1f8b178(%rip)        # <_DYNAMIC+0x238>
+	jmp    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x296>
+	mov    %rbx,%rsi
+	call   <_RNvMs2_NtNtNtCs3lM3HIkrSdE_14regex_automata4util4pool5innerINtB5_4PoolNtNtNtBb_4meta5regex5CacheINtNtCsgFX3jaOk65H_5alloc5boxed3BoxDINtNtNtCskADBYZwJmSU_4core3ops8function2FnuEp6OutputB16_NtNtNtB2d_5panic11unwind_safe13RefUnwindSafeNtNtB2d_6marker4SendNtB3K_4SyncNtB32_10UnwindSafeEL_EE9put_valueCs4yeYYbwosrp_13sparkles_core>
+	jmp    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x296>
+	mov    %rdi,%r14
+	mov    %rbx,%rdi
+	mov    $0xffffffff,%edx
+	mov    %rcx,%r15
+	call   *0x1f90332(%rip)        # <_DYNAMIC+0x5418>
+	mov    %r15,%rcx
+	mov    %r14,%rdi
+	mov    0x40(%rdi),%rax
+	mov    0x20(%rax),%rdx
+	cmpb   $0x2,0x9a(%rdx)
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x119>
+	mov    0xb8(%rdx),%rdx
+	cmpl   $0x1,(%rdx)
+	jne    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x253>
+	cmp    0x8(%rdx),%rcx
+	jb     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x119>
+	testb  $0x1,0x3c(%rdx)
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x253>
+	testb  $0x2,0x40(%rdx)
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x253>
+	cmpl   $0x1,0x10(%rdx)
+	jne    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x253>
+	cmp    0x18(%rdx),%rcx
+	ja     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x119>
+	add    $0x78,%rdi
+	mov    0x10(%rax),%rcx
+	mov    0x18(%rax),%r8
+	mov    0x10(%r8),%rax
+	dec    %rax
+	and    $0xfffffffffffffff0,%rax
+	lea    (%rcx,%rax,1),%rsi
+	add    $0x10,%rsi
+	lea    0x20(%rsp),%rax
+	lea    0x50(%rsp),%rcx
+	mov    %rdi,%rdx
+	mov    %rax,%rdi
+	call   *0x50(%r8)
+	movzbl 0x20(%rsp),%r14d
+	xor    %ecx,%ecx
+	mov    $0x1,%al
+	lock cmpxchg %cl,(%rbx)
+	jne    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x2a7>
+	mov    %r14d,%eax
+	add    $0x88,%rsp
+	pop    %rbx
+	pop    %r14
+	pop    %r15
+	pop    %rbp
+	ret
+	mov    %rbx,%rdi
+	xor    %esi,%esi
+	call   *0x1f90746(%rip)        # <_DYNAMIC+0x58d8>
+	jmp    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x296>
+	mov    0x1f8e1d5(%rip),%rcx        # <_DYNAMIC+0x3370>
+	mov    $0x1,%edx
+	lock xadd %rdx,(%rcx)
+	test   %rdx,%rdx
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x342>
+	mov    %rdx,%fs:(%rax)
+	movb   $0x1,%fs:0x8(%rax)
+	mov    0x28(%rsi),%rcx
+	cmp    %rcx,%rdx
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x152>
+	mov    %rsp,%rdi
+	call   <_RNvMs2_NtNtNtCs3lM3HIkrSdE_14regex_automata4util4pool5innerINtB5_4PoolNtNtNtBb_4meta5regex5CacheINtNtCsgFX3jaOk65H_5alloc5boxed3BoxDINtNtNtCskADBYZwJmSU_4core3ops8function2FnuEp6OutputB16_NtNtNtB2d_5panic11unwind_safe13RefUnwindSafeNtNtB2d_6marker4SendNtB3K_4SyncNtB32_10UnwindSafeEL_EE8get_slowCs4yeYYbwosrp_13sparkles_core>
+	mov    0x10(%rbx),%rcx
+	mov    0x18(%rbx),%rax
+	mov    0x10(%rax),%rdx
+	dec    %rdx
+	and    $0xfffffffffffffff0,%rdx
+	lea    (%rcx,%rdx,1),%rdi
+	add    $0x10,%rdi
+	cmpl   $0x1,(%rsp)
+	jne    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x313>
+	mov    0x10(%rsp),%rsi
+	jmp    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x18c>
+	mov    0x8(%rsp),%rsi
+	xor    %ebp,%ebp
+	jmp    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x193>
+	mov    0x1f8e21a(%rip),%rsi        # <_DYNAMIC+0x3420>
+	lea    0x1ee8a23(%rip),%r9        # <anon.9c0d019417e7fd7003674c847d8ce2dd.8259.llvm.11489617589792712380+0x150>
+	lea    0x80(%rsp),%rdx
+	mov    $0x1,%edi
+	xor    %ecx,%ecx
+	call   *0x1f8b106(%rip)        # <_DYNAMIC+0x328>
+	lea    -0x56da962(%rip),%rdi        # <_RNvNtNtNtCs4yeYYbwosrp_13sparkles_core4text4dict11java_tables6RANGES+0x334d>
+	lea    0x1efb5d0(%rip),%rdx        # <_RNvNvNCNvNtNtCs4yeYYbwosrp_13sparkles_core6sparql9exprcache8distincts_010___CALLSITE4META+0xa8>
+	mov    $0x57,%esi
+	call   *0x1f8b005(%rip)        # <_DYNAMIC+0x240>
+	mov    %rax,%r14
+	mov    %rbx,%rdi
+	call   *0x1f8aff1(%rip)        # <_DYNAMIC+0x238>
+	mov    %r14,%rdi
+	call   <_Unwind_Resume@plt>
+	mov    %rax,%r14
+	xor    %ecx,%ecx
+	mov    $0x1,%al
+	lock cmpxchg %cl,(%rbx)
+	je     <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x39a>
+	mov    %rbx,%rdi
+	xor    %esi,%esi
+	call   *0x1f90671(%rip)        # <_DYNAMIC+0x58d8>
+	jmp    <_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search+0x39a>
+	call   *0x1f8b0c9(%rip)        # <_DYNAMIC+0x338>
+	mov    %rax,%r14
+	mov    %rsp,%rdi
+	call   <_RINvNtCskADBYZwJmSU_4core3ptr9drop_glueINtNtNtCs3lM3HIkrSdE_14regex_automata4util4pool9PoolGuardNtNtNtBI_4meta5regex5CacheINtNtCsgFX3jaOk65H_5alloc5boxed3BoxDINtNtNtB4_3ops8function2FnuEp6OutputB1w_NtNtNtB4_5panic11unwind_safe13RefUnwindSafeNtNtB4_6marker4SendNtB3T_4SyncNtB3c_10UnwindSafeEL_EEECs4yeYYbwosrp_13sparkles_core>
+	mov    %r14,%rdi
+	call   <_Unwind_Resume@plt>
+	call   *0x1f8b0b0(%rip)        # <_DYNAMIC+0x338>
+
+Disassembly of section .init:
+
+Disassembly of section .fini:
+
+Disassembly of section .plt:

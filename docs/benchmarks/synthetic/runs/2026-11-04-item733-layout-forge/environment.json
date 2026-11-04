@@ -1,0 +1,56 @@
+{
+  "host": "forge",
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "kernel": "7.2.9",
+  "cpu_count": 20,
+  "memory": [
+    "MemTotal:       15995308 kB",
+    "MemFree:         1457764 kB",
+    "MemAvailable:   14445992 kB"
+  ],
+  "perf_event_paranoid": "2",
+  "pmu_core_type": "4",
+  "pmu_core_cpus": "0-11",
+  "binaries": {
+    "A": {
+      "sha256": "4061c8dac619cfbf5b82a9c38b22dc04eee7375fde6aa0113445e704d42e0b6d",
+      "compiler_comments": "\nString dump of section '.comment':\n  [     1]  GCC: (GNU) 16.2.0\n  [    13]  clang version 21.1.8\n  [    28]  rustc version 1.99.1 (58cf8f9c3 2026-10-13)\n  [    54]  Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145)\n\n"
+    },
+    "M": {
+      "sha256": "981d5c85d1f3f73341c1cfcfecd480d66e78c3d21a14b13284de01379083f16d",
+      "compiler_comments": "\nString dump of section '.comment':\n  [     1]  GCC: (GNU) 16.2.0\n  [    13]  clang version 21.1.8\n  [    28]  rustc version 1.99.1 (58cf8f9c3 2026-10-13)\n  [    54]  Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145)\n\n"
+    },
+    "B": {
+      "sha256": "44922b9a353ecc0b202bf411875af513de0bf0ee4d19c791aad9adcd5279502a",
+      "compiler_comments": "\nString dump of section '.comment':\n  [     1]  GCC: (GNU) 16.2.0\n  [    13]  clang version 21.1.8\n  [    28]  rustc version 1.99.1 (58cf8f9c3 2026-10-13)\n  [    54]  Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145)\n\n"
+    }
+  },
+  "data_nt_sha256": "c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8",
+  "data_zst_sha256": "befe6b2d417c379b1abf871abe95b8e8712637ad02f479c2aeffa735b188f4d3",
+  "data_quads": 1052807,
+  "queries": {
+    "count-all.rq": "920525f60d268d48728aa85cafd97b0a52cd584a3a137834696f8d82308cb8ef",
+    "exists-join.rq": "ce893939573a13674964425baa2b4eb00722fa6612be5718f658e0b650d29c44",
+    "lang-filter.rq": "c102c1b13c7aca32fe519c91405e3eeec479eb8d2f35678b9958d4e2bd428feb",
+    "regex-iri.rq": "ae4ab66cc61e0a9204671bde5d789b161e800e6fa05c308a390095e62b9e02b8",
+    "star-join.rq": "c0e213f99c77d7177c973f0010ccf3c4caf15387279ac98237297ad3d4e248be",
+    "types-grouped.rq": "2ab793972acf7eb1b73d6e8ffcba2a7fcc507b3f5059426a080f75a6fa26c9a1"
+  },
+  "protocol": {
+    "rounds_per_order": 8,
+    "reps_per_query_epoch": 100,
+    "warmups": 3,
+    "rayon_threads": 1,
+    "server_cpu": 2,
+    "client_cpu": 4,
+    "port": 45100,
+    "spin": true,
+    "result_cache_mb": 0,
+    "execution": "default",
+    "memory_max": "12G",
+    "swap_max": "2G",
+    "counters": "all existing server threads, user space only, instructions/cycles/LLC cache misses",
+    "added_thread_policy": "reject and retry entire interval",
+    "missing_trim": "The stores were loaded without a preceding trim. Load timings are not compared. All query measurements are warm."
+  }
+}

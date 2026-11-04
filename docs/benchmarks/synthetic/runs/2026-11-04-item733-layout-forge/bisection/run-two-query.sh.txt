@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd /home/kclejeune/lanes/item733
+comments() {
+  readelf -p .comment "$1" | sed 's/^ *\[[^]]*\] *//' |
+    grep -E '^(GCC:|clang version|rustc version|Linker:)' | sort
+}
+comments bin/A/sparkles > compiler-original.txt
+comments bin/D/sparkles > compiler-midpoint.txt
+cmp compiler-original.txt compiler-midpoint.txt
+sha256sum bin/D/sparkles > midpoint.sha256
+test ! -e final-bisect.DONE
+test ! -e stores/D
+ln -s B stores/D
+printf '%s\n' 'A/M/B reuse their existing stores; D shares B. No new loads or load timings. A pre-load trim required unavailable administrator authentication.' > final-preparation.txt
+python3 measure.py --rounds 4 --reps 100 --variants A,M,D,B --queries regex-iri,types-grouped --out bisect-forward
+python3 measure.py --rounds 4 --reps 100 --variants B,D,M,A --queries regex-iri,types-grouped --out bisect-reverse
+python3 analyze.py bisect-forward/samples.jsonl bisect-reverse/samples.jsonl --out summary-bisect.json > summary-bisect.log
+zstd -q -9 -k bisect-forward/samples.jsonl
+zstd -q -9 -k bisect-reverse/samples.jsonl
+printf 'DONE\n' > final-bisect.DONE

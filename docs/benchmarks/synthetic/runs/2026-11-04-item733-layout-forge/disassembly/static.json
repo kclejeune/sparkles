@@ -1,0 +1,151 @@
+{
+  "binaries": {
+    "A": "/home/kclejeune/.cache/sparkles-nsc/bin/ae8a6cd58299039e575e7802fc73347c7167b95c/sparkles",
+    "M": "/home/kclejeune/.cache/sparkles-nsc/bin/4ab93ecbc605d50a0edde8872d2abb37f435fce2/sparkles",
+    "B": "/home/kclejeune/.cache/sparkles-nsc/bin/5b0acdf99c32f47510e5b5b9075fae841ff91389/sparkles"
+  },
+  "core_function_counts": {
+    "A": 22168,
+    "M": 22168,
+    "B": 22185
+  },
+  "common_functions": 20629,
+  "selected": {
+    "_RINvMNtNtCskADBYZwJmSU_4core4cell4onceINtB3_8OnceCellNtNtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regex7MatcherE8try_initNCINvB2_11get_or_initNCNCNvMs1_NtBT_9keyfilterNtB2v_14BoundKeyFilter4test00E0zEBV_": {
+      "symbols": {
+        "A": {
+          "address": "0x5c21f90",
+          "bytes": 301
+        },
+        "M": {
+          "address": "0x5c22290",
+          "bytes": 301
+        },
+        "B": {
+          "address": "0x5cbfbe0",
+          "bytes": 301
+        }
+      },
+      "disassembly": {
+        "A": {
+          "path": "A-function-0.txt",
+          "sha256": "f8b0495195c8667e293f6a927cabc766dc80c8897b600b8778bd9a2c328732c9",
+          "normalized_instructions": 68
+        },
+        "M": {
+          "path": "M-function-0.txt",
+          "sha256": "385750f11c9e68e5469ef56a8bb0745dafd001d177e825b01a6cd8a8cb638f5a",
+          "normalized_instructions": 68
+        },
+        "B": {
+          "path": "B-function-0.txt",
+          "sha256": "ab2136d73f0c5cbf4d12cef56cc0289ebe7627fafc7df22327294272f5c30dd4",
+          "normalized_instructions": 68
+        }
+      },
+      "identical_normalized_instructions": true
+    },
+    "_RINvMs0_NtNtCs4yeYYbwosrp_13sparkles_core6sparql9keyfilterNtB6_9KeyFilter9test_withNCNvMs1_B6_NtB6_14BoundKeyFilter4test0EBa_": {
+      "symbols": {
+        "A": {
+          "address": "0x5c30cd0",
+          "bytes": 2577
+        },
+        "M": {
+          "address": "0x5c30fd0",
+          "bytes": 2577
+        },
+        "B": {
+          "address": "0x5cce920",
+          "bytes": 2577
+        }
+      },
+      "disassembly": {
+        "A": {
+          "path": "A-function-1.txt",
+          "sha256": "09cff62ccacd53a6d62fdb9f3fc3d66e2864081dfaf55d5497720fa29080a6d2",
+          "normalized_instructions": 630
+        },
+        "M": {
+          "path": "M-function-1.txt",
+          "sha256": "b4d142f3df1a4890d2f60d737e7905a1ee7e458309ab99f9c6c72ff5db1bb49f",
+          "normalized_instructions": 630
+        },
+        "B": {
+          "path": "B-function-1.txt",
+          "sha256": "96a8311a56c0d1aa0faf886360e13fe64e2682bd91d0fc45dac2c4a2a88e69d4",
+          "normalized_instructions": 630
+        }
+      },
+      "identical_normalized_instructions": true
+    },
+    "_RNvMs0_NtNtCs4yeYYbwosrp_13sparkles_core6sparql9keyfilterNtB5_9KeyFilter4test": {
+      "symbols": {
+        "A": {
+          "address": "0x63b7e60",
+          "bytes": 2700
+        },
+        "M": {
+          "address": "0x63b8160",
+          "bytes": 2700
+        },
+        "B": {
+          "address": "0x6455ab0",
+          "bytes": 2700
+        }
+      },
+      "disassembly": {
+        "A": {
+          "path": "A-function-2.txt",
+          "sha256": "1702854a68d75fce8e4f7b249f35b5e1082459391e4c1995e67d886265b6f3ca",
+          "normalized_instructions": 652
+        },
+        "M": {
+          "path": "M-function-2.txt",
+          "sha256": "6f006460220d4d8f5bb47ea50a4aed4463ca40a34f74616f2cd212d3bda0b6ef",
+          "normalized_instructions": 652
+        },
+        "B": {
+          "path": "B-function-2.txt",
+          "sha256": "cdf77e48627359d845143a331275d7a38f53ce6aa9559049756a657cd7507986",
+          "normalized_instructions": 652
+        }
+      },
+      "identical_normalized_instructions": true
+    },
+    "_RNvMs4_NtNtCs4yeYYbwosrp_13sparkles_core6sparql11query_regexNtB5_10RegexState6search": {
+      "symbols": {
+        "A": {
+          "address": "0x653d4d0",
+          "bytes": 936
+        },
+        "M": {
+          "address": "0x653d7d0",
+          "bytes": 936
+        },
+        "B": {
+          "address": "0x65db280",
+          "bytes": 936
+        }
+      },
+      "disassembly": {
+        "A": {
+          "path": "A-function-3.txt",
+          "sha256": "8db3b8ac4a20c8f9112718b1cedad883eb4f5dd87be3634592b00f2c9194376c",
+          "normalized_instructions": 228
+        },
+        "M": {
+          "path": "M-function-3.txt",
+          "sha256": "eea7c1e275c51a56fd93be8724ae43dc8b463e07857b742742f41860760dd013",
+          "normalized_instructions": 228
+        },
+        "B": {
+          "path": "B-function-3.txt",
+          "sha256": "ea43fe1daf3327fb0ba5e5bdc923e1714bc4542b8e35c8585552ccb9178d151d",
+          "normalized_instructions": 228
+        }
+      },
+      "identical_normalized_instructions": true
+    }
+  }
+}
