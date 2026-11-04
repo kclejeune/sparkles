@@ -362,10 +362,13 @@ test('the phone page keeps the order head, counts, definition, metadata, hierarc
   await page.setViewportSize({ width: 390, height: 844 });
   await openTerm(page, 'Person');
   const y = async (sel: string) => (await page.locator(sel).first().boundingBox())!.y;
-  const order = ['.b-head', '.b-chips', '.b-def', '.b-info', '.b-tree', '.b-refs'];
-  const ys = [];
-  for (const sel of order) ys.push(await y(sel));
-  for (let i = 1; i < ys.length; i++) expect(ys[i - 1]).toBeLessThan(ys[i]);
+  const inOrder = async (order: string[]) => {
+    const ys = [];
+    for (const sel of order) ys.push(await y(sel));
+    for (let i = 1; i < ys.length; i++) expect(ys[i - 1], order[i]).toBeLessThan(ys[i]);
+  };
+  // Metadata follows Definition directly, before Axioms
+  await inOrder(['.b-head', '.b-chips', '.b-def', '.b-info', '.b-ax', '.b-tree', '.b-refs']);
   // the counts stay compact: at most two lines of text links
   const chips = (await page.locator('.b-chips').boundingBox())!;
   expect(chips.height).toBeLessThanOrEqual(2 * 22 + 2);
@@ -380,6 +383,14 @@ test('the phone page keeps the order head, counts, definition, metadata, hierarc
   );
   // the shell's search icon stands in for the field
   await expect(page.getByRole('button', { name: 'Open search' })).toBeVisible();
+  // a term with no Axioms card keeps the same order without it
+  await openTerm(page, 'Agent');
+  await expect(page.locator('.b-ax')).toHaveCount(0);
+  await inOrder(['.b-head', '.b-chips', '.b-def', '.b-info', '.b-tree', '.b-refs']);
+  // the width above a phone keeps Axioms before Metadata
+  await page.setViewportSize({ width: 900, height: 900 });
+  await openTerm(page, 'Person');
+  await inOrder(['.b-def', '.b-ax', '.b-info', '.b-tree', '.b-refs']);
 });
 
 test('a large screen shows the term in two columns of cards whose bottoms stay close', async ({

@@ -513,8 +513,8 @@ its page there. **Similar terms** lists the entity's nearest neighbours in the d
 first ready vector index, through the same search as Similar's Search page, and links to
 that page for more. A dataset without a vector index or a term without a vector shows no
 such section. Below 1,100 pixels the cards are one column, in the order Definition, Axioms,
-Metadata, Hierarchy and References, and on a phone the Hierarchy card opens on request or when
-a view is chosen ([screenshot](../images/browse-phone.png)).
+Metadata, Hierarchy and References. On a phone Metadata comes before Axioms, and the Hierarchy
+card opens on request or when a view is chosen ([screenshot](../images/browse-phone.png)).
 
 A caller who can write to the dataset gets an **Edit** button beside the title, and `E`
 or the palette's **Edit this page** does the same. Edit mode changes the page in place

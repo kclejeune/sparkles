@@ -1980,8 +1980,9 @@
     container: browse / inline-size;
     min-width: 0;
   }
-  /* one column on a phone and a medium screen: the head, the counts, Definition, Axioms,
-     Metadata with Identifiers and Download, Hierarchy and References (item 734) */
+  /* one column at a medium size: the head, the counts, Definition, Axioms, Metadata with
+     Identifiers and Download, Hierarchy and References (item 734). A phone has Metadata before
+     Axioms, below. In one column the columns are `display: contents`, so `order` sets all this */
   .browse {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
@@ -2045,8 +2046,14 @@
     order: 1;
     min-width: 0;
   }
-  /* on a phone the definition's lead sits close under its heading */
+  /* on a phone the definition's lead sits close under its heading, and Metadata follows it */
   @container browse (max-width: 639px) {
+    .browse .b-info {
+      order: 3;
+    }
+    .browse :global(.b-ax) {
+      order: 4;
+    }
     .b-def :global(.panel-body) {
       padding-top: var(--sp-3);
     }

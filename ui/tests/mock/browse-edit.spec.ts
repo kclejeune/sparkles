@@ -339,6 +339,16 @@ test('the rail holds the parent editor and the SKOS links within its card', asyn
     await open(page, term('thes', TH + 'owls', '&edit=1'));
     const branch = await startSession(page, 'skos');
     const tree = page.locator('.b-side').getByRole('complementary', { name: 'Hierarchy' });
+    // an edit waits for the labels of the new commit, so the next one starts after they are read
+    const commitAndRead = async () => {
+      const read = page.waitForResponse(
+        (r) =>
+          /prefLabel/.test(r.request().postData() ?? '') &&
+          (r.request().postData() ?? '').includes(TH + 'owls'),
+      );
+      await commit(page);
+      await read;
+    };
     await tree.getByRole('button', { name: 'Add broader' }).click();
     const up = tree.getByRole('group', { name: 'Broader picker' });
     await insideCard(tree, up);
@@ -347,7 +357,7 @@ test('the rail holds the parent editor and the SKOS links within its card', asyn
     await expect(hit).toBeVisible();
     await insideCard(tree, hit);
     await hit.click();
-    await commit(page);
+    await commitAndRead();
     const broader = tree.locator('[data-section="broader"]');
     await expect(broader).toContainText('Marine animals');
     await tree.getByRole('button', { name: 'Add narrower' }).click();
@@ -355,7 +365,7 @@ test('the rail holds the parent editor and the SKOS links within its card', asyn
     await insideCard(tree, down);
     await down.getByRole('searchbox').fill('Bats');
     await down.getByRole('button', { name: /Bats/ }).click();
-    await commit(page);
+    await commitAndRead();
     const narrower = tree.locator('[data-section="narrower"]');
     await expect(narrower).toContainText('Bats');
     await expect(tree.locator('.tree-body')).toBeVisible();
@@ -370,10 +380,10 @@ test('the rail holds the parent editor and the SKOS links within its card', asyn
       .toBeLessThanOrEqual(0);
     // the mock keeps a deleted branch's edits for the next session, so these go again
     await narrower.getByRole('button', { name: /Remove.*Bats/ }).click();
-    await commit(page);
+    await commitAndRead();
     await expect(narrower).not.toContainText('Bats');
     await broader.getByRole('button', { name: /Remove.*Marine animals/ }).click();
-    await commit(page);
+    await commitAndRead();
     await expect(broader).not.toContainText('Marine animals');
     return branch;
   });
