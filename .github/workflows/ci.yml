@@ -415,6 +415,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with: { fetch-depth: 2 }
+      # The doctest build of the workspace's libraries and the swap file outgrow the free
+      # disk of GitHub's runner image, as the test build does.
+      - name: Free disk space
+        run: *free-disk
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
       - name: Add swap
@@ -431,8 +435,13 @@ jobs:
           version: 1.28.0
           cache-generation: sparkles-doctests-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+      - name: Disk space before doctests
+        run: *free-disk-wait
       - name: Doctests
         run: mbx test --locked --workspace --doc
+      - name: Disk space after doctests
+        if: ${{ always() }}
+        run: *free-disk-report
       - name: Remove swap
         if: ${{ always() && env.CI_SWAPFILE != '' }}
         run: *remove-swap
@@ -544,6 +553,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with: { fetch-depth: 2 }
+      # The server's test build and the swap file take much of the free disk of GitHub's
+      # runner image.
+      - name: Free disk space
+        run: *free-disk
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
       # The test build can exceed the runner's physical memory.
@@ -570,10 +583,15 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Disk space before feature tests
+        run: *free-disk-wait
       - name: Server tests with the feature set
         env:
           NEXTEST_PROFILE: ci
         run: scripts/test-features.sh "${{ matrix.set }}"
+      - name: Disk space after feature tests
+        if: ${{ always() }}
+        run: *free-disk-report
 
   # Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectionFuseki, GSP, DSP,
   # QueryExecHTTP, UpdateExecHTTP) and Fuseki admin calls against the debug server binary
