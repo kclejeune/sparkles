@@ -114,7 +114,7 @@ export function termKey(t: Term): string {
 export const iri = (value: string): Term => ({ type: 'uri', value });
 
 export function sparqlIri(value: string): string {
-  return `<${value.replace(/[<>"{}|^`\\\s]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'))}>`;
+  return `<${value.replace(/[<>"{}|^`\\\u0000- ]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'))}>`;
 }
 
 export function sparqlString(value: string): string {

@@ -16,7 +16,6 @@ import {
   type EntityKind,
   type Lit,
   type ManchesterToken,
-  validIri,
 } from './ontology';
 import { localName, shorten, sparqlIri, WELL_KNOWN, type PrefixMap } from './rdf';
 import { browsePath, editorOf, workbenchPath } from './routes';
@@ -1332,7 +1331,7 @@ export function xrefName(
   prefixes: PrefixMap,
 ): string {
   // a string that only starts like an IRI is not one, and keeps its exact value
-  const iri = queryableIri(x.value);
+  const iri = iriRef(x.value);
   const known = iri && /^(https?|urn):/.test(x.value) ? label(x.value) : null;
   if (known) return known;
   if (iri && /^https?:/.test(x.value)) return shorten(x.value, prefixes) ?? readableIri(x.value);
@@ -1596,8 +1595,31 @@ export function usageQuery(iri: string, graphs: readonly string[], offset: numbe
   return `SELECT DISTINCT ?s WHERE { ${overGraphs(graphs, `?s ${sparqlIri(iri)} ?o FILTER(isIRI(?s))`)} } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}`;
 }
 
-/** Whether a value from the data can stand as an IRI in a query as it is. */
-const queryableIri = (s: string) => validIri(s) && !/[\u0000-\u0020]/.test(s);
+/** Whether a string is an absolute IRI by the IRIREF production of SPARQL. */
+const iriRef = (s: string) => /^[A-Za-z][A-Za-z0-9+.-]*:[^<>"{}|^`\\\x00-\x20]*$/.test(s);
+
+/**
+ * Whether a value from the data can stand as an IRI in a query as it is. The server's parser takes
+ * an IRIREF and then checks it against RFC 3987, and a value that fails fails the whole query, so
+ * this asks both. It can refuse a rare valid IRI, such as one with a bracketed host, which then
+ * only goes without a label.
+ */
+function queryableIri(s: string): boolean {
+  if (!iriRef(s)) return false;
+  // controls, private use, surrogates and noncharacters
+  if (
+    /[\x7F-\x9F\uD800-\uDFFF\uE000-\uF8FF\uFDD0-\uFDEF\uFFF0-\uFFFF\u{E0000}-\u{E0FFF}\u{F0000}-\u{10FFFF}]/u.test(
+      s,
+    )
+  )
+    return false;
+  if ([...s].some((c) => (c.codePointAt(0)! & 0xfffe) === 0xfffe)) return false;
+  if (/%(?![0-9A-Fa-f]{2})/.test(s) || /[[\]]/.test(s)) return false;
+  const [, authority = '', fragment = ''] =
+    /^[^:]*:(?:\/\/([^/?#]*))?[^#]*(?:#(.*))?$/.exec(s) ?? [];
+  // one fragment, then user info, a host and a port of digits
+  return !fragment.includes('#') && /^(?:[^@]*@)?[^@:]*(?::[0-9]*)?$/.test(authority);
+}
 
 /**
  * Which of `values`, IRIs or cross-references that are only strings, a page should read labels

@@ -1253,3 +1253,54 @@ describe('values from the data in SPARQL', () => {
     expect(asked).toEqual([]);
   });
 });
+
+describe('IRIs the SPARQL parser takes and refuses', () => {
+  const ATTACK =
+    'http://example.org/x> } SERVICE <https://attacker.example/sparql> { ?s ?p ?d } } #';
+  const NBSP = 'http://example.org/a\u00a0b';
+  const OK = 'http://example.org/ok';
+  it('keeps an IRI with a no-break space and leaves out what cannot be one', () => {
+    expect(labelsWanted([NBSP, ATTACK, 'http://example.org/a b'], {})).toEqual([NBSP]);
+    const q = namesQuery([NBSP, ATTACK, 'http://example.org/a b'], null);
+    expect(q).toContain(`VALUES ?s { <${NBSP}> }`);
+    expect(q).not.toContain('attacker.example');
+    expect(q).not.toContain('example.org/a b');
+  });
+  it('keeps the identity of a graph and a subject with a no-break space', () => {
+    expect(namesQuery([OK], NBSP)).toContain(`GRAPH <${NBSP}>`);
+    expect(headQuery(NBSP)).toContain(`GRAPH <${NBSP}>`);
+    expect(definitionsQuery([NBSP], null)).toContain(`<${NBSP}>`);
+    expect(reuseQuery(NBSP)).toContain(`<${NBSP}>`);
+    expect(reuseQuery(NBSP)).not.toContain('%A0');
+  });
+  it('reads the label of a cross-reference with a no-break space', () => {
+    expect(xrefName({ database: '', id: NBSP, value: NBSP }, () => 'named', {})).toBe('named');
+  });
+  // each of these fails a whole query at the server, so one must not cost the others their labels
+  it.each([
+    ['a stray percent sign', 'http://example.org/100%'],
+    ['a percent sign without hex digits', 'http://example.org/a%zz'],
+    ['a second fragment', 'http://example.org/a#b#c'],
+    ['brackets in a path', 'http://example.org/a[1]'],
+    ['a port that is no number', 'http://example.org:abc/a'],
+    ['an unclosed IPv6 host', 'http://[bad/a'],
+    ['a malformed IPv6 host', 'http://[1:2]/a'],
+    ['a C1 control', 'http://example.org/a\u0085b'],
+    ['DEL', 'http://example.org/a\u007fb'],
+    ['a private use character in a path', 'http://example.org/a\ue000b'],
+    ['a noncharacter', 'http://example.org/a\ufffeb'],
+  ])('leaves out %s', (_, bad) => {
+    expect(labelsWanted([bad, OK], {})).toEqual([OK]);
+    expect(namesQuery([bad, OK], null)).toContain(`VALUES ?s { <${OK}> }`);
+  });
+  it.each([
+    ['percent encoding', 'http://example.org/a%20b'],
+    ['one fragment', 'http://example.org/a#b'],
+    ['a query and a fragment', 'http://example.org/a?x=1&y=2#b'],
+    ['a port', 'http://example.org:8080/a'],
+    ['a URN', 'urn:a:b'],
+    ['letters beyond ASCII', 'http://example.org/caf\u00e9/\u{1F600}'],
+  ])('keeps %s', (_, good) => {
+    expect(labelsWanted([good], {})).toEqual([good]);
+  });
+});
