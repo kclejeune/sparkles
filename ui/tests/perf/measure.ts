@@ -41,10 +41,13 @@ export function groupOf(url: string): string {
   m = p.match(/^\/\$\/([^/]+)/);
   if (m && !/^\/\$\/ontology\/[^/]+$/.test(p)) return `$/${m[1]}`;
   if (/^\/\$\/ontology\/[^/]+$/.test(p)) return 'ontology/summary';
-  m = p.match(/^\/[^/]+\/(sparql|query|update)$/);
+  m = p.match(/^\/[^/]+\/(sparql|query|update|changes)$/);
   if (m) return m[1];
   return p.split('/').slice(0, 3).join('/');
 }
+
+/** Background polling of the page, which neither counts as load nor keeps the network busy. */
+const POLLING = new Set(['$/ping', '$/datasets', 'changes', '$/auth', '$/whoami']);
 
 export type NetGroup = { count: number; encodedBytes: number; decodedBytes: number; ms: number };
 
@@ -55,6 +58,7 @@ export class Net {
     {
       url: string;
       group: string;
+      poll: boolean;
       start: number;
       end?: number;
       enc: number;
@@ -88,16 +92,18 @@ export class Net {
     this.cdp.on('Network.dataReceived', (e) => {
       const r = this.reqs.get(e.requestId);
       if (r) r.dec += e.dataLength;
-      this.lastActivity = Date.now();
+      if (r && !r.poll) this.lastActivity = Date.now();
     });
     const done = (e: { requestId: string; timestamp: number; encodedDataLength?: number }) => {
       const r = this.reqs.get(e.requestId);
       if (r && r.end === undefined) {
         r.end = e.timestamp;
         r.enc = e.encodedDataLength ?? 0;
-        this.inflight--;
+        if (!r.poll) {
+          this.inflight--;
+          this.lastActivity = Date.now();
+        }
       }
-      this.lastActivity = Date.now();
     };
     this.cdp.on('Network.loadingFinished', done);
     this.cdp.on('Network.loadingFailed', done);
@@ -132,7 +138,7 @@ export class Net {
     for (const r of this.reqs.values()) {
       const g = (groups[r.group] ??= blank());
       const ms = r.end !== undefined ? (r.end - r.start) * 1000 : 0;
-      for (const t of r.group === 'static' ? [g, total] : [g, total, api]) {
+      for (const t of r.group === 'static' ? [g, total] : r.poll ? [g, total] : [g, total, api]) {
         t.count++;
         t.encodedBytes += r.enc;
         t.decodedBytes += r.dec;
