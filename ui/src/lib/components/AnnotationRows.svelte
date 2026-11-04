@@ -51,6 +51,12 @@
   let problem = $state<string | null>(null);
   /** The row being edited as it was when editing began. */
   let original: Annotation | null = null;
+  /** The fields as editing began, so a page can tell a changed form from an opened one. */
+  let started = $state('');
+  const fields = () => JSON.stringify([property, value, lang, datatype, isIriValue]);
+  const dirty = $derived(
+    editing !== null && (editing === 'new' ? !!value.trim() : fields() !== started),
+  );
 
   /** Where the row being edited is now, or -1 when it is new or gone. */
   const editIndex = $derived(
@@ -90,6 +96,7 @@
       datatype = LITERAL_TYPES[0];
       isIriValue = false;
     }
+    started = fields();
   }
 
   function save() {
@@ -185,6 +192,8 @@
   <form
     class="form"
     aria-label="Annotation of {label}"
+    data-edit-form
+    data-dirty={dirty ? 'true' : 'false'}
     onsubmit={(e) => {
       e.preventDefault();
       save();
@@ -242,7 +251,7 @@
           original = null;
         }}>Cancel</button
       >
-      <button class="btn sm primary" type="submit">Preview</button>
+      <button class="btn sm primary" type="submit" data-preview>Preview</button>
     </div>
   </form>
 {/snippet}

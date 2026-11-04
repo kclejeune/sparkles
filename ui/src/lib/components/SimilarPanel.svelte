@@ -154,10 +154,9 @@
         </select>
       </label>
     {/if}
-    <div class="seg" role="radiogroup" aria-label="Metric">
+    <div class="segmented" role="radiogroup" aria-label="Metric">
       {#each METRICS as m (m)}
         <button
-          class:on={metric === m}
           role="radio"
           aria-checked={metric === m}
           title="{metricInfo(m).label}: {metricInfo(m).better} is closer"
@@ -262,30 +261,6 @@
     height: 24px;
     font-size: var(--fs-sm);
     max-width: 190px;
-  }
-  .seg {
-    display: inline-flex;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    overflow: hidden;
-  }
-  .seg button {
-    all: unset;
-    padding: 2px 8px;
-    font-size: var(--fs-xs);
-    cursor: pointer;
-    color: var(--text-2);
-  }
-  .seg button + button {
-    border-left: 1px solid var(--border);
-  }
-  .seg button.on {
-    background: color-mix(in srgb, var(--iri) 12%, transparent);
-    color: var(--iri);
-    font-weight: 600;
-  }
-  .seg button:focus-visible {
-    box-shadow: var(--focus);
   }
   .sim {
     width: 100%;

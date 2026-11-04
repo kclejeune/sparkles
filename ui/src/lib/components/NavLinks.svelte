@@ -76,6 +76,10 @@
     color: var(--text);
     box-shadow: 0 0 0 1px var(--border);
   }
+  /* the active link's outline gives way to the focus ring */
+  a:focus-visible {
+    box-shadow: var(--focus);
+  }
   a.active::before {
     content: '';
     position: absolute;

@@ -868,3 +868,294 @@ fn the_el_run_after_the_horn_budget_draws_on_what_the_pool_admitted() {
             .is_subclass(&c("FilopodiumMembrane"), &c("OrganelleMembrane"))
     );
 }
+
+/// A universal on a role no chain reaches, which puts an ontology on the Horn rules, so
+/// that a run carries its chains by the automata alone and composes none (item 693).
+const HORN: &str = "SubClassOf(:X ObjectAllValuesFrom(:u :Y))";
+
+/// Checks the body on the Horn rules, with no chain composed.
+fn chain_free(body: &str, yes: &[(&str, &str)], no: &[(&str, &str)]) {
+    let out = check(&format!("{HORN}\n{body}"), yes, no);
+    assert_eq!(out.stats.tier, Tier::Horn);
+}
+
+#[test]
+fn a_chain_reaches_a_negative_existential_without_composed_links() {
+    chain_free(
+        "SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :B)))
+         EquivalentClasses(:C ObjectSomeValuesFrom(:t :B))",
+        &[("A", "C")],
+        &[("B", "C")],
+    );
+}
+
+#[test]
+fn a_chain_through_an_inverse_reaches_a_negative_existential() {
+    chain_free(
+        "SubObjectPropertyOf(ObjectPropertyChain(ObjectInverseOf(:r) :s) :t)
+         SubClassOf(:A ObjectSomeValuesFrom(ObjectInverseOf(:r) ObjectSomeValuesFrom(:s :B)))
+         EquivalentClasses(:C ObjectSomeValuesFrom(:t :B))",
+        &[("A", "C")],
+        &[],
+    );
+    // the chain's inverse, read from the end of the path back to its start
+    chain_free(
+        "SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+         SubClassOf(:B ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectSomeValuesFrom(ObjectInverseOf(:r) :A)))
+         EquivalentClasses(:C ObjectSomeValuesFrom(ObjectInverseOf(:t) :A))",
+        &[("B", "C")],
+        &[("A", "C")],
+    );
+}
+
+#[test]
+fn a_transitive_role_reaches_a_negative_existential() {
+    chain_free(
+        "TransitiveObjectProperty(:t)
+         SubClassOf(:A ObjectSomeValuesFrom(:t ObjectSomeValuesFrom(:t ObjectSomeValuesFrom(:t :B))))
+         EquivalentClasses(:C ObjectSomeValuesFrom(:t :B))
+         SubObjectPropertyOf(:t :w)
+         EquivalentClasses(:D ObjectSomeValuesFrom(:w :B))",
+        &[("A", "C"), ("A", "D")],
+        &[("B", "C")],
+    );
+    // part of and has part, inverse to each other, as GO and Uberon have them
+    chain_free(
+        "TransitiveObjectProperty(:part_of)
+         InverseObjectProperties(:part_of :has_part)
+         SubClassOf(:A ObjectSomeValuesFrom(:has_part ObjectSomeValuesFrom(:has_part :B)))
+         EquivalentClasses(:C ObjectSomeValuesFrom(:has_part :B))
+         SubClassOf(:B2 ObjectSomeValuesFrom(:part_of ObjectSomeValuesFrom(:part_of :A2)))
+         EquivalentClasses(:C2 ObjectSomeValuesFrom(ObjectInverseOf(:has_part) :A2))",
+        &[("A", "C"), ("B2", "C2")],
+        &[],
+    );
+}
+
+#[test]
+fn a_chain_whose_middle_class_carries_a_universal() {
+    chain_free(
+        "SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+         SubClassOf(:A ObjectSomeValuesFrom(:r :M))
+         SubClassOf(:M ObjectSomeValuesFrom(:s :B))
+         SubClassOf(:M ObjectAllValuesFrom(:s :D))
+         EquivalentClasses(:C ObjectSomeValuesFrom(:t ObjectIntersectionOf(:B :D)))",
+        &[("A", "C")],
+        &[("M", "C"), ("B", "D")],
+    );
+}
+
+#[test]
+fn a_conjunction_context_reached_only_through_a_chain() {
+    // A's universal on t meets B two steps on, in a context that holds B and D, whose
+    // subsumer E returns to A along the inverse of the chain
+    chain_free(
+        "SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+         SubClassOf(:A ObjectAllValuesFrom(:t :D))
+         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :B)))
+         SubClassOf(ObjectIntersectionOf(:B :D) :E)
+         EquivalentClasses(:G ObjectSomeValuesFrom(:t :E))",
+        &[("A", "G")],
+        &[("B", "E"), ("B", "G")],
+    );
+}
+
+#[test]
+fn domains_and_ranges_hold_along_a_chain() {
+    chain_free(
+        "SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+         ObjectPropertyDomain(:t :C)
+         ObjectPropertyRange(:t :D)
+         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :B)))
+         EquivalentClasses(:E ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s ObjectIntersectionOf(:B :D))))",
+        &[("A", "C"), ("A", "E")],
+        &[("B", "D")],
+    );
+}
+
+#[test]
+fn nested_chains_and_superroles_reach_a_negative_existential() {
+    chain_free(
+        "SubObjectPropertyOf(ObjectPropertyChain(:p :q) :r)
+         SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+         SubObjectPropertyOf(:t :w)
+         SubClassOf(:A ObjectSomeValuesFrom(:p ObjectSomeValuesFrom(:q ObjectSomeValuesFrom(:s :B))))
+         EquivalentClasses(:C ObjectSomeValuesFrom(:w :B))",
+        &[("A", "C")],
+        &[],
+    );
+}
+
+#[test]
+fn a_reflexive_operand_of_a_chain() {
+    chain_free(
+        "ReflexiveObjectProperty(:r)
+         SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+         SubClassOf(:A ObjectSomeValuesFrom(:s :B))
+         EquivalentClasses(:C ObjectSomeValuesFrom(:t :B))",
+        &[("A", "C")],
+        &[("B", "C")],
+    );
+}
+
+#[test]
+fn counting_on_a_simple_role_beside_a_chain() {
+    // the two f-successors of A are one, two steps under t from Z
+    chain_free(
+        "FunctionalObjectProperty(:f)
+         SubObjectPropertyOf(ObjectPropertyChain(:r :f) :t)
+         SubClassOf(:Z ObjectSomeValuesFrom(:r :A))
+         SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:f :B) ObjectSomeValuesFrom(:f :C)))
+         EquivalentClasses(:D ObjectSomeValuesFrom(:t ObjectIntersectionOf(:B :C)))",
+        &[("Z", "D")],
+        &[("A", "D")],
+    );
+}
+
+#[test]
+fn an_empty_role_keeps_the_composed_chains() {
+    // with a role under the bottom property, the run composes its chains as for EL
+    chain_free(
+        "SubObjectPropertyOf(:e owl:bottomObjectProperty)
+         SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :B)))
+         EquivalentClasses(:C ObjectSomeValuesFrom(:t :B))
+         SubClassOf(:F ObjectSomeValuesFrom(:e :B))",
+        &[("A", "C")],
+        &[("B", "C")],
+    );
+}
+
+#[test]
+fn a_chain_over_an_inverse_holds_in_its_mirror_image() {
+    // r0 ∘ r2⁻ ⊑ r0 with r2 the inverse of r0 makes r0 transitive, and so r2
+    let body = "SubObjectPropertyOf(ObjectPropertyChain(:r0 ObjectInverseOf(:r2)) :r0)
+         InverseObjectProperties(:r2 :r0)
+         SubClassOf(:A5 ObjectSomeValuesFrom(:r2 :A0))
+         EquivalentClasses(:A0 ObjectSomeValuesFrom(:r2 ObjectIntersectionOf(:A3 :A2)))";
+    check(body, &[("A5", "A0")], &[("A0", "A5")]);
+    chain_free(body, &[("A5", "A0")], &[("A0", "A5")]);
+    // with an empty role, which keeps every chain composed
+    check(
+        &format!(
+            "{body}\nSubObjectPropertyOf(:e owl:bottomObjectProperty)\nSubClassOf(:F ObjectSomeValuesFrom(:e :A3))"
+        ),
+        &[("A5", "A0")],
+        &[("A0", "A5")],
+    );
+}
+
+#[test]
+fn r5_merges_every_counted_successor_at_once() {
+    // A1's at-most restriction counts successors that arrive one by one; merging them in
+    // pairs made a context for each subset on the way and passed the Horn budget
+    let (out, ex) = run("SubObjectPropertyOf(:r1 :r0)
+         InverseObjectProperties(:r0 :r1)
+         EquivalentClasses(:A0 ObjectSomeValuesFrom(:r0 ObjectIntersectionOf(:A5 :A4)))
+         EquivalentClasses(:A6 ObjectSomeValuesFrom(:r1 ObjectIntersectionOf(:A2 :A3)))
+         SubClassOf(:A3 ObjectAllValuesFrom(:r0 :A1))
+         SubClassOf(:A7 :A0)
+         EquivalentClasses(:A7 ObjectSomeValuesFrom(:r0 ObjectIntersectionOf(:A2 :A1)))
+         SubClassOf(:A6 ObjectSomeValuesFrom(:r1 ObjectSomeValuesFrom(:r1 :A5)))
+         SubClassOf(:A1 ObjectMaxCardinality(1 :r1 :A3))
+         SubClassOf(:A0 ObjectSomeValuesFrom(ObjectInverseOf(:r0) ObjectSomeValuesFrom(:r1 :A6)))
+         SubClassOf(ObjectSomeValuesFrom(ObjectInverseOf(:r1) :A5) :A3)
+         SubClassOf(ObjectSomeValuesFrom(:r0 :A5) :A6)");
+    assert!(ex.is_empty(), "{ex:#?}");
+    assert!(!out.stats.horn_over_budget);
+    assert!(out.stats.conjunctions < 1_000, "{}", out.stats.conjunctions);
+    assert!(out.taxonomy.is_subclass(&c("A0"), &c("A6")));
+}
+
+#[test]
+fn a_filler_no_rule_reads_still_reaches_named_classes() {
+    // C has no told subsumer and no rule takes it as a premise: R3 passes over it, but
+    // R4 takes it to the predecessor, and a loop by a reflexive role to the class itself
+    check(
+        "SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:B ObjectAllValuesFrom(ObjectInverseOf(:r) :C))
+         ReflexiveObjectProperty(:s)
+         SubClassOf(:D ObjectAllValuesFrom(:s :C))
+         SubClassOf(:E ObjectSomeValuesFrom(:q :F))
+         SubClassOf(:E ObjectAllValuesFrom(:q :C))
+         EquivalentClasses(:G ObjectSomeValuesFrom(:q ObjectIntersectionOf(:F :C)))",
+        &[("A", "C"), ("D", "C"), ("E", "G")],
+        &[("B", "C"), ("F", "C")],
+    );
+}
+
+#[test]
+fn mirror_images_of_longer_chains_told_mirrors_and_superroles() {
+    // three operands: q ∘ s⁻ ∘ r⁻ ⊑ t⁻ is the mirror image of r ∘ s ∘ q⁻ ⊑ t
+    let three = "SubObjectPropertyOf(ObjectPropertyChain(:r :s ObjectInverseOf(:q)) :t)
+         SubClassOf(:A ObjectSomeValuesFrom(:q ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectSomeValuesFrom(ObjectInverseOf(:r) :B))))
+         EquivalentClasses(:C ObjectSomeValuesFrom(ObjectInverseOf(:t) :B))";
+    // a chain told beside its own mirror image, which is composed once
+    let told = "SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+         SubObjectPropertyOf(ObjectPropertyChain(ObjectInverseOf(:s) ObjectInverseOf(:r)) ObjectInverseOf(:t))
+         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :B)))
+         SubClassOf(:D ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectSomeValuesFrom(ObjectInverseOf(:r) :E)))
+         EquivalentClasses(:C ObjectSomeValuesFrom(:t :B))
+         EquivalentClasses(:F ObjectSomeValuesFrom(ObjectInverseOf(:t) :E))";
+    // the mirror image's result under the inverse of a superrole
+    let sup = "SubObjectPropertyOf(ObjectPropertyChain(:r ObjectInverseOf(:s)) :t)
+         SubObjectPropertyOf(:t :u)
+         SubClassOf(:A ObjectSomeValuesFrom(:s ObjectSomeValuesFrom(ObjectInverseOf(:r) :B)))
+         EquivalentClasses(:C ObjectSomeValuesFrom(ObjectInverseOf(:u) :B))";
+    for body in [three, sup] {
+        check(body, &[("A", "C")], &[("B", "C")]);
+        chain_free(body, &[("A", "C")], &[("B", "C")]);
+    }
+    check(told, &[("A", "C"), ("D", "F")], &[("A", "F"), ("D", "C")]);
+    chain_free(told, &[("A", "C"), ("D", "F")], &[("A", "F"), ("D", "C")]);
+}
+
+#[test]
+fn r5_over_successors_that_hold_only_the_top_class() {
+    // both successors' cores are empty, so their merge changes nothing
+    check(
+        "SubObjectPropertyOf(:r :s)
+         SubObjectPropertyOf(:q :s)
+         FunctionalObjectProperty(:s)
+         SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:r owl:Thing) ObjectSomeValuesFrom(:q owl:Thing)))
+         SubClassOf(ObjectSomeValuesFrom(:s owl:Thing) :B)",
+        &[("A", "B")],
+        &[("B", "A")],
+    );
+}
+
+#[test]
+fn a_cancellation_polled_once_stops_a_horn_run_wherever_it_comes() {
+    // 40,000 classes no rule reads under one superclass: enough work for the absorbed
+    // fillers' pass to poll, with a saturation that stays linear
+    let mut body = String::from("SubClassOf(:X ObjectAllValuesFrom(:u :Y))\n");
+    for i in 0..40_000 {
+        body.push_str(&format!("SubClassOf(:C{i} :D)\n"));
+    }
+    let ax = axioms(&body);
+    let counting = |stop_at: usize| {
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let m = n.clone();
+        let limits = Limits {
+            threads: 1,
+            cancelled: Some(std::sync::Arc::new(move || {
+                m.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 == stop_at
+            })),
+            ..Limits::default()
+        };
+        (n, limits)
+    };
+    let (n, limits) = counting(0);
+    let out = Classifier::of(&ax).classify(&limits).unwrap();
+    assert_eq!(out.stats.tier, Tier::Horn);
+    let polls = n.load(std::sync::atomic::Ordering::Relaxed);
+    for k in 1..=polls {
+        let (_, limits) = counting(k);
+        let r = Classifier::of(&ax).classify(&limits);
+        assert!(
+            matches!(r, Err(sparkles_owl::classify::Error::Cancelled)),
+            "poll {k} of {polls}"
+        );
+    }
+}

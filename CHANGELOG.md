@@ -55,6 +55,15 @@ on the benchmark host it takes 3.31 s and 8.32 s, against 3.47 s and 8.77 s for 
 A term is kept only when it is a URN or a URL that OpenJDK 17's `java.net.URL` accepts, as
 ROBOT keeps it.
 
+The ontology browser has an edit mode (spec U12, roadmap item 630). A caller who can write
+to a dataset switches an entity's page into edit mode and changes its definition and
+sources, synonyms, annotations, parents and axioms in place, or a concept's labels,
+broader, narrower, related and mapping concepts. Each change is a previewed commit through
+the editors' write path, with their session branches, undo history and access checks, and
+a refused or stale write is explained in the preview. On a phone the edit bar sits at the
+bottom of the screen. A 403 in any editor's preview now names the dataset and graph that
+the caller can read but not write.
+
 The web UI has an ontology browser (spec U12, roadmap item 616). `/ui/browse` gives each
 entity of a dataset's ontologies and thesauri a read-only page with its label, short form,
 IRI, definition and sources, synonyms by kind, notes, SKOS labels by language,
@@ -84,6 +93,21 @@ their own dataset menus to the top bar, their graph, branch and language choices
 to a row under the title, the query page's branch, state, history and row limit fold
 behind an Options button on a phone, and the ontology editor's trees show labels on
 ontologies larger than the 50,000 axioms it lists, such as the Gene Ontology.
+
+The web UI's pages follow one layout after a design review (roadmap item 633). The top
+bar's search sits in the middle of the viewport, and on Explore it is also the resource
+finder that Explore's own search field was, with its Open and Ask rows. Every page starts
+at the gutter, the Query and Explore toolbars keep one row with the run and clear actions
+at their end, Explore's graph tools keep their icons beside the details panel, and the
+Query page's branch, state, history, row limit and inferences sit
+behind **Options** at every width, whose button names what differs from the defaults.
+Every control shows a focus ring that differs from its unfocused look, which a design
+check walks with Tab on every page.
+Panels side by side end on the same line, counts use one chip, two to four choices use
+one segmented control, the Server page shows its uptime and version once, and the dataset
+page's branch and past-state choices share one row under the title. On a phone, dialogs
+dock at the bottom of the screen as sheets, toolbar and page-head buttons keep their icons,
+and the dataset settings and branch review pages no longer scroll sideways.
 
 Ontologies and thesauri have a typo-tolerant entity search for typeahead (spec U12,
 roadmap item 616). `GET /$/ontology/{ds}/search?q=` matches the labels, synonyms, short
@@ -192,8 +216,9 @@ and irreflexive properties and transitive properties and chains through automata
 creates contexts for the conjunctions that universal and at-most restrictions need.
 `Stats` reports the tier of rules a run needed, the axioms outside OWL 2 EL it took and
 the conjunctions it created. GO's taxonomy now has the 14 subsumptions that its inverse
-properties entail, as Konclude's does, and GO classifies 17 to 18% slower on the
-benchmark host. `sparkles ontology reason` and `reduce` with `--reasoner ELK`, and the
+properties entail, as Konclude's does, and GO classifies 12% slower on one thread on the
+benchmark host than with the EL rules alone. `sparkles ontology reason` and `reduce` with
+`--reasoner ELK`, and the
 library's `ClassifyRequest::el_only` and `Limits::el_only`, classify by the OWL 2 EL
 rules alone, as ELK does, so the ROBOT-compatible outputs equal ROBOT's with ELK. Without
 `--reasoner` they take the Horn axioms too. The functional-syntax reader can pass over SWRL rules and count them
@@ -201,7 +226,7 @@ with `ofn_read::Options::skip_rules`, and refuses them otherwise as before. A ru
 the Horn rules has a memory budget of 64 times its index and axioms, at least 1 GiB, and
 one that passes it classifies again by the EL rules alone and sets
 `Stats::horn_over_budget`. Two Uberon-based ORE 2015 ontologies that ran out of memory
-now classify in 4.2 s with the EL answer.
+now classify with the Horn rules in 4.0 and 2.2 s on one thread on the benchmark host.
 
 The classifier takes axioms that need case analysis in ALCHI ontologies without
 individuals or data properties (roadmap item 603), with the consequence-based calculus of
@@ -301,6 +326,41 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+The planner estimates more joins from statistics of how predicates occur together (spec
+X15, roadmap item 454). A bulk load or compaction keeps 32,768 subject characteristic sets
+instead of 10,000 and counts the subjects outside them as a remainder, so a star whose
+predicates the kept sets cover poorly is estimated from the sets too. It also counts the
+characteristic sets of nodes over both directions, which estimate joins on an object and
+the links of chains. A join on several keys divides by the key tuples of the larger side,
+with exponential back-off between the largest count and the product of the counts, and a
+key sample that finds no rows is no longer taken as an empty join. Over the join nodes of
+the recorded plans, the geometric mean of the q-error falls from 8.80 to 3.98 on WatDiv
+at scale 100, from 4.84 to 1.96 on an 8.2M-triple DBpedia slice and from 3.52 to 1.81
+on LUBM(10), and answers are unchanged. The switches are `set_remainders`, `node_sets` and
+`key_backoff`. The statistics grow `stats.json`, from 5.0 MB to 44.3 MB on the DBpedia
+slice, and the node pass adds about 0.2 s to a WatDiv load and 0.7 s to the DBpedia
+load. On atlas, opening the DBpedia slice takes 0.30 s instead of 0.07 s and the server
+holds 214 MB instead of 133 MB once ready. The node pass keeps the same sets at any
+thread count. On forge, WatDiv's `C` queries run 2.2 to 4.9 times as fast, BSBM BI
+`q1-3` 4.4 times and LUBM `q2` 2.0 times. WatDiv `S4-2` and `S4-4` take 1.6 times as long
+after a plan change, and planning takes 1 to 90 microseconds longer on short queries and
+WatDiv `F4`.
+
+A classification with the Horn rules costs less (roadmap item 693). A run composes only
+the property chains that a negative existential restriction kept on composed links
+needs, and unfolds every other such restriction over a property that chains reach by its
+automaton, so that conjunction contexts no longer compose Uberon's parthood chains
+again. A context merges every successor that an at-most restriction counts in one step,
+and the rule for a successor passes over fillers that no rule reads. On the benchmark
+host GO classifies in 306 ms on one thread against 320 ms before and 274 ms with the EL
+rules alone, with a peak resident set of 223 MiB against 248 MiB. ore_ont_9663 and
+ore_ont_14817 of the ORE 2015 DL sample finish with the Horn rules in 4.0 and 2.2 s on
+one thread, where they passed the memory budget after 20.4 and 9.8 s and fell back to
+the EL rules, and ore_ont_9855 classifies in 1.5 s against 4.4 s. The taxonomies
+measured are unchanged except those of the two Uberon files, which gain the subsumptions
+that the Horn rules give. The EL rules classify `ore_ont_3836` 7% slower on one thread,
+from code layout in the index stage, which roadmap item 711 follows.
+
 `sparkles ontology classify FILE` and `sparkles ontology check FILE` read a file of one
 graph into memory without a store and give the answers that a store of the loaded file
 gives (spec F24, roadmap item 649). RDF/XML, Turtle, N-Triples and functional-style
@@ -372,6 +432,23 @@ stage 4). Per-value reuse in BIND and FILTER, ORDER BY keys, top k and the pre-d
 FILTER, BIND and ORDER BY columns choose their algorithms by the size of their input in
 both execution modes, so an eager table of up to 16,384 rows runs them as a cursor batch
 does, and an eager top-k scan reads its pieces in morsels into one heap.
+
+Short queries no longer pay the fixed costs that the charged query state added to every
+request (spec X14, roadmap items 679 and 681). A query makes its regular-expression map
+and the 64 shards of its value cache only when it uses them, so a query without patterns
+neither replaces nor frees a map, and FILTER, BIND and ORDER BY skip the checks of their
+larger-input paths on a few rows. A small sort's key column takes its payload charge a step
+of at most 64 KiB ahead, exactly when the step is refused, instead of once per row. The
+whole request of `count-all`, `distinct-obj` and `path-plus` now takes fewer instructions
+than before the charged query state, and `types-grouped` about 1,200 more. With one thread
+`star-lookup` runs 1.9% longer than before stage 4, since the build places the index join's
+unchanged search loop 16 bytes into its cache line, and roadmap item 696 follows the
+alignment of the join loops. A sort of more
+than 4,096 distinct dictionary terms decodes them in one parallel pass that admits each
+value before it builds it, and a large sorted key column is freed on the pool, which takes
+eager `order-by-full` at 1.05M triples with 12 threads from 13.1 ms to 8.9 ms on the
+benchmark host. Each decoding piece and each key column can hold up to one step of
+charged memory above its values until the sort ends.
 
 `sparkles ask` takes its question argument as optional, since `--questions FILE` reads
 questions from a batch file instead. A command line that passes a question parses and
@@ -1415,6 +1492,27 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+A quick query text no longer settles in its slower execution mode because of one cold
+run. The server's history ran a text's first run as an automatic cursor and its second
+eagerly, and kept whichever of those two single runs was faster for the server's whole
+life. The first cursor run is cold, so on atlas three fresh servers in four answered the
+synthetic `expr-bind-group` eagerly in 0.65 ms of execution instead of as a cursor in
+0.41 ms once the correlation-aware estimates of item 454 made that first run about
+0.2 ms slower. A text whose two modes are both quick now settles only once the slower
+mode has run twice, which costs it at most two runs in that mode.
+
+A classification with the Horn rules no longer misses subsumptions that a property chain
+over an inverse gives through its mirror image (roadmap item 693). The rules of item 603
+composed each told chain `r_1 ∘ … ∘ r_n ⊑ s` but not `r_n⁻ ∘ … ∘ r_1⁻ ⊑ s⁻`, which the
+chain entails. With `r0 ∘ r2⁻ ⊑ r0` and `r2` the inverse of `r0`, for example, `r2` is
+transitive only through that mirror image, and `A ⊑ ∃r2.B`, `B ≡ ∃r2.C` did not give
+`A ⊑ B`. The inputs affected were ontologies the Horn rules take with a chain that names
+an inverse, a three-operand chain over inverses, or a chain whose mirror image's result
+sits under the inverse of a superproperty. A differential test found the case. It
+compares random small Horn ontologies with chains, inverses, transitivity and property
+hierarchies between two builds and shrinks each difference to a few axioms. Runs by the
+OWL 2 EL rules alone are unchanged.
+
 `check_query` no longer fails with `budget-memory` when a draft uses a predicate that no
 instance of its typed variable's class has. On the DBpedia 2022.12.01 database the
 class lookup's estimate passed the 2 GiB query memory budget, which failed the whole
@@ -1581,6 +1679,14 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+The planner statistics in `gen-*/stats.json` gain the member `correlations`, which
+carries its own version, 1, and is registered as the derived kind `planner-statistics`.
+It holds the remainder of the subject characteristic sets and the node characteristic
+sets with their remainder. A member of another version is refused with a recorded reason,
+`sparkles check` reports it, and the planner estimates as it did before. Releases without
+it ignore the member, and stores loaded before it keep their estimates until the next
+bulk load or full compaction.
 
 The resource catalog is the server file `resources.json`, format 1, registered as a
 server settings file. A file of another format, or one that does not parse or breaks the

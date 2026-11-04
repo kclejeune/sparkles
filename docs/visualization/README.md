@@ -12,7 +12,8 @@ The SvelteKit UI is embedded in the server binary.
 
 * Every page sits in one shell. A top bar holds the brand, a search field whose first
   segment switches the dataset and names the branch a page has open, the connection
-  status, the theme and the account. A rail beside the page lists the working pages and,
+  status, the theme and the account. The search field stays in the middle of the
+  viewport on large and medium screens. A rail beside the page lists the working pages and,
   below a rule, the administration pages. From 1200 pixels the rail shows labels, below
   that it shows icons with their names as tooltips, and from 760 pixels down it moves into
   a drawer that the menu button opens, together with the dataset switcher, the status,
@@ -21,8 +22,8 @@ The SvelteKit UI is embedded in the server binary.
 * The search field is also the command palette. `Ctrl+K` or `Cmd+K` opens it from
   anywhere, including the query editor, and pressing it again closes it. `/` opens it
   outside a text field, except on a page with a search of its own, where `/` focuses that
-  search instead, such as the class tree filter of the ontology editor and the label
-  search of the thesaurus editor. Escape gives the focus back to where it was, and a
+  search instead, such as the class tree filter of the ontology editor, the label search
+  of the thesaurus editor and the field of Explore's text-search tab. Escape gives the focus back to where it was, and a
   command that runs in place returns the focus there before it runs. On a phone the bar
   shows a search button, and the button or the keys expand the field over the whole bar
   with a back button ([screenshot](../images/palette-phone.png)).
@@ -34,7 +35,10 @@ The SvelteKit UI is embedded in the server binary.
   Thesaurus and dataset pages, the dataset's branches. Enter opens a class or property in
   the ontology editor, a concept in the thesaurus editor, any other entity in Explore and
   a saved query in a new tab of the Query page
-  ([screenshot](../images/shell-search.png)).
+  ([screenshot](../images/shell-search.png)). On Explore the field is also the resource
+  finder. Its placeholder says so, and its first group lists the dataset's resources by
+  label or IRI, an **Open** row for a typed IRI or prefixed name and **Ask a question…**
+  when the dataset answers questions. A pick focuses the resource in the graph.
 * A prefix shows one kind of item. `>` lists commands and pages, `@` entities, `#`
   datasets and branches, and `?` saved queries, and a row of chips above the results sets
   the same prefixes by touch. Escape on a prefix with nothing after it returns to every
@@ -67,11 +71,29 @@ The SvelteKit UI is embedded in the server binary.
   page head and context row styles, and a list beside its detail ends both panes on the
   same line ([medium width](../images/shell-medium.png),
   [phone](../images/shell-phone.png)).
+* Every page's content starts at the gutter. A workspace page's tools are one
+  `.toolbar` row with the primary action at its end, and where the row does not fit the
+  end group takes a row of its own, flush right. On a phone, buttons in a toolbar or a
+  page head keep their icons and drop their labels, which stay their accessible names.
+  The Query toolbar does the same for **History**, **Pattern** and **Format** below
+  1,200 pixels, and Explore's graph tools do it whenever the canvas is narrower than
+  860 pixels, such as beside the details panel, where a still narrower canvas wraps
+  the tools to more rows.
+  Panels side by side in a `.panel-grid` are as tall as the tallest in their row,
+  headline numbers share one `.figures` grid, a choice of two to four values is one
+  `.segmented` control, and the menus under a button share `.dropdown-menu`. At 760
+  pixels and below a dialog docks at the bottom of the screen as a sheet whose body
+  scrolls under a fixed head and footer.
 
 ### Query page
 
 * The query page has an editor with completion of declared prefixes, linting and
   formatting in the browser, and results as a table, graph or plan.
+* The toolbar holds the query's kind and endpoint, **Examples**, **Saved** and
+  **Options**, then the pattern pane, **Format**, **Explain** and **Run** at its end.
+  **Options** holds the branch, the past state to read, the history slider, the row
+  limit and the inferences toggle, and its button names any of them that differ from
+  the default, including inferences left out on a dataset that reasons.
 * The **Saved** menu lists the dataset's stored queries, shows a form for a query's
   parameters and runs it. An admin can save the editor's query with parameters picked from
   its variables, or delete one.
@@ -103,7 +125,8 @@ The SvelteKit UI is embedded in the server binary.
 
 * The explorer shows an entity's properties, its nearest vector neighbours, ranked
   `text:query` search and a map card with Nearby. The Similar page searches from an entity
-  or a pasted vector.
+  or a pasted vector. The top bar's search finds the resource to start from, and the
+  graph toolbar's **View** menu shows literals and hides `rdf:type` edges.
 * Explore opens on an overview of the dataset's classes and the predicates between them,
   drawn with sigma.js on WebGL and laid out with ForceAtlas2 in a web worker
   ([U06](../specs/U06-large-graph-rendering.md), [USAGE.md](../USAGE.md#the-explore-overview),
@@ -297,8 +320,8 @@ another writer's commit reloads the page through the change feed.
 
 ### Ontology browser
 
-The **Browse** page, `/ui/browse`, is a read-only reference to the ontologies and thesauri
-of a dataset, with a page for each entity in the manner of the term pages of OLS and
+The **Browse** page, `/ui/browse`, is a reference to the ontologies and thesauri of a
+dataset, with a page for each entity in the manner of the term pages of OLS and
 Ontobee ([U12](../specs/U12-ontology-workbench/SPEC.md#ontology-browser),
 [screenshot](../images/browse-term.png)). The top bar's search opens an entity's page,
 and every name on a page links to the page of that entity. `/ui/browse?ds=NAME` is the
@@ -327,9 +350,34 @@ property, with their counts and further pages. **In other datasets** asks every 
 dataset the caller can read, up to 20, whether it mentions the IRI, and links its page
 there. The infobox lists the kind, status, identifiers, ontology, subsets and the counts
 of parents, children and instances, and downloads the entity in Turtle, RDF/XML, OWL
-functional syntax or JSON-LD. **Edit** opens the entity in the ontology or thesaurus
-editor. On a phone the page is one column with the header first, then the infobox, the
+functional syntax or JSON-LD. On a phone the page is one column with the header first, then the infobox, the
 hierarchy and the article ([screenshot](../images/browse-phone.png)).
+
+A caller who can write to the dataset gets an **Edit** button beside the title, and `E`
+or the palette's **Edit this page** does the same. Edit mode changes the page in place
+([screenshot](../images/browse-edit.png)). A bar under the top bar names the branch the
+edits go to and holds **Undo**, **Redo**, **Start session**, a link to the full ontology
+or thesaurus editor and **Done**. The definition becomes a text field with its language
+and its sources as chips, and each synonym, annotation and parent gets edit and remove
+buttons with an add row below them. On an OWL page the parents are picked through the
+entity search and the axioms are added in Manchester syntax with completion and the
+server's parse errors underlined. On a SKOS page the broader, narrower,
+related and mapping concepts are picked the same way, and the labels are edited by language.
+
+Each change is one commit through the editors' write path. It is previewed as a dry run
+against the commit the page shows ([screenshot](../images/browse-edit-preview.png)),
+and the preview names the axioms or triples it removes and adds. A definition or synonym
+keeps its sources and other axiom annotations through an edit. Undo and redo are
+previewed commits that share the editors' history for the dataset and graph. When the
+branch is protected the fields are disabled and **Start session** creates a session
+branch, as in the editors. A write the caller's grants refuse names the dataset and
+graph in the preview, and a commit by another writer makes the preview stale until
+**Reload** reads the page again. Statements that another graph states are shown without
+buttons. `Mod+S` previews the field that has focus, `Esc` leaves edit mode and asks
+first when a field holds an unsaved change, and `S`, `P` and `A` focus the add rows of
+synonyms, parents and axioms when focus is outside a text field. On a phone the bar
+moves to the bottom of the screen with **Undo**, **Redo**, a menu and **Done**, and the
+hierarchy comes before the article ([screenshot](../images/browse-edit-phone.png)).
 
 The landing page shows the ontology or scheme header with its title, version, license and
 description, a graph picker when named graphs hold ontologies or schemes, a search over
@@ -473,8 +521,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   read-only, 611. For the same reason the thesaurus editor's notes and members forms are
   read-only on branches other than main when authentication is on. Undo and redo revert commits, which needs write access to the
   whole branch, so a caller whose grants cover some graphs only can edit but not undo.
-* The ontology browser is read-only, and its edit mode is item 630. Its pages and
-  hierarchy show asserted axioms only, and inferred ones are item 622. Its search reads
+* The ontology browser's edit mode changes definitions, synonyms, annotations, parents,
+  axioms and SKOS labels and links. SKOS-XL labels and collection members are edited in
+  the thesaurus editor, and property assertions, keys and chains have no form of their
+  own and are added as an axiom, 706. Its first preview on a large
+  ontology waits for the axioms route to open the whole ontology, 707. Its
+  pages and hierarchy show asserted axioms only, and inferred ones are item 622. Its search reads
   the head of a branch, so a page at a past state has no search box, item 658. It shows
   entities by label with the reader's languages first, and a choice of label, prefixed
   name or IRI is item 625. Reuse is looked up in the other datasets of the same server,

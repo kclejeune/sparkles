@@ -252,7 +252,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   ontologies never need, so these stay polynomial. A run with the Horn rules has a
   memory budget of 64 times its index and axioms, at least 1 GiB and no more than the
   caller's. A run that passes it classifies again by the EL rules alone, leaves the Horn
-  axioms out and reports them, and sets `Stats::horn_over_budget`. In an ontology
+  axioms out and reports them, and sets `Stats::horn_over_budget`. No ontology measured
+  reaches it, since a run composes only the property chains that a negative existential
+  restriction needs and unfolds the others by their automata. In an ontology
   without individuals, data properties, self restrictions, reflexive properties or top
   properties, axioms that need case analysis, such as unions, complements and universal
   restrictions on the left, take the disjunctive rules of the consequence-based calculus
@@ -284,12 +286,12 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   the memory budget, and a run whose chunks would pass it normalizes on one thread. This
   and the saturation's message buffers raise the peak resident set on eight threads by
   up to 13% on some ontologies in exchange for the speed. On the benchmark host GO
-  classifies in 95 ms and ChEBI lite in 0.39 seconds on eight threads, and the
+  classifies in 91 ms and ChEBI lite in 0.39 seconds on eight threads, and the
   classifier is 3.1 to 20 times as fast as ELK on GO, ChEBI lite and the largest ORE
   2015 EL ontologies on one and eight threads. GO's `InverseObjectProperties(part_of
   has_part)` takes the Horn rules, which add the 14 subsumptions that Konclude and HermiT
-  entail and ELK misses and make GO 17 to 18% slower to classify than with the EL rules
-  alone, item 693. The classifier's direct hierarchy of GO is the one GO's release
+  entail and ELK misses and make GO 12% slower to classify on one thread than with the EL
+  rules alone, item 693. The classifier's direct hierarchy of GO is the one GO's release
   publishes with those 7 direct edges added, and its taxonomy of ChEBI entails every subsumption ChEBI asserts and
   gives no direct subsumption that ChEBI does not assert
   ([results](../benchmarks/el-classification/RESULTS.md)).
@@ -613,10 +615,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 664.
 * The classifier leaves out the Horn axioms outside OWL 2 EL in an ontology with
   individuals, functional data properties or top properties. Roadmap item 692.
-* GO's inverse properties take the Horn rules, which classify it 17 to 18% slower than
-  the EL rules and raise its peak resident set. Two Uberon-based ontologies of the ORE
-  2015 DL sample pass the Horn rules' memory budget and get the EL answer in 4.2 seconds
-  instead of 0.8. Roadmap item 693.
+* GO's inverse properties take the Horn rules, which classify it 12% slower than the EL
+  rules on one thread and raise its peak resident set from 196 to 223 MiB. Two
+  Uberon-based ontologies of the ORE 2015 DL sample classify with the Horn rules in 2.2
+  and 4.0 seconds on one thread, against 0.7 and 0.8 for the EL rules alone. Roadmap item
+  693.
 * The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
   restrictions passes 10 GiB. Roadmap item 695.
 * The ELK mode, which classifies by the OWL 2 EL rules alone, is an option of the Rust

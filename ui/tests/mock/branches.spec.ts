@@ -142,6 +142,7 @@ test('an update on a branch through the query page, merged with the Merge button
   await request.post('/$/branches/ledger', { data: { name: 'feature' } });
   await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'ledger'));
   await page.goto('/ui/query');
+  await page.getByRole('button', { name: /^Options/ }).click();
   const branch = page.getByRole('combobox', { name: 'Branch' });
   await branch.selectOption({ label: 'feature · commit 1' });
   const editor = page.locator('.cm-content');
@@ -267,6 +268,7 @@ test('memory branches are selectable and isolate writes from main', async ({ pag
   await expect(row(page, 'dev')).toBeVisible();
   await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'memory-branches'));
   await page.goto('/ui/query');
+  await page.getByRole('button', { name: /^Options/ }).click();
   await expect(
     page.getByRole('combobox', { name: 'Branch' }).getByRole('option', { name: /^dev/ }),
   ).toHaveCount(1);

@@ -60,6 +60,35 @@ pub struct Measure {
     /// them
     pub rows: f64,
     pub d: f64,
+    /// the values probed, and whether they were every distinct value of the small input
+    pub keys: u32,
+    pub complete: bool,
+}
+
+impl Measure {
+    /// The share of the small input's rows that the pattern holds. A sample that found
+    /// no value of a pattern, without being every value of the input, says only that the
+    /// share is small: it is taken as `1 / (keys + 2)`, the rule of succession, instead of
+    /// 0, so that a join of a few matching values among many is not estimated at one row.
+    #[inline]
+    fn share(&self) -> f64 {
+        if self.f > 0.0 || self.complete {
+            self.f
+        } else {
+            1.0 / (f64::from(self.keys) + 2.0)
+        }
+    }
+
+    /// The mean rows of the pattern per row of the small input: for a sample without a
+    /// hit, the share above times the pattern's average rows per value.
+    #[inline]
+    fn mean(&self) -> f64 {
+        if self.m > 0.0 || self.complete {
+            self.m
+        } else {
+            self.share() * self.rows / self.d.max(1.0)
+        }
+    }
 }
 
 /// A small input of a group: its signature, for recognizing it in plans.
@@ -148,8 +177,11 @@ pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>]) {
 }
 
 /// The values of `v` in the small input `src`, with their rows: from a VALUES table or
-/// read from the pattern's scan.
-fn source_values(ctx: &Ctx, src: &Node, v: VarId) -> Result<Option<Vec<Id>>> {
+/// read from the pattern's scan, and whether they are all of its values. A scan stops
+/// reading at four times the rows of a small input, so a pattern estimated too small
+/// gives the values of its first rows only.
+fn source_values(ctx: &Ctx, src: &Node, v: VarId) -> Result<Option<(Vec<Id>, bool)>> {
+    let mut read_all = true;
     let mut vals: Vec<Id> = match &src.kind {
         Kind::Values(t) => {
             let Some(c) = t.col_of(v) else {
@@ -209,7 +241,9 @@ fn source_values(ctx: &Ctx, src: &Node, v: VarId) -> Result<Option<Vec<Id>>> {
                         }
                     }
                 }
-                Ok(out.len() < limit)
+                let more = out.len() < limit;
+                read_all &= more;
+                Ok(more)
             })?;
             out
         }
@@ -219,7 +253,28 @@ fn source_values(ctx: &Ctx, src: &Node, v: VarId) -> Result<Option<Vec<Id>>> {
         return Ok(None);
     }
     vals.sort_unstable();
-    Ok(Some(vals))
+    Ok(Some((vals, read_all)))
+}
+
+/// Whether the sorted `keys` are every distinct value of the sorted `vals`, which only
+/// values read whole (`read_all`) can tell.
+pub(super) fn covers_every_value(vals: &[Id], keys: &[Id], read_all: bool) -> bool {
+    if !read_all {
+        return false;
+    }
+    let mut ki = 0;
+    for (i, &x) in vals.iter().enumerate() {
+        if i > 0 && vals[i - 1] == x {
+            continue;
+        }
+        while ki < keys.len() && keys[ki] < x {
+            ki += 1;
+        }
+        if ki >= keys.len() || keys[ki] != x {
+            return false;
+        }
+    }
+    true
 }
 
 fn probe_var(
@@ -262,7 +317,7 @@ fn probe_var(
         ),
         _ => return Ok(None),
     };
-    let Some(vals) = source_values(ctx, src, v)? else {
+    let Some((vals, read_all)) = source_values(ctx, src, v)? else {
         return Ok(None);
     };
     // rows of the small input spread over its values in order
@@ -270,6 +325,7 @@ fn probe_var(
     let keys: Vec<Id> = (0..k)
         .map(|i| vals[(2 * i + 1) * vals.len() / (2 * k)])
         .collect();
+    let complete = covers_every_value(&vals, &keys, read_all);
     let mut targets = Vec::new();
     for (i, opts) in leaves.iter().enumerate() {
         if i == si || !opts[0].vars.contains(&v) {
@@ -284,7 +340,7 @@ fn probe_var(
         }) else {
             continue;
         };
-        if let Some(m) = measure(ctx, spec, &keys, budget)? {
+        if let Some(m) = measure(ctx, spec, &keys, complete, budget)? {
             let sigs = opts
                 .iter()
                 .filter_map(|o| match &o.kind {
@@ -316,17 +372,24 @@ fn probe_var(
 
 /// Count the rows of the pattern `spec` (sorted on the probed variable) for each of
 /// `keys`, within the `budget` of blocks to decode.
-fn measure(ctx: &Ctx, spec: &ScanSpec, keys: &[Id], budget: &mut usize) -> Result<Option<Measure>> {
+fn measure(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    keys: &[Id],
+    complete: bool,
+    budget: &mut usize,
+) -> Result<Option<Measure>> {
     // the pattern's range and the values probed decide the measure
     let mut h = rustc_hash::FxHasher::default();
     keys.hash(&mut h);
     let key = format!(
-        "probe|{}|{:?}|{:?}|{}|{:x}",
+        "probe|{}|{:?}|{:?}|{}|{:x}|{}",
         spec.perm.name(),
         spec.prefix,
         spec.graph,
         keys.len(),
-        h.finish()
+        h.finish(),
+        complete
     );
     if let Some(m) = ctx.snap.counts.probed(&key) {
         return Ok(m);
@@ -341,6 +404,8 @@ fn measure(ctx: &Ctx, spec: &ScanSpec, keys: &[Id], budget: &mut usize) -> Resul
         f: counts.iter().filter(|&&c| c > 0).count() as f64 / n,
         rows: 0.0,
         d: 0.0,
+        keys: counts.len() as u32,
+        complete,
     });
     ctx.snap.counts.set_probed(key, m);
     Ok(m)
@@ -530,12 +595,14 @@ pub(super) fn applies(ctx: &Ctx, v: VarId, a: Side, b: Side) -> Option<(Measure,
 /// rows holding a probed pattern measured as `m`.
 #[inline]
 pub(super) fn est(s_est: f64, t_est: f64, m: &Measure) -> f64 {
-    let e = s_est * m.m * (t_est / m.rows.max(1.0));
+    let e = s_est * m.mean() * (t_est / m.rows.max(1.0));
     e.max(if s_est > 0.0 && t_est > 0.0 { 1.0 } else { 0.0 })
 }
 
 /// The distinct values of the join variable after such a join, from `ds` and `dt`.
 #[inline]
 pub(super) fn distinct(ds: f64, dt: f64, m: &Measure) -> f64 {
-    (ds * m.f * (dt / m.d.max(1.0)).min(1.0)).min(ds).min(dt)
+    (ds * m.share() * (dt / m.d.max(1.0)).min(1.0))
+        .min(ds)
+        .min(dt)
 }

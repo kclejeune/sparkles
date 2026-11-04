@@ -89,7 +89,7 @@ test.describe('on a phone', () => {
       await expect(page.locator('main .spinner')).toHaveCount(0);
 
       const boxes = await page.evaluate(() =>
-        [...document.querySelectorAll('.page :is(.tabs, section.card)')].map((e) => {
+        [...document.querySelectorAll('.page :is(.tabs, section.panel)')].map((e) => {
           const r = e.getBoundingClientRect();
           return {
             name: e.getAttribute('aria-label'),

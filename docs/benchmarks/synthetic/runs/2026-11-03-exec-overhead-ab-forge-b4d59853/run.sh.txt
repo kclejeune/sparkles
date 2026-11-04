@@ -1,0 +1,97 @@
+# Run on forge alone under ~/lanes/.bench.lock with the A/B harness of the post-push check of
+# 62d9cb53: the stage 4 lane's scripts/x08-gates/ab.sh driving nsc-bench-remote.sh, its
+# synthetic queries and the people datasets of 100,000 and 1,000,000 people (1.05M and
+# 10.5M triples). Each A/B runs A=base, B=candidate (the *-cand-second directories) and
+# A=candidate, B=base (*-cand-first). Twelve-thread runs pin the server to CPUs 0-11 and the
+# client to CPU 12, and one-thread runs pin them to CPUs 2 and 4 with SCHED_IDLE spinners.
+# The binaries are release builds made off forge from git archives inside the repository's
+# Nix shell, with learned incremental reuse turned off (build-config.json; every build
+# shares it):
+#   MBX_LEARNED_INCREMENTAL=false scripts/nsc-build.sh OUT
+# The runs were queued as systemd user units, each holding the benchmark lock for its runs:
+#   systemd-run --user --unit exec679-forgeN flock ~/lanes/.bench.lock bash forge-runN.sh
+# Each directory keeps the samples (gzip), answers, environment and settings of one order.
+# summary.md combines the two orders of each run with the post-push check's analyze.py:
+#   python3 analyze.py <run>   (reads <run>/eager-cand-second and <run>/eager-cand-first)
+
+# ---- forge-run.sh
+# Forge checks of lane exec-overhead-679. Runs under ~/lanes/.bench.lock, held once by the caller.
+# A = 005df56d (main before stage 4), C = the lane's candidate, plus 62d9cb53 against 125edd41.
+set -u
+L=$HOME/lanes/exec-679; cd "$L"
+mkdir -p logs
+log() { echo "$(date -u +%T) $*" | tee -a logs/progress.log; }
+BA=bin/sparkles-005df56d; BC=bin/sparkles-${CAND:-d1f3d8b5}; B1=bin/sparkles-62d9cb53; B2=bin/sparkles-125edd41
+ALL=$(cd work/queries && for f in *.rq; do printf '%s ' "${f%.rq}"; done)
+P4Q="distinct-obj count-all predicate-counts predicate-subjects types-grouped path-plus values-star employee-docs star-lookup subquery-agg minus"
+MICRO="count-all distinct-obj predicate-counts types-grouped path-plus"
+ab() { # <tag> <people> <threads> <queries> <base> <cand> <rounds> <reps> <mode>
+  local cpu=0-11 client=12 spin=0
+  if [ "$3" = 1 ]; then cpu=2; client=4; spin=1; fi
+  log "start $1"
+  env TAG=$1 THREADS=$3 SCPU=$cpu CCPU=$client SPINV=$spin PORT=4179 DATA=$L/data/people-$2.nt.zst QS="$4" \
+    bash scripts/ab.sh work "$5" "$6" "$7" "$8" "$9" > "logs/$1.log" 2>&1
+  log "done $1 exit $?"
+}
+log "begin: $(uptime)"
+ab f1-p4-100000-1 100000 1 "$P4Q" $BA $BC 12 200 eager
+ab f2-all-100000-12 100000 12 "$ALL" $BA $BC 10 30 eager
+ab f4-682-1000000-12 1000000 12 "subquery-agg expr-bind-group regex-iri lang-filter" $BA $BC 4 10 eager
+# The two post-push builds may arrive while the run is under way; wait up to two hours.
+for i in $(seq 240); do [ -f $B1.ready ] && [ -f $B2.ready ] && break; sleep 30; done
+ab f3-pp-100000-1 100000 1 "$MICRO" $B1 $B2 12 200 eager
+log "RUN-DONE"
+
+# ---- forge-run2.sh
+# Second forge pass of lane exec-overhead-679, for the final candidate b4d59853 (lazy regular-expression
+# map and value-cache shards, small-input checks). Runs under ~/lanes/.bench.lock, held once by the caller.
+set -u
+L=$HOME/lanes/exec-679; cd "$L"
+log() { echo "$(date -u +%T) $*" | tee -a logs/progress.log; }
+BA=bin/sparkles-005df56d; BC=bin/sparkles-b4d59853; BM=bin/sparkles-62d9cb53
+ALL=$(cd work/queries && for f in *.rq; do printf '%s ' "${f%.rq}"; done)
+P4Q="distinct-obj count-all predicate-counts predicate-subjects types-grouped path-plus values-star employee-docs star-lookup subquery-agg minus"
+ab() { # <tag> <people> <threads> <queries> <base> <cand> <rounds> <reps> <mode>
+  local cpu=0-11 client=12 spin=0
+  if [ "$3" = 1 ]; then cpu=2; client=4; spin=1; fi
+  log "start $1"
+  env TAG=$1 THREADS=$3 SCPU=$cpu CCPU=$client SPINV=$spin PORT=4179 DATA=$L/data/people-$2.nt.zst QS="$4" \
+    bash scripts/ab.sh work "$5" "$6" "$7" "$8" "$9" > "logs/$1.log" 2>&1
+  log "done $1 exit $?"
+}
+log "begin2: $(uptime)"
+ab f5-p4-100000-1 100000 1 "$P4Q" $BA $BC 12 200 eager
+ab f6-all-100000-12 100000 12 "$ALL" $BM $BC 10 30 eager
+log "RUN2-DONE"
+
+# ---- forge-run3.sh
+# Third forge pass of lane exec-overhead-679: item 682's eager queries at 10.5M triples with 12 threads,
+# 005df56d against the final candidate b4d59853, in ten rounds. Runs under ~/lanes/.bench.lock.
+set -u
+L=$HOME/lanes/exec-679; cd "$L"
+log() { echo "$(date -u +%T) $*" | tee -a logs/progress.log; }
+log "begin3: $(uptime)"
+log "start f7-682-1000000-12"
+env TAG=f7-682-1000000-12 THREADS=12 SCPU=0-11 CCPU=12 SPINV=0 PORT=4179 DATA=$L/data/people-1000000.nt.zst \
+  QS="subquery-agg expr-bind-group regex-iri lang-filter expr-agg-arg group-avg" \
+  bash scripts/ab.sh work bin/sparkles-005df56d bin/sparkles-b4d59853 10 30 eager > logs/f7-682-1000000-12.log 2>&1
+log "done f7-682-1000000-12 exit $?"
+log "RUN3-DONE"
+
+
+# ---- forge-run4.sh
+# Fourth forge pass of lane exec-overhead-679: star-lookup and employee-docs with one thread, the
+# reviewed lane head d1f3d8b5 against the final candidate b4d59853, and 005df56d against b4d59853 again.
+set -u
+L=$HOME/lanes/exec-679; cd "$L"
+log() { echo "$(date -u +%T) $*" | tee -a logs/progress.log; }
+ab() { # <tag> <queries> <base> <cand>
+  log "start $1"
+  env TAG=$1 THREADS=1 SCPU=2 CCPU=4 SPINV=1 PORT=4179 DATA=$L/data/people-100000.nt.zst QS="$2" \
+    bash scripts/ab.sh work "$3" "$4" 12 200 eager > "logs/$1.log" 2>&1
+  log "done $1 exit $?"
+}
+log "begin4: $(uptime)"
+ab f8-p4-100000-1 "star-lookup employee-docs types-grouped count-all distinct-obj" bin/sparkles-d1f3d8b5 bin/sparkles-b4d59853
+ab f9-p4-100000-1 "star-lookup employee-docs" bin/sparkles-005df56d bin/sparkles-b4d59853
+log "RUN4-DONE"

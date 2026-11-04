@@ -448,6 +448,7 @@ INSERT DATA { ex:lyon12 ex:worksIn ex:acme ; geo:hasDefaultGeometry ex:lyon12Geo
   });
   await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'flows'));
   await page.goto('/ui/query');
+  await page.getByRole('button', { name: /^Options/ }).click();
   await page.getByRole('combobox', { name: 'Branch' }).selectOption('rerouted');
   const editor = page.locator('.cm-content');
   await editor.click();

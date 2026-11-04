@@ -302,11 +302,9 @@
 
       <fieldset class="group">
         <legend>Schedule</legend>
-        <div class="seg" role="radiogroup" aria-label="Schedule kind">
+        <div class="segmented" role="radiogroup" aria-label="Schedule kind">
           {#each [['hourly', 'Hourly'], ['daily', 'Daily'], ['weekly', 'Weekly'], ['custom', 'Custom']] as [v, label] (v)}
-            <label class:sel={kind === v}
-              ><input type="radio" bind:group={kind} value={v} />{label}</label
-            >
+            <label><input type="radio" bind:group={kind} value={v} />{label}</label>
           {/each}
         </div>
         <div class="row wrap">
@@ -527,30 +525,9 @@
     flex-wrap: wrap;
     font-size: var(--fs-sm);
   }
-  .check input,
-  .seg input {
+  .check input {
     margin: 0;
     accent-color: var(--iri);
-  }
-  .seg {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-  }
-  .seg label {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    height: 28px;
-    padding: 0 10px;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    font-size: var(--fs-sm);
-    cursor: pointer;
-  }
-  .seg label.sel {
-    border-color: var(--iri);
-    background: color-mix(in srgb, var(--iri) 8%, transparent);
   }
   .wrap {
     flex-wrap: wrap;

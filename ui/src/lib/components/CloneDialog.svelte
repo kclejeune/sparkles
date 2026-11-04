@@ -111,13 +111,9 @@
     </label>
     <fieldset>
       <legend>Type</legend>
-      <div class="seg" role="radiogroup" aria-label="Type">
-        <label class:sel={type === 'persistent'}
-          ><input type="radio" bind:group={type} value="persistent" />Persistent</label
-        >
-        <label class:sel={type === 'mem'}
-          ><input type="radio" bind:group={type} value="mem" />In memory</label
-        >
+      <div class="segmented" role="radiogroup" aria-label="Type">
+        <label><input type="radio" bind:group={type} value="persistent" />Persistent</label>
+        <label><input type="radio" bind:group={type} value="mem" />In memory</label>
       </div>
       <span class="hint"
         >{type === 'mem'
@@ -127,13 +123,9 @@
     </fieldset>
     <fieldset>
       <legend>Graphs</legend>
-      <div class="seg" role="radiogroup" aria-label="Graphs">
-        <label class:sel={!partial}
-          ><input type="radio" bind:group={partial} value={false} />All graphs</label
-        >
-        <label class:sel={partial}
-          ><input type="radio" bind:group={partial} value={true} />Only some</label
-        >
+      <div class="segmented" role="radiogroup" aria-label="Graphs">
+        <label><input type="radio" bind:group={partial} value={false} />All graphs</label>
+        <label><input type="radio" bind:group={partial} value={true} />Only some</label>
       </div>
       {#if partial}
         {#if choices.length}
@@ -239,30 +231,6 @@
     font-weight: 500;
     margin-bottom: 4px;
     padding: 0;
-  }
-  .seg {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-  }
-  .seg label {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    height: 28px;
-    padding: 0 10px;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    font-size: var(--fs-sm);
-    cursor: pointer;
-  }
-  .seg label.sel {
-    border-color: var(--iri);
-    background: color-mix(in srgb, var(--iri) 8%, transparent);
-  }
-  .seg input {
-    margin: 0;
-    accent-color: var(--iri);
   }
   .graphs {
     display: grid;

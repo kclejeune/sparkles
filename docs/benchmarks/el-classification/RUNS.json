@@ -799,6 +799,76 @@
     }
    },
    "metadata_note": "A manual measurement record of the Horn rules of item 603 against the EL rules on GO and ChEBI lite on the benchmark host. Read the method with each time."
+  },
+  {
+   "run_id": "sha256-85eeef58255fc2fac2e69371972f1f90ee1b3b6659890e0a8fddfaf1d50d0db3",
+   "path": "runs/2026-11-03-horn-cost-forge-320d4708/record.json",
+   "sha256": "85eeef58255fc2fac2e69371972f1f90ee1b3b6659890e0a8fddfaf1d50d0db3",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26, ChEBI lite 256, and ore_ont_9663, 14817, 9855, 13581, 3836, 13482 and 2828 of the ORE 2015 sample",
+    "manifest": {
+     "commit": "320d4708",
+     "base_commit": "17d04145",
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": {
+      "bin/base": "b1e17d27cd570f60687611b137a6da91cbaaf612572c43b7c9ffd5edfa196cb9",
+      "bin/lane": "2ca0f244716051fbbe88146167e5d54280e195a98134b55e5193d7d242bf8278"
+     },
+     "build": "mbx build --release -p sparkles-owl --example el_classify on stanley at 320d4708 in a scratch worktree for the lane, and the release build of 17d04145 for the base, copied to the benchmark host.",
+     "data": {
+      "chebi_lite": {
+       "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+      },
+      "go": {
+       "sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+      },
+      "ore_ont_13482": {
+       "sha256": "f732cc7d4ebdb45099e421d062e05d64837b22e60b53d6848a723aa8f0e8d971"
+      },
+      "ore_ont_13581": {
+       "sha256": "f58d3c11abfbf7e58219d7a0bbe23f2136cf071eaadb6a31c74ad958a01d44ae"
+      },
+      "ore_ont_14817": {
+       "sha256": "c9ef59caad989ff6ab355038030256b9ac6409c1dd11265fa28e8266b63c100f"
+      },
+      "ore_ont_2828": {
+       "sha256": "92904986903648178baf9eaf134ea6101aa6dd214ddb2aa74a0824c3cd72b094"
+      },
+      "ore_ont_3836": {
+       "sha256": "fc559045f566b2837188505b707480dc3416b3e699c5188632fa5be3d4cf2473"
+      },
+      "ore_ont_9663": {
+       "sha256": "13497cacd9c6fc1035450e50255c8f2d605a7aa85829958aa4c5d9fedfc7c86b"
+      },
+      "ore_ont_9855": {
+       "sha256": "73e70d6d8af1c80ae7ce10d8e95cc2bb20e7ff8c6bc600d3f0e445bb59dbd9d4"
+      }
+     }
+    },
+    "settings": {
+     "repeat": 5,
+     "rounds": 3,
+     "threads": [
+      1,
+      8
+     ]
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "forge",
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "ram_mib": 15620,
+      "kernel": "7.2.9"
+     },
+     "method": "forge-ab.sh.txt holds the bench and heavy locks, and in each of three rounds runs el_classify of the base with the Horn rules (base), the base with --el-only (el) and the lane (lane), in rotating order, on each ontology on one and eight threads, one process each with five classifications, in a systemd scope with a 13 GiB cap. Each process reports the median of its five classifications. The tables give the median over the rounds. The load average was 0.04 when the run started.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual measurement record of the Horn rules after item 693 against the base's Horn rules and the base's EL rules on GO, ChEBI lite and seven files of the ORE 2015 sample on the benchmark host. Read the method with each time."
   }
  ]
 }

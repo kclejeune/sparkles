@@ -1,0 +1,22 @@
+# Run on forge alone under ~/lanes/.bench.lock, as the systemd user unit est454-forge.
+# bin/sparkles-base is a release build of 62d9cb53 and bin/sparkles-c6 of 96984649, both
+# built on the laptop with `MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-server`
+# and copied to forge. <w>/db-base holds each workload loaded by the base build and
+# <w>/db-c5 the same data loaded by b150d225, whose statistics 96984649 writes identically:
+#   sparkles load --loc <w>/db-<tag> <data>   (DBpedia with --lenient)
+systemd-run --user --unit est454-forge -p MemoryMax=12G --setenv=BT=c5 \
+  --working-directory="$HOME/lanes/estimation-454/ab" \
+  flock "$HOME/lanes/.bench.lock" ./ab-all.sh "$PWD/bin/sparkles-c6" out-f4 4 20
+
+# ab-all.sh, per workload (bsbm-bi runs its queries on the BSBM explore stores):
+python3 bin/abtime.py --a "$PWD/bin/sparkles-base" --a-loc "$PWD/$db/db-base" \
+  --b "$B" --b-loc "$PWD/$db/db-${BT:-c1}" --queries "queries-$name" --out "$OUT/$name" \
+  --rounds 4 --reps 20 --threads 12 --cpus 0-11 --port 29600
+
+# abtime.py runs A, B, B, A per round, each a fresh `sparkles --result-cache-mb 0 serve`
+# under `taskset -c 0-11` with RAYON_NUM_THREADS=12, the client pinned to CPU 12 and an
+# idle-priority busy loop on CPUs 0-12. Each query gets 3 warm-ups and 20 timed requests
+# with ?nocache=true, and a request's time is meta.timing.planMs + execMs. The record
+# keeps the medians over every request and per round, and the answer digests. The plans
+# in the record come from scripts/bench-estimates/qerror.py runs of the same binaries and
+# stores on the laptop, whose plans do not depend on the host.

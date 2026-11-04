@@ -393,4 +393,59 @@ test.describe('browse', () => {
     await shoot(page, 'browse-phone');
     await ctx.close();
   });
+
+  // edit mode (item 630): the page's sections as the editors' forms, a changed definition
+  // ready to preview, its preview, and the forms on a phone with the bottom edit bar
+  test('browse-edit', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.goto(`${term}&edit=1`);
+    const def = page.getByRole('textbox', { name: 'Definition', exact: true });
+    await expect(def).toHaveValue(/self-replicating organelle/);
+    await def.fill(
+      "A self-replicating organelle of the cytoplasm of eukaryotic cells, where most of the cell's respiration and ATP synthesis take place.",
+    );
+    await page
+      .getByRole('textbox', { name: 'New synonym', exact: true })
+      .fill('mitochondrial organelle');
+    await shoot(page, 'browse-edit');
+  });
+
+  test('browse-edit-preview', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(`${term}&edit=1`);
+    const def = page.getByRole('textbox', { name: 'Definition', exact: true });
+    await expect(def).toHaveValue(/self-replicating organelle/);
+    await def.fill(
+      "A self-replicating organelle of the cytoplasm of eukaryotic cells, where most of the cell's respiration and ATP synthesis take place.",
+    );
+    await page
+      .getByRole('group', { name: /^Definition/ })
+      .getByRole('button', { name: 'Preview change' })
+      .click();
+    await expect(page.getByRole('dialog').locator('[data-outcome]')).toHaveAttribute(
+      'data-outcome',
+      'commit',
+    );
+    await shoot(page, 'browse-edit-preview');
+  });
+
+  test('browse-edit-phone', async ({ browser }) => {
+    const ctx = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      deviceScaleFactor: 2,
+      isMobile: true,
+      hasTouch: true,
+      colorScheme: 'dark',
+      baseURL: process.env.SPARKLES_SCREENSHOTS_URL,
+    });
+    await ctx.addInitScript(() => localStorage.setItem('sparkles.theme', 'dark'));
+    const page = await ctx.newPage();
+    await page.goto(`${term}&edit=1`);
+    await expect(page.getByRole('toolbar', { name: 'Edit mode' })).toBeVisible();
+    await expect(page.getByRole('textbox', { name: 'Definition', exact: true })).toHaveValue(
+      /self-replicating/,
+    );
+    await shoot(page, 'browse-edit-phone');
+    await ctx.close();
+  });
 });

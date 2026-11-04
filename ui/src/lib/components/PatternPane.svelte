@@ -1337,7 +1337,7 @@
         <Icon name="plus" size={13} /> Edge
       </button>
     {/if}
-    <div class="seg" role="group" aria-label="Show the pattern as">
+    <div class="segmented" role="group" aria-label="Show the pattern as">
       <button class="btn sm" aria-pressed={mode === 'canvas'} onclick={() => (mode = 'canvas')}
         >Canvas</button
       >
@@ -1446,7 +1446,7 @@
           ? ` · ${planHeader}`
           : ''}</span
       >
-      <div class="seg" role="group" aria-label="Numbers on the pattern">
+      <div class="segmented" role="group" aria-label="Numbers on the pattern">
         <button class="btn sm" aria-pressed={!showTime} onclick={() => (planTime = false)}
           >Rows</button
         >
@@ -1715,13 +1715,6 @@
   }
   .spacer {
     flex: 1;
-  }
-  .seg {
-    display: inline-flex;
-  }
-  .seg .btn[aria-pressed='true'] {
-    background: var(--spark-soft);
-    border-color: var(--spark);
   }
   .add {
     /* above the canvas and its panel, so a picker's list opens over the drawing */

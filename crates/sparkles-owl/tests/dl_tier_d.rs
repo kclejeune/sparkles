@@ -468,7 +468,7 @@ fn a_chain_of_three_holds_in_its_mirror_image_under_inverses() {
 
 /// A small random Horn ontology over classes `A0`…`A5` and roles `r0`…`r2`, with
 /// inverses, inclusions, transitivity and chains.
-fn random_horn(seed: u64) -> (String, String) {
+fn random_horn(seed: u64) -> String {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let mut next = |m: u64| {
         x ^= x << 13;
@@ -502,35 +502,23 @@ fn random_horn(seed: u64) -> (String, String) {
             _ => format!("DisjointClasses(:A{a} :A{b})\n"),
         });
     }
-    // the mirror image of each chain, sn⁻ ∘ … ∘ s1⁻ ⊑ s⁻, which the Horn rules of
-    // this phase take only when it is told
-    let mut mirrors = String::new();
     for _ in 0..next(3) {
         let (p, q) = (next(3), next(3));
-        let (inv, ip) = (next(2) == 0, format!("ObjectInverseOf(:r{p})"));
+        let inv = next(2) == 0;
         match next(4) {
             0 => s.push_str(&format!("SubObjectPropertyOf(:r{p} {})\n", role(q, inv))),
-            1 => {
-                s.push_str(&format!("TransitiveObjectProperty(:r{p})\n"));
-                mirrors.push_str(&format!("TransitiveObjectProperty({ip})\n"));
-            }
+            1 => s.push_str(&format!("TransitiveObjectProperty(:r{p})\n")),
             2 if p != q => s.push_str(&format!("InverseObjectProperties(:r{p} :r{q})\n")),
-            _ => {
-                s.push_str(&format!(
-                    "SubObjectPropertyOf(ObjectPropertyChain(:r{p} {}) :r{p})\n",
-                    role(q, inv)
-                ));
-                mirrors.push_str(&format!(
-                    "SubObjectPropertyOf(ObjectPropertyChain({} {ip}) {ip})\n",
-                    role(q, !inv)
-                ));
-            }
+            _ => s.push_str(&format!(
+                "SubObjectPropertyOf(ObjectPropertyChain(:r{p} {}) :r{p})\n",
+                role(q, inv)
+            )),
         }
     }
     for a in 0..6 {
         s.push_str(&format!("Declaration(Class(:A{a}))\n"));
     }
-    (s, mirrors)
+    s
 }
 
 #[test]
@@ -543,10 +531,10 @@ fn tier_d_answers_horn_ontologies_as_the_horn_rules_do() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(if cfg!(debug_assertions) { 200 } else { 1000 });
     for seed in 0..seeds {
-        let (body, mirrors) = random_horn(seed);
+        let body = random_horn(seed);
         let d = axioms(&format!("{body}{UNION}"));
         let h = axioms(&format!(
-            "{body}{mirrors}SubClassOf(:Y DataSomeValuesFrom(:dp owl:real))"
+            "{body}SubClassOf(:Y DataSomeValuesFrom(:dp owl:real))"
         ));
         let cs: Vec<Class> = (0..6)
             .map(|a| c(&format!("A{a}")))
@@ -590,7 +578,7 @@ fn tier_d_answers_horn_ontologies_as_the_horn_rules_do() {
 
 /// A random ALCHI ontology: a random Horn one with a few unions in the heads.
 fn random_dl(seed: u64) -> String {
-    let (mut s, _) = random_horn(seed);
+    let mut s = random_horn(seed);
     let mut x = seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1;
     let mut next = |m: u64| {
         x ^= x << 13;

@@ -40,8 +40,9 @@ const SAMPLE: usize = 4096;
 /// Most distinct values (estimated) that are collected by hashing instead of sorting a
 /// copy of the column.
 const HASH_DISTINCT: usize = 1 << 14;
-/// Sorted ids located in the numeric column by one parallel task of a cursor's decoding.
-const NUMERIC_PIECE: usize = 4096;
+/// Sorted distinct dictionary ids that one parallel task of [`decode_in_pieces`] locates in
+/// the numeric column and decodes, and the fewest for which the decoding is parallel.
+const DECODE_PIECE: usize = 4096;
 
 /// What one operator's expressions did, for EXPLAIN.
 #[derive(Default, Debug)]
@@ -316,6 +317,27 @@ impl<T> Column<T> {
     }
 }
 
+impl<T: Send> Column<T> {
+    /// Drop the column, freeing the stored results of a large one on the pool. Freeing
+    /// the 102,000 decoded names of `order-by-full` on the query's thread took about 2 ms
+    /// of its 13 ms on forge with 12 threads. The results go before the charge that
+    /// holds them, as an ordinary drop orders them.
+    pub fn drop_in_parallel(self) {
+        let (vals, charge) = match self {
+            Column::Rows { vals, _charge } => (vals, _charge),
+            Column::Values(p) => (p.vals, p._charge),
+        };
+        if vals.len() > super::exec::PAR_THRESHOLD && std::mem::needs_drop::<T>() {
+            vals.into_par_iter()
+                .with_min_len(PAR_MIN_LEN)
+                .for_each(drop);
+        } else {
+            drop(vals);
+        }
+        drop(charge);
+    }
+}
+
 /// The distinct inputs of a column: a one-column table of sorted distinct ids (one row
 /// for an expression without an input column) and each row's index into it.
 struct Distinct {
@@ -471,12 +493,14 @@ pub(super) fn column(
     report: &mut Report,
     eval: impl FnOnce(&Table) -> Result<Vec<Id>>,
 ) -> Result<Option<Vec<Id>>> {
-    let Ok(v) = eligible(&[e]) else {
-        return Ok(None);
-    };
+    // The size test comes first: `eligible` walks the expression and formats its
+    // reason, which cost a one-row BIND, such as an aggregate's, about 400 instructions.
     if !ctx.opt.expr_cache || t.len() < MIN_ROWS {
         return Ok(None);
     }
+    let Ok(v) = eligible(&[e]) else {
+        return Ok(None);
+    };
     if t.len() > super::exec::PAR_THRESHOLD {
         return Ok(per_value(ctx, t, &[e], false, report, eval)?.map(|p| p.rows(t.len())));
     }
@@ -1392,119 +1416,45 @@ fn cursor_values(
         .iter()
         .map(|id| id.payload())
         .collect::<Vec<_>>();
-    // where each payload's value goes in `vals`
-    let mut positions: Vec<usize> = (lo..hi).collect();
-    // numbers from the numeric column: only the other terms are decoded
-    if let Some(num) = ctx.snap.generation.vocab.numeric()
-        && !payloads.is_empty()
-    {
-        // Locating an id in the column counts the valued ids before it, which is most of
-        // the work for a large input. Pieces of the sorted ids are located on the pool,
-        // as eager execution decodes them, into the same vector of results.
-        let found = if payloads.len() >= 4 * NUMERIC_PIECE {
-            payloads
-                .par_chunks(NUMERIC_PIECE)
-                .map(|piece| {
-                    ctx.check()?;
-                    Ok(num.get_many(piece))
-                })
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect()
-        } else {
-            num.get_many(&payloads)
-        };
-        ctx.check()?;
-        let (mut rest, mut rest_at) = (Vec::new(), Vec::new());
-        for ((&p, &pos), n) in payloads.iter().zip(&positions).zip(found) {
-            match n.value() {
-                Some(v) => vals[pos] = Some(v),
-                None => {
-                    rest.push(p);
-                    rest_at.push(pos);
-                }
-            }
-        }
-        payloads = rest;
-        positions = rest_at;
-    }
+    let numeric = ctx.snap.generation.vocab.numeric();
     let scratch = ctx.charge(0)?;
     let mut reserved = 0;
     let mut bytes = base;
-    let mut at = 0;
+    let step = ctx.reservation_step();
     let parallel_bytes = (payloads.len() as u64)
         .saturating_mul(std::mem::size_of::<Option<super::value::Value>>() as u64 * 2)
         .saturating_add(rayon::current_num_threads() as u64 * 2048);
-    let parallel = (payloads.len() >= 4096)
+    let parallel = (payloads.len() >= DECODE_PIECE)
         .then(|| ctx.charge(parallel_bytes).ok())
         .flatten();
     if let Some(_parallel) = parallel {
-        // First measure retained payload without constructing values. Admit the
-        // combined payload once, before parallel decoding, instead of contending
-        // on charge ownership and counters for every dictionary value.
-        let payload = payloads
-            .par_chunks(4096)
-            .map(|chunk| {
-                let scratch = ctx.charge(0)?;
-                let mut reserved = 0;
-                let mut bytes = 0u64;
-                ctx.snap.generation.vocab.get_sorted_checked(
-                    chunk,
-                    |need| {
-                        let need = need as u64 * 2;
-                        scratch.add(need.saturating_sub(reserved))?;
-                        reserved = need;
-                        ctx.check()
-                    },
-                    |_, key| {
-                        bytes = bytes.saturating_add(key.len() as u64 * 8 + 128);
-                        Ok::<_, crate::error::Error>(())
-                    },
-                )?;
-                ctx.check()?;
-                Ok(bytes)
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .fold(0u64, u64::saturating_add);
-        bytes = bytes.saturating_add(payload);
-        if let Some(charge) = &mut charge
-            && charge.resize(bytes).is_err()
-        {
-            return Ok(None);
-        }
-        let decoded = payloads
-            .par_chunks(4096)
-            .map(|chunk| {
-                let scratch = ctx.charge(0)?;
-                let mut reserved = 0;
-                let mut values = Vec::with_capacity(chunk.len());
-                ctx.snap.generation.vocab.get_sorted_checked(
-                    chunk,
-                    |need| {
-                        let need = need as u64 * 2;
-                        scratch.add(need.saturating_sub(reserved))?;
-                        reserved = need;
-                        ctx.check()
-                    },
-                    |_, key| {
-                        if values.len().is_multiple_of(1024) {
-                            ctx.check()?;
-                        }
-                        values.push(Some(super::value::Value::from_key(key)));
-                        Ok::<_, crate::error::Error>(())
-                    },
-                )?;
-                ctx.check()?;
-                Ok(values)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for value in decoded.into_iter().flatten() {
-            vals[positions[at]] = value;
-            at += 1;
+        match decode_in_pieces(ctx, &payloads, &mut vals[lo..hi], numeric, &mut charge)? {
+            Some(payload) => bytes = bytes.saturating_add(payload),
+            None => return Ok(None),
         }
     } else {
+        // where each payload's value goes in `vals`
+        let mut positions: Vec<usize> = (lo..hi).collect();
+        // numbers from the numeric column: only the other terms are decoded
+        if let Some(num) = numeric
+            && !payloads.is_empty()
+        {
+            let found = num.get_many(&payloads);
+            ctx.check()?;
+            let (mut rest, mut rest_at) = (Vec::new(), Vec::new());
+            for ((&p, &pos), n) in payloads.iter().zip(&positions).zip(found) {
+                match n.value() {
+                    Some(v) => vals[pos] = Some(v),
+                    None => {
+                        rest.push(p);
+                        rest_at.push(pos);
+                    }
+                }
+            }
+            payloads = rest;
+            positions = rest_at;
+        }
+        let mut at = 0usize;
         let decoded = ctx.snap.generation.vocab.get_sorted_checked(
             &payloads,
             |need| {
@@ -1519,7 +1469,7 @@ fn cursor_values(
                 }
                 bytes = bytes.saturating_add(key.len() as u64 * 8 + 128);
                 if let Some(charge) = &mut charge {
-                    charge.resize(bytes)?;
+                    charge.cover(bytes, step)?;
                 }
                 vals[positions[at]] = Some(super::value::Value::from_key(key));
                 at += 1;
@@ -1548,7 +1498,7 @@ fn cursor_values(
         ) {
             bytes = bytes.saturating_add(ctx.decoded_bytes(unique[row])?);
             if let Some(charge) = &mut charge
-                && let Err(error) = charge.resize(bytes)
+                && let Err(error) = charge.cover(bytes, step)
             {
                 // A large input's caller falls back to per-value reuse, which keeps one value
                 // per distinct term, so the refusal declines this optional decoding there. A
@@ -1573,7 +1523,8 @@ fn cursor_values(
             + vals.capacity() as u64 * std::mem::size_of::<Option<super::value::Value>>() as u64
             + bytes.saturating_sub(base)
             + 4096;
-        if kept < bytes {
+        // The steps' slack goes too.
+        if kept < charge.bytes() {
             charge.resize(kept)?;
         }
     }
@@ -1582,6 +1533,138 @@ fn cursor_values(
         slot: Some(slots),
         _charge: charge,
     }))
+}
+
+/// Decode the sorted distinct base-vocabulary ids `payloads` into `out`, which holds a
+/// slot for each, in one parallel pass over pieces of [`DECODE_PIECE`] ids. Each piece
+/// reads its numbers from the numeric column and decodes the rest in key order, admitting
+/// each value's payload before it builds the value, on a charge of its own on `charge`'s
+/// owner that grows a step ahead and exactly when the step is refused. The pieces' charges
+/// join `charge` once the pass ends, and their steps' slack is given back.
+///
+/// The payload bytes, or `None` when the budget refused a payload, which declines the
+/// optional decoding. A context without an owner has no charge, and its values are kept
+/// uncharged, as eager decoding always kept them.
+///
+/// It replaces a pass that measured every payload before a second pass decoded it, and
+/// the serial placing of the numbers and the decoded values that followed each pass, which
+/// made eager `order-by-full` about 3% slower on forge with 12 threads.
+fn decode_in_pieces(
+    ctx: &Ctx,
+    payloads: &[u64],
+    out: &mut [Option<super::value::Value>],
+    numeric: Option<&crate::vocab::numeric::NumColumn>,
+    charge: &mut Option<super::ctx::RetainedCharge>,
+) -> Result<Option<u64>> {
+    debug_assert_eq!(payloads.len(), out.len());
+    let step = ctx.reservation_step();
+    let refused = std::sync::atomic::AtomicBool::new(false);
+    let owner = charge.as_ref();
+    // Every piece runs to its end or its first error and returns its charge with it, so
+    // that no charge is released while values it admitted are still in `out`.
+    let mut pieces: Vec<_> = out
+        .par_chunks_mut(DECODE_PIECE)
+        .zip(payloads.par_chunks(DECODE_PIECE))
+        .map(|(out, piece)| {
+            let part = owner.map(|c| c.part(ctx));
+            let mut covered = 0u64;
+            let mut bytes = 0u64;
+            let mut decode = || -> Result<()> {
+                ctx.check()?;
+                // the payloads to decode and where their values go in `out`
+                let (rest, rest_at): (std::borrow::Cow<'_, [u64]>, Option<Vec<usize>>) =
+                    match numeric {
+                        Some(num) => {
+                            let mut rest = Vec::new();
+                            let mut rest_at = Vec::new();
+                            for (i, (&p, n)) in piece.iter().zip(num.get_many(piece)).enumerate() {
+                                match n.value() {
+                                    Some(v) => out[i] = Some(v),
+                                    None => {
+                                        rest.push(p);
+                                        rest_at.push(i);
+                                    }
+                                }
+                            }
+                            (rest.into(), Some(rest_at))
+                        }
+                        None => (piece.into(), None),
+                    };
+                let scratch = ctx.charge(0)?;
+                let mut reserved = 0;
+                let mut at = 0usize;
+                ctx.snap.generation.vocab.get_sorted_checked(
+                    &rest,
+                    |need| {
+                        let need = need as u64 * 2;
+                        scratch.add(need.saturating_sub(reserved))?;
+                        reserved = need;
+                        ctx.check()
+                    },
+                    |_, key| {
+                        if at.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        bytes = bytes.saturating_add(key.len() as u64 * 8 + 128);
+                        if let Some(part) = &part
+                            && bytes > covered
+                        {
+                            let ahead = bytes.saturating_add(step);
+                            match part.add(ahead - covered) {
+                                Ok(()) => covered = ahead,
+                                Err(_) => {
+                                    part.add(bytes - covered).inspect_err(|_| {
+                                        refused.store(true, std::sync::atomic::Ordering::Relaxed)
+                                    })?;
+                                    covered = bytes;
+                                }
+                            }
+                        }
+                        let i = rest_at.as_ref().map_or(at, |r| r[at]);
+                        out[i] = Some(super::value::Value::from_key(key));
+                        at += 1;
+                        Ok::<_, crate::error::Error>(())
+                    },
+                )?;
+                ctx.check()
+            };
+            let result = decode();
+            (result, bytes, covered, part)
+        })
+        .collect();
+    if let Some(at) = pieces.iter().position(|(result, ..)| result.is_err()) {
+        let (result, _, _, part) = pieces.swap_remove(at);
+        // The values go before the charges that admitted them.
+        out.par_iter_mut()
+            .with_min_len(PAR_MIN_LEN)
+            .for_each(|value| *value = None);
+        drop((part, pieces));
+        return match result {
+            Err(crate::Error::BudgetExceeded(_))
+                if refused.load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                Ok(None)
+            }
+            result => result.map(|()| None),
+        };
+    }
+    let (mut payload, mut slack) = (0u64, 0u64);
+    for (_, bytes, covered, part) in pieces {
+        payload = payload.saturating_add(bytes);
+        // only a charged piece covers its payload, a step ahead at most
+        if let Some(part) = part {
+            slack = slack.saturating_add(covered - bytes);
+            if let Some(charge) = charge.as_mut() {
+                charge.absorb(part);
+            }
+        }
+    }
+    if let Some(charge) = charge.as_mut()
+        && slack > 0
+    {
+        charge.resize(charge.bytes() - slack)?;
+    }
+    Ok(Some(payload))
 }
 
 #[cfg(test)]
@@ -1723,6 +1806,170 @@ mod tests {
             }
         }
         high
+    }
+
+    /// A store whose base vocabulary holds `n` distinct simple literals and a few numbers
+    /// too large to be inline, with the ids of a column that reads each literal twice and
+    /// each number once, in a scrambled order.
+    fn vocabulary_column(n: usize) -> (crate::store::Store, Vec<Id>) {
+        use crate::io::{RdfFormat, Source};
+        use oxrdf::{Literal, NamedNode, Term};
+        const INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+        let store = crate::store::Store::in_memory(Default::default());
+        let literal = |i: usize| format!("value {i:06} {}", "x".repeat(i % 37));
+        let number = |i: usize| format!("{}{i:04}", "9".repeat(30));
+        let mut nt = String::new();
+        for i in 0..n {
+            let o = literal(i);
+            nt.push_str(&format!(
+                "<http://ex.org/s{i}> <http://ex.org/v> \"{o}\" .\n"
+            ));
+        }
+        for i in 0..n / 8 {
+            let o = number(i);
+            nt.push_str(&format!(
+                "<http://ex.org/n{i}> <http://ex.org/v> \"{o}\"^^<{INTEGER}> .\n"
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let id = |term: Term| {
+            let id = snap.lookup_term(&term).expect("a loaded term");
+            assert_eq!(id.tag(), Tag::Vocab, "{term}");
+            id
+        };
+        let mut col: Vec<Id> = (0..2 * n)
+            .map(|i| id(Literal::new_simple_literal(literal(i % n)).into()))
+            .collect();
+        col.extend((0..n / 8).map(|i| {
+            id(Literal::new_typed_literal(number(i), NamedNode::new_unchecked(INTEGER)).into())
+        }));
+        let mut next = 0x9e37_79b9_7f4a_7c15u64;
+        for i in (1..col.len()).rev() {
+            next ^= next << 13;
+            next ^= next >> 7;
+            next ^= next << 17;
+            col.swap(i, (next % (i as u64 + 1)) as usize);
+        }
+        (store, col)
+    }
+
+    /// A column with more distinct base-vocabulary terms than one piece decodes them in
+    /// parallel pieces, in place and in key order, to the values that decoding each term
+    /// alone gives, and keeps their payload charged without the steps' slack.
+    #[test]
+    fn vocabulary_keys_decode_in_pieces_with_their_payload_charged() {
+        let n = 3 * DECODE_PIECE + 17;
+        let (store, col) = vocabulary_column(n);
+        let (ctx, _) = owned(&store, 1 << 30, &[]);
+        let (t, v) = column(&ctx, col);
+        let before = ctx.live_bytes();
+        let values = cursor_variable_values(&ctx, &t, &Expr::Var(v))
+            .unwrap()
+            .expect("a large column decodes per term");
+        assert_eq!(values.vals.len(), n + n / 8);
+        let held = ctx.live_bytes() - before;
+        // each simple literal's key is its text between a quote and a 0xFF byte
+        let payload: u64 = values
+            .vals
+            .iter()
+            .flatten()
+            .filter_map(|value| match value {
+                super::super::value::Value::Str(s) => Some((s.len() as u64 + 2) * 8 + 128),
+                _ => None,
+            })
+            .sum();
+        let slots = t.len() as u64 * 4
+            + values.vals.capacity() as u64
+                * std::mem::size_of::<Option<super::super::value::Value>>() as u64;
+        assert!(
+            held >= payload,
+            "{held} bytes held for {payload} of payload"
+        );
+        assert!(
+            held <= slots + payload + (n as u64 / 8) * 1024 + 4096,
+            "{held} bytes held for {payload} of payload and {slots} of slots"
+        );
+        // decoding each term alone, which leaves the value cache as it is
+        for (row, &id) in t.cols[0].iter().enumerate() {
+            let alone = ctx.cursor_value_checked(id).unwrap();
+            assert_eq!(
+                format!("{:?}", values.get(row)),
+                format!("{alone:?}"),
+                "row {row}"
+            );
+        }
+        drop(values);
+        ctx.release_work();
+        assert_eq!(ctx.live_bytes(), before);
+    }
+
+    /// Below the room its pieces need, the parallel decoding of a large column of
+    /// base-vocabulary terms declines or fails with the budget, keeps no charge and
+    /// leaves no failure behind, and the column decodes once the room is back.
+    #[test]
+    fn a_refused_vocabulary_payload_keeps_no_charge() {
+        let (store, col) = vocabulary_column(2 * DECODE_PIECE);
+        let (ctx, _) = owned(&store, 1 << 30, &[]);
+        let (t, _) = column(&ctx, col);
+        // The room the pieces take depends on how their steps interleave, by up to a
+        // step per piece, so half of the least room seen is below what any order needs.
+        let peak = least_room(&ctx, &t);
+        let storage = ctx.charge(ctx.memory_room() - peak / 2).unwrap();
+        let before = ctx.live_bytes();
+        let refused = cursor_variable_values(&ctx, &t, &Expr::Var(t.vars[0]));
+        assert!(
+            matches!(refused, Ok(None) | Err(crate::Error::BudgetExceeded(_))),
+            "{:?}",
+            refused.map(|v| v.map(|v| v.vals.len()))
+        );
+        assert_eq!(ctx.live_bytes(), before, "the refusal kept its charge");
+        assert!(ctx.check_memory_failure().is_ok());
+        drop(storage);
+        assert!(
+            cursor_variable_values(&ctx, &t, &Expr::Var(t.vars[0]))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A piece whose payload the budget refuses after pieces wrote values clears every
+    /// value before any piece's charge goes, declines the decoding and keeps no charge,
+    /// and a context without an owner decodes the same column uncharged.
+    #[test]
+    fn a_refused_piece_clears_the_values_before_their_charges() {
+        let (store, col) = vocabulary_column(4 * DECODE_PIECE);
+        let (ctx, _) = owned(&store, 1 << 30, &[]);
+        let mut payloads: Vec<u64> = col.iter().map(|id| id.payload()).collect();
+        payloads.sort_unstable();
+        payloads.dedup();
+        let numeric = ctx.snap.generation.vocab.numeric();
+        let mut out = vec![None; payloads.len()];
+        let mut charge = ctx.retained_charge(4096).unwrap();
+        let storage = ctx.charge(ctx.memory_room() - 300_000).unwrap();
+        let before = ctx.live_bytes();
+        assert!(matches!(
+            decode_in_pieces(&ctx, &payloads, &mut out, numeric, &mut charge),
+            Ok(None)
+        ));
+        assert!(out.iter().all(Option::is_none));
+        assert_eq!(ctx.live_bytes(), before);
+        assert_eq!(charge.as_ref().map(|c| c.bytes()), Some(4096));
+        drop((storage, charge));
+        let unowned = Ctx::new(store.snapshot());
+        let mut none = None;
+        let payload = decode_in_pieces(&unowned, &payloads, &mut out, numeric, &mut none)
+            .unwrap()
+            .expect("an uncharged decoding");
+        assert!(payload > 0);
+        assert!(out.iter().all(Option::is_some));
+        assert_eq!(unowned.live_bytes(), 0);
     }
 
     /// A refused payload charge of query-local terms in a large input declines the

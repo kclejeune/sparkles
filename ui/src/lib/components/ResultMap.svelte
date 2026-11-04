@@ -136,7 +136,7 @@
   <div class="result-map arcs-mode">
     {#if columns.length > 0}
       <div class="opts">
-        <div class="seg" role="group" aria-label="Draw the result as">
+        <div class="segmented" role="group" aria-label="Draw the result as">
           <button class="btn sm" aria-pressed="false" onclick={() => (chosen = 'points')}
             >Points</button
           >
@@ -150,7 +150,7 @@
   <div class="result-map">
     <div class="opts">
       {#if arcsAvailable}
-        <div class="seg" role="group" aria-label="Draw the result as">
+        <div class="segmented" role="group" aria-label="Draw the result as">
           <button class="btn sm" aria-pressed="true">Points</button>
           <button class="btn sm" aria-pressed="false" onclick={() => (chosen = 'arcs')}>Arcs</button
           >
@@ -245,18 +245,6 @@
   .arcs-mode > :last-child {
     flex: 1;
     min-height: 0;
-  }
-  .seg {
-    display: inline-flex;
-  }
-  .seg .btn:first-child {
-    border-top-right-radius: 0;
-    border-bottom-right-radius: 0;
-  }
-  .seg .btn:last-child {
-    border-top-left-radius: 0;
-    border-bottom-left-radius: 0;
-    margin-left: -1px;
   }
   .result-map {
     display: grid;
@@ -375,11 +363,6 @@
     .body {
       grid-template-columns: 1fr;
       grid-template-rows: 320px 160px;
-    }
-    /* taps need 44 px targets: the switch between points and arcs */
-    .seg .btn {
-      min-height: 44px;
-      min-width: 44px;
     }
   }
 </style>

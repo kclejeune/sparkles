@@ -270,6 +270,9 @@ impl Generation {
         let meta: IndexMeta = crate::builder::read_index_meta(dir, written_by.as_deref())?;
         let stats: Stats = serde_json::from_slice(&std::fs::read(dir.join("stats.json"))?)
             .map_err(|e| Error::Corrupt(format!("stats.json: {e}")))?;
+        if let Some(why) = stats.correlations.refusal() {
+            tracing::warn!(target: "sparkles::store", "generation {name}: {why}");
+        }
         let patterns = crate::patterns::Loaded::open(dir, meta.patterns.as_ref());
         Ok(Generation {
             uid: crate::index::next_uid(),

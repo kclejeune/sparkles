@@ -77,6 +77,427 @@
         }
       },
       "metadata_note": "A gate record of scripts/bench-gate.py. Read the record for its manifest, settings, metrics and checks."
+    },
+    {
+      "run_id": "sha256-c15fbed835451ae0f93ca3a2399156ed059390734724d4addd5cb1803c153609",
+      "path": "runs/2026-11-03-estimation-ab-forge-96984649/record.json",
+      "sha256": "c15fbed835451ae0f93ca3a2399156ed059390734724d4addd5cb1803c153609",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": "estimation-ab",
+        "scale": "synthetic 1.05M, WatDiv 100, BSBM 10M explore and BI, LUBM(10) with OWL RL, DBpedia 8.2M-triple slice",
+        "manifest": {
+          "base_commit": "62d9cb53",
+          "base_sha256": "cdb5abc921dd1fabdca9bd948f9e8fb34dd2a2fe8e8e2e232c325f5d6dd87669",
+          "build": "mbx build --release -p sparkles-server with MBX_LEARNED_INCREMENTAL=false on the laptop",
+          "candidate_commit": "96984649",
+          "candidate_sha256": "4aff0e88a3f62fd0c7e4c5b218f0bb7755bd43a0164e24323022bd19e90cd724",
+          "data": {
+            "bsbm/dataset.nt": {
+              "bytes": 2619263591,
+              "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be"
+            },
+            "dbpedia/anchor-text_lang=en.nt.zst": {
+              "bytes": 20412837,
+              "sha256": "f51eebf5ce775ab05e1816343281c87f633e6b724e90191f17f7bd72cef30e93"
+            },
+            "dbpedia/article-templates_lang=en.nt.zst": {
+              "bytes": 3998043,
+              "sha256": "d6894436ddf086aa03e3cc06e2b2617bc575b8f19a7e9ffc232f966355c2ef02"
+            },
+            "dbpedia/article-templates_lang=en_nested.nt.zst": {
+              "bytes": 864073,
+              "sha256": "4b12b3d03299556bd7a8dbada65c4acd90f3407384951ac26a448d8d7dfb3bdf"
+            },
+            "dbpedia/categories_lang=en_articles.nt.zst": {
+              "bytes": 3573932,
+              "sha256": "6fb62e42153b50604af22b7d3b7ab53b37eae1f40825cf324d066985aa20c672"
+            },
+            "dbpedia/categories_lang=en_labels.nt.zst": {
+              "bytes": 321875,
+              "sha256": "672b8b1e8b6f8c65192d1a5a8fc396fe83862beb229bea912a6b87e10b9cbf89"
+            },
+            "dbpedia/categories_lang=en_skos.nt.zst": {
+              "bytes": 905874,
+              "sha256": "e4c1a6bdef998b31e74480d6d59af14519bcdc1d78be1b2aa163917a0f53a85d"
+            },
+            "dbpedia/citations_lang=en_data.nt.zst": {
+              "bytes": 18377390,
+              "sha256": "8b2860eb62f9fb7e5b6a7f7017fa437cb53bd3aae7a52bdab4f32ea6a2cf695e"
+            },
+            "dbpedia/citations_lang=en_links.nt.zst": {
+              "bytes": 7046514,
+              "sha256": "0fb9a524658cc18f33eb233e6c34c0ebb7e963d690487f51c967ac99b3a76c02"
+            },
+            "dbpedia/commons-sameas-links_lang=en.nt.zst": {
+              "bytes": 8539,
+              "sha256": "8e6cf98679c076037cc23660678e66e8f1aa032020309b834d907364fceaf4d4"
+            },
+            "dbpedia/disambiguations_lang=en.nt.zst": {
+              "bytes": 176990,
+              "sha256": "a30c20b4da8908dba2d0ab37f497f008fddffb249defe43f81ebcbd66c7ede4b"
+            },
+            "dbpedia/external-links_lang=en.nt.zst": {
+              "bytes": 2153063,
+              "sha256": "eef08530ab650e09f2e01a2a9351bd1f1d3b9c7e8dab3ff2a5bca278b7ca027d"
+            },
+            "dbpedia/geo-coordinates-mappingbased_lang=en.nt.zst": {
+              "bytes": 268288,
+              "sha256": "5ea8c33c473f2120f46d73ca042990536a6978ecce9493b8ba224a60407de966"
+            },
+            "dbpedia/geo-coordinates_lang=en.nt.zst": {
+              "bytes": 508941,
+              "sha256": "69119e5a89d9b678fb2a9a0679372512b3856e0a59ed1626889d12ded72dfcce"
+            },
+            "dbpedia/homepages_lang=en.nt.zst": {
+              "bytes": 156741,
+              "sha256": "c43db6b4d034945cd507546fcf80a874f0b711325c38d9e8010fd6f138ea468c"
+            },
+            "dbpedia/images_lang=en.nt.zst": {
+              "bytes": 7204639,
+              "sha256": "7bfb8404cba90784fa36e82ecbf4694eb14b0cafbb4400641e441e392c646f14"
+            },
+            "dbpedia/infobox-properties_lang=en.nt.zst": {
+              "bytes": 11339691,
+              "sha256": "41ae553b78afe92edaad4ade64f212fcf8eadbe4579c00c440c1bf6be869b27a"
+            },
+            "dbpedia/infobox-property-definitions_lang=en.nt.zst": {
+              "bytes": 8652,
+              "sha256": "c570ed0b48897cba62b6c14926a32cf535cf2773b417d869a3c5fe87e073c885"
+            },
+            "dbpedia/instance-types_lang=en_specific.nt.zst": {
+              "bytes": 854148,
+              "sha256": "fcfcc151683c3642db649e9ac47bf5923c459f4654e12e296d871ebcc5f8c994"
+            },
+            "dbpedia/instance-types_lang=en_transitive.nt.zst": {
+              "bytes": 2486438,
+              "sha256": "3c74ad554199504897d2d1a74f29e99bee3151821fea31e966fa7e1818d0e7ba"
+            },
+            "dbpedia/interlanguage-links_lang=en.nt.zst": {
+              "bytes": 10176,
+              "sha256": "2963d4611a060842d7fab9ca15c25a7e0a24e5c0bc5a57c153f1c762da1899bb"
+            },
+            "dbpedia/labels_lang=en.nt.zst": {
+              "bytes": 2386511,
+              "sha256": "1b1cd3c468069be04769a1b95ad2d2c78306f7436585ed101999a579daa9cb5f"
+            },
+            "dbpedia/long-abstracts_lang=en.nt.zst": {
+              "bytes": 10067531,
+              "sha256": "b3b54fafdd0a961aaed90431db8679e28c342c266e1db7e4bad3a5eb90e095b4"
+            },
+            "dbpedia/mappingbased-literals_lang=en.nt.zst": {
+              "bytes": 2267693,
+              "sha256": "07675287ae08184364eee92694c283bb665c50a88946a5aa59eb28291aaf2767"
+            },
+            "dbpedia/mappingbased-objects_lang=en.nt.zst": {
+              "bytes": 2562003,
+              "sha256": "f7716156312d0576ea9022efa6a20a19000d07de6848b4c15eea2bb748d2c34d"
+            },
+            "dbpedia/mappingbased-objects_lang=en_disjointDomain.nt.zst": {
+              "bytes": 7684,
+              "sha256": "1ef8b71bd465f67dd7231eb31ed986cc62440e7d81d2d51e3ecd9132c6fa4731"
+            },
+            "dbpedia/mappingbased-objects_lang=en_disjointRange.nt.zst": {
+              "bytes": 12439,
+              "sha256": "7da5d478f4eae145f1580f72a8d269686529a0d3602753eda7b2f03eee9dfddc"
+            },
+            "dbpedia/ontology--DEV_type=parsed.nt.zst": {
+              "bytes": 6271,
+              "sha256": "f0a24c5e58e3ac48d015da98f5721b25baa7df50509286a041503a73f4f7f14a"
+            },
+            "dbpedia/page_lang=en_ids.nt.zst": {
+              "bytes": 2972184,
+              "sha256": "2b55d69fcdd5d14cc1cfea1f43880d1fc039e5c71f3fd91ed521cc7f106afa7d"
+            },
+            "dbpedia/page_lang=en_length.nt.zst": {
+              "bytes": 1945704,
+              "sha256": "07f9951c5715fdaf9641a96a871690e07d58916fbbf8f86b4e6a39ffbb995c60"
+            },
+            "dbpedia/persondata_lang=en.nt.zst": {
+              "bytes": 13,
+              "sha256": "f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c"
+            },
+            "dbpedia/redirects_lang=en.nt.zst": {
+              "bytes": 1673286,
+              "sha256": "d8fe88726218d11f006626cdbac5122ddd5e73bb677724634df93e90b0d34eea"
+            },
+            "dbpedia/redirects_lang=en_transitive.nt.zst": {
+              "bytes": 1673286,
+              "sha256": "d8fe88726218d11f006626cdbac5122ddd5e73bb677724634df93e90b0d34eea"
+            },
+            "dbpedia/revisions_lang=en_ids.nt.zst": {
+              "bytes": 3102833,
+              "sha256": "a436f35d6304db89a4b6bd863c41f691791e444cf5ce85b28899c6326f575f41"
+            },
+            "dbpedia/revisions_lang=en_uris.nt.zst": {
+              "bytes": 3804499,
+              "sha256": "0c3b6a4b109a563142fdc561fed88e4340f4ce1ff4f70351e7e456b1de850254"
+            },
+            "dbpedia/short-abstracts_lang=en.nt.zst": {
+              "bytes": 7181911,
+              "sha256": "20b0b12a1847e546692b1be0ea7cf9711b05cdd13766d49eeaa71be5eeb23a86"
+            },
+            "dbpedia/specific-mappingbased-properties_lang=en.nt.zst": {
+              "bytes": 143026,
+              "sha256": "f3ba3380edc1292062ec72374cb384586eb2f76ae70b2b14057300e3dc42c5a7"
+            },
+            "dbpedia/wikilinks_lang=en.nt.zst": {
+              "bytes": 23458564,
+              "sha256": "3413225ed3acb42184f16f32963f8f641636a138d222675c423b23d4bb5ffe7c"
+            },
+            "dbpedia/wikipedia-links_lang=en.nt.zst": {
+              "bytes": 5262221,
+              "sha256": "af1a6ccf677551ceb9745d909e02b553260a6d5805fce7b4eb5e0b00db6c92fa"
+            },
+            "lubm/owl-rl.nt": {
+              "bytes": 380128034,
+              "sha256": "6822f21549982a1db36f75955ee7290de565370f233bbcd198c8007b64743180"
+            },
+            "synthetic/people-100000.nt.zst": {
+              "bytes": 6223532,
+              "sha256": "befe6b2d417c379b1abf871abe95b8e8712637ad02f479c2aeffa735b188f4d3"
+            },
+            "watdiv/data.nt": {
+              "bytes": 1550231398,
+              "sha256": "980cee8905f8f3b982348df79d27fc21a800e7453971433d3fef51dc3d42b967"
+            }
+          },
+          "stores": "A on stores loaded by the base build, B on stores loaded by the candidate (b150d225, whose statistics the candidate writes identically)"
+        },
+        "settings": {
+          "client_cpu": 12,
+          "cpus": "0-11",
+          "reps": 20,
+          "result_cache_mb": 0,
+          "rounds": 4,
+          "threads": 12,
+          "threshold": 1.05,
+          "warmup": 3
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": {
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "kernel": "7.2.9",
+            "name": "forge"
+          },
+          "method": "abtime.py: per workload 4 rounds of A, B, B, A, each a fresh server pinned to CPUs 0-11 with RAYON_NUM_THREADS=12 and the result cache off, an idle-priority spinner on each server CPU and on the client CPU 12, 3 warm-ups and 20 timed requests per query and process; time is the server's planMs + execMs, medians over all requests and per round",
+          "kind": "interleaved-ab"
+        }
+      },
+      "metadata_note": "An interleaved A/B record of abtime.py. Read the record for its method, manifest, settings, summary and per-query results."
+    },
+    {
+      "run_id": "sha256-5a226b76fe45f44ce250e544bcbf7ebe27a3f30b9ed4f0427c396e764137c731",
+      "path": "runs/2026-11-03-estimation-ab-forge-e8e0e4cd/record.json",
+      "sha256": "5a226b76fe45f44ce250e544bcbf7ebe27a3f30b9ed4f0427c396e764137c731",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": "estimation-ab",
+        "scale": "synthetic 1.05M, WatDiv 100, BSBM 10M explore and BI, LUBM(10) with OWL RL, DBpedia 8.2M-triple slice",
+        "manifest": {
+          "base_commit": "125edd41",
+          "base_sha256": "edcffae2d2e0731d75d29167c13192e1fb754b10637c71ee74174f6ae54cce44",
+          "build": "scripts/nsc-build.sh (mbx build --release -p sparkles-server with MBX_LEARNED_INCREMENTAL=false) on wally from git archive tarballs of each commit",
+          "candidate_commit": "e8e0e4cd",
+          "candidate_sha256": "fa2fc2f8deaa63e57de6a7a7c1d87923530c1231051c75a98f255860d7efed8f",
+          "data": {
+            "bsbm/dataset.nt": {
+              "bytes": 2619263591,
+              "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be"
+            },
+            "dbpedia/anchor-text_lang=en.nt.zst": {
+              "bytes": 20412837,
+              "sha256": "f51eebf5ce775ab05e1816343281c87f633e6b724e90191f17f7bd72cef30e93"
+            },
+            "dbpedia/article-templates_lang=en.nt.zst": {
+              "bytes": 3998043,
+              "sha256": "d6894436ddf086aa03e3cc06e2b2617bc575b8f19a7e9ffc232f966355c2ef02"
+            },
+            "dbpedia/article-templates_lang=en_nested.nt.zst": {
+              "bytes": 864073,
+              "sha256": "4b12b3d03299556bd7a8dbada65c4acd90f3407384951ac26a448d8d7dfb3bdf"
+            },
+            "dbpedia/categories_lang=en_articles.nt.zst": {
+              "bytes": 3573932,
+              "sha256": "6fb62e42153b50604af22b7d3b7ab53b37eae1f40825cf324d066985aa20c672"
+            },
+            "dbpedia/categories_lang=en_labels.nt.zst": {
+              "bytes": 321875,
+              "sha256": "672b8b1e8b6f8c65192d1a5a8fc396fe83862beb229bea912a6b87e10b9cbf89"
+            },
+            "dbpedia/categories_lang=en_skos.nt.zst": {
+              "bytes": 905874,
+              "sha256": "e4c1a6bdef998b31e74480d6d59af14519bcdc1d78be1b2aa163917a0f53a85d"
+            },
+            "dbpedia/citations_lang=en_data.nt.zst": {
+              "bytes": 18377390,
+              "sha256": "8b2860eb62f9fb7e5b6a7f7017fa437cb53bd3aae7a52bdab4f32ea6a2cf695e"
+            },
+            "dbpedia/citations_lang=en_links.nt.zst": {
+              "bytes": 7046514,
+              "sha256": "0fb9a524658cc18f33eb233e6c34c0ebb7e963d690487f51c967ac99b3a76c02"
+            },
+            "dbpedia/commons-sameas-links_lang=en.nt.zst": {
+              "bytes": 8539,
+              "sha256": "8e6cf98679c076037cc23660678e66e8f1aa032020309b834d907364fceaf4d4"
+            },
+            "dbpedia/disambiguations_lang=en.nt.zst": {
+              "bytes": 176990,
+              "sha256": "a30c20b4da8908dba2d0ab37f497f008fddffb249defe43f81ebcbd66c7ede4b"
+            },
+            "dbpedia/external-links_lang=en.nt.zst": {
+              "bytes": 2153063,
+              "sha256": "eef08530ab650e09f2e01a2a9351bd1f1d3b9c7e8dab3ff2a5bca278b7ca027d"
+            },
+            "dbpedia/geo-coordinates-mappingbased_lang=en.nt.zst": {
+              "bytes": 268288,
+              "sha256": "5ea8c33c473f2120f46d73ca042990536a6978ecce9493b8ba224a60407de966"
+            },
+            "dbpedia/geo-coordinates_lang=en.nt.zst": {
+              "bytes": 508941,
+              "sha256": "69119e5a89d9b678fb2a9a0679372512b3856e0a59ed1626889d12ded72dfcce"
+            },
+            "dbpedia/homepages_lang=en.nt.zst": {
+              "bytes": 156741,
+              "sha256": "c43db6b4d034945cd507546fcf80a874f0b711325c38d9e8010fd6f138ea468c"
+            },
+            "dbpedia/images_lang=en.nt.zst": {
+              "bytes": 7204639,
+              "sha256": "7bfb8404cba90784fa36e82ecbf4694eb14b0cafbb4400641e441e392c646f14"
+            },
+            "dbpedia/infobox-properties_lang=en.nt.zst": {
+              "bytes": 11339691,
+              "sha256": "41ae553b78afe92edaad4ade64f212fcf8eadbe4579c00c440c1bf6be869b27a"
+            },
+            "dbpedia/infobox-property-definitions_lang=en.nt.zst": {
+              "bytes": 8652,
+              "sha256": "c570ed0b48897cba62b6c14926a32cf535cf2773b417d869a3c5fe87e073c885"
+            },
+            "dbpedia/instance-types_lang=en_specific.nt.zst": {
+              "bytes": 854148,
+              "sha256": "fcfcc151683c3642db649e9ac47bf5923c459f4654e12e296d871ebcc5f8c994"
+            },
+            "dbpedia/instance-types_lang=en_transitive.nt.zst": {
+              "bytes": 2486438,
+              "sha256": "3c74ad554199504897d2d1a74f29e99bee3151821fea31e966fa7e1818d0e7ba"
+            },
+            "dbpedia/interlanguage-links_lang=en.nt.zst": {
+              "bytes": 10176,
+              "sha256": "2963d4611a060842d7fab9ca15c25a7e0a24e5c0bc5a57c153f1c762da1899bb"
+            },
+            "dbpedia/labels_lang=en.nt.zst": {
+              "bytes": 2386511,
+              "sha256": "1b1cd3c468069be04769a1b95ad2d2c78306f7436585ed101999a579daa9cb5f"
+            },
+            "dbpedia/long-abstracts_lang=en.nt.zst": {
+              "bytes": 10067531,
+              "sha256": "b3b54fafdd0a961aaed90431db8679e28c342c266e1db7e4bad3a5eb90e095b4"
+            },
+            "dbpedia/mappingbased-literals_lang=en.nt.zst": {
+              "bytes": 2267693,
+              "sha256": "07675287ae08184364eee92694c283bb665c50a88946a5aa59eb28291aaf2767"
+            },
+            "dbpedia/mappingbased-objects_lang=en.nt.zst": {
+              "bytes": 2562003,
+              "sha256": "f7716156312d0576ea9022efa6a20a19000d07de6848b4c15eea2bb748d2c34d"
+            },
+            "dbpedia/mappingbased-objects_lang=en_disjointDomain.nt.zst": {
+              "bytes": 7684,
+              "sha256": "1ef8b71bd465f67dd7231eb31ed986cc62440e7d81d2d51e3ecd9132c6fa4731"
+            },
+            "dbpedia/mappingbased-objects_lang=en_disjointRange.nt.zst": {
+              "bytes": 12439,
+              "sha256": "7da5d478f4eae145f1580f72a8d269686529a0d3602753eda7b2f03eee9dfddc"
+            },
+            "dbpedia/ontology--DEV_type=parsed.nt.zst": {
+              "bytes": 6271,
+              "sha256": "f0a24c5e58e3ac48d015da98f5721b25baa7df50509286a041503a73f4f7f14a"
+            },
+            "dbpedia/page_lang=en_ids.nt.zst": {
+              "bytes": 2972184,
+              "sha256": "2b55d69fcdd5d14cc1cfea1f43880d1fc039e5c71f3fd91ed521cc7f106afa7d"
+            },
+            "dbpedia/page_lang=en_length.nt.zst": {
+              "bytes": 1945704,
+              "sha256": "07f9951c5715fdaf9641a96a871690e07d58916fbbf8f86b4e6a39ffbb995c60"
+            },
+            "dbpedia/persondata_lang=en.nt.zst": {
+              "bytes": 13,
+              "sha256": "f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c"
+            },
+            "dbpedia/redirects_lang=en.nt.zst": {
+              "bytes": 1673286,
+              "sha256": "d8fe88726218d11f006626cdbac5122ddd5e73bb677724634df93e90b0d34eea"
+            },
+            "dbpedia/redirects_lang=en_transitive.nt.zst": {
+              "bytes": 1673286,
+              "sha256": "d8fe88726218d11f006626cdbac5122ddd5e73bb677724634df93e90b0d34eea"
+            },
+            "dbpedia/revisions_lang=en_ids.nt.zst": {
+              "bytes": 3102833,
+              "sha256": "a436f35d6304db89a4b6bd863c41f691791e444cf5ce85b28899c6326f575f41"
+            },
+            "dbpedia/revisions_lang=en_uris.nt.zst": {
+              "bytes": 3804499,
+              "sha256": "0c3b6a4b109a563142fdc561fed88e4340f4ce1ff4f70351e7e456b1de850254"
+            },
+            "dbpedia/short-abstracts_lang=en.nt.zst": {
+              "bytes": 7181911,
+              "sha256": "20b0b12a1847e546692b1be0ea7cf9711b05cdd13766d49eeaa71be5eeb23a86"
+            },
+            "dbpedia/specific-mappingbased-properties_lang=en.nt.zst": {
+              "bytes": 143026,
+              "sha256": "f3ba3380edc1292062ec72374cb384586eb2f76ae70b2b14057300e3dc42c5a7"
+            },
+            "dbpedia/wikilinks_lang=en.nt.zst": {
+              "bytes": 23458564,
+              "sha256": "3413225ed3acb42184f16f32963f8f641636a138d222675c423b23d4bb5ffe7c"
+            },
+            "dbpedia/wikipedia-links_lang=en.nt.zst": {
+              "bytes": 5262221,
+              "sha256": "af1a6ccf677551ceb9745d909e02b553260a6d5805fce7b4eb5e0b00db6c92fa"
+            },
+            "lubm/owl-rl.nt": {
+              "bytes": 380128034,
+              "sha256": "6822f21549982a1db36f75955ee7290de565370f233bbcd198c8007b64743180"
+            },
+            "synthetic/people-100000.nt.zst": {
+              "bytes": 6223532,
+              "sha256": "befe6b2d417c379b1abf871abe95b8e8712637ad02f479c2aeffa735b188f4d3"
+            },
+            "watdiv/data.nt": {
+              "bytes": 1550231398,
+              "sha256": "980cee8905f8f3b982348df79d27fc21a800e7453971433d3fef51dc3d42b967"
+            }
+          },
+          "stores": "A on stores loaded by the lane's base build 62d9cb53, whose loader 125edd41 shares; B on stores loaded by the candidate"
+        },
+        "settings": {
+          "client_cpu": 12,
+          "cpus": "0-11",
+          "reps": 20,
+          "rerun_rounds": 8,
+          "result_cache_mb": 0,
+          "rounds": 4,
+          "threads": 12,
+          "threshold": 1.05,
+          "warmup": 3
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": {
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "kernel": "7.2.9",
+            "name": "forge"
+          },
+          "method": "abtime.py: per workload 4 rounds of A, B, B, A, each a fresh server pinned to CPUs 0-11 with RAYON_NUM_THREADS=12 and the result cache off, an idle-priority spinner on each server CPU and on the client CPU 12, 3 warm-ups and 20 timed requests per query and process; time is the server's planMs + execMs, medians over all requests and per round",
+          "kind": "interleaved-ab"
+        }
+      },
+      "metadata_note": "An interleaved A/B record of abtime.py. Read the record for its method, manifest, settings, summary and per-query results."
     }
   ]
 }

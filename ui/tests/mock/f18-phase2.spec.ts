@@ -478,7 +478,8 @@ test('Similar keeps branch handoffs in query and embedding pages', async ({ page
   expect(href.searchParams.get('ds')).toBe('foaf');
   expect(href.searchParams.get('branch')).toBe('dev');
   await results.getByRole('button', { name: 'Open in query editor' }).click();
-  await expect(page.getByRole('combobox', { name: 'Branch', exact: true })).toHaveValue('dev');
+  // the Options button names the branch the query runs on
+  await expect(page.getByRole('button', { name: /^Options\b.*\bdev\b/ })).toBeVisible();
   await page.goto(href.toString());
   await expect(page.locator('.emap[data-ready="true"]')).toBeVisible();
   await expect(page).toHaveURL(
@@ -549,5 +550,6 @@ test('Similar opens the query editor on the branch that produced its result', as
   const results = page.getByRole('region', { name: 'Similar results' });
   await expect(results.locator('tbody tr')).toHaveCount(10);
   await results.getByRole('button', { name: 'Open in query editor' }).click();
-  await expect(page.getByRole('combobox', { name: 'Branch', exact: true })).toHaveValue('dev');
+  // the Options button names the branch the query runs on
+  await expect(page.getByRole('button', { name: /^Options\b.*\bdev\b/ })).toBeVisible();
 });

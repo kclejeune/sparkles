@@ -173,3 +173,78 @@ fn probed_estimates_never_change_answers() {
         );
     }
 }
+
+/// A sample that finds no value of a pattern, among values it did not all probe, says
+/// only that few match: the join is estimated with the rule of succession and the
+/// pattern's rows per value. Probing every value keeps an exact empty join.
+#[test]
+fn a_sample_without_hits_is_not_an_empty_join() {
+    use super::keyprobe::{Measure, est};
+    let sampled = Measure {
+        m: 0.0,
+        f: 0.0,
+        rows: 300.0,
+        d: 10.0,
+        keys: 32,
+        complete: false,
+    };
+    // 1,000 rows, 1/34 of them matching 30 rows each
+    let e = est(1000.0, 300.0, &sampled);
+    assert!((e - 1000.0 / 34.0 * 30.0).abs() < 1e-6, "{e}");
+    let complete = Measure {
+        complete: true,
+        ..sampled
+    };
+    assert_eq!(est(1000.0, 300.0, &complete), 1.0);
+    // a hit keeps the measured mean
+    let hit = Measure {
+        m: 2.0,
+        f: 0.5,
+        ..sampled
+    };
+    assert_eq!(est(1000.0, 300.0, &hit), 2000.0);
+}
+
+/// A small class whose few members a pattern points at: LUBM's `?u a University . ?d
+/// subOrganizationOf ?u`, where only ten of a thousand universities have departments.
+#[test]
+fn few_matching_values_of_a_small_input_are_not_estimated_at_one_row() {
+    let mut t = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..1000 {
+        t.push_str(&format!("ex:u{i} a ex:U .\n"));
+    }
+    for d in 0..300 {
+        t.push_str(&format!("ex:d{d} ex:sub ex:u{} .\n", d % 10 * 97));
+    }
+    let s = load(t);
+    let snap = s.snapshot();
+    let q = "SELECT * WHERE { ?u a ex:U . ?d ex:sub ?u }";
+    // the node sets aside, so that the probes estimate the join
+    let probes = Optimizations {
+        node_sets: false,
+        ..Optimizations::ALL
+    };
+    assert_eq!(answer(&snap, q, probes).len(), 300);
+    // the first query reads the blocks that later ones probe
+    let _ = answer(&snap, q, probes);
+    let est = root_est(&snap, q, probes);
+    assert!(est >= 30.0, "estimated {est} for 300");
+    let with_sets = root_est(&snap, q, Optimizations::ALL);
+    assert!(
+        (with_sets - 300.0).abs() <= 1.0,
+        "estimated {with_sets} for 300 from the node sets"
+    );
+}
+
+/// Probed keys cover a small input only when its values were read whole: a scan that
+/// stopped at its row limit gave the values of its first rows, and a value after them was
+/// never probed.
+#[test]
+fn keys_cover_a_source_only_when_it_was_read_whole() {
+    use super::keyprobe::covers_every_value;
+    let ids = |v: &[u64]| v.iter().map(|&x| crate::id::Id(x)).collect::<Vec<_>>();
+    let vals = ids(&[1, 1, 2, 3, 3]);
+    assert!(covers_every_value(&vals, &ids(&[1, 2, 3]), true));
+    assert!(!covers_every_value(&vals, &ids(&[1, 3]), true));
+    assert!(!covers_every_value(&vals, &ids(&[1, 2, 3]), false));
+}

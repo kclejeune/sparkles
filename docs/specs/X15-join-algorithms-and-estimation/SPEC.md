@@ -87,4 +87,135 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-Nothing is built. [Item 454](../../ROADMAP.md) tracks the work.
+The first phase of *correlation-aware cardinality estimation* is built, and the other
+phases are not. [Item 454](../../ROADMAP.md) tracks the remaining work.
+
+* **Subject sets with a remainder.** A bulk load or compaction keeps 32,768 subject
+  characteristic sets instead of 10,000 and counts the subjects outside them as one
+  remainder, with its subjects and, per predicate or class, its holders and triples. A
+  star's estimate adds the remainder, in which the items are taken to be independent, so
+  the 95% coverage rule applies only to statistics without a remainder.
+* **Node sets.** The same builds count the characteristic sets of nodes over both
+  directions, out-items, in-items and classes, 32,768 sets with a remainder, in one pass
+  over SPO and OPS on the build's threads. A partial compaction updates both families for
+  the nodes its changes touch, and freezes the kept signatures once a remainder holds
+  anything. A variable that is the object of `?x p ?v` with a constant predicate other
+  than `rdf:type` is estimated from the node sets for every join on it. When an input
+  also restricts such a variable by a constant object, a subquery or a VALUES table, a
+  join over its outgoing items alone is estimated from the subject sets, which take the
+  restriction to be independent, and other joins keep the estimate from distinct values.
+  This is the characteristic-pair idea reduced to the join node. Pairs keyed by both ends' sets are not built.
+* **Same sets at any thread count.** The node pass keeps the same sets at any thread
+  count, so a load of data without blank nodes writes the same `stats.json` at any
+  thread count. A load numbers blank nodes in the order its parser threads meet them, so
+  their identifiers in the statistics can differ between loads, as they did before.
+  When the data has at most 2^20 distinct node signatures, the node pass counts
+  them all exactly. Otherwise its first pass also fills a count-min sketch of the nodes
+  per signature, and a second pass counts exactly the 2^20 signatures with the most nodes
+  by the sketch, with ties broken by a stable hash of the signature. None of the
+  benchmark stores has that many signatures, so none pays for the second pass.
+* **Several keys.** A join on several keys divides by the key tuples of the larger side,
+  from its distinct counts with exponents 1, 1/2, 1/4 and 1/8, at most its rows when each
+  side has one input binding every key.
+* **Zero hits in a key sample.** A sample that finds no rows, without covering every
+  distinct value of the small input, keeps a share of `1 / (k + 2)` of the `k` values
+  probed instead of an empty join.
+* **Format.** The member `correlations` of `stats.json` has its own version, 1, the
+  derived kind `planner-statistics`. A member of another version is refused with a
+  recorded reason that `sparkles check` reports, and the planner estimates without it.
+* **Switches.** `set_remainders`, `node_sets` and `key_backoff` turn the parts off.
+
+The q-error of a plan node is `max(est, act) / min(est, act)`, both at least one row,
+over the nodes that ran to completion. `scripts/bench-estimates/qerror.py` recorded every
+join node of these workloads on the base build and on this change, on the laptop, with
+identical answers.
+
+| Workload | Joins | Geometric mean | 90th percentile | Largest |
+|---|---|---|---|---|
+| Synthetic, 1.05M triples | 34 | 1.39 to 1.37 | 2.7 to 2.7 | 42 to 42 |
+| WatDiv at scale 100 | 260 to 246 | 8.80 to 3.98 | 661 to 59 | 1,222 to 666 |
+| BSBM explore, 10M | 136 to 135 | 1.89 to 1.86 | 5.6 to 5.6 | 18 to 18 |
+| BSBM BI, 10M | 130 | 2.17 to 1.78 | 12.5 to 6.5 | 41 to 31 |
+| LUBM(10) with OWL RL | 26 | 3.52 to 1.81 | 32 to 4.1 | 3,016 to 9 |
+| DBpedia, 8.2M-triple slice | 22 | 4.84 to 1.96 | 78 to 7.7 | 1,478 to 78 |
+
+The recorded plans of `plan_fidelity_tests.rs`, 21 queries over stars, object joins,
+chains, a triangle, joins on two keys, a class variable, a subquery's variable and small
+inputs, have no join whose q-error rises against the three switches off, and five fall.
+The largest join q-error of a query falls on 54 of the 234 recorded queries and rises on
+13, two of them by less than 2%. On the five WatDiv `F1` queries it rises from 88 to 103
+at most, since the inputs of an empty join are now estimated
+exactly and the empty join itself keeps the estimate from distinct values. On `F4-2` it
+rises from 3 to 9 and on LUBM `q12` from 6.2 to 8.8, after plan changes that move a join
+estimated from distinct values. On BSBM BI `q1-2` it rises from 4.1 to 6.8, and on two
+DBpedia queries of six people from 2 and 2.5 to 6 and 5, where the remainder takes a
+category's people to be as likely as others to have a label and a class.
+
+The node pass takes 0.2 s of a 5 to 6 s WatDiv load and 0.7 s of a 10 to 20 s DBpedia
+load on the laptop, and the peak memory of a load stays within 5% of the base build's.
+`stats.json` grows from 2.5 MB to 16.3 MB on WatDiv and from 5.0 MB to 44.3 MB on DBpedia.
+On atlas, an Intel host like forge, the DBpedia slice opens in 0.30 s instead of 0.07 s
+and the server holds 214 MB instead of 133 MB once ready. WatDiv opens in 0.13 s instead
+of 0.10 s and holds 156 MB instead of 127 MB. These are medians of five opens, polled
+every 20 ms. Items 700, 704 and 705 would reduce these costs.
+
+Both families keep 32,768 sets. Smaller caps, measured on the same stores, lose much of
+the gain on WatDiv, where 16,384 sets raise the geometric mean of the join q-error by
+10% and 8,192 by 19%. The 90th percentile is lower at 16,384 than at 32,768 because the
+plans, and so the joins measured, differ.
+
+| Workload | Sets | Geometric mean | 90th percentile | Largest | `stats.json` | Open | Memory once ready |
+|---|---|---|---|---|---|---|---|
+| WatDiv at scale 100 | Base build | 8.80 | 661 | 1,222 | 2.5 MB | 0.10 s | 127 MB |
+| WatDiv at scale 100 | 8,192 | 4.72 | 49 | 666 | 4.4 MB | 0.07 s | 133 MB |
+| WatDiv at scale 100 | 16,384 | 4.36 | 31 | 666 | 9.3 MB | 0.10 s | 144 MB |
+| WatDiv at scale 100 | 32,768 | 3.98 | 59 | 666 | 16.3 MB | 0.13 s | 156 MB |
+| DBpedia, 8.2M-triple slice | Base build | 4.84 | 78 | 1,478 | 5.0 MB | 0.07 s | 133 MB |
+| DBpedia, 8.2M-triple slice | 8,192 | 3.36 | 15 | 78 | 7.1 MB | 0.07 s | 141 MB |
+| DBpedia, 8.2M-triple slice | 16,384 | 2.06 | 6.0 | 78 | 16.7 MB | 0.14 s | 157 MB |
+| DBpedia, 8.2M-triple slice | 32,768 | 1.96 | 7.7 | 78 | 44.3 MB | 0.30 s | 214 MB |
+
+Against 32,768 sets, the largest join error of WatDiv `F1-2` rises from 17 to 49 at 8,192
+sets, of `F4-2` from 9 to 58 and of DBpedia's `film-director-optional` from 1.0 to 15. At
+16,384 sets that of WatDiv `F4-1` rises from 2.1 to 7.0 and of DBpedia's `births-by-decade`
+from 1.0 to 2.1.
+
+On forge at 12 threads, with interleaved rounds of fresh servers and identical answers,
+the geometric mean of the query times against main without these estimates is 0.968 on
+WatDiv, 0.933 on BSBM BI, 0.946 on LUBM, 1.000 on BSBM explore, 1.028 on the synthetic
+workload and 0.993 on DBpedia. The plans of 41 queries change. WatDiv's `C` queries take
+0.20 to 0.45 times as long, BSBM BI `q1-3` 0.23 times, LUBM `q2` 0.51 times and DBpedia's
+`costar-birthplace` 0.63 times. WatDiv `S4-2` and `S4-4` take 1.6 times as long, since an
+accurate estimate leads the planner to a 704-key index join that the cost model prices
+too low. A cost term for keys spread at random brought their base plan back, but the 64
+queries whose plans it changed took 1.15 times as long, since keys close together cost a
+third of what spread keys cost and the planner cannot tell them apart. The
+[experiment](../../PERFORMANCE-EXPERIMENTS.md#query-execution) is recorded, and item
+701 prices probes by how their keys spread. Planning takes 1 to 90 microseconds
+longer on WatDiv `F4` and on short synthetic, WatDiv and DBpedia queries, 5% to 10% of
+their time, which item 702 follows up. Two synthetic queries with unchanged plans
+run 1.06 and 1.11 times as long in execution in eight rounds, and item 703 follows
+them up. Interleaved runs on atlas, an Intel host like forge, found the same slowdowns of
+`S4-2`, `S4-4` and `F4`. The
+[engine results](../../benchmarks/engine/RESULTS.md#estimation-timing-on-forge) list every
+changed plan.
+
+The first query of a fresh server over a store that holds the correlation statistics pays
+for them once. On atlas at 1.05M triples, with one thread, the first run of the synthetic
+`expr-bind-group` took a median of 1.19 ms of server time over five fresh servers,
+against 0.98 ms without these estimates. Its plan was the same, it ran about the same instructions, and its later
+runs took the same time. The three switches off left it unchanged, and a store without
+the member did not show it. The server's history of quick texts compared that cold
+cursor run with the eager run after it and kept most fresh servers eager for their whole
+life, so the Namespace screen of the batch read the query at 1.465 of main. The history
+now gives the slower mode a second run before a quick text settles, as the
+[X06 outcome](../X06-benchmark-coverage.md#query-threads-on-hybrid-cores) describes, which
+removes that effect. The cold cost of the first query stays, and item 708 looks for it.
+The [synthetic results](../../benchmarks/synthetic/RESULTS.md#execution-mode-of-quick-texts-in-fresh-servers)
+give the measurements.
+
+Sampling of sources above 1,024 rows and of subplans, degree caps and full
+characteristic pairs are deferred to items 698, 699 and 697. The
+measurements above leave the far-end restrictions of a link and the overestimates of
+empty joins as the largest remaining errors, which samples of large sources would not
+change.

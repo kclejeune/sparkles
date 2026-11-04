@@ -444,32 +444,135 @@ they stay polynomial. A test checks that their contexts grow linearly.
 The classifier's answers entail only what HermiT 1.4.5.519 entails on 640 generated and
 hand-written OWL 2 DL ontologies, are the same on one and four threads, and equal
 HermiT's on the 54 Horn ones that the rules take whole. On GO, whose
-`InverseObjectProperties(part_of has_part)` the rules take, it creates 2,577 contexts of
-conjunctions and derives 3.5 million conclusions where the EL rules derived 2.8 million.
-On the benchmark host GO classifies in 325 ms on one thread and 95 ms on eight, against
-278 and 81 ms for the EL rules alone, 17 to 18% slower, and its peak resident set rises
-from 195 to 248 MiB on one thread and from 288 to 331 MiB on eight
+`InverseObjectProperties(part_of has_part)` the rules take, phase 3 created 2,577
+contexts of conjunctions and derived 3.5 million conclusions where the EL rules derived
+2.8 million. On the benchmark host GO classified in 325 ms on one thread and 95 ms on
+eight, against 278 and 81 ms for the EL rules alone, 17 to 18% slower, and its peak
+resident set rose from 195 to 248 MiB on one thread and from 288 to 331 MiB on eight
 ([record](../../benchmarks/el-classification/runs/2026-11-03-horn-forge-8966216c/record.json)).
-ChEBI lite's one `InverseObjectProperties` axiom fires no Horn rule, so it runs the EL
-rules in the same time.
-The maintainer accepted this cost as the
-tradeoff for GO's complete taxonomy, and the ELK mode keeps the EL rules' time and
-taxonomy. Item 693 follows the cost. The taxonomies of the 298 ORE 2015 EL ontologies and
-ChEBI lite are byte for byte those of the EL rules on one and eight threads.
+The maintainer accepted this cost as the tradeoff for GO's complete taxonomy, and the
+ELK mode keeps the EL rules' time and taxonomy. With item 693, GO derives 2.9 million
+conclusions and classifies in 306 ms on one thread, against 320 ms for the rules of
+phase 3 and 274 ms for the EL rules alone in the same A/B, 12% slower than the EL rules,
+with a peak resident set of 223 MiB against 248 and 196 MiB. On eight threads it takes
+91 ms against 87 and 92 ms, within the spread of the rounds
+([record](../../benchmarks/el-classification/runs/2026-11-03-horn-cost-forge-320d4708/record.json)).
+Item 693 follows the remaining cost. ChEBI lite's one `InverseObjectProperties` axiom
+fires no Horn rule, so it runs the EL rules in the same time. The taxonomies of the 298
+ORE 2015 EL ontologies and ChEBI lite are byte for byte those of the EL rules on one and
+eight threads, and GO's taxonomy is the same before and after item 693.
 
 A run with the Horn rules has a memory budget of its own. The budget is 64 times the
 estimated bytes of the run's index and axioms, at least 1 GiB, and never more than the
 caller's `Limits::max_memory`. A run that passes it classifies again by the EL rules
 alone, as the ELK mode does, leaves the axioms outside OWL 2 EL out and reports them,
-and sets `Stats::horn_over_budget`. Two ontologies of the ORE 2015 DL sample derived from
-Uberon, ore_ont_9663 and ore_ont_14817, need this. Their transitive parthood properties
-are each other's inverses, and the contexts of conjunctions compose the parthood chains
-again until the run passes 10 GiB, with most of the memory in waiting messages. The EL
-rules alone classify them in 0.8 s with a peak resident set of 0.4 GB. With the budget
-they classify in 4.2 s and 2.4 GB on four threads on the laptop, against 8.9 and 9.7 s
-for Konclude 0.7.0. Item 693 follows this cost with GO's. The largest Horn run on
-the development set below, ore_ont_9855, peaks at 666 MB, and GO at 74 MB, so neither
-reaches the budget.
+and sets `Stats::horn_over_budget`. The rules of phase 3 needed it on two ontologies of
+the ORE 2015 DL sample derived from Uberon, ore_ont_9663 and ore_ont_14817. Their
+transitive parthood properties are each other's inverses, and the contexts of
+conjunctions composed the parthood chains again until the run passed 10 GiB, with most
+of the memory in waiting messages. With the budget they classified in 4.2 s and 2.4 GB
+on four threads on the laptop, with the EL rules' answer. Item 693's chain selection
+below removed that composition, and both now finish with the Horn rules. On the
+benchmark host ore_ont_9663 takes 4.0 s and 1.0 GiB on one thread and 0.89 s and 1.4 GiB
+on eight, and ore_ont_14817 takes 2.2 s and 0.7 GiB and 0.46 s and 1.0 GiB. The EL rules
+alone take 0.77 and 0.68 s on one thread, and Konclude 0.7.0 took 8.9 to 9.7 s and 3.5
+to 4.2 GB on four threads on the laptop. The two taxonomies miss 33 and 27 of Konclude's
+subsumptions, which follow from axioms that are not Horn, and give none that Konclude
+does not entail. On one thread the Horn rules still derive 52.0 million conclusions on
+ore_ont_9663 and 29.4 million on ore_ont_14817, where the EL rules derive 18.5 and 20.8
+million, which item 693 follows. No file of the development set below and no case of the
+differential test reaches the budget with item 693's rules, and the budget stays as a
+safety net. The largest Horn run of the development set, ore_ont_9855, classifies in 1.5
+s on one thread on the benchmark host against 4.4 s with the rules of phase 3, with a
+peak resident set of 359 MiB.
+
+A run with the Horn rules composes only the property chains that some negative existential
+restriction needs, and carries every other property inclusion by the automata (item 693).
+Two definitions are used here, both over the role hierarchy closed under inverses and the
+told chains together with their mirror images, `r_n⁻ ∘ … ∘ r_1⁻ ⊑ s⁻` for
+`r_1 ∘ … ∘ r_n ⊑ s`. A chain `s_1 ∘ s_2 ⊑ v` is left-linear when `v` is under `s_1`. A
+property `s` is letter-closed when every chain whose result is under `s` has all its
+operands under `s`, so that every path that implies `s` is a path of links by properties
+under `s`.
+
+A negative existential restriction `∃t.F ⊑ G` stays on composed links when the automaton
+of `t⁻` has no transition by a property that a link runs under, which phase 3 calls not
+linked. Its closure starts with `t`, and each chain whose result is under a property of
+the closure adds the chain's left operand. It adds the right operand too, unless the chain
+is left-linear and the right operand is letter-closed. The restriction is kept when every
+chain of its closure has two operands. Every other negative existential restriction over a
+property that chains reach becomes `F ⊑ ∀t⁻.G` and is unfolded by the automaton, as the
+universal restrictions are. The run composes the chains of the kept closures and no
+others.
+
+- **Uberon.** The composition of the parthood chains, which the conjunction contexts
+  repeated, is gone.
+- **GO.** The regulation properties stay composed. Their automata would spread a state down
+  every descendant of each regulated process.
+
+The argument for completeness has three steps.
+
+1. **The translation.** Replace every universal restriction and every negative existential
+   restriction over a property that chains reach by the residual states of its automaton,
+   and drop the chains. This preserves named subsumption.
+   - A model of the ontology gives each state the elements whose accepted paths end in the
+     filler.
+   - A model of the translation, with its properties closed under the chains, satisfies
+     each restriction by induction along the path that gave an added edge.
+   - Simple properties gain no edge, so the at-most, self, disjointness, asymmetry and
+     irreflexivity axioms, which take simple properties only, still hold.
+2. **The calculus without composition is complete for the translation,** which has no
+   chains left.
+3. **Every conclusion of the run without composition is also derived with chain
+   selection.**
+   - A kept restriction's residual states move only backwards along links, by the rule for
+     a universal restriction on an inverse. No link runs under their transitions, so the
+     rule for a successor never applies to them.
+   - Those states reach a context `P` only along a path of links from `P` to a context that
+     holds `F`, whose properties spell a word that implies `t`.
+   - By induction on how the word implies `t`, the kept chains compose a link from `P` to
+     that context by a property under `t`. A left operand's links are complete, which the
+     closure ensures. A letter-closed right operand contributes its links one at a time,
+     each joined to the link built so far, which the chain being left-linear keeps under
+     `s_1`.
+   - The restriction's own EL rule then gives `G` at `P`.
+
+Composed links are entailed and are never successors of the Horn rules. A restriction kept
+on composed links and one unfolded by its automaton can share properties, and neither
+takes a premise from the other. Two kinds of run compose every told chain and its mirror
+image, and unfold only the linked restrictions, as phase 3 did:
+
+- a run with a property under the bottom property, since closing the properties of a
+  model could give that property an edge;
+- a run with a negative existential restriction over a property that chains reach and
+  whose inverse the run lacks, since that restriction cannot be unfolded.
+
+Two further changes cut the cost of the Horn rules.
+
+- **Merging by at-most restrictions.** At the end of its activation, a context merges
+  every successor that an at-most restriction counts into one conjunction of their
+  classes. Merging pairs created a context for each subset on the way.
+- **Fillers no rule reads.** The rule for a successor passes over a filler that no rule
+  takes as a premise and whose told subsumers every context holds. The rule for a
+  universal restriction on an inverse still takes such a filler to the predecessors.
+
+Item 693 also fixed a gap in completeness that phase 3 left. A chain
+`r_1 ∘ … ∘ r_n ⊑ s` entails its mirror image `r_n⁻ ∘ … ∘ r_1⁻ ⊑ s⁻`, and the rules of
+phase 3 composed the told chain only. With `r0 ∘ r2⁻ ⊑ r0` and `r2` the inverse of `r0`,
+`r2` is transitive only through the mirror image, and `A ⊑ ∃r2.B` with `B ≡ ∃r2.C` did
+not give `A ⊑ B`. The inputs affected were ontologies that the Horn rules take with a
+chain that names an inverse, a chain of three or more operands over inverses, or a chain
+whose mirror image's result sits under the inverse of a superproperty. A run with the
+Horn rules now composes the mirror image of every chain that is not told itself. Runs by
+the EL rules alone have no inverses and are unchanged.
+
+A differential test found the gap. It generates small random Horn ontologies with chains,
+inverses, transitivity and property hierarchies, compares the taxonomies of two builds on
+one and eight threads, and shrinks each difference to a few axioms. Against the build of
+phase 3, 6,000 cases gave this one difference. A scratch build with the mirror images
+and with chain selection turned off by a switch served as the reference, and 6,000 cases
+against it gave no difference, both for chain selection alone and for the final build. Chain selection changed the run's conclusion
+count in 294 of 600 sampled cases, so about half the cases exercise it.
 
 The development set of the ORE 2015 DL sample was compared on the laptop with four
 threads and a 10 GiB cap, as an unpublished measurement. The classifier's taxonomy
@@ -486,6 +589,17 @@ the EL saturation past 10 GiB, item 695. The classification time is 0.16 of
 Konclude's in geometric mean on the equal files and 0.23 on the sound ones, and never
 above HermiT's. Two equal files and 11 sound ones classify slower than Konclude. The
 largest gap is ore_ont_9855, an equal file at 2.5 s against 1.3 s.
+
+With item 693's rules the same comparison gives 62 equal files and 139 sound ones, since
+ore_ont_9663 and ore_ont_14817 now finish with the Horn rules and are sound, and only
+ore_ont_8737 runs out of memory. Estimated from that run's times, scaled by the ratio of
+item 693's build to the base's on `atlas`, the classification time is 0.15 of the faster
+reference's in geometric mean on the equal files and 0.22 on the sound ones. It is 0.14
+on the equal files that the Horn rules take, 0.16 on those of the EL rules, 0.30 on the
+sound Horn files and 0.19 on the sound files with axioms that are not Horn. One equal
+file and 11 sound ones are estimated slower than Konclude in one cold run, by up to 163
+ms on ore_ont_8273, though warm runs of each beat Konclude's time, which item 709
+follows. ore_ont_9855 takes 0.5 s on the laptop against Konclude's 1.3 s.
 
 The references disagree on two files of the set. On ore_ont_15516, Konclude's parsers all
 failed at the first SWRL rule and it classified an empty ontology. HermiT found the

@@ -1887,6 +1887,25 @@ for the cause. The history's fastest runs do not age, so a text whose costs chan
 writes keeps its earlier mode until the history forgets it, which item 577 covers.
 Item 576 measures other hybrid processors and macOS.
 
+A text that runs quickly in both modes settled on the faster of its first two runs. The
+first run of a text is an automatic cursor and the second is eager, and each meets its
+mode's code and data for the first time. On atlas, a warm cursor answered the synthetic
+`expr-bind-group` in 0.41 ms of execution and a warm eager run in 0.65 ms, but with the
+correlation-aware estimates of item 454 the first cursor run took about 0.2 ms longer, a
+median of 1.19 ms of server time, and lost to the first eager run in most fresh servers.
+Those servers answered the query eagerly for their whole life, and the Namespace screen of
+that batch read it at 1.465 of main. The history now counts the runs of each mode, up to
+two. When both modes' fastest runs are quick and the run just recorded is quick, the next
+run goes to the slower mode while it has run only once, and the earlier rules decide
+after that. A text therefore runs at most twice in its slower mode, and a slow run, an
+eager failure, an ASK and the eager trial keep their earlier rules. Every fresh server of
+the fix answered `expr-bind-group` as a cursor from its fifth request on, while 29 of 32
+servers of a build of main answered it eagerly in one A/B on atlas. The fix ran it at
+0.620 of main on atlas and 0.852 on Namespace, with the 30 queries of the screen at a
+geometric mean of 0.956. The
+[synthetic results](../benchmarks/synthetic/RESULTS.md#execution-mode-of-quick-texts-in-fresh-servers)
+give the measurements. Item 708 looks for the cold cost of the first query after 454.
+
 ### Request placement under concurrent load
 
 Item 583 measured the placement of item 449 under the mixed load of `scripts/bench.sh` on

@@ -6,21 +6,68 @@
   // entity and never the whole ontology. The landing page reads the header and counts by
   // SPARQL and the roots from the hierarchy route. The components come from
   // lib/components/browse, and this page only lays them out.
-  import { goto } from '$app/navigation';
+  import { beforeNavigate, goto } from '$app/navigation';
   import { base } from '$app/paths';
   import { page } from '$app/state';
+  import { onMount, tick, untrack } from 'svelte';
   import * as api from '$lib/api';
-  import { app } from '$lib/app.svelte';
-  import { branchParam, branchPath, onBranch } from '$lib/branches';
+  import { app, toasts } from '$lib/app.svelte';
+  import { auth } from '$lib/auth.svelte';
+  import { branchParam, branchPath, MAIN, onBranch } from '$lib/branches';
+  import {
+    annotationsOp,
+    inGraph,
+    isAnnotation,
+    parentRows,
+    parentsEditable,
+    toAnnotation,
+    statementKey,
+    withAssertions,
+    type DefinitionDraft,
+    type EditMode,
+    type OnEdit,
+  } from '$lib/browse-edit';
+  import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
+  import { launcher, useCommands } from '$lib/launcher.svelte';
+  import type { NameOption } from '$lib/manchester-complete';
+  import {
+    describeAxiom,
+    iriName,
+    KIND_SINGULAR,
+    parseManchester,
+    usedQuery,
+    type AxiomInput,
+    type ParseAs,
+  } from '$lib/ontology';
+  import {
+    detailsQuery,
+    linkEdit,
+    MAPPING_NAME,
+    MAPPINGS,
+    parseDetails,
+    SESSION_PREFIX,
+    type Details,
+  } from '$lib/skos';
+  import AnnotationRows from '$components/AnnotationRows.svelte';
+  import OntoPreview from '$components/OntoPreview.svelte';
+  import SkosLabels from '$components/SkosLabels.svelte';
+  import SkosLinks from '$components/SkosLinks.svelte';
+  import AxiomEditor from '$components/browse/AxiomEditor.svelte';
+  import DefinitionField from '$components/browse/DefinitionField.svelte';
+  import EditBar from '$components/browse/EditBar.svelte';
+  import ParentEditor from '$components/browse/ParentEditor.svelte';
+  import SynonymEditor from '$components/browse/SynonymEditor.svelte';
   import {
     axiomGroups,
     browseHref,
     builtIn,
     countsQuery,
     definitionsQuery,
+    DEFINITION_PROPS,
     displayName,
     downloadHref,
     editHref,
+    editorKindOf,
     fetchHierarchy,
     fetchTerm,
     headGraphsQuery,
@@ -36,6 +83,7 @@
     parseDefinitions,
     parseReuse,
     reuseQuery,
+    SYNONYM_KINDS,
     termSections,
     treeKindOf,
     treeWords,
@@ -53,7 +101,6 @@
     type TreeNode,
   } from '$lib/browse';
   import type { EntitySearchKind } from '$lib/entity-search';
-  import { iriName } from '$lib/ontology';
   import { WELL_KNOWN } from '$lib/rdf';
   import Icon from '$components/Icon.svelte';
   import DownloadButtons from '$components/browse/DownloadButtons.svelte';
@@ -85,7 +132,9 @@
   const graph = $derived(q.get('graph') || null);
   const at = $derived(q.get('at') || null);
   const iri = $derived(q.get('iri') || null);
-  const view = $derived(q.get('view') === 'graph' ? 'graph' : 'tree');
+  /** The address asks for edit mode, which holds only for a caller who may edit (below). */
+  const wantEdit = $derived(q.get('edit') === '1');
+  const view = $derived(q.get('view') === 'graph' && !wantEdit ? 'graph' : 'tree');
   const sel = $derived<BrowseSelection>({ graph, at });
   const prefixes = $derived(app.prefixes(name));
   const langs: readonly string[] = typeof navigator === 'undefined' ? [] : [...navigator.languages];
@@ -96,7 +145,7 @@
     if (name) void app.loadPrefixes(name);
   });
 
-  const keep = $derived({ graph, branch, at });
+  const keep = $derived.by(() => ({ graph, branch, at, edit: editing ? '1' : null }));
   const hrefOf = (i: string | null, extra: Record<string, string | null> = {}) =>
     browseHref(base, name, i, { ...keep, ...extra });
 
@@ -115,13 +164,16 @@
     loading: false,
   });
 
+  // the page reads again when the target, graph, state or entity change, and not when
+  // only the view or edit mode does
   $effect(() => {
     const t = target;
-    const s = sel;
+    const g = graph;
+    const a = at;
     const i = iri;
     if (!t || !i) return;
     const ctl = new AbortController();
-    void loadTerm(t, s, i, ctl.signal);
+    untrack(() => void loadTerm(t, { graph: g, at: a }, i, ctl.signal));
     return () => ctl.abort();
   });
 
@@ -144,6 +196,7 @@
     }
     if (signal.aborted) return;
     term = got;
+    termTarget = t;
     piece = neighbourhood(got, prefixes);
     graphEpoch++;
     const kind = treeKindOf(got.kinds);
@@ -332,6 +385,485 @@
     return branch ? `${h}&branch=${encodeURIComponent(branch)}` : h;
   });
 
+  // --- edit mode (ROADMAP item 630) ------------------------------------------------------
+  // A caller with write access switches the page into edit mode (`edit=1`), where its
+  // sections become the editors' forms. Every change is one operation that OntoPreview
+  // runs as a dry run with the term's entity tag and then commits, and EditSession keeps
+  // the undo stack under the editors' own keys, so a tab shares it with the editor.
+  /** The target the shown term was read from, for the live refresh. */
+  let termTarget = $state('');
+  const mode = $derived<EditMode>(isSkos ? 'skos' : 'owl');
+  const editorKind = $derived(term ? editorKindOf(term.kinds) : null);
+  const canWrite = $derived(auth.loaded && auth.can(name, 'write'));
+  /** Edit mode needs write access, a branch head (not a past state) and the term's tag. */
+  const canEdit = $derived(
+    canWrite && !at && !!term?.etag && (isSkos || (!!editorKind && editorKind !== 'Datatype')),
+  );
+  const editing = $derived(wantEdit && canEdit);
+  // a caller who may not edit keeps no `edit=1` in the address
+  $effect(() => {
+    if (wantEdit && term && auth.loaded && !canEdit) setEdit(false);
+  });
+
+  let branchList = $state<api.Branch[]>([]);
+  $effect(() => {
+    if (!editing || !name) return;
+    const n = name;
+    api.branches(n).then(
+      (r) => {
+        if (n === name) branchList = r.branches;
+      },
+      () => (branchList = []),
+    );
+  });
+  const protectedBranch = $derived(
+    !!branchList.find((b) => b.name === (branch ?? MAIN))?.protected,
+  );
+  /** The forms are read-only outside edit mode and on a protected branch. */
+  const readonly = $derived(!editing || protectedBranch);
+  const editorName = $derived(isSkos ? 'Thesaurus' : 'Ontology');
+
+  function setEdit(on: boolean) {
+    const u = new URL(page.url);
+    if (on) {
+      u.searchParams.set('edit', '1');
+      u.searchParams.delete('view');
+    } else u.searchParams.delete('edit');
+    void goto(u, { replaceState: true, noScroll: true, keepFocus: true });
+  }
+  /** Whether a form holds a change that is not previewed yet. */
+  const unsaved = () =>
+    typeof document !== 'undefined' &&
+    !!document.querySelector('[data-edit-form][data-dirty="true"]');
+  function leaveEdit() {
+    if (unsaved() && !confirm('Leave edit mode and discard the changes you have not previewed?'))
+      return;
+    session.notice = null;
+    setEdit(false);
+  }
+  beforeNavigate((nav) => {
+    if (!editing || !unsaved() || nav.type === 'leave') return;
+    const to = nav.to?.url;
+    // a change of view or mode keeps the forms; another entity, dataset, branch, graph,
+    // state or page does not
+    const same = (k: string) => to?.searchParams.get(k) === page.url.searchParams.get(k);
+    if (
+      to &&
+      to.pathname === page.url.pathname &&
+      ['ds', 'iri', 'branch', 'graph', 'at', 'imports'].every(same)
+    )
+      return;
+    if (!confirm('Leave this page and discard the changes you have not previewed?')) nav.cancel();
+  });
+  onMount(() => {
+    const unload = (e: BeforeUnloadEvent) => {
+      if (editing && unsaved()) e.preventDefault();
+    };
+    window.addEventListener('beforeunload', unload);
+    return () => window.removeEventListener('beforeunload', unload);
+  });
+
+  let sessionError = $state<string | null>(null);
+  async function startSession() {
+    sessionError = null;
+    try {
+      const n = await startSessionBranch(name, {
+        from: branch,
+        branches: branchList,
+        user: auth.who?.principal?.name,
+        prefix: isSkos ? SESSION_PREFIX : 'onto',
+        note: isSkos ? 'thesaurus editing session' : 'ontology editing session',
+      });
+      await goto(
+        browseHref(base, name, iri, { ...keep, branch: n === MAIN ? null : n, edit: '1' }),
+      );
+    } catch (e) {
+      sessionError = api.errorMessage(e);
+    }
+  }
+
+  /** Read the entity again after a commit, in place, keeping the forms' text. */
+  async function refresh() {
+    const t = target;
+    const s = sel;
+    const i = iri;
+    if (!t || !i) return;
+    try {
+      const got = await fetchTerm(t, s, i);
+      if (t !== target || i !== iri) return;
+      term = got;
+      termTarget = t;
+      const kind = treeKindOf(got.kinds);
+      treeKind = kind;
+      if (kind) {
+        const h = await fetchHierarchy(t, s, { kind, iri: i, ancestors: true, limit: 50 });
+        if (t === target && i === iri) tree = h;
+      }
+    } catch (e) {
+      toasts.error('Could not read the entity again', e);
+    }
+  }
+
+  const session = new EditSession({
+    reload: refresh,
+    staleText: 'Another commit landed since the page read this entity.',
+  });
+  $effect(() => {
+    const k = `sparkles.${mode === 'skos' ? 'skos' : 'onto'}.undo.${target}|${graph ?? ''}`;
+    untrack(() => session.reset(k));
+  });
+  $effect(() => {
+    if (!editing) return;
+    const t = target;
+    return session.follow(
+      t,
+      () => term?.commit ?? 0,
+      () => !!term && termTarget === t,
+    );
+  });
+  onMount(() => session.keys(() => readonly || session.previewOpen || launcher.open));
+  const onedit: OnEdit = (op, label, after) => session.edit(op, label, after);
+  const describe = (a: AxiomInput) =>
+    describeAxiom(a, (i) => displayName(i, term?.names, prefixes), prefixes);
+
+  // the thesaurus editor's reading of a SKOS resource, for its labels and links
+  // kept with the target, graph and entity it was read for, so the forms never pair one
+  // concept's labels with another's IRI and tag, and read again at each commit, dropping a
+  // superseded answer; the forms stay mounted across a commit so their drafts survive
+  let read = $state<{ key: string; commit: number; details: Details } | null>(null);
+  let detailsTry = $state(0);
+  const detailsKey = $derived(
+    term && termTarget ? JSON.stringify([termTarget, graph, term.iri]) : '',
+  );
+  const details = $derived(read && read.key === detailsKey ? read.details : null);
+  $effect(() => {
+    if (!editing || !isSkos || !term || !detailsKey) return;
+    const key = detailsKey;
+    const t = termTarget!;
+    const r = term.iri;
+    const g = graph;
+    const commit = term.commit;
+    void detailsTry;
+    let live = true;
+    api.select(t, detailsQuery(r, g), { nocache: true }).then(
+      (rows) => {
+        if (live && key === detailsKey) read = { key, commit, details: parseDetails(r, rows) };
+      },
+      (e) => {
+        if (live) toasts.error('Could not read the labels', e);
+      },
+    );
+    return () => (live = false);
+  });
+  /**
+   * A SKOS edit built from the details, previewed only when they were read at the commit the
+   * page shows, so a label another writer changed is never replaced by its old reading.
+   */
+  function skosEdit(sparql: string, label: string) {
+    if (!read || !term || read.commit !== term.commit) {
+      toasts.push(
+        'info',
+        'Reading the labels again',
+        'Another commit changed this concept. Try again in a moment.',
+      );
+      detailsTry++;
+      return false;
+    }
+    onedit({ kind: 'update', sparql }, label);
+    return true;
+  }
+  const skosLangs = $derived([
+    ...new Set([
+      ...(details?.labels ?? []).map((l) => l.label.lang).filter(Boolean),
+      ...langs.map((l) => l.split('-')[0].toLowerCase()),
+    ]),
+  ] as string[]);
+  const picker = $derived({ target, dataset: name, graph, prefixes, langs });
+  /** The mapping kinds the caller chose to add, shown before they have a mapping. */
+  let addedMappings = $state<string[]>([]);
+  $effect(() => {
+    void iri;
+    addedMappings = [];
+  });
+  const linkWord = (p: string) =>
+    p === 'broader' || p === 'narrower' || p === 'related'
+      ? p
+      : (MAPPING_NAME[p] ?? p).toLowerCase();
+  function addLink(property: string, other: string, picked?: string) {
+    if (!term) return;
+    skosEdit(
+      linkEdit(term.iri, property, other, false, graph),
+      `Add ${picked ?? linker.name(other)} as ${linkWord(property)} of ${title}`,
+    );
+  }
+  function removeLink(property: string, other: string) {
+    if (!term) return;
+    skosEdit(
+      linkEdit(term.iri, property, other, true, graph),
+      `Remove ${linker.name(other)} as ${linkWord(property)} of ${title}`,
+    );
+  }
+
+  /** The statements with the annotation assertions that state them in the edited graph. */
+  const stated = $derived(
+    term ? withAssertions(term.iri, term.statements, term.axioms, graph) : [],
+  );
+  /** The definitions, the edited graph's first, then the others. */
+  const definitions = $derived(
+    term
+      ? stated
+          .filter((s) => DEFINITION_PROPS.includes(s.property))
+          .sort((a, b) => Number(inGraph(b, graph)) - Number(inGraph(a, graph)))
+      : [],
+  );
+  /**
+   * Drafts of definitions that another writer's commit changed while they were typed, each
+   * shown as a definition of its own until it is previewed or cancelled.
+   */
+  let orphans = $state<{ id: number; draft: DefinitionDraft }[]>([]);
+  let orphanId = 0;
+  function keepOrphan(draft: DefinitionDraft) {
+    if (editing && term?.iri === iri) orphans = [...orphans, { id: ++orphanId, draft }];
+  }
+  const dropOrphan = (id: number) => (orphans = orphans.filter((o) => o.id !== id));
+  $effect(() => {
+    void iri;
+    if (!editing) untrack(() => (orphans = []));
+  });
+  let addingDefinition = $state(false);
+  const synonymStatements = $derived(
+    stated.filter((s) => SYNONYM_KINDS.some(([p]) => p === s.property)),
+  );
+  const owned = new Set([...DEFINITION_PROPS, ...SYNONYM_KINDS.map(([p]) => p)]);
+  const annotationStatements = $derived(
+    stated.filter((s) => isAnnotation(s, owned, (p) => term?.names[p]?.kinds)),
+  );
+  const ownAnnotations = $derived(annotationStatements.filter((s) => inGraph(s, graph)));
+  const annotationProperties = $derived(
+    term
+      ? Object.entries(term.names)
+          .filter(([, n]) => n.kinds.includes('annotationProperty'))
+          .map(([i]) => i)
+      : [],
+  );
+  const shortName = (i: string) => term?.names[i]?.label ?? iriName(i, prefixes);
+  const parents = $derived(
+    term && tree?.ancestors && treeKind && parentsEditable(treeKind)
+      ? parentRows(treeKind, term.iri, tree.ancestors.edges, term.axioms, graph)
+      : [],
+  );
+  const completionNames = $derived.by(() => {
+    const out: NameOption[] = [];
+    for (const [i, n] of Object.entries(term?.names ?? {})) {
+      const k = editorKindOf(n.kinds);
+      if (!k) continue;
+      const kind = KIND_SINGULAR[k];
+      const shown = n.label ?? n.shortForm ?? iriName(i, prefixes);
+      out.push({ name: shown, iri: i, kind });
+      const short = iriName(i, prefixes);
+      if (short !== shown) out.push({ name: short, iri: i, kind });
+    }
+    return out;
+  });
+  const parse = (text: string, as: ParseAs) =>
+    parseManchester(target, { graph, imports: true }, text, as);
+  const defaultLang = $derived(
+    (
+      sections?.definition?.lang ??
+      term?.labelLang ??
+      langs[0]?.split('-')[0] ??
+      'en'
+    ).toLowerCase(),
+  );
+
+  // --- the keyboard and the palette ------------------------------------------------------
+  /** Press the Preview button of the form that holds focus, or of the only changed form. */
+  function previewForm() {
+    const active = document.activeElement;
+    const here = active?.closest<HTMLElement>('[data-edit-form]') ?? null;
+    // focus in a field of another form previews nothing rather than some other change
+    if (!here && active?.closest('input, textarea, select, [contenteditable], .cm-editor')) return;
+    const changed = [
+      ...document.querySelectorAll<HTMLElement>('[data-edit-form][data-dirty="true"]'),
+    ];
+    const form = here ?? (changed.length === 1 ? changed[0] : null);
+    const b = form?.querySelector<HTMLButtonElement>('[data-preview]');
+    if (b && !b.disabled) b.click();
+    else if (!form && changed.length > 1)
+      toasts.push('info', 'Several forms have changes', 'Click into the one to preview first.');
+  }
+  /** Enter edit mode if needed, then focus the add field of a section. */
+  async function focusAdd(which: 'synonym' | 'parent' | 'axiom') {
+    if (!editing) setEdit(true);
+    for (let i = 0; i < 40; i++) {
+      await tick();
+      const el = addField(which);
+      if (el) {
+        el.scrollIntoView({ block: 'center' });
+        el.focus();
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+  function addField(which: 'synonym' | 'parent' | 'axiom'): HTMLElement | null {
+    if (which === 'axiom') return document.querySelector('#browse-add-axiom .cm-content');
+    if (which === 'parent') {
+      if (!isSkos) return document.getElementById('browse-add-parent');
+      const b = document.querySelector<HTMLButtonElement>(
+        '[data-section="broader"] button[aria-label="Add broader"]',
+      );
+      b?.click();
+      return b ? document.querySelector('[data-section="broader"] input') : null;
+    }
+    if (!isSkos) return document.getElementById('browse-add-synonym');
+    const form = document.querySelector('form[aria-label="Add a label"]');
+    const kindSel = form?.querySelector<HTMLSelectElement>('select');
+    if (kindSel && kindSel.value !== 'alt') {
+      kindSel.value = 'alt';
+      kindSel.dispatchEvent(new Event('change'));
+    }
+    return form?.querySelector<HTMLElement>('input[aria-label="Label"]') ?? null;
+  }
+  const inText = (el: EventTarget | null) => {
+    const e = el as HTMLElement | null;
+    return (
+      !!e &&
+      (e.tagName === 'INPUT' ||
+        e.tagName === 'TEXTAREA' ||
+        e.tagName === 'SELECT' ||
+        e.isContentEditable ||
+        !!e.closest?.('.cm-editor'))
+    );
+  };
+  /** A dialog or the palette has the keyboard. */
+  const covered = () => launcher.open || !!document.querySelector('dialog[open]');
+  onMount(() => {
+    const key = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || covered()) return;
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 's') {
+        if (!editing) return;
+        e.preventDefault();
+        previewForm();
+        return;
+      }
+      if (mod || e.altKey || inText(e.target)) return;
+      if (e.key === 'Escape' && editing) {
+        e.preventDefault();
+        leaveEdit();
+        return;
+      }
+      if (e.shiftKey || !term || !canEdit) return;
+      const k = e.key.toLowerCase();
+      if (k === 'e' && !editing) {
+        e.preventDefault();
+        setEdit(true);
+      } else if (k === 's') {
+        e.preventDefault();
+        void focusAdd('synonym');
+      } else if (k === 'p' && (isSkos ? treeKind === 'concept' : parentsEditable(treeKind))) {
+        e.preventDefault();
+        void focusAdd('parent');
+      } else if (k === 'a' && !isSkos) {
+        e.preventDefault();
+        void focusAdd('axiom');
+      }
+    };
+    window.addEventListener('keydown', key);
+    return () => window.removeEventListener('keydown', key);
+  });
+  useCommands(() => [
+    {
+      id: 'browse.edit',
+      label: 'Edit this page',
+      icon: 'pencil',
+      shortcut: 'E',
+      keywords: ['edit', 'change', 'curate'],
+      active: () => !!iri && canEdit && !editing,
+      run: () => setEdit(true),
+    },
+    {
+      id: 'browse.done',
+      label: 'Leave edit mode',
+      icon: 'check',
+      shortcut: 'Escape',
+      keywords: ['done', 'stop editing'],
+      active: () => editing,
+      run: leaveEdit,
+    },
+    {
+      id: 'browse.preview',
+      label: 'Preview change',
+      icon: 'check',
+      shortcut: 'Mod+S',
+      keywords: ['save', 'commit'],
+      active: () => editing && unsaved(),
+      run: () => void tick().then(previewForm),
+    },
+    {
+      id: 'browse.undo',
+      label: 'Undo',
+      icon: 'stepBack',
+      shortcut: 'Mod+Z',
+      active: () => editing && !readonly && session.done.length > 0,
+      run: () => session.undoLast(),
+    },
+    {
+      id: 'browse.redo',
+      label: 'Redo',
+      icon: 'stepForward',
+      shortcut: 'Mod+Shift+Z',
+      active: () => editing && !readonly && session.undone.length > 0,
+      run: () => session.redoLast(),
+    },
+    {
+      id: 'browse.synonym',
+      label: 'Add synonym',
+      icon: 'plus',
+      shortcut: 'S',
+      keywords: ['label', 'alternative'],
+      active: () => !!iri && canEdit,
+      run: () => void focusAdd('synonym'),
+    },
+    {
+      id: 'browse.parent',
+      label: 'Add parent',
+      icon: 'plus',
+      shortcut: 'P',
+      keywords: ['superclass', 'broader', 'hierarchy'],
+      active: () =>
+        !!iri && canEdit && (isSkos ? treeKind === 'concept' : parentsEditable(treeKind)),
+      run: () => void focusAdd('parent'),
+    },
+    {
+      id: 'browse.axiom',
+      label: 'Add axiom',
+      icon: 'plus',
+      shortcut: 'A',
+      keywords: ['logical definition', 'manchester'],
+      active: () => !!iri && canEdit && !isSkos,
+      run: () => void focusAdd('axiom'),
+    },
+    {
+      id: 'browse.session',
+      label: 'Start session',
+      icon: 'branch',
+      keywords: ['edit', 'branch'],
+      subtitle: 'Edit on a branch of your own, then merge it',
+      active: () => editing && !branch,
+      run: startSession,
+    },
+    {
+      id: 'browse.editor',
+      label: 'Open in the full editor',
+      icon: 'tree',
+      keywords: ['ontology', 'thesaurus', 'editor'],
+      active: () => !!term,
+      run: () => void goto(editLink),
+    },
+  ]);
+
   // --- the landing page ----------------------------------------------------------------
   let head = $state<{ head: OntologyHead; scheme: boolean } | null>(null);
   let counts = $state<{ kind: string; label: string; count: number }[]>([]);
@@ -345,10 +877,11 @@
 
   $effect(() => {
     const t = target;
-    const s = sel;
+    const g = graph;
+    const a = at;
     if (!t || iri) return;
     const ctl = new AbortController();
-    void loadLanding(t, s, ctl.signal);
+    untrack(() => void loadLanding(t, { graph: g, at: a }, ctl.signal));
     return () => ctl.abort();
   });
 
@@ -475,7 +1008,30 @@
     {:else if !term || !sections}
       <div class="page-container"><p class="faint" aria-live="polite">Loading…</p></div>
     {:else}
-      <div class="browse" class:graph={view === 'graph'} data-kind={treeKind ?? 'none'}>
+      {#if editing}
+        <EditBar
+          variant="top"
+          branch={branch ?? MAIN}
+          {protectedBranch}
+          canSession={!branch}
+          undoLabel={session.done.at(-1)?.label ?? null}
+          redoLabel={session.undone.at(-1)?.label ?? null}
+          notice={session.notice}
+          error={sessionError}
+          editorHref={editLink}
+          {editorName}
+          onundo={() => session.undoLast()}
+          onredo={() => session.redoLast()}
+          onsession={startSession}
+          ondone={leaveEdit}
+        />
+      {/if}
+      <div
+        class="browse"
+        class:graph={view === 'graph'}
+        class:editing
+        data-kind={treeKind ?? 'none'}
+      >
         <div class="b-head">
           <TermHeader
             name={term}
@@ -485,7 +1041,7 @@
               { label: ontologyName, href: hrefOf(null) },
               { label: plural[kind] ?? 'Entities', href: null },
             ]}
-            definition={sections.definition}
+            definition={editing ? null : sections.definition}
             replacedBy={iris(OBO + 'IAO_0100001')}
             consider={values(OIO + 'consider')
               .map((v) => valueText(v))
@@ -494,7 +1050,7 @@
             {curieIri}
           >
             {#snippet actions()}
-              {#if !treeKind}
+              {#if !treeKind && !editing}
                 {#if view === 'graph'}
                   <a class="btn sm" href={hrefOf(iri)} data-sveltekit-noscroll
                     ><Icon name="book" size={14} />Page</a
@@ -508,9 +1064,83 @@
               <a class="btn sm" href={exploreHref}
                 ><Icon name="explore" size={14} />Open in Explore</a
               >
-              <a class="btn sm" href={editLink}><Icon name="pencil" size={14} />Edit</a>
+              {#if canEdit && !editing}
+                <button
+                  type="button"
+                  class="btn sm"
+                  aria-pressed="false"
+                  title="Edit this page (E)"
+                  onclick={() => setEdit(true)}><Icon name="pencil" size={14} />Edit</button
+                >
+              {/if}
             {/snippet}
           </TermHeader>
+          {#if editing}
+            <div class="defs" aria-label="Definitions" role="group">
+              {#each definitions as d (statementKey(d))}
+                {#if inGraph(d, graph)}
+                  <DefinitionField
+                    {mode}
+                    iri={term.iri}
+                    {title}
+                    before={d}
+                    {graph}
+                    {readonly}
+                    {onedit}
+                    onorphan={keepOrphan}
+                  />
+                {:else}
+                  <p class="def-ro">
+                    {valueText(d.value)}
+                    <span class="from">from {d.graph}, not editable here</span>
+                  </p>
+                {/if}
+              {/each}
+              {#each orphans as o (o.id)}
+                <DefinitionField
+                  {mode}
+                  iri={term.iri}
+                  {title}
+                  before={null}
+                  {graph}
+                  initial={o.draft}
+                  note="Another commit changed this definition while you typed. Preview adds your text as a definition of its own."
+                  {readonly}
+                  onedit={(op, label, after) =>
+                    onedit(op, label, () => {
+                      after?.();
+                      dropOrphan(o.id);
+                    })}
+                  oncancel={() => dropOrphan(o.id)}
+                />
+              {/each}
+              {#if addingDefinition || !definitions.some((d) => inGraph(d, graph))}
+                <DefinitionField
+                  {mode}
+                  iri={term.iri}
+                  {title}
+                  before={null}
+                  {graph}
+                  lang={defaultLang}
+                  {readonly}
+                  onedit={(op, label, after) =>
+                    onedit(op, label, () => {
+                      after?.();
+                      addingDefinition = false;
+                    })}
+                  oncancel={addingDefinition ? () => (addingDefinition = false) : undefined}
+                  autofocus={addingDefinition}
+                />
+              {:else if !readonly}
+                <button
+                  type="button"
+                  class="btn sm ghost add-def"
+                  onclick={() => (addingDefinition = true)}
+                  ><Icon name="plus" size={14} />Add a definition in another language</button
+                >
+              {/if}
+            </div>
+          {/if}
         </div>
 
         {#if treeKind}
@@ -518,18 +1148,65 @@
             <div class="tree-head">
               <h2>Hierarchy</h2>
               <span class="spacer"></span>
-              <span class="seg" role="group" aria-label="View">
-                <a
-                  href={hrefOf(term.iri)}
-                  aria-current={view === 'tree' ? 'true' : undefined}
-                  data-sveltekit-noscroll>Tree</a
-                ><a
-                  href={hrefOf(term.iri, { view: 'graph' })}
-                  aria-current={view === 'graph' ? 'true' : undefined}
-                  data-sveltekit-noscroll>Graph</a
-                >
-              </span>
+              {#if !editing}
+                <span class="seg" role="group" aria-label="View">
+                  <a
+                    href={hrefOf(term.iri)}
+                    aria-current={view === 'tree' ? 'true' : undefined}
+                    data-sveltekit-noscroll>Tree</a
+                  ><a
+                    href={hrefOf(term.iri, { view: 'graph' })}
+                    aria-current={view === 'graph' ? 'true' : undefined}
+                    data-sveltekit-noscroll>Graph</a
+                  >
+                </span>
+              {/if}
             </div>
+            {#if editing && isSkos && treeKind === 'concept'}
+              <div class="skos-parents">
+                <SkosLinks
+                  title="Broader"
+                  id="broader"
+                  links={details?.broader ?? []}
+                  name={(i) => linker.name(i)}
+                  sub={(i) => linker.short(i)}
+                  {readonly}
+                  paired
+                  {picker}
+                  onopen={(i) => void goto(hrefOf(i))}
+                  onadd={(i, n) => addLink('broader', i, n)}
+                  onremove={(i) => removeLink('broader', i)}
+                  onrepair={(l) => addLink('broader', l.iri)}
+                />
+                <SkosLinks
+                  title="Narrower"
+                  id="narrower"
+                  links={details?.narrower ?? []}
+                  name={(i) => linker.name(i)}
+                  sub={(i) => linker.short(i)}
+                  {readonly}
+                  paired
+                  {picker}
+                  onopen={(i) => void goto(hrefOf(i))}
+                  onadd={(i, n) => addLink('narrower', i, n)}
+                  onremove={(i) => removeLink('narrower', i)}
+                  onrepair={(l) => addLink('narrower', l.iri)}
+                />
+              </div>
+            {:else if editing && parentsEditable(treeKind)}
+              <ParentEditor
+                kind={treeKind}
+                iri={term.iri}
+                {title}
+                rows={parents}
+                {linker}
+                {target}
+                {graph}
+                {prefixes}
+                {readonly}
+                {onedit}
+              />
+            {/if}
             {#if tree}
               <LineageTree
                 {target}
@@ -559,48 +1236,181 @@
           </div>
         {:else}
           <div class="b-article">
-            <TermLogic {groups} {linker} {prefixes} />
-            <TermSynonyms synonyms={sections.synonyms} {linker} />
-            <TermNotes
-              notes={sections.otherDefinitions.length
-                ? [
-                    { kind: 'Definition in other languages', values: sections.otherDefinitions },
-                    ...sections.notes,
-                  ]
-                : sections.notes}
-              {linker}
-              {langs}
-              {curieIri}
-            />
-            <TermLabels labels={sections.labels} />
-            {#if sections.related.length}
-              <section class="term-sec" aria-labelledby="rel-h">
-                <h2 id="rel-h">
-                  Related concepts <span class="count-badge">{sections.related.length}</span>
+            {#if editing}
+              {#if !isSkos && editorKind}
+                <AxiomEditor
+                  {groups}
+                  kind={editorKind}
+                  iri={term.iri}
+                  {title}
+                  {linker}
+                  {prefixes}
+                  {graph}
+                  {readonly}
+                  names={() => completionNames}
+                  {parse}
+                  {onedit}
+                />
+                <SynonymEditor
+                  iri={term.iri}
+                  {title}
+                  synonyms={synonymStatements}
+                  kinds={SYNONYM_KINDS}
+                  {graph}
+                  lang={defaultLang}
+                  {readonly}
+                  {onedit}
+                />
+              {:else if details}
+                <section class="term-sec labels-edit" aria-labelledby="labels-edit-h">
+                  <h2 id="labels-edit-h">Labels and synonyms</h2>
+                  <!-- the editor's label table is wider than a phone, so it scrolls in place -->
+                  <div class="labels-scroll">
+                    <SkosLabels
+                      iri={term.iri}
+                      name={title}
+                      entries={details.labels}
+                      {graph}
+                      langs={skosLangs}
+                      {readonly}
+                      onedit={skosEdit}
+                      scope={`${target}|${graph ?? ''}`}
+                      isUsed={async (i) => {
+                        const r = await api.query(target, usedQuery(i, graph), { nocache: true });
+                        return !!r.boolean;
+                      }}
+                    />
+                  </div>
+                </section>
+                <section class="term-sec links-edit" aria-labelledby="links-edit-h">
+                  <h2 id="links-edit-h">Related concepts and mappings</h2>
+                  <SkosLinks
+                    title="Related"
+                    id="related"
+                    links={details.related}
+                    name={(i) => linker.name(i)}
+                    sub={(i) => linker.short(i)}
+                    {readonly}
+                    paired
+                    {picker}
+                    onopen={(i) => void goto(hrefOf(i))}
+                    onadd={(i, n) => addLink('related', i, n)}
+                    onremove={(i) => removeLink('related', i)}
+                    onrepair={(l) => addLink('related', l.iri)}
+                  />
+                  {#each MAPPINGS.filter((m) => addedMappings.includes(m) || details?.mappings.some((x) => x.property === m)) as m (m)}
+                    <SkosLinks
+                      title={MAPPING_NAME[m]}
+                      id={m}
+                      links={details.mappings
+                        .filter((x) => x.property === m)
+                        .map((x) => ({ iri: x.target, forward: true, inverse: true }))}
+                      name={(i) => linker.name(i)}
+                      sub={(i) => linker.short(i)}
+                      {readonly}
+                      {picker}
+                      onopen={(i) => void goto(hrefOf(i))}
+                      onadd={(i, n) => addLink(m, i, n)}
+                      onremove={(i) => removeLink(m, i)}
+                    />
+                  {/each}
+                  {#if !readonly && MAPPINGS.some((m) => !addedMappings.includes(m) && !details?.mappings.some((x) => x.property === m))}
+                    <label class="add-map">
+                      <span class="sr-only">Add a mapping</span>
+                      <select
+                        class="select sm"
+                        value=""
+                        onchange={(e) => {
+                          const m = e.currentTarget.value;
+                          e.currentTarget.value = '';
+                          if (m) addedMappings = [...addedMappings, m];
+                        }}
+                      >
+                        <option value="">Add a mapping…</option>
+                        {#each MAPPINGS.filter((m) => !addedMappings.includes(m) && !details?.mappings.some((x) => x.property === m)) as m (m)}
+                          <option value={m}>{MAPPING_NAME[m]}</option>
+                        {/each}
+                      </select>
+                    </label>
+                  {/if}
+                </section>
+              {:else}
+                <p class="faint" aria-live="polite">Loading the labels…</p>
+              {/if}
+              <section class="term-sec" aria-labelledby="ann-edit-h">
+                <h2 id="ann-edit-h">
+                  Annotations {#if ownAnnotations.length}<span class="count-badge"
+                      >{ownAnnotations.length}</span
+                    >{/if}
                 </h2>
-                <div class="term-flow">
-                  {#each sections.related as r (r)}<a href={linker.href(r)}>{linker.name(r)}</a
-                    >{/each}
-                </div>
+                <p class="sec-note">
+                  {isSkos ? 'Notes' : 'The label, comments, cross-references'} and the other annotations.
+                  The definition and {isSkos ? 'labels' : 'synonyms'} are edited above.
+                </p>
+                <AnnotationRows
+                  annotations={ownAnnotations.map(toAnnotation)}
+                  name={shortName}
+                  {prefixes}
+                  properties={annotationProperties}
+                  {readonly}
+                  label={title}
+                  onchange={(next, what) => {
+                    if (!term) return;
+                    const op = annotationsOp(mode, term.iri, ownAnnotations, next, graph);
+                    if (op) onedit(op, what);
+                  }}
+                />
+                {#if annotationStatements.length > ownAnnotations.length}
+                  <p class="sec-note">
+                    {annotationStatements.length - ownAnnotations.length} more come from other graphs
+                    and are not editable here.
+                  </p>
+                {/if}
               </section>
+            {:else}
+              <TermLogic {groups} {linker} {prefixes} />
+              <TermSynonyms synonyms={sections.synonyms} {linker} />
+              <TermNotes
+                notes={sections.otherDefinitions.length
+                  ? [
+                      { kind: 'Definition in other languages', values: sections.otherDefinitions },
+                      ...sections.notes,
+                    ]
+                  : sections.notes}
+                {linker}
+                {langs}
+                {curieIri}
+              />
+              <TermLabels labels={sections.labels} />
+              {#if sections.related.length}
+                <section class="term-sec" aria-labelledby="rel-h">
+                  <h2 id="rel-h">
+                    Related concepts <span class="count-badge">{sections.related.length}</span>
+                  </h2>
+                  <div class="term-flow">
+                    {#each sections.related as r (r)}<a href={linker.href(r)}>{linker.name(r)}</a
+                      >{/each}
+                  </div>
+                </section>
+              {/if}
+              {#if sections.members.length}
+                <section class="term-sec" aria-labelledby="mem-h">
+                  <h2 id="mem-h">
+                    Members <span class="count-badge">{sections.members.length}</span>
+                  </h2>
+                  <div class="term-flow">
+                    {#each sections.members as r (r)}<a href={linker.href(r)}>{linker.name(r)}</a
+                      >{/each}
+                  </div>
+                </section>
+              {/if}
+              <TermXrefs
+                xrefs={sections.xrefs}
+                seeAlso={sections.seeAlso}
+                mappings={sections.mappings}
+                {linker}
+              />
             {/if}
-            {#if sections.members.length}
-              <section class="term-sec" aria-labelledby="mem-h">
-                <h2 id="mem-h">
-                  Members <span class="count-badge">{sections.members.length}</span>
-                </h2>
-                <div class="term-flow">
-                  {#each sections.members as r (r)}<a href={linker.href(r)}>{linker.name(r)}</a
-                    >{/each}
-                </div>
-              </section>
-            {/if}
-            <TermXrefs
-              xrefs={sections.xrefs}
-              seeAlso={sections.seeAlso}
-              mappings={sections.mappings}
-              {linker}
-            />
             <TermUsage
               iri={term.iri}
               groups={mentions}
@@ -619,7 +1429,7 @@
               loading={reuse.loading}
               href={(d) => browseHref(base, d, term?.iri ?? null)}
             />
-            {#if sections.other.length}
+            {#if sections.other.length && !editing}
               <section class="term-sec">
                 <details class="ann">
                   <summary
@@ -805,7 +1615,45 @@
   {/if}
 </div>
 
+{#if editing && term}
+  <EditBar
+    variant="bottom"
+    branch={branch ?? MAIN}
+    {protectedBranch}
+    canSession={!branch}
+    undoLabel={session.done.at(-1)?.label ?? null}
+    redoLabel={session.undone.at(-1)?.label ?? null}
+    notice={session.notice}
+    error={sessionError}
+    editorHref={editLink}
+    {editorName}
+    onundo={() => session.undoLast()}
+    onredo={() => session.redoLast()}
+    onsession={startSession}
+    ondone={leaveEdit}
+  />
+{/if}
+
+<OntoPreview
+  bind:open={session.previewOpen}
+  title={session.previewTitle}
+  {target}
+  sel={{ graph, imports: true }}
+  op={session.previewOp}
+  etag={term?.etag ?? null}
+  head={term?.commit ?? null}
+  {describe}
+  oncommitted={(op, a) => void session.committed(op, a)}
+  onstale={() => void session.stale()}
+/>
+
 <style>
+  .labels-edit {
+    min-width: 0;
+  }
+  .labels-scroll {
+    overflow-x: auto;
+  }
   .wrap {
     container: browse / inline-size;
     min-width: 0;
@@ -1077,5 +1925,67 @@
     margin: 0;
     min-width: 0;
     overflow-wrap: anywhere;
+  }
+
+  /* edit mode (item 630) */
+  .browse.editing {
+    padding-top: var(--sp-5);
+  }
+  .defs {
+    display: grid;
+    gap: var(--sp-4);
+    margin-top: var(--sp-5);
+    min-width: 0;
+  }
+  .def-ro {
+    margin: 0;
+    max-width: 68ch;
+    color: var(--text-2);
+    line-height: 1.6;
+  }
+  .from {
+    font-size: var(--fs-xs);
+    color: var(--text-3);
+    margin-left: 6px;
+  }
+  .add-def {
+    justify-self: start;
+  }
+  .sec-note {
+    font-size: var(--fs-sm);
+    color: var(--text-3);
+    margin: 0 0 var(--sp-2);
+  }
+  .skos-parents {
+    margin: 0 0 var(--sp-4);
+    padding: 0 0 var(--sp-4);
+    border-bottom: 1px solid var(--border);
+  }
+  .links-edit {
+    display: grid;
+    gap: var(--sp-3);
+  }
+  .links-edit h2 {
+    margin-bottom: 0;
+  }
+  .add-map {
+    justify-self: start;
+  }
+  /* on a phone the parents come right after the definition while editing */
+  @container browse (max-width: 639px) {
+    .browse.editing:not([data-kind='none']) {
+      grid-template-areas: 'head' 'tree' 'article' 'info';
+    }
+  }
+  @container browse (min-width: 1040px) {
+    .browse.editing .b-tree {
+      top: calc(var(--gutter) + 56px);
+      max-height: calc(100vh - var(--topbar-h) - 2 * var(--gutter) - 56px);
+    }
+  }
+  @media (max-width: 760px) {
+    .browse.editing {
+      padding-bottom: calc(96px + env(safe-area-inset-bottom));
+    }
   }
 </style>

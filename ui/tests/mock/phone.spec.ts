@@ -24,6 +24,21 @@ async function open(page: Page, name: string | RegExp, role: 'button' | 'tab' = 
   await page.getByRole(role, { name }).first().click();
   await settle(page);
   await expectNoSidewaysScroll(page, `${page.url()} after ${name}`);
+  await expectSheet(page, `${page.url()} after ${name}`);
+}
+
+/** An open dialog (Modal.svelte) docks at the bottom of a phone's screen, full width. */
+async function expectSheet(page: Page, where: string) {
+  const box = await page.evaluate(() => {
+    const d = document.querySelector('dialog[open][aria-labelledby="modal-title"]');
+    if (!d) return null;
+    const r = d.getBoundingClientRect();
+    return { left: r.left, width: r.width, bottom: r.bottom, vw: innerWidth, vh: innerHeight };
+  });
+  if (!box) return;
+  expect(Math.abs(box.left), `${where}: the dialog's left edge`).toBeLessThanOrEqual(1);
+  expect(Math.abs(box.width - box.vw), `${where}: the dialog's width`).toBeLessThanOrEqual(1);
+  expect(Math.abs(box.bottom - box.vh), `${where}: the dialog's bottom`).toBeLessThanOrEqual(1);
 }
 
 async function run(page: Page, ds: string, query: string) {
@@ -195,8 +210,18 @@ test('the ontology editor: the trees, a frame, the header and the new-class dial
   await page.getByRole('button', { name: 'New', exact: true }).click();
   await expect(page.getByRole('dialog', { name: 'New class' })).toBeVisible();
   await expectNoSidewaysScroll(page, 'the new-class dialog');
+  await expectSheet(page, 'the new-class dialog');
   await page.keyboard.press('Escape');
   await page.getByRole('tab', { name: 'Header' }).click();
   await expect(page.getByRole('heading', { name: 'Ontology header' })).toBeVisible();
   await expectNoSidewaysScroll(page, 'the header');
+});
+
+test("the thesaurus editor's dialogs dock as a sheet", async ({ page }) => {
+  await page.goto('/ui/thesaurus?ds=thes');
+  await expect(page.getByRole('tree').first()).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('button', { name: 'Concept', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: 'New concept' })).toBeVisible();
+  await expectNoSidewaysScroll(page, 'the new-concept dialog');
+  await expectSheet(page, 'the new-concept dialog');
 });
