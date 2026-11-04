@@ -484,6 +484,8 @@ pub const CONTEXT_BYTES: usize = 320;
 const OUTBOX: usize = 4096;
 /// The clauses of Tier D a context processes between checks of the bounds.
 const DL_CLAUSES: usize = 256;
+/// The bytes of waiting messages below which a saturation never counts as congested.
+const CONGESTED_BYTES: usize = 256 << 20;
 /// The roots from which a saturation on several threads starts them all at once.
 const EAGER_ROOTS: usize = if cfg!(test) { 64 } else { 4096 };
 /// How long the first worker of a smaller saturation runs before the others start, so
@@ -971,21 +973,58 @@ impl<'a> Run<'a> {
             return;
         }
         outbox.group();
+        let filter = self.congested();
         let outbox = &mut outbox.msgs;
         let mut at = 0;
         while at < outbox.len() {
             let to = outbox[at].0;
             let end = at + outbox[at..].iter().take_while(|m| m.0 == to).count();
             let ctx = self.get(to);
-            ctx.todo
-                .lock()
-                .extend(outbox[at..end].iter().map(|&(_, c)| c));
+            if !(filter && self.deliver_new(ctx, &outbox[at..end])) {
+                ctx.todo
+                    .lock()
+                    .extend(outbox[at..end].iter().map(|&(_, c)| c));
+            }
             if self.mark(ctx) {
                 mine.push_back(to);
             }
             at = end;
         }
         outbox.clear();
+    }
+
+    /// Delivers to a context the messages it does not already hold, and says whether it
+    /// could look, which it cannot while another worker holds the context (roadmap item
+    /// 695).
+    #[cold]
+    #[inline(never)]
+    fn deliver_new(&self, ctx: &Ctx, msgs: &[(Ex, Concl)]) -> bool {
+        let Some(st) = ctx.st.try_lock() else {
+            return false;
+        };
+        if !st.init {
+            return false;
+        }
+        let mut t = ctx.todo.lock();
+        let before = t.len();
+        t.extend(
+            msgs.iter()
+                .map(|&(_, c)| c)
+                .filter(|c| !(matches!(c, Concl::Sub(_) | Concl::Back(..)) && st.holds(c))),
+        );
+        let dropped = msgs.len() - (t.len() - before);
+        if dropped > 0 {
+            self.queued.fetch_sub(dropped as isize, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// Whether the messages waiting in to-do lists and outboxes take more than the stored
+    /// conclusions and [`CONGESTED_BYTES`], as of the workers' last checks.
+    fn congested(&self) -> bool {
+        let waiting = self.queued.load(Ordering::Relaxed).max(0) as usize;
+        waiting * std::mem::size_of::<Concl>()
+            > self.memory.load(Ordering::Relaxed).max(CONGESTED_BYTES)
     }
 
     /// Moves half of a worker's queue to the shared queue when a worker waits for it.
