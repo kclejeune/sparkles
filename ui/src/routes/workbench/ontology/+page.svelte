@@ -1119,7 +1119,7 @@
         {:else if !name}
           Choose a dataset in the top bar.
         {:else}
-          Reading the ontology of {name}…
+          <span class="spinner"></span> Reading the ontology of {name}…
         {/if}
       </p>
     </div>
@@ -1290,7 +1290,11 @@
                   })}
               >
                 {#each TREE_KINDS as k (k)}<option value={k}
-                    >{KIND_LABEL[k]}{counts[k] ? ` · ${fmtInt(counts[k])}` : ''}</option
+                    >{KIND_LABEL[k]}{counts[k]
+                      ? ` · ${fmtInt(counts[k])}`
+                      : !summary
+                        ? ' · …'
+                        : ''}</option
                   >{/each}
               </select>
               <input
