@@ -1303,17 +1303,34 @@ function decodedPart(s: string): string {
 /** A Wikipedia page's title from its name in a link, whose underscores stand for spaces. */
 const wikipediaTitle = (s: string) => decodedPart(s).replace(/_/g, ' ');
 
+const LINE_BREAK = /[\n\r\u2028\u2029]/;
+const WIKI = '/wiki/';
+
 /**
  * A readable form of an http or https IRI: a Wikipedia title, a DOI whole, or else the fragment or
  * last path segment. An IRI with a query or nothing after its host stays whole, since no part of
- * it names what it points at.
+ * it names what it points at. A value can be long, so this finds its parts by scanning.
  */
 function readableIri(iri: string): string {
-  const m = /^https?:\/\/([^/?#]+)([^?#]*)(\?[^#]*)?(?:#(.*))?$/.exec(iri);
-  if (!m || m[3]) return iri;
-  const [, host, path, , fragment] = m;
-  const wiki = /^\/wiki\/(.+)$/.exec(path);
-  if (wiki && !fragment && /(^|\.)wikipedia\.org$/i.test(host)) return wikipediaTitle(wiki[1]);
+  const start = iri.startsWith('https://') ? 8 : iri.startsWith('http://') ? 7 : -1;
+  if (start < 0) return iri;
+  const hash = iri.indexOf('#');
+  const beforeHash = hash < 0 ? iri : iri.slice(0, hash);
+  const fragment = hash < 0 ? '' : iri.slice(hash + 1);
+  const slash = beforeHash.indexOf('/', start);
+  const host = slash < 0 ? beforeHash.slice(start) : beforeHash.slice(start, slash);
+  const path = slash < 0 ? '' : beforeHash.slice(slash);
+  // a value with a line break in its fragment is no reference to name
+  if (!host || beforeHash.includes('?') || LINE_BREAK.test(fragment)) return iri;
+  if (
+    path.length > WIKI.length &&
+    path.startsWith(WIKI) &&
+    !fragment &&
+    !LINE_BREAK.test(path) &&
+    /(^|\.)wikipedia\.org$/i.test(host)
+  ) {
+    return wikipediaTitle(path.slice(WIKI.length));
+  }
   if (!fragment && /(^|\.)doi\.org$/i.test(host) && path.length > 1) return path.slice(1);
   if (fragment) return decodedPart(fragment);
   const last = path.split('/').filter(Boolean).at(-1);

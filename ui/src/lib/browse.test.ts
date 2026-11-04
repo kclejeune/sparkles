@@ -1330,6 +1330,32 @@ describe('line and paragraph separators in an IRI', () => {
   });
 });
 
+describe('the time to name a long cross-reference', () => {
+  // a quadratic scan takes many seconds at this length and a linear one a few milliseconds
+  const n = 100_000;
+  const shapes = (sep: string) => [
+    `http://${'a'.repeat(n)}#b${sep}c`,
+    `http://${'a'.repeat(n)}${sep}`,
+    `http://example.org/${'a'.repeat(n)}#${sep}`,
+    `http://example.org/${'a/'.repeat(n / 2)}${sep}`,
+    `http://example.org/${'%41'.repeat(n / 3)}${sep}`,
+    `http://en.wikipedia.org/wiki/${'_'.repeat(n)}${sep}`,
+    `https://doi.org/${'a'.repeat(n)}${sep}`,
+    `http://${'a.'.repeat(n / 2)}wikipedia.org/x${sep}`,
+  ];
+  it.each([String.fromCodePoint(0x2028), String.fromCodePoint(0x2029)])(
+    'stays linear with %j',
+    (sep) => {
+      for (const v of shapes(sep)) {
+        const start = performance.now();
+        xrefName({ database: '', id: v, value: v }, () => null, {});
+        expect(performance.now() - start).toBeLessThan(2000);
+      }
+    },
+    240_000,
+  );
+});
+
 describe('the time to check a long value from the data', () => {
   // a quadratic check takes many seconds at this length and a linear one a few milliseconds
   const n = 100_000;

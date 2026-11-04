@@ -113,8 +113,20 @@ export function termKey(t: Term): string {
 
 export const iri = (value: string): Term => ({ type: 'uri', value });
 
+/** The escapes `sparqlIri` has used, at most one for each of the few characters it encodes. */
+const iriEscapes = new Map<string, string>();
+
+function iriEscape(c: string): string {
+  let e = iriEscapes.get(c);
+  if (!e) {
+    e = '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0');
+    iriEscapes.set(c, e);
+  }
+  return e;
+}
+
 export function sparqlIri(value: string): string {
-  return `<${value.replace(/[<>"{}|^`\\\u0000- ]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'))}>`;
+  return `<${value.replace(/[<>"{}|^`\\\u0000- ]/g, iriEscape)}>`;
 }
 
 export function sparqlString(value: string): string {
