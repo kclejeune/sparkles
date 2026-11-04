@@ -144,7 +144,7 @@
   );
   function setTab(t: Tab) {
     goto(withParams({ tab: t === 'overview' ? null : t }), {
-      replaceState: true,
+      // a tab is a step that Back returns to (ROADMAP item 633)
       keepFocus: true,
       noScroll: true,
     });
@@ -1071,14 +1071,9 @@ ex:PersonShape a sh:NodeShape ;
           <div class="panel-head">
             <h2>Validate</h2>
             {#if info?.endpoints?.shex}
-              <div class="tabs" role="tablist" aria-label="Validation language">
+              <div class="segmented" role="group" aria-label="Validation language">
                 {#each [['shacl', 'SHACL'], ['shex', 'ShEx']] as const as [l, title] (l)}
-                  <button
-                    class="tab"
-                    role="tab"
-                    aria-selected={lang === l}
-                    onclick={() => setLang(l)}>{title}</button
-                  >
+                  <button aria-pressed={lang === l} onclick={() => setLang(l)}>{title}</button>
                 {/each}
               </div>
             {/if}

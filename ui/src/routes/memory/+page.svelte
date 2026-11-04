@@ -28,6 +28,7 @@
   import InboxPanel from '$components/InboxPanel.svelte';
   import { reviewCounts } from '$lib/review-count.svelte';
   import IngestSettings from '$components/IngestSettings.svelte';
+  import PageSearch from '$components/PageSearch.svelte';
   import RecallView from '$components/RecallView.svelte';
   import TermView from '$components/TermView.svelte';
 
@@ -41,7 +42,7 @@
     else q.delete('tab');
     const qs = q.toString();
     goto(`${resolve('/memory')}${qs ? `?${qs}` : ''}`, {
-      replaceState: true,
+      // a tab is a step that Back returns to (ROADMAP item 633)
       keepFocus: true,
       noScroll: true,
     });
@@ -241,41 +242,27 @@
         />
       {/key}
     {:else}
-      <section class="panel" aria-label="Search memory">
-        <div class="panel-head"><h2>Search memory</h2></div>
-        <div class="panel-body card-body">
-          <form
-            class="row search"
-            onsubmit={(e) => {
-              e.preventDefault();
-              void search();
-            }}
-          >
-            <input
-              class="input"
-              placeholder="payments team"
-              aria-label="Search memory"
-              bind:value={text}
-            />
-            <button class="btn primary" type="submit" disabled={!text.trim() || searching}>
-              {#if searching}<span class="spinner"></span>{:else}<Icon
-                  name="search"
-                  size={13}
-                />{/if}
-              Search
-            </button>
-          </form>
-          {#if searchError}
-            <div class="error-box">{searchError}</div>
-          {:else if found}
+      <!-- the page's search is a field across the content, as on Browse (ROADMAP item 633) -->
+      <PageSearch
+        bind:value={text}
+        label="Search memory"
+        placeholder="Search what agents remember, such as payments team"
+        busy={searching}
+        onsubmit={() => void search()}
+      />
+      {#if searchError}
+        <div class="error-box">{searchError}</div>
+      {:else if found}
+        <section class="panel" aria-label="Memory search results">
+          <div class="panel-body card-body">
             {#if found.entities.length === 0}
               <p class="faint">No matches.</p>
             {:else}
               <RecallView result={found} {prefixes} onopen={openIri} />
             {/if}
-          {/if}
-        </div>
-      </section>
+          </div>
+        </section>
+      {/if}
 
       <div class="grid panel-grid">
         <section class="panel" aria-label="Agents">
@@ -445,14 +432,6 @@
     align-content: start;
     min-width: 0;
     overflow-x: auto;
-  }
-  .search {
-    display: flex;
-    gap: 8px;
-  }
-  .search .input {
-    flex: 1;
-    min-width: 0;
   }
   .data {
     width: 100%;

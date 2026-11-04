@@ -40,7 +40,7 @@ test('the explorer, the datasets, the server and the tokens', async ({ page }) =
     await expectNoSidewaysScroll(page, url);
   }
   await page.goto(`/ui/datasets/${DATASET}`);
-  await page.getByRole('tab', { name: 'ShEx' }).click();
+  await page.getByRole('button', { name: 'ShEx', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'ShEx schema' })).toBeVisible();
   await expectNoSidewaysScroll(page, 'the ShEx tab');
 });

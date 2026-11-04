@@ -9,7 +9,9 @@ const ANA = 'http://example.org/resource/ana';
 
 test('the Memory tab lists facts with citations, badges and history', async ({ page }) => {
   await page.goto(`/ui/explore?ds=org&iri=${encodeURIComponent(ANA)}&view=memory`);
-  await expect(page.getByRole('tab', { name: 'Memory' })).toHaveAttribute('aria-selected', 'true');
+  await expect(
+    page.getByRole('group', { name: 'Resource views' }).getByRole('button', { name: 'Memory' }),
+  ).toHaveAttribute('aria-pressed', 'true');
   const memory = page.getByLabel('Memory', { exact: true });
   const facts = memory.getByRole('region', { name: /Facts about/ });
   await expect(facts).toContainText('ex:memberOf');
@@ -65,9 +67,12 @@ test('the Memory page shows agents, sources, activity, branches and settings', a
     'https://example.org/notes/*',
   );
 
-  const search = page.getByRole('region', { name: 'Search memory' });
-  await search.getByRole('textbox', { name: 'Search memory' }).fill('payments team');
-  await search.getByRole('button', { name: 'Search' }).click();
+  await page
+    .getByRole('search', { name: 'Search memory' })
+    .getByRole('searchbox', { name: 'Search memory' })
+    .fill('payments team');
+  await page.keyboard.press('Enter');
+  const search = page.getByRole('region', { name: 'Memory search results' });
   await expect(search).toContainText('"Payments team"');
   await expect(search.getByRole('region', { name: /Facts about/ }).first()).toBeVisible();
 });
@@ -84,7 +89,7 @@ test.describe('on a phone', () => {
       page,
     }) => {
       await page.goto(`/ui/memory?ds=${ds}`);
-      await expect(page.getByRole('region', { name: 'Search memory' })).toBeVisible();
+      await expect(page.getByRole('search', { name: 'Search memory' })).toBeVisible();
       await expect(page.getByRole('region', { name: 'Agents' })).toBeVisible();
       await expect(page.locator('main .spinner')).toHaveCount(0);
 
@@ -112,7 +117,7 @@ test.describe('on a phone', () => {
       }
       // the search card sits fully above the Agents card
       const [search, agents] = [
-        await page.getByRole('region', { name: 'Search memory' }).boundingBox(),
+        await page.getByRole('search', { name: 'Search memory' }).boundingBox(),
         await page.getByRole('region', { name: 'Agents' }).boundingBox(),
       ];
       expect(search!.y + search!.height).toBeLessThanOrEqual(agents!.y + 1);

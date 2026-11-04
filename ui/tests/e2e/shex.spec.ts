@@ -46,7 +46,7 @@ async function setSchema(page: Page, text: string) {
 
 async function showShex(page: Page, name: string) {
   await page.goto(`/ui/datasets/${name}`);
-  await panel(page).getByRole('tab', { name: 'ShEx' }).click();
+  await panel(page).getByRole('button', { name: 'ShEx', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'ShEx schema' })).toBeVisible();
 }
 
@@ -119,15 +119,15 @@ open('the language and the ShEx draft survive a reload', async ({ page, request 
   await page.getByRole('textbox', { name: 'Shape map' }).fill(MAP);
 
   await page.reload();
-  await expect(panel(page).getByRole('tab', { name: 'ShEx' })).toHaveAttribute(
-    'aria-selected',
+  await expect(panel(page).getByRole('button', { name: 'ShEx', exact: true })).toHaveAttribute(
+    'aria-pressed',
     'true',
   );
   await expect(page.getByRole('textbox', { name: 'Shape map' })).toHaveValue(MAP);
   await expect(page.getByRole('textbox', { name: 'ShEx schema' })).toContainText('ex:Org CLOSED');
 
   // back to SHACL, which is kept too
-  await panel(page).getByRole('tab', { name: 'SHACL' }).click();
+  await panel(page).getByRole('button', { name: 'SHACL', exact: true }).click();
   await page.reload();
   await expect(page.getByRole('textbox', { name: 'Shapes graph (Turtle)' })).toBeVisible();
   await expect(page.getByRole('textbox', { name: 'ShEx schema' })).toHaveCount(0);

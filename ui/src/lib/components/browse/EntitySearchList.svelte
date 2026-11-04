@@ -6,7 +6,7 @@
   import { usePageSearch } from '$lib/launcher.svelte';
   import { kindWord } from '$lib/browse';
   import { searchEntities, type EntityHit, type EntitySearchKind } from '$lib/entity-search';
-  import Icon from '$components/Icon.svelte';
+  import PageSearch from '$components/PageSearch.svelte';
 
   let {
     target,
@@ -102,18 +102,7 @@
 </script>
 
 <section class="search" aria-label="Search the ontology">
-  <label class="field">
-    <Icon name="search" size={18} />
-    <span class="sr-only">Search</span>
-    <input
-      type="search"
-      bind:this={field}
-      bind:value={q}
-      {placeholder}
-      autocomplete="off"
-      spellcheck="false"
-    />
-  </label>
+  <PageSearch bind:value={q} bind:field {placeholder} label="Search" />
   <div class="chips" role="radiogroup" aria-label="Kind">
     <button
       type="button"
@@ -168,32 +157,6 @@
     display: grid;
     gap: var(--sp-3);
     min-width: 0;
-  }
-  .field {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-2);
-    height: 44px;
-    padding: 0 var(--sp-4);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--r-lg);
-    background: var(--surface);
-    color: var(--text-3);
-    min-width: 0;
-  }
-  .field:focus-within {
-    box-shadow: var(--focus);
-  }
-  input {
-    flex: 1;
-    min-width: 0;
-    border: 0;
-    background: none;
-    outline: none;
-    font-size: 15px;
-    color: var(--text);
-    height: 100%;
-    padding: 0;
   }
   .chips {
     display: flex;

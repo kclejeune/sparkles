@@ -68,7 +68,7 @@
     else p.set('tab', t);
     const qs = p.toString();
     goto(`${resolve('/admin/backups')}${qs ? `?${qs}` : ''}`, {
-      replaceState: true,
+      // a tab is a step that Back returns to (ROADMAP item 633)
       keepFocus: true,
       noScroll: true,
     });
