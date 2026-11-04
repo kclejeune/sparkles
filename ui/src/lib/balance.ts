@@ -6,7 +6,8 @@
 // gap to shrink by more than a threshold, so cards stay put while a tree opens or a graph
 // lays out, and a card that holds focus never moves. While the columns stack as one (their
 // `display` is `contents`) every card is at home. The side column gets `data-stick` when it
-// is the shorter and fits in the scrolling box, for a sticky position.
+// is the shorter, for a sticky position. A column taller than the scrolling box gets a negative
+// `--stick-top`, so that it sticks with its bottom edge in view.
 
 /** A card that may move, with its height and the column it is in. */
 export type Movable = { height: number; inMain: boolean; locked: boolean };
@@ -31,6 +32,14 @@ export function pickMove(
     if (after < now - threshold) return i;
   }
   return -1;
+}
+
+/**
+ * The `top` of a sticky column: the gutter when the column fits in the scrolling box, and
+ * otherwise the negative offset that holds its bottom edge a gutter above the box's bottom.
+ */
+export function stickTop(gutter: number, boxHeight: number, columnHeight: number): number {
+  return Math.min(gutter, boxHeight - columnHeight - gutter);
 }
 
 /** The content height of a column: the bottom of its last card below its top. */
@@ -76,6 +85,7 @@ export function balance(node: HTMLElement, opts: { threshold?: number } = {}) {
     if (getComputedStyle(m).display === 'contents') {
       for (const el of list) goHome(el);
       delete s.dataset.stick;
+      s.style.removeProperty('--stick-top');
       return;
     }
     const gap = parseFloat(getComputedStyle(m).rowGap) || 0;
@@ -100,9 +110,17 @@ export function balance(node: HTMLElement, opts: { threshold?: number } = {}) {
       schedule();
       return;
     }
+    // the shorter column sticks. One taller than the window scrolls with the page until its
+    // bottom edge is in view, and then stays there, so all of it can be reached
     const box = s.closest<HTMLElement>('[data-scroll], .page, main') ?? document.documentElement;
-    if (hs < hm && hs < box.clientHeight - 32) s.dataset.stick = '';
-    else delete s.dataset.stick;
+    if (hs < hm) {
+      s.dataset.stick = '';
+      const gutter = parseFloat(getComputedStyle(s).getPropertyValue('--gutter')) || 24;
+      s.style.setProperty('--stick-top', `${stickTop(gutter, box.clientHeight, hs)}px`);
+    } else {
+      delete s.dataset.stick;
+      s.style.removeProperty('--stick-top');
+    }
   }
 
   function schedule() {
@@ -110,6 +128,7 @@ export function balance(node: HTMLElement, opts: { threshold?: number } = {}) {
   }
 
   const ro = new ResizeObserver(schedule);
+  window.addEventListener('resize', schedule);
   const watch = () => {
     ro.disconnect();
     ro.observe(node);
@@ -127,6 +146,7 @@ export function balance(node: HTMLElement, opts: { threshold?: number } = {}) {
   return {
     destroy() {
       cancelAnimationFrame(frame);
+      window.removeEventListener('resize', schedule);
       ro.disconnect();
       mo.disconnect();
     },
