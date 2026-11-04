@@ -87,9 +87,20 @@ annotation properties and individuals. Each tree shows the asserted hierarchy fr
 axioms, and the individuals are listed with their asserted classes beside each name. Entities are named by
 their `rdfs:label` or `skos:prefLabel` in the browser's language, with the prefixed name
 beside a label. A filter keeps the matching entities and their ancestors. A cycle in the
-asserted hierarchy is drawn once and not followed. The trees read every entity and
-hierarchy axiom of the graph in pages of 10,000, up to 50,000 of each, so very large
-ontologies load slowly and a lazy hierarchy route remains a follow-up.
+asserted hierarchy is drawn once and not followed. The class and property trees read one
+level at a time from the hierarchy route, and every tree draws only the rows in view, so
+ontologies of millions of classes open and scroll at the speed of a screenful. The
+individuals tree has no hierarchy route and reads its individuals, up to 50,000, and their
+types when its tab opens.
+
+**Reads.** Opening the editor reads the summary and the first level of the tree on screen.
+The other trees read when their tab opens. Names come from the hierarchy answers and from
+batched reads of the labels of the IRIs a panel names for the first time. The entity lists
+that the add fields' pickers and the new-entity check use are read once an entity, the
+header, the DL Query tab or the new-entity dialog needs them, for each kind of up to 5,000
+entities. The Manchester fields complete a longer kind through the entity search and the
+server's Manchester reader resolves its names. This is item 725, whose measurements are in
+the [web UI scale report](../../benchmarks/web-ui-scale/README.md).
 
 **Inferred tree.** The **Inferred** switch shows the class taxonomy of the EL classifier
 of [F24](../F24-owl-classification/README.md) beside the asserted tree. Its nodes are the
