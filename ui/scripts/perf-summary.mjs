@@ -86,11 +86,7 @@ for (const name of names) {
       for (const r of m) for (const g of Object.keys(r.network?.groups ?? {})) groups.add(g);
     for (const g of [...groups].filter((g) => g !== 'static').sort())
       console.log(
-        row(
-          name,
-          `${g}: requests / MB decoded`.replace(/ \/ MB decoded/, ' requests'),
-          `network.groups.${g}.count`,
-        ) +
+        row(name, `${g}: requests`, `network.groups.${g}.count`) +
           '\n' +
           row(name, `${g}: MB decoded`, `network.groups.${g}.decodedBytes`, mb, 2),
       );
