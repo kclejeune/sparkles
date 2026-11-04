@@ -41,17 +41,28 @@ const labels = [...new Set([...runs.values()].flatMap((m) => [...m.keys()]))];
 const names = [...runs.keys()].sort();
 
 const get = (j, path) => path.split('.').reduce((o, k) => (o == null ? o : o[k]), j);
-const row = (name, title, path, scale = (x) => x, d = 0) =>
-  `| ${title} | ${labels
-    .map((l) => {
-      const rs = (runs.get(name)?.get(l) ?? []).filter((r) => r.status === 'ok');
-      const failed = (runs.get(name)?.get(l) ?? []).length - rs.length;
-      const v = med(rs.map((r) => scale(get(r, path))));
-      return fmt(v, d) + (failed ? ` (${failed} failed)` : '');
-    })
-    .join(' | ')} |`;
-const head = (title) =>
-  `\n#### ${title}\n\n| Measure | ${labels.join(' | ')} |\n|---|${labels.map(() => '---').join('|')}|`;
+const row = (name, title, path, scale = (x) => x, d = 0) => {
+  const vals = labels.map((l) => {
+    const all = runs.get(name)?.get(l) ?? [];
+    const rs = all.filter((r) => r.status === 'ok');
+    return { v: med(rs.map((r) => scale(get(r, path)))), failed: all.length - rs.length };
+  });
+  const cells = vals.map((x) => fmt(x.v, d) + (x.failed ? ` (${x.failed} failed)` : ''));
+  // with two builds, the second over the first
+  if (labels.length === 2) {
+    const [a, b] = vals;
+    cells.push(
+      a.v != null && b.v != null && a.v !== 0
+        ? `${(b.v / a.v).toFixed(b.v / a.v < 0.1 ? 3 : 2)}x`
+        : 'n/a',
+    );
+  }
+  return `| ${title} | ${cells.join(' | ')} |`;
+};
+const head = (title) => {
+  const cols = labels.length === 2 ? [...labels, `${labels[1]} / ${labels[0]}`] : labels;
+  return `\n#### ${title}\n\n| Measure | ${cols.join(' | ')} |\n|---|${cols.map(() => '---').join('|')}|`;
+};
 
 console.log('# Scale measurements\n');
 for (const l of labels) {
