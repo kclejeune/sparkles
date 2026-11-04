@@ -4,6 +4,7 @@
 // a page. tests/e2e/browse.spec.ts checks the server's answers on a real dataset.
 
 import { expect, test, type Page } from '@playwright/test';
+import { pageAction } from '../page-actions';
 
 test.describe.configure({ timeout: 90_000 });
 
@@ -55,20 +56,43 @@ test('an entity page shows its axioms as linked prose, its usage and its facts',
   await expect(page.getByRole('navigation', { name: 'Breadcrumbs' })).toContainText(
     'University ontology',
   );
-  const logic = page.getByRole('region', { name: 'Logical definition' });
-  await expect(logic.getByRole('heading', { name: 'Subclass of' })).toBeVisible();
-  await expect(logic.getByRole('link', { name: 'Employee' })).toBeVisible();
-  await expect(logic.locator('.kw', { hasText: 'some' })).toBeVisible();
+  // with no definition, the comment leads the Definition card, marked as a comment
+  const lede = page.locator('.lede');
+  await expect(lede).toContainText('An academic who leads research');
+  await expect(page.locator('.lead [data-kind]').first().locator('h3')).toHaveText(
+    /^Comment\s*·\s*rdfs:comment$/,
+  );
+  await expect(page.getByRole('region', { name: 'Comment' })).toHaveCount(0);
+  // the frame in Manchester syntax: asserted clauses, then what the classification infers
+  const logic = page.getByRole('region', { name: 'Axioms' });
+  const sub = logic.locator('[data-section="sub"]');
+  await expect(sub.locator('dt')).toHaveText('SubClassOf:');
+  await expect(sub.getByRole('link', { name: 'Employee' })).toBeVisible();
+  await expect(sub.locator('.kw', { hasText: 'some' })).toBeVisible();
+  // a class with no EquivalentTo axiom has no logical definition
+  await expect(page.getByRole('region', { name: 'Logical definition' })).toHaveCount(0);
+  await logic.getByRole('button', { name: 'Classify' }).click();
+  const inferred = logic.locator('[data-section="inferred-sub"]');
+  await expect(inferred.getByRole('link', { name: 'Teacher' })).toBeVisible();
+  await expect(inferred).toContainText('Inferred');
+  // the asserted superclass is not repeated as inferred
+  await expect(inferred.getByRole('link', { name: 'Employee' })).toHaveCount(0);
 
   const usage = page.getByRole('region', { name: /What links here/ });
   await expect(usage.getByRole('heading', { name: /Instances/ })).toBeVisible();
   await expect(usage.getByRole('link', { name: 'Ada Lovelace' })).toBeVisible();
   await expect(usage.getByRole('heading', { name: /Range of/ })).toBeVisible();
 
-  const facts = page.getByRole('complementary', { name: 'About this entity' });
+  const facts = page.getByRole('region', { name: 'Metadata' });
+  await expect(facts.getByRole('heading', { name: 'Metadata' })).toBeVisible();
   await expect(facts).toContainText('Class');
-  await expect(facts).toContainText('1 parent, 0 subclasses');
-  await expect(facts.getByRole('link', { name: 'Turtle' })).toBeVisible();
+  // the counts under the header carry the hierarchy, so the card does not
+  await expect(facts).not.toContainText('1 parent');
+  const counts = page.getByRole('navigation', { name: 'Counts' });
+  await expect(counts.getByRole('link', { name: '1 parent' })).toHaveAttribute('href', '#tree-h');
+  await expect(counts.getByRole('link', { name: '0 subclasses' })).toBeVisible();
+  const download = page.getByRole('region', { name: 'Download' });
+  await expect(download.getByRole('link', { name: 'Turtle' })).toBeVisible();
 
   await logic.getByRole('link', { name: 'Employee' }).click();
   await expect(page.getByRole('heading', { level: 1, name: 'Employee' })).toBeVisible();
@@ -77,6 +101,29 @@ test('an entity page shows its axioms as linked prose, its usage and its facts',
 test('a definition leads the page and a mention names its restriction', async ({ page }) => {
   await openTerm(page, 'Person');
   await expect(page.locator('.lede')).toContainText('A human being');
+  // the lead block lists each kind under its heading, and folds French under Definition
+  const lead = page.locator('.lead');
+  await expect(lead.locator('[data-kind] > h3')).toHaveText([
+    /^Definition\s*·\s*skos:definition$/,
+    /^Comment\s*·\s*rdfs:comment$/,
+    /^Scope note\s*·\s*skos:scopeNote$/,
+  ]);
+  const comments = lead.getByRole('group', { name: 'Comment' });
+  await expect(comments.locator(':scope > .entry')).toHaveCount(2);
+  const def = lead.getByRole('group', { name: 'Definition' });
+  const fr = def.locator('details.fold');
+  await expect(fr.locator('summary')).toHaveText('In 1 other language');
+  await expect(fr.locator('.entry')).toBeHidden();
+  await fr.locator('summary').click();
+  await expect(fr.locator('.entry')).toContainText('Un être humain');
+  await expect(fr.locator('.lang-tag')).toHaveText('fr');
+  // the notes keep their own kinds below
+  for (const k of ['Example', 'History note', 'Editorial note'])
+    await expect(page.getByRole('region', { name: k })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'History note' }).locator('h2')).toContainText(
+    'skos:historyNote',
+  );
+  await expect(page.getByRole('region', { name: 'Comment' })).toHaveCount(0);
   await openTerm(page, 'Course');
   const usage = page.getByRole('region', { name: /What links here/ });
   await expect(usage.getByRole('heading', { name: /teaches some Course/ })).toBeVisible();
@@ -105,17 +152,136 @@ test('the lineage tree opens children and siblings a level at a time', async ({ 
   await expect(tree.locator('.kids').getByRole('link', { name: /^Person/ })).toHaveCount(0);
 });
 
-test('the graph view draws the neighbourhood and switches back to the page', async ({ page }) => {
+test('the graph view draws the neighbourhood in the hierarchy card and switches back', async ({
+  page,
+}) => {
   await openTerm(page, 'Professor');
   await page.getByRole('link', { name: 'Graph', exact: true }).click();
   await expect(page).toHaveURL(/view=graph/);
-  await expect(page.locator('.canvas canvas').first()).toBeVisible({ timeout: 20_000 });
+  // the graph replaces the card's tree, and the article stays
+  const card = page.getByRole('complementary', { name: 'Hierarchy' });
+  await expect(card.locator('.canvas canvas').first()).toBeVisible({ timeout: 20_000 });
+  await expect(card.locator('.tree-body')).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Axioms' })).toBeVisible();
+  // a reload keeps the view
+  await page.reload();
+  await expect(card.locator('.canvas canvas').first()).toBeVisible({ timeout: 20_000 });
   await expect(page.getByRole('link', { name: 'Open in Explore' }).first()).toHaveAttribute(
     'href',
     /explore\?ds=uni&iri=/,
   );
   await page.getByRole('link', { name: 'Tree', exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Logical definition' })).toBeVisible();
+  await expect(card.locator('.tree-body')).toBeVisible();
+  await expect(card.locator('.canvas')).toHaveCount(0);
+});
+
+test('a defined class keeps its logical definition, and a class with no axioms has no card', async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await openTerm(page, 'Teacher');
+  const def = page.getByRole('region', { name: 'Logical definition' });
+  await expect(def.getByRole('link', { name: 'Person' })).toBeVisible();
+  await expect(def.locator('.kw', { hasText: 'and' })).toBeVisible();
+  const axioms = page.getByRole('region', { name: 'Axioms' });
+  await expect(axioms.locator('[data-section="equivalent"] dt')).toHaveText('EquivalentTo:');
+  await axioms.getByRole('button', { name: 'Copy' }).click();
+  const text = await page.evaluate(() => navigator.clipboard.readText());
+  expect(text).toContain('Class: Teacher');
+  expect(text).toContain('    EquivalentTo: ');
+  expect(text).toContain('Person and (teaches some Course)');
+  await axioms.getByRole('button', { name: 'Classify' }).click();
+  await expect(axioms).toContainText('infers nothing more');
+
+  // a classification run in this tab is asked again on the next class page
+  await openTerm(page, 'Professor');
+  await expect(
+    page
+      .getByRole('region', { name: 'Axioms' })
+      .locator('[data-section="inferred-sub"]')
+      .getByRole('link', { name: 'Teacher' }),
+  ).toBeVisible();
+
+  // Agent states no axiom of its own and the classification infers nothing more
+  await openTerm(page, 'Agent');
+  await expect(page.getByRole('heading', { level: 1, name: 'Agent' })).toBeVisible();
+  await expect(page.locator('.lede')).toHaveText('No definition in this ontology.');
+  await expect(page.getByRole('region', { name: 'Axioms' })).toHaveCount(0);
+});
+
+test('no section or card shows a heading without content', async ({ page }) => {
+  const pages = [
+    termUrl('Professor'),
+    termUrl('Teacher'),
+    termUrl('Agent'),
+    termUrl('teaches'),
+    termUrl('ada'),
+    `/ui/browse?ds=thes&iri=${encodeURIComponent('http://example.org/thesaurus/fish')}`,
+  ];
+  for (const url of pages) {
+    await page.goto(url);
+    await expect(page.locator('h1.term-title')).toBeVisible({ timeout: 30_000 });
+    await page.waitForLoadState('networkidle');
+    const empty = await page.evaluate(() => {
+      const out: string[] = [];
+      const text = (el: Element | null) => (el as HTMLElement | null)?.innerText.trim() ?? '';
+      for (const sec of document.querySelectorAll('.browse section.term-sec, .browse .panel')) {
+        const head = sec.querySelector(':scope > h2, :scope > .panel-head');
+        if (!head || !(sec as HTMLElement).offsetParent) continue;
+        if (text(sec).length <= text(head).length) out.push(text(head));
+      }
+      return out;
+    });
+    expect(empty, url).toEqual([]);
+  }
+  // a concept's raw statements never show as axioms or a logical definition
+  await expect(page.getByRole('region', { name: 'Axioms' })).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Logical definition' })).toHaveCount(0);
+});
+
+test('a rich OBO term keeps its paragraphs, sources and synonym types', async ({ page }) => {
+  await page.goto(
+    `/ui/browse?ds=cells&iri=${encodeURIComponent('http://purl.obolibrary.org/obo/CL_0000129')}`,
+  );
+  await expect(page.getByRole('heading', { level: 1, name: 'microglial cell' })).toBeVisible({
+    timeout: 30_000,
+  });
+  const lead = page.locator('.lead');
+  await expect(lead.locator('[data-kind] > h3')).toHaveText([
+    /^Definition\s*·\s*obo:IAO_0000115$/,
+    /^Description\s*·\s*dcterms:description$/,
+    /^Comment\s*·\s*rdfs:comment$/,
+  ]);
+  // a predicate the ontology names links to its page, with its full IRI on hover
+  const pred = lead.locator('[data-kind] > h3 a').first();
+  await expect(pred).toHaveAttribute('title', 'http://purl.obolibrary.org/obo/IAO_0000115');
+  await expect(pred).toHaveAttribute('href', /IAO_0000115/);
+  await expect(lead.locator('.lede')).toContainText('GOC:fixture');
+  // the description's blank lines are paragraphs and its newlines line breaks
+  const desc = lead.getByRole('group', { name: 'Description' });
+  await expect(desc.locator('.para-gap')).toHaveCount(4);
+  await expect(desc.locator('br')).toHaveCount(1);
+  const syn = page.getByRole('region', { name: 'Synonyms' });
+  await expect(syn).toContainText('brain-resident macrophage');
+  await expect(syn).toContainText('PMID:00000002');
+  // a typed synonym names its type, by label when it has one
+  await expect(syn.locator('.syn-type')).toHaveText(['ABBREVIATION', 'plural']);
+});
+
+test('the labels of a synonym type are read at the state the page shows', async ({ page }) => {
+  const asked: string[] = [];
+  await page.route('**/cells/sparql**', (route) => {
+    const req = route.request();
+    if ((req.postData() ?? '').includes('ABBREVIATION')) asked.push(req.url());
+    return route.fallback();
+  });
+  await page.goto(
+    `/ui/browse?ds=cells&at=1&iri=${encodeURIComponent('http://purl.obolibrary.org/obo/CL_0000129')}`,
+  );
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible({ timeout: 30_000 });
+  await expect.poll(() => asked.length, { timeout: 15_000 }).toBeGreaterThan(0);
+  expect(asked[0]).toMatch(/[?&]at=1\b/);
 });
 
 test('downloads answer the entity in each format as an attachment', async ({ page }) => {
@@ -136,15 +302,13 @@ test('an individual has no tree, shows its types and edits in place or in the on
   await openTerm(page, 'ada');
   await expect(page.getByRole('complementary', { name: 'Hierarchy' })).toHaveCount(0);
   await expect(
-    page.getByRole('region', { name: 'Logical definition' }).getByRole('heading', {
-      name: 'Types',
-    }),
-  ).toBeVisible();
+    page.getByRole('region', { name: 'Axioms' }).locator('[data-section="types"] dt'),
+  ).toHaveText('Types:');
   // Edit switches the page into edit mode (item 630), whose bar links the full editor
-  await page.getByRole('button', { name: 'Edit', exact: true }).click();
+  await pageAction(page, 'Edit');
   await expect(
     page.getByRole('toolbar', { name: 'Edit mode' }).getByRole('link', { name: 'Ontology editor' }),
-  ).toHaveAttribute('href', /\/ui\/ontology\?ds=uni&iri=.*ada&tab=NamedIndividual/);
+  ).toHaveAttribute('href', /\/ui\/workbench\/ontology\?ds=uni&iri=.*ada&kind=NamedIndividual/);
 });
 
 test('an IRI the graphs do not mention says so', async ({ page }) => {
@@ -191,19 +355,65 @@ for (const [w, h] of [
   });
 }
 
-test('the phone page keeps the order head, facts, hierarchy, article', async ({ page }) => {
+test('the phone page keeps the order head, counts, definition, metadata, hierarchy', async ({
+  page,
+}) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await openTerm(page, 'Person');
   const y = async (sel: string) => (await page.locator(sel).first().boundingBox())!.y;
-  const head = await y('.b-head');
-  const info = await y('.b-info');
-  const tree = await y('.b-tree');
-  const article = await y('.b-article');
-  expect(head).toBeLessThan(info);
-  expect(info).toBeLessThan(tree);
-  expect(tree).toBeLessThan(article);
+  const order = ['.b-head', '.b-chips', '.b-def', '.b-info', '.b-tree', '.b-refs', '.b-dl'];
+  const ys = [];
+  for (const sel of order) ys.push(await y(sel));
+  for (let i = 1; i < ys.length; i++) expect(ys[i - 1]).toBeLessThan(ys[i]);
+  // the counts stay compact: at most two lines of chips
+  const chips = (await page.locator('.b-chips').boundingBox())!;
+  expect(chips.height).toBeLessThanOrEqual(2 * 32 + 8);
+  // the hierarchy card opens on request
+  const card = page.getByRole('complementary', { name: 'Hierarchy' });
+  await expect(card.locator('.tree-body')).toBeHidden();
+  await card.getByRole('button', { name: 'Show the hierarchy' }).click();
+  await expect(card.locator('.tree-body')).toBeVisible();
+  await expect(card.getByRole('button', { name: 'Hide the hierarchy' })).toHaveAttribute(
+    'aria-expanded',
+    'true',
+  );
   // the shell's search icon stands in for the field
   await expect(page.getByRole('button', { name: 'Open search' })).toBeVisible();
+});
+
+test('a large screen shows the term in two columns of cards whose bottoms stay close', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await openTerm(page, 'Person');
+  const box = async (sel: string) => (await page.locator(sel).first().boundingBox())!;
+  const def = await box('.b-def');
+  const info = await box('.b-info');
+  expect(def.x).toBeLessThan(info.x);
+  expect(Math.abs(def.y - info.y)).toBeLessThan(2);
+  // the side column is sized to its cards, narrower than the term's own
+  expect(info.width).toBeLessThan(def.width);
+  expect(info.width).toBeLessThanOrEqual(400);
+  // the bottoms of the two columns stay within a card of each other
+  const bottom = (sel: string) =>
+    page
+      .locator(sel)
+      .evaluate((c) => (c.lastElementChild as HTMLElement).getBoundingClientRect().bottom);
+  await expect
+    .poll(async () => Math.abs((await bottom('.b-main')) - (await bottom('.b-side'))))
+    .toBeLessThan(400);
+  // the cards keep their reading order: the term's own, then the side's
+  const order = await page.evaluate(() =>
+    [...document.querySelectorAll('.b-main > .panel, .b-side > *')].map((e) =>
+      e.classList.contains('b-info') ? 'meta' : e.className.match(/b-(def|ax|tree|refs|dl)/)?.[1],
+    ),
+  );
+  // Person states one axiom, so its Axioms card follows the definition
+  expect(order.slice(0, 3)).toEqual(['def', 'ax', 'tree']);
+  expect(order).toContain('meta');
+  // at 1024 the cards are one column
+  await page.setViewportSize({ width: 1024, height: 900 });
+  await expect.poll(async () => (await box('.b-info')).x).toBeLessThan(def.x + 80);
 });
 
 test('a list whose count is a lower bound pages on until a short page', async ({ page }) => {
@@ -262,4 +472,17 @@ test('a landing page at a past state has no search box', async ({ page }) => {
     timeout: 30_000,
   });
   await expect(page.locator('main').getByRole('searchbox')).toHaveCount(0);
+});
+
+test('the incoming count matches What links here', async ({ page }) => {
+  await openTerm(page, 'Professor');
+  const usage = page.getByRole('region', { name: /What links here/ });
+  const shown = (
+    await usage.getByRole('heading', { level: 2 }).locator('.count-badge').innerText()
+  ).trim();
+  await expect(
+    page
+      .getByRole('navigation', { name: 'Counts' })
+      .getByRole('link', { name: `${shown} incoming` }),
+  ).toBeVisible();
 });

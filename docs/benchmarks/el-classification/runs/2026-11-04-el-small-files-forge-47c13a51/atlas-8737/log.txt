@@ -1,0 +1,5 @@
+main5 t4 rc=0
+tip2 t4 rc=0
+main5 t1 rc=0
+tip2 t1 rc=0
+MEM-DONE

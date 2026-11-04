@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageActions from '$components/PageActions.svelte';
   import { resolve } from '$app/paths';
   import { goto, replaceState } from '$app/navigation';
   import { page } from '$app/state';
@@ -63,16 +64,16 @@
         total
       </p>
     </div>
-    <div class="page-actions">
+    <PageActions>
       <button class="btn" onclick={refresh} disabled={refreshing}>
         <Icon name="refresh" size={14} /> Refresh
       </button>
       {#if auth.hasServer('server-admin')}
-        <button class="btn primary" onclick={() => (createOpen = true)}
+        <button class="btn primary" data-primary onclick={() => (createOpen = true)}
           ><Icon name="plus" size={14} /> New dataset</button
         >
       {/if}
-    </div>
+    </PageActions>
   </header>
 
   {#if app.datasetsError}

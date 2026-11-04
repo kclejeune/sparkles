@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { routes } from '$lib/routes';
   // The dataset page's vector indexes (`/$/vector/{ds}`): a card per index with its
   // predicate, dimension, metric, model, HNSW settings, build state, sizes and exact
   // threshold, a recall measurement, the embedding worker of an index that computes its
@@ -137,10 +138,8 @@
     s === 'ready' ? 'ok' : s === 'building' ? 'warn' : 'danger';
   const actionsOff = $derived(readOnly || !canAdmin);
   const offTitle = $derived(readOnly ? 'The server is read-only' : undefined);
-  const searchHref = (index: string) =>
-    `${resolve('/similar')}?ds=${encodeURIComponent(name)}&index=${encodeURIComponent(index)}`;
-  const mapHref = (index: string) =>
-    `${resolve('/embedding')}?ds=${encodeURIComponent(name)}&index=${encodeURIComponent(index)}`;
+  const searchHref = (index: string) => routes.similar(name, { index });
+  const mapHref = (index: string) => routes.similarMap(name, { index });
 
   // --- recall --------------------------------------------------------------------------
   const RECALL_KS = [1, 10, 50, 100];

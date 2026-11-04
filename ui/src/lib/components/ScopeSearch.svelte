@@ -94,7 +94,7 @@
       }),
       launcher.register(commandProvider('page')),
       launcher.register(commandProvider('global')),
-      launcher.register(pageProvider(base, backupsVisible)),
+      launcher.register(pageProvider(base, backupsVisible, (ds) => !!ds && auth.can(ds, 'write'))),
       launcher.register(datasetProvider()),
       launcher.register(savedQueryProvider(base)),
       launcher.command(

@@ -8,6 +8,7 @@
 // history with one record of format 1.
 
 import { expect, test, type Page } from '@playwright/test';
+import { pageAction } from '../page-actions';
 import { phone } from '../phone';
 
 test.describe.configure({ timeout: 90_000 });
@@ -197,6 +198,17 @@ test.describe('the drawer on a Browse page', () => {
   });
   test.afterEach(async ({ request }) => {
     await request.put('/$/assistant/uni', { data: {} });
+  });
+
+  test("a term page's Ask about this opens the drawer about the term", async ({ page }) => {
+    await fresh(page, 'uni');
+    await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + 'Professor')}`);
+    await expect(page.locator('h1.term-title')).toBeVisible({ timeout: 30_000 });
+    await pageAction(page, 'Ask about this');
+    const d = drawer(page);
+    await expect(d).toBeVisible();
+    await expect(d).toContainText('About Professor');
+    await expect(d.getByRole('textbox', { name: 'Question' })).toBeFocused();
   });
 
   test('opens with Shift+A and the class as context, and asks about it', async ({ page }) => {

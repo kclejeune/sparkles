@@ -56,6 +56,13 @@ test('the merge page resolves conflicts per row and per subject, then merges', a
   await update(request, 'orchard', swap('a', 'age', 1, 2));
   await update(request, 'orchard', swap('b', 'height', 1, 2));
 
+  // another dataset is the shell's, and the change set must name its terms from orchard's
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'foaf'));
+  const asked: string[] = [];
+  page.on('request', (r) => {
+    const u = new URL(r.url());
+    if (/^\/(foaf|orchard)(@[^/]*)?\/sparql$/.test(u.pathname)) asked.push(u.pathname);
+  });
   await page.goto('/ui/datasets/orchard/merge?source=dev&target=main');
   const summary = page.getByRole('region', { name: 'Summary' });
   await expect(summary).toContainText('dev@', { timeout: 30_000 });
@@ -75,6 +82,14 @@ test('the merge page resolves conflicts per row and per subject, then merges', a
   await expect(conflicts(page)).toContainText('Every conflict has a choice');
 
   // the changes those choices make
+  // the change set names each subject with its added and removed values
+  const set = changes(page).getByRole('list', { name: 'Changes of the merge' });
+  await expect(set.getByRole('listitem').first()).toContainText('urn:a');
+  await expect(set).toContainText('height');
+  expect(asked.some((p) => p.startsWith('/orchard'))).toBe(true);
+  expect(asked.filter((p) => p.startsWith('/foaf'))).toEqual([]);
+  // the changes as N-Quads lines rather than the change set
+  await changes(page).getByRole('button', { name: 'N-Quads' }).click();
   const lines = changes(page).getByLabel('Changes of the merge');
   await expect(lines).toContainText('− <urn:a> <urn:height> "2"^^');
   await expect(lines).toContainText('+ <urn:a> <urn:height> "3"^^');
@@ -186,7 +201,10 @@ test('the History graph draws every branch with its forks and merges', async ({
   // a commit's changes, and a link to query at it
   await panel.getByRole('button', { name: /^Commit \d+ on fix$/ }).click();
   const detail = panel.getByRole('region', { name: /^Commit \d+ on fix$/ });
-  await expect(detail.getByLabel('Changes')).toContainText('+ <urn:f> <urn:p> "1"^^');
+  await detail.getByRole('button', { name: 'N-Quads' }).click();
+  await expect(detail.getByLabel('Changes', { exact: true })).toContainText(
+    '+ <urn:f> <urn:p> "1"^^',
+  );
   await detail.getByRole('link', { name: /^Query at commit/ }).click();
   await expect(page).toHaveURL(/\/ui\/query$/);
   await page.getByRole('button', { name: /^Options/ }).click();

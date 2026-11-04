@@ -16,7 +16,7 @@ const expect = baseExpect.configure({ timeout: 15_000 });
 type Pt = { entity: string; x: number; y: number };
 
 async function openMap(page: Page, ds: string, index: string) {
-  await page.goto(`/ui/embedding?ds=${ds}&index=${index}`);
+  await page.goto(`/ui/similar/map?ds=${ds}&index=${index}`);
   const map = page.locator('.emap[data-ready="true"]');
   await expect(map).toBeVisible();
   await expect(page.getByTestId('facts')).toBeVisible();
@@ -166,7 +166,7 @@ test('Open as graph draws the selected entities in Explore', async ({ page }) =>
 test('A large projection runs as a task with progress, then colours by class with a legend and lists the points in view', async ({
   page,
 }) => {
-  await page.goto('/ui/embedding?ds=world&index=shipments');
+  await page.goto('/ui/similar/map?ds=world&index=shipments');
   await expect(page.getByTestId('progress')).toBeVisible();
   await expect(page.getByTestId('progress')).toContainText('Projecting shipments');
   const map = page.locator('.emap[data-ready="true"]');
@@ -192,7 +192,7 @@ test('A large projection runs as a task with progress, then colours by class wit
 });
 
 test('Cancel stops a projection task', async ({ page }) => {
-  await page.goto('/ui/embedding?ds=world&index=shipments&method=neighbours');
+  await page.goto('/ui/similar/map?ds=world&index=shipments&method=neighbours');
   const progress = page.getByTestId('progress');
   await expect(progress).toBeVisible();
   await progress.getByRole('button', { name: 'Cancel' }).click();
@@ -223,7 +223,7 @@ test('A change to the data marks the projection stale, and Recompute builds it a
 });
 
 test('A dataset without a vector index links to the dataset page', async ({ page }) => {
-  await page.goto('/ui/embedding?ds=scratch');
+  await page.goto('/ui/similar/map?ds=scratch');
   const empty = page.locator('[data-state="no-index"]');
   await expect(empty).toContainText('This dataset has no vector index to map');
   await expect(
@@ -241,7 +241,7 @@ test('A caller limited to some graphs is told the map needs the whole dataset', 
       body: JSON.stringify({ error: 'requires access to the whole dataset foaf' }),
     }),
   );
-  await page.goto('/ui/embedding?ds=foaf&index=embedding');
+  await page.goto('/ui/similar/map?ds=foaf&index=embedding');
   await expect(page.locator('[data-state="forbidden"]')).toContainText(
     'Embedding maps need access to every graph',
   );
@@ -254,7 +254,7 @@ test('Explore, the Similar page and the dataset page link to the map', async ({ 
   await expect(page.getByText(/\d+ nodes, \d+ edges/)).toBeVisible();
   await expect(page.getByRole('link', { name: 'Embedding map' })).toHaveAttribute(
     'href',
-    /\/ui\/embedding\?ds=foaf&index=embedding/,
+    /\/ui\/similar\/map\?ds=foaf&index=embedding/,
   );
   // scratch has no vector index
   await page.goto('/ui/explore?ds=scratch');
@@ -264,10 +264,10 @@ test('Explore, the Similar page and the dataset page link to the map', async ({ 
     page
       .getByRole('article', { name: 'Vector index embedding' })
       .getByRole('link', { name: 'Embedding map' }),
-  ).toHaveAttribute('href', /\/ui\/embedding\?ds=foaf&index=embedding/);
+  ).toHaveAttribute('href', /\/ui\/similar\/map\?ds=foaf&index=embedding/);
   await page.goto('/ui/similar?ds=foaf&index=embedding');
   await page.getByRole('link', { name: 'Embedding map' }).click();
-  await expect(page).toHaveURL(/\/ui\/embedding\?ds=foaf&index=embedding/);
+  await expect(page).toHaveURL(/\/ui\/similar\/map\?ds=foaf&index=embedding/);
   await expect(page.locator('.emap[data-ready="true"]')).toBeVisible();
 });
 

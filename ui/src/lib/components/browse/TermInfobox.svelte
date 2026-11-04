@@ -9,12 +9,21 @@
     rows,
     linker,
     footer,
+    heading,
     limit = 6,
-  }: { rows: InfoRow[]; linker: Linker; footer?: Snippet; limit?: number } = $props();
+  }: {
+    rows: InfoRow[];
+    linker: Linker;
+    footer?: Snippet;
+    limit?: number;
+    /** A panel heading, such as "Metadata" on a term page's card. */
+    heading?: string;
+  } = $props();
   let open = $state<Record<string, boolean>>({});
 </script>
 
-<section class="panel info" aria-label="Facts">
+<section class="panel info" aria-label={heading ?? 'Facts'}>
+  {#if heading}<div class="panel-head"><h2>{heading}</h2></div>{/if}
   <div class="panel-body">
     <dl>
       {#each rows as r (r.label)}

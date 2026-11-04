@@ -409,7 +409,7 @@
                   {/if}
                 </td>
                 <td class="num">{fmtInt(c.quads)}</td>
-                <td class="row-actions">
+                <td class="actions">
                   <div class="cell-actions">
                     <button
                       class="btn ghost sm"
@@ -490,7 +490,7 @@
               {#if diff.method === 'compare'}· compared full states{/if}
             </p>
             {#if diff.quads}
-              <DiffLines quads={diff.quads} total={diff.added + diff.removed} />
+              <DiffLines quads={diff.quads} total={diff.added + diff.removed} ds={target} />
             {/if}
           {/if}
         </div>
@@ -696,7 +696,7 @@
   .inherited {
     font-family: var(--font-mono);
   }
-  .row-actions {
+  .actions {
     text-align: right;
     width: 1%;
   }

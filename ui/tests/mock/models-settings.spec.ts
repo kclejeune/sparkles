@@ -14,7 +14,7 @@ test.beforeEach(async ({ request }) => {
 });
 
 async function openPanel(page: Page) {
-  await page.goto('/ui/server');
+  await page.goto('/ui/admin/server');
   const panel = page.getByTestId('settings-model-configuration');
   await expect(panel.locator('[data-field="providers.claude.allowedModels"]')).toBeVisible();
   return {

@@ -39,6 +39,7 @@
     names,
     parse,
     onedit,
+    bare = false,
   }: {
     groups: AxiomGroup[];
     kind: EntityKind;
@@ -55,6 +56,8 @@
       as: ParseAs,
     ) => Promise<{ ok: true; parsed: Parsed } | { ok: false; problem: ManchesterProblem }>;
     onedit: OnEdit;
+    /** Leave out the heading, for a card whose own head names the frame. */
+    bare?: boolean;
   } = $props();
 
   const PAIRS = new Set(['objectAssertions', 'dataAssertions', 'negative']);
@@ -159,8 +162,12 @@
   }
 </script>
 
-<section class="term-sec" aria-labelledby="logic-edit-h">
-  <h2 id="logic-edit-h">Logical definition</h2>
+<svelte:element
+  this={bare ? 'div' : 'section'}
+  class="term-sec"
+  aria-labelledby={bare ? undefined : 'logic-edit-h'}
+>
+  {#if !bare}<h2 id="logic-edit-h">Logical definition</h2>{/if}
   {#each groups as g (g.id)}
     <h3>{g.title}</h3>
     <ul class="erows" data-section={g.id}>
@@ -242,7 +249,7 @@
       {#if problem}<p class="problem" role="alert">{problem.message}</p>{/if}
     </form>
   {/if}
-</section>
+</svelte:element>
 
 <style>
   .erows {

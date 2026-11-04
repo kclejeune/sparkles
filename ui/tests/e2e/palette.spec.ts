@@ -46,7 +46,7 @@ test.describe('at 1440 pixels', () => {
   });
 
   test('`@` finds entities with the server ranking', async ({ page }) => {
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await palette(page, '@pers');
     await expect(list(page).getByRole('group', { name: `Entities in ${DATASET}` })).toBeVisible();
     await expect(option(page, 'Person')).toBeVisible();
@@ -68,7 +68,7 @@ test.describe('at 1440 pixels', () => {
   });
 
   test('`#` lists the datasets and the page branches', async ({ page }) => {
-    await visit(page, '/ui/ontology?ds=' + DATASET);
+    await visit(page, '/ui/workbench/ontology?ds=' + DATASET);
     await palette(page, '#');
     await expect(list(page).getByRole('group', { name: 'Datasets' })).toBeVisible();
     await expect(list(page).getByRole('group', { name: `Branches of ${DATASET}` })).toBeVisible();
@@ -76,7 +76,7 @@ test.describe('at 1440 pixels', () => {
   });
 
   test('`/` filters the ontology tree; Ctrl+K stays the palette', async ({ page }) => {
-    await visit(page, '/ui/ontology?ds=' + DATASET);
+    await visit(page, '/ui/workbench/ontology?ds=' + DATASET);
     const filter = page.getByRole('searchbox', { name: 'Filter' });
     await expect(filter).toBeVisible();
     await page.locator('main h1').click();

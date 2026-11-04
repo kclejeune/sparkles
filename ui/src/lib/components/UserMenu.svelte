@@ -49,8 +49,10 @@
 
 {#snippet links()}
   {#if who?.canMintTokens}
-    <a class="link" role={variant === 'bar' ? 'menuitem' : undefined} href={resolve('/tokens')}
-      ><Icon name="key" size={14} /> API tokens</a
+    <a
+      class="link"
+      role={variant === 'bar' ? 'menuitem' : undefined}
+      href={resolve('/admin/tokens')}><Icon name="key" size={14} /> API tokens</a
     >
   {/if}
   {#if who?.logout}

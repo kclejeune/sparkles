@@ -5,6 +5,8 @@
 // commit. The tests share the mock's state and run in order.
 
 import { expect, test, type Page } from '@playwright/test';
+import { pageAction } from '../page-actions';
+import { expectNoSidewaysScroll } from '../phone';
 
 test.describe.configure({ timeout: 90_000 });
 
@@ -33,7 +35,7 @@ async function commitPreview(page: Page) {
 }
 
 test('the trees, the frame, the usage and the header', async ({ page }) => {
-  await page.goto('/ui/ontology?ds=uni');
+  await page.goto('/ui/workbench/ontology?ds=uni');
   const classes = page.getByRole('tree', { name: 'Classes (asserted)' });
   await expect(classes.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
     timeout: 30_000,
@@ -49,23 +51,23 @@ test('the trees, the frame, the usage and the header', async ({ page }) => {
   await expect(sub).toContainText('teaches some Course');
   await expect(frame).toContainText('Professeur');
   // the usage view lists every axiom that mentions the class
-  await page.getByRole('tab', { name: /Usage/ }).click();
+  await page.getByRole('button', { name: /^Usage/ }).click();
   await expect(page.getByRole('region', { name: 'ObjectPropertyRange' })).toContainText(
     'uni:advisor',
   );
-  await page.getByRole('tab', { name: 'Frame' }).click();
+  await page.getByRole('button', { name: 'Frame', exact: true }).click();
 
   // the property trees
-  await page.getByRole('tab', { name: /Object properties/ }).click();
+  await page.getByRole('combobox', { name: 'Entity kind' }).selectOption('ObjectProperty');
   await expand(page, 'member of');
   await expand(page, 'works for');
   await pick(page, 'Object properties (asserted)', 'head of');
   await expect(page.getByRole('checkbox', { name: 'Functional', exact: true })).toBeChecked();
   await expect(frame.locator('[data-section="superProperties"]')).toContainText('works for');
-  await page.getByRole('tab', { name: /Data properties/ }).click();
+  await page.getByRole('combobox', { name: 'Entity kind' }).selectOption('DataProperty');
   await pick(page, 'Data properties (asserted)', 'credits');
   await expect(frame.locator('[data-section="ranges"]')).toContainText('xsd:integer');
-  await page.getByRole('tab', { name: /Individuals/ }).click();
+  await page.getByRole('combobox', { name: 'Entity kind' }).selectOption('NamedIndividual');
   await expect(node(page, 'Ada Lovelace')).toContainText('Professor');
   await pick(page, 'Individuals (asserted)', 'Ada Lovelace');
   await expect(frame.locator('[data-section="objectAssertions"]')).toContainText('Logic 101');
@@ -82,9 +84,16 @@ test('the trees, the frame, the usage and the header', async ({ page }) => {
 });
 
 test('the inferred class tree sits beside the asserted one', async ({ page }) => {
-  await page.goto('/ui/ontology?ds=uni&tab=Class&inferred=1');
+  await page.goto('/ui/workbench/ontology?ds=uni&inferred=1');
   const inferred = page.getByRole('tree', { name: 'Classes (inferred)' });
   await expect(inferred).toBeVisible({ timeout: 30_000 });
+  // the two trees share the pane in equal columns, side by side
+  const widths = await page
+    .locator('.tree-col')
+    .evaluateAll((cols) => cols.map((c) => c.getBoundingClientRect()));
+  expect(widths).toHaveLength(2);
+  expect(Math.abs(widths[0].width - widths[1].width)).toBeLessThan(2);
+  expect(widths[1].left).toBeGreaterThan(widths[0].left + 100);
   // Teacher is defined as a person who teaches a course, so Professor falls under it
   await inferred.getByRole('button', { name: 'Expand Teacher' }).click();
   await expect(inferred.getByRole('button', { name: 'Professor', exact: true })).toBeVisible();
@@ -95,11 +104,121 @@ test('the inferred class tree sits beside the asserted one', async ({ page }) =>
   ).toHaveCount(0);
 });
 
+test('a filtered tree is read again when the branch changes', async ({ page, request }) => {
+  const made = await request.post('/$/branches/uni', { data: { name: 'dr-filter' } });
+  expect(made.status()).toBe(201);
+  try {
+    const up = await request.post('/uni@dr-filter/update', {
+      headers: { 'Content-Type': 'application/sparql-update' },
+      data: `PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+INSERT DATA { <http://example.org/uni#Zebra> a owl:Class ; rdfs:label "Zebra"@en }`,
+    });
+    expect(up.ok()).toBe(true);
+    await page.goto('/ui/workbench/ontology?ds=uni');
+    const tree = page.getByRole('tree', { name: 'Classes (asserted)' });
+    await expect(tree.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
+      timeout: 30_000,
+    });
+    await page.getByRole('searchbox', { name: /^Filter/ }).fill('Zebra');
+    await expect(page.getByText('Nothing matches')).toBeVisible({ timeout: 10_000 });
+    // the same filter on the branch that has the class finds it
+    await page.getByRole('combobox', { name: 'Branch', exact: true }).selectOption('dr-filter');
+    await expect(tree.getByRole('treeitem', { name: /Zebra/ })).toBeVisible({ timeout: 10_000 });
+  } finally {
+    await request.delete('/$/branches/uni/dr-filter?force=true');
+  }
+});
+
+test('a long named graph in a history change set wraps on a phone', async ({ page, request }) => {
+  const long = 'http://example.org/graphs/' + 'a-named-graph-without-a-break-'.repeat(8) + 'end';
+  const made = await request.post('/$/branches/uni', { data: { name: 'dr-wrap' } });
+  expect(made.status()).toBe(201);
+  try {
+    const up = await request.post('/uni@dr-wrap/update', {
+      headers: {
+        'Content-Type': 'application/sparql-update',
+        'Sparkles-Commit-Message': 'Add to a long graph',
+      },
+      data: `PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+INSERT DATA { GRAPH <${long}> { <http://example.org/uni#Newt> rdfs:comment "in a long graph" } }`,
+    });
+    expect(up.ok()).toBe(true);
+    await page.addInitScript(() => localStorage.setItem('sparkles.iris', 'full'));
+    await page.setViewportSize({ width: 320, height: 700 });
+    await page.goto(
+      `/ui/workbench/ontology?ds=uni&branch=dr-wrap&tab=history&graph=${encodeURIComponent(long)}`,
+    );
+    await page
+      .getByRole('list', { name: 'Changes' })
+      .getByRole('button', { name: /Add to a long graph/ })
+      .click();
+    await expect(page.locator('.changeset').first()).toContainText(long, { timeout: 10_000 });
+    await expectNoSidewaysScroll(page, 'a history change set in a long named graph');
+  } finally {
+    await request.delete('/$/branches/uni/dr-wrap?force=true');
+  }
+});
+
+test('the history of the default graph leaves out what a commit changed in a named graph', async ({
+  page,
+  request,
+}) => {
+  const made = await request.post('/$/branches/uni', { data: { name: 'dr-hist' } });
+  expect(made.status()).toBe(201);
+  try {
+    const up = await request.post('/uni@dr-hist/update', {
+      headers: {
+        'Content-Type': 'application/sparql-update',
+        'Sparkles-Commit-Message': 'Add to two graphs',
+      },
+      data: `PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+INSERT DATA {
+  <http://example.org/uni#Newt> rdfs:comment "in the default graph" .
+  GRAPH <http://example.org/graphs/other> { <http://example.org/uni#Newt> rdfs:comment "in a named graph" }
+}`,
+    });
+    expect(up.ok()).toBe(true);
+    await page.goto('/ui/workbench/ontology?ds=uni&branch=dr-hist&tab=history');
+    const commits = page.getByRole('list', { name: 'Changes' });
+    await commits.getByRole('button', { name: /Add to two graphs/ }).click();
+    const changes = page.locator('.changeset').first();
+    await expect(changes).toContainText('in the default graph', { timeout: 10_000 });
+    await expect(changes).not.toContainText('in a named graph');
+    // a change set that reaches a named graph says which graph each change is in
+    await page.goto(
+      '/ui/workbench/ontology?ds=uni&branch=dr-hist&tab=history&graph=http%3A%2F%2Fexample.org%2Fgraphs%2Fother',
+    );
+    await page
+      .getByRole('list', { name: 'Changes' })
+      .getByRole('button', { name: /Add to two graphs/ })
+      .click();
+    const named = page.locator('.changeset').first();
+    await expect(named).toContainText('in a named graph', { timeout: 10_000 });
+    await expect(named).toContainText('in http://example.org/graphs/other');
+    await expect(named).not.toContainText('in the default graph');
+    // the viewer's choice of full IRIs reaches the names a change set falls back to
+    await expect(named).toContainText('rdfs:comment');
+    await page.evaluate(() => localStorage.setItem('sparkles.iris', 'full'));
+    await page.reload();
+    await page
+      .getByRole('list', { name: 'Changes' })
+      .getByRole('button', { name: /Add to two graphs/ })
+      .click();
+    await expect(page.locator('.changeset').first()).toContainText(
+      'http://www.w3.org/2000/01/rdf-schema#comment',
+      { timeout: 10_000 },
+    );
+  } finally {
+    await request.delete('/$/branches/uni/dr-hist?force=true');
+  }
+});
+
 test('edits on a session branch are previewed, committed, undone and redone', async ({
   page,
   request,
 }) => {
-  await page.goto('/ui/ontology?ds=uni');
+  await page.goto('/ui/workbench/ontology?ds=uni');
   await expect(page.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
     timeout: 30_000,
   });
@@ -130,7 +249,7 @@ test('edits on a session branch are previewed, committed, undone and redone', as
   expect(main).toBe(404);
 
   // undo takes the commit back, redo makes it again
-  await page.getByRole('button', { name: /^Undo/ }).click();
+  await pageAction(page, 'Undo');
   await expect(preview(page)).toContainText('Undo: Create class teaching assistant');
   await commitPreview(page);
   await expect(
@@ -208,18 +327,20 @@ test('edits on a session branch are previewed, committed, undone and redone', as
       .getByRole('button', { name: 'teaching assistant' }),
   ).toHaveCount(0);
   // the undo stack holds every edit of the session
-  await expect(page.getByRole('button', { name: /^Undo/ })).toHaveText('Undo (7)');
+  await expect(page.getByRole('button', { name: /^Undo/, includeHidden: true })).toHaveText(
+    'Undo (7)',
+  );
 });
 
 test('a stale edit is refused and another writer’s commit refreshes the views', async ({
   page,
   request,
 }) => {
-  await page.goto('/ui/ontology?ds=uni');
+  await page.goto('/ui/workbench/ontology?ds=uni');
   await expect(page.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
     timeout: 30_000,
   });
-  await expect(page.locator('.live')).toContainText('Live');
+  await expect(page.getByText('Following changes')).toBeVisible();
   await page.getByRole('button', { name: 'New', exact: true }).click();
   const create = page.getByRole('dialog', { name: 'New class' });
   await create.getByRole('textbox', { name: 'Label', exact: true }).fill('Lab');
@@ -261,7 +382,7 @@ test('a stale edit is refused and another writer’s commit refreshes the views'
   await choose('uni');
   // Course stays open from before
   await expect(page.getByRole('button', { name: 'Collapse Course' })).toBeVisible();
-  await expect(page.locator('.live')).toContainText('Live');
+  await expect(page.getByText('Following changes')).toBeVisible();
   const again = await request.post('/$/ontology/uni/axioms', {
     data: { add: [{ type: 'SubClassOf', subClass: `${UNI}Workshop`, superClass: `${UNI}Course` }] },
   });
@@ -275,7 +396,7 @@ test('a stale edit is refused and another writer’s commit refreshes the views'
   await create.getByRole('textbox', { name: 'Label', exact: true }).fill('Lab');
   await create.getByRole('button', { name: 'Preview' }).click();
   await commitPreview(page);
-  await page.getByRole('button', { name: /^Undo/ }).click();
+  await pageAction(page, 'Undo');
   await expect(preview(page)).toContainText('Reverts commit');
   // back past the new class's page, then to foaf
   await page.goBack();
@@ -285,7 +406,9 @@ test('a stale edit is refused and another writer’s commit refreshes the views'
   await expect(preview(page)).toBeHidden();
   await page.goForward();
   await expect(page).toHaveURL(/ds=uni$/);
-  await expect(page.getByRole('button', { name: /^Undo/ })).toHaveText('Undo (1)');
+  await expect(page.getByRole('button', { name: /^Undo/, includeHidden: true })).toHaveText(
+    'Undo (1)',
+  );
 });
 
 test('the mock revert keeps blank nodes and refuses a cell a later commit changed', async ({

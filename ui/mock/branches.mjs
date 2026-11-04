@@ -967,6 +967,13 @@ export function handleDiff(req, res, url, seg, ctx) {
   const hidden = (q) =>
     limited && q.graph.termType === 'NamedNode' && q.graph.value === PRIVATE_GRAPH;
   for (const [k, ch] of net) if (hidden(ch.quad)) net.delete(k);
+  // `graph=IRI` or `graph=default`: only the changes of that graph
+  const only = url.searchParams.get('graph');
+  if (only)
+    for (const [k, ch] of net) {
+      const g = ch.quad.graph;
+      if (only === 'default' ? g.termType !== 'DefaultGraph' : g.value !== only) net.delete(k);
+    }
   // `term=`: only the changes whose subject or object is one of the terms
   const terms = url.searchParams
     .getAll('term')

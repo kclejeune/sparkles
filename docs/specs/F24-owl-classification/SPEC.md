@@ -607,6 +607,29 @@ file and 11 sound ones are estimated slower than Konclude in one cold run, by up
 ms on ore_ont_8273, though warm runs of each beat Konclude's time, which item 709
 follows. ore_ont_9855 takes 0.5 s on the laptop against Konclude's 1.3 s.
 
+Item 709 measured the 12 small files on the benchmark host. A cold run of the smallest
+of them on four threads spent most of its time starting helper threads that a saturation
+of a few milliseconds does not need. The saturation now starts them once its first
+thread has worked for 0.5 ms, or at once for 4,096 roots, and the parallel steps of the
+normalization run on one thread below 4,096 axioms, while those of the taxonomy keep
+chunks of 1,024 classes. Cold runs of the 12 files take 0.74 of the
+time of the build before on four threads and 0.68 on eight, and a whole cold process of
+each on four threads takes 1.9 to 21.8 ms, under Konclude's times on the laptop. The
+item's estimates had come from the laptop while other work ran on it. Warm runs of five of
+the files take 0.4 to 0.6 ms longer on eight threads, item 720. On one thread
+ChEBI lite and `ore_ont_13482` classify 1.0 to 1.6% slower from code layout, item
+722. Item 695 found that the peak memory of ore_ont_8737 is messages waiting in
+to-do lists that repeat conclusions their contexts already hold. When the waiting messages
+take more memory than the stored conclusions and 256 MiB, a delivery to a context whose
+state is free drops the subsumptions and backward links that the context holds. The peak
+resident set falls from 10.5 to 7.5 GiB on four threads on `atlas` and the run from 32.3
+to 29.0 s, so the comparison's 10 GiB cap no longer stops it, while a run on one thread
+still peaks at 9.4 GiB, item 721. Every ORE 2015 EL ontology, GO, ChEBI lite and
+development file keeps its taxonomy byte for byte on one and eight threads, and
+the [small files and memory results](../../benchmarks/el-classification/RESULTS.md#small-files)
+give the numbers. Five variants that measured no better are in
+[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md).
+
 The references disagree on two files of the set. On ore_ont_15516, Konclude's parsers all
 failed at the first SWRL rule and it classified an empty ontology. HermiT found the
 ontology inconsistent, which its rules cannot cause, since the properties in their heads

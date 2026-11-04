@@ -196,7 +196,7 @@ pub(super) fn build(
 ) -> Result<(Taxonomy, usize), Halt> {
     // the classes the normalization met, by class id in parallel chunks
     let met = &k.interner.met;
-    let found = super::par_map(met, threads, |at, chunk| {
+    let found = super::par_map(met, threads, super::MIN_CLASSES, |at, chunk| {
         let mut out = Vec::new();
         for (j, &m) in chunk.iter().enumerate() {
             let id = (at + j) as u32;
@@ -218,7 +218,7 @@ pub(super) fn build(
         // owl:Nothing and owl:Thing first, then the classes, which are in IRI order
         let mut bottom = vec![Class::nothing(), Class::thing()];
         bottom.extend(
-            super::par_map(&classes, threads, |_, chunk| {
+            super::par_map(&classes, threads, super::MIN_CLASSES, |_, chunk| {
                 chunk.iter().map(|(c, _)| (*c).clone()).collect::<Vec<_>>()
             })
             .into_iter()
@@ -265,7 +265,7 @@ pub(super) fn build(
     // whether the class is unsatisfiable
     let mut subs: Vec<(bool, Vec<u32>)> = vec![(false, Vec::new()); n];
     let mut work: Vec<(usize, &mut (bool, Vec<u32>))> = subs.iter_mut().enumerate().collect();
-    super::par_chunks(&mut work, threads, |chunk| {
+    super::par_chunks(&mut work, threads, super::MIN_CLASSES, |chunk| {
         for (j, (i, slot)) in chunk.iter_mut().enumerate() {
             if halt(j) {
                 return;
@@ -311,7 +311,7 @@ pub(super) fn build(
     // unsatisfiable classes and those equivalent to owl:Thing get NONE
     let mut key: Vec<u32> = vec![NONE; n];
     let mut work: Vec<(usize, &mut u32)> = key.iter_mut().enumerate().collect();
-    super::par_chunks(&mut work, threads, |chunk| {
+    super::par_chunks(&mut work, threads, super::MIN_CLASSES, |chunk| {
         for (j, (i, slot)) in chunk.iter_mut().enumerate() {
             if halt(j) {
                 return;
@@ -374,7 +374,7 @@ pub(super) fn build(
         members[start[node as usize] + slot as usize] = i as u32;
     }
     let ids: Vec<usize> = (0..size.len()).collect();
-    let nodes = super::par_map(&ids, threads, |_, chunk| {
+    let nodes = super::par_map(&ids, threads, super::MIN_CLASSES, |_, chunk| {
         chunk
             .iter()
             .map(|&j| Node {
@@ -397,7 +397,7 @@ pub(super) fn build(
     let mut parents: Vec<Vec<usize>> = vec![Vec::new(); reps.len()];
     let mut work: Vec<(u32, &mut Vec<usize>)> =
         reps.iter().copied().zip(parents.iter_mut()).collect();
-    super::par_chunks(&mut work, threads, |chunk| {
+    super::par_chunks(&mut work, threads, super::MIN_CLASSES, |chunk| {
         for (j, (r, slot)) in chunk.iter_mut().enumerate() {
             if halt(j) {
                 return;
@@ -453,13 +453,14 @@ fn sort_by_iri(mut v: Vec<(&Class, Ex)>, threads: usize) -> Vec<(&Class, Ex)> {
         .collect();
     let bucket = |c: &Class| splitters.partition_point(|s| *s <= c.as_str());
     // each chunk's classes by bucket, then each bucket joined from the chunks and sorted
-    let parts: Vec<Vec<Vec<(&Class, Ex)>>> = super::par_map(&v, threads, |_, chunk| {
-        let mut out: Vec<Vec<(&Class, Ex)>> = vec![Vec::new(); buckets];
-        for &x in chunk {
-            out[bucket(x.0)].push(x);
-        }
-        out
-    });
+    let parts: Vec<Vec<Vec<(&Class, Ex)>>> =
+        super::par_map(&v, threads, super::MIN_CLASSES, |_, chunk| {
+            let mut out: Vec<Vec<(&Class, Ex)>> = vec![Vec::new(); buckets];
+            for &x in chunk {
+                out[bucket(x.0)].push(x);
+            }
+            out
+        });
     drop(v);
     let sorted: Vec<Vec<(&Class, Ex)>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..buckets)

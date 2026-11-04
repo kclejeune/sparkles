@@ -71,7 +71,7 @@ open('the tree, the search and the checks read the thesaurus', async ({ page, re
   expect(shapes.ok()).toBe(true);
   expect(await shapes.text()).toContain('urn:x-sparkles:skos:');
 
-  await page.goto(`/ui/thesaurus?ds=${DS}`);
+  await page.goto(`/ui/workbench/thesaurus?ds=${DS}`);
   await expect(node(page, 'Vertebrates')).toBeVisible({ timeout: 30_000 });
   await expect(tree(page).getByRole('treeitem', { name: 'Flying animals' })).toContainText(
     'not a top concept',
@@ -89,7 +89,7 @@ open('the tree, the search and the checks read the thesaurus', async ({ page, re
   await expect(labels(page).locator('tr[data-lang="la"] .badge')).toHaveText('XL');
 
   // Birds is both preferred and alternative: S13, from the server's shapes
-  await page.getByRole('tab', { name: 'Checks' }).click();
+  await page.getByRole('tab', { name: 'Validation' }).click();
   const results = page.getByRole('list', { name: 'Check results' });
   await expect(results).toContainText('S13');
   await expect(results.getByRole('button', { name: 'Birds' }).first()).toBeVisible();
@@ -99,7 +99,7 @@ open(
   'edits on a session branch leave main and unrelated triples alone',
   async ({ page, request }) => {
     const before = await count(request, DS, '?s ?p ?o');
-    await page.goto(`/ui/thesaurus?ds=${DS}&iri=${encodeURIComponent(TH + 'bats')}`);
+    await page.goto(`/ui/workbench/thesaurus?ds=${DS}&iri=${encodeURIComponent(TH + 'bats')}`);
     await expect(page.getByRole('heading', { name: 'Bats' })).toBeVisible({ timeout: 30_000 });
     await page.getByRole('button', { name: 'Start session' }).click();
     await expect(page).toHaveURL(/branch=skos\./);
@@ -138,7 +138,7 @@ open(
     expect(await count(request, on, `<${TH}mammals> <${SKOS}narrower> <${TH}bats>`)).toBe(0);
 
     // a related link, written in both directions
-    await page.getByRole('tab', { name: 'Relations' }).click();
+    await page.getByRole('button', { name: 'Relations', exact: true }).click();
     await page.getByRole('button', { name: 'Add related', exact: true }).click();
     const picker = page.getByRole('group', { name: 'Related picker' });
     await picker.getByRole('searchbox').fill('bird');
@@ -147,7 +147,7 @@ open(
     expect(await count(request, on, `<${TH}birds> <${SKOS}related> <${TH}bats>`)).toBe(1);
 
     // a definition through the notes form of the built-in shapes
-    await page.getByRole('tab', { name: 'Notes' }).click();
+    await page.getByRole('button', { name: 'Notes', exact: true }).click();
     await expect(page.getByRole('region', { name: 'Details' })).toContainText(
       'built-in SKOS shapes',
     );
@@ -194,7 +194,7 @@ open(
         <${SKOS}prefLabel> "Owls"@en . ${note} } ${note} }`)
       ).ok(),
     ).toBe(true);
-    const url = `/ui/thesaurus?ds=${ds}&graph=${encodeURIComponent('urn:g')}&iri=${encodeURIComponent(
+    const url = `/ui/workbench/thesaurus?ds=${ds}&graph=${encodeURIComponent('urn:g')}&iri=${encodeURIComponent(
       TH + 'owls',
     )}&view=notes`;
     const details = page.getByRole('region', { name: 'Details' });

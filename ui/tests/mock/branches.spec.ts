@@ -45,7 +45,7 @@ test('the branch selector keeps the branch in the URL and in every request', asy
     asked.push(u.pathname + u.search);
   });
   await page.goto('/ui/datasets/ledger');
-  const select = page.getByRole('combobox', { name: 'Branch' });
+  const select = page.getByRole('combobox', { name: 'Branch', exact: true });
   // the first page load compiles the UI in vite dev
   await expect(select).toHaveValue('main', { timeout: 30_000 });
   await expect(select.getByRole('option')).toHaveText(['main · commit 1', 'dev · commit 2']);
@@ -65,10 +65,10 @@ test('the branch selector keeps the branch in the URL and in every request', asy
 
   // a link opens the same branch
   await page.reload();
-  await expect(page.getByRole('combobox', { name: 'Branch' })).toHaveValue('dev');
+  await expect(page.getByRole('combobox', { name: 'Branch', exact: true })).toHaveValue('dev');
   await expect(row(page, 'dev')).toHaveAttribute('aria-current', 'true');
 
-  await page.getByRole('combobox', { name: 'Branch' }).selectOption('main');
+  await page.getByRole('combobox', { name: 'Branch', exact: true }).selectOption('main');
   await expect(page).toHaveURL(/\/ui\/datasets\/ledger$/);
   await expect(page.locator('.meta')).toContainText('/ledger/sparql');
 });
@@ -83,7 +83,7 @@ test('older servers without memory branches keep the dataset page usable', async
   );
   await page.goto('/ui/datasets/scratch');
   await expect(page.getByRole('heading', { name: 'History' })).toBeVisible();
-  await expect(page.getByRole('combobox', { name: 'Branch' })).toHaveCount(0);
+  await expect(page.getByRole('combobox', { name: 'Branch', exact: true })).toHaveCount(0);
   await expect(panel(page)).toHaveCount(0);
 });
 
@@ -143,7 +143,7 @@ test('an update on a branch through the query page, merged with the Merge button
   await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'ledger'));
   await page.goto('/ui/query');
   await page.getByRole('button', { name: /^Options/ }).click();
-  const branch = page.getByRole('combobox', { name: 'Branch' });
+  const branch = page.getByRole('combobox', { name: 'Branch', exact: true });
   await branch.selectOption({ label: 'feature · commit 1' });
   const editor = page.locator('.cm-content');
   await editor.click();
@@ -245,7 +245,9 @@ test('renaming the selected branch updates its URL and preserves identity and ch
   await dialog.getByRole('textbox', { name: 'New name' }).fill('rename-new');
   await dialog.getByRole('button', { name: 'Rename', exact: true }).click();
   await expect(page).toHaveURL(/\?branch=rename-new$/);
-  await expect(page.getByRole('combobox', { name: 'Branch' })).toHaveValue('rename-new');
+  await expect(page.getByRole('combobox', { name: 'Branch', exact: true })).toHaveValue(
+    'rename-new',
+  );
   await expect(row(page, 'rename-old')).toHaveCount(0);
   const renamed = await (await request.get('/$/branches/ledger/rename-new')).json();
   expect(renamed.id).toBe(original.id);
@@ -264,13 +266,15 @@ test('memory branches are selectable and isolate writes from main', async ({ pag
   );
   await update(request, 'memory-branches@dev', 'INSERT DATA { <urn:branch> <urn:p> 1 }');
   await page.goto('/ui/datasets/memory-branches?branch=dev');
-  await expect(page.getByRole('combobox', { name: 'Branch' })).toHaveValue('dev');
+  await expect(page.getByRole('combobox', { name: 'Branch', exact: true })).toHaveValue('dev');
   await expect(row(page, 'dev')).toBeVisible();
   await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'memory-branches'));
   await page.goto('/ui/query');
   await page.getByRole('button', { name: /^Options/ }).click();
   await expect(
-    page.getByRole('combobox', { name: 'Branch' }).getByRole('option', { name: /^dev/ }),
+    page
+      .getByRole('combobox', { name: 'Branch', exact: true })
+      .getByRole('option', { name: /^dev/ }),
   ).toHaveCount(1);
   const main = await request.get('/memory-branches/sparql', {
     params: { query: 'ASK { <urn:branch> <urn:p> 1 }' },

@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A conclusion waiting in a context's to-do list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -484,6 +484,15 @@ pub const CONTEXT_BYTES: usize = 320;
 const OUTBOX: usize = 4096;
 /// The clauses of Tier D a context processes between checks of the bounds.
 const DL_CLAUSES: usize = 256;
+/// The bytes of waiting messages below which a saturation never counts as congested.
+const CONGESTED_BYTES: usize = 256 << 20;
+/// The roots from which a saturation on several threads starts them all at once.
+const EAGER_ROOTS: usize = if cfg!(test) { 64 } else { 4096 };
+/// How long the first worker of a smaller saturation runs before the others start, so
+/// that a run that ends sooner pays for no thread (roadmap item 709).
+const LAZY_START: Duration = Duration::from_micros(if cfg!(test) { 0 } else { 500 });
+/// The activations between the first worker's checks of [`LAZY_START`].
+const LAZY_EVERY: u32 = 16;
 
 struct Run<'a> {
     ix: &'a Index,
@@ -581,7 +590,8 @@ pub fn saturate_counted(
         next_root: AtomicUsize::new(0),
         queue: Mutex::new(Vec::new()),
         ready: Condvar::new(),
-        pending: AtomicUsize::new(bounds.threads.max(1)),
+        // the first worker, which the others join when they start (`Run::workers`)
+        pending: AtomicUsize::new(1),
         idle: AtomicUsize::new(0),
         stop: AtomicU8::new(STOP_NONE),
         memory: AtomicUsize::new(bounds.base_memory),
@@ -963,21 +973,58 @@ impl<'a> Run<'a> {
             return;
         }
         outbox.group();
+        let filter = self.congested();
         let outbox = &mut outbox.msgs;
         let mut at = 0;
         while at < outbox.len() {
             let to = outbox[at].0;
             let end = at + outbox[at..].iter().take_while(|m| m.0 == to).count();
             let ctx = self.get(to);
-            ctx.todo
-                .lock()
-                .extend(outbox[at..end].iter().map(|&(_, c)| c));
+            if !(filter && self.deliver_new(ctx, &outbox[at..end])) {
+                ctx.todo
+                    .lock()
+                    .extend(outbox[at..end].iter().map(|&(_, c)| c));
+            }
             if self.mark(ctx) {
                 mine.push_back(to);
             }
             at = end;
         }
         outbox.clear();
+    }
+
+    /// Delivers to a context the messages it does not already hold, and says whether it
+    /// could look, which it cannot while another worker holds the context (roadmap item
+    /// 695).
+    #[cold]
+    #[inline(never)]
+    fn deliver_new(&self, ctx: &Ctx, msgs: &[(Ex, Concl)]) -> bool {
+        let Some(st) = ctx.st.try_lock() else {
+            return false;
+        };
+        if !st.init {
+            return false;
+        }
+        let mut t = ctx.todo.lock();
+        let before = t.len();
+        t.extend(
+            msgs.iter()
+                .map(|&(_, c)| c)
+                .filter(|c| !(matches!(c, Concl::Sub(_) | Concl::Back(..)) && st.holds(c))),
+        );
+        let dropped = msgs.len() - (t.len() - before);
+        if dropped > 0 {
+            self.queued.fetch_sub(dropped as isize, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// Whether the messages waiting in to-do lists and outboxes take more than the stored
+    /// conclusions and [`CONGESTED_BYTES`], as of the workers' last checks.
+    fn congested(&self) -> bool {
+        let waiting = self.queued.load(Ordering::Relaxed).max(0) as usize;
+        waiting * std::mem::size_of::<Concl>()
+            > self.memory.load(Ordering::Relaxed).max(CONGESTED_BYTES)
     }
 
     /// Moves half of a worker's queue to the shared queue when a worker waits for it.
@@ -1037,16 +1084,27 @@ impl<'a> Run<'a> {
     /// set has a worker of its own that inlines its activation, so that the worker of the
     /// EL rules does not hold the activations of the Horn and disjunctive rules
     /// (roadmap items 711 and 715).
+    ///
+    /// The calling thread is the first worker. A run of many roots starts the others at
+    /// once, and a smaller one when the first has run for [`LAZY_START`], so that a
+    /// small ontology, whose saturation takes less time than starting threads, runs on
+    /// one (roadmap item 709).
     fn workers<R: Rules>(&self, threads: usize) {
         if threads == 1 {
-            self.worker::<R>();
-        } else {
-            std::thread::scope(|s| {
-                for _ in 0..threads {
-                    s.spawn(|| self.worker::<R>());
-                }
-            });
+            self.worker::<R>(None);
+            return;
         }
+        std::thread::scope(|s| {
+            let start = || {
+                // counted while the first worker is busy, so that the count cannot reach 0
+                // before they start
+                self.pending.fetch_add(threads - 1, Ordering::SeqCst);
+                for _ in 1..threads {
+                    s.spawn(|| self.worker::<R>(None));
+                }
+            };
+            self.worker::<R>(Some(&start));
+        });
     }
 
     /// A worker activates up to [`ROOTS_PER_ROUND`] roots, then the contexts those
@@ -1054,7 +1112,14 @@ impl<'a> Run<'a> {
     /// before it takes more roots. A context that many others send to, such as a class
     /// that fills many existential restrictions, then takes the conclusions of a round
     /// in one activation rather than one at a time.
-    fn worker<R: Rules>(&self) {
+    fn worker<R: Rules>(&self, mut others: Option<&dyn Fn()>) {
+        if self.roots.len() >= EAGER_ROOTS
+            && let Some(start) = others.take()
+        {
+            start();
+        }
+        let began = others.map(|_| Instant::now());
+        let mut activations = 0u32;
         let mut mine: VecDeque<Ex> = VecDeque::new();
         let mut chunk: Vec<Ex> = Vec::new();
         let mut round = 0usize;
@@ -1122,6 +1187,15 @@ impl<'a> Run<'a> {
                 return;
             }
             self.process::<R>(next, &mut mine, &mut tally, &mut local, &mut outbox);
+            if let Some(start) = others {
+                activations += 1;
+                if activations.is_multiple_of(LAZY_EVERY)
+                    && began.is_some_and(|b| b.elapsed() >= LAZY_START)
+                {
+                    others = None;
+                    start();
+                }
+            }
             if !outbox.is_empty() && self.idle.load(Ordering::Relaxed) > 0 {
                 self.deliver(&mut outbox, &mut mine);
             }

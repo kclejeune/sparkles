@@ -6,6 +6,7 @@
   import { toasts } from '$lib/app.svelte';
   import type { Linker, Name, Sourced } from '$lib/browse';
   import Icon from '$components/Icon.svelte';
+  import PageActions from '$components/PageActions.svelte';
   import LinkedText from './LinkedText.svelte';
   import { valueText } from '$lib/browse';
 
@@ -44,7 +45,9 @@
   }
 </script>
 
-<header class="term-head">
+<!-- the shared page head: the crumbs above, the title with the actions level with it, and
+     the IRI row and notes under the title (ROADMAP item 633) -->
+<header class="page-head term-head">
   {#if crumbs.length}
     <nav class="crumbs" aria-label="Breadcrumbs">
       {#each crumbs as c, i (i)}
@@ -53,10 +56,8 @@
       {/each}
     </nav>
   {/if}
-  <div class="title-row">
-    <h1 class="term-title" class:struck={name.deprecated}>{title}</h1>
-    {#if actions}<div class="actions">{@render actions()}</div>{/if}
-  </div>
+  <h1 class="term-title" class:struck={name.deprecated}>{title}</h1>
+  {#if actions}<PageActions small>{@render actions()}</PageActions>{/if}
   <div class="ids">
     {#if name.shortForm && name.shortForm !== title}<span class="sf">{name.shortForm}</span>{/if}
     <span class="badge iri">{kind}</span>
@@ -105,16 +106,15 @@
     display: flex;
     gap: 6px;
     flex-wrap: wrap;
-    margin-bottom: var(--sp-2);
+  }
+  /* the small actions sit level with the middle of the large title's first line */
+  @media (min-width: 640px) {
+    .term-head > :global(.page-actions) {
+      margin-top: calc((var(--fs-display) * 1.12 - var(--ctl-h-sm)) / 2);
+    }
   }
   .crumbs a {
     color: var(--text-2);
-  }
-  .title-row {
-    display: flex;
-    align-items: flex-start;
-    gap: var(--sp-3);
-    flex-wrap: wrap;
   }
   .term-title {
     font-size: var(--fs-display);
@@ -130,18 +130,11 @@
     text-decoration-thickness: 2px;
     text-decoration-color: var(--danger);
   }
-  .actions {
-    margin-left: auto;
-    display: flex;
-    gap: var(--sp-2);
-    flex-wrap: wrap;
-  }
   .ids {
     display: flex;
     align-items: center;
     gap: var(--sp-2) var(--sp-3);
     flex-wrap: wrap;
-    margin-top: var(--sp-2);
     min-width: 0;
   }
   .sf {
@@ -188,10 +181,6 @@
     text-decoration: underline;
   }
   @container browse (max-width: 639px) {
-    .actions {
-      margin-left: 0;
-      width: 100%;
-    }
     .lede {
       font-size: 14px;
     }

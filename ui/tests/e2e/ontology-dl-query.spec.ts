@@ -55,7 +55,7 @@ open.beforeAll(async ({ request }) => {
 });
 
 open('the EL classifier answers a query inside OWL 2 EL', async ({ page }) => {
-  await page.goto(`/ui/ontology?ds=${DS}&tab=dlquery`);
+  await page.goto(`/ui/workbench/ontology?ds=${DS}&tab=dlquery`);
   await run(page, 'Person and (teaches some Course)');
   const a = answers(page);
   await expect(a.getByRole('status')).toContainText('OWL 2 EL classifier');
@@ -72,7 +72,7 @@ open('the EL classifier answers a query inside OWL 2 EL', async ({ page }) => {
 });
 
 open('outside OWL 2 EL the RL rules answer, labelled as incomplete', async ({ page }) => {
-  await page.goto(`/ui/ontology?ds=${DS}&tab=dlquery`);
+  await page.goto(`/ui/workbench/ontology?ds=${DS}&tab=dlquery`);
   await run(page, "teaches only 'Graduate course'");
   const a = answers(page);
   await expect(a.getByRole('status')).toContainText('OWL 2 RL');
@@ -84,14 +84,14 @@ open('outside OWL 2 EL the RL rules answer, labelled as incomplete', async ({ pa
 });
 
 open('a name the ontology does not have is underlined', async ({ page }) => {
-  await page.goto(`/ui/ontology?ds=${DS}&tab=dlquery`);
+  await page.goto(`/ui/workbench/ontology?ds=${DS}&tab=dlquery`);
   await run(page, 'Person and Robot');
   await expect(page.getByRole('alert')).toContainText('Robot');
   await expect(page.locator('.cm-lint-error')).toHaveText('Robot');
 });
 
 open('a frame section reads a Manchester expression on the server', async ({ page }) => {
-  await page.goto(`/ui/ontology?ds=${DS}&tab=Class&iri=${encodeURIComponent(UNI + 'Employee')}`);
+  await page.goto(`/ui/workbench/ontology?ds=${DS}&iri=${encodeURIComponent(UNI + 'Employee')}`);
   const sub = page.locator('.frame [data-section="sub"]');
   await sub.getByRole('textbox', { name: /^Add to/ }).click();
   await page.keyboard.type("teaches only 'Graduate course'");

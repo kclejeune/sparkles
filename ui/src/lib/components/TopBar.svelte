@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { iriForm } from '$lib/iri-form.svelte';
   // The shell's top bar (docs/visualization/README.md, "Web UI"): the brand, the scope and
   // search field, the connection status, the theme and the account. On a phone the status,
   // theme, account, dataset switcher and pages move into a drawer that the menu button opens.
@@ -62,6 +63,18 @@
   </button>
 {/snippet}
 
+{#snippet iriButton()}
+  <!-- how IRIs are written across the app: prefixed names or in full -->
+  <button
+    class="btn ghost sm iri-toggle"
+    aria-pressed={iriForm.full}
+    title={iriForm.full
+      ? 'IRIs are shown in full. Show prefixed names instead.'
+      : 'IRIs are shown as prefixed names. Show them in full instead.'}
+    onclick={() => iriForm.set(!iriForm.full)}>{iriForm.full ? 'Full IRIs' : 'Prefixed'}</button
+  >
+{/snippet}
+
 <header class="topbar">
   <a class="brand" href={resolve('/query')} aria-label="Sparkles home">
     <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true">
@@ -76,6 +89,7 @@
 
   <div class="end">
     <span class="wide">{@render statusDot()}</span>
+    <span class="wide">{@render iriButton()}</span>
     <span class="wide">{@render themeButton()}</span>
     <span class="wide"><UserMenu /></span>
     <button
@@ -123,6 +137,7 @@
         <div class="row">
           {@render statusDot()}<span class="status-text">{status}</span>
           <span class="spacer"></span>
+          {@render iriButton()}
           {@render themeButton()}
         </div>
       </div>
@@ -300,5 +315,10 @@
       transform: translateX(-24px);
       opacity: 0;
     }
+  }
+  .iri-toggle {
+    min-width: 5.5rem;
+    color: var(--text-2);
+    font-size: var(--fs-sm);
   }
 </style>

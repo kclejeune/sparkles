@@ -3237,7 +3237,7 @@ and a note says how many were left out.
 The embedding map draws the entities of a vector index as points on a plane, so that
 entities with alike vectors sit close together. **Embedding map** on an index's card on the
 dataset page, in Explore's graph toolbar and on the Similar page opens it at
-`/ui/embedding?ds=…&index=…`. The server computes the projection the first time the map is
+`/ui/similar/map?ds=…&index=…`. The server computes the projection the first time the map is
 opened and keeps it in memory, so later visits draw at once.
 
 **Layout** chooses how the points are placed. **PCA** projects every vector onto the two
@@ -5084,7 +5084,7 @@ plaintext, replace any API keys that an earlier copy may hold. Sealing also does
 stop someone with write access to `secrets/` from putting back an older sealed value of
 the same secret, because sealing does not record a value's revision.
 
-The **Server** page of the web UI has a **Models** section for users with
+The **Server** tab of the web UI's **Admin** page has a **Models** section for users with
 `server-admin`. It lists the providers with their protocol, endpoint and whether their
 key can be read, and has a form to add a provider. Below it, the model configuration is
 a form with a group of fields for each provider, the role lists and the routing, with the

@@ -216,7 +216,7 @@ test('validate', async ({ page }) => {
   const panel = page.locator('section.panel').filter({
     has: page.getByRole('heading', { name: 'Validate', exact: true }),
   });
-  await panel.getByRole('tab', { name: 'ShEx' }).click();
+  await panel.getByRole('button', { name: 'ShEx', exact: true }).click();
   await page.getByRole('textbox', { name: 'ShEx schema' }).click();
   await page.keyboard.press('ControlOrMeta+a');
   await page.keyboard.press('Delete');
@@ -294,7 +294,7 @@ test('palette-phone', async ({ browser }) => {
     localStorage.setItem('sparkles.dataset', ds);
   }, DATASET);
   const page = await ctx.newPage();
-  await page.goto(`/ui/ontology?ds=${DATASET}`);
+  await page.goto(`/ui/workbench/ontology?ds=${DATASET}`);
   await expect(page.getByRole('heading', { name: 'Ontology', exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Open search' }).click();
   await expect(
@@ -307,7 +307,7 @@ test('palette-phone', async ({ browser }) => {
 test('shell-medium', async ({ page }) => {
   await page.setViewportSize({ width: 900, height: 900 });
   await page.goto(
-    `/ui/ontology?ds=${DATASET}&iri=${encodeURIComponent('http://example.org/ns#Person')}`,
+    `/ui/workbench/ontology?ds=${DATASET}&iri=${encodeURIComponent('http://example.org/ns#Person')}`,
   );
   await expect(page.getByRole('heading', { name: 'Person', exact: true })).toBeVisible();
   await shoot(page, 'shell-medium');

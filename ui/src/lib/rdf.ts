@@ -1,4 +1,5 @@
 import type { Term } from './api';
+import { iriForm } from './iri-form.svelte';
 
 export const WELL_KNOWN: Record<string, string> = {
   rdf: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
@@ -65,7 +66,9 @@ function decodeSafe(s: string) {
   }
 }
 
+/** An IRI as the viewer chose to see IRIs: a prefixed name where one fits, or in full. */
 export function displayIri(iri: string, prefixes: PrefixMap): string {
+  if (iriForm.full) return iri;
   return shorten(iri, prefixes) ?? iri;
 }
 

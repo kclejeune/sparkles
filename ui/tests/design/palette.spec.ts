@@ -17,17 +17,17 @@ const OUT = resolve(
 const PAGES = [
   ['query', '/ui/query?ds=demo'],
   ['explore', '/ui/explore?ds=demo'],
-  ['ontology', '/ui/ontology?ds=go'],
-  ['thesaurus', '/ui/thesaurus?ds=unesco'],
+  ['ontology', '/ui/workbench/ontology?ds=go'],
+  ['thesaurus', '/ui/workbench/thesaurus?ds=unesco'],
   ['similar', '/ui/similar?ds=demo'],
   ['memory', '/ui/memory?ds=demo'],
-  ['embedding', '/ui/embedding?ds=demo'],
+  ['embedding', '/ui/similar/map?ds=demo'],
   ['datasets', '/ui/datasets'],
   ['dataset', '/ui/datasets/demo'],
   ['merge', '/ui/datasets/demo/merge?source=draft-places'],
-  ['backups', '/ui/backups'],
-  ['server', '/ui/server'],
-  ['tokens', '/ui/tokens'],
+  ['backups', '/ui/admin/backups'],
+  ['server', '/ui/admin/server'],
+  ['tokens', '/ui/admin/tokens'],
 ].map(([name, path]) => ({ name, path }));
 const WIDTHS = { large: [1440, 900], medium: [900, 1000], phone: [390, 844] } as const;
 
@@ -87,7 +87,7 @@ test('each source answers on real data', async ({ browser }) => {
   // GO's classes through the server's typo-tolerant ranking; the first search builds the
   // index, which takes a while on a debug build
   await page.request.get(`${BASE}/$/ontology/go/search?q=mito&limit=1`, { timeout: 120_000 });
-  await page.goto(`${BASE}/ui/ontology?ds=go`);
+  await page.goto(`${BASE}/ui/workbench/ontology?ds=go`);
   await expect(page.locator('main h1')).toBeAttached({ timeout: 60_000 });
   await open(page, false, '@mitochondrion inher');
   await expect(
@@ -102,7 +102,7 @@ test('each source answers on real data', async ({ browser }) => {
   await page.keyboard.press('Escape');
 
   // UNESCO's concepts
-  await page.goto(`${BASE}/ui/thesaurus?ds=unesco`);
+  await page.goto(`${BASE}/ui/workbench/thesaurus?ds=unesco`);
   await expect(page.locator('main h1')).toBeAttached({ timeout: 60_000 });
   await open(page, false, '@educaton');
   await expect(

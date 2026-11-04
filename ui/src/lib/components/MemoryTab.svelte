@@ -115,6 +115,13 @@
   const SIGN = { added: '+', superseded: '−', retracted: '−' } as const;
   const citationOf = (reifier: string | undefined) =>
     reifier ? result?.citations.find((c) => c.reifier === reifier)?.id : undefined;
+  /** The value that replaced a superseded fact, when the result holds the replacing fact. */
+  const replacement = (h: askApi.RecallSuperseded): string | undefined => {
+    const id = citationOf(h.replacedBy);
+    return id == null
+      ? undefined
+      : entity?.facts.find((f) => String(f.citation) === String(id) && f.p === h.p)?.o;
+  };
   const day = (t: string | undefined) => (t ? t.slice(0, 10) : '?');
 </script>
 
@@ -243,19 +250,38 @@
     {#if history.length === 0}
       <p class="faint small">No superseded or retracted facts.</p>
     {:else}
-      <ul class="history" aria-label="History">
+      <ol class="timeline steps" aria-label="History">
         {#each history as h (h.reifier)}
           {@const by = citationOf(h.replacedBy)}
-          <li>
-            <span class="when mono small">{day(h.at)} → {day(h.invalidatedAt)}</span>
-            <span class="mono"><TermView term={parseCompact(h.p, all)} prefixes={all} /></span>
-            <span class="mono"
-              ><TermView term={parseCompact(h.o, all)} prefixes={all} {onopen} /></span
-            >
-            <span class="faint small">{fateLine(h, by)} · {h.graph}</span>
+          {@const now = replacement(h)}
+          <li
+            class:retracted={!h.replacedBy}
+            style:--dot={h.replacedBy ? 'var(--warn)' : 'var(--removed)'}
+          >
+            <div class="step-head">
+              <span class="when mono small">{day(h.at)} → {day(h.invalidatedAt)}</span>
+              <span class="badge" class:danger={!h.replacedBy}
+                >{h.replacedBy ? 'superseded' : 'retracted'}</span
+              >
+            </div>
+            <div class="pair">
+              <span class="mono pred"
+                ><TermView term={parseCompact(h.p, all)} prefixes={all} /></span
+              >
+              <span class="mono old"
+                ><TermView term={parseCompact(h.o, all)} prefixes={all} {onopen} /></span
+              >
+              {#if now}
+                <span class="arrow" aria-label="replaced by">→</span>
+                <span class="mono new"
+                  ><TermView term={parseCompact(now, all)} prefixes={all} {onopen} /></span
+                >
+              {/if}
+            </div>
+            <div class="faint small">{fateLine(h, by)} · {h.graph}</div>
           </li>
         {/each}
-      </ul>
+      </ol>
     {/if}
   {:else if result}
     <p class="faint">No memory about this resource yet.</p>
@@ -303,6 +329,31 @@
   }
   .when {
     color: var(--text-2);
+  }
+  .steps {
+    padding-top: var(--sp-1);
+    font-size: var(--fs-sm);
+  }
+  .step-head,
+  .pair {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px var(--sp-2);
+    overflow-wrap: anywhere;
+  }
+  .pred {
+    color: var(--text-2);
+  }
+  .old {
+    text-decoration: line-through;
+    color: var(--text-3);
+  }
+  .arrow {
+    color: var(--text-2);
+  }
+  .new {
+    font-weight: 600;
   }
   .change {
     padding-left: 6px;

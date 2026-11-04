@@ -141,6 +141,48 @@ page's branch and past-state choices share one row under the title. On a phone, 
 dock at the bottom of the screen as sheets, toolbar and page-head buttons keep their icons,
 and the dataset settings and branch review pages no longer scroll sideways.
 
+The web UI separates reading from authoring (roadmap item 633). Browse is the reader with
+its edit mode, and a new **Workbench** group in the rail holds the Ontology and Thesaurus
+editors at `/ui/workbench/ontology` and `/ui/workbench/thesaurus`, which replace
+`/ui/ontology` and `/ui/thesaurus` without redirects. The rail shows the Workbench only to
+callers who may write the open dataset. Admin's Server, Backups and Tokens pages moved to
+`/ui/admin/server`, `/ui/admin/backups` and `/ui/admin/tokens`, and the embedding map moved
+to `/ui/similar/map`, under the Admin and Similar groups. A page has at most one row of tabs.
+The editors' entity kinds and the thesaurus's concepts and collections are selects, and an
+entity's views are a segmented control. The Ontology editor gains a **History** tab and the
+Thesaurus editor **History** and **Validation** tabs, where each commit opens as a change
+set named by labels. A term page links to its editor and to similar terms in the dataset's
+vector index, and an editor's entity panel and Explore's details panel link to the term's
+page. A data table pins its actions to the right edge when it scrolls, and on a phone shows
+each row as a card. The editors' trees indent less below the fourth level, keep the
+ancestors of the first visible row at the top as the tree scrolls, show the selected
+entity's path above its panel, and give labels the room before short forms.
+A level with more than 1,000 children now says so and shows the rest with **Show more**,
+where it showed only the first 1,000 before. A Browse term page is a row of counts under its
+header and cards for its definition, axioms, hierarchy and references beside cards for its
+metadata and downloads, in two columns that balance their heights. The hierarchy card
+scrolls on its own, draws the graph in place of the tree, and on a phone opens on
+request. Pages with a side column, Browse and a dataset's page, share one side column
+width.
+
+The Browse term page and the page heads of the web UI changed again in the second stage of
+that review (roadmap item 633). The Definition card leads with every definition,
+description, comment and scope note, grouped under a heading that names the kind and the
+predicate, and an **Axioms** card shows the term's frame in Manchester syntax with the
+inferences of a classification that a **Classify** button runs. SKOS concepts get no
+Axioms card. Every page's title shares a row with its buttons, and buttons that do not fit
+fold into a **More** menu. A page's counts are one row of chips, on Browse and on a
+dataset's overview. The landing search spans the content. Edit previews and the history
+tabs show each change as one block for a subject, named by its label, with the N-Quads one
+tab away. Memory's facts are cards that show their source, quote, confidence and review
+status, a fact's history is a timeline that pairs each superseded value with its
+replacement, the Memory page heads its overview with counts and lists activity as a
+timeline, and a dataset's Communities tab can draw the hierarchy as a treemap. The top
+bar's dataset follows a dataset's own page, and choosing another dataset there opens that
+dataset's page. The ontology editor's asserted and inferred class trees share their pane
+in equal columns, where the asserted tree had been squeezed to a sliver. Every screenshot
+in `docs/images` was taken again.
+
 Ontologies and thesauri have a typo-tolerant entity search for typeahead (spec U12,
 roadmap item 616). `GET /$/ontology/{ds}/search?q=` matches the labels, synonyms, short
 forms and definitions of OWL, RDFS and SKOS entities in any language, with up to two
@@ -365,6 +407,20 @@ forge `ore_ont_3836` classifies in 0.97 of the time of the build before, `ore_on
 in 0.96, ChEBI lite in 0.98 and GO in 0.99, with the same taxonomies. The crate takes 25
 to 27 s to compile in a release build instead of 9 to 12 s on atlas, and a release build
 of the server takes the same time, since its dependents start from the crate's metadata.
+
+The EL classifier starts its helper threads once the first thread has worked for 0.5 ms,
+or at once for a run of 4,096 roots, and runs the parallel steps of its normalization on
+one thread below 4,096 axioms (roadmap item 709). Cold runs of 12 small ORE 2015 DL
+files take 0.74 of the time of the build before on four threads on forge and 0.68 on
+eight, with the same taxonomies. Warm runs of five of them take about 0.5 ms longer on
+eight threads, which roadmap item 720 follows, and ChEBI lite and `ore_ont_13482`
+classify 1.0 to 1.6% slower on one thread from code layout, item 722.
+
+A congested EL saturation drops the subsumptions and backward links it delivers to a
+context that already holds them (roadmap item 695). The peak resident set of
+`ore_ont_8737`, with 2.5 million existential restrictions, falls from 10.5 to 7.5 GiB on
+four threads on atlas and its time from 32.3 to 29.0 s. A run on one thread still peaks at 9.4
+GiB, item 721.
 
 The planner estimates more joins from statistics of how predicates occur together (spec
 X15, roadmap item 454). A bulk load or compaction keeps 32,768 subject characteristic sets

@@ -1129,7 +1129,7 @@ directory.
 
 ## 6. UI (SvelteKit, `ui/`)
 
-The top navigation gains a **Backups** entry (`routes/backups/+page.svelte`). It is
+The top navigation gains a **Backups** entry (`routes/admin/backups/+page.svelte`). It is
 visible to `server-admin`, and to dataset admins in a reduced form through C09's
 permission-aware actions. The page has four tabs:
 

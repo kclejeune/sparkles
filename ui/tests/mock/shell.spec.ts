@@ -46,7 +46,7 @@ test.describe('at 1440 pixels', () => {
 
   test('a query that matches nothing says so', async ({ page }) => {
     await onDataset(page, 'uni');
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await search(page).click();
     await page.keyboard.type('zzzzqqq');
     await expect(page.getByRole('listbox', { name: 'Search results' })).toContainText(
@@ -209,7 +209,7 @@ test.describe('at 1440 pixels', () => {
   });
 
   test('a provider can suggest items before anything is typed', async ({ page }) => {
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     // the mock runs under Vite, which serves the app's own instance of the module
     await page.evaluate(async () => {
       const path = '/ui/src/lib/launcher.svelte.ts';
@@ -257,26 +257,44 @@ test.describe('at 1440 pixels', () => {
   });
 
   test('the rail names every page and marks the open one', async ({ page }) => {
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     const rail = page.getByRole('navigation', { name: 'Pages' });
-    for (const name of ['Query', 'Explore', 'Ontology', 'Thesaurus', 'Similar', 'Memory'])
+    for (const name of ['Query', 'Explore', 'Browse', 'Workbench', 'Similar', 'Memory'])
       await expect(rail.getByRole('link', { name, exact: true })).toBeVisible();
+    // a group shows its pages while one of them is open, and marks that page
+    await expect(rail.getByRole('button', { name: 'Close Admin' })).toHaveAttribute(
+      'aria-expanded',
+      'true',
+    );
     await expect(rail.getByRole('link', { name: 'Server', exact: true })).toHaveAttribute(
       'aria-current',
       'page',
     );
-    await expect(rail.getByText('Server', { exact: true })).toBeVisible();
+    await expect(rail.getByText('Admin', { exact: true })).toBeVisible();
   });
 
   test('choosing a dataset reopens a page that names its dataset', async ({ page }) => {
-    await visit(page, '/ui/ontology?ds=uni');
+    await visit(page, '/ui/workbench/ontology?ds=uni');
     await expect(page.getByRole('heading', { name: 'Ontology', exact: true })).toBeVisible();
     await page.locator('.ds-button').click();
     await page
       .getByRole('listbox', { name: 'Datasets' })
       .getByRole('option', { name: /^foaf / })
       .click();
-    await expect(page).toHaveURL(/\/ui\/ontology\?ds=foaf$/);
+    await expect(page).toHaveURL(/\/ui\/workbench\/ontology\?ds=foaf$/);
+    await expect(page.locator('.ds-button')).toContainText('foaf');
+  });
+
+  test("the top bar's dataset is the one a dataset page shows", async ({ page }) => {
+    await onDataset(page, 'foaf');
+    await visit(page, '/ui/datasets/uni');
+    await expect(page.locator('.ds-button')).toContainText('uni');
+    await page.locator('.ds-button').click();
+    await page
+      .getByRole('listbox', { name: 'Datasets' })
+      .getByRole('option', { name: /^foaf / })
+      .click();
+    await expect(page).toHaveURL(/\/ui\/datasets\/foaf$/);
     await expect(page.locator('.ds-button')).toContainText('foaf');
   });
 
@@ -316,7 +334,7 @@ test.describe('at 900 pixels', () => {
   test.use({ viewport: MEDIUM });
 
   test('the rail shows icons and keeps each page name', async ({ page }) => {
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     const rail = page.getByRole('navigation', { name: 'Pages' });
     const query = rail.getByRole('link', { name: 'Query', exact: true });
     await expect(query).toBeVisible();
@@ -350,7 +368,7 @@ test.describe('at 390 pixels', () => {
 
   test('the keys expand the search, Escape collapses it', async ({ page }) => {
     await onDataset(page, 'uni');
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await page.keyboard.press('Control+k');
     await expect(search(page)).toBeFocused();
     await page.keyboard.press('Escape');
@@ -367,7 +385,7 @@ test.describe('at 390 pixels', () => {
   });
 
   test('the drawer holds the dataset switcher and every page', async ({ page }) => {
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     await expect(page.getByRole('navigation', { name: 'Pages' })).toBeHidden();
     await page.getByRole('button', { name: 'Menu' }).click();
     const drawer = page.getByRole('dialog', { name: 'Menu' });
@@ -380,16 +398,7 @@ test.describe('at 390 pixels', () => {
     await expect(drawer.getByRole('listbox', { name: 'Datasets' })).toBeHidden();
     await expect(drawer).toBeVisible();
     await expect(drawer.locator('.ds-button')).toBeFocused();
-    for (const name of [
-      'Query',
-      'Explore',
-      'Browse',
-      'Ontology',
-      'Thesaurus',
-      'Similar',
-      'Memory',
-      'Datasets',
-    ])
+    for (const name of ['Query', 'Explore', 'Browse', 'Workbench', 'Similar', 'Memory', 'Datasets'])
       await expect(drawer.getByRole('link', { name, exact: true })).toBeVisible();
     await expect(drawer.getByRole('img', { name: /Connected|Connecting/ })).toBeVisible();
     await drawer.getByRole('link', { name: 'Datasets', exact: true }).click();
@@ -407,15 +416,15 @@ const PAGES = [
   '/ui/explore?ds=foaf',
   '/ui/browse?ds=uni',
   '/ui/browse?ds=uni&iri=http%3A%2F%2Fexample.org%2Funi%23Professor',
-  '/ui/ontology?ds=uni',
-  '/ui/thesaurus?ds=uni',
+  '/ui/workbench/ontology?ds=uni',
+  '/ui/workbench/thesaurus?ds=uni',
   '/ui/similar?ds=foaf',
   '/ui/memory?ds=foaf',
-  '/ui/embedding?ds=foaf',
+  '/ui/similar/map?ds=foaf',
   '/ui/datasets',
   '/ui/datasets/foaf',
-  '/ui/backups',
-  '/ui/server',
+  '/ui/admin/backups',
+  '/ui/admin/server',
 ];
 
 for (const [name, viewport] of Object.entries({ large: LARGE, medium: MEDIUM, phone: PHONE })) {

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# mem695.sh OUT "SIDE:THREADS ...": one el_classify run of ore_ont_8737 per entry under the heavy
+# lock in a 13 GiB scope, the JSON line of each to OUT/SIDE.tTHREADS.json.
+set -uo pipefail
+E=~/lanes/el-cost
+O=$1; mkdir -p "$O"
+exec 8> "$HOME/lanes/.heavy.lock"
+flock 8
+for s in $2; do
+  b=${s%:*}; t=${s#*:}
+  systemd-run --user --scope --quiet -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+    timeout 900 $E/bin/$b --threads $t $E/data/dev/ore_ont_8737.owl > "$O/$b.t$t.json" 2> "$O/$b.t$t.err"
+  echo "$b t$t rc=$?" >> "$O/log.txt"
+done
+echo MEM-DONE >> "$O/log.txt"

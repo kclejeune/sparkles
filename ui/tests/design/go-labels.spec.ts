@@ -8,7 +8,7 @@ const BASE = process.env.SPARKLES_DESIGN_URL ?? 'http://127.0.0.1:36320';
 
 test('the GO class tree shows labels', async ({ page }) => {
   test.setTimeout(240_000);
-  await page.goto(`${BASE}/ui/ontology?ds=go`);
+  await page.goto(`${BASE}/ui/workbench/ontology?ds=go`);
   const tree = page.getByRole('tree', { name: 'Classes (asserted)' });
   await expect(tree).toBeVisible({ timeout: 120_000 });
   // the labels arrive after the tree: wait until the first rows have them
