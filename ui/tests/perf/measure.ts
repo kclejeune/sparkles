@@ -4,7 +4,7 @@
 import type { CDPSession, Page, TestInfo } from '@playwright/test';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { hostname, tmpdir } from 'node:os';
+import { hostname, loadavg, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 export const BASE = (process.env.PERF_URL ?? '').replace(/\/$/, '');
@@ -257,6 +257,7 @@ export async function meta(page: Page) {
     browser: page.context().browser()?.version(),
     viewport: page.viewportSize(),
     webgl: gl,
+    loadavg: loadavg().map((x) => +x.toFixed(2)),
   };
 }
 const safe = (f: () => string) => {
