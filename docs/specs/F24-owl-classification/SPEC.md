@@ -375,7 +375,13 @@ one thread, outboxes that sort and drop repeated messages, and subsumer lists of
 208b8efc, reverted in 9ea7a425. The rules for individuals run in functions of their own, outside the
 saturation's loop, since a first build that kept them inline, commit 68a683b5, made the
 saturation of ontologies without individuals 3 to 19% slower on one thread in an
-interleaved A/B on `atlas` ([record](../../benchmarks/el-classification/runs/2026-11-03-el-inline-atlas-68a683b5/record.json)). The [benchmark
+interleaved A/B on `atlas` ([record](../../benchmarks/el-classification/runs/2026-11-03-el-inline-atlas-68a683b5/record.json)).
+Release builds compile `sparkles-owl` as one codegen unit, since with four the time of the
+index stage moved by up to 7% with changes to code that EL runs never reach. One unit
+classifies `ore_ont_3836` on one thread on forge in 543 ms against 559 ms and
+`ore_ont_13482` in 868 against 902 ms, with 3.8% fewer instructions on `ore_ont_3836`, and
+the crate takes 25 to 27 s to compile instead of 9 to 12 s ([code layout
+results](../../benchmarks/el-classification/RESULTS.md#code-layout)). The [benchmark
 report](../../benchmarks/el-classification/RESULTS.md) has the numbers and the records.
 
 **Testing.** Tests in `crates/sparkles-owl/tests/classify.rs` cover worked examples of
@@ -700,9 +706,12 @@ take only ore_ont_5940, whose taxonomy is now complete and faster than Konclude'
 classifies slower than Konclude, item 712. The taxonomies of the 298 ORE 2015 EL
 ontologies, GO, ChEBI lite and every development file that the disjunctive rules do not
 take are byte for byte those of the Horn tier on one and eight threads. The saturation's
-arms for the disjunctive rules compile away in other runs, but on the benchmark host GO and
-ChEBI lite classify 0.9% and 1.4% slower on one thread and in the same time on eight, item
-715.
+arms for the disjunctive rules compile away in other runs. They first made the one worker's
+activation too large to inline, and GO and ChEBI lite classified 0.9% and 1.4% slower on
+one thread on the benchmark host. Each rule set now has a worker of its own that inlines
+its activation, and with `sparkles-owl` in one codegen unit GO classifies on one thread in
+0.99 of the time of the build before and ChEBI lite in 0.98, with the same taxonomies, as
+the [code layout results](../../benchmarks/el-classification/RESULTS.md#code-layout) give.
 
 ### ROBOT-compatible commands
 

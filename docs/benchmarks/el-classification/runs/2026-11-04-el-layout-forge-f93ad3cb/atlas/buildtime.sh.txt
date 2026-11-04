@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# buildtime.sh N "LABELS": in each worktree ~/lanes/el-cost/wt/LABEL, N times in alternating
+# order, changes a comment line in sparkles-owl (a new nonce, so no cache hit) and times
+# `mbx build --release -p sparkles-server --timings`, then copies the timing report.
+# Lines "LABEL i secs owl_unit_secs" go to ~/lanes/el-cost/logs/buildtime.txt.
+set -euo pipefail
+N=$1 LABELS=($2)
+E=~/lanes/el-cost
+exec 8> "$HOME/lanes/.heavy.lock"
+flock 8
+mkdir -p $E/logs/timings
+for i in $(seq 1 "$N"); do
+  for L in "${LABELS[@]}"; do
+    cd $E/wt/$L
+    git checkout -q -- crates/sparkles-owl/src/lib.rs
+    echo "// build-time nonce $(date +%s%N)" >> crates/sparkles-owl/src/lib.rs
+    s=$(date +%s.%N)
+    systemd-run --user --scope --quiet -p MemoryMax=13G -p MemorySwapMax=2G -p OOMPolicy=continue \
+      mbx build --release -p sparkles-server --timings > $E/logs/timings/$L.$i.log 2>&1
+    e=$(date +%s.%N)
+    h=$(ls -t target/cargo-timings/cargo-timing-*.html | head -1)
+    cp "$h" $E/logs/timings/$L.$i.html
+    owl=$(python3 - "$h" <<'PY'
+import re,sys,json
+t=open(sys.argv[1]).read()
+m=re.search(r'const UNIT_DATA = (\[.*?\]);', t, re.S)
+units=json.loads(m.group(1)) if m else []
+print(" ".join(f"{u['name']}={u['duration']:.1f}" for u in units if u['name'] in ('sparkles-owl','sparkles-server','sparkles-core','sparkles-reasoner')))
+PY
+)
+    git checkout -q -- crates/sparkles-owl/src/lib.rs
+    echo "$L $i $(python3 -c "print(round($e - $s, 1))") $owl" | tee -a $E/logs/buildtime.txt
+  done
+done
+echo BUILDTIME-DONE

@@ -563,11 +563,82 @@ runs never reach, execute the same number of instructions on `ore_ont_3836` on `
 within 0.2%. A build of `sparkles-owl` with one codegen unit classifies `ore_ont_3836`
 on `atlas` in 543 ms with the current rules and 531 ms without chain selection, against
 600 and 559 ms for the same commits built by default, so the difference comes from how
-the compiler partitions the crate. Roadmap item 711 follows it. ChEBI lite's
-eight-thread rounds spread from 411 to 538 ms on every side, which roadmap item 683
-follows.
+the compiler partitions the crate. Release builds now compile the crate as one unit, as
+the [next section](#code-layout) describes. ChEBI lite's eight-thread rounds spread from
+411 to 538 ms on every side, which roadmap item 683 follows.
+
+<a id="code-layout"></a>
+
+### Code layout
+
+Release builds compile `sparkles-owl` as one codegen unit, and each rule set of the
+saturation has a worker of its own that inlines that set's activation of a context. With
+four units, the time of the classifier's stages moved by several percent with changes to
+code they never run. The chain selection of item 693 made `ore_ont_3836` 7% slower on one
+thread, and the hooks of the disjunctive rules made GO 0.9% and ChEBI lite 1.4% slower,
+with the same work. One worker held the activations of all four rule sets, and whether
+the compiler inlined each into it changed with their size.
+
+An A/B on forge ran the base, commit aa1b4502 with four units, and the lane, commit
+f93ad3cb, five rounds each, with three rounds of two reference builds and of the base with
+one unit beside them in a screen of the same files. Times are the median over the rounds
+of each process's median classification in ms.
+
+| Ontology | Threads | Base | Lane | Lane / base | Before chain selection | Before the disjunctive rules |
+|---|---:|---:|---:|---:|---:|---:|
+| GO | 1 | 303.5 | 301.5 | 0.99 | 359.5 | 303.3 |
+| | 8 | 89.5 | 85.9 | 0.96 | 96.9 | 95.7 |
+| ChEBI lite | 1 | 1,041 | 1,022 | 0.98 | 1,041 | 1,047 |
+| | 8 | 427 | 451 | 1.06 | 443 | 468 |
+| `ore_ont_3836` | 1 | 558.5 | 542.7 | 0.97 | 562.1 | 561.1 |
+| | 8 | 219.2 | 217.0 | 0.99 | 212.6 | 218.8 |
+| `ore_ont_13482` | 1 | 902.1 | 867.8 | 0.96 | 907.4 | 911.6 |
+| | 8 | 307.5 | 303.5 | 0.99 | 306.4 | 311.3 |
+
+The reference columns come from the screen. Before chain selection is commit 3acec7c2,
+whose Horn rules derive more on GO, and before the disjunctive rules is commit 3bc10115.
+At the base the slowdowns of items 711 and 715 no longer show against either reference
+on one thread, since the merge of the disjunctive rules moved the layout again, and the
+lane is faster than all three builds on one thread on every file, by under 1% on GO. The
+index stage gives most of the gain, 378 against 397 ms on `ore_ont_3836`
+and 299 against 317 ms on `ore_ont_13482`, and on `atlas` the lane runs 3.8% fewer
+user-space instructions than the base on `ore_ont_3836` and 2.0% fewer on GO, so one unit
+lets the compiler inline across the crate as well as place its code.
+
+ChEBI lite's eight-thread rounds spread by 15% on both sides of the gate. Six more rounds
+with each process pinned to the performance cores 0 to 11 took ChEBI lite in 393 ms on
+the lane against 418 ms on the base, with an 11 to 14% spread, and GO in 79.3 against
+79.1 ms, so the eight-thread difference is within the noise that roadmap item 683 follows.
+The 12 small ORE 2015 DL files of roadmap item 709 take 0.2 to 25 ms on both builds. The
+lane is within 0.3 ms of the base on each on one thread, and from 1.5 ms faster to 0.2 ms
+slower on eight. Every build gives
+the same taxonomy of each file on one and eight threads.
+
+One codegen unit for the base without the workers per rule set made GO about 1% slower
+on one thread, since the Horn rules' activation then stayed out of line, and the workers
+per rule set alone left the index stage as it was. Two codegen units recovered about half
+of one unit's gain, and PERFORMANCE-EXPERIMENTS.md records it.
+
+| Ontology, one thread pinned | Base | Two units | One unit |
+|---|---:|---:|---:|
+| GO | 301.7 | 304.6 | 301.7 |
+| ChEBI lite | 1,042 | 1,031 | 1,021 |
+| `ore_ont_3836` | 564.5 | 549.5 | 540.7 |
+| `ore_ont_13482` | 899.1 | 881.9 | 867.4 |
+
+On `atlas` the crate takes 25 to 27 s to compile in a release build with one unit, 15 s
+with two and 9 to 12 s with four. A release build of `sparkles-server` after a change to
+the crate took 713.5 s with one unit against 711.7 s with four, since the crates that
+depend on it start from its metadata and its code generation runs beside theirs. A build
+of the `el_classify` example after such a change takes about 46 s against 21 s. The
+debug and test builds of `scripts/ci.sh` are unchanged.
 
 ## Records
+
+The [code layout record](runs/2026-11-04-el-layout-forge-f93ad3cb/record.json) holds every
+classification time of the gate, the screen with the reference builds, the pinned
+eight-thread rounds and the pinned two-unit rounds, the taxonomy hashes, the scripts that
+ran, and the build times and instruction counts taken on `atlas`.
 
 The [record of item 693's A/B](runs/2026-11-03-horn-cost-forge-320d4708/record.json)
 holds every classification time of the three sides, the stage times, the conjunction
