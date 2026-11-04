@@ -48,7 +48,9 @@ use oxrdf::{Literal, NamedNode, Term};
 use rustc_hash::FxHashSet;
 use sparkles_core::algo::Control;
 use sparkles_core::algo::pool::Par;
-use sparkles_owl::classify::{Changes, Classification, Excluded, Limits, Saturation, logical};
+use sparkles_owl::classify::{
+    Changes, Classification, Excluded, Expansion, Limits, Saturation, logical,
+};
 use sparkles_owl::read::Mode;
 use sparkles_owl::{
     AnnotationProperty, AnnotationValue, Axiom, AxiomKind, ClassExpression, Entity, vocab,
@@ -85,6 +87,15 @@ pub struct ClassifyRequest {
     /// ([`sparkles_owl::classify::Limits::el_only`]). Such a run does not use the
     /// dataset's kept classification.
     pub el_only: bool,
+    /// a run with the disjunctive rules that its deadline, cancellation or memory budget
+    /// stops answers with what it proved, a [`Classification`] whose
+    /// [`complete`](Classification::complete) is false, instead of failing
+    /// ([`sparkles_owl::classify::Limits::partial`]). A run of the other tiers fails as
+    /// before. A classification that writes its taxonomy refuses it.
+    pub partial: bool,
+    /// the expansion strategy of the disjunctive rules, which gives the same answer
+    /// either way ([`sparkles_owl::classify::Limits::expansion`])
+    pub expansion: Expansion,
 }
 
 /// The opening of the comment the classifier writes on a taxonomy graph's header, by
@@ -106,9 +117,10 @@ pub struct Classified {
 
 impl Classified {
     /// Whether every subsumption between named classes that the ontology entails is in
-    /// the taxonomy: true when no axiom is left out or used only in part.
+    /// the taxonomy: true when no axiom is left out or used only in part and the run was
+    /// not stopped part way ([`ClassifyRequest::partial`]).
     pub fn complete(&self) -> bool {
-        self.excluded.is_empty()
+        self.excluded.is_empty() && self.classification.complete
     }
 }
 
@@ -225,6 +237,11 @@ impl Ontologies {
                 "a classification reads the asserted axioms: leave out 'inferences'",
             ));
         }
+        if c.target.is_some() && c.partial {
+            return Err(Error::invalid(
+                "a classification that writes its taxonomy needs a complete answer: leave out 'partial' or 'target'",
+            ));
+        }
         if c.target.is_some() && req.at.is_some() {
             return Err(Error::invalid(
                 "a classification that writes reads the head: leave out 'at'",
@@ -292,13 +309,14 @@ impl Ontologies {
             // state as it was
             let par = admit(c.threads, opts)?;
             let out = e.run_over(o, Vec::new(), |s, axioms, changes| {
-                run(s, axioms, changes, par, opts, false)
+                run(s, axioms, changes, par, opts, c)
             })?;
             let cl = Arc::new(out);
             let ex = Arc::new(e.saturation.excluded().to_vec());
             let keep = cl.stats.memory <= CACHE_MAX_BYTES;
             e.commit = commit;
-            e.result = keep.then(|| (cl.clone(), ex.clone()));
+            // a partial answer is never kept, so that no later call reuses it
+            e.result = (keep && cl.complete).then(|| (cl.clone(), ex.clone()));
             Ok(((cl, ex, false), keep))
         })
     }
@@ -566,23 +584,26 @@ pub(crate) fn classify_once(
 ) -> Result<(Classification, Vec<Excluded>)> {
     let mut s = Saturation::new();
     let par = admit(c.threads, opts)?;
-    let out = run(&mut s, axioms, None, par, opts, c.el_only)?;
+    let out = run(&mut s, axioms, None, par, opts, c)?;
     Ok((out, s.excluded().to_vec()))
 }
 
 /// Runs a classification on the threads of `par` under the options' deadline,
-/// cancellation and memory budget, by the OWL 2 EL rules alone when `el_only`.
+/// cancellation and memory budget, with the rules, the partial answer and the expansion
+/// strategy that `c` asks for.
 fn run(
     k: &mut Saturation,
     axioms: &[&AxiomKind],
     changes: Option<Changes<'_>>,
     par: Par,
     opts: &QueryOptions,
-    el_only: bool,
+    c: &ClassifyRequest,
 ) -> Result<Classification> {
     bounded(par, opts, |limits| {
         let limits = Limits {
-            el_only,
+            el_only: c.el_only,
+            partial: c.partial,
+            expansion: c.expansion,
             ..limits.clone()
         };
         k.classify(axioms, changes, &limits)
