@@ -8,19 +8,23 @@
     seeAlso,
     mappings,
     linker,
+    here = true,
   }: {
     xrefs: Sections['xrefs'];
     seeAlso: Sections['seeAlso'];
     mappings: Sections['mappings'];
     linker: Linker;
+    /** The cross-references show here. Otherwise a panel of the facts has them, and only the
+     * see-also links remain. */
+    here?: boolean;
   } = $props();
   const external = (v: string) => /^https?:\/\//.test(v);
 </script>
 
-{#if xrefs.length || seeAlso.length}
+{#if (here && xrefs.length) || seeAlso.length}
   <section class="term-sec" aria-labelledby="xref-h">
-    <h2 id="xref-h">Cross-references</h2>
-    {#if xrefs.length}
+    <h2 id="xref-h">{here ? 'Cross-references' : 'See also'}</h2>
+    {#if here && xrefs.length}
       <div class="term-flow xrefs">
         {#each xrefs as x (x.value)}
           {#if x.href}
@@ -36,7 +40,7 @@
       </div>
     {/if}
     {#if seeAlso.length}
-      <h3>See also</h3>
+      {#if here}<h3>See also</h3>{/if}
       <ul class="term-links">
         {#each seeAlso as s, i (i)}
           {@const v = valueText(s.value)}

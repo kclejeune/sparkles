@@ -127,6 +127,7 @@
   import TermSynonyms from '$components/browse/TermSynonyms.svelte';
   import TermUsage from '$components/browse/TermUsage.svelte';
   import TermXrefs from '$components/browse/TermXrefs.svelte';
+  import TermIdentifiers from '$components/browse/TermIdentifiers.svelte';
   import TopTerms from '$components/browse/TopTerms.svelte';
   import SimilarTerms from '$components/browse/SimilarTerms.svelte';
   import { editorOf, workbenchPath } from '$lib/routes';
@@ -156,10 +157,28 @@
   // the rail.
   const layout = $derived.by(() => {
     const l = q.get('layout');
-    return l === 'A0' || l === 'B' || l === 'C' || l === 'D' ? l : 'A';
+    return l === 'A0' || l === 'B' || l === 'C' || l === 'D' || l === 'E' || l === 'F' ? l : 'A';
   });
   const flat = $derived(layout === 'C' || layout === 'D');
-  const railTree = $derived(layout === 'B' || layout === 'D');
+  /** The hierarchy card is in the rail. */
+  const railTree = $derived(layout === 'B' || layout === 'D' || layout === 'F');
+  /** B and D move the hierarchy card into the left column while the graph is on. E and F never
+   * move it, and draw the graph in the card, at the width of the column it is in. */
+  const graphMoves = $derived(layout === 'B' || layout === 'D');
+  /** F draws the graph at the rail's width, with an Expand button for the large view. */
+  const compactGraph = $derived(layout === 'F');
+  /** `?sec=separate` gives every section of the page its own heading, as the original page did,
+   * `?sec=grouped` keeps them in the Definition and References cards under stronger sub-headings
+   * and `?sec=weak` is the page as it was. */
+  const secStyle = $derived.by(() => {
+    const v = q.get('sec');
+    if (v === 'separate' || v === 'grouped' || v === 'weak') return v;
+    return layout === 'E' || layout === 'F' ? 'grouped' : 'weak';
+  });
+  /** E and F, and `?ids=meta`, show the cross-references in Metadata as Identifiers. */
+  const idsMeta = $derived(layout === 'E' || layout === 'F' || q.get('ids') === 'meta');
+  /** `?rname=related` names the References card "Related terms". */
+  const refsName = $derived(q.get('rname') === 'related' ? 'Related terms' : 'References');
   const chipStyle = $derived(q.get('chips') ?? (layout === 'A0' ? 'pill' : 'text'));
   const layoutKeep = $derived(q.get('layout'));
   /** C and D only: `?refs=rail` puts References in the rail and `?ibox=left` left-aligns the
@@ -553,6 +572,7 @@
     canWrite && !at && !!term?.etag && (isSkos || (!!editorKind && editorKind !== 'Datatype')),
   );
   const editing = $derived(wantEdit && canEdit);
+  const treeInRail = $derived(railTree && !(graphMoves && view === 'graph' && piece && !editing));
 
   // the hierarchy card: open on a phone only on request or while editing, and its own scroll keeps the
   // entity in view
@@ -1265,74 +1285,117 @@
           </span>
         {/if}
       {/snippet}
+      {#snippet defRest()}
+        {#if logicalDefinition.length}
+          <section class="term-sec" aria-labelledby="logic-h">
+            <h2 id="logic-h">Logical definition</h2>
+            {#each logicalDefinition as v, i (i)}
+              <p class="logic"><AxiomProse value={v} {linker} {prefixes} /></p>
+            {/each}
+          </section>
+        {/if}
+        <TermSynonyms
+          synonyms={sections.synonyms}
+          {linker}
+          typeName={(i) => typeLabels.get(i) ?? synonymTypeName(i, term?.names)}
+        />
+        <TermNotes notes={sections.notes} {linker} {langs} {curieIri} {prefixes} {predicateHref} />
+        <TermLabels labels={sections.labels} />
+        {#if sections.related.length}
+          <section class="term-sec" aria-labelledby="rel-h">
+            <h2 id="rel-h">
+              Related concepts <span class="count-badge">{sections.related.length}</span>
+            </h2>
+            <div class="term-flow">
+              {#each sections.related as r (r)}<a href={linker.href(r)}>{linker.name(r)}</a>{/each}
+            </div>
+          </section>
+        {/if}
+        {#if sections.members.length}
+          <section class="term-sec" aria-labelledby="mem-h">
+            <h2 id="mem-h">
+              Members <span class="count-badge">{sections.members.length}</span>
+            </h2>
+            <div class="term-flow">
+              {#each sections.members as r (r)}<a href={linker.href(r)}>{linker.name(r)}</a>{/each}
+            </div>
+          </section>
+        {/if}
+      {/snippet}
+      {#snippet refsContent()}
+        <TermXrefs
+          here={!idsMeta}
+          xrefs={sections.xrefs}
+          seeAlso={sections.seeAlso}
+          mappings={sections.mappings}
+          {linker}
+        />
+        <TermUsage
+          iri={term!.iri}
+          groups={mentions}
+          total={term!.mentions.total}
+          truncated={term!.mentions.truncated}
+          incoming={term!.incoming}
+          usage={term!.usage}
+          {linker}
+          {prefixes}
+          more={moreIncoming}
+          skip={skipIncoming}
+        />
+        <TermReuse
+          found={reuse.found}
+          checked={reuse.checked}
+          loading={reuse.loading}
+          href={(d) => browseHref(base, d, term?.iri ?? null)}
+        />
+        {#if !editing}
+          <SimilarTerms ds={target} iri={term!.iri} href={(i) => hrefOf(i)} />
+        {/if}
+        <!-- the statements no other section shows, folded away -->
+        {#if sections.other.length && !editing}
+          <section class="term-sec">
+            <details class="ann">
+              <summary
+                >All other statements <span class="count-badge"
+                  >{sections.other.reduce((n, o) => n + o.values.length, 0)}</span
+                ></summary
+              >
+              <div class="table-scroll">
+                <table class="data">
+                  <tbody>
+                    {#each sections.other as o (o.property)}
+                      <tr>
+                        <th scope="row" class="mono">{iriName(o.property, prefixes)}</th>
+                        <td>
+                          {#each o.values as v, i (i)}{#if i > 0}<br />{/if}{#if isLiteral(v)}{v[
+                                '@value'
+                              ]}{#if v['@language']}<span class="lang-tag">{v['@language']}</span
+                                >{/if}{:else if linker.href(v)}<a href={linker.href(v)}
+                                >{linker.name(v)}</a
+                              >{:else}<span class="mono">{v}</span>{/if}{/each}
+                        </td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          </section>
+        {/if}
+      {/snippet}
       {#snippet refsCard()}
-        <section
-          class="panel b-refs"
-          aria-labelledby="refs-h"
-          data-movable={layout === 'A0' || layout === 'A' ? '' : undefined}
-        >
-          <div class="panel-head"><h2 id="refs-h">References</h2></div>
-          <div class="panel-body ruled">
-            <TermXrefs
-              xrefs={sections.xrefs}
-              seeAlso={sections.seeAlso}
-              mappings={sections.mappings}
-              {linker}
-            />
-            <TermUsage
-              iri={term!.iri}
-              groups={mentions}
-              total={term!.mentions.total}
-              truncated={term!.mentions.truncated}
-              incoming={term!.incoming}
-              usage={term!.usage}
-              {linker}
-              {prefixes}
-              more={moreIncoming}
-              skip={skipIncoming}
-            />
-            <TermReuse
-              found={reuse.found}
-              checked={reuse.checked}
-              loading={reuse.loading}
-              href={(d) => browseHref(base, d, term?.iri ?? null)}
-            />
-            {#if !editing}
-              <SimilarTerms ds={target} iri={term!.iri} href={(i) => hrefOf(i)} />
-            {/if}
-            <!-- the statements no other section shows, folded away -->
-            {#if sections.other.length && !editing}
-              <section class="term-sec">
-                <details class="ann">
-                  <summary
-                    >All other statements <span class="count-badge"
-                      >{sections.other.reduce((n, o) => n + o.values.length, 0)}</span
-                    ></summary
-                  >
-                  <div class="table-scroll">
-                    <table class="data">
-                      <tbody>
-                        {#each sections.other as o (o.property)}
-                          <tr>
-                            <th scope="row" class="mono">{iriName(o.property, prefixes)}</th>
-                            <td>
-                              {#each o.values as v, i (i)}{#if i > 0}<br
-                                  />{/if}{#if isLiteral(v)}{v['@value']}{#if v['@language']}<span
-                                      class="lang-tag">{v['@language']}</span
-                                    >{/if}{:else if linker.href(v)}<a href={linker.href(v)}
-                                    >{linker.name(v)}</a
-                                  >{:else}<span class="mono">{v}</span>{/if}{/each}
-                            </td>
-                          </tr>
-                        {/each}
-                      </tbody>
-                    </table>
-                  </div>
-                </details>
-              </section>
-            {/if}
-          </div>
-        </section>
+        {#if secStyle === 'separate'}
+          <div class="sep-stack b-refs-sep">{@render refsContent()}</div>
+        {:else}
+          <section
+            class="panel b-refs"
+            aria-labelledby="refs-h"
+            data-movable={layout === 'A0' || layout === 'A' ? '' : undefined}
+          >
+            <div class="panel-head"><h2 id="refs-h">{refsName}</h2></div>
+            <div class="panel-body ruled">{@render refsContent()}</div>
+          </section>
+        {/if}
       {/snippet}
       {#snippet treeCard()}
         <aside class="panel b-tree" class:shut={!treeOpen && !editing} aria-labelledby="tree-h">
@@ -1346,6 +1409,7 @@
               epoch={graphEpoch}
               lead={treeHead}
               shut={!treeOpen}
+              compact={compactGraph}
             />
           {:else}
             <div class="panel-head">{@render treeHead()}</div>
@@ -1419,6 +1483,7 @@
         use:balance
         data-layout={layout}
         data-chips={chipStyle}
+        data-sec={secStyle}
         class:flat
         class:rail={railTree}
         class:ibox-left={iboxLeft}
@@ -1711,52 +1776,7 @@
                     {/if}
                   </section>
                 {:else}
-                  {#if logicalDefinition.length}
-                    <section class="term-sec" aria-labelledby="logic-h">
-                      <h2 id="logic-h">Logical definition</h2>
-                      {#each logicalDefinition as v, i (i)}
-                        <p class="logic"><AxiomProse value={v} {linker} {prefixes} /></p>
-                      {/each}
-                    </section>
-                  {/if}
-                  <TermSynonyms
-                    synonyms={sections.synonyms}
-                    {linker}
-                    typeName={(i) => typeLabels.get(i) ?? synonymTypeName(i, term?.names)}
-                  />
-                  <TermNotes
-                    notes={sections.notes}
-                    {linker}
-                    {langs}
-                    {curieIri}
-                    {prefixes}
-                    {predicateHref}
-                  />
-                  <TermLabels labels={sections.labels} />
-                  {#if sections.related.length}
-                    <section class="term-sec" aria-labelledby="rel-h">
-                      <h2 id="rel-h">
-                        Related concepts <span class="count-badge">{sections.related.length}</span>
-                      </h2>
-                      <div class="term-flow">
-                        {#each sections.related as r (r)}<a href={linker.href(r)}
-                            >{linker.name(r)}</a
-                          >{/each}
-                      </div>
-                    </section>
-                  {/if}
-                  {#if sections.members.length}
-                    <section class="term-sec" aria-labelledby="mem-h">
-                      <h2 id="mem-h">
-                        Members <span class="count-badge">{sections.members.length}</span>
-                      </h2>
-                      <div class="term-flow">
-                        {#each sections.members as r (r)}<a href={linker.href(r)}
-                            >{linker.name(r)}</a
-                          >{/each}
-                      </div>
-                    </section>
-                  {/if}
+                  {#if secStyle !== 'separate'}{@render defRest()}{/if}
                 {/if}
                 {#if term.statementsTruncated}
                   <p class="faint">
@@ -1765,6 +1785,9 @@
                 {/if}
               </div>
             </section>
+            {#if secStyle === 'separate' && !editing}
+              <div class="sep-stack b-def-rest">{@render defRest()}</div>
+            {/if}
             {#if !isSkos && editorKind}
               <!-- the entity's frame in Manchester syntax, after Definition on a phone -->
               {#snippet axiomEditor()}
@@ -1796,7 +1819,7 @@
                 editor={editing ? axiomEditor : undefined}
               />
             {/if}
-            {#if treeKind && !(railTree && !(view === 'graph' && piece && !editing))}
+            {#if treeKind && !treeInRail}
               {@render treeCard()}
             {/if}
             {#if !refsRail}
@@ -1805,6 +1828,10 @@
           </div>
         {/if}
         <div class="b-side" data-col="side">
+          {#snippet metaFoot()}
+            {#if idsMeta}<TermIdentifiers xrefs={sections!.xrefs} />{/if}
+            {@render downloads()}
+          {/snippet}
           {#snippet downloads()}
             <DownloadButtons
               noun="this {kind}"
@@ -1819,10 +1846,10 @@
             </section>
           {:else}
             <div class="b-info">
-              <TermInfobox rows={infoRows} {linker} heading="Metadata" footer={downloads} />
+              <TermInfobox rows={infoRows} {linker} heading="Metadata" footer={metaFoot} />
             </div>
           {/if}
-          {#if treeKind && railTree && !(view === 'graph' && piece && !editing)}
+          {#if treeKind && treeInRail}
             {@render treeCard()}
           {/if}
           {#if refsRail}
@@ -2347,6 +2374,71 @@
       border-radius: 0;
       background: none;
     }
+  }
+
+  /* --- section treatments of E and F (?sec=) --------------------------------------------- */
+  .browse {
+    --sep-pad: 14px;
+  }
+  @container browse (min-width: 640px) and (max-width: 1099px) {
+    .browse {
+      --sep-pad: var(--sp-5);
+    }
+  }
+  /* grouped: the sections stay in the Definition and References cards, under heads that carry
+     weight: the card's title at 17 px and each section's heading at 14 px in the text colour */
+  .browse[data-sec='grouped'] :global(.panel > .panel-head h2),
+  .browse[data-sec='grouped'] :global(.b-tree .lead h2) {
+    font-size: var(--fs-lg);
+  }
+  .browse[data-sec='grouped'] .ruled :global(.term-sec > h2) {
+    font-size: var(--fs-md);
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: var(--sp-3);
+  }
+  .browse[data-sec='grouped'] .ruled :global(.term-sec > h3) {
+    color: var(--text-2);
+  }
+  /* separate: every section is a card of its own with its heading as the card's head, as the
+     page before item 633 gave each section its own heading */
+  .sep-stack {
+    display: contents;
+  }
+  .b-def-rest > :global(section) {
+    order: 2;
+  }
+  .b-refs-sep > :global(section) {
+    order: 6;
+  }
+  @container browse (min-width: 1100px) {
+    .browse .b-main > .sep-stack > :global(section) {
+      order: 0;
+    }
+  }
+  .sep-stack > :global(section) {
+    min-width: 0;
+    padding: 0 var(--sep-pad) var(--sp-4);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+  }
+  .sep-stack > :global(section > h2) {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    min-height: var(--panel-head-h);
+    margin: 0 calc(-1 * var(--sep-pad)) var(--sp-3);
+    padding: 0 var(--sep-pad);
+    border-bottom: 1px solid var(--border);
+    font-size: var(--fs-lg);
+    font-weight: 600;
+  }
+  .sep-stack > :global(section > h2 .count-badge) {
+    font-size: var(--fs-xs);
+  }
+  .sep-stack > :global(p.faint) {
+    order: 2;
   }
 
   /* the landing page */

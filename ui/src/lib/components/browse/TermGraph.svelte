@@ -4,9 +4,11 @@
   // to it, as edges named by the property. The lenses are Explore's, and double-clicking a
   // node adds its neighbourhood. In a card, `lead` is the card's own heading row and the
   // graph's tools sit under it in the card's header (ROADMAP item 633).
-  import { onDestroy, type Snippet } from 'svelte';
+  import { onDestroy, onMount, type Snippet } from 'svelte';
   import type { GraphPiece, Linker } from '$lib/browse';
   import { Lenses } from '$lib/lenses.svelte';
+  import Self from './TermGraph.svelte';
+  import Modal from '$components/Modal.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
   import LensMenu from '$components/LensMenu.svelte';
   import LensLegend from '$components/LensLegend.svelte';
@@ -21,6 +23,8 @@
     epoch = 0,
     lead,
     shut = false,
+    compact = false,
+    fitOnOpen = false,
   }: {
     /** The dataset with its branch, for the lenses' reads. */
     ds: string;
@@ -34,7 +38,35 @@
     lead?: Snippet;
     /** The card is collapsed to its heading. */
     shut?: boolean;
+    /** In a narrow rail: only the parents and the first children, with an Expand button that
+     * opens the whole neighbourhood in a large view. */
+    compact?: boolean;
+    /** Fit the graph once the view has its size, for a graph in a dialog. */
+    fitOnOpen?: boolean;
   } = $props();
+
+  onMount(() => {
+    if (!fitOnOpen) return;
+    const t = setTimeout(() => view?.fit(), 400);
+    return () => clearTimeout(t);
+  });
+
+  let big = $state(false);
+  const HIERARCHY = new Set(['subclass of', 'broader']);
+  /** The parents and the first children of the entity, which is what fits a rail. */
+  function hierarchyOf(p: GraphPiece, kids = 6): GraphPiece {
+    const focus = p.nodes.find((n) => n.focus)?.id;
+    let n = 0;
+    const edges = p.edges.filter((e) => {
+      if (!HIERARCHY.has(e.label)) return false;
+      if (e.target === focus) return ++n <= kids;
+      return true;
+    });
+    const used = new Set(edges.flatMap((e) => [e.source, e.target]));
+    if (focus) used.add(focus);
+    return { nodes: p.nodes.filter((x) => used.has(x.id)), edges };
+  }
+  const shown = $derived(compact ? hierarchyOf(piece) : piece);
 
   const lenses = new Lenses();
   onDestroy(() => lenses.destroy());
@@ -43,7 +75,7 @@
   let selected = $state<string | null>(null);
 
   const nodes = $derived<GNode[]>(
-    piece.nodes.map((n) => ({
+    shown.nodes.map((n) => ({
       id: n.id,
       label: n.label,
       kind: 'iri',
@@ -53,7 +85,7 @@
     })),
   );
   const edges = $derived<GEdge[]>(
-    piece.edges.map((e) => ({ id: e.id, source: e.source, target: e.target, label: e.label })),
+    shown.edges.map((e) => ({ id: e.id, source: e.source, target: e.target, label: e.label })),
   );
   $effect(() => {
     lenses.setInput({
@@ -66,21 +98,27 @@
       short: (iri) => linker.short(iri) ?? linker.name(iri),
     });
   });
-  const pick = $derived(selected ? piece.nodes.find((n) => n.id === selected) : null);
+  const pick = $derived(selected ? shown.nodes.find((n) => n.id === selected) : null);
 </script>
 
-<div class="canvas" class:card={!!lead} class:shut>
+<div class="canvas" class:card={!!lead} class:shut class:compact>
   {#if lead}<div class="lead">{@render lead()}</div>{/if}
   <div class="bar" bind:this={toolbar}>
     <LensMenu {lenses} anchor={toolbar} short={(iri) => linker.short(iri) ?? linker.name(iri)} />
     <span class="spacer"></span>
-    {#if pick && linker.href(pick.id)}
+    {#if pick && linker.href(pick.id) && !compact}
       <a class="btn sm" href={linker.href(pick.id)}>Open {pick.label}</a>
     {/if}
     <button class="btn sm" type="button" onclick={() => view?.fit()}
       ><Icon name="fit" size={14} />Fit</button
     >
-    <a class="btn sm" href={exploreHref}><Icon name="explore" size={14} />Open in Explore</a>
+    {#if compact}
+      <button class="btn sm" type="button" onclick={() => (big = true)}
+        ><Icon name="expand" size={14} />Expand</button
+      >
+    {:else}
+      <a class="btn sm" href={exploreHref}><Icon name="explore" size={14} />Open in Explore</a>
+    {/if}
   </div>
   <div class="host">
     <GraphView
@@ -97,9 +135,18 @@
   </div>
   <div class="legend">
     <LensLegend results={lenses.results} {ds} />
-    <span class="faint">Double-click a node to add its neighbours.</span>
+    {#if !compact}<span class="faint">Double-click a node to add its neighbours.</span>{/if}
   </div>
 </div>
+{#if compact}
+  <Modal
+    bind:open={big}
+    title="Graph of {piece.nodes.find((n) => n.focus)?.label ?? 'the entity'}"
+    width={1100}
+  >
+    <Self {ds} {piece} {linker} {exploreHref} {onexpand} {epoch} fitOnOpen />
+  </Modal>
+{/if}
 
 <style>
   .canvas {
@@ -171,5 +218,21 @@
     .canvas {
       height: 420px;
     }
+  }
+  /* in the rail the canvas is a column of the card's width and shorter */
+  .canvas.card.compact {
+    height: var(--term-graph-h, 400px);
+  }
+  @container browse (max-width: 639px) {
+    .canvas.card.compact.shut {
+      height: auto;
+    }
+  }
+  .compact .bar {
+    padding: 8px 12px;
+    gap: 6px;
+  }
+  .compact .legend {
+    padding: 6px 12px;
   }
 </style>
