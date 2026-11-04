@@ -144,10 +144,6 @@ bh_resolve() {
   esac
 }
 
-bh_mbx_pin() {
-  sed -n 's/^mr-boxington = "\(.*\)"$/\1/p' "$BH_ROOT/mise.toml"
-}
-
 # bh_cleanup: stop the scope and remove the scratch directory of an unfinished remote build
 bh_cleanup() {
   [ -n "$BH_RDIR" ] || return 0
@@ -170,9 +166,8 @@ bh_build() {
 }
 
 bh_build_steps() {
-  local host=$1 sha=$2 out=$3 pin tmp args got want
+  local host=$1 sha=$2 out=$3 tmp args got want
   shift 3
-  pin=$(bh_mbx_pin)
   BH_RHOST=$host
   # shellcheck disable=SC2029 # the commit expands here
   BH_RDIR=$(ssh "${bh_ssh_opts[@]}" "$host" "mkdir -p \$HOME/lanes/nsc-build && mktemp -d \$HOME/lanes/nsc-build/$sha.XXXXXXXX" < /dev/null) || {
@@ -206,7 +201,7 @@ bh_build_steps() {
     echo "copying the source of $sha to $host failed" >&2
     return 1
   }
-  args=$(printf '%q ' "$BH_RDIR" "$BH_RUNIT" "$pin" "$@")
+  args=$(printf '%q ' "$BH_RDIR" "$BH_RUNIT" "$@")
   # shellcheck disable=SC2029
   ssh "${bh_ssh_opts[@]}" "$host" "bash $BH_RDIR/bin/nsc-build-remote.sh $args" < /dev/null || {
     echo "the build on $host failed" >&2

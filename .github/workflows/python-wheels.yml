@@ -114,7 +114,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
           github-cache-mode: objects
           cache-generation: sparkles-python-linux-${{ matrix.libc }}-${{ env.PROFILE_ARG }}-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
@@ -193,7 +193,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
       # This build tool invokes Cargo itself.
       - name: Route build-tool Cargo calls through Boxington
         shell: bash
@@ -247,7 +247,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
       # This build tool invokes Cargo itself.
       - name: Route build-tool Cargo calls through Boxington
         shell: bash

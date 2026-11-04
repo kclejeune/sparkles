@@ -165,6 +165,17 @@ jobs:
         env:
           API_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
+          # BEGIN API EVENT BASE FETCH
+          if [ -n "$API_BASE_REF" ]; then
+            if [[ ! $API_BASE_REF =~ ^[0-9a-f]{40}$ ]]; then
+              echo 'API base revision must be an explicit full commit hash' >&2
+              exit 2
+            fi
+            if ! git cat-file -e "$API_BASE_REF^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "$API_BASE_REF"
+            fi
+          fi
+          # END API EVENT BASE FETCH
           mise run api:check
           if [ -n "$API_BASE_REF" ]; then
             python3 scripts/api-compat.py --check-manifest --base-ref "$API_BASE_REF"
@@ -240,7 +251,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
           github-cache-mode: objects
           cache-generation: sparkles-${{ matrix.platform }}-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
@@ -334,7 +345,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
           cache-generation: sparkles-tests-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
@@ -432,7 +443,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
           cache-generation: sparkles-doctests-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       - name: Disk space before doctests
@@ -575,7 +586,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
           cache-generation: sparkles-features-${{ matrix.set }}-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       # the script runs the tests under nextest when it is installed, which stops a test
@@ -662,7 +673,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}

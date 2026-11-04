@@ -5,18 +5,18 @@ mbx_container_install() {
   local mbx_root mbx_version mbx_arch mbx_digest mbx_tmp mbx_install
   mbx_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
   mbx_version=$(sed -n 's/^mr-boxington = "\([^"]*\)"$/\1/p' "$mbx_root/mise.toml")
-  if [ "$mbx_version" != 1.28.0 ]; then
+  if [ "$mbx_version" != 1.29.1 ]; then
     echo 'Update the verified container checksums with the Boxington version pin.' >&2
     return 1
   fi
   case $(uname -m) in
     x86_64)
       mbx_arch=x86_64
-      mbx_digest=0093c725fb031dd5b0db547298901aaffb1ff93ebf903f6adf9c72b0611f2bf0
+      mbx_digest=3d2a6c9c01c182d135290d7cef261990c5ab1650bdd69a8da9643ef651283af2
       ;;
     aarch64 | arm64)
       mbx_arch=aarch64
-      mbx_digest=7b4336a5800847fee9e9f0082ca65091020bafdb4ff9d50f15d9ce4eaeb368b6
+      mbx_digest=79fb378e26ee06ae3d23b18406d0eff1db196552f65de9af98bc64cf8902f4a8
       ;;
     *)
       echo 'Unsupported Boxington container architecture.' >&2

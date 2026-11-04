@@ -310,7 +310,6 @@ def pack(binary, source, destination, builder):
               "cargo_lock_sha256": sha256(source / "Cargo.lock"), "ui": ui,
               "tools": {tool: run([tool, "--version"], text=True).splitlines()[0]
                         for tool in ("rustc", "mbx", "node", "pnpm", "wasm-bindgen", "objcopy")}}
-    require(record["tools"]["mbx"].split()[-1] == "1.28.0", "unexpected Boxington version")
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".server-artifact-", dir=destination.parent) as work:
         work = Path(work)

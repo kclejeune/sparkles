@@ -130,7 +130,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
           github-cache-mode: objects
           cache-generation: sparkles-server-manylinux228-release-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}

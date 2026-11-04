@@ -100,7 +100,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
           github-cache-mode: objects
           cache-generation: sparkles-jvm-natives-${{ matrix.platform }}-${{ env.JVM_PROFILE }}-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
@@ -165,7 +165,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
           github-cache-mode: objects
           cache-generation: sparkles-jvm-bindgen-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
@@ -215,7 +215,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
           github-cache-mode: objects
           cache-generation: sparkles-jvm-bindgen-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
@@ -251,7 +251,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
       - uses: actions/download-artifact@v4
         with: { pattern: "jvm-native-*", path: target/jvm/natives, merge-multiple: true }
       # Maven Central through the Central Portal's OSSRH Staging API: Gradle deploys the

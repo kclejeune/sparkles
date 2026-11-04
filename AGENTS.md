@@ -15,8 +15,9 @@ adds to this file and does not override it.
 ## Building and testing
 
 - Build with Mr. Boxington by running `mbx build`, `mbx check`, `mbx test` or
-  `mbx nextest run` in place of Cargo. Check that `mbx --version` matches `mise.toml` on
-  each host, since having `mbx` on PATH does not prove that plain Cargo uses it.
+  `mbx nextest run` in place of Cargo. Check the installed version and ensure that
+  child Cargo calls use the matching Boxington shim. `mise.toml` selects the default
+  version, but other compatible releases may be used.
 - Keep Boxington's one shared cache per host and its managed `target` in each worktree.
   Do not set a private `MBX_CACHE_DIR`, `CARGO_TARGET_DIR` or `--target-dir` for
   ordinary builds, since these opt out of the shared cache or the managed target.

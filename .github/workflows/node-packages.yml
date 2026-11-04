@@ -111,7 +111,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
           github-cache-mode: objects
           cache-generation: sparkles-node-${{ matrix.platform }}-${{ env.NODE_PROFILE }}-v1
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
@@ -200,7 +200,7 @@ jobs:
           remote-url: https://mbx.kclj.dev
           namespace: kclejeune/sparkles
           oidc-audience: https://mbx.kclj.dev
-          version: 1.28.0
+          version: 1.29.1
       # Rustup and pnpm remain tool caches; compiler outputs use the remote cache.
       - uses: actions/cache/restore@v4
         id: musl-tools

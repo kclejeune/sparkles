@@ -61,9 +61,9 @@ mbx run --release -p sparkles-server -- serve --data ./data --port 3030   # UI a
 ```
 
 `rust-toolchain.toml` pins Rust and installs the `wasm32-unknown-unknown` target.
-Run `mise install mr-boxington` once on each build host to install the pinned
-compiler cache. Ensure `mbx --version` matches `mise.toml` and that the pinned
-binary is first on PATH. Use `mbx build`, `mbx check`, `mbx test` and `mbx nextest run`
+Run `mise install mr-boxington` once on each build host to install the default
+compiler cache version. A compatible release may also be used. Check `mbx --version`
+and ensure child Cargo calls use its matching shim. Use `mbx build`, `mbx check`, `mbx test` and `mbx nextest run`
 directly. Mise tasks use `mbx` and wrap Cargo calls made by their child scripts
 and build tools, including maturin. The same setup applies on atlas, forge, wally
 and ephemeral build runners. Rustup continues to select the pinned Rust toolchain.
@@ -1122,6 +1122,12 @@ payload for root-workspace jobs and an object payload for binding workspaces or 
 targets. The target payload includes Cargo downloads, while object jobs let Cargo download
 dependencies again.
 
+The remote cache uses Boxington's versioned protocol rather than requiring the client
+and server application versions to match. CI keeps its tested client version pinned,
+including checksum-verified container downloads. When changing it, verify remote cache
+access and use matching local compiler shims and agents. Other client versions may miss
+cache entries or lack features used by these build scripts.
+
 The hosted **Build tests** job uses mbx remote caching and managed target views.
 Boxington holds the target lease while `mbx nextest archive` builds and writes its
 archive under `RUNNER_TEMP`. Recompression and artifact upload read that archive
@@ -1207,7 +1213,7 @@ changed or deleted, so check a deployment in the Portal before you release it.
 
 The build-only `server-artifacts.yml` workflow defines one unpublished GNU x86_64
 candidate. It runs UI, formatter Wasm and the default-feature Rust release build
-sequentially in one pinned manylinux 2.28 job container. Boxington 1.28.0 manages the
+sequentially in one pinned manylinux 2.28 job container. Boxington manages the
 workspace target and routes child Cargo calls through its shims. Separate smoke jobs
 download the archive and start its extracted binary in pinned Rocky Linux 8 and
 Debian 11 images, without the checkout or host libraries. No release, image, registry

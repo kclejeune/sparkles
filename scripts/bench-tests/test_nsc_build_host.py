@@ -306,17 +306,17 @@ class BuildHost(unittest.TestCase):
         self.assertFalse((self.entry() / "build.txt").exists())
         self.assertFalse((self.entry() / "sparkles").exists())
 
-    def test_a_mismatched_mbx_is_refused_on_the_host(self):
+    def test_a_different_mbx_version_is_accepted_on_the_host(self):
         (self.repo / "mise.toml").write_text('[tools]\nmr-boxington = "1.0.0"\n')
         git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
                "-c", "commit.gpgsign=false"]
         subprocess.run([*git, "commit", "-qam", "pin"], check=True)
         self.sha = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True,
                                   text=True).stdout.strip()
-        result, out = self.bench("--build-host", "h1", ok_stop=False)
-        self.assertIn("mbx is 9.9.9, but mise.toml pins 1.0.0", (out / "logs" / "build-A.log").read_text())
+        result, out = self.bench("--build-host", "h1")
+        self.assertIn("mbx 9.9.9", (out / "logs" / "build-A.log").read_text())
         self.assertEqual(self.scratch("h1"), [])
-        self.assertEqual(self.builds(), [])
+        self.assertTrue(self.builds())
 
     def test_an_interrupt_stops_the_scope_and_removes_the_scratch(self):
         out = self.root / "out-interrupted"

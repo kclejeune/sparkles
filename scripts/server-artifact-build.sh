@@ -16,10 +16,7 @@ if [[ ${SPARKLES_ARTIFACT_BUILDER_IMAGE:-} != "$expected_builder" ]]; then
   echo 'server-artifact: missing or incorrect builder digest' >&2
   exit 2
 fi
-if [[ $(mbx --version) != 'mbx 1.28.0' ]]; then
-  echo 'server-artifact: install the pinned Boxington 1.28.0' >&2
-  exit 2
-fi
+mbx --version
 # Set up the Cargo drop-in as well as direct mbx calls, for child build tools.
 mbx setup --yes
 mbx_data_dir=${XDG_DATA_HOME:-${HOME}/.local/share}

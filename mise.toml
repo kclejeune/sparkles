@@ -3,7 +3,7 @@
 min_version = "2026.8.16"
 
 [tools]
-mr-boxington = "1.28.0"
+mr-boxington = "1.29.1"
 node = "24"
 pnpm = "10.34.5"
 hyperfine = "2.0.0"
