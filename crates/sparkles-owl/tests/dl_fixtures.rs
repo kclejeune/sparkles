@@ -211,6 +211,7 @@ fn the_counting_cases_with_many_successor_equalities_finish_in_tier_d() {
                 .classify(&Limits {
                     threads,
                     expansion,
+                    dl_work: Some(1 << 23),
                     ..Limits::default()
                 })
                 .unwrap();

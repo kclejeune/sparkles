@@ -385,6 +385,10 @@ impl DlRun {
     pub fn set_work_limit(&self, n: usize) {
         self.work_limit.store(n, Ordering::Relaxed);
     }
+    /// The conclusions derived so far.
+    pub fn work(&self) -> usize {
+        self.work.load(Ordering::Relaxed)
+    }
     /// Passes the bound on derived conclusions at once, for an inference too wide to make.
     fn exhaust(&self) {
         self.work.fetch_add(usize::MAX / 4, Ordering::Relaxed);

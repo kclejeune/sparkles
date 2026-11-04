@@ -1260,3 +1260,90 @@ fn a_maximum_of_a_hundred_passes_the_bound_instead_of_factoring_its_equalities()
     assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
     assert!(out.stats.dl_over_budget || out.complete);
 }
+
+/// A counting ontology: A has at least three B-successors by r and at most two r-successors,
+/// so that A is unsatisfiable when the run counts, and the disjunction keeps Tier D in use.
+const COUNTING: &str = "SubClassOf(:A ObjectMinCardinality(3 :r :B))
+SubClassOf(:A ObjectMaxCardinality(2 :r owl:Thing))
+SubClassOf(:X ObjectUnionOf(:Y :Z))
+SubClassOf(:Y :W)
+SubClassOf(:Z :W)";
+
+#[test]
+fn a_counting_run_past_its_bound_classifies_again_without_counting() {
+    let ax = axioms(COUNTING);
+    let cs = classes(&ax);
+    let a = c("A");
+    // within the default bound the counting gives A no model and X below W
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(!out.stats.dl_counting_over && !out.stats.dl_over_budget);
+        assert!(out.stats.dl_work > 0);
+        assert!(out.taxonomy.is_unsatisfiable(&a));
+        assert!(k.excluded().is_empty());
+    }
+    // a bound of one conclusion is passed on every schedule: the run starts again without
+    // counting, which leaves the maximum out and reports it, and the
+    // answer is sound, with X below W still found by the case analysis
+    let full = pairs(
+        &Classifier::of(&ax)
+            .classify(&Limits::default())
+            .unwrap()
+            .taxonomy,
+        &cs,
+    );
+    let mut answers = BTreeSet::new();
+    for threads in [1, 4] {
+        for expansion in [Expansion::Cautious, Expansion::Eager] {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    dl_work: Some(1),
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert!(out.stats.dl_counting_over, "{threads} {expansion:?}");
+            assert!(out.stats.dl_over_budget);
+            assert_eq!(out.stats.tier, Tier::Disjunctive);
+            assert!(!out.taxonomy.is_unsatisfiable(&a));
+            assert!(!k.excluded().is_empty(), "the maximum is left out");
+            let got = pairs(&out.taxonomy, &cs);
+            // sound: the full answer has A below ⊥, so below every class
+            assert!(full.contains(&("http://ex.org/A".into(), "⊥".into())));
+            assert!(!got.contains(&("http://ex.org/A".into(), "⊥".into())));
+            assert!(got.contains(&("http://ex.org/X".into(), "http://ex.org/W".into())));
+            answers.insert(got);
+        }
+    }
+    assert_eq!(answers.len(), 1);
+}
+
+#[test]
+fn the_bound_on_derived_conclusions_does_not_stop_a_run_that_does_not_count() {
+    let ax = axioms(
+        "SubClassOf(:X ObjectUnionOf(:Y :Z))
+SubClassOf(:Y :W)
+SubClassOf(:Z :W)",
+    );
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                dl_work: Some(1),
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(!out.stats.dl_counting_over && !out.stats.dl_over_budget);
+        assert!(k.excluded().is_empty());
+        assert!(out.taxonomy.is_subclass(&c("X"), &c("W")));
+    }
+}

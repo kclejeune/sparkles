@@ -814,16 +814,18 @@ impl Norm<'_> {
 /// clauses of case analysis, after the EL axioms are in `ax`. `None` when it takes no axiom
 /// that needs case analysis, or when the role inclusions are not regular or their automata
 /// pass the limit, and then `ax` is as it was, the interner aside. The answer's flags say
-/// which axioms were taken.
+/// which axioms were taken. A run that does not allow counting leaves the axioms that need
+/// it out, as the normalization did before it counted.
 pub fn normalize(
     axioms: &[&AxiomKind],
     it: &mut Interner,
     ax: &mut Axioms,
     limit: Option<usize>,
     stop: &dyn Fn() -> bool,
+    counting_allowed: bool,
 ) -> Result<Option<(Vec<bool>, DlAx)>, Halt> {
     let mut taken = vec![false; axioms.len()];
-    let counting = axioms.iter().any(|k| axiom_counts(k));
+    let counting = counting_allowed && axioms.iter().any(|k| axiom_counts(k));
     // every object property has its inverse
     let named: Vec<ObjectProperty> = it
         .roles
@@ -1049,7 +1051,7 @@ mod tests {
         let mut it = Interner::new();
         let mut ax = Axioms::default();
         let refs: Vec<&AxiomKind> = axioms.iter().collect();
-        normalize(&refs, &mut it, &mut ax, None, &|| false)
+        normalize(&refs, &mut it, &mut ax, None, &|| false, true)
             .unwrap()
             .map(|(t, d)| (t, d, ax, it))
     }
