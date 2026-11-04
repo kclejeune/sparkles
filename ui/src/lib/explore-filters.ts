@@ -31,9 +31,11 @@ export type FEdge = {
   source: string;
   target: string;
   /** The predicate IRI. */
-  predicate: string;
-  isType: boolean;
+  title?: string;
+  isType?: boolean;
 };
+
+const pred = (e: FEdge) => e.title ?? '';
 
 export type Filters = {
   /** Predicate IRIs whose edges are not drawn. */
@@ -75,7 +77,7 @@ export type FacetEntry = { key: string; count: number };
 /** The edge types of the held edges, most frequent first, ties by predicate. */
 export function predicateFacet(edges: readonly FEdge[]): FacetEntry[] {
   const n = new Map<string, number>();
-  for (const e of edges) n.set(e.predicate, (n.get(e.predicate) ?? 0) + 1);
+  for (const e of edges) n.set(pred(e), (n.get(pred(e)) ?? 0) + 1);
   return sorted(n);
 }
 
@@ -159,7 +161,7 @@ export function applyFilters<N extends FNode, E extends FEdge>(
   // 2. edges by predicate and by their ends
   const live: E[] = [];
   for (const e of edges) {
-    if (f.predicates.has(e.predicate)) continue;
+    if (f.predicates.has(pred(e))) continue;
     if (!alive.has(e.source) || !alive.has(e.target)) continue;
     live.push(e);
   }

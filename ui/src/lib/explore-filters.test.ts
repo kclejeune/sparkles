@@ -21,7 +21,7 @@ const e = (s: string, p: string, t: string): FEdge => ({
   id: `${s}|${p}|${t}`,
   source: s,
   target: t,
-  predicate: p,
+  title: p,
   isType: p === T,
 });
 
@@ -79,7 +79,7 @@ describe('applyFilters', () => {
   });
   it('hides an edge type without loading less', () => {
     const d = applyFilters(nodes, edges, { ...all, predicates: new Set(['knows']) });
-    expect(d.edges.some((x) => x.predicate === 'knows')).toBe(false);
+    expect(d.edges.some((x) => x.title === 'knows')).toBe(false);
     expect(d.edges).toHaveLength(5);
     expect(d.nodes).toHaveLength(nodes.length);
   });
