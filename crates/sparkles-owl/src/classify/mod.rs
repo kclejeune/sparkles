@@ -470,7 +470,9 @@ fn threads_of(limits: &Limits) -> usize {
 }
 
 /// The items below which a parallel step runs on one thread.
-const MIN_CHUNK: usize = 4096;
+// Tests keep the smaller chunks so that their few thousand axioms still split across
+// threads.
+const MIN_CHUNK: usize = if cfg!(test) { 1024 } else { 4096 };
 
 /// Runs `f` on chunks of `items`, on up to `threads` scoped threads.
 pub(crate) fn par_chunks<T: Send>(items: &mut [T], threads: usize, f: impl Fn(&mut [T]) + Sync) {
