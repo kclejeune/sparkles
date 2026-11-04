@@ -1009,20 +1009,49 @@ function checkAnswer(r, { full, want }) {
 }
 
 /**
- * Classify the cases under deadlines that find the saturation. The deadlines rise by a
- * few percent from a short one until one gives an answer instead of a timeout, which has
- * run out in the saturation, since that is the first part of a run that can stop with an
- * answer. The step may be longer than the saturation, so the milliseconds between the
- * last timeout and that answer are halved until they are one apart. The deadlines go on
- * until twenty have answered. A ladder fixed from the time of a full run misses a
- * saturation of some milliseconds on a loaded machine. Return the partial answers'
- * consistencies, in the order of the deadlines.
+ * Find the saturation of a classification by the time that stops it. The times rise by a
+ * few percent from a short one until one gives an answer instead of a stop before the
+ * answer, which has run out in the saturation, since that is the first part of a run that
+ * can stop with an answer. The step may be longer than the saturation, so the
+ * milliseconds between the last time that failed and that answer are halved until they
+ * are one apart. The times go on until twenty have answered, or `limit` milliseconds. A
+ * ladder fixed from the time of a full run misses a saturation of some milliseconds on a
+ * loaded machine. `answers` runs a classification stopped at a time and says whether it
+ * answered.
+ */
+async function saturationLadder(limit, answers) {
+  let answered = 0;
+  const run = async (ms) => {
+    const ok = await answers(ms);
+    if (ok) answered++;
+    return ok;
+  };
+  const next = (ms) => Math.ceil(ms + Math.max(1, 0.08 * ms));
+  let lo = 0;
+  let ms = 2;
+  while (ms < limit && !(await run(ms))) {
+    lo = ms;
+    ms = next(ms);
+  }
+  for (let hi = ms; hi - lo > 1;) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (await run(mid)) hi = mid;
+    else lo = mid;
+  }
+  while (answered < 20 && ms < limit) {
+    ms = next(ms);
+    await run(ms);
+  }
+}
+
+/**
+ * Classify the cases under the deadlines of [saturationLadder]. Return the partial
+ * answers' consistencies, in the order of the deadlines.
  */
 async function deadlineAnswers(t, inconsistent) {
   const whole = await wholeRun(t, inconsistent);
   const seen = [];
-  let answered = 0;
-  const answers = async (ms) => {
+  await saturationLadder(Math.max(2000, 20 * whole.took), async (ms) => {
     // a dataset of its own, whose read of the ontology takes as long as the full run's
     const ds = Dataset.memory();
     await ds.update(whole.body);
@@ -1035,28 +1064,10 @@ async function deadlineAnswers(t, inconsistent) {
     } finally {
       await ds.close();
     }
-    answered++;
     const c = checkAnswer(r, whole);
     if (c) seen.push(c);
     return true;
-  };
-  const next = (ms) => Math.ceil(ms + Math.max(1, 0.08 * ms));
-  const limit = 20 * whole.took;
-  let lo = 0;
-  let ms = 2;
-  while (ms < limit && !(await answers(ms))) {
-    lo = ms;
-    ms = next(ms);
-  }
-  for (let hi = ms; hi - lo > 1;) {
-    const mid = Math.floor((lo + hi) / 2);
-    if (await answers(mid)) hi = mid;
-    else lo = mid;
-  }
-  while (answered < 20 && ms < limit) {
-    ms = next(ms);
-    await answers(ms);
-  }
+  });
   return seen;
 }
 
@@ -1127,35 +1138,30 @@ test('the ontology handle answers a classification in part under a deadline', as
 });
 
 test('a classification answers in part when its signal aborts it', async (t) => {
-  const body = cases(300, false);
-  const whole = t.resource(Dataset.memory());
-  await whole.update(body);
-  const start = performance.now();
-  await whole.ontology.classify({ threads: 1 });
-  const took = performance.now() - start;
+  const whole = await wholeRun(t, false);
   let partial = 0;
-  for (let f = 0.02; f < 1.5; f *= 1.25) {
+  await saturationLadder(Math.max(2000, 20 * whole.took), async (ms) => {
     const ds = Dataset.memory();
-    await ds.update(body);
+    await ds.update(whole.body);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), took * f);
+    const timer = setTimeout(() => controller.abort(), ms);
     try {
       const r = await ds.ontology.classify({
         partial: true,
         threads: 1,
+        limit: 10000,
         signal: controller.signal,
       });
-      if (r.partial) {
-        assert.equal(r.complete, false);
-        partial++;
-      }
+      if (checkAnswer(r, whole)) partial++;
+      return true;
     } catch (e) {
       if (!controller.signal.aborted) throw e;
+      return false;
     } finally {
       clearTimeout(timer);
       await ds.close();
     }
-  }
+  });
   assert.ok(partial > 0, 'no abort gave a partial answer');
 });
 

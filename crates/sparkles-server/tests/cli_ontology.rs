@@ -326,9 +326,15 @@ fn cases(n: usize, inconsistent: bool) -> String {
     s
 }
 
-/// Classifies the cases with `--partial` under deadlines from a fraction of a full run's
-/// time upwards, checks each answer and its exit status, and returns the partial
-/// answers' consistencies.
+/// Classifies the cases with `--partial` under deadlines that find the saturation, checks
+/// each answer and its exit status, and returns the partial answers' consistencies. The
+/// deadlines rise by 8 percent from 2 ms until one of them gives an answer instead of a
+/// timeout, which has run out in the saturation, since that is the first part of a run
+/// that can stop with an answer. The step may be longer than the saturation, so the
+/// milliseconds between the last timeout and that answer are halved until they are one
+/// apart. The deadlines go on until twenty have answered. A ladder fixed from the time of
+/// a full run misses a saturation of some milliseconds on a loaded machine. The command
+/// has no memory budget to stop a run at a fixed place, so the deadline decides.
 fn partial_on_the_command_line(inconsistent: bool) -> Vec<String> {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
@@ -363,17 +369,19 @@ fn partial_on_the_command_line(inconsistent: bool) -> Vec<String> {
         + s["saturationMs"].as_f64().unwrap()
         + s["taxonomyMs"].as_f64().unwrap())
         / 1000.0;
-    let mut seen = Vec::new();
-    let mut f = 0.02;
-    while f < 1.5 {
-        let t = format!("{}", (took * f).max(1e-6));
-        f *= 1.25;
+    let limit = ((took * 20000.0) as u64).max(2000);
+    let seen = std::cell::RefCell::new(Vec::new());
+    let answered = std::cell::Cell::new(0);
+    // whether the command answered under a deadline of `ms` milliseconds
+    let run = |ms: u64| -> bool {
+        let t = format!("{}", ms as f64 / 1000.0);
         let o = sparkles(dir, &[&args[..], &["--partial", "--timeout", &t]].concat());
         let Ok(j) = serde_json::from_slice::<serde_json::Value>(&o.stdout) else {
             // a stop before the saturation fails as before
             assert_eq!(o.status.code(), Some(1), "{}", err(&o));
-            continue;
+            return false;
         };
+        answered.set(answered.get() + 1);
         assert_eq!(j["classes"], full["classes"], "{j}");
         let clean = j["consistent"] == true && j["unsatisfiableCount"] == 0;
         if j["partial"] == false {
@@ -384,7 +392,7 @@ fn partial_on_the_command_line(inconsistent: bool) -> Vec<String> {
                 "{}",
                 err(&o)
             );
-            continue;
+            return true;
         }
         assert_eq!(
             j["complete"], false,
@@ -404,9 +412,29 @@ fn partial_on_the_command_line(inconsistent: bool) -> Vec<String> {
             Some(j["incomplete"].as_array().unwrap().len() as u64),
             "{j}"
         );
-        seen.push(c);
+        seen.borrow_mut().push(c);
+        true
+    };
+    let after = |ms: u64| ms + (ms * 8 / 100).max(1);
+    let (mut lo, mut ms) = (0, 2);
+    while ms < limit && !run(ms) {
+        lo = ms;
+        ms = after(ms);
     }
-    seen
+    let mut hi = ms;
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if run(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    while answered.get() < 20 && ms < limit {
+        ms = after(ms);
+        run(ms);
+    }
+    seen.into_inner()
 }
 
 #[test]
