@@ -425,9 +425,10 @@ parents and first children, and **Expand** opens the whole neighbourhood in a di
 than the window sticks by its bottom edge. The main column has lost its cards and its Definition
 heading. One text leads under the counts, and the other definitions, descriptions, comments and
 notes wait behind one disclosure per kind, with the property as a chip at the end of each value.
-A `schema:description` can now lead the page. Axioms and References are headed sections on the
-page background, and References joins See also, the mappings, What links here, Replaces and In
-other datasets. The counts under the title are one line of text links that leave out zeros, a term
+A `schema:description` can now lead the page. Logical definition, Synonyms, Labels, Axioms, See
+also, Mappings, What links here and In other datasets are sections on the page background with
+headings of one size, and In other datasets no longer shows on a server with no other dataset. It
+also waits for the dataset list, where a page opened directly could say there was none. The counts under the title are one line of text links that leave out zeros, a term
 with no text no longer says so, a concept's labels are rows by kind in place of a table, and a phone
 shows Metadata and Hierarchy before Axioms.
 

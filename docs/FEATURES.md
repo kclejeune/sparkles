@@ -180,7 +180,7 @@ datasets and saved queries alone.
 
 ![The top bar's search listing the demo dataset's classes and properties that match org, with the matched text highlighted](images/shell-search.png)
 
-![The ontology browser's page of mitochondrion, with a line of counts under its title, one text that leads with its property as a chip, disclosures for its other texts, and a rail of cards with its metadata and hierarchy](images/browse-term.png)
+![The ontology browser's page of mitochondrion, with a line of counts under its title, one text that leads with its property as a chip, disclosures for its other texts, sections with headings of one size, and a rail of cards with its metadata and hierarchy](images/browse-term.png)
 
 ![The ontology browser's page of mitochondrion in edit mode, with the edit bar, the definition as a text field with its sources, and edit and remove buttons on the synonyms and annotations](images/browse-edit.png)
 

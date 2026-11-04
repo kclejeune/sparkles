@@ -262,6 +262,10 @@
   }
 
   async function loadReuse(i: string, signal: AbortSignal) {
+    // the shell's first read of the datasets may still be on its way, and its absence must not
+    // read as a server with no other dataset
+    if (!app.datasetsLoaded) await app.refreshDatasets();
+    if (signal.aborted) return;
     const others = app.datasets
       .map((d) => d.name)
       .filter((d) => d !== name)
@@ -1608,66 +1612,60 @@
                 editor={editing ? axiomEditor : undefined}
               />
             {/if}
-            <section class="b-refs" aria-labelledby="refs-h">
-              <div class="term-head-row"><h2 id="refs-h">References</h2></div>
-              <div class="ruled rows">
-                <TermXrefs seeAlso={sections.seeAlso} mappings={sections.mappings} {linker} />
-                <TermUsage
-                  iri={term.iri}
-                  groups={mentions}
-                  total={term.mentions.total}
-                  truncated={term.mentions.truncated}
-                  incoming={term.incoming}
-                  usage={term.usage}
-                  {linker}
-                  {prefixes}
-                  more={moreIncoming}
-                  skip={skipIncoming}
-                />
-                <TermReuse
-                  found={reuse.found}
-                  checked={reuse.checked}
-                  loading={reuse.loading}
-                  href={(d) => browseHref(base, d, term?.iri ?? null)}
-                />
-                {#if !editing}
-                  <SimilarTerms ds={target} iri={term.iri} href={(i) => hrefOf(i)} />
-                {/if}
-                <!-- the statements no other section shows, folded away -->
-                {#if sections.other.length && !editing}
-                  <section class="term-sec">
-                    <details class="ann">
-                      <summary
-                        >All other statements <span class="count-badge"
-                          >{sections.other.reduce((n, o) => n + o.values.length, 0)}</span
-                        ></summary
-                      >
-                      <div class="table-scroll">
-                        <table class="data">
-                          <tbody>
-                            {#each sections.other as o (o.property)}
-                              <tr>
-                                <th scope="row" class="mono">{iriName(o.property, prefixes)}</th>
-                                <td>
-                                  {#each o.values as v, i (i)}{#if i > 0}<br
-                                      />{/if}{#if isLiteral(v)}{v[
-                                        '@value'
-                                      ]}{#if v['@language']}<span class="lang-tag"
-                                          >{v['@language']}</span
-                                        >{/if}{:else if linker.href(v)}<a href={linker.href(v)}
-                                        >{linker.name(v)}</a
-                                      >{:else}<span class="mono">{v}</span>{/if}{/each}
-                                </td>
-                              </tr>
-                            {/each}
-                          </tbody>
-                        </table>
-                      </div>
-                    </details>
-                  </section>
-                {/if}
-              </div>
-            </section>
+            <!-- the sections about the entity's links, each its own at the page's one heading size -->
+            <TermXrefs seeAlso={sections.seeAlso} mappings={sections.mappings} {linker} />
+            <TermUsage
+              iri={term.iri}
+              groups={mentions}
+              total={term.mentions.total}
+              truncated={term.mentions.truncated}
+              incoming={term.incoming}
+              usage={term.usage}
+              {linker}
+              {prefixes}
+              more={moreIncoming}
+              skip={skipIncoming}
+            />
+            <TermReuse
+              found={reuse.found}
+              checked={reuse.checked}
+              loading={reuse.loading}
+              href={(d) => browseHref(base, d, term?.iri ?? null)}
+            />
+            {#if !editing}
+              <SimilarTerms ds={target} iri={term.iri} href={(i) => hrefOf(i)} />
+            {/if}
+            <!-- the statements no other section shows, folded away -->
+            {#if sections.other.length && !editing}
+              <section class="term-sec">
+                <details class="ann">
+                  <summary
+                    >All other statements <span class="count-badge"
+                      >{sections.other.reduce((n, o) => n + o.values.length, 0)}</span
+                    ></summary
+                  >
+                  <div class="table-scroll">
+                    <table class="data">
+                      <tbody>
+                        {#each sections.other as o (o.property)}
+                          <tr>
+                            <th scope="row" class="mono">{iriName(o.property, prefixes)}</th>
+                            <td>
+                              {#each o.values as v, i (i)}{#if i > 0}<br
+                                  />{/if}{#if isLiteral(v)}{v['@value']}{#if v['@language']}<span
+                                      class="lang-tag">{v['@language']}</span
+                                    >{/if}{:else if linker.href(v)}<a href={linker.href(v)}
+                                    >{linker.name(v)}</a
+                                  >{:else}<span class="mono">{v}</span>{/if}{/each}
+                            </td>
+                          </tr>
+                        {/each}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              </section>
+            {/if}
           </div>
         {/if}
         <div class="b-side" data-col="side">
@@ -1983,8 +1981,8 @@
     container: browse / inline-size;
     min-width: 0;
   }
-  /* one column at a medium size: the head, the counts, Definition, Axioms, Metadata with
-     Identifiers and Download, Hierarchy and References (item 734). A phone has Metadata before
+  /* one column at a medium size: the head, the counts, the texts, Axioms, Metadata with
+     Identifiers and Download, then Hierarchy (item 734). A phone has Metadata before
      Axioms, below. In one column the columns are `display: contents`, so `order` sets all this */
   .browse {
     display: grid;
@@ -2030,23 +2028,14 @@
     /* the graph at the rail's width */
     --term-graph-h: 380px;
   }
-  .b-refs {
+  .b-main > :global(.term-sec) {
     order: 6;
     min-width: 0;
   }
-  /* the titles carry weight, and each section's heading under them is the text colour */
+  /* the main column's sections and the rail's cards share one size of title */
   .browse :global(.panel > .panel-head h2),
   .browse :global(.b-tree .lead h2) {
     font-size: var(--fs-lg);
-  }
-  .ruled :global(.term-sec > h2) {
-    font-size: var(--fs-md);
-    font-weight: 600;
-    color: var(--text);
-    margin-bottom: var(--sp-3);
-  }
-  .ruled :global(.term-sec > h3) {
-    color: var(--text-2);
   }
   .b-chips {
     order: 1;
@@ -2065,7 +2054,10 @@
     }
   }
   /* in one column the sections on the page background stand further apart than the cards */
-  .b-refs,
+  .browse {
+    --section-gap: calc(var(--gap) + var(--sp-4));
+  }
+  .b-main > :global(.term-sec),
   .browse :global(.b-ax) {
     margin-top: var(--sp-4);
   }
@@ -2098,7 +2090,7 @@
   }
   /* the reading view: the parts are split by space and not by rules */
   .ruled.rows {
-    gap: var(--sp-5);
+    gap: var(--section-gap);
   }
   .ruled.rows > :global(section),
   .ruled.rows > :global(.lead + section) {
@@ -2111,9 +2103,6 @@
   /* a term with no text at all has no block, and the page goes on to what it has */
   .b-def:not(:has(.ruled > *)) {
     display: none;
-  }
-  .b-refs .term-head-row {
-    margin-bottom: var(--sp-4);
   }
   /* one wide column at a medium size: the rail's cards run to the edges, so their padding opens
      a little to keep the measure in hand */
@@ -2148,10 +2137,13 @@
       min-width: 0;
       align-content: start;
     }
-    .b-main {
-      gap: var(--sp-8);
+    .browse {
+      --section-gap: var(--sp-8);
     }
-    .b-refs,
+    .b-main {
+      gap: var(--section-gap);
+    }
+    .b-main > :global(.term-sec),
     .browse :global(.b-ax) {
       margin-top: 0;
     }

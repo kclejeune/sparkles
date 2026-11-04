@@ -483,14 +483,15 @@ has any, with its count and closed at first, such as "In 1 other language", "1 m
 below the row, so that the row keeps its place. **Notes** holds the scope, history, editorial and
 change notes, the plain notes and the examples, where the chip tells them apart and each row names
 its kind to a screen reader. A lone lead has no disclosures. Edit mode opens them all, so that
-every value can be reached. A **Logical definition** and the **Synonyms** by kind stay in view
+every value can be reached. The sections after it are all headings of one size. A
+**Logical definition** and the **Synonyms** by kind stay in view
 under the row, each synonym with its languages, sources and its synonym type as a chip.
 **Axioms** gives the entity's frame in Manchester syntax, with the names linked to their pages and
 a **Copy** button beside its heading, and an **Inferred** section that a **Classify** button fills
 from the server's classification. A SKOS concept has no Axioms section, since SKOS statements are
-not axioms. **References** holds See also, the mappings, what links here, the other datasets and,
-folded away under **All other statements**, every statement the other sections do not show, each
-under a stronger sub-heading.
+not axioms. **See also**, **Mappings**, **What links here** and **In other datasets** follow as
+sections of their own, and **All other statements** folds away every statement the other sections
+do not show.
 
 The rail has the width of the side column on a dataset's page. **Metadata** lists the kind,
 status, ontology and subsets, then **Identifiers**, the entity's cross-references by database,
@@ -517,16 +518,17 @@ A SKOS concept gets its **Labels** as rows in the style of the synonyms, Preferr
 Hidden, with every value in every language and its language tag, which replace the alternative and
 hidden labels in Synonyms, and its related concepts and mappings. Identifiers in well-known databases such as Wikipedia, PubMed and DOI are links. A class that is defined by an expression shows it as a **Logical definition**
 under its texts, and only class expressions count, never the other axioms.
-**What links here** lists the axioms of other entities that mention it, grouped by the
-restriction that holds it as in "part of some mitochondrion", then the other statements that
-point at it by property, with their counts and further pages. **In other datasets** asks
-every other dataset the caller can read, up to 20, whether it mentions the IRI, and links
-its page there. **Similar terms** lists the entity's nearest neighbours in the dataset's
+**What links here** lists the axioms of other entities that mention it, grouped under smaller
+headings by the restriction that holds it as in "part of some mitochondrion", then the other
+statements that point at it by property, such as Replaces, with their counts and further pages.
+**In other datasets** asks every other dataset the caller can read, up to 20, whether it mentions
+the IRI, and links its page there or says that none does. It shows once the answers are in, and a
+server with no other dataset has no such section. **Similar terms** lists the entity's nearest neighbours in the dataset's
 first ready vector index, through the same search as Similar's Search page, and links to
 that page for more. A dataset without a vector index or a term without a vector shows no
 such section. Below 1,100 pixels the page is one column, in the order of the texts, Axioms,
-Metadata, Hierarchy and References. On a phone the order is the texts with the Logical definition
-and Synonyms, Metadata, Hierarchy, Axioms and References, and the Hierarchy
+Metadata, Hierarchy and the sections of links. On a phone the order is the texts with the Logical
+definition and Synonyms, Metadata, Hierarchy, Axioms and the sections of links, and the Hierarchy
 card opens on request or when a view is chosen ([screenshot](../images/browse-phone.png)).
 
 A caller who can write to the dataset gets an **Edit** button beside the title, and `E`

@@ -518,8 +518,10 @@ the whole neighbourhood in a dialog. The rail sticks even when it is taller than
 main column has no cards and no Definition heading. One text leads under the counts, and the other
 definitions, descriptions, comments and notes wait behind one disclosure per kind on a wrapping
 row, with a chip of the property at the end of every value. `schema:description` joined the
-properties that can lead. Axioms and References are headed sections on the page background, and
-References joins See also, the mappings, What links here, Replaces and In other datasets. Counts of
+properties that can lead. Logical definition, Synonyms, Labels, Axioms, See also, Mappings, What
+links here and In other datasets are sections on the page background with headings of one size,
+and Replaces stays a smaller group within What links here. In other datasets waits for the
+dataset list and for its answers, and a server with no other dataset has no such section. Counts of
 zero are hidden, a term with no text shows no line about it, and a concept's labels are rows by
 kind in place of a table. A phone puts Metadata and Hierarchy before Axioms.
 

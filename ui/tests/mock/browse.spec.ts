@@ -3,7 +3,7 @@
 // children and siblings, the graph view, the downloads, and the top bar's search opening
 // a page. tests/e2e/browse.spec.ts checks the server's answers on a real dataset.
 
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from '@playwright/test';
 import { pageAction } from '../page-actions';
 
 test.describe.configure({ timeout: 90_000 });
@@ -379,7 +379,8 @@ test('the phone page keeps the order head, counts, texts, metadata, hierarchy, a
     for (let i = 1; i < ys.length; i++) expect(ys[i - 1], order[i]).toBeLessThan(ys[i]);
   };
   // Metadata follows the definition block directly, then Hierarchy, then Axioms
-  await inOrder(['.b-head', '.b-chips', '.b-def', '.b-info', '.b-tree', '.b-ax', '.b-refs']);
+  const links = '.b-main > .term-sec';
+  await inOrder(['.b-head', '.b-chips', '.b-def', '.b-info', '.b-tree', '.b-ax', links]);
   // the counts stay compact: at most two lines of text links
   const chips = (await page.locator('.b-chips').boundingBox())!;
   expect(chips.height).toBeLessThanOrEqual(2 * 22 + 2);
@@ -397,11 +398,11 @@ test('the phone page keeps the order head, counts, texts, metadata, hierarchy, a
   // a term with no Axioms card keeps the same order without it
   await openTerm(page, 'Agent');
   await expect(page.locator('.b-ax')).toHaveCount(0);
-  await inOrder(['.b-head', '.b-chips', '.b-info', '.b-tree', '.b-refs']);
+  await inOrder(['.b-head', '.b-chips', '.b-info', '.b-tree', links]);
   // the width above a phone keeps Axioms before Metadata
   await page.setViewportSize({ width: 900, height: 900 });
   await openTerm(page, 'Person');
-  await inOrder(['.b-def', '.b-ax', '.b-info', '.b-tree', '.b-refs']);
+  await inOrder(['.b-def', '.b-ax', '.b-info', '.b-tree', links]);
 });
 
 test('a large screen shows the term in two columns of cards whose bottoms stay close', async ({
@@ -423,11 +424,19 @@ test('a large screen shows the term in two columns of cards whose bottoms stay c
       (c) =>
         [...document.querySelectorAll(`${c} > *`)]
           .filter((e) => (e as HTMLElement).offsetParent)
-          .map((e) => e.className.match(/b-(def|ax|tree|refs|info|ids)/)?.[1]),
+          .map((e) =>
+            e.className
+              .match(/b-(def|ax|tree|info|ids)|term-(sec)/)
+              ?.slice(1)
+              .join(''),
+          ),
       col,
     );
-  // Person states one axiom, so its Axioms card follows the definition
-  expect(await cards('.b-main')).toEqual(['def', 'ax', 'refs']);
+  // Person states one axiom, so Axioms follows the texts, and then the links' own sections
+  const main = await cards('.b-main');
+  expect(main.slice(0, 2)).toEqual(['def', 'ax']);
+  expect(main.length).toBeGreaterThan(2);
+  expect(new Set(main.slice(2))).toEqual(new Set(['sec']));
   expect(await cards('.b-side')).toEqual(['info', 'tree']);
   // no card of the term's page moves between the columns
   await expect(page.locator('.browse [data-movable]')).toHaveCount(0);
@@ -477,10 +486,10 @@ test('Identifiers groups the cross-references by database in the rail', async ({
     'https://en.wikipedia.org/wiki/Border-associated_macrophage',
   );
   await expect(ids.getByRole('button', { name: /more/ })).toHaveCount(0);
-  // the identifiers left References, which keeps See also, and the rail keeps its order
-  const refs = page.getByRole('region', { name: 'References' });
-  await expect(refs).not.toContainText('Border-associated_macrophage');
-  await expect(refs.getByRole('heading', { name: 'See also' })).toBeVisible();
+  // the identifiers left See also, and the rail keeps its order
+  const also = page.getByRole('region', { name: 'See also' });
+  await expect(also).not.toContainText('Border-associated_macrophage');
+  await expect(also.getByRole('heading', { name: 'See also' })).toBeVisible();
   // in the rail: the facts, the identifiers, the downloads and then the hierarchy
   const ys: number[] = [];
   for (const el of [
@@ -512,39 +521,80 @@ test('Identifiers shows a ninth database rather than offering one more', async (
   await expect(ids.getByRole('button', { name: /more/ })).toHaveCount(0);
 });
 
-test('See also, What links here and In other datasets share References under stronger headings', async ({
+test('the main column has one size of heading and skips no level', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const levels = () =>
+    page.evaluate(() =>
+      [...document.querySelectorAll('.browse h1, .browse h2, .browse h3, .browse h4')]
+        .filter((h) => (h as HTMLElement).offsetParent)
+        .map((h) => Number(h.tagName[1])),
+    );
+  await page.goto(HEAVY);
+  await expect(page.getByRole('heading', { level: 2, name: 'See also' })).toBeVisible({
+    timeout: 30_000,
+  });
+  const size = (h: Locator) => h.evaluate((el) => getComputedStyle(el).fontSize);
+  for (const name of [
+    'Logical definition',
+    'Synonyms',
+    'Axioms',
+    'See also',
+    /What links here/,
+    'Metadata',
+    'Hierarchy',
+  ]) {
+    const h = page.locator('.browse').getByRole('heading', { level: 2, name });
+    expect(await size(h.first()), String(name)).toBe('17px');
+  }
+  // no heading stands over the links, and the groups of What links here stay smaller
+  await expect(page.getByRole('heading', { name: 'References' })).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'References' })).toHaveCount(0);
+  const usage = page.getByRole('region', { name: /What links here/ });
+  const group = usage.getByRole('heading', { level: 3 }).first();
+  expect(parseFloat(await size(group))).toBeLessThan(17);
+  for (const name of ['See also', /What links here/])
+    await expect(page.locator('.b-main > section').getByRole('heading', { name })).toBeVisible();
+  const ok = (l: number[]) => l.every((n, i) => i === 0 || n <= l[i - 1] + 1);
+  expect(ok(await levels()), (await levels()).join(' ')).toBe(true);
+  // on a concept Labels is at the same level, with the same check in edit mode
+  await page.goto(
+    `/ui/browse?ds=thes&iri=${encodeURIComponent('http://example.org/thesaurus/fish')}`,
+  );
+  const labels = page.getByRole('heading', { level: 2, name: 'Labels' });
+  await expect(labels).toBeVisible({ timeout: 30_000 });
+  expect(await size(labels)).toBe('17px');
+  expect(ok(await levels()), (await levels()).join(' ')).toBe(true);
+  await page.goto(`${HEAVY}&edit=1`);
+  await expect(page.getByRole('heading', { level: 2, name: 'Axioms' })).toBeVisible({
+    timeout: 30_000,
+  });
+  expect(ok(await levels()), (await levels()).join(' ')).toBe(true);
+});
+
+test('In other datasets says what it found, and is absent with no other dataset', async ({
   page,
 }) => {
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await page.goto(HEAVY);
-  const refs = page.locator('.b-main').getByRole('region', { name: 'References' });
-  await expect(refs.getByRole('heading', { name: 'See also' })).toBeVisible({ timeout: 30_000 });
-  for (const name of [/What links here/, /In other datasets/])
-    await expect(refs.getByRole('heading', { level: 2, name })).toBeVisible();
-  const style = (el: Element) => {
-    const s = getComputedStyle(el);
-    return { size: s.fontSize, weight: s.fontWeight, color: s.color };
-  };
-  const text = await page.evaluate(() =>
-    getComputedStyle(document.documentElement).getPropertyValue('--text').trim(),
-  );
-  const title = await refs.locator('#refs-h').evaluate(style);
-  const sub = await refs.locator('.term-sec > h2').first().evaluate(style);
-  expect(title.size).toBe('17px');
-  // the rail's cards have the same size of title
-  for (const name of ['Axioms', 'Metadata', 'Hierarchy']) {
-    const h = page.locator('.browse').getByRole('heading', { level: 2, name, exact: true });
-    expect((await h.first().evaluate(style)).size, name).toBe('17px');
-  }
-  expect(sub.size).toBe('14px');
-  expect(sub.weight).toBe('600');
-  const rgb = (hex: string) =>
-    `rgb(${[1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16)).join(', ')})`;
-  expect(sub.color).toBe(rgb(text));
-  // and the definition block's sections read the same way
-  const syn = await page.getByRole('region', { name: 'Synonyms' }).locator('h2').evaluate(style);
-  expect(syn.size).toBe('14px');
-  expect(syn.color).toBe(rgb(text));
+  await page.route(/\/\$\/datasets(\?|$)/, async (route) => {
+    const res = await route.fetch();
+    const j = await res.json();
+    const key = Array.isArray(j) ? null : Object.keys(j).find((k) => Array.isArray(j[k]));
+    const keep = (l: { name?: string; 'ds.name'?: string }[]) =>
+      l.filter((d) => (d.name ?? d['ds.name'] ?? '').replace(/^\//, '') === 'uni');
+    await route.fulfill({
+      response: res,
+      json: key ? { ...j, [key]: keep(j[key]) } : keep(j),
+    });
+  });
+  await openTerm(page, 'Person');
+  await expect(page.getByRole('region', { name: /What links here/ })).toBeVisible();
+  await page.waitForLoadState('networkidle');
+  await expect(page.getByRole('region', { name: /In other datasets/ })).toHaveCount(0);
+  await expect(page.getByText(/no other dataset/)).toHaveCount(0);
+  await page.unrouteAll();
+  await page.reload();
+  const reuse = page.getByRole('region', { name: /In other datasets/ });
+  await expect(reuse).toBeVisible({ timeout: 30_000 });
+  await expect(reuse).toContainText(/Checked|default graph/);
 });
 
 test('one text leads, and each other kind waits behind a disclosure with its count', async ({
@@ -583,13 +633,16 @@ test('one text leads, and each other kind waits behind a disclosure with its cou
   ]);
   // no card or heading stands for the block, which is still a named region
   await expect(page.getByRole('heading', { name: 'Definition', exact: true })).toHaveCount(0);
-  await expect(page.locator('.b-def.panel, .b-ax.panel, .b-refs.panel')).toHaveCount(0);
+  await expect(page.locator('.b-main > .panel, .b-main > section.panel')).toHaveCount(0);
   await expect(page.getByRole('region', { name: 'About this class' })).toBeVisible();
   // Logical definition and Synonyms stay in view without opening anything
   await expect(page.getByRole('heading', { level: 2, name: 'Logical definition' })).toBeVisible();
   await expect(page.getByRole('heading', { level: 2, name: 'Synonyms' })).toBeVisible();
   // the sections on the page background have no card behind them
-  const bg = await page.locator('.b-refs').evaluate((el) => getComputedStyle(el).backgroundColor);
+  const bg = await page
+    .locator('.b-main > .term-sec')
+    .first()
+    .evaluate((el) => getComputedStyle(el).backgroundColor);
   expect(bg).toBe('rgba(0, 0, 0, 0)');
 });
 
