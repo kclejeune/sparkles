@@ -1,0 +1,656 @@
+{
+ "name": "reveal-taxon300k-deepest",
+ "rep": 1,
+ "meta": {
+  "label": "after3",
+  "base": "http://127.0.0.1:18725",
+  "host": "stanley",
+  "date": "2026-11-04T13:57:46.664Z",
+  "uiDir": "/home/kclejeune/lanes-local/explore-scale-725/ui-after3/ui/build",
+  "commit": "4ab93ecb/a199a8ae",
+  "server": "release-4ab93ecb",
+  "note": "laptop, synthetic taxon, software WebGL",
+  "browser": "153.0.8010.12",
+  "viewport": {
+   "width": 1440,
+   "height": 900
+  },
+  "webgl": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+  "loadavg": [
+   3.33,
+   3.3,
+   3.35
+  ]
+ },
+ "url": "/ui/workbench/ontology?ds=taxon300k&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35976",
+ "status": "ok",
+ "firstRowMs": 401,
+ "quietMs": 1360,
+ "networkQuiet": true,
+ "longTasks": {
+  "count": 1,
+  "totalMs": 75,
+  "maxMs": 75,
+  "lastEndMs": 169
+ },
+ "interactiveMs": 401,
+ "network": {
+  "api": {
+   "count": 57,
+   "encodedBytes": 73731,
+   "decodedBytes": 61333,
+   "ms": 2762.402000138536
+  },
+  "total": {
+   "count": 125,
+   "encodedBytes": 622894,
+   "decodedBytes": 1612183,
+   "ms": 3972.535999957472
+  },
+  "groups": {
+   "static": {
+    "count": 63,
+    "encodedBytes": 544635,
+    "decodedBytes": 1543716,
+    "ms": 1169.2959998035803
+   },
+   "$/prefixes": {
+    "count": 2,
+    "encodedBytes": 2412,
+    "decodedBytes": 1294,
+    "ms": 52.00899997726083
+   },
+   "ontology/summary": {
+    "count": 1,
+    "encodedBytes": 1305,
+    "decodedBytes": 434,
+    "ms": 31.413999968208373
+   },
+   "$/auth": {
+    "count": 1,
+    "encodedBytes": 859,
+    "decodedBytes": 17,
+    "ms": 7.1810000808909535
+   },
+   "$/whoami": {
+    "count": 1,
+    "encodedBytes": 1072,
+    "decodedBytes": 259,
+    "ms": 7.184999994933605
+   },
+   "ontology/hierarchy": {
+    "count": 43,
+    "encodedBytes": 57108,
+    "decodedBytes": 53825,
+    "ms": 1666.3500000722706
+   },
+   "ontology/entity": {
+    "count": 1,
+    "encodedBytes": 1336,
+    "decodedBytes": 694,
+    "ms": 245.10599998757243
+   },
+   "ontology/axioms": {
+    "count": 1,
+    "encodedBytes": 1411,
+    "decodedBytes": 1487,
+    "ms": 422.2109999973327
+   },
+   "$/ping": {
+    "count": 1,
+    "encodedBytes": 831,
+    "decodedBytes": 20,
+    "ms": 12.73600000422448
+   },
+   "$/datasets": {
+    "count": 1,
+    "encodedBytes": 1766,
+    "decodedBytes": 6838,
+    "ms": 13.735999935306609
+   },
+   "sparql": {
+    "count": 5,
+    "encodedBytes": 5974,
+    "decodedBytes": 2631,
+    "ms": 183.60400013625622
+   },
+   "$/assistant": {
+    "count": 1,
+    "encodedBytes": 1061,
+    "decodedBytes": 259,
+    "ms": 43.81199995987117
+   },
+   "$/memory": {
+    "count": 1,
+    "encodedBytes": 904,
+    "decodedBytes": 87,
+    "ms": 45.039999997243285
+   },
+   "ontology/entities": {
+    "count": 1,
+    "encodedBytes": 1043,
+    "decodedBytes": 146,
+    "ms": 40.55500007234514
+   },
+   "$/branches": {
+    "count": 1,
+    "encodedBytes": 1177,
+    "decodedBytes": 476,
+    "ms": 32.300999970175326
+   },
+   "changes": {
+    "count": 1,
+    "encodedBytes": 0,
+    "decodedBytes": 0,
+    "ms": 0
+   }
+  }
+ },
+ "requests": [
+  {
+   "url": "/$/prefixes/taxon300k",
+   "group": "$/prefixes",
+   "status": 200,
+   "ms": 7,
+   "encodedBytes": 1206,
+   "decodedBytes": 647
+  },
+  {
+   "url": "/$/ontology/taxon300k?graph=default",
+   "group": "ontology/summary",
+   "status": 200,
+   "ms": 31,
+   "encodedBytes": 1305,
+   "decodedBytes": 434
+  },
+  {
+   "url": "/$/auth/config",
+   "group": "$/auth",
+   "status": 200,
+   "ms": 7,
+   "encodedBytes": 859,
+   "decodedBytes": 17
+  },
+  {
+   "url": "/$/whoami",
+   "group": "$/whoami",
+   "status": 200,
+   "ms": 7,
+   "encodedBytes": 1072,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 205,
+   "encodedBytes": 1286,
+   "decodedBytes": 397
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35976&ancestors=true&limit=1&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 11,
+   "encodedBytes": 2093,
+   "decodedBytes": 12136
+  },
+  {
+   "url": "/$/ontology/taxon300k/entity?graph=default&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35976",
+   "group": "ontology/entity",
+   "status": 200,
+   "ms": 245,
+   "encodedBytes": 1336,
+   "decodedBytes": 694
+  },
+  {
+   "url": "/$/ontology/taxon300k/axioms?graph=default&about=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35976&assertions=true&limit=5000&offset=0",
+   "group": "ontology/axioms",
+   "status": 200,
+   "ms": 422,
+   "encodedBytes": 1411,
+   "decodedBytes": 1487
+  },
+  {
+   "url": "/$/ping",
+   "group": "$/ping",
+   "status": 200,
+   "ms": 13,
+   "encodedBytes": 831,
+   "decodedBytes": 20
+  },
+  {
+   "url": "/$/datasets",
+   "group": "$/datasets",
+   "status": 200,
+   "ms": 14,
+   "encodedBytes": 1766,
+   "decodedBytes": 6838
+  },
+  {
+   "url": "/taxon300k/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1710,
+   "decodedBytes": 1997
+  },
+  {
+   "url": "/taxon300k/sparql",
+   "group": "sparql",
+   "status": 200,
+   "ms": 43,
+   "encodedBytes": 1164,
+   "decodedBytes": 260
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35975&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 9,
+   "encodedBytes": 1311,
+   "decodedBytes": 577
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35974&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 10,
+   "encodedBytes": 1310,
+   "decodedBytes": 574
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35973&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 14,
+   "encodedBytes": 1308,
+   "decodedBytes": 567
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35972&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 14,
+   "encodedBytes": 1307,
+   "decodedBytes": 568
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35971&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 17,
+   "encodedBytes": 1306,
+   "decodedBytes": 565
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35970&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 18,
+   "encodedBytes": 1307,
+   "decodedBytes": 567
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35969&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 21,
+   "encodedBytes": 1312,
+   "decodedBytes": 576
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35968&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 21,
+   "encodedBytes": 1309,
+   "decodedBytes": 572
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35967&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 24,
+   "encodedBytes": 1308,
+   "decodedBytes": 566
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35966&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 24,
+   "encodedBytes": 1308,
+   "decodedBytes": 573
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35965&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 28,
+   "encodedBytes": 1309,
+   "decodedBytes": 577
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35964&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 28,
+   "encodedBytes": 1311,
+   "decodedBytes": 573
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35963&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 32,
+   "encodedBytes": 1306,
+   "decodedBytes": 571
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35962&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 31,
+   "encodedBytes": 1306,
+   "decodedBytes": 566
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35961&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 34,
+   "encodedBytes": 1305,
+   "decodedBytes": 563
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35960&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 34,
+   "encodedBytes": 1306,
+   "decodedBytes": 571
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35959&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 36,
+   "encodedBytes": 1310,
+   "decodedBytes": 574
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35958&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 36,
+   "encodedBytes": 1309,
+   "decodedBytes": 570
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35957&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 38,
+   "encodedBytes": 1308,
+   "decodedBytes": 570
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35956&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 38,
+   "encodedBytes": 1307,
+   "decodedBytes": 570
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35955&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 37,
+   "encodedBytes": 1308,
+   "decodedBytes": 573
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35954&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 40,
+   "encodedBytes": 1308,
+   "decodedBytes": 576
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35953&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 39,
+   "encodedBytes": 1306,
+   "decodedBytes": 569
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35952&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 40,
+   "encodedBytes": 1305,
+   "decodedBytes": 564
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35951&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 43,
+   "encodedBytes": 1305,
+   "decodedBytes": 567
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35950&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 43,
+   "encodedBytes": 1306,
+   "decodedBytes": 569
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35949&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 43,
+   "encodedBytes": 1311,
+   "decodedBytes": 572
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35948&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 45,
+   "encodedBytes": 1308,
+   "decodedBytes": 574
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35947&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 45,
+   "encodedBytes": 1307,
+   "decodedBytes": 568
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35946&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 45,
+   "encodedBytes": 1309,
+   "decodedBytes": 568
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35945&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 47,
+   "encodedBytes": 1310,
+   "decodedBytes": 577
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35944&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 46,
+   "encodedBytes": 1311,
+   "decodedBytes": 574
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35943&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 46,
+   "encodedBytes": 1307,
+   "decodedBytes": 567
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35942&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 49,
+   "encodedBytes": 1298,
+   "decodedBytes": 560
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35941&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 49,
+   "encodedBytes": 1294,
+   "decodedBytes": 550
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35940&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 48,
+   "encodedBytes": 1293,
+   "decodedBytes": 546
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_309&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 50,
+   "encodedBytes": 1295,
+   "decodedBytes": 544
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_25&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 51,
+   "encodedBytes": 1508,
+   "decodedBytes": 2914
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_2&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 53,
+   "encodedBytes": 1498,
+   "decodedBytes": 2890
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_1&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 51,
+   "encodedBytes": 1466,
+   "decodedBytes": 2324
+  },
+  {
+   "url": "/$/prefixes/chebi",
+   "group": "$/prefixes",
+   "status": 200,
+   "ms": 45,
+   "encodedBytes": 1206,
+   "decodedBytes": 647
+  },
+  {
+   "url": "/$/assistant/taxon300k",
+   "group": "$/assistant",
+   "status": 200,
+   "ms": 44,
+   "encodedBytes": 1061,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/memory/taxon300k/maintenance",
+   "group": "$/memory",
+   "status": 200,
+   "ms": 45,
+   "encodedBytes": 904,
+   "decodedBytes": 87
+  },
+  {
+   "url": "/$/ontology/taxon300k/hierarchy?graph=default&kind=class&iri=http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FNCBITaxon_35976&ancestors=true&limit=1&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 33,
+   "encodedBytes": 913,
+   "decodedBytes": 12136
+  },
+  {
+   "url": "/$/ontology/taxon300k/entities?graph=default&kind=ObjectProperty%2CDataProperty%2CAnnotationProperty%2CNamedIndividual%2CDatatype&limit=10000&offset=0",
+   "group": "ontology/entities",
+   "status": 200,
+   "ms": 41,
+   "encodedBytes": 1043,
+   "decodedBytes": 146
+  },
+  {
+   "url": "/taxon300k/sparql",
+   "group": "sparql",
+   "status": 200,
+   "ms": 123,
+   "encodedBytes": 968,
+   "decodedBytes": 57
+  },
+  {
+   "url": "/$/branches/taxon300k",
+   "group": "$/branches",
+   "status": 200,
+   "ms": 32,
+   "encodedBytes": 1177,
+   "decodedBytes": 476
+  },
+  {
+   "url": "/taxon300k/sparql",
+   "group": "sparql",
+   "status": 200,
+   "ms": 11,
+   "encodedBytes": 1164,
+   "decodedBytes": 260
+  },
+  {
+   "url": "/taxon300k/changes?limit=1&after=commit:1",
+   "group": "changes",
+   "status": 200,
+   "ms": 0,
+   "encodedBytes": 0,
+   "decodedBytes": 0
+  },
+  {
+   "url": "/taxon300k/sparql",
+   "group": "sparql",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 968,
+   "decodedBytes": 57
+  }
+ ],
+ "heap": {
+  "jsHeapUsedMB": 6.2,
+  "jsHeapTotalMB": 6.8,
+  "domNodes": 2514,
+  "layoutCount": 0
+ },
+ "rowsLoaded": 78,
+ "rowsInDom": 38,
+ "toggleLatencyMs": 41
+}

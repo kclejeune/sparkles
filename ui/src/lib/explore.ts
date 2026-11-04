@@ -132,21 +132,27 @@ export async function searchInstances(
 
 export type Neighbour = { predicate: string; term: Term; label?: string; incoming: boolean };
 
-/** Outgoing and incoming edges of a resource (LIMIT 100 each). */
+/**
+ * Outgoing and incoming edges of a resource (LIMIT 100 each), leaving out the predicates in
+ * `skip`, which Explore draws as group nodes instead (ROADMAP item 725).
+ */
 export async function neighbours(
   ds: string,
   iri: string,
   at?: string,
   signal?: AbortSignal,
+  skip: { out?: readonly string[]; inc?: readonly string[] } = {},
 ): Promise<{ out: Neighbour[]; inc: Neighbour[]; label?: string }> {
   const node = sparqlIri(iri);
+  const not = (ps: readonly string[] | undefined) =>
+    ps?.length ? `\n  FILTER(?p NOT IN (${ps.map(sparqlIri).join(', ')}))` : '';
   const o = { ...opts, ...(at ? { at } : {}), signal };
   const [outRows, incRows] = await Promise.all([
     api.select(
       ds,
       `${P}
 SELECT ?p ?o (SAMPLE(?l) AS ?label) WHERE {
-  ${node} ?p ?o .
+  ${node} ?p ?o .${not(skip.out)}
   OPTIONAL { ?o ${LABEL_PATH} ?l }
 }
 GROUP BY ?p ?o
@@ -157,7 +163,7 @@ LIMIT 100`,
       ds,
       `${P}
 SELECT ?s ?p (SAMPLE(?l) AS ?label) WHERE {
-  ?s ?p ${node} .
+  ?s ?p ${node} .${not(skip.inc)}
   OPTIONAL { ?s ${LABEL_PATH} ?l }
 }
 GROUP BY ?s ?p

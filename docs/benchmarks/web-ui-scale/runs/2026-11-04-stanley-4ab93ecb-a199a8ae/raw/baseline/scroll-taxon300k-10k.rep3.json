@@ -1,0 +1,78 @@
+{
+ "name": "scroll-taxon300k-10k",
+ "rep": 1,
+ "meta": {
+  "label": "baseline",
+  "base": "http://127.0.0.1:18725",
+  "host": "stanley",
+  "date": "2026-11-04T14:09:49.610Z",
+  "uiDir": "/home/kclejeune/repositories/github.com/kclejeune/sparkles-lane-explore-scale-725-measure/ui/build",
+  "commit": "4ab93ecb/a199a8ae",
+  "server": "release-4ab93ecb",
+  "note": "laptop, synthetic taxon, software WebGL",
+  "browser": "153.0.8010.12",
+  "viewport": {
+   "width": 1440,
+   "height": 900
+  },
+  "webgl": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+  "loadavg": [
+   5.27,
+   5.74,
+   4.73
+  ]
+ },
+ "status": "ok",
+ "hub": "http://purl.obolibrary.org/obo/NCBITaxon_1637",
+ "showMoreMs": [
+  198,
+  215,
+  229,
+  266,
+  277,
+  331,
+  345,
+  417,
+  449
+ ],
+ "rowsLoaded": 10038,
+ "rowsInDomBefore": 10038,
+ "heapBefore": {
+  "jsHeapUsedMB": 293,
+  "jsHeapTotalMB": 308.8,
+  "domNodes": 411875,
+  "layoutCount": 0
+ },
+ "scrollDown": {
+  "frames": 372,
+  "p50": 33.3,
+  "p95": 50,
+  "p99": 50.1,
+  "max": 66.7,
+  "over50ms": 18,
+  "meanFps": 27.6
+ },
+ "scrollUp": {
+  "frames": 372,
+  "p50": 33.3,
+  "p95": 50,
+  "p99": 50.1,
+  "max": 83.4,
+  "over50ms": 16,
+  "meanFps": 27.7
+ },
+ "scrollHeightPx": 260998,
+ "rowsInDomAfter": 10038,
+ "heapAfter": {
+  "jsHeapUsedMB": 293.1,
+  "jsHeapTotalMB": 306.8,
+  "domNodes": 411869,
+  "layoutCount": 4
+ },
+ "longTasks": {
+  "count": 29,
+  "totalMs": 2944,
+  "maxMs": 614,
+  "lastEndMs": 33826
+ }
+}

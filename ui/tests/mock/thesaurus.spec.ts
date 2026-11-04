@@ -105,6 +105,8 @@ test('edits on a session branch: labels, XL, a move, a mapping', async ({ page, 
     return Number((await r.json()).results.bindings[0].n.value);
   };
   const before = await count('thes');
+  // a tall page, so the whole tree sits in its box and a drag does not scroll it
+  await page.setViewportSize({ width: 1280, height: 1100 });
   await open(page, `&iri=${encodeURIComponent(TH + 'fish')}`);
   await page.getByRole('button', { name: 'Start session' }).click();
   await expect(page).toHaveURL(/branch=skos\./);
@@ -153,18 +155,14 @@ test('edits on a session branch: labels, XL, a move, a mapping', async ({ page, 
   await node(page, 'Bats').dragTo(node(page, 'Flying animals'));
   await expect(preview(page)).toContainText('Move Bats under Flying animals');
   await commitPreview(page);
-  await expect(
-    tree(page).getByRole('treeitem', { name: 'Mammals' }).first().getByRole('button', {
-      name: 'Bats',
-      exact: true,
-    }),
-  ).toHaveCount(0);
-  await expect(
-    tree(page).getByRole('treeitem', { name: 'Flying animals' }).getByRole('button', {
-      name: 'Bats',
-      exact: true,
-    }),
-  ).toBeVisible();
+  // the tree lists a concept's children as the rows after it, one level down, so the
+  // moved concept is now the row below Flying animals and no longer under Mammals
+  const bats = tree(page).getByRole('treeitem', { name: 'Bats' });
+  await expect(bats).toHaveCount(1);
+  const flying = tree(page).getByRole('treeitem', { name: 'Flying animals' });
+  const level = Number(await flying.getAttribute('aria-level'));
+  await expect(bats).toHaveAttribute('aria-level', String(level + 1));
+  await expect(flying.locator('xpath=following-sibling::li[1]')).toContainText('Bats');
   // moving a concept under its own narrower concept is refused
   await node(page, 'Vertebrates').dragTo(node(page, 'Mammals'));
   await expect(page.locator('.toast').filter({ hasText: 'narrower concepts' })).toBeVisible();

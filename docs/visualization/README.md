@@ -154,6 +154,29 @@ The SvelteKit UI is embedded in the server binary.
   draw the GraphRAG communities instead, with a community's report beside the picture
   ([screenshot](../images/explore-communities.png)). A list view (`L`) is the accessible
   companion, and without WebGL the overview falls back to Cytoscape.
+* The drawn graph of a resource holds what the person has explored, up to 100,000 nodes, and
+  draws up to a budget of 5,000 of them. Past 1,000 visible nodes the canvas changes from
+  Cytoscape to the WebGL view that the overview uses, and it changes back under 700. Click,
+  double click to expand, a right click or a long press for the node menu, a click on an
+  edge for its derivation, the selection's highlight, the lenses and the path overlay work
+  in both. New nodes are placed beside their neighbours and stay where they are put until
+  **Re-run layout**. The WebGL view does not draw the time slider's fades, which colour
+  added and removed nodes instead, and its validation badges are drawn but not clickable.
+  It draws one line for all the predicates between two nodes, and a click on the line explains
+  an inferred edge or names the predicates, and it does not draw an edge from a node to itself.
+  A node with a large fan-out is expanded into one **N via predicate** group node for each
+  predicate that has more than 25 edges in a direction. The group's panel reads 100 members
+  at a time, filters them by name, splits them by class and draws the members or the page
+  that the person chooses, so the graph holds only what was drawn.
+  The **Filters** panel (`Shift+G`) chooses what is drawn and never reads from the server.
+  It toggles each edge type and each class, with the counts of the explored graph, sets a
+  minimum degree, hides leaves and sets the budget of drawn nodes. With communities from the
+  memory store, **Group by communities** colours nodes by community and the legend's entries
+  hide a community. The graph holds every node however it is filtered, and a chip in the
+  toolbar says how many the filters and the budget leave out. Holding the explored graph
+  costs memory in the page for each node, in exchange for filters and budgets that change the
+  picture at once, and drawing at most the budget bounds the cost of a frame
+  ([measurements](../benchmarks/web-ui-scale/RESULTS.md)).
 * The **Paths** panel (`Shift+P`) finds the shortest path, every shortest path or the k
   shortest paths between two entities, with filters for length, direction, predicates and
   hubs and an optional weight from reifier properties
@@ -363,6 +386,17 @@ it. A breadcrumb above the entity panel gives the selected entity's path from a 
 tree. A level with more than 1,000 children shows its
 first 1,000 with a **Show more** row that reads the next 1,000 from the hierarchy route.
 
+A tree draws only the rows in view, with a few above and below them, however many nodes are
+open, so a level of thousands of children and an ontology of millions of classes scroll as
+smoothly as a short list. The tree is one tab stop, and the arrow keys move a cursor over
+the whole tree, including the rows that are not in the page. Up and Down move a row, Right
+opens a node or enters it, Left closes a node or goes to its parent, Home, End, Page Up and
+Page Down move further, typing a name jumps to the next row that starts with it, and Enter
+selects the row or reads the next page of a **Show more** row, which is an item of the tree. Each row tells assistive
+technology its level and its place among its siblings. Keeping the rows out of the page costs
+a little memory for the list of rows, about the size of the open nodes' ids, in exchange for a
+page whose size does not grow with the tree.
+
 A change set is drawn the same way wherever the pages show one, in the edit previews and in
 the history tabs. Each subject is a block named by its label, with every added or removed
 property and value on a line of its own and a sign beside it, and the plain N-Quads are one
@@ -383,6 +417,16 @@ not read, or in functional-style syntax. The page's tabs are **Tree**, **DL Quer
 **Header** and **History**. A select at the top of the tree picks the classes, object,
 data or annotation properties or individuals, and a segmented control on the entity panel
 switches between its frame and its usage.
+
+The editor reads what its views show. Opening it reads the ontology's summary and the first
+level of the tree on screen, and the other trees read their levels when their tab opens.
+Names come from the labels of the hierarchy answers and from one query for the labels of the
+IRIs a panel names for the first time, so no read lists every label of the ontology. The
+entity lists behind the add fields' pickers and the new-entity checks are read once an entity,
+the header, the DL Query tab or the new-entity dialog needs them, for each kind of up to 5,000
+entities. A longer kind is completed by the entity search as a name is typed and is resolved by
+the server's Manchester reader. The Individuals tree has no hierarchy route, so it reads its
+individuals, up to 50,000, and their types when it opens.
 
 The **DL Query** tab answers a Manchester class expression with its equivalent classes,
 its direct and inferred superclasses and subclasses, and its instances

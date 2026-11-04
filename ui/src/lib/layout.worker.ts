@@ -39,7 +39,7 @@ let current = 0;
 function settings(n: number) {
   return {
     linLogMode: false,
-    outboundAttractionDistribution: false,
+    outboundAttractionDistribution: n > 1000,
     adjustSizes: false,
     edgeWeightInfluence: 0.5,
     scalingRatio: n > 2000 ? 10 : 6,

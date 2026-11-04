@@ -1,0 +1,13 @@
+host load 5.29 6.59 7.32, 2026-11-04T09:53:09-05:00
+chebi cold 7.250251 s, 1837 bytes
+chebi server rss after the first read: 2501472 KiB
+chebi warm 0.048679 s, 1836 bytes
+chebi warm 0.045836 s, 1836 bytes
+taxon300k cold 3.090818 s, 435 bytes
+taxon300k server rss after the first read: 1319908 KiB
+taxon300k warm 0.018535 s, 434 bytes
+taxon300k warm 0.022702 s, 434 bytes
+taxon1m cold 13.904737 s, 438 bytes
+taxon1m server rss after the first read: 4091820 KiB
+taxon1m warm 10.644343 s, 438 bytes
+taxon1m warm 11.726375 s, 438 bytes

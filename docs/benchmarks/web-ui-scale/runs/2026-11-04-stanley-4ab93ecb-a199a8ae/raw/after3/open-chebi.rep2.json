@@ -1,0 +1,253 @@
+{
+ "name": "open-chebi",
+ "rep": 1,
+ "meta": {
+  "label": "after3",
+  "base": "http://127.0.0.1:18725",
+  "host": "stanley",
+  "date": "2026-11-04T14:03:09.104Z",
+  "uiDir": "/home/kclejeune/lanes-local/explore-scale-725/ui-after3/ui/build",
+  "commit": "4ab93ecb/a199a8ae",
+  "server": "release-4ab93ecb",
+  "note": "laptop, synthetic taxon, software WebGL",
+  "browser": "153.0.8010.12",
+  "viewport": {
+   "width": 1440,
+   "height": 900
+  },
+  "webgl": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+  "loadavg": [
+   3.99,
+   4.18,
+   3.77
+  ]
+ },
+ "url": "/ui/workbench/ontology?ds=chebi",
+ "status": "ok",
+ "firstRowMs": 901,
+ "quietMs": 8454,
+ "networkQuiet": true,
+ "longTasks": {
+  "count": 1,
+  "totalMs": 65,
+  "maxMs": 65,
+  "lastEndMs": 177
+ },
+ "interactiveMs": 901,
+ "network": {
+  "api": {
+   "count": 9,
+   "encodedBytes": 16898,
+   "decodedBytes": 178603,
+   "ms": 8031.858999864198
+  },
+  "total": {
+   "count": 77,
+   "encodedBytes": 566061,
+   "decodedBytes": 1729453,
+   "ms": 9573.14999983646
+  },
+  "groups": {
+   "static": {
+    "count": 63,
+    "encodedBytes": 544635,
+    "decodedBytes": 1543716,
+    "ms": 1524.3869998957962
+   },
+   "$/prefixes": {
+    "count": 1,
+    "encodedBytes": 1206,
+    "decodedBytes": 647,
+    "ms": 3.1299999682232738
+   },
+   "ontology/summary": {
+    "count": 1,
+    "encodedBytes": 1932,
+    "decodedBytes": 1837,
+    "ms": 7495.727999950759
+   },
+   "$/auth": {
+    "count": 1,
+    "encodedBytes": 859,
+    "decodedBytes": 17,
+    "ms": 3.4280000254511833
+   },
+   "$/whoami": {
+    "count": 1,
+    "encodedBytes": 1072,
+    "decodedBytes": 259,
+    "ms": 3.5149999894201756
+   },
+   "ontology/hierarchy": {
+    "count": 1,
+    "encodedBytes": 5610,
+    "decodedBytes": 170131,
+    "ms": 447.7770000230521
+   },
+   "$/ping": {
+    "count": 1,
+    "encodedBytes": 831,
+    "decodedBytes": 20,
+    "ms": 3.089000005275011
+   },
+   "$/datasets": {
+    "count": 1,
+    "encodedBytes": 1766,
+    "decodedBytes": 6838,
+    "ms": 6.872000056318939
+   },
+   "sparql": {
+    "count": 3,
+    "encodedBytes": 5011,
+    "decodedBytes": 5174,
+    "ms": 78.91299994662404
+   },
+   "$/assistant": {
+    "count": 1,
+    "encodedBytes": 1061,
+    "decodedBytes": 259,
+    "ms": 1.8019999843090773
+   },
+   "$/memory": {
+    "count": 1,
+    "encodedBytes": 900,
+    "decodedBytes": 83,
+    "ms": 2.215999993495643
+   },
+   "$/branches": {
+    "count": 1,
+    "encodedBytes": 1178,
+    "decodedBytes": 472,
+    "ms": 2.2929999977350235
+   },
+   "changes": {
+    "count": 1,
+    "encodedBytes": 0,
+    "decodedBytes": 0,
+    "ms": 0
+   }
+  }
+ },
+ "requests": [
+  {
+   "url": "/$/prefixes/chebi",
+   "group": "$/prefixes",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 1206,
+   "decodedBytes": 647
+  },
+  {
+   "url": "/$/ontology/chebi?graph=default",
+   "group": "ontology/summary",
+   "status": 200,
+   "ms": 7496,
+   "encodedBytes": 1932,
+   "decodedBytes": 1837
+  },
+  {
+   "url": "/$/auth/config",
+   "group": "$/auth",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 859,
+   "decodedBytes": 17
+  },
+  {
+   "url": "/$/whoami",
+   "group": "$/whoami",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1072,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/ontology/chebi/hierarchy?graph=default&kind=class&limit=1000&lang=en-US%2Cen",
+   "group": "ontology/hierarchy",
+   "status": 200,
+   "ms": 448,
+   "encodedBytes": 5610,
+   "decodedBytes": 170131
+  },
+  {
+   "url": "/$/ping",
+   "group": "$/ping",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 831,
+   "decodedBytes": 20
+  },
+  {
+   "url": "/$/datasets",
+   "group": "$/datasets",
+   "status": 200,
+   "ms": 7,
+   "encodedBytes": 1766,
+   "decodedBytes": 6838
+  },
+  {
+   "url": "/chebi/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 73,
+   "encodedBytes": 1716,
+   "decodedBytes": 2008
+  },
+  {
+   "url": "/$/assistant/chebi",
+   "group": "$/assistant",
+   "status": 200,
+   "ms": 2,
+   "encodedBytes": 1061,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/memory/chebi/maintenance",
+   "group": "$/memory",
+   "status": 200,
+   "ms": 2,
+   "encodedBytes": 900,
+   "decodedBytes": 83
+  },
+  {
+   "url": "/$/branches/chebi",
+   "group": "$/branches",
+   "status": 200,
+   "ms": 2,
+   "encodedBytes": 1178,
+   "decodedBytes": 472
+  },
+  {
+   "url": "/chebi/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 2,
+   "encodedBytes": 2129,
+   "decodedBytes": 2886
+  },
+  {
+   "url": "/chebi/sparql",
+   "group": "sparql",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1166,
+   "decodedBytes": 280
+  },
+  {
+   "url": "/chebi/changes?limit=1&after=commit:1",
+   "group": "changes",
+   "status": 200,
+   "ms": 0,
+   "encodedBytes": 0,
+   "decodedBytes": 0
+  }
+ ],
+ "heap": {
+  "jsHeapUsedMB": 5.9,
+  "jsHeapTotalMB": 6.6,
+  "domNodes": 2033,
+  "layoutCount": 0
+ },
+ "rowsLoaded": 1001,
+ "rowsInDom": 30
+}

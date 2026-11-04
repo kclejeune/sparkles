@@ -1,0 +1,88 @@
+{
+ "name": "explore-1000",
+ "rep": 1,
+ "meta": {
+  "label": "baseline",
+  "base": "http://127.0.0.1:18725",
+  "host": "stanley",
+  "date": "2026-11-04T14:29:03.726Z",
+  "uiDir": "/home/kclejeune/repositories/github.com/kclejeune/sparkles-lane-explore-scale-725-measure/ui/build",
+  "commit": "4ab93ecb/a199a8ae",
+  "server": "release-4ab93ecb",
+  "note": "laptop, synthetic taxon, software WebGL",
+  "browser": "153.0.8010.12",
+  "viewport": {
+   "width": 1440,
+   "height": 900
+  },
+  "webgl": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+  "loadavg": [
+   7.5,
+   9.37,
+   7.65
+  ]
+ },
+ "target": 1000,
+ "status": "ok",
+ "firstGraphMs": 416,
+ "renderer": "cytoscape",
+ "growMs": 1818,
+ "nodes": 1000,
+ "drawn": 1000,
+ "reached": true,
+ "expansions": 10,
+ "expandLatencyMs": {
+  "median": 138,
+  "max": 319
+ },
+ "viewportBefore": {
+  "pan": {
+   "x": 423.97411429757796,
+   "y": 339.9881063213813
+  },
+  "zoom": 1.25
+ },
+ "panZoom": {
+  "frames": 62,
+  "p50": 83.3,
+  "p95": 150,
+  "p99": 183.3,
+  "max": 183.3,
+  "over50ms": 52,
+  "meanFps": 12.2
+ },
+ "viewportAfter": {
+  "pan": {
+   "x": 427.9741142975779,
+   "y": 275.9881063213813
+  },
+  "zoom": 1.25
+ },
+ "idle": {
+  "frames": 121,
+  "p50": 16.7,
+  "p95": 16.7,
+  "p99": 16.8,
+  "max": 16.8,
+  "over50ms": 0,
+  "meanFps": 60
+ },
+ "longTasks": {
+  "count": 78,
+  "totalMs": 6582,
+  "maxMs": 182,
+  "lastEndMs": 9033
+ },
+ "network": {
+  "count": 34,
+  "encodedBytes": 64345,
+  "decodedBytes": 256197,
+  "ms": 175.57899956591427
+ },
+ "heap": {
+  "jsHeapUsedMB": 23,
+  "jsHeapTotalMB": 24.1,
+  "domNodes": 2326,
+  "layoutCount": 0
+ }
+}

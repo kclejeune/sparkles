@@ -2,107 +2,42 @@
   // Sticky ancestor rows at the top of a tree's scroll box (ROADMAP item 633), as in the
   // sticky scroll of code editors: the path of the topmost visible row, nearest last, with
   // the nearest six shown when the path is longer. Clicking one scrolls to that ancestor.
-  // It goes first inside the scrolling element, whose tree it reads.
-  import { onMount } from 'svelte';
+  // The tree works out which ancestors from its rows (ROADMAP item 725), since a tree that
+  // draws only the rows in view has no rows above to read them from. It goes first inside
+  // the tree's box.
   import { treeIndent } from './OntoTree.svelte';
 
-  const MAX = 6;
-
-  type Row = { id: string; name: string; depth: number; node: HTMLElement };
-  let el = $state<HTMLElement>();
-  let pane = $state<HTMLElement>();
-  let rows = $state<Row[]>([]);
-  let hidden = $state(0);
-
-  function depthOf(li: HTMLElement) {
-    let d = 0;
-    for (let p = li.parentElement?.closest('li[role="treeitem"]'); p;) {
-      d++;
-      p = p.parentElement?.closest('li[role="treeitem"]');
-    }
-    return d;
-  }
-
-  function update() {
-    const box = el?.parentElement;
-    if (!el || !box) return;
-    // the rows overlay the tree without taking room in it, so a row counts as hidden
-    // once it is under them
-    const top = box.getBoundingClientRect().top + (pane?.offsetHeight ?? 0);
-    const nodes = box.querySelectorAll<HTMLElement>('li[role="treeitem"] > .node');
-    let first: HTMLElement | null = null;
-    for (const n of nodes) {
-      if (n.getBoundingClientRect().bottom > top + 1) {
-        first = n;
-        break;
-      }
-    }
-    const path: Row[] = [];
-    let li = first?.parentElement?.parentElement?.closest<HTMLElement>('li[role="treeitem"]');
-    while (li) {
-      const node = li.querySelector<HTMLElement>(':scope > .node');
-      if (node && node.getBoundingClientRect().top < top) {
-        path.unshift({
-          id: li.dataset.id ?? '',
-          name: li.getAttribute('aria-label') ?? '',
-          depth: depthOf(li),
-          node,
-        });
-      }
-      li = li.parentElement?.closest<HTMLElement>('li[role="treeitem"]');
-    }
-    // at most 30% of the box, so a short tree keeps most of its rows in view
-    const rowH = first?.offsetHeight || 26;
-    const cap = Math.max(1, Math.min(MAX, Math.floor((box.clientHeight * 0.3) / rowH)));
-    hidden = Math.max(0, path.length - cap);
-    rows = path.slice(-cap);
-  }
-
-  onMount(() => {
-    const box = el?.parentElement;
-    if (!box) return;
-    let queued = 0;
-    const later = () => {
-      if (!queued) queued = requestAnimationFrame(() => ((queued = 0), update()));
-    };
-    box.addEventListener('scroll', later, { passive: true });
-    const mo = new MutationObserver(later);
-    mo.observe(box, { childList: true, subtree: true });
-    update();
-    return () => {
-      cancelAnimationFrame(queued);
-      box.removeEventListener('scroll', later);
-      mo.disconnect();
-    };
-  });
-
-  function go(r: Row) {
-    const box = el?.parentElement;
-    if (!box) return;
-    // the ancestor's row at the top, under the rows that stay above it
-    const above = rows.findIndex((x) => x.id === r.id);
-    const rowH = pane?.lastElementChild?.getBoundingClientRect().height ?? 0;
-    const offset = hidden ? (pane?.firstElementChild?.getBoundingClientRect().height ?? 0) : 0;
-    box.scrollTop +=
-      r.node.getBoundingClientRect().top - box.getBoundingClientRect().top - offset - above * rowH;
-  }
+  let {
+    rows,
+    hidden,
+    name,
+    rowH,
+    ongo,
+  }: {
+    rows: { index: number; id: string; depth: number }[];
+    hidden: number;
+    name: (id: string) => string;
+    rowH: number;
+    ongo: (index: number) => void;
+  } = $props();
 </script>
 
-<div class="sticky" bind:this={el}>
+<div class="sticky">
   <div
     class="pane"
     class:on={rows.length > 0}
-    bind:this={pane}
     role="group"
     aria-label="Path to the first row"
+    style:--sticky-h="{rowH}px"
   >
     {#if hidden}<div class="row faint" style:padding-left="4px">… {hidden} more above</div>{/if}
-    {#each rows as r (r.id)}
+    {#each rows as r (r.index)}
       <button
         class="row"
+        tabindex="-1"
         style:padding-left="{treeIndent(r.depth) + 22}px"
-        title={r.name}
-        onclick={() => go(r)}>{r.name}</button
+        title={name(r.id)}
+        onclick={() => ongo(r.index)}>{name(r.id)}</button
       >
     {/each}
   </div>
@@ -128,14 +63,14 @@
   }
   .row {
     display: block;
-    min-height: var(--row-h);
+    height: var(--sticky-h, var(--row-h));
     padding: 0 6px;
     border: 0;
     background: none;
     color: var(--text-2);
     font: inherit;
     font-size: var(--fs-sm);
-    line-height: var(--row-h);
+    line-height: var(--sticky-h, var(--row-h));
     text-align: left;
     white-space: nowrap;
     overflow: hidden;

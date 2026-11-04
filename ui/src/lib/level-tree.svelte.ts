@@ -5,6 +5,7 @@
 
 import { buildTree, type Tree } from './ontology';
 import type { Hierarchy, TreeNode } from './browse';
+import { revealInTrees } from './virtual-tree';
 
 /** The children of one level that the tree reads at most. */
 export const LEVEL_LIMIT = 1000;
@@ -47,6 +48,20 @@ export class LevelTree {
   /** Whether `id` has children that the tree has not read. */
   more(id: string): boolean {
     return (this.counts[id] ?? 0) > 0 && !(id in this.levels);
+  }
+
+  /**
+   * Forget every level and drop the reads in flight, without reading again, for a tree the
+   * person is not looking at when its dataset or graph changes. The next `reset` reads.
+   */
+  drop() {
+    this.#generation++;
+    this.#pending.clear();
+    this.levels = {};
+    this.counts = {};
+    this.clipped = {};
+    this.loading = false;
+    this.error = null;
   }
 
   /** Forget every level, for a new commit or graph, and read the roots and `open` again. */
@@ -188,14 +203,11 @@ export function filteredTree(answers: Hierarchy[]): Tree {
 }
 
 /**
- * Scrolls the row of `iri` in a tree into view once the tree has drawn it, so a selection
- * that arrives by link shows in its tree as well as in the detail panel.
+ * Scrolls the row of `iri` in a tree into view once the tree lists it, so a selection that
+ * arrives by link shows in its tree as well as in the detail panel. The trees draw only the
+ * rows in view, so the row is found in the trees' own rows and not in the page.
  */
 export function scrollToRow(iri: string, tries = 10) {
   if (typeof document === 'undefined') return;
-  const row = document.querySelector<HTMLElement>(
-    `[role="tree"] li[data-id="${CSS.escape(iri)}"] > .node`,
-  );
-  if (row) row.scrollIntoView({ block: 'nearest' });
-  else if (tries > 0) requestAnimationFrame(() => scrollToRow(iri, tries - 1));
+  if (!revealInTrees(iri) && tries > 0) requestAnimationFrame(() => scrollToRow(iri, tries - 1));
 }

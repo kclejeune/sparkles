@@ -1,0 +1,288 @@
+{
+ "name": "open-unesco-thesaurus",
+ "rep": 1,
+ "meta": {
+  "label": "after3",
+  "base": "http://127.0.0.1:18725",
+  "host": "stanley",
+  "date": "2026-11-04T14:03:09.104Z",
+  "uiDir": "/home/kclejeune/lanes-local/explore-scale-725/ui-after3/ui/build",
+  "commit": "4ab93ecb/a199a8ae",
+  "server": "release-4ab93ecb",
+  "note": "laptop, synthetic taxon, software WebGL",
+  "browser": "153.0.8010.12",
+  "viewport": {
+   "width": 1440,
+   "height": 900
+  },
+  "webgl": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+  "loadavg": [
+   3.99,
+   4.18,
+   3.77
+  ]
+ },
+ "url": "/ui/workbench/thesaurus?ds=unesco",
+ "status": "ok",
+ "firstRowMs": 355,
+ "quietMs": 1063,
+ "networkQuiet": true,
+ "longTasks": {
+  "count": 0,
+  "totalMs": 0,
+  "maxMs": 0,
+  "lastEndMs": 0
+ },
+ "interactiveMs": 355,
+ "network": {
+  "api": {
+   "count": 14,
+   "encodedBytes": 75776,
+   "decodedBytes": 842624,
+   "ms": 211.18499978911132
+  },
+  "total": {
+   "count": 86,
+   "encodedBytes": 556183,
+   "decodedBytes": 2127855,
+   "ms": 1489.7809997200966
+  },
+  "groups": {
+   "static": {
+    "count": 67,
+    "encodedBytes": 475879,
+    "decodedBytes": 1278097,
+    "ms": 1264.7779999533668
+   },
+   "$/prefixes": {
+    "count": 2,
+    "encodedBytes": 2476,
+    "decodedBytes": 1479,
+    "ms": 6.9809999549761415
+   },
+   "/unesco/data": {
+    "count": 1,
+    "encodedBytes": 0,
+    "decodedBytes": 0,
+    "ms": 28.292999952100217
+   },
+   "$/auth": {
+    "count": 1,
+    "encodedBytes": 859,
+    "decodedBytes": 17,
+    "ms": 3.495000069960952
+   },
+   "$/whoami": {
+    "count": 1,
+    "encodedBytes": 1072,
+    "decodedBytes": 259,
+    "ms": 3.2049999572336674
+   },
+   "$/ping": {
+    "count": 1,
+    "encodedBytes": 831,
+    "decodedBytes": 20,
+    "ms": 3.2659999560564756
+   },
+   "$/datasets": {
+    "count": 1,
+    "encodedBytes": 1766,
+    "decodedBytes": 6838,
+    "ms": 3.851999994367361
+   },
+   "sparql": {
+    "count": 8,
+    "encodedBytes": 70163,
+    "decodedBytes": 840330,
+    "ms": 162.97000006306916
+   },
+   "$/assistant": {
+    "count": 1,
+    "encodedBytes": 1061,
+    "decodedBytes": 259,
+    "ms": 4.301999928429723
+   },
+   "$/memory": {
+    "count": 1,
+    "encodedBytes": 901,
+    "decodedBytes": 84,
+    "ms": 5.7669999077916145
+   },
+   "$/branches": {
+    "count": 1,
+    "encodedBytes": 1175,
+    "decodedBytes": 472,
+    "ms": 2.8719999827444553
+   },
+   "changes": {
+    "count": 1,
+    "encodedBytes": 0,
+    "decodedBytes": 0,
+    "ms": 0
+   }
+  }
+ },
+ "requests": [
+  {
+   "url": "/$/prefixes/unesco",
+   "group": "$/prefixes",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 1270,
+   "decodedBytes": 832
+  },
+  {
+   "url": "/unesco/data?default",
+   "group": "/unesco/data",
+   "status": 200,
+   "ms": 28,
+   "encodedBytes": 0,
+   "decodedBytes": 0
+  },
+  {
+   "url": "/$/auth/config",
+   "group": "$/auth",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 859,
+   "decodedBytes": 17
+  },
+  {
+   "url": "/$/whoami",
+   "group": "$/whoami",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 1072,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/ping",
+   "group": "$/ping",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 831,
+   "decodedBytes": 20
+  },
+  {
+   "url": "/$/datasets",
+   "group": "$/datasets",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1766,
+   "decodedBytes": 6838
+  },
+  {
+   "url": "/unesco/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 7,
+   "encodedBytes": 1431,
+   "decodedBytes": 1311
+  },
+  {
+   "url": "/unesco/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 7,
+   "encodedBytes": 1979,
+   "decodedBytes": 3904
+  },
+  {
+   "url": "/unesco/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 5,
+   "encodedBytes": 2296,
+   "decodedBytes": 18696
+  },
+  {
+   "url": "/unesco/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 113,
+   "encodedBytes": 2007,
+   "decodedBytes": 3556
+  },
+  {
+   "url": "/$/prefixes/chebi",
+   "group": "$/prefixes",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1206,
+   "decodedBytes": 647
+  },
+  {
+   "url": "/$/assistant/unesco",
+   "group": "$/assistant",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1061,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/memory/unesco/maintenance",
+   "group": "$/memory",
+   "status": 200,
+   "ms": 6,
+   "encodedBytes": 901,
+   "decodedBytes": 84
+  },
+  {
+   "url": "/$/branches/unesco",
+   "group": "$/branches",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 1175,
+   "decodedBytes": 472
+  },
+  {
+   "url": "/unesco/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 13,
+   "encodedBytes": 5895,
+   "decodedBytes": 235557
+  },
+  {
+   "url": "/unesco/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 7,
+   "encodedBytes": 26425,
+   "decodedBytes": 295602
+  },
+  {
+   "url": "/unesco/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 6,
+   "encodedBytes": 20572,
+   "decodedBytes": 208636
+  },
+  {
+   "url": "/unesco/sparql?nocache=true&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 9558,
+   "decodedBytes": 73068
+  },
+  {
+   "url": "/unesco/changes?limit=1&after=commit:1",
+   "group": "changes",
+   "status": 200,
+   "ms": 0,
+   "encodedBytes": 0,
+   "decodedBytes": 0
+  }
+ ],
+ "heap": {
+  "jsHeapUsedMB": 4.9,
+  "jsHeapTotalMB": 5.6,
+  "domNodes": 1718,
+  "layoutCount": 0
+ },
+ "rowsLoaded": 680,
+ "rowsInDom": 23,
+ "toggleLatencyMs": 60
+}

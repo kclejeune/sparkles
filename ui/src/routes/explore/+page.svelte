@@ -38,6 +38,26 @@
   import GeoMapCard from '$components/GeoMapCard.svelte';
   import GraphMap from '$components/GraphMap.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
+  import LargeGraphView, { type LEdge, type LNode } from '$components/LargeGraphView.svelte';
+  import ExploreFilters, {
+    freshFilters,
+    type FilterState,
+    type GroupEntry,
+  } from '$components/ExploreFilters.svelte';
+  import ExploreGroup from '$components/ExploreGroup.svelte';
+  import * as grp from '$lib/explore-groups';
+  import {
+    applyFilters,
+    classFacet,
+    HELD_LIMIT,
+    parallelEdges,
+    predicateFacet,
+    VISIBLE_BUDGET,
+    WEBGL_FROM,
+    wantWebgl,
+    type Filters,
+  } from '$lib/explore-filters';
+  import { hasWebGL2, seed } from '$lib/overview';
   import SelectionBar from '$components/SelectionBar.svelte';
   import FacetPanel from '$components/FacetPanel.svelte';
   import { selectionQuery, setQuery, VALUES_CAP, type Brush } from '$lib/facets';
@@ -75,7 +95,7 @@
   import { getForm } from '$lib/forms-api';
   import ValidationSource from '$components/ValidationSource.svelte';
   import { type Badge, type GuardProbe, type VResult } from '$lib/validation-overlay';
-  import { load as loadPref, save as savePref } from '$lib/storage';
+  import { load as loadPref, loadRaw, save as savePref } from '$lib/storage';
   import { useHint, usePageSearch, useProvider, type LauncherItem } from '$lib/launcher.svelte';
 
   type ENode = {
@@ -86,11 +106,12 @@
     label?: string;
     expanded: boolean;
     lit: boolean;
+    /** A group node (ROADMAP item 725): the neighbours of `owner` through one predicate. */
+    group?: grp.GroupSpec;
   };
   type EEdge = GEdge & { lit: boolean };
 
   const RDFS_COMMENT = 'http://www.w3.org/2000/01/rdf-schema#comment';
-  const MAX_NODES = 1500;
   const INFERRED_GRAPH = 'urn:x-sparkles:inferred';
 
   const ds = $derived(app.current);
@@ -250,6 +271,18 @@
   let expandLog: string[] = [];
   /** Every resource the graph has drawn since it was focused, so that a replay can find it again. */
   let seenTerms = new Map<string, Term>();
+  /**
+   * The members the person drew from each group node, by group id, with what the group
+   * stood for, so that a replay draws them again at a commit where the group exists.
+   */
+  type DrawnGroup = {
+    owner: string;
+    ownerTerm: Term;
+    predicate: string;
+    incoming: boolean;
+    members: Map<string, grp.Member>;
+  };
+  let drawLog = new Map<string, DrawnGroup>();
 
   function resetGraph() {
     graphGen.bump();
@@ -261,9 +294,12 @@
     detailCache = {};
     expandLog = [];
     seenTerms = new Map();
+    drawLog = new Map();
     changes = null;
     selection.clear();
     lensPick = null;
+    // the nodes of a hidden group belong to the graph that is gone
+    if (fstate.hiddenGroups.size) fstate = { ...fstate, hiddenGroups: new Map() };
     vShown = new Set();
     graphEpoch++;
   }
@@ -643,17 +679,31 @@
     ghostEdges: Record<string, EEdge>;
   } | null>(null);
 
-  const gNodes = $derived.by((): GNode[] => {
-    const toG = (n: ENode, change?: 'added' | 'removed'): GNode => ({
-      id: n.id,
-      label: labelFor(n.term, n.label),
-      kind: n.term.type === 'uri' ? 'iri' : n.term.type,
-      title: n.term.type === 'uri' ? n.term.value : undefined,
-      focus: n.id === focusId,
-      expanded: n.expanded,
-      change,
-      term: n.term,
-    });
+  // The graph the page holds is `allNodes` and `allEdges`. The filters and the budget of
+  // visible nodes (ROADMAP item 725) choose `gNodes` and `gEdges` from them, and those are
+  // what the canvases, the lenses and the lists draw.
+  const allNodes = $derived.by((): GNode[] => {
+    const toG = (n: ENode, change?: 'added' | 'removed'): GNode =>
+      n.group
+        ? {
+            id: n.id,
+            label: n.label ?? '',
+            kind: 'group',
+            title: `${n.group.total.toLocaleString('en-US')} resources through ${n.group.predicate}`,
+            focus: false,
+            expanded: false,
+            via: n.group.predicate,
+          }
+        : {
+            id: n.id,
+            label: labelFor(n.term, n.label),
+            kind: n.term.type === 'uri' ? 'iri' : n.term.type,
+            title: n.term.type === 'uri' ? n.term.value : undefined,
+            focus: n.id === focusId,
+            expanded: n.expanded,
+            change,
+            term: n.term,
+          };
     const real = Object.values(nodes)
       .filter((n) => showLiterals || !n.lit)
       .map((n) => toG(n, changes?.addedNodes.has(n.id) ? 'added' : undefined));
@@ -681,9 +731,12 @@
       }));
     return [...marked, ...extra];
   });
-  const gEdges = $derived.by((): GEdge[] => {
-    const keep = (e: EEdge) => (showLiterals || !e.lit) && (!hideTypes || !e.isType);
+  const allEdges = $derived.by((): GEdge[] => {
+    // the type edges stay in the held edges whether or not they are drawn, since the class
+    // facet and the class filter read a node's classes from them
+    const keep = (e: EEdge) => showLiterals || !e.lit;
     const tripleOf = (e: EEdge): EdgeTriple | undefined => {
+      if (nodes[e.source]?.group || nodes[e.target]?.group) return undefined;
       const s = nodes[e.source]?.term;
       const o = nodes[e.target]?.term;
       return s && o && e.title ? [s, { type: 'uri', value: e.title }, o] : undefined;
@@ -725,6 +778,63 @@
     return [...marked, ...extra];
   });
   const nodeCount = $derived(Object.keys(nodes).length);
+
+  // --- what is drawn of the held graph (ROADMAP item 725) -----------------------------------
+
+  /** The nodes the filters always draw: the selection, the focus and the path finder's. */
+  const keepIds = $derived.by(
+    () =>
+      new Set<string>([
+        ...(selectedId ? [selectedId] : []),
+        ...(focusId ? [focusId] : []),
+        ...(pathOverlay?.nodes.map((n) => n.key) ?? []),
+      ]),
+  );
+  let fstate = $state<FilterState>(freshFilters(VISIBLE_BUDGET));
+  /** Without WebGL the canvas keeps to what it can draw. */
+  let webglOff = $state<string | null>(
+    typeof document !== 'undefined' && !hasWebGL2() ? 'This browser has no WebGL 2.' : null,
+  );
+  const filters = $derived<Filters>({
+    predicates: fstate.predicates,
+    classes: fstate.classes,
+    minDegree: fstate.minDegree,
+    hideLeaves: fstate.hideLeaves,
+    hiddenIds: new Set([...fstate.hiddenGroups.values()].flatMap((g) => g.ids)),
+    budget: webglOff ? Math.min(fstate.budget, WEBGL_FROM) : fstate.budget,
+    // the type edges give nodes their classes whether or not they are drawn
+    hideTypes,
+  });
+  const drawn = $derived(applyFilters(allNodes, allEdges, filters, keepIds));
+  const gNodes = $derived(drawn.nodes);
+  const gEdges = $derived(drawn.edges);
+  /** The visible node count at which the page draws with WebGL, `localStorage` for tests. */
+  const webglFrom = loadPref<number>('sparkles.explore.webglFrom', WEBGL_FROM);
+  let useWebgl = $state(false);
+  $effect(() => {
+    const n = gNodes.length;
+    const on = untrack(() => useWebgl);
+    const want = !webglOff && wantWebgl(n, on, webglFrom);
+    if (want !== on) useWebgl = want;
+  });
+  const predicateFacets = $derived(predicateFacet(allEdges));
+  const classFacets = $derived(classFacet(allNodes, allEdges));
+  const maxDegree = $derived.by(() => {
+    const d = new Map<string, number>();
+    for (const e of allEdges) {
+      d.set(e.source, (d.get(e.source) ?? 0) + 1);
+      d.set(e.target, (d.get(e.target) ?? 0) + 1);
+    }
+    return Math.max(0, ...d.values());
+  });
+  let filtersOpen = $state(page.url.searchParams.get('filters') === '1');
+  const filtering = $derived(
+    fstate.predicates.size > 0 ||
+      fstate.classes.size > 0 ||
+      fstate.minDegree > 0 ||
+      fstate.hideLeaves ||
+      fstate.hiddenGroups.size > 0,
+  );
 
   // --- the validation overlay's drawn nodes and list column ---
   // the nodes the canvas draws, path finder nodes included and ghosts left out
@@ -856,7 +966,7 @@
         near.set(k, [...new Set([...(near.get(k) ?? []), ...around])]);
       });
     const fresh = o.nodes.filter((n) => !nodes[n.key]).length;
-    pathsAlone = nodeCount + Math.min(fresh, MAX_PATH_NODES) > MAX_NODES;
+    pathsAlone = nodeCount + Math.min(fresh, MAX_PATH_NODES) > HELD_LIMIT;
     if (pathsAlone)
       toasts.push(
         'info',
@@ -888,8 +998,138 @@
   }
 
   function fitPath(p: pf.FoundPath) {
-    graphView?.fitTo(p.nodes.map((t) => termKey(t)));
+    view.fitTo(p.nodes.map((t) => termKey(t)));
   }
+
+  // --- the WebGL view past about 1,000 visible nodes (ROADMAP item 725) ----------------------
+
+  let largeView: LargeGraphView | undefined = $state();
+  /** Whether the WebGL view's layout has settled, after which new nodes are placed in place. */
+  let largeSettled = $state(false);
+  $effect(() => {
+    void graphEpoch;
+    void useWebgl;
+    largeSettled = false;
+  });
+  function graphColors(): Record<string, string> {
+    const css = typeof document === 'undefined' ? null : getComputedStyle(document.documentElement);
+    const v = (n: string, d: string) => css?.getPropertyValue(n).trim() || d;
+    return {
+      iri: v('--iri', '#2459c7'),
+      literal: v('--literal', '#0b7d69'),
+      bnode: v('--bnode', '#7d45c9'),
+      triple: v('--text-2', '#525b6d'),
+      group: v('--spark', '#e5a117'),
+      added: v('--added', '#1a7f37'),
+      removed: v('--removed', '#c62828'),
+    };
+  }
+  const largeNodes = $derived.by((): LNode[] => {
+    if (!useWebgl) return [];
+    const colors = graphColors();
+    const radius = 100 + Math.sqrt(gNodes.length) * 4;
+    // a picture of thousands of nodes has room for small dots only: at the default size the
+    // members of a hub run together into one disc that looks like a single large node
+    const dense = gNodes.length > WEBGL_FROM;
+    const dot = dense ? 1.8 : 3.5;
+    return gNodes.map((g) => {
+      const p = seed(g.id, undefined, radius);
+      return {
+        key: g.id,
+        label: g.label,
+        size:
+          g.kind === 'group'
+            ? 6.5
+            : g.kind === 'literal'
+              ? dot * 0.7
+              : g.focus
+                ? 5.5
+                : g.expanded && dense
+                  ? 4
+                  : dot,
+        color:
+          g.change === 'added'
+            ? colors.added
+            : g.change === 'removed'
+              ? colors.removed
+              : (colors[g.kind] ?? colors.iri),
+        x: p.x,
+        y: p.y,
+        ...(g.paths?.length ? { paths: g.paths } : {}),
+      };
+    });
+  });
+  const largeEdges = $derived.by((): LEdge[] => {
+    if (!useWebgl) return [];
+    const colors = graphColors();
+    return gEdges.map((e) => ({
+      key: e.id,
+      source: e.source,
+      target: e.target,
+      size: 0.6,
+      ...(e.change === 'added'
+        ? { color: colors.added }
+        : e.change === 'removed'
+          ? { color: colors.removed }
+          : {}),
+      ...(e.paths?.length ? { paths: e.paths } : {}),
+    }));
+  });
+  /**
+   * The edges of each pair of nodes, by the key of the first, which is the one the WebGL view
+   * draws for the pair: it draws one line for the predicates between two nodes.
+   */
+  const largePairs = $derived(useWebgl ? parallelEdges(gEdges) : new Map<string, GEdge[]>());
+  /** A click on a line of the WebGL view: the explanation of an inferred edge, else the predicates it stands for. */
+  function openLargeEdge(id: string) {
+    const group = largePairs.get(id);
+    if (!group) return void openWhyEdge(id);
+    const inferred = group.find((e) => lenses.encoding.inferred.has(e.id));
+    if (inferred && openWhyEdge(inferred.id)) return;
+    toasts.push(
+      'info',
+      `${group.length} predicates join these nodes`,
+      group.map((e) => e.label).join(', '),
+    );
+  }
+  /** The nodes with their neighbours loaded and the group nodes, which the overlay rings. */
+  const expandedIds = $derived(new Set(gNodes.filter((n) => n.expanded).map((n) => n.id)));
+  const groupIds = $derived(new Set(gNodes.filter((n) => n.kind === 'group').map((n) => n.id)));
+  /** An active selection narrows the lens's marks rather than giving way to them. */
+  const largeMarked = $derived.by((): string[] | null => {
+    const extra = whyFor ? (whyMarked?.nodes ?? []) : [];
+    const base = !selection.active
+      ? lensMarked
+      : !lensMarked
+        ? [...selection.ids]
+        : lensMarked.filter((k) => selection.has(k));
+    return base || extra.length ? [...(base ?? []), ...extra] : null;
+  });
+  const view = {
+    fit: () => (useWebgl ? largeView?.fit() : graphView?.fit()),
+    relayout: () => (useWebgl ? largeView?.relayout() : graphView?.relayout()),
+    center: (id: string) => (useWebgl ? largeView?.reveal(id) : graphView?.center(id)),
+    fitTo: (ids: string[]) => (useWebgl ? largeView?.fitTo(ids) : graphView?.fitTo(ids)),
+  };
+
+  // A handle for the performance measurements (ROADMAP item 725), installed only when
+  // `localStorage['sparkles.explore.perfHook']` is '1'. Its members read the page's state
+  // when they are called, so it costs nothing while nobody measures.
+  onMount(() => {
+    if (loadRaw('sparkles.explore.perfHook') !== '1') return;
+    (window as unknown as { __perfHook: unknown }).__perfHook = {
+      nodeCount: () => Object.keys(nodes).length,
+      drawnCount: () => gNodes.length,
+      nodeIds: () => Object.keys(nodes),
+      expand: (id: string) => expand(id),
+      renderer: () => (useWebgl ? 'webgl' : 'cytoscape'),
+      viewport: () => (useWebgl ? largeView?.viewport() : graphView?.viewport()),
+      screenOf: (id: string) => (useWebgl ? largeView?.screenOf(id) : null),
+    };
+    return () => {
+      delete (window as unknown as { __perfHook?: unknown }).__perfHook;
+    };
+  });
 
   // --- lenses (docs/specs/U10-canvas-lenses.md) ------------------------------------------
 
@@ -1065,24 +1305,100 @@
     }
   }
 
+  /**
+   * Read a resource's neighbourhood as Explore draws it: the predicates with few edges as
+   * neighbours, and each predicate with many as one group node (ROADMAP item 725).
+   */
+  async function readNeighbourhood(target: string, iri: string, at?: string, signal?: AbortSignal) {
+    const plan = grp.planFanout(await grp.fanout(target, iri, at, signal));
+    // a label is read from the resource's own edges, so those predicates are never grouped
+    const keep = (f: grp.Fan) => !f.incoming && ex.LABEL_IRIS.includes(f.predicate);
+    const groups = plan.groups.filter((f) => !keep(f));
+    const skip = (incoming: boolean) =>
+      groups.filter((f) => f.incoming === incoming).map((f) => f.predicate);
+    const r = await ex.neighbours(target, iri, at, signal, { out: skip(false), inc: skip(true) });
+    return { r, groups };
+  }
+
+  /** Draw a group node for the edges of one predicate at `owner`. */
+  function addGroup(owner: ENode, f: grp.Fan) {
+    const id = grp.groupId(owner.id, f.predicate, f.incoming);
+    const caption = grp.groupCaption(f.count, shortLabel(f.predicate, prefixes), f.incoming);
+    const existing = nodes[id];
+    if (existing) {
+      existing.label = caption;
+      if (existing.group) existing.group = { ...existing.group, total: f.count };
+      return;
+    }
+    nodes[id] = {
+      id,
+      term: { type: 'bnode', value: id },
+      iri: '',
+      label: caption,
+      expanded: false,
+      lit: false,
+      group: {
+        owner: owner.id,
+        ownerIri: owner.iri,
+        predicate: f.predicate,
+        incoming: f.incoming,
+        total: f.count,
+      },
+    };
+    const eid = `${f.incoming ? id : owner.id}|${f.predicate}|${f.incoming ? owner.id : id}`;
+    edges[eid] = {
+      id: eid,
+      source: f.incoming ? id : owner.id,
+      target: f.incoming ? owner.id : id,
+      label: shortLabel(f.predicate, prefixes),
+      title: f.predicate,
+      isType: f.predicate === RDF_TYPE,
+      lit: false,
+    };
+  }
+
+  /** Draw members the group panel chose, linked to the group's owner through its predicate. */
+  function drawMembers(gid: string, members: grp.Member[]) {
+    const g = nodes[gid]?.group;
+    if (!g) return;
+    const ownerTerm = nodes[g.owner]?.term;
+    const logged = drawLog.get(gid) ?? {
+      owner: g.owner,
+      ownerTerm: ownerTerm as Term,
+      predicate: g.predicate,
+      incoming: g.incoming,
+      members: new Map<string, grp.Member>(),
+    };
+    if (ownerTerm) drawLog.set(gid, logged);
+    for (const m of members) {
+      const lit = m.term.type === 'literal';
+      const oid = lit ? `lit:${g.owner}|${g.predicate}|${termKey(m.term)}` : termKey(m.term);
+      logged.members.set(oid, m);
+      ensureNode(m.term, m.label, oid);
+      if (lit) showLiterals = true;
+      if (g.incoming) addEdge(oid, g.predicate, g.owner, false);
+      else addEdge(g.owner, g.predicate, oid, lit);
+    }
+  }
+
   async function expand(id: string) {
     const n = nodes[id];
-    if (!n || n.term.type !== 'uri' || !ds || expanding[id]) return;
+    if (!n || n.group || n.term.type !== 'uri' || !ds || expanding[id]) return;
     const gen = graphGen.current;
     const target = resourceTarget;
     const stale = () => target !== resourceTarget || !graphGen.isCurrent(gen) || nodes[id] !== n;
-    if (nodeCount > MAX_NODES) {
+    if (nodeCount > HELD_LIMIT) {
       toasts.push(
         'error',
         'Graph is getting large',
-        `Over ${MAX_NODES} nodes. Remove some or refocus before expanding.`,
+        `Over ${HELD_LIMIT.toLocaleString('en-US')} nodes. Remove some or refocus before expanding.`,
       );
       return;
     }
     expanding[id] = gen;
     const signal = expandCtl.signal;
     try {
-      const r = await ex.neighbours(
+      const { r, groups } = await readNeighbourhood(
         target!,
         n.iri,
         timeActive && graphTimeOpen ? exAt || undefined : undefined,
@@ -1090,6 +1406,7 @@
       );
       if (stale()) return;
       populate(n, r);
+      for (const f of groups) addGroup(n, f);
       n.expanded = true;
       if (!expandLog.includes(id)) expandLog.push(id);
       // comparing: the new neighbours are marked against the earlier state too
@@ -1204,6 +1521,45 @@
       .join(' ');
   }
 
+  /** The members drawn from group nodes whose edge holds at the state `at` names, by group. */
+  async function drawnMembersAt(
+    target: string,
+    at: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<{ gid: string; owner: string; members: grp.Member[] }[]> {
+    const wanted: { gid: string; oid: string; m: grp.Member; triple: EdgeTriple }[] = [];
+    for (const [gid, g] of drawLog) {
+      const p: Term = { type: 'uri', value: g.predicate };
+      for (const [oid, m] of g.members)
+        wanted.push({
+          gid,
+          oid,
+          m,
+          triple: g.incoming ? [m.term, p, g.ownerTerm] : [g.ownerTerm, p, m.term],
+        });
+    }
+    if (!wanted.length) return [];
+    const found = await ex.presentEdges(
+      target,
+      wanted.map((w) => w.triple),
+      at,
+      signal,
+    );
+    const by = new Map<string, { gid: string; owner: string; members: grp.Member[] }>();
+    for (const w of wanted) {
+      // a member or a group the person removed while the read was out is not drawn
+      const log = drawLog.get(w.gid);
+      if (!log?.members.has(w.oid)) continue;
+      // a blank node or a triple term cannot be checked, so its member stays
+      const checkable = w.triple.every((t) => t.type === 'uri' || t.type === 'literal');
+      if (checkable && !found.has(edgeIdOf(w.triple))) continue;
+      const d = by.get(w.gid) ?? { gid: w.gid, owner: log.owner, members: [] };
+      d.members.push(w.m);
+      by.set(w.gid, d);
+    }
+    return [...by.values()];
+  }
+
   /**
    * Read the graph again at the state the graph slider names: the focus and the nodes the
    * person expanded, in the order they were expanded, are read at that commit, and an
@@ -1223,16 +1579,23 @@
     const t0 = performance.now();
     try {
       const present = new Set([root]);
-      const fetched = new Map<string, Awaited<ReturnType<typeof ex.neighbours>>>();
+      const fetched = new Map<string, Awaited<ReturnType<typeof readNeighbourhood>>>();
+      // the members drawn from a group stay when their edge holds at that commit
+      const drawnAt = await drawnMembersAt(target!, at, signal);
+      if (!owns()) return;
       for (const id of [...expandLog]) {
         const term = seenTerms.get(id);
         if (!present.has(id) || !term || term.type !== 'uri') continue;
-        const r = await ex.neighbours(target!, term.value, at, signal);
+        const nh = await readNeighbourhood(target!, term.value, at, signal);
         if (!owns()) return;
-        fetched.set(id, r);
-        for (const nb of [...r.out, ...r.inc]) {
+        fetched.set(id, nh);
+        for (const nb of [...nh.r.out, ...nh.r.inc]) {
           if (nb.term.type === 'literal') continue;
           present.add(termKey(nb.term));
+        }
+        for (const d of drawnAt) {
+          if (d.owner !== id) continue;
+          for (const m of d.members) if (m.term.type !== 'literal') present.add(termKey(m.term));
         }
       }
       graphEpoch++;
@@ -1243,12 +1606,29 @@
       nodes = {};
       edges = {};
       const rn = ensureNode(rootTerm, keepLabels.get(root), root);
-      for (const id of expandLog) {
-        const r = fetched.get(id);
-        const n = id === root ? rn : nodes[id];
-        if (!r || !n) continue;
-        populate(n, r);
-        n.expanded = true;
+      const replayed = new Set<string>();
+      const drawnGroups = new Set<string>();
+      // an expansion makes its groups, whose drawn members can be expanded in turn, so the
+      // passes go on until one expands nothing more
+      for (let more = true; more;) {
+        more = false;
+        for (const id of expandLog) {
+          const nh = fetched.get(id);
+          const n = id === root ? rn : nodes[id];
+          if (!nh || !n || replayed.has(id)) continue;
+          replayed.add(id);
+          more = true;
+          populate(n, nh.r);
+          for (const f of nh.groups) addGroup(n, f);
+          n.expanded = true;
+        }
+        // each group's members are drawn once, when the group exists
+        for (const d of drawnAt) {
+          if (drawnGroups.has(d.gid) || !nodes[d.gid]?.group) continue;
+          drawnGroups.add(d.gid);
+          drawMembers(d.gid, d.members);
+          more = true;
+        }
       }
       for (const [id, n] of Object.entries(nodes)) {
         const kept = keepLabels.get(id);
@@ -1330,7 +1710,7 @@
       }
       if (
         quads.length < d.added + d.removed ||
-        Object.keys(nodes).length + fresh.size > MAX_NODES
+        Object.keys(nodes).length + fresh.size > HELD_LIMIT
       ) {
         graphReading = false;
         await rereadGraph();
@@ -1468,6 +1848,7 @@
     if (tab !== 'graph') p.set('tab', tab);
     if (canvasMode === 'map' && tab === 'graph') p.set('map', '1');
     if (facetsOpen && tab === 'graph') p.set('facets', '1');
+    if (filtersOpen && tab === 'graph') p.set('filters', '1');
     if (tab === 'search' && textQuery.trim()) p.set('q', textQuery.trim());
     if (iri && sideTab === 'memory') p.set('view', 'memory');
     if (!iri && tab === 'graph' && overviewMode === 'communities') {
@@ -1521,7 +1902,7 @@
     if (!ds) return;
     const terms = ids
       .filter((id) => id.startsWith('<') && id.endsWith('>'))
-      .slice(0, MAX_NODES)
+      .slice(0, VISIBLE_BUDGET)
       .map((id): Term => ({ type: 'uri', value: id.slice(1, -1) }));
     if (!terms.length) return;
     resetGraph();
@@ -1580,8 +1961,17 @@
     edges = keep;
     const { [id]: _removed, ...rest } = nodes;
     void _removed;
-    // Drop literal nodes that belonged to the removed node.
-    nodes = Object.fromEntries(Object.entries(rest).filter(([k]) => !k.startsWith(`lit:${id}|`)));
+    // Drop literal nodes and group nodes that belonged to the removed node.
+    nodes = Object.fromEntries(
+      Object.entries(rest).filter(([k, n]) => !k.startsWith(`lit:${id}|`) && n.group?.owner !== id),
+    );
+    // what the person removed is not drawn again by a replay
+    for (const [gid, g] of drawLog) {
+      if (g.owner === id) drawLog.delete(gid);
+      else
+        for (const oid of [...g.members.keys()])
+          if (oid === id || oid.startsWith(`lit:${id}|`)) g.members.delete(oid);
+    }
     if (selectedId === id) selectedId = null;
     if (focusId === id) focusId = null;
   }
@@ -1592,7 +1982,7 @@
     if (incoming) addEdge(target.id, predicate, from, false);
     else addEdge(from, predicate, target.id, false);
     select(target.id);
-    queueMicrotask(() => graphView?.center(target.id));
+    queueMicrotask(() => view.center(target.id));
   }
 
   function clearGraph() {
@@ -1686,8 +2076,50 @@
     if (JSON.stringify(w) !== JSON.stringify(untrack(() => facetWithin))) facetWithin = w;
   });
 
+  // the filters and the facets share the panel beside the canvas
+  function toggleFilters() {
+    filtersOpen = !filtersOpen;
+    if (filtersOpen && facetsOpen) {
+      facetsOpen = false;
+      if (selection.source === 'the facets') selection.clear();
+    }
+    syncUrl(selected?.term.type === 'uri' ? selected.iri : null);
+  }
+  function openFilters() {
+    if (!filtersOpen) toggleFilters();
+  }
+
+  // the Communities section is offered where the dataset has GraphRAG communities
+  $effect(() => {
+    if (filtersOpen && nodeCount > 0) void lenses.loadAlgoOptions();
+  });
+
+  /** The categories of the colour lens, such as communities, which the filters can hide. */
+  const COMMUNITY_LENSES = new Set(['wcc', 'labelPropagation', 'louvain', 'leiden', 'graphrag']);
+  const communityGroups = $derived.by((): GroupEntry[] => {
+    const r = lenses.results.colour;
+    if (!r || !r.legend.some((e) => e.key.startsWith('cat-'))) return [];
+    return r.legend.map((e) => ({
+      key: `${r.lens}:${e.key}`,
+      text: e.text,
+      count: e.count,
+      ids: e.ids,
+    }));
+  });
+  const communityTitle = $derived.by(() => {
+    const r = lenses.results.colour;
+    if (!r || !communityGroups.length) return 'Communities';
+    return COMMUNITY_LENSES.has(r.lens) ? 'Communities' : `Groups by ${r.name}`;
+  });
+  /** Colour by the GraphRAG communities of the memory store, whose legend then groups the graph. */
+  function groupByCommunities() {
+    const levels = lenses.algo.graphrag?.levels ?? [];
+    lenses.set('colour', { lens: 'graphrag', ...(levels.length ? { level: levels.at(-1) } : {}) });
+  }
+
   function toggleFacets() {
     facetsOpen = !facetsOpen;
+    if (facetsOpen && filtersOpen) filtersOpen = false;
     if (!facetsOpen && selection.source === 'the facets') selection.clear();
     syncUrl(selected?.term.type === 'uri' ? selected.iri : null);
   }
@@ -2148,6 +2580,13 @@
         setCanvasMode(canvasMode === 'map' ? 'graph' : 'map');
         return;
       }
+      // Shift+G opens and closes the filters
+      if (e.key === 'G' && e.shiftKey) {
+        if (tab !== 'graph' || (!nodeCount && !filtersOpen)) return;
+        e.preventDefault();
+        toggleFilters();
+        return;
+      }
       // Shift+F opens and closes the facet panel
       if (e.key === 'F' && e.shiftKey) {
         if (tab !== 'graph' || (!nodeCount && !facetsOpen)) return;
@@ -2278,7 +2717,7 @@
       class:overview={nodeCount === 0 && !graphTimeOpen && !community && !pathsOpen}
       class:reporting={nodeCount === 0 && !!community && !pathsOpen}
       class:mapmode={canvasMode === 'map' && nodeCount > 0 && !pathsOpen}
-      class:faceted={facetsOpen && nodeCount > 0 && !pathsOpen}
+      class:faceted={(facetsOpen || filtersOpen) && nodeCount > 0 && !pathsOpen}
     >
       <div class="canvas">
         {#if nodeCount > 0 || graphTimeOpen || pathsOpen}
@@ -2348,6 +2787,14 @@
                 >
                 <button
                   class="btn sm"
+                  aria-pressed={filtersOpen}
+                  aria-label="Filters"
+                  title="Choose which edge types, classes and nodes are drawn (Shift+G)"
+                  onclick={toggleFilters}
+                  ><Icon name="sliders" size={13} /><span class="lbl">Filters</span></button
+                >
+                <button
+                  class="btn sm"
                   aria-pressed={graphTimeOpen}
                   aria-label="Graph history"
                   title="Move the whole graph through the commits (Shift+H)"
@@ -2379,20 +2826,38 @@
               </div>
             </div>
             <div class="toolbar-end">
-              <span class="note">{gNodes.length} nodes, {gEdges.length} edges</span>
+              <span class="note" data-testid="graph-counts"
+                >{gNodes.length} nodes, {gEdges.length} edges{#if useWebgl}
+                  <span
+                    class="renderer"
+                    title="Drawn with WebGL, since the graph shows over {webglFrom.toLocaleString(
+                      'en-US',
+                    )} nodes">WebGL</span
+                  >{/if}</span
+              >
+              {#if drawn.hidden > 0}
+                <button
+                  class="btn sm hidden-chip"
+                  data-testid="hidden-chip"
+                  title="The graph holds {nodeCount.toLocaleString(
+                    'en-US',
+                  )} nodes. The filters and the budget leave these out of the picture."
+                  onclick={openFilters}>{drawn.hidden.toLocaleString('en-US')} hidden</button
+                >
+              {/if}
               {#if nodeCount && canvasMode === 'graph'}
                 {#if !listView}
                   <button
                     class="btn sm icon graph-control"
                     aria-label="Fit to view"
                     title="Fit to view"
-                    onclick={() => graphView?.fit()}><Icon name="fit" size={14} /></button
+                    onclick={() => view.fit()}><Icon name="fit" size={14} /></button
                   >
                   <button
                     class="btn sm icon graph-control"
                     aria-label="Re-run layout"
                     title="Re-run layout"
-                    onclick={() => graphView?.relayout()}><Icon name="refresh" size={14} /></button
+                    onclick={() => view.relayout()}><Icon name="refresh" size={14} /></button
                   >
                 {/if}
                 <button
@@ -2435,7 +2900,7 @@
               {selectedId}
               onselect={(id) => {
                 select(id);
-                graphView?.center(id);
+                view.center(id);
               }}
               onshowtriples={showResultTriples}
               onopenquery={(text) => {
@@ -2536,6 +3001,30 @@
                     if (n?.term.type === 'uri') void focusOn(n.iri, n.label);
                   }}
                 />
+              {:else if useWebgl}
+                <LargeGraphView
+                  bind:this={largeView}
+                  nodes={largeNodes}
+                  edges={largeEdges}
+                  still={largeSettled}
+                  relayoutBulk
+                  onlayout={() => (largeSettled = true)}
+                  selected={selectedId}
+                  label="Explored graph"
+                  onselect={select}
+                  onexpand={expand}
+                  onmenu={(id, at) =>
+                    (menu =
+                      nodes[id]?.term.type === 'uri' && !nodes[id]?.group ? { id, ...at } : null)}
+                  onedge={openLargeEdge}
+                  expanded={expandedIds}
+                  groups={groupIds}
+                  lens={lenses.encoding}
+                  marked={largeMarked}
+                  dimEmpty={selection.active}
+                  pathFocus={pathHighlight}
+                  onfail={(reason) => (webglOff = reason)}
+                />
               {:else}
                 <GraphView
                   bind:this={graphView}
@@ -2549,7 +3038,8 @@
                   highlight={selection.active ? selection.ids : null}
                   pathFocus={pathHighlight}
                   onmenu={(id, at) =>
-                    (menu = nodes[id]?.term.type === 'uri' ? { id, ...at } : null)}
+                    (menu =
+                      nodes[id]?.term.type === 'uri' && !nodes[id]?.group ? { id, ...at } : null)}
                   lens={lenses.encoding}
                   marked={lensMarked}
                   onedge={(id) => void openWhyEdge(id)}
@@ -2558,34 +3048,34 @@
                     ? { badges: vBadges, marked: vMarked, onbadge: (id) => overlay?.open(id) }
                     : null}
                 />
-                {#if menu}
-                  <div
-                    class="node-menu"
-                    role="menu"
-                    aria-label="Node actions"
-                    style="left: {menu.x}px; top: {menu.y}px"
+              {/if}
+              {#if menu && !listView}
+                <div
+                  class="node-menu"
+                  role="menu"
+                  aria-label="Node actions"
+                  style="left: {menu.x}px; top: {menu.y}px"
+                >
+                  <button
+                    role="menuitem"
+                    class="btn sm ghost"
+                    onclick={() => openPaths({ from: menu!.id })}>Paths from here</button
                   >
-                    <button
-                      role="menuitem"
-                      class="btn sm ghost"
-                      onclick={() => openPaths({ from: menu!.id })}>Paths from here</button
-                    >
-                    <button
-                      role="menuitem"
-                      class="btn sm ghost"
-                      onclick={() => openPaths({ to: menu!.id })}>Paths to here</button
-                    >
-                    <button
-                      role="menuitem"
-                      class="btn sm ghost"
-                      onclick={() => {
-                        const id = menu!.id;
-                        menu = null;
-                        void expand(id);
-                      }}>Expand</button
-                    >
-                  </div>
-                {/if}
+                  <button
+                    role="menuitem"
+                    class="btn sm ghost"
+                    onclick={() => openPaths({ to: menu!.id })}>Paths to here</button
+                  >
+                  <button
+                    role="menuitem"
+                    class="btn sm ghost"
+                    onclick={() => {
+                      const id = menu!.id;
+                      menu = null;
+                      void expand(id);
+                    }}>Expand</button
+                  >
+                </div>
               {/if}
               <LensLegend
                 results={lenses.results}
@@ -2595,12 +3085,42 @@
               />
             </div>
             <div class="hint faint">
-              Double-click a node to load its neighbours. Blue-ringed nodes are expanded.
+              Double-click a node to load its neighbours. {useWebgl
+                ? 'Ringed nodes are expanded.'
+                : 'Blue-ringed nodes are expanded.'} A dashed box is a group of neighbours, which the
+              panel opens a page at a time.
             </div>
           {/if}
         {/if}
       </div>
 
+      {#if filtersOpen && !facetsOpen && nodeCount > 0 && !pathsOpen && ds}
+        <aside class="side side-facets" aria-label="Filters">
+          <ExploreFilters
+            bind:value={fstate}
+            predicates={predicateFacets}
+            classes={classFacets}
+            predicateLabel={(iri) => shortLabel(iri, prefixes)}
+            classLabel={(id) => {
+              const n = nodes[id];
+              return n ? labelFor(n.term, n.label) : id;
+            }}
+            held={{ nodes: allNodes.length, edges: allEdges.length }}
+            drawn={{ nodes: gNodes.length, edges: gEdges.length }}
+            hidden={drawn.hidden}
+            overBudget={drawn.overBudget}
+            groups={communityGroups}
+            groupsTitle={communityTitle}
+            canCommunities={!!lenses.algo.graphrag}
+            oncommunities={groupByCommunities}
+            {maxDegree}
+            webglNote={webglOff
+              ? `WebGL is off (${webglOff}), so the canvas draws at most ${WEBGL_FROM.toLocaleString('en-US')} nodes.`
+              : null}
+            onclose={toggleFilters}
+          />
+        </aside>
+      {/if}
       {#if facetsOpen && nodeCount > 0 && !pathsOpen && ds}
         <aside class="side side-facets" aria-label="Facets">
           <FacetPanel
@@ -2666,6 +3186,22 @@
               onshow={showWhy}
               onopen={(iri) => focusOn(iri)}
               onclose={closeWhy}
+            />
+          {:else if selected?.group}
+            {@const g = selected.group}
+            <ExploreGroup
+              ds={resourceTarget ?? ds}
+              at={timeActive && graphTimeOpen ? exAt : ''}
+              spec={g}
+              predicateLabel={shortLabel(g.predicate, prefixes)}
+              ownerLabel={nodes[g.owner]
+                ? labelFor(nodes[g.owner].term, nodes[g.owner].label)
+                : g.ownerIri}
+              termLabel={(t) => labelFor(t)}
+              drawn={(t) =>
+                !!nodes[termKey(t)] || !!nodes[`lit:${g.owner}|${g.predicate}|${termKey(t)}`]}
+              ondraw={(m) => drawMembers(selected!.id, m)}
+              onremove={() => removeNode(selected!.id)}
             />
           {:else if selected}
             {@const n = selected}
@@ -3566,6 +4102,18 @@
   .split.faceted {
     grid-template-columns: minmax(0, 1fr) 320px 380px;
   }
+  .renderer {
+    margin-left: 6px;
+    padding: 0 6px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: var(--fs-xs);
+    color: var(--text-2);
+  }
+  .hidden-chip {
+    border-radius: 999px;
+    color: var(--text-2);
+  }
   .facet-set select {
     max-width: 100%;
   }
@@ -4143,8 +4691,22 @@
     .side-facets {
       max-height: none;
     }
-    .side-facets :global(.facets) {
+    .side-facets :global(.facets),
+    .side-facets :global(.filters) {
       height: auto;
+    }
+    /* the panels stack under the canvas, each at the height its content needs */
+    .side-facets {
+      min-height: min-content;
+    }
+    /* the toolbars of a phone take most of the row, so the drawn graph gets more of it */
+    .split:not(.overview, .mapmode, .reporting) {
+      grid-template-rows: minmax(560px, 1fr) auto;
+      /* the rows take their content's height and the page scrolls */
+      flex: none;
+    }
+    .split.faceted:not(.overview, .mapmode, .reporting) {
+      grid-template-rows: minmax(560px, 1fr) auto auto;
     }
     .side-facets :global(.fbody) {
       flex: none;
@@ -4172,8 +4734,19 @@
     }
   }
   @media (max-width: 760px) {
+    /* the counts are in the filter panel and the list, so the end group's buttons share the
+       last row of the tools and the canvas keeps the height the counts would take */
     .gtools .note {
-      margin-right: auto;
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+    }
+    .gtools .toolbar-end {
+      flex: 1 1 auto;
+      flex-wrap: nowrap;
     }
     /* taps need 44 px targets */
     .graph-control {

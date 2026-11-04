@@ -38,6 +38,21 @@ say so. A run that does not count has no such bound. The normalization keeps the
 beside a universal or a maximum in a clause's body, which classifies BioTop in 27 ms on
 four threads where it took 350 ms.
 
+The web UI scales to large ontologies and graphs. The Workbench ontology and thesaurus trees
+draw only the rows in view, with the keyboard, sticky ancestors, **Show more** paging and
+selection reveal that they had, so a level of thousands of children scrolls at 16.7 ms a
+frame at 10,000 rows. The ontology editor opens on its summary and the first level of classes
+and no longer reads every label, every subclass axiom and up to 50,000 entities, which takes
+ChEBI lite from 9.9 s to 0.9 s to its first row and from 68 MB to 0.2 MB of answers. Its page
+head shows the counts as loading until the server's summary arrives. Explore holds up to
+100,000 explored nodes and draws a budget of 5,000, with the WebGL view past 1,000 visible
+nodes, an "N via predicate" group node for a resource with a large fan-out and a **Filters**
+panel for edge types, classes, minimum degree, leaves and communities that choose what is
+drawn and never read from the server. The WebGL view draws one line for the predicates between
+two nodes. The [web UI at scale report](docs/benchmarks/web-ui-scale/RESULTS.md) has the
+measurements, including a first call of the ontology summary route that takes 7.25 s on ChEBI
+lite.
+
 A classification can answer in part on every surface. `partial` on
 `POST /$/ontology/{ds}/classify`, the JSON operation, Python's, Node.js's and the JVM's
 `classify` and `sparkles ontology classify --partial` asks a run of the disjunctive rules

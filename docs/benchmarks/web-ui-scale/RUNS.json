@@ -1,0 +1,92 @@
+{
+  "catalog_version": 1,
+  "sources": [
+    {
+      "context": {
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": {
+            "cpu": "Intel(R) Core(TM) Ultra X7 358H",
+            "kernel": "7.2.9",
+            "memory_gib": 30,
+            "name": "stanley",
+            "note": "a laptop with other lanes running, the one-minute load average at the start of each run is in its raw record",
+            "threads": 16
+          }
+        },
+        "manifest": {
+          "browser": "Chromium 153.0.8010.12 headless, software WebGL (ANGLE over SwiftShader), viewport 1440 by 900",
+          "builds": {
+            "after3": "the UI of a199a8ae, a snapshot built from the lane's ui tree",
+            "baseline": "the UI of 4ab93ecb"
+          },
+          "correctness": "Each case waits for its rows or graph and fails when they do not appear, and the raw files record the status of each run.",
+          "data": {
+            "chebi_lite": {
+              "release": "256",
+              "sha256": "ebea75e0500818e319245a1bf605a684b2e22a2069680290b5dda638d5d25b16",
+              "url": "http://purl.obolibrary.org/obo/chebi/256/chebi_lite.owl"
+            },
+            "hub": {
+              "generator": "ui/scripts/perf-gen-hub.mjs",
+              "sha256": "46cd18b915b6b84e3b721e3afb999b3b5c81e047f4e6bb6829670e9457e635c3"
+            },
+            "taxon_1000000": {
+              "generator": "ui/scripts/perf-gen-taxon.mjs",
+              "sha256": "07e5b00abb188c2bf13e65b3d8c59f6660ccfa7c8922b348cf40ed37dc951aa5"
+            },
+            "taxon_2600000": {
+              "generator": "ui/scripts/perf-gen-taxon.mjs",
+              "sha256": "560764235ce465f9d8cd4f75657f02fe50b63f22832cc90e9dd8092461bf7de0"
+            },
+            "taxon_300000": {
+              "generator": "ui/scripts/perf-gen-taxon.mjs",
+              "sha256": "d81fb410c44f2bc198e7ca842de25bf75874a717c3cbcfd0c0d8eac71c199470"
+            },
+            "unesco_thesaurus": {
+              "sha256": "fa78145d189776bfb97e1635200060012b853684b9f7d542d41804c37c5178c3"
+            }
+          },
+          "harness": {
+            "commit": "2ffba3dd of lane/explore-scale-725-measure",
+            "files": {
+              "ui/scripts/perf-gen-hub.mjs": "dddcc1bb15bf96dd426e16fb2c21f2b56f577d02b8e4b790485eacf293d76a56",
+              "ui/scripts/perf-gen-taxon.mjs": "880bb890fa42ebb0cc5411ceacc34a8ff6b57639a7971e5f65112e23d0552038",
+              "ui/scripts/perf-run.sh": "5c9937e27e59a03b7ada3260e1a82fa9d66eca6df1ccd171ba264d242e74dce0",
+              "ui/tests/perf/adapter.ts": "c604894a10c5e239840dbd28899a05736f1daf3c7a1f0e548ab83e385b27369f",
+              "ui/tests/perf/explore.perf.ts": "be37ab45df0e4d35a338871d0f0783896a37334f9554c6a2845514774fe1cdc3",
+              "ui/tests/perf/measure.ts": "eda286a044aaec30069e5e4ae50758ad926d8cd629cb96aa9e29a42561ccf3f3",
+              "ui/tests/perf/workbench.perf.ts": "715f6fed8cfaee4cae1fb5868e488eeb695e34f29ac55a81227bffc475d3d519"
+            }
+          },
+          "kind": "manual run of the browser harness of ROADMAP item 725",
+          "scripts": [
+            "README.txt",
+            "run-interleaved.sh",
+            "run-second.sh",
+            "summary-route.txt",
+            "tables.md"
+          ],
+          "server": {
+            "binary": "release build of 4ab93ecb on wally",
+            "commit": "4ab93ecb",
+            "sha256": "162cc814996143362d817ad4d52338e1bbcbdf1062eeac4dc19ccf5e88f242ee"
+          }
+        },
+        "scale": "ChEBI lite 256, an NCBITaxon-shaped synthetic taxonomy of 300,000, 1,000,000 and 2,600,000 classes, a 90-ary hub and the UNESCO thesaurus",
+        "settings": {
+          "browser_memory_cap": "4G",
+          "fresh_server_per_group": true,
+          "interleaved": true,
+          "repetitions": 3,
+          "server_memory_cap": "11G, 13G for the 1 M taxon of after3"
+        },
+        "suite": "web-ui-scale"
+      },
+      "format": "legacy-assessment",
+      "path": "runs/2026-11-04-stanley-4ab93ecb-a199a8ae/record.json",
+      "run_id": "sha256-e0975f66a4d137e47bf5e62ce15e1bcd94caf48f5854da4e7d33b4628530ab1f",
+      "sha256": "e0975f66a4d137e47bf5e62ce15e1bcd94caf48f5854da4e7d33b4628530ab1f"
+    }
+  ]
+}

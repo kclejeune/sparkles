@@ -1,0 +1,87 @@
+{
+ "name": "explore-20000",
+ "rep": 1,
+ "meta": {
+  "label": "after3",
+  "base": "http://127.0.0.1:18725",
+  "host": "stanley",
+  "date": "2026-11-04T14:22:31.165Z",
+  "uiDir": "/home/kclejeune/lanes-local/explore-scale-725/ui-after3/ui/build",
+  "commit": "4ab93ecb/a199a8ae",
+  "server": "release-4ab93ecb",
+  "note": "laptop, synthetic taxon, software WebGL",
+  "browser": "153.0.8010.12",
+  "viewport": {
+   "width": 1440,
+   "height": 900
+  },
+  "webgl": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+  "loadavg": [
+   12.44,
+   10.45,
+   7.89
+  ]
+ },
+ "target": 20000,
+ "status": "ok",
+ "firstGraphMs": 400,
+ "renderer": "cytoscape",
+ "growMs": 300698,
+ "nodes": 16303,
+ "drawn": 5000,
+ "reached": false,
+ "blockedAt": 16303,
+ "expansions": 183,
+ "expandLatencyMs": {
+  "median": 373,
+  "max": 3183
+ },
+ "viewportBefore": {
+  "x": 0.5,
+  "y": 0.5,
+  "angle": 0,
+  "ratio": 1
+ },
+ "panZoom": {
+  "frames": 19,
+  "p50": 250,
+  "p95": 400,
+  "p99": 400,
+  "max": 400,
+  "over50ms": 19,
+  "meanFps": 3.8
+ },
+ "viewportAfter": {
+  "x": 0.46799807100427104,
+  "y": 0.5198021610259539,
+  "angle": 0,
+  "ratio": 0.19827999488705894
+ },
+ "idle": {
+  "frames": 93,
+  "p50": 16.7,
+  "p95": 16.8,
+  "p99": 166.7,
+  "max": 166.7,
+  "over50ms": 3,
+  "meanFps": 46.1
+ },
+ "longTasks": {
+  "count": 856,
+  "totalMs": 220348,
+  "maxMs": 1338,
+  "lastEndMs": 309431
+ },
+ "network": {
+  "count": 753,
+  "encodedBytes": 1455885,
+  "decodedBytes": 4598914,
+  "ms": 1996.143999742344
+ },
+ "heap": {
+  "jsHeapUsedMB": 85,
+  "jsHeapTotalMB": 86.3,
+  "domNodes": 2370,
+  "layoutCount": 0
+ }
+}

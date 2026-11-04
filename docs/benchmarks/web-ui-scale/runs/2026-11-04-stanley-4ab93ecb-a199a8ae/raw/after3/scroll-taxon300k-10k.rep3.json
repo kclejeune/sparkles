@@ -1,0 +1,78 @@
+{
+ "name": "scroll-taxon300k-10k",
+ "rep": 1,
+ "meta": {
+  "label": "after3",
+  "base": "http://127.0.0.1:18725",
+  "host": "stanley",
+  "date": "2026-11-04T14:11:10.808Z",
+  "uiDir": "/home/kclejeune/lanes-local/explore-scale-725/ui-after3/ui/build",
+  "commit": "4ab93ecb/a199a8ae",
+  "server": "release-4ab93ecb",
+  "note": "laptop, synthetic taxon, software WebGL",
+  "browser": "153.0.8010.12",
+  "viewport": {
+   "width": 1440,
+   "height": 900
+  },
+  "webgl": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+  "loadavg": [
+   5.7,
+   5.68,
+   4.79
+  ]
+ },
+ "status": "ok",
+ "hub": "http://purl.obolibrary.org/obo/NCBITaxon_1637",
+ "showMoreMs": [
+  162,
+  200,
+  179,
+  137,
+  117,
+  213,
+  439,
+  104,
+  129
+ ],
+ "rowsLoaded": 10038,
+ "rowsInDomBefore": 38,
+ "heapBefore": {
+  "jsHeapUsedMB": 14.5,
+  "jsHeapTotalMB": 15.1,
+  "domNodes": 2633,
+  "layoutCount": 0
+ },
+ "scrollDown": {
+  "frames": 372,
+  "p50": 16.7,
+  "p95": 16.7,
+  "p99": 16.8,
+  "max": 16.8,
+  "over50ms": 0,
+  "meanFps": 60
+ },
+ "scrollUp": {
+  "frames": 372,
+  "p50": 16.7,
+  "p95": 16.7,
+  "p99": 16.8,
+  "max": 16.8,
+  "over50ms": 0,
+  "meanFps": 60
+ },
+ "scrollHeightPx": 260998,
+ "rowsInDomAfter": 30,
+ "heapAfter": {
+  "jsHeapUsedMB": 16.4,
+  "jsHeapTotalMB": 17.3,
+  "domNodes": 2557,
+  "layoutCount": 746
+ },
+ "longTasks": {
+  "count": 3,
+  "totalMs": 185,
+  "maxMs": 68,
+  "lastEndMs": 9701
+ }
+}

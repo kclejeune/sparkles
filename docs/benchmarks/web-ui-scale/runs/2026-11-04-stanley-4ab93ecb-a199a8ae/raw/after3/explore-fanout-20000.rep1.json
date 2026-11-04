@@ -1,0 +1,210 @@
+{
+ "name": "explore-fanout-20000",
+ "rep": 1,
+ "meta": {
+  "label": "after3",
+  "base": "http://127.0.0.1:18725",
+  "host": "stanley",
+  "date": "2026-11-04T14:14:46.552Z",
+  "uiDir": "/home/kclejeune/lanes-local/explore-scale-725/ui-after3/ui/build",
+  "commit": "4ab93ecb/a199a8ae",
+  "server": "release-4ab93ecb",
+  "note": "laptop, synthetic taxon, software WebGL",
+  "browser": "153.0.8010.12",
+  "viewport": {
+   "width": 1440,
+   "height": 900
+  },
+  "webgl": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+  "loadavg": [
+   7.62,
+   8.91,
+   6.71
+  ]
+ },
+ "status": "ok",
+ "firstGraphMs": 323,
+ "nodes": 4,
+ "drawn": 4,
+ "renderer": "cytoscape",
+ "network": {
+  "count": 16,
+  "encodedBytes": 23550,
+  "decodedBytes": 165916,
+  "ms": 76.15699979942292
+ },
+ "requests": [
+  {
+   "url": "/$/prefixes/hub",
+   "group": "$/prefixes",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1206,
+   "decodedBytes": 647
+  },
+  {
+   "url": "/$/branches/hub",
+   "group": "$/branches",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1171,
+   "decodedBytes": 469
+  },
+  {
+   "url": "/$/auth/config",
+   "group": "$/auth",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 859,
+   "decodedBytes": 17
+  },
+  {
+   "url": "/$/whoami",
+   "group": "$/whoami",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1072,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/vector/hub",
+   "group": "$/vector",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 910,
+   "decodedBytes": 93
+  },
+  {
+   "url": "/$/assistant/hub",
+   "group": "$/assistant",
+   "status": 200,
+   "ms": 4,
+   "encodedBytes": 1061,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/memory/hub/maintenance",
+   "group": "$/memory",
+   "status": 200,
+   "ms": 7,
+   "encodedBytes": 898,
+   "decodedBytes": 81
+  },
+  {
+   "url": "/$/ping",
+   "group": "$/ping",
+   "status": 200,
+   "ms": 7,
+   "encodedBytes": 831,
+   "decodedBytes": 20
+  },
+  {
+   "url": "/$/datasets",
+   "group": "$/datasets",
+   "status": 200,
+   "ms": 7,
+   "encodedBytes": 1767,
+   "decodedBytes": 6838
+  },
+  {
+   "url": "/$/assistant/hub",
+   "group": "$/assistant",
+   "status": 200,
+   "ms": 6,
+   "encodedBytes": 1061,
+   "decodedBytes": 259
+  },
+  {
+   "url": "/$/forms/hub?focus=http%3A%2F%2Fexample.org%2Fperf%23big",
+   "group": "$/forms",
+   "status": 200,
+   "ms": 10,
+   "encodedBytes": 1557,
+   "decodedBytes": 9993
+  },
+  {
+   "url": "/hub/sparql?send=5000&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 5,
+   "encodedBytes": 1635,
+   "decodedBytes": 1632
+  },
+  {
+   "url": "/hub/sparql?send=5000&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 5,
+   "encodedBytes": 1582,
+   "decodedBytes": 1338
+  },
+  {
+   "url": "/hub/sparql?send=5000&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 5,
+   "encodedBytes": 2895,
+   "decodedBytes": 117064
+  },
+  {
+   "url": "/hub/sparql?send=5000&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 5,
+   "encodedBytes": 1912,
+   "decodedBytes": 23947
+  },
+  {
+   "url": "/hub/sparql?send=5000&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 5,
+   "encodedBytes": 1618,
+   "decodedBytes": 1491
+  },
+  {
+   "url": "/hub/shacl?shapes=guard",
+   "group": "/hub/shacl",
+   "status": 404,
+   "ms": 2,
+   "encodedBytes": 905,
+   "decodedBytes": 81
+  },
+  {
+   "url": "/hub/sparql?send=5000&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 2190,
+   "decodedBytes": 4402
+  },
+  {
+   "url": "/hub/sparql?send=5000&execution=eager",
+   "group": "sparql",
+   "status": 200,
+   "ms": 3,
+   "encodedBytes": 2091,
+   "decodedBytes": 4119
+  },
+  {
+   "url": "/$/validation/hub",
+   "group": "$/validation",
+   "status": 200,
+   "ms": 2,
+   "encodedBytes": 858,
+   "decodedBytes": 41
+  }
+ ],
+ "heap": {
+  "jsHeapUsedMB": 8.5,
+  "jsHeapTotalMB": 9.1,
+  "domNodes": 2782,
+  "layoutCount": 0
+ },
+ "longTasks": {
+  "count": 1,
+  "totalMs": 102,
+  "maxMs": 102,
+  "lastEndMs": 199
+ }
+}

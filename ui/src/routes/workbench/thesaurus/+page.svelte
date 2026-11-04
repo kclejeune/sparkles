@@ -90,7 +90,6 @@
   import SkosLinks from '$components/SkosLinks.svelte';
   import EditorHistory from '$components/EditorHistory.svelte';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
-  import TreeSticky from '$components/TreeSticky.svelte';
 
   import { scrollToRow } from '$lib/level-tree.svelte';
   import { routes, THESAURUS_TABS, type ThesaurusTab } from '$lib/routes';
@@ -1173,7 +1172,6 @@
                 </div>
               {/if}
               <div class="tree-scroll">
-                <TreeSticky />
                 {#if tree.roots.length}
                   <OntoTree
                     label="Concepts"
