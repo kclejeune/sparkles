@@ -389,11 +389,12 @@ def partial_answers(inconsistent: bool) -> list[str]:
     assert full["complete"] and not full["partial"]
     assert (full["consistency"], full["tier"]) == (want, "disjunctive")
     assert full["incomplete"] == [] and full["incompleteCount"] == 0
-    d = sparkles.Dataset()
-    d.update(body)
     seen = []
     f = 0.02
     while f < 1.5:
+        # a dataset of its own, whose read of the ontology takes as long as the full run's
+        d = sparkles.Dataset()
+        d.update(body)
         try:
             r = d.ontology.classify(partial=True, threads=1, limit=10000, timeout=took * f)
         except sparkles.QueryTimeoutError:
@@ -423,6 +424,37 @@ def test_classify_answers_in_part_under_a_deadline(ds: sparkles.Dataset) -> None
         ds.ontology.classify(partial=True, target=EX + "taxonomy")
     with pytest.raises(ValueError):
         ds.ontology.classify(expansion="greedy")
+
+
+def test_classify_answers_in_part_when_its_token_is_cancelled() -> None:
+    import threading
+    import time
+
+    body = f"{PREFIXES} INSERT DATA {{ {cases(300, False)} }}"
+    d = sparkles.Dataset()
+    d.update(body)
+    t = time.perf_counter()
+    d.ontology.classify(threads=1)
+    took = time.perf_counter() - t
+    partial = 0
+    f = 0.02
+    while f < 1.5:
+        fresh = sparkles.Dataset()
+        fresh.update(body)
+        token = sparkles.CancelToken()
+        timer = threading.Timer(took * f, token.cancel)
+        timer.start()
+        try:
+            r = fresh.ontology.classify(partial=True, threads=1, cancel=token)
+        except sparkles.CancelledError:
+            r = None
+        finally:
+            timer.cancel()
+        f *= 1.25
+        if r is not None and r["partial"]:
+            assert not r["complete"]
+            partial += 1
+    assert partial > 0, "no cancellation gave a partial answer"
 
 
 def test_classify_leaves_the_consistency_unknown_when_stopped_early() -> None:

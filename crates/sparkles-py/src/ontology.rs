@@ -239,26 +239,28 @@ impl PyOntologies {
         write: bool,
     ) -> PyResult<J> {
         let ds = if write { self.write(py)? } else { self.ds(py)? };
-        // A partial classification answers after the deadline that stopped it, so the
-        // deadline goes to the classifier alone and not to the check after the call.
+        // A partial classification answers with what it proved when its deadline or the
+        // caller's token stops it, so both go to the classifier alone and not to the
+        // checks around the call, which still stop it on a signal such as Ctrl-C.
         let partial = op == "classify" && args.get("partial") == Some(&J::Bool(true));
-        let (timeout, own) = match timeout {
-            Some(s) if partial => (None, Some(s)),
-            t => (t, None),
+        let (timeout, own, cancel, token) = if partial {
+            let own = timeout
+                .map(|s| {
+                    Duration::try_from_secs_f64(s)
+                        .ok()
+                        .filter(|_| s.is_finite())
+                        .and_then(|d| Instant::now().checked_add(d))
+                        .ok_or_else(|| {
+                            pyo3::exceptions::PyValueError::new_err(
+                                "timeout must be finite, nonnegative and not too large",
+                            )
+                        })
+                })
+                .transpose()?;
+            (None, own, None, Some(interrupt::flag(cancel)?))
+        } else {
+            (timeout, None, cancel, None)
         };
-        let own = own
-            .map(|s| {
-                Duration::try_from_secs_f64(s)
-                    .ok()
-                    .filter(|_| s.is_finite())
-                    .and_then(|d| Instant::now().checked_add(d))
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyValueError::new_err(
-                            "timeout must be finite, nonnegative and not too large",
-                        )
-                    })
-            })
-            .transpose()?;
         let args = J::Object(args);
         interrupt::controlled(py, cancel, None, timeout, move |ctl| {
             let ctl = sparkles::task::Control {
@@ -267,6 +269,7 @@ impl PyOntologies {
             };
             let mut opts = sparkles::sparql::QueryOptions {
                 cancel: Some(ctl.cancel.flag()),
+                cancellation: token.map(|t| sparkles::task::Cancellation::from_flags([t])),
                 deadline: ctl.deadline,
                 ..Default::default()
             };

@@ -2280,9 +2280,10 @@ prefixes. Manchester text that `parse` or `dl_query` cannot read raises Python's
 `InvalidInputError`, a `ValueError`, with `reason`, `start`, `end` and `candidates` as
 attributes, and Node.js's `InvalidInputError` with them under `details`. A
 classification's `partial` and `expansion` are keyword arguments in Python, options in
-Node.js and members of `ClassifyQuery` on the JVM, and the deadline that stops a partial
-run is the call's `timeout`, Node.js's `timeout` in milliseconds or the JVM's
-`SparklesOperation` timeout.
+Node.js and members of `ClassifyQuery` on the JVM. A partial run stops at the call's
+`timeout`, which is in milliseconds in Node.js and is the `SparklesOperation` timeout on the
+JVM, or when the caller cancels it with Python's `cancel` token, Node.js's `signal` or the
+JVM's `SparklesOperation.cancel()`. A dataset that closes during the call still fails it.
 
 Typed constructors build axioms without writing their syntax. Python's `sparkles.owl`
 and Node.js's `owl` namespace have one constructor per axiom type and per expression,

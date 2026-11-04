@@ -890,16 +890,17 @@ export class Dataset extends Queryable {
     // them, which most small calls do not.
     const cancel = operation.length >= 1 ? new native.Cancellation() : undefined;
     const controller = operation.length >= 2 ? new AbortController() : undefined;
-    let stopped: { reason: unknown } | undefined;
-    const stop = (reason: unknown) => {
+    // what stopped the operation first: the caller's signal or timeout, or the dataset
+    let stopped: { reason: unknown; byCaller: boolean } | undefined;
+    const stop = (reason: unknown, byCaller = true) => {
       if (stopped) return;
-      stopped = { reason };
+      stopped = { reason, byCaller };
       cancel?.cancel();
       controller?.abort(reason);
     };
     const owner = {
       cancel() {
-        stop(new InvalidInputError('Dataset is closing'));
+        stop(new InvalidInputError('Dataset is closing'), false);
       },
     };
     this.tokens.add(owner);
@@ -916,10 +917,11 @@ export class Dataset extends Queryable {
     const task = (async () => {
       try {
         const value = await operation(cancel!, controller?.signal as AbortSignal);
-        // a partial classification answers with what it proved when its timeout stops it
+        // a partial classification answers with what it proved when the caller's timeout
+        // or signal stops it, but not when the dataset closes
         if (
           stopped &&
-          !(timedOut && (options as { answersWhenStopped?: boolean }).answersWhenStopped)
+          !(stopped.byCaller && (options as { answersWhenStopped?: boolean }).answersWhenStopped)
         ) {
           const handle = value as any;
           if (handle && typeof handle.end === 'function') await handle.end(false);

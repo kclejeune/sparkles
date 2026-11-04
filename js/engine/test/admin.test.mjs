@@ -969,32 +969,47 @@ function cases(n, inconsistent) {
 /** Classify the cases under deadlines from a fraction of a full run's time upwards and return the partial answers' consistencies. */
 async function partialAnswers(t, inconsistent) {
   const body = cases(300, inconsistent);
-  const whole = t.resource(Dataset.memory());
-  await whole.update(body);
-  const start = performance.now();
-  const full = await whole.ontology.classify({ partial: true, threads: 1, limit: 10000 });
-  const took = performance.now() - start;
+  // the quickest of three full runs, each on a dataset of its own, so that a loaded
+  // machine's slow first run does not push every deadline past the saturation
+  let full;
+  let took = Infinity;
+  for (let k = 0; k < 3; k++) {
+    const whole = t.resource(Dataset.memory());
+    await whole.update(body);
+    const start = performance.now();
+    full = await whole.ontology.classify({ partial: true, threads: 1, limit: 10000 });
+    took = Math.min(took, performance.now() - start);
+  }
   const want = inconsistent ? 'inconsistent' : 'consistent';
   assert.equal(full.complete, true);
   assert.equal(full.partial, false);
   assert.equal(full.consistency, want);
   assert.equal(full.tier, 'disjunctive');
   assert.deepEqual(full.incomplete, []);
-  const ds = t.resource(Dataset.memory());
-  await ds.update(body);
+  // Deadlines from the end of the read of the ontology, which takes most of a run here,
+  // through the classifier's time, a millisecond or more apart.
+  const s = full.stats;
+  const run = s.indexMs + s.saturationMs + s.taxonomyMs;
+  const read = Math.max(0, took - run);
+  const step = Math.max(1, run / 24);
   const seen = [];
-  for (let f = 0.02; f < 1.5; f *= 1.25) {
+  for (let ms = Math.max(1, Math.floor(read)); ms < read + 1.5 * run + 1; ms += step) {
+    // a dataset of its own, whose read of the ontology takes as long as the full run's
+    const ds = Dataset.memory();
+    await ds.update(body);
     let r;
     try {
       r = await ds.ontology.classify({
         partial: true,
         threads: 1,
         limit: 10000,
-        timeout: Math.max(1, Math.round(took * f)),
+        timeout: Math.round(ms),
       });
     } catch (e) {
       if (e instanceof QueryTimeoutError) continue;
       throw e;
+    } finally {
+      await ds.close();
     }
     assert.equal(r.classes, full.classes);
     if (!r.partial) {
@@ -1024,6 +1039,39 @@ test('the ontology handle answers a classification in part under a deadline', as
     [true, false, 'consistent', 'el', []],
   );
   await assert.rejects(ds.ontology.classify({ partial: true, target: 'http://ex.org/taxonomy' }));
+});
+
+test('a classification answers in part when its signal aborts it', async (t) => {
+  const body = cases(300, false);
+  const whole = t.resource(Dataset.memory());
+  await whole.update(body);
+  const start = performance.now();
+  await whole.ontology.classify({ threads: 1 });
+  const took = performance.now() - start;
+  let partial = 0;
+  for (let f = 0.02; f < 1.5; f *= 1.25) {
+    const ds = Dataset.memory();
+    await ds.update(body);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), took * f);
+    try {
+      const r = await ds.ontology.classify({
+        partial: true,
+        threads: 1,
+        signal: controller.signal,
+      });
+      if (r.partial) {
+        assert.equal(r.complete, false);
+        partial++;
+      }
+    } catch (e) {
+      if (!controller.signal.aborted) throw e;
+    } finally {
+      clearTimeout(timer);
+      await ds.close();
+    }
+  }
+  assert.ok(partial > 0, 'no abort gave a partial answer');
 });
 
 test('the ontology handle reads Manchester syntax and answers DL queries', async (t) => {

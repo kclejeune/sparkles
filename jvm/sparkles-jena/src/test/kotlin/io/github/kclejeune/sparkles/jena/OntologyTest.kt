@@ -342,22 +342,23 @@ class OntologyTest {
         assertEquals(want, full.getString("consistency"))
         assertEquals("disjunctive", full.getString("tier"))
         val seen = mutableListOf<String>()
-        SparklesDatasets.memory().use { ds ->
-            UpdateAction.parseExecute(body, ds)
-            var f = 0.02
-            while (f < 1.5) {
-                val ms = maxOf(1L, (took * f).toLong())
-                f *= 1.25
+        var f = 0.02
+        while (f < 1.5) {
+            val ms = maxOf(1L, (took * f).toLong())
+            f *= 1.25
+            // a dataset of its own, whose read of the ontology takes as long as the full run's
+            SparklesDatasets.memory().use { ds ->
+                UpdateAction.parseExecute(body, ds)
                 val r = try {
                     SparklesOperation(ms).use { ds.ontology().classify(OntologyRead(), query, it) }
                 } catch (e: org.apache.jena.query.QueryCancelledException) {
-                    continue
+                    return@use
                 }
                 assertEquals(full.getNumber("classes"), r.getNumber("classes"))
                 if (!r.getBoolean("partial")) {
                     assertTrue(r.getBoolean("complete"))
                     assertEquals(want, r.getString("consistency"))
-                    continue
+                    return@use
                 }
                 assertFalse(r.getBoolean("complete"), "a partial answer is presented as complete")
                 val open = r.get("incomplete").asArray
