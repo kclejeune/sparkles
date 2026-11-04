@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A conclusion waiting in a context's to-do list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -486,9 +486,11 @@ const OUTBOX: usize = 4096;
 const DL_CLAUSES: usize = 256;
 /// The roots from which a saturation on several threads starts them all at once.
 const EAGER_ROOTS: usize = if cfg!(test) { 64 } else { 4096 };
-/// The conclusions the first worker of a smaller saturation applies before the others
-/// start, so that a run that ends sooner pays for no thread (roadmap item 709).
-const LAZY_CONCLUSIONS: usize = if cfg!(test) { 256 } else { 32_768 };
+/// How long the first worker of a smaller saturation runs before the others start, so
+/// that a run that ends sooner pays for no thread (roadmap item 709).
+const LAZY_START: Duration = Duration::from_micros(if cfg!(test) { 0 } else { 500 });
+/// The activations between the first worker's checks of [`LAZY_START`].
+const LAZY_EVERY: u32 = 16;
 
 struct Run<'a> {
     ix: &'a Index,
@@ -1045,7 +1047,7 @@ impl<'a> Run<'a> {
     /// (roadmap items 711 and 715).
     ///
     /// The calling thread is the first worker. A run of many roots starts the others at
-    /// once, and a smaller one when the first has applied [`LAZY_CONCLUSIONS`], so that a
+    /// once, and a smaller one when the first has run for [`LAZY_START`], so that a
     /// small ontology, whose saturation takes less time than starting threads, runs on
     /// one (roadmap item 709).
     fn workers<R: Rules>(&self, threads: usize) {
@@ -1077,6 +1079,8 @@ impl<'a> Run<'a> {
         {
             start();
         }
+        let began = others.map(|_| Instant::now());
+        let mut activations = 0u32;
         let mut mine: VecDeque<Ex> = VecDeque::new();
         let mut chunk: Vec<Ex> = Vec::new();
         let mut round = 0usize;
@@ -1144,11 +1148,14 @@ impl<'a> Run<'a> {
                 return;
             }
             self.process::<R>(next, &mut mine, &mut tally, &mut local, &mut outbox);
-            if others.is_some()
-                && self.applied.load(Ordering::Relaxed) + tally.applied >= LAZY_CONCLUSIONS
-                && let Some(start) = others.take()
-            {
-                start();
+            if let Some(start) = others {
+                activations += 1;
+                if activations.is_multiple_of(LAZY_EVERY)
+                    && began.is_some_and(|b| b.elapsed() >= LAZY_START)
+                {
+                    others = None;
+                    start();
+                }
             }
             if !outbox.is_empty() && self.idle.load(Ordering::Relaxed) > 0 {
                 self.deliver(&mut outbox, &mut mine);
