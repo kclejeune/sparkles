@@ -21,6 +21,9 @@
 #   --cargo-jobs N  set CARGO_BUILD_JOBS on every host of the run (see below)
 #   --tag T         name the run <short>-T, so a second run of the same commit can coexist
 #   --dry-run       print the chosen hosts and checks and stop before pushing or starting
+#   --link-only     run only the server artifact link check (scripts/server-artifact-link-check.sh)
+#                   on the host that --host names, which needs podman. The nightly gate
+#                   runs it beside the full gate (scripts/gate/nightly.sh).
 #
 # The gate host chooses the checks from the files that changed between the merge base and
 # the commit, with the commit's scripts/gate/select-checks.py, and records them in
@@ -93,6 +96,7 @@ jobs=1
 cargo_jobs=
 base_rev=${GATE_BASE:-origin/main}
 all_checks=0
+link_only=0
 tag=
 helper_set=0
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10)
@@ -133,6 +137,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --full) all_checks=1 ;;
+    --link-only) link_only=1 ;;
     --tag)
       tag=${2:?--tag needs a name}
       shift
@@ -153,6 +158,12 @@ fi
 case $jobs in '' | *[!0-9]* | 0) die "bad --jobs $jobs" ;; esac
 case $cargo_jobs in *[!0-9]* | 0) die "bad --cargo-jobs $cargo_jobs" ;; esac
 case $tag in *[!A-Za-z0-9._-]*) die "bad --tag $tag" ;; esac
+if [ $link_only = 1 ]; then
+  [ $auto = 0 ] || die "--link-only runs on the host that --host names, so it does not take --auto"
+  [ $mode != hosts ] || die "--link-only does not take --hosts"
+  helper=none
+  helper_set=1
+fi
 # A helper named by --helper or GATE_HELPER is used as given. Otherwise the run picks a
 # free one below, once it knows whether the batch needs the conformance suites.
 pick_helper=0
@@ -415,7 +426,7 @@ esac
 # The GitHub workflows (the server artifact link, the wheel tests, the CI shards) run on
 # GitHub and not in this gate, so a failure there on the last push is reported here before
 # the next batch goes out. GATE_GITHUB_RUNS=0 skips the report.
-if [ "${GATE_GITHUB_RUNS:-1}" != 0 ]; then
+if [ "${GATE_GITHUB_RUNS:-1}" != 0 ] && [ $link_only = 0 ]; then
   python3 "$here/github-runs.py" >&2 ||
     echo "gate.sh: a GitHub workflow failed on main; fix it in this batch or say why it can wait" >&2
 fi
@@ -424,7 +435,10 @@ fi
 # conformance suites, from the same selection the host makes (scripts/gate/select-checks.py).
 mb=
 needs_conf=1
-if [ $all_checks = 0 ]; then
+if [ $link_only = 1 ]; then
+  needs_conf=0
+  echo "checks: the server artifact link check only (--link-only)"
+elif [ $all_checks = 0 ]; then
   if mb=$(git merge-base "$base_rev" "$full" 2> /dev/null); then
     sel=$(python3 "$here/select-checks.py" --base "$mb" --rev "$full" --paths-only 2> /dev/null) || sel=
     if [ -n "$sel" ] && ! echo "$sel" | grep -Eq '^(conformance|spill) [a-z]'; then needs_conf=0; fi
@@ -581,7 +595,12 @@ if [ "$helper" != none ]; then
 fi
 if [ "$helper" = none ]; then
   [ -n "$note" ] || note="whole gate on $primary"
-  start_on "$primary" "$name" all "$note"
+  part=all
+  if [ $link_only = 1 ]; then
+    part="link"
+    note="server artifact link check on $primary"
+  fi
+  start_on "$primary" "$name" "$part" "$note"
 else
   start_on "$primary" "$name" ci "split: conformance half runs on $helper as gate-$hname"
 fi

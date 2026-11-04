@@ -5,10 +5,11 @@
 # the systemd user unit gate-<name>, which survives the ssh session because linger is on,
 # prints the unit name and returns at once.
 #
-# Usage: gate-start.sh <full-sha> [--name NAME] [--part all|ci|conformance] [--jobs N]
+# Usage: gate-start.sh <full-sha> [--name NAME] [--part all|ci|conformance|link] [--jobs N]
 #                      [--cargo-jobs N] [--base SHA] [--full] [--note TEXT]
 #   --name        unit, worktree and out-directory name (default: the first 8 hex digits)
-#   --part        all runs every step, ci only scripts/ci.sh, conformance only the suites
+#   --part        all runs every step, ci only scripts/ci.sh, conformance only the suites,
+#                 link only the server artifact link check (scripts/server-artifact-link-check.sh)
 #   --jobs        passed to scripts/ci.sh --jobs (default 1)
 #   --cargo-jobs  CARGO_BUILD_JOBS for the run (default: from the memory cap, see below)
 #   --base        the commit the batch is compared with, so that the run selects its checks
@@ -66,7 +67,7 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
-case $part in all | ci | conformance) ;; *)
+case $part in all | ci | conformance | link) ;; *)
   echo "gate-start.sh: bad --part $part" >&2
   exit 2
   ;;
