@@ -326,7 +326,13 @@ class OntologyTest {
         return "$prefixes\nINSERT DATA { $out }"
     }
 
-    /** Classifies the cases under deadlines from a fraction of a full run's time upwards, and returns the partial answers' consistencies. */
+    /**
+     * Classifies the cases under deadlines that rise by a few percent from a short one until twenty of them are long
+     * enough for the read of the ontology, and returns the partial answers' consistencies. The first deadline that gives
+     * an answer instead of a timeout has run out in the saturation, since that is the first part of a run that can stop
+     * with an answer, and at most a few percent of the read after its start. So the ladder finds the saturation, which
+     * lasts some milliseconds, on a loaded machine too, where a ladder fixed from the time of a full run misses it.
+     */
     private fun partialAnswers(inconsistent: Boolean): List<String> {
         val body = cases(300, inconsistent)
         val want = if (inconsistent) "inconsistent" else "consistent"
@@ -342,10 +348,11 @@ class OntologyTest {
         assertEquals(want, full.getString("consistency"))
         assertEquals("disjunctive", full.getString("tier"))
         val seen = mutableListOf<String>()
-        var f = 0.02
-        while (f < 1.5) {
-            val ms = maxOf(1L, (took * f).toLong())
-            f *= 1.25
+        var answered = 0
+        var deadline = 2.0
+        while (answered < 20 && deadline < 20 * took) {
+            val ms = maxOf(1L, deadline.toLong())
+            deadline += maxOf(1.0, 0.08 * deadline)
             // a dataset of its own, whose read of the ontology takes as long as the full run's
             SparklesDatasets.memory().use { ds ->
                 UpdateAction.parseExecute(body, ds)
@@ -354,6 +361,7 @@ class OntologyTest {
                 } catch (e: org.apache.jena.query.QueryCancelledException) {
                     return@use
                 }
+                answered++
                 assertEquals(full.getNumber("classes"), r.getNumber("classes"))
                 if (!r.getBoolean("partial")) {
                     assertTrue(r.getBoolean("complete"))

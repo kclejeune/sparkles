@@ -375,8 +375,15 @@ def cases(n: int, inconsistent: bool) -> str:
 
 
 def partial_answers(inconsistent: bool) -> list[str]:
-    """Classify the cases under deadlines from a fraction of a full run's time upwards,
-    check every answer and return the consistencies of the partial ones."""
+    """Classify the cases under deadlines that rise by a few percent from a short one until
+    twenty of them are long enough for the read of the ontology, check every answer and
+    return the consistencies of the partial ones.
+
+    The first deadline that gives an answer instead of a timeout has run out in the
+    saturation, since that is the first part of a run that can stop with an answer, and at
+    most a few percent of the read after its start. So the ladder finds the saturation,
+    which lasts some milliseconds, on a loaded machine too, where a ladder fixed from the
+    time of a full run misses it."""
     import time
 
     body = f"{PREFIXES} INSERT DATA {{ {cases(300, inconsistent)} }}"
@@ -390,18 +397,20 @@ def partial_answers(inconsistent: bool) -> list[str]:
     assert (full["consistency"], full["tier"]) == (want, "disjunctive")
     assert full["incomplete"] == [] and full["incompleteCount"] == 0
     seen = []
-    f = 0.02
-    while f < 1.5:
+    answered = 0
+    timeout = 0.002
+    while answered < 20 and timeout < 20 * took:
         # a dataset of its own, whose read of the ontology takes as long as the full run's
         d = sparkles.Dataset()
         d.update(body)
         try:
-            r = d.ontology.classify(partial=True, threads=1, limit=10000, timeout=took * f)
+            r = d.ontology.classify(partial=True, threads=1, limit=10000, timeout=timeout)
         except sparkles.QueryTimeoutError:
             r = None
-        f *= 1.25
+        timeout += max(0.001, 0.08 * timeout)
         if r is None:
             continue
+        answered += 1
         assert r["classes"] == full["classes"]
         if not r["partial"]:
             assert r["complete"] and r["consistency"] == want

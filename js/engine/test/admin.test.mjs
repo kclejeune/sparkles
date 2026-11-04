@@ -31,6 +31,7 @@ import {
   Catalog,
   Repository,
   factory,
+  BudgetExceededError,
   ConflictError,
   InvalidInputError,
   NotFoundError,
@@ -966,8 +967,11 @@ function cases(n, inconsistent) {
     INSERT DATA { ${out.join('\n')} }`;
 }
 
-/** Classify the cases under deadlines from a fraction of a full run's time upwards and return the partial answers' consistencies. */
-async function partialAnswers(t, inconsistent) {
+/**
+ * Classify the cases once in full, and give the full answer, the time of the call and what
+ * a partial answer is checked against.
+ */
+async function wholeRun(t, inconsistent) {
   const body = cases(300, inconsistent);
   // the quickest of three full runs, each on a dataset of its own, so that a loaded
   // machine's slow first run does not push every deadline past the saturation
@@ -986,17 +990,41 @@ async function partialAnswers(t, inconsistent) {
   assert.equal(full.consistency, want);
   assert.equal(full.tier, 'disjunctive');
   assert.deepEqual(full.incomplete, []);
-  // Deadlines from the end of the read of the ontology, which takes most of a run here,
-  // through the classifier's time, a millisecond or more apart.
-  const s = full.stats;
-  const run = s.indexMs + s.saturationMs + s.taxonomyMs;
-  const read = Math.max(0, took - run);
-  const step = Math.max(1, run / 24);
+  return { body, full, took, want };
+}
+
+/** Check an answer to a stopped classification against the full one, and return its consistency when it is partial. */
+function checkAnswer(r, { full, want }) {
+  assert.equal(r.classes, full.classes);
+  if (!r.partial) {
+    assert.equal(r.complete, true);
+    assert.equal(r.consistency, want);
+    return undefined;
+  }
+  assert.equal(r.complete, false, 'a partial answer is presented as complete');
+  assert.equal(r.incompleteCount, r.incomplete.length);
+  assert.ok([want, 'unknown'].includes(r.consistency), r.consistency);
+  if (r.consistency === 'unknown') assert.ok(r.incomplete.length + 2 >= r.classes);
+  return r.consistency;
+}
+
+/**
+ * Classify the cases under deadlines that rise by a few percent from a short one until
+ * twenty of them are long enough for the read of the ontology and the index. The first
+ * deadline that gives an answer instead of a timeout has run out in the saturation, since
+ * that is the first part of a run that can stop with an answer, and at most a few percent
+ * of the read after its start. So the ladder finds the saturation, which lasts some
+ * milliseconds, on a loaded machine too, where a ladder fixed from the time of a full run
+ * misses it. Return the partial answers' consistencies, in the order of the deadlines.
+ */
+async function deadlineAnswers(t, inconsistent) {
+  const whole = await wholeRun(t, inconsistent);
   const seen = [];
-  for (let ms = Math.max(1, Math.floor(read)); ms < read + 1.5 * run + 1; ms += step) {
+  let answered = 0;
+  for (let ms = 2; answered < 20 && ms < 20 * whole.took; ms += Math.max(1, 0.08 * ms)) {
     // a dataset of its own, whose read of the ontology takes as long as the full run's
     const ds = Dataset.memory();
-    await ds.update(body);
+    await ds.update(whole.body);
     let r;
     try {
       r = await ds.ontology.classify({
@@ -1011,24 +1039,67 @@ async function partialAnswers(t, inconsistent) {
     } finally {
       await ds.close();
     }
-    assert.equal(r.classes, full.classes);
-    if (!r.partial) {
-      assert.equal(r.complete, true);
-      assert.equal(r.consistency, want);
+    answered++;
+    const c = checkAnswer(r, whole);
+    if (c) seen.push(c);
+  }
+  return seen;
+}
+
+/**
+ * Classify the cases on one thread under memory budgets from a small part of the full run's
+ * estimate to nearly all of it, which stop the saturation at the same place every time, and
+ * return the partial answers' consistencies. A memory stop answers in part as a deadline
+ * does, and it does not depend on the speed of the machine.
+ */
+async function budgetAnswers(t, inconsistent) {
+  const whole = await wholeRun(t, inconsistent);
+  const estimate = whole.full.stats.estimatedBytes;
+  const seen = [];
+  for (let k = 1; k < 20; k++) {
+    const ds = Dataset.memory();
+    await ds.update(whole.body);
+    let r;
+    try {
+      r = await ds.ontology.classify({
+        partial: true,
+        threads: 1,
+        limit: 10000,
+        maxMemoryBytes: Math.floor((estimate * k) / 20),
+      });
+    } catch (e) {
+      // a budget under the size of the ontology and its index refuses the run
+      if (e instanceof BudgetExceededError) continue;
+      throw e;
+    } finally {
+      await ds.close();
+    }
+    // a budget past the one of the disjunctive rules runs the EL rules instead, whose answer
+    // leaves the disjunctive axioms out, so it is neither complete nor partial
+    if (!r.partial && !r.complete) {
+      assert.ok(r.excludedCount > 0);
       continue;
     }
-    assert.equal(r.complete, false, 'a partial answer is presented as complete');
-    assert.equal(r.incompleteCount, r.incomplete.length);
-    assert.ok([want, 'unknown'].includes(r.consistency), r.consistency);
-    if (r.consistency === 'unknown') assert.ok(r.incomplete.length + 2 >= r.classes);
-    seen.push(r.consistency);
+    const c = checkAnswer(r, whole);
+    if (c) seen.push(c);
   }
   return seen;
 }
 
 test('the ontology handle answers a classification in part under a deadline', async (t) => {
-  assert.ok((await partialAnswers(t, false)).length > 0, 'no deadline gave a partial answer');
-  assert.ok((await partialAnswers(t, true)).includes('unknown'));
+  assert.ok((await deadlineAnswers(t, false)).length > 0, 'no deadline gave a partial answer');
+  // The stop that leaves the consistency unknown comes before the saturation of owl:Thing,
+  // which is the last of it here, so a stop of any kind in most of the saturation gives
+  // it. A budget stops at the same place on every machine, where a deadline lands in the
+  // few milliseconds of the saturation by the clock.
+  const budget = await budgetAnswers(t, true);
+  assert.ok(budget.includes('unknown'), 'no budget left the consistency unknown');
+  assert.ok(
+    (await budgetAnswers(t, false)).length > 0,
+    'no budget gave a partial answer to a consistent ontology',
+  );
+  // the same ontology under deadlines, which check every answer and may meet the unknown
+  await deadlineAnswers(t, true);
   const ds = t.resource(Dataset.memory());
   await ds.update(`PREFIX : <http://ex.org/>
     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
