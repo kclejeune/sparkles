@@ -89,7 +89,10 @@ test.describe('workbench open', () => {
     test(c.name, async ({ browser }, info) => {
       for (let rep = 1; rep <= REPEAT; rep++) {
         await calm();
-        const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+        const ctx = await browser.newContext({
+          bypassCSP: true,
+          viewport: { width: 1440, height: 900 },
+        });
         const page = await ctx.newPage();
         await page.addInitScript(LONGTASK_INIT);
         const cdp = await ctx.newCDPSession(page);
@@ -156,7 +159,10 @@ test.describe('workbench scroll', () => {
     const hub = taxon!.hubs[0].iri;
     for (let rep = 1; rep <= REPEAT; rep++) {
       await calm();
-      const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+      const ctx = await browser.newContext({
+        bypassCSP: true,
+        viewport: { width: 1440, height: 900 },
+      });
       const page = await ctx.newPage();
       await page.addInitScript(LONGTASK_INIT);
       const cdp = await ctx.newCDPSession(page);

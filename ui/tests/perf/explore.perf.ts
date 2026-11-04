@@ -68,7 +68,10 @@ test.describe('explore scale', () => {
     test(`explore-${target}`, async ({ browser }, info) => {
       for (let rep = 1; rep <= REPEAT; rep++) {
         await calm();
-        const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+        const ctx = await browser.newContext({
+          bypassCSP: true,
+          viewport: { width: 1440, height: 900 },
+        });
         const page = await ctx.newPage();
         await page.addInitScript(LONGTASK_INIT);
         const cdp = await ctx.newCDPSession(page);
@@ -113,8 +116,10 @@ test.describe('explore scale', () => {
           // pan and zoom
           const c = (await page.evaluate(GRAPH_CANVAS_JS)) as { x: number; y: number } | null;
           if (c) {
+            r.viewportBefore = await page.evaluate(() => window.__perfHook!.viewport?.());
             const dts = (await page.evaluate(FRAME_STATS_JS(PAN_ZOOM(c.x, c.y), 5000))) as number[];
             r.panZoom = frameSummary(dts);
+            r.viewportAfter = await page.evaluate(() => window.__perfHook!.viewport?.());
           }
           // an idle page: how fast frames come with nothing moving
           r.idle = frameSummary(
@@ -139,7 +144,10 @@ test.describe('explore scale', () => {
   test('explore-fanout-20000', async ({ browser }, info) => {
     for (let rep = 1; rep <= REPEAT; rep++) {
       await calm();
-      const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+      const ctx = await browser.newContext({
+        bypassCSP: true,
+        viewport: { width: 1440, height: 900 },
+      });
       const page = await ctx.newPage();
       await page.addInitScript(LONGTASK_INIT);
       const cdp = await ctx.newCDPSession(page);

@@ -64,6 +64,8 @@ export type PerfHook = {
   expand(id: string): Promise<void>;
   /** The renderer in use, 'cytoscape' or 'webgl'. */
   renderer(): string;
+  /** The camera, to check that the synthetic pan and zoom moved it (optional). */
+  viewport?(): unknown;
 };
 
 /** Installs `window.__perfHook` from the Cytoscape instance, when the page has not set one. */
@@ -89,6 +91,7 @@ export const INSTALL_HOOK_JS = `(() => {
       });
     },
     renderer: () => 'cytoscape',
+    viewport: () => ({ pan: cy.pan(), zoom: cy.zoom() }),
   };
   return true;
 })()`;
