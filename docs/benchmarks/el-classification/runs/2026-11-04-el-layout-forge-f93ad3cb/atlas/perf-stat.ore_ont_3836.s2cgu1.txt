@@ -1,0 +1,7 @@
+# started on Tue Nov  3 21:25:05 2026
+
+46926418616,,cpu_core/instructions/u,3595099776,100.00,,
+13574171033,,cpu_core/cycles/u,3595099776,100.00,,
+1401674,,cpu_core/L1-icache-load-misses/u,3595099776,100.00,,
+93842,,cpu_core/iTLB-load-misses/u,3595099776,100.00,,
+37213668,,cpu_core/branch-misses/u,3595099776,100.00,,

@@ -157,8 +157,8 @@ case with Jena 6 fails before loading the dataset.
 
 ## Release build settings
 
-Release builds compile `sparkles-core` as one codegen unit and every other crate with
-four. With four units for the engine crate, the split of its functions across units moved
+Release builds compile `sparkles-core` and `sparkles-owl` as one codegen unit each and
+every other crate with four. With four units for the engine crate, the split of its functions across units moved
 with unrelated changes elsewhere in the crate, and so did the inlining of hot query loops.
 A change that touched only SERVICE code once added 4.5% to the instructions per request of
 `expr-order-key`. One unit gives `expr-order-key` 6.4% fewer instructions per request on
@@ -186,6 +186,17 @@ A Namespace screen could not decide this setting. Its geometric mean was 0.997 f
 time, with queries under 2 ms moving 9% to 32% in both directions, so the pinned check on
 forge decided it. A release rebuild after a change to `sparkles-core` takes about 35
 seconds longer, 2m37s instead of 2m02s on atlas with six jobs.
+
+`sparkles-owl` has one unit for the same reason. With four, the time of the classifier's
+index stage moved by up to 7% with changes elsewhere in the crate that EL runs never
+reach. One unit, with a saturation worker for each rule set, classifies `ore_ont_3836`
+2.8% faster and `ore_ont_13482` 3.8% faster on one thread on forge, ChEBI lite 1.9% and
+GO within 1%, and runs 3.8% fewer instructions on `ore_ont_3836`. The crate compiles in
+25 to 27 s instead of 9 to 12 s on atlas. A release build of `sparkles-server` after a
+change to the crate took the same time, 713.5 s against 711.7 s, since its dependents start
+from its metadata, while a build of the `el_classify` example takes about 46 s instead of
+21 s. The [EL classification results](benchmarks/el-classification/RESULTS.md#code-layout)
+have the measurements.
 
 ## Benchmark scripts
 

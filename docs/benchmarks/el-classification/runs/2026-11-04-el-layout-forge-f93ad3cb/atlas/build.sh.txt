@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# build.sh LABEL REV [CGU]: builds el_classify of REV in a worktree ~/lanes/el-cost/wt/LABEL on
+# atlas, with sparkles-owl in CGU codegen units when CGU is given, and copies it to
+# ~/lanes/el-cost/bin/LABEL. Holds the heavy lock and runs in a capped scope.
+set -euo pipefail
+LABEL=$1 REV=$2 CGU=${3:-}
+E=~/lanes/el-cost
+cd $E/repo
+mkdir -p $E/wt $E/bin $E/logs
+W=$E/wt/$LABEL
+if [ ! -d "$W" ]; then git worktree add -q --detach "$W" "$REV"; else git -C "$W" checkout -q -- Cargo.toml; git -C "$W" checkout -q --detach "$REV"; fi
+cd "$W"
+if [ -n "$CGU" ]; then
+  printf '\n[profile.release.package.sparkles-owl]\ncodegen-units = %s\n' "$CGU" >> Cargo.toml
+fi
+exec 8> "$HOME/lanes/.heavy.lock"
+flock 8
+start=$(date +%s)
+systemd-run --user --scope --quiet -p MemoryMax=13G -p MemorySwapMax=2G -p OOMPolicy=continue \
+  mbx build --release -p sparkles-owl --example el_classify
+end=$(date +%s)
+cp target/release/examples/el_classify $E/bin/$LABEL
+echo "$LABEL $REV cgu=${CGU:-default} secs=$((end-start)) sha=$(sha256sum $E/bin/$LABEL | cut -c1-16)" | tee -a $E/logs/builds.txt

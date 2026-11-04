@@ -1,0 +1,9 @@
+base aa1b45024 cgu=default secs=27 sha=3add7669dad33041
+cgu1 aa1b45024 cgu=1 secs=48 sha=f63ae7039a23a9fe
+r715 3bc10115 cgu=default secs=19 sha=e6994dd610b98c8a
+r711 3acec7c2 cgu=default secs=21 sha=ae4faa9280cfa99b
+s1 s1 cgu=default secs=22 sha=cef325aff190696e
+s1cgu1 s1 cgu=1 secs=48 sha=8ebea675c41791cc
+s2 s2 cgu=default secs=20 sha=efea2a9242443af2
+s2cgu1 s2 cgu=1 secs=46 sha=77753421dc93d93e
+s2cgu2 s2 cgu=2 secs=45 sha=c104aa7f595b3498

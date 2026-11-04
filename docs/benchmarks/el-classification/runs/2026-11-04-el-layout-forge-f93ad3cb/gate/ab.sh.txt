@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# ab.sh DIR ROUNDS "FILES" "SIDES" [LOCKS]: interleaved el_classify runs of each side
+# (DIR/bin/SIDE) on each file (DIR/data/FILE) on THREADS (default "1 8"), REPEAT (default 5)
+# classifications per process, the order of the sides rotating each round. JSON lines to
+# DIR/out-STAMP/runs.jsonl with the taxonomies' hashes. Holds the heavy lock, and the
+# bench lock too when LOCKS=bench. PIN1 pins one-thread runs to that CPU. Runs no other
+# reasoner.
+set -euo pipefail
+D=$1 R=$2 FILES=$3 SIDES=($4) LOCKS=${5:-heavy}
+cd "$D"
+exec 8> "$HOME/lanes/.heavy.lock"
+if [ "$LOCKS" = bench ]; then exec 9> "$HOME/lanes/.bench.lock"; flock 9; fi
+flock 8
+OUT=out-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT"
+{
+  echo "host=$(hostname)"
+  echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')"
+  echo "cpus=$(nproc)"
+  echo "kernel=$(uname -r)"
+  for s in "${SIDES[@]}"; do echo "binary_sha256 $s=$(sha256sum "bin/$s" | cut -d' ' -f1)"; done
+  for f in $FILES; do echo "data_sha256 $f=$(sha256sum "data/$f" | cut -d' ' -f1)"; done
+  echo "rounds=$R threads=${THREADS:-1 8} repeat=${REPEAT:-5} pin1=${PIN1:-none}"
+  echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)"
+} > "$OUT/env.txt"
+cp "$0" "$OUT/ab.sh.txt"
+n=${#SIDES[@]}
+for round in $(seq 1 "$R"); do
+  for f in $FILES; do
+    b=$(basename "${f%.*}")
+    for t in ${THREADS:-1 8}; do
+      for k in $(seq 0 $((n - 1))); do
+        side=${SIDES[$(( (k + round) % n ))]}
+        pin=(); if [ $t = 1 ] && [ -n "${PIN1:-}" ]; then pin=(taskset -c "$PIN1"); fi
+        systemd-run --user --scope --quiet -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+          "${pin[@]}" "bin/$side" --threads $t --repeat ${REPEAT:-5} --taxonomy "$OUT/$b.$side.t$t.txt" "data/$f" 2>> "$OUT/err.txt" |
+          python3 -c "import json,sys; r=json.load(sys.stdin); r.update(side='$side', round=$round, file='$b', threads=$t); print(json.dumps(r))" \
+          >> "$OUT/runs.jsonl" ||
+          echo "{\"side\":\"$side\",\"file\":\"$b\",\"threads\":$t,\"round\":$round,\"failed\":true}" >> "$OUT/runs.jsonl"
+      done
+    done
+  done
+done
+echo "ended=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$OUT/env.txt"
+(cd "$OUT" && for x in *.t*.txt; do printf '%s  %s\n' "$(sort "$x" | sha256sum | cut -d' ' -f1)" "$x"; done) > "$OUT/taxonomy.sha256"
+rm -f "$OUT"/*.t1.txt "$OUT"/*.t8.txt "$OUT"/*.t4.txt
+echo "AB-DONE $OUT"

@@ -1,0 +1,2 @@
+base 1 711.7 sparkles-owl=12.0 sparkles-server=0.2 sparkles-server=0.0 sparkles-core=241.7 sparkles-reasoner=12.0 sparkles-server=388.7
+cgu1 1 713.5 sparkles-owl=27.1 sparkles-server=0.2 sparkles-server=0.0 sparkles-core=242.2 sparkles-reasoner=12.0 sparkles-server=386.1

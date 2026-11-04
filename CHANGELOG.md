@@ -335,6 +335,14 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+Release builds compile `sparkles-owl` as one codegen unit, and each rule set of the EL
+classifier's saturation has a worker that inlines its own activation (roadmap items 711
+and 715). Code that EL runs never reach no longer moves their time. On one thread on
+forge `ore_ont_3836` classifies in 0.97 of the time of the build before, `ore_ont_13482`
+in 0.96, ChEBI lite in 0.98 and GO in 0.99, with the same taxonomies. The crate takes 25
+to 27 s to compile in a release build instead of 9 to 12 s on atlas, and a release build
+of the server takes the same time, since its dependents start from the crate's metadata.
+
 The planner estimates more joins from statistics of how predicates occur together (spec
 X15, roadmap item 454). A bulk load or compaction keeps 32,768 subject characteristic sets
 instead of 10,000 and counts the subjects outside them as a remainder, so a star whose

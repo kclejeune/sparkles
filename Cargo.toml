@@ -123,11 +123,11 @@ codegen-units = 1
 
 # The OWL crate is compiled as one codegen unit for the same reason. With four, the time of
 # the classifier's index stage moved by up to 7% with changes elsewhere in the crate that it
-# never runs (roadmap item 711). One unit classifies ore_ont_3836 2.7% faster on one thread
-# on forge, ore_ont_13482 4.1% and ChEBI lite 1.7%, with each rule set's saturation worker
-# inlining its own activation. A release rebuild after a change to the crate takes about
-# BUILD-TIME-TBD longer on atlas. docs/benchmarks/el-classification/RESULTS.md records the
-# measurements.
+# never runs (roadmap item 711). One unit, with each rule set's saturation worker inlining
+# its own activation, classifies ore_ont_3836 2.8% faster on one thread on forge,
+# ore_ont_13482 3.8% and ChEBI lite 1.9%. The crate compiles in 25 to 27 s instead of 9 to
+# 12 s on atlas, which a release build of the server does not wait for, since its
+# dependents start from its metadata. docs/BENCHMARKING.md records the measurements.
 [profile.release.package.sparkles-owl]
 codegen-units = 1
 

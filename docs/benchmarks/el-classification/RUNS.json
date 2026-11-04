@@ -869,6 +869,148 @@
     }
    },
    "metadata_note": "A manual measurement record of the Horn rules after item 693 against the base's Horn rules and the base's EL rules on GO, ChEBI lite and seven files of the ORE 2015 sample on the benchmark host. Read the method with each time."
+  },
+  {
+   "run_id": "sha256-975f73f8b2184383717b760212650d84790f06cc18c511069a2df720765cdbe9",
+   "path": "runs/2026-11-04-el-layout-forge-f93ad3cb/record.json",
+   "sha256": "975f73f8b2184383717b760212650d84790f06cc18c511069a2df720765cdbe9",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26, ChEBI lite 256, ore_ont_3836 and 13482 of the ORE 2015 EL sample, and the 12 small ORE 2015 DL files of roadmap item 709",
+    "manifest": {
+     "commit": "f93ad3cb",
+     "base_commit": "aa1b4502",
+     "reference_commits": {
+      "r711": "3acec7c2",
+      "r715": "3bc10115"
+     },
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": {
+      "base": "3add7669dad3304164b81381775a659c7a2cd8dbcc82dee3f43288a83e0f7669",
+      "lane1": "b4ab0ec7a8015f20d282ed37f2752271e9d8f4cb2557d5c8474efc0fa8da1473",
+      "r711": "ae4faa9280cfa99b732b198347f045cb4413b3f5a2ae738043c0a2202b9fd380",
+      "r715": "e6994dd610b98c8a15b2df0f0357b37986c3f71cb42e446bf7da6e825c95e3a7",
+      "cgu1": "f63ae7039a23a9fe710974b2686a0afd3698d5c1743c8d93279c6ee2fb485fb9",
+      "s2cgu1": "77753421dc93d93e60bf79ddf1e9c078280f4d797f8cd5d13b27066a6b0b641f",
+      "s2": "efea2a9242443af2f4acd343314187f41c9ba6f6743b3e286830cbd37e0ea360",
+      "s2cgu2": "c104aa7f595b34985d6d121c8c684c94dc6e98361545b4a3cfb2dc73e4aebdb3"
+     },
+     "build": "mbx build --release -p sparkles-owl --example el_classify. The lane binary lane1 was built on stanley from the tree of f93ad3cb before its Cargo.toml comment was final. The others were built on atlas by atlas/build.sh.txt, with the codegen units of sparkles-owl appended to Cargo.toml for the cgu sides. lane1 and s2cgu1 come from the same code and place every function of the saturation at the same address.",
+     "sides": {
+      "base": "aa1b4502, four codegen units",
+      "lane1": "the lane, f93ad3cb: a worker per rule set and one codegen unit",
+      "r711": "3acec7c2, before chain selection",
+      "r715": "3bc10115, before the disjunctive rules",
+      "cgu1": "aa1b4502 with one codegen unit",
+      "s2": "the lane's worker per rule set with four codegen units",
+      "s2cgu1": "the lane's code with one codegen unit, built on atlas",
+      "s2cgu2": "the lane's code with two codegen units"
+     },
+     "data": {
+      "go": {
+       "sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+      },
+      "chebi_lite": {
+       "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+      },
+      "ore_ont_3836": {
+       "sha256": "fc559045f566b2837188505b707480dc3416b3e699c5188632fa5be3d4cf2473"
+      },
+      "ore_ont_13482": {
+       "sha256": "f732cc7d4ebdb45099e421d062e05d64837b22e60b53d6848a723aa8f0e8d971"
+      },
+      "ore_ont_13581": {
+       "sha256": "f58d3c11abfbf7e58219d7a0bbe23f2136cf071eaadb6a31c74ad958a01d44ae"
+      },
+      "ore_ont_1445": {
+       "sha256": "93a5b8189d20fbc691b63ea693425f87c4e864d685aa3882e744890e776e745d"
+      },
+      "ore_ont_2775": {
+       "sha256": "674f05d2420e700cc49d3bc0842c3c11083a7cd785bdfe5c348f8ea3fc08cd33"
+      },
+      "ore_ont_3231": {
+       "sha256": "f8e63362c7c7448362bd701bd170478da239b3cdc334d8c1436c7b3d1aff4304"
+      },
+      "ore_ont_5564": {
+       "sha256": "2ed733ac71f6991f9e4fce403a57982ecb4af83021dd0387ae053cb20f78ce63"
+      },
+      "ore_ont_5940": {
+       "sha256": "e0911595e0782a559889d8ac62cc5a8f6f69219eb8dd58bff4bb27bd1f0c856e"
+      },
+      "ore_ont_6855": {
+       "sha256": "2a3ebab8ec0e933f1e261d26740fdfc9e042156c6250007515452dbeed8fb9ec"
+      },
+      "ore_ont_7584": {
+       "sha256": "623acf0024da64fea4ffdcf76a0265d10b703b106a967782fa614537894ee57d"
+      },
+      "ore_ont_7663": {
+       "sha256": "228b6e6ad34a8e35de85fab21da4940810b6ca2ccd61eb6712f4974f478836d0"
+      },
+      "ore_ont_8203": {
+       "sha256": "391049dc638f182392bb69bbe05cf09470b94079c0d6b4c07214dd9f35793769"
+      },
+      "ore_ont_8273": {
+       "sha256": "10c15bd019500abd57d05b6277428ff113e81645da7ad4c10a116fe9ac6b5be4"
+      },
+      "ore_ont_9096": {
+       "sha256": "d5c9f1a970bb5faad25fe379415f74a2e7e62a288a96071e1f353e721a9cb207"
+      }
+     }
+    },
+    "settings": {
+     "repeat": 5,
+     "parts": {
+      "gate": {
+       "rounds": 5,
+       "threads": [
+        1,
+        8
+       ],
+       "pin1": "none",
+       "pinn": "none"
+      },
+      "screen": {
+       "rounds": 3,
+       "threads": [
+        1,
+        8
+       ],
+       "pin1": "none",
+       "pinn": "none"
+      },
+      "pinned-t8": {
+       "rounds": 6,
+       "threads": [
+        8
+       ],
+       "pin1": "none",
+       "pinn": "0-11"
+      },
+      "pinned-t1-cgu2": {
+       "rounds": 4,
+       "threads": [
+        1
+       ],
+       "pin1": "4",
+       "pinn": "none"
+      }
+     }
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "forge",
+      "cpu": "13th",
+      "cpus": 20,
+      "ram_mib": 15620,
+      "kernel": "7.2.9"
+     },
+     "method": "Each part's ab.sh.txt held the bench and heavy locks and ran one el_classify process per side, file and thread count with --repeat 5, in an order of the sides that rotates each round. Each round's value is the process's median classification time. gate: Five rounds of the base and the lane, unpinned, on one and eight threads, as the earlier records of this suite ran. screen: Three rounds of the base, the two reference commits, the base with one codegen unit and the lane's code built on atlas, unpinned. pinned-t8: Six rounds on eight threads with each process pinned to the performance cores 0 to 11, which removes the placement of threads on the efficiency cores from the spread. pinned-t1-cgu2: Four rounds on one thread pinned to CPU 4, of the base, the lane and the lane's code with two codegen units.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual measurement record of the code layout of items 711 and 715 on the benchmark host: the gate, a screen with reference builds, pinned eight-thread rounds and pinned two-unit rounds, with build times and instruction counts from atlas."
   }
  ]
 }
