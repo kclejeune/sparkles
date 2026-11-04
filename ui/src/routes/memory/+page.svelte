@@ -246,7 +246,7 @@
       <PageSearch
         bind:value={text}
         label="Search memory"
-        placeholder="Search what agents remember, such as payments team"
+        placeholder="Search what agents remember"
         busy={searching}
         onsubmit={() => void search()}
       />
