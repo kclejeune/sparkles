@@ -211,11 +211,10 @@
   }
   .row :global(.icon) {
     flex: none;
-    transform: rotate(-90deg);
     color: var(--text-3);
   }
   li.open .row :global(.icon) {
-    transform: none;
+    transform: rotate(90deg);
   }
   .msg {
     flex: 1 1 auto;

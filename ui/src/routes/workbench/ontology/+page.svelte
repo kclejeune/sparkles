@@ -18,7 +18,7 @@
   import { fmtInt } from '$lib/format';
   import { fetchHierarchy, type TreeKind, type TreeNode } from '$lib/browse';
   import { searchEntities } from '$lib/entity-search';
-  import { filteredTree, LEVEL_LIMIT, LevelTree } from '$lib/level-tree.svelte';
+  import { filteredTree, LEVEL_LIMIT, LevelTree, scrollToRow } from '$lib/level-tree.svelte';
   import { useCommands, usePageSearch, useProvider } from '$lib/launcher.svelte';
   import { branchProvider } from '$lib/palette.svelte';
   import {
@@ -393,8 +393,8 @@
     untrack(() => {
       void lt.reveal(iri).then((anc) => {
         const cur = openSet(k);
-        if (anc.every((a) => cur.has(a))) return;
-        opened = { ...opened, [k]: new Set([...cur, ...anc]) };
+        if (!anc.every((a) => cur.has(a))) opened = { ...opened, [k]: new Set([...cur, ...anc]) };
+        scrollToRow(iri);
       });
     });
   });
@@ -1021,8 +1021,10 @@
     </p>
   {:else if !canWrite && name}
     <p class="notice" role="status">
-      <strong>Read-only.</strong> You can read {name} but not edit it, so the editing controls are hidden.
-      The tree, DL Query, the header and the history still read.
+      <span
+        ><strong>Read-only.</strong> You can read {name} but not edit it, so the editing controls are
+        hidden. The tree, DL Query, the header and the history still read.</span
+      >
     </p>
   {/if}
   {#if loadError}

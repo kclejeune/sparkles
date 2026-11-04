@@ -86,6 +86,7 @@
   import SkosLabels from '$components/SkosLabels.svelte';
   import SkosLinks from '$components/SkosLinks.svelte';
   import EditorHistory from '$components/EditorHistory.svelte';
+  import { scrollToRow } from '$lib/level-tree.svelte';
   import { routes, THESAURUS_TABS, type ThesaurusTab } from '$lib/routes';
 
   const TAB_LABEL: [ThesaurusTab, string][] = [
@@ -327,6 +328,7 @@
       );
       await loadChildren(anc);
       opened = new Set([...opened, ...anc]);
+      scrollToRow(iri);
     } catch {
       /* the tree stays as it is */
     }
@@ -983,8 +985,10 @@
     </p>
   {:else if !canWrite && name}
     <p class="notice" role="status">
-      <strong>Read-only.</strong> You can read {name} but not edit it, so the editing controls are hidden.
-      The tree, the history and the validation report still read.
+      <span
+        ><strong>Read-only.</strong> You can read {name} but not edit it, so the editing controls are
+        hidden. The tree, the history and the validation report still read.</span
+      >
     </p>
   {:else if noHead && name}
     <p class="notice" role="status">

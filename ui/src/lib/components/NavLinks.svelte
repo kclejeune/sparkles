@@ -231,12 +231,12 @@
     color: var(--text-3);
     cursor: pointer;
   }
+  /* the chevron points right while the group is closed and down while it is open */
   .chev :global(.icon) {
-    transform: rotate(-90deg);
     transition: transform 0.12s;
   }
   .chev[aria-expanded='true'] :global(.icon) {
-    transform: none;
+    transform: rotate(90deg);
   }
   .chev:hover {
     background: var(--hover);

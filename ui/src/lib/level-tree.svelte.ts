@@ -126,3 +126,16 @@ export function filteredTree(answers: Hierarchy[]): Tree {
   }
   return buildTree(nodes, edges);
 }
+
+/**
+ * Scrolls the row of `iri` in a tree into view once the tree has drawn it, so a selection
+ * that arrives by link shows in its tree as well as in the detail panel.
+ */
+export function scrollToRow(iri: string, tries = 10) {
+  if (typeof document === 'undefined') return;
+  const row = document.querySelector<HTMLElement>(
+    `[role="tree"] li[data-id="${CSS.escape(iri)}"] > .node`,
+  );
+  if (row) row.scrollIntoView({ block: 'nearest' });
+  else if (tries > 0) requestAnimationFrame(() => scrollToRow(iri, tries - 1));
+}
