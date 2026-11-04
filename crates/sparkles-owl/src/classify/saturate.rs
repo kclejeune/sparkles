@@ -1091,7 +1091,7 @@ impl<'a> Run<'a> {
     /// one (roadmap item 709).
     fn workers<R: Rules>(&self, threads: usize) {
         if threads == 1 {
-            self.worker::<R, false>(None);
+            self.worker::<R>(None);
             return;
         }
         std::thread::scope(|s| {
@@ -1100,10 +1100,10 @@ impl<'a> Run<'a> {
                 // before they start
                 self.pending.fetch_add(threads - 1, Ordering::SeqCst);
                 for _ in 1..threads {
-                    s.spawn(|| self.worker::<R, false>(None));
+                    s.spawn(|| self.worker::<R>(None));
                 }
             };
-            self.worker::<R, true>(Some(&start));
+            self.worker::<R>(Some(&start));
         });
     }
 
@@ -1112,18 +1112,13 @@ impl<'a> Run<'a> {
     /// before it takes more roots. A context that many others send to, such as a class
     /// that fills many existential restrictions, then takes the conclusions of a round
     /// in one activation rather than one at a time.
-    fn worker<R: Rules, const LAZY: bool>(&self, mut others: Option<&dyn Fn()>) {
-        if LAZY
-            && self.roots.len() >= EAGER_ROOTS
+    fn worker<R: Rules>(&self, mut others: Option<&dyn Fn()>) {
+        if self.roots.len() >= EAGER_ROOTS
             && let Some(start) = others.take()
         {
             start();
         }
-        let began = if LAZY {
-            others.map(|_| Instant::now())
-        } else {
-            None
-        };
+        let began = others.map(|_| Instant::now());
         let mut activations = 0u32;
         let mut mine: VecDeque<Ex> = VecDeque::new();
         let mut chunk: Vec<Ex> = Vec::new();
@@ -1192,7 +1187,7 @@ impl<'a> Run<'a> {
                 return;
             }
             self.process::<R>(next, &mut mine, &mut tally, &mut local, &mut outbox);
-            if LAZY && let Some(start) = others {
+            if let Some(start) = others {
                 activations += 1;
                 if activations.is_multiple_of(LAZY_EVERY)
                     && began.is_some_and(|b| b.elapsed() >= LAZY_START)
