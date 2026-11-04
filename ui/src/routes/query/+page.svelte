@@ -6,6 +6,7 @@
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { useCommands, useProvider } from '$lib/launcher.svelte';
+  import { askThread, useAskContext } from '$lib/ask-thread.svelte';
   import { branchProvider } from '$lib/palette.svelte';
   import { auth } from '$lib/auth.svelte';
   import { branchOption, branchParam, MAIN, onBranch, onBranchLabel } from '$lib/branches';
@@ -64,7 +65,6 @@
   import PatternPane, { type CountAnswer } from '$components/PatternPane.svelte';
   import { SchemaSource, type SchemaApi } from '$lib/pattern-schema';
   import QuestionHeader from '$components/QuestionHeader.svelte';
-  import AskBar from '$components/AskBar.svelte';
   import AnswerSummary from '$components/AnswerSummary.svelte';
   import GlobalAnswer from '$components/GlobalAnswer.svelte';
   import {
@@ -840,26 +840,20 @@
     askPrefs = loadAskPrefs(who);
   });
   $effect(() => {
-    const p = { mode: askPrefs.mode, summaryCollapsed: askPrefs.summaryCollapsed };
-    untrack(() => saveAskPrefs(prefsFor, p));
+    // the run mode is the Ask thread's, which saves it
+    const collapsed = askPrefs.summaryCollapsed;
+    untrack(() =>
+      saveAskPrefs(prefsFor, { ...loadAskPrefs(prefsFor), summaryCollapsed: collapsed }),
+    );
   });
 
-  let askText = $state('');
-  /** New question was pressed: the next ask carries no earlier turns. */
-  let fresh = $state(false);
   /** The ask in progress: its tab, the step the server is on, and Stop. */
   let asking = $state<{ tabId: string; step: string; controller: AbortController } | null>(null);
-  const askContext = $derived(fresh ? [] : followUpContext(active.ask, active.query));
-  let askBar: AskBar | undefined = $state();
   /** The row under the pointer and the row a citation chose (0-based). */
   let hoverRow = $state<number | null>(null);
   let highlight = $state<{ row: number } | null>(null);
 
-  /**
-   * Ask the server. Without `tabId` the answer opens in a new tab. With it the tab is
-   * asked again, for a clarification, Try harder or Summarize again.
-   */
-  async function ask(o: {
+  type AskOpts = {
     question: string;
     tabId?: string;
     context?: Turn[];
@@ -869,16 +863,43 @@
     run?: boolean;
     /** answer from the data or from community reports (C22 §2.4) */
     mode?: askApi.AskMode;
-  }) {
+  };
+
+  /** What an ask carries from this page: its state, branch, reasoning and row limit. */
+  function askExtras(): Partial<askApi.AskRequest> | null {
     const name = ds;
-    if (!name) return;
+    if (!name) return null;
     let at: string | undefined;
     try {
       at = normalizeAt(app.queryAt) ?? undefined;
     } catch (e) {
       toasts.push('error', 'Invalid At', (e as Error).message);
-      return;
+      return null;
     }
+    const reasoning = reasoningFor(name);
+    return {
+      ...(at ? { at } : {}),
+      ...(branch ? { branch } : {}),
+      ...(reasoning != null ? { reasoning } : {}),
+      maxRows: limit,
+    };
+  }
+
+  /**
+   * The tab an ask fills as its events arrive: without `tabId` a new tab, with it the tab
+   * asked again, for a clarification, Try harder or Summarize again. `end` keeps the
+   * question in this browser's Asked list when the server keeps no history.
+   */
+  function beginTab(o: AskOpts & { run: boolean; controller: AbortController }) {
+    const name = ds;
+    if (!name) return null;
+    const at = (() => {
+      try {
+        return normalizeAt(app.queryAt) ?? undefined;
+      } catch {
+        return undefined;
+      }
+    })();
     asking?.controller.abort();
     let tabId = o.tabId;
     const context = o.context ?? [];
@@ -887,7 +908,7 @@
       tabId = activeId;
     }
     const tab = tabs.find((t) => t.id === tabId);
-    if (!tab) return;
+    if (!tab) return null;
     tab.ask = {
       question: o.question,
       original: o.query ?? tab.ask?.original ?? '',
@@ -898,17 +919,17 @@
       delete outcomes[tabId];
       delete lastShown[tabId];
     }
-    const run = o.run ?? askPrefs.mode === 'run';
+    const run = o.run;
     const summary = !!assistant?.summary;
-    const controller = new AbortController();
-    asking = { tabId, step: FIRST_STEP, controller };
+    asking = { tabId, step: FIRST_STEP, controller: o.controller };
     // the state proxy, so that a later ask can tell it is no longer this one
     const mine = asking;
     const owns = claim(tabId);
     let diagnosis: askApi.Diagnosis | undefined;
     const started = performance.now();
     const reasoning = reasoningFor(name);
-    const t = () => tabs.find((x) => x.id === tabId);
+    const id = tabId;
+    const t = () => tabs.find((x) => x.id === id);
     const q = () => t()?.ask;
     const setText = (text: string | undefined) => {
       const cur = t();
@@ -943,7 +964,7 @@
           if (r.results && owns()) {
             const res = r.results;
             const cols = graphColumns(r.graph, res.vars ?? []);
-            outcomes[tabId!] = {
+            outcomes[id] = {
               status: 'done',
               ds: name,
               branch,
@@ -957,9 +978,9 @@
             if (cols) gCols = cols;
             else autoPickColumns(res);
             if (isEmptyResult(res)) {
-              if (diagnosis) outcomes[tabId!].diagnosis = { state: 'done', d: diagnosis };
+              if (diagnosis) outcomes[id].diagnosis = { state: 'done', d: diagnosis };
               else if (r.query)
-                void diagnose(tabId!, started, onBranch(name, branch), r.query, at, reasoning);
+                void diagnose(id, started, onBranch(name, branch), r.query, at, reasoning);
             }
           }
           break;
@@ -992,6 +1013,36 @@
           break;
       }
     };
+    const end = (e?: unknown) => {
+      const a = q();
+      if (e && a && !(e instanceof DOMException && e.name === 'AbortError')) {
+        const err = e instanceof api.ApiError ? e : null;
+        a.failure = askFailure(
+          err?.code ?? '',
+          err?.message ?? api.errorMessage(e),
+          typeof err?.body?.resetAt === 'string' ? err.body.resetAt : undefined,
+        );
+      }
+      if (asking === mine) asking = null;
+      const cur = t();
+      // the server keeps the question when the dataset has a history, else this browser does
+      if (a && cur?.query.trim() && !a.clarify && !assistant?.historyDays)
+        remember(name, a, cur.query);
+    };
+    return { on, end };
+  }
+
+  /** Ask the server again for a tab: a clarification, Try harder, another source or Summarize again. */
+  async function ask(o: AskOpts) {
+    const name = ds;
+    const extras = askExtras();
+    if (!name || !extras) return;
+    const controller = new AbortController();
+    const run = o.run ?? askThread.mode === 'run';
+    const sink = beginTab({ ...o, run, controller });
+    if (!sink) return;
+    const context = o.context ?? [];
+    let error: unknown;
     try {
       await askApi.askStream(
         name,
@@ -1002,51 +1053,79 @@
           ...(o.tryHarder ? { tryHarder: o.tryHarder } : {}),
           ...(o.query ? { query: o.query } : {}),
           ...(o.mode ? { mode: o.mode } : {}),
-          ...(at ? { at } : {}),
-          ...(branch ? { branch } : {}),
-          ...(reasoning != null ? { reasoning } : {}),
+          ...extras,
           run,
-          maxRows: limit,
         },
-        on,
+        sink.on,
         controller.signal,
       );
     } catch (e) {
-      const a = q();
-      if (a && !(e instanceof DOMException && e.name === 'AbortError')) {
-        const err = e instanceof api.ApiError ? e : null;
-        a.failure = askFailure(
-          err?.code ?? '',
-          err?.message ?? api.errorMessage(e),
-          typeof err?.body?.resetAt === 'string' ? err.body.resetAt : undefined,
-        );
-      }
+      error = e;
     } finally {
-      if (asking === mine) asking = null;
+      sink.end(error);
     }
-    const a = q();
-    const cur = t();
-    // the server keeps the question when the dataset has a history, else this browser does
-    if (a && cur?.query.trim() && !a.clarify && !assistant?.historyDays)
-      remember(name, a, cur.query);
   }
 
-  function askQuestion() {
-    const question = askText.trim();
-    if (!question) return;
-    const context = fresh ? [] : followUpContext(active.ask, active.query);
-    fresh = false;
-    void ask({ question, context });
-  }
+  // The Ask thread docked beside the editor: each question it asks opens in a tab as the
+  // Ask bar's did, and Open in Query and Save as query land here (C18 §6.2).
+  onMount(() =>
+    askThread.attach({
+      extras: () => askExtras(),
+      begin: (o) =>
+        beginTab({
+          question: o.question,
+          context: o.context,
+          run: o.run,
+          controller: o.controller,
+        }),
+      open: (o) => openTurn(o),
+    }),
+  );
+  useAskContext(() =>
+    active.query.trim() && active.query !== DEFAULT_QUERY && kind !== 'UPDATE'
+      ? {
+          kind: 'query',
+          label: 'the query in this tab',
+          question: active.ask?.question,
+          query: active.query,
+        }
+      : null,
+  );
 
-  function newQuestion() {
-    fresh = true;
-    askText = '';
-    askBar?.focus();
-  }
-
-  function stopAsk() {
-    asking?.controller.abort();
+  /** A turn of the thread opened in a new tab, with its question, its rows when it has them, or its Save as example dialog. */
+  function openTurn(o: {
+    query: string;
+    question: TabQuestion;
+    save: boolean;
+    result?: api.SparklesResult;
+  }) {
+    if (o.save) {
+      void openSaveExample({
+        question: o.question.question ?? '',
+        query: o.query,
+        explanation: o.question.explanation,
+      });
+      return;
+    }
+    addTab(o.query, questionTitle(o.question.question ?? 'Question'));
+    active.ask = o.question;
+    const name = ds;
+    if (o.result && name) {
+      const cols = graphColumns(o.question.graph, o.result.vars ?? []);
+      outcomes[activeId] = {
+        status: 'done',
+        ds: name,
+        branch,
+        kind: o.result.queryType,
+        result: o.result,
+        view: cols ? 'graph' : defaultView(o.result),
+        startedAt: performance.now(),
+        elapsed: 0,
+        reasoning: reasoningFor(name),
+      };
+      if (cols) gCols = cols;
+      else autoPickColumns(o.result);
+    }
   }
 
   /** Answer a clarification: the same tab asks again with the choice. */
@@ -2580,11 +2659,16 @@
   onMount(() => {
     webglOk = hasWebGL2();
     if (app.pendingQuery) {
-      const { query, title, question, ask: text } = app.pendingQuery;
+      const { query, title, question, ask: text, saveExample: saveFlag } = app.pendingQuery;
       app.pendingQuery = null;
       if (text) {
-        askText = text;
-        queueMicrotask(() => askBar?.focus());
+        askThread.show(text);
+      } else if (saveFlag && question) {
+        void openSaveExample({
+          question: question.question ?? '',
+          query,
+          explanation: question.explanation,
+        });
       } else {
         addTab(query, title);
         if (question) active.ask = question;
@@ -2662,22 +2746,6 @@
 
 <h1 class="sr-only">Query</h1>
 <div class="page" style:--editor-h="{editorH}px">
-  <!-- the Ask bar, when the dataset has an assistant -->
-  <div class="askbar-slot">
-    {#if canAsk}
-      <AskBar
-        bind:this={askBar}
-        bind:value={askText}
-        bind:mode={askPrefs.mode}
-        model={draftModel}
-        step={asking?.step ?? null}
-        context={askContext}
-        onask={askQuestion}
-        onstop={stopAsk}
-        onnew={newQuestion}
-      />
-    {/if}
-  </div>
   <!-- query tabs -->
   <div class="qtabs" role="tablist" aria-label="Query tabs">
     {#each tabs as t (t.id)}
@@ -3046,6 +3114,17 @@
         </div>
       </div>
       <div class="toolbar-end">
+        {#if canAsk}
+          <button
+            class="btn sm"
+            aria-pressed={askThread.open}
+            title="Ask a question beside the editor (Shift+A)"
+            onclick={() => (askThread.open ? askThread.close() : askThread.show())}
+          >
+            <Icon name="sparkle" size={13} /><span class="lbl">Ask</span>
+            {#if asking}<span class="spinner" aria-hidden="true"></span>{/if}
+          </button>
+        {/if}
         <button
           class="btn sm"
           aria-pressed={patternOpen}
@@ -4302,12 +4381,12 @@
   .page {
     flex: 1;
     display: grid;
-    /* the Ask bar, the tabs, the question and the toolbar, then the editor, the splitter
-       and the results; a phone changes only the two variables, so the tracks stay in step
-       when a row is added */
+    /* the tabs, the question and the toolbar, then the editor, the splitter and the
+       results; a phone changes only the two variables, so the tracks stay in step when a
+       row is added */
     --editor-row: var(--editor-h);
     --results-row: minmax(0, 1fr);
-    grid-template-rows: auto auto auto auto var(--editor-row) 7px var(--results-row);
+    grid-template-rows: auto auto auto var(--editor-row) 7px var(--results-row);
     /* without an explicit column, wide content (long editor lines, the plan table)
        stretches the grid past the viewport and the toolbar's Run button is clipped */
     grid-template-columns: minmax(0, 1fr);
@@ -4507,8 +4586,7 @@
     display: grid;
     gap: 10px;
   }
-  .qhead-slot,
-  .askbar-slot {
+  .qhead-slot {
     min-width: 0;
   }
   .clarify {

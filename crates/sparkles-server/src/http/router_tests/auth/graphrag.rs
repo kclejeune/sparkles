@@ -24,7 +24,8 @@ const DATA: &str = r#"@prefix ex: <http://ex/> .
 /// * `tub` has tua's grants, but `own` depends on `?user`, so tub sees other triples;
 /// * `tlift` has the same grants and lifts `own`;
 /// * `tpart` reads `urn:g:a` and the reports graph only;
-/// * `tnarrow` reads the same as tpart and lifts `own`.
+/// * `tnarrow` reads the same as tpart and lifts `own`;
+/// * `tmain` reads what tub reads, on `main` only.
 ///
 /// The change feed refuses callers whose protections depend on the data, so its tests
 /// use the protection without its pattern.
@@ -110,6 +111,15 @@ dataset = "rag"
 level = "read"
 graphs = ["urn:g:a", "{REPORTS}"]
 lifts = ["own"]
+
+[[users]]
+name = "tmain"
+password = "{tmain}"
+[[users.grants]]
+dataset = "rag"
+level = "read"
+graphs = ["urn:g:*", "{REPORTS}"]
+branches = ["main"]
 "#,
         pattern = if pattern {
             r#"pattern = "?s <http://ex/owner> ?user""#
@@ -125,6 +135,7 @@ lifts = ["own"]
         tzero = h("tzero-pw"),
         twrite = h("twrite-pw"),
         tmixed = h("tmixed-pw"),
+        tmain = h("tmain-pw"),
     )
 }
 
@@ -797,6 +808,13 @@ async fn a5_unproven_callers_answer_locally() {
         let mut on = |_: &str, _: &serde_json::Value| {};
         let out = crate::ask::ask(&server, &models, &p, &o, &mut on);
         assert_eq!(out["mode"], "global", "{out}");
+        // the stored answer keeps the points with their reports (C18 §6.4)
+        let a = crate::assistant::stored_answer(&out, &serde_json::Value::Null).unwrap();
+        assert_eq!(a["global"]["points"][0]["n"], 1, "{a}");
+        assert_eq!(a["global"]["points"][0]["text"], "A team.", "{a}");
+        assert!(a["global"]["points"][0]["reports"][0].is_string(), "{a}");
+        assert!(a["global"]["reports"][0]["iri"].is_string(), "{a}");
+        assert_eq!(a["summary"]["citations"], serde_json::json!([1]), "{a}");
     })
     .await
     .unwrap();
@@ -1015,4 +1033,145 @@ fn the_overview_uses_the_guarded_namespace_of_the_server() {
         GraphragSettings::default().reports_graph
     );
     const { assert!(sparkles::overview::MAX_REPORT_LEVEL >= MAX_LEVELS) };
+}
+
+/// C18 §6.4: a stored answer can reveal data from the graphs its ask read, so the
+/// history shows it only to a reader whose view covers what the asker's view read,
+/// with the same protections in force; otherwise the record comes without its answer
+/// and says so. The records are written as if each reader had asked earlier under the
+/// asker's grants, which is what a later narrowing of the reader's grants looks like.
+#[tokio::test]
+async fn stored_answers_need_the_askers_view() {
+    let s = server();
+    let ds = s.state.datasets().get("rag").cloned().unwrap();
+    let snap = ds.store.snapshot();
+    let at = chrono::Utc::now().to_rfc3339();
+    let access = |asker: &str| {
+        let p = guarded(&s, asker);
+        crate::assistant::answer_access(
+            Some(&snap),
+            p.view("rag", Endpoint::Query).as_ref(),
+            &p.caller(),
+            "rag",
+            None,
+            &p.id(),
+        )
+    };
+    // (reader, the view the answer was stored under, whether the reader sees it)
+    let cases: &[(&str, Option<&str>, bool)] = &[
+        // the same view
+        ("tua", Some("tua"), true),
+        ("tlift", Some("tlift"), true),
+        // an unrestricted reader is proven for any view
+        ("tadmin", Some("tua"), true),
+        ("tadmin", None, true),
+        // fewer graphs than the asker
+        ("tpart", Some("tua"), false),
+        ("tnarrow", Some("tlift"), false),
+        // the same graphs, but `own` depends on `?user`, so tub sees other triples
+        ("tub", Some("tua"), false),
+        // masking: `own` is lifted for the asker and in force for the reader
+        ("tub", Some("tlift"), false),
+        // an answer stored without what it read is shown to unrestricted readers only
+        ("tua", None, false),
+    ];
+    let mut records = Vec::new();
+    for (i, (reader, asker, _)) in cases.iter().enumerate() {
+        let mut r: crate::assistant::AskRecord = serde_json::from_value(serde_json::json!({
+            "id": format!("ask{i}"),
+            "principal": s.auth().user_principal(reader).unwrap().id(),
+            "at": at,
+            "question": "What does x keep secret?",
+            "query": "SELECT ?o { ?s <http://ex/secret> ?o }",
+            "result": "answered",
+            "outcome": "none",
+            "routing": {},
+            "thread": format!("t{i}"),
+            "answer": { "summary": { "text": "x keeps \"s\" [1].", "citations": [1] } },
+        }))
+        .unwrap();
+        r.access = asker.map(access);
+        records.push(r);
+    }
+    crate::assistant::store_history(&s.state, &ds, &records).unwrap();
+    for (i, (reader, asker, sees)) in cases.iter().enumerate() {
+        let r = get(
+            &s.app,
+            reader,
+            &format!("/$/asks/rag?thread=t{i}"),
+            "application/json",
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{reader}");
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        let rec = &v["asks"][0];
+        assert_eq!(rec["id"], format!("ask{i}"), "{reader}: {v}");
+        assert!(rec.get("access").is_none(), "{reader}: {v}");
+        if *sees {
+            assert_eq!(
+                rec["answer"]["summary"]["text"], "x keeps \"s\" [1].",
+                "{reader} under {asker:?}: {v}"
+            );
+            assert!(rec.get("answerWithheld").is_none(), "{reader}: {v}");
+        } else {
+            assert!(rec.get("answer").is_none(), "{reader} under {asker:?}: {v}");
+            assert_eq!(rec["answerWithheld"], true, "{reader}: {v}");
+            // the question and the query stay, as before stored answers
+            assert_eq!(rec["question"], "What does x keep secret?");
+        }
+    }
+    // the reports graph is guarded: tua's view reads it and records it apart, with the
+    // protections in force on it
+    assert!(access("tua").guarded.iter().any(|g| g == REPORTS));
+    assert!(access("tua").guarded_footprint.is_some());
+    assert!(access("tua").footprint.is_some());
+    // a state that cannot be opened keeps no footprint
+    assert!(
+        crate::assistant::answer_access(None, None, &Default::default(), "rag", None, "tua")
+            .footprint
+            .is_none()
+    );
+
+    // a branch answer: shown to a reader granted the branch, and withheld from one whose
+    // grants leave the branch out, whose missing view of it is not an unrestricted one,
+    // and for a branch that no longer exists
+    ds.store.create_branch("dev", &Default::default()).unwrap();
+    let mut branch_records = Vec::new();
+    let branch_cases = [
+        ("tua", "dev", true),
+        ("tmain", "dev", false),
+        ("tua", "gone", false),
+    ];
+    for (i, (reader, b, _)) in branch_cases.iter().enumerate() {
+        let mut r = records[0].clone();
+        r.id = format!("branch{i}");
+        r.thread = Some(format!("b{i}"));
+        r.principal = s.auth().user_principal(reader).unwrap().id();
+        let mut a = access(reader);
+        a.branch = Some(b.to_string());
+        r.access = Some(a);
+        branch_records.push(r);
+    }
+    crate::assistant::store_history(&s.state, &ds, &branch_records).unwrap();
+    for (i, (reader, b, sees)) in branch_cases.iter().enumerate() {
+        let r = get(
+            &s.app,
+            reader,
+            &format!("/$/asks/rag?thread=b{i}"),
+            "application/json",
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(
+            v["asks"][0]["id"],
+            format!("branch{i}"),
+            "{reader}@{b}: {v}"
+        );
+        assert_eq!(v["asks"][0]["branch"], *b, "{v}");
+        assert_eq!(
+            v["asks"][0].get("answer").is_some(),
+            *sees,
+            "{reader}@{b}: {v}"
+        );
+    }
 }

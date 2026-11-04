@@ -261,7 +261,14 @@ export type AskRequest = {
   query?: string;
   /** Answer from the data, from the community reports, or as the question needs (C22 §2.4). */
   mode?: AskMode;
+  /** The thread a follow-up continues; the first ask of a thread names none. */
+  thread?: string;
+  /** The resource on the page the question is asked from. */
+  about?: AskAbout;
 };
+
+/** The resource a question is about, which the server renders into the question. */
+export type AskAbout = { iri: string; kind?: string; label?: string };
 
 export type AskMode = 'auto' | 'local' | 'global';
 
@@ -362,6 +369,8 @@ export type AskEscalation = { role: string; from: Pair; to: Pair; signal: string
 export type AskUsage = {
   outcome?: string;
   askId?: string;
+  /** The ask's thread: the one the request named, or the ask's own id. */
+  threadId?: string;
   inputTokens?: number;
   outputTokens?: number;
   estimatedCost?: number;
@@ -488,10 +497,54 @@ export type AskRecord = {
   mode?: 'local' | 'global';
   /** The reports a global answer used, while the caller may read them. */
   reports?: string[];
+  /** The ask's thread; a record kept before threads is its own. */
+  thread?: string;
+  about?: AskAbout;
+  /** The stored answer, kept with records from format 2 of the history. */
+  answer?: AskStoredAnswer;
+  /** The answer was kept, but the caller's view no longer covers what it read. */
+  answerWithheld?: boolean;
+  /** The branch the ask read, when it was not main. */
+  branch?: string;
+  /** The pipeline's routing record, with its steps. */
+  routing?: unknown;
 };
 
-export async function askHistory(ds: string, signal?: AbortSignal): Promise<AskRecord[]> {
-  const body = await json<{ asks: AskRecord[] }>(`/$/asks/${enc(ds)}?limit=50`, {
+/** What a history record keeps of an answer: never its rows. */
+export type AskStoredAnswer = {
+  explanation?: string;
+  assumptions?: string[];
+  summary?: {
+    text: string;
+    citations?: number[];
+    rowsSent?: number;
+    provider?: string;
+    model?: string;
+    uncited?: boolean;
+  };
+  global?: {
+    points?: { n: number; text: string; reports?: string[] }[];
+    reports?: { iri: string; title?: string }[];
+    uncitedSentences?: string[];
+  };
+  graph?: AskGraph;
+  verdict?: 'query' | 'data' | 'unknown';
+  diagnosis?: string;
+  notes?: string[];
+  clarify?: { question: string; choices: { label: string; value: string }[] };
+  error?: { code?: string; message?: string };
+  entities?: string[];
+  communities?: string[];
+};
+
+export async function askHistory(
+  ds: string,
+  signal?: AbortSignal,
+  o: { limit?: number; thread?: string } = {},
+): Promise<AskRecord[]> {
+  const q = new URLSearchParams({ limit: String(o.limit ?? 50) });
+  if (o.thread) q.set('thread', o.thread);
+  const body = await json<{ asks: AskRecord[] }>(`/$/asks/${enc(ds)}?${q}`, {
     signal,
     cache: 'no-store',
   });

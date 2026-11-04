@@ -42,6 +42,7 @@
   import { selectionQuery, setQuery, VALUES_CAP, type Brush } from '$lib/facets';
   import type { FacetSetSpec } from '$lib/api';
   import { selection } from '$lib/selection.svelte';
+  import { useAskContext, useAskTarget } from '$lib/ask-thread.svelte';
   import Icon from '$components/Icon.svelte';
   import SchemaDiffDialog from '$components/SchemaDiffDialog.svelte';
   import ShapesDraftDialog from '$components/ShapesDraftDialog.svelte';
@@ -109,11 +110,19 @@
     return () => ctl.abort();
   });
 
-  /** Take the search text to the query page's Ask bar. */
-  function askInQuery(text: string) {
-    app.pendingQuery = { query: '', ask: text.trim() };
-    goto(resolve('/query'));
-  }
+  // the selected resource is the context of a question asked from the Ask drawer
+  useAskContext(() => {
+    const n = selectedId ? nodes[selectedId] : null;
+    if (!n || n.lit || n.term.type !== 'uri') return null;
+    return {
+      kind: 'entity',
+      iri: n.iri,
+      label: n.label ?? shortLabel(n.iri, prefixes),
+      type: 'resource',
+    };
+  });
+  // the branch and the state the page reads
+  useAskTarget(() => ({ branch: overviewBranch, at: timeActive && exAt ? exAt : null }));
 
   type Tab = 'graph' | 'schema' | 'search';
   const urlTab = page.url.searchParams.get('tab');
@@ -1710,8 +1719,8 @@
   }
 
   // The resource finder lives in the top bar's launcher: while Explore is open its hits come
-  // first, each focusing the resource in the graph, with "Open <IRI>" for a typed IRI and
-  // "Ask a question…" when the dataset answers questions.
+  // first, each focusing the resource in the graph, with "Open <IRI>" for a typed IRI. The
+  // Ask drawer's own provider adds "Ask a question…" when the dataset answers questions.
   useProvider({
     id: 'resources',
     label: ({ ds: name }) => (name ? `Resources in ${name}` : 'Resources'),
@@ -1719,9 +1728,8 @@
     modes: ['@'],
     recent: false,
     active: ({ ds: name }) => !!name,
-    // the Open row needs the prefixes and the Ask row the assistant's settings, which can
-    // arrive after the launcher asked
-    watch: () => [Object.keys(prefixes).length, canAsk],
+    // the Open row needs the prefixes, which can arrive after the launcher asked
+    watch: () => [Object.keys(prefixes).length],
     async search(raw, { ds: name, signal }) {
       const q = raw.trim();
       if (!name || q.length < 2) return [];
@@ -1734,7 +1742,7 @@
           icon: 'target',
           run: () => void focusOn(direct),
         });
-      // a failed label search leaves the Open and Ask rows, which need no answer
+      // a failed label search leaves the Open row, which needs no answer
       let hits: Awaited<ReturnType<typeof ex.search>> = [];
       try {
         hits = await ex.search(name, q, signal);
@@ -1750,14 +1758,6 @@
             icon: 'explore',
             run: () => void focusOn(h.iri, h.label),
           });
-      if (canAsk)
-        out.push({
-          id: '?ask',
-          title: 'Ask a question…',
-          subtitle: `“${q}”`,
-          icon: 'sparkle',
-          run: () => askInQuery(q),
-        });
       return out;
     },
   });

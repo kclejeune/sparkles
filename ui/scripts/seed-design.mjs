@@ -11,7 +11,10 @@
 // ~/.cache/sparkles-ui-seed). SPARKLES_BIN selects the binary (default
 // ../target/debug/sparkles), SPARKLES_UI_DIR a UI build to serve instead of the embedded
 // one, and SPARKLES_SEED_PORT the port (default a free one). SPARKLES_SEED_SKIP=go leaves
-// out the slow GO load. The script prints `ready <url>` once every dataset answers.
+// out the slow GO load. SPARKLES_SEED_ASK=1 also starts the stand-in model provider of
+// scripts/ask-stub.mjs and turns on the `demo` dataset's assistant, so that the Ask thread
+// can be checked against a real server without a paid model. The script prints
+// `ready <url>` once every dataset answers.
 
 import { spawn, spawnSync } from 'node:child_process';
 import {
@@ -21,8 +24,10 @@ import {
   mkdtempSync,
   readdirSync,
   rmSync,
+  writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:net';
+import { startAskStub, stubModelConfig } from './ask-stub.mjs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
@@ -32,6 +37,7 @@ const ROOT = resolve(import.meta.dirname, '../..');
 const BIN = process.env.SPARKLES_BIN ?? join(ROOT, 'target/debug/sparkles');
 const CACHE = process.env.SPARKLES_SEED_CACHE ?? join(homedir(), '.cache/sparkles-ui-seed');
 const SKIP = new Set((process.env.SPARKLES_SEED_SKIP ?? '').split(',').filter(Boolean));
+const ASK = process.env.SPARKLES_SEED_ASK === '1';
 
 const SOURCES = {
   go: { file: 'go-basic.owl', url: 'https://current.geneontology.org/ontology/go-basic.owl' },
@@ -136,9 +142,16 @@ async function main() {
   ];
   for (const ds of datasets) args.push('--loc', `${ds}=${join(dir, ds)}`);
   args.push('--text', 'demo', '--geo', 'demo');
+  const stub = ASK ? await startAskStub() : null;
+  if (stub) {
+    const cfg = join(dir, 'models.json');
+    writeFileSync(cfg, JSON.stringify(stubModelConfig(stub.url)));
+    args.push('--model-config', cfg, '--outbound-allow-private');
+  }
   const child = spawn(BIN, args, { stdio: 'inherit' });
   const stop = () => {
     child.kill('SIGTERM');
+    stub?.close();
   };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
@@ -168,6 +181,8 @@ async function main() {
     await call(url, 'PUT', `/$/queries/demo/${name}`, def);
   for (const name of ['draft-places', 'review-2026'])
     await call(url, 'POST', '/$/branches/demo', { name, note: `Seeded branch ${name}` });
+  if (stub)
+    await call(url, 'PUT', '/$/assistant/demo', { enabled: true, send: 'rows', historyDays: 30 });
   console.log(`ready ${url}`);
 }
 

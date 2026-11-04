@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { useAskContext } from '$lib/ask-thread.svelte';
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
@@ -138,6 +139,12 @@
   const DIFF_LIMIT = 500;
   let diffForm = $state<{ from: string; to: string } | null>(null);
   let diff = $state<api.Diff | null>(null);
+  // the commit whose changes are on screen is the context of a question asked from the
+  // Ask drawer, which then reads the data as of that commit
+  useAskContext(() => {
+    const seq = diffForm && /^\d+$/.test(diffForm.to) ? Number(diffForm.to) : null;
+    return seq != null ? { kind: 'commit', label: `commit ${seq}`, commit: seq } : null;
+  });
   let diffError = $state<api.ApiError | Error | null>(null);
   let diffLoading = $state(false);
 

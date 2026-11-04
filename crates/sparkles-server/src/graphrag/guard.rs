@@ -238,6 +238,17 @@ pub struct CaptureInput<'a> {
 
 /// Capture the footprint of a build.
 pub fn capture(i: &CaptureInput<'_>) -> Result<Footprint, CaptureError> {
+    capture_inner(i, false)
+}
+
+/// Capture what a reader of guarded graphs, such as reports graphs, must match: the
+/// same footprint as [`capture`], over graphs that a build may not read. A stored Ask
+/// answer keeps one for the reports graphs its asker could read (C18 §6.4).
+pub fn capture_guarded(i: &CaptureInput<'_>) -> Result<Footprint, CaptureError> {
+    capture_inner(i, true)
+}
+
+fn capture_inner(i: &CaptureInput<'_>, guarded: bool) -> Result<Footprint, CaptureError> {
     let mut graphs = Vec::with_capacity(i.graphs.len());
     let mut names: Vec<&String> = i.graphs.iter().collect();
     names.sort();
@@ -246,7 +257,7 @@ pub fn capture(i: &CaptureInput<'_>) -> Result<Footprint, CaptureError> {
         if g.starts_with("_:") || g.is_empty() {
             return Err(CaptureError::Unrepresentable(format!("the graph {g:?}")));
         }
-        if super::settings::is_guarded(g) {
+        if !guarded && super::settings::is_guarded(g) {
             return Err(CaptureError::Unrepresentable(format!(
                 "a build that reads the guarded graph {g}"
             )));

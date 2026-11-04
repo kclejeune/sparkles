@@ -6,6 +6,8 @@
   // naming the commit the page shows. The session's undo stack undoes the editor's commits
   // by reverting them, which restores exactly the triples each commit changed, and the
   // change feed refreshes the views when a commit lands.
+  import { useAskContext, useAskTarget } from '$lib/ask-thread.svelte';
+  import { shortLabel } from '$lib/graph';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
@@ -103,6 +105,18 @@
   const view = $derived(q.get('view') === 'usage' ? 'usage' : 'frame');
   const inferredOn = $derived(q.get('inferred') === '1');
   const prefixes = $derived(app.prefixes(name));
+  // the entity on screen is the context of a question asked from the Ask drawer
+  useAskContext(() =>
+    selected
+      ? {
+          kind: 'entity',
+          iri: selected,
+          label: shortLabel(selected, prefixes),
+          type: 'resource',
+        }
+      : null,
+  );
+  useAskTarget(() => ({ branch }));
 
   function withParams(over: Record<string, string | null>) {
     const p = new URLSearchParams(page.url.searchParams);

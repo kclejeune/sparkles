@@ -30,8 +30,26 @@ const DRAFT = [SMALL, LARGE];
 
 /** The settings of datasets that changed them, by name. */
 const settings = {};
-/** The history of each dataset, oldest first. */
-const history = {};
+/** The history of each dataset, oldest first. `org` starts with one record kept before
+ * threads and stored answers (format 1 of `asks.json`), which reopens as a thread of its
+ * own without its answer. */
+const history = {
+  org: [
+    {
+      id: 'legacy0001',
+      principal: 'local',
+      at: new Date(Date.now() - 3 * 86_400_000).toISOString(),
+      question: 'Which teams are there?',
+      query: `${PREFIXES}SELECT ?team WHERE { ?team a ex:Team }`,
+      commit: 1,
+      result: 'answered',
+      outcome: 'accepted',
+      routing: {
+        steps: [{ role: 'draft', ...SMALL, outcome: 'ok', latencyMs: 320 }],
+      },
+    },
+  ],
+};
 /** The draft pair of each ask, for Try harder. */
 const drafted = {};
 
@@ -40,8 +58,20 @@ const who = (req) => mockPrincipal(req) ?? 'local';
 /** The community reports of a global answer (C22 §7.2). */
 const REPORT = 'urn:x-sparkles:graphrag:report:';
 const REPORTS = [
-  { iri: `${REPORT}pay`, title: 'The payments team', level: 1, status: 'reviewed', rating: 7 },
-  { iri: `${REPORT}plat`, title: 'The platform team', level: 1, status: 'unreviewed', rating: 5 },
+  {
+    iri: `${REPORT}pay`,
+    title: 'The payments team',
+    level: 1,
+    status: 'reviewed',
+    rating: 7,
+  },
+  {
+    iri: `${REPORT}plat`,
+    title: 'The platform team',
+    level: 1,
+    status: 'unreviewed',
+    rating: 5,
+  },
 ];
 const GLOBAL = {
   points: [
@@ -154,11 +184,37 @@ async function runAsk(req, res, ds, body, { sparklesResult }) {
   });
   let closed = false;
   res.on('close', () => (closed = true));
+  const thread = typeof body.thread === 'string' && body.thread ? body.thread : id;
+  /** What the record stores of the answer, from the events sent (never the rows). */
+  const answer = {};
   const emit = async (event, data) => {
+    if (event === 'usage') data = { ...data, threadId: thread };
+    if (event === 'summary') answer.summary = data;
+    if (event === 'result') {
+      if (data.explanation) answer.explanation = data.explanation;
+      if (data.assumptions?.length) answer.assumptions = data.assumptions;
+      if (data.graph) answer.graph = data.graph;
+    }
+    if (event === 'global')
+      answer.global = {
+        points: data.points.map((p) => ({
+          n: p.n,
+          text: p.text,
+          reports: p.reports,
+        })),
+      };
+    if (event === 'diagnosis' && data.text) answer.diagnosis = data.text;
+    if (event === 'clarify') answer.clarify = { question: data.question, choices: data.choices };
+    if (event === 'error') answer.error = { code: data.code, message: data.message };
     if (closed) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     await sleep(40);
   };
+  const stored = () => ({
+    thread,
+    ...(body.about ? { about: body.about } : {}),
+    ...(Object.keys(answer).length ? { answer } : {}),
+  });
   const steps = [];
   const escalations = [];
   let pos = 0;
@@ -199,6 +255,7 @@ async function runAsk(req, res, ds, body, { sparklesResult }) {
         result: outcome,
         outcome: 'none',
         routing: { steps, escalations },
+        ...stored(),
       });
     await emit('usage', usage);
     res.end();
@@ -209,7 +266,12 @@ async function runAsk(req, res, ds, body, { sparklesResult }) {
     (body.mode === 'global' || /main areas/i.test(question));
   if (global) {
     if (body.mode !== 'global') {
-      await emit('ground', { examples: [], entities: [], classes: 2, predicates: 3 });
+      await emit('ground', {
+        examples: [],
+        entities: [],
+        classes: 2,
+        predicates: 3,
+      });
       steps.push({ role: 'draft', ...SMALL, outcome: 'ok', latencyMs: 300 });
       await emit('scope', { scope: 'global', ...SMALL });
     }
@@ -235,6 +297,7 @@ async function runAsk(req, res, ds, body, { sparklesResult }) {
         routing: { steps, escalations },
         mode: 'global',
         reports: REPORTS.map((r) => r.iri),
+        ...stored(),
       });
     await emit('usage', {
       outcome: 'answered',
@@ -446,7 +509,15 @@ export async function handleAssistant(req, res, url, seg, ctx) {
     }
     if (seg[3]) return false;
     if (req.method === 'GET') {
-      const mine = list.filter((r) => r.principal === me).reverse();
+      const t = url.searchParams.get('thread');
+      const mine = t
+        ? list
+            .filter((r) => r.principal === me && (r.thread ?? r.id) === t)
+            .map((r) => ({ ...r, thread: r.thread ?? r.id }))
+        : list
+            .filter((r) => r.principal === me)
+            .map((r) => ({ ...r, thread: r.thread ?? r.id }))
+            .reverse();
       const days = settingsOf(ds.name).status.historyDays;
       return (
         send(res, 200, {

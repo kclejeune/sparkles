@@ -1,6 +1,7 @@
-// The pure parts of the Ask bar (C18 Phase 2): the step indicator, row citations in the
-// summary, the failure words, graph variables, follow-up context, the remembered run
-// mode, the routing record and the event stream parser.
+// The pure parts of asking (C18 Phase 2) that the Ask thread and the Query page share:
+// the step indicator, row citations in the summary, the failure words, graph variables,
+// follow-up context, the remembered run mode, the routing record and the event stream
+// parser.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SseParser, type AskEvent, type AskUsage } from './ask-api';
 import {

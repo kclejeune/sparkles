@@ -1004,6 +1004,14 @@ fn asking(put: &mut dyn FnMut(&str, J)) {
         json!({ "question": string(), "query": string() }),
     );
     let choice = closed(&["value"], json!({ "id": string(), "value": string() }));
+    let about = closed(
+        &["iri"],
+        json!({
+            "iri": with_desc(string(), "An absolute IRI of at most 2000 characters."),
+            "kind": with_desc(string(), "What the resource is, such as `class`, `property` or `concept`, at most 32 characters."),
+            "label": with_desc(string(), "Its label, at most 200 characters."),
+        }),
+    );
     put(
         "AskRequest",
         doc(
@@ -1030,6 +1038,8 @@ fn asking(put: &mut dyn FnMut(&str, J)) {
                     "shapeCheck": with_desc(boolean(), "Repair once when the result does not fit the question's form. Over the dataset's `repairs.shapeCheck`."),
                     "drafts": with_desc(int(), "First drafts whose results vote on the query, 1 to 5. Over the dataset's `repairs.drafts`."),
                     "typeHints": with_desc(boolean(), "Link mentions with the classes the words around them name. Over the dataset's `repairs.typeHints`."),
+                    "thread": with_desc(string(), "The thread a follow-up continues: the `threadId` of an earlier ask, 1 to 64 letters, digits, `_` or `-`. The first ask of a thread names none and its own id becomes the thread's."),
+                    "about": with_desc(about.clone(), "The resource on the page the question was asked from. The pipeline reads the question with `(about <iri>)` after it, and the history keeps the question as written with `about` beside it."),
                 }),
             ),
             "A question for the dataset.",
@@ -1055,7 +1065,8 @@ fn asking(put: &mut dyn FnMut(&str, J)) {
                     "error": obj(&["code", "message"], json!({ "code": string(), "message": string() })),
                     "attempts": array(any_object("One draft with its check and run.")),
                     "notes": strings(),
-                    "usage": any_object("`askId`, the tokens (with the prompt cache's `cacheWriteInputTokens`, `cacheWrite1hInputTokens`, `cacheReadInputTokens` and `budgetTokens` when the provider used it) and estimated cost, `complexity`, the `steps` with their pairs and signals, `escalations`, `draftPair`, `answeredBy` and `tryHarder`."),
+                    "usage": any_object("`askId`, `threadId`, the tokens (with the prompt cache's `cacheWriteInputTokens`, `cacheWrite1hInputTokens`, `cacheReadInputTokens` and `budgetTokens` when the provider used it) and estimated cost, `complexity`, the `steps` with their pairs and signals, `escalations`, `draftPair`, `answeredBy` and `tryHarder`."),
+                    "threadId": with_desc(string(), "The ask's thread: the request's `thread`, or the ask's own id."),
                 }),
             ),
             "The whole answer of an ask in the JSON form.",
@@ -1112,6 +1123,23 @@ fn asking(put: &mut dyn FnMut(&str, J)) {
             "assistant-settings",
         ),
     );
+    let stored = obj(
+        &[],
+        json!({
+            "explanation": string(),
+            "assumptions": strings(),
+            "summary": obj(&["text", "citations"], json!({ "text": string(), "citations": array(int()), "rowsSent": int(), "provider": string(), "model": string(), "uncited": boolean() })),
+            "global": obj(&["points"], json!({ "points": array(obj(&["n", "text"], json!({ "n": int(), "text": string(), "reports": strings() }))), "reports": array(obj(&["iri"], json!({ "iri": string(), "title": string() }))), "uncitedSentences": strings() })),
+            "graph": obj(&[], json!({ "subject": string(), "predicate": string(), "object": string() })),
+            "verdict": string_enum(&["query", "data", "unknown"]),
+            "diagnosis": with_desc(string(), "Why the result was empty."),
+            "notes": strings(),
+            "clarify": obj(&["question", "choices"], json!({ "question": string(), "choices": array(obj(&["label", "value"], json!({ "label": string(), "value": string() }))) })),
+            "error": obj(&[], json!({ "code": string(), "message": string() })),
+            "entities": with_desc(strings(), "The entities the question linked exactly."),
+            "communities": with_desc(strings(), "The community reports the ask read for context."),
+        }),
+    );
     put(
         "AskHistory",
         doc(
@@ -1134,10 +1162,15 @@ fn asking(put: &mut dyn FnMut(&str, J)) {
                         "mode": string_enum(&["local", "global"]),
                         "reports": with_desc(strings(), "The reports a global answer used, listed only while their graph is proven for the caller."),
                         "reportsGraph": string(),
+                        "thread": with_desc(string(), "The ask's thread. A record kept before threads has its own id."),
+                        "about": about,
+                        "answer": with_desc(stored, "The answer as it was given, from format 2 of the history: never its rows. Present only while the caller's view covers every graph the ask read under the same protections."),
+                        "answerWithheld": with_desc(boolean(), "The answer is kept, but the caller's view no longer covers what it read."),
+                        "branch": with_desc(string(), "The branch the ask read, when it was not `main`."),
                     }))),
                 }),
             ),
-            "The caller's asked questions, newest first.",
+            "The caller's asked questions, newest first, or one thread's oldest first.",
             "ask-history",
         ),
     );

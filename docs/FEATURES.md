@@ -131,6 +131,16 @@ and execution timings while the remaining accuracy and latency work stays open.
 Anthropic providers use [prompt caching](ai/README.md#questions-in-plain-language) for
 the stable start of each prompt, and budgets price cache writes and reads apart.
 
+The web UI asks through an [Ask thread](ai/README.md#the-ask-thread), shown as a page at
+`/ui/ask` and as a drawer beside any page. `Shift+A` or the palette's Ask row opens the
+drawer with the page's resource or query as context. Each answer folds its query, rows,
+sources and steps, follow-ups continue the thread, and the history reopens a thread from
+the answers the server keeps.
+
+![The Ask page with a thread's answer, its checked query, its rows and its sources, with the first cited row marked and the memory facts about it quoted](images/ask-answer.png)
+
+![The Ask drawer beside a Browse page of the class Professor, carrying the class as context and offering questions about it](images/ask-drawer.png)
+
 <a id="web-ui"></a>
 <a id="query-page"></a>
 <a id="explore"></a>
