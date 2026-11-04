@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import pytest
-from conftest import ex, foaf
+from conftest import ex, foaf, optional_dependency
 
 from sparkles import BlankNode, Dataset, DefaultGraph, Literal, NamedNode, Quad, Variable
 from sparkles.rdflib import from_rdflib, to_rdflib
 
-rdflib = pytest.importorskip("rdflib")
+rdflib = optional_dependency("rdflib")
 
 
 def test_round_trip() -> None:

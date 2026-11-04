@@ -9,13 +9,14 @@
 # package. The copy keeps the checkout's layout, because some tests read fixtures of
 # other crates by relative path (Jena's patch files under crates/sparkles-core/tests, and
 # the type stub and the binding inventory that the parity test compares).
-# TEST_DEPS (default: pytest rdflib mypy) are installed next to it.
+# The pinned test dependencies of crates/sparkles-py/tests/requirements-test.txt are
+# installed next to it, and TEST_DEPS replaces them with another pip argument list.
 set -euo pipefail
 
 package="$1"
 shift
-deps="${TEST_DEPS:-pytest rdflib mypy}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
+deps="${TEST_DEPS:--r $root/crates/sparkles-py/tests/requirements-test.txt}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/crates/sparkles-py/python/sparkles" "$work/crates/sparkles-core/tests" "$work/crates/sparkles"
@@ -36,5 +37,9 @@ for python in "$@"; do
   echo "== $("$py" --version) =="
   # shellcheck disable=SC2086 # the dependencies are a word list
   "$py" -m pip install --quiet "$package" $deps
+  # the pinned dependencies are installed, so a missing one fails rather than skips
+  if [ -z "${TEST_DEPS:-}" ]; then
+    export SPARKLES_PY_TEST_DEPS=required
+  fi
   (cd "$work" && "$py" -m pytest -p no:cacheprovider crates/sparkles-py/tests)
 done

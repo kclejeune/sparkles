@@ -564,9 +564,12 @@ is and fail while it lacks something the crate needs.
 `target` directory, so it reuses the workspace's compiled dependencies. It assembles the
 package in `target/py` and runs `crates/sparkles-py/tests` with pytest. The tests include
 mypy's `stubtest`, which checks the `.pyi` stubs against the compiled module, and rdflib
-interoperability tests. Both skip when mypy or rdflib is missing. The dev shell's
-`python3` has pytest, mypy and rdflib. With another `python3`, the script installs pytest
-into a virtual environment in `target/py-venv`. Extra arguments go to pytest, as in
+interoperability tests. `crates/sparkles-py/tests/requirements-test.txt` pins pytest, mypy
+and rdflib, and the wheel workflow's `scripts/py-wheel-test.sh` installs the same versions,
+so both run the same stubtest. The script uses the `python3` on PATH when it has those
+versions, and otherwise installs them into a virtual environment in `target/py-venv`.
+Both scripts set `SPARKLES_PY_TEST_DEPS=required`, which makes a missing mypy or rdflib
+fail the run. Without that variable, as under a bare `pytest`, those tests skip. Extra arguments go to pytest, as in
 `mise run py:test -- -k transaction`. `mise run py:lint` runs clippy on the crate with its
 default features and with none. Both tasks are part of `mise run ci`. The first run
 compiles the crate and the engine for the Python build, and later runs take seconds.
@@ -933,6 +936,15 @@ broke it in a follow-up commit and gate that commit as usual. A batch whose sele
 skipped the failing check gets a rule in `scripts/gate/select-checks.py` when the miss is
 one the rules should have caught.
 
+The GitHub workflows run on GitHub and not in either gate. Among them are the server
+artifact build against glibc 2.28, the wheel tests on several CPython versions and the CI
+test shards. `scripts/gate/github-runs.py` prints the newest finished run of each
+workflow on `main` with the failed jobs of a failed run. `gate.sh` prints it before it
+starts and warns when a run failed, and `GATE_GITHUB_RUNS=0` skips it. The nightly gate
+writes it to `github-runs.txt` beside its log and copies it to `GITHUB-FAILED` while a
+run failed. A failed run does not change either gate's exit status. Fix it in the next
+batch, or say in the batch why it can wait.
+
 ## Continuous integration
 
 The workflows in `.github/workflows` run on standard GitHub-hosted runners, which are free
@@ -952,7 +964,7 @@ manual **compatibility-features** input.
 |---|---|
 | Checks | Formatting of the Rust, UI, JavaScript and shell sources, shellcheck, the cited doc paths, the benchmark scripts' tests, the license notices, the generated TypeScript client against `docs/openapi.json`, the API compatibility inventory and checker fixtures, and the UI's build, type check and unit tests. It compiles small tooling fixtures and leaves the workspace crates unbuilt. |
 | Clippy | Clippy with warnings as errors on the workspace, on the formatter's wasm32 build and on the three binding crates with and without their default features. |
-| Build tests | `mbx nextest archive` builds every test binary once and uploads three artifacts. These are the whole archive, a small archive of the binaries in `HEAVY_1` and `HEAVY_2`, and the debug server binary. |
+| Build tests | `mbx nextest archive` builds every test binary once and uploads three artifacts. These are the whole archive, a small archive of the binaries in `HEAVY_1` and `HEAVY_2`, and the debug server binary. `scripts/ci-free-disk.sh` first removes unused preinstalled toolchains from GitHub's runner and reports the least free disk the job reached. |
 | Doctests | The workspace's doctests, which nextest does not run. They build in parallel with the test archive, so the test jobs do not wait for them. |
 | Test | Two heavy shards run the binaries with the slowest tests from the small archive. The `timing` shard runs the `timing` group of `.config/nextest.toml`, which needs a machine to itself. Four more shards split the other tests by count, and the `SPARKLES_TEST_SLICES` variable changes how many. |
 | Jena clients | Jena's own HTTP clients against the debug server binary (`mise run test:jena-clients`). |

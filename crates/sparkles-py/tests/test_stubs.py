@@ -1,4 +1,5 @@
-"""The type stubs match the compiled module (A14, first half). Skipped without mypy."""
+"""The type stubs match the compiled module (A14, first half). Skipped without mypy, unless
+SPARKLES_PY_TEST_DEPS=required."""
 
 from __future__ import annotations
 
@@ -8,10 +9,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 import sparkles
+from conftest import optional_dependency
 
-pytest.importorskip("mypy")
+optional_dependency("mypy")
 
 
 def test_stubtest(tmp_path: Path) -> None:

@@ -126,10 +126,11 @@ pub fn record_all(st: &AppState) {
 /// and decodes only save work for later requests.
 fn lower_priority() {
     #[cfg(target_os = "linux")]
-    // SAFETY: gettid and setpriority take no pointers; on Linux a thread id names the
-    // calling thread alone for PRIO_PROCESS
+    // SAFETY: the gettid system call and setpriority take no pointers, and on Linux a
+    // thread id names the calling thread alone for PRIO_PROCESS. The raw system call
+    // keeps the server linking against glibc before 2.30, which has no gettid wrapper.
     unsafe {
-        let tid = libc::gettid();
+        let tid = libc::syscall(libc::SYS_gettid);
         let _ = libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, 10);
     }
 }
