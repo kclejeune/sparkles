@@ -201,3 +201,27 @@ export function applyFilters<N extends FNode, E extends FEdge>(
 export function wantWebgl(visible: number, on: boolean, from = WEBGL_FROM): boolean {
   return on ? visible > Math.min(CANVAS_BELOW, from) : visible > from;
 }
+
+/**
+ * The edges of each ordered pair of nodes, by the id of the first edge of the pair. A graph
+ * of simple edges, such as the WebGL view's, draws one line for the pair, so the page uses
+ * this to say which predicates that line stands for. Only pairs of two or more edges are
+ * listed.
+ */
+export function parallelEdges<E extends { id: string; source: string; target: string }>(
+  edges: readonly E[],
+): Map<string, E[]> {
+  const first = new Map<string, string>();
+  const groups = new Map<string, E[]>();
+  for (const e of edges) {
+    if (e.source === e.target) continue;
+    const k = `${e.source}\u0001${e.target}`;
+    const head = first.get(k);
+    if (head === undefined) {
+      first.set(k, e.id);
+      groups.set(e.id, [e]);
+    } else groups.get(head)!.push(e);
+  }
+  for (const [k, g] of groups) if (g.length < 2) groups.delete(k);
+  return groups;
+}

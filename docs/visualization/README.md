@@ -162,6 +162,8 @@ The SvelteKit UI is embedded in the server binary.
   in both. New nodes are placed beside their neighbours and stay where they are put until
   **Re-run layout**. The WebGL view does not draw the time slider's fades, which colour
   added and removed nodes instead, and its validation badges are drawn but not clickable.
+  It draws one line for all the predicates between two nodes, and a click on the line explains
+  an inferred edge or names the predicates, and it does not draw an edge from a node to itself.
   A node with a large fan-out is expanded into one **N via predicate** group node for each
   predicate that has more than 25 edges in a direction. The group's panel reads 100 members
   at a time, filters them by name, splits them by class and draws the members or the page
@@ -390,7 +392,7 @@ smoothly as a short list. The tree is one tab stop, and the arrow keys move a cu
 the whole tree, including the rows that are not in the page. Up and Down move a row, Right
 opens a node or enters it, Left closes a node or goes to its parent, Home, End, Page Up and
 Page Down move further, typing a name jumps to the next row that starts with it, and Enter
-selects the row or reads the next page of a **Show more** row. Each row tells assistive
+selects the row or reads the next page of a **Show more** row, which is an item of the tree. Each row tells assistive
 technology its level and its place among its siblings. Keeping the rows out of the page costs
 a little memory for the list of rows, about the size of the open nodes' ids, in exchange for a
 page whose size does not grow with the tree.

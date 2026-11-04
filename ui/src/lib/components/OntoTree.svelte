@@ -340,6 +340,14 @@
 
   function pickRow(i: number) {
     cursorKey = rows[i].key;
+    holdFocus();
+  }
+  /**
+   * A click focuses the button it lands on, and the row of that button leaves the page when
+   * the tree scrolls on, so the focus goes to the tree, which stays.
+   */
+  function holdFocus() {
+    list?.focus({ preventScroll: true });
   }
 
   function goSticky(index: number) {
@@ -376,7 +384,12 @@
       {#if row.kind === 'more'}
         <li
           class="more-row"
-          role="none"
+          role="treeitem"
+          aria-selected="false"
+          aria-level={row.depth + 1}
+          aria-label="Show more, {row.shown.toLocaleString('en-US')} of {row.total.toLocaleString(
+            'en-US',
+          )} shown"
           id={rowDomId(i)}
           style:padding-left="{treeIndent(row.depth) + 22}px"
         >
@@ -390,7 +403,10 @@
             class:cur={focused && cursor === i}
             tabindex="-1"
             disabled={reading[row.key]}
-            onclick={() => doMore(row.of, row.key)}
+            onclick={() => {
+              pickRow(i);
+              doMore(row.of, row.key);
+            }}
             >{#if reading[row.key]}<span class="spinner"></span>{/if} Show more</button
           >
         </li>

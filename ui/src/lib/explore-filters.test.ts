@@ -5,6 +5,7 @@ import {
   filtering,
   NO_CLASS,
   NO_FILTERS,
+  parallelEdges,
   predicateFacet,
   wantWebgl,
   type FEdge,
@@ -149,5 +150,19 @@ describe('wantWebgl', () => {
   it('follows a lowered threshold', () => {
     expect(wantWebgl(30, false, 20)).toBe(true);
     expect(wantWebgl(15, true, 20)).toBe(false);
+  });
+});
+
+describe('the edges one line stands for', () => {
+  it('lists the predicates between a pair by the first edge, and not the other direction', () => {
+    const edges = [
+      e('a', 'knows', 'b'),
+      e('a', 'owns', 'b'),
+      e('b', 'knows', 'a'),
+      e('a', 'p', 'a'),
+    ];
+    const pairs = parallelEdges(edges);
+    expect([...pairs.keys()]).toEqual(['a|knows|b']);
+    expect(pairs.get('a|knows|b')!.map((x) => x.title)).toEqual(['knows', 'owns']);
   });
 });

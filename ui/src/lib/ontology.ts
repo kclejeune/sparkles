@@ -316,12 +316,14 @@ export function typedLabelsQuery(sel: Selection, types: readonly string[]): stri
 
 /**
  * The SPARQL of the labels of the individuals: the subjects with a type that is not one of
- * the OWL entity types, so that an individual which only its class assertions name has its
- * label read with the declared ones.
+ * the OWL schema types, so that an individual which only its class assertions name has its
+ * label read with the ones declared `owl:NamedIndividual`, which count as individuals here.
  */
 export function individualLabelsQuery(sel: Selection): string {
   const schema = [
-    ...Object.values(KIND_TYPE),
+    ...Object.entries(KIND_TYPE)
+      .filter(([kind]) => kind !== 'NamedIndividual')
+      .map(([, type]) => type),
     OWL + 'Ontology',
     OWL + 'Restriction',
     OWL + 'Axiom',

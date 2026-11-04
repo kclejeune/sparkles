@@ -50,6 +50,7 @@
     applyFilters,
     classFacet,
     HELD_LIMIT,
+    parallelEdges,
     predicateFacet,
     VISIBLE_BUDGET,
     WEBGL_FROM,
@@ -270,6 +271,8 @@
   let expandLog: string[] = [];
   /** Every resource the graph has drawn since it was focused, so that a replay can find it again. */
   let seenTerms = new Map<string, Term>();
+  /** The members the person drew from each group node, by group id, which a replay draws again. */
+  let drawLog = new Map<string, Map<string, grp.Member>>();
 
   function resetGraph() {
     graphGen.bump();
@@ -281,6 +284,7 @@
     detailCache = {};
     expandLog = [];
     seenTerms = new Map();
+    drawLog = new Map();
     changes = null;
     selection.clear();
     lensPick = null;
@@ -718,7 +722,9 @@
     return [...marked, ...extra];
   });
   const allEdges = $derived.by((): GEdge[] => {
-    const keep = (e: EEdge) => (showLiterals || !e.lit) && (!hideTypes || !e.isType);
+    // the type edges stay in the held edges whether or not they are drawn, since the class
+    // facet and the class filter read a node's classes from them
+    const keep = (e: EEdge) => showLiterals || !e.lit;
     const tripleOf = (e: EEdge): EdgeTriple | undefined => {
       if (nodes[e.source]?.group || nodes[e.target]?.group) return undefined;
       const s = nodes[e.source]?.term;
@@ -789,7 +795,10 @@
   });
   const drawn = $derived(applyFilters(allNodes, allEdges, filters, keepIds));
   const gNodes = $derived(drawn.nodes);
-  const gEdges = $derived(drawn.edges);
+  // hiding the type edges changes what is drawn, and not what the filters know of a node
+  const gEdges = $derived(
+    hideTypes ? drawn.edges.filter((e) => !e.isType || e.paths != null) : drawn.edges,
+  );
   /** The visible node count at which the page draws with WebGL, `localStorage` for tests. */
   const webglFrom = loadPref<number>('sparkles.explore.webglFrom', WEBGL_FROM);
   let useWebgl = $state(false);
@@ -1057,6 +1066,23 @@
       ...(e.paths?.length ? { paths: e.paths } : {}),
     }));
   });
+  /**
+   * The edges of each pair of nodes, by the key of the first, which is the one the WebGL view
+   * draws for the pair: it draws one line for the predicates between two nodes.
+   */
+  const largePairs = $derived(useWebgl ? parallelEdges(gEdges) : new Map<string, GEdge[]>());
+  /** A click on a line of the WebGL view: the explanation of an inferred edge, else the predicates it stands for. */
+  function openLargeEdge(id: string) {
+    const group = largePairs.get(id);
+    if (!group) return void openWhyEdge(id);
+    const inferred = group.find((e) => lenses.encoding.inferred.has(e.id));
+    if (inferred && openWhyEdge(inferred.id)) return;
+    toasts.push(
+      'info',
+      `${group.length} predicates join these nodes`,
+      group.map((e) => e.label).join(', '),
+    );
+  }
   /** The nodes with their neighbours loaded and the group nodes, which the overlay rings. */
   const expandedIds = $derived(new Set(gNodes.filter((n) => n.expanded).map((n) => n.id)));
   const groupIds = $derived(new Set(gNodes.filter((n) => n.kind === 'group').map((n) => n.id)));
@@ -1089,6 +1115,7 @@
       expand: (id: string) => expand(id),
       renderer: () => (useWebgl ? 'webgl' : 'cytoscape'),
       viewport: () => (useWebgl ? largeView?.viewport() : graphView?.viewport()),
+      screenOf: (id: string) => (useWebgl ? largeView?.screenOf(id) : null),
     };
     return () => {
       delete (window as unknown as { __perfHook?: unknown }).__perfHook;
@@ -1325,9 +1352,12 @@
   function drawMembers(gid: string, members: grp.Member[]) {
     const g = nodes[gid]?.group;
     if (!g) return;
+    const logged = drawLog.get(gid) ?? new Map<string, grp.Member>();
+    drawLog.set(gid, logged);
     for (const m of members) {
       const lit = m.term.type === 'literal';
       const oid = lit ? `lit:${g.owner}|${g.predicate}|${termKey(m.term)}` : termKey(m.term);
+      logged.set(oid, m);
       ensureNode(m.term, m.label, oid);
       if (lit) showLiterals = true;
       if (g.incoming) addEdge(oid, g.predicate, g.owner, false);
@@ -1475,6 +1505,44 @@
       .join(' ');
   }
 
+  /** The members drawn from group nodes whose edge holds at the state `at` names, by group. */
+  async function drawnMembersAt(
+    target: string,
+    at: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<{ gid: string; owner: string; members: grp.Member[] }[]> {
+    const wanted: { gid: string; owner: string; m: grp.Member; triple: EdgeTriple }[] = [];
+    for (const [gid, logged] of drawLog) {
+      const g = nodes[gid]?.group;
+      const owner = g ? nodes[g.owner]?.term : undefined;
+      if (!g || !owner) continue;
+      for (const m of logged.values()) {
+        const p: Term = { type: 'uri', value: g.predicate };
+        wanted.push({
+          gid,
+          owner: g.owner,
+          m,
+          triple: g.incoming ? [m.term, p, owner] : [owner, p, m.term],
+        });
+      }
+    }
+    if (!wanted.length) return [];
+    const found = await ex.presentEdges(
+      target,
+      wanted.map((w) => w.triple),
+      at,
+      signal,
+    );
+    const by = new Map<string, { gid: string; owner: string; members: grp.Member[] }>();
+    for (const w of wanted) {
+      if (!found.has(edgeIdOf(w.triple))) continue;
+      const d = by.get(w.gid) ?? { gid: w.gid, owner: w.owner, members: [] };
+      d.members.push(w.m);
+      by.set(w.gid, d);
+    }
+    return [...by.values()];
+  }
+
   /**
    * Read the graph again at the state the graph slider names: the focus and the nodes the
    * person expanded, in the order they were expanded, are read at that commit, and an
@@ -1495,6 +1563,9 @@
     try {
       const present = new Set([root]);
       const fetched = new Map<string, Awaited<ReturnType<typeof readNeighbourhood>>>();
+      // the members drawn from a group stay when their edge holds at that commit
+      const drawnAt = await drawnMembersAt(target!, at, signal);
+      if (!owns()) return;
       for (const id of [...expandLog]) {
         const term = seenTerms.get(id);
         if (!present.has(id) || !term || term.type !== 'uri') continue;
@@ -1505,6 +1576,10 @@
           if (nb.term.type === 'literal') continue;
           present.add(termKey(nb.term));
         }
+        for (const d of drawnAt) {
+          if (d.owner !== id) continue;
+          for (const m of d.members) if (m.term.type !== 'literal') present.add(termKey(m.term));
+        }
       }
       graphEpoch++;
       // the graph is rebuilt in one step, so that what stays keeps its place
@@ -1514,13 +1589,19 @@
       nodes = {};
       edges = {};
       const rn = ensureNode(rootTerm, keepLabels.get(root), root);
-      for (const id of expandLog) {
-        const nh = fetched.get(id);
-        const n = id === root ? rn : nodes[id];
-        if (!nh || !n) continue;
-        populate(n, nh.r);
-        for (const f of nh.groups) addGroup(n, f);
-        n.expanded = true;
+      const replayed = new Set<string>();
+      // an expansion makes its groups, whose drawn members can be expanded in turn
+      for (let pass = 0; pass < 4; pass++) {
+        for (const id of expandLog) {
+          const nh = fetched.get(id);
+          const n = id === root ? rn : nodes[id];
+          if (!nh || !n || replayed.has(id)) continue;
+          replayed.add(id);
+          populate(n, nh.r);
+          for (const f of nh.groups) addGroup(n, f);
+          n.expanded = true;
+        }
+        for (const d of drawnAt) drawMembers(d.gid, d.members);
       }
       for (const [id, n] of Object.entries(nodes)) {
         const kept = keepLabels.get(id);
@@ -2901,7 +2982,7 @@
                   onmenu={(id, at) =>
                     (menu =
                       nodes[id]?.term.type === 'uri' && !nodes[id]?.group ? { id, ...at } : null)}
-                  onedge={(id) => void openWhyEdge(id)}
+                  onedge={openLargeEdge}
                   expanded={expandedIds}
                   groups={groupIds}
                   lens={lenses.encoding}
@@ -2933,34 +3014,34 @@
                     ? { badges: vBadges, marked: vMarked, onbadge: (id) => overlay?.open(id) }
                     : null}
                 />
-                {#if menu}
-                  <div
-                    class="node-menu"
-                    role="menu"
-                    aria-label="Node actions"
-                    style="left: {menu.x}px; top: {menu.y}px"
+              {/if}
+              {#if menu && !listView}
+                <div
+                  class="node-menu"
+                  role="menu"
+                  aria-label="Node actions"
+                  style="left: {menu.x}px; top: {menu.y}px"
+                >
+                  <button
+                    role="menuitem"
+                    class="btn sm ghost"
+                    onclick={() => openPaths({ from: menu!.id })}>Paths from here</button
                   >
-                    <button
-                      role="menuitem"
-                      class="btn sm ghost"
-                      onclick={() => openPaths({ from: menu!.id })}>Paths from here</button
-                    >
-                    <button
-                      role="menuitem"
-                      class="btn sm ghost"
-                      onclick={() => openPaths({ to: menu!.id })}>Paths to here</button
-                    >
-                    <button
-                      role="menuitem"
-                      class="btn sm ghost"
-                      onclick={() => {
-                        const id = menu!.id;
-                        menu = null;
-                        void expand(id);
-                      }}>Expand</button
-                    >
-                  </div>
-                {/if}
+                  <button
+                    role="menuitem"
+                    class="btn sm ghost"
+                    onclick={() => openPaths({ to: menu!.id })}>Paths to here</button
+                  >
+                  <button
+                    role="menuitem"
+                    class="btn sm ghost"
+                    onclick={() => {
+                      const id = menu!.id;
+                      menu = null;
+                      void expand(id);
+                    }}>Expand</button
+                  >
+                </div>
               {/if}
               <LensLegend
                 results={lenses.results}

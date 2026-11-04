@@ -1385,7 +1385,11 @@ async function handleQuery(req, res, ds, p) {
   }
   // Jena's name for the stored default graph, which the ontology editor's label reads use:
   // oxigraph would take it for a named graph, so the pattern reads the default graph
-  query = query.replaceAll('GRAPH <urn:x-arq:DefaultGraph>', '');
+  // (a string literal that holds the same words is kept as it is)
+  query = query.replace(
+    /("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|GRAPH\s*<urn:x-arq:DefaultGraph>/g,
+    (m, lit) => lit ?? '',
+  );
   // a `SERVICE algo:` call over the drawn nodes, answered from computed rows (mock/algo.mjs)
   try {
     query = rewriteService(ds.store, query, queryOptions(ds, p)) ?? query;

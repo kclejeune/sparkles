@@ -50,6 +50,20 @@ export class LevelTree {
     return (this.counts[id] ?? 0) > 0 && !(id in this.levels);
   }
 
+  /**
+   * Forget every level and drop the reads in flight, without reading again, for a tree the
+   * person is not looking at when its dataset or graph changes. The next `reset` reads.
+   */
+  drop() {
+    this.#generation++;
+    this.#pending.clear();
+    this.levels = {};
+    this.counts = {};
+    this.clipped = {};
+    this.loading = false;
+    this.error = null;
+  }
+
   /** Forget every level, for a new commit or graph, and read the roots and `open` again. */
   reset(open: Iterable<string> = []) {
     this.#generation++;

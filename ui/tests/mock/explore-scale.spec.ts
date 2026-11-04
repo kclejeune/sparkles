@@ -232,6 +232,57 @@ test('the performance hook is installed only on request and expands a node', asy
   expect(r.after).toBeGreaterThanOrEqual(r.before);
 });
 
+test('members drawn from a group stay when the graph is read at an earlier commit', async ({
+  page,
+  request,
+}) => {
+  // commit 1 loads a hub with 30 members, and commit 2 adds a triple that touches none of them
+  const made = await request.post('/$/datasets', {
+    data: { dbName: 'scalet', dbType: 'persistent' },
+  });
+  if (made.status() !== 409) {
+    expect(made.ok()).toBe(true);
+    const members = Array.from(
+      { length: 30 },
+      (_, i) => `ex:hub ex:member ex:t${i} . ex:t${i} rdfs:label "T${i}" .`,
+    );
+    for (const [msg, body] of [
+      ['Load the hub', members.join(' ')],
+      ['An unrelated triple', 'ex:other ex:p ex:q .'],
+    ]) {
+      const u = await request.post('/scalet/update', {
+        headers: { 'Content-Type': 'application/sparql-update', 'Sparkles-Commit-Message': msg },
+        data: `PREFIX ex: <${EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> INSERT DATA { ${body} }`,
+      });
+      expect(u.ok()).toBe(true);
+    }
+  }
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'scalet'));
+  await page.goto(`/ui/explore?ds=scalet&iri=${encodeURIComponent(`${EX}hub`)}`);
+  await expect(counts(page)).toContainText(/\d+ nodes/, { timeout: 45_000 });
+  await page.getByRole('button', { name: 'List', exact: true }).click();
+  await page
+    .getByRole('table', { name: 'Drawn nodes' })
+    .getByRole('button', { name: /^30 via/ })
+    .click();
+  await panel(page)
+    .getByRole('button', { name: /^Draw this page/ })
+    .click();
+  await expect(counts(page)).toContainText('32 nodes');
+  await page.getByRole('button', { name: 'Graph history' }).click();
+  const slider = page
+    .getByRole('region', { name: 'Graph history time slider' })
+    .getByRole('slider', { name: /^(Commit|Compared to)$/ });
+  await expect(slider).toHaveAttribute('aria-valuenow', '2');
+  await slider.focus();
+  await page.keyboard.press('ArrowLeft');
+  await expect(slider).toHaveAttribute('aria-valuenow', '1');
+  // the graph is read again at commit 1, where every drawn member is a member too
+  await expect.poll(() => new URL(page.url()).searchParams.get('at')).toBe('commit:1');
+  await page.waitForTimeout(2000);
+  await expect(counts(page)).toContainText('32 nodes');
+});
+
 test.describe('at 390 px', () => {
   test.use({ ...phone, viewport: { width: 390, height: 844 } });
 
@@ -247,4 +298,79 @@ test.describe('at 390 px', () => {
     await expect(page.getByTestId('explore-filters')).toBeVisible();
     await expectNoSidewaysScroll(page, 'the filters');
   });
+});
+
+test('a right click on a node of the WebGL view opens the node menu', async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('sparkles.explore.perfHook', '1'));
+  await open(page, 20);
+  await selectGroup(page);
+  await panel(page)
+    .getByRole('button', { name: /^Draw this page/ })
+    .click();
+  await expect(counts(page)).toContainText('WebGL');
+  await page.getByRole('button', { name: 'List', exact: true }).click();
+  const canvas = page.locator('.lg-host canvas').first();
+  await expect(canvas).toBeVisible();
+  // the layout has settled, so the node stays where it is found
+  await expect(page.getByText(/^Layout \d+%/)).toHaveCount(0, { timeout: 30_000 });
+  await expect
+    .poll(() =>
+      page.evaluate(
+        (id) =>
+          (
+            window as unknown as {
+              __perfHook: { screenOf: (id: string) => unknown };
+            }
+          ).__perfHook.screenOf(id),
+        '<http://example.org/ada>',
+      ),
+    )
+    .not.toBeNull();
+  const at = (await page.evaluate(
+    (id) =>
+      (
+        window as unknown as {
+          __perfHook: { screenOf: (id: string) => { x: number; y: number } };
+        }
+      ).__perfHook.screenOf(id),
+    '<http://example.org/ada>',
+  )) as { x: number; y: number };
+  const box = (await canvas.boundingBox())!;
+  await page.mouse.click(box.x + at.x, box.y + at.y, { button: 'right' });
+  const menu = page.getByRole('menu', { name: 'Node actions' });
+  await expect(menu).toBeVisible();
+  await expect(menu.getByRole('menuitem', { name: 'Paths from here' })).toBeVisible();
+});
+
+test('hiding the type edges does not forget the classes of the nodes', async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('sparkles.explore.perfHook', '1'));
+  await open(page);
+  // the page installs the hook when it mounts, and an expansion asked before the graph is
+  // ready does nothing, so it is asked until the node has its class
+  await expect
+    .poll(
+      () =>
+        page.evaluate(async () => {
+          const h = (
+            window as unknown as {
+              __perfHook: { expand: (id: string) => Promise<void>; nodeIds: () => string[] };
+            }
+          ).__perfHook;
+          await h.expand('<http://example.org/ada>');
+          return h.nodeIds().includes('<http://example.org/Person>');
+        }),
+      { timeout: 20_000 },
+    )
+    .toBe(true);
+  await expect(counts(page)).toContainText('6 nodes');
+  await page.getByRole('button', { name: 'Filters', exact: true }).click();
+  const filters = page.getByTestId('explore-filters');
+  const classes = filters.getByRole('list', { name: 'Classes' });
+  await classes.getByRole('checkbox', { name: /Person/ }).uncheck();
+  await expect(counts(page)).toContainText('5 nodes');
+  await page.getByRole('button', { name: 'View', exact: true }).click();
+  await page.getByRole('checkbox', { name: /Hide rdf:type/ }).check();
+  // the class is still excluded and still listed, and the nodes of the class stay out
+  await expect(counts(page)).toContainText('5 nodes');
+  await expect(classes).toContainText('Person');
 });

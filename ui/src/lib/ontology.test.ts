@@ -8,6 +8,7 @@ import {
   editableIri,
   filterTree,
   hierarchyEdges,
+  individualLabelsQuery,
   labelsOf,
   labelsOfBindings,
   labelsQuery,
@@ -642,5 +643,16 @@ describe('the labels a capped listing leaves out', () => {
     expect(out.get('a')).toEqual([{ '@value': 'A' }]);
     expect(out.get('b')).toEqual([{ '@value': 'B' }]);
     expect(have.has('b')).toBe(false);
+  });
+});
+
+describe('the label query of the individuals', () => {
+  it('reads the labels of an individual that only its declaration names', () => {
+    const q = individualLabelsQuery({ graph: null, imports: false });
+    const notIn = q.slice(q.indexOf('NOT IN'), q.indexOf('VALUES ?p'));
+    // `owl:NamedIndividual` is a type that qualifies an individual, not one that excludes it
+    expect(notIn).not.toContain('NamedIndividual');
+    expect(notIn).toContain('owl#Class');
+    expect(notIn).toContain('owl#ObjectProperty');
   });
 });

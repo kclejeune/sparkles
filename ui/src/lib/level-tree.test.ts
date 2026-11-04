@@ -182,3 +182,22 @@ describe('a clipped level', () => {
     expect(t.clippedOf('urn:p')).toBeNull();
   });
 });
+
+describe('LevelTree.drop', () => {
+  it('forgets the levels, reads nothing and drops an answer still on its way', async () => {
+    let release: (h: Hierarchy) => void = () => {};
+    const names: string[][] = [];
+    const t = new LevelTree(
+      () => new Promise<Hierarchy>((r) => (release = r)),
+      (nodes) => names.push(nodes.map((n) => n.iri)),
+    );
+    t.reset();
+    expect(t.loading).toBe(true);
+    t.drop();
+    expect(t.loading).toBe(false);
+    release(answer({ children: [node('a')] }));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(t.roots()).toEqual([]);
+    expect(names).toEqual([]);
+  });
+});

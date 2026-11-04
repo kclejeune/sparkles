@@ -110,3 +110,61 @@ test('a link to a class far down a long level scrolls the tree to its row', asyn
   const scrolled = await page.locator('.trees .tree-scroll').evaluate((e) => e.scrollTop);
   expect(scrolled).toBeGreaterThan(10_000);
 });
+
+test('the tree keeps its labels when a slow summary arrives after the first level', async ({
+  page,
+}) => {
+  const summary = /\/\$\/ontology\/deep(\?.*)?$/;
+  await page.route(summary, async (route) => {
+    await new Promise((r) => setTimeout(r, 2500));
+    await route.continue();
+  });
+  const arrived = page.waitForResponse((r) => summary.test(r.url()), { timeout: 30_000 });
+  await page.goto('/ui/workbench/ontology?ds=deep');
+  const parent = tree(page).getByRole('button', { name: 'wide parent', exact: true });
+  await expect(parent).toBeVisible({ timeout: 30_000 });
+  // the summary comes after the first level, and the labels are still there once it has
+  await arrived;
+  await page.waitForTimeout(500);
+  await expect(parent).toBeVisible();
+});
+
+test('a refused list is not read again until another list is needed', async ({ page }) => {
+  let reads = 0;
+  await page.route(/\/\$\/ontology\/deep\/entities/, async (route) => {
+    reads++;
+    await route.fulfill({ status: 500, body: 'refused' });
+  });
+  await page.goto(url('C3'));
+  await expect(page.getByRole('heading', { name: /level 3/ })).toBeVisible({ timeout: 30_000 });
+  await page.waitForTimeout(2000);
+  const first = reads;
+  expect(first).toBeGreaterThan(0);
+  expect(first).toBeLessThanOrEqual(2);
+  await page.waitForTimeout(1500);
+  expect(reads).toBe(first);
+});
+
+test('a click keeps the focus on the tree and the paging row is an item of it', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('/ui/workbench/ontology?ds=deep');
+  await tree(page).getByRole('button', { name: 'Expand wide parent' }).click();
+  await expect(tree(page).getByRole('treeitem', { name: 'wide child 0000' })).toBeVisible({
+    timeout: 30_000,
+  });
+  await tree(page).getByRole('button', { name: 'wide child 0003', exact: true }).click();
+  // the row of the clicked button leaves the page when the tree scrolls far, and the focus stays
+  await expect(tree(page).getByRole('treeitem', { selected: true })).toBeVisible();
+  await page.waitForTimeout(800);
+  await page.locator('.trees .tree-scroll').evaluate((e) => (e.scrollTop = 20_000));
+  await expect(tree(page).getByRole('treeitem', { name: 'wide child 0003' })).toHaveCount(0);
+  await expect(tree(page)).toBeFocused();
+  await page.keyboard.press('End');
+  // the end of a clipped level is the paging row, which is an item of the tree
+  const active = await tree(page).getAttribute('aria-activedescendant');
+  expect(active).toBeTruthy();
+  await expect(page.locator(`[id="${active}"]`)).toHaveAttribute('role', 'treeitem');
+  await expect(page.locator(`[id="${active}"]`)).toHaveAccessibleName(/Show more.*1,000 of 1,050/);
+});

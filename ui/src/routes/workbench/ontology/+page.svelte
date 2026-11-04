@@ -182,6 +182,9 @@
   let truncated = $state(false);
   /** Whether the individuals and their types are read for the Individuals tree. */
   let individualsReady = $state(false);
+  /** A failed read of the lists is not tried again until the person asks for a list anew. */
+  let listFailed = $state(false);
+  let individualsFailed = $state(false);
   /** The most entities of a kind that the pickers list. A longer kind is searched instead. */
   const LIST_MAX = 5_000;
   /** The kinds the pickers and completion list. */
@@ -238,8 +241,9 @@
       // the summary alone: its counts head the page, and the tree reads its own levels
       const r = await ontologySummary(t, s);
       if (my !== loadSeq) return;
-      // what was read for the commit before is read again when a view needs it
-      if (loadedTarget !== t || shown !== r.summary.commit) resetLazy();
+      // what was read for the commit before is read again when a view needs it, and what the
+      // first summary of a scope arrives beside, such as the labels of the tree, is kept
+      if (loadedTarget === t && shown !== r.summary.commit) resetLazy();
       summary = r.summary;
       etag = r.etag;
       shown = r.summary.commit;
@@ -262,6 +266,8 @@
     typeAxioms = [];
     truncated = false;
     individualsReady = false;
+    listFailed = false;
+    individualsFailed = false;
     listSeq++;
   }
   let listSeq = 0;
@@ -299,8 +305,11 @@
       addLabels(more);
       batch.know(more.keys());
     } catch {
-      // the pickers stay empty, and the next need reads the lists again
-      if (my === listSeq) listed = new Set([...listed].filter((k) => !read.includes(k)));
+      // the pickers stay empty, and the next need the person creates reads the lists again
+      if (my === listSeq) {
+        listed = new Set([...listed].filter((k) => !read.includes(k)));
+        listFailed = true;
+      }
     }
   }
 
@@ -337,6 +346,7 @@
     } catch (e) {
       if (my === listSeq) {
         individualsReady = false;
+        individualsFailed = true;
         loadError = e as Error;
       }
     }
@@ -366,6 +376,10 @@
       summary = null;
       shown = 0;
       loadedTarget = null;
+      // the names, lists and levels of the scope before are another scope's, and a read of a
+      // tree not on screen must not bring them back
+      resetLazy();
+      for (const lt of levelTrees.values()) lt.drop();
       classification = null;
       session.reset(`sparkles.onto.undo.${target}|${graph ?? ''}`);
       void loadAll();
@@ -458,7 +472,11 @@
       } else if (commit != null && commit !== levelCommit) {
         const first = levelCommit == null;
         levelCommit = commit;
-        if (!first) levelEpoch++;
+        if (!first) {
+          // a read of a tree not on screen, begun for the commit before, must not land
+          for (const lt of levelTrees.values()) lt.drop();
+          levelEpoch++;
+        }
       }
     });
   });
@@ -560,14 +578,42 @@
 
   // the lists that the pickers and completion read: the page reads them once an entity, the
   // header, the DL query or the create dialog needs them, and not when it opens
+  let needKey = '';
   $effect(() => {
     const need = !!selected || tab === 'header' || tab === 'dlquery' || createOpen;
-    if (need && summary && PICKER_KINDS.some((k) => !listed.has(k)))
-      untrack(() => void ensureKinds(PICKER_KINDS));
+    const key = `${selected ?? ''}\u0000${tab}\u0000${createOpen}`;
+    const missing = PICKER_KINDS.some((k) => !listed.has(k));
+    const failed = listFailed;
+    const ready = !!summary;
+    untrack(() => {
+      // another need is a new try
+      if (key !== needKey) {
+        needKey = key;
+        if (failed) {
+          listFailed = false;
+          return;
+        }
+      }
+      if (need && ready && missing && !failed) void ensureKinds(PICKER_KINDS);
+    });
   });
+  let individualsKey = '';
   $effect(() => {
-    if (kindTab === 'NamedIndividual' && summary && !individualsReady)
-      untrack(() => void ensureIndividuals());
+    const on = kindTab === 'NamedIndividual';
+    const failed = individualsFailed;
+    const ready = !!summary;
+    const done = individualsReady;
+    untrack(() => {
+      // opening the tab again is a new try
+      if (on !== (individualsKey === 'on')) {
+        individualsKey = on ? 'on' : '';
+        if (failed) {
+          individualsFailed = false;
+          return;
+        }
+      }
+      if (on && ready && !done && !failed) void ensureIndividuals();
+    });
   });
 
   // --- the inferred tree ---------------------------------------------------------------

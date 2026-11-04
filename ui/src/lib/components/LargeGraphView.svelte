@@ -1096,6 +1096,13 @@
     return renderer?.getCamera().getState() ?? null;
   }
 
+  /** Where a node is in the view, in pixels from its top left corner, for the tests of the pages. */
+  export function screenOf(key: string): { x: number; y: number } | null {
+    if (!renderer || !graph?.hasNode(key)) return null;
+    const a = graph.getNodeAttributes(key) as { x: number; y: number };
+    return renderer.graphToViewport({ x: a.x, y: a.y });
+  }
+
   /** Run the layout again over every node, the ones placed beside their neighbours included. */
   export function relayout() {
     if (!graph) return;
