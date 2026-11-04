@@ -211,6 +211,14 @@ describe('records of the history', () => {
     expect(threadLine(list[0])).toBe('2 questions, edited');
     expect(threadLine(list[1])).toBe('1 question, from reports');
   });
+  it('take the first question as the title when a follow-up lands in the same second', () => {
+    // the history is newest first
+    const list = threadsFromRecords([
+      record({ id: 'b', thread: 't1', at: '2026-11-03T10:00:00Z', question: 'And?' }),
+      record({ id: 'a', thread: 't1', at: '2026-11-03T10:00:00Z' }),
+    ]);
+    expect(list[0]).toMatchObject({ title: 'Who is on payments?', turns: 2 });
+  });
   it('fall into day groups', () => {
     const now = new Date('2026-11-03T12:00:00');
     expect(dayGroup('2026-11-03T08:00:00', now)).toBe('Today');

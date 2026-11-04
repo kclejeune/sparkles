@@ -55,6 +55,8 @@
   });
   /** The citation chosen (1-based row), which marks its row and its source. */
   let chosen = $state<number | null>(null);
+  /** In a global answer, the point a citation chose. */
+  let chosenPoint = $state<number | null>(null);
   let rowsView = $state<'table' | 'graph'>('table');
   let rerunNote = $state<string | null>(null);
   let rerunError = $state<string | null>(null);
@@ -68,6 +70,15 @@
   );
   const cols = $derived(graphColumns(turn.result?.graph, res?.vars ?? []));
   const uid = $derived(`turn-${turn.key}`);
+
+  /** A global answer's markers cite its points, not rows. */
+  const isGlobal = $derived(turn.mode === 'global' || !!turn.global?.points.length);
+  const reportTitle = (iri: string) =>
+    turn.global?.reports.find((r) => r.iri === iri)?.title ?? iri;
+  /** The graph of a CONSTRUCT or DESCRIBE result. */
+  const tripleGraph = $derived(
+    res?.triples?.length ? triplesToGraph(res.triples, prefixes, { maxNodes: 120 }) : null,
+  );
 
   const graph = $derived.by(() => {
     if (!res?.rows || !res.vars || !cols) return null;
@@ -89,6 +100,10 @@
   });
 
   function cite(rows: number[]) {
+    if (isGlobal) {
+      chosenPoint = rows[0];
+      return;
+    }
     chosen = rows[0];
     opened.sources = true;
     if (res) {
@@ -133,16 +148,25 @@
       {#each parts as p, i (i)}{#if p.rows}<button
             type="button"
             class="cite"
-            class:hot={chosen != null && p.rows.includes(chosen)}
+            class:hot={(isGlobal ? chosenPoint : chosen) != null &&
+              p.rows.includes((isGlobal ? chosenPoint : chosen)!)}
             aria-label="Citation {p.text}"
             onclick={() => cite(p.rows!)}>{p.text.replace(/^\[|\]$/g, '')}</button
           >{:else}{p.text}{/if}{/each}
     </p>
-  {:else if turn.global?.points.length}
-    <ol class="points">
-      {#each turn.global.points as pt (pt.n)}<li>{pt.text}</li>{/each}
+  {/if}
+  {#if turn.global?.points.length}
+    <ol class="points" aria-label="Points of the answer">
+      {#each turn.global.points as pt (pt.n)}
+        <li class:hot={chosenPoint === pt.n} value={pt.n}>
+          {pt.text}
+          {#if pt.reports.length}<span class="faint small">
+              from {pt.reports.map(reportTitle).join(', ')}</span
+            >{/if}
+        </li>
+      {/each}
     </ol>
-  {:else if turn.result?.explanation && !running}
+  {:else if !turn.summary && turn.result?.explanation && !running}
     <p class="answer muted">{turn.result.explanation}</p>
   {/if}
   {#if turn.withheld}
@@ -272,6 +296,16 @@
                 {#if rerunNote}<p class="small faint">{rerunNote}</p>{/if}
               {:else if res?.boolean != null}
                 <p>{res.boolean ? 'Yes' : 'No'}</p>
+              {:else if tripleGraph}
+                <div class="graph-box">
+                  <GraphView
+                    nodes={tripleGraph.nodes}
+                    edges={tripleGraph.edges}
+                    showControls={false}
+                  />
+                </div>
+                <p class="small faint">{fmtInt(res?.triples?.length ?? 0)} triples</p>
+                {#if rerunNote}<p class="small faint">{rerunNote}</p>{/if}
               {:else if turn.result?.query}
                 <p class="small faint">
                   {turn.status === 'stored' || turn.rowsDropped
@@ -515,6 +549,10 @@
     font-size: var(--fs-md);
     line-height: 1.6;
     max-width: 68ch;
+  }
+  .points li.hot {
+    background: var(--spark-soft);
+    border-radius: var(--r-sm);
   }
   .cite {
     display: inline-flex;

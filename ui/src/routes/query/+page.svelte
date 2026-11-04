@@ -1070,7 +1070,7 @@
   // Ask bar's did, and Open in Query and Save as query land here (C18 §6.2).
   onMount(() =>
     askThread.attach({
-      extras: () => askExtras() ?? {},
+      extras: () => askExtras(),
       begin: (o) =>
         beginTab({
           question: o.question,

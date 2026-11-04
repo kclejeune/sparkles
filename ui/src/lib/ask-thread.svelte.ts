@@ -7,6 +7,7 @@
 import { onMount } from 'svelte';
 import * as api from './api';
 import * as askApi from './ask-api';
+import { MAIN, onBranch } from './branches';
 import {
   askFailure as askFailureText,
   FIRST_STEP,
@@ -31,8 +32,11 @@ import {
 
 /** The Query page's part in an ask: a tab that follows the turn's events. */
 export interface AskSink {
-  /** What the request carries from the page: its state, branch, reasoning and row limit. */
-  extras(): Partial<askApi.AskRequest>;
+  /**
+   * What the request carries from the page: its state, branch, reasoning and row limit,
+   * or null when the page's state is not valid, which asks nothing.
+   */
+  extras(): Partial<askApi.AskRequest> | null;
   /** A question starts; the returned consumer sees its events and its end. */
   begin(o: {
     question: string;
@@ -49,11 +53,13 @@ export interface AskSink {
   }): void;
 }
 
-const STORE_KEY = (ds: string) => `sparkles.askThread.${ds}`;
+/** One thread per principal and dataset, so that a sign-in never shows another's. */
+const STORE_KEY = (principal: string | null, ds: string) =>
+  `sparkles.askThread.${encodeURIComponent(principal ?? '')}.${ds}`;
 
-function loadSession(ds: string): Thread | null {
+function loadSession(principal: string | null, ds: string): Thread | null {
   try {
-    const raw = globalThis.sessionStorage?.getItem(STORE_KEY(ds));
+    const raw = globalThis.sessionStorage?.getItem(STORE_KEY(principal, ds));
     if (!raw) return null;
     const t = JSON.parse(raw) as Thread;
     if (!Array.isArray(t?.turns)) return null;
@@ -69,7 +75,7 @@ function loadSession(ds: string): Thread | null {
   }
 }
 
-function saveSession(ds: string, t: Thread) {
+function saveSession(principal: string | null, ds: string, t: Thread) {
   try {
     // rows can be large: a reload shows them again with Show rows
     const slim = {
@@ -80,7 +86,7 @@ function saveSession(ds: string, t: Thread) {
           : x,
       ),
     };
-    globalThis.sessionStorage?.setItem(STORE_KEY(ds), JSON.stringify(slim));
+    globalThis.sessionStorage?.setItem(STORE_KEY(principal, ds), JSON.stringify(slim));
   } catch {
     /* ignore */
   }
@@ -133,16 +139,20 @@ class AskThreadState {
 
   /** Follow the open dataset: its status, its thread of this tab and its history. */
   async setDataset(ds: string | null, principal: string | null) {
-    if (principal !== this.#principal) {
+    const someoneElse = principal !== this.#principal;
+    if (someoneElse) {
       this.#principal = principal;
       this.mode = loadAskPrefs(principal).mode;
     }
-    if (ds === this.ds) return;
+    if (ds === this.ds && !someoneElse) return;
+    // another dataset, or another person: nothing of the last one stays on screen
     this.stop();
     this.ds = ds;
     this.status = null;
     this.history = null;
-    this.thread = (ds && loadSession(ds)) || { turns: [] };
+    this.historyError = null;
+    this.draft = '';
+    this.thread = (ds && loadSession(principal ?? null, ds)) || { turns: [] };
     if (!ds) return;
     try {
       const s = await askApi.assistantSettings(ds);
@@ -203,7 +213,7 @@ class AskThreadState {
   }
 
   #persist() {
-    if (this.ds) saveSession(this.ds, this.thread);
+    if (this.ds) saveSession(this.#principal ?? null, this.ds, this.thread);
   }
 
   newThread() {
@@ -235,6 +245,12 @@ class AskThreadState {
   ) {
     const ds = this.ds;
     if (!ds || !question.trim()) return;
+    // the Query page's state, or the branch and state of the page on screen; a state the
+    // Query page cannot read asks nothing
+    const extras: Partial<askApi.AskRequest> | null = this.#sink
+      ? this.#sink.extras()
+      : pageTarget(o.retry ? o.retry.chip : this.pageContext);
+    if (!extras) return;
     this.stop();
     const chip = o.retry ? o.retry.chip : (this.chip ?? undefined);
     const earlier = o.retry
@@ -251,6 +267,7 @@ class AskThreadState {
       step: FIRST_STEP,
       trail: [],
       at: new Date().toISOString(),
+      ...(extras.branch ? { branch: extras.branch } : {}),
     };
     if (o.retry) {
       const i = this.thread.turns.indexOf(o.retry);
@@ -261,7 +278,6 @@ class AskThreadState {
     const controller = new AbortController();
     this.#controller = controller;
     const sink = this.#sink?.begin({ question, context, run, controller }) ?? null;
-    const extras = this.#sink?.extras() ?? {};
     const mode = o.mode ?? (this.source === 'auto' ? undefined : this.source);
     const body: askApi.AskRequest = {
       ...extras,
@@ -356,7 +372,7 @@ class AskThreadState {
 
   /** Run a turn's stored query again, read-only, at its commit when that state is kept. */
   async rerun(t: ThreadTurn): Promise<string | null> {
-    const ds = this.ds;
+    const ds = this.ds && onBranch(this.ds, t.branch);
     const q = t.result?.query;
     if (!ds || !q) return null;
     t.rerun = 'loading';
@@ -370,7 +386,9 @@ class AskThreadState {
           ...(commit != null ? { at: `commit:${commit}` } : {}),
         });
       } catch (e) {
-        if (commit == null) throw e;
+        // only a state the server no longer keeps falls back to the current one
+        const gone = e instanceof api.ApiError && (e.status === 410 || e.code === 'history-gone');
+        if (commit == null || !gone) throw e;
         res = await api.query(ds, q, { send: 200 });
         note = `Commit ${commit} is no longer kept, so these rows are from the current state.`;
       }
@@ -392,6 +410,14 @@ function failureOf(err: api.ApiError | null, e: unknown): string {
     err?.message ?? api.errorMessage(e),
     typeof body?.resetAt === 'string' ? body.resetAt : undefined,
   );
+}
+
+/** The branch and state a page reads, which an ask from it reads too. */
+function pageTarget(c: AskContextChip | null | undefined): Partial<askApi.AskRequest> {
+  return {
+    ...(c?.branch && c.branch !== MAIN ? { branch: c.branch } : {}),
+    ...(c?.at ? { at: c.at } : {}),
+  };
 }
 
 export const askThread = new AskThreadState();

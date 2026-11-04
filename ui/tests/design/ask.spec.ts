@@ -5,7 +5,7 @@
 // answer, a follow-up joins the thread, the history reopens it, Show rows runs the stored
 // query again without a model, and the drawer opens on a Browse page with the resource as
 // context, with no sideways overflow. Shots go to SPARKLES_DESIGN_OUT. Run with
-// `pnpm exec playwright test --config playwright.design.config.ts ask`.
+// `pnpm exec playwright test --config playwright.design.config.ts design/ask.spec`.
 
 import { expect, test, type Page } from '@playwright/test';
 import { mkdirSync } from 'node:fs';

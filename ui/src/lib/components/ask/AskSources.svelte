@@ -112,7 +112,7 @@
         </li>
       {/each}
     </ol>
-  {:else if turn.summary?.citations.length && !rows.length}
+  {:else if turn.summary?.citations.length && !rows.length && turn.mode !== 'global' && !turn.global}
     <p class="faint small">
       The answer cites {turn.summary.citations.length === 1 ? 'a row' : 'rows'} of its result. Rows are
       not kept, so open Rows and choose Show rows to read them.

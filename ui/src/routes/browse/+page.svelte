@@ -302,7 +302,16 @@
   const kind = $derived(term ? kindWord(term.kinds) : '');
   // the term on screen is the context of a question asked from the Ask drawer
   useAskContext(() =>
-    term ? { kind: 'entity', iri: term.iri, label: title, type: chipTypeOf(term.kinds) } : null,
+    term
+      ? {
+          kind: 'entity',
+          iri: term.iri,
+          label: title,
+          type: chipTypeOf(term.kinds),
+          branch,
+          ...(at ? { at } : {}),
+        }
+      : null,
   );
   const isSkos = $derived(
     !!term?.kinds.some((k) => k === 'concept' || k === 'conceptScheme' || k === 'collection'),

@@ -21,7 +21,11 @@ import { askFailure, MAX_TURNS, nextStep, type Turn } from './ask';
 import { fmtInt } from './format';
 
 /** What a page lends the questions asked from it, shown as a removable chip. */
-export type AskContextChip =
+/**
+ * What a page lends a question: the resource or query it shows, and the branch and state
+ * (`at`) it reads, which the question reads too.
+ */
+export type AskContextChip = { branch?: string | null; at?: string | null } & (
   | {
       kind: 'entity';
       iri: string;
@@ -30,7 +34,8 @@ export type AskContextChip =
       type?: 'class' | 'property' | 'individual' | 'concept' | 'resource';
     }
   | { kind: 'query'; label: string; question?: string; query: string }
-  | { kind: 'commit'; label: string; commit: number };
+  | { kind: 'commit'; label: string; commit: number }
+);
 
 /** One step of the work as it lands, for the rail of a running turn. */
 export type TrailStep = { key: string; name: string; detail: string; ok: boolean };
@@ -44,6 +49,8 @@ export type ThreadTurn = {
   id?: string;
   question: string;
   chip?: AskContextChip;
+  /** The branch the turn read, when it was not main. */
+  branch?: string;
   status: TurnStatus;
   /** The step the server is on while the turn runs. */
   step?: string;
@@ -310,6 +317,7 @@ export function turnFromRecord(r: AskRecord): ThreadTurn {
     trail: [],
     at: r.at,
     commit: r.commit,
+    ...(r.branch ? { branch: r.branch } : {}),
     mode: r.mode === 'global' ? 'global' : 'local',
     withheld: r.answerWithheld === true,
     feedback: r.outcome === 'none' ? undefined : r.outcome,
@@ -343,9 +351,11 @@ export function turnFromRecord(r: AskRecord): ThreadTurn {
         reports: p.reports ?? [],
         findings: [],
       })),
-      reports: (r.reports ?? []).map((iri) => ({
+      reports: (
+        a.global.reports ?? (r.reports ?? []).map((iri) => ({ iri, title: undefined }))
+      ).map(({ iri, title }) => ({
         iri,
-        title: iri,
+        title: title ?? iri,
         level: 0,
         status: '',
         findings: [],
@@ -379,7 +389,8 @@ export type ThreadSummary = {
 /** The history's records grouped into threads, the most recent thread first. */
 export function threadsFromRecords(records: AskRecord[]): ThreadSummary[] {
   const by = new Map<string, AskRecord[]>();
-  for (const r of records) {
+  // the history comes newest first, and records of one second keep the server's order
+  for (const r of [...records].reverse()) {
     const id = r.thread ?? r.id;
     const list = by.get(id);
     if (list) list.push(r);
@@ -408,7 +419,7 @@ export function threadsFromRecords(records: AskRecord[]): ThreadSummary[] {
                 : undefined,
     });
   }
-  return out.sort((a, b) => b.at.localeCompare(a.at));
+  return out.reverse().sort((a, b) => b.at.localeCompare(a.at));
 }
 
 /** The day group of a thread in the list: Today, Yesterday or Earlier. */

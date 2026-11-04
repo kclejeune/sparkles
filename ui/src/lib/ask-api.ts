@@ -504,6 +504,8 @@ export type AskRecord = {
   answer?: AskStoredAnswer;
   /** The answer was kept, but the caller's view no longer covers what it read. */
   answerWithheld?: boolean;
+  /** The branch the ask read, when it was not main. */
+  branch?: string;
   /** The pipeline's routing record, with its steps. */
   routing?: unknown;
 };
@@ -522,6 +524,7 @@ export type AskStoredAnswer = {
   };
   global?: {
     points?: { n: number; text: string; reports?: string[] }[];
+    reports?: { iri: string; title?: string }[];
     uncitedSentences?: string[];
   };
   graph?: AskGraph;

@@ -110,7 +110,13 @@
   // the entity on screen is the context of a question asked from the Ask drawer
   useAskContext(() =>
     selected
-      ? { kind: 'entity', iri: selected, label: shortLabel(selected, prefixes), type: 'concept' }
+      ? {
+          kind: 'entity',
+          iri: selected,
+          label: shortLabel(selected, prefixes),
+          type: 'concept',
+          branch,
+        }
       : null,
   );
   const browserLangs =

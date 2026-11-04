@@ -119,6 +119,9 @@
       iri: n.iri,
       label: n.label ?? shortLabel(n.iri, prefixes),
       type: 'resource',
+      // the branch and the state the resource is read at
+      branch: overviewBranch,
+      ...(timeActive && exAt ? { at: exAt } : {}),
     };
   });
 
