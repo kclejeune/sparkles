@@ -18,9 +18,14 @@ export default defineConfig({
       use: {
         ...devices['Desktop Chrome'],
         viewport: { width: 1440, height: 900 },
-        // the full browser in headless mode: it has WebGL 2, in software on a host without a GPU
-        channel: 'chromium',
-        launchOptions: { args: ['--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] },
+        // the full browser in headless mode: it has WebGL 2, in software on a host without a GPU.
+        // PERF_CHROMIUM names another Chromium, such as the system's on a host whose Playwright
+        // browsers are of another revision.
+        ...(process.env.PERF_CHROMIUM ? {} : { channel: 'chromium' }),
+        launchOptions: {
+          ...(process.env.PERF_CHROMIUM ? { executablePath: process.env.PERF_CHROMIUM } : {}),
+          args: ['--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'],
+        },
       },
     },
   ],
