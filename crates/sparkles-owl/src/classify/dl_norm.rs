@@ -127,15 +127,6 @@ struct Norm<'a> {
     counting: bool,
 }
 
-fn abs_bit(b: u32) -> bool {
-    std::env::var("SPARKLES_ABS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(3)
-        & b
-        != 0
-}
-
 /// The largest minimum that becomes that many existential restrictions.
 const MAX_MIN: u32 = 64;
 
@@ -399,12 +390,6 @@ impl Norm<'_> {
                 // `D ⊓ ¬F ⊑ y` is the clause `D → y ⊔ F`, with a body, where the complement
                 // alone would give a clause of every context; so are `∀r.F` and `≤n r.F`,
                 // whose duals are `∃r.¬F` and `≥(n+1) r.F`
-                let split = if self.counting {
-                    self.absorb_counts(cs.iter())
-                } else {
-                    cs.iter().cloned().collect()
-                };
-                let cs = &split;
                 let (moved, plain): (Vec<&ClassExpression>, Vec<&ClassExpression>) =
                     cs.iter().partition(|c| self.dual(c).is_some());
                 if moved.is_empty() || plain.is_empty() {
@@ -516,22 +501,8 @@ impl Norm<'_> {
                 let m = self.pos(&C::ObjectMinCardinality(1, p.clone(), f.clone()), d)?;
                 self.global_or(m)?
             }
-            C::ObjectExactCardinality(n, p, f) if self.counting && *n >= 1 && abs_bit(1) => {
-                // =n p.f is ≥n p.f ⊓ ≤n p.f, which keeps ∃p.f as the clause's body
-                // and moves the two bounds to its head, in place of a clause of every
-                // context
-                let both = C::ObjectIntersectionOf(
-                    [
-                        C::ObjectMinCardinality(*n, p.clone(), f.clone()),
-                        C::ObjectMaxCardinality(*n, p.clone(), f.clone()),
-                    ]
-                    .into_iter()
-                    .collect(),
-                );
-                self.neg(&both, d)?
-            }
             C::ObjectExactCardinality(n, p, f) if self.counting => {
-                // =0 p.f is handled above; =n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f ⊔ ≥(n+1) p.f
+                // =n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f ⊔ ≥(n+1) p.f
                 let lo = self.pos(&C::ObjectMaxCardinality(n - 1, p.clone(), f.clone()), d)?;
                 let n1 = n.checked_add(1).ok_or("a cardinality too large")?;
                 let hi = self.pos(&C::ObjectMinCardinality(n1, p.clone(), f.clone()), d)?;
@@ -556,39 +527,6 @@ impl Norm<'_> {
             C::ObjectHasSelf(_) => return Err("self restrictions"),
             _ => return Err("data restrictions"),
         })
-    }
-
-    /// The conjuncts of an intersection in a negative position with the exact cardinalities
-    /// above zero split into their two bounds, the nested intersections flattened, and
-    /// each minimum above one given the existential restriction `≥1 r.F` beside it, which
-    /// stays in the body when the minimum moves to the head as its dual `≤(n-1) r.F`. The
-    /// clause with that body is equivalent to the clause of every context: where no
-    /// `r.F` successor exists, `≤(n-1) r.F` holds.
-    fn absorb_counts<'a>(
-        &self,
-        cs: impl DoubleEndedIterator<Item = &'a ClassExpression>,
-    ) -> Vec<ClassExpression> {
-        use ClassExpression as C;
-        let mut out = Vec::new();
-        let mut todo: Vec<&ClassExpression> = cs.rev().collect();
-        while let Some(c) = todo.pop() {
-            match c {
-                C::ObjectIntersectionOf(inner) => todo.extend(inner.iter().rev()),
-                C::ObjectExactCardinality(n, p, f) if *n >= 1 && abs_bit(1) => {
-                    out.push(C::ObjectMinCardinality(*n, p.clone(), f.clone()));
-                    out.push(C::ObjectMaxCardinality(*n, p.clone(), f.clone()));
-                    if *n >= 2 {
-                        out.push(C::ObjectMinCardinality(1, p.clone(), f.clone()));
-                    }
-                }
-                C::ObjectMinCardinality(n, p, f) if *n >= 2 && abs_bit(2) => {
-                    out.push(c.clone());
-                    out.push(C::ObjectMinCardinality(1, p.clone(), f.clone()));
-                }
-                c => out.push(c.clone()),
-            }
-        }
-        out
     }
 
     /// The dual that a conjunct in a negative position moves to the head as: `F` for `¬F`,
@@ -661,17 +599,6 @@ impl Norm<'_> {
             if let Some(c) = todo_l.pop() {
                 match c {
                     C::ObjectIntersectionOf(cs) => todo_l.extend(cs),
-                    // an exact cardinality is its two bounds and a minimum above one keeps
-                    // `∃r.F` in the body, so that the bounds do not make a clause of
-                    // every context
-                    C::ObjectExactCardinality(n, p, f) if self.counting && n >= 1 && abs_bit(1) => {
-                        todo_l.push(C::ObjectMinCardinality(n, p.clone(), f.clone()));
-                        todo_l.push(C::ObjectMaxCardinality(n, p, f));
-                    }
-                    C::ObjectMinCardinality(n, p, f) if self.counting && n >= 2 && abs_bit(2) => {
-                        left.push(C::ObjectMinCardinality(1, p.clone(), f.clone()));
-                        todo_r.push(C::ObjectMaxCardinality(n - 1, p, f));
-                    }
                     // a complement, a universal or a maximum on the left is its dual on the
                     // right, which keeps the clause's body
                     c if self.dual(&c).is_some() => {
@@ -896,7 +823,8 @@ impl Norm<'_> {
 /// clauses of case analysis, after the EL axioms are in `ax`. `None` when it takes no axiom
 /// that needs case analysis, or when the role inclusions are not regular or their automata
 /// pass the limit, and then `ax` is as it was, the interner aside. The answer's flags say
-/// which axioms were taken.
+/// which axioms were taken. A run that does not allow counting leaves the axioms that need
+/// it out, as the normalization did before it counted.
 pub fn normalize(
     axioms: &[&AxiomKind],
     it: &mut Interner,
