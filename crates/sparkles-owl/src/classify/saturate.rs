@@ -484,6 +484,11 @@ pub const CONTEXT_BYTES: usize = 320;
 const OUTBOX: usize = 4096;
 /// The clauses of Tier D a context processes between checks of the bounds.
 const DL_CLAUSES: usize = 256;
+/// The roots from which a saturation on several threads starts them all at once.
+const EAGER_ROOTS: usize = if cfg!(test) { 64 } else { 4096 };
+/// The conclusions the first worker of a smaller saturation applies before the others
+/// start, so that a run that ends sooner pays for no thread (roadmap item 709).
+const LAZY_CONCLUSIONS: usize = if cfg!(test) { 256 } else { 32_768 };
 
 struct Run<'a> {
     ix: &'a Index,
@@ -581,7 +586,8 @@ pub fn saturate_counted(
         next_root: AtomicUsize::new(0),
         queue: Mutex::new(Vec::new()),
         ready: Condvar::new(),
-        pending: AtomicUsize::new(bounds.threads.max(1)),
+        // the first worker, which the others join when they start (`Run::workers`)
+        pending: AtomicUsize::new(1),
         idle: AtomicUsize::new(0),
         stop: AtomicU8::new(STOP_NONE),
         memory: AtomicUsize::new(bounds.base_memory),
@@ -1037,16 +1043,27 @@ impl<'a> Run<'a> {
     /// set has a worker of its own that inlines its activation, so that the worker of the
     /// EL rules does not hold the activations of the Horn and disjunctive rules
     /// (roadmap items 711 and 715).
+    ///
+    /// The calling thread is the first worker. A run of many roots starts the others at
+    /// once, and a smaller one when the first has applied [`LAZY_CONCLUSIONS`], so that a
+    /// small ontology, whose saturation takes less time than starting threads, runs on
+    /// one (roadmap item 709).
     fn workers<R: Rules>(&self, threads: usize) {
         if threads == 1 {
-            self.worker::<R>();
-        } else {
-            std::thread::scope(|s| {
-                for _ in 0..threads {
-                    s.spawn(|| self.worker::<R>());
-                }
-            });
+            self.worker::<R>(None);
+            return;
         }
+        std::thread::scope(|s| {
+            let start = || {
+                // counted while the first worker is busy, so that the count cannot reach 0
+                // before they start
+                self.pending.fetch_add(threads - 1, Ordering::SeqCst);
+                for _ in 1..threads {
+                    s.spawn(|| self.worker::<R>(None));
+                }
+            };
+            self.worker::<R>(Some(&start));
+        });
     }
 
     /// A worker activates up to [`ROOTS_PER_ROUND`] roots, then the contexts those
@@ -1054,7 +1071,12 @@ impl<'a> Run<'a> {
     /// before it takes more roots. A context that many others send to, such as a class
     /// that fills many existential restrictions, then takes the conclusions of a round
     /// in one activation rather than one at a time.
-    fn worker<R: Rules>(&self) {
+    fn worker<R: Rules>(&self, mut others: Option<&dyn Fn()>) {
+        if self.roots.len() >= EAGER_ROOTS
+            && let Some(start) = others.take()
+        {
+            start();
+        }
         let mut mine: VecDeque<Ex> = VecDeque::new();
         let mut chunk: Vec<Ex> = Vec::new();
         let mut round = 0usize;
@@ -1122,6 +1144,12 @@ impl<'a> Run<'a> {
                 return;
             }
             self.process::<R>(next, &mut mine, &mut tally, &mut local, &mut outbox);
+            if others.is_some()
+                && self.applied.load(Ordering::Relaxed) + tally.applied >= LAZY_CONCLUSIONS
+                && let Some(start) = others.take()
+            {
+                start();
+            }
             if !outbox.is_empty() && self.idle.load(Ordering::Relaxed) > 0 {
                 self.deliver(&mut outbox, &mut mine);
             }
