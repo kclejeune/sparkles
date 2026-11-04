@@ -677,8 +677,8 @@ base's within 0.1 ms. Five files whose saturation takes 1.8 to 4 ms on one threa
 0.4 to 0.6 ms slower in warm runs on eight threads, since their helper threads start 0.5 ms later, and
 roadmap item NEW-ITEM-1 follows them. On four threads the warm runs take 0.86 of the
 base's time. Seven more rounds of the base, commit 6b4c8e87 and the final commit
-47c13a51 gave the cold runs of 47c13a51 0.73 of the base's time on four threads and 0.67
-on eight, against 0.76 and 0.66 for 6b4c8e87 in the same rounds.
+47c13a51 gave the cold runs of 47c13a51 0.74 of the base's time on four threads and 0.67
+on eight, against 0.75 and 0.67 for 6b4c8e87 in the same rounds.
 
 A whole cold process of the lane on four threads takes less time on forge than Konclude
 0.7.0 took on the same file on the laptop in the comparison of item 709, from 1.9 ms for
@@ -710,11 +710,11 @@ item NEW-ITEM-3 follows it. [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPER
 records that build.
 
 A screen of the 161 development files under 20 MB on a Namespace instance, three rounds
-on eight threads, flagged files of 7,000 to 40,000 classes, and five rounds of six of
+on eight threads, flagged files of 7,646 to 53,085 classes, and five rounds of six of
 them on forge on four and eight threads found one difference beyond the spread of the
-rounds. With chunks of 4,096 classes the taxonomy of `ore_ont_9151`, which has 16,448
-classes, took 5.5 ms on eight threads against 2.9 ms, and the whole classification 32.2
-against 30.0 ms. Commit 47c13a51 took 2.9 and 29.8 ms, which is why the taxonomy keeps
+rounds. With chunks of 4,096 classes the taxonomy of `ore_ont_9151`, which has 7,646
+classes, ran in two chunks instead of eight and took 5.5 ms on eight threads against
+2.9 ms, and the whole classification 32.2 against 30.0 ms. Commit 47c13a51 took 2.9 and 29.8 ms, which is why the taxonomy keeps
 chunks of 1,024 classes. `ore_ont_16680`, the longest of the six, takes 2.6 s on eight
 threads on every build.
 

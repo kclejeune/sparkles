@@ -1013,9 +1013,9 @@
    "metadata_note": "A manual measurement record of the code layout of items 711 and 715 on the benchmark host: the gate, a screen with reference builds, pinned eight-thread rounds and pinned two-unit rounds, with build times and instruction counts from atlas."
   },
   {
-   "run_id": "sha256-2b04636405402a993a896e0bc63c0ff1dafdccdd23a930addf33e6b22eff8b57",
+   "run_id": "sha256-1eb1525c974c0e213c97d16628f71270069d6c1d483edebcd1cca5cd51aa7017",
    "path": "runs/2026-11-04-el-small-files-forge-47c13a51/record.json",
-   "sha256": "2b04636405402a993a896e0bc63c0ff1dafdccdd23a930addf33e6b22eff8b57",
+   "sha256": "1eb1525c974c0e213c97d16628f71270069d6c1d483edebcd1cca5cd51aa7017",
    "format": "legacy-assessment",
    "context": {
     "suite": "el-classification",
@@ -1232,7 +1232,7 @@
       "ram_mib": 15620,
       "kernel": "7.2.9"
      },
-     "method": "Every part held the heavy lock, and the forge parts also held the bench lock. gate: gate/ab.sh.txt ran one el_classify process per side, file and thread count with --repeat 5 in five rounds whose order of the sides rotates, one thread pinned to CPU 4 and eight threads pinned to the performance cores 0 to 11. Each round's value is the process's median classification time. ow1: the same as the gate with the experiment ow1 as a third side. mid: the same on four and eight threads on six development files of 7,000 to 40,000 classes that a Namespace screen of the development files flagged. mc1: the same on four of them with mc1 as a third side. mc1-cold-t4 and mc1-cold-t8: the cold parts below with mc1 as a third side. cold-t1, cold-t4 and cold-t8: cold.sh.txt ran each small file in seven rounds of rotating order, one process with --repeat 1 for the cold classification and the wall time of the whole process, and one process with --repeat 10 whose last nine classifications give the warm median, pinned in the same way. atlas-8737: atlas-8737/mem695.sh.txt ran one classification of ore_ont_8737 per side on four and on one thread in a scope with a 13 GiB cap, and reports the peak RSS of the process and the classifier's peak estimate of its own memory.",
+     "method": "Every part held the heavy lock, and the forge parts also held the bench lock. gate: gate/ab.sh.txt ran one el_classify process per side, file and thread count with --repeat 5 in five rounds whose order of the sides rotates, one thread pinned to CPU 4 and eight threads pinned to the performance cores 0 to 11. Each round's value is the process's median classification time. ow1: the same as the gate with the experiment ow1 as a third side. mid: the same on four and eight threads on six development files of 7,646 to 53,085 classes that a Namespace screen of the development files flagged. mc1: the same on four of them with mc1 as a third side. mc1-cold-t4 and mc1-cold-t8: the cold parts below with mc1 as a third side. cold-t1, cold-t4 and cold-t8: cold.sh.txt ran each small file in seven rounds of rotating order, one process with --repeat 1 for the cold classification and the wall time of the whole process, and one process with --repeat 10 whose last nine classifications give the warm median, pinned in the same way. atlas-8737: atlas-8737/mem695.sh.txt ran one classification of ore_ont_8737 per side on four and on one thread in a scope with a 13 GiB cap, and reports the peak RSS of the process and the classifier's peak estimate of its own memory.",
      "kind": "measurement"
     }
    },
