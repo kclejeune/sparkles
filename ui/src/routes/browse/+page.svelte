@@ -6,7 +6,7 @@
   // entity and never the whole ontology. The landing page reads the header and counts by
   // SPARQL and the roots from the hierarchy route. The components come from
   // lib/components/browse, and this page only lays them out.
-  import { useAskContext, useAskTarget } from '$lib/ask-thread.svelte';
+  import { askThread, useAskContext, useAskTarget } from '$lib/ask-thread.svelte';
   import { chipTypeOf } from '$lib/ask-thread';
   import { beforeNavigate, goto } from '$app/navigation';
   import { base } from '$app/paths';
@@ -121,7 +121,6 @@
   import TermXrefs from '$components/browse/TermXrefs.svelte';
   import TopTerms from '$components/browse/TopTerms.svelte';
   import SimilarTerms from '$components/browse/SimilarTerms.svelte';
-  import { askHook } from '$lib/ask-hook.svelte';
   import { editorOf } from '$lib/routes';
 
   const RDFS = WELL_KNOWN.rdfs;
@@ -404,15 +403,6 @@
   });
   /** The term in its Workbench editor, selected in the tree with its path open. */
   const workbenchLink = $derived(editLink);
-  /** The kind of resource the Ask drawer's suggestions are for. */
-  const askType = (kinds: readonly string[]) =>
-    kinds.includes('class')
-      ? ('class' as const)
-      : kinds.some((k) => k.endsWith('Property'))
-        ? ('property' as const)
-        : kinds.includes('individual')
-          ? ('individual' as const)
-          : ('resource' as const);
 
   // --- edit mode (ROADMAP item 630) ------------------------------------------------------
   // A caller with write access switches the page into edit mode (`edit=1`), where its
@@ -1157,18 +1147,15 @@
                     : 'Ontology'}</a
                 >
               {/if}
-              {#if askHook.open}
-                <button
-                  type="button"
-                  class="btn sm"
-                  onclick={() =>
-                    askHook.open?.({
-                      iri: term!.iri,
-                      label: title,
-                      type: isSkos ? 'concept' : askType(term!.kinds),
-                    })}><Icon name="sparkle" size={14} />Ask about this</button
-                >
-              {/if}
+              <!-- the drawer's context chip is the entity this page lends (ROADMAP item 633) -->
+              <button
+                type="button"
+                class="btn sm"
+                onclick={() => {
+                  askThread.chipRemoved = false;
+                  askThread.show();
+                }}><Icon name="sparkle" size={14} />Ask about this</button
+              >
               {#if canEdit && !editing}
                 <button
                   type="button"

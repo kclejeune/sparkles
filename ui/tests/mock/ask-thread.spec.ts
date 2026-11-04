@@ -199,6 +199,17 @@ test.describe('the drawer on a Browse page', () => {
     await request.put('/$/assistant/uni', { data: {} });
   });
 
+  test("a term page's Ask about this opens the drawer about the term", async ({ page }) => {
+    await fresh(page, 'uni');
+    await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + 'Professor')}`);
+    await expect(page.locator('h1.term-title')).toBeVisible({ timeout: 30_000 });
+    await page.getByRole('button', { name: 'Ask about this' }).click();
+    const d = drawer(page);
+    await expect(d).toBeVisible();
+    await expect(d).toContainText('About Professor');
+    await expect(d.getByRole('textbox', { name: 'Question' })).toBeFocused();
+  });
+
   test('opens with Shift+A and the class as context, and asks about it', async ({ page }) => {
     await fresh(page, 'uni');
     await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + 'Professor')}`);
