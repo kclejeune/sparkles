@@ -244,6 +244,38 @@ test('memory', async ({ page }) => {
   await shoot(page, 'memory');
 });
 
+test('memory-facts', async ({ page }) => {
+  // what memory holds about one person, as cards with their provenance, and the history of
+  // the facts that were superseded
+  await page.goto(
+    `/ui/explore?ds=${DATASET}&iri=${encodeURIComponent('http://example.org/resource/ana')}&view=memory`,
+  );
+  const memory = page.getByLabel('Memory', { exact: true });
+  await expect(memory.getByRole('article', { name: 'ex:memberOf' })).toContainText('agent-7', {
+    timeout: 30_000,
+  });
+  const history = memory.getByRole('list', { name: 'History' });
+  await expect(history).toContainText('res:platform');
+  await history.scrollIntoViewIfNeeded();
+  await shoot(page, 'memory-facts');
+});
+
+test('communities-map', async ({ page }) => {
+  // the hierarchy of `world`'s GraphRAG communities as a treemap, with a report below it
+  await page.goto('/ui/datasets/world?tab=communities');
+  const panel = page.getByTestId('communities');
+  await panel
+    .getByRole('group', { name: 'Hierarchy view' })
+    .getByRole('button', { name: 'Map' })
+    .click();
+  const map = panel.getByRole('group', { name: 'Community map' });
+  await expect(map).toBeVisible({ timeout: 30_000 });
+  // a parent's title strip is the part of its box its children leave free
+  await map.getByRole('button', { name: /^Gulf head office/ }).click({ position: { x: 10, y: 8 } });
+  await expect(panel.getByRole('heading', { name: 'Gulf head office' })).toBeVisible();
+  await shoot(page, 'communities-map');
+});
+
 test('time-slider', async ({ page }) => {
   // the last two commits of main moved Lea to the platform team and corrected Kai's date
   const query = `PREFIX ex: <http://example.org/ontology#>

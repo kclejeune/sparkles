@@ -85,6 +85,13 @@ test('the inferred class tree sits beside the asserted one', async ({ page }) =>
   await page.goto('/ui/workbench/ontology?ds=uni&inferred=1');
   const inferred = page.getByRole('tree', { name: 'Classes (inferred)' });
   await expect(inferred).toBeVisible({ timeout: 30_000 });
+  // the two trees share the pane in equal columns, side by side
+  const widths = await page
+    .locator('.tree-col')
+    .evaluateAll((cols) => cols.map((c) => c.getBoundingClientRect()));
+  expect(widths).toHaveLength(2);
+  expect(Math.abs(widths[0].width - widths[1].width)).toBeLessThan(2);
+  expect(widths[1].left).toBeGreaterThan(widths[0].left + 100);
   // Teacher is defined as a person who teaches a course, so Professor falls under it
   await inferred.getByRole('button', { name: 'Expand Teacher' }).click();
   await expect(inferred.getByRole('button', { name: 'Professor', exact: true })).toBeVisible();

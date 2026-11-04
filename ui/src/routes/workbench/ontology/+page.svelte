@@ -1173,7 +1173,7 @@
                 ><Icon name="key" size={13} /></button
               >
             </div>
-            <div class="tree-cols" class:two={kindTab === 'Class' && inferredOn}>
+            <div class="tree-cols" class:dual={kindTab === 'Class' && inferredOn}>
               <div class="tree-col">
                 {#if kindTab === 'Class' && inferredOn}<h2 class="col-title">Asserted</h2>{/if}
                 <div class="tree-scroll">
@@ -1859,7 +1859,7 @@
     flex: 1;
     min-height: 0;
   }
-  .tree-cols.two {
+  .tree-cols.dual {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
   .tree-col {
@@ -1868,7 +1868,7 @@
     display: flex;
     flex-direction: column;
   }
-  .tree-cols.two .tree-col + .tree-col {
+  .tree-cols.dual .tree-col + .tree-col {
     border-left: 1px solid var(--border);
   }
   .col-title {
@@ -2007,10 +2007,10 @@
     .tree-scroll {
       max-height: 50vh;
     }
-    .tree-cols.two {
+    .tree-cols.dual {
       grid-template-columns: minmax(0, 1fr);
     }
-    .tree-cols.two .tree-col + .tree-col {
+    .tree-cols.dual .tree-col + .tree-col {
       border-left: 0;
       border-top: 1px solid var(--border);
     }
