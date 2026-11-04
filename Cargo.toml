@@ -129,7 +129,7 @@ codegen-units = 1
 # BUILD-TIME-TBD longer on atlas. docs/benchmarks/el-classification/RESULTS.md records the
 # measurements.
 [profile.release.package.sparkles-owl]
-codegen-units = 2
+codegen-units = 1
 
 # Full debug info made each test binary about 1.3 GB, so linking and writing the 130-odd
 # test binaries dominated `cargo test`. Line tables keep file and line numbers in
