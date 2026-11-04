@@ -442,7 +442,8 @@ async function withXrefs(page: Page, n: number) {
 test('Identifiers groups the cross-references by database in the rail', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto(HEAVY);
-  const ids = page.locator('.b-side').getByRole('region', { name: 'Identifiers' });
+  const facts = page.locator('.b-side').getByRole('region', { name: 'Metadata' });
+  const ids = facts.getByRole('region', { name: 'Identifiers' });
   await expect(ids.locator('dt')).toHaveText(['FMA', 'MESH', 'NCIT', 'PMID', 'Wikipedia'], {
     timeout: 30_000,
   });
@@ -458,10 +459,16 @@ test('Identifiers groups the cross-references by database in the rail', async ({
   const refs = page.getByRole('region', { name: 'References' });
   await expect(refs).not.toContainText('Border-associated_macrophage');
   await expect(refs.getByRole('heading', { name: 'See also' })).toBeVisible();
+  // in the rail: the facts, the identifiers, the downloads and then the hierarchy
   const ys: number[] = [];
-  for (const sel of ['.b-info', '.b-ids', '.b-tree'])
-    ys.push((await page.locator(sel).boundingBox())!.y);
-  expect(ys).toEqual([...ys].sort((a, b) => a - b));
+  for (const el of [
+    facts.locator('dl').first(),
+    ids,
+    facts.locator('[data-format]').first(),
+    page.locator('.b-tree'),
+  ])
+    ys.push((await el.boundingBox())!.y);
+  expect(ys).toEqual([...ys].sort((x, y) => x - y));
 });
 
 test('Identifiers shows the first eight databases and the rest on request', async ({ page }) => {
@@ -502,11 +509,20 @@ test('See also, What links here and In other datasets share References under str
   const title = await refs.locator('.panel-head h2').evaluate(style);
   const sub = await refs.locator('.term-sec > h2').first().evaluate(style);
   expect(title.size).toBe('17px');
+  // every card's title is the same size, the rail's too
+  for (const name of ['Definition', 'Metadata', 'Hierarchy']) {
+    const h = page.locator('.browse').getByRole('heading', { level: 2, name, exact: true });
+    expect((await h.first().evaluate(style)).size, name).toBe('17px');
+  }
   expect(sub.size).toBe('14px');
   expect(sub.weight).toBe('600');
   const rgb = (hex: string) =>
     `rgb(${[1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16)).join(', ')})`;
   expect(sub.color).toBe(rgb(text));
+  // and the Definition card's sections read the same way
+  const syn = await page.getByRole('region', { name: 'Synonyms' }).locator('h2').evaluate(style);
+  expect(syn.size).toBe('14px');
+  expect(syn.color).toBe(rgb(text));
 });
 
 test('the counts are one line of text links', async ({ page }) => {
@@ -518,6 +534,11 @@ test('the counts are one line of text links', async ({ page }) => {
   expect(box.height).toBeLessThanOrEqual(22);
   const chip = counts.getByRole('link', { name: '3 subclasses' });
   expect(await chip.evaluate((e) => getComputedStyle(e).borderTopStyle)).toBe('none');
+  // the pills stay on the pages that keep them
+  await page.goto('/ui/datasets/uni');
+  const pill = page.locator('.stat-chip').first();
+  await expect(pill).toBeVisible({ timeout: 30_000 });
+  expect(await pill.evaluate((e) => getComputedStyle(e).borderTopStyle)).toBe('solid');
 });
 
 test('the rail sticks, and one taller than the window stays by its bottom edge', async ({

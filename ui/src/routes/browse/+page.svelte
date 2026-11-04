@@ -1671,6 +1671,7 @@
           <div class="b-info">
             <TermInfobox rows={infoRows} {linker} heading="Metadata">
               {#snippet footer()}
+                <TermIdentifiers xrefs={sections!.xrefs} />
                 <DownloadButtons
                   noun="this {kind}"
                   href={(f) => branchPath(downloadHref(target, sel, term!.iri, f))}
@@ -1678,7 +1679,6 @@
               {/snippet}
             </TermInfobox>
           </div>
-          <div class="b-ids"><TermIdentifiers xrefs={sections.xrefs} /></div>
           {#if treeKind}
             <!-- the hierarchy keeps this place in the rail in both its views, and on a phone
                is a card that opens on request, which choosing a view does too (item 734) -->
@@ -1981,7 +1981,7 @@
     min-width: 0;
   }
   /* one column on a phone and a medium screen: the head, the counts, Definition, Axioms,
-     Metadata, Identifiers, Hierarchy and References (item 734) */
+     Metadata with Identifiers and Download, Hierarchy and References (item 734) */
   .browse {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
@@ -2015,15 +2015,8 @@
     order: 4;
     min-width: 0;
   }
-  .b-ids {
-    order: 5;
-    min-width: 0;
-  }
-  .b-ids:empty {
-    display: none;
-  }
   .b-tree {
-    order: 6;
+    order: 5;
     min-width: 0;
     display: flex;
     flex-direction: column;
@@ -2031,25 +2024,26 @@
     --term-graph-h: 380px;
   }
   .b-refs {
-    order: 7;
+    order: 6;
     min-width: 0;
   }
-  /* the term's own cards carry the larger titles, which the sub-headings of References sit
-     under, in the text colour and stronger than the Definition card's */
-  .browse .b-def :global(.panel-head h2),
-  .browse :global(.b-ax .panel-head h2),
-  .browse .b-refs :global(.panel-head h2) {
+  /* the cards' titles carry weight, and each section's heading under them is the text colour */
+  .browse :global(.panel > .panel-head h2),
+  .browse :global(.b-tree .lead h2) {
     font-size: var(--fs-lg);
   }
-  .b-refs .ruled :global(.term-sec > h2) {
+  .ruled :global(.term-sec > h2) {
     font-size: var(--fs-md);
     font-weight: 600;
     color: var(--text);
+    margin-bottom: var(--sp-3);
+  }
+  .ruled :global(.term-sec > h3) {
+    color: var(--text-2);
   }
   .b-chips {
     order: 1;
     min-width: 0;
-    margin-top: calc(-1 * var(--sp-2));
   }
   /* on a phone the definition's lead sits close under its heading */
   @container browse (max-width: 639px) {
@@ -2081,12 +2075,6 @@
   }
   .ruled > :global(section:last-child) {
     padding-bottom: 0;
-  }
-  .ruled :global(.term-sec > h2) {
-    font-size: var(--fs-sm);
-    font-weight: 600;
-    color: var(--text-2);
-    margin-bottom: var(--sp-2);
   }
   .ruled > :global(.lead) {
     margin-bottom: var(--sp-3);
@@ -2147,9 +2135,6 @@
       position: sticky;
       top: var(--stick-top, var(--gutter));
     }
-  }
-  .b-tree h2 {
-    font-size: var(--fs-md);
   }
   .tree-edit:not(:empty) {
     padding: var(--sp-3) 14px 0;

@@ -1,7 +1,7 @@
 <script lang="ts">
-  // The identifiers of an entity in other databases, for a card of the page's side column: the
-  // database in a short column and the ids after it as links, a database's ids on one line. The
-  // first rows show and the rest open on request.
+  // The identifiers of an entity in other databases, for the Metadata card: the database in a
+  // short column and the ids after it as links, a database's ids on one line. The first rows
+  // show and the rest open on request.
   import { hiddenRows, xrefsByDatabase, type Sections } from '$lib/browse';
 
   let { xrefs, limit = 8 }: { xrefs: Sections['xrefs']; limit?: number } = $props();
@@ -12,36 +12,42 @@
 </script>
 
 {#if rows.length}
-  <section class="panel ids" aria-labelledby="identifiers-h">
-    <div class="panel-head"><h2 id="identifiers-h">Identifiers</h2></div>
-    <div class="panel-body">
-      <dl>
-        {#each hidden ? rows.slice(0, limit) : rows as r (r.database)}
-          <dt>{r.database || 'Other'}</dt>
-          <dd>
-            {#each r.ids as x, i (x.value)}{#if i > 0},{' '}{/if}{#if x.href}<a
-                  href={x.href}
-                  rel="noopener noreferrer"
-                  target="_blank">{x.id}</a
-                >{:else}{x.id}{/if}{/each}
-          </dd>
-        {/each}
-      </dl>
-      {#if hidden}
-        <button class="more-btn" type="button" onclick={() => (all = true)}
-          >and {hidden} more</button
-        >
-      {/if}
-    </div>
+  <section class="ids" aria-labelledby="identifiers-h">
+    <h3 id="identifiers-h">Identifiers</h3>
+    <dl>
+      {#each hidden ? rows.slice(0, limit) : rows as r (r.database)}
+        <dt>{r.database || 'Other'}</dt>
+        <dd>
+          {#each r.ids as x, i (x.value)}{#if i > 0},{' '}{/if}{#if x.href}<a
+                href={x.href}
+                rel="noopener noreferrer"
+                target="_blank">{x.id}</a
+              >{:else}{x.id}{/if}{/each}
+        </dd>
+      {/each}
+    </dl>
+    {#if hidden}
+      <button class="more-btn" type="button" onclick={() => (all = true)}>and {hidden} more</button>
+    {/if}
   </section>
 {/if}
 
 <style>
-  /* the columns of the Metadata card above it, so the two cards read as one list */
+  .ids {
+    padding-bottom: var(--sp-3);
+    margin-bottom: var(--sp-3);
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    margin: 0 0 var(--sp-2);
+    font-size: var(--fs-sm);
+    font-weight: 600;
+    color: var(--text-2);
+  }
   dl {
     display: grid;
     grid-template-columns: 96px minmax(0, 1fr);
-    gap: 8px 12px;
+    gap: 6px 12px;
     margin: 0;
   }
   dt {
@@ -57,9 +63,6 @@
   }
   dd a {
     color: var(--iri);
-  }
-  .panel-body {
-    padding: var(--sp-3) 14px var(--sp-4);
   }
   .more-btn {
     margin-top: var(--sp-2);

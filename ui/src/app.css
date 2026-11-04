@@ -804,25 +804,26 @@ a.stat-chip:hover {
   color: var(--text);
   border-color: var(--border-strong);
 }
-/* the counts as one line of text links, each figure with its words, split by a middle dot */
 .stat-chips.plain {
-  gap: 2px 0;
-  line-height: 20px;
+  gap: var(--sp-1) 0;
 }
+/* the counts as one line of text links, split by dots */
 .stat-chips.plain .stat-chip {
   height: auto;
   padding: 0;
   border: 0;
   border-radius: 0;
   background: none;
+  line-height: 1.3;
 }
 .stat-chips.plain a.stat-chip:hover {
-  border: 0;
   text-decoration: underline;
+  text-underline-offset: 2px;
 }
-.stat-chips.plain > :not(:last-child)::after {
+.stat-chips.plain .stat-chip:not(:last-child)::after {
   content: '\00b7';
-  margin: 0 8px;
+  display: inline-block;
+  margin: 0 0.45em 0 0.3em;
   color: var(--text-3);
 }
 @media (max-width: 639px) {

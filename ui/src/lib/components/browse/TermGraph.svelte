@@ -121,12 +121,15 @@
       emptyText="Nothing to draw"
     />
   </div>
-  <div class="legend">
-    <LensLegend results={lenses.results} {ds} />
-    {#if !compact}
-      <span class="faint">Double-click a node to add its neighbours.</span>
-    {/if}
-  </div>
+  <!-- the rail's graph has no hint, so its legend shows only for an active lens -->
+  {#if !compact || Object.values(lenses.results).some(Boolean)}
+    <div class="legend">
+      <LensLegend results={lenses.results} {ds} />
+      {#if !compact}
+        <span class="faint">Double-click a node to add its neighbours.</span>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 {#if compact}
@@ -207,9 +210,6 @@
   }
   .compact .legend {
     padding: 6px 12px;
-  }
-  .compact .legend:empty {
-    display: none;
   }
   /* a card collapsed to its heading on a phone */
   @container browse (max-width: 639px) {
