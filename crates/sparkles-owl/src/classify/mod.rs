@@ -835,8 +835,8 @@ impl Saturation {
             };
             r = self.run(axioms, None, held_bytes, &one, with_taxonomy);
         }
-        let mut counting_over = false;
-        if let Err(Error::Memory { .. }) = r
+        let mut counting_over = None;
+        if let Err(Error::Memory { used: counted, .. }) = r
             && self.dl_tried
             && !limits.el_only
             && !self.partial_over
@@ -867,7 +867,7 @@ impl Saturation {
             };
             r = self.run(axioms, None, held_bytes, &without, with_taxonomy);
             self.no_counting = false;
-            counting_over = true;
+            counting_over = Some(counted);
         }
         let mut dl_over = None;
         if let Err(Error::Memory { used, .. }) = r
@@ -940,7 +940,11 @@ impl Saturation {
         if r.is_err() && self.dirty {
             self.reset();
         }
-        if counting_over && let Ok((_, _, stats)) = &mut r {
+        if let Some(counted) = counting_over
+            && let Ok((_, _, stats)) = &mut r
+        {
+            // the high-water mark of the run that counted, which the retry's may not reach
+            stats.peak_memory = stats.peak_memory.max(counted);
             stats.dl_counting_over = true;
             stats.dl_over_budget = true;
         }

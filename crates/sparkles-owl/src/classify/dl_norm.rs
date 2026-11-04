@@ -710,6 +710,15 @@ impl Norm<'_> {
                 let r = self.role(p)?;
                 self.out.chains.push((vec![r, r], r));
             }
+            // these four read the counting rules, so a run that does not count leaves them out
+            K::FunctionalObjectProperty(_)
+            | K::InverseFunctionalObjectProperty(_)
+            | K::DisjointObjectProperties(_)
+            | K::AsymmetricObjectProperty(_)
+                if !self.counting =>
+            {
+                return Err("a role axiom that needs counting");
+            }
             K::FunctionalObjectProperty(p) | K::InverseFunctionalObjectProperty(p) => {
                 let r = match ax {
                     K::FunctionalObjectProperty(_) => self.role(p)?,

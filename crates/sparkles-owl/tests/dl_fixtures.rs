@@ -192,8 +192,8 @@ fn the_classifier_is_sound_everywhere_and_complete_on_what_it_takes_whole() {
 }
 
 /// The counting cases whose equalities of successor terms once grew past any bound: each is
-/// taken whole by Tier D, within its bound on derived conclusions, on one thread and on
-/// four with both strategies, with HermiT's answer, which the test above checks.
+/// taken whole by Tier D, within a raised bound on derived conclusions, on one thread and on
+/// four with both strategies, with HermiT's answer.
 #[test]
 fn the_counting_cases_with_many_successor_equalities_finish_in_tier_d() {
     for stem in [
@@ -201,6 +201,20 @@ fn the_counting_cases_with_many_successor_equalities_finish_in_tier_d() {
     ] {
         let path = fixtures().join(format!("{stem}.ofn"));
         let doc = ofn_read::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut classes: BTreeSet<String> = doc
+            .axioms
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AxiomKind::Declaration(Entity::Class(c)) => Some(c.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        classes.insert(THING.to_string());
+        classes.insert(NOTHING.to_string());
+        let want = reference(
+            &std::fs::read_to_string(path.with_extension("hermit.ofn")).unwrap(),
+            &classes,
+        );
         for (threads, expansion) in [
             (1, Expansion::Cautious),
             (4, Expansion::Cautious),
@@ -219,6 +233,32 @@ fn the_counting_cases_with_many_successor_equalities_finish_in_tier_d() {
                 !out.stats.dl_over_budget,
                 "{stem} on {threads} threads, {expansion:?}: Tier D passed its bound"
             );
+            // sriq-010 names an individual, which Tier D leaves out, so its answer is sound
+            // and the others' is HermiT's
+            let whole = k.excluded().is_empty();
+            assert!(
+                whole || stem.starts_with("sriq"),
+                "{stem}: an axiom is left out"
+            );
+            let mut got = BTreeSet::new();
+            for a in &classes {
+                for b in &classes {
+                    if out
+                        .taxonomy
+                        .is_subclass(&Class::new(a.as_str()), &Class::new(b.as_str()))
+                    {
+                        got.insert((a.clone(), b.clone()));
+                    }
+                }
+            }
+            if whole {
+                assert_eq!(got, want, "{stem} on {threads} threads, {expansion:?}");
+            } else {
+                assert!(
+                    got.is_subset(&want),
+                    "{stem} on {threads} threads, {expansion:?}"
+                );
+            }
         }
     }
 }

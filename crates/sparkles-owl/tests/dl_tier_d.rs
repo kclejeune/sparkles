@@ -1347,3 +1347,35 @@ SubClassOf(:Z :W)",
         assert!(out.taxonomy.is_subclass(&c("X"), &c("W")));
     }
 }
+
+#[test]
+fn a_run_without_counting_leaves_the_role_axioms_that_count_out() {
+    // Top has an r-successor, r is below s, and r and s are disjoint: every element has an
+    // edge that both roles hold, so the ontology is inconsistent when the run counts
+    let ax = axioms(
+        "SubClassOf(owl:Thing ObjectSomeValuesFrom(:r owl:Thing))
+SubObjectPropertyOf(:r :s)
+DisjointObjectProperties(:r :s)
+SubClassOf(:X ObjectUnionOf(:Y :Z))",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.stats.dl_counting_over);
+    assert!(out.taxonomy.is_unsatisfiable(&c("X")));
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&Limits {
+            dl_work: Some(1),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(out.stats.dl_counting_over);
+    // the retry has no rule for the disjoint roles, so it must not report them as taken
+    assert!(
+        k.excluded()
+            .iter()
+            .any(|e| format!("{e:?}").contains("DisjointObjectProperties")),
+        "{:?}",
+        k.excluded()
+    );
+}
