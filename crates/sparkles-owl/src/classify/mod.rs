@@ -168,9 +168,17 @@ pub struct Limits {
     pub expansion: Expansion,
     /// the most conclusions, kept or redundant, that a run of Tier D with counting derives
     /// before the run starts again without counting. `None` takes a bound of
-    /// [`DL_WORK_BOUND`] conclusions. A run of Tier D without counting has no such bound,
-    /// except the run that starts again after this one passed it, whose bound is 4 million.
+    /// [`DL_WORK_BOUND`] conclusions. It applies only with [`counting`](Limits::counting).
+    /// A run of Tier D without counting has no such bound, except the run that starts again
+    /// after this one passed it, whose bound is 4 million.
     pub dl_work: Option<usize>,
+    /// whether Tier D counts, which is off by default. A run that counts takes number
+    /// restrictions, functional and inverse functional properties, disjoint properties and
+    /// asymmetric properties into the case analysis, and it is complete for them when it
+    /// finishes within [`dl_work`](Limits::dl_work). On real ontologies it rarely does, so
+    /// a run that does not count leaves those axioms out and reports them, as the
+    /// classifier did before it counted, and costs what that run costs.
+    pub counting: bool,
 }
 
 /// Which context the Succ rule of Tier D (roadmap item 603) gives a successor. Both
@@ -1170,7 +1178,7 @@ impl Saturation {
                 &mut ax,
                 limits.max_memory,
                 &stop,
-                !self.no_counting,
+                limits.counting && !self.no_counting,
             )
             .map_err(halt)?
             {

@@ -446,13 +446,14 @@ fn axioms_the_horn_rules_cannot_take_stay_left_out() {
     assert_eq!(ex.len(), 3, "{ex:#?}");
     assert_eq!(out.stats.outside_el.taken, 1);
     assert_eq!(out.stats.tier, Tier::Disjunctive);
-    // without it Tier D takes the union, the universals and the counting
+    // without it Tier D takes the union and the universals, and only the counting stays
+    // out
     let (out, ex) = run("SubClassOf(:A ObjectAllValuesFrom(:r :B))
          SubClassOf(:A ObjectUnionOf(:B :C))
          SubClassOf(ObjectAllValuesFrom(:r :B) :D)
          SubClassOf(:A ObjectMaxCardinality(2 :r :B))");
-    assert_eq!(ex.len(), 0, "{ex:#?}");
-    assert_eq!(out.stats.outside_el.taken, 4);
+    assert_eq!(ex.len(), 1, "{ex:#?}");
+    assert_eq!(out.stats.outside_el.taken, 3);
     // with an individual the run keeps the EL rules alone
     let (out, ex) = run("SubClassOf(:A ObjectAllValuesFrom(:r :B))
          ClassAssertion(:A :a)");

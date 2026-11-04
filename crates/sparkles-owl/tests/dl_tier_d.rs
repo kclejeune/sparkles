@@ -75,6 +75,7 @@ fn whole(body: &str) -> Classification {
         let out = k
             .classify(&Limits {
                 threads,
+                counting: true,
                 ..Limits::default()
             })
             .unwrap();
@@ -105,6 +106,14 @@ fn check(body: &str, yes: &[(&str, &str)], no: &[(&str, &str)]) {
             !out.taxonomy.is_subclass(&c(a), &c(b)),
             "{a} ⊑ {b} is not entailed"
         );
+    }
+}
+
+/// The limits of a run that counts, which is off by default.
+fn counting() -> Limits {
+    Limits {
+        counting: true,
+        ..Limits::default()
     }
 }
 
@@ -1098,7 +1107,7 @@ fn random_ontologies_answer_the_same_with_counting() {
             .chain([Class::thing(), Class::nothing()])
             .collect();
         let mut kd = Classifier::of(&d);
-        let od = kd.classify(&Limits::default()).unwrap();
+        let od = kd.classify(&counting()).unwrap();
         if !kd.excluded().is_empty() || od.stats.dl_over_budget {
             continue;
         }
@@ -1113,7 +1122,7 @@ fn random_ontologies_answer_the_same_with_counting() {
                 .classify(&Limits {
                     threads,
                     expansion,
-                    ..Limits::default()
+                    ..counting()
                 })
                 .unwrap();
             let got = pairs(&on.taxonomy, &cs);
@@ -1156,12 +1165,12 @@ fn a_functional_role_answers_as_a_maximum_of_one_on_every_class() {
             .chain([Class::thing(), Class::nothing()])
             .collect();
         let mut kf = Classifier::of(&f);
-        let of = kf.classify(&Limits::default()).unwrap();
+        let of = kf.classify(&counting()).unwrap();
         let mut km = Classifier::of(&m);
         let om = km
             .classify(&Limits {
                 threads: 4,
-                ..Limits::default()
+                ..counting()
             })
             .unwrap();
         let whole = |k: &Classifier, o: &sparkles_owl::classify::Classification| {
@@ -1183,7 +1192,7 @@ fn a_functional_role_answers_as_a_maximum_of_one_on_every_class() {
 fn entailed_or_left_out(body: &str, a: &str, b: &str) {
     let ax = axioms(body);
     let mut k = Classifier::of(&ax);
-    let out = k.classify(&Limits::default()).unwrap();
+    let out = k.classify(&counting()).unwrap();
     assert!(
         out.taxonomy.is_subclass(&c(a), &c(b)) || !k.excluded().is_empty(),
         "{a} ⊑ {b} is missing and no axiom is left out"
@@ -1225,7 +1234,7 @@ fn a_wide_maximum_passes_the_bound_instead_of_enumerating_its_subsets() {
     body.push_str(UNION);
     let ax = axioms(&body);
     let mut k = Classifier::of(&ax);
-    let out = k.classify(&Limits::default()).unwrap();
+    let out = k.classify(&counting()).unwrap();
     // the answer is sound: A is satisfiable
     assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
     assert!(out.stats.dl_over_budget || out.complete);
@@ -1241,7 +1250,7 @@ fn a_maximum_of_many_passes_the_bound_instead_of_making_its_equalities() {
     body.push_str(UNION);
     let ax = axioms(&body);
     let mut k = Classifier::of(&ax);
-    let out = k.classify(&Limits::default()).unwrap();
+    let out = k.classify(&counting()).unwrap();
     assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
     assert!(out.stats.dl_over_budget || out.complete);
 }
@@ -1256,7 +1265,7 @@ fn a_maximum_of_a_hundred_passes_the_bound_instead_of_factoring_its_equalities()
     body.push_str(UNION);
     let ax = axioms(&body);
     let mut k = Classifier::of(&ax);
-    let out = k.classify(&Limits::default()).unwrap();
+    let out = k.classify(&counting()).unwrap();
     assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
     assert!(out.stats.dl_over_budget || out.complete);
 }
@@ -1280,7 +1289,7 @@ fn a_counting_run_past_its_bound_classifies_again_without_counting() {
         let out = k
             .classify(&Limits {
                 threads,
-                ..Limits::default()
+                ..counting()
             })
             .unwrap();
         assert!(!out.stats.dl_counting_over && !out.stats.dl_over_budget);
@@ -1292,10 +1301,7 @@ fn a_counting_run_past_its_bound_classifies_again_without_counting() {
     // counting, which leaves the maximum out and reports it, and the
     // answer is sound, with X below W still found by the case analysis
     let full = pairs(
-        &Classifier::of(&ax)
-            .classify(&Limits::default())
-            .unwrap()
-            .taxonomy,
+        &Classifier::of(&ax).classify(&counting()).unwrap().taxonomy,
         &cs,
     );
     let mut answers = BTreeSet::new();
@@ -1307,7 +1313,7 @@ fn a_counting_run_past_its_bound_classifies_again_without_counting() {
                     threads,
                     expansion,
                     dl_work: Some(1),
-                    ..Limits::default()
+                    ..counting()
                 })
                 .unwrap();
             assert!(out.stats.dl_counting_over, "{threads} {expansion:?}");
@@ -1339,7 +1345,7 @@ SubClassOf(:Z :W)",
             .classify(&Limits {
                 threads,
                 dl_work: Some(1),
-                ..Limits::default()
+                ..counting()
             })
             .unwrap();
         assert!(!out.stats.dl_counting_over && !out.stats.dl_over_budget);
@@ -1359,14 +1365,14 @@ DisjointObjectProperties(:r :s)
 SubClassOf(:X ObjectUnionOf(:Y :Z))",
     );
     let mut k = Classifier::of(&ax);
-    let out = k.classify(&Limits::default()).unwrap();
+    let out = k.classify(&counting()).unwrap();
     assert!(!out.stats.dl_counting_over);
     assert!(out.taxonomy.is_unsatisfiable(&c("X")));
     let mut k = Classifier::of(&ax);
     let out = k
         .classify(&Limits {
             dl_work: Some(1),
-            ..Limits::default()
+            ..counting()
         })
         .unwrap();
     assert!(out.stats.dl_counting_over);
@@ -1378,4 +1384,35 @@ SubClassOf(:X ObjectUnionOf(:Y :Z))",
         "{:?}",
         k.excluded()
     );
+}
+
+#[test]
+fn counting_is_off_by_default_and_the_axioms_that_count_are_left_out() {
+    let ax = axioms(COUNTING);
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                ..Limits::default()
+            })
+            .unwrap();
+        // no attempt to count was made, so none passed a bound
+        assert!(!out.stats.dl_counting_over && !out.stats.dl_over_budget);
+        assert_eq!(out.stats.tier, Tier::Disjunctive);
+        assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+        assert!(!k.excluded().is_empty(), "the maximum is left out");
+        assert!(out.taxonomy.is_subclass(&c("X"), &c("W")));
+        // the bound sets nothing when the run does not count
+        let mut k = Classifier::of(&ax);
+        let again = k
+            .classify(&Limits {
+                threads,
+                dl_work: Some(1),
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(!again.stats.dl_counting_over);
+        assert_eq!(again.stats.dl_work, out.stats.dl_work);
+    }
 }

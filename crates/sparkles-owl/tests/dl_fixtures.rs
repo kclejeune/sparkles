@@ -133,6 +133,7 @@ fn the_classifier_is_sound_everywhere_and_complete_on_what_it_takes_whole() {
                 .classify(&Limits {
                     threads,
                     expansion,
+                    counting: true,
                     ..Limits::default()
                 })
                 .unwrap();
@@ -225,6 +226,7 @@ fn the_counting_cases_with_many_successor_equalities_finish_in_tier_d() {
                 .classify(&Limits {
                     threads,
                     expansion,
+                    counting: true,
                     dl_work: Some(1 << 23),
                     ..Limits::default()
                 })
@@ -289,6 +291,7 @@ fn the_cases_past_the_bound_fall_back_on_every_schedule() {
                     .classify(&Limits {
                         threads,
                         expansion,
+                        counting: true,
                         ..Limits::default()
                     })
                     .unwrap();
