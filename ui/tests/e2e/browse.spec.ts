@@ -56,7 +56,7 @@ open(
     await expect(synonyms).toContainText('CELLO:plural');
     await expect(synonyms).toContainText('powerhouse of the cell');
 
-    const logic = page.getByRole('region', { name: 'Logical definition' });
+    const logic = page.getByRole('region', { name: 'Axioms' });
     await expect(logic.getByRole('link', { name: 'membrane-bounded organelle' })).toBeVisible();
     await expect(logic.locator('[data-section="sub"]')).toContainText('part of some cytoplasm');
 
@@ -70,10 +70,13 @@ open(
       'href',
       'https://en.wikipedia.org/wiki/Mitochondrion',
     );
-    const facts = page.getByRole('complementary', { name: 'About this entity' });
+    const facts = page.getByRole('region', { name: 'Metadata' });
     await expect(facts).toContainText('CELLO:0000005');
     await expect(facts).toContainText('Cell organelle ontology');
-    await expect(facts).toContainText('2 parents, 1 subclass');
+    // the counts under the header carry the hierarchy
+    const counts = page.getByRole('navigation', { name: 'Counts' });
+    await expect(counts.getByRole('link', { name: '2 parents' })).toBeVisible();
+    await expect(counts.getByRole('link', { name: '1 subclass' })).toBeVisible();
   },
 );
 
@@ -118,7 +121,7 @@ open('a property page shows its characteristics and inverse', async ({ page }) =
     `/ui/browse?ds=${DS}&iri=${encodeURIComponent('http://purl.obolibrary.org/obo/BFO_0000050')}`,
   );
   await expect(page.getByRole('heading', { level: 1, name: 'part of' })).toBeVisible();
-  const logic = page.getByRole('region', { name: 'Logical definition' });
+  const logic = page.getByRole('region', { name: 'Axioms' });
   await expect(logic).toContainText('Transitive');
 });
 

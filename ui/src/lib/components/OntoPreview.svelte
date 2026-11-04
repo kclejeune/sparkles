@@ -211,6 +211,7 @@
           total={preview.changes.total}
           label="Triples the edit would change"
           maxHeight={200}
+          ds={target}
         />
       {/if}
     {/if}

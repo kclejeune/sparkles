@@ -6,6 +6,7 @@
   // naming the commit the page shows. The session's undo stack undoes the editor's commits
   // by reverting them, which restores exactly the triples each commit changed, and the
   // change feed refreshes the views when a commit lands.
+  import PageActions from '$components/PageActions.svelte';
   import { useAskContext, useAskTarget } from '$lib/ask-thread.svelte';
   import { shortLabel } from '$lib/graph';
   import { goto } from '$app/navigation';
@@ -13,11 +14,15 @@
   import { page } from '$app/state';
   import { onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
+  import { markClassified } from '$lib/browse';
   import { app } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { branchParam, MAIN, onBranch } from '$lib/branches';
   import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
   import { fmtInt } from '$lib/format';
+  import { fetchHierarchy, type TreeKind, type TreeNode } from '$lib/browse';
+  import { searchEntities } from '$lib/entity-search';
+  import { filteredTree, LEVEL_LIMIT, LevelTree, scrollToRow } from '$lib/level-tree.svelte';
   import { useCommands, usePageSearch, useProvider } from '$lib/launcher.svelte';
   import { branchProvider } from '$lib/palette.svelte';
   import {
@@ -75,6 +80,7 @@
     type Tree,
   } from '$lib/ontology';
   import Icon from '$components/Icon.svelte';
+  import FollowState from '$components/FollowState.svelte';
   import ManchesterEditor from '$components/ManchesterEditor.svelte';
   import type { NameOption } from '$lib/manchester-complete';
   import Modal from '$components/Modal.svelte';
@@ -82,8 +88,20 @@
   import OntoHeader from '$components/OntoHeader.svelte';
   import OntoPreview from '$components/OntoPreview.svelte';
   import OntoTree from '$components/OntoTree.svelte';
+  import EditorHistory from '$components/EditorHistory.svelte';
+  import TreeCrumbs from '$components/TreeCrumbs.svelte';
+  import TreeSticky from '$components/TreeSticky.svelte';
 
-  type Tab = EntityKind | 'header' | 'dlquery';
+  import { ONTOLOGY_TABS, routes, type OntologyTab } from '$lib/routes';
+
+  const TAB_LABEL: [OntologyTab, string][] = [
+    ['tree', 'Tree'],
+    ['dlquery', 'DL Query'],
+    ['header', 'Header'],
+    ['history', 'History'],
+  ];
+
+  type Tab = OntologyTab;
 
   // --- the URL's state ---------------------------------------------------------------
   const q = $derived(page.url.searchParams);
@@ -92,15 +110,20 @@
   const target = $derived(onBranch(name, branch));
   const graph = $derived(q.get('graph') || null);
   const sel: Selection = $derived({ graph, imports: true });
+  // the page's one tab row: the tree, DL Query, the header and the history (ROADMAP item 633)
   const tab = $derived<Tab>(
-    (TREE_KINDS as string[]).includes(q.get('tab') ?? '') ||
-      q.get('tab') === 'header' ||
-      q.get('tab') === 'dlquery'
+    (ONTOLOGY_TABS as readonly string[]).includes(q.get('tab') ?? '')
       ? (q.get('tab') as Tab)
+      : 'tree',
+  );
+  /** The tree's entity kind, a control at the top of the tree rather than a second tab row. */
+  const kind = $derived<EntityKind>(
+    (TREE_KINDS as string[]).includes(q.get('kind') ?? '')
+      ? (q.get('kind') as EntityKind)
       : 'Class',
   );
-  /** The entity kind of the tab, when it shows a tree. */
-  const kindTab = $derived<EntityKind | null>(tab === 'header' || tab === 'dlquery' ? null : tab);
+  /** The entity kind of the tree, when the page shows it. */
+  const kindTab = $derived<EntityKind | null>(tab === 'tree' ? kind : null);
   const selected = $derived(q.get('iri'));
   const view = $derived(q.get('view') === 'usage' ? 'usage' : 'frame');
   const inferredOn = $derived(q.get('inferred') === '1');
@@ -125,7 +148,7 @@
       if (v == null || v === '') p.delete(k);
       else p.set(k, v);
     }
-    return `${resolve('/ontology')}?${p}`;
+    return routes.ontology(p.get('ds') ?? name, Object.fromEntries(p));
   }
   const nav = (over: Record<string, string | null>, replace = false) =>
     goto(withParams(over), { replaceState: replace, keepFocus: true, noScroll: true });
@@ -162,7 +185,10 @@
 
   const langs = typeof navigator === 'undefined' ? ['en'] : [...(navigator.languages ?? []), 'en'];
   const nameOf = (iri: string) => entityName(iri, labels, prefixes, langs);
-  const subOf = (iri: string) => (labels.get(iri)?.length ? iriName(iri, prefixes) : null);
+  /** The short forms the hierarchy route gives, such as GO:0008150, as the browse pages show them. */
+  let shortForms = $state<Map<string, string>>(new Map());
+  const subOf = (iri: string) =>
+    labels.get(iri)?.length ? (shortForms.get(iri) ?? iriName(iri, prefixes)) : null;
 
   async function loadAll() {
     const t = target;
@@ -172,7 +198,11 @@
     loading = true;
     try {
       const r = await ontologySummary(t, s);
-      const [ents, ax, types] = await Promise.all([
+      // Every label of the graph in one query, beside the capped listings, so that a large
+      // ontology's trees show labels from their first paint rather than local names until
+      // a later query answers. A failure leaves the labels the listings carry.
+      const allLabels = ontologyLabels(t, s).catch(() => new Map<string, Lit[]>());
+      const [ents, ax, types, more] = await Promise.all([
         ontologyEntities(t, s, [...TREE_KINDS, 'Datatype']),
         ontologyAxioms(t, s, {
           types: [
@@ -184,6 +214,7 @@
           ],
         }),
         ontologyAxioms(t, s, { types: ['ClassAssertion'], assertions: true, cap: 10_000 }),
+        allLabels,
       ]);
       if (my !== loadSeq) return;
       const byKind = new Map<EntityKind, string[]>();
@@ -205,17 +236,9 @@
       entities = byKind;
       hierarchy = ax.axioms;
       typeAxioms = types.axioms;
-      labels = labelsOf(ax.axioms);
+      labels = withMissingLabels(labelsOf(ax.axioms), more);
       truncated = ents.truncated || ax.truncated || types.truncated;
       loadError = null;
-      // The capped listing stops before most labels of a large ontology: one query reads
-      // them all and fills in those it left out.
-      if (ax.truncated)
-        void ontologyLabels(t, s)
-          .then((more) => {
-            if (my === loadSeq) labels = withMissingLabels(labels, more);
-          })
-          .catch(() => {});
     } catch (e) {
       if (my === loadSeq) loadError = e as Error;
     } finally {
@@ -282,12 +305,135 @@
   const tree = $derived(kindTab ? trees.get(kindTab) : null);
   const keep = $derived(tree ? filterTree(tree, nameOf, filter) : null);
 
-  // open the path to the selection
+  // --- the class and property trees, one level at a time (item 607) ----------------------
+  // The hierarchy route reads a level from the store's indexes, so these trees are whole
+  // however large the ontology, where the capped listings above stop at 50,000 entries.
+  const LEVEL_KIND: Partial<Record<EntityKind, TreeKind>> = {
+    Class: 'class',
+    ObjectProperty: 'objectProperty',
+    DataProperty: 'dataProperty',
+    AnnotationProperty: 'annotationProperty',
+  };
+  /** The labels the hierarchy answers carry, merged into the page's labels. */
+  function takeNames(nodes: TreeNode[]) {
+    const more = new Map<string, Lit[]>();
+    for (const n of nodes)
+      if (n.label && !labels.get(n.iri)?.length)
+        more.set(n.iri, [
+          { '@value': n.label, ...(n.labelLang ? { '@language': n.labelLang } : {}) },
+        ]);
+    if (more.size) labels = withMissingLabels(labels, more);
+    const forms = nodes.filter((n) => n.shortForm && !shortForms.has(n.iri));
+    if (forms.length)
+      shortForms = new Map([...shortForms, ...forms.map((n) => [n.iri, n.shortForm!] as const)]);
+  }
+  const levelTrees = new Map<EntityKind, LevelTree>(
+    Object.entries(LEVEL_KIND).map(([k, kind]) => [
+      k as EntityKind,
+      new LevelTree(
+        (q) =>
+          fetchHierarchy(target, sel, {
+            kind,
+            iri: q.iri,
+            ancestors: q.ancestors,
+            limit: q.ancestors ? 1 : LEVEL_LIMIT,
+            offset: q.offset,
+            lang: langs,
+          }),
+        takeNames,
+      ),
+    ]),
+  );
+  /** The level tree of the tab, when its kind has a hierarchy. */
+  const level = $derived(kindTab ? (levelTrees.get(kindTab) ?? null) : null);
+  // a new target, graph or commit reads the open levels again
+  $effect(() => {
+    void target;
+    void graph;
+    const commit = summary?.commit;
+    if (commit == null) return;
+    untrack(() => {
+      for (const [k, t] of levelTrees) t.reset(openSet(k));
+    });
+  });
+  function toggleLevel(k: EntityKind, id: string) {
+    toggle(k, id);
+    if (openSet(k).has(id)) void levelTrees.get(k)?.load(id);
+  }
+  // a filter reads the search's hits of the tab's kind and their ancestors
+  let filtered = $state<{ text: string; tree: ReturnType<typeof filteredTree> } | null>(null);
+  // the dataset, branch and graph the filtered tree was read in
+  let filteredIn = '';
+  $effect(() => {
+    const text = filter.trim();
+    const k = kindTab;
+    const kind = k ? LEVEL_KIND[k] : undefined;
+    // the scope is read here, where the effect tracks it, not in the timer below
+    const scopeTarget = target;
+    const scopeGraph = graph;
+    const scope = `${scopeTarget}\u0000${scopeGraph ?? ''}`;
+    if (scope !== filteredIn) {
+      // another dataset, branch or graph must not keep showing the last scope's hits
+      filteredIn = scope;
+      filtered = null;
+    }
+    if (!kind || text.length < 2) {
+      filtered = null;
+      return;
+    }
+    const ctl = new AbortController();
+    const t = setTimeout(async () => {
+      try {
+        const r = await searchEntities(scopeTarget, text, {
+          kind: [kind],
+          limit: 20,
+          graph: scopeGraph,
+          signal: ctl.signal,
+        });
+        const answers = await Promise.all(
+          r.results.map((h) =>
+            fetchHierarchy(
+              scopeTarget,
+              { graph: scopeGraph, imports: true },
+              { kind, iri: h.iri, ancestors: true, limit: 1 },
+              ctl.signal,
+            ),
+          ),
+        );
+        if (ctl.signal.aborted) return;
+        for (const a of answers)
+          takeNames([...(a.node ? [a.node] : []), ...(a.ancestors?.nodes ?? [])]);
+        filtered = { text, tree: filteredTree(answers) };
+      } catch {
+        if (!ctl.signal.aborted) filtered = { text, tree: filteredTree([]) };
+      }
+    }, 200);
+    return () => {
+      clearTimeout(t);
+      ctl.abort();
+    };
+  });
+
+  // open the path to the selection: through the route's ancestors in a level tree
+  $effect(() => {
+    const iri = selected;
+    const lt = level;
+    const k = kindTab;
+    if (!iri || !lt || !k) return;
+    void summary?.commit;
+    untrack(() => {
+      void lt.reveal(iri).then((anc) => {
+        const cur = openSet(k);
+        if (!anc.every((a) => cur.has(a))) opened = { ...opened, [k]: new Set([...cur, ...anc]) };
+        scrollToRow(iri);
+      });
+    });
+  });
   $effect(() => {
     const iri = selected;
     const t = tree;
     const k = kindTab;
-    if (!iri || !t || !k) return;
+    if (!iri || !t || !k || levelTrees.has(k)) return;
     const anc = ancestorsOf(t, iri);
     untrack(() => {
       const cur = openSet(k);
@@ -306,6 +452,8 @@
     classifyError = null;
     try {
       const c = await classifyOntology(target, sel);
+      // the Browse pages of this tab now show what the kept classification infers
+      markClassified(target);
       if (my === classifySeq) classification = c;
     } catch (e) {
       if (my === classifySeq) classifyError = api.errorMessage(e);
@@ -316,7 +464,7 @@
   $effect(() => {
     if (
       inferredOn &&
-      tab === 'Class' &&
+      kindTab === 'Class' &&
       summary &&
       (!classification || classification.commit !== summary.commit)
     )
@@ -642,7 +790,7 @@
     createOpen = false;
     const what = `Create ${KIND_SINGULAR[createKind]} ${createLabel.trim() || iriName(iri, prefixes)}`;
     edit({ kind: 'axioms', add, remove: [] }, what, () =>
-      nav({ tab: createKind, iri, view: null }),
+      nav({ tab: null, kind: createKind, iri, view: null }),
     );
   }
 
@@ -701,8 +849,11 @@
   }
 
   // --- live refresh ---------------------------------------------------------------------------
+  /** Bumped to follow the change feed again after it stopped. */
+  let followRun = $state(0);
   $effect(() => {
     const t = target;
+    void followRun;
     if (!name) return;
     return session.follow(
       t,
@@ -728,6 +879,14 @@
         ? selected
         : null;
   useCommands(() => [
+    {
+      id: 'workbench.page',
+      label: 'Open page in Browse',
+      icon: 'book',
+      keywords: ['browse', 'page', 'read', 'open page'],
+      active: () => !!name && !!selected,
+      run: () => void goto(routes.browse(name, { iri: selected, graph, branch })),
+    },
     {
       id: 'ontology.session',
       label: 'Start session',
@@ -777,7 +936,9 @@
   );
 
   const counts = $derived(
-    Object.fromEntries(TREE_KINDS.map((k) => [k, entities.get(k)?.length ?? 0])),
+    Object.fromEntries(
+      TREE_KINDS.map((k) => [k, summary?.entities[k] ?? entities.get(k)?.length ?? 0]),
+    ),
   );
   const headerTitle = $derived(
     summary?.header.iri
@@ -808,36 +969,29 @@
         {/if}
       </p>
     </div>
-    <div class="page-actions">
-      <span
-        class="live"
-        class:on={session.live === 'on'}
-        title={session.live === 'on'
-          ? 'Following the change feed'
-          : 'Not following the change feed'}
-        ><span class="dot"></span>{session.live === 'on'
-          ? 'Live'
-          : session.live === 'stopped'
-            ? 'Live updates stopped'
-            : ''}</span
-      >
-      <button
-        class="btn ghost"
-        disabled={!session.done.length || readonly}
-        onclick={() => session.undoLast()}
-        title={session.done.at(-1) ? `Undo: ${session.done.at(-1)?.label}` : 'Nothing to undo'}
-        >Undo{session.done.length ? ` (${session.done.length})` : ''}</button
-      >
-      <button
-        class="btn ghost"
-        disabled={!session.undone.length || readonly}
-        onclick={() => session.redoLast()}
-        title={session.undone.at(-1) ? `Redo: ${session.undone.at(-1)?.label}` : 'Nothing to redo'}
-        >Redo</button
-      >
+    <PageActions>
+      <FollowState live={session.live} onretry={() => followRun++} />
+      {#if canWrite}
+        <button
+          class="btn ghost"
+          disabled={!session.done.length || readonly}
+          onclick={() => session.undoLast()}
+          title={session.done.at(-1) ? `Undo: ${session.done.at(-1)?.label}` : 'Nothing to undo'}
+          >Undo{session.done.length ? ` (${session.done.length})` : ''}</button
+        >
+        <button
+          class="btn ghost"
+          disabled={!session.undone.length || readonly}
+          onclick={() => session.redoLast()}
+          title={session.undone.at(-1)
+            ? `Redo: ${session.undone.at(-1)?.label}`
+            : 'Nothing to redo'}>Redo</button
+        >
+      {/if}
       {#if canWrite && !branch}
         <button
           class="btn"
+          data-primary
           onclick={startSession}
           title="Edit on a branch of your own, then merge it"
           ><Icon name="branch" size={14} /> Start session</button
@@ -846,13 +1000,14 @@
       {#if branch}
         <a
           class="btn"
+          data-primary
           href="{resolve('/datasets/[name]/merge', { name })}?source={encodeURIComponent(
             branch,
           )}&target={encodeURIComponent(currentBranch?.upstream ?? MAIN)}"
           ><Icon name="merge" size={14} /> Merge</a
         >
       {/if}
-    </div>
+    </PageActions>
   </header>
   {#if name}
     <div class="page-context">
@@ -900,7 +1055,12 @@
       {branch ?? MAIN} is protected and takes changes through merges only. Start a session branch to edit.
     </p>
   {:else if !canWrite && name}
-    <p class="notice" role="status">You can read this dataset but not edit it.</p>
+    <p class="notice" role="status">
+      <span
+        ><strong>Read-only.</strong> You can read {name} but not edit it, so the editing controls are
+        hidden. The tree, DL Query, the header and the history still read.</span
+      >
+    </p>
   {/if}
   {#if loadError}
     <div class="error-box" role="alert">
@@ -908,268 +1068,356 @@
       {api.errorMessage(loadError)}
     </div>
   {/if}
-  {#if truncated}
+  <!-- the class and property trees read their levels whole; the individuals list is capped -->
+  {#if truncated && kindTab === 'NamedIndividual'}
     <p class="notice" role="status">
-      The ontology is larger than the editor reads at once. The trees show the first 50,000 entries.
+      The ontology is larger than the editor reads at once. The list shows the first 50,000
+      individuals.
     </p>
   {/if}
 
   {#if name && summary}
-    <!-- one strip for the entity kinds and the ontology's views, which wraps rather than
-         hiding tabs past the edge -->
     <div class="tabs onto-tabs" role="tablist" aria-label="Ontology views">
-      {#each TREE_KINDS as k (k)}
-        <button class="tab" role="tab" aria-selected={tab === k} onclick={() => nav({ tab: k })}
-          >{KIND_LABEL[k]} <span class="count">{counts[k] ? fmtInt(counts[k]) : ''}</span></button
+      {#each TAB_LABEL as [t, l] (t)}
+        <button
+          class="tab"
+          role="tab"
+          aria-selected={tab === t}
+          onclick={() => nav({ tab: t === 'tree' ? null : t })}>{l}</button
         >
       {/each}
-      <span class="tab-sep" aria-hidden="true"></span>
-      <button
-        class="tab"
-        role="tab"
-        aria-selected={tab === 'dlquery'}
-        onclick={() => nav({ tab: 'dlquery' })}>DL Query</button
-      >
-      <button
-        class="tab"
-        role="tab"
-        aria-selected={tab === 'header'}
-        onclick={() => nav({ tab: 'header', iri: null })}>Header</button
-      >
     </div>
-    <div class="panes split-view">
-      <section class="panel trees" aria-label="Entities">
-        {#if kindTab && tree}
-          <div class="tree-bar">
-            <input
-              class="input"
-              type="search"
-              placeholder="Filter {KIND_LABEL[kindTab].toLowerCase()}"
-              aria-label="Filter"
-              bind:this={filterInput}
-              bind:value={filter}
-            />
-            {#if !readonly}
-              <button
-                class="btn sm"
-                onclick={() =>
-                  openCreate(
-                    kindTab,
-                    selected && kindTab !== 'NamedIndividual' && tree?.nodes.has(selected)
-                      ? selected
-                      : kindTab === 'NamedIndividual' &&
-                          selected &&
-                          (trees.get('Class')?.nodes.has(selected) ?? false)
+    {#if tab === 'header'}
+      <section class="panel" aria-label="Ontology header">
+        <div class="panel-head"><h2>Ontology header</h2></div>
+        <div class="panel-body">
+          <OntoHeader
+            {target}
+            {sel}
+            {summary}
+            name={nameOf}
+            {prefixes}
+            {annotationProperties}
+            {readonly}
+            onedit={(op, label) => edit(op, label)}
+            onrename={openRename}
+          />
+        </div>
+      </section>
+    {:else if tab === 'history'}
+      <section class="panel" aria-label="History">
+        <div class="panel-body">
+          <EditorHistory
+            {name}
+            {target}
+            {branch}
+            {graph}
+            {langs}
+            {prefixes}
+            onopen={(iri) => nav({ tab: null, iri, view: null })}
+            refreshKey={summary?.commit ?? 0}
+          />
+        </div>
+      </section>
+    {:else}
+      <div class="panes split-view">
+        <section class="panel trees" aria-label="Entities">
+          {#if kindTab && tree}
+            <div class="tree-bar">
+              <select
+                class="select sm kind-select"
+                aria-label="Entity kind"
+                value={kind}
+                onchange={(e) =>
+                  nav({
+                    kind: e.currentTarget.value === 'Class' ? null : e.currentTarget.value,
+                    iri: null,
+                    view: null,
+                  })}
+              >
+                {#each TREE_KINDS as k (k)}<option value={k}
+                    >{KIND_LABEL[k]}{counts[k] ? ` · ${fmtInt(counts[k])}` : ''}</option
+                  >{/each}
+              </select>
+              <input
+                class="input"
+                type="search"
+                placeholder="Filter {KIND_LABEL[kindTab].toLowerCase()}"
+                aria-label="Filter"
+                bind:this={filterInput}
+                bind:value={filter}
+              />
+              {#if !readonly}
+                <button
+                  class="btn sm"
+                  onclick={() =>
+                    openCreate(
+                      kindTab,
+                      selected && kindTab !== 'NamedIndividual' && tree?.nodes.has(selected)
                         ? selected
-                        : null,
-                  )}
-                title={selected
-                  ? `New ${KIND_SINGULAR[kindTab]} under the selection`
-                  : `New ${KIND_SINGULAR[kindTab]}`}><Icon name="plus" size={13} /> New</button
-              >
-            {/if}
-            {#if tab === 'Class'}
-              <label class="inferred-toggle"
-                ><input
-                  type="checkbox"
-                  checked={inferredOn}
-                  onchange={(e) => nav({ inferred: e.currentTarget.checked ? '1' : null })}
-                />
-                Inferred</label
-              >
-            {/if}
-            <button
-              class="btn ghost icon sm"
-              aria-label="IRI policy"
-              title="How new entities get their IRIs"
-              onclick={() => ((policyDraft = { ...policy }), (policyOpen = true))}
-              ><Icon name="key" size={13} /></button
-            >
-          </div>
-          <div class="tree-cols" class:two={tab === 'Class' && inferredOn}>
-            <div class="tree-col">
-              {#if tab === 'Class' && inferredOn}<h2 class="col-title">Asserted</h2>{/if}
-              <div class="tree-scroll">
-                {#if tree.roots.length}
-                  <OntoTree
-                    label="{KIND_LABEL[kindTab]} (asserted)"
-                    roots={tree.roots}
-                    children={(id) => tree?.children.get(id) ?? []}
-                    name={nameOf}
-                    sub={subOf}
-                    badge={kindTab === 'NamedIndividual'
-                      ? (id) => (typesOf.get(id) ?? []).map(nameOf).join(', ') || null
-                      : undefined}
-                    open={openSet(kindTab)}
-                    {selected}
-                    {keep}
-                    onselect={(id) => nav({ iri: id })}
-                    ontoggle={(id) => toggle(kindTab, id)}
+                        : kindTab === 'NamedIndividual' &&
+                            selected &&
+                            (trees.get('Class')?.nodes.has(selected) ?? false)
+                          ? selected
+                          : null,
+                    )}
+                  title={selected
+                    ? `New ${KIND_SINGULAR[kindTab]} under the selection`
+                    : `New ${KIND_SINGULAR[kindTab]}`}><Icon name="plus" size={13} /> New</button
+                >
+              {/if}
+              {#if kindTab === 'Class'}
+                <label class="inferred-toggle"
+                  ><input
+                    type="checkbox"
+                    checked={inferredOn}
+                    onchange={(e) => nav({ inferred: e.currentTarget.checked ? '1' : null })}
                   />
-                {:else}
-                  <p class="empty">No {KIND_LABEL[kindTab].toLowerCase()}.</p>
-                {/if}
-              </div>
+                  Inferred</label
+                >
+              {/if}
+              <button
+                class="btn ghost icon sm"
+                aria-label="IRI policy"
+                title="How new entities get their IRIs"
+                onclick={() => ((policyDraft = { ...policy }), (policyOpen = true))}
+                ><Icon name="key" size={13} /></button
+              >
             </div>
-            {#if tab === 'Class' && inferredOn}
+            <div class="tree-cols" class:dual={kindTab === 'Class' && inferredOn}>
               <div class="tree-col">
-                <h2 class="col-title">
-                  Inferred
-                  {#if classification}<span class="faint">
-                      {classification.complete
-                        ? 'OWL 2 EL'
-                        : `${fmtInt(classification.excludedCount)} axioms outside OWL 2 EL`}</span
-                    >{/if}
-                </h2>
+                {#if kindTab === 'Class' && inferredOn}<h2 class="col-title">Asserted</h2>{/if}
                 <div class="tree-scroll">
-                  {#if classifying && !inferred}<p class="faint">
-                      <span class="spinner"></span> Classifying…
-                    </p>{/if}
-                  {#if classifyError}<p class="error-box" role="alert">{classifyError}</p>{/if}
-                  {#if inferred}
-                    {#if classification && !classification.consistent}
-                      <p class="error-box" role="alert">
-                        The ontology is inconsistent, so every class is unsatisfiable.
-                      </p>
+                  <TreeSticky />
+                  {#if level && filtered}
+                    {#if filtered.tree.roots.length}
+                      <OntoTree
+                        label="{KIND_LABEL[kindTab]} (asserted)"
+                        roots={filtered.tree.roots}
+                        children={(id) => filtered?.tree.children.get(id) ?? []}
+                        name={nameOf}
+                        sub={subOf}
+                        open={filtered.tree.nodes}
+                        {selected}
+                        keep={filtered.tree.nodes}
+                        onselect={(id) => nav({ iri: id })}
+                        ontoggle={() => {}}
+                      />
+                    {:else}
+                      <p class="empty">Nothing matches “{filtered.text}”.</p>
                     {/if}
+                  {:else if level}
+                    {#if level.roots().length}
+                      <OntoTree
+                        label="{KIND_LABEL[kindTab]} (asserted)"
+                        roots={level.roots()}
+                        children={(id) => level?.children(id) ?? []}
+                        more={(id) => level?.more(id) ?? false}
+                        clipped={(p) => level?.clippedOf(p) ?? null}
+                        onmore={(p) => level?.loadMore(p)}
+                        name={nameOf}
+                        sub={subOf}
+                        open={openSet(kindTab)}
+                        {selected}
+                        onselect={(id) => nav({ iri: id })}
+                        ontoggle={(id) => toggleLevel(kindTab!, id)}
+                      />
+                    {:else if level.loading}
+                      <p class="empty">Reading the {KIND_LABEL[kindTab].toLowerCase()}…</p>
+                    {:else if level.error}
+                      <p class="empty">{level.error}</p>
+                    {:else}
+                      <p class="empty">No {KIND_LABEL[kindTab].toLowerCase()}.</p>
+                    {/if}
+                  {:else if tree.roots.length}
                     <OntoTree
-                      label="Classes (inferred)"
-                      roots={inferred.tree.roots}
-                      children={(id) => inferred?.tree.children.get(id) ?? []}
-                      name={inferredName}
-                      badge={(id) => (id === 'n:1' ? 'unsatisfiable' : null)}
-                      open={openSet('inferred')}
-                      selected={selected ? (inferred.nodeOf.get(selected) ?? null) : null}
-                      keep={inferredKeep}
-                      onselect={(id) => {
-                        const c = inferred?.classesOf.get(id)?.[0];
-                        if (c) void nav({ iri: c });
-                      }}
-                      ontoggle={(id) => toggle('inferred', id)}
+                      label="{KIND_LABEL[kindTab]} (asserted)"
+                      roots={tree.roots}
+                      children={(id) => tree?.children.get(id) ?? []}
+                      name={nameOf}
+                      sub={subOf}
+                      badge={kindTab === 'NamedIndividual'
+                        ? (id) => (typesOf.get(id) ?? []).map(nameOf).join(', ') || null
+                        : undefined}
+                      open={openSet(kindTab)}
+                      {selected}
+                      {keep}
+                      onselect={(id) => nav({ iri: id })}
+                      ontoggle={(id) => toggle(kindTab, id)}
                     />
+                  {:else}
+                    <p class="empty">No {KIND_LABEL[kindTab].toLowerCase()}.</p>
                   {/if}
                 </div>
               </div>
-            {/if}
-          </div>
-        {/if}
-        {#if tab === 'header'}
-          <p class="faint pad">The header describes the ontology of the graph as a whole.</p>
-        {/if}
-        {#if tab === 'dlquery'}
-          {@render dlPanel()}
-        {/if}
-      </section>
-
-      <section class="panel detail" aria-label="Details">
-        {#if tab === 'header' || !selected}
-          <div class="panel-head"><h2>Ontology header</h2></div>
-          <div class="panel-body">
-            <OntoHeader
-              {target}
-              {sel}
-              {summary}
-              name={nameOf}
-              {prefixes}
-              {annotationProperties}
-              {readonly}
-              onedit={(op, label) => edit(op, label)}
-              onrename={openRename}
-            />
-          </div>
-        {:else}
-          <div class="panel-head entity-head">
-            <div class="who">
-              <h2>{nameOf(selected)}</h2>
-              <span class="mono faint iri">{selected}</span>
-              <span class="kinds">
-                {#each frameKinds as k (k)}<span class="badge">{KIND_SINGULAR[k]}</span>{/each}
-              </span>
-            </div>
-            <span class="spacer"></span>
-            {#if !readonly && frameKinds.length}
-              <button class="btn sm" onclick={() => openRename(selected!)}
-                ><Icon name="pencil" size={13} /> Rename</button
-              >
-              <button class="btn sm danger" onclick={() => remove(selected!)}
-                ><Icon name="trash" size={13} /> Delete</button
-              >
-            {/if}
-          </div>
-          <div class="tabs sub" role="tablist" aria-label="Entity views">
-            <button
-              class="tab"
-              role="tab"
-              aria-selected={view === 'frame'}
-              onclick={() => nav({ view: null })}>Frame</button
-            >
-            <button
-              class="tab"
-              role="tab"
-              aria-selected={view === 'usage'}
-              onclick={() => nav({ view: 'usage' })}
-              >Usage <span class="count">{frameFor === selected ? frameItems.length : ''}</span
-              ></button
-            >
-          </div>
-          <div class="panel-body">
-            {#if frameError}<p class="error-box" role="alert">{frameError}</p>{/if}
-            {#if inferredOn && frameKind === 'Class' && inferred && selected}
-              {@const sup = inferredParents(selected)}
-              {#if sup.length}
-                <p class="inferred-sup">
-                  <span class="faint">Inferred direct superclasses:</span>
-                  {#each sup as c, i (c)}{#if i},
-                    {/if}<button class="link" onclick={() => nav({ iri: c })}>{nameOf(c)}</button
-                    >{/each}
-                </p>
+              {#if kindTab === 'Class' && inferredOn}
+                <div class="tree-col">
+                  <h2 class="col-title">
+                    Inferred
+                    {#if classification}<span class="faint">
+                        {classification.complete
+                          ? 'OWL 2 EL'
+                          : `${fmtInt(classification.excludedCount)} axioms outside OWL 2 EL`}</span
+                      >{/if}
+                  </h2>
+                  <div class="tree-scroll">
+                    {#if classifying && !inferred}<p class="faint">
+                        <span class="spinner"></span> Classifying…
+                      </p>{/if}
+                    {#if classifyError}<p class="error-box" role="alert">{classifyError}</p>{/if}
+                    {#if inferred}
+                      {#if classification && !classification.consistent}
+                        <p class="error-box" role="alert">
+                          The ontology is inconsistent, so every class is unsatisfiable.
+                        </p>
+                      {/if}
+                      <OntoTree
+                        label="Classes (inferred)"
+                        roots={inferred.tree.roots}
+                        children={(id) => inferred?.tree.children.get(id) ?? []}
+                        name={inferredName}
+                        badge={(id) => (id === 'n:1' ? 'unsatisfiable' : null)}
+                        open={openSet('inferred')}
+                        selected={selected ? (inferred.nodeOf.get(selected) ?? null) : null}
+                        keep={inferredKeep}
+                        onselect={(id) => {
+                          const c = inferred?.classesOf.get(id)?.[0];
+                          if (c) void nav({ iri: c });
+                        }}
+                        ontoggle={(id) => toggle('inferred', id)}
+                      />
+                    {/if}
+                  </div>
+                </div>
               {/if}
-            {/if}
-            {#if frameFor === selected && view === 'frame'}
-              {#key `${selected}|${frameKind}`}
-                <OntoFrame
-                  kind={frameKind}
-                  iri={selected}
-                  items={frameItems}
-                  name={nameOf}
-                  {prefixes}
-                  {options}
-                  {annotationProperties}
-                  {readonly}
-                  {names}
-                  {parse}
-                  onedit={(op, label) => edit(op, label)}
-                  onopen={(iri) => nav({ iri, view: null })}
-                />
-              {/key}
-            {:else if frameFor === selected && view === 'usage'}
-              {#if !usageGroups.length}<p class="empty">No axiom mentions this entity.</p>{/if}
-              {#each usageGroups as [type, items] (type)}
-                <section class="usage" aria-label={type}>
-                  <h3>{type} <span class="faint">{items.length}</span></h3>
-                  <ul>
-                    {#each items as it, i (it.ofn + i)}
-                      <li>
-                        <span class="mono small">{it.ofn}</span>
-                        <span class="refs">
-                          {#each mentionedBy(it).slice(0, 4) as m (m)}
-                            <button class="link" onclick={() => nav({ iri: m, view: null })}
-                              >{nameOf(m)}</button
-                            >
-                          {/each}
-                        </span>
-                      </li>
-                    {/each}
-                  </ul>
-                </section>
-              {/each}
-            {:else}
-              <p class="faint"><span class="spinner"></span> Reading the entity…</p>
-            {/if}
-          </div>
-        {/if}
-      </section>
-    </div>
+            </div>
+          {/if}
+          {#if tab === 'dlquery'}
+            {@render dlPanel()}
+          {/if}
+        </section>
+
+        <section class="panel detail" aria-label="Details">
+          {#if kindTab && selected}
+            <TreeCrumbs
+              roots={level ? level.roots() : (tree?.roots ?? [])}
+              children={(id) => (level ? level.children(id) : (tree?.children.get(id) ?? []))}
+              target={selected}
+              name={nameOf}
+              onselect={(id) => nav({ iri: id })}
+            />
+          {/if}
+          {#if !selected}
+            <div class="panel-head"><h2>Ontology header</h2></div>
+            <div class="panel-body">
+              <OntoHeader
+                {target}
+                {sel}
+                {summary}
+                name={nameOf}
+                {prefixes}
+                {annotationProperties}
+                {readonly}
+                onedit={(op, label) => edit(op, label)}
+                onrename={openRename}
+              />
+            </div>
+          {:else}
+            <div class="panel-head entity-head">
+              <div class="who">
+                <h2>{nameOf(selected)}</h2>
+                <span class="mono faint iri">{selected}</span>
+                <span class="kinds">
+                  {#each frameKinds as k (k)}<span class="badge">{KIND_SINGULAR[k]}</span>{/each}
+                </span>
+              </div>
+              <span class="spacer"></span>
+              <a
+                class="btn sm ghost"
+                href={routes.browse(name, { iri: selected, graph, branch })}
+                title="Open this entity's page in Browse"
+                ><Icon name="book" size={13} /> Open page</a
+              >
+              {#if !readonly && frameKinds.length}
+                <button class="btn sm" onclick={() => openRename(selected!)}
+                  ><Icon name="pencil" size={13} /> Rename</button
+                >
+                <button class="btn sm danger" onclick={() => remove(selected!)}
+                  ><Icon name="trash" size={13} /> Delete</button
+                >
+              {/if}
+            </div>
+            <div class="view-bar">
+              <div class="segmented" role="group" aria-label="Entity views">
+                <button aria-pressed={view === 'frame'} onclick={() => nav({ view: null })}
+                  >Frame</button
+                >
+                <button aria-pressed={view === 'usage'} onclick={() => nav({ view: 'usage' })}
+                  >Usage{frameFor === selected && frameItems.length
+                    ? ` ${fmtInt(frameItems.length)}`
+                    : ''}</button
+                >
+              </div>
+            </div>
+            <div class="panel-body">
+              {#if frameError}<p class="error-box" role="alert">{frameError}</p>{/if}
+              {#if inferredOn && frameKind === 'Class' && inferred && selected}
+                {@const sup = inferredParents(selected)}
+                {#if sup.length}
+                  <p class="inferred-sup">
+                    <span class="faint">Inferred direct superclasses:</span>
+                    {#each sup as c, i (c)}{#if i},
+                      {/if}<button class="link" onclick={() => nav({ iri: c })}>{nameOf(c)}</button
+                      >{/each}
+                  </p>
+                {/if}
+              {/if}
+              {#if frameFor === selected && view === 'frame'}
+                {#key `${selected}|${frameKind}`}
+                  <OntoFrame
+                    kind={frameKind}
+                    iri={selected}
+                    items={frameItems}
+                    name={nameOf}
+                    {prefixes}
+                    {options}
+                    {annotationProperties}
+                    {readonly}
+                    {names}
+                    {parse}
+                    onedit={(op, label) => edit(op, label)}
+                    onopen={(iri) => nav({ iri, view: null })}
+                  />
+                {/key}
+              {:else if frameFor === selected && view === 'usage'}
+                {#if !usageGroups.length}<p class="empty">No axiom mentions this entity.</p>{/if}
+                {#each usageGroups as [type, items] (type)}
+                  <section class="usage" aria-label={type}>
+                    <h3>{type} <span class="faint">{items.length}</span></h3>
+                    <ul>
+                      {#each items as it, i (it.ofn + i)}
+                        <li>
+                          <span class="mono small">{it.ofn}</span>
+                          <span class="refs">
+                            {#each mentionedBy(it).slice(0, 4) as m (m)}
+                              <button class="link" onclick={() => nav({ iri: m, view: null })}
+                                >{nameOf(m)}</button
+                              >
+                            {/each}
+                          </span>
+                        </li>
+                      {/each}
+                    </ul>
+                  </section>
+                {/each}
+              {:else}
+                <p class="faint"><span class="spinner"></span> Reading the entity…</p>
+              {/if}
+            </div>
+          {/if}
+        </section>
+      </div>
+    {/if}
   {:else if loading}
     <p class="faint"><span class="spinner"></span> Reading the ontology…</p>
   {:else if !name}
@@ -1491,25 +1739,6 @@
 {/snippet}
 
 <style>
-  .live {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: var(--fs-xs);
-    color: var(--text-3);
-  }
-  .live:empty {
-    display: none;
-  }
-  .live .dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--border-strong);
-  }
-  .live.on .dot {
-    background: var(--ok);
-  }
   .notice {
     display: flex;
     align-items: center;
@@ -1539,17 +1768,7 @@
     border-radius: var(--r-lg) var(--r-lg) 0 0;
   }
   .onto-tabs {
-    flex-wrap: wrap;
-    row-gap: 0;
     border-bottom: 1px solid var(--border);
-  }
-  .tab-sep {
-    width: 1px;
-    align-self: center;
-    height: 18px;
-    margin: 0 6px;
-    background: var(--border);
-    flex: none;
   }
   .dl-form {
     display: grid;
@@ -1651,7 +1870,7 @@
     flex: 1;
     min-height: 0;
   }
-  .tree-cols.two {
+  .tree-cols.dual {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
   .tree-col {
@@ -1660,7 +1879,7 @@
     display: flex;
     flex-direction: column;
   }
-  .tree-cols.two .tree-col + .tree-col {
+  .tree-cols.dual .tree-col + .tree-col {
     border-left: 1px solid var(--border);
   }
   .col-title {
@@ -1703,8 +1922,9 @@
     gap: 4px;
     flex-wrap: wrap;
   }
-  .tabs.sub {
-    padding: 0 10px;
+  .view-bar {
+    display: flex;
+    padding: 8px 10px;
     border-bottom: 1px solid var(--border);
   }
   .inferred-sup {
@@ -1798,10 +2018,10 @@
     .tree-scroll {
       max-height: 50vh;
     }
-    .tree-cols.two {
+    .tree-cols.dual {
       grid-template-columns: minmax(0, 1fr);
     }
-    .tree-cols.two .tree-col + .tree-col {
+    .tree-cols.dual .tree-col + .tree-col {
       border-left: 0;
       border-top: 1px solid var(--border);
     }

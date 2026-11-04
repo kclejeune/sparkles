@@ -172,7 +172,7 @@ test('Similar: from an entity and from a pasted vector', async ({ page }) => {
 });
 
 test('backups: every tab, the drawer and the dialogs', async ({ page }) => {
-  await visit(page, '/ui/backups');
+  await visit(page, '/ui/admin/backups');
   await open(page, 'foaf-before-reload');
   await page.keyboard.press('Escape');
   await open(page, /Repositories/, 'tab');
@@ -185,7 +185,7 @@ test('backups: every tab, the drawer and the dialogs', async ({ page }) => {
 });
 
 test('the server, tokens, sign-in and CLI pages', async ({ page }) => {
-  for (const url of ['/ui/', '/ui/server', '/ui/tokens', '/ui/login', '/ui/cli/device'])
+  for (const url of ['/ui/', '/ui/admin/server', '/ui/admin/tokens', '/ui/login', '/ui/cli/device'])
     await visit(page, url);
 });
 
@@ -199,13 +199,13 @@ test('the ontology editor: the trees, a frame, the header and the new-class dial
     await expect(page.locator('main .spinner')).toHaveCount(0, { timeout: 15_000 });
     await expectNoSidewaysScroll(page, url);
   };
-  await ready('/ui/ontology?ds=uni');
+  await ready('/ui/workbench/ontology?ds=uni');
   await ready(
-    `/ui/ontology?ds=uni&tab=Class&inferred=1&iri=${encodeURIComponent('http://example.org/uni#Professor')}`,
+    `/ui/workbench/ontology?ds=uni&inferred=1&iri=${encodeURIComponent('http://example.org/uni#Professor')}`,
   );
   await expect(page.locator('.frame [data-section="sub"]')).toContainText('Employee');
   await expectNoSidewaysScroll(page, 'the frame of Professor');
-  await page.getByRole('tab', { name: /Usage/ }).click();
+  await page.getByRole('button', { name: /^Usage/ }).click();
   await expectNoSidewaysScroll(page, 'the usage view');
   await page.getByRole('button', { name: 'New', exact: true }).click();
   await expect(page.getByRole('dialog', { name: 'New class' })).toBeVisible();
@@ -218,7 +218,7 @@ test('the ontology editor: the trees, a frame, the header and the new-class dial
 });
 
 test("the thesaurus editor's dialogs dock as a sheet", async ({ page }) => {
-  await page.goto('/ui/thesaurus?ds=thes');
+  await page.goto('/ui/workbench/thesaurus?ds=thes');
   await expect(page.getByRole('tree').first()).toBeVisible({ timeout: 30_000 });
   await page.getByRole('button', { name: 'Concept', exact: true }).click();
   await expect(page.getByRole('dialog', { name: 'New concept' })).toBeVisible();

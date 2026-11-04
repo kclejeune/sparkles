@@ -43,6 +43,11 @@
     open = open.includes(k) ? open.filter((x) => x !== k) : [...open, k];
   };
   const shown = $derived(entities ?? result.entities);
+  /** The highest confidence among a value's citations, when any gives one. */
+  const confidence = (ids: (number | string)[]): number | null => {
+    const c = ids.map((i) => byId.get(String(i))?.confidence).filter((x): x is number => x != null);
+    return c.length ? Math.max(...c) : null;
+  };
 </script>
 
 {#snippet marker(id: number | string)}
@@ -74,56 +79,79 @@
       {#if groups.length === 0 && gone.length === 0}
         <p class="faint small">No facts to show.</p>
       {/if}
-      <table class="facts">
-        <tbody>
-          {#each groups as g (g.p)}
-            {@const hist = gone.filter((h) => h.p === g.p)}
-            <tr>
-              <th><span class="mono"><TermView term={term(g.p)} prefixes={all} /></span></th>
-              <td>
-                {#each g.values as v (v.o)}
-                  <div class="val" data-status={v.status ?? ''}>
-                    <span class="mono"><TermView term={term(v.o)} prefixes={all} {onopen} /></span>
+      <div class="cards">
+        {#each groups as g (g.p)}
+          {@const hist = gone.filter((h) => h.p === g.p)}
+          {@const clash = conflictsOf(result.conflicts, e.iri).find((c) => c.p === g.p)}
+          <article class="fact" class:clash={!!clash} aria-label={g.p}>
+            <h5 class="pred">
+              <span class="mono"><TermView term={term(g.p)} prefixes={all} /></span>
+            </h5>
+            {#each g.values as v (v.o)}
+              {@const first = byId.get(String(v.citations[0]))}
+              {@const conf = confidence(v.citations)}
+              <div class="val" data-status={v.status ?? ''}>
+                <div class="vline">
+                  <span class="mono vo"><TermView term={term(v.o)} prefixes={all} {onopen} /></span>
+                  <span class="chips">
+                    {#if v.status}<span class="badge status {v.status}">{v.status}</span>{/if}
+                    {#if conf != null}
+                      <span class="badge" title="Confidence the agent gave this fact"
+                        >confidence {conf.toFixed(2)}</span
+                      >
+                    {/if}
                     <span class="cites"
                       >{#each v.citations as c (c)}{@render marker(c)}{/each}</span
                     >
-                    {#if v.status}
-                      <span class="badge status {v.status}">{v.status}</span>
-                    {/if}
-                  </div>
-                {/each}
-                {#each hist as h (h.reifier)}
-                  <div class="val gone">
-                    <span class="mono"><TermView term={term(h.o)} prefixes={all} /></span>
-                    <span class="badge">superseded</span>
-                  </div>
-                {/each}
-              </td>
-            </tr>
-          {/each}
-          {#each gone.filter((h) => !groups.some((g) => g.p === h.p)) as h (h.reifier)}
-            <tr>
-              <th><span class="mono"><TermView term={term(h.p)} prefixes={all} /></span></th>
-              <td>
-                <div class="val gone">
-                  <span class="mono"><TermView term={term(h.o)} prefixes={all} /></span>
-                  <span class="badge">{h.replacedBy ? 'superseded' : 'retracted'}</span>
+                  </span>
                 </div>
-              </td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-      {#each conflictsOf(result.conflicts, e.iri) as c (c.p)}
-        <p class="conflict small" role="note">
-          <strong>Conflict</strong>
-          <span class="mono"><TermView term={term(c.p)} prefixes={all} /></span>
-          {#each c.values as v, i (v.o)}{#if i}<span class="faint"> · </span>{/if}<span class="mono"
-              ><TermView term={term(v.o)} prefixes={all} /></span
-            >
-            {@render marker(v.citation)}{/each}
-        </p>
-      {/each}
+                {#if first && (first.by || first.source || first.quote)}
+                  <p class="prov">
+                    {#if first.by}<span class="by" title={first.by}>{principalName(first.by)}</span
+                      >{/if}
+                    {#if first.source}
+                      <span class="src mono"
+                        ><TermView term={term(first.source)} prefixes={all} {onopen} /></span
+                      >
+                    {/if}
+                    {#if first.quote}<q class="quote">{first.quote}</q>{/if}
+                  </p>
+                {/if}
+              </div>
+            {/each}
+            {#each hist as h (h.reifier)}
+              <div class="val gone">
+                <div class="vline">
+                  <span class="mono vo"><TermView term={term(h.o)} prefixes={all} /></span>
+                  <span class="badge">superseded</span>
+                </div>
+              </div>
+            {/each}
+            {#if clash}
+              <p class="conflict small" role="note">
+                <strong>Conflict</strong>
+                {#each clash.values as v, i (v.o)}{#if i}<span class="faint"> · </span>{/if}<span
+                    class="mono"><TermView term={term(v.o)} prefixes={all} /></span
+                  >
+                  {@render marker(v.citation)}{/each}
+              </p>
+            {/if}
+          </article>
+        {/each}
+        {#each gone.filter((h) => !groups.some((g) => g.p === h.p)) as h (h.reifier)}
+          <article class="fact" aria-label={h.p}>
+            <h5 class="pred">
+              <span class="mono"><TermView term={term(h.p)} prefixes={all} /></span>
+            </h5>
+            <div class="val gone">
+              <div class="vline">
+                <span class="mono vo"><TermView term={term(h.o)} prefixes={all} /></span>
+                <span class="badge">{h.replacedBy ? 'superseded' : 'retracted'}</span>
+              </div>
+            </div>
+          </article>
+        {/each}
+      </div>
     </section>
   {/each}
 
@@ -203,31 +231,83 @@
     font-size: var(--fs-sm);
     font-weight: 600;
   }
-  .facts {
-    width: 100%;
-    border-collapse: collapse;
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr));
+    gap: var(--sp-2);
+  }
+  .fact {
+    display: grid;
+    gap: var(--sp-2);
+    align-content: start;
+    min-width: 0;
+    padding: var(--sp-2) var(--sp-3);
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    background: var(--surface);
     font-size: var(--fs-sm);
   }
-  .facts th {
-    text-align: left;
-    vertical-align: top;
-    font-weight: 500;
-    padding: 3px 8px 3px 0;
-    width: 34%;
+  .fact.clash {
+    border-color: color-mix(in srgb, var(--warn) 55%, var(--border));
+    box-shadow: inset 3px 0 0 var(--warn);
+  }
+  .pred {
+    margin: 0;
     color: var(--text-2);
+    font-size: var(--fs-xs);
+    font-weight: 500;
     overflow-wrap: anywhere;
   }
-  .facts td {
-    padding: 3px 0;
-    vertical-align: top;
+  .val {
+    display: grid;
+    gap: 2px;
     min-width: 0;
   }
-  .val {
+  .val + .val {
+    padding-top: var(--sp-2);
+    border-top: 1px solid var(--border);
+  }
+  .vline {
     display: flex;
     flex-wrap: wrap;
     align-items: baseline;
-    gap: 4px;
+    justify-content: space-between;
+    gap: 2px var(--sp-2);
     overflow-wrap: anywhere;
+  }
+  .vo {
+    min-width: 0;
+    color: var(--text);
+  }
+  .chips {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px;
+  }
+  .prov {
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 var(--sp-2);
+    color: var(--text-2);
+    font-size: var(--fs-xs);
+    overflow-wrap: anywhere;
+  }
+  .by {
+    font-weight: 600;
+  }
+  .src {
+    min-width: 0;
+  }
+  .quote {
+    flex-basis: 100%;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+    font-style: italic;
   }
   .val.gone {
     text-decoration: line-through;

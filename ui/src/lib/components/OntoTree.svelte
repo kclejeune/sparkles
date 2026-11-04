@@ -1,6 +1,14 @@
 <script module lang="ts">
   /** The drag data type of a tree node: `{id, from}` as JSON. */
   export const TREE_DRAG = 'application/x-sparkles-tree-node';
+
+  /**
+   * The indent of a row at `depth` (ROADMAP item 633): full 14-pixel steps for the first
+   * four levels, then 6-pixel steps, so a row 15 levels down keeps room for its label.
+   */
+  export function treeIndent(depth: number): number {
+    return depth <= 4 ? depth * 14 : 56 + (depth - 4) * 6;
+  }
 </script>
 
 <script lang="ts">
@@ -28,6 +36,8 @@
     label,
     more,
     ondrop,
+    clipped,
+    onmore,
   }: {
     roots: string[];
     children: (id: string) => string[];
@@ -52,7 +62,14 @@
      * `copy` when Ctrl or Alt was held. Nodes are draggable when this is given.
      */
     ondrop?: (node: string, from: string | null, onto: string, copy: boolean) => void;
+    /** A level that holds fewer children than its node has: how many it shows of how many. */
+    clipped?: (parent: string | null) => { shown: number; total: number } | null;
+    /** Reads the next page of a clipped level. */
+    onmore?: (parent: string | null) => void;
   } = $props();
+  const parent = $derived(path.at(-1) ?? null);
+  const clip = $derived(clipped?.(parent) ?? null);
+  let reading = $state(false);
 
   const DRAG = TREE_DRAG;
   let over = $state<string | null>(null);
@@ -61,7 +78,13 @@
     [...ids].sort((a, b) => name(a).localeCompare(name(b), undefined, { sensitivity: 'base' }));
 </script>
 
-<ul class="tree" role={depth === 0 ? 'tree' : 'group'} aria-label={depth === 0 ? label : undefined}>
+<ul
+  class="tree"
+  role={depth === 0 ? 'tree' : 'group'}
+  aria-label={depth === 0 ? label : undefined}
+  class:guided={depth > 0 && depth <= 4}
+  style:--guide={depth > 0 && depth <= 4 ? `${treeIndent(depth - 1) + 11}px` : undefined}
+>
   {#each sorted(roots.filter((r) => !keep || keep.has(r))) as id (id)}
     {#if !path.includes(id)}
       {@const kids = children(id).filter((k) => !path.includes(k) && (!keep || keep.has(k)))}
@@ -80,7 +103,7 @@
           class="node"
           class:sel={selected === id}
           class:over={over === id}
-          style:padding-left="{depth * 14 + 2}px"
+          style:padding-left="{treeIndent(depth) + 2}px"
           role="presentation"
           draggable={ondrop ? 'true' : undefined}
           ondragstart={ondrop
@@ -127,7 +150,7 @@
           {/if}
           <button
             class="label"
-            title={id.startsWith('n:') ? undefined : id}
+            title={id.startsWith('n:') ? undefined : [name(id), s, id].filter(Boolean).join('\n')}
             onclick={() => onselect(id)}
           >
             <span class="name">{name(id)}</span>
@@ -152,11 +175,33 @@
             path={[...path, id]}
             {more}
             {ondrop}
+            {clipped}
+            {onmore}
           />
         {/if}
       </li>
     {/if}
   {/each}
+  {#if clip && clip.shown < clip.total && !keep}
+    <li class="more-row" role="none" style:padding-left="{treeIndent(depth) + 22}px">
+      <span class="faint"
+        >Showing {clip.shown.toLocaleString('en-US')} of {clip.total.toLocaleString('en-US')}</span
+      >
+      <button
+        class="btn ghost sm"
+        disabled={reading}
+        onclick={async () => {
+          reading = true;
+          try {
+            await onmore?.(parent);
+          } finally {
+            reading = false;
+          }
+        }}
+        >{#if reading}<span class="spinner"></span>{/if} Show more</button
+      >
+    </li>
+  {/if}
 </ul>
 
 <style>
@@ -164,6 +209,20 @@
     list-style: none;
     margin: 0;
     padding: 0;
+  }
+  /* a guide line under each open node of the first levels, down the length of its
+     children; deeper levels step only 6px, where a line per level reads as a comb */
+  .tree.guided {
+    background: linear-gradient(var(--border), var(--border)) no-repeat;
+    background-size: 1px 100%;
+    background-position: var(--guide, 0) 0;
+  }
+  .more-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    min-height: var(--row-h);
+    font-size: var(--fs-sm);
   }
   .node {
     display: flex;
@@ -213,6 +272,7 @@
     gap: 6px;
     min-width: 0;
     flex: 1;
+    container-type: inline-size;
     border: 0;
     background: none;
     padding: 2px 4px;
@@ -223,6 +283,8 @@
     border-radius: var(--r-sm);
   }
   .name {
+    flex: 0 1 auto;
+    min-width: 0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -235,6 +297,26 @@
     overflow: hidden;
     text-overflow: ellipsis;
     min-width: 0;
+    flex: 0 100 auto;
+  }
+  /* a narrow row keeps its label: the short form goes first */
+  @container (max-width: 240px) {
+    .iri {
+      display: none;
+    }
+  }
+  /* the selected row shows its whole label and short form */
+  .node.sel .label {
+    flex-wrap: wrap;
+  }
+  .node.sel .name {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .node.sel .iri {
+    display: inline;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
   .badge {
     font-size: var(--fs-xs);

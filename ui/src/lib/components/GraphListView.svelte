@@ -112,7 +112,7 @@
           <td class="hide-sm faint">{r.kind}</td>
           {#if !plain}<td class="hide-sm faint mono small">{r.cls ?? ''}</td>{/if}
           <td class="num hide-sm">{fmtInt(r.degree)}</td>
-          <td class="act">
+          <td class="actions">
             <button class="btn sm" onclick={() => onopen?.(r.key)}
               >{r.openable ? openLabel : 'Explore'}</button
             >
@@ -194,7 +194,7 @@
     border-radius: 50%;
     flex: none;
   }
-  .act {
+  .actions {
     text-align: right;
     white-space: nowrap;
   }

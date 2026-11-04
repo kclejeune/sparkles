@@ -1,4 +1,6 @@
 <script lang="ts">
+  import PageActions from '$components/PageActions.svelte';
+  import { routes } from '$lib/routes';
   // Similar: nearest neighbours by `spk:vectorSearch` (docs/API.md "Vector similarity").
   // Pick a vector index (or a predicate without one), then search from an entity's own
   // vector or from a pasted vector. The URL keeps the dataset, the index or predicate,
@@ -414,15 +416,17 @@
         {#if ds}in <span class="mono">{ds}</span>{/if}
       </p>
     </div>
-    <span class="spacer"></span>
     {#if ds && chosenIndex}
-      <a
-        class="btn"
-        href="{resolve('/embedding')}?{new URLSearchParams({
-          ds: family!,
-          ...(selectedBranch ? { branch: selectedBranch } : {}),
-        })}&index={encodeURIComponent(chosenIndex.name)}">Embedding map</a
-      >
+      <PageActions>
+        <a
+          class="btn"
+          data-primary
+          href={routes.similarMap(family, {
+            branch: selectedBranch,
+            index: chosenIndex.name,
+          })}><Icon name="map" size={14} /> Embedding map</a
+        >
+      </PageActions>
     {/if}
   </header>
 
@@ -661,7 +665,7 @@
                     >{info.score} {info.better === 'lower' ? '↓' : '↑'}</th
                   >
                   <th class="vec">Matched vector</th>
-                  <th class="acts"><span class="sr">Actions</span></th>
+                  <th class="actions"><span class="sr">Actions</span></th>
                 </tr>
               </thead>
               <tbody>
@@ -690,7 +694,7 @@
                       title={h.vector?.type === 'literal' ? h.vector.value : undefined}
                       >{vectorLabel(h.vector)}</td
                     >
-                    <td class="acts">
+                    <td class="actions">
                       <div class="cell-actions">
                         {#if h.term.type === 'uri'}
                           {@const iri = h.term.value}
@@ -843,7 +847,7 @@
   .hits th.vec {
     width: 30%;
   }
-  .hits th.acts {
+  .hits th.actions {
     width: 64px;
   }
   .ent {
@@ -885,7 +889,7 @@
     background: var(--literal);
     opacity: 0.7;
   }
-  td.acts {
+  td.actions {
     white-space: nowrap;
     text-align: right;
   }

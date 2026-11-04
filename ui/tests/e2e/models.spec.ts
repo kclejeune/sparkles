@@ -18,7 +18,7 @@ open('the Models section edits providers, roles and keys', async ({ page, reques
   for (const name of ['anthropic', 'gw2'])
     expect((await request.delete(`/$/server/secrets/${name}`)).ok()).toBe(true);
 
-  await page.goto('/ui/server');
+  await page.goto('/ui/admin/server');
   const models = page.getByTestId('models-section');
   const providers = models.getByRole('table', { name: 'Model providers' });
   await expect(providers.locator('[data-provider=claude]')).toContainText('anthropic');
@@ -204,7 +204,7 @@ open('the Models section edits providers, roles and keys', async ({ page, reques
 });
 
 test('people without server-admin see no Models section', async ({ page }) => {
-  await page.goto('/ui/server');
+  await page.goto('/ui/admin/server');
   await expect(page.getByRole('heading', { name: 'Readiness' })).toBeVisible();
   await expect(page.getByTestId('models-section')).toHaveCount(0);
 });
@@ -213,7 +213,7 @@ open(
   'a save of allowed models, per-model options and headers round-trips',
   async ({ page, request }) => {
     expect((await request.delete('/$/server/settings/models')).ok()).toBe(true);
-    await page.goto('/ui/server');
+    await page.goto('/ui/admin/server');
     const panel = page.getByTestId('settings-model-configuration');
     const row = (field: string) => panel.locator(`[data-field="${field}"]`);
     const save = () => panel.getByRole('button', { name: 'Save', exact: true }).click();

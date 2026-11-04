@@ -210,7 +210,7 @@ open(
     ).toBeVisible();
     await expect(tree).toContainText('Also under');
 
-    const logic = page.getByRole('region', { name: 'Logical definition' });
+    const logic = page.getByRole('region', { name: 'Axioms' });
     await page.locator('#browse-add-axiom .cm-content').click();
     await page.keyboard.type("'part of' some cytoplasm");
     await page
@@ -380,7 +380,7 @@ anonymous('a reader sees no edit affordance', async ({ page }) => {
   expect(login.ok()).toBe(true);
   await page.goto(termUrl(BROWSE_EDIT_AUTH, 5, '&edit=1'));
   await expect(page.locator('h1.term-title')).toHaveText('mitochondrion');
-  await expect(page.getByRole('region', { name: 'Logical definition' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Axioms' })).toBeVisible();
   await expect(page).not.toHaveURL(/edit=1/);
   await expect(page.getByRole('button', { name: 'Edit', exact: true })).toHaveCount(0);
   await expect(bar(page)).toHaveCount(0);

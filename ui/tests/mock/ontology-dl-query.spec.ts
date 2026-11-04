@@ -8,17 +8,9 @@ import { expect, test, type Page } from '@playwright/test';
 test.describe.configure({ timeout: 90_000 });
 
 const UNI = 'http://example.org/uni#';
-const VIEWS = [
-  'Classes',
-  'Object properties',
-  'Data properties',
-  'Annotation properties',
-  'Individuals',
-  'DL Query',
-  'Header',
-];
+const VIEWS = ['Tree', 'DL Query', 'Header', 'History'];
 
-async function open(page: Page, url = '/ui/ontology?ds=uni') {
+async function open(page: Page, url = '/ui/workbench/ontology?ds=uni') {
   await page.goto(url);
   await expect(page.getByRole('tablist', { name: 'Ontology views' })).toBeVisible({
     timeout: 30_000,
@@ -56,7 +48,7 @@ test('the view strip wraps at phone width instead of hiding tabs', async ({ page
 const editor = (page: Page) => page.getByRole('textbox', { name: 'Class expression' });
 
 test('a DL query lists its answers with the reasoning that found them', async ({ page }) => {
-  await open(page, '/ui/ontology?ds=uni&tab=dlquery');
+  await open(page, '/ui/workbench/ontology?ds=uni&tab=dlquery');
   await editor(page).click();
   await page.keyboard.type('Person and (teaches some Course)');
   await page.keyboard.press('Escape');
@@ -82,7 +74,7 @@ test('a DL query lists its answers with the reasoning that found them', async ({
 });
 
 test('a link to the tab runs its query', async ({ page }) => {
-  await open(page, `/ui/ontology?ds=uni&tab=dlquery&dl=${encodeURIComponent('Student')}`);
+  await open(page, `/ui/workbench/ontology?ds=uni&tab=dlquery&dl=${encodeURIComponent('Student')}`);
   const result = page.getByLabel('DL query answers');
   await expect(result.getByRole('region', { name: 'Direct subclasses' })).toContainText(
     'Graduate student',
@@ -91,7 +83,7 @@ test('a link to the tab runs its query', async ({ page }) => {
 });
 
 test('a query that does not parse is underlined where the reader stopped', async ({ page }) => {
-  await open(page, '/ui/ontology?ds=uni&tab=dlquery');
+  await open(page, '/ui/workbench/ontology?ds=uni&tab=dlquery');
   await editor(page).click();
   await page.keyboard.type('Person and Robot');
   await page.keyboard.press('Escape');
@@ -102,7 +94,7 @@ test('a query that does not parse is underlined where the reader stopped', async
 });
 
 test('names complete as the expression is typed, quoted where they need it', async ({ page }) => {
-  await open(page, '/ui/ontology?ds=uni&tab=dlquery');
+  await open(page, '/ui/workbench/ontology?ds=uni&tab=dlquery');
   await editor(page).click();
   await page.keyboard.type('Grad');
   const list = page.locator('.cm-tooltip-autocomplete');
@@ -112,7 +104,7 @@ test('names complete as the expression is typed, quoted where they need it', asy
 });
 
 test('a frame section takes a Manchester expression and previews its axiom', async ({ page }) => {
-  await open(page, `/ui/ontology?ds=uni&tab=Class&iri=${encodeURIComponent(UNI + 'Student')}`);
+  await open(page, `/ui/workbench/ontology?ds=uni&iri=${encodeURIComponent(UNI + 'Student')}`);
   const sub = page.locator('.frame [data-section="sub"]');
   await sub.getByRole('textbox', { name: /^Add to/ }).click();
   // the quote closes itself as it is typed, and the second steps over it
@@ -126,7 +118,7 @@ test('a frame section takes a Manchester expression and previews its axiom', asy
 });
 
 test('an unknown name in a frame section is reported with its span', async ({ page }) => {
-  await open(page, `/ui/ontology?ds=uni&tab=Class&iri=${encodeURIComponent(UNI + 'Student')}`);
+  await open(page, `/ui/workbench/ontology?ds=uni&iri=${encodeURIComponent(UNI + 'Student')}`);
   const sub = page.locator('.frame [data-section="sub"]');
   await sub.getByRole('textbox', { name: /^Add to/ }).click();
   await page.keyboard.type('attends some Course');
@@ -137,7 +129,7 @@ test('an unknown name in a frame section is reported with its span', async ({ pa
 });
 
 test('the editor follows the address through the history', async ({ page }) => {
-  await open(page, '/ui/ontology?ds=uni&tab=dlquery');
+  await open(page, '/ui/workbench/ontology?ds=uni&tab=dlquery');
   const result = page.getByLabel('DL query answers');
   for (const q of ['Student', 'Course']) {
     await editor(page).click();
@@ -164,7 +156,7 @@ test('the editor follows the address through the history', async ({ page }) => {
 });
 
 test('a problem is underlined where it is when the text starts with spaces', async ({ page }) => {
-  await open(page, '/ui/ontology?ds=uni&tab=dlquery');
+  await open(page, '/ui/workbench/ontology?ds=uni&tab=dlquery');
   await editor(page).click();
   await page.keyboard.type('  Person and Robot');
   await page.keyboard.press('Escape');

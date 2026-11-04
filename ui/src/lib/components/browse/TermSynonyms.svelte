@@ -2,9 +2,19 @@
   // The synonyms of an entity by kind: exact, related, broad and narrow, and the SKOS
   // alternative and hidden labels, each value with its language and sources.
   import type { Linker, Sections } from '$lib/browse';
+  import { localName } from '$lib/rdf';
   import SourcedValue from './SourcedValue.svelte';
 
-  let { synonyms, linker }: { synonyms: Sections['synonyms']; linker: Linker } = $props();
+  let {
+    synonyms,
+    linker,
+    typeName = localName,
+  }: {
+    synonyms: Sections['synonyms'];
+    linker: Linker;
+    /** What a synonym type is called, such as "plural" (`synonymTypeName`). */
+    typeName?: (iri: string) => string;
+  } = $props();
 </script>
 
 {#if synonyms.length}
@@ -14,7 +24,7 @@
       {#each synonyms as g (g.kind)}
         <dt>{g.kind}</dt>
         <dd>
-          {#each g.values as v, i (i)}<SourcedValue {v} {linker} />{/each}
+          {#each g.values as v, i (i)}<SourcedValue {v} {linker} {typeName} />{/each}
         </dd>
       {/each}
     </dl>

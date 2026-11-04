@@ -40,6 +40,9 @@
   /* the page edge and the gap between panels, per breakpoint below */
   --gutter: 24px;
   --gap: 16px;
+  /* the side column of a page with content beside it (Browse, a dataset), one width on
+     every such page so it holds still between them (ROADMAP item 633) */
+  --side-column: clamp(300px, 28%, 400px);
 
   /* control heights: buttons, inputs, selects and tabs share them */
   --ctl-h: 30px;
@@ -583,16 +586,20 @@ label.field {
    a spacer and the page's actions at the end of the row. The row wraps, so the actions
    drop below the title on a phone instead of crowding it. Components that have a `.head`
    of their own keep it, because this class has a distinct name. */
+/* A page's head (ROADMAP item 633). From 640px it is two columns: the title block takes the
+   rest and the actions (PageActions.svelte, .page-actions) their own width, level with the
+   title's first line and never under it. Breadcrumbs take a row of their own above both.
+   PageActions folds the actions a page does not mark primary into a "More" menu when the
+   title column would fall under 60% of the head. Below 640px the head stacks: the title,
+   then the actions on a row of their own from the start. */
 .page-head {
   display: flex;
-  align-items: flex-start;
-  gap: var(--sp-2) var(--sp-4);
-  flex-wrap: wrap;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-2);
+  min-width: 0;
 }
-/* the title block takes the row's room, so the actions sit at its end until they no
-   longer fit beside a readable title */
-.page-head > :first-child {
-  flex: 1 1 20rem;
+.page-head > * {
   min-width: 0;
 }
 .page-head p {
@@ -604,20 +611,51 @@ label.field {
   color: var(--text-3);
   overflow-wrap: anywhere;
 }
-/* The page's actions at the end of its head, level with the title. On a phone they take a
-   row of their own under the title, from its start, so the title keeps the width. */
+@media (min-width: 640px) {
+  .page-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: var(--sp-4);
+    row-gap: var(--sp-2);
+    align-items: start;
+  }
+  .page-head > * {
+    grid-column: 1;
+  }
+  .page-head > .breadcrumbs,
+  .page-head > .crumbs {
+    grid-column: 1 / -1;
+  }
+  .page-head > .page-actions {
+    grid-column: 2;
+    grid-row: 1;
+    /* level with the middle of the title's first line */
+    margin-top: calc((var(--fs-xl) * var(--lh-tight) - var(--ctl-h)) / 2);
+  }
+  .page-head:has(> .breadcrumbs, > .crumbs) > .page-actions {
+    grid-row: 2;
+  }
+}
+/* a checkbox or a label in a page's actions stands as tall as the buttons beside it */
+.page-actions > .form-row {
+  min-height: var(--ctl-h);
+}
 .page-actions {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
   flex-wrap: wrap;
-  margin-left: auto;
+  min-width: 0;
 }
-@media (max-width: 760px) {
+@media (min-width: 640px) {
   .page-actions {
-    margin-left: 0;
-    width: 100%;
+    flex-wrap: nowrap;
+    justify-content: flex-end;
   }
+}
+/* an action that PageActions folded into the More menu */
+.page-actions > [data-folded] {
+  display: none !important;
 }
 
 /* The row under a page's head with the controls that choose what the page shows, each a
@@ -726,6 +764,54 @@ label.field {
   letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
+}
+
+/* Headline counts as a row of chips (StatChips.svelte): each its figure in the text colour and
+   what it counts in the secondary one, 32px tall, linking to the section it counts when it
+   has one. On a phone the chips tighten so that a page's five or six counts take two lines. */
+.stat-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+.stat-chips > li {
+  display: contents;
+}
+.stat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  text-decoration: none;
+  font-variant-numeric: tabular-nums;
+}
+.stat-chip b {
+  color: var(--text);
+  font-weight: 600;
+}
+a.stat-chip:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+@media (max-width: 639px) {
+  .stat-chips {
+    gap: 4px;
+  }
+  .stat-chip {
+    height: 28px;
+    padding: 0 9px;
+  }
 }
 
 /* A workspace page's tools (Query, Explore): one row at --gutter, its groups split by
@@ -1023,6 +1109,93 @@ table.data .num {
   white-space: nowrap;
 }
 
+/* a table wider than its box keeps its actions column pinned to the box's right edge
+   (src/lib/tables.ts marks the box) */
+[data-clipped] > table.data tr > .actions:last-child,
+[data-clipped] > table.data:has(td.actions:last-child) thead tr > th:last-child {
+  position: sticky;
+  right: 0;
+  z-index: 1;
+  background: var(--surface);
+  box-shadow: inset 1px 0 0 var(--border);
+}
+[data-clipped] > table.data:has(td.actions:last-child) thead tr > th:last-child {
+  z-index: 3;
+}
+[data-clipped] > table.data tbody tr:hover > .actions:last-child {
+  background: linear-gradient(var(--hover), var(--hover)), var(--surface);
+}
+
+/* on a phone a table too wide for its box is one card a row (src/lib/tables.ts sets
+   data-stack and each cell's column name) */
+table.data[data-stack],
+table.data[data-stack] tbody,
+table.data[data-stack] tr,
+table.data[data-stack] td {
+  display: block;
+  width: auto;
+}
+table.data[data-stack] thead {
+  display: none;
+}
+table.data[data-stack] tr {
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--border);
+}
+table.data[data-stack] tr:last-child {
+  border-bottom: 0;
+}
+table.data[data-stack] td {
+  position: relative;
+  min-width: 0;
+  max-width: none;
+  padding: 2px var(--sp-3) 2px calc(var(--sp-3) + 8.5rem);
+  border: 0;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+table.data[data-stack] td::before {
+  content: attr(data-label);
+  position: absolute;
+  left: var(--sp-3);
+  width: 8rem;
+  color: var(--text-3);
+  font-size: var(--fs-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+table.data[data-stack] td:first-child,
+table.data[data-stack] td.actions,
+table.data[data-stack] td:not([data-label]) {
+  padding-left: var(--sp-3);
+}
+table.data[data-stack] td:first-child {
+  padding-bottom: var(--sp-1);
+  font-weight: 600;
+}
+table.data[data-stack] td:first-child::before,
+table.data[data-stack] td.actions::before {
+  display: none;
+}
+table.data[data-stack] td:empty {
+  display: none;
+}
+table.data[data-stack] td.actions {
+  padding-top: var(--sp-2);
+}
+table.data[data-stack] td.actions > div,
+table.data[data-stack] td.actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: var(--sp-2);
+}
+table.data[data-stack] tbody tr:hover td {
+  background: none;
+}
+
 /* term styling shared across views */
 .t-iri {
   color: var(--iri);
@@ -1097,6 +1270,22 @@ table.data .num {
   overflow-y: hidden;
   scrollbar-width: none;
 }
+/* off-screen tabs fade out at the strip's edge (lib/tabstrip.ts sets the attributes) */
+.tabs[data-more-end] {
+  mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
+}
+.tabs[data-more-start] {
+  mask-image: linear-gradient(to left, #000 calc(100% - 32px), transparent);
+}
+.tabs[data-more-start][data-more-end] {
+  mask-image: linear-gradient(
+    to right,
+    transparent,
+    #000 32px,
+    #000 calc(100% - 32px),
+    transparent
+  );
+}
 .tab {
   display: inline-flex;
   align-items: center;
@@ -1116,7 +1305,8 @@ table.data .num {
 .tab:hover {
   color: var(--text);
 }
-.tab[aria-selected='true'] {
+.tab[aria-selected='true'],
+.tab[aria-current='page'] {
   color: var(--text);
   border-bottom-color: var(--spark);
 }
@@ -1125,7 +1315,7 @@ table.data .num {
   padding: 0 5px;
   font-size: var(--fs-xs);
 }
-.tab[aria-selected='true'] .count {
+.tab:is([aria-selected='true'], [aria-current='page']) .count {
   background: var(--spark-soft);
   color: var(--spark-ink);
 }
@@ -1242,4 +1432,42 @@ kbd,
 }
 .more-btn:hover {
   color: var(--text);
+}
+
+/* A vertical timeline (ROADMAP item 633): a list whose entries hang on one rule, each with
+   a dot that takes its colour from --dot. Memory's activity and a fact's history use it.
+   The meaning of an entry is always in its text, never in the dot's colour alone. */
+.timeline {
+  position: relative;
+  display: grid;
+  gap: var(--sp-3);
+  margin: 0;
+  padding: 0 0 0 var(--sp-5);
+  list-style: none;
+  min-width: 0;
+}
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  background: var(--border);
+}
+.timeline > li {
+  position: relative;
+  min-width: 0;
+}
+.timeline > li::before {
+  content: '';
+  position: absolute;
+  left: calc(-1 * var(--sp-5));
+  top: 4px;
+  width: 12px;
+  height: 12px;
+  box-sizing: border-box;
+  border: 2px solid var(--dot, var(--border-strong));
+  border-radius: 50%;
+  background: var(--surface);
 }

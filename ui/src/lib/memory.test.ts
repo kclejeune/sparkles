@@ -14,6 +14,8 @@ import {
   isReviewBranch,
   principalName,
   SOURCES_QUERY,
+  LISTING_LIMIT,
+  listed,
 } from './memory';
 
 const facts: RecallFact[] = [
@@ -203,5 +205,15 @@ describe('factChanges', () => {
 
   it('treats an entity that did not exist before as all added', () => {
     expect(factChanges(undefined, [fact('a', 'b')]).map((c) => c.kind)).toEqual(['added']);
+  });
+});
+
+describe('listed', () => {
+  it('marks the count of a listing that stopped at its limit', () => {
+    expect(listed(7)).toBe('7');
+    expect(listed(LISTING_LIMIT - 1)).toBe(String(LISTING_LIMIT - 1));
+    expect(listed(LISTING_LIMIT)).toBe(`${LISTING_LIMIT}+`);
+    expect(AGENTS_QUERY).toContain(`LIMIT ${LISTING_LIMIT}`);
+    expect(SOURCES_QUERY).toContain(`LIMIT ${LISTING_LIMIT}`);
   });
 });

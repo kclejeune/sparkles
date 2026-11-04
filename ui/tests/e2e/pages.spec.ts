@@ -2,6 +2,8 @@ import { expect, open, test } from './fixtures';
 import { DATASET, EX } from './data';
 
 test('the query page runs a query and shows the results', async ({ page }) => {
+  // the page opens on the first dataset the server lists, which is not this one
+  await page.addInitScript((ds) => localStorage.setItem('sparkles.dataset', ds), DATASET);
   await page.goto('/ui/query');
   const editor = page.locator('.cm-content');
   await editor.click();

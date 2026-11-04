@@ -18,6 +18,8 @@
     AGENTS_QUERY,
     graphPrefixes,
     isReviewBranch,
+    LISTING_LIMIT,
+    listed,
     principalName,
     SOURCES_QUERY,
   } from '$lib/memory';
@@ -28,6 +30,8 @@
   import InboxPanel from '$components/InboxPanel.svelte';
   import { reviewCounts } from '$lib/review-count.svelte';
   import IngestSettings from '$components/IngestSettings.svelte';
+  import PageSearch from '$components/PageSearch.svelte';
+  import StatChips, { type StatChip } from '$components/StatChips.svelte';
   import RecallView from '$components/RecallView.svelte';
   import TermView from '$components/TermView.svelte';
 
@@ -41,7 +45,7 @@
     else q.delete('tab');
     const qs = q.toString();
     goto(`${resolve('/memory')}${qs ? `?${qs}` : ''}`, {
-      replaceState: true,
+      // a tab is a step that Back returns to (ROADMAP item 633)
       keepFocus: true,
       noScroll: true,
     });
@@ -156,6 +160,47 @@
     });
   });
 
+  /** The counts that head the overview, once the queries have answered. */
+  const chips = $derived.by<StatChip[]>(() => {
+    if (agents.loading || sources.loading || activity.loading) return [];
+    const facts = agents.rows.reduce((t, r) => t + n(r.facts), 0);
+    const plural = (k: number, one: string, many: string) => (k === 1 ? one : many);
+    // the agents and sources are listings cut at LISTING_LIMIT rows, so their counts, and the
+    // facts of the agents listed, are lower bounds when a listing is full
+    const cut = agents.rows.length >= LISTING_LIMIT;
+    const out: StatChip[] = [
+      {
+        key: 'facts',
+        value: cut ? `${fmtInt(facts)}+` : fmtInt(facts),
+        label: plural(facts, 'fact', 'facts'),
+        title: cut ? 'The facts of the first agents the listing reads' : undefined,
+      },
+      {
+        key: 'agents',
+        value: listed(agents.rows.length),
+        label: plural(agents.rows.length, 'agent', 'agents'),
+      },
+      {
+        key: 'sources',
+        value: listed(sources.rows.length),
+        label: plural(sources.rows.length, 'source', 'sources'),
+      },
+      {
+        key: 'branches',
+        value: fmtInt(review.rows.length),
+        label: plural(review.rows.length, 'review branch', 'review branches'),
+      },
+    ];
+    if (inboxCount != null)
+      out.push({
+        key: 'inbox',
+        value: fmtInt(inboxCount),
+        label: 'open in the inbox',
+        href: `${resolve('/memory')}?tab=inbox`,
+      });
+    return out;
+  });
+
   // --- search ---------------------------------------------------------------------------
   let text = $state(page.url.searchParams.get('q') ?? '');
   let searching = $state(false);
@@ -241,41 +286,28 @@
         />
       {/key}
     {:else}
-      <section class="panel" aria-label="Search memory">
-        <div class="panel-head"><h2>Search memory</h2></div>
-        <div class="panel-body card-body">
-          <form
-            class="row search"
-            onsubmit={(e) => {
-              e.preventDefault();
-              void search();
-            }}
-          >
-            <input
-              class="input"
-              placeholder="payments team"
-              aria-label="Search memory"
-              bind:value={text}
-            />
-            <button class="btn primary" type="submit" disabled={!text.trim() || searching}>
-              {#if searching}<span class="spinner"></span>{:else}<Icon
-                  name="search"
-                  size={13}
-                />{/if}
-              Search
-            </button>
-          </form>
-          {#if searchError}
-            <div class="error-box">{searchError}</div>
-          {:else if found}
+      <StatChips items={chips} label="Memory counts" />
+      <!-- the page's search is a field across the content, as on Browse (ROADMAP item 633) -->
+      <PageSearch
+        bind:value={text}
+        label="Search memory"
+        placeholder="Search what agents remember"
+        busy={searching}
+        onsubmit={() => void search()}
+      />
+      {#if searchError}
+        <div class="error-box">{searchError}</div>
+      {:else if found}
+        <section class="panel" aria-label="Memory search results">
+          <div class="panel-body card-body">
             {#if found.entities.length === 0}
               <p class="faint">No matches.</p>
             {:else}
               <RecallView result={found} {prefixes} onopen={openIri} />
             {/if}
-          {/if}
-        </div>
-      </section>
+          </div>
+        </section>
+      {/if}
 
       <div class="grid panel-grid">
         <section class="panel" aria-label="Agents">
@@ -349,16 +381,18 @@
             {:else if activities.length === 0}
               <p class="faint">No activity yet.</p>
             {:else}
-              <ul class="plain">
+              <ol class="timeline act">
                 {#each activities as r (v(r.act))}
-                  <li>
-                    <span class="small mono faint">{when(r.time)}</span>
-                    <span>{principalName(v(r.agent))}</span>
-                    <span>{r.label ? `"${v(r.label)}"` : ''}</span>
-                    <span class="faint small mono">{v(r.g)}</span>
+                  <li style:--dot="var(--spark)">
+                    <div class="act-head">
+                      <span class="small mono faint">{when(r.time)}</span>
+                      <span class="who">{principalName(v(r.agent))}</span>
+                    </div>
+                    {#if r.label}<div>"{v(r.label)}"</div>{/if}
+                    <div class="faint small mono">{v(r.g)}</div>
                   </li>
                 {/each}
-              </ul>
+              </ol>
             {/if}
           </div>
         </section>
@@ -446,14 +480,6 @@
     min-width: 0;
     overflow-x: auto;
   }
-  .search {
-    display: flex;
-    gap: 8px;
-  }
-  .search .input {
-    flex: 1;
-    min-width: 0;
-  }
   .data {
     width: 100%;
     border-collapse: collapse;
@@ -488,6 +514,19 @@
     gap: 6px;
     align-items: baseline;
     overflow-wrap: anywhere;
+  }
+  .act {
+    font-size: var(--fs-sm);
+    overflow-wrap: anywhere;
+  }
+  .act-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px var(--sp-2);
+  }
+  .who {
+    font-weight: 600;
   }
   .kv {
     display: grid;

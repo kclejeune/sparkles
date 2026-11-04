@@ -30,9 +30,9 @@ test('the explorer, the datasets, the server and the tokens', async ({ page }) =
     `/ui/explore?ds=${DATASET}&tab=schema`,
     '/ui/datasets',
     `/ui/datasets/${DATASET}`,
-    '/ui/backups',
-    '/ui/server',
-    '/ui/tokens',
+    '/ui/admin/backups',
+    '/ui/admin/server',
+    '/ui/admin/tokens',
   ]) {
     await page.goto(url);
     await page.waitForLoadState('networkidle');
@@ -40,7 +40,7 @@ test('the explorer, the datasets, the server and the tokens', async ({ page }) =
     await expectNoSidewaysScroll(page, url);
   }
   await page.goto(`/ui/datasets/${DATASET}`);
-  await page.getByRole('tab', { name: 'ShEx' }).click();
+  await page.getByRole('button', { name: 'ShEx', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'ShEx schema' })).toBeVisible();
   await expectNoSidewaysScroll(page, 'the ShEx tab');
 });

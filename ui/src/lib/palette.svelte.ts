@@ -6,6 +6,7 @@
 
 import { goto } from '$app/navigation';
 import * as api from './api';
+import { iriForm } from './iri-form.svelte';
 import { app } from './app.svelte';
 import {
   launcher,
@@ -69,28 +70,37 @@ export function commandProvider(group: 'page' | 'global'): LauncherProvider {
 }
 
 /** The shell's pages, with the open dataset's own page. */
-export function pageProvider(base: string, backupsVisible: () => boolean): LauncherProvider {
+/** Words a page answers to beside its name. */
+const KEYWORDS: Record<string, string[]> = {
+  '/similar/map': ['embedding map', 'vectors', 'projection', 'umap'],
+  '/admin/tokens': ['access tokens', 'api keys'],
+  '/admin/backups': ['backup', 'snapshots', 'restore'],
+  '/workbench/ontology': ['editor', 'owl', 'classes', 'dl query', 'edit ontology'],
+  '/workbench/thesaurus': ['editor', 'skos', 'concepts', 'edit thesaurus'],
+};
+
+export function pageProvider(
+  base: string,
+  backupsVisible: () => boolean,
+  /** Whether the caller may write dataset `ds`, which shows the Workbench. */
+  canWrite: (ds: string | null) => boolean = () => false,
+): LauncherProvider {
   const pages = (ds: string | null) => {
-    const out: (LauncherItem & { keywords?: string[] })[] = navItems(backupsVisible()).map((n) => ({
-      id: n.href,
-      title: n.label,
-      icon: n.icon,
-      href: navLink(base, n.href, ds),
-    }));
-    out.push({
-      id: '/embedding',
-      title: 'Embedding map',
-      icon: 'similar',
-      href: navLink(base, '/embedding', ds),
-      keywords: ['vectors', 'projection', 'umap'],
-    });
-    out.push({
-      id: '/tokens',
-      title: 'Access tokens',
-      icon: 'key',
-      href: `${base}/tokens`,
-      keywords: ['tokens', 'api keys'],
-    });
+    // the rail's pages, and each page of a group as its own row
+    const out: (LauncherItem & { keywords?: string[] })[] = navItems({
+      backupsVisible: backupsVisible(),
+      workbench: canWrite(ds),
+    }).flatMap((n) =>
+      n.children
+        ? n.children.map((c) => ({
+            id: c.href,
+            title: `${n.label} › ${c.label}`,
+            icon: c.icon,
+            href: navLink(base, c.href, ds),
+            keywords: [c.label.toLowerCase(), ...(KEYWORDS[c.href] ?? [])],
+          }))
+        : [{ id: n.href, title: n.label, icon: n.icon, href: navLink(base, n.href, ds) }],
+    );
     if (ds) {
       out.push({
         id: '/dataset',
@@ -288,6 +298,24 @@ export function shellCommands(
     theme('dark', 'dark'),
     theme('system', 'follow the system'),
     {
+      id: 'iris.full',
+      label: 'Show full IRIs',
+      group: 'global',
+      icon: 'code',
+      keywords: ['iri', 'prefixed names', 'curie', 'namespace'],
+      active: () => !iriForm.full,
+      run: () => iriForm.set(true),
+    },
+    {
+      id: 'iris.prefixed',
+      label: 'Show prefixed names',
+      group: 'global',
+      icon: 'code',
+      keywords: ['iri', 'prefixed names', 'curie', 'namespace'],
+      active: () => iriForm.full,
+      run: () => iriForm.set(false),
+    },
+    {
       id: 'go.settings',
       label: 'Open dataset settings',
       group: 'global',
@@ -302,7 +330,7 @@ export function shellCommands(
       group: 'global',
       icon: 'server',
       keywords: ['metrics', 'health', 'tasks'],
-      run: go('/server'),
+      run: go('/admin/server'),
     },
     {
       id: 'go.tokens',
@@ -310,7 +338,7 @@ export function shellCommands(
       group: 'global',
       icon: 'key',
       keywords: ['api keys', 'credentials'],
-      run: go('/tokens'),
+      run: go('/admin/tokens'),
     },
     {
       id: 'go.backups',
@@ -319,7 +347,7 @@ export function shellCommands(
       icon: 'archive',
       keywords: ['restore', 'snapshots'],
       active: can.backups,
-      run: go('/backups'),
+      run: go('/admin/backups'),
     },
     {
       id: 'dataset.new',

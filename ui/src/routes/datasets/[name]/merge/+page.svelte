@@ -8,6 +8,7 @@
   // The page is laid out as a summary, the conflicts, the changes and an actions bar
   // whose options section takes further ways of merging (a squash, a revert) as more
   // controls next to the message.
+  import PageActions from '$components/PageActions.svelte';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
@@ -15,7 +16,14 @@
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
-  import { MAIN, mergeChanges, mergeCommands, ntShort, remainingConflicts } from '$lib/branches';
+  import {
+    MAIN,
+    mergeChanges,
+    onBranch,
+    mergeCommands,
+    ntShort,
+    remainingConflicts,
+  } from '$lib/branches';
   import { fmtInt } from '$lib/format';
   import {
     cellKey,
@@ -303,12 +311,12 @@
       ><Icon name="chevron" size={12} /><span aria-current="page">Merge</span>
     </nav>
     <h1>Merge {source || 'a branch'} into {target}</h1>
-    <div class="page-actions">
-      <button class="btn" onclick={load} disabled={loading} aria-label="Compare again">
+    <PageActions>
+      <button class="btn" data-primary onclick={load} disabled={loading} aria-label="Compare again">
         {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={14} />{/if} Compare
         again
       </button>
-    </div>
+    </PageActions>
   </header>
   <div class="page-context">
     <label class="form-row">
@@ -595,6 +603,7 @@
                 total={dry.changes.total}
                 label="Changes of the merge"
                 maxHeight={360}
+                ds={onBranch(name, target)}
               />
             {:else}
               <p class="faint">The merge changes no quads.</p>
@@ -657,9 +666,6 @@
 </div>
 
 <style>
-  .page-head .breadcrumbs {
-    flex-basis: 100%;
-  }
   .page-context .select {
     max-width: 200px;
   }

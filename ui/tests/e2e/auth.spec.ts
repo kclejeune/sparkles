@@ -47,7 +47,7 @@ test('a token minted on the tokens page calls the API but does not sign in to th
 }) => {
   // tests share the server (and --repeat-each runs this one several times)
   const name = `e2e-${randomBytes(4).toString('hex')}`;
-  await page.goto('/ui/tokens');
+  await page.goto('/ui/admin/tokens');
   await page.getByRole('button', { name: 'New token' }).click();
   const form = page.getByRole('dialog', { name: 'New API token' });
   await form.getByLabel('Token name').fill(name);

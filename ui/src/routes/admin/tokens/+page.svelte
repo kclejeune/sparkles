@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageActions from '$components/PageActions.svelte';
   import { onMount } from 'svelte';
   import { errorMessage } from '$lib/api';
   import { toasts } from '$lib/app.svelte';
@@ -100,7 +101,7 @@
         more access than you do, even if your access changes later.
       </p>
     </div>
-    <div class="page-actions">
+    <PageActions>
       {#if admin}
         <label class="form-row">
           <input type="checkbox" bind:checked={showAll} onchange={refresh} /> All tokens
@@ -110,11 +111,11 @@
         <Icon name="refresh" size={14} /> Refresh
       </button>
       {#if auth.who?.canMintTokens}
-        <button class="btn primary" onclick={() => (createOpen = true)}>
+        <button class="btn primary" data-primary onclick={() => (createOpen = true)}>
           <Icon name="plus" size={14} /> New token
         </button>
       {/if}
-    </div>
+    </PageActions>
   </header>
 
   {#if !auth.enabled && auth.loaded}

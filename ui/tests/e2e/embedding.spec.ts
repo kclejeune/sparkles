@@ -104,7 +104,7 @@ open(
     const wrong = (p.points as P[]).filter((q) => nearest(q) !== q.class);
     expect(wrong).toHaveLength(0);
 
-    await page.goto(`/ui/embedding?ds=${NAME}&index=vec`);
+    await page.goto(`/ui/similar/map?ds=${NAME}&index=vec`);
     const map = page.locator('.emap[data-ready="true"]');
     await expect(map).toHaveAttribute('data-points', '10000', { timeout: 30_000 });
     await expect(page.getByTestId('facts')).toContainText('10,000 entities');
@@ -141,7 +141,7 @@ anonymous(
       await page.goto(`/ui/explore?ds=${NAME}&iri=${encodeURIComponent(`${EX}e0`)}`);
       await expect(page.getByText(/\d+ nodes, \d+ edges/)).toBeVisible({ timeout: 20_000 });
       await expect(page.getByRole('link', { name: 'Embedding map' })).toHaveCount(0);
-      await page.goto(`/ui/embedding?ds=${NAME}&index=vec`);
+      await page.goto(`/ui/similar/map?ds=${NAME}&index=vec`);
       await expect(page.locator('[data-state="forbidden"]')).toContainText(
         'Embedding maps need access to every graph',
       );

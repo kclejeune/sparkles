@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageActions from '$components/PageActions.svelte';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
@@ -37,6 +38,7 @@
   import BackupsPanel from '$components/BackupsPanel.svelte';
   import BranchesPanel from '$components/BranchesPanel.svelte';
   import CommunitiesPanel from '$components/CommunitiesPanel.svelte';
+  import StatChips from '$components/StatChips.svelte';
   import CloneDialog from '$components/CloneDialog.svelte';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
   import DatasetSettingsTab from '$components/DatasetSettingsTab.svelte';
@@ -58,6 +60,11 @@
   import WriteValidationPanel from '$components/WriteValidationPanel.svelte';
 
   const name = $derived(page.params.name ?? '');
+  // the top bar's dataset follows the page's, as on every page that names one
+  $effect(() => {
+    if (name && name !== app.current && app.datasets.some((d) => d.name === name))
+      app.setDataset(name);
+  });
   const info = $derived(app.datasets.find((d) => d.name === name));
   /** The branch the page shows (`?branch=`): null for `main`. */
   const branch = $derived(branchParam(page.url.searchParams.get('branch')));
@@ -144,7 +151,7 @@
   );
   function setTab(t: Tab) {
     goto(withParams({ tab: t === 'overview' ? null : t }), {
-      replaceState: true,
+      // a tab is a step that Back returns to (ROADMAP item 633)
       keepFocus: true,
       noScroll: true,
     });
@@ -708,14 +715,16 @@ ex:PersonShape a sh:NodeShape ;
         </div>
       {/if}
     </div>
-    <div class="page-actions">
+    <PageActions>
       <button class="btn" onclick={refreshAll} disabled={loading} aria-label="Refresh">
         {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={14} />{/if}<span
           class="lbl">Refresh</span
         >
       </button>
-      <button class="btn" onclick={openQuery}><Icon name="query" size={14} /> Query</button>
-      <a class="btn" href={explore('')}><Icon name="explore" size={14} /> Explore</a>
+      <button class="btn" data-primary onclick={openQuery}
+        ><Icon name="query" size={14} /> Query</button
+      >
+      <a class="btn" data-primary href={explore('')}><Icon name="explore" size={14} /> Explore</a>
       {#if auth.can(name, 'admin')}
         <button
           class="btn"
@@ -736,7 +745,7 @@ ex:PersonShape a sh:NodeShape ;
           ><Icon name="trash" size={14} /><span class="lbl">Delete</span></button
         >
       {/if}
-    </div>
+    </PageActions>
   </header>
 
   <!-- the state the page shows: a branch, and a past state of the figures -->
@@ -871,38 +880,39 @@ ex:PersonShape a sh:NodeShape ;
       />
     </div>
   {:else if stats}
-    <!-- headline numbers -->
-    <dl class="figures">
-      <div>
-        <dt>Quads</dt>
-        <dd>{fmtInt(stats.quads)}</dd>
-      </div>
-      <div>
-        <dt>Terms</dt>
-        <dd>{fmtInt(stats.terms)}</dd>
-      </div>
-      <div>
-        <dt>Graphs</dt>
-        <dd>{fmtInt(stats.graphs.length)}</dd>
-      </div>
-      <div>
-        <dt>Predicates</dt>
-        <dd>{fmtInt(stats.predicates.length)}{stats.predicates.length >= 100 ? '+' : ''}</dd>
-      </div>
-      <div>
-        <dt>Classes</dt>
-        <dd>{fmtInt(stats.classes.length)}{stats.classes.length >= 100 ? '+' : ''}</dd>
-      </div>
-      <div>
-        <dt>On disk</dt>
-        <dd>
-          {info?.type === 'mem'
-            ? 'in memory'
-            : fmtBytes(stats.diskBytes)}{#if stats.quota?.maxBytes}
-            of {fmtBytes(stats.quota.maxBytes)}{/if}
-        </dd>
-      </div>
-    </dl>
+    <!-- headline numbers, as the chips of the Browse pages -->
+    <div class="ov-chips">
+      <StatChips
+        items={[
+          { key: 'quads', value: fmtInt(stats.quads), label: stats.quads === 1 ? 'quad' : 'quads' },
+          { key: 'terms', value: fmtInt(stats.terms), label: stats.terms === 1 ? 'term' : 'terms' },
+          {
+            key: 'graphs',
+            value: fmtInt(stats.graphs.length),
+            label: stats.graphs.length === 1 ? 'graph' : 'graphs',
+          },
+          {
+            key: 'predicates',
+            value: fmtInt(stats.predicates.length) + (stats.predicates.length >= 100 ? '+' : ''),
+            label: stats.predicates.length === 1 ? 'predicate' : 'predicates',
+          },
+          {
+            key: 'classes',
+            value: fmtInt(stats.classes.length) + (stats.classes.length >= 100 ? '+' : ''),
+            label: stats.classes.length === 1 ? 'class' : 'classes',
+          },
+          info?.type === 'mem'
+            ? { key: 'disk', value: 'In memory', label: '' }
+            : {
+                key: 'disk',
+                value: fmtBytes(stats.diskBytes),
+                label: stats.quota?.maxBytes
+                  ? `of ${fmtBytes(stats.quota.maxBytes)} on disk`
+                  : 'on disk',
+              },
+        ]}
+      />
+    </div>
 
     <div class="cols">
       <div class="col">
@@ -1071,14 +1081,9 @@ ex:PersonShape a sh:NodeShape ;
           <div class="panel-head">
             <h2>Validate</h2>
             {#if info?.endpoints?.shex}
-              <div class="tabs" role="tablist" aria-label="Validation language">
+              <div class="segmented" role="group" aria-label="Validation language">
                 {#each [['shacl', 'SHACL'], ['shex', 'ShEx']] as const as [l, title] (l)}
-                  <button
-                    class="tab"
-                    role="tab"
-                    aria-selected={lang === l}
-                    onclick={() => setLang(l)}>{title}</button
-                  >
+                  <button aria-pressed={lang === l} onclick={() => setLang(l)}>{title}</button>
                 {/each}
               </div>
             {/if}
@@ -1700,10 +1705,6 @@ ex:PersonShape a sh:NodeShape ;
   .review-link {
     text-decoration: none;
   }
-  /* the breadcrumbs take a row of their own above the title */
-  .page-head .breadcrumbs {
-    flex-basis: 100%;
-  }
   .title {
     display: grid;
     gap: 6px;
@@ -1740,20 +1741,9 @@ ex:PersonShape a sh:NodeShape ;
   a.btn {
     text-decoration: none;
   }
-  dt {
-    font-size: var(--fs-sm);
-    color: var(--text-2);
-  }
-  dd {
-    margin: 2px 0 0;
-    font-size: 20px;
-    font-weight: 600;
-    letter-spacing: -0.02em;
-    font-variant-numeric: tabular-nums;
-  }
   .cols {
     display: grid;
-    grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) var(--side-column);
     gap: var(--gap);
     align-items: start;
   }

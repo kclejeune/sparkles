@@ -210,12 +210,20 @@ editor and browser and the app shell. The collapsed panel below it has more work
     <td>A question answered with a checked query and a cited summary</td>
   </tr>
   <tr>
-    <td><img src="docs/images/memory.png" alt="The Memory page listing facts that agents recorded, each with its source and review status, and a conflict between two values"></td>
+    <td><img src="docs/images/memory.png" alt="The Memory page with its counts of facts, agents, sources and branches over a search for the payments team, whose results are cards of facts that each show a review status, a confidence, the agent, the source and the quote, with a conflict between two dates marked on its card"></td>
     <td><img src="docs/images/query-paths.png" alt="A query's graph of 37 freight flights between cities, with the Paths panel beside it listing the three shortest routes from Vancouver to Auckland by distance, each with its cost summed from the ex:km values on the reifiers of its flights, and the routes drawn over the result with each edge numbered by the paths that use it"></td>
   </tr>
   <tr>
     <td>Agent memory with sources and review status</td>
     <td>The shortest routes by a distance on the edges' reifiers, drawn on a query's graph</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/memory-facts.png" alt="The resource explorer's Memory tab for Ana Lima, with a card for each predicate showing the values agents recorded with their review status, confidence, agent, source and quote, and under them a timeline whose entry pairs the superseded team res:platform, struck through, with the res:payments that replaced it"></td>
+    <td><img src="docs/images/communities-map.png" alt="A dataset's Communities tab drawing the GraphRAG hierarchy of a freight network as a treemap, with a box for each community sized by its members and tinted by its report's status, and the report of the Gulf head office selected"></td>
+  </tr>
+  <tr>
+    <td>What memory holds about a person, with each fact's provenance and a timeline of what was replaced</td>
+    <td>The community hierarchy as a treemap sized by members and tinted by report status</td>
   </tr>
   <tr>
     <td><img src="docs/images/explore-lenses.png" alt="The resource explorer with lenses on, sizing nodes by their degree in the dataset, colouring them by class, badging the nodes with inferred edges and drawing those edges dashed, with the legend beside the graph"></td>
@@ -264,15 +272,15 @@ editor and browser and the app shell. The collapsed panel below it has more work
     <td colspan="2" align="center">A DL query in Manchester syntax, labelled with the reasoning that answered it</td>
   </tr>
   <tr>
-    <td><img src="docs/images/browse-term.png" alt="The ontology browser's page of mitochondrion, with its lineage from cellular component on the left, its definition and sources, its subclass axioms with part of some cytoplasm as linked prose, its exact and related synonyms, and an infobox with its ID, subsets, ontology, hierarchy counts and downloads"></td>
-    <td><img src="docs/images/browse-landing.png" alt="The landing page of a cell organelle ontology in the ontology browser, with its title, version and description, a search that lists the classes matching mitoch, the top class with its definition and child count, and the counts of classes and properties"></td>
+    <td><img src="docs/images/browse-term.png" alt="The ontology browser's page of mitochondrion, with a row of counts under its title, its definition and comment each under the predicate that states it, its exact and related synonyms, its axioms as Manchester prose with part of some cytoplasm linked, its hierarchy, and cards for its metadata, references and downloads"></td>
+    <td><img src="docs/images/browse-landing.png" alt="The landing page of a cell organelle ontology in the ontology browser, with its title, version and description, a search across the content that lists the classes matching mitoch, the top classes with their definitions and child counts, and the counts of classes and properties"></td>
   </tr>
   <tr>
     <td>The ontology browser: a page for each entity, with its lineage and linked axioms</td>
     <td>An ontology's landing page with its search and top classes</td>
   </tr>
   <tr>
-    <td><img src="docs/images/browse-edit.png" alt="The ontology browser's page of mitochondrion in edit mode, with a bar naming the branch and holding undo, redo, start session, the ontology editor link and done, the definition as a text field with its language and its sources as chips, and edit and remove buttons on each synonym, parent and axiom with an add row below them"></td>
+    <td><img src="docs/images/browse-edit.png" alt="The ontology browser's page of mitochondrion in edit mode, with a bar naming the branch and holding undo, redo, start session, the ontology editor link and done, the definition as a text field with its language and its sources as chips, and edit and remove buttons on each synonym and annotation with an add row below them"></td>
     <td><img src="docs/images/browse-edit-preview.png" alt="The preview of a definition edit in the ontology browser's edit mode, listing the definition it removes and the one it adds, each with its one source annotation, the dry run's six triples removed and six added, and a button that commits it"></td>
   </tr>
   <tr>

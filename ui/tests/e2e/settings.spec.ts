@@ -118,7 +118,9 @@ open('declared datasets offer no delete', async ({ page }) => {
   await expect(del).toBeDisabled();
   await expect(del).toHaveAttribute('title', /declared this dataset/);
   await page.goto(`/ui/datasets/${DECLARED_DATASET}`);
-  await expect(page.getByRole('button', { name: 'Delete' })).toBeDisabled();
+  await expect(
+    page.getByRole('button', { name: 'Delete', exact: true, includeHidden: true }),
+  ).toBeDisabled();
 });
 
 test('a user without admin reads the settings', async ({ page }) => {

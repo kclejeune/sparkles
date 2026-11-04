@@ -449,7 +449,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   why it was chosen, whether it is complete and the axioms outside the profile. The
   instances come from a classification with the assertions, which the dataset does not
   keep, so an instance query classifies the ontology again.
-* The web UI's **Ontology** page, `/ui/ontology`, edits an ontology graph over these
+* The web UI's **Ontology** page, `/ui/workbench/ontology`, edits an ontology graph over these
   routes ([U12](../specs/U12-ontology-workbench/SPEC.md#outcome)). It has trees of
   classes, object, data and annotation properties and individuals, an entity frame with
   the entity's axioms in Manchester syntax, an annotation editor with language tags and

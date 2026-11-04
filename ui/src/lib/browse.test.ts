@@ -8,23 +8,32 @@ import {
   displayName,
   downloadHref,
   editHref,
+  frameText,
+  inferredOf,
+  manchesterFrame,
   incomingQuery,
   kindWord,
   langRank,
   lineage,
   linkCuries,
+  logicalDefinitionOf,
   mentionGroups,
   mergePieces,
+  namesQuery,
   neighbourhood,
   oboIri,
   parseCounts,
   parseDefinitions,
   parseHead,
   parseReuse,
+  synonymTypeName,
+  languageCount,
   termSections,
+  textBlocks,
   treeKindOf,
   xrefHref,
   usageQuery,
+  valueText,
   type Statement,
   type TermPage,
   type TreeNode,
@@ -64,6 +73,156 @@ const node = (iri: string, label: string, children = 0, deprecated = false): Tre
 });
 
 describe('the sections of a page', () => {
+  it('lists every definition, description, comment and scope note under its predicate', () => {
+    const DCT = 'http://purl.org/dc/terms/';
+    const IAO = OBO + 'IAO_0000115';
+    const of = (stmts: Statement[], langs = ['en']) =>
+      termSections({ statements: stmts }, langs).lead.groups.map((g) => [
+        g.kind,
+        g.predicates,
+        g.values.map((v) => [valueText(v.value), v.lang]),
+        g.translations.map((v) => v.lang),
+      ]);
+    // two English definitions from different predicates: a group for each
+    expect(
+      of([st(SKOS + 'definition', lit('skos text', 'en')), st(IAO, lit('obo text', 'en'))]),
+    ).toEqual([
+      ['Definition', [IAO], [['obo text', 'en']], []],
+      ['Definition', [SKOS + 'definition'], [['skos text', 'en']], []],
+    ]);
+    // English and French of one predicate: the French value folds
+    expect(of([st(IAO, lit('texte', 'fr')), st(IAO, lit('text', 'en'))])).toEqual([
+      ['Definition', [IAO], [['text', 'en']], ['fr']],
+    ]);
+    // the same text from both predicates is one entry under a heading that names both
+    expect(of([st(SKOS + 'definition', lit('same', 'en')), st(IAO, lit('same', 'en'))])).toEqual([
+      ['Definition', [IAO, SKOS + 'definition'], [['same', 'en']], []],
+    ]);
+    // a definition, a description, a comment and a scope note, in priority order
+    expect(
+      of([
+        st(SKOS + 'scopeNote', lit('scope')),
+        st(RDFS + 'comment', lit('comment')),
+        st(DCT + 'description', lit('description')),
+        st(IAO, lit('definition')),
+      ]),
+    ).toEqual([
+      ['Definition', [IAO], [['definition', null]], []],
+      ['Description', [DCT + 'description'], [['description', null]], []],
+      ['Comment', [RDFS + 'comment'], [['comment', null]], []],
+      ['Scope note', [SKOS + 'scopeNote'], [['scope', null]], []],
+    ]);
+    // nothing in the block: a note leads it and leaves the notes, which name their predicate
+    const n = termSections(
+      { statements: [st(SKOS + 'note', lit('first')), st(SKOS + 'example', lit('e.g.'))] },
+      ['en'],
+    );
+    expect(n.lead.groups.map((g) => [g.kind, g.predicates])).toEqual([['Note', [SKOS + 'note']]]);
+    expect(n.notes.map((g) => [g.kind, g.property])).toEqual([['Example', SKOS + 'example']]);
+    expect(
+      termSections({ statements: [st(RDFS + 'label', lit('x'))] }, ['en']).definition,
+    ).toBeNull();
+  });
+
+  it('folds the translations of a UNESCO scope note under its heading', () => {
+    const notes = ['en', 'fr', 'es', 'ru', 'ar'].map((l) =>
+      st(SKOS + 'scopeNote', lit(`note ${l}`, l)),
+    );
+    const [g] = termSections({ statements: notes }, ['en']).lead.groups;
+    expect([g.kind, g.predicates]).toEqual(['Scope note', [SKOS + 'scopeNote']]);
+    expect(g.values.map((v) => valueText(v.value))).toEqual(['note en']);
+    expect(g.translations.map((v) => v.lang).sort()).toEqual(['ar', 'es', 'fr', 'ru']);
+    // a reader of French gets the French note first
+    const [fr] = termSections({ statements: notes }, ['fr']).lead.groups;
+    expect(valueText(fr.values[0].value)).toBe('note fr');
+    // a kind with only translations shows its best one
+    const [only] = termSections({ statements: notes.slice(1) }, ['en']).lead.groups;
+    expect(only.values).toHaveLength(1);
+    expect(only.translations).toHaveLength(3);
+  });
+
+  it('takes only class expressions as a logical definition', () => {
+    const iri = EX + 'C';
+    const expr = { type: 'ObjectIntersectionOf', classes: [EX + 'A', EX + 'B'] };
+    const both = axiomGroups(
+      iri,
+      ['class'],
+      [
+        item({ type: 'EquivalentClasses', classes: [iri, EX + 'Alias'] }),
+        item({ type: 'EquivalentClasses', classes: [iri, expr] }),
+      ],
+    );
+    expect(logicalDefinitionOf(both)).toEqual([expr]);
+    const alias = axiomGroups(
+      iri,
+      ['class'],
+      [item({ type: 'EquivalentClasses', classes: [iri, EX + 'Alias'] })],
+    );
+    expect(logicalDefinitionOf(alias)).toEqual([]);
+  });
+
+  it('keeps a description’s paragraphs and line breaks', () => {
+    expect(textBlocks('One line.')).toEqual([['One line.']]);
+    expect(
+      textBlocks('\n  First paragraph,\n  its second line.\n\n\nSecond.  \r\n\r\nThird.\n'),
+    ).toEqual([['First paragraph,', 'its second line.'], ['Second.'], ['Third.']]);
+    expect(textBlocks('   ')).toEqual([]);
+  });
+
+  it('names a synonym’s type by its label, else its local name', () => {
+    const CL = 'http://purl.obolibrary.org/obo/cl#';
+    const s = termSections(
+      {
+        statements: [
+          st(OIO + 'hasRelatedSynonym', lit('microglia'), [
+            { property: OIO + 'hasSynonymType', value: CL + 'PLURAL' },
+            { property: OIO + 'hasDbXref', value: lit('X:1') },
+          ]),
+          st(OIO + 'hasRelatedSynonym', lit('MG'), [
+            { property: OIO + 'hasSynonymType', value: CL + 'ABBREVIATION' },
+          ]),
+        ],
+      },
+      ['en'],
+    );
+    const vs = s.synonyms[0].values;
+    expect(vs.map((v) => [valueText(v.value), v.types, v.sources])).toEqual([
+      ['MG', [CL + 'ABBREVIATION'], []],
+      ['microglia', [CL + 'PLURAL'], ['X:1']],
+    ]);
+    const names = {
+      [CL + 'PLURAL']: {
+        label: 'plural',
+        labelLang: 'en',
+        shortForm: null,
+        kinds: [],
+        deprecated: false,
+      },
+    };
+    expect(synonymTypeName(CL + 'PLURAL', names)).toBe('plural');
+    expect(synonymTypeName(CL + 'ABBREVIATION', names)).toBe('ABBREVIATION');
+  });
+
+  it('keeps a SKOS concept’s facts with the other statements', () => {
+    const p = EX + 'custom';
+    const names = {
+      [p]: {
+        kinds: ['dataProperty'],
+        label: null,
+        labelLang: null,
+        shortForm: null,
+        deprecated: false,
+      },
+    };
+    const stmts = [st(p, lit('v'))];
+    expect(termSections({ statements: stmts, names }, ['en']).other).toEqual([]);
+    expect(
+      termSections({ statements: stmts, names, kinds: ['concept'] }, ['en']).other.map(
+        (o) => o.property,
+      ),
+    ).toEqual([p]);
+  });
+
   it('sorts statements into definition, synonyms, notes, xrefs and the rest', () => {
     const s = termSections(
       {
@@ -96,9 +255,13 @@ describe('the sections of a page', () => {
     );
     expect(s.definition?.value).toEqual(lit('A definition'));
     expect(s.definition?.sources).toEqual(['GOC:al']);
-    expect(s.otherDefinitions.map((d) => d.lang)).toEqual(['fr']);
+    // the comment joins the lead block and the French definition folds as a translation
+    expect(s.lead.groups.map((g) => [g.kind, g.translations.map((v) => v.lang)])).toEqual([
+      ['Definition', ['fr']],
+      ['Comment', []],
+    ]);
     expect(s.synonyms.map((g) => g.kind)).toEqual(['Exact', 'Related']);
-    expect(s.notes.map((g) => g.kind)).toEqual(['Comment']);
+    expect(s.notes).toEqual([]);
     expect(s.xrefs.map((x) => [x.database, x.id, x.href])).toEqual([
       ['NIF', 'sao1', null],
       ['Wikipedia', 'Mitochondrion', 'https://en.wikipedia.org/wiki/Mitochondrion'],
@@ -159,7 +322,7 @@ describe('the sections of a page', () => {
     );
     // the sources of every copy stay with the one value
     expect(s.definition?.sources).toEqual(['GOC:al']);
-    expect(s.otherDefinitions).toEqual([]);
+    expect(s.lead.groups.map((g) => g.values.length)).toEqual([1]);
     expect(s.synonyms[0].values).toHaveLength(1);
     expect(s.xrefs).toHaveLength(1);
     expect(s.info[0].values).toHaveLength(1);
@@ -227,6 +390,8 @@ describe('the sections of a page', () => {
   });
 });
 
+const OWL_THING = 'http://www.w3.org/2002/07/owl#Thing';
+
 describe('axioms', () => {
   it('groups the axioms about a class by the frame’s sections and leaves the rest last', () => {
     const iri = EX + 'C';
@@ -261,6 +426,140 @@ describe('axioms', () => {
     );
     expect(g.map((x) => x.id)).toEqual(['domains', 'characteristics']);
     expect(g[1].items[0].word).toBe('Transitive');
+  });
+
+  it('writes a class’s axioms as a Manchester frame, with the rest left out', () => {
+    const iri = EX + 'C';
+    const groups = axiomGroups(
+      iri,
+      ['class'],
+      [
+        item({ type: 'SubClassOf', subClass: iri, superClass: EX + 'P' }),
+        item({
+          type: 'SubClassOf',
+          subClass: iri,
+          superClass: {
+            type: 'ObjectSomeValuesFrom',
+            property: EX + 'partOf',
+            class: EX + 'Q',
+          },
+        }),
+        item({ type: 'EquivalentClasses', classes: [iri, EX + 'E'] }),
+        item({
+          type: 'HasKey',
+          class: iri,
+          objectProperties: [EX + 'k1'],
+          dataProperties: [EX + 'k2'],
+        }),
+        item({
+          type: 'HasKey',
+          class: iri,
+          objectProperties: [EX + 'k3'],
+          dataProperties: [],
+        }),
+        item({
+          type: 'HasKey',
+          class: EX + 'Other',
+          objectProperties: [],
+          dataProperties: [],
+        }),
+      ],
+    );
+    const name = (i: string) => (i === iri ? 'my class' : i.slice(EX.length));
+    const f = manchesterFrame('Class', groups, name, {});
+    expect(f.word).toBe('Class');
+    expect(f.sections.map((s) => [s.word, s.items.length])).toEqual([
+      ['SubClassOf', 2],
+      ['EquivalentTo', 1],
+      ['HasKey', 2],
+    ]);
+    expect(f.other).toHaveLength(1);
+    expect(frameText(f, iri, name)).toBe(
+      [
+        "Class: 'my class'",
+        '',
+        '    SubClassOf: ',
+        '        P,',
+        '        partOf some Q',
+        '',
+        '    EquivalentTo: ',
+        '        E',
+        '',
+        '    HasKey: ',
+        '        k1, k2',
+        '',
+        '    HasKey: ',
+        '        k3',
+        '',
+      ].join('\n'),
+    );
+  });
+
+  it('writes a property’s characteristics and an individual’s facts in one clause each', () => {
+    const p = EX + 'p';
+    const pf = manchesterFrame(
+      'ObjectProperty',
+      axiomGroups(
+        p,
+        ['objectProperty'],
+        [
+          item({ type: 'InverseFunctionalObjectProperty', property: p }),
+          item({ type: 'TransitiveObjectProperty', property: p }),
+        ],
+      ),
+      (i) => i.slice(EX.length),
+      {},
+    );
+    expect(pf.sections).toHaveLength(1);
+    expect(pf.sections[0].word).toBe('Characteristics');
+    expect(pf.sections[0].items.map((t) => t[0].text)).toEqual(['InverseFunctional', 'Transitive']);
+    const a = EX + 'a';
+    const af = manchesterFrame(
+      'NamedIndividual',
+      axiomGroups(
+        a,
+        ['individual'],
+        [
+          item({
+            type: 'ObjectPropertyAssertion',
+            property: EX + 'knows',
+            source: a,
+            target: EX + 'b',
+          }),
+          item({
+            type: 'NegativeObjectPropertyAssertion',
+            property: EX + 'knows',
+            source: a,
+            target: EX + 'c',
+          }),
+        ],
+      ),
+      (i) => i.slice(EX.length),
+      {},
+    );
+    expect(af.word).toBe('Individual');
+    expect(af.sections.map((s) => s.word)).toEqual(['Facts']);
+    expect(frameText(af, a, (i) => i.slice(EX.length))).toContain('        not knows c\n');
+  });
+
+  it('keeps the inferences that the asserted axioms do not state', () => {
+    const iri = EX + 'C';
+    const groups = axiomGroups(
+      iri,
+      ['class'],
+      [item({ type: 'SubClassOf', subClass: iri, superClass: EX + 'P' })],
+    );
+    const inf = inferredOf(
+      iri,
+      groups,
+      { classes: [iri, EX + 'Same'], parentClasses: [EX + 'P', EX + 'T'] },
+      true,
+      false,
+    );
+    expect(inf.superClasses).toEqual([EX + 'T']);
+    expect(inf.equivalents).toEqual([EX + 'Same']);
+    const top = inferredOf(iri, [], { classes: [iri], parentClasses: [OWL_THING] }, true, true);
+    expect(top.superClasses).toEqual([]);
   });
 
   it('groups the mentions by the restriction that holds the entity', () => {
@@ -409,10 +708,10 @@ describe('links', () => {
       '/$/ontology/go%40dev/term?graph=default&iri=http%3A%2F%2Fexample.org%2Fa&format=ttl',
     );
     expect(editHref('/ui', 'go', EX + 'p', ['objectProperty'], { graph: null })).toBe(
-      '/ui/ontology?ds=go&iri=http%3A%2F%2Fexample.org%2Fp&tab=ObjectProperty',
+      '/ui/workbench/ontology?ds=go&iri=http%3A%2F%2Fexample.org%2Fp&kind=ObjectProperty',
     );
     expect(editHref('/ui', 'th', EX + 'c', ['concept'], { graph: 'urn:g' })).toBe(
-      '/ui/thesaurus?ds=th&iri=http%3A%2F%2Fexample.org%2Fc&graph=urn%3Ag',
+      '/ui/workbench/thesaurus?ds=th&iri=http%3A%2F%2Fexample.org%2Fc&graph=urn%3Ag',
     );
   });
 
@@ -520,5 +819,26 @@ describe('SPARQL of the landing page and the further reads', () => {
     expect(usageQuery(EX + 'p', ['default'], 50)).toBe(
       `SELECT DISTINCT ?s WHERE { { GRAPH <urn:x-arq:DefaultGraph> { ?s <${EX}p> ?o FILTER(isIRI(?s)) } } } ORDER BY ?s LIMIT 50 OFFSET 50`,
     );
+  });
+});
+
+describe('namesQuery', () => {
+  it('reads the labels in one graph, in the graphs a term answer read, or anywhere', () => {
+    expect(namesQuery([EX + 'a'], 'urn:g')).toContain('GRAPH <urn:g> { ?s ');
+    // a label may sit in a graph the one shown imports
+    const q = namesQuery([EX + 'a'], 'urn:g', ['default', 'urn:g', 'urn:imp']);
+    expect(q).toContain('VALUES ?g { <urn:g> <urn:imp> }');
+    expect(q).toContain('UNION');
+    expect(q).not.toContain('GRAPH <urn:g> { ?s ');
+    expect(namesQuery([EX + 'a'], 'urn:g', ['default'])).not.toContain('GRAPH');
+    expect(namesQuery([EX + 'a'], null)).not.toContain('GRAPH');
+  });
+});
+
+describe('languageCount', () => {
+  it('counts the distinct languages of translations, not their values', () => {
+    expect(languageCount([{ lang: 'fr' }, { lang: 'fr' }, { lang: 'FR' }])).toBe(1);
+    expect(languageCount([{ lang: 'fr' }, { lang: 'de' }, { lang: null }])).toBe(3);
+    expect(languageCount([])).toBe(0);
   });
 });

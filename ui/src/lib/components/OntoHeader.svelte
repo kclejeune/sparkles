@@ -353,10 +353,23 @@
     flex-wrap: wrap;
     overflow-wrap: anywhere;
   }
+  /* the counts as key and value columns, numbers right-aligned, like the panel's other rows */
   .stats {
-    display: flex;
-    gap: 24px;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+    gap: 0 var(--sp-6);
+  }
+  .stats table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .stats table:not(:has(tr)) {
+    display: none;
+  }
+  .stats th,
+  .stats td {
+    padding: 3px 0;
+    border-bottom: 1px solid var(--border);
   }
   .stats th {
     text-align: left;
@@ -364,6 +377,10 @@
     color: var(--text-2);
     padding-right: 14px;
     font-size: var(--fs-sm);
+  }
+  .stats td.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
   }
   .diag {
     margin: 0;

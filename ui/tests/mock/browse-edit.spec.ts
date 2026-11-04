@@ -6,6 +6,7 @@
 // branches that each test deletes, so the other suites see the mock's data unchanged.
 
 import { expect, test, type Page, type APIRequestContext } from '@playwright/test';
+import { pageAction } from '../page-actions';
 import { expectNoSidewaysScroll } from '../phone';
 
 test.describe.configure({ mode: 'serial', timeout: 120_000 });
@@ -73,7 +74,7 @@ test('a read-only caller sees no edit affordance', async ({ page }) => {
     }),
   );
   await open(page, term('uni', UNI + 'Professor', '&edit=1'));
-  await expect(page.getByRole('heading', { name: 'Logical definition' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Axioms' })).toBeVisible();
   await expect(page).not.toHaveURL(/edit=1/);
   await expect(page.getByRole('button', { name: 'Edit', exact: true })).toHaveCount(0);
   await expect(bar(page)).toHaveCount(0);
@@ -95,7 +96,7 @@ test('OWL edits on a session branch: definition, synonym, annotation, parent and
 }) => {
   await onSession(request, 'uni', async () => {
     await open(page, term('uni', UNI + 'Professor'));
-    await page.getByRole('button', { name: 'Edit', exact: true }).click();
+    await pageAction(page, 'Edit');
     await expect(page).toHaveURL(/edit=1/);
     // on the protected main the fields wait for a session
     await expect(page.getByRole('textbox', { name: 'Definition', exact: true })).toBeDisabled();
@@ -186,7 +187,7 @@ test('OWL edits on a session branch: definition, synonym, annotation, parent and
       .getByRole('button', { name: 'Add' })
       .click();
     await commit(page);
-    const logic = page.getByRole('region', { name: 'Logical definition' });
+    const logic = page.getByRole('region', { name: 'Axioms' });
     await expect(logic.getByRole('link', { name: 'Agent', exact: true })).toBeVisible();
     await logic.getByRole('button', { name: /Remove the axiom SubClassOf\(.*Agent\)/ }).click();
     await commit(page);
@@ -206,6 +207,49 @@ test('OWL edits on a session branch: definition, synonym, annotation, parent and
     await expect(page).not.toHaveURL(/edit=1/);
     await expect(page.locator('.lede')).toContainText('A teacher who holds a chair.');
     await expect(page.locator('.lede')).toContainText('UNI:handbook');
+    return branch;
+  });
+});
+
+test('inferences follow an edit: a superclass made asserted leaves the inferred list', async ({
+  page,
+  request,
+}) => {
+  await onSession(request, 'uni', async () => {
+    await open(page, term('uni', UNI + 'Professor'));
+    const axioms = page.getByRole('region', { name: 'Axioms' });
+    // the session starts first and the classification runs on its branch, so that the card
+    // stays mounted through the edit and only its commit prop says the state changed
+    await pageAction(page, 'Edit');
+    const branch = await startSession(page, 'onto');
+    await bar(page).getByRole('button', { name: /^Done/ }).click();
+    await expect(page).not.toHaveURL(/edit=1/);
+    await axioms.getByRole('button', { name: 'Classify' }).click();
+    const inferredSub = axioms.locator('[data-section="inferred-sub"]');
+    await expect(inferredSub.getByRole('link', { name: 'Teacher' })).toBeVisible();
+    await axioms.evaluate((el) => el.setAttribute('data-mounted', 'first'));
+
+    await pageAction(page, 'Edit');
+    await expect(page).toHaveURL(/edit=1/);
+    const tree = page.getByRole('complementary', { name: 'Hierarchy' });
+    await tree.getByRole('combobox', { name: 'Add a parent class' }).fill('Teach');
+    await tree
+      .getByRole('option', { name: /Teacher/ })
+      .first()
+      .click();
+    await commit(page);
+    await bar(page).getByRole('button', { name: /^Done/ }).click();
+    await expect(page).not.toHaveURL(/edit=1/);
+    // the superclass is asserted now, so the card no longer lists it as inferred, and it is
+    // the same card that listed it before the edit
+    await expect(
+      axioms.locator('[data-section="sub"]').getByRole('link', { name: 'Teacher' }),
+    ).toBeVisible();
+    // and the classification was asked again, not forgotten
+    await expect(axioms).toContainText('infers nothing more than these axioms state');
+    await expect(axioms.getByRole('button', { name: 'Classify' })).toHaveCount(0);
+    await expect(inferredSub.getByRole('link', { name: 'Teacher' })).toHaveCount(0);
+    await expect(axioms).toHaveAttribute('data-mounted', 'first');
     return branch;
   });
 });
@@ -477,7 +521,7 @@ test('the palette enters edit mode and focuses the add fields', async ({ page })
   await page.keyboard.press('Control+k');
   await page.keyboard.type('>full editor');
   await list.getByRole('option', { name: /^Open in the full editor/ }).click();
-  await expect(page).toHaveURL(/\/ui\/ontology\?ds=uni&iri=/);
+  await expect(page).toHaveURL(/\/ui\/workbench\/ontology\?ds=uni&iri=/);
 });
 
 test.describe('on a phone', () => {

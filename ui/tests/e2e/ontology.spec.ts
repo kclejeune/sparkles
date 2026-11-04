@@ -69,7 +69,7 @@ open.beforeAll(async ({ request }) => {
 });
 
 open('the trees, the frame and the inferred tree read the ontology', async ({ page }) => {
-  await page.goto(`/ui/ontology?ds=${DS}&inferred=1`);
+  await page.goto(`/ui/workbench/ontology?ds=${DS}&inferred=1`);
   await expect(tree(page).getByRole('button', { name: 'Agent', exact: true })).toBeVisible();
   await expand(page, 'Agent');
   await expand(page, 'Person');
@@ -92,7 +92,7 @@ open(
   'edits on a session branch leave main and unrelated triples alone',
   async ({ page, request }) => {
     const before = await count(request, DS, '?s ?p ?o');
-    await page.goto(`/ui/ontology?ds=${DS}`);
+    await page.goto(`/ui/workbench/ontology?ds=${DS}`);
     await expect(tree(page).getByRole('button', { name: 'Agent', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Start session' }).click();
     await expect(page).toHaveURL(/branch=onto\./);

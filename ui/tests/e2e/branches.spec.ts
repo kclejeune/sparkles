@@ -131,6 +131,11 @@ open(
     expect(await head()).toBe(before);
 
     await cell.getByRole('radio', { name: 'Theirs' }).click();
+    // the changes as N-Quads lines rather than the change set
+    await page
+      .getByRole('region', { name: 'Changes' })
+      .getByRole('button', { name: 'N-Quads' })
+      .click();
     const lines = page.getByRole('region', { name: 'Changes' }).getByLabel('Changes of the merge');
     await expect(lines).toContainText('− <urn:acct:1> <urn:balance> "90"^^');
     await expect(lines).toContainText('+ <urn:acct:1> <urn:balance> "150"^^');

@@ -48,7 +48,7 @@ test('a hidden page makes no requests, and refreshes once it is shown again', as
   await page.clock.install();
   await controlVisibility(page);
   const requests = countRequests(page);
-  await page.goto('/ui/server');
+  await page.goto('/ui/admin/server');
   await expect(page.getByRole('heading', { name: 'Tasks' })).toBeVisible();
   await page.clock.runFor(2000);
 
@@ -66,8 +66,8 @@ test('a hidden page makes no requests, and refreshes once it is shown again', as
 test('an idle Backups page does not poll repositories or policies', async ({ page }) => {
   await page.clock.install();
   const requests = countRequests(page);
-  await page.goto('/ui/backups');
-  await expect(page.getByRole('tab', { name: /Backups/ })).toBeVisible();
+  await page.goto('/ui/admin/backups');
+  await expect(page.getByRole('tab', { name: /Snapshots/ })).toBeVisible();
   await page.clock.runFor(2000);
   requests.reset();
   await page.clock.runFor(10 * 60_000);
@@ -110,7 +110,7 @@ test('an expired session goes to sign-in once, without bouncing back', async ({ 
   );
   const requests = countRequests(page);
 
-  await page.goto('/ui/backups');
+  await page.goto('/ui/admin/backups');
   await expect(page).toHaveURL(/\/ui\/login\?return_to=/);
   await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
   await page.waitForTimeout(1500);

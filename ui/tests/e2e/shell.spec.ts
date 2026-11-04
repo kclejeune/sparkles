@@ -37,7 +37,7 @@ test.describe('at 1440 pixels', () => {
   });
 
   test('/ focuses the search and Escape gives the focus back', async ({ page }) => {
-    await visit(page, '/ui/server');
+    await visit(page, '/ui/admin/server');
     const refresh = page.getByRole('button', { name: 'Refresh' });
     await refresh.focus();
     await page.keyboard.press('/');
@@ -65,8 +65,8 @@ test.describe('at 390 pixels', () => {
     await page.getByRole('button', { name: 'Menu' }).click();
     const drawer = page.getByRole('dialog', { name: 'Menu' });
     await expect(drawer.locator('.ds-button')).toContainText(DATASET);
-    await drawer.getByRole('link', { name: 'Server', exact: true }).click();
-    await expect(page).toHaveURL(/\/ui\/server$/);
+    await drawer.getByRole('link', { name: 'Admin', exact: true }).click();
+    await expect(page).toHaveURL(/\/ui\/admin\/server$/);
     await expect(drawer).toBeHidden();
     await expectNoSidewaysScroll(page, 'the server page');
   });

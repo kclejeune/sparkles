@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PageActions from '$components/PageActions.svelte';
   import { resolve } from '$app/paths';
   import { onMount } from 'svelte';
   import * as api from '$lib/api';
@@ -183,15 +184,17 @@
       <h1>Server</h1>
       <p class="muted">{origin}</p>
     </div>
-    <span class="spacer"></span>
-    <button
-      class="btn"
-      onclick={() => {
-        load();
-        loadStatus();
-        app.ping();
-      }}><Icon name="refresh" size={14} /> Refresh</button
-    >
+    <PageActions>
+      <button
+        class="btn"
+        data-primary
+        onclick={() => {
+          load();
+          loadStatus();
+          app.ping();
+        }}><Icon name="refresh" size={14} /> Refresh</button
+      >
+    </PageActions>
   </header>
 
   {#if error}

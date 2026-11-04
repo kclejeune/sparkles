@@ -234,11 +234,46 @@ test('memory', async ({ page }) => {
   await expect(page.getByRole('region', { name: 'Agents' })).toContainText('agent-7', {
     timeout: 30_000,
   });
-  const search = page.getByRole('region', { name: 'Search memory' });
-  await search.getByRole('textbox', { name: 'Search memory' }).fill('payments team');
-  await search.getByRole('button', { name: 'Search' }).click();
+  await page
+    .getByRole('search', { name: 'Search memory' })
+    .getByRole('searchbox', { name: 'Search memory' })
+    .fill('payments team');
+  await page.keyboard.press('Enter');
+  const search = page.getByRole('region', { name: 'Memory search results' });
   await expect(search.getByRole('region', { name: /Facts about/ }).first()).toBeVisible();
   await shoot(page, 'memory');
+});
+
+test('memory-facts', async ({ page }) => {
+  // what memory holds about one person, as cards with their provenance, and the history of
+  // the facts that were superseded
+  await page.goto(
+    `/ui/explore?ds=${DATASET}&iri=${encodeURIComponent('http://example.org/resource/ana')}&view=memory`,
+  );
+  const memory = page.getByLabel('Memory', { exact: true });
+  await expect(memory.getByRole('article', { name: 'ex:memberOf' })).toContainText('agent-7', {
+    timeout: 30_000,
+  });
+  const history = memory.getByRole('list', { name: 'History' });
+  await expect(history).toContainText('res:platform');
+  await history.scrollIntoViewIfNeeded();
+  await shoot(page, 'memory-facts');
+});
+
+test('communities-map', async ({ page }) => {
+  // the hierarchy of `world`'s GraphRAG communities as a treemap, with a report below it
+  await page.goto('/ui/datasets/world?tab=communities');
+  const panel = page.getByTestId('communities');
+  await panel
+    .getByRole('group', { name: 'Hierarchy view' })
+    .getByRole('button', { name: 'Map' })
+    .click();
+  const map = panel.getByRole('group', { name: 'Community map' });
+  await expect(map).toBeVisible({ timeout: 30_000 });
+  // a parent's title strip is the part of its box its children leave free
+  await map.getByRole('button', { name: /^Gulf head office/ }).click({ position: { x: 10, y: 8 } });
+  await expect(panel.getByRole('heading', { name: 'Gulf head office' })).toBeVisible();
+  await shoot(page, 'communities-map');
 });
 
 test('time-slider', async ({ page }) => {
@@ -376,7 +411,7 @@ test('explore-facets', async ({ page }) => {
 test('embedding-map', async ({ page, request }) => {
   // the 6,000 invented shipments of `world` projected by the server and coloured by cargo
   // class, with a lasso around one lobe of the largest class in the shared selection
-  await page.goto('/ui/embedding?ds=world&index=shipments');
+  await page.goto('/ui/similar/map?ds=world&index=shipments');
   const map = page.locator('.emap[data-ready="true"]');
   await expect(map).toHaveAttribute('data-points', '6000', { timeout: 30_000 });
   await expect(page.getByTestId('progress')).toHaveCount(0);
@@ -1138,7 +1173,7 @@ test('forms-list', async ({ page, request }) => {
 /** The server page's model configuration form, scrolled to the row of `field`. */
 async function modelsForm(page: Page, request: APIRequestContext, field: string) {
   await request.delete('/$/server/settings/models');
-  await page.goto('/ui/server');
+  await page.goto('/ui/admin/server');
   const panel = page.getByTestId('settings-model-configuration');
   const row = (f: string) => panel.locator(`[data-field="${f}"]`);
   await expect(row(field)).toBeVisible();
@@ -1317,7 +1352,7 @@ test('reasoning-support-preview', async ({ page }) => {
 const UNI = 'http://example.org/uni#';
 
 test('ontology-editor', async ({ page }) => {
-  await page.goto(`/ui/ontology?ds=uni&tab=Class&iri=${encodeURIComponent(`${UNI}Professor`)}`);
+  await page.goto(`/ui/workbench/ontology?ds=uni&iri=${encodeURIComponent(`${UNI}Professor`)}`);
   const classes = page.getByRole('tree', { name: 'Classes (asserted)' });
   await expect(classes.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
     timeout: 30_000,
@@ -1332,7 +1367,7 @@ test('ontology-editor', async ({ page }) => {
 
 test('ontology-inferred', async ({ page }) => {
   await page.goto(
-    `/ui/ontology?ds=uni&tab=Class&inferred=1&iri=${encodeURIComponent(`${UNI}Teacher`)}`,
+    `/ui/workbench/ontology?ds=uni&inferred=1&iri=${encodeURIComponent(`${UNI}Teacher`)}`,
   );
   const asserted = page.getByRole('tree', { name: 'Classes (asserted)' });
   const inferred = page.getByRole('tree', { name: 'Classes (inferred)' });
@@ -1349,7 +1384,7 @@ test('ontology-dl-query', async ({ page }) => {
   // label, and the frame of the instance the answers link to
   const q = 'Person and (teaches some Course)';
   await page.goto(
-    `/ui/ontology?ds=uni&tab=dlquery&dl=${encodeURIComponent(q)}&iri=${encodeURIComponent(`${UNI}Professor`)}`,
+    `/ui/workbench/ontology?ds=uni&tab=dlquery&dl=${encodeURIComponent(q)}&iri=${encodeURIComponent(`${UNI}Professor`)}`,
   );
   const answers = page.getByRole('region', { name: 'DL query answers' });
   await expect(answers.getByRole('region', { name: 'Equivalent classes' })).toContainText(
@@ -1361,7 +1396,7 @@ test('ontology-dl-query', async ({ page }) => {
 });
 
 test('ontology-preview', async ({ page }) => {
-  await page.goto(`/ui/ontology?ds=uni&tab=Class&iri=${encodeURIComponent(`${UNI}Employee`)}`);
+  await page.goto(`/ui/workbench/ontology?ds=uni&iri=${encodeURIComponent(`${UNI}Employee`)}`);
   await expect(page.locator('.frame')).toBeVisible({ timeout: 30_000 });
   await page.getByRole('button', { name: 'New', exact: true }).click();
   const create = page.getByRole('dialog', { name: 'New class' });
@@ -1381,7 +1416,7 @@ const THES = 'http://example.org/thesaurus/';
 const thesTree = (page: Page) => page.getByRole('tree', { name: 'Concepts' });
 
 test('thesaurus-editor', async ({ page }) => {
-  await page.goto(`/ui/thesaurus?ds=thes&iri=${encodeURIComponent(`${THES}whales`)}`);
+  await page.goto(`/ui/workbench/thesaurus?ds=thes&iri=${encodeURIComponent(`${THES}whales`)}`);
   const tree = thesTree(page);
   await expect(page.getByRole('heading', { name: 'Whales' })).toBeVisible({ timeout: 30_000 });
   await expect(tree.getByRole('button', { name: 'Collapse Vertebrates' })).toBeVisible();
@@ -1395,17 +1430,17 @@ test('thesaurus-editor', async ({ page }) => {
 });
 
 test('thesaurus-checks', async ({ page }) => {
-  await page.goto('/ui/thesaurus?ds=thes');
+  await page.goto('/ui/workbench/thesaurus?ds=thes');
   await expect(
     thesTree(page).getByRole('button', { name: 'Vertebrates', exact: true }),
   ).toBeVisible({ timeout: 30_000 });
-  await page.getByRole('tab', { name: 'Checks' }).click();
+  await page.getByRole('tab', { name: 'Validation' }).click();
   await expect(page.getByRole('list', { name: 'Check results' })).toContainText('S13');
   await shoot(page, 'thesaurus-checks');
 });
 
 test('thesaurus-move', async ({ page }) => {
-  await page.goto(`/ui/thesaurus?ds=thes&iri=${encodeURIComponent(`${THES}bats`)}`);
+  await page.goto(`/ui/workbench/thesaurus?ds=thes&iri=${encodeURIComponent(`${THES}bats`)}`);
   const tree = thesTree(page);
   await expect(page.getByRole('heading', { name: 'Bats' })).toBeVisible({ timeout: 30_000 });
   const node = (name: string) => tree.getByRole('button', { name, exact: true }).first();

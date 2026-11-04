@@ -290,9 +290,10 @@
     background: color-mix(in srgb, var(--warn) 14%, transparent);
     color: var(--warn);
   }
+  /* three choices side by side where each has room, one under another in a side column */
   .profiles {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     gap: 8px;
   }
   .opt {
@@ -316,10 +317,5 @@
   .opt input {
     margin-top: 2px;
     accent-color: var(--iri);
-  }
-  @media (max-width: 760px) {
-    .profiles {
-      grid-template-columns: minmax(0, 1fr);
-    }
   }
 </style>

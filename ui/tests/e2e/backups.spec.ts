@@ -44,7 +44,7 @@ open(
 );
 
 open('adding an fs repository tests the connection', async ({ page }) => {
-  await page.goto('/ui/backups?tab=repositories');
+  await page.goto('/ui/admin/backups?tab=repositories');
   await page.getByRole('button', { name: 'Add repository' }).click();
   const dialog = page.getByRole('dialog', { name: 'Add repository' });
   await dialog.getByRole('textbox', { name: 'Name' }).fill(REPO);
@@ -94,7 +94,7 @@ open('a backup made on the dataset page restores into a new dataset', async ({ p
 });
 
 open('the policy editor previews runs from the server', async ({ page }) => {
-  await page.goto('/ui/backups?tab=policies');
+  await page.goto('/ui/admin/backups?tab=policies');
   await page.getByRole('button', { name: 'New policy' }).click();
   const dialog = page.getByRole('dialog', { name: 'New backup policy' });
   await dialog.getByRole('textbox', { name: 'Name', exact: true }).fill('e2e-weekly');

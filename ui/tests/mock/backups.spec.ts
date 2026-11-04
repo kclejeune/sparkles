@@ -6,7 +6,7 @@ import { expect, test } from '@playwright/test';
 test('the backup table spans repositories and shows lineage, verify results and the manifest', async ({
   page,
 }) => {
-  await page.goto('/ui/backups');
+  await page.goto('/ui/admin/backups');
   await expect(page.getByText('minio-lab is unreachable')).toBeVisible();
 
   const older = page.getByRole('row', { name: /foaf-before-reload/ });
@@ -31,7 +31,7 @@ test('the backup table spans repositories and shows lineage, verify results and 
 test('adding a repository tests the connection; a failed one can be removed again', async ({
   page,
 }) => {
-  await page.goto('/ui/backups?tab=repositories');
+  await page.goto('/ui/admin/backups?tab=repositories');
   await page.getByRole('button', { name: 'Add repository' }).click();
   let dialog = page.getByRole('dialog', { name: 'Add repository' });
   await dialog.getByRole('textbox', { name: 'Name' }).fill('e2e-offline');
@@ -59,7 +59,7 @@ test('adding a repository tests the connection; a failed one can be removed agai
 test('S3 repositories added here name a credential source the operator defined', async ({
   page,
 }) => {
-  await page.goto('/ui/backups?tab=repositories');
+  await page.goto('/ui/admin/backups?tab=repositories');
   await page.getByRole('button', { name: 'Add repository' }).click();
   const dialog = page.getByRole('dialog', { name: 'Add repository' });
   await dialog.getByRole('radio', { name: 'S3' }).check();
@@ -132,7 +132,7 @@ test('replacing a dataset shows the lost commits and needs its name typed', asyn
 });
 
 test('the policy editor previews runs, the name template and retention', async ({ page }) => {
-  await page.goto('/ui/backups?tab=policies');
+  await page.goto('/ui/admin/backups?tab=policies');
   await page.getByRole('button', { name: 'New policy' }).click();
   const dialog = page.getByRole('dialog', { name: 'New backup policy' });
   await dialog.getByRole('textbox', { name: 'Name', exact: true }).fill('e2e-weekly');
@@ -169,7 +169,7 @@ test('the policy editor previews runs, the name template and retention', async (
 });
 
 test('garbage collection starts with a dry run', async ({ page }) => {
-  await page.goto('/ui/backups?tab=repositories');
+  await page.goto('/ui/admin/backups?tab=repositories');
   await page
     .getByRole('article', { name: 'local' })
     .getByRole('button', { name: 'Run GC' })
@@ -188,7 +188,7 @@ test('a running backup task can be cancelled from Activity', async ({ page, requ
   expect(res.status()).toBe(202);
   const task = await res.json();
 
-  await page.goto('/ui/backups?tab=activity');
+  await page.goto('/ui/admin/backups?tab=activity');
   await page.getByRole('button', { name: `Cancel task ${task.id} (backup-verify)` }).click();
   await expect(
     page.getByRole('listitem').filter({ hasText: 'cancelled at' }).first(),

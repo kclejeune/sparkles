@@ -4,6 +4,7 @@
   import { page } from '$app/state';
   import { onDestroy, onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
+  import { routes } from '$lib/routes';
   import { assistantSettings } from '$lib/ask-api';
   import type { Term } from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
@@ -1631,6 +1632,19 @@
     return Object.entries(by).sort((a, b) => order(a[0]) - order(b[0]) || a[0].localeCompare(b[0]));
   });
   const types = $derived(grouped.find(([p]) => p === RDF_TYPE)?.[1] ?? []);
+  /** The types that make a resource a term with a page in Browse: a class, property or concept. */
+  const TERM_TYPES = new Set([
+    'http://www.w3.org/2002/07/owl#Class',
+    'http://www.w3.org/2000/01/rdf-schema#Class',
+    'http://www.w3.org/1999/02/22-rdf-syntax-ns#Property',
+    'http://www.w3.org/2002/07/owl#ObjectProperty',
+    'http://www.w3.org/2002/07/owl#DatatypeProperty',
+    'http://www.w3.org/2002/07/owl#AnnotationProperty',
+    'http://www.w3.org/2004/02/skos/core#Concept',
+    'http://www.w3.org/2004/02/skos/core#ConceptScheme',
+    'http://www.w3.org/2004/02/skos/core#Collection',
+  ]);
+  const isTerm = (ts: Term[]) => ts.some((t) => t.type === 'uri' && TERM_TYPES.has(t.value));
 
   // --- facets -------------------------------------------------------------------
 
@@ -2302,9 +2316,7 @@
                   <a
                     class="btn sm"
                     title="The entities of the vector index {mapIndex} projected to two dimensions"
-                    href="{resolve('/embedding')}?ds={encodeURIComponent(
-                      ds,
-                    )}&index={encodeURIComponent(mapIndex)}">Embedding map</a
+                    href={routes.similarMap(ds, { index: mapIndex })}>Embedding map</a
                   >
                 {/if}
                 {#if canvasMode === 'graph'}
@@ -2718,6 +2730,17 @@
                   <button class="btn sm" onclick={() => describeInQuery(n.iri)}
                     ><Icon name="query" size={13} /> Describe</button
                   >
+                  {#if ds && isTerm(types)}
+                    <a
+                      class="btn sm"
+                      href={routes.browse(ds, {
+                        iri: n.iri,
+                        branch: overviewBranch,
+                        at: timeActive && exAt ? exAt : null,
+                      })}
+                      title="This term's page in Browse"><Icon name="book" size={13} /> Open page</a
+                    >
+                  {/if}
                   {#if ds && editable[`${ds}|${n.iri}`] && !timeActive}
                     <button
                       class="btn sm"
@@ -2746,17 +2769,12 @@
                     ><Icon name="clock" size={13} /> History</button
                   >
                 </div>
-                <div class="tabs side-tabs" role="tablist" aria-label="Resource views">
-                  <button
-                    class="tab"
-                    role="tab"
-                    aria-selected={sideTab === 'props'}
-                    onclick={() => (sideTab = 'props')}>Properties</button
+                <div class="segmented side-tabs" role="group" aria-label="Resource views">
+                  <button aria-pressed={sideTab === 'props'} onclick={() => (sideTab = 'props')}
+                    >Properties</button
                   >
                   <button
-                    class="tab"
-                    role="tab"
-                    aria-selected={sideTab === 'memory'}
+                    aria-pressed={sideTab === 'memory'}
                     onclick={() => (sideTab = 'memory')}
                     title="Facts agents recorded about this resource, with citations"
                     ><Icon name="brain" size={13} /> Memory</button
@@ -3794,6 +3812,7 @@
   }
   .side-tabs {
     margin-top: 8px;
+    align-self: start;
   }
   .hist-net ul {
     list-style: none;

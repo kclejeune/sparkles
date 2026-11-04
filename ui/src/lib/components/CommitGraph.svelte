@@ -140,6 +140,8 @@
   const DIFF_LIMIT = 500;
   let diff = $state<api.Diff | null>(null);
   let diffError = $state<api.ApiError | Error | null>(null);
+  /** The dataset and branch whose labels name the opened commit's changes. */
+  let diffTarget = $state<string | null>(null);
   let diffLoading = $state(false);
 
   async function select(c: GraphCommit) {
@@ -151,6 +153,8 @@
     selected = key;
     diff = null;
     diffError = null;
+    // the labels of the changes come from the branch the commit is on
+    diffTarget = onBranch(name, c.branch);
     if (c.seq === 0) return;
     const owns = runs.claim('diff');
     diffLoading = true;
@@ -402,7 +406,11 @@
             commit {diff.from.commit.seq} → commit {diff.to.commit.seq}:
             <span class="mono">{diffSummary(diff)}</span>
           </p>
-          {#if diff.quads}<DiffLines quads={diff.quads} total={diff.added + diff.removed} />{/if}
+          {#if diff.quads}<DiffLines
+              quads={diff.quads}
+              total={diff.added + diff.removed}
+              ds={diffTarget}
+            />{/if}
         {/if}
       </section>
     {/if}

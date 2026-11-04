@@ -136,7 +136,11 @@
     if (indexName) p.set('index', indexName);
     if (method !== 'pca') p.set('method', method);
     if (colourIri) p.set('colour', colourIri);
-    goto(`${resolve('/embedding')}?${p}`, { replaceState: true, keepFocus: true, noScroll: true });
+    goto(`${resolve('/similar/map')}?${p}`, {
+      replaceState: true,
+      keepFocus: true,
+      noScroll: true,
+    });
   }
 
   function failure(e: unknown) {

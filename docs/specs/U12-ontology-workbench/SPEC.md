@@ -75,7 +75,7 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ### Ontology editor
 
-The ontology editor phase is built as the UI's **Ontology** page, `/ui/ontology`. It reads
+The ontology editor phase is built as the UI's **Ontology** page, `/ui/workbench/ontology`. It reads
 and edits one graph of a dataset, the default graph unless the caller picks another, with
 the graphs that graph imports. Every read and write goes through the `/$/ontology/{ds}`
 routes of [F21](../F21-ontology-api.md#outcome), with the caller's grants, and through
@@ -241,7 +241,7 @@ the same engine to answer the entity accessors from the kept classification.
 ### Thesaurus editor
 
 The SKOS and SKOS-XL thesaurus editor phase is built as the UI's **Thesaurus** page,
-`/ui/thesaurus`. It reads and writes one graph of a dataset with SPARQL queries and
+`/ui/workbench/thesaurus`. It reads and writes one graph of a dataset with SPARQL queries and
 `DELETE DATA` and `INSERT DATA` updates, so it needs no routes of its own beyond the
 built-in shapes.
 
@@ -488,9 +488,20 @@ roots, which ChEBI lite does not name and the route finds by one scan of the par
 took 183 ms on the first call and 97 ms after it, for 19,430 roots. Every page stays far
 under the 300 ms target.
 
-**Remaining work.** Inferred axioms and hierarchies are item 622, search at a past
-state item 658, rendering preferences item 625, metrics item 621 and other servers' term
-pages item 461.
+The design review of item 633 reshaped the pages without a server change. The Definition
+card lists every definition, description, comment and scope note under a heading that names
+its kind and predicate, an Axioms card shows the entity's frame in Manchester syntax with a
+classification's inferences, and SKOS statements are kept out of axioms. The header, the
+counts as one row of chips and a More menu for buttons that do not fit are shared by the pages
+of the UI. The Hierarchy card draws the graph in its own body. The Workbench editors' trees
+show labels before short forms and keep their ancestors in view, and the two columns of
+cards balance their heights. The Axioms card shows inferences only
+after a **Classify** click, since no read-only route says whether a kept classification
+exists, which item 726 adds.
+
+**Remaining work.** Inferred axioms and hierarchies beyond the card's click are items 622 and
+726, search at a past state item 658, rendering preferences item 625, metrics item 621
+and other servers' term pages item 461.
 
 ### Ontology browser edit mode
 
@@ -554,5 +565,5 @@ whole ontology, and later previews took 0.16 to 0.4 s.
 
 **Remaining work.** SKOS-XL labels and collection members are edited in the thesaurus
 editor, and property assertions, keys and chains have no form of their own, 706.
-The first preview's wait on a large ontology is 707. Phone dialogs as bottom
-sheets belong to the design review of item 633.
+The first preview's wait on a large ontology is 707. Phone dialogs dock as bottom
+sheets after the design review of item 633.

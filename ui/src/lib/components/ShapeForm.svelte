@@ -11,7 +11,7 @@
   import type { Term } from '$lib/api';
   import { toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
-  import { MAIN } from '$lib/branches';
+  import { MAIN, onBranch } from '$lib/branches';
   import { LABEL_IRIS } from '$lib/explore';
   import { fmtInt } from '$lib/format';
   import {
@@ -785,6 +785,7 @@
               total={a.preview.changes.total}
               label="Changes the save would make"
               maxHeight={180}
+              ds={onBranch(ds, a.branch)}
             />
           {/if}
           {#if a.validation.withheld}

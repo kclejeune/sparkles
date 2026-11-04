@@ -3,9 +3,11 @@
 // (docs/API.md, "Ontology"), and the pure functions that turn their answers into the
 // sections of an entity's page. The page's components take what these return as props,
 // so the editor, DL Query and the term pages of item 461 can reuse them.
-import { request, select } from './api';
+import { ApiError, request, select } from './api';
 import {
   iriName,
+  manchesterName,
+  manchesterTokens,
   OBJECT_CHARACTERISTICS,
   sectionOf,
   SECTIONS,
@@ -13,8 +15,10 @@ import {
   type AxiomJson,
   type EntityKind,
   type Lit,
+  type ManchesterToken,
 } from './ontology';
-import { WELL_KNOWN, type PrefixMap } from './rdf';
+import { localName, WELL_KNOWN, type PrefixMap } from './rdf';
+import { browsePath, editorOf, workbenchPath } from './routes';
 
 const enc = encodeURIComponent;
 const RDF = WELL_KNOWN.rdf;
@@ -183,10 +187,7 @@ export function browseHref(
   iri: string | null,
   extra: Record<string, string | null | undefined> = {},
 ): string {
-  const p = new URLSearchParams({ ds });
-  if (iri) p.set('iri', iri);
-  for (const [k, v] of Object.entries(extra)) if (v) p.set(k, v);
-  return `${base}/browse?${p}`;
+  return browsePath(base, ds, { iri, ...extra });
 }
 
 // --- names ----------------------------------------------------------------------------
@@ -242,7 +243,10 @@ export function editorKindOf(kinds: readonly string[]): EntityKind | null {
   return null;
 }
 
-/** Where Edit opens an entity: the thesaurus editor for SKOS, the ontology editor otherwise. */
+/**
+ * Where an entity opens in the Workbench: the Thesaurus editor for SKOS, the Ontology editor
+ * otherwise, on the tree of the entity's kind with the entity selected.
+ */
 export function editHref(
   base: string,
   ds: string,
@@ -250,10 +254,11 @@ export function editHref(
   kinds: readonly string[],
   sel: BrowseSelection,
 ) {
-  const p = new URLSearchParams({ ds, iri });
-  if (sel.graph) p.set('graph', sel.graph);
-  if (kinds.some((k) => k === 'concept' || k === 'conceptScheme' || k === 'collection'))
-    return `${base}/thesaurus?${p}`;
+  const editor = editorOf(kinds);
+  if (editor === 'thesaurus') {
+    const kind = kinds.includes('collection') ? 'collections' : null;
+    return workbenchPath(base, editor, ds, { iri, graph: sel.graph, kind });
+  }
   const tab: Record<string, string> = {
     objectProperty: 'ObjectProperty',
     dataProperty: 'DataProperty',
@@ -261,14 +266,43 @@ export function editHref(
     individual: 'NamedIndividual',
   };
   const t = kinds.find((k) => k in tab);
-  if (t && !kinds.includes('class')) p.set('tab', tab[t]);
-  return `${base}/ontology?${p}`;
+  const kind = t && !kinds.includes('class') ? tab[t] : null;
+  return workbenchPath(base, editor, ds, { iri, graph: sel.graph, kind });
 }
 
 // --- the sections of a page -----------------------------------------------------------
 
 export const LABEL_PROPS = [RDFS + 'label', SKOS + 'prefLabel'];
 export const DEFINITION_PROPS = [OBO + 'IAO_0000115', SKOS + 'definition'];
+
+/**
+ * The properties of a page's lead block, in priority order, with the kind each is listed
+ * under: the definitions, then descriptions, comments and scope notes.
+ */
+export const LEAD_KINDS: [string, string][] = [
+  [OBO + 'IAO_0000115', 'Definition'],
+  [SKOS + 'definition', 'Definition'],
+  [DCT + 'description', 'Description'],
+  [DC + 'description', 'Description'],
+  [RDFS + 'comment', 'Comment'],
+  [SKOS + 'scopeNote', 'Scope note'],
+];
+
+/** How many values of a group in the reader's languages show before "N more". */
+export const LEAD_SHOWN = 3;
+
+/** One predicate of the lead block, or the predicates that state the same texts, under its
+ * heading: its values in the reader's languages and its translations, which fold. */
+export type LeadGroup = {
+  kind: string;
+  /** the predicates the heading names, in priority order */
+  predicates: string[];
+  values: Sourced[];
+  translations: Sourced[];
+};
+
+/** The lead block of a page, its groups in priority order. The first group leads. */
+export type Lead = { groups: LeadGroup[] };
 
 /** Synonym properties, in display order, with their kind. */
 export const SYNONYM_KINDS: [string, string][] = [
@@ -281,16 +315,13 @@ export const SYNONYM_KINDS: [string, string][] = [
   [SKOS + 'hiddenLabel', 'Hidden'],
 ];
 
+/** The notes after the lead block. A note leads the block only when nothing else does. */
 export const NOTE_KINDS: [string, string][] = [
-  [RDFS + 'comment', 'Comment'],
-  [SKOS + 'scopeNote', 'Scope note'],
   [SKOS + 'note', 'Note'],
   [SKOS + 'example', 'Example'],
   [SKOS + 'historyNote', 'History note'],
   [SKOS + 'editorialNote', 'Editorial note'],
   [SKOS + 'changeNote', 'Change note'],
-  [DCT + 'description', 'Description'],
-  [DC + 'description', 'Description'],
 ];
 
 export const MAPPING_KINDS: [string, string][] = [
@@ -330,6 +361,7 @@ const SHOWN = new Set([
   OWL + 'deprecated',
   ...LABEL_PROPS,
   ...DEFINITION_PROPS,
+  ...LEAD_KINDS.map(([p]) => p),
   ...SYNONYM_KINDS.map(([p]) => p),
   ...NOTE_KINDS.map(([p]) => p),
   ...MAPPING_KINDS.map(([p]) => p),
@@ -352,7 +384,16 @@ export const isLiteral = (v: Value): v is Lit => typeof v === 'object' && v !== 
 export const valueText = (v: Value) => (isLiteral(v) ? v['@value'] : v);
 
 /** A value with the sources its annotations name (`oboInOwl:hasDbXref` or `dc:source`). */
-export type Sourced = { value: Value; lang: string | null; sources: string[]; property: string };
+export type Sourced = {
+  value: Value;
+  lang: string | null;
+  sources: string[];
+  property: string;
+  /** every property that states this text, when several do */
+  properties: string[];
+  /** the synonym types its axiom annotations name (`oboInOwl:hasSynonymType`) */
+  types: string[];
+};
 
 const SOURCE_PROPS = new Set([OIO + 'hasDbXref', DC + 'source', DCT + 'source', OIO + 'source']);
 
@@ -360,11 +401,45 @@ function sourced(s: Statement): Sourced {
   return {
     value: s.value,
     property: s.property,
+    properties: [s.property],
+    types: s.annotations
+      .filter((a) => a.property === OIO + 'hasSynonymType' && typeof a.value === 'string')
+      .map((a) => a.value as string),
     lang: isLiteral(s.value) ? (s.value['@language'] ?? null) : null,
     sources: s.annotations
       .filter((a) => SOURCE_PROPS.has(a.property))
       .map((a) => valueText(a.value)),
   };
+}
+
+/** The number of distinct languages among values, which a summary of translations says. */
+export function languageCount(values: readonly Pick<Sourced, 'lang'>[]): number {
+  return new Set(values.map((v) => (v.lang ?? '').toLowerCase())).size;
+}
+
+/** What a synonym type is called: its label when the page has one, else its local name. */
+export function synonymTypeName(
+  iri: string,
+  names: Record<string, Partial<Omit<Name, 'iri'>>> | undefined,
+): string {
+  return names?.[iri]?.label ?? localName(iri);
+}
+
+/**
+ * A text as its paragraphs, each a list of lines: blank lines split paragraphs and single
+ * newlines split lines. Each line loses the space at its ends and empty paragraphs go.
+ */
+export function textBlocks(text: string): string[][] {
+  return text
+    .replace(/\r\n?/g, '\n')
+    .split(/\n[ \t]*\n\s*/)
+    .map((p) =>
+      p
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l !== ''),
+    )
+    .filter((p) => p.length > 0);
 }
 
 /** Rank of a language among the caller's: theirs first, then none, then English, then the rest. */
@@ -385,12 +460,12 @@ const byLang = (langs: readonly string[]) => (a: Sourced, b: Sourced) =>
   valueText(a.value).localeCompare(valueText(b.value));
 
 export type Sections = {
-  /** the definition in the best language, with its sources */
+  /** the value that leads the page: the best of the lead block, or else a note */
   definition: Sourced | null;
-  /** the definitions in the other languages */
-  otherDefinitions: Sourced[];
+  /** every definition, description, comment and scope note, as the Definition card shows them */
+  lead: Lead;
   synonyms: { kind: string; values: Sourced[] }[];
-  notes: { kind: string; values: Sourced[] }[];
+  notes: { kind: string; property: string; values: Sourced[] }[];
   /** preferred, alternative and hidden labels by language, for SKOS resources */
   labels: { lang: string; preferred: string[]; alternative: string[]; hidden: string[] }[];
   xrefs: { database: string; id: string; href: string | null; value: string }[];
@@ -409,8 +484,18 @@ function uniqueSourced(list: Sourced[]): Sourced[] {
   for (const v of list) {
     const k = `${isLiteral(v.value) ? 'l' : 'i'}\u0000${valueText(v.value)}\u0000${v.lang ?? ''}`;
     const was = by.get(k);
-    if (!was) by.set(k, { ...v, sources: [...v.sources] });
-    else for (const src of v.sources) if (!was.sources.includes(src)) was.sources.push(src);
+    if (!was)
+      by.set(k, {
+        ...v,
+        sources: [...v.sources],
+        properties: [...v.properties],
+        types: [...v.types],
+      });
+    else {
+      for (const src of v.sources) if (!was.sources.includes(src)) was.sources.push(src);
+      for (const t of v.types) if (!was.types.includes(t)) was.types.push(t);
+      for (const p of v.properties) if (!was.properties.includes(p)) was.properties.push(p);
+    }
   }
   return [...by.values()];
 }
@@ -434,11 +519,13 @@ const groupsOf = (kinds: [string, string][], stmts: Statement[], langs: readonly
   kinds
     .map(([p, kind]) => ({
       kind,
+      property: p,
       values: uniqueSourced(stmts.filter((s) => s.property === p).map(sourced)).sort(byLang(langs)),
     }))
     .filter((g) => g.values.length > 0);
 
 const SKOSXL = 'http://www.w3.org/2008/05/skos-xl#';
+const SKOS_KINDS = new Set(['concept', 'conceptScheme', 'collection']);
 /** The plain SKOS property that each SKOS-XL label property stands for in the sections. */
 const XL_PLAIN: Record<string, string> = {
   [SKOSXL + 'prefLabel']: SKOS + 'prefLabel',
@@ -447,12 +534,52 @@ const XL_PLAIN: Record<string, string> = {
 };
 
 /**
+ * The lead block of `stmts` in the reader's languages `langs`: every value of `LEAD_KINDS`
+ * once, grouped by the predicate that states it, or by the predicates that state the same
+ * text. In each group the values in the reader's languages, or with none, show and the
+ * translations fold. A group with only translations shows its best one.
+ */
+export function leadOf(stmts: Statement[], langs: readonly string[]): Lead {
+  const index = new Map(LEAD_KINDS.map(([p], i) => [p, i]));
+  const rank = (p: string) => index.get(p) ?? 99;
+  const all = uniqueSourced(stmts.filter((s) => index.has(s.property)).map(sourced));
+  const groups = new Map<string, LeadGroup>();
+  for (const v of all.sort(
+    (a, b) =>
+      langRank(a.lang, langs) - langRank(b.lang, langs) ||
+      valueText(a.value).localeCompare(valueText(b.value)),
+  )) {
+    const predicates = [...v.properties].sort((a, b) => rank(a) - rank(b));
+    const key = predicates.join(' ');
+    let g = groups.get(key);
+    if (!g)
+      groups.set(
+        key,
+        (g = {
+          kind: LEAD_KINDS[rank(predicates[0])][1],
+          predicates,
+          values: [],
+          translations: [],
+        }),
+      );
+    (langRank(v.lang, langs) <= langs.length ? g.values : g.translations).push(v);
+  }
+  const out = [...groups.values()].sort(
+    (a, b) =>
+      rank(a.predicates[0]) - rank(b.predicates[0]) || a.predicates.length - b.predicates.length,
+  );
+  for (const g of out)
+    if (!g.values.length && g.translations.length) g.values.push(g.translations.shift()!);
+  return { groups: out };
+}
+
+/**
  * Sort a page's statements into its sections, in the caller's languages. A value that
  * several graphs state comes once, and the literal forms of SKOS-XL labels count as the
  * plain SKOS labels they stand for.
  */
 export function termSections(
-  t: Pick<TermPage, 'statements'> & Partial<Pick<TermPage, 'names' | 'xlLabels'>>,
+  t: Pick<TermPage, 'statements'> & Partial<Pick<TermPage, 'names' | 'xlLabels' | 'kinds'>>,
   langs: readonly string[],
 ): Sections {
   const stmts: Statement[] = [
@@ -463,9 +590,7 @@ export function termSections(
         : [],
     ),
   ];
-  const defs = uniqueSourced(
-    stmts.filter((s) => DEFINITION_PROPS.includes(s.property)).map(sourced),
-  ).sort(byLang(langs));
+  const lead = leadOf(stmts, langs);
   const labelRows = new Map<
     string,
     { preferred: string[]; alternative: string[]; hidden: string[] }
@@ -507,10 +632,12 @@ export function termSections(
     );
   const otherMap = new Map<string, Value[]>();
   const facts = new Set(['objectProperty', 'dataProperty']);
+  // a SKOS resource has no Axioms card, so its facts stay with the other statements
+  const skos = !!t.kinds?.some((k) => SKOS_KINDS.has(k));
   for (const s of stmts) {
     if (SHOWN.has(s.property) || LOGICAL.some((ns) => s.property.startsWith(ns))) continue;
-    // the facts of an individual are axioms, which the logical definition shows
-    if (t.names?.[s.property]?.kinds.some((k) => facts.has(k))) continue;
+    // the facts of an individual are axioms, which the Axioms card shows
+    if (!skos && t.names?.[s.property]?.kinds.some((k) => facts.has(k))) continue;
     const l = otherMap.get(s.property) ?? [];
     l.push(s.value);
     otherMap.set(s.property, l);
@@ -522,11 +649,26 @@ export function termSections(
         property: s.property,
         value: s.value,
       });
+  // with nothing in the lead block a note leads it, and leaves the notes
+  let notes = groupsOf(NOTE_KINDS, stmts, langs);
+  const note = notes.find((g) => g.kind === 'Note');
+  if (!lead.groups.length && note) {
+    const [first, ...rest] = note.values;
+    lead.groups.push({
+      kind: 'Note',
+      predicates: [SKOS + 'note'],
+      values: [first],
+      translations: [],
+    });
+    notes = notes
+      .map((g) => (g === note ? { ...g, values: rest } : g))
+      .filter((g) => g.values.length > 0);
+  }
   return {
-    definition: defs[0] ?? null,
-    otherDefinitions: defs.slice(1),
+    definition: lead.groups[0]?.values[0] ?? null,
+    lead,
     synonyms: groupsOf(SYNONYM_KINDS, stmts, langs),
-    notes: groupsOf(NOTE_KINDS, stmts, langs),
+    notes,
     labels,
     xrefs,
     seeAlso: [...seeAlso.values()],
@@ -642,6 +784,239 @@ export function axiomGroups(
   if (traits.items.length) out.push(traits);
   if (other.items.length) out.push(other);
   return out;
+}
+
+// --- the frame in Manchester syntax ----------------------------------------------------
+
+/** The frame keyword of each kind of entity (W3C OWL 2 Manchester Syntax, section 2.4). */
+const FRAME_WORD: Record<EntityKind, string> = {
+  Class: 'Class',
+  ObjectProperty: 'ObjectProperty',
+  DataProperty: 'DataProperty',
+  AnnotationProperty: 'AnnotationProperty',
+  NamedIndividual: 'Individual',
+  Datatype: 'Datatype',
+};
+
+/** The Manchester keyword of each section of `axiomGroups`. */
+const SECTION_WORD: Record<string, string> = {
+  sub: 'SubClassOf',
+  equivalent: 'EquivalentTo',
+  disjoint: 'DisjointWith',
+  disjointUnion: 'DisjointUnionOf',
+  keys: 'HasKey',
+  domains: 'Domain',
+  ranges: 'Range',
+  superProperties: 'SubPropertyOf',
+  inverses: 'InverseOf',
+  chains: 'SubPropertyChain',
+  characteristics: 'Characteristics',
+  types: 'Types',
+  same: 'SameAs',
+  different: 'DifferentFrom',
+  objectAssertions: 'Facts',
+  dataAssertions: 'Facts',
+  negative: 'Facts',
+  definitions: 'EquivalentTo',
+};
+
+/** One clause of a frame: its keyword and its items, each a run of Manchester tokens. */
+export type FrameSection = {
+  id: string;
+  word: string;
+  items: ManchesterToken[][];
+};
+
+/** An entity's frame: the clauses Manchester syntax writes, and the axioms it cannot. */
+export type Frame = {
+  word: string;
+  sections: FrameSection[];
+  other: AxiomItem[];
+};
+
+/**
+ * The asserted axioms of `groups` as a Manchester frame of an entity of `kind`, in the
+ * order of the groups. The three kinds of facts share one Facts clause, and axioms of a
+ * form no clause takes are left to `other`.
+ */
+export function manchesterFrame(
+  kind: EntityKind,
+  groups: AxiomGroup[],
+  name: (iri: string) => string,
+  prefixes: PrefixMap,
+): Frame {
+  const sections: FrameSection[] = [];
+  const other: AxiomItem[] = [];
+  const toks = (v: unknown) => manchesterTokens(v, name, prefixes);
+  const space: ManchesterToken = { text: ' ', role: 'space' };
+  for (const g of groups) {
+    if (g.id === 'other') {
+      other.push(...g.items.map((it) => it.axiom));
+      continue;
+    }
+    const word = SECTION_WORD[g.id];
+    if (!word) {
+      other.push(...g.items.map((it) => it.axiom));
+      continue;
+    }
+    let sec = sections.find((s) => s.word === word);
+    if (!sec) sections.push((sec = { id: g.id, word, items: [] }));
+    for (const it of g.items) {
+      if (it.word) {
+        sec.items.push([
+          {
+            text: it.word.replace(/ (\w)/g, (_, c: string) => c.toUpperCase()),
+            role: 'kw',
+          },
+        ]);
+      } else if (word === 'Facts') {
+        const neg: ManchesterToken[] =
+          g.id === 'negative' ? [{ text: 'not', role: 'kw' }, space] : [];
+        sec.items.push([...neg, ...toks(it.values[0]), space, ...toks(it.values[1])]);
+      } else if (g.id === 'keys' || g.id === 'disjointUnion') {
+        // one axiom names several entities: a key's properties and a union's classes, which
+        // Manchester syntax separates with commas
+        const sep: ManchesterToken[] = [{ text: ',', role: 'punct' }, space];
+        sec.items.push(it.values.flatMap((v, i) => [...(i ? sep : []), ...toks(v)]));
+      } else {
+        for (const v of it.values) sec.items.push(toks(v));
+      }
+    }
+  }
+  return { word: FRAME_WORD[kind], sections, other };
+}
+
+/**
+ * A frame as Manchester text, indented as Protégé writes it, with the entity's name from
+ * `name`. Axioms of a form the syntax has no clause for are left out.
+ */
+export function frameText(frame: Frame, iri: string, name: (iri: string) => string): string {
+  const lines = [`${frame.word}: ${manchesterName(name(iri))}`];
+  for (const s of frame.sections) {
+    if (s.id === 'keys') {
+      // each key is its own clause, since one HasKey clause would join them into one key
+      for (const it of s.items)
+        lines.push('', `    ${s.word}: `, `        ${it.map((t) => t.text).join('')}`);
+      continue;
+    }
+    lines.push('', `    ${s.word}: `);
+    s.items.forEach((it, i) => {
+      const text = it.map((t) => t.text).join('');
+      lines.push(`        ${text}${i < s.items.length - 1 ? ',' : ''}`);
+    });
+  }
+  return lines.join('\n') + '\n';
+}
+
+/** What the kept classification says of one class, and what of it the axioms do not. */
+export type Inferred = {
+  /** the direct superclasses the taxonomy has and no SubClassOf axiom asserts */
+  superClasses: string[];
+  /** the equivalent named classes no EquivalentClasses axiom asserts */
+  equivalents: string[];
+  /** whether the taxonomy is complete, with no axiom left out of the classification */
+  complete: boolean;
+  /** whether the dataset's kept classification answered without classifying again */
+  reused: boolean;
+};
+
+const THING = OWL + 'Thing';
+
+/**
+ * The inferences about class `iri` that its asserted axioms `groups` do not state: the
+ * classification's direct superclasses and its equivalent classes, less those asserted,
+ * `owl:Thing` and the class itself.
+ */
+export function inferredOf(
+  iri: string,
+  groups: AxiomGroup[],
+  about: { classes: string[]; parentClasses: string[] },
+  complete: boolean,
+  reused: boolean,
+): Inferred {
+  const named = (id: string) =>
+    new Set(
+      groups
+        .filter((g) => g.id === id)
+        .flatMap((g) => g.items.flatMap((it) => it.values))
+        .filter((v): v is string => typeof v === 'string'),
+    );
+  const sup = named('sub');
+  const eq = named('equivalent');
+  return {
+    superClasses: about.parentClasses.filter((c) => c !== THING && c !== iri && !sup.has(c)),
+    equivalents: about.classes.filter((c) => c !== iri && !eq.has(c)),
+    complete,
+    reused,
+  };
+}
+
+/** Whether a classification ran for `target` in this tab, so later pages may ask it again. */
+export function classifiedHere(target: string): boolean {
+  try {
+    return sessionStorage.getItem(`sparkles.classified.${target}`) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/** Notes that a classification ran for `target` in this tab. */
+export function markClassified(target: string): void {
+  try {
+    sessionStorage.setItem(`sparkles.classified.${target}`, '1');
+  } catch {
+    // the next page offers to classify again
+  }
+}
+
+/**
+ * `POST /$/ontology/{ds}/classify` about one class: its node in the dataset's kept
+ * classification, which a first call computes and later calls reuse incrementally. A class
+ * the taxonomy does not have answers null.
+ */
+export async function classifyAbout(
+  target: string,
+  graph: string | null,
+  iri: string,
+  signal?: AbortSignal,
+): Promise<{
+  complete: boolean;
+  reused: boolean;
+  class: { classes: string[]; parentClasses: string[] };
+} | null> {
+  try {
+    const res = await request(`/$/ontology/${enc(target)}/classify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        graph: graph ?? 'default',
+        imports: true,
+        about: iri,
+        limit: 1,
+      }),
+      signal,
+    });
+    markClassified(target);
+    return await res.json();
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
+}
+
+/**
+ * The class expressions a class is equivalent to, its logical definition: intersections,
+ * unions, restrictions, enumerations and complements. An equivalence to one named class is an
+ * alias, which only the Axioms card shows.
+ */
+export function logicalDefinitionOf(groups: AxiomGroup[]): unknown[] {
+  return groups
+    .filter((g) => g.id === 'equivalent')
+    .flatMap((g) => g.items.flatMap((it) => it.values))
+    .filter((v) => typeof v === 'object' && v !== null);
 }
 
 /** "SubClass Of" as "Subclass of". */
@@ -1050,6 +1425,32 @@ export function definitionsQuery(iris: readonly string[], graph: string | null) 
   const values = iris.map((i) => `<${i}>`).join(' ');
   const props = [...DEFINITION_PROPS, RDFS + 'comment'].map((p) => `<${p}>`).join('|');
   return `SELECT ?s ?d WHERE { VALUES ?s { ${values} } ${inGraph(graph, `?s ${props} ?d`)} }`;
+}
+
+/**
+ * The SPARQL of the labels of `iris`, `rdfs:label` or `skos:prefLabel`, for names such as the
+ * properties and values of an ontology's header. `parseDefinitions` reads its rows.
+ */
+export function namesQuery(
+  iris: readonly string[],
+  graph: string | null,
+  over?: readonly string[],
+) {
+  const values = iris.map((i) => `<${i}>`).join(' ');
+  const props = [RDFS + 'label', SKOS + 'prefLabel'].map((p) => `<${p}>`).join('|');
+  const body = `?s ${props} ?d`;
+  // `over` is the graphs a term answer read, imports included, which a name may be in. A
+  // label is read wherever the default graph reaches, so that part needs no graph pattern.
+  const named = (over ?? []).filter((g) => g !== 'default');
+  const where = over?.length
+    ? [
+        ...(over.includes('default') ? [`{ ${body} }`] : []),
+        ...(named.length
+          ? [`{ VALUES ?g { ${named.map((g) => `<${g}>`).join(' ')} } GRAPH ?g { ${body} } }`]
+          : []),
+      ].join(' UNION ')
+    : inGraph(graph, body);
+  return `SELECT ?s ?d WHERE { VALUES ?s { ${values} } ${where} FILTER(isLiteral(?d)) }`;
 }
 
 /** The best definition of each subject in `definitionsQuery`'s rows, in the caller's languages. */

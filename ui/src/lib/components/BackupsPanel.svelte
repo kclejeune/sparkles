@@ -207,7 +207,9 @@
         {/if}
         <span class="spacer"></span>
         {#if auth.hasServer('server-admin') || admin}
-          <a class="btn ghost sm" href="{resolve('/backups')}?dataset={encodeURIComponent(name)}"
+          <a
+            class="btn ghost sm"
+            href="{resolve('/admin/backups')}?dataset={encodeURIComponent(name)}"
             >Open in Backups <Icon name="chevron" size={12} /></a
           >
         {/if}
