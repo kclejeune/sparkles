@@ -1187,7 +1187,14 @@ export function lineage(
 
 export type GraphPiece = {
   nodes: { id: string; label: string; focus?: boolean }[];
-  edges: { id: string; source: string; target: string; label: string }[];
+  edges: {
+    id: string;
+    source: string;
+    target: string;
+    label: string;
+    /** A subclass, subproperty or broader link itself, whatever the label says. */
+    hierarchy?: boolean;
+  }[];
 };
 
 /**
@@ -1202,7 +1209,7 @@ export function neighbourhood(
   maxChildren = 20,
 ): GraphPiece {
   const nodes = new Map<string, { id: string; label: string; focus?: boolean }>();
-  const edges = new Map<string, { id: string; source: string; target: string; label: string }>();
+  const edges = new Map<string, GraphPiece['edges'][number]>();
   const name = (iri: string) =>
     iri === t.iri && (t.label || t.shortForm)
       ? (t.label ?? t.shortForm)!
@@ -1210,15 +1217,17 @@ export function neighbourhood(
   const node = (iri: string, focus = false) => {
     if (!nodes.has(iri)) nodes.set(iri, { id: iri, label: name(iri), focus: focus || undefined });
   };
-  const edge = (s: string, o: string, label: string) => {
+  const edge = (s: string, o: string, label: string, hierarchy = false) => {
     node(s);
     node(o);
     const id = `${s} ${label} ${o}`;
-    edges.set(id, { id, source: s, target: o, label });
+    // a restriction whose property has the label of a hierarchy link can share this edge's id
+    const was = edges.get(id)?.hierarchy;
+    edges.set(id, { id, source: s, target: o, label, hierarchy: hierarchy || was || undefined });
   };
   node(t.iri, true);
   const relate = (sub: string, sup: unknown) => {
-    if (typeof sup === 'string') return edge(sub, sup, 'subclass of');
+    if (typeof sup === 'string') return edge(sub, sup, 'subclass of', true);
     const r = sup as Record<string, unknown> | null;
     const word = r && RESTRICTION_WORD[String(r.type)];
     const filler = r?.class ?? r?.individual;
@@ -1240,14 +1249,11 @@ export function neighbourhood(
     if (a.type === 'SubClassOf' && typeof a.subClass === 'string') relate(a.subClass, a.superClass);
   }
   const subs = t.incoming.find((i) => i.property === RDFS + 'subClassOf');
-  for (const s of (subs?.subjects ?? []).slice(0, maxChildren)) edge(s, t.iri, 'subclass of');
+  for (const s of (subs?.subjects ?? []).slice(0, maxChildren)) edge(s, t.iri, 'subclass of', true);
   const broader = t.incoming.find((i) => i.property === SKOS + 'broader');
-  for (const s of (broader?.subjects ?? []).slice(0, maxChildren)) edge(s, t.iri, 'broader');
+  for (const s of (broader?.subjects ?? []).slice(0, maxChildren)) edge(s, t.iri, 'broader', true);
   return { nodes: [...nodes.values()], edges: [...edges.values()] };
 }
-
-/** The edge words of the hierarchies, as `neighbourhood` and the hierarchy route's edges say them. */
-const HIERARCHY_WORDS = new Set(['subclass of', 'subproperty of', 'broader']);
 
 /**
  * The entity's direct parents and its first children, which is what fits a narrow rail. An
@@ -1258,7 +1264,7 @@ export function hierarchyOf(p: GraphPiece, kids = 6): GraphPiece {
   const focus = p.nodes.find((n) => n.focus)?.id;
   let children = 0;
   const edges = p.edges.filter((e) => {
-    if (!HIERARCHY_WORDS.has(e.label)) return false;
+    if (!e.hierarchy) return false;
     if (e.source === focus) return true;
     return e.target === focus && ++children <= kids;
   });
@@ -1335,7 +1341,10 @@ export function mergePieces(a: GraphPiece, b: GraphPiece): GraphPiece {
   const nodes = new Map(a.nodes.map((n) => [n.id, n]));
   for (const n of b.nodes) if (!nodes.has(n.id)) nodes.set(n.id, { ...n, focus: undefined });
   const edges = new Map(a.edges.map((e) => [e.id, e]));
-  for (const e of b.edges) edges.set(e.id, e);
+  for (const e of b.edges) {
+    const hierarchy = e.hierarchy || edges.get(e.id)?.hierarchy;
+    edges.set(e.id, hierarchy ? { ...e, hierarchy } : e);
+  }
   return { nodes: [...nodes.values()], edges: [...edges.values()] };
 }
 

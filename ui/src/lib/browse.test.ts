@@ -858,6 +858,7 @@ describe('hierarchyOf', () => {
     source,
     target,
     label,
+    hierarchy: true,
   });
 
   it('keeps the parents and children of what neighbourhood emits, and not the axioms', () => {
@@ -901,6 +902,66 @@ describe('hierarchyOf', () => {
     expect(h.edges.find((e) => e.target === X + 'parent')?.source).toBe(X + 'c');
   });
 
+  const restriction = (word: string, extra: object[] = []) =>
+    neighbourhood(
+      {
+        iri: X + 'c',
+        axioms: [
+          {
+            axiom: {
+              type: 'SubClassOf',
+              subClass: X + 'c',
+              superClass: { type: 'ObjectSomeValuesFrom', property: X + 'p', class: X + 'filler' },
+            },
+            ofn: '',
+            graph: 'default',
+          },
+          ...extra,
+        ],
+        mentions: { axioms: [], total: 0, truncated: false },
+        incoming: [],
+        names: { [X + 'p']: { label: word, shortForm: null, kinds: [], deprecated: false } },
+      } as never,
+      {},
+    );
+
+  it('takes a restriction on a property with a hierarchy word for no parent', () => {
+    for (const word of ['broader', 'subclass of', 'subproperty of']) {
+      const g = restriction(word);
+      // the expanded view keeps the edge under its label
+      expect(g.edges.map((e) => [e.target, e.label])).toEqual([[X + 'filler', word]]);
+      const h = hierarchyOf(g);
+      expect(h.edges, word).toEqual([]);
+      expect(h.nodes.map((n) => n.id)).toEqual([X + 'c']);
+    }
+  });
+
+  it('keeps a parent that is also the filler of such a restriction, in either order', () => {
+    const parent = {
+      axiom: { type: 'SubClassOf', subClass: X + 'c', superClass: X + 'filler' },
+      ofn: '',
+      graph: 'default',
+    };
+    const h = hierarchyOf(restriction('subclass of', [parent]));
+    expect(h.edges.map((e) => e.target)).toEqual([X + 'filler']);
+    const lineage = {
+      nodes: [{ id: X + 'c', label: 'c', focus: true }],
+      edges: [
+        {
+          id: `${X}c subclass of ${X}filler`,
+          source: X + 'c',
+          target: X + 'filler',
+          label: 'subclass of',
+          hierarchy: true,
+        },
+      ],
+    };
+    const plain = restriction('subclass of');
+    const edges = (a: typeof plain, b: typeof plain) => hierarchyOf(mergePieces(a, b)).edges;
+    expect(edges(plain, lineage)).toHaveLength(1);
+    expect(edges(lineage, plain)).toHaveLength(1);
+  });
+
   it('keeps the first children and every parent', () => {
     const kids = Array.from({ length: 9 }, (_, i) => `k${i}`);
     const h = hierarchyOf(
@@ -939,7 +1000,7 @@ describe('hierarchyOf', () => {
   it('keeps the entity alone when it has no hierarchy', () => {
     const h = hierarchyOf({
       nodes: [node('c', true), node('o')],
-      edges: [edge('c', 'part of', 'o')],
+      edges: [{ ...edge('c', 'part of', 'o'), hierarchy: undefined }],
     });
     expect(h.nodes.map((n) => n.id)).toEqual(['c']);
     expect(h.edges).toEqual([]);

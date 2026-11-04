@@ -252,11 +252,17 @@
       if (c !== iri) continue;
       const n = h.ancestors?.nodes.find((x) => x.iri === p);
       shown({ iri: p, label: n?.label ?? null, shortForm: n?.shortForm ?? null });
-      edges.push({ id: `${c} ${word} ${p}`, source: c, target: p, label: word });
+      edges.push({ id: `${c} ${word} ${p}`, source: c, target: p, label: word, hierarchy: true });
     }
     for (const k of h.children.slice(0, 20)) {
       shown(k);
-      edges.push({ id: `${k.iri} ${word} ${iri}`, source: k.iri, target: iri!, label: word });
+      edges.push({
+        id: `${k.iri} ${word} ${iri}`,
+        source: k.iri,
+        target: iri!,
+        label: word,
+        hierarchy: true,
+      });
     }
     return { nodes: [...nodes.values()], edges };
   }
