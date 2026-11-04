@@ -191,7 +191,7 @@ for (const [w, h] of [
   });
 }
 
-test('the phone page keeps the order head, facts, hierarchy, article', async ({ page }) => {
+test('the phone page keeps the order head, hierarchy, facts, article', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await openTerm(page, 'Person');
   const y = async (sel: string) => (await page.locator(sel).first().boundingBox())!.y;
@@ -199,11 +199,40 @@ test('the phone page keeps the order head, facts, hierarchy, article', async ({ 
   const info = await y('.b-info');
   const tree = await y('.b-tree');
   const article = await y('.b-article');
-  expect(head).toBeLessThan(info);
-  expect(info).toBeLessThan(tree);
-  expect(tree).toBeLessThan(article);
+  expect(head).toBeLessThan(tree);
+  expect(tree).toBeLessThan(info);
+  expect(info).toBeLessThan(article);
+  // the hierarchy card opens on request
+  const card = page.getByRole('complementary', { name: 'Hierarchy' });
+  await expect(card.locator('.tree-body')).toBeHidden();
+  await card.getByRole('button', { name: 'Show the hierarchy' }).click();
+  await expect(card.locator('.tree-body')).toBeVisible();
+  await expect(card.getByRole('button', { name: 'Hide the hierarchy' })).toHaveAttribute(
+    'aria-expanded',
+    'true',
+  );
   // the shell's search icon stands in for the field
   await expect(page.getByRole('button', { name: 'Open search' })).toBeVisible();
+});
+
+test('the hierarchy is a card in the side column above the facts', async ({ page }) => {
+  for (const width of [1440, 1024]) {
+    await page.setViewportSize({ width, height: 900 });
+    await openTerm(page, 'Person');
+    const box = async (sel: string) => (await page.locator(sel).first().boundingBox())!;
+    const head = await box('.b-head');
+    const tree = await box('.b-tree');
+    const info = await box('.b-info');
+    const article = await box('.b-article');
+    // the content starts at the gutter, with the side column beside the head
+    expect(head.x).toBeLessThan(tree.x);
+    expect(Math.abs(tree.y - head.y)).toBeLessThan(24);
+    expect(tree.y + tree.height).toBeLessThanOrEqual(info.y);
+    expect(Math.abs(tree.x - info.x)).toBeLessThan(1);
+    expect(article.x + article.width).toBeLessThanOrEqual(tree.x);
+    await expect(page.locator('.b-tree .tree-toggle')).toBeHidden();
+    await expect(page.locator('.b-tree .tree-body')).toBeVisible();
+  }
 });
 
 test('a list whose count is a lower bound pages on until a short page', async ({ page }) => {

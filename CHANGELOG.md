@@ -126,7 +126,9 @@ each row as a card. The editors' trees indent less below the fourth level, keep 
 ancestors of the first visible row at the top as the tree scrolls, show the selected
 entity's path above its panel, and give labels the room before short forms.
 A level with more than 1,000 children now says so and shows the rest with **Show more**,
-where it showed only the first 1,000 before.
+where it showed only the first 1,000 before. A Browse term page shows its hierarchy as a card
+above the facts in the column beside the article, with its own scroll, and on a phone the
+card opens on request.
 
 Ontologies and thesauri have a typo-tolerant entity search for typeahead (spec U12,
 roadmap item 616). `GET /$/ontology/{ds}/search?q=` matches the labels, synonyms, short

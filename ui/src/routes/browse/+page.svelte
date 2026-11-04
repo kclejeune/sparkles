@@ -415,6 +415,23 @@
     canWrite && !at && !!term?.etag && (isSkos || (!!editorKind && editorKind !== 'Datatype')),
   );
   const editing = $derived(wantEdit && canEdit);
+
+  // the hierarchy card: open on a phone only on request or while editing, and its own scroll keeps the
+  // entity in view
+  let treeOpen = $state(false);
+  let treeBox = $state<HTMLElement>();
+  $effect(() => {
+    const box = treeBox;
+    void tree;
+    void treeOpen;
+    if (!box) return;
+    void tick().then(() => {
+      const here = box.querySelector<HTMLElement>('.here');
+      if (!here || box.scrollHeight <= box.clientHeight) return;
+      const top = here.getBoundingClientRect().top - box.getBoundingClientRect().top;
+      box.scrollTop += top - box.clientHeight / 3;
+    });
+  });
   // a caller who may not edit keeps no `edit=1` in the address
   $effect(() => {
     if (wantEdit && term && auth.loaded && !canEdit) setEdit(false);
@@ -1217,85 +1234,115 @@
           {/if}
         </div>
 
-        {#if treeKind}
-          <aside class="b-tree" aria-label="Hierarchy">
-            <div class="tree-head">
-              <h2>Hierarchy</h2>
-              <span class="spacer"></span>
-              {#if !editing}
-                <span class="seg" role="group" aria-label="View">
-                  <a
-                    href={hrefOf(term.iri)}
-                    aria-current={view === 'tree' ? 'true' : undefined}
-                    data-sveltekit-noscroll>Tree</a
-                  ><a
-                    href={hrefOf(term.iri, { view: 'graph' })}
-                    aria-current={view === 'graph' ? 'true' : undefined}
-                    data-sveltekit-noscroll>Graph</a
+        <!-- the side column: the hierarchy card above the facts card (ROADMAP item 633) -->
+        <div class="b-rail">
+          {#if treeKind}
+            <!-- the hierarchy is a card above the facts in the page's side column, and on a
+                 phone a card that opens on request (ROADMAP item 633) -->
+            <aside class="panel b-tree" class:shut={!treeOpen && !editing} aria-labelledby="tree-h">
+              <div class="panel-head">
+                {#if !editing}
+                  <button
+                    type="button"
+                    class="btn sm ghost icon tree-toggle"
+                    aria-expanded={treeOpen}
+                    aria-controls="tree-body"
+                    aria-label={treeOpen ? 'Hide the hierarchy' : 'Show the hierarchy'}
+                    onclick={() => (treeOpen = !treeOpen)}
+                    ><Icon name={treeOpen ? 'chevronDown' : 'chevron'} size={16} /></button
                   >
-                </span>
-              {/if}
-            </div>
-            {#if editing && isSkos && treeKind === 'concept'}
-              <div class="skos-parents">
-                <SkosLinks
-                  title="Broader"
-                  id="broader"
-                  links={details?.broader ?? []}
-                  name={(i) => linker.name(i)}
-                  sub={(i) => linker.short(i)}
-                  {readonly}
-                  paired
-                  {picker}
-                  onopen={(i) => void goto(hrefOf(i))}
-                  onadd={(i, n) => addLink('broader', i, n)}
-                  onremove={(i) => removeLink('broader', i)}
-                  onrepair={(l) => addLink('broader', l.iri)}
-                />
-                <SkosLinks
-                  title="Narrower"
-                  id="narrower"
-                  links={details?.narrower ?? []}
-                  name={(i) => linker.name(i)}
-                  sub={(i) => linker.short(i)}
-                  {readonly}
-                  paired
-                  {picker}
-                  onopen={(i) => void goto(hrefOf(i))}
-                  onadd={(i, n) => addLink('narrower', i, n)}
-                  onremove={(i) => removeLink('narrower', i)}
-                  onrepair={(l) => addLink('narrower', l.iri)}
-                />
+                {/if}
+                <h2 id="tree-h">Hierarchy</h2>
+                <span class="spacer"></span>
+                {#if !editing}
+                  <span class="seg" role="group" aria-label="View">
+                    <a
+                      href={hrefOf(term.iri)}
+                      aria-current={view === 'tree' ? 'true' : undefined}
+                      data-sveltekit-noscroll>Tree</a
+                    ><a
+                      href={hrefOf(term.iri, { view: 'graph' })}
+                      aria-current={view === 'graph' ? 'true' : undefined}
+                      data-sveltekit-noscroll>Graph</a
+                    >
+                  </span>
+                {/if}
               </div>
-            {:else if editing && parentsEditable(treeKind)}
-              <ParentEditor
-                kind={treeKind}
-                iri={term.iri}
-                {title}
-                rows={parents}
-                {linker}
-                {target}
-                {graph}
-                {prefixes}
-                {readonly}
-                {onedit}
-              />
-            {/if}
-            {#if tree}
-              <LineageTree
-                {target}
-                {sel}
-                kind={treeKind}
-                iri={term.iri}
-                {title}
-                answer={tree}
-                href={(i) => hrefOf(i)}
-              />
-            {:else}
-              <p class="faint">Loading…</p>
-            {/if}
+              <div class="tree-edit">
+                {#if editing && isSkos && treeKind === 'concept'}
+                  <div class="skos-parents">
+                    <SkosLinks
+                      title="Broader"
+                      id="broader"
+                      links={details?.broader ?? []}
+                      name={(i) => linker.name(i)}
+                      sub={(i) => linker.short(i)}
+                      {readonly}
+                      paired
+                      {picker}
+                      onopen={(i) => void goto(hrefOf(i))}
+                      onadd={(i, n) => addLink('broader', i, n)}
+                      onremove={(i) => removeLink('broader', i)}
+                      onrepair={(l) => addLink('broader', l.iri)}
+                    />
+                    <SkosLinks
+                      title="Narrower"
+                      id="narrower"
+                      links={details?.narrower ?? []}
+                      name={(i) => linker.name(i)}
+                      sub={(i) => linker.short(i)}
+                      {readonly}
+                      paired
+                      {picker}
+                      onopen={(i) => void goto(hrefOf(i))}
+                      onadd={(i, n) => addLink('narrower', i, n)}
+                      onremove={(i) => removeLink('narrower', i)}
+                      onrepair={(l) => addLink('narrower', l.iri)}
+                    />
+                  </div>
+                {:else if editing && parentsEditable(treeKind)}
+                  <ParentEditor
+                    kind={treeKind}
+                    iri={term.iri}
+                    {title}
+                    rows={parents}
+                    {linker}
+                    {target}
+                    {graph}
+                    {prefixes}
+                    {readonly}
+                    {onedit}
+                  />
+                {/if}
+              </div>
+              <div class="tree-body" id="tree-body" bind:this={treeBox}>
+                {#if tree}
+                  <LineageTree
+                    {target}
+                    {sel}
+                    kind={treeKind}
+                    iri={term.iri}
+                    {title}
+                    answer={tree}
+                    href={(i) => hrefOf(i)}
+                  />
+                {:else}
+                  <p class="faint">Loading…</p>
+                {/if}
+              </div>
+            </aside>
+          {/if}
+          <aside class="b-info" aria-label="About this entity">
+            <TermInfobox rows={infoRows} {linker}>
+              {#snippet footer()}
+                <DownloadButtons
+                  noun="this {kind}"
+                  href={(f) => branchPath(downloadHref(target, sel, term!.iri, f))}
+                />
+              {/snippet}
+            </TermInfobox>
           </aside>
-        {/if}
+        </div>
 
         {#if view === 'graph' && piece}
           <div class="b-graph">
@@ -1543,17 +1590,6 @@
             {/if}
           </div>
         {/if}
-
-        <aside class="b-info" aria-label="About this entity">
-          <TermInfobox rows={infoRows} {linker}>
-            {#snippet footer()}
-              <DownloadButtons
-                noun="this {kind}"
-                href={(f) => branchPath(downloadHref(target, sel, term!.iri, f))}
-              />
-            {/snippet}
-          </TermInfobox>
-        </aside>
       </div>
     {/if}
   {:else}
@@ -1744,18 +1780,19 @@
     container: browse / inline-size;
     min-width: 0;
   }
-  /* one column on a phone: head, facts, hierarchy, article */
+  /* one column on a phone: the head with the description, the hierarchy and facts cards,
+     and the article */
   .browse {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: 'head' 'info' 'tree' 'article';
+    grid-template-areas: 'head' 'rail' 'article';
     gap: var(--sp-6);
     padding: var(--gutter) var(--gutter) var(--sp-10);
     max-width: 1360px;
     min-width: 0;
   }
   .browse.graph {
-    grid-template-areas: 'head' 'graph' 'tree' 'info';
+    grid-template-areas: 'head' 'graph' 'rail';
   }
   .b-head {
     grid-area: head;
@@ -1772,78 +1809,65 @@
     grid-area: graph;
     min-width: 0;
   }
-  .b-info {
-    grid-area: info;
+  .b-rail {
+    grid-area: rail;
     min-width: 0;
     align-self: start;
+    display: grid;
+    gap: var(--gap);
   }
   .b-tree {
-    grid-area: tree;
     min-width: 0;
-    align-self: start;
+    display: flex;
+    flex-direction: column;
   }
-  .browse[data-kind='none'] {
-    grid-template-areas: 'head' 'info' 'article';
-  }
-  .browse[data-kind='none'].graph {
-    grid-template-areas: 'head' 'graph' 'info';
-  }
-  /* two columns: the article, and a side column with the hierarchy above the facts */
+  /* the head and the article, and a side column from the top of the page with the
+     hierarchy card above the facts card; a large screen and a medium one share the layout */
   @container browse (min-width: 640px) {
     .browse {
-      grid-template-columns: minmax(0, 1fr) 272px;
-      grid-template-areas: 'head head' 'article tree' 'article info';
-      grid-template-rows: auto auto 1fr;
-    }
-    .browse.graph {
-      grid-template-areas: 'head head' 'graph graph' 'tree info';
-      grid-template-rows: auto auto 1fr;
-    }
-    .browse[data-kind='none'] {
-      grid-template-areas: 'head head' 'article info';
-      grid-template-rows: auto 1fr;
-    }
-    .browse[data-kind='none'].graph {
-      grid-template-areas: 'head head' 'graph graph' '. info';
-    }
-  }
-  /* three columns: the hierarchy, the article and the facts */
-  @container browse (min-width: 1040px) {
-    .browse {
-      grid-template-columns: 264px minmax(0, 1fr) 288px;
-      grid-template-areas: 'tree head head' 'tree article info';
+      grid-template-columns: minmax(0, 1fr) 288px;
+      grid-template-areas: 'head rail' 'article rail';
       grid-template-rows: auto 1fr;
       gap: var(--sp-6) var(--sp-8);
     }
     .browse.graph {
-      grid-template-areas: 'tree head head' 'tree graph graph';
-      grid-template-rows: auto 1fr;
+      grid-template-areas: 'head rail' 'graph rail';
     }
-    .browse.graph .b-info {
+  }
+  @container browse (min-width: 1040px) {
+    .browse {
+      grid-template-columns: minmax(0, 1fr) 320px;
+    }
+  }
+  .b-tree .panel-head h2 {
+    font-size: var(--fs-md);
+  }
+  .tree-edit:not(:empty) {
+    padding: var(--sp-3) 14px 0;
+  }
+  /* the card scrolls on its own, about half the window at most */
+  .tree-body {
+    position: relative;
+    max-height: 50vh;
+    overflow: auto;
+    padding: var(--sp-3) 14px;
+    overscroll-behavior: contain;
+  }
+  .b-tree .panel-head .tree-toggle {
+    display: none;
+    margin-left: -6px;
+  }
+  @container browse (max-width: 639px) {
+    .b-tree .panel-head .tree-toggle {
+      display: inline-flex;
+    }
+    .b-tree.shut .tree-body,
+    .b-tree.shut .tree-edit {
       display: none;
     }
-    .browse[data-kind='none'] {
-      grid-template-columns: minmax(0, 1fr) 288px;
-      grid-template-areas: 'head head' 'article info';
+    .b-tree.shut .panel-head {
+      border-bottom: 0;
     }
-    .browse[data-kind='none'].graph {
-      grid-template-areas: 'head head' 'graph graph';
-    }
-    .b-tree {
-      position: sticky;
-      top: var(--gutter);
-      max-height: calc(100vh - var(--topbar-h) - 2 * var(--gutter));
-      overflow: auto;
-    }
-  }
-  .tree-head {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-2);
-    margin-bottom: var(--sp-3);
-  }
-  .tree-head h2 {
-    font-size: var(--fs-md);
   }
   .seg {
     display: inline-flex;
@@ -2060,18 +2084,6 @@
   }
   .add-map {
     justify-self: start;
-  }
-  /* on a phone the parents come right after the definition while editing */
-  @container browse (max-width: 639px) {
-    .browse.editing:not([data-kind='none']) {
-      grid-template-areas: 'head' 'tree' 'article' 'info';
-    }
-  }
-  @container browse (min-width: 1040px) {
-    .browse.editing .b-tree {
-      top: calc(var(--gutter) + 56px);
-      max-height: calc(100vh - var(--topbar-h) - 2 * var(--gutter) - 56px);
-    }
   }
   @media (max-width: 760px) {
     .browse.editing {

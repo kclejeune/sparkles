@@ -390,8 +390,9 @@ landing page of the default graph's ontology, and `&iri=IRI` opens an entity. `g
 
 An entity's page leads with its label, short form, kind, IRI and definition with the
 sources its axiom annotations name. A deprecated entity says so under its title and
-links its replacement. The hierarchy beside the article shows the lineage from a root to
-the entity on one line, the entity's other direct parents under it, its children with
+links its replacement. The **Hierarchy** card sits above the infobox in the column beside
+the article, scrolls on its own within half the window's height with the entity in view,
+and shows the lineage from a root to the entity on one line, the entity's other direct parents under it, its children with
 their counts and its siblings behind one row, and it reads each further level when it
 opens. **Graph** draws the entity's neighbourhood on the Explore canvas with Explore's
 lenses instead: its parents, its first children, the entities its axioms relate it to
@@ -412,8 +413,8 @@ there. **Similar terms** lists the entity's nearest neighbours in the dataset's 
 vector index, through the same search as Similar's Search page, and links to that page for
 more. A dataset without a vector index or a term without a vector shows no such section. The infobox lists the kind, status, identifiers, ontology, subsets and the counts
 of parents, children and instances, and downloads the entity in Turtle, RDF/XML, OWL
-functional syntax or JSON-LD. On a phone the page is one column with the header first, then the infobox, the
-hierarchy and the article ([screenshot](../images/browse-phone.png)).
+functional syntax or JSON-LD. On a phone the page is one column with the header first, then the Hierarchy card,
+which opens on request, the infobox and the article ([screenshot](../images/browse-phone.png)).
 
 A caller who can write to the dataset gets an **Edit** button beside the title, and `E`
 or the palette's **Edit this page** does the same. Edit mode changes the page in place
