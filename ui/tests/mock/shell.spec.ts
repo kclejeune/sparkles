@@ -285,6 +285,19 @@ test.describe('at 1440 pixels', () => {
     await expect(page.locator('.ds-button')).toContainText('foaf');
   });
 
+  test("the top bar's dataset is the one a dataset page shows", async ({ page }) => {
+    await onDataset(page, 'foaf');
+    await visit(page, '/ui/datasets/uni');
+    await expect(page.locator('.ds-button')).toContainText('uni');
+    await page.locator('.ds-button').click();
+    await page
+      .getByRole('listbox', { name: 'Datasets' })
+      .getByRole('option', { name: /^foaf / })
+      .click();
+    await expect(page).toHaveURL(/\/ui\/datasets\/foaf$/);
+    await expect(page.locator('.ds-button')).toContainText('foaf');
+  });
+
   test('Tab reaches the top bar and the rail with a visible focus', async ({ page }) => {
     await visit(page, '/ui/datasets');
     await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());

@@ -119,9 +119,16 @@ export function navActive(base: string, href: string, pathname: string, exact = 
 /**
  * Where choosing dataset `ds` goes from `url`: a page that names its dataset in `?ds=`
  * reopens on the new one, without the parameters that belonged to the old one (an
- * entity, a graph, a branch); any other page stays where it is.
+ * entity, a graph, a branch). A dataset's own page opens the new dataset's page on the same
+ * tab. Any other page stays where it is.
  */
 export function datasetSwitchHref(url: URL, ds: string): string | null {
+  // a dataset's own page names it in the path, and keeps its tab
+  const own = /^(.*\/datasets\/)[^/]+$/.exec(url.pathname);
+  if (own) {
+    const tab = url.searchParams.get('tab');
+    return `${own[1]}${encodeURIComponent(ds)}${tab ? `?tab=${encodeURIComponent(tab)}` : ''}`;
+  }
   if (!url.searchParams.has('ds')) return null;
   return `${url.pathname}?ds=${encodeURIComponent(ds)}`;
 }

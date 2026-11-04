@@ -60,6 +60,11 @@
   import WriteValidationPanel from '$components/WriteValidationPanel.svelte';
 
   const name = $derived(page.params.name ?? '');
+  // the top bar's dataset follows the page's, as on every page that names one
+  $effect(() => {
+    if (name && name !== app.current && app.datasets.some((d) => d.name === name))
+      app.setDataset(name);
+  });
   const info = $derived(app.datasets.find((d) => d.name === name));
   /** The branch the page shows (`?branch=`): null for `main`. */
   const branch = $derived(branchParam(page.url.searchParams.get('branch')));
