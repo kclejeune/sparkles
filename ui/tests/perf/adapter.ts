@@ -44,6 +44,8 @@ export async function rowsInDom(page: Page): Promise<number> {
 
 /** The pages' own scrolling element of the tree: the nearest scrollable ancestor of the tree. */
 export const SCROLLER_JS = `(() => {
+  const known = document.querySelector('.tree-scroll');
+  if (known) return known;
   const tree = document.querySelector('[role="tree"]');
   for (let e = tree; e; e = e.parentElement) {
     const o = getComputedStyle(e).overflowY;

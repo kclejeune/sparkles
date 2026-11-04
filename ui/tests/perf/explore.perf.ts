@@ -1,5 +1,5 @@
 // The Explore measurements (ROADMAP item 725): a graph grown to 1,000, 5,000 and 20,000
-// explored nodes in the `hub` dataset (a 100-ary tree, so each expansion adds about 100
+// explored nodes in the `hub` dataset (a 90-ary tree, so each expansion adds about 90
 // nodes), the frame times of a synthetic pan and zoom over it, the latency of an expansion
 // and the heap, and the fan-out of a resource with 20,000 neighbours.
 //

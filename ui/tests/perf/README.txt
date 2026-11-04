@@ -6,7 +6,7 @@ Scale measurements of the Workbench and Explore (ROADMAP item 725).
        node scripts/perf-seed.mjs                 # prints "ready http://127.0.0.1:PORT"
 
    Datasets: chebi (ChEBI lite), taxon (synthetic, NCBITaxon-shaped, 2.6 M classes), hub
-   (Explore: a 100-ary tree and a resource with 20,000 neighbours), unesco (thesaurus).
+   (Explore: a 90-ary tree and a resource with 20,000 neighbours), unesco (thesaurus).
    SPARKLES_UI_DIR picks the UI build under test without rebuilding the server.
 
 2. Run (one build, label = the name of its output directory):

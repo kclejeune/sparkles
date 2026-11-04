@@ -8,7 +8,7 @@
 //   `node scripts/perf-gen-taxon.mjs`
 // - `taxon1m`, the same with 1 million classes, for the cases where 2.6 million do not open
 // - `taxon300k`, with 300,000 classes and a largest family of 18,750, which the baseline opens
-// - `hub`, a 100-ary tree and a resource with 20,000 neighbours, from `node scripts/perf-gen-hub.mjs`
+// - `hub`, a 90-ary tree and a resource with 20,000 neighbours, from `node scripts/perf-gen-hub.mjs`
 //
 // - `unesco`, the UNESCO Thesaurus of the design seed, for the thesaurus editor
 //
