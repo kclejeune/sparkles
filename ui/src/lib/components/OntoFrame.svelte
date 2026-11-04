@@ -48,6 +48,7 @@
     annotationProperties,
     readonly = false,
     names,
+    search,
     parse,
     onedit,
     onopen,
@@ -63,6 +64,8 @@
     readonly?: boolean;
     /** The entity names that Manchester fields complete. */
     names: () => NameOption[];
+    /** Names found by the server as they are typed, for an ontology too large to list. */
+    search?: (word: string, signal: AbortSignal) => Promise<NameOption[]>;
     /** Read Manchester text on the server. */
     parse: (
       text: string,
@@ -368,6 +371,7 @@
               <ManchesterEditor
                 bind:value={() => adding[s.id] ?? '', (v) => (adding = { ...adding, [s.id]: v })}
                 {names}
+                {search}
                 label="Add to {s.title}"
                 placeholder={as === 'classExpression'
                   ? 'Class name, IRI or class expression'
@@ -479,6 +483,7 @@
         <ManchesterEditor
           bind:value={() => adding.axiom ?? '', (v) => (adding = { ...adding, axiom: v })}
           {names}
+          {search}
           label="Add an axiom"
           placeholder="An axiom, such as {label.includes(' ') ? `'${label}'` : label} SubClassOf …"
           problem={problems.axiom?.start != null

@@ -13,6 +13,7 @@
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
   import { onMount, untrack } from 'svelte';
+  import { SvelteMap } from 'svelte/reactivity';
   import * as api from '$lib/api';
   import { markClassified } from '$lib/browse';
   import { app } from '$lib/app.svelte';
@@ -23,6 +24,7 @@
   import { fetchHierarchy, type TreeKind, type TreeNode } from '$lib/browse';
   import { searchEntities } from '$lib/entity-search';
   import { filteredTree, LEVEL_LIMIT, LevelTree, scrollToRow } from '$lib/level-tree.svelte';
+  import { LabelBatch } from '$lib/label-batch';
   import { useCommands, usePageSearch, useProvider } from '$lib/launcher.svelte';
   import { branchProvider } from '$lib/palette.svelte';
   import {
@@ -47,8 +49,10 @@
     ONTOLOGY_GRAPHS,
     ontologyAxioms,
     ontologyEntities,
-    ontologyLabels,
-    withMissingLabels,
+    ontologyIndividualLabels,
+    ontologyKindLabels,
+    ontologyLabelsFor,
+    READ_CAP,
     ontologyEntity,
     ontologySummary,
     RDFS_LABEL,
@@ -90,7 +94,6 @@
   import OntoTree from '$components/OntoTree.svelte';
   import EditorHistory from '$components/EditorHistory.svelte';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
-  import TreeSticky from '$components/TreeSticky.svelte';
 
   import { ONTOLOGY_TABS, routes, type OntologyTab } from '$lib/routes';
 
@@ -164,11 +167,32 @@
   let etag = $state<string | null>(null);
   let loadError = $state<api.ApiError | Error | null>(null);
   let loading = $state(false);
+  // What the page reads is what its views show (ROADMAP item 725): the summary when it
+  // opens, the levels of the tree on screen, the labels of the names it draws, and the
+  // lists of entities only when a picker, completion or the Individuals tree needs them.
+  /** The entities of the kinds listed so far, for the pickers and the Individuals tree. */
   let entities = $state<Map<EntityKind, string[]>>(new Map());
-  let labels = $state<Map<string, Lit[]>>(new Map());
-  let hierarchy = $state<AxiomItem[]>([]);
+  /** The kinds whose list was read, or skipped for being longer than `LIST_MAX`. */
+  let listed = $state<Set<EntityKind>>(new Set());
+  /** The kinds too long to list: their names are found by the server's search. */
+  let bigKinds = $state<Set<EntityKind>>(new Set());
+  /** The labels the views know. A name read since the page opened is added in place. */
+  const labels = new SvelteMap<string, Lit[]>();
   let typeAxioms = $state<AxiomItem[]>([]);
   let truncated = $state(false);
+  /** Whether the individuals and their types are read for the Individuals tree. */
+  let individualsReady = $state(false);
+  /** The most entities of a kind that the pickers list. A longer kind is searched instead. */
+  const LIST_MAX = 5_000;
+  /** The kinds the pickers and completion list. */
+  const PICKER_KINDS: EntityKind[] = [
+    'Class',
+    'ObjectProperty',
+    'DataProperty',
+    'AnnotationProperty',
+    'NamedIndividual',
+    'Datatype',
+  ];
   let graphs = $state<string[]>([]);
   let branchList = $state<api.Branch[]>([]);
   /** The commit the views show, which a change after it makes stale. */
@@ -184,7 +208,21 @@
   let classifySeq = 0;
 
   const langs = typeof navigator === 'undefined' ? ['en'] : [...(navigator.languages ?? []), 'en'];
-  const nameOf = (iri: string) => entityName(iri, labels, prefixes, langs);
+  /** The name of `iri` as a tree draws it: the tree's own levels carry the labels. */
+  const treeName = (iri: string) => entityName(iri, labels, prefixes, langs);
+  /** Add the labels in `more` that the views do not have yet. */
+  function addLabels(more: Map<string, Lit[]>) {
+    for (const [s, l] of more) if (!labels.get(s)?.length) labels.set(s, l);
+  }
+  const batch = new LabelBatch(
+    (iris) => ontologyLabelsFor(target, sel, iris),
+    (m) => addLabels(m),
+  );
+  /** The name of `iri`, reading its label when the views name it for the first time. */
+  const nameOf = (iri: string) => {
+    if (!labels.get(iri)?.length) batch.want(iri);
+    return treeName(iri);
+  };
   /** The short forms the hierarchy route gives, such as GO:0008150, as the browse pages show them. */
   let shortForms = $state<Map<string, string>>(new Map());
   const subOf = (iri: string) =>
@@ -197,52 +235,110 @@
     const my = ++loadSeq;
     loading = true;
     try {
+      // the summary alone: its counts head the page, and the tree reads its own levels
       const r = await ontologySummary(t, s);
-      // Every label of the graph in one query, beside the capped listings, so that a large
-      // ontology's trees show labels from their first paint rather than local names until
-      // a later query answers. A failure leaves the labels the listings carry.
-      const allLabels = ontologyLabels(t, s).catch(() => new Map<string, Lit[]>());
-      const [ents, ax, types, more] = await Promise.all([
-        ontologyEntities(t, s, [...TREE_KINDS, 'Datatype']),
-        ontologyAxioms(t, s, {
-          types: [
-            'SubClassOf',
-            'SubObjectPropertyOf',
-            'SubDataPropertyOf',
-            'SubAnnotationPropertyOf',
-            'AnnotationAssertion',
-          ],
-        }),
-        ontologyAxioms(t, s, { types: ['ClassAssertion'], assertions: true, cap: 10_000 }),
-        allLabels,
-      ]);
       if (my !== loadSeq) return;
-      const byKind = new Map<EntityKind, string[]>();
-      for (const e of ents.entities) {
-        const l = byKind.get(e.kind) ?? [];
-        l.push(e.iri);
-        byKind.set(e.kind, l);
-      }
-      // individuals that only their class assertions name
-      const inds = new Set(byKind.get('NamedIndividual') ?? []);
-      for (const a of types.axioms)
-        if (typeof a.axiom.individual === 'string' && !a.axiom.individual.startsWith('_:'))
-          inds.add(a.axiom.individual);
-      byKind.set('NamedIndividual', [...inds]);
+      // what was read for the commit before is read again when a view needs it
+      if (loadedTarget !== t || shown !== r.summary.commit) resetLazy();
       summary = r.summary;
       etag = r.etag;
       shown = r.summary.commit;
       loadedTarget = t;
-      entities = byKind;
-      hierarchy = ax.axioms;
-      typeAxioms = types.axioms;
-      labels = withMissingLabels(labelsOf(ax.axioms), more);
-      truncated = ents.truncated || ax.truncated || types.truncated;
       loadError = null;
     } catch (e) {
       if (my === loadSeq) loadError = e as Error;
     } finally {
       if (my === loadSeq) loading = false;
+    }
+  }
+
+  /** Forget the lists and labels read, which belong to a commit or graph the page left. */
+  function resetLazy() {
+    batch.reset();
+    labels.clear();
+    entities = new Map();
+    listed = new Set();
+    bigKinds = new Set();
+    typeAxioms = [];
+    truncated = false;
+    individualsReady = false;
+    listSeq++;
+  }
+  let listSeq = 0;
+
+  /**
+   * Read the entities of `kinds` that the pickers and completion list, once for each kind.
+   * A kind with more than `LIST_MAX` entities is not listed: the server's search finds its
+   * names as they are typed. The labels of the kinds read come in one query.
+   */
+  async function ensureKinds(kinds: EntityKind[]) {
+    if (!summary) return;
+    const want = kinds.filter((k) => !listed.has(k));
+    if (!want.length) return;
+    const my = listSeq;
+    const t = target;
+    const s = sel;
+    const counts = summary.entities as Partial<Record<EntityKind, number>>;
+    const big = want.filter((k) => (counts[k] ?? 0) > LIST_MAX);
+    const read = want.filter((k) => !big.includes(k));
+    listed = new Set([...listed, ...want]);
+    if (big.length) bigKinds = new Set([...bigKinds, ...big]);
+    if (!read.length) return;
+    try {
+      const [ents, more] = await Promise.all([
+        ontologyEntities(t, s, read),
+        ontologyKindLabels(t, s, read).catch(() => new Map<string, Lit[]>()),
+      ]);
+      if (my !== listSeq) return;
+      const next = new Map(entities);
+      const byKind = new Map<EntityKind, string[]>();
+      for (const e of ents.entities) byKind.set(e.kind, [...(byKind.get(e.kind) ?? []), e.iri]);
+      for (const k of read)
+        next.set(k, [...new Set([...(next.get(k) ?? []), ...(byKind.get(k) ?? [])])]);
+      entities = next;
+      addLabels(more);
+      batch.know(more.keys());
+    } catch {
+      // the pickers stay empty, and the next need reads the lists again
+      if (my === listSeq) listed = new Set([...listed].filter((k) => !read.includes(k)));
+    }
+  }
+
+  /** Read the individuals and their types, for the Individuals tree. */
+  async function ensureIndividuals() {
+    if (!summary || individualsReady) return;
+    const my = listSeq;
+    const t = target;
+    const s = sel;
+    individualsReady = true;
+    try {
+      const [ents, types, more] = await Promise.all([
+        ontologyEntities(t, s, ['NamedIndividual']),
+        ontologyAxioms(t, s, { types: ['ClassAssertion'], assertions: true, cap: 10_000 }),
+        ontologyIndividualLabels(t, s).catch(() => new Map<string, Lit[]>()),
+      ]);
+      if (my !== listSeq) return;
+      // individuals that only their class assertions name
+      const inds = new Set(ents.entities.map((e) => e.iri));
+      for (const a of types.axioms)
+        if (typeof a.axiom.individual === 'string' && !a.axiom.individual.startsWith('_:'))
+          inds.add(a.axiom.individual);
+      entities = new Map(entities).set('NamedIndividual', [...inds]);
+      listed = new Set([...listed, 'NamedIndividual']);
+      typeAxioms = types.axioms;
+      truncated = ents.truncated || types.truncated;
+      addLabels(more);
+      batch.know(more.keys());
+      // the class names of the badges
+      for (const a of types.axioms) {
+        const c = a.axiom.class;
+        if (typeof c === 'string') batch.want(c);
+      }
+    } catch (e) {
+      if (my === listSeq) {
+        individualsReady = false;
+        loadError = e as Error;
+      }
     }
   }
 
@@ -278,14 +374,8 @@
   });
 
   // --- trees ---------------------------------------------------------------------------
-  const trees = $derived.by(() => {
-    const out = new Map<EntityKind, Tree>();
-    for (const k of TREE_KINDS) {
-      const edges = hierarchyEdges(k, k === 'NamedIndividual' ? [] : hierarchy);
-      out.set(k, buildTree(entities.get(k) ?? [], edges));
-    }
-    return out;
-  });
+  // the kinds without a hierarchy route, the individuals, are a flat list read on demand
+  const individualTree = $derived<Tree>(buildTree(entities.get('NamedIndividual') ?? [], []));
   /** The individuals by their named types. */
   const typesOf = $derived.by(() => {
     const m = new Map<string, string[]>();
@@ -302,8 +392,9 @@
     else s.add(id);
     opened = { ...opened, [key]: s };
   }
-  const tree = $derived(kindTab ? trees.get(kindTab) : null);
-  const keep = $derived(tree ? filterTree(tree, nameOf, filter) : null);
+  /** The flat tree of the tab, when its kind has no hierarchy route. */
+  const tree = $derived(kindTab === 'NamedIndividual' ? individualTree : null);
+  const keep = $derived(tree ? filterTree(tree, treeName, filter) : null);
 
   // --- the class and property trees, one level at a time (item 607) ----------------------
   // The hierarchy route reads a level from the store's indexes, so these trees are whole
@@ -322,7 +413,9 @@
         more.set(n.iri, [
           { '@value': n.label, ...(n.labelLang ? { '@language': n.labelLang } : {}) },
         ]);
-    if (more.size) labels = withMissingLabels(labels, more);
+    if (more.size) addLabels(more);
+    // a node the route gives no label has none to read
+    batch.know(nodes.filter((n) => !n.label).map((n) => n.iri));
     const forms = nodes.filter((n) => n.shortForm && !shortForms.has(n.iri));
     if (forms.length)
       shortForms = new Map([...shortForms, ...forms.map((n) => [n.iri, n.shortForm!] as const)]);
@@ -442,6 +535,18 @@
     });
   });
 
+  // the lists that the pickers and completion read: the page reads them once an entity, the
+  // header, the DL query or the create dialog needs them, and not when it opens
+  $effect(() => {
+    const need = !!selected || tab === 'header' || tab === 'dlquery' || createOpen;
+    if (need && summary && PICKER_KINDS.some((k) => !listed.has(k)))
+      untrack(() => void ensureKinds(PICKER_KINDS));
+  });
+  $effect(() => {
+    if (kindTab === 'NamedIndividual' && summary && !individualsReady)
+      untrack(() => void ensureIndividuals());
+  });
+
   // --- the inferred tree ---------------------------------------------------------------
   let classification = $state<Classification | null>(null);
   let classifyError = $state<string | null>(null);
@@ -473,7 +578,7 @@
   const inferred = $derived(classification ? taxonomyTree(classification) : null);
   const inferredName = (id: string) => {
     const cs = inferred?.classesOf.get(id) ?? [];
-    return cs.length ? cs.map(nameOf).join(' ≡ ') : id;
+    return cs.length ? cs.map(treeName).join(' ≡ ') : id;
   };
   const inferredKeep = $derived(
     inferred && filter.trim() ? filterTree(inferred.tree, inferredName, filter) : null,
@@ -579,6 +684,15 @@
     return out;
   });
   const names = () => completionNames;
+  /** Names of the kinds too long to list, found by the server's search as they are typed. */
+  async function searchNames(word: string, signal: AbortSignal): Promise<NameOption[]> {
+    const r = await searchEntities(target, word, { limit: 20, graph, signal });
+    return r.results.map((h) => ({
+      name: h.label ?? h.shortForm ?? iriName(h.iri, prefixes),
+      iri: h.iri,
+      kind: h.kinds[0] ?? 'entity',
+    }));
+  }
   const parse = (text: string, as: ParseAs) => parseManchester(target, sel, text, as);
 
   // --- the DL query --------------------------------------------------------------------
@@ -729,7 +843,14 @@
   });
 
   const describe = (a: AxiomInput) =>
-    describeAxiom(a, (iri) => entityName(iri, previewLabels, prefixes, langs), prefixes);
+    describeAxiom(
+      a,
+      (iri) => {
+        if (!previewLabels.get(iri)?.length) batch.want(iri);
+        return entityName(iri, previewLabels, prefixes, langs);
+      },
+      prefixes,
+    );
 
   // --- create, rename, delete --------------------------------------------------------------
   let policy = $state<IriPolicy>(loadPolicy('', null));
@@ -873,11 +994,11 @@
   });
   /** The parent a new entity of `kind` gets from the selection, as the tree's button does. */
   const createParentFor = (kind: EntityKind) =>
-    selected && kind !== 'NamedIndividual' && trees.get(kind)?.nodes.has(selected)
+    selected &&
+    frameFor === selected &&
+    frameKinds.includes(kind === 'NamedIndividual' ? 'Class' : kind)
       ? selected
-      : kind === 'NamedIndividual' && selected && (trees.get('Class')?.nodes.has(selected) ?? false)
-        ? selected
-        : null;
+      : null;
   useCommands(() => [
     {
       id: 'workbench.page',
@@ -942,11 +1063,16 @@
   );
   const headerTitle = $derived(
     summary?.header.iri
-      ? labels.get(summary.header.iri)
+      ? labels.get(summary.header.iri)?.length
         ? nameOf(summary.header.iri)
         : summary.header.iri
       : 'Anonymous ontology',
   );
+  // the ontology's own label is the one name the head asks for, once the summary is in
+  $effect(() => {
+    const iri = summary?.header.iri;
+    if (iri) batch.want(iri);
+  });
 </script>
 
 <svelte:head><title>Ontology{name ? ` · ${name}` : ''} | Sparkles</title></svelte:head>
@@ -1068,7 +1194,7 @@
       {api.errorMessage(loadError)}
     </div>
   {/if}
-  <!-- the class and property trees read their levels whole; the individuals list is capped -->
+  <!-- the class and property trees read their levels as they open; the individuals list is capped -->
   {#if truncated && kindTab === 'NamedIndividual'}
     <p class="notice" role="status">
       The ontology is larger than the editor reads at once. The list shows the first 50,000
@@ -1122,7 +1248,7 @@
     {:else}
       <div class="panes split-view">
         <section class="panel trees" aria-label="Entities">
-          {#if kindTab && tree}
+          {#if kindTab}
             <div class="tree-bar">
               <select
                 class="select sm kind-select"
@@ -1150,17 +1276,7 @@
               {#if !readonly}
                 <button
                   class="btn sm"
-                  onclick={() =>
-                    openCreate(
-                      kindTab,
-                      selected && kindTab !== 'NamedIndividual' && tree?.nodes.has(selected)
-                        ? selected
-                        : kindTab === 'NamedIndividual' &&
-                            selected &&
-                            (trees.get('Class')?.nodes.has(selected) ?? false)
-                          ? selected
-                          : null,
-                    )}
+                  onclick={() => openCreate(kindTab, createParentFor(kindTab))}
                   title={selected
                     ? `New ${KIND_SINGULAR[kindTab]} under the selection`
                     : `New ${KIND_SINGULAR[kindTab]}`}><Icon name="plus" size={13} /> New</button
@@ -1188,14 +1304,13 @@
               <div class="tree-col">
                 {#if kindTab === 'Class' && inferredOn}<h2 class="col-title">Asserted</h2>{/if}
                 <div class="tree-scroll">
-                  <TreeSticky />
                   {#if level && filtered}
                     {#if filtered.tree.roots.length}
                       <OntoTree
                         label="{KIND_LABEL[kindTab]} (asserted)"
                         roots={filtered.tree.roots}
                         children={(id) => filtered?.tree.children.get(id) ?? []}
-                        name={nameOf}
+                        name={treeName}
                         sub={subOf}
                         open={filtered.tree.nodes}
                         {selected}
@@ -1215,7 +1330,7 @@
                         more={(id) => level?.more(id) ?? false}
                         clipped={(p) => level?.clippedOf(p) ?? null}
                         onmore={(p) => level?.loadMore(p)}
-                        name={nameOf}
+                        name={treeName}
                         sub={subOf}
                         open={openSet(kindTab)}
                         {selected}
@@ -1229,12 +1344,12 @@
                     {:else}
                       <p class="empty">No {KIND_LABEL[kindTab].toLowerCase()}.</p>
                     {/if}
-                  {:else if tree.roots.length}
+                  {:else if tree?.roots.length}
                     <OntoTree
                       label="{KIND_LABEL[kindTab]} (asserted)"
                       roots={tree.roots}
                       children={(id) => tree?.children.get(id) ?? []}
-                      name={nameOf}
+                      name={treeName}
                       sub={subOf}
                       badge={kindTab === 'NamedIndividual'
                         ? (id) => (typesOf.get(id) ?? []).map(nameOf).join(', ') || null
@@ -1245,6 +1360,8 @@
                       onselect={(id) => nav({ iri: id })}
                       ontoggle={(id) => toggle(kindTab, id)}
                     />
+                  {:else if !individualsReady}
+                    <p class="empty">Reading the {KIND_LABEL[kindTab].toLowerCase()}…</p>
                   {:else}
                     <p class="empty">No {KIND_LABEL[kindTab].toLowerCase()}.</p>
                   {/if}
@@ -1276,6 +1393,10 @@
                         roots={inferred.tree.roots}
                         children={(id) => inferred?.tree.children.get(id) ?? []}
                         name={inferredName}
+                        onview={(ids) => {
+                          for (const id of ids)
+                            for (const c of inferred?.classesOf.get(id) ?? []) batch.want(c);
+                        }}
                         badge={(id) => (id === 'n:1' ? 'unsatisfiable' : null)}
                         open={openSet('inferred')}
                         selected={selected ? (inferred.nodeOf.get(selected) ?? null) : null}
@@ -1384,6 +1505,7 @@
                     {annotationProperties}
                     {readonly}
                     {names}
+                    search={bigKinds.size ? searchNames : undefined}
                     {parse}
                     onedit={(op, label) => edit(op, label)}
                     onopen={(iri) => nav({ iri, view: null })}
@@ -1628,6 +1750,7 @@
     <ManchesterEditor
       bind:value={dlText}
       {names}
+      search={bigKinds.size ? searchNames : undefined}
       label="Class expression"
       placeholder="Person and (teaches some Course)"
       multiline

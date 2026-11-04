@@ -41,10 +41,62 @@ test('a level with more children than one read shows the rest on request', async
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto('/ui/workbench/ontology?ds=deep');
   await tree(page).getByRole('button', { name: 'Expand wide parent' }).click();
+  // the tree draws the rows in view, so the end of the level is reached by the keyboard
+  await expect(tree(page).getByRole('treeitem', { name: 'wide child 0000' })).toBeVisible({
+    timeout: 30_000,
+  });
+  await tree(page).focus();
+  await page.keyboard.press('End');
   const more = tree(page).locator('.more-row');
   await expect(more).toContainText('Showing 1,000 of 1,050', { timeout: 30_000 });
-  await expect(tree(page).getByRole('treeitem', { name: 'wide child 1049' })).toHaveCount(0);
+  await expect(more).toBeInViewport();
   await more.getByRole('button', { name: 'Show more' }).click();
-  await expect(tree(page).getByRole('treeitem', { name: 'wide child 1049' })).toHaveCount(1);
   await expect(more).toHaveCount(0);
+  // 1,050 children are now rows of the tree, of which a screenful is in the page
+  await tree(page).focus();
+  await page.keyboard.press('End');
+  await expect(tree(page).getByRole('treeitem').last()).toBeInViewport();
+  await page.keyboard.type('wide child 1049');
+  await expect(tree(page).getByRole('treeitem', { name: 'wide child 1049' })).toHaveCount(1);
+});
+
+test('a long level draws the rows in view and the keyboard walks the tree', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('/ui/workbench/ontology?ds=deep');
+  const rows = tree(page).getByRole('treeitem');
+  await tree(page).getByRole('button', { name: 'Expand wide parent' }).click();
+  await expect(tree(page).getByRole('treeitem', { name: 'wide child 0000' })).toBeVisible({
+    timeout: 30_000,
+  });
+  // a thousand children are read and a screenful of them is in the page
+  expect(await rows.count()).toBeLessThan(80);
+  const wide = tree(page).getByRole('treeitem', { name: 'wide parent' });
+  await expect(wide).toHaveAttribute('aria-expanded', 'true');
+  // the tree is one tab stop, and its arrow keys move a cursor
+  await tree(page).focus();
+  await page.keyboard.press('Home');
+  const first = rows.first();
+  await expect(first).toHaveAttribute('aria-level', '1');
+  const id = await tree(page).evaluate((e) => e.getAttribute('aria-activedescendant'));
+  expect(id).toBeTruthy();
+  await page.keyboard.press('ArrowDown');
+  const next = await tree(page).evaluate((e) => e.getAttribute('aria-activedescendant'));
+  expect(next).not.toBe(id);
+  // Enter selects the row under the cursor
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(/iri=/);
+  await expect(page.getByRole('heading', { name: 'wide parent' })).toBeVisible();
+  // a row at the end of the level is reached by End, and the page holds the same
+  // screenful of rows there. Showing the selection scrolls too, so End is pressed until
+  // the end is in view.
+  await expect(async () => {
+    await tree(page).focus();
+    await page.keyboard.press('End');
+    expect(await rows.count()).toBeLessThan(80);
+    await expect(tree(page).locator('.more-row, li[role="treeitem"]').last()).toBeInViewport({
+      timeout: 1_000,
+    });
+  }).toPass({ timeout: 15_000 });
+  // the sticky ancestor names the open parent while its children scroll under it
+  await expect(page.getByLabel('Path to the first row')).toContainText('wide parent');
 });

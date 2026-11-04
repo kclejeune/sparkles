@@ -23,6 +23,7 @@
   let {
     value = $bindable(''),
     names,
+    search,
     label,
     placeholder = '',
     multiline = false,
@@ -32,6 +33,11 @@
     value?: string;
     /** The entity names to complete, with their IRIs and kinds. */
     names: () => NameOption[];
+    /**
+     * More names found by the server as a name is typed, for an ontology too large to list
+     * in the page. They are added to `names()` in the completions.
+     */
+    search?: (word: string, signal: AbortSignal) => Promise<NameOption[]>;
     /** The accessible name of the field. */
     label: string;
     placeholder?: string;
@@ -69,12 +75,29 @@
     '.cm-completionDetail': { color: 'var(--text-3)', marginLeft: '8px', fontStyle: 'normal' },
   });
 
-  function complete(ctx: CompletionContext): CompletionResult | null {
+  async function complete(ctx: CompletionContext): Promise<CompletionResult | null> {
     const line = ctx.state.doc.lineAt(ctx.pos);
     const w = completionWord(line.text.slice(0, ctx.pos - line.from));
     if (!w && !ctx.explicit) return null;
     const from = ctx.pos - (w?.length ?? 0);
-    const options = manchesterCompletions(w ?? '', names());
+    let all = names();
+    const typed = (w ?? '').replace(/^'/, '');
+    if (search && typed.length >= 2) {
+      // the editor drops this request when the word changes, which aborts the search
+      const ctl = new AbortController();
+      ctx.addEventListener('abort', () => ctl.abort());
+      // a pause for typing keeps a search to one request a word
+      await new Promise((r) => setTimeout(r, 150));
+      if (ctx.aborted) return null;
+      try {
+        const found = await search(typed, ctl.signal);
+        if (ctx.aborted) return null;
+        all = [...found, ...all];
+      } catch {
+        if (ctx.aborted) return null;
+      }
+    }
+    const options = manchesterCompletions(w ?? '', all);
     if (!options.length) return null;
     return { from, options, filter: false };
   }

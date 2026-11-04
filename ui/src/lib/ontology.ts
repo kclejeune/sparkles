@@ -292,6 +292,100 @@ export async function ontologyLabels(
   return labelsOfBindings(j.results.bindings);
 }
 
+/** The RDF type that declares an entity of each kind, which a read of a kind's labels follows. */
+export const KIND_TYPE: Record<EntityKind, string> = {
+  Class: OWL + 'Class',
+  ObjectProperty: OWL + 'ObjectProperty',
+  DataProperty: OWL + 'DatatypeProperty',
+  AnnotationProperty: OWL + 'AnnotationProperty',
+  NamedIndividual: OWL + 'NamedIndividual',
+  Datatype: RDFS + 'Datatype',
+};
+
+/** The SPARQL of the labels of `iris` alone, in the graph `sel` reads, as `labelsQuery` reads them. */
+export function labelsForQuery(sel: Selection, iris: readonly string[]): string {
+  const pattern = `VALUES ?s { ${iris.map(sparqlIri).join(' ')} } VALUES ?p { ${sparqlIri(RDFS_LABEL)} ${sparqlIri(SKOS_PREF_LABEL)} } ?s ?p ?l FILTER(isLiteral(?l))`;
+  return `SELECT ?s ?p ?l WHERE { GRAPH ${sparqlIri(sel.graph ?? DEFAULT_GRAPH_IRI)} { ${pattern} } }`;
+}
+
+/** The SPARQL of the labels of the entities declared with one of `types`. */
+export function typedLabelsQuery(sel: Selection, types: readonly string[]): string {
+  const pattern = `VALUES ?t { ${types.map(sparqlIri).join(' ')} } ?s a ?t . VALUES ?p { ${sparqlIri(RDFS_LABEL)} ${sparqlIri(SKOS_PREF_LABEL)} } ?s ?p ?l FILTER(isIRI(?s) && isLiteral(?l))`;
+  return `SELECT ?s ?p ?l WHERE { GRAPH ${sparqlIri(sel.graph ?? DEFAULT_GRAPH_IRI)} { ${pattern} } }`;
+}
+
+/**
+ * The SPARQL of the labels of the individuals: the subjects with a type that is not one of
+ * the OWL entity types, so that an individual which only its class assertions name has its
+ * label read with the declared ones.
+ */
+export function individualLabelsQuery(sel: Selection): string {
+  const schema = [
+    ...Object.values(KIND_TYPE),
+    OWL + 'Ontology',
+    OWL + 'Restriction',
+    OWL + 'Axiom',
+    OWL + 'AllDisjointClasses',
+    OWL + 'AllDifferent',
+    RDFS + 'Class',
+    WELL_KNOWN.rdf + 'Property',
+  ];
+  const pattern = `?s a ?t FILTER(?t NOT IN (${schema.map(sparqlIri).join(', ')})) VALUES ?p { ${sparqlIri(RDFS_LABEL)} ${sparqlIri(SKOS_PREF_LABEL)} } ?s ?p ?l FILTER(isIRI(?s) && isLiteral(?l))`;
+  return `SELECT DISTINCT ?s ?p ?l WHERE { GRAPH ${sparqlIri(sel.graph ?? DEFAULT_GRAPH_IRI)} { ${pattern} } }`;
+}
+
+async function labelRows(target: string, query: string, signal?: AbortSignal) {
+  const res = await request(`/${enc(target)}/sparql`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/sparql-query',
+      Accept: 'application/sparql-results+json',
+    },
+    body: query,
+    signal,
+  });
+  const j = await readJson<{ results: { bindings: SparqlBinding[] } }>(res);
+  return labelsOfBindings(j.results.bindings);
+}
+
+/** The labels of `iris`, in one query; the editor reads the labels it shows as they are asked for. */
+export function ontologyLabelsFor(
+  target: string,
+  sel: Selection,
+  iris: readonly string[],
+  signal?: AbortSignal,
+): Promise<Map<string, Lit[]>> {
+  return iris.length
+    ? labelRows(target, labelsForQuery(sel, iris), signal)
+    : Promise.resolve(new Map());
+}
+
+/** The labels of the individuals, declared or named only by their class assertions, in one query. */
+export function ontologyIndividualLabels(
+  target: string,
+  sel: Selection,
+  signal?: AbortSignal,
+): Promise<Map<string, Lit[]>> {
+  return labelRows(target, individualLabelsQuery(sel), signal);
+}
+
+/** The labels of every entity of `kinds` that the graph declares, in one query. */
+export function ontologyKindLabels(
+  target: string,
+  sel: Selection,
+  kinds: readonly EntityKind[],
+  signal?: AbortSignal,
+): Promise<Map<string, Lit[]>> {
+  return labelRows(
+    target,
+    typedLabelsQuery(
+      sel,
+      kinds.map((k) => KIND_TYPE[k]),
+    ),
+    signal,
+  );
+}
+
 /** `labels` with the subjects of `more` that it has no label for. */
 export function withMissingLabels(
   labels: Map<string, Lit[]>,
