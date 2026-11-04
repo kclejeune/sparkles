@@ -235,6 +235,8 @@ writeFileSync(
       hubs: big.map((b) => ({ ...b, iri: at(b.id) })),
       // the classes from the root down to the largest family, for opening it without selecting it
       hubPath: hubPath(hubId).map(at),
+      // a child of the largest family, whose selection opens the family in the tree
+      hubChild: at(firstChild),
       // a class at the bottom of the tree, and one in the middle of the largest family
       deepest: { iri: at(deepest), depth: depth[deepest] },
       pastFirstPage: { iri: at(firstChild + Math.floor(big[0].children / 2)), parent: at(hubId) },
