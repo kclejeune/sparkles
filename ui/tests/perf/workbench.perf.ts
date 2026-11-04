@@ -54,12 +54,18 @@ const sidecar = (classes: number): Sidecar | null => {
     return null;
   }
 };
-const taxon = sidecar(2_600_000);
-/** The dataset of the scroll case: the 1 million class one opens in the baseline too. */
-const SCROLL_DS = process.env.PERF_SCROLL_DS ?? 'taxon1m';
-const scrollTaxon = sidecar(
-  { taxon: 2_600_000, taxon1m: 1_000_000, taxon300k: 300_000 }[SCROLL_DS] ?? 1_000_000,
-);
+/** The classes of each synthetic taxon dataset. */
+const TAXON_SIZE: Record<string, number> = {
+  taxon: 2_600_000,
+  taxon1m: 1_000_000,
+  taxon300k: 300_000,
+};
+/** The dataset of the taxon cases of an open and a reveal (PERF_TAXON_DS, default the 2.6 million). */
+const TAXON_DS = process.env.PERF_TAXON_DS ?? 'taxon';
+const taxon = sidecar(TAXON_SIZE[TAXON_DS] ?? 2_600_000);
+/** The dataset of the scroll case: the 300,000 class one opens in the baseline too. */
+const SCROLL_DS = process.env.PERF_SCROLL_DS ?? 'taxon300k';
+const scrollTaxon = sidecar(TAXON_SIZE[SCROLL_DS] ?? 1_000_000);
 
 const CHEBI_WATER = 'http://purl.obolibrary.org/obo/CHEBI_15377';
 
@@ -72,19 +78,19 @@ const cases = (): Case[] => {
       url: ontologyUrl(BASE, 'chebi', `&iri=${encodeURIComponent(CHEBI_WATER)}`),
       wait: rowOf(CHEBI_WATER),
     },
-    { name: 'open-taxon', url: ontologyUrl(BASE, 'taxon'), wait: TREE_ROW },
+    { name: `open-${TAXON_DS}`, url: ontologyUrl(BASE, TAXON_DS), wait: TREE_ROW },
     { name: 'open-unesco-thesaurus', url: thesaurusUrl(BASE, 'unesco'), wait: TREE_ROW },
   ];
   if (taxon) {
     out.push(
       {
-        name: 'reveal-taxon-deepest',
-        url: ontologyUrl(BASE, 'taxon', `&iri=${encodeURIComponent(taxon.deepest.iri)}`),
+        name: `reveal-${TAXON_DS}-deepest`,
+        url: ontologyUrl(BASE, TAXON_DS, `&iri=${encodeURIComponent(taxon.deepest.iri)}`),
         wait: rowOf(taxon.deepest.iri),
       },
       {
-        name: 'reveal-taxon-past-first-page',
-        url: ontologyUrl(BASE, 'taxon', `&iri=${encodeURIComponent(taxon.pastFirstPage.iri)}`),
+        name: `reveal-${TAXON_DS}-past-first-page`,
+        url: ontologyUrl(BASE, TAXON_DS, `&iri=${encodeURIComponent(taxon.pastFirstPage.iri)}`),
         wait: rowOf(taxon.pastFirstPage.iri),
       },
     );

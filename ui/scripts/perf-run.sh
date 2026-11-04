@@ -8,8 +8,10 @@
 #     PERF_REPEAT=3 sh scripts/perf-run.sh
 #
 # PERF_UIS lists LABEL=DIR[:GROUPS] entries, where GROUPS limits a build to some of
-# chebi, explore, taxon-open, taxon-reveal, scroll (the 1 million class taxon) and
-# scroll-taxon (the 2.6 million class one). The default is all but scroll-taxon. PERF_COMMIT and
+# chebi, explore, taxon300k, taxon1m and taxon (the open and the reveals of the synthetic
+# taxon of 300,000, 1 million and 2.6 million classes) and scroll-taxon300k, scroll-taxon1m and
+# scroll-taxon (the scroll through 10,000 rows of each). The default is all but taxon and
+# scroll-taxon, which need more memory than the laptop has. PERF_COMMIT and
 # PERF_NOTE are recorded. PERF_SERVER_MEM caps the server (default 14G) and PERF_BROWSER_MEM
 # the browser (default 6G), each in a systemd-run scope when systemd-run exists.
 # PERF_CHROMIUM names a Chromium. PERF_TAXON_TIMEOUT_MS bounds the open of the taxon.
@@ -23,7 +25,7 @@ PORT="${SPARKLES_SEED_PORT:-18725}"
 export SPARKLES_BIN PERF_OUT SPARKLES_SEED_PORT="$PORT"
 export SPARKLES_PERF_MEM="${PERF_SERVER_MEM:-14G}"
 export PERF_URL="http://127.0.0.1:$PORT" PERF_REPEAT=1
-ALL=chebi,explore,taxon-open,taxon-reveal,scroll
+ALL=chebi,explore,taxon300k,scroll-taxon300k,taxon1m,scroll-taxon1m
 
 scoped() {
   if command -v systemd-run > /dev/null 2>&1; then
@@ -66,10 +68,10 @@ while [ "$rep" -lt "$REPEAT" ]; do
     LOG="$PERF_OUT/$PERF_LABEL/run.log"
     wants chebi && PERF_ONLY=open-chebi,reveal-chebi-water,open-unesco-thesaurus group workbench.perf -g open
     wants explore && group explore.perf
-    wants taxon-open && PERF_ONLY=open-taxon PERF_LOAD_TIMEOUT_MS="${PERF_TAXON_TIMEOUT_MS:-240000}" group workbench.perf -g open
-    wants taxon-reveal && PERF_ONLY=reveal-taxon-deepest,reveal-taxon-past-first-page group workbench.perf -g open
-    wants scroll && PERF_SCROLL_DS=taxon1m group workbench.perf -g scroll
-    wants scroll-taxon && PERF_SCROLL_DS=taxon group workbench.perf -g scroll
+    for ds in taxon300k taxon1m taxon; do
+      wants "$ds" && PERF_TAXON_DS=$ds PERF_ONLY="open-$ds,reveal-$ds-deepest,reveal-$ds-past-first-page" PERF_LOAD_TIMEOUT_MS="${PERF_TAXON_TIMEOUT_MS:-240000}" group workbench.perf -g open
+      wants "scroll-$ds" && PERF_SCROLL_DS=$ds group workbench.perf -g scroll
+    done
   done
   rep=$((rep + 1))
 done
