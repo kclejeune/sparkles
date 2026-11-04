@@ -760,13 +760,14 @@ async fn whole_over_http(inconsistent: bool) -> (serde_json::Value, f64) {
 /// Classifies the cases on one thread on a server of its own, which keeps a complete
 /// answer for the next call, with the query string `query` and the memory budget
 /// `memory`. Checks the answer against the full one and returns the consistency of a
-/// partial answer, `Some(None)` for a complete one, and `None` when the call was refused
-/// or timed out.
+/// partial answer, `Some(None)` for a complete one, and `None` when the call ended with the
+/// status `refused`.
 async fn stopped_over_http(
     inconsistent: bool,
     full: &serde_json::Value,
     query: &str,
     memory: Option<u64>,
+    refused: StatusCode,
 ) -> Option<Option<String>> {
     let s = server_with_memory(&cases(case_count(), inconsistent), memory);
     let r = post(
@@ -775,10 +776,12 @@ async fn stopped_over_http(
         json!({"partial": true, "threads": 1, "limit": 10000}),
     )
     .await;
-    if r.status != StatusCode::OK {
-        // a stop before the saturation fails as before
+    if r.status == refused {
+        // a stop before the saturation fails as before: a deadline times out, and a
+        // budget under the size of the ontology and its index is refused
         return None;
     }
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let want = if inconsistent {
         "inconsistent"
     } else {
@@ -842,7 +845,14 @@ async fn partial_over_http(inconsistent: bool) -> Vec<String> {
         seen: &mut Vec<String>,
     ) -> bool {
         let query = format!("?timeout={}", ms as f64 / 1000.0);
-        let r = stopped_over_http(inconsistent, full, &query, None).await;
+        let r = stopped_over_http(
+            inconsistent,
+            full,
+            &query,
+            None,
+            StatusCode::REQUEST_TIMEOUT,
+        )
+        .await;
         if let Some(c) = &r {
             *answered += 1;
             seen.extend(c.clone());
@@ -880,7 +890,14 @@ async fn partial_over_http_under_budgets(inconsistent: bool) -> Vec<String> {
     let estimate = full["stats"]["estimatedBytes"].as_u64().unwrap();
     let mut seen = Vec::new();
     for k in 1..20 {
-        let r = stopped_over_http(inconsistent, &full, "", Some(estimate * k / 20)).await;
+        let r = stopped_over_http(
+            inconsistent,
+            &full,
+            "",
+            Some(estimate * k / 20),
+            StatusCode::INSUFFICIENT_STORAGE,
+        )
+        .await;
         seen.extend(r.flatten());
     }
     seen
