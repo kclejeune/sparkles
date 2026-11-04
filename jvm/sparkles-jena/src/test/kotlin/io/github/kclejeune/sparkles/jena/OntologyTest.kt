@@ -327,11 +327,12 @@ class OntologyTest {
     }
 
     /**
-     * Classifies the cases under deadlines that rise by a few percent from a short one until twenty of them are long
-     * enough for the read of the ontology, and returns the partial answers' consistencies. The first deadline that gives
-     * an answer instead of a timeout has run out in the saturation, since that is the first part of a run that can stop
-     * with an answer, and at most a few percent of the read after its start. So the ladder finds the saturation, which
-     * lasts some milliseconds, on a loaded machine too, where a ladder fixed from the time of a full run misses it.
+     * Classifies the cases under deadlines that find the saturation, and returns the partial answers' consistencies. The
+     * deadlines rise by a few percent from a short one until one gives an answer instead of a timeout, which has run out in
+     * the saturation, since that is the first part of a run that can stop with an answer. The step may be longer than the
+     * saturation, so the milliseconds between the last timeout and that answer are halved until they are one apart. The
+     * deadlines go on until twenty have answered. A ladder fixed from the time of a full run misses a saturation of some
+     * milliseconds on a loaded machine.
      */
     private fun partialAnswers(inconsistent: Boolean): List<String> {
         val body = cases(300, inconsistent)
@@ -349,24 +350,22 @@ class OntologyTest {
         assertEquals("disjunctive", full.getString("tier"))
         val seen = mutableListOf<String>()
         var answered = 0
-        var deadline = 2.0
-        while (answered < 20 && deadline < 20 * took) {
-            val ms = maxOf(1L, deadline.toLong())
-            deadline += maxOf(1.0, 0.08 * deadline)
+        // whether the classification under a deadline of `ms` milliseconds answered instead of timing out
+        fun answers(ms: Long): Boolean {
             // a dataset of its own, whose read of the ontology takes as long as the full run's
-            SparklesDatasets.memory().use { ds ->
+            return SparklesDatasets.memory().use { ds ->
                 UpdateAction.parseExecute(body, ds)
                 val r = try {
                     SparklesOperation(ms).use { ds.ontology().classify(OntologyRead(), query, it) }
                 } catch (e: org.apache.jena.query.QueryCancelledException) {
-                    return@use
+                    return@use false
                 }
                 answered++
                 assertEquals(full.getNumber("classes"), r.getNumber("classes"))
                 if (!r.getBoolean("partial")) {
                     assertTrue(r.getBoolean("complete"))
                     assertEquals(want, r.getString("consistency"))
-                    return@use
+                    return@use true
                 }
                 assertFalse(r.getBoolean("complete"), "a partial answer is presented as complete")
                 val open = r.get("incomplete").asArray
@@ -375,7 +374,25 @@ class OntologyTest {
                 assertTrue(c == want || c == "unknown", c)
                 if (c == "unknown") assertTrue(open.size + 2 >= r.getNumber("classes").toInt())
                 seen.add(c)
+                return@use true
             }
+        }
+        fun after(ms: Long) = ms + maxOf(1L, Math.round(0.08 * ms))
+        val limit = (20 * took).toLong()
+        var lo = 0L
+        var ms = 2L
+        while (ms < limit && !answers(ms)) {
+            lo = ms
+            ms = after(ms)
+        }
+        var hi = ms
+        while (hi - lo > 1) {
+            val mid = (lo + hi) / 2
+            if (answers(mid)) hi = mid else lo = mid
+        }
+        while (answered < 20 && ms < limit) {
+            ms = after(ms)
+            answers(ms)
         }
         return seen
     }

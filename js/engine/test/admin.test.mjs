@@ -1009,32 +1009,28 @@ function checkAnswer(r, { full, want }) {
 }
 
 /**
- * Classify the cases under deadlines that rise by a few percent from a short one until
- * twenty of them are long enough for the read of the ontology and the index. The first
- * deadline that gives an answer instead of a timeout has run out in the saturation, since
- * that is the first part of a run that can stop with an answer, and at most a few percent
- * of the read after its start. So the ladder finds the saturation, which lasts some
- * milliseconds, on a loaded machine too, where a ladder fixed from the time of a full run
- * misses it. Return the partial answers' consistencies, in the order of the deadlines.
+ * Classify the cases under deadlines that find the saturation. The deadlines rise by a
+ * few percent from a short one until one gives an answer instead of a timeout, which has
+ * run out in the saturation, since that is the first part of a run that can stop with an
+ * answer. The step may be longer than the saturation, so the milliseconds between the
+ * last timeout and that answer are halved until they are one apart. The deadlines go on
+ * until twenty have answered. A ladder fixed from the time of a full run misses a
+ * saturation of some milliseconds on a loaded machine. Return the partial answers'
+ * consistencies, in the order of the deadlines.
  */
 async function deadlineAnswers(t, inconsistent) {
   const whole = await wholeRun(t, inconsistent);
   const seen = [];
   let answered = 0;
-  for (let ms = 2; answered < 20 && ms < 20 * whole.took; ms += Math.max(1, 0.08 * ms)) {
+  const answers = async (ms) => {
     // a dataset of its own, whose read of the ontology takes as long as the full run's
     const ds = Dataset.memory();
     await ds.update(whole.body);
     let r;
     try {
-      r = await ds.ontology.classify({
-        partial: true,
-        threads: 1,
-        limit: 10000,
-        timeout: Math.round(ms),
-      });
+      r = await ds.ontology.classify({ partial: true, threads: 1, limit: 10000, timeout: ms });
     } catch (e) {
-      if (e instanceof QueryTimeoutError) continue;
+      if (e instanceof QueryTimeoutError) return false;
       throw e;
     } finally {
       await ds.close();
@@ -1042,6 +1038,24 @@ async function deadlineAnswers(t, inconsistent) {
     answered++;
     const c = checkAnswer(r, whole);
     if (c) seen.push(c);
+    return true;
+  };
+  const next = (ms) => Math.ceil(ms + Math.max(1, 0.08 * ms));
+  const limit = 20 * whole.took;
+  let lo = 0;
+  let ms = 2;
+  while (ms < limit && !(await answers(ms))) {
+    lo = ms;
+    ms = next(ms);
+  }
+  for (let hi = ms; hi - lo > 1;) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (await answers(mid)) hi = mid;
+    else lo = mid;
+  }
+  while (answered < 20 && ms < limit) {
+    ms = next(ms);
+    await answers(ms);
   }
   return seen;
 }
