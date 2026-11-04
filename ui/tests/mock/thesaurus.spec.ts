@@ -105,6 +105,8 @@ test('edits on a session branch: labels, XL, a move, a mapping', async ({ page, 
     return Number((await r.json()).results.bindings[0].n.value);
   };
   const before = await count('thes');
+  // a tall page, so the whole tree sits in its box and a drag does not scroll it
+  await page.setViewportSize({ width: 1280, height: 1100 });
   await open(page, `&iri=${encodeURIComponent(TH + 'fish')}`);
   await page.getByRole('button', { name: 'Start session' }).click();
   await expect(page).toHaveURL(/branch=skos\./);

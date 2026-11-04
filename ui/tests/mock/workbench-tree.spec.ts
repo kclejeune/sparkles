@@ -100,3 +100,13 @@ test('a long level draws the rows in view and the keyboard walks the tree', asyn
   // the sticky ancestor names the open parent while its children scroll under it
   await expect(page.getByLabel('Path to the first row')).toContainText('wide parent');
 });
+
+test('a link to a class far down a long level scrolls the tree to its row', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 800 });
+  await page.goto(url('W1045'));
+  const row = tree(page).getByRole('treeitem', { selected: true });
+  await expect(row).toBeVisible({ timeout: 30_000 });
+  await expect(row).toBeInViewport();
+  const scrolled = await page.locator('.trees .tree-scroll').evaluate((e) => e.scrollTop);
+  expect(scrolled).toBeGreaterThan(10_000);
+});

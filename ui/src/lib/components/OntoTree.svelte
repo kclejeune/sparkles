@@ -40,7 +40,7 @@
   // costs the rows on screen and not the level. The WAI-ARIA tree pattern's keys work on
   // the whole tree, since the rows off screen are not in the page: the tree is one tab stop
   // whose arrow keys move a cursor, and rows carry their level and place for assistive tech.
-  import { onMount, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import TreeSticky from './TreeSticky.svelte';
   import {
@@ -207,9 +207,13 @@
     readView();
     const off = registerTree({
       reveal(id) {
-        const i = indexOfId(rows, id);
-        if (i < 0) return false;
-        ensureVisible(i);
+        if (indexOfId(rows, id) < 0) return false;
+        // the page holds the rows it had before the ones just read, so its height is short
+        // of the new rows until it is drawn: scrolling waits for that, or it lands short
+        void tick().then(() => {
+          const i = indexOfId(rows, id);
+          if (i >= 0) ensureVisible(i);
+        });
         return true;
       },
     });
