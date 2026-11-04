@@ -8,7 +8,8 @@
 
   cytoscape.use(fcose);
 
-  export type GNodeKind = 'iri' | 'literal' | 'bnode' | 'triple';
+  /** `group` is Explore's "N via predicate" node (ROADMAP item 725). */
+  export type GNodeKind = 'iri' | 'literal' | 'bnode' | 'triple' | 'group';
   export type GNode = {
     id: string;
     label: string;
@@ -28,6 +29,8 @@
     near?: string[];
     /** The term the node stands for, for the lenses' reads. */
     term?: Term;
+    /** For a group node: the predicate it stands for. */
+    via?: string;
   };
   export type GEdge = {
     id: string;
@@ -218,6 +221,25 @@
       {
         selector: 'node[kind = "bnode"]',
         style: { 'background-color': bnode, width: 12, height: 12 },
+      },
+      {
+        selector: 'node[kind = "group"]',
+        style: {
+          shape: 'round-rectangle',
+          width: 'data(w)',
+          height: 22,
+          'text-valign': 'center',
+          'text-margin-y': 0,
+          'background-color': surface,
+          'background-opacity': 1,
+          'border-width': 2,
+          'border-style': 'dashed',
+          'border-color': spark,
+          color: text,
+          'font-weight': 600,
+          'text-outline-width': 0,
+          'text-max-width': '220px',
+        },
       },
       { selector: 'node[kind = "triple"]', style: { shape: 'diamond', 'background-color': text2 } },
       { selector: 'node[?color]', style: { 'background-color': 'data(color)' } },
@@ -991,6 +1013,11 @@
   export function center(id: string) {
     const n = cy?.getElementById(id);
     if (n && n.nonempty()) cy!.animate({ center: { eles: n }, duration: reduced() ? 0 : 250 });
+  }
+
+  /** The pan and zoom, for the performance hook of the pages. */
+  export function viewport() {
+    return cy ? { pan: cy.pan(), zoom: cy.zoom() } : null;
   }
 
   export function relayout() {

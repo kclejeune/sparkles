@@ -47,8 +47,14 @@
     selected = null,
     onselect,
     onopen,
+    onexpand,
+    onmenu,
+    onedge,
+    expanded = null,
+    groups = null,
     onlayout,
     onfail,
+    relayoutBulk = false,
     iterations = 300,
     label = 'Graph',
     marked = null,
@@ -66,6 +72,25 @@
     dimEmpty?: boolean;
     onselect?: (key: string | null) => void;
     onopen?: (key: string) => void;
+    /**
+     * A node was opened for its neighbours: a double click, or Enter on the focused node.
+     * With it set, Enter calls this and not `onopen`.
+     */
+    onexpand?: (key: string) => void;
+    /** A node's context menu was asked for (right click or long press), at a point of the view. */
+    onmenu?: (key: string, at: { x: number; y: number }) => void;
+    /** An edge was clicked, such as an inferred one to explain. Costs a hit test per move. */
+    onedge?: (key: string) => void;
+    /** Nodes whose neighbours are loaded, which get a thin ring. */
+    expanded?: ReadonlySet<string> | null;
+    /** Group nodes, which get a dashed ring. */
+    groups?: ReadonlySet<string> | null;
+    /**
+     * With `still`, 40 nodes or more added at once are spread by a short layout in which the
+     * nodes already drawn stay where they are, instead of staying where their neighbours put
+     * them, so that a page of a group does not pile up. Re-run layout moves every node.
+     */
+    relayoutBulk?: boolean;
     /** Positions after the layout ends or is paused. */
     onlayout?: (positions: Map<string, { x: number; y: number }>) => void;
     /** WebGL failed for good (no context, or lost twice). */
@@ -231,10 +256,39 @@
     };
     drawInferred(ctx, w, h);
     drawPathNumbers(ctx, w, h);
+    drawRings(ctx, w, h);
     ring(selected, false);
     if (focusKey !== selected) ring(focusKey, true);
     for (const m of marked ?? []) if (m !== selected) ring(m, true);
     drawBadges(ctx, w, h);
+  }
+
+  /** Rings the overlay draws around expanded and group nodes, on screen, at most. */
+  const MAX_RINGS = 1500;
+
+  /** A thin ring for each expanded node and a dashed one for each group node. */
+  function drawRings(ctx: CanvasRenderingContext2D, w: number, h: number) {
+    if (!graph || (!expanded?.size && !groups?.size)) return;
+    ctx.save();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = colors.text2;
+    let drawn = 0;
+    const each = (set: ReadonlySet<string> | null | undefined, dashed: boolean) => {
+      for (const key of set ?? []) {
+        if (drawn >= MAX_RINGS) return;
+        const p = place(key);
+        if (!p || p.x < -20 || p.y < -20 || p.x > w + 20 || p.y > h + 20) continue;
+        ctx.beginPath();
+        ctx.setLineDash(dashed ? [3, 2] : []);
+        ctx.arc(p.x, p.y, p.r + 2.5, 0, Math.PI * 2);
+        ctx.stroke();
+        drawn++;
+      }
+    };
+    each(expanded, false);
+    each(groups, true);
+    ctx.restore();
+    overlay.dataset.rings = String(drawn);
   }
 
   /** Inferred edges the overlay draws at most; past that they are drawn as other edges. */
@@ -431,6 +485,7 @@
       renderer = new SigmaCtor(graph, host, {
         allowInvalidContainer: true,
         renderEdgeLabels: false,
+        enableEdgeEvents: !!onedge,
         defaultEdgeType: edgeType(),
         defaultEdgeColor: colors.edge,
         labelColor: { color: colors.text },
@@ -542,7 +597,35 @@
       onselect?.(node);
       onopen?.(node);
     });
-    renderer.on('doubleClickNode', (e) => e.preventSigmaDefault());
+    renderer.on('doubleClickNode', (e) => {
+      e.preventSigmaDefault();
+      if (onexpand) onexpand(e.node);
+    });
+    renderer.on('clickEdge', ({ edge }) => onedge?.(edge));
+    renderer.on('rightClickNode', ({ node, event }) => {
+      if (!onmenu) return;
+      event.preventSigmaDefault();
+      event.original.preventDefault();
+      onmenu(node, { x: event.x, y: event.y });
+    });
+    // a long press on a touch screen asks for the menu, as a right click does
+    let press = 0;
+    const unpress = () => {
+      clearTimeout(press);
+      press = 0;
+    };
+    renderer.on('downNode', ({ node, event }) => {
+      unpress();
+      if (!onmenu || !(typeof TouchEvent !== 'undefined' && event.original instanceof TouchEvent))
+        return;
+      press = window.setTimeout(() => {
+        press = 0;
+        onmenu(node, { x: event.x, y: event.y });
+      }, 550);
+    });
+    renderer.on('upNode', unpress);
+    renderer.on('upStage', unpress);
+    renderer.on('moveBody', unpress);
     renderer.on('clickStage', () => {
       focusKey = null;
       onselect?.(null);
@@ -634,7 +717,7 @@
     }
   }
 
-  function startLayout(fit: boolean) {
+  function startLayout(fit: boolean, cap = iterations) {
     if (!graph) return;
     stopLayout();
     const n = graph.order;
@@ -688,7 +771,7 @@
       fixed,
       edges: Uint32Array.from(pairs),
       weights: Float32Array.from(weights),
-      iterations: fixed.some((f) => f) ? Math.min(iterations, 200) : iterations,
+      iterations: Math.min(cap, fixed.some((f) => f) ? Math.min(iterations, 200) : iterations),
       final: reduced(),
     };
     running = true;
@@ -779,6 +862,9 @@
     startLayout(true);
   }
 
+  /** Nodes added at once from which `relayoutBulk` lays them out. */
+  const BULK_NODES = 40;
+
   /** A twenty-fifth of the larger side of the picture, or 20 for an empty one. */
   function gapOf(b: { x: [number, number]; y: [number, number] }): number {
     const side = Math.max(b.x[1] - b.x[0], b.y[1] - b.y[0]);
@@ -817,6 +903,8 @@
       // the pinned bounds, which a previous overlay's nodes do not widen
       gapOf(renderer.getCustomBBox() ?? renderer.getBBox()),
     );
+    const bulk = relayoutBulk && fresh.length >= BULK_NODES;
+    if (bulk) g.forEachNode((k) => g.setNodeAttribute(k, 'fixed', true));
     for (const n of fresh) {
       const p = place.get(n.key)!;
       g.addNode(n.key, {
@@ -826,7 +914,7 @@
         paths: n.paths,
         x: p.x,
         y: p.y,
-        fixed: true,
+        fixed: !bulk,
       });
     }
     const wantE = new Set(edges.map((e) => e.key));
@@ -853,6 +941,8 @@
     countPaths();
     setFocusSet();
     renderer.refresh();
+    // the picture was laid out already and holds still, so a short run settles the new nodes
+    if (bulk) startLayout(false, 150);
   }
 
   // the props change as a whole (a new level), so one rebuild per change. The rebuild
@@ -862,6 +952,12 @@
     void nodes;
     void edges;
     if (ready) untrack(() => (still && graph && graph.order > 0 ? update() : sync()));
+  });
+
+  $effect(() => {
+    void expanded;
+    void groups;
+    if (ready) untrack(() => renderer?.refresh({ skipIndexation: true }));
   });
 
   $effect(() => {
@@ -975,6 +1071,38 @@
     }
   }
 
+  /** Fit the view to some nodes, such as a path's. */
+  export function fitTo(keys: string[]) {
+    if (!renderer || !graph) return;
+    let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+    for (const k of keys) {
+      if (!graph.hasNode(k)) continue;
+      const d = renderer.getNodeDisplayData(k);
+      if (!d) continue;
+      x0 = Math.min(x0, d.x);
+      y0 = Math.min(y0, d.y);
+      x1 = Math.max(x1, d.x);
+      y1 = Math.max(y1, d.y);
+    }
+    if (!Number.isFinite(x0)) return;
+    const ratio = Math.min(1, Math.max(0.05, Math.max(x1 - x0, y1 - y0) * 1.6));
+    renderer
+      .getCamera()
+      .animate({ x: (x0 + x1) / 2, y: (y0 + y1) / 2, ratio }, { duration: reduced() ? 0 : 300 });
+  }
+
+  /** The camera's state, for the performance hook of the pages. */
+  export function viewport() {
+    return renderer?.getCamera().getState() ?? null;
+  }
+
+  /** Run the layout again over every node, the ones placed beside their neighbours included. */
+  export function relayout() {
+    if (!graph) return;
+    graph.forEachNode((k) => graph!.setNodeAttribute(k, 'fixed', false));
+    startLayout(false);
+  }
+
   /** Centre a node and show its ring. */
   export function reveal(key: string) {
     if (!renderer || !graph?.hasNode(key)) return;
@@ -1038,7 +1166,8 @@
     }
     if (e.key === 'Enter' && focusKey) {
       e.preventDefault();
-      onopen?.(focusKey);
+      if (onexpand) onexpand(focusKey);
+      else onopen?.(focusKey);
       return;
     }
     const pan = (dx: number, dy: number) => {
