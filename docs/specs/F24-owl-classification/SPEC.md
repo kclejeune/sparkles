@@ -738,7 +738,7 @@ that need counting out and reports them, and takes a minimum as the existential
 restriction it implies, so it costs what the classifier cost before counting. The reason
 is the cost on real ontologies, since no file of the ORE 2015 DL development set finishes
 with counting and the five that attempt it spend 2 to 30 times the time of the run
-without it before they give up where that run finishes, item NEW-ITEM-2. Turning counting on is the work of
+without it before they give up where that run finishes, item 728. Turning counting on is the work of
 that item. A run that counts when asked takes a number restriction that the Horn rules
 cannot take, a functional or inverse functional property, disjoint properties or an
 asymmetric property. The terms of a clause then include
@@ -772,14 +772,14 @@ with a bound of 4 million conclusions of its own, and sets `Stats::dl_counting_o
 as before. A run that does not count has no bound on its conclusions, only the memory
 budget. Of the 150 counting fixtures, all but three derive at most 190,000 conclusions on
 one thread, `shiq-046` derives 1.0 million and needs a raised `Limits::dl_work`, and
-`shq-041` and `shiq-028` pass any bound, item NEW-ITEM-3.
+`shq-041` and `shiq-028` pass any bound, item 729.
 
 The bound has a limit that this section states plainly. Near it, the thread schedule can
 decide whether a run answers in full or falls back, since the clauses stored at the
 fixpoint vary with the schedule, for example 3,229 to 6,762 on `sriq-010` at four threads
 against 3,253 on one. A fallback is always reported through the statistics and the axioms
 left out and is never a different complete answer, so a caller learns from
-`dl_counting_over` whether counting finished. A deterministic bound is item NEW-ITEM-1.
+`dl_counting_over` whether counting finished. A deterministic bound is item 727.
 
 The generated `shq`, `shiq` and `sriq` fixtures equal HermiT 1.4.5.519 on every case that
 Tier D takes whole with counting on, on one and four threads and under both strategies. Of 50 cases each,
@@ -791,7 +791,7 @@ sample is taken whole with counting. Its counting files fall back when counting 
 ore_ont_6485 after 205 ms on one thread against 7 ms without counting, and ore_ont_6952
 and ore_ont_10140 after 1.4 and 1.7 s against 0.6 and 0.5 s. The cost is not counting alone, since the same ontologies
 with every exact cardinality read as an existential restriction do not finish on the base
-either, item NEW-ITEM-2. The normalization of a clause with a universal or a maximum
+either, item 728. The normalization of a clause with a universal or a maximum
 beside a class or an existential restriction keeps the class in the clause's body, which
 classifies BioTop in 56 ms on one thread and 27 ms on four against 940 and 350 ms before,
 item 712.

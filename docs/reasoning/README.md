@@ -270,7 +270,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   left incomplete in `incomplete`, and a consistency of consistent, inconsistent or
   unknown, which leaves every class incomplete when unknown. The same rules can count, but
   counting is off by default, since it finishes on none of the ORE 2015 DL development
-  files and only delays their answer, item NEW-ITEM-2. `Limits::counting` turns it on.
+  files and only delays their answer, item 728. `Limits::counting` turns it on.
   Number restrictions, functional and inverse functional properties, disjoint properties
   and asymmetric properties then take equalities of successors, and a run that counts has
   a bound of 262,144 derived conclusions, `Limits::dl_work`. Without it those axioms are
@@ -278,7 +278,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   again without counting, leaves the axioms that need counting out and reports them, and
   sets `Stats::dl_counting_over` and `Stats::dl_over_budget`. Near the bound the thread
   schedule can decide whether a run answers in full or falls back, and the fallback is
-  always reported and never a different complete answer, item NEW-ITEM-1. Any other axiom
+  always reported and never a different complete answer, item 727. Any other axiom
   outside OWL 2 EL, such as nominals, is left out and reported with its rule, and Horn
   reasoning with individuals is item 692. An axiom with a literal or datatype that the
   classifier cannot compare, such as an XML literal, an ill-typed literal or a datatype
@@ -662,7 +662,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the five counting files of the ORE 2015 DL development set that the disjunctive rules
   take, so those files get the answer without counting. ore_ont_6485 spends 205 ms on the
   attempt against 7 ms for the run without it, and Konclude takes 8 ms. Roadmap items
-  NEW-ITEM-2 and NEW-ITEM-3.
+  728 and 729.
 * BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 27 ms on four threads
   against 23 ms for Konclude. Roadmap item 712.
 * ore_ont_3215 of the ORE 2015 DL sample passes the disjunctive rules' memory budget and
