@@ -328,6 +328,13 @@
   .small {
     font-size: var(--fs-xs);
   }
+  /* under the canvas the panel sits in a row that has no height of its own */
+  @media (max-width: 1000px) {
+    .group {
+      min-height: 45vh;
+      max-height: 50vh;
+    }
+  }
   @media (max-width: 760px) {
     .members li {
       min-height: 44px;

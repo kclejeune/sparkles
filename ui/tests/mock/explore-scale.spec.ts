@@ -208,6 +208,30 @@ test('communities of the memory store group the graph, and a group can be hidden
   await expect.poll(nodesOf).toBe(before);
 });
 
+test('the performance hook is installed only on request and expands a node', async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('sparkles.explore.perfHook', '1'));
+  await open(page);
+  const hook = () =>
+    page.evaluate(async () => {
+      const h = (window as unknown as { __perfHook: Record<string, (...a: unknown[]) => unknown> })
+        .__perfHook;
+      const before = h.nodeCount() as number;
+      await h.expand('<http://example.org/ada>');
+      return {
+        before,
+        after: h.nodeCount() as number,
+        drawn: h.drawnCount() as number,
+        ids: (h.nodeIds() as string[]).length,
+        renderer: h.renderer() as string,
+      };
+    });
+  const r = await hook();
+  expect(r.renderer).toBe('cytoscape');
+  expect(r.drawn).toBe(r.after);
+  expect(r.ids).toBe(r.after);
+  expect(r.after).toBeGreaterThanOrEqual(r.before);
+});
+
 test.describe('at 390 px', () => {
   test.use({ ...phone, viewport: { width: 390, height: 844 } });
 

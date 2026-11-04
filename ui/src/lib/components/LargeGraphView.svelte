@@ -54,6 +54,7 @@
     groups = null,
     onlayout,
     onfail,
+    relayoutBulk = false,
     iterations = 300,
     label = 'Graph',
     marked = null,
@@ -84,6 +85,12 @@
     expanded?: ReadonlySet<string> | null;
     /** Group nodes, which get a dashed ring. */
     groups?: ReadonlySet<string> | null;
+    /**
+     * With `still`, 40 nodes or more added at once are spread by a short layout in which the
+     * nodes already drawn stay where they are, instead of staying where their neighbours put
+     * them, so that a page of a group does not pile up. Re-run layout moves every node.
+     */
+    relayoutBulk?: boolean;
     /** Positions after the layout ends or is paused. */
     onlayout?: (positions: Map<string, { x: number; y: number }>) => void;
     /** WebGL failed for good (no context, or lost twice). */
@@ -710,7 +717,7 @@
     }
   }
 
-  function startLayout(fit: boolean) {
+  function startLayout(fit: boolean, cap = iterations) {
     if (!graph) return;
     stopLayout();
     const n = graph.order;
@@ -764,7 +771,7 @@
       fixed,
       edges: Uint32Array.from(pairs),
       weights: Float32Array.from(weights),
-      iterations: fixed.some((f) => f) ? Math.min(iterations, 200) : iterations,
+      iterations: Math.min(cap, fixed.some((f) => f) ? Math.min(iterations, 200) : iterations),
       final: reduced(),
     };
     running = true;
@@ -855,6 +862,9 @@
     startLayout(true);
   }
 
+  /** Nodes added at once from which `relayoutBulk` lays them out. */
+  const BULK_NODES = 40;
+
   /** A twenty-fifth of the larger side of the picture, or 20 for an empty one. */
   function gapOf(b: { x: [number, number]; y: [number, number] }): number {
     const side = Math.max(b.x[1] - b.x[0], b.y[1] - b.y[0]);
@@ -893,6 +903,8 @@
       // the pinned bounds, which a previous overlay's nodes do not widen
       gapOf(renderer.getCustomBBox() ?? renderer.getBBox()),
     );
+    const bulk = relayoutBulk && fresh.length >= BULK_NODES;
+    if (bulk) g.forEachNode((k) => g.setNodeAttribute(k, 'fixed', true));
     for (const n of fresh) {
       const p = place.get(n.key)!;
       g.addNode(n.key, {
@@ -902,7 +914,7 @@
         paths: n.paths,
         x: p.x,
         y: p.y,
-        fixed: true,
+        fixed: !bulk,
       });
     }
     const wantE = new Set(edges.map((e) => e.key));
@@ -929,6 +941,8 @@
     countPaths();
     setFocusSet();
     renderer.refresh();
+    // the picture was laid out already and holds still, so a short run settles the new nodes
+    if (bulk) startLayout(false, 150);
   }
 
   // the props change as a whole (a new level), so one rebuild per change. The rebuild
@@ -1075,6 +1089,11 @@
     renderer
       .getCamera()
       .animate({ x: (x0 + x1) / 2, y: (y0 + y1) / 2, ratio }, { duration: reduced() ? 0 : 300 });
+  }
+
+  /** The camera's state, for the performance hook of the pages. */
+  export function viewport() {
+    return renderer?.getCamera().getState() ?? null;
   }
 
   /** Run the layout again over every node, the ones placed beside their neighbours included. */

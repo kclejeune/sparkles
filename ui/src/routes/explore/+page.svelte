@@ -94,7 +94,7 @@
   import { getForm } from '$lib/forms-api';
   import ValidationSource from '$components/ValidationSource.svelte';
   import { type Badge, type GuardProbe, type VResult } from '$lib/validation-overlay';
-  import { load as loadPref, save as savePref } from '$lib/storage';
+  import { load as loadPref, loadRaw, save as savePref } from '$lib/storage';
   import { useHint, usePageSearch, useProvider, type LauncherItem } from '$lib/launcher.svelte';
 
   type ENode = {
@@ -1064,6 +1064,24 @@
     fitTo: (ids: string[]) => (useWebgl ? largeView?.fitTo(ids) : graphView?.fitTo(ids)),
   };
 
+  // A handle for the performance measurements (ROADMAP item 725), installed only when
+  // `localStorage['sparkles.explore.perfHook']` is '1'. Its members read the page's state
+  // when they are called, so it costs nothing while nobody measures.
+  onMount(() => {
+    if (loadRaw('sparkles.explore.perfHook') !== '1') return;
+    (window as unknown as { __perfHook: unknown }).__perfHook = {
+      nodeCount: () => Object.keys(nodes).length,
+      drawnCount: () => gNodes.length,
+      nodeIds: () => Object.keys(nodes),
+      expand: (id: string) => expand(id),
+      renderer: () => (useWebgl ? 'webgl' : 'cytoscape'),
+      viewport: () => (useWebgl ? largeView?.viewport() : graphView?.viewport()),
+    };
+    return () => {
+      delete (window as unknown as { __perfHook?: unknown }).__perfHook;
+    };
+  });
+
   // --- lenses (docs/specs/U10-canvas-lenses.md) ------------------------------------------
 
   const lenses = new Lenses();
@@ -1822,8 +1840,10 @@
     edges = keep;
     const { [id]: _removed, ...rest } = nodes;
     void _removed;
-    // Drop literal nodes that belonged to the removed node.
-    nodes = Object.fromEntries(Object.entries(rest).filter(([k]) => !k.startsWith(`lit:${id}|`)));
+    // Drop literal nodes and group nodes that belonged to the removed node.
+    nodes = Object.fromEntries(
+      Object.entries(rest).filter(([k, n]) => !k.startsWith(`lit:${id}|`) && n.group?.owner !== id),
+    );
     if (selectedId === id) selectedId = null;
     if (focusId === id) focusId = null;
   }
@@ -2859,6 +2879,7 @@
                   nodes={largeNodes}
                   edges={largeEdges}
                   still={largeSettled}
+                  relayoutBulk
                   onlayout={() => (largeSettled = true)}
                   selected={selectedId}
                   label="Explored graph"
@@ -4542,8 +4563,22 @@
     .side-facets {
       max-height: none;
     }
-    .side-facets :global(.facets) {
+    .side-facets :global(.facets),
+    .side-facets :global(.filters) {
       height: auto;
+    }
+    /* the panels stack under the canvas, each at the height its content needs */
+    .side-facets {
+      min-height: min-content;
+    }
+    /* the toolbars of a phone take most of the row, so the drawn graph gets more of it */
+    .split:not(.overview, .mapmode, .reporting) {
+      grid-template-rows: minmax(560px, 1fr) auto;
+      /* the rows take their content's height and the page scrolls */
+      flex: none;
+    }
+    .split.faceted:not(.overview, .mapmode, .reporting) {
+      grid-template-rows: minmax(560px, 1fr) auto auto;
     }
     .side-facets :global(.fbody) {
       flex: none;

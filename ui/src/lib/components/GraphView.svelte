@@ -1015,6 +1015,11 @@
     if (n && n.nonempty()) cy!.animate({ center: { eles: n }, duration: reduced() ? 0 : 250 });
   }
 
+  /** The pan and zoom, for the performance hook of the pages. */
+  export function viewport() {
+    return cy ? { pan: cy.pan(), zoom: cy.zoom() } : null;
+  }
+
   export function relayout() {
     layout(true);
   }
