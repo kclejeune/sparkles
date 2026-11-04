@@ -16,6 +16,7 @@ import {
   rowsInDom,
   SCROLLER_JS,
   SHOW_MORE,
+  twistyOf,
   thesaurusUrl,
   TREE_ROW,
 } from './adapter';
@@ -185,33 +186,51 @@ test.describe('workbench scroll', () => {
       const cdp = await ctx.newCDPSession(page);
       const r: Record<string, unknown> = { status: 'ok', hub };
       try {
-        // select a child of the largest family, which opens the family in the tree, rather than
-        // the family itself, whose entity frame would list its 100,000 subclass axioms
-        await page.goto(
-          ontologyUrl(BASE, SCROLL_DS, `&iri=${encodeURIComponent(scrollTaxon!.hubChild)}`),
-        );
-        await page.locator(rowOf(scrollTaxon!.hubChild)).first().waitFor({ timeout: LOAD_TIMEOUT });
+        // select the parent of the largest family, so that the tree opens down to it, open it, scroll
+        // to the family and open that. Selecting the family itself would read its entity frame,
+        // which lists its subclass axioms.
+        const path = scrollTaxon!.hubPath;
+        const parent = path[path.length - 2];
+        await page.goto(ontologyUrl(BASE, SCROLL_DS, `&iri=${encodeURIComponent(parent)}`));
+        await page.locator(rowOf(parent)).first().waitFor({ timeout: LOAD_TIMEOUT });
+        if ((await page.locator(rowOf(parent)).first().getAttribute('aria-expanded')) !== 'true')
+          await page.locator(twistyOf(parent)).first().click();
+        for (let i = 0; i < 400 && !(await page.locator(rowOf(hub)).count()); i++) {
+          await page.evaluate(`(() => { const s = ${SCROLLER_JS}; s.scrollTop += 300; })()`);
+          await page.waitForTimeout(30);
+        }
+        await page.locator(twistyOf(hub)).first().click({ timeout: 30_000 });
         const pages: number[] = [];
         // read pages of the hub's children until 10,000 rows are loaded
         for (let i = 0; i < 14; i++) {
-          const rows = await loadedRows(page);
-          if (rows >= 10_000) break;
-          // a virtual tree draws the "Show more" row only when it is in view
-          await page.evaluate(
-            `(() => { const s = ${SCROLLER_JS}; s.scrollTop = s.scrollHeight; })()`,
-          );
-          const more = page.locator(SHOW_MORE).first();
-          await more.waitFor({ timeout: 60_000 }).catch(() => {});
-          if (!(await more.count())) {
+          // let the level that is being read finish, so that the click is not lost
+          let rows = await loadedRows(page);
+          for (let k = 0; k < 100; k++) {
             await page.waitForTimeout(500);
-            if (!(await more.count())) break;
+            const now = await loadedRows(page);
+            if (now === rows) break;
+            rows = now;
           }
+          if (rows >= 10_000) break;
+          // a virtual tree draws the "Show more" row only when it is in view, and a level
+          // that is still being read grows under the scroll, so keep going to the bottom
+          const more = page.locator(SHOW_MORE).first();
+          for (let k = 0; k < 300 && !(await more.count()); k++) {
+            await page.evaluate(
+              `(() => { const s = ${SCROLLER_JS}; s.scrollTop = s.scrollHeight; })()`,
+            );
+            await page.waitForTimeout(200);
+          }
+          if (!(await more.count())) break;
           const t = Date.now();
           await more.click();
-          const until = Date.now() + 60_000;
+          const until = Date.now() + 20_000;
           while ((await loadedRows(page)) <= rows && Date.now() < until)
             await page.waitForTimeout(50);
+          if ((await loadedRows(page)) <= rows) break;
           pages.push(Date.now() - t);
+          if (process.env.PERF_DEBUG)
+            console.log('show more', i, pages.at(-1), await loadedRows(page));
         }
         r.showMoreMs = pages;
         r.rowsLoaded = await loadedRows(page);
