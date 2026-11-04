@@ -646,6 +646,7 @@ fn bounded<T>(
         }),
         partial: false,
         expansion: Default::default(),
+        ..Limits::default()
     };
     let out = f(&limits);
     drop(par);

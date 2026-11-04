@@ -24,9 +24,12 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
-The disjunctive classification rules count. Number restrictions, functional and inverse
-functional properties, disjoint properties and asymmetric properties in an ontology
-without individuals or data properties take part in the consequence-based case analysis,
+The disjunctive classification rules can count, and `Limits::counting` turns it on. It is
+off by default, because counting finishes on no real ontology of the ORE 2015 DL
+development set and only delays the answer, so a default run leaves those axioms out and
+reports them as before. Number restrictions, functional and inverse functional
+properties, disjoint properties and asymmetric properties in an ontology without
+individuals or data properties then take part in the consequence-based case analysis,
 with the equalities of successors, and a run of them equals HermiT on the generated
 counting fixtures that it takes whole. A run that counts stops at 262,144 derived
 conclusions, which `Limits::dl_work` changes, and classifies again without counting,
