@@ -25,7 +25,10 @@ The SvelteKit UI is embedded in the server binary.
   that it shows icons with their names as tooltips, and from 760 pixels down it moves into
   a drawer that the menu button opens, together with the dataset switcher, the status,
   the theme and the account. Choosing a dataset on a page that names one in its address
-  reopens that page on the new dataset.
+  reopens that page on the new dataset. A **Prefixed** or **Full IRIs** switch beside the theme
+  button, also in the palette, chooses how every page writes IRIs. Prefixed names come from
+  the dataset's prefix map together with the conventional prefixes such as `rdf`, `owl`,
+  `skos` and `dcterms`, and the choice is kept per viewer in the browser.
 * The search field is also the command palette. `Ctrl+K` or `Cmd+K` opens it from
   anywhere, including the query editor, and pressing it again closes it. `/` opens it
   outside a text field, except on a page with a search of its own, where `/` focuses that

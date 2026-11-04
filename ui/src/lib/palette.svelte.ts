@@ -6,6 +6,7 @@
 
 import { goto } from '$app/navigation';
 import * as api from './api';
+import { iriForm } from './iri-form.svelte';
 import { app } from './app.svelte';
 import {
   launcher,
@@ -296,6 +297,24 @@ export function shellCommands(
     theme('light', 'light'),
     theme('dark', 'dark'),
     theme('system', 'follow the system'),
+    {
+      id: 'iris.full',
+      label: 'Show full IRIs',
+      group: 'global',
+      icon: 'code',
+      keywords: ['iri', 'prefixed names', 'curie', 'namespace'],
+      active: () => !iriForm.full,
+      run: () => iriForm.set(true),
+    },
+    {
+      id: 'iris.prefixed',
+      label: 'Show prefixed names',
+      group: 'global',
+      icon: 'code',
+      keywords: ['iri', 'prefixed names', 'curie', 'namespace'],
+      active: () => iriForm.full,
+      run: () => iriForm.set(false),
+    },
     {
       id: 'go.settings',
       label: 'Open dataset settings',
