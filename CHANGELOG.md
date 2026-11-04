@@ -429,7 +429,7 @@ A `schema:description` can now lead the page. Logical definition, Synonyms, Labe
 also, Mappings, What links here and In other datasets are sections on the page background with
 headings of one size, and In other datasets no longer shows on a server with no other dataset. It
 also waits for the dataset list, where a page opened directly could say there was none. The counts under the title are one line of text links that leave out zeros, a term
-with no text no longer says so, a concept's labels are rows by kind in place of a table with hidden labels behind their toggle, identifiers say the best name the page has for them with the exact value as their title, and a phone
+with no text no longer says so, a concept's labels are rows by kind in place of a table with hidden labels behind their toggle, identifiers say the best name the page has for them with the exact value as their title, typed literals show their value with a datatype chip, and a phone
 shows Metadata and Hierarchy before Axioms.
 
 Release builds compile `sparkles-owl` as one codegen unit, and each rule set of the EL

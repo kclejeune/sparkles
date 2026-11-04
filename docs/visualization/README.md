@@ -477,7 +477,10 @@ its first `skos:note`. An entity with none of these shows no lead and generates 
 ends with a small chip of the property that states it, such as `rdfs:comment`, which stays with
 the last word of its text, follows the **Prefixed** or **Full IRIs** switch, links to the
 property's page when it has one and shows the full IRI as its title. The same text under two
-predicates is one entry with two chips, and blank lines in a text are paragraphs.
+predicates is one entry with two chips, and blank lines in a text are paragraphs. A typed literal
+anywhere on the page shows its exact lexical form with a small chip of its datatype, such as
+`xsd:date`, before any property chip, and strings and language-tagged texts have none. **Copy**
+still gives Manchester syntax, with `^^` where it needs it.
 
 Under the lead, one wrapping row of quiet disclosures holds what remains, one for each kind that
 has any, with its count and closed at first, such as "In 1 other language", "1 more definition",

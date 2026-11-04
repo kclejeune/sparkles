@@ -773,6 +773,56 @@ test('the header writes the IRI as the switch says and copies it in full', async
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(none);
 });
 
+test('typed literals read as their value with a datatype chip, and copy as syntax', async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(HEAVY);
+  const axioms = page.getByRole('region', { name: 'Axioms' });
+  const sub = axioms.locator('[data-section="sub"]');
+  await expect(sub).toContainText('first seen', { timeout: 30_000 });
+  const chip = (scope: Locator, name: string) => scope.locator('.datatype', { hasText: name });
+  await expect(chip(sub, 'xsd:date')).toHaveAttribute(
+    'title',
+    'http://www.w3.org/2001/XMLSchema#date',
+  );
+  await expect(chip(sub, 'xsd:integer')).toHaveCount(1);
+  await expect(chip(sub, 'xsd:date').locator('.sr-only')).toHaveText('datatype');
+  await expect(sub).toContainText('2026-10-01');
+  // Metadata shows its created date exactly, with its chip
+  const facts = page.getByRole('region', { name: 'Metadata' });
+  await expect(facts.locator('dd', { hasText: '2026-10-01' }).locator('.datatype')).toHaveText(
+    /xsd:date/,
+  );
+  // the other statements: typed ones have a chip and a string has none
+  await page.getByText('All other statements').click();
+  const other = page.locator('details.ann');
+  await expect(
+    other.locator('tr', { hasText: '2026-10-02T09:30:00Z' }).locator('.datatype'),
+  ).toHaveText(/xsd:dateTime/);
+  await expect(other.locator('tr', { hasText: 'reviewCount' }).locator('.datatype')).toHaveText(
+    /xsd:integer/,
+  );
+  await expect(other.locator('tr', { hasText: 'a plain string' }).locator('.datatype')).toHaveCount(
+    0,
+  );
+  // nothing rendered shows the syntax
+  for (const s of await page.locator('details[data-more] > summary').all()) await s.click();
+  const shown = await page.locator('.browse').evaluate((el) => {
+    const c = el.cloneNode(true) as HTMLElement;
+    c.querySelectorAll('.other code').forEach((x) => x.remove());
+    return c.textContent ?? '';
+  });
+  expect(shown).not.toContain('^^');
+  // the Copy button's Manchester text stays valid syntax
+  await axioms.getByRole('button', { name: /Copy/ }).click();
+  const copied = await page.evaluate(() => navigator.clipboard.readText());
+  expect(copied).toContain('"2026-10-01"^^xsd:date');
+  expect(copied).not.toContain('datatype');
+});
+
 test('a concept keeps its hidden labels behind their toggle', async ({ page }) => {
   const concept = (l: string) =>
     `/ui/browse?ds=thes&iri=${encodeURIComponent(`http://example.org/thesaurus/${l}`)}`;

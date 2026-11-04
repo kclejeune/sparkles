@@ -53,6 +53,7 @@
     {v}
     {linker}
     {curieIri}
+    {prefixes}
     showLang={foreign(v)}
   />&nbsp;<PredicateName {predicates} {prefixes} href={predicateHref} />
 {/snippet}

@@ -16,6 +16,7 @@ import {
   localFromLabel,
   manchesterTokens,
   litText,
+  literalDatatype,
   manchester,
   manchesterName,
   mintIri,
@@ -654,5 +655,34 @@ describe('the label query of the individuals', () => {
     expect(notIn).not.toContain('NamedIndividual');
     expect(notIn).toContain('owl#Class');
     expect(notIn).toContain('owl#ObjectProperty');
+  });
+});
+
+describe('typed literals', () => {
+  const X = 'http://www.w3.org/2001/XMLSchema#';
+  const RDF_LANG = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#langString';
+  const p = { xsd: X };
+  it('names a datatype but for strings, language-tagged literals and other values', () => {
+    expect(literalDatatype({ '@value': '5', '@type': X + 'integer' })).toBe(X + 'integer');
+    expect(literalDatatype({ '@value': 'a', '@type': X + 'string' })).toBeNull();
+    expect(literalDatatype({ '@value': 'a', '@type': RDF_LANG })).toBeNull();
+    expect(literalDatatype({ '@value': 'a', '@language': 'en', '@type': RDF_LANG })).toBeNull();
+    expect(literalDatatype({ '@value': 'a' })).toBeNull();
+    expect(literalDatatype('http://x/iri')).toBeNull();
+  });
+  it('gives the token the exact lexical form and keeps its text valid syntax', () => {
+    const [date] = manchesterTokens({ '@value': '2026-10-01', '@type': X + 'date' }, String, p);
+    expect(date).toMatchObject({
+      text: '"2026-10-01"^^xsd:date',
+      value: '2026-10-01',
+      datatype: X + 'date',
+    });
+    // an integer writes bare and still has its datatype, in its own spelling
+    const [n] = manchesterTokens({ '@value': '+05', '@type': X + 'integer' }, String, p);
+    expect(n).toMatchObject({ text: '+05', value: '+05', datatype: X + 'integer' });
+    const [s] = manchesterTokens({ '@value': 'a', '@type': X + 'string' }, String, p);
+    expect(s).toEqual({ text: '"a"', role: 'lit' });
+    const [l] = manchesterTokens({ '@value': 'a', '@language': 'fr' }, String, p);
+    expect(l).toEqual({ text: '"a"@fr', role: 'lit' });
   });
 });

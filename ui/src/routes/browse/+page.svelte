@@ -42,6 +42,7 @@
     usedQuery,
     type AxiomInput,
     type ParseAs,
+    literalDatatype,
   } from '$lib/ontology';
   import {
     detailsQuery,
@@ -119,6 +120,7 @@
   import TermInfobox from '$components/browse/TermInfobox.svelte';
   import TermLabels from '$components/browse/TermLabels.svelte';
   import AxiomProse from '$components/browse/AxiomProse.svelte';
+  import DatatypeChip from '$components/browse/DatatypeChip.svelte';
   import TermAxioms from '$components/browse/TermAxioms.svelte';
   import StatChips from '$components/StatChips.svelte';
   import LeadBlock from '$components/browse/LeadBlock.svelte';
@@ -1558,6 +1560,7 @@
                   <TermSynonyms
                     synonyms={synonymRows}
                     {linker}
+                    {prefixes}
                     typeName={(i) => typeLabels.get(i) ?? synonymTypeName(i, term?.names)}
                   />
                   <TermLabels labels={sections.labels} />
@@ -1625,7 +1628,12 @@
               />
             {/if}
             <!-- the sections about the entity's links, each its own at the page's one heading size -->
-            <TermXrefs seeAlso={sections.seeAlso} mappings={sections.mappings} {linker} />
+            <TermXrefs
+              seeAlso={sections.seeAlso}
+              mappings={sections.mappings}
+              {linker}
+              {prefixes}
+            />
             <TermUsage
               iri={term.iri}
               groups={mentions}
@@ -1664,8 +1672,11 @@
                             <th scope="row" class="mono">{iriName(o.property, prefixes)}</th>
                             <td>
                               {#each o.values as v, i (i)}{#if i > 0}<br
-                                  />{/if}{#if isLiteral(v)}{v['@value']}{#if v['@language']}<span
-                                      class="lang-tag">{v['@language']}</span
+                                  />{/if}{#if isLiteral(v)}{v['@value']}<DatatypeChip
+                                    iri={literalDatatype(v)}
+                                    {prefixes}
+                                  />{#if v['@language']}<span class="lang-tag"
+                                      >{v['@language']}</span
                                     >{/if}{:else if linker.href(v)}<a href={linker.href(v)}
                                     >{linker.name(v)}</a
                                   >{:else}<span class="mono">{v}</span>{/if}{/each}
@@ -1682,7 +1693,7 @@
         {/if}
         <div class="b-side" data-col="side">
           <div class="b-info">
-            <TermInfobox rows={infoRows} {linker} heading="Metadata">
+            <TermInfobox rows={infoRows} {linker} {prefixes} heading="Metadata">
               {#snippet footer()}
                 <TermIdentifiers
                   xrefs={sections!.xrefs}

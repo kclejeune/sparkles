@@ -2,7 +2,9 @@
   // One annotation value with its language and the sources its axiom annotations name,
   // such as a GO synonym with `GOC:al`.
   import { isLiteral, valueText, type Linker, type Sourced } from '$lib/browse';
-  import { localName } from '$lib/rdf';
+  import { literalDatatype } from '$lib/ontology';
+  import { localName, WELL_KNOWN, type PrefixMap } from '$lib/rdf';
+  import DatatypeChip from './DatatypeChip.svelte';
   import LinkedText from './LinkedText.svelte';
 
   let {
@@ -11,6 +13,7 @@
     curieIri,
     showLang = true,
     typeName = localName,
+    prefixes = WELL_KNOWN,
   }: {
     v: Sourced;
     linker: Linker;
@@ -18,6 +21,7 @@
     showLang?: boolean;
     /** What a synonym type is called, after the value as a chip. */
     typeName?: (iri: string) => string;
+    prefixes?: PrefixMap;
   } = $props();
   const iriHref = $derived(isLiteral(v.value) ? null : linker.href(v.value as string));
 </script>
@@ -28,7 +32,8 @@
       text={valueText(v.value)}
       {linker}
       {curieIri}
-    />{/if}{#if showLang && v.lang}<span class="lang-tag">{v.lang}</span
+    /><DatatypeChip iri={literalDatatype(v.value)} {prefixes} />{/if}{#if showLang && v.lang}<span
+      class="lang-tag">{v.lang}</span
     >{/if}{#each v.types ?? [] as t (t)}<span class="badge syn-type" title={t}>{typeName(t)}</span
     >{/each}{#if v.sources.length}<span class="src">{v.sources.join(', ')}</span>{/if}</span
 >

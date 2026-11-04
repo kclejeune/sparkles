@@ -524,7 +524,8 @@ and Replaces stays a smaller group within What links here. In other datasets wai
 dataset list and for its answers, and a server with no other dataset has no such section. Counts of
 zero are hidden, a term with no text shows no line about it, and a concept's labels are rows by
 kind in place of a table, with hidden labels behind their toggle. Identifiers say the best name the
-page already has for them, and keep the exact value as their title. A phone puts Metadata and Hierarchy before Axioms.
+page already has for them, and keep the exact value as their title. Typed literals show their exact value with a datatype chip,
+and copied Manchester text keeps its syntax. A phone puts Metadata and Hierarchy before Axioms.
 
 **Remaining work.** Inferred axioms and hierarchies beyond the card's click are items 622 and
 726, search at a past state item 658, rendering preferences item 625, metrics item 621

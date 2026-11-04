@@ -1160,6 +1160,17 @@ export function litText(l: Lit, prefixes: PrefixMap): string {
   return `${v}^^${shorten(t, prefixes) ?? `<${t}>`}`;
 }
 
+/**
+ * The datatype a rendered literal names: any but `xsd:string` and `rdf:langString`, which read as
+ * plain text, and none for a language-tagged literal or a value that is no literal.
+ */
+export function literalDatatype(v: unknown): string | null {
+  if (!isLit(v) || v['@language']) return null;
+  const t = v['@type'];
+  if (!t || t === XSD + 'string') return null;
+  return t === 'http://www.w3.org/1999/02/22-rdf-syntax-ns#langString' ? null : t;
+}
+
 /** The words of Manchester syntax that a name written bare would be read as. */
 export const MANCHESTER_KEYWORDS = [
   'and',
@@ -1226,6 +1237,11 @@ export type ManchesterToken = {
   text: string;
   role: 'kw' | 'name' | 'lit' | 'punct' | 'space' | 'bnode';
   iri?: string;
+  /** A typed literal's exact lexical form, for a page that shows `datatype` as a chip. `text`
+   * stays valid Manchester syntax for everything that reads the tokens as text. */
+  value?: string;
+  /** A typed literal's datatype IRI, as `literalDatatype` chooses it. */
+  datatype?: string;
 };
 
 /**
@@ -1270,7 +1286,12 @@ export function manchesterTokens(
     return out;
   }
   if (isLit(e)) {
-    out.push({ text: litText(e, prefixes), role: 'lit' });
+    const datatype = literalDatatype(e);
+    out.push({
+      text: litText(e, prefixes),
+      role: 'lit',
+      ...(datatype ? { value: e['@value'], datatype } : {}),
+    });
     return out;
   }
   if (!e || typeof e !== 'object') {

@@ -2,15 +2,20 @@
   // The links of an entity that are not identifiers: `rdfs:seeAlso` and `rdfs:isDefinedBy`,
   // and the five SKOS mapping relations. TermIdentifiers shows the `oboInOwl:hasDbXref` ones.
   import { valueText, isLiteral, type Linker, type Sections } from '$lib/browse';
+  import { literalDatatype } from '$lib/ontology';
+  import { WELL_KNOWN, type PrefixMap } from '$lib/rdf';
+  import DatatypeChip from './DatatypeChip.svelte';
 
   let {
     seeAlso,
     mappings,
     linker,
+    prefixes = WELL_KNOWN,
   }: {
     seeAlso: Sections['seeAlso'];
     mappings: Sections['mappings'];
     linker: Linker;
+    prefixes?: PrefixMap;
   } = $props();
   const external = (v: string) => /^https?:\/\//.test(v);
 </script>
@@ -28,7 +33,7 @@
             <a href={v} rel="noopener noreferrer" target="_blank">{v}</a>
           {:else}
             <span>{v}</span>
-          {/if}
+          {/if}<DatatypeChip iri={literalDatatype(s.value)} {prefixes} />
         </li>
       {/each}
     </ul>

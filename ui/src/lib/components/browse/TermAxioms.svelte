@@ -5,6 +5,7 @@
   // functional-style syntax, and a copy of the whole frame as Manchester text. A class also
   // shows what the dataset's kept classification infers of it and no axiom asserts. A class
   // with neither asserted nor inferred axioms shows no card.
+  import DatatypeChip from './DatatypeChip.svelte';
   import {
     classifiedHere,
     classifyAbout,
@@ -133,8 +134,10 @@
           class="builtin"
           title={t.iri}>{linker.name(t.iri)}</span
         >{/if}{:else if t.role === 'kw'}<span class="kw">{t.text}</span
-      >{:else if t.role === 'lit'}<span class="lit">{t.text}</span
-      >{:else}{t.text}{/if}{/each}{/snippet}
+      >{:else if t.role === 'lit'}<span class="lit">{t.value ?? t.text}</span><DatatypeChip
+        iri={t.datatype ?? null}
+        {prefixes}
+      />{:else}{t.text}{/if}{/each}{/snippet}
 
 {#snippet name(i: string)}{#if linker.href(i)}<a href={linker.href(i)} title={i}>{nameOf(i)}</a
     >{:else}<span class="builtin" title={i}>{nameOf(i)}</span>{/if}{/snippet}

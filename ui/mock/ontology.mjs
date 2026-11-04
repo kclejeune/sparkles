@@ -123,6 +123,8 @@ export const CELLS_TURTLE = `
 obo:IAO_0000115 a owl:AnnotationProperty ; rdfs:label "definition"@en .
 oboInOwl:hasExactSynonym a owl:AnnotationProperty . oboInOwl:hasRelatedSynonym a owl:AnnotationProperty .
 oboInOwl:hasDbXref a owl:AnnotationProperty . oboInOwl:hasSynonymType a owl:AnnotationProperty .
+cl:markerCount a owl:DatatypeProperty ; rdfs:label "marker count"@en .
+cl:firstSeen a owl:DatatypeProperty ; rdfs:label "first seen"@en .
 cl:PLURAL a owl:AnnotationProperty ; rdfs:label "plural"@en .
 cl:ABBREVIATION a owl:AnnotationProperty .
 obo:BFO_0000050 a owl:ObjectProperty ; rdfs:label "part of"@en .
@@ -217,6 +219,12 @@ Note: this text was written for a test fixture and is not taken from a published
   oboInOwl:hasRelatedSynonym "meningeal macrophage"@en , "perivascular macrophage"@en , "choroid plexus macrophage"@en ;
   oboInOwl:hasDbXref "PMID:00000011" , "PMID:00000012" , "FMA:00002" , "MESH:D000001" , "NCIT:C00001" , "Wikipedia:Border-associated_macrophage" ,
     obo:CL_0009006 , <https://en.wikipedia.org/wiki/Foam_cell> ;
+  dcterms:created "2026-10-01"^^xsd:date ;
+  cl:reviewedOn "2026-10-02T09:30:00Z"^^xsd:dateTime ;
+  cl:reviewCount "5"^^xsd:integer ;
+  cl:reviewNote "a plain string"^^xsd:string ;
+  rdfs:subClassOf [ a owl:Restriction ; owl:onProperty cl:markerCount ; owl:hasValue "3"^^xsd:integer ] ,
+    [ a owl:Restriction ; owl:onProperty cl:firstSeen ; owl:hasValue "2026-10-01"^^xsd:date ] ;
   rdfs:seeAlso <http://example.org/reviews/brain-macrophages> .
 obo:CL_0009002 a owl:Class ; rdfs:subClassOf obo:CL_0009001 ; rdfs:label "meningeal macrophage"@en .
 obo:CL_0009003 a owl:Class ; rdfs:subClassOf obo:CL_0009001 ; rdfs:label "choroid plexus macrophage"@en .
