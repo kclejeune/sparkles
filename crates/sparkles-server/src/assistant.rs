@@ -880,8 +880,8 @@ impl AskAbout {
     }
 }
 
-/// The most graphs an answer's access record lists. A view over more graphs keeps no
-/// footprint, and only unrestricted readers see that answer again.
+/// The most graphs an answer's access record lists, of each kind. A view over more
+/// graphs keeps no footprint, and only unrestricted readers see that answer again.
 pub const MAX_ACCESS_GRAPHS: usize = 512;
 
 /// What an ask could read, so that its stored answer is shown again only to a reader
@@ -896,23 +896,35 @@ pub struct AnswerAccess {
     pub footprint: Option<crate::graphrag::guard::Footprint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guarded: Vec<String>,
+    /// the protections in force on `guarded` for the asker, which a reader must match
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guarded_footprint: Option<crate::graphrag::guard::Footprint>,
     /// the branch the ask read, `main` when absent
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
 }
 
-/// The access record of an ask over `snap`, read through `view` (`None`:
-/// unrestricted) by `principal`.
+/// The access record of an ask over `snap`, the state its answer read (`None` when
+/// that state cannot be opened, which keeps no footprint), read through `view`
+/// (`None`: unrestricted) by `principal`.
 pub fn answer_access(
-    snap: &Arc<sparkles::store::Snapshot>,
+    snap: Option<&Arc<sparkles::store::Snapshot>>,
     view: Option<&Arc<sparkles::access::GraphAccess>>,
     caller: &sparkles::access::Caller,
     dataset: &str,
     branch: Option<&str>,
     principal: &str,
 ) -> AnswerAccess {
-    use crate::graphrag::guard::{CaptureInput, capture};
+    use crate::graphrag::guard::{CaptureInput, capture, capture_guarded};
     use crate::graphrag::settings::is_guarded;
+    let Some(snap) = snap else {
+        return AnswerAccess {
+            footprint: None,
+            guarded: Vec::new(),
+            guarded_footprint: None,
+            branch: branch.map(str::to_string),
+        };
+    };
     let bound = view.map(|v| v.bound(snap));
     let mut graphs = vec!["default".to_string()];
     let mut guarded = Vec::new();
@@ -939,26 +951,39 @@ pub fn answer_access(
     if bound.as_ref().is_some_and(|v| !v.read.allows(None)) {
         graphs.retain(|g| g != "default");
     }
-    guarded.truncate(MAX_ACCESS_GRAPHS);
-    let footprint = (describable && graphs.len() <= MAX_ACCESS_GRAPHS)
-        .then(|| {
-            capture(&CaptureInput {
-                dataset,
-                branch: branch.unwrap_or(sparkles::branch::MAIN),
-                source_commit: snap.commit,
-                principal,
-                endpoint: "query",
-                view: bound.as_deref(),
-                caller,
-                graphs: &graphs,
-                reports: &[],
-            })
-            .ok()
-        })
-        .flatten();
+    let cap = |graphs: &[String], of_guarded: bool| {
+        let i = CaptureInput {
+            dataset,
+            branch: branch.unwrap_or(sparkles::branch::MAIN),
+            source_commit: snap.commit,
+            principal,
+            endpoint: "query",
+            view: bound.as_deref(),
+            caller,
+            graphs,
+            reports: &[],
+        };
+        if of_guarded {
+            capture_guarded(&i).ok()
+        } else {
+            capture(&i).ok()
+        }
+    };
+    // past either bound, or with protections a footprint cannot name, the record keeps
+    // no footprint: dropping a graph would let a narrower reader see what it informed
+    let fits =
+        describable && graphs.len() <= MAX_ACCESS_GRAPHS && guarded.len() <= MAX_ACCESS_GRAPHS;
+    let footprint = if fits { cap(&graphs, false) } else { None };
+    let guarded_footprint = if fits && !guarded.is_empty() {
+        cap(&guarded, true)
+    } else {
+        None
+    };
+    let complete = guarded.is_empty() || guarded_footprint.is_some();
     AnswerAccess {
-        footprint,
-        guarded,
+        footprint: footprint.filter(|_| complete),
+        guarded: if fits { guarded } else { Vec::new() },
+        guarded_footprint,
         branch: branch.map(str::to_string),
     }
 }
@@ -980,13 +1005,21 @@ pub fn answer_visible(
     if covers(bound.as_deref(), fp) != Decision::Proven {
         return false;
     }
-    a.guarded.iter().all(|g| {
+    // the guarded graphs it read: each readable, under the protections the asker had
+    if a.guarded.is_empty() {
+        return true;
+    }
+    let readable = a.guarded.iter().all(|g| {
         bound.as_ref().is_none_or(|v| {
             v.read.allows(Some(&oxrdf::Term::NamedNode(
                 oxrdf::NamedNode::new_unchecked(g),
             )))
         })
-    })
+    });
+    readable
+        && a.guarded_footprint
+            .as_ref()
+            .is_some_and(|g| covers(bound.as_deref(), g) == Decision::Proven)
 }
 
 /// The most characters of a stored text, and the most items of a stored list.
@@ -1044,9 +1077,9 @@ pub fn stored_answer(out: &Value, ground: &Value) -> Option<Value> {
         }
         put("summary", Some(sum));
     }
-    let g = &out["global"];
-    if g.is_object() {
-        let points = cut_list(&g["points"], |p| {
+    // a global answer's points and reports sit beside its `global` selection
+    if out["global"].is_object() || out["points"].is_array() {
+        let points = cut_list(&out["points"], |p| {
             Some(json!({
                 "n": p["n"].as_u64()?,
                 "text": cut(&p["text"])?,
@@ -1054,6 +1087,11 @@ pub fn stored_answer(out: &Value, ground: &Value) -> Option<Value> {
             }))
         });
         let mut gl = json!({ "points": points.unwrap_or(json!([])) });
+        if let Some(r) = cut_list(&out["reports"], |r| {
+            Some(json!({ "iri": cut(&r["iri"])?, "title": cut(&r["title"]) }))
+        }) {
+            gl["reports"] = r;
+        }
         if let Some(u) = cut_list(&s["uncitedSentences"], cut) {
             gl["uncitedSentences"] = u;
         }
@@ -1542,9 +1580,10 @@ async fn list_asks(
                 // C18 §6.4: the answer only to a reader whose view covers what it read,
                 // and a global answer's text only while its reports are readable
                 if r.answer.is_some() {
-                    let view = reader_view(&p, &ds.name, &opts, r.access.as_ref());
-                    let visible =
-                        !reports_hidden && answer_visible(r.access.as_ref(), view.as_ref(), &snap);
+                    let visible = !reports_hidden
+                        && reader_view(&st, &ds, &p, &opts, &snap, r.access.as_ref()).is_some_and(
+                            |(view, snap)| answer_visible(r.access.as_ref(), view.as_ref(), &snap),
+                        );
                     if !visible {
                         r.answer = None;
                     }
@@ -1565,32 +1604,76 @@ async fn list_asks(
     .await
 }
 
-/// A record as `GET /$/asks/{ds}` gives it: always with its thread, never with what
-/// its answer read.
+/// A record as `GET /$/asks/{ds}` gives it: always with its thread and the branch it
+/// read when that was not main, never with what its answer read.
 fn record_json(r: &AskRecord) -> Value {
     let mut v = serde_json::to_value(r).unwrap_or_default();
     if let Some(o) = v.as_object_mut() {
         o.remove("access");
         o.insert("thread".into(), r.thread_id().into());
+        if let Some(b) = r
+            .access
+            .as_ref()
+            .and_then(|a| a.branch.as_deref())
+            .filter(|b| *b != sparkles::branch::MAIN)
+        {
+            o.insert("branch".into(), b.into());
+        }
     }
     v
 }
 
-/// The reader's view of the branch a record's answer read (`None`: unrestricted).
+/// The reader's view of the branch a record's answer read (`None` in it:
+/// unrestricted), with that branch's current state, or `None` when the reader may not
+/// query the branch or it cannot be opened, which withholds the answer.
 #[cfg_attr(not(feature = "auth"), allow(unused_variables))]
+#[allow(clippy::type_complexity)]
 fn reader_view(
+    st: &AppState,
+    ds: &Arc<Dataset>,
     p: &Principal,
-    ds: &str,
     opts: &sparkles::sparql::QueryOptions,
+    snap: &Arc<sparkles::store::Snapshot>,
     access: Option<&AnswerAccess>,
-) -> Option<Arc<sparkles::access::GraphAccess>> {
+) -> Option<(
+    Option<Arc<sparkles::access::GraphAccess>>,
+    Arc<sparkles::store::Snapshot>,
+)> {
+    let branch = access
+        .and_then(|a| a.branch.as_deref())
+        .filter(|b| *b != sparkles::branch::MAIN);
+    let Some(b) = branch else {
+        #[cfg(feature = "auth")]
+        if st.auth.is_some()
+            && !p.can_at(
+                &ds.name,
+                crate::auth::Endpoint::Query,
+                crate::auth::Level::Read,
+            )
+        {
+            return None;
+        }
+        return Some((opts.graphs.clone(), snap.clone()));
+    };
+    let target = st.branch_dataset(ds, b).ok()?;
+    let snap = target.store.snapshot();
     #[cfg(feature = "auth")]
-    if let Some(b) = access.and_then(|a| a.branch.as_deref())
-        && b != sparkles::branch::MAIN
     {
-        return p.view(&format!("{ds}@{b}"), crate::auth::Endpoint::Query);
+        let name = format!("{}@{b}", ds.name);
+        // an ungranted branch has no view, which is not an unrestricted one
+        if st.auth.is_some()
+            && !p.can_at(
+                &name,
+                crate::auth::Endpoint::Query,
+                crate::auth::Level::Read,
+            )
+        {
+            return None;
+        }
+        return Some((p.view(&name, crate::auth::Endpoint::Query), snap));
     }
-    opts.graphs.clone()
+    #[cfg(not(feature = "auth"))]
+    Some((opts.graphs.clone(), snap))
 }
 
 async fn delete_asks(

@@ -2074,10 +2074,18 @@ an answer. A history file the server cannot read answers `409` on the list and d
 routes and is left unchanged, instead of being replaced by a new history.
 
 A stored answer was written from the asker's view, so the record keeps an access
-footprint of the graphs the answer read, the guarded graphs among them and the branch.
-`GET /$/asks/{ds}` returns the answer only when the caller's current view, built with
-the same grants and masking as a query, covers that footprint and can read every guarded
-graph, and otherwise returns the record with `answerWithheld` and no answer. This is the
+footprint of the graphs the answer read in the one state every step of the ask read, a
+second footprint
+of the guarded reports graphs with their protections, and the branch. `GET /$/asks/{ds}`
+returns the answer only when the caller may query that branch and its current view of
+it, built with the same grants and masking as a query, covers both footprints, and
+otherwise returns the record with `answerWithheld` and no answer. An ask at the head
+whose head moved while it ran, a pinned state that cannot be opened again, a branch that
+is gone and a view over more than 512 graphs of either kind all fail closed, so that
+only unrestricted readers see such an answer again. Pages lend their branch and state to
+the questions asked on them whether or not a resource is chosen, and the browser keeps
+one thread per person and dataset and drops responses that arrive after either
+changed. This is the
 rule C22 §6.6 applies to the cleared global text. The route filters by `thread`, oldest
 first within a thread. Rows stay off the server, and **Show rows** reruns the stored
 query read-only at its commit, falling back to the head with a note when the commit is

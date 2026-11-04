@@ -4908,6 +4908,10 @@ export interface components {
                             reports?: string[];
                             text: string;
                         }[];
+                        reports?: {
+                            iri: string;
+                            title?: string;
+                        }[];
                         uncitedSentences?: string[];
                     };
                     graph?: {
@@ -4931,6 +4935,8 @@ export interface components {
                 answerWithheld?: boolean;
                 /** Format: date-time */
                 at: string;
+                /** @description The branch the ask read, when it was not `main`. */
+                branch?: string;
                 commit?: number;
                 id: string;
                 /** @enum {string} */

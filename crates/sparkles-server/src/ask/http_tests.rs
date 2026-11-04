@@ -846,3 +846,63 @@ async fn newer_or_damaged_history_is_refused_and_kept() {
         assert_eq!(raw_history(&st), file, "pruning leaves the file");
     }
 }
+
+/// C18 §6.4: a stored answer keeps a footprint only for one state that every read of
+/// the ask saw. A write while the ask reads the head leaves the record without one, so
+/// only unrestricted readers see that answer again (round 2, finding 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_head_that_moves_during_an_ask_keeps_no_footprint() {
+    let shared: Arc<std::sync::OnceLock<Arc<AppState>>> = Arc::default();
+    let write = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let m = {
+        let shared = shared.clone();
+        let write = write.clone();
+        MockModel::start(move |r, _| {
+            if !is_summary(r)
+                && write.load(std::sync::atomic::Ordering::SeqCst)
+                && let Some(st) = shared.get()
+            {
+                st.get("org")
+                    .unwrap()
+                    .store
+                    .load(&[Source::from_bytes(
+                        b"<urn:x> <urn:p> <urn:y> .".to_vec(),
+                        RdfFormat::NTriples,
+                        None,
+                    )])
+                    .unwrap();
+            }
+            if is_summary(r) {
+                return (
+                    200,
+                    mock::openai(&json!({ "text": "Teams [1].", "citations": [1] }).to_string()),
+                );
+            }
+            (200, mock::openai(&draft(EASY)))
+        })
+    };
+    let (st, app) = app(
+        [&m.url(), &m.url(), &m.url()],
+        json!({ "draft": [pair("cheap")], "summarize": [pair("cheap")] }),
+    );
+    shared.set(st.clone()).ok();
+    put_settings(&app, json!({ "enabled": true, "send": "rows" })).await;
+    let (s, _) = ask_json(&app, json!({ "question": "Which teams are there?" })).await;
+    assert_eq!(s, StatusCode::OK);
+    write.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (s, _) = ask_json(&app, json!({ "question": "Which teams now?" })).await;
+    assert_eq!(s, StatusCode::OK);
+    let raw = raw_history(&st);
+    let asks = raw["asks"].as_array().unwrap();
+    let of = |q: &str| asks.iter().find(|r| r["question"] == q).unwrap().clone();
+    assert!(
+        of("Which teams are there?")["access"]["footprint"].is_object(),
+        "{raw}"
+    );
+    assert!(
+        of("Which teams now?")["access"]
+            .get("footprint")
+            .is_none_or(|f| f.is_null()),
+        "{raw}"
+    );
+}

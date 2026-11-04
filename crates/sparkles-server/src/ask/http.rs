@@ -312,6 +312,33 @@ async fn ask_route(
     let server = crate::mcp::McpServer::new(st.clone(), cfg);
     // the ground event's linked entities and communities, for the stored answer
     let ground = Arc::new(parking_lot::Mutex::new(Value::Null));
+    // the state the ask reads: grounding, the query and reports all resolve `at` to it,
+    // or read the head, which must not move while they do (C18 §6.4)
+    let target = o
+        .branch
+        .as_deref()
+        .filter(|b| *b != sparkles::branch::MAIN)
+        .and_then(|b| st.branch_dataset(&ds, b).ok())
+        .unwrap_or_else(|| ds.clone());
+    let at_of = |v: &Value| -> Option<sparkles::history::At> {
+        match v {
+            Value::String(s) => s.parse().ok(),
+            Value::Number(n) => n.as_u64().map(sparkles::history::At::Commit),
+            _ => None,
+        }
+    };
+    let (start, moving) = match o.at.as_ref().map(at_of) {
+        None | Some(Some(sparkles::history::At::Head)) => (Some(target.store.snapshot()), true),
+        Some(Some(a)) => (
+            target
+                .store
+                .snapshot_at(&a, &Default::default())
+                .ok()
+                .map(|(s, _)| s),
+            false,
+        ),
+        Some(None) => (None, false),
+    };
     let finish = {
         let st = st.clone();
         let ds = ds.clone();
@@ -326,18 +353,22 @@ async fn ask_route(
             st.asks.add_tokens(&ds.name, &me, tokens);
             st.asks
                 .record(&id, assistant::recent_of(&ds.name, &me, out), &out["usage"]);
-            // what the answer could read, from the asker's view of the snapshot now
-            let target = branch
-                .as_deref()
-                .filter(|b| *b != sparkles::branch::MAIN)
-                .and_then(|b| st.branch_dataset(&ds, b).ok())
-                .unwrap_or_else(|| ds.clone());
+            // what the answer could read, from the asker's view of that state
             let view_name = match branch.as_deref().filter(|b| *b != sparkles::branch::MAIN) {
                 Some(b) => format!("{}@{b}", ds.name),
                 None => ds.name.clone(),
             };
+            // one state for every read: the pinned one, or a head that did not move while
+            // the ask read it, and the result's commit, if any, is that state's; otherwise
+            // the record keeps no footprint
+            let read = start.clone().filter(|s| {
+                (!moving || target.store.snapshot().commit == s.commit)
+                    && out["result"]["commit"]
+                        .as_u64()
+                        .is_none_or(|c| c == s.commit)
+            });
             let access = assistant::answer_access(
-                &target.store.snapshot(),
+                read.as_ref(),
                 principal
                     .view(&view_name, crate::auth::Endpoint::Query)
                     .as_ref(),

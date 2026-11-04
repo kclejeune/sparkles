@@ -14118,22 +14118,27 @@ clarification or error, and the linked entities and community reports. Rows are 
 stored. Each caller sees and removes only their own entries.
 
 An answer can repeat data from the graphs its ask read, so the entry also records what
-the asker's view read, as the disclosure footprint of
-[GraphRAG community reports](#graphrag) does. `GET` lists the `answer` only
-while the caller's current view reads every one of those graphs with the same protections
-in force, and otherwise lists the entry with `answerWithheld: true` and without the
-answer. A caller whose view is unrestricted always sees it. A global answer's text is
-also withheld while its reports graph is not proven for the caller.
+the asker's view read in the one state every step of the ask read, as the disclosure footprint of
+[GraphRAG community reports](#graphrag) does, with the reports graphs and their
+protections apart. `GET` lists the `answer` only while the caller may query the branch
+the ask read and the caller's current view of it reads every one of those graphs with
+the same protections in force. Otherwise it lists the entry with `answerWithheld: true`
+and without the answer. A caller whose view is unrestricted sees it unless the branch is
+gone. An entry records no footprint when its ask read the head and the head moved while
+it ran, when its pinned state can no longer be opened, or when its view read more than
+512 named graphs or 512 reports graphs, and then only unrestricted callers see its
+answer. A global answer's text is also withheld while its reports graph is not
+proven for the caller. An entry of a branch other than `main` lists that `branch`.
 
 A thread groups an ask and its follow-ups. The first ask of a thread names none, and its
 own id becomes the thread's `threadId`, which the `usage` event and the JSON answer of
 `POST /{ds}/ask` carry. A follow-up sends it back as `thread`. An entry kept before
 threads is the thread of its own id.
 
-`asks.json` is format 2, and format 1 still reads. A file of a newer format, or one this
-server cannot parse, is refused with `409` (`unsupported-format` or
-`unreadable-history`) on every route, and no ask, feedback, delete or prune writes over
-it.
+`asks.json` is format 2, and format 1 still reads. The list and delete routes refuse a
+file of a newer format, or one this server cannot parse, with `409`
+(`unsupported-format` or `unreadable-history`). An ask still answers and feedback on a
+recent ask still counts, but neither they nor the hourly prune write over such a file.
 
 | Method and path | Needs | Effect |
 |---|---|---|

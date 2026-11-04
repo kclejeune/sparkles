@@ -1507,6 +1507,23 @@
                           },
                           "type": "array"
                         },
+                        "reports": {
+                          "items": {
+                            "properties": {
+                              "iri": {
+                                "type": "string"
+                              },
+                              "title": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "iri"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
                         "uncitedSentences": {
                           "items": {
                             "type": "string"
@@ -1586,6 +1603,10 @@
                 },
                 "at": {
                   "format": "date-time",
+                  "type": "string"
+                },
+                "branch": {
+                  "description": "The branch the ask read, when it was not `main`.",
                   "type": "string"
                 },
                 "commit": {
