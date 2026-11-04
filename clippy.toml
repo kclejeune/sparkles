@@ -1,0 +1,5 @@
+# The release artifacts link against glibc 2.28 (manylinux_2_28), which has no gettid
+# wrapper. libc::syscall(libc::SYS_gettid) works on every glibc.
+disallowed-methods = [
+  { path = "libc::gettid", reason = "glibc before 2.30 has no gettid; use libc::syscall(libc::SYS_gettid)" },
+]

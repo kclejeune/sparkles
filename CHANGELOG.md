@@ -1507,6 +1507,12 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+The Linux server build links again against glibc 2.28, the baseline of the x86_64
+release archive. The background prewarm thread called glibc's `gettid` wrapper, which
+glibc added in 2.30, so the archive's link failed with an undefined `gettid`. It now
+makes the system call directly, as the compaction and embedding threads do, and Clippy
+refuses `libc::gettid` in the workspace.
+
 A quick query text no longer settles in its slower execution mode because of one cold
 run. The server's history ran a text's first run as an automatic cursor and its second
 eagerly, and kept whichever of those two single runs was faster for the server's whole
