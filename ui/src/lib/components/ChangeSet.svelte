@@ -148,6 +148,22 @@
   .small {
     font-size: var(--fs-sm);
   }
+  /* a name that opens its entity reads as a link, not a button */
+  .link {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--iri);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .link:hover {
+    text-decoration: underline;
+  }
+  .link:focus-visible {
+    box-shadow: var(--focus);
+  }
   .more {
     margin: var(--sp-2) 0 0;
   }

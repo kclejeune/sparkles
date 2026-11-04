@@ -241,5 +241,9 @@
     .msg {
       flex-basis: calc(100% - 24px);
     }
+    .body {
+      padding-left: 0;
+      padding-right: 0;
+    }
   }
 </style>
