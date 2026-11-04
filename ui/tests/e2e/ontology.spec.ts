@@ -83,7 +83,11 @@ open('the trees, the frame and the inferred tree read the ontology', async ({ pa
   // Employee, and the selection opens both of Professor's paths
   const inferred = page.getByRole('tree', { name: 'Classes (inferred)' });
   const teacher = inferred.getByRole('treeitem', { name: 'Teacher', exact: true });
-  await expect(teacher.getByRole('button', { name: 'Professor', exact: true })).toBeVisible();
+  // the rows are flat, so a child is the row after its parent, one level down
+  const level = Number(await teacher.getAttribute('aria-level'));
+  const below = teacher.locator('xpath=following-sibling::li[1]');
+  await expect(below).toHaveAttribute('aria-level', String(level + 1));
+  await expect(below.getByRole('button', { name: 'Professor', exact: true })).toBeVisible();
   await expect(inferred.getByRole('button', { name: 'Professor', exact: true })).toHaveCount(2);
   await expect(tree(page).getByRole('button', { name: 'Expand Teacher' })).toHaveCount(0);
 });
