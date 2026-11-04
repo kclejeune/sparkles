@@ -1674,6 +1674,7 @@ mod classification {
     use crate::handles::ontology::classify::ClassifyRequest;
     use crate::handles::ontology::wire;
     use serde_json::json;
+    use std::collections::BTreeSet;
 
     const ONTO: &str = ":partOf a owl:ObjectProperty .
         :Nucleus rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :partOf ;
@@ -2028,5 +2029,329 @@ mod classification {
             wire::call(&ds, "classify", &json!({"profiles": []}), &opts()),
             Err(Error::Invalid(_))
         ));
+    }
+
+    /// The ontology of item 603's partial answers in Turtle: chains of cases whose common
+    /// subsumers hold, over existential and universal restrictions and an inverse role,
+    /// large enough that a deadline stops the disjunctive rules part way. The inconsistent
+    /// one gives every element a successor in a union of two empty classes.
+    pub(crate) fn cases(n: usize, inconsistent: bool) -> String {
+        let mut s = String::from(":r a owl:ObjectProperty . :s a owl:ObjectProperty .\n");
+        let some = |p: &str, c: &str| {
+            format!("[ a owl:Restriction ; owl:onProperty {p} ; owl:someValuesFrom {c} ]")
+        };
+        for i in 0..n {
+            let (b, d) = ((7 * i + 3) % n, (13 * i + 5) % n);
+            s.push_str(&format!(
+                ":C{i} a owl:Class ; rdfs:subClassOf [ owl:unionOf ( :B{i} :E{i} ) ] .
+                 :B{i} rdfs:subClassOf :K{i} , :C{b} . :E{i} rdfs:subClassOf :K{i} .
+                 :K{i} rdfs:subClassOf {} .
+                 :E{i} rdfs:subClassOf [ a owl:Restriction ;
+                     owl:onProperty [ owl:inverseOf :r ] ; owl:allValuesFrom :F{d} ] .
+                 {} rdfs:subClassOf :G{b} .\n",
+                some(":r", &format!(":C{d}")),
+                some(":r", &format!(":F{i}")),
+            ));
+        }
+        if inconsistent {
+            s.push_str(&format!(
+                "owl:Thing rdfs:subClassOf {} .
+                 :N1 rdfs:subClassOf owl:Nothing . :N2 rdfs:subClassOf :N3 .
+                 :N3 owl:disjointWith :N2 .\n",
+                some(":s", "[ owl:unionOf ( :N1 :N2 ) ]"),
+            ));
+        }
+        s
+    }
+
+    fn partial_request() -> ClassifyRequest {
+        ClassifyRequest {
+            partial: true,
+            threads: 1,
+            ..Default::default()
+        }
+    }
+
+    /// The pairs of named classes the taxonomy puts one below the other.
+    fn pairs(t: &sparkles_owl::classify::Taxonomy) -> BTreeSet<(String, String)> {
+        let mut out = BTreeSet::new();
+        for x in t.classes() {
+            let Some(n) = t.node_of(x) else { continue };
+            for a in t.ancestors(n) {
+                for y in &t.node(a).classes {
+                    out.insert((x.as_str().to_string(), y.as_str().to_string()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Checks one answer under a deadline against the full one, in Rust and in its JSON,
+    /// and answers whether it was partial and its consistency.
+    fn check_answer(
+        ds: &Dataset,
+        part: &classify::Classified,
+        full: &classify::Classified,
+    ) -> (bool, &'static str) {
+        let read = part.opened.view();
+        let j = wire::classification_body(
+            "ds",
+            &wire::ClassificationView {
+                read: &read,
+                classification: &part.classification,
+                excluded: &part.excluded,
+                reused: part.reused,
+                written: None,
+            },
+            &OntologyRequest::default(),
+            &crate::owl::ofn::Renderer::new(ds.prefixes()),
+            &wire::ClassifyQuery {
+                limit: wire::MAX_LIMIT,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cl = &part.classification;
+        let got = pairs(&cl.taxonomy);
+        let want = pairs(&full.classification.taxonomy);
+        // every subsumption holds in an inconsistent ontology
+        let everything = !full.classification.consistent;
+        assert!(
+            everything || got.is_subset(&want),
+            "a partial answer has more"
+        );
+        assert_eq!(j["tier"], json!("disjunctive"));
+        assert_eq!(j["partial"], json!(!cl.complete));
+        assert_eq!(j["complete"], json!(part.complete()));
+        assert_eq!(j["incompleteCount"], json!(cl.incomplete.len()));
+        let consistency = j["consistency"].as_str().unwrap();
+        if cl.complete {
+            assert!(everything || got == want);
+            assert!(part.complete());
+            assert_eq!(j["incomplete"], json!([]));
+            assert_ne!(consistency, "unknown");
+            return (
+                false,
+                if full.classification.consistent {
+                    "consistent"
+                } else {
+                    "inconsistent"
+                },
+            );
+        }
+        assert!(
+            !part.complete(),
+            "a partial answer is presented as complete"
+        );
+        let listed: Vec<&str> = j["incomplete"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let open: BTreeSet<&str> = cl.incomplete.iter().map(|c| c.as_str()).collect();
+        assert_eq!(listed.iter().copied().collect::<BTreeSet<_>>(), open);
+        let contradiction = if full.classification.consistent {
+            "inconsistent"
+        } else {
+            "consistent"
+        };
+        assert_ne!(consistency, contradiction);
+        for x in full.classification.taxonomy.classes() {
+            if *x == Class::thing() || *x == Class::nothing() {
+                continue;
+            }
+            if consistency == "unknown" {
+                assert!(
+                    open.contains(x.as_str()),
+                    "{x:?} is complete while the consistency is unknown"
+                );
+            }
+            if open.contains(x.as_str()) {
+                continue;
+            }
+            if everything {
+                assert!(
+                    cl.taxonomy.is_unsatisfiable(x),
+                    "{x:?} is reported complete"
+                );
+                continue;
+            }
+            let above = |a: &BTreeSet<(String, String)>| -> Vec<String> {
+                a.iter()
+                    .filter(|(p, _)| p == x.as_str())
+                    .map(|(_, q)| q.clone())
+                    .collect()
+            };
+            assert_eq!(above(&got), above(&want), "{x:?} is reported complete");
+        }
+        let c = match consistency {
+            "consistent" => "consistent",
+            "inconsistent" => "inconsistent",
+            _ => "unknown",
+        };
+        (true, c)
+    }
+
+    /// Classifies the cases under deadlines from a small fraction of a full run's time
+    /// upwards, each on a dataset of its own, and answers the consistencies of the
+    /// partial answers.
+    fn under_deadlines(inconsistent: bool) -> Vec<&'static str> {
+        let n = if cfg!(debug_assertions) { 120 } else { 400 };
+        let body = cases(n, inconsistent);
+        let req = OntologyRequest::default();
+        let ds = dataset(&body);
+        let t = std::time::Instant::now();
+        let full = ds
+            .ontology()
+            .classify(
+                &req,
+                &ClassifyRequest {
+                    threads: 1,
+                    ..Default::default()
+                },
+                &opts(),
+            )
+            .unwrap();
+        let took = t.elapsed();
+        assert!(full.classification.complete);
+        assert_eq!(full.classification.consistent, !inconsistent);
+        assert_eq!(full.classification.stats.tier.as_str(), "disjunctive");
+        let mut partial = Vec::new();
+        let mut f = 0.02;
+        while f < 1.5 {
+            let ds = dataset(&body);
+            let o = QueryOptions {
+                timeout: Some(took.mul_f64(f)),
+                ..opts()
+            };
+            if let Ok(part) = ds.ontology().classify(&req, &partial_request(), &o) {
+                let (p, c) = check_answer(&ds, &part, &full);
+                if p {
+                    partial.push(c);
+                }
+            }
+            f *= 1.25;
+        }
+        partial
+    }
+
+    #[test]
+    fn a_deadline_answers_in_part_with_the_classes_it_leaves_open() {
+        let seen = under_deadlines(false);
+        assert!(!seen.is_empty(), "no deadline gave a partial answer");
+        assert!(!seen.contains(&"inconsistent"));
+    }
+
+    #[test]
+    fn a_stop_before_the_inconsistency_is_found_leaves_it_unknown() {
+        let seen = under_deadlines(true);
+        assert!(
+            seen.contains(&"unknown"),
+            "no partial answer left the consistency unknown: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_json_operation_reports_a_complete_run_and_an_inconsistent_one() {
+        let ds = dataset(ONTO);
+        for partial in [false, true] {
+            let j = wire::call(
+                &ds,
+                "classify",
+                &json!({"partial": partial, "expansion": "eager"}),
+                &opts(),
+            )
+            .unwrap();
+            assert_eq!(j["complete"], json!(true));
+            assert_eq!(j["partial"], json!(false));
+            assert_eq!(j["consistency"], json!("consistent"));
+            assert_eq!(j["incompleteCount"], json!(0));
+            assert_eq!(j["incomplete"], json!([]));
+            assert_eq!(j["tier"], json!("el"));
+        }
+        let bad = wire::call(&ds, "classify", &json!({"expansion": "greedy"}), &opts());
+        assert!(matches!(bad, Err(Error::Invalid(_))), "{:?}", bad.err());
+        let ds = dataset(&format!(
+            "{ONTO} owl:Thing rdfs:subClassOf [ owl:unionOf ( :Cell :Organelle ) ] .
+             :Cell rdfs:subClassOf owl:Nothing . :Organelle rdfs:subClassOf owl:Nothing ."
+        ));
+        let j = wire::call(&ds, "classify", &json!({"partial": true}), &opts()).unwrap();
+        assert_eq!(j["consistent"], json!(false));
+        assert_eq!(j["consistency"], json!("inconsistent"));
+        assert_eq!(j["partial"], json!(false));
+        assert_eq!(j["incompleteCount"], json!(0));
+        assert_eq!(j["tier"], json!("disjunctive"));
+    }
+
+    #[test]
+    fn a_cancellation_stops_a_classification_waiting_for_threads() {
+        // Every slot of the algorithm pool is taken, so admission waits for one. A
+        // cancellation source beside the options' flag, as the bindings give a partial
+        // classification, is set before the call, so only admission can see it, and it
+        // ends the wait at once instead of blocking until a slot frees.
+        use sparkles_core::algo::{Control, pool};
+        let held: Vec<pool::Par> = (0..pool::capacity())
+            .map(|_| pool::Par::acquire(1, &Control::unlimited()).unwrap())
+            .collect();
+        let o = QueryOptions {
+            cancel: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            cancellation: Some(crate::task::Cancellation::from_flags([Arc::new(
+                std::sync::atomic::AtomicBool::new(true),
+            )])),
+            ..opts()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(classify::admit(1, &o).err());
+        });
+        let r = rx.recv_timeout(std::time::Duration::from_secs(10));
+        drop(held);
+        assert!(
+            matches!(r, Ok(Some(Error::Cancelled))),
+            "the cancellation did not end the wait for threads: {r:?}"
+        );
+    }
+
+    #[test]
+    fn a_partial_answer_is_not_kept_and_does_not_write() {
+        let body = cases(if cfg!(debug_assertions) { 120 } else { 400 }, false);
+        let req = OntologyRequest::default();
+        let ds = dataset(&body);
+        let writes = ClassifyRequest {
+            target: Some(named("http://ex.org/taxonomy")),
+            ..partial_request()
+        };
+        assert!(matches!(
+            ds.ontology().classify(&req, &writes, &opts()),
+            Err(Error::Invalid(_))
+        ));
+        // the first deadline that answers in part, each on a dataset of its own
+        let mut t = std::time::Duration::from_millis(1);
+        let (ds, part) = loop {
+            assert!(
+                t < std::time::Duration::from_secs(120),
+                "no deadline answered in part"
+            );
+            let ds = dataset(&body);
+            let o = QueryOptions {
+                timeout: Some(t),
+                ..opts()
+            };
+            let r = ds.ontology().classify(&req, &partial_request(), &o);
+            match r {
+                Ok(c) if !c.classification.complete => break (ds, c),
+                _ => t = t.mul_f64(1.2),
+            }
+        };
+        let h = ds.ontology();
+        assert!(!part.complete());
+        let next = h
+            .classify(&req, &ClassifyRequest::default(), &opts())
+            .unwrap();
+        assert!(!next.reused, "a partial answer was kept");
+        assert!(next.complete());
+        let again = h.classify(&req, &partial_request(), &opts()).unwrap();
+        assert!(again.reused && again.complete());
     }
 }

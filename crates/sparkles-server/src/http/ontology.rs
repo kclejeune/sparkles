@@ -25,7 +25,7 @@ use sparkles_reasoner::inputs::{GraphRef, ImportMode};
 
 pub(crate) use onto::wire::{
     AxiomQuery, ClassifyQuery, DEFAULT_LIMIT, MAX_LIMIT, axiom_page, check_body, classify_body,
-    diff_body, diff_lines, edit_body, mentioned, page_body, summary_body,
+    diff_body, diff_lines, edit_body, expansion_of, mentioned, page_body, summary_body,
 };
 
 fn bad(m: impl Into<String>) -> ApiError {
@@ -1163,9 +1163,9 @@ mod tests;
 
 /// `POST /$/ontology/{ds}/classify`: the OWL 2 EL classification of the ontology (spec
 /// F24), with the members of the ontology read and `assertions`, `about`, `nodes`,
-/// `limit`, `offset` and `threads`. `target` writes the taxonomy to that named graph in
-/// one commit, as an edit does, with `message`, a dry run and `If-Match`. `format=ofn`
-/// answers the taxonomy as a functional-style document.
+/// `limit`, `offset`, `threads`, `partial` and `expansion`. `target` writes the taxonomy
+/// to that named graph in one commit, as an edit does, with `message`, a dry run and
+/// `If-Match`. `format=ofn` answers the taxonomy as a functional-style document.
 pub(super) async fn classify(
     State(st): St,
     Path(name): Path<String>,
@@ -1191,6 +1191,8 @@ pub(super) async fn classify(
             "limit",
             "offset",
             "threads",
+            "partial",
+            "expansion",
         ],
     )?;
     let req = request_body(&o, request_of(&params)?)?;
@@ -1228,6 +1230,8 @@ pub(super) async fn classify(
         message: text("message")?,
         about: about.clone(),
         el_only: false,
+        partial: flag("partial")?,
+        expansion: expansion_of(text("expansion")?.as_deref()).map_err(ontology_error)?,
     };
     let q = ClassifyQuery {
         about,
@@ -1240,6 +1244,11 @@ pub(super) async fn classify(
         Some("ofn") => true,
         Some(f) => return Err(bad(format!("format must be json or ofn, not '{f}'"))),
     };
+    if c.partial && ofn {
+        return Err(bad(
+            "format=ofn has no place to say that an answer is partial: leave out 'partial' or 'format'",
+        ));
+    }
     let writes = c.target.is_some();
     if writes && ofn {
         return Err(bad(

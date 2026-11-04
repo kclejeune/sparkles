@@ -14,6 +14,7 @@ use serde_json::{Map, Value as J, json};
 use sparkles::handles::ontology::wire;
 use sparkles::owl::{self, Axiom};
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 handle!(PyOntologies, "Ontologies");
 
@@ -239,10 +240,37 @@ impl PyOntologies {
         write: bool,
     ) -> PyResult<J> {
         let ds = if write { self.write(py)? } else { self.ds(py)? };
+        // A partial classification answers with what it proved when its deadline or the
+        // caller's token stops it, so both go to the classifier alone and not to the
+        // checks around the call, which still stop it on a signal such as Ctrl-C.
+        let partial = op == "classify" && args.get("partial") == Some(&J::Bool(true));
+        let (timeout, own, cancel, token) = if partial {
+            let own = timeout
+                .map(|s| {
+                    Duration::try_from_secs_f64(s)
+                        .ok()
+                        .filter(|_| s.is_finite())
+                        .and_then(|d| Instant::now().checked_add(d))
+                        .ok_or_else(|| {
+                            pyo3::exceptions::PyValueError::new_err(
+                                "timeout must be finite, nonnegative and not too large",
+                            )
+                        })
+                })
+                .transpose()?;
+            (None, own, None, Some(interrupt::flag(cancel)?))
+        } else {
+            (timeout, None, cancel, None)
+        };
         let args = J::Object(args);
         interrupt::controlled(py, cancel, None, timeout, move |ctl| {
+            let ctl = sparkles::task::Control {
+                deadline: ctl.deadline.or(own),
+                ..ctl
+            };
             let mut opts = sparkles::sparql::QueryOptions {
                 cancel: Some(ctl.cancel.flag()),
+                cancellation: token.map(|t| sparkles::task::Cancellation::from_flags([t])),
                 deadline: ctl.deadline,
                 ..Default::default()
             };
@@ -620,8 +648,11 @@ impl PyOntologies {
     /// Classify by OWL 2 EL (spec F24): whether the ontology is consistent, its
     /// unsatisfiable classes, the axioms left out or used in part, and on request one
     /// class (`about`) and the taxonomy's nodes (`nodes`, `limit` from `offset`).
-    /// `target` writes the taxonomy to that named graph in one commit.
-    #[pyo3(signature=(graph=None, *, assertions=false, about=None, nodes=false, limit=None, offset=None, threads=None, target=None, message=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
+    /// `target` writes the taxonomy to that named graph in one commit. `partial` answers
+    /// what a run with the disjunctive rules proved when `timeout` or `cancel` stops it,
+    /// with `partial` true, the `incomplete` classes and the `consistency`, and
+    /// `expansion` (`cautious` or `eager`) picks those rules' expansion strategy.
+    #[pyo3(signature=(graph=None, *, assertions=false, about=None, nodes=false, limit=None, offset=None, threads=None, target=None, message=None, partial=false, expansion=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn classify<'py>(
         &self,
@@ -635,6 +666,8 @@ impl PyOntologies {
         threads: Option<usize>,
         target: Option<&Bound<'py, PyAny>>,
         message: Option<String>,
+        partial: bool,
+        expansion: Option<String>,
         imports: bool,
         mode: &str,
         at: Option<&Bound<'py, PyAny>>,
@@ -645,6 +678,8 @@ impl PyOntologies {
         a.remove("inferences");
         a.insert("at".into(), at_json(at)?);
         a.insert("assertions".into(), json!(assertions));
+        a.insert("partial".into(), json!(partial));
+        a.insert("expansion".into(), json!(expansion));
         if let Some(c) = about {
             a.insert(
                 "about".into(),

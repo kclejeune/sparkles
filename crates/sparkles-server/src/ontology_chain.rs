@@ -372,7 +372,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
                 ..c.clone()
             };
             let file = w.to_file()?;
-            let (j, doc) = classify_body_of_file(&file, &c, &io.read, about)?;
+            let (j, doc) = classify_body_of_file(&file, &c, &io.read, about, &q)?;
             for o in &io.output {
                 w.write(o)?;
             }

@@ -941,6 +941,139 @@ test('the ontology handle classifies by OWL 2 EL and writes the taxonomy', async
   assert.ok(Number(tax.total) >= 1);
 });
 
+/** Item 603's cases, as the Rust tests write them: a classification the disjunctive rules take. */
+function cases(n, inconsistent) {
+  const some = (p, c) => `[ a owl:Restriction ; owl:onProperty ${p} ; owl:someValuesFrom ${c} ]`;
+  const out = [':r a owl:ObjectProperty . :s a owl:ObjectProperty .'];
+  for (let i = 0; i < n; i++) {
+    const [b, d] = [(7 * i + 3) % n, (13 * i + 5) % n];
+    out.push(
+      `:C${i} a owl:Class ; rdfs:subClassOf [ owl:unionOf ( :B${i} :E${i} ) ] .
+       :B${i} rdfs:subClassOf :K${i} , :C${b} . :E${i} rdfs:subClassOf :K${i} .
+       :K${i} rdfs:subClassOf ${some(':r', `:C${d}`)} .
+       :E${i} rdfs:subClassOf [ a owl:Restriction ;
+         owl:onProperty [ owl:inverseOf :r ] ; owl:allValuesFrom :F${d} ] .
+       ${some(':r', `:F${i}`)} rdfs:subClassOf :G${b} .`,
+    );
+  }
+  if (inconsistent) {
+    out.push(`owl:Thing rdfs:subClassOf ${some(':s', '[ owl:unionOf ( :N1 :N2 ) ]')} .
+      :N1 rdfs:subClassOf owl:Nothing . :N2 rdfs:subClassOf :N3 . :N3 owl:disjointWith :N2 .`);
+  }
+  return `PREFIX : <http://ex.org/>
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    INSERT DATA { ${out.join('\n')} }`;
+}
+
+/** Classify the cases under deadlines from a fraction of a full run's time upwards and return the partial answers' consistencies. */
+async function partialAnswers(t, inconsistent) {
+  const body = cases(300, inconsistent);
+  // the quickest of three full runs, each on a dataset of its own, so that a loaded
+  // machine's slow first run does not push every deadline past the saturation
+  let full;
+  let took = Infinity;
+  for (let k = 0; k < 3; k++) {
+    const whole = t.resource(Dataset.memory());
+    await whole.update(body);
+    const start = performance.now();
+    full = await whole.ontology.classify({ partial: true, threads: 1, limit: 10000 });
+    took = Math.min(took, performance.now() - start);
+  }
+  const want = inconsistent ? 'inconsistent' : 'consistent';
+  assert.equal(full.complete, true);
+  assert.equal(full.partial, false);
+  assert.equal(full.consistency, want);
+  assert.equal(full.tier, 'disjunctive');
+  assert.deepEqual(full.incomplete, []);
+  // Deadlines from the end of the read of the ontology, which takes most of a run here,
+  // through the classifier's time, a millisecond or more apart.
+  const s = full.stats;
+  const run = s.indexMs + s.saturationMs + s.taxonomyMs;
+  const read = Math.max(0, took - run);
+  const step = Math.max(1, run / 24);
+  const seen = [];
+  for (let ms = Math.max(1, Math.floor(read)); ms < read + 1.5 * run + 1; ms += step) {
+    // a dataset of its own, whose read of the ontology takes as long as the full run's
+    const ds = Dataset.memory();
+    await ds.update(body);
+    let r;
+    try {
+      r = await ds.ontology.classify({
+        partial: true,
+        threads: 1,
+        limit: 10000,
+        timeout: Math.round(ms),
+      });
+    } catch (e) {
+      if (e instanceof QueryTimeoutError) continue;
+      throw e;
+    } finally {
+      await ds.close();
+    }
+    assert.equal(r.classes, full.classes);
+    if (!r.partial) {
+      assert.equal(r.complete, true);
+      assert.equal(r.consistency, want);
+      continue;
+    }
+    assert.equal(r.complete, false, 'a partial answer is presented as complete');
+    assert.equal(r.incompleteCount, r.incomplete.length);
+    assert.ok([want, 'unknown'].includes(r.consistency), r.consistency);
+    if (r.consistency === 'unknown') assert.ok(r.incomplete.length + 2 >= r.classes);
+    seen.push(r.consistency);
+  }
+  return seen;
+}
+
+test('the ontology handle answers a classification in part under a deadline', async (t) => {
+  assert.ok((await partialAnswers(t, false)).length > 0, 'no deadline gave a partial answer');
+  assert.ok((await partialAnswers(t, true)).includes('unknown'));
+  const ds = t.resource(Dataset.memory());
+  await ds.update(`PREFIX : <http://ex.org/>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    INSERT DATA { :A rdfs:subClassOf :B . }`);
+  const r = await ds.ontology.classify({ partial: true, expansion: 'eager' });
+  assert.deepEqual(
+    [r.complete, r.partial, r.consistency, r.tier, r.incomplete],
+    [true, false, 'consistent', 'el', []],
+  );
+  await assert.rejects(ds.ontology.classify({ partial: true, target: 'http://ex.org/taxonomy' }));
+});
+
+test('a classification answers in part when its signal aborts it', async (t) => {
+  const body = cases(300, false);
+  const whole = t.resource(Dataset.memory());
+  await whole.update(body);
+  const start = performance.now();
+  await whole.ontology.classify({ threads: 1 });
+  const took = performance.now() - start;
+  let partial = 0;
+  for (let f = 0.02; f < 1.5; f *= 1.25) {
+    const ds = Dataset.memory();
+    await ds.update(body);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), took * f);
+    try {
+      const r = await ds.ontology.classify({
+        partial: true,
+        threads: 1,
+        signal: controller.signal,
+      });
+      if (r.partial) {
+        assert.equal(r.complete, false);
+        partial++;
+      }
+    } catch (e) {
+      if (!controller.signal.aborted) throw e;
+    } finally {
+      clearTimeout(timer);
+      await ds.close();
+    }
+  }
+  assert.ok(partial > 0, 'no abort gave a partial answer');
+});
+
 test('the ontology handle reads Manchester syntax and answers DL queries', async (t) => {
   const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
   await ds.update(`PREFIX : <http://ex.org/>

@@ -24,6 +24,18 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+A classification can answer in part on every surface. `partial` on
+`POST /$/ontology/{ds}/classify`, the JSON operation, Python's, Node.js's and the JVM's
+`classify` and `sparkles ontology classify --partial` asks a run of the disjunctive rules
+that its deadline or cancellation stops to answer what it proved, and `expansion` picks
+their strategy. Every answer now gives `tier` and `consistency`, which is `consistent`,
+`inconsistent` or `unknown`, and a partial one has `partial: true`, `complete: false` and
+its open classes under `incomplete` and `incompleteCount`. `complete` and
+`Classified::complete` are now also false for a partial answer, which only a request with
+`partial` gets. `partial` is refused with `target` and `format=ofn`.
+`sparkles ontology classify` takes `--timeout SECONDS`, notes a partial answer on stderr
+and exits with status 2 for one that is otherwise clean.
+
 The web UI asks through an Ask thread, a page at `/ui/ask` and a drawer beside any page
 that `Shift+A` and the palette open with the page's resource or query as context. Each
 answer folds its query, rows, sources and steps, follow-ups continue the thread, and the

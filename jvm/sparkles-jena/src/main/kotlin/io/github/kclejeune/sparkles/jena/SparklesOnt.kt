@@ -603,9 +603,14 @@ public data class ClassifyQuery @JvmOverloads public constructor(
     public val threads: Int = 0,
     public val target: String? = null,
     public val message: String? = null,
+    /** answer what a run with the disjunctive rules proved when the operation's deadline or cancellation stops it */
+    public val partial: Boolean = false,
+    /** the expansion strategy of the disjunctive rules, `cautious` (the default) or `eager` */
+    public val expansion: String? = null,
 ) {
     init {
         require(limit > 0 && offset >= 0 && threads >= 0)
+        require(expansion == null || expansion == "cautious" || expansion == "eager")
     }
 
     internal fun into(j: JsonObject) {
@@ -617,5 +622,7 @@ public data class ClassifyQuery @JvmOverloads public constructor(
         j.put("threads", threads.toLong())
         target?.let { j.put("target", it) }
         message?.let { j.put("message", it) }
+        if (partial) j.put("partial", true)
+        expansion?.let { j.put("expansion", it) }
     }
 }

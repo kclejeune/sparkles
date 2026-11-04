@@ -164,7 +164,8 @@ impl Control {
         Self::with_cancellation(cancel, None, deadline, mem_limit)
     }
 
-    pub(crate) fn with_cancellation(
+    /// [`new`](Self::new) that also stops when any flag of `cancellation` is set.
+    pub fn with_cancellation(
         cancel: Arc<AtomicBool>,
         cancellation: Option<crate::task::Cancellation>,
         deadline: Option<Instant>,
