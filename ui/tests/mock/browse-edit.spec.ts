@@ -73,7 +73,7 @@ test('a read-only caller sees no edit affordance', async ({ page }) => {
     }),
   );
   await open(page, term('uni', UNI + 'Professor', '&edit=1'));
-  await expect(page.getByRole('heading', { name: 'Logical definition' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Axioms' })).toBeVisible();
   await expect(page).not.toHaveURL(/edit=1/);
   await expect(page.getByRole('button', { name: 'Edit', exact: true })).toHaveCount(0);
   await expect(bar(page)).toHaveCount(0);
@@ -186,7 +186,7 @@ test('OWL edits on a session branch: definition, synonym, annotation, parent and
       .getByRole('button', { name: 'Add' })
       .click();
     await commit(page);
-    const logic = page.getByRole('region', { name: 'Logical definition' });
+    const logic = page.getByRole('region', { name: 'Axioms' });
     await expect(logic.getByRole('link', { name: 'Agent', exact: true })).toBeVisible();
     await logic.getByRole('button', { name: /Remove the axiom SubClassOf\(.*Agent\)/ }).click();
     await commit(page);

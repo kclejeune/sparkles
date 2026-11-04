@@ -115,7 +115,8 @@
   import TermHeader from '$components/browse/TermHeader.svelte';
   import TermInfobox from '$components/browse/TermInfobox.svelte';
   import TermLabels from '$components/browse/TermLabels.svelte';
-  import TermLogic from '$components/browse/TermLogic.svelte';
+  import AxiomProse from '$components/browse/AxiomProse.svelte';
+  import TermAxioms from '$components/browse/TermAxioms.svelte';
   import TermNotes from '$components/browse/TermNotes.svelte';
   import TermReuse from '$components/browse/TermReuse.svelte';
   import TermSynonyms from '$components/browse/TermSynonyms.svelte';
@@ -302,6 +303,15 @@
 
   const sections = $derived(term ? termSections(term, langs) : null);
   const groups = $derived(term ? axiomGroups(term.iri, term.kinds, term.axioms) : []);
+  /** A class's EquivalentTo axioms, the OBO genus and differentia, which the Definition card
+   * also shows as its logical definition; the Axioms card holds every axiom. */
+  const logicalDefinition = $derived(
+    term && editorKindOf(term.kinds) === 'Class'
+      ? groups
+          .filter((g) => g.id === 'equivalent')
+          .flatMap((g) => g.items.flatMap((it) => it.values))
+      : [],
+  );
   const mentions = $derived(term ? mentionGroups(term.iri, term.mentions.axioms) : []);
   const title = $derived(term ? (term.label ?? term.shortForm ?? iriName(term.iri, prefixes)) : '');
   const kind = $derived(term ? kindWord(term.kinds) : '');
@@ -1331,27 +1341,18 @@
               <div class="panel-head"><h2 id="def-h">Definition</h2></div>
               <div class="panel-body ruled">
                 {#if sections.definition}<p class="lede">
-                    {valueText(
+                    {#if sections.definitionKind}<span class="badge lede-kind"
+                        >{sections.definitionKind}</span
+                      >{/if}{valueText(
                       sections.definition.value,
-                    )}{#if sections.definition.sources.length}<span class="faint small">
+                    )}{#if sections.definition.sources.length}<span class="faint small lede-src">
                         {sections.definition.sources.join(', ')}</span
                       >{/if}
+                  </p>{:else if !editing}<p class="lede none">
+                    No definition in this ontology.
                   </p>{/if}
                 {#if editing}
                   {#if !isSkos && editorKind}
-                    <AxiomEditor
-                      {groups}
-                      kind={editorKind}
-                      iri={term.iri}
-                      {title}
-                      {linker}
-                      {prefixes}
-                      {graph}
-                      {readonly}
-                      names={() => completionNames}
-                      {parse}
-                      {onedit}
-                    />
                     <SynonymEditor
                       iri={term.iri}
                       {title}
@@ -1471,7 +1472,14 @@
                     {/if}
                   </section>
                 {:else}
-                  <TermLogic {groups} {linker} {prefixes} />
+                  {#if logicalDefinition.length}
+                    <section class="term-sec" aria-labelledby="logic-h">
+                      <h2 id="logic-h">Logical definition</h2>
+                      {#each logicalDefinition as v, i (i)}
+                        <p class="logic"><AxiomProse value={v} {linker} {prefixes} /></p>
+                      {/each}
+                    </section>
+                  {/if}
                   <TermSynonyms synonyms={sections.synonyms} {linker} />
                   <TermNotes
                     notes={sections.otherDefinitions.length
@@ -1513,38 +1521,6 @@
                     </section>
                   {/if}
                 {/if}
-                {#if sections.other.length && !editing}
-                  <section class="term-sec">
-                    <details class="ann">
-                      <summary
-                        >All other annotations <span class="count-badge"
-                          >{sections.other.reduce((n, o) => n + o.values.length, 0)}</span
-                        ></summary
-                      >
-                      <div class="table-scroll">
-                        <table class="data">
-                          <tbody>
-                            {#each sections.other as o (o.property)}
-                              <tr>
-                                <th scope="row" class="mono">{iriName(o.property, prefixes)}</th>
-                                <td>
-                                  {#each o.values as v, i (i)}{#if i > 0}<br
-                                      />{/if}{#if isLiteral(v)}{v[
-                                        '@value'
-                                      ]}{#if v['@language']}<span class="lang-tag"
-                                          >{v['@language']}</span
-                                        >{/if}{:else if linker.href(v)}<a href={linker.href(v)}
-                                        >{linker.name(v)}</a
-                                      >{:else}<span class="mono">{v}</span>{/if}{/each}
-                                </td>
-                              </tr>
-                            {/each}
-                          </tbody>
-                        </table>
-                      </div>
-                    </details>
-                  </section>
-                {/if}
                 {#if term.statementsTruncated}
                   <p class="faint">
                     This entity has more statements than the page reads. The download has them all.
@@ -1552,6 +1528,36 @@
                 {/if}
               </div>
             </section>
+            {#if !isSkos && editorKind}
+              <!-- the entity's frame in Manchester syntax, after Definition on a phone -->
+              {#snippet axiomEditor()}
+                <AxiomEditor
+                  {groups}
+                  kind={editorKind!}
+                  iri={term!.iri}
+                  {title}
+                  {linker}
+                  {prefixes}
+                  {graph}
+                  {readonly}
+                  names={() => completionNames}
+                  {parse}
+                  {onedit}
+                  bare
+                />
+              {/snippet}
+              <TermAxioms
+                kind={editorKind}
+                iri={term.iri}
+                {groups}
+                {linker}
+                {prefixes}
+                {target}
+                {graph}
+                historic={!!at}
+                editor={editing ? axiomEditor : undefined}
+              />
+            {/if}
             {#if treeKind}
               <!-- the hierarchy is a card above the facts in the page's side column, and on a
                  phone a card that opens on request (ROADMAP item 633) -->
@@ -1695,6 +1701,39 @@
                 />
                 {#if !editing}
                   <SimilarTerms ds={target} iri={term.iri} href={(i) => hrefOf(i)} />
+                {/if}
+                <!-- the statements no other section shows, folded away -->
+                {#if sections.other.length && !editing}
+                  <section class="term-sec">
+                    <details class="ann">
+                      <summary
+                        >All other statements <span class="count-badge"
+                          >{sections.other.reduce((n, o) => n + o.values.length, 0)}</span
+                        ></summary
+                      >
+                      <div class="table-scroll">
+                        <table class="data">
+                          <tbody>
+                            {#each sections.other as o (o.property)}
+                              <tr>
+                                <th scope="row" class="mono">{iriName(o.property, prefixes)}</th>
+                                <td>
+                                  {#each o.values as v, i (i)}{#if i > 0}<br
+                                      />{/if}{#if isLiteral(v)}{v[
+                                        '@value'
+                                      ]}{#if v['@language']}<span class="lang-tag"
+                                          >{v['@language']}</span
+                                        >{/if}{:else if linker.href(v)}<a href={linker.href(v)}
+                                        >{linker.name(v)}</a
+                                      >{:else}<span class="mono">{v}</span>{/if}{/each}
+                                </td>
+                              </tr>
+                            {/each}
+                          </tbody>
+                        </table>
+                      </div>
+                    </details>
+                  </section>
                 {/if}
               </div>
             </section>
@@ -1902,8 +1941,8 @@
     container: browse / inline-size;
     min-width: 0;
   }
-  /* one column on a phone and a medium screen: the head, the counts, Definition, Metadata,
-     Hierarchy, References and Download (ROADMAP item 633) */
+  /* one column on a phone and a medium screen: the head, the counts, Definition, Axioms,
+     Metadata, Hierarchy, References and Download (ROADMAP item 633) */
   .browse {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
@@ -1928,21 +1967,29 @@
     order: 2;
     min-width: 0;
   }
-  .b-info {
+  .browse :global(.b-ax) {
     order: 3;
+  }
+  .logic {
+    margin: 0;
+    font-size: var(--fs-md);
+    line-height: 1.5;
+  }
+  .b-info {
+    order: 4;
     min-width: 0;
   }
   .b-tree {
-    order: 4;
+    order: 5;
     min-width: 0;
     display: flex;
     flex-direction: column;
   }
   .b-refs {
-    order: 5;
+    order: 6;
   }
   .b-dl {
-    order: 6;
+    order: 7;
   }
   /* the tiles share the row whatever their number, so no cell stands empty */
   .b-strip {
@@ -2018,6 +2065,18 @@
     color: var(--text-2);
     margin-bottom: var(--sp-2);
   }
+  /* the definition's sources follow it after a gap, whatever whitespace the markup keeps */
+  .lede-src {
+    margin-left: var(--sp-2);
+  }
+  .lede-kind {
+    margin-right: var(--sp-2);
+    vertical-align: 2px;
+  }
+  .ruled > .lede.none {
+    color: var(--text-3, var(--text-2));
+    font-size: var(--fs-md);
+  }
   .ruled > .lede {
     margin: 0 0 var(--sp-3);
     font-size: 15px;
@@ -2054,6 +2113,11 @@
     }
     .b-side {
       grid-area: side;
+    }
+    /* in two columns a card keeps its place in its column, where balance.ts puts it */
+    .browse .b-main > :global(*),
+    .browse .b-side > :global(*) {
+      order: 0;
     }
     /* the shorter column stays in view while the page scrolls */
     .b-side:global([data-stick]) {

@@ -56,7 +56,8 @@ uni:GraduateStudent a owl:Class ; rdfs:subClassOf uni:Student ; rdfs:label "Grad
 uni:Employee a owl:Class ; rdfs:subClassOf uni:Person ; rdfs:label "Employee"@en .
 uni:Professor a owl:Class ; rdfs:subClassOf uni:Employee ;
   rdfs:subClassOf [ a owl:Restriction ; owl:onProperty uni:teaches ; owl:someValuesFrom uni:Course ] ;
-  rdfs:label "Professor"@en , "Professeur"@fr .
+  rdfs:label "Professor"@en , "Professeur"@fr ;
+  rdfs:comment "An academic who leads research and teaching in a department."@en .
 uni:Teacher a owl:Class ; rdfs:label "Teacher"@en ;
   owl:equivalentClass [ owl:intersectionOf ( uni:Person [ a owl:Restriction ; owl:onProperty uni:teaches ; owl:someValuesFrom uni:Course ] ) ] .
 uni:Organization a owl:Class ; rdfs:subClassOf uni:Agent ; rdfs:label "Organization"@en .
@@ -1875,6 +1876,20 @@ export async function handleOntology(req, res, url, seg, ctx) {
       ...n,
       parentClasses: n.parents.map((x) => c.nodes[x].classes[0]),
     }));
+    // one class's node, as the server's `about` answers it
+    let about;
+    if (body.about) {
+      const i = c.nodes.findIndex((n) => n.classes.includes(body.about));
+      if (i < 0) return (fail(res, 404, `the taxonomy has no class <${body.about}>`), true);
+      const n = c.nodes[i];
+      about = {
+        ...n,
+        node: i,
+        iri: body.about,
+        unsatisfiable: false,
+        parentClasses: n.parents.map((x) => c.nodes[x].classes[0]),
+      };
+    }
     send(res, 200, {
       ...opened(o),
       consistent: true,
@@ -1887,6 +1902,7 @@ export async function handleOntology(req, res, url, seg, ctx) {
       excludedCount: 0,
       excluded: [],
       stats: { incremental: false, saturationMs: 0.4, indexMs: 0.1, taxonomyMs: 0.1 },
+      ...(about ? { class: about } : {}),
       ...(body.nodes
         ? { nodes, offset, ...(offset + limit < c.nodes.length ? { next: offset + limit } : {}) }
         : {}),

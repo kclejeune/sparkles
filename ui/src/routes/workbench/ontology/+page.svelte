@@ -13,6 +13,7 @@
   import { page } from '$app/state';
   import { onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
+  import { markClassified } from '$lib/browse';
   import { app } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { branchParam, MAIN, onBranch } from '$lib/branches';
@@ -439,6 +440,8 @@
     classifyError = null;
     try {
       const c = await classifyOntology(target, sel);
+      // the Browse pages of this tab now show what the kept classification infers
+      markClassified(target);
       if (my === classifySeq) classification = c;
     } catch (e) {
       if (my === classifySeq) classifyError = api.errorMessage(e);

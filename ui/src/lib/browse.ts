@@ -3,9 +3,11 @@
 // (docs/API.md, "Ontology"), and the pure functions that turn their answers into the
 // sections of an entity's page. The page's components take what these return as props,
 // so the editor, DL Query and the term pages of item 461 can reuse them.
-import { request, select } from './api';
+import { ApiError, request, select } from './api';
 import {
   iriName,
+  manchesterName,
+  manchesterTokens,
   OBJECT_CHARACTERISTICS,
   sectionOf,
   SECTIONS,
@@ -13,6 +15,7 @@ import {
   type AxiomJson,
   type EntityKind,
   type Lit,
+  type ManchesterToken,
 } from './ontology';
 import { WELL_KNOWN, type PrefixMap } from './rdf';
 import { browsePath, editorOf, workbenchPath } from './routes';
@@ -295,6 +298,19 @@ export const NOTE_KINDS: [string, string][] = [
   [DC + 'description', 'Description'],
 ];
 
+/**
+ * The properties a page's lead falls back on when the entity has no definition, in order:
+ * a description, a comment, a scope note and a note. The first that holds a value gives the
+ * lead, in the caller's best language.
+ */
+export const LEAD_FALLBACKS: [string, string][] = [
+  [DCT + 'description', 'Description'],
+  [DC + 'description', 'Description'],
+  [RDFS + 'comment', 'Comment'],
+  [SKOS + 'scopeNote', 'Scope note'],
+  [SKOS + 'note', 'Note'],
+];
+
 export const MAPPING_KINDS: [string, string][] = [
   [SKOS + 'exactMatch', 'Exact match'],
   [SKOS + 'closeMatch', 'Close match'],
@@ -387,8 +403,11 @@ const byLang = (langs: readonly string[]) => (a: Sourced, b: Sourced) =>
   valueText(a.value).localeCompare(valueText(b.value));
 
 export type Sections = {
-  /** the definition in the best language, with its sources */
+  /** the definition in the best language, with its sources, or else the first value of
+   * `LEAD_FALLBACKS`, which the notes then leave out */
   definition: Sourced | null;
+  /** the kind of note the lead is, when it is not a definition */
+  definitionKind: string | null;
   /** the definitions in the other languages */
   otherDefinitions: Sourced[];
   synonyms: { kind: string; values: Sourced[] }[];
@@ -441,6 +460,7 @@ const groupsOf = (kinds: [string, string][], stmts: Statement[], langs: readonly
     .filter((g) => g.values.length > 0);
 
 const SKOSXL = 'http://www.w3.org/2008/05/skos-xl#';
+const SKOS_KINDS = new Set(['concept', 'conceptScheme', 'collection']);
 /** The plain SKOS property that each SKOS-XL label property stands for in the sections. */
 const XL_PLAIN: Record<string, string> = {
   [SKOSXL + 'prefLabel']: SKOS + 'prefLabel',
@@ -454,7 +474,7 @@ const XL_PLAIN: Record<string, string> = {
  * plain SKOS labels they stand for.
  */
 export function termSections(
-  t: Pick<TermPage, 'statements'> & Partial<Pick<TermPage, 'names' | 'xlLabels'>>,
+  t: Pick<TermPage, 'statements'> & Partial<Pick<TermPage, 'names' | 'xlLabels' | 'kinds'>>,
   langs: readonly string[],
 ): Sections {
   const stmts: Statement[] = [
@@ -465,9 +485,15 @@ export function termSections(
         : [],
     ),
   ];
+  // in the best language first, and there the OBO definition before the SKOS one
   const defs = uniqueSourced(
     stmts.filter((s) => DEFINITION_PROPS.includes(s.property)).map(sourced),
-  ).sort(byLang(langs));
+  ).sort(
+    (a, b) =>
+      langRank(a.lang, langs) - langRank(b.lang, langs) ||
+      DEFINITION_PROPS.indexOf(a.property) - DEFINITION_PROPS.indexOf(b.property) ||
+      valueText(a.value).localeCompare(valueText(b.value)),
+  );
   const labelRows = new Map<
     string,
     { preferred: string[]; alternative: string[]; hidden: string[] }
@@ -509,10 +535,12 @@ export function termSections(
     );
   const otherMap = new Map<string, Value[]>();
   const facts = new Set(['objectProperty', 'dataProperty']);
+  // a SKOS resource has no Axioms card, so its facts stay with the other statements
+  const skos = !!t.kinds?.some((k) => SKOS_KINDS.has(k));
   for (const s of stmts) {
     if (SHOWN.has(s.property) || LOGICAL.some((ns) => s.property.startsWith(ns))) continue;
-    // the facts of an individual are axioms, which the logical definition shows
-    if (t.names?.[s.property]?.kinds.some((k) => facts.has(k))) continue;
+    // the facts of an individual are axioms, which the Axioms card shows
+    if (!skos && t.names?.[s.property]?.kinds.some((k) => facts.has(k))) continue;
     const l = otherMap.get(s.property) ?? [];
     l.push(s.value);
     otherMap.set(s.property, l);
@@ -524,11 +552,31 @@ export function termSections(
         property: s.property,
         value: s.value,
       });
+  // without a definition the lead is the first description, comment or note, once
+  let lead = defs[0] ?? null;
+  let leadKind: string | null = null;
+  let notes = groupsOf(NOTE_KINDS, stmts, langs);
+  if (!lead)
+    for (const [p, kind] of LEAD_FALLBACKS) {
+      const vs = uniqueSourced(stmts.filter((s) => s.property === p).map(sourced)).sort(
+        byLang(langs),
+      );
+      if (!vs.length) continue;
+      lead = vs[0];
+      leadKind = kind;
+      const same = (v: Sourced) =>
+        valueText(v.value) === valueText(lead!.value) && v.lang === lead!.lang;
+      notes = notes
+        .map((g) => (g.kind === kind ? { ...g, values: g.values.filter((v) => !same(v)) } : g))
+        .filter((g) => g.values.length > 0);
+      break;
+    }
   return {
-    definition: defs[0] ?? null,
+    definition: lead,
+    definitionKind: leadKind,
     otherDefinitions: defs.slice(1),
     synonyms: groupsOf(SYNONYM_KINDS, stmts, langs),
-    notes: groupsOf(NOTE_KINDS, stmts, langs),
+    notes,
     labels,
     xrefs,
     seeAlso: [...seeAlso.values()],
@@ -644,6 +692,221 @@ export function axiomGroups(
   if (traits.items.length) out.push(traits);
   if (other.items.length) out.push(other);
   return out;
+}
+
+// --- the frame in Manchester syntax ----------------------------------------------------
+
+/** The frame keyword of each kind of entity (W3C OWL 2 Manchester Syntax, section 2.4). */
+const FRAME_WORD: Record<EntityKind, string> = {
+  Class: 'Class',
+  ObjectProperty: 'ObjectProperty',
+  DataProperty: 'DataProperty',
+  AnnotationProperty: 'AnnotationProperty',
+  NamedIndividual: 'Individual',
+  Datatype: 'Datatype',
+};
+
+/** The Manchester keyword of each section of `axiomGroups`. */
+const SECTION_WORD: Record<string, string> = {
+  sub: 'SubClassOf',
+  equivalent: 'EquivalentTo',
+  disjoint: 'DisjointWith',
+  disjointUnion: 'DisjointUnionOf',
+  keys: 'HasKey',
+  domains: 'Domain',
+  ranges: 'Range',
+  superProperties: 'SubPropertyOf',
+  inverses: 'InverseOf',
+  chains: 'SubPropertyChain',
+  characteristics: 'Characteristics',
+  types: 'Types',
+  same: 'SameAs',
+  different: 'DifferentFrom',
+  objectAssertions: 'Facts',
+  dataAssertions: 'Facts',
+  negative: 'Facts',
+  definitions: 'EquivalentTo',
+};
+
+/** One clause of a frame: its keyword and its items, each a run of Manchester tokens. */
+export type FrameSection = {
+  id: string;
+  word: string;
+  items: ManchesterToken[][];
+};
+
+/** An entity's frame: the clauses Manchester syntax writes, and the axioms it cannot. */
+export type Frame = {
+  word: string;
+  sections: FrameSection[];
+  other: AxiomItem[];
+};
+
+/**
+ * The asserted axioms of `groups` as a Manchester frame of an entity of `kind`, in the
+ * order of the groups. The three kinds of facts share one Facts clause, and axioms of a
+ * form no clause takes are left to `other`.
+ */
+export function manchesterFrame(
+  kind: EntityKind,
+  groups: AxiomGroup[],
+  name: (iri: string) => string,
+  prefixes: PrefixMap,
+): Frame {
+  const sections: FrameSection[] = [];
+  const other: AxiomItem[] = [];
+  const toks = (v: unknown) => manchesterTokens(v, name, prefixes);
+  const space: ManchesterToken = { text: ' ', role: 'space' };
+  for (const g of groups) {
+    if (g.id === 'other') {
+      other.push(...g.items.map((it) => it.axiom));
+      continue;
+    }
+    const word = SECTION_WORD[g.id];
+    if (!word) {
+      other.push(...g.items.map((it) => it.axiom));
+      continue;
+    }
+    let sec = sections.find((s) => s.word === word);
+    if (!sec) sections.push((sec = { id: g.id, word, items: [] }));
+    for (const it of g.items) {
+      if (it.word) {
+        sec.items.push([
+          {
+            text: it.word.replace(/ (\w)/g, (_, c: string) => c.toUpperCase()),
+            role: 'kw',
+          },
+        ]);
+      } else if (word === 'Facts') {
+        const neg: ManchesterToken[] =
+          g.id === 'negative' ? [{ text: 'not', role: 'kw' }, space] : [];
+        sec.items.push([...neg, ...toks(it.values[0]), space, ...toks(it.values[1])]);
+      } else if (g.id === 'keys' || g.id === 'disjointUnion') {
+        // one axiom names several entities: a key's properties and a union's classes
+        const sep: ManchesterToken[] =
+          g.id === 'keys' ? [space] : [{ text: ',', role: 'punct' }, space];
+        sec.items.push(it.values.flatMap((v, i) => [...(i ? sep : []), ...toks(v)]));
+      } else {
+        for (const v of it.values) sec.items.push(toks(v));
+      }
+    }
+  }
+  return { word: FRAME_WORD[kind], sections, other };
+}
+
+/**
+ * A frame as Manchester text, indented as Protégé writes it, with the entity's name from
+ * `name`. Axioms of a form the syntax has no clause for are left out.
+ */
+export function frameText(frame: Frame, iri: string, name: (iri: string) => string): string {
+  const lines = [`${frame.word}: ${manchesterName(name(iri))}`];
+  for (const s of frame.sections) {
+    lines.push('', `    ${s.word}: `);
+    s.items.forEach((it, i) => {
+      const text = it.map((t) => t.text).join('');
+      lines.push(`        ${text}${i < s.items.length - 1 ? ',' : ''}`);
+    });
+  }
+  return lines.join('\n') + '\n';
+}
+
+/** What the kept classification says of one class, and what of it the axioms do not. */
+export type Inferred = {
+  /** the direct superclasses the taxonomy has and no SubClassOf axiom asserts */
+  superClasses: string[];
+  /** the equivalent named classes no EquivalentClasses axiom asserts */
+  equivalents: string[];
+  /** whether the taxonomy is complete, with no axiom left out of the classification */
+  complete: boolean;
+  /** whether the dataset's kept classification answered without classifying again */
+  reused: boolean;
+};
+
+const THING = OWL + 'Thing';
+
+/**
+ * The inferences about class `iri` that its asserted axioms `groups` do not state: the
+ * classification's direct superclasses and its equivalent classes, less those asserted,
+ * `owl:Thing` and the class itself.
+ */
+export function inferredOf(
+  iri: string,
+  groups: AxiomGroup[],
+  about: { classes: string[]; parentClasses: string[] },
+  complete: boolean,
+  reused: boolean,
+): Inferred {
+  const named = (id: string) =>
+    new Set(
+      groups
+        .filter((g) => g.id === id)
+        .flatMap((g) => g.items.flatMap((it) => it.values))
+        .filter((v): v is string => typeof v === 'string'),
+    );
+  const sup = named('sub');
+  const eq = named('equivalent');
+  return {
+    superClasses: about.parentClasses.filter((c) => c !== THING && c !== iri && !sup.has(c)),
+    equivalents: about.classes.filter((c) => c !== iri && !eq.has(c)),
+    complete,
+    reused,
+  };
+}
+
+/** Whether a classification ran for `target` in this tab, so later pages may ask it again. */
+export function classifiedHere(target: string): boolean {
+  try {
+    return sessionStorage.getItem(`sparkles.classified.${target}`) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/** Notes that a classification ran for `target` in this tab. */
+export function markClassified(target: string): void {
+  try {
+    sessionStorage.setItem(`sparkles.classified.${target}`, '1');
+  } catch {
+    // the next page offers to classify again
+  }
+}
+
+/**
+ * `POST /$/ontology/{ds}/classify` about one class: its node in the dataset's kept
+ * classification, which a first call computes and later calls reuse incrementally. A class
+ * the taxonomy does not have answers null.
+ */
+export async function classifyAbout(
+  target: string,
+  graph: string | null,
+  iri: string,
+  signal?: AbortSignal,
+): Promise<{
+  complete: boolean;
+  reused: boolean;
+  class: { classes: string[]; parentClasses: string[] };
+} | null> {
+  try {
+    const res = await request(`/$/ontology/${enc(target)}/classify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        graph: graph ?? 'default',
+        imports: true,
+        about: iri,
+        limit: 1,
+      }),
+      signal,
+    });
+    markClassified(target);
+    return await res.json();
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
 }
 
 /** "SubClass Of" as "Subclass of". */

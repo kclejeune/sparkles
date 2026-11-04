@@ -8,6 +8,9 @@ import {
   displayName,
   downloadHref,
   editHref,
+  frameText,
+  inferredOf,
+  manchesterFrame,
   incomingQuery,
   kindWord,
   langRank,
@@ -64,6 +67,54 @@ const node = (iri: string, label: string, children = 0, deprecated = false): Tre
 });
 
 describe('the sections of a page', () => {
+  it('leads with a definition, else a description, a comment, a scope note or a note', () => {
+    const DCT = 'http://purl.org/dc/terms/';
+    const lead = (stmts: Statement[]) => {
+      const s = termSections({ statements: stmts }, ['en']);
+      return [
+        s.definition ? (s.definition.value as { '@value': string })['@value'] : null,
+        s.definitionKind,
+      ];
+    };
+    const all = [
+      st(SKOS + 'note', lit('a note')),
+      st(SKOS + 'scopeNote', lit('a scope note')),
+      st(RDFS + 'comment', lit('a comment')),
+      st(DCT + 'description', lit('a description')),
+      st(SKOS + 'definition', lit('a SKOS definition')),
+      st(OBO + 'IAO_0000115', lit('an OBO definition')),
+    ];
+    // each property leads once those before it are gone, in order
+    const expected: [string, string | null][] = [
+      ['an OBO definition', null],
+      ['a SKOS definition', null],
+      ['a description', 'Description'],
+      ['a comment', 'Comment'],
+      ['a scope note', 'Scope note'],
+      ['a note', 'Note'],
+    ];
+    expected.forEach((e, i) => expect(lead(all.slice(0, all.length - i))).toEqual(e));
+    expect(lead([st(RDFS + 'label', lit('x'))])).toEqual([null, null]);
+    // the note that leads is not repeated in the notes
+    const s = termSections(
+      { statements: [st(SKOS + 'scopeNote', lit('first')), st(SKOS + 'note', lit('other'))] },
+      ['en'],
+    );
+    expect(s.notes.map((g) => g.kind)).toEqual(['Note']);
+  });
+
+  it('keeps a SKOS concept’s facts with the other statements', () => {
+    const p = EX + 'custom';
+    const names = { [p]: { kinds: ['dataProperty'] } };
+    const stmts = [st(p, lit('v'))];
+    expect(termSections({ statements: stmts, names }, ['en']).other).toEqual([]);
+    expect(
+      termSections({ statements: stmts, names, kinds: ['concept'] }, ['en']).other.map(
+        (o) => o.property,
+      ),
+    ).toEqual([p]);
+  });
+
   it('sorts statements into definition, synonyms, notes, xrefs and the rest', () => {
     const s = termSections(
       {
@@ -227,6 +278,8 @@ describe('the sections of a page', () => {
   });
 });
 
+const OWL_THING = 'http://www.w3.org/2002/07/owl#Thing';
+
 describe('axioms', () => {
   it('groups the axioms about a class by the frame’s sections and leaves the rest last', () => {
     const iri = EX + 'C';
@@ -261,6 +314,131 @@ describe('axioms', () => {
     );
     expect(g.map((x) => x.id)).toEqual(['domains', 'characteristics']);
     expect(g[1].items[0].word).toBe('Transitive');
+  });
+
+  it('writes a class’s axioms as a Manchester frame, with the rest left out', () => {
+    const iri = EX + 'C';
+    const groups = axiomGroups(
+      iri,
+      ['class'],
+      [
+        item({ type: 'SubClassOf', subClass: iri, superClass: EX + 'P' }),
+        item({
+          type: 'SubClassOf',
+          subClass: iri,
+          superClass: {
+            type: 'ObjectSomeValuesFrom',
+            property: EX + 'partOf',
+            class: EX + 'Q',
+          },
+        }),
+        item({ type: 'EquivalentClasses', classes: [iri, EX + 'E'] }),
+        item({
+          type: 'HasKey',
+          class: iri,
+          objectProperties: [EX + 'k1'],
+          dataProperties: [EX + 'k2'],
+        }),
+        item({
+          type: 'HasKey',
+          class: EX + 'Other',
+          objectProperties: [],
+          dataProperties: [],
+        }),
+      ],
+    );
+    const name = (i: string) => (i === iri ? 'my class' : i.slice(EX.length));
+    const f = manchesterFrame('Class', groups, name, {});
+    expect(f.word).toBe('Class');
+    expect(f.sections.map((s) => [s.word, s.items.length])).toEqual([
+      ['SubClassOf', 2],
+      ['EquivalentTo', 1],
+      ['HasKey', 1],
+    ]);
+    expect(f.other).toHaveLength(1);
+    expect(frameText(f, iri, name)).toBe(
+      [
+        "Class: 'my class'",
+        '',
+        '    SubClassOf: ',
+        '        P,',
+        '        partOf some Q',
+        '',
+        '    EquivalentTo: ',
+        '        E',
+        '',
+        '    HasKey: ',
+        '        k1 k2',
+        '',
+      ].join('\n'),
+    );
+  });
+
+  it('writes a property’s characteristics and an individual’s facts in one clause each', () => {
+    const p = EX + 'p';
+    const pf = manchesterFrame(
+      'ObjectProperty',
+      axiomGroups(
+        p,
+        ['objectProperty'],
+        [
+          item({ type: 'InverseFunctionalObjectProperty', property: p }),
+          item({ type: 'TransitiveObjectProperty', property: p }),
+        ],
+      ),
+      (i) => i.slice(EX.length),
+      {},
+    );
+    expect(pf.sections).toHaveLength(1);
+    expect(pf.sections[0].word).toBe('Characteristics');
+    expect(pf.sections[0].items.map((t) => t[0].text)).toEqual(['InverseFunctional', 'Transitive']);
+    const a = EX + 'a';
+    const af = manchesterFrame(
+      'NamedIndividual',
+      axiomGroups(
+        a,
+        ['individual'],
+        [
+          item({
+            type: 'ObjectPropertyAssertion',
+            property: EX + 'knows',
+            source: a,
+            target: EX + 'b',
+          }),
+          item({
+            type: 'NegativeObjectPropertyAssertion',
+            property: EX + 'knows',
+            source: a,
+            target: EX + 'c',
+          }),
+        ],
+      ),
+      (i) => i.slice(EX.length),
+      {},
+    );
+    expect(af.word).toBe('Individual');
+    expect(af.sections.map((s) => s.word)).toEqual(['Facts']);
+    expect(frameText(af, a, (i) => i.slice(EX.length))).toContain('        not knows c\n');
+  });
+
+  it('keeps the inferences that the asserted axioms do not state', () => {
+    const iri = EX + 'C';
+    const groups = axiomGroups(
+      iri,
+      ['class'],
+      [item({ type: 'SubClassOf', subClass: iri, superClass: EX + 'P' })],
+    );
+    const inf = inferredOf(
+      iri,
+      groups,
+      { classes: [iri, EX + 'Same'], parentClasses: [EX + 'P', EX + 'T'] },
+      true,
+      false,
+    );
+    expect(inf.superClasses).toEqual([EX + 'T']);
+    expect(inf.equivalents).toEqual([EX + 'Same']);
+    const top = inferredOf(iri, [], { classes: [iri], parentClasses: [OWL_THING] }, true, true);
+    expect(top.superClasses).toEqual([]);
   });
 
   it('groups the mentions by the restriction that holds the entity', () => {
