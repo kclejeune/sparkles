@@ -791,7 +791,7 @@ fn ontology(p: &mut Paths) {
     );
     p.add(
         write_params(op(POST, "/$/ontology/{ds}/classify", "classifyOntology", "Ontology", "Classify an OWL 2 EL ontology"))
-            .doc("Classifies the terminology with the OWL 2 EL classifier and answers whether it is consistent, the unsatisfiable classes, the axioms outside OWL 2 EL that the classification left out or used in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses and its equivalent classes, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. The dataset keeps the last classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`.")
+            .doc("Classifies the terminology with the OWL 2 EL classifier and answers whether it is consistent, the unsatisfiable classes, the axioms outside OWL 2 EL that the classification left out or used in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses and its equivalent classes, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. The dataset keeps the last classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what a run with the disjunctive rules proved before it stopped. The answer's `complete` is false for such a partial answer, `partial` is true, `incomplete` lists the classes whose superclasses it may miss and `consistency` is `consistent`, `inconsistent` or `unknown`. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.")
             .see("ontology")
             .query("format", json!({ "type": "string", "enum": ["json", "ofn"] }), "`json` (the default) or `ofn`.")
             .body(
@@ -809,9 +809,11 @@ fn ontology(p: &mut Paths) {
                         "message": { "type": "string", "description": "The commit message of the write, also kept as a comment on the header." },
                         "about": { "type": "string", "description": "A class IRI to describe." },
                         "nodes": { "type": "boolean", "description": "List the taxonomy's nodes." },
-                        "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "The most nodes, unsatisfiable classes and excluded axioms listed (100 by default)." },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "The most nodes, unsatisfiable classes, incomplete classes and excluded axioms listed (100 by default)." },
                         "offset": { "type": "integer", "minimum": 0, "description": "The first node listed." },
-                        "threads": { "type": "integer", "minimum": 0, "maximum": 1024, "description": "The worker threads, within the algorithm pool's grant (0 for the grant)." }
+                        "threads": { "type": "integer", "minimum": 0, "maximum": 1024, "description": "The worker threads, within the algorithm pool's grant (0 for the grant)." },
+                        "partial": { "type": "boolean", "description": "Answer what a run with the disjunctive rules proved when its deadline, cancellation or memory budget stops it, instead of failing. Runs of the other rules fail as before." },
+                        "expansion": { "type": "string", "enum": ["cautious", "eager"], "description": "The expansion strategy of the disjunctive rules, `cautious` by default. Both give the same answer." }
                     }
                 } } }),
             )

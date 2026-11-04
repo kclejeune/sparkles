@@ -12,8 +12,9 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+from conftest import optional_dependency
 
-rdflib = pytest.importorskip("rdflib")
+rdflib = optional_dependency("rdflib")
 
 from rdflib import RDF, RDFS, BNode, ConjunctiveGraph, Graph, Literal, Namespace, URIRef, Variable  # noqa: E402
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, QuotedGraph  # noqa: E402

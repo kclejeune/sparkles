@@ -660,6 +660,198 @@ async fn classify_answers_the_taxonomy_and_writes_it() {
     assert!(j["total"].as_u64().unwrap() >= 1, "{j}");
 }
 
+/// Item 603's cases in Turtle, as the `sparkles` crate's tests write them: a classification
+/// that the disjunctive rules take, long enough that a deadline stops it part way.
+fn cases(n: usize, inconsistent: bool) -> String {
+    let mut s = String::from(
+        "@prefix : <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:r a owl:ObjectProperty . :s a owl:ObjectProperty .\n",
+    );
+    let some = |p: &str, c: &str| {
+        format!("[ a owl:Restriction ; owl:onProperty {p} ; owl:someValuesFrom {c} ]")
+    };
+    for i in 0..n {
+        let (b, d) = ((7 * i + 3) % n, (13 * i + 5) % n);
+        s.push_str(&format!(
+            ":C{i} a owl:Class ; rdfs:subClassOf [ owl:unionOf ( :B{i} :E{i} ) ] .
+             :B{i} rdfs:subClassOf :K{i} , :C{b} . :E{i} rdfs:subClassOf :K{i} .
+             :K{i} rdfs:subClassOf {} .
+             :E{i} rdfs:subClassOf [ a owl:Restriction ;
+                 owl:onProperty [ owl:inverseOf :r ] ; owl:allValuesFrom :F{d} ] .
+             {} rdfs:subClassOf :G{b} .\n",
+            some(":r", &format!(":C{d}")),
+            some(":r", &format!(":F{i}")),
+        ));
+    }
+    if inconsistent {
+        s.push_str(&format!(
+            "owl:Thing rdfs:subClassOf {} .
+             :N1 rdfs:subClassOf owl:Nothing . :N2 rdfs:subClassOf :N3 . :N3 owl:disjointWith :N2 .\n",
+            some(":s", "[ owl:unionOf ( :N1 :N2 ) ]"),
+        ));
+    }
+    s
+}
+
+/// A server whose dataset `t` holds `data` in Turtle.
+fn server_of(data: &str) -> Server {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    let ds = state.attach("t", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            data.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let app = router(state.clone());
+    Server {
+        _dir: dir,
+        _state: state,
+        app,
+    }
+}
+
+/// Classifies the cases over HTTP under deadlines from a small fraction of a full run's
+/// time upwards, checks each answer and returns the consistencies of the partial ones.
+async fn partial_over_http(inconsistent: bool) -> Vec<String> {
+    let n = if cfg!(debug_assertions) { 120 } else { 400 };
+    let s = server_of(&cases(n, inconsistent));
+    let body = json!({"partial": true, "threads": 1, "limit": 10000});
+    let t = std::time::Instant::now();
+    // a fresh server for the full run, since the dataset keeps a complete taxonomy
+    let full = post(
+        &server_of(&cases(n, inconsistent)).app,
+        "/$/ontology/t/classify",
+        body.clone(),
+    )
+    .await
+    .json();
+    let took = t.elapsed().as_secs_f64();
+    assert_eq!(full["complete"], true, "{full}");
+    assert_eq!(full["partial"], false, "{full}");
+    assert_eq!(full["tier"], "disjunctive", "{full}");
+    let want = if inconsistent {
+        "inconsistent"
+    } else {
+        "consistent"
+    };
+    assert_eq!(full["consistency"], want, "{full}");
+    assert_eq!(full["consistent"], !inconsistent, "{full}");
+    let classes = full["classes"].clone();
+    let mut seen = Vec::new();
+    let mut f = 0.02;
+    while f < 1.5 {
+        let r = post(
+            &s.app,
+            &format!("/$/ontology/t/classify?timeout={}", took * f),
+            body.clone(),
+        )
+        .await;
+        f *= 1.25;
+        if r.status == StatusCode::REQUEST_TIMEOUT {
+            continue;
+        }
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let j = r.json();
+        assert_eq!(j["classes"], classes, "{j}");
+        if j["partial"] == false {
+            assert_eq!(j["complete"], true, "{j}");
+            assert_eq!(j["consistency"], want, "{j}");
+            assert_eq!(j["incompleteCount"], 0, "{j}");
+            continue;
+        }
+        assert_eq!(
+            j["complete"], false,
+            "a partial answer is presented as complete: {j}"
+        );
+        let open = j["incomplete"].as_array().unwrap();
+        assert_eq!(
+            j["incompleteCount"].as_u64(),
+            Some(open.len() as u64),
+            "{j}"
+        );
+        let c = j["consistency"].as_str().unwrap().to_string();
+        assert!(c == want || c == "unknown", "{j}");
+        if c == "unknown" {
+            // every class but owl:Thing and owl:Nothing is open
+            assert!(
+                open.len() as u64 + 2 >= j["classes"].as_u64().unwrap(),
+                "{j}"
+            );
+        }
+        seen.push(c);
+    }
+    seen
+}
+
+#[tokio::test]
+async fn classify_answers_in_part_under_a_deadline() {
+    let seen = partial_over_http(false).await;
+    assert!(!seen.is_empty(), "no deadline gave a partial answer");
+    let s = server();
+    // a partial answer cannot be written or answered as a functional-style document
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"partial": true, "target": "http://ex.org/tax"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify?format=ofn&partial=true",
+        json!({}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"expansion": "greedy"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // a complete run of an EL ontology, with either strategy
+    for e in ["cautious", "eager"] {
+        let j = post(
+            &s.app,
+            "/$/ontology/t/classify",
+            json!({"partial": true, "expansion": e}),
+        )
+        .await
+        .json();
+        assert_eq!(
+            (
+                &j["complete"],
+                &j["partial"],
+                &j["consistency"],
+                &j["tier"],
+                &j["incomplete"]
+            ),
+            (
+                &json!(true),
+                &json!(false),
+                &json!("consistent"),
+                &json!("el"),
+                &json!([])
+            ),
+            "{j}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn classify_leaves_the_consistency_unknown_when_stopped_early() {
+    let seen = partial_over_http(true).await;
+    assert!(seen.iter().any(|c| c == "unknown"), "{seen:?}");
+}
+
 /// Every quad of dataset `t`, as sorted N-Quads lines.
 async fn quads(app: &Router, ds: &str) -> Vec<String> {
     let r = send(

@@ -702,6 +702,8 @@ fn members(op: &str) -> &'static [&'static str] {
             "limit",
             "offset",
             "threads",
+            "partial",
+            "expansion",
         ],
         "parse" => &["text", "as"],
         "hierarchy" => &[
@@ -751,6 +753,16 @@ fn string<'a>(a: &'a Map<String, J>, k: &str) -> Result<Option<&'a str>> {
         None | Some(J::Null) => Ok(None),
         Some(J::String(s)) => Ok(Some(s)),
         Some(_) => Err(bad(format!("{k}: a string"))),
+    }
+}
+
+/// The expansion strategy that `expansion` names: `cautious`, the default, or `eager`.
+pub fn expansion_of(s: Option<&str>) -> Result<sparkles_owl::classify::Expansion> {
+    use sparkles_owl::classify::Expansion;
+    match s {
+        None | Some("cautious") => Ok(Expansion::Cautious),
+        Some("eager") => Ok(Expansion::Eager),
+        Some(x) => Err(bad(format!("expansion: cautious or eager, not '{x}'"))),
     }
 }
 
@@ -887,8 +899,9 @@ fn profiles_of(a: &Map<String, J>) -> Result<Vec<Profile>> {
 ///   first), `limit`, `offset`, `fuzzy` and `definitions`.
 /// - `classify`: the OWL 2 EL classification of `POST /$/ontology/{ds}/classify`, with
 ///   `assertions`, `target` and `message` (write the taxonomy to that graph), `about` (a
-///   class to describe), `nodes` (list the taxonomy's nodes), `limit`, `offset` and
-///   `threads`.
+///   class to describe), `nodes` (list the taxonomy's nodes), `limit`, `offset`,
+///   `threads`, `partial` (answer what a run stopped part way proved) and `expansion`
+///   (`cautious` or `eager`).
 /// - `parse`: Manchester `text` read against the ontology, as
 ///   `POST /$/ontology/{ds}/parse` answers it, with `as` (`classExpression`, the
 ///   default, `dataRange`, `individual`, `literal` or `axiom`).
@@ -1050,6 +1063,8 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 message: string(a, "message")?.map(str::to_string),
                 about: about.clone(),
                 el_only: false,
+                partial: boolean(a, "partial")?.unwrap_or(false),
+                expansion: expansion_of(string(a, "expansion")?)?,
             };
             let q = ClassifyQuery {
                 about,
@@ -1426,7 +1441,8 @@ pub struct ClassifyQuery {
     pub about: Option<String>,
     /// list the taxonomy's nodes, `limit` from `offset`
     pub nodes: bool,
-    /// the most unsatisfiable classes, excluded axioms and nodes listed
+    /// the most unsatisfiable classes, incomplete classes, excluded axioms and nodes
+    /// listed
     pub limit: usize,
     pub offset: usize,
 }
@@ -1445,10 +1461,11 @@ fn node_json(t: &sparkles_owl::classify::Taxonomy, i: usize) -> J {
 
 /// The JSON of a classification, as `POST /$/ontology/{ds}/classify` answers it: the
 /// members of the ontology read, whether the ontology is consistent, whether the
-/// taxonomy is complete, the counts, the unsatisfiable classes and the axioms left out
-/// or used in part (at most `q.limit` of each), the times of the run, and on request
-/// the nodes, one class and the edit that wrote the taxonomy. `about` a class the
-/// taxonomy does not have is `NotFound`.
+/// taxonomy is complete, whether it is the partial answer of a stopped run, the rules
+/// the axioms need, the counts, the unsatisfiable classes, the classes a partial answer
+/// leaves open and the axioms left out or used in part (at most `q.limit` of each), the
+/// times of the run, and on request the nodes, one class and the edit that wrote the
+/// taxonomy. `about` a class the taxonomy does not have is `NotFound`.
 pub fn classify_body(
     name: &str,
     c: &Classified,
@@ -1489,8 +1506,26 @@ pub fn classification_body(
     let s = &c.classification.stats;
     let mut j = read_json(name, c.read, req);
     let unsat: Vec<&str> = t.unsatisfiable().map(|c| c.as_str()).collect();
-    j["consistent"] = json!(c.classification.consistent);
-    j["complete"] = json!(c.excluded.is_empty());
+    use sparkles_owl::classify::Consistency;
+    let cl = c.classification;
+    j["consistent"] = json!(cl.consistent);
+    j["consistency"] = json!(match cl.consistency {
+        Consistency::Consistent => "consistent",
+        Consistency::Inconsistent => "inconsistent",
+        Consistency::Unknown => "unknown",
+    });
+    // a partial answer is never complete, whatever it left out
+    j["complete"] = json!(c.excluded.is_empty() && cl.complete);
+    j["partial"] = json!(!cl.complete);
+    j["tier"] = json!(s.tier.as_str());
+    j["incompleteCount"] = json!(cl.incomplete.len());
+    j["incomplete"] = json!(
+        cl.incomplete
+            .iter()
+            .take(q.limit)
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>()
+    );
     j["reused"] = json!(c.reused);
     j["classes"] = json!(t.classes().count());
     j["nodeCount"] = json!(t.nodes().len());

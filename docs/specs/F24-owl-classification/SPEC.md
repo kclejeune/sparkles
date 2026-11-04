@@ -375,7 +375,13 @@ one thread, outboxes that sort and drop repeated messages, and subsumer lists of
 208b8efc, reverted in 9ea7a425. The rules for individuals run in functions of their own, outside the
 saturation's loop, since a first build that kept them inline, commit 68a683b5, made the
 saturation of ontologies without individuals 3 to 19% slower on one thread in an
-interleaved A/B on `atlas` ([record](../../benchmarks/el-classification/runs/2026-11-03-el-inline-atlas-68a683b5/record.json)). The [benchmark
+interleaved A/B on `atlas` ([record](../../benchmarks/el-classification/runs/2026-11-03-el-inline-atlas-68a683b5/record.json)).
+Release builds compile `sparkles-owl` as one codegen unit, since with four the time of the
+index stage moved by up to 7% with changes to code that EL runs never reach. One unit
+classifies `ore_ont_3836` on one thread on forge in 543 ms against 559 ms and
+`ore_ont_13482` in 868 against 902 ms, with 3.8% fewer instructions on `ore_ont_3836`, and
+the crate takes 25 to 27 s to compile instead of 9 to 12 s ([code layout
+results](../../benchmarks/el-classification/RESULTS.md#code-layout)). The [benchmark
 report](../../benchmarks/el-classification/RESULTS.md) has the numbers and the records.
 
 **Testing.** Tests in `crates/sparkles-owl/tests/classify.rs` cover worked examples of
@@ -674,7 +680,25 @@ is unsatisfiable, or when it and every context it reaches are closed, and when i
 no class is complete. The taxonomy of a partial answer is built from its proved subsumptions
 closed transitively, after the clause stores are freed. A partial answer that passes the
 budget fails with the memory error, and the next run starts again. Runs of the other tiers
-ignore the flag and fail on a stop as before, item 714.
+ignore the flag and fail on a stop as before, item 714. A class whose context the stop came
+before is open too, and so is the consistency while `owl:Thing` has no context.
+
+Phase 7's surfaces give the partial answer to every caller of a classification.
+`ClassifyRequest::partial` and `ClassifyRequest::expansion` carry the flag and the
+strategy, and the JSON operation, `POST /$/ontology/{ds}/classify`, the Python, Node.js
+and JVM bindings and `sparkles ontology classify --partial --expansion` take them. Every
+answer gives `tier` and `consistency`, and a partial one has `partial` true, `complete`
+false and the open classes under `incomplete` with `incompleteCount`. The `complete` of
+the JSON and of `Classified::complete` stays true only for an answer that left nothing out
+and finished. The dataset keeps no partial answer. A request that writes its taxonomy,
+asks for the functional-style answer or runs a ROBOT-compatible command refuses or ignores
+the flag, since none of them can say that a taxonomy is partial. The command line takes
+`--timeout`, notes a partial answer on stderr and exits with status 2 for one that is
+otherwise clean. Each surface's tests classify a generated ALCHI ontology under deadlines
+from a fiftieth of a full run's time upwards, and check that a partial answer is never
+complete, that it lists its open classes and that its consistency agrees with the full run
+or is unknown, which an inconsistent ontology gives when stopped early. The Workbench does
+not ask for partial answers, item 719.
 
 A run of the disjunctive rules has the Horn rules' memory budget, 64 times the estimated
 bytes of its index and axioms, at least 1 GiB, and no more than the caller's. The clause
@@ -691,7 +715,8 @@ four threads and under both strategies. A random test of 20,000 small Horn ontol
 inverses, chains and transitive properties gives the disjunctive rules' answer and the Horn
 rules' the same taxonomy, and a random test of ALCHI ontologies stops each run at every
 point of its cancellation and checks that each partial answer is part of the full one and
-whole for every class it reports complete. On the development set of the ORE 2015 DL
+whole for every class of its signature that it reports complete. The deadline tests stop
+runs before every class has a context. On the development set of the ORE 2015 DL
 sample, the disjunctive rules take nine files of the `dl` and `dl-i` strata whole, and
 their taxonomies equal the reference on all nine. Eight files of the strata have
 individuals or data properties and stay sound, and ore_ont_3215 passes the budget. Of the 13
@@ -700,9 +725,12 @@ take only ore_ont_5940, whose taxonomy is now complete and faster than Konclude'
 classifies slower than Konclude, item 712. The taxonomies of the 298 ORE 2015 EL
 ontologies, GO, ChEBI lite and every development file that the disjunctive rules do not
 take are byte for byte those of the Horn tier on one and eight threads. The saturation's
-arms for the disjunctive rules compile away in other runs, but on the benchmark host GO and
-ChEBI lite classify 0.9% and 1.4% slower on one thread and in the same time on eight, item
-715.
+arms for the disjunctive rules compile away in other runs. They first made the one worker's
+activation too large to inline, and GO and ChEBI lite classified 0.9% and 1.4% slower on
+one thread on the benchmark host. Each rule set now has a worker of its own that inlines
+its activation, and with `sparkles-owl` in one codegen unit GO classifies on one thread in
+0.99 of the time of the build before and ChEBI lite in 0.98, with the same taxonomies, as
+the [code layout results](../../benchmarks/el-classification/RESULTS.md#code-layout) give.
 
 ### ROBOT-compatible commands
 

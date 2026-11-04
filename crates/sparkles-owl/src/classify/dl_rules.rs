@@ -2023,8 +2023,9 @@ pub fn record(
             edge(f);
         }
     }
-    // a context reached but never made has not started either
-    for e in reached {
+    // a context reached but never made has not started either, nor has a root's that
+    // the run stopped before it made
+    for e in reached.into_iter().chain(roots.iter().copied()) {
         if get(e).is_none() {
             open.insert(e);
         }

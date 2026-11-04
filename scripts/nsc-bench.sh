@@ -5,11 +5,13 @@
 #   scripts/nsc-bench.sh [options] A B
 #
 # A and B are git revisions of this repository or paths to built `sparkles` binaries. A
-# revision is built here, before any instance exists, from a `git archive` of it with
-# `mbx build --release -p sparkles-server`, and the binary is cached under
+# revision is built before any instance exists, from a `git archive` of it with
+# `mbx build --release -p sparkles-server`, on this machine or on a build host over ssh
+# (--build-host, see scripts/nsc-build-host.sh), and the binary is cached under
 # $SPARKLES_NSC_CACHE/bin/<commit> (default ~/.cache/sparkles-nsc), or under
 # bin/<commit>-<SHA-256 of the --cargo-args text> when --cargo-args is given. An entry is
-# reused only when its build.txt records the same cargo arguments. The dataset comes from
+# reused only when its build.txt records the same cargo arguments, wherever it was built,
+# and build.txt and the manifest name the host that built it. The dataset comes from
 # scripts/gen-data.py and is cached there as zstd. The queries are those of scripts/bench.sh
 # unless --query-dir names a directory of *.rq files.
 #
@@ -53,6 +55,9 @@
 #   --prepare-reps N    runs of --prepare-repeat (default 5); results/prepare.tsv gets
 #                       every timing, and the summary its medians
 #   --cargo-args "..."  extra `cargo build` flags, e.g. "--features text"
+#   --build-host H      where revisions are built: local, auto (the first free host of
+#                       SPARKLES_NSC_BUILD_HOSTS) or a host name (default auto when
+#                       SPARKLES_NSC_BUILD_HOSTS is set, else local)
 #   --machine-type T    Namespace machine type (default linux/amd64:8x16)
 #   --duration D        instance lifetime cap, as nsc takes it (default 2h)
 #   --out DIR           results directory (default .artifacts/nsc-bench/<UTC time>)
@@ -108,6 +113,8 @@ usage() {
   sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'
   exit "${1:-0}"
 }
+# shellcheck source=scripts/nsc-build-host.sh
+. "$ROOT/scripts/nsc-build-host.sh"
 ARGS=()
 while [ $# -gt 0 ]; do
   case $1 in
@@ -141,6 +148,7 @@ while [ $# -gt 0 ]; do
     --serve-args) SERVE_ARGS=$2 ;;
     --execution) EXECUTION=$2 ;;
     --cargo-args) CARGO_ARGS=$2 ;;
+    --build-host) BH_ARG=$2 ;;
     --prepare) PREPARE=$2 ;;
     --prepare-a) PREPARE_A=$2 ;;
     --prepare-b) PREPARE_B=$2 ;;
@@ -161,6 +169,7 @@ while [ $# -gt 0 ]; do
   shift 2
 done
 [ ${#ARGS[@]} -eq 2 ] || usage 1
+bh_check_arg
 for t in nsc zstd python3 mbx cargo readelf flock; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
 OUT=$(realpath -m "${OUT:-$ROOT/.artifacts/nsc-bench/$(date -u +%Y%m%dT%H%M%SZ)}")
 mkdir -p "$OUT/stage/queries" "$OUT/logs" "$CACHE"/{bin,data,src,locks}
@@ -182,12 +191,13 @@ SRC_TMP=
 cleanup_src() {
   [ -z "$SRC_TMP" ] || rm -rf -- "$SRC_TMP"
   SRC_TMP=
+  bh_cleanup
 }
 trap cleanup_src EXIT
 trap 'exit 130' INT TERM
 # binary <rev|path> <A|B>: stages bin-<A|B>.zst and notes its source, SHA-256 and compilers
 binary() {
-  local ref=$1 v=$2 bin sha src key entry lock
+  local ref=$1 v=$2 bin sha src key entry lock host
   entry_current() { [ -x "$bin" ] && grep -qxF "cargo args: $CARGO_ARGS" "$entry/build.txt" 2> /dev/null; }
   if [ -f "$ref" ]; then
     bin=$(realpath "$ref")
@@ -207,33 +217,46 @@ binary() {
       exec {lock}> "$CACHE/locks/$key.lock"
       flock "$lock"
       if ! entry_current; then
-        echo "building $ref ($sha); log: $OUT/logs/build-$v.log"
+        bh_resolve
         rm -f "$entry/build.txt"
         mkdir -p "$entry"
         # Holding the lock, no other run is building this entry, so earlier private trees are
         # abandoned by runs that were killed.
         rm -rf -- "${CACHE:?}/src/$key".*
         SRC_TMP=$(mktemp -d "$CACHE/src/$key.XXXXXXXX")
-        # Keep source mtimes current. Each archive has its own managed mutable target;
-        # Boxington shares immutable build results rather than one Cargo target.
-        git -C "$ROOT" archive "$sha" | tar -x -m -C "$SRC_TMP"
-        # the server embeds ui/build; its build script writes a placeholder, but does not
-        # rerun for a second source tree in the shared target directory
-        mkdir -p "$SRC_TMP/ui/build"
-        echo '<!doctype html><title>Sparkles</title><p>The UI was not built for this benchmark binary.</p>' \
-          > "$SRC_TMP/ui/build/index.html"
-        # The build inherits the lock descriptor, so a build that outlives a killed run keeps
-        # the lock and the next run waits for it.
-        # shellcheck disable=SC2086 # CARGO_ARGS is a list of flags
-        (cd "$SRC_TMP" && bash "$ROOT/scripts/nsc-build.sh" "$bin" $CARGO_ARGS) \
-          > "$OUT/logs/build-$v.log" 2>&1 || die "build of $ref failed, see $OUT/logs/build-$v.log"
-        # the shell's compilers, beside the binary's own record of them in .comment
+        if [ "$BH_HOST" = local ]; then
+          echo "building $ref ($sha); log: $OUT/logs/build-$v.log"
+          # Keep source mtimes current. Each archive has its own managed mutable target;
+          # Boxington shares immutable build results rather than one Cargo target.
+          git -C "$ROOT" archive "$sha" | tar -x -m -C "$SRC_TMP"
+          bh_ui_placeholder "$SRC_TMP"
+          # The build inherits the lock descriptor, so a build that outlives a killed run keeps
+          # the lock and the next run waits for it.
+          # shellcheck disable=SC2086 # CARGO_ARGS is a list of flags
+          (cd "$SRC_TMP" && bash "$ROOT/scripts/nsc-build.sh" "$bin" $CARGO_ARGS) \
+            > "$OUT/logs/build-$v.log" 2>&1 || die "build of $ref failed, see $OUT/logs/build-$v.log"
+          # the shell's compilers, beside the binary's own record of them in .comment
+          {
+            echo "build host: local ($(uname -n))"
+            echo "cc: $(cc --version 2> /dev/null | head -1)"
+            echo "c++: $(c++ --version 2> /dev/null | head -1)"
+            (cd "$SRC_TMP" && rustc -V)
+          } > "$SRC_TMP/.nsc-build-info.txt"
+        else
+          echo "building $ref ($sha) on $BH_HOST; log: $OUT/logs/build-$v.log"
+          # The private tree receives the binary and the build host's record of its compilers.
+          # shellcheck disable=SC2086 # CARGO_ARGS is a list of flags
+          bh_build "$BH_HOST" "$sha" "$SRC_TMP" $CARGO_ARGS > "$OUT/logs/build-$v.log" 2>&1 ||
+            die "build of $ref on $BH_HOST failed, see $OUT/logs/build-$v.log"
+          cp -- "$SRC_TMP/sparkles" "$bin.tmp.$$"
+          chmod 755 "$bin.tmp.$$"
+          mv -- "$bin.tmp.$$" "$bin"
+          mv -- "$SRC_TMP/info.txt" "$SRC_TMP/.nsc-build-info.txt"
+        fi
         {
           echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "cargo args: $CARGO_ARGS"
-          echo "cc: $(cc --version 2> /dev/null | head -1)"
-          echo "c++: $(c++ --version 2> /dev/null | head -1)"
-          (cd "$SRC_TMP" && rustc -V)
+          cat "$SRC_TMP/.nsc-build-info.txt"
         } > "$entry/build.txt.tmp.$$"
         mv "$entry/build.txt.tmp.$$" "$entry/build.txt"
         cleanup_src
@@ -242,6 +265,8 @@ binary() {
     fi
     src="commit $sha ($ref)"
     [ -z "$CARGO_ARGS" ] || src+=", cargo $CARGO_ARGS"
+    host=$(sed -n 's/^build host: //p' "$entry/build.txt")
+    src+=", built on ${host:-an unrecorded host}"
   fi
   note "$v: $src"
   note "$v sha256: $(sha256sum "$bin" | cut -d' ' -f1)"

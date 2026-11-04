@@ -515,9 +515,23 @@ export interface OntologyExcluded extends OntologyAxiom {
 }
 /** The OWL 2 EL classification of an ontology (spec F24). */
 export interface OntologyClassification extends OntologyState {
+  /** false only when the ontology is proved inconsistent; see `consistency` */
   consistent: boolean;
-  /** false when an axiom is left out or used in part, so that entailments may be missing */
+  /** whether the ontology has a model as far as the run knows: only a partial answer is `unknown` */
+  consistency: 'consistent' | 'inconsistent' | 'unknown';
+  /**
+   * false when an axiom is left out or used in part, or the answer is partial, so that
+   * entailments may be missing
+   */
   complete: boolean;
+  /** true for the partial answer of a run that its deadline, cancellation or memory budget stopped */
+  partial: boolean;
+  /** the rules the ontology's axioms need */
+  tier: 'el' | 'horn' | 'disjunctive';
+  /** the classes whose superclasses a partial answer may miss */
+  incompleteCount: number;
+  /** those classes, the first `limit`, in IRI order */
+  incomplete: string[];
   /** whether the dataset's kept classification of the same state answered */
   reused: boolean;
   classes: number;
@@ -1000,6 +1014,9 @@ export class Administration {
        * Classify by OWL 2 EL (spec F24): consistency, the unsatisfiable classes, the axioms
        * left out or used in part, one class (`about`) and the taxonomy's nodes (`nodes`,
        * `limit` from `offset`). `target` writes the taxonomy to that named graph in one commit.
+       * `partial` answers what a run with the disjunctive rules proved when its deadline or
+       * cancellation stops it, with `partial` true, the `incomplete` classes and the
+       * `consistency`.
        */
       classify: (
         o: OntologySelection &
@@ -1013,6 +1030,10 @@ export class Administration {
             threads?: number;
             target?: OntologyGraph;
             message?: string;
+            /** answer what a run with the disjunctive rules proved when `timeout` or `signal` stops it */
+            partial?: boolean;
+            /** the expansion strategy of the disjunctive rules */
+            expansion?: 'cautious' | 'eager';
           } = {},
       ) =>
         call<OntologyClassification>(
@@ -1030,8 +1051,11 @@ export class Administration {
             threads: o.threads,
             target: o.target,
             message: o.message,
+            partial: o.partial,
+            expansion: o.expansion,
           },
-          o,
+          // a partial answer comes after the timeout that stopped the run
+          o.partial ? ({ ...o, answersWhenStopped: true } as typeof o) : o,
           o.target !== undefined,
         ),
       /**

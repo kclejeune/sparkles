@@ -90,7 +90,8 @@ pub enum OntologyCmd {
     },
     /// Classify by OWL 2 EL: the inferred class hierarchy and the unsatisfiable
     /// classes. Exits with status 1 when the ontology is inconsistent or has an
-    /// unsatisfiable class
+    /// unsatisfiable class, and with status 2 for a partial answer (--partial) that is
+    /// otherwise clean
     Classify {
         /// An ontology file to classify without a database (Turtle, RDF/XML, OWL
         /// functional-style syntax, … by its extension)
@@ -123,6 +124,17 @@ pub enum OntologyCmd {
         /// consistent
         #[arg(long)]
         allow_unsatisfiable: bool,
+        /// Stop the run after this many seconds (fractions allowed)
+        #[arg(long)]
+        timeout: Option<f64>,
+        /// When the deadline stops a run with the disjunctive rules, answer what it
+        /// proved, with the classes it left open and the consistency it knows, and exit
+        /// with status 2. Not with --target, --format ofn or a chain
+        #[arg(long)]
+        partial: bool,
+        /// The expansion strategy of the disjunctive rules: cautious or eager
+        #[arg(long, default_value = "cautious")]
+        expansion: String,
         /// ofn (the taxonomy as a functional-style document), json or text
         #[arg(long, default_value = "ofn")]
         format: String,
@@ -419,6 +431,9 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             about,
             threads,
             allow_unsatisfiable,
+            timeout,
+            partial,
+            expansion,
             format,
             rest,
         } => {
@@ -429,6 +444,30 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             if chain.is_some() && target.is_some() {
                 bail!("--target writes to a database: a chain from a FILE writes files");
             }
+            if partial && chain.is_some() {
+                bail!(
+                    "--partial answers in part, which a chain does not transform: leave out --partial"
+                );
+            }
+            if partial && format == "ofn" {
+                bail!(
+                    "--format ofn has no place to say that an answer is partial: name --format json or text"
+                );
+            }
+            if partial && target.is_some() {
+                bail!("--target writes a complete taxonomy: leave out --partial");
+            }
+            if let Some(t) = timeout
+                && !(t.is_finite() && t > 0.0)
+            {
+                bail!("--timeout: a positive number of seconds");
+            }
+            let expansion = sparkles::handles::ontology::wire::expansion_of(Some(&expansion))
+                .map_err(|e| anyhow::anyhow!("--{e}"))?;
+            let qopts = sparkles::sparql::QueryOptions {
+                timeout: timeout.map(std::time::Duration::from_secs_f64),
+                ..Default::default()
+            };
             let about = about
                 .as_deref()
                 .map(|a| a.trim_start_matches('<').trim_end_matches('>').to_string());
@@ -445,6 +484,8 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 message: message.clone(),
                 about: about.clone(),
                 el_only: false,
+                partial,
+                expansion,
             };
             let q = ClassifyQuery {
                 about: about.clone(),
@@ -459,7 +500,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             };
             let local_run = |ds: &sparkles::Dataset, name: &str| -> Result<(J, String)> {
                 let req = read.request()?;
-                let out = ds.ontology().classify(&req, &c, &Default::default())?;
+                let out = ds.ontology().classify(&req, &c, &qopts)?;
                 let r = renderer(ds);
                 let j = classify_body(name, &out, &req, &r, &q)?;
                 let doc = owl::ofn::document(
@@ -484,7 +525,9 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     let req = read.request()?;
                     match OntologyFile::read(&f, &req, 0)? {
                         // the file's axioms, read without a database
-                        Some(file) => classify_body_of_file(&file, &c, &read, about.clone())?,
+                        Some(file) => {
+                            classify_body_of_file(&file, &c, &read, about.clone(), &qopts)?
+                        }
                         None => {
                             let ds = sparkles::Dataset::memory();
                             let source = sparkles::io::Source::from_path(&f, None)
@@ -505,6 +548,12 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     body["assertions"] = json!(assertions);
                     body["threads"] = json!(threads);
                     body["limit"] = json!(MAX_LIMIT);
+                    if partial {
+                        body["partial"] = json!(true);
+                    }
+                    if c.expansion == sparkles::owl::classify::Expansion::Eager {
+                        body["expansion"] = json!("eager");
+                    }
                     if let Some(t) = &target {
                         body["target"] = json!(t);
                     }
@@ -514,7 +563,11 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     if let Some(a) = &q.about {
                         body["about"] = json!(a);
                     }
-                    let j = remote_post(&at, "/classify", &body)?;
+                    let path = match timeout {
+                        Some(t) => format!("/classify?timeout={t}"),
+                        None => "/classify".to_string(),
+                    };
+                    let j = remote_post(&at, &path, &body)?;
                     let doc = if format == "ofn" {
                         // the kept classification answers the second request
                         if let Some(o) = body.as_object_mut() {
@@ -522,7 +575,8 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                             o.remove("message");
                             o.remove("about");
                         }
-                        remote_post_text(&at, "/classify?format=ofn", &body)?
+                        let sep = if path.contains('?') { '&' } else { '?' };
+                        remote_post_text(&at, &format!("{path}{sep}format=ofn"), &body)?
                     } else {
                         String::new()
                     };
@@ -533,6 +587,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             match chain {
                 Some(f) => ontology_chain::resume(&f, &read, threads, output, rest, ok, opts),
                 None if !ok => std::process::exit(1),
+                None if j["partial"].as_bool() == Some(true) => std::process::exit(2),
                 None => Ok(()),
             }
         }
@@ -654,6 +709,7 @@ pub(crate) fn classify_body_of_file(
     c: &ClassifyRequest,
     read: &Read,
     about: Option<String>,
+    opts: &sparkles::sparql::QueryOptions,
 ) -> Result<(J, String)> {
     let req = read.request()?;
     let q = ClassifyQuery {
@@ -662,7 +718,7 @@ pub(crate) fn classify_body_of_file(
         limit: MAX_LIMIT,
         offset: 0,
     };
-    let out = file.classify(c, &Default::default())?;
+    let out = file.classify(c, opts)?;
     let r = file.renderer();
     let view = file.view();
     let j = classification_body(
@@ -687,7 +743,8 @@ pub(crate) fn classify_body_of_file(
 }
 
 /// Print a classification; false when the exit status is 1: the ontology is
-/// inconsistent, or it has unsatisfiable classes and they are not allowed.
+/// inconsistent, or it has unsatisfiable classes and they are not allowed. A partial
+/// answer also gets a note on stderr, since its exit status of 2 is a usage error's too.
 pub(crate) fn finish_classify(
     j: &J,
     doc: &str,
@@ -699,6 +756,13 @@ pub(crate) fn finish_classify(
         "json" => println!("{}", serde_json::to_string_pretty(j)?),
         "text" => print_classify(j),
         f => bail!("unknown --format {f}: ofn, json or text"),
+    }
+    if j["partial"].as_bool() == Some(true) {
+        eprintln!(
+            "partial answer: the run stopped before it finished, {} classes may miss superclasses, consistency {}",
+            j["incompleteCount"].as_u64().unwrap_or(0),
+            j["consistency"].as_str().unwrap_or("unknown"),
+        );
     }
     let consistent = j["consistent"].as_bool().unwrap_or(false);
     let unsat = j["unsatisfiableCount"].as_u64().unwrap_or(0);
@@ -954,14 +1018,13 @@ fn print_check(j: &J, format: &str) -> Result<()> {
 
 fn print_classify(j: &J) {
     let n = |k: &str| j[k].as_u64().unwrap_or(0);
-    let consistent = j["consistent"].as_bool().unwrap_or(false);
+    let consistency = match j["consistency"].as_str() {
+        Some("unknown") => "consistency unknown",
+        _ if j["consistent"].as_bool().unwrap_or(false) => "consistent",
+        _ => "inconsistent",
+    };
     println!(
-        "{}: {} classes in {} nodes, {} unsatisfiable",
-        if consistent {
-            "consistent"
-        } else {
-            "inconsistent"
-        },
+        "{consistency}: {} classes in {} nodes, {} unsatisfiable",
         n("classes"),
         n("nodeCount"),
         n("unsatisfiableCount"),
@@ -969,7 +1032,16 @@ fn print_classify(j: &J) {
     for c in j["unsatisfiable"].as_array().into_iter().flatten() {
         println!("  unsatisfiable {}", c.as_str().unwrap_or(""));
     }
-    if j["complete"].as_bool() != Some(true) {
+    if j["partial"].as_bool() == Some(true) {
+        println!(
+            "partial: the run stopped, {} classes incomplete",
+            n("incompleteCount")
+        );
+        for c in j["incomplete"].as_array().into_iter().flatten() {
+            println!("  incomplete {}", c.as_str().unwrap_or(""));
+        }
+    }
+    if j["complete"].as_bool() != Some(true) && n("excludedCount") > 0 {
         println!(
             "incomplete: {} axioms left out or used in part",
             n("excludedCount")

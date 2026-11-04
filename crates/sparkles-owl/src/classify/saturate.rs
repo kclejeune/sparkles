@@ -606,14 +606,14 @@ pub fn saturate_counted(
         run.pending.fetch_add(q.len(), Ordering::SeqCst);
     }
     let threads = bounds.threads.max(1);
-    if threads == 1 {
-        run.worker();
+    if run.horn {
+        run.workers::<Horn>(threads);
+    } else if run.disj {
+        run.workers::<Disj>(threads);
+    } else if run.plain {
+        run.workers::<Plain>(threads);
     } else {
-        std::thread::scope(|s| {
-            for _ in 0..threads {
-                s.spawn(|| run.worker());
-            }
-        });
+        run.workers::<Full>(threads);
     }
     let memory = run.memory.load(Ordering::Relaxed);
     let peak = run.peak.load(Ordering::Relaxed).max(memory);
@@ -1033,12 +1033,28 @@ impl<'a> Run<'a> {
         }
     }
 
+    /// Runs the saturation on `threads` workers with the rules that `R` holds. Each rule
+    /// set has a worker of its own that inlines its activation, so that the worker of the
+    /// EL rules does not hold the activations of the Horn and disjunctive rules
+    /// (roadmap items 711 and 715).
+    fn workers<R: Rules>(&self, threads: usize) {
+        if threads == 1 {
+            self.worker::<R>();
+        } else {
+            std::thread::scope(|s| {
+                for _ in 0..threads {
+                    s.spawn(|| self.worker::<R>());
+                }
+            });
+        }
+    }
+
     /// A worker activates up to [`ROOTS_PER_ROUND`] roots, then the contexts those
     /// activations woke, in the order they woke, and the contexts these wake in turn,
     /// before it takes more roots. A context that many others send to, such as a class
     /// that fills many existential restrictions, then takes the conclusions of a round
     /// in one activation rather than one at a time.
-    fn worker(&self) {
+    fn worker<R: Rules>(&self) {
         let mut mine: VecDeque<Ex> = VecDeque::new();
         let mut chunk: Vec<Ex> = Vec::new();
         let mut round = 0usize;
@@ -1105,15 +1121,7 @@ impl<'a> Run<'a> {
                 }
                 return;
             }
-            if self.horn {
-                self.process::<Horn>(next, &mut mine, &mut tally, &mut local, &mut outbox);
-            } else if self.disj {
-                self.process::<Disj>(next, &mut mine, &mut tally, &mut local, &mut outbox);
-            } else if self.plain {
-                self.process::<Plain>(next, &mut mine, &mut tally, &mut local, &mut outbox);
-            } else {
-                self.process::<Full>(next, &mut mine, &mut tally, &mut local, &mut outbox);
-            }
+            self.process::<R>(next, &mut mine, &mut tally, &mut local, &mut outbox);
             if !outbox.is_empty() && self.idle.load(Ordering::Relaxed) > 0 {
                 self.deliver(&mut outbox, &mut mine);
             }
@@ -1163,7 +1171,9 @@ impl<'a> Run<'a> {
     }
 
     /// Activates a context: applies the rules to what waits in its to-do list until none
-    /// is left, with the rules that `R` holds.
+    /// is left, with the rules that `R` holds. Its one call is in the worker of its rule
+    /// set, which it inlines into.
+    #[inline(always)]
     fn process<R: Rules>(
         &self,
         me: Ex,

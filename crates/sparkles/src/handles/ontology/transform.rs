@@ -163,12 +163,17 @@ impl WorkingOntology {
 }
 
 /// The classification of a transformation: the classifier with the request's threads
-/// and the options' deadline and budgets.
+/// and the options' deadline and budgets. A transformation asserts what the taxonomy
+/// says, so it never takes a partial answer, and a stopped run fails.
 fn classifier<'a>(
     c: &'a ClassifyRequest,
     opts: &'a QueryOptions,
 ) -> impl FnMut(&[&AxiomKind]) -> Result<(Classification, Vec<Excluded>)> + 'a {
-    move |kinds: &[&AxiomKind]| classify_once(kinds, c, opts)
+    let c = ClassifyRequest {
+        partial: false,
+        ..c.clone()
+    };
+    move |kinds: &[&AxiomKind]| classify_once(kinds, &c, opts)
 }
 
 /// The syntaxes the writers write, by the extensions ROBOT reads them from.

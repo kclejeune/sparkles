@@ -24,6 +24,18 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+A classification can answer in part on every surface. `partial` on
+`POST /$/ontology/{ds}/classify`, the JSON operation, Python's, Node.js's and the JVM's
+`classify` and `sparkles ontology classify --partial` asks a run of the disjunctive rules
+that its deadline or cancellation stops to answer what it proved, and `expansion` picks
+their strategy. Every answer now gives `tier` and `consistency`, which is `consistent`,
+`inconsistent` or `unknown`, and a partial one has `partial: true`, `complete: false` and
+its open classes under `incomplete` and `incompleteCount`. `complete` and
+`Classified::complete` are now also false for a partial answer, which only a request with
+`partial` gets. `partial` is refused with `target` and `format=ofn`.
+`sparkles ontology classify` takes `--timeout SECONDS`, notes a partial answer on stderr
+and exits with status 2 for one that is otherwise clean.
+
 The web UI asks through an Ask thread, a page at `/ui/ask` and a drawer beside any page
 that `Shift+A` and the palette open with the page's resource or query as context. Each
 answer folds its query, rows, sources and steps, follow-ups continue the thread, and the
@@ -334,6 +346,14 @@ view's rows against its query and records a forge baseline.
 CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
+
+Release builds compile `sparkles-owl` as one codegen unit, and each rule set of the EL
+classifier's saturation has a worker that inlines its own activation (roadmap items 711
+and 715). Code that EL runs never reach no longer moves their time. On one thread on
+forge `ore_ont_3836` classifies in 0.97 of the time of the build before, `ore_ont_13482`
+in 0.96, ChEBI lite in 0.98 and GO in 0.99, with the same taxonomies. The crate takes 25
+to 27 s to compile in a release build instead of 9 to 12 s on atlas, and a release build
+of the server takes the same time, since its dependents start from the crate's metadata.
 
 The planner estimates more joins from statistics of how predicates occur together (spec
 X15, roadmap item 454). A bulk load or compaction keeps 32,768 subject characteristic sets
@@ -1063,6 +1083,12 @@ fewer instructions.
 `scripts/nsc-bench.sh` now records the compilers of each binary and refuses to compare
 two binaries built with different ones unless `--allow-mixed-compilers` is given.
 
+`mise run bench:nsc` and `bench:nsc-writes` take `--build-host local|auto|HOST` and can
+build their revisions on a build host over ssh, in a memory-capped scope that holds the
+host's heavy lock, so the release link no longer has to fit on the machine that runs the
+screen. Without `SPARKLES_NSC_BUILD_HOSTS` they build locally as before. `build.txt`,
+`build.json` and the run manifests name the host that built each binary.
+
 `scripts/nsc-bench.sh` reruns the queries it flags, at an execution-time ratio of 1.10 or
 more, on the same instance in 8 rounds of 40 timed requests, and reports both passes.
 `mise run test:partitioned` runs the nextest tests in shares on several machines from one
@@ -1500,6 +1526,24 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 (X14, item 478).
 
 ### Fixed
+
+A partial answer of the disjunctive rules no longer reports a class complete when the
+run stopped before it made that class's context. The class's answer then held only
+`owl:Thing` while its told superclasses were missing, and the ontology's consistency
+could be reported as known before the context of `owl:Thing` existed. Such a class is
+now left open, and an unmade context of `owl:Thing` leaves the consistency unknown.
+
+The Linux server build links again against glibc 2.28, the baseline of the x86_64
+release archive. The background prewarm thread called glibc's `gettid` wrapper, which
+glibc added in 2.30, so the archive's link failed with an undefined `gettid`. It now
+makes the system call directly, as the compaction and embedding threads do, and Clippy
+refuses `libc::gettid` in the workspace.
+
+The Python type stubs match the module again. `Axiom.from_json` takes its argument by
+position only, as the stub and `Axiom.parse` say, and `owl.ObjectPropertyChain` has
+empty `__slots__`, so it adds no layout to `tuple` and mypy's stubtest no longer reports
+it as a disjoint base. A call that passed `from_json(value=...)` by keyword now raises
+`TypeError`.
 
 A quick query text no longer settles in its slower execution mode because of one cold
 run. The server's history ran a text's first run as an automatic cursor and its second

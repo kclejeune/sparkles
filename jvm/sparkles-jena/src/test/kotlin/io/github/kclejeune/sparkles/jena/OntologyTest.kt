@@ -300,6 +300,97 @@ class OntologyTest {
         }
     }
 
+    /** Item 603's cases, as the Rust tests write them: a classification the disjunctive rules take. */
+    private fun cases(n: Int, inconsistent: Boolean): String {
+        fun some(p: String, c: String) = "[ a owl:Restriction ; owl:onProperty $p ; owl:someValuesFrom $c ]"
+        val out = StringBuilder(":r a owl:ObjectProperty . :s a owl:ObjectProperty .\n")
+        for (i in 0 until n) {
+            val b = (7 * i + 3) % n
+            val d = (13 * i + 5) % n
+            out.append(
+                """:C$i a owl:Class ; rdfs:subClassOf [ owl:unionOf ( :B$i :E$i ) ] .
+                :B$i rdfs:subClassOf :K$i , :C$b . :E$i rdfs:subClassOf :K$i .
+                :K$i rdfs:subClassOf ${some(":r", ":C$d")} .
+                :E$i rdfs:subClassOf [ a owl:Restriction ;
+                  owl:onProperty [ owl:inverseOf :r ] ; owl:allValuesFrom :F$d ] .
+                ${some(":r", ":F$i")} rdfs:subClassOf :G$b .
+                """,
+            )
+        }
+        if (inconsistent) {
+            out.append(
+                """owl:Thing rdfs:subClassOf ${some(":s", "[ owl:unionOf ( :N1 :N2 ) ]")} .
+                :N1 rdfs:subClassOf owl:Nothing . :N2 rdfs:subClassOf :N3 . :N3 owl:disjointWith :N2 .""",
+            )
+        }
+        return "$prefixes\nINSERT DATA { $out }"
+    }
+
+    /** Classifies the cases under deadlines from a fraction of a full run's time upwards, and returns the partial answers' consistencies. */
+    private fun partialAnswers(inconsistent: Boolean): List<String> {
+        val body = cases(300, inconsistent)
+        val want = if (inconsistent) "inconsistent" else "consistent"
+        val query = ClassifyQuery(partial = true, threads = 1, limit = 10000)
+        val (full, took) = SparklesDatasets.memory().use { ds ->
+            UpdateAction.parseExecute(body, ds)
+            val start = System.nanoTime()
+            val r = ds.ontology().classify(OntologyRead(), query)
+            r to (System.nanoTime() - start) / 1_000_000.0
+        }
+        assertTrue(full.getBoolean("complete"))
+        assertFalse(full.getBoolean("partial"))
+        assertEquals(want, full.getString("consistency"))
+        assertEquals("disjunctive", full.getString("tier"))
+        val seen = mutableListOf<String>()
+        var f = 0.02
+        while (f < 1.5) {
+            val ms = maxOf(1L, (took * f).toLong())
+            f *= 1.25
+            // a dataset of its own, whose read of the ontology takes as long as the full run's
+            SparklesDatasets.memory().use { ds ->
+                UpdateAction.parseExecute(body, ds)
+                val r = try {
+                    SparklesOperation(ms).use { ds.ontology().classify(OntologyRead(), query, it) }
+                } catch (e: org.apache.jena.query.QueryCancelledException) {
+                    return@use
+                }
+                assertEquals(full.getNumber("classes"), r.getNumber("classes"))
+                if (!r.getBoolean("partial")) {
+                    assertTrue(r.getBoolean("complete"))
+                    assertEquals(want, r.getString("consistency"))
+                    return@use
+                }
+                assertFalse(r.getBoolean("complete"), "a partial answer is presented as complete")
+                val open = r.get("incomplete").asArray
+                assertEquals(open.size, r.getNumber("incompleteCount").toInt())
+                val c = r.getString("consistency")
+                assertTrue(c == want || c == "unknown", c)
+                if (c == "unknown") assertTrue(open.size + 2 >= r.getNumber("classes").toInt())
+                seen.add(c)
+            }
+        }
+        return seen
+    }
+
+    /** Item 603 phase 7: a classification answers in part under a deadline, with its open classes and consistency. */
+    @Test fun the_native_handle_answers_a_classification_in_part() {
+        assertTrue(partialAnswers(false).isNotEmpty(), "no deadline gave a partial answer")
+        assertTrue("unknown" in partialAnswers(true))
+        SparklesDatasets.memory().use { ds ->
+            a1(ds)
+            val r = SparklesOnt.classify(ds, "http://ex.org/onto", ClassifyQuery(partial = true, expansion = "eager"))
+            assertTrue(r.getBoolean("complete"))
+            assertFalse(r.getBoolean("partial"))
+            assertEquals("consistent", r.getString("consistency"))
+            assertEquals("el", r.getString("tier"))
+            assertEquals(0, r.get("incomplete").asArray.size)
+            assertThrows(IllegalArgumentException::class.java) { ClassifyQuery(expansion = "greedy") }
+            assertThrows(SparklesInvalidException::class.java) {
+                SparklesOnt.classify(ds, "http://ex.org/onto", ClassifyQuery(partial = true, target = "http://ex.org/taxonomy"))
+            }
+        }
+    }
+
     /** Items 608 and 457: Manchester text read against the graph, and a DL query of it. */
     @Test fun the_native_handle_reads_manchester_and_answers_dl_queries() {
         SparklesDatasets.memory().use { ds ->

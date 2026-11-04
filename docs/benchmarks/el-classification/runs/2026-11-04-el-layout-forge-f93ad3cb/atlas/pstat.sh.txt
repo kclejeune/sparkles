@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# pstat.sh "FILES" "SIDES": perf stat (user-space instructions, cycles, front-end stalls,
+# L1 instruction-cache and iTLB misses) and perf record of one pinned one-thread process
+# per side and file (--repeat 3), under the heavy lock. Output in prof/.
+set -euo pipefail
+E=~/lanes/el-cost
+P=/nix/store/qyym38g8svwhx58fhdv7d8qrxxv41lrc-perf-linux-7.3/bin/perf
+cd $E
+mkdir -p prof
+exec 8> "$HOME/lanes/.heavy.lock"
+flock 8
+for f in $1; do
+  b=$(basename "${f%.*}")
+  for s in $2; do
+    taskset -c 4 $P stat -x, -o prof/$b.$s.stat -e cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/L1-icache-load-misses/u,cpu_core/iTLB-load-misses/u,cpu_core/branch-misses/u \
+      bin/$s --threads 1 --repeat 3 data/$f > prof/$b.$s.json
+    taskset -c 4 $P record -q -o prof/$b.$s.data bin/$s --threads 1 --repeat 3 data/$f > /dev/null
+    $P report -q -i prof/$b.$s.data --no-children --percent-limit 0.7 --stdio 2>/dev/null | grep -v '^$' | head -40 > prof/$b.$s.top
+  done
+done
+echo PSTAT-DONE

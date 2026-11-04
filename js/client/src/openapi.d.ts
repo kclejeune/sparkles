@@ -2157,7 +2157,7 @@ export interface paths {
         put?: never;
         /**
          * Classify an OWL 2 EL ontology
-         * @description Classifies the terminology with the OWL 2 EL classifier and answers whether it is consistent, the unsatisfiable classes, the axioms outside OWL 2 EL that the classification left out or used in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses and its equivalent classes, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. The dataset keeps the last classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`.
+         * @description Classifies the terminology with the OWL 2 EL classifier and answers whether it is consistent, the unsatisfiable classes, the axioms outside OWL 2 EL that the classification left out or used in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses and its equivalent classes, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. The dataset keeps the last classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what a run with the disjunctive rules proved before it stopped. The answer's `complete` is false for such a partial answer, `partial` is true, `incomplete` lists the classes whose superclasses it may miss and `consistency` is `consistent`, `inconsistent` or `unknown`. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.
          */
         post: operations["classifyOntology"];
         delete?: never;
@@ -17776,10 +17776,15 @@ export interface operations {
                     about?: string;
                     /** @description Also classify the assertions the store holds, so that they can make the ontology inconsistent. Such a run is not kept. */
                     assertions?: boolean;
+                    /**
+                     * @description The expansion strategy of the disjunctive rules, `cautious` by default. Both give the same answer.
+                     * @enum {string}
+                     */
+                    expansion?: "cautious" | "eager";
                     /** @description A graph IRI or `default`, or a list of them. */
                     graph?: unknown;
                     imports?: boolean;
-                    /** @description The most nodes, unsatisfiable classes and excluded axioms listed (100 by default). */
+                    /** @description The most nodes, unsatisfiable classes, incomplete classes and excluded axioms listed (100 by default). */
                     limit?: number;
                     /** @description The commit message of the write, also kept as a comment on the header. */
                     message?: string;
@@ -17789,6 +17794,8 @@ export interface operations {
                     nodes?: boolean;
                     /** @description The first node listed. */
                     offset?: number;
+                    /** @description Answer what a run with the disjunctive rules proved when its deadline, cancellation or memory budget stops it, instead of failing. Runs of the other rules fail as before. */
+                    partial?: boolean;
                     /** @description A named graph outside the graphs read that takes the direct taxonomy. */
                     target?: string;
                     /** @description The worker threads, within the algorithm pool's grant (0 for the grant). */

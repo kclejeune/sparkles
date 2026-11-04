@@ -309,6 +309,21 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   matches, and it trades that memory for fast reclassification. `sparkles ontology classify FILE` classifies a file without a
   database and exits with status 1 when the ontology is inconsistent or has an
   unsatisfiable class.
+* Every classification answer gives `tier`, the rules the axioms need, and `consistency`,
+  which is `consistent`, `inconsistent` or `unknown`. `partial` on the request, `--partial`
+  on the command line and the bindings' `partial` option ask a run of the disjunctive rules
+  that its deadline or cancellation stops to answer what it proved. Such an answer has
+  `partial` true and `complete` false, lists the classes whose superclasses it may miss
+  under `incomplete` and gives every other class its full answer. Its consistency is
+  `unknown` when the run stopped before deciding it, and then every class is incomplete.
+  The dataset never keeps a partial answer, and a classification that writes its taxonomy
+  to a graph, the functional-style answer and the ROBOT-compatible commands refuse or
+  ignore `partial`, since none of them can say that the taxonomy is partial. `sparkles
+  ontology classify` takes `--timeout SECONDS` for the deadline, prints a note on stderr
+  for a partial answer and exits with status 2 when the answer is partial and otherwise
+  clean. A usage error also exits with status 2, so a script tells a partial answer apart
+  by that note or by `partial: true` in the JSON output. `expansion` picks the cautious
+  or the eager strategy of the disjunctive rules, which give the same answer.
 * `sparkles ontology classify FILE` and `sparkles ontology check FILE` read a file of one
   graph straight into memory, with no store, and give the answers of a store that loaded
   the file. RDF/XML, Turtle, N-Triples and N3 parse on several threads, and so does a
@@ -633,8 +648,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   global case analysis again. Roadmap item 712.
 * ore_ont_3215 of the ORE 2015 DL sample passes the disjunctive rules' memory budget and
   gets the Horn rules' answer without its 18,323 unions. Roadmap item 713.
-* `Limits::partial` applies only to runs of the disjunctive rules, and runs of the EL and
-  Horn rules still fail at a deadline. Roadmap item 714.
+* `partial` applies only to runs of the disjunctive rules, and runs of the EL and Horn
+  rules still fail at a deadline on every surface. Roadmap item 714.
+* The Workbench does not ask for a partial classification, so it shows no partial answers
+  or incomplete classes. Roadmap item 719.
 * No MCP tool classifies, roadmap item 586, and the entity accessors and the
   inferred reads do not answer from a classification, nor does any surface answer the
   subclasses of a class expression, roadmap item 588.

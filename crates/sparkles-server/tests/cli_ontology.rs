@@ -298,3 +298,164 @@ fn classify_a_file_and_a_database() {
         out(&o)
     );
 }
+
+/// Item 603's cases in functional-style syntax, as the `sparkles` crate's tests write
+/// them: a classification that the disjunctive rules take, long enough that a deadline
+/// stops it part way.
+fn cases(n: usize, inconsistent: bool) -> String {
+    let mut s = String::from(
+        "Prefix(:=<http://ex.org/>)\nPrefix(owl:=<http://www.w3.org/2002/07/owl#>)\nOntology(\n",
+    );
+    for i in 0..n {
+        let (b, d) = ((7 * i + 3) % n, (13 * i + 5) % n);
+        s.push_str(&format!(
+            "SubClassOf(:C{i} ObjectUnionOf(:B{i} :E{i}))
+             SubClassOf(:B{i} :K{i}) SubClassOf(:B{i} :C{b}) SubClassOf(:E{i} :K{i})
+             SubClassOf(:K{i} ObjectSomeValuesFrom(:r :C{d}))
+             SubClassOf(:E{i} ObjectAllValuesFrom(ObjectInverseOf(:r) :F{d}))
+             SubClassOf(ObjectSomeValuesFrom(:r :F{i}) :G{b})\n"
+        ));
+    }
+    if inconsistent {
+        s.push_str(
+            "SubClassOf(owl:Thing ObjectSomeValuesFrom(:s ObjectUnionOf(:N1 :N2)))
+             SubClassOf(:N1 owl:Nothing) SubClassOf(:N2 :N3) DisjointClasses(:N3 :N2)\n",
+        );
+    }
+    s.push_str(")\n");
+    s
+}
+
+/// Classifies the cases with `--partial` under deadlines from a fraction of a full run's
+/// time upwards, checks each answer and its exit status, and returns the partial
+/// answers' consistencies.
+fn partial_on_the_command_line(inconsistent: bool) -> Vec<String> {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("dl.ofn"), cases(300, inconsistent)).unwrap();
+    let args = [
+        "ontology",
+        "classify",
+        "dl.ofn",
+        "--threads",
+        "1",
+        "--format",
+        "json",
+    ];
+    let o = sparkles(dir, &args);
+    let full: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(if inconsistent { 1 } else { 0 }),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(full["partial"], false, "{full}");
+    assert_eq!(full["tier"], "disjunctive", "{full}");
+    let want = if inconsistent {
+        "inconsistent"
+    } else {
+        "consistent"
+    };
+    assert_eq!(full["consistency"], want, "{full}");
+    let s = &full["stats"];
+    let took = (s["indexMs"].as_f64().unwrap()
+        + s["saturationMs"].as_f64().unwrap()
+        + s["taxonomyMs"].as_f64().unwrap())
+        / 1000.0;
+    let mut seen = Vec::new();
+    let mut f = 0.02;
+    while f < 1.5 {
+        let t = format!("{}", (took * f).max(1e-6));
+        f *= 1.25;
+        let o = sparkles(dir, &[&args[..], &["--partial", "--timeout", &t]].concat());
+        let Ok(j) = serde_json::from_slice::<serde_json::Value>(&o.stdout) else {
+            // a stop before the saturation fails as before
+            assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+            continue;
+        };
+        assert_eq!(j["classes"], full["classes"], "{j}");
+        let clean = j["consistent"] == true && j["unsatisfiableCount"] == 0;
+        if j["partial"] == false {
+            assert_eq!(j["complete"], true, "{j}");
+            assert_eq!(
+                o.status.code(),
+                Some(if clean { 0 } else { 1 }),
+                "{}",
+                err(&o)
+            );
+            continue;
+        }
+        assert_eq!(
+            j["complete"], false,
+            "a partial answer is presented as complete: {j}"
+        );
+        assert_eq!(
+            o.status.code(),
+            Some(if clean { 2 } else { 1 }),
+            "{}",
+            err(&o)
+        );
+        assert!(err(&o).contains("partial answer"), "{}", err(&o));
+        let c = j["consistency"].as_str().unwrap().to_string();
+        assert!(c == want || c == "unknown", "{j}");
+        assert_eq!(
+            j["incompleteCount"].as_u64(),
+            Some(j["incomplete"].as_array().unwrap().len() as u64),
+            "{j}"
+        );
+        seen.push(c);
+    }
+    seen
+}
+
+#[test]
+fn classify_answers_in_part_under_a_deadline() {
+    assert!(
+        !partial_on_the_command_line(false).is_empty(),
+        "no deadline gave a partial answer"
+    );
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("dl.ofn"), cases(3, false)).unwrap();
+    // a functional-style answer, a write and a chain cannot say that they are partial
+    for extra in [
+        &["--format", "ofn"][..],
+        &["--format", "json", "--target", "http://ex.org/t"][..],
+        &["--format", "json", "relax"][..],
+    ] {
+        let o = sparkles(
+            dir,
+            &[&["ontology", "classify", "dl.ofn", "--partial"][..], extra].concat(),
+        );
+        assert_ne!(o.status.code(), Some(0), "{extra:?}");
+    }
+    let o = sparkles(
+        dir,
+        &["ontology", "classify", "dl.ofn", "--expansion", "greedy"],
+    );
+    assert_ne!(o.status.code(), Some(0));
+    // a run that finishes is complete, with either strategy, and its text says so
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "dl.ofn",
+            "--partial",
+            "--expansion",
+            "eager",
+            "--format",
+            "text",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(out(&o).starts_with("consistent:"), "{}", out(&o));
+    assert!(!out(&o).contains("partial"), "{}", out(&o));
+}
+
+#[test]
+fn classify_leaves_the_consistency_unknown_when_stopped_early() {
+    let seen = partial_on_the_command_line(true);
+    assert!(seen.iter().any(|c| c == "unknown"), "{seen:?}");
+}
