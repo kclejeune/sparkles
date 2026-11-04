@@ -129,3 +129,63 @@ test.describe('on a phone', () => {
     await expectNoSidewaysScroll(page, 'the Communities tab');
   });
 });
+
+test('the Map view draws the hierarchy as nested boxes that open a report', async ({ page }) => {
+  await page.goto('/ui/datasets/world?tab=communities');
+  const panel = page.getByTestId('communities');
+  await expect(panel.getByRole('navigation', { name: 'Community hierarchy' })).toBeVisible();
+  await panel
+    .getByRole('group', { name: 'Hierarchy view' })
+    .getByRole('button', { name: 'Map' })
+    .click();
+  const map = panel.getByRole('group', { name: 'Community map' });
+  const boxes = map.getByRole('button');
+  expect(await boxes.count()).toBeGreaterThan(10);
+  // a box names its level, members and status, so colour is never the only cue
+  await expect(boxes.first()).toHaveAttribute('aria-label', /level 0, \d+ members?, \w+/);
+  // a box lies inside the map, and the map never scrolls the page sideways
+  const inside = await map.evaluate((m) => {
+    const r = m.getBoundingClientRect();
+    return [...m.querySelectorAll('button')].every((b) => {
+      const q = b.getBoundingClientRect();
+      return (
+        q.left >= r.left - 1 &&
+        q.right <= r.right + 1 &&
+        q.top >= r.top - 1 &&
+        q.bottom <= r.bottom + 1
+      );
+    });
+  });
+  expect(inside).toBe(true);
+  // a parent's box lies under its children, so a leaf is the one to click
+  const leaf = map.locator('button.leaf').first();
+  await leaf.click();
+  await expect(panel.locator('.detail').getByRole('heading').first()).toBeVisible();
+  await expect(leaf).toHaveAttribute('aria-current', 'true');
+  // the choice is remembered
+  await page.reload();
+  await expect(panel.getByRole('group', { name: 'Community map' })).toBeVisible();
+  await panel
+    .getByRole('group', { name: 'Hierarchy view' })
+    .getByRole('button', { name: 'Tree' })
+    .click();
+  await expect(panel.getByRole('group', { name: 'Community map' })).toHaveCount(0);
+});
+
+test.describe('on a phone', () => {
+  test.use({ ...phone, viewport: { width: 390, height: 844 } });
+  test('the Map view fits the screen', async ({ page }) => {
+    await page.goto('/ui/datasets/world?tab=communities');
+    const panel = page.getByTestId('communities');
+    await panel
+      .getByRole('group', { name: 'Hierarchy view' })
+      .getByRole('button', { name: 'Map' })
+      .click();
+    await expect(panel.getByRole('group', { name: 'Community map' })).toBeVisible();
+    await expectNoSidewaysScroll(page, 'the Communities map');
+    await panel
+      .getByRole('group', { name: 'Hierarchy view' })
+      .getByRole('button', { name: 'Tree' })
+      .click();
+  });
+});

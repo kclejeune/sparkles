@@ -1433,3 +1433,41 @@ kbd,
 .more-btn:hover {
   color: var(--text);
 }
+
+/* A vertical timeline (ROADMAP item 633): a list whose entries hang on one rule, each with
+   a dot that takes its colour from --dot. Memory's activity and a fact's history use it.
+   The meaning of an entry is always in its text, never in the dot's colour alone. */
+.timeline {
+  position: relative;
+  display: grid;
+  gap: var(--sp-3);
+  margin: 0;
+  padding: 0 0 0 var(--sp-5);
+  list-style: none;
+  min-width: 0;
+}
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  background: var(--border);
+}
+.timeline > li {
+  position: relative;
+  min-width: 0;
+}
+.timeline > li::before {
+  content: '';
+  position: absolute;
+  left: calc(-1 * var(--sp-5));
+  top: 4px;
+  width: 12px;
+  height: 12px;
+  box-sizing: border-box;
+  border: 2px solid var(--dot, var(--border-strong));
+  border-radius: 50%;
+  background: var(--surface);
+}

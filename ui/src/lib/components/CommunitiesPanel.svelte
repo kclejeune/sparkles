@@ -13,6 +13,7 @@
   import { displayIri } from '$lib/rdf';
   import * as gr from '$lib/graphrag';
   import CommunityReport from './CommunityReport.svelte';
+  import CommunityTreemap from './CommunityTreemap.svelte';
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
 
@@ -45,6 +46,25 @@
   let detailError = $state<unknown>(null);
   let detailLoading = $state(false);
   let filter = $state<gr.ReportStatus | ''>('');
+  // the hierarchy as a list or as a treemap, which the viewer's browser remembers
+  const VIEW_KEY = 'sparkles.communities.view';
+  let view = $state<'tree' | 'map'>(
+    (() => {
+      try {
+        return localStorage.getItem(VIEW_KEY) === 'map' ? 'map' : 'tree';
+      } catch {
+        return 'tree';
+      }
+    })(),
+  );
+  function showView(v: 'tree' | 'map') {
+    view = v;
+    try {
+      localStorage.setItem(VIEW_KEY, v);
+    } catch {
+      // a blocked store only forgets the choice
+    }
+  }
 
   // the run this tab started or found, and its estimate dialog
   let task = $state<api.Task | null>(null);
@@ -76,6 +96,14 @@
         keep.add(n.iri);
     }
     return keep;
+  });
+
+  /** The forest the filter keeps: a match with its ancestors. */
+  const shownForest = $derived.by(() => {
+    if (!shownIris) return forest;
+    const keep = (l: gr.TreeNode[]): gr.TreeNode[] =>
+      l.filter((n) => shownIris.has(n.iri)).map((n) => ({ ...n, children: keep(n.children) }));
+    return keep(forest);
   });
 
   async function load() {
@@ -308,6 +336,16 @@
     {#if st?.enabled && list?.available}<span class="badge">{fmtInt(list.communities.length)}</span
       >{/if}
     <span class="spacer"></span>
+    {#if st?.enabled && st.available && list?.communities.length && !branch}
+      <div class="segmented" role="group" aria-label="Hierarchy view">
+        <button aria-pressed={view === 'tree'} onclick={() => showView('tree')}>
+          <Icon name="tree" size={13} /> Tree
+        </button>
+        <button aria-pressed={view === 'map'} onclick={() => showView('map')}>
+          <Icon name="layers" size={13} /> Map
+        </button>
+      </div>
+    {/if}
     {#if canAdmin && st?.enabled && !branch}
       <button
         class="btn sm"
@@ -411,7 +449,7 @@
           Build the reports to group the dataset's resources and summarize each group.{/if}
       </p>
     {:else if list}
-      <div class="split">
+      <div class="split" class:map={view === 'map'}>
         <nav class="tree" aria-label="Community hierarchy">
           <label class="filter">
             <span class="faint">Show</span>
@@ -420,9 +458,18 @@
               {#each gr.STATUSES as s (s)}<option value={s}>{s}</option>{/each}
             </select>
           </label>
-          <ul class="root">
-            {#each forest as n (n.iri)}{@render node(n)}{/each}
-          </ul>
+          {#if view === 'map'}
+            <CommunityTreemap
+              forest={shownForest}
+              {selected}
+              name={(n) => n.report?.title ?? short(n.iri)}
+              onopen={(iri) => open(iri)}
+            />
+          {:else}
+            <ul class="root">
+              {#each forest as n (n.iri)}{@render node(n)}{/each}
+            </ul>
+          {/if}
         </nav>
         <div class="detail" aria-live="polite">
           {#if !selected}
@@ -521,18 +568,25 @@
     border-top: 1px solid var(--border);
   }
   @media (min-width: 860px) {
-    .split {
+    .split:not(.map) {
       grid-template-columns: minmax(260px, 2fr) minmax(0, 3fr);
     }
-    .tree {
+    .split:not(.map) .tree {
       border-right: 1px solid var(--border);
       max-height: 72vh;
       overflow: auto;
     }
-    .detail {
+    .split:not(.map) .detail {
       max-height: 72vh;
       overflow: auto;
     }
+  }
+  /* the map takes the full width above the report */
+  .split.map .tree {
+    border-bottom: 1px solid var(--border);
+  }
+  .split.map .filter {
+    margin: 0;
   }
   .tree {
     padding: 8px;

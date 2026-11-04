@@ -29,6 +29,7 @@
   import { reviewCounts } from '$lib/review-count.svelte';
   import IngestSettings from '$components/IngestSettings.svelte';
   import PageSearch from '$components/PageSearch.svelte';
+  import StatChips, { type StatChip } from '$components/StatChips.svelte';
   import RecallView from '$components/RecallView.svelte';
   import TermView from '$components/TermView.svelte';
 
@@ -157,6 +158,39 @@
     });
   });
 
+  /** The counts that head the overview, once the queries have answered. */
+  const chips = $derived.by<StatChip[]>(() => {
+    if (agents.loading || sources.loading || activity.loading) return [];
+    const facts = agents.rows.reduce((t, r) => t + n(r.facts), 0);
+    const plural = (k: number, one: string, many: string) => (k === 1 ? one : many);
+    const out: StatChip[] = [
+      { key: 'facts', value: fmtInt(facts), label: plural(facts, 'fact', 'facts') },
+      {
+        key: 'agents',
+        value: fmtInt(agents.rows.length),
+        label: plural(agents.rows.length, 'agent', 'agents'),
+      },
+      {
+        key: 'sources',
+        value: fmtInt(sources.rows.length),
+        label: plural(sources.rows.length, 'source', 'sources'),
+      },
+      {
+        key: 'branches',
+        value: fmtInt(review.rows.length),
+        label: plural(review.rows.length, 'review branch', 'review branches'),
+      },
+    ];
+    if (inboxCount != null)
+      out.push({
+        key: 'inbox',
+        value: fmtInt(inboxCount),
+        label: 'open in the inbox',
+        href: `${resolve('/memory')}?tab=inbox`,
+      });
+    return out;
+  });
+
   // --- search ---------------------------------------------------------------------------
   let text = $state(page.url.searchParams.get('q') ?? '');
   let searching = $state(false);
@@ -242,6 +276,7 @@
         />
       {/key}
     {:else}
+      <StatChips items={chips} label="Memory counts" />
       <!-- the page's search is a field across the content, as on Browse (ROADMAP item 633) -->
       <PageSearch
         bind:value={text}
@@ -336,16 +371,18 @@
             {:else if activities.length === 0}
               <p class="faint">No activity yet.</p>
             {:else}
-              <ul class="plain">
+              <ol class="timeline act">
                 {#each activities as r (v(r.act))}
-                  <li>
-                    <span class="small mono faint">{when(r.time)}</span>
-                    <span>{principalName(v(r.agent))}</span>
-                    <span>{r.label ? `"${v(r.label)}"` : ''}</span>
-                    <span class="faint small mono">{v(r.g)}</span>
+                  <li style:--dot="var(--spark)">
+                    <div class="act-head">
+                      <span class="small mono faint">{when(r.time)}</span>
+                      <span class="who">{principalName(v(r.agent))}</span>
+                    </div>
+                    {#if r.label}<div>"{v(r.label)}"</div>{/if}
+                    <div class="faint small mono">{v(r.g)}</div>
                   </li>
                 {/each}
-              </ul>
+              </ol>
             {/if}
           </div>
         </section>
@@ -467,6 +504,19 @@
     gap: 6px;
     align-items: baseline;
     overflow-wrap: anywhere;
+  }
+  .act {
+    font-size: var(--fs-sm);
+    overflow-wrap: anywhere;
+  }
+  .act-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px var(--sp-2);
+  }
+  .who {
+    font-weight: 600;
   }
   .kv {
     display: grid;

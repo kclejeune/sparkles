@@ -25,7 +25,11 @@ test('the Memory tab lists facts with citations, badges and history', async ({ p
   await expect(conflict).toContainText('2025-11-17');
 
   // a citation expands to its graph, source, quote, time, principal and confidence
-  const row = facts.getByRole('row').filter({ hasText: 'ex:memberOf' });
+  const row = facts.getByRole('article', { name: 'ex:memberOf' });
+  // the card shows its provenance without a click: who wrote it, from which source
+  await expect(row).toContainText('agent-7');
+  await expect(row).toContainText('Ana moved to the payments team this week.');
+  await expect(row).toContainText('confidence 0.90');
   await row.getByRole('button', { name: /^\[\d+\]$/ }).click();
   const citation = memory.getByRole('definition').filter({ hasText: 'quote' });
   await expect(citation).toContainText('https://example.org/notes/2026-10-08');
@@ -38,6 +42,8 @@ test('the Memory tab lists facts with citations, badges and history', async ({ p
   const history = memory.getByRole('list', { name: 'History' });
   await expect(history).toContainText('res:platform');
   await expect(history).toContainText(/superseded on 2026-10-08 by \[\d+\]/);
+  // a timeline pairs the old value with the one that replaced it
+  await expect(history.getByRole('listitem').first()).toContainText('res:payments');
   await memory.getByRole('checkbox', { name: 'Show superseded' }).check();
   await expect(facts.getByText('superseded')).toBeVisible();
 
