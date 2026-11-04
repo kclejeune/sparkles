@@ -105,17 +105,27 @@ test('the lineage tree opens children and siblings a level at a time', async ({ 
   await expect(tree.locator('.kids').getByRole('link', { name: /^Person/ })).toHaveCount(0);
 });
 
-test('the graph view draws the neighbourhood and switches back to the page', async ({ page }) => {
+test('the graph view draws the neighbourhood in the hierarchy card and switches back', async ({
+  page,
+}) => {
   await openTerm(page, 'Professor');
   await page.getByRole('link', { name: 'Graph', exact: true }).click();
   await expect(page).toHaveURL(/view=graph/);
-  await expect(page.locator('.canvas canvas').first()).toBeVisible({ timeout: 20_000 });
+  // the graph replaces the card's tree, and the article stays
+  const card = page.getByRole('complementary', { name: 'Hierarchy' });
+  await expect(card.locator('.canvas canvas').first()).toBeVisible({ timeout: 20_000 });
+  await expect(card.locator('.tree-body')).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Logical definition' })).toBeVisible();
+  // a reload keeps the view
+  await page.reload();
+  await expect(card.locator('.canvas canvas').first()).toBeVisible({ timeout: 20_000 });
   await expect(page.getByRole('link', { name: 'Open in Explore' }).first()).toHaveAttribute(
     'href',
     /explore\?ds=uni&iri=/,
   );
   await page.getByRole('link', { name: 'Tree', exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Logical definition' })).toBeVisible();
+  await expect(card.locator('.tree-body')).toBeVisible();
+  await expect(card.locator('.canvas')).toHaveCount(0);
 });
 
 test('downloads answer the entity in each format as an attachment', async ({ page }) => {

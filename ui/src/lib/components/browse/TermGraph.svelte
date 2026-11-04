@@ -2,8 +2,9 @@
   // The graph view of an entity: its neighbourhood on the Explore canvas, with the entity,
   // its parents, its first children and the entities its axioms relate it to or that relate
   // to it, as edges named by the property. The lenses are Explore's, and double-clicking a
-  // node adds its neighbourhood.
-  import { onDestroy } from 'svelte';
+  // node adds its neighbourhood. In a card, `lead` is the card's own heading row and the
+  // graph's tools sit under it in the card's header (ROADMAP item 633).
+  import { onDestroy, type Snippet } from 'svelte';
   import type { GraphPiece, Linker } from '$lib/browse';
   import { Lenses } from '$lib/lenses.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
@@ -18,6 +19,8 @@
     exploreHref,
     onexpand,
     epoch = 0,
+    lead,
+    shut = false,
   }: {
     /** The dataset with its branch, for the lenses' reads. */
     ds: string;
@@ -27,6 +30,10 @@
     /** Add the neighbourhood of a node. */
     onexpand?: (iri: string) => void;
     epoch?: number;
+    /** The card's heading row; the graph then draws as the card's body, without a frame. */
+    lead?: Snippet;
+    /** The card is collapsed to its heading. */
+    shut?: boolean;
   } = $props();
 
   const lenses = new Lenses();
@@ -62,7 +69,8 @@
   const pick = $derived(selected ? piece.nodes.find((n) => n.id === selected) : null);
 </script>
 
-<div class="canvas">
+<div class="canvas" class:card={!!lead} class:shut>
+  {#if lead}<div class="lead">{@render lead()}</div>{/if}
   <div class="bar" bind:this={toolbar}>
     <LensMenu {lenses} anchor={toolbar} short={(iri) => linker.short(iri) ?? linker.name(iri)} />
     <span class="spacer"></span>
@@ -126,6 +134,38 @@
     padding: 6px 12px;
     font-size: var(--fs-xs);
     border-top: 1px solid var(--border);
+  }
+  /* in a card: the card's heading, the tools, the canvas and the legend */
+  .canvas.card {
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    height: var(--term-graph-h, 480px);
+    border: 0;
+    border-radius: 0;
+    background: none;
+  }
+  .lead {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-2) 14px;
+    min-height: var(--panel-head-h);
+    border-bottom: 1px solid var(--border);
+  }
+  .card .bar {
+    padding: 8px 14px;
+  }
+  /* a card collapsed to its heading on a phone */
+  @container browse (max-width: 639px) {
+    .canvas.shut {
+      height: auto;
+      grid-template-rows: auto;
+    }
+    .canvas.shut > :not(.lead) {
+      display: none;
+    }
+    .canvas.shut .lead {
+      border-bottom: 0;
+    }
   }
   @container browse (max-width: 639px) {
     .canvas {

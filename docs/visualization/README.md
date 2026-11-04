@@ -394,8 +394,10 @@ links its replacement. The **Hierarchy** card sits above the infobox in the colu
 the article, scrolls on its own within half the window's height with the entity in view,
 and shows the lineage from a root to the entity on one line, the entity's other direct parents under it, its children with
 their counts and its siblings behind one row, and it reads each further level when it
-opens. **Graph** draws the entity's neighbourhood on the Explore canvas with Explore's
-lenses instead: its parents, its first children, the entities its axioms relate it to
+opens. **Graph** in the card's header draws the entity's neighbourhood in the card in place
+of the tree, on the Explore canvas with Explore's lenses, while the article stays beside it.
+An entity outside any hierarchy has **Graph** beside its title, which shows the graph in
+place of the article. The graph holds its parents, its first children, the entities its axioms relate it to
 and those whose axioms hold it, with each edge named by its property. Double-clicking a
 node adds that entity's neighbourhood, and **Open in Explore** opens the entity there.
 

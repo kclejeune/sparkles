@@ -1099,7 +1099,7 @@
       {/if}
       <div
         class="browse"
-        class:graph={view === 'graph'}
+        class:graph={view === 'graph' && !treeKind}
         class:editing
         data-kind={treeKind ?? 'none'}
       >
@@ -1239,97 +1239,111 @@
           {#if treeKind}
             <!-- the hierarchy is a card above the facts in the page's side column, and on a
                  phone a card that opens on request (ROADMAP item 633) -->
-            <aside class="panel b-tree" class:shut={!treeOpen && !editing} aria-labelledby="tree-h">
-              <div class="panel-head">
-                {#if !editing}
-                  <button
-                    type="button"
-                    class="btn sm ghost icon tree-toggle"
-                    aria-expanded={treeOpen}
-                    aria-controls="tree-body"
-                    aria-label={treeOpen ? 'Hide the hierarchy' : 'Show the hierarchy'}
-                    onclick={() => (treeOpen = !treeOpen)}
-                    ><Icon name={treeOpen ? 'chevronDown' : 'chevron'} size={16} /></button
+            {#snippet treeHead()}
+              {#if !editing}
+                <button
+                  type="button"
+                  class="btn sm ghost icon tree-toggle"
+                  aria-expanded={treeOpen}
+                  aria-controls="tree-body"
+                  aria-label={treeOpen ? 'Hide the hierarchy' : 'Show the hierarchy'}
+                  onclick={() => (treeOpen = !treeOpen)}
+                  ><Icon name={treeOpen ? 'chevronDown' : 'chevron'} size={16} /></button
+                >
+              {/if}
+              <h2 id="tree-h">Hierarchy</h2>
+              <span class="spacer"></span>
+              {#if !editing}
+                <span class="seg" role="group" aria-label="View">
+                  <a
+                    href={hrefOf(iri)}
+                    aria-current={view === 'tree' ? 'true' : undefined}
+                    data-sveltekit-noscroll>Tree</a
+                  ><a
+                    href={hrefOf(iri, { view: 'graph' })}
+                    aria-current={view === 'graph' ? 'true' : undefined}
+                    data-sveltekit-noscroll>Graph</a
                   >
-                {/if}
-                <h2 id="tree-h">Hierarchy</h2>
-                <span class="spacer"></span>
-                {#if !editing}
-                  <span class="seg" role="group" aria-label="View">
-                    <a
-                      href={hrefOf(term.iri)}
-                      aria-current={view === 'tree' ? 'true' : undefined}
-                      data-sveltekit-noscroll>Tree</a
-                    ><a
-                      href={hrefOf(term.iri, { view: 'graph' })}
-                      aria-current={view === 'graph' ? 'true' : undefined}
-                      data-sveltekit-noscroll>Graph</a
-                    >
-                  </span>
-                {/if}
-              </div>
-              <div class="tree-edit">
-                {#if editing && isSkos && treeKind === 'concept'}
-                  <div class="skos-parents">
-                    <SkosLinks
-                      title="Broader"
-                      id="broader"
-                      links={details?.broader ?? []}
-                      name={(i) => linker.name(i)}
-                      sub={(i) => linker.short(i)}
+                </span>
+              {/if}
+            {/snippet}
+            <aside class="panel b-tree" class:shut={!treeOpen && !editing} aria-labelledby="tree-h">
+              {#if view === 'graph' && piece && !editing}
+                <TermGraph
+                  ds={target}
+                  {piece}
+                  {linker}
+                  {exploreHref}
+                  onexpand={expand}
+                  epoch={graphEpoch}
+                  lead={treeHead}
+                  shut={!treeOpen}
+                />
+              {:else}
+                <div class="panel-head">{@render treeHead()}</div>
+                <div class="tree-edit">
+                  {#if editing && isSkos && treeKind === 'concept'}
+                    <div class="skos-parents">
+                      <SkosLinks
+                        title="Broader"
+                        id="broader"
+                        links={details?.broader ?? []}
+                        name={(i) => linker.name(i)}
+                        sub={(i) => linker.short(i)}
+                        {readonly}
+                        paired
+                        {picker}
+                        onopen={(i) => void goto(hrefOf(i))}
+                        onadd={(i, n) => addLink('broader', i, n)}
+                        onremove={(i) => removeLink('broader', i)}
+                        onrepair={(l) => addLink('broader', l.iri)}
+                      />
+                      <SkosLinks
+                        title="Narrower"
+                        id="narrower"
+                        links={details?.narrower ?? []}
+                        name={(i) => linker.name(i)}
+                        sub={(i) => linker.short(i)}
+                        {readonly}
+                        paired
+                        {picker}
+                        onopen={(i) => void goto(hrefOf(i))}
+                        onadd={(i, n) => addLink('narrower', i, n)}
+                        onremove={(i) => removeLink('narrower', i)}
+                        onrepair={(l) => addLink('narrower', l.iri)}
+                      />
+                    </div>
+                  {:else if editing && parentsEditable(treeKind)}
+                    <ParentEditor
+                      kind={treeKind}
+                      iri={term.iri}
+                      {title}
+                      rows={parents}
+                      {linker}
+                      {target}
+                      {graph}
+                      {prefixes}
                       {readonly}
-                      paired
-                      {picker}
-                      onopen={(i) => void goto(hrefOf(i))}
-                      onadd={(i, n) => addLink('broader', i, n)}
-                      onremove={(i) => removeLink('broader', i)}
-                      onrepair={(l) => addLink('broader', l.iri)}
+                      {onedit}
                     />
-                    <SkosLinks
-                      title="Narrower"
-                      id="narrower"
-                      links={details?.narrower ?? []}
-                      name={(i) => linker.name(i)}
-                      sub={(i) => linker.short(i)}
-                      {readonly}
-                      paired
-                      {picker}
-                      onopen={(i) => void goto(hrefOf(i))}
-                      onadd={(i, n) => addLink('narrower', i, n)}
-                      onremove={(i) => removeLink('narrower', i)}
-                      onrepair={(l) => addLink('narrower', l.iri)}
+                  {/if}
+                </div>
+                <div class="tree-body" id="tree-body" bind:this={treeBox}>
+                  {#if tree}
+                    <LineageTree
+                      {target}
+                      {sel}
+                      kind={treeKind}
+                      iri={term.iri}
+                      {title}
+                      answer={tree}
+                      href={(i) => hrefOf(i)}
                     />
-                  </div>
-                {:else if editing && parentsEditable(treeKind)}
-                  <ParentEditor
-                    kind={treeKind}
-                    iri={term.iri}
-                    {title}
-                    rows={parents}
-                    {linker}
-                    {target}
-                    {graph}
-                    {prefixes}
-                    {readonly}
-                    {onedit}
-                  />
-                {/if}
-              </div>
-              <div class="tree-body" id="tree-body" bind:this={treeBox}>
-                {#if tree}
-                  <LineageTree
-                    {target}
-                    {sel}
-                    kind={treeKind}
-                    iri={term.iri}
-                    {title}
-                    answer={tree}
-                    href={(i) => hrefOf(i)}
-                  />
-                {:else}
-                  <p class="faint">Loading…</p>
-                {/if}
-              </div>
+                  {:else}
+                    <p class="faint">Loading…</p>
+                  {/if}
+                </div>
+              {/if}
             </aside>
           {/if}
           <aside class="b-info" aria-label="About this entity">
@@ -1344,7 +1358,7 @@
           </aside>
         </div>
 
-        {#if view === 'graph' && piece}
+        {#if view === 'graph' && piece && !treeKind}
           <div class="b-graph">
             <TermGraph
               ds={target}
@@ -1839,7 +1853,7 @@
       grid-template-columns: minmax(0, 1fr) 320px;
     }
   }
-  .b-tree .panel-head h2 {
+  .b-tree h2 {
     font-size: var(--fs-md);
   }
   .tree-edit:not(:empty) {
@@ -1853,12 +1867,12 @@
     padding: var(--sp-3) 14px;
     overscroll-behavior: contain;
   }
-  .b-tree .panel-head .tree-toggle {
+  .browse .b-tree .tree-toggle {
     display: none;
     margin-left: -6px;
   }
   @container browse (max-width: 639px) {
-    .b-tree .panel-head .tree-toggle {
+    .browse .b-tree .tree-toggle {
       display: inline-flex;
     }
     .b-tree.shut .tree-body,
