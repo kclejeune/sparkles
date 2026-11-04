@@ -1,0 +1,371 @@
+"""Where scripts/nsc-bench.sh and scripts/nsc-writes.sh build a revision (--build-host,
+scripts/nsc-build-host.sh): the choice of host, the remote build and its cleanup.
+
+A fake ssh runs each remote command in its own session with HOME set to the host's
+directory under hosts/, so the "remote" processes outlive an interrupted ssh as they would
+on a real host. A fake systemd-run makes each scope its own process group, which the fake
+systemctl stop kills."""
+
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS = ["nsc-bench.sh", "nsc-writes.sh", "nsc-build.sh", "nsc-build-host.sh",
+           "nsc-build-remote.sh", "nsc-writes-remote.sh", "cargo-sparkles-task", "gate/config.sh"]
+
+TOOLS = {
+    "ssh": """#!/usr/bin/env python3
+import os,pathlib,signal,subprocess,sys
+a=sys.argv[1:]
+while a and a[0].startswith('-'):
+    a=a[2:] if a[0]=='-o' else a[1:]
+host,cmd=a[0],' '.join(a[1:])
+home=pathlib.Path(os.environ['FAKE_HOSTS'])/host
+with open(os.environ['FAKE_SSH_LOG'],'a') as s:s.write(host+'\\t'+cmd+'\\n')
+if not home.is_dir() or (home/'unreachable').exists():
+    sys.stderr.write('ssh: connect to host '+host+': unreachable\\n');raise SystemExit(255)
+env=dict(os.environ,HOME=str(home))
+p=subprocess.Popen(['bash','-c',cmd],cwd=home,env=env,start_new_session=True)
+signal.signal(signal.SIGINT,lambda *_:os._exit(255))
+raise SystemExit(p.wait())
+""",
+    "systemd-run": """#!/usr/bin/env python3
+import os,pathlib,sys
+a=sys.argv[1:];unit=None;props=[]
+while a and a[0].startswith('-'):
+    o=a.pop(0)
+    if o=='--':break
+    if o in('--unit','-p'):
+        v=a.pop(0)
+        if o=='--unit':unit=v
+        else:props.append(v)
+state=pathlib.Path(os.environ['FAKE_HOSTS'])/'units'
+state.mkdir(exist_ok=True)
+if unit:
+    os.setsid()
+    (state/unit).write_text(str(os.getpid())+'\\n'+' '.join(props)+'\\n')
+os.execvp(a[0],a)
+""",
+    "systemctl": """#!/usr/bin/env python3
+import os,pathlib,signal,sys
+a=sys.argv[1:]
+state=pathlib.Path(os.environ['FAKE_HOSTS'])
+with open(state/'systemctl.log','a') as s:s.write(os.environ['HOME']+'\\t'+' '.join(a)+'\\n')
+if 'list-units' in a:
+    n=int((pathlib.Path(os.environ['HOME'])/'gate-units').read_text()) if (pathlib.Path(os.environ['HOME'])/'gate-units').exists() else 0
+    for i in range(n):print(f'gate-{i}.service loaded active running gate')
+    raise SystemExit(0)
+if 'stop' in a:
+    f=state/'units'/a[-1]
+    if f.exists():
+        try:os.killpg(int(f.read_text().split()[0]),signal.SIGKILL)
+        except ProcessLookupError:pass
+""",
+    "mbx": """#!/usr/bin/env python3
+import json,os,pathlib,subprocess,sys,time
+a=sys.argv[1:]
+if a==['--version']:print('mbx 9.9.9');raise SystemExit(0)
+if a[:2]==['sparkles-task','--']:raise SystemExit(subprocess.run(a[2:]).returncode)
+with open(os.environ['FAKE_BUILDS'],'a') as s:s.write(json.dumps({'home':os.environ['HOME'],'cwd':os.getcwd(),'args':a,'jobs':os.environ.get('CARGO_BUILD_JOBS')})+'\\n')
+pathlib.Path(os.environ['FAKE_HOSTS'],'build-started').touch()
+time.sleep(float(os.environ.get('FAKE_BUILD_DELAY','0')))
+if os.environ.get('FAKE_BUILD_FAIL'):raise SystemExit(17)
+assert pathlib.Path('ui/build/index.html').read_text().startswith('<!doctype html>')
+pathlib.Path('target/release').mkdir(parents=True,exist_ok=True)
+pathlib.Path('target/release/sparkles').write_text('built in '+os.environ['HOME']+' with '+' '.join(a[4:]))
+pathlib.Path('target/release/sparkles').chmod(0o755)
+""",
+    "readelf": "#!/bin/sh\nexit 0\n",
+    "nsc": "#!/bin/sh\necho 'nsc must not run' >&2\nexit 99\n",
+    "cargo": "#!/bin/sh\necho 'cargo test'\n",
+    "rustc": "#!/bin/sh\necho 'rustc test'\n",
+    "cc": "#!/bin/sh\necho 'cc test'\n",
+    "c++": "#!/bin/sh\necho 'c++ test'\n",
+    "zstd": """#!/usr/bin/env python3
+import shutil,sys
+a=sys.argv[1:];shutil.copyfile([x for x in a if not x.startswith('-') and x!=a[a.index('-o')+1]][0],a[a.index('-o')+1])
+""",
+}
+
+
+class BuildHost(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="sparkles-nsc-host-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.repo = self.root / "repo"
+        for name in SCRIPTS:
+            (self.repo / "scripts" / name).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ROOT / "scripts" / name, self.repo / "scripts" / name)
+        (self.repo / "mise.toml").write_text('[tools]\nmr-boxington = "9.9.9"\n')
+        git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
+               "-c", "commit.gpgsign=false"]
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        subprocess.run([*git, "add", "."], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "fixture"], check=True)
+        self.sha = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True,
+                                  text=True).stdout.strip()
+        self.hosts = self.root / "hosts"
+        for host in ("h1", "h2", "bench"):
+            (self.hosts / host).mkdir(parents=True)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.cache = self.root / "cache"
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        for name, text in TOOLS.items():
+            (self.bin / name).write_text(text)
+            (self.bin / name).chmod(0o755)
+        self.builds_log = self.root / "builds.jsonl"
+        self.ssh_log = self.root / "ssh.log"
+        self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+                        HOME=str(self.home), SPARKLES_NSC_CACHE=str(self.cache),
+                        FAKE_HOSTS=str(self.hosts), FAKE_BUILDS=str(self.builds_log),
+                        FAKE_SSH_LOG=str(self.ssh_log), SPARKLES_BENCH_HOST="bench",
+                        SPARKLES_GATE_CONFIG=str(self.root / "no-gate.env"),
+                        SPARKLES_NSC_BUILD_MIN_FREE_GB="0")
+        for name in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "SPARKLES_NSC_BUILD_HOSTS",
+                     "SPARKLES_NSC_BUILD_CONFIG", "CARGO_BUILD_JOBS"):
+            self.env.pop(name, None)
+        self.runs = 0
+        self.holders = []
+
+    def tearDown(self):
+        for holder in self.holders:
+            holder.kill()
+            holder.wait()
+
+    def hold_lock(self, host, seconds=60):
+        lanes = self.hosts / host / "lanes"
+        lanes.mkdir(exist_ok=True)
+        holder = subprocess.Popen(["flock", str(lanes / ".heavy.lock"), "sleep", str(seconds)])
+        self.holders.append(holder)
+        deadline = time.monotonic() + 5
+        while subprocess.run(["flock", "-n", str(lanes / ".heavy.lock"), "true"]).returncode == 0:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        return holder
+
+    def bench(self, *args, env=None, ok_stop=True):
+        self.runs += 1
+        out = self.root / f"out-{self.runs}"
+        result = subprocess.run(["bash", str(self.repo / "scripts/nsc-bench.sh"), "--out", str(out),
+                                 *args, self.sha, self.sha], env=env or self.env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        if ok_stop:
+            # Both binaries are staged and the run stops at the compiler check.
+            self.assertIn("not built with the same known compilers", result.stderr, result.stderr)
+        return result, out
+
+    def builds(self):
+        if not self.builds_log.exists():
+            return []
+        return [json.loads(line) for line in self.builds_log.read_text().splitlines()]
+
+    def entry(self):
+        return self.cache / "bin" / self.sha
+
+    def scratch(self, host):
+        d = self.hosts / host / "lanes" / "nsc-build"
+        return sorted(p.name for p in d.iterdir()) if d.exists() else []
+
+    def test_without_configuration_the_build_stays_local(self):
+        result, out = self.bench()
+        [build] = self.builds()
+        self.assertEqual(build["home"], str(self.home))
+        self.assertFalse(self.ssh_log.exists(), "a local build must not use ssh")
+        record = (self.entry() / "build.txt").read_text()
+        self.assertIn("build host: local (", record)
+        self.assertIn("cc: cc test", record)
+        self.assertIn("built on local (", (out / "manifest.txt").read_text())
+        # auto with no hosts also builds here.
+        (self.entry() / "build.txt").unlink()
+        result, _ = self.bench("--build-host", "auto")
+        self.assertIn("none configured", result.stdout)
+        self.assertEqual(self.builds()[-1]["home"], str(self.home))
+
+    def test_auto_skips_a_held_host_and_the_entry_is_reused(self):
+        self.hold_lock("h1")
+        env = dict(self.env, SPARKLES_NSC_BUILD_HOSTS="h1 h2")
+        result, out = self.bench(env=env)
+        self.assertIn("build host h1: busy (heavy lock held", result.stdout)
+        self.assertIn("build host: h2", result.stdout)
+        [build] = self.builds()
+        self.assertEqual(Path(build["home"]), self.hosts / "h2")
+        self.assertTrue(build["cwd"].startswith(str(self.hosts / "h2" / "lanes" / "nsc-build" / self.sha)))
+        self.assertEqual(build["args"], ["build", "--release", "-p", "sparkles-server"])
+        self.assertEqual((self.entry() / "sparkles").read_text(), f"built in {self.hosts / 'h2'} with ")
+        record = (self.entry() / "build.txt").read_text()
+        self.assertIn("build host: h2\n", record)
+        self.assertIn("cargo args: \n", record)
+        self.assertIn("rustc test", record)
+        self.assertIn("built on h2", (out / "manifest.txt").read_text())
+        log = (out / "logs" / "build-A.log").read_text()
+        self.assertIn(f"scope nsc-build-{self.sha[:12]}-", log)
+        self.assertIn("MemoryMax=", log)
+        self.assertEqual(self.scratch("h2"), [], "the remote scratch directory must go")
+        self.assertEqual(list((self.cache / "src").iterdir()), [])
+        # The scope has the memory cap and swap limit, and the build holds the heavy lock.
+        unit = next((self.hosts / "units").iterdir())
+        props = unit.read_text().splitlines()[1]
+        self.assertIn("MemorySwapMax=2G", props)
+        self.assertIn("OOMPolicy=continue", props)
+        # A second run reuses the entry without probing or building.
+        before = self.ssh_log.read_text()
+        result, out = self.bench(env=env)
+        self.assertEqual(len(self.builds()), 1)
+        self.assertEqual(self.ssh_log.read_text(), before)
+        self.assertIn("built on h2", (out / "manifest.txt").read_text())
+
+    def test_cargo_args_reach_the_remote_build(self):
+        self.bench("--build-host", "h1", "--cargo-args", "--features text,geo --locked")
+        [build] = self.builds()
+        self.assertEqual(build["args"], ["build", "--release", "-p", "sparkles-server",
+                                         "--features", "text,geo", "--locked"])
+
+    def test_a_gate_unit_makes_a_host_busy_and_short_disk_skips_it(self):
+        (self.hosts / "h1" / "gate-units").write_text("1")
+        env = dict(self.env, SPARKLES_NSC_BUILD_HOSTS="h1 h2")
+        result, _ = self.bench(env=env)
+        self.assertIn("build host h1: busy (heavy lock free, 1 gate units)", result.stdout)
+        self.assertEqual(Path(self.builds()[0]["home"]), self.hosts / "h2")
+        (self.entry() / "build.txt").unlink()
+        env = dict(env, SPARKLES_NSC_BUILD_MIN_FREE_GB="999999999")
+        result, _ = self.bench(env=env, ok_stop=False)
+        self.assertIn("is reachable with 999999999 GiB free", result.stderr)
+
+    def test_the_benchmark_host_never_builds(self):
+        env = dict(self.env, SPARKLES_NSC_BUILD_HOSTS="bench h1")
+        result, _ = self.bench(env=env)
+        self.assertIn("build host bench: skipped", result.stdout)
+        self.assertEqual(Path(self.builds()[0]["home"]), self.hosts / "h1")
+        result, _ = self.bench("--build-host", "bench", ok_stop=False)
+        self.assertIn("is the benchmark host", result.stderr)
+        result, _ = self.bench("--build-host", "bench.example", ok_stop=False)
+        self.assertIn("is the benchmark host", result.stderr)
+        self.assertEqual(len(self.builds()), 1)
+
+    def test_bad_build_host_values_are_refused_before_any_work(self):
+        for value in ("-x", "a b", "h1;rm"):
+            result, out = self.bench("--build-host", value, ok_stop=False)
+            self.assertIn("--build-host is local, auto or a host name", result.stderr)
+            self.assertFalse(out.exists())
+        self.assertEqual(self.builds(), [])
+
+    def test_every_host_busy_waits_for_the_first_ones_lock(self):
+        self.hold_lock("h1", seconds=2)
+        self.hold_lock("h2")
+        env = dict(self.env, SPARKLES_NSC_BUILD_HOSTS="h1 h2")
+        started = time.monotonic()
+        result, out = self.bench(env=env)
+        self.assertGreater(time.monotonic() - started, 1.0)
+        self.assertIn("every build host is busy", result.stdout)
+        self.assertIn("--build-host local builds on this machine instead", result.stdout)
+        self.assertEqual(Path(self.builds()[0]["home"]), self.hosts / "h1")
+        self.assertIn("waiting for", (out / "logs" / "build-A.log").read_text())
+
+    def test_no_reachable_host_stops_the_run(self):
+        (self.hosts / "h1" / "unreachable").touch()
+        env = dict(self.env, SPARKLES_NSC_BUILD_HOSTS="h1 nohost")
+        result, _ = self.bench(env=env, ok_stop=False)
+        self.assertIn("build host h1: unreachable", result.stdout)
+        self.assertIn("pass --build-host local", result.stderr)
+        result, _ = self.bench("--build-host", "nohost", ok_stop=False)
+        self.assertIn("build host nohost is unreachable", result.stderr)
+        self.assertEqual(self.builds(), [])
+        # local overrides the configured hosts.
+        self.bench("--build-host", "local", env=env)
+        self.assertEqual(self.builds()[0]["home"], str(self.home))
+
+    def test_the_config_file_supplies_the_hosts(self):
+        config = self.root / "nsc-build.env"
+        config.write_text("SPARKLES_NSC_BUILD_HOSTS=h2\nOTHER=ignored\n")
+        self.bench(env=dict(self.env, SPARKLES_NSC_BUILD_CONFIG=str(config)))
+        self.assertEqual(Path(self.builds()[0]["home"]), self.hosts / "h2")
+
+    def test_a_failed_remote_build_leaves_no_scratch_and_no_entry(self):
+        result, out = self.bench("--build-host", "h1", env=dict(self.env, FAKE_BUILD_FAIL="1"),
+                                 ok_stop=False)
+        self.assertIn("build of", result.stderr)
+        self.assertIn("on h1 failed", result.stderr)
+        self.assertEqual(self.scratch("h1"), [])
+        self.assertFalse((self.entry() / "build.txt").exists())
+        self.assertFalse((self.entry() / "sparkles").exists())
+
+    def test_a_mismatched_mbx_is_refused_on_the_host(self):
+        (self.repo / "mise.toml").write_text('[tools]\nmr-boxington = "1.0.0"\n')
+        git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
+               "-c", "commit.gpgsign=false"]
+        subprocess.run([*git, "commit", "-qam", "pin"], check=True)
+        self.sha = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True,
+                                  text=True).stdout.strip()
+        result, out = self.bench("--build-host", "h1", ok_stop=False)
+        self.assertIn("mbx is 9.9.9, but mise.toml pins 1.0.0", (out / "logs" / "build-A.log").read_text())
+        self.assertEqual(self.scratch("h1"), [])
+        self.assertEqual(self.builds(), [])
+
+    def test_an_interrupt_stops_the_scope_and_removes_the_scratch(self):
+        out = self.root / "out-interrupted"
+        process = subprocess.Popen(
+            ["bash", str(self.repo / "scripts/nsc-bench.sh"), "--out", str(out), "--build-host", "h1",
+             self.sha, self.sha], env=dict(self.env, FAKE_BUILD_DELAY="60"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        deadline = time.monotonic() + 20
+        while not (self.hosts / "build-started").exists():
+            self.assertLess(time.monotonic(), deadline, "the build did not start")
+            time.sleep(0.05)
+        [unit] = list((self.hosts / "units").iterdir())
+        scope = int(unit.read_text().split()[0])
+        os.killpg(process.pid, signal.SIGINT)
+        process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 130)
+        self.assertEqual(self.scratch("h1"), [])
+        self.assertIn(f"stop {unit.name}", (self.hosts / "systemctl.log").read_text())
+        time.sleep(0.2)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(scope, 0)
+        self.assertFalse((self.entry() / "build.txt").exists())
+
+    def test_nsc_writes_builds_on_the_host_and_records_it(self):
+        # nsc-writes stops when it tries to create the instance, after staging the binaries.
+        (self.cache / "data").mkdir(parents=True)
+        (self.cache / "data" / "people-100000.nt.zst").write_text("data")
+        (self.repo / "crates/sparkles-core/tests/support").mkdir(parents=True)
+
+        def writes(*args):
+            self.runs += 1
+            out = self.root / f"writes-{self.runs}"
+            result = subprocess.run(["bash", str(self.repo / "scripts/nsc-writes.sh"), "--out", str(out),
+                                     *args, f"a={self.sha}", f"b={self.sha}:--flag"], env=self.env,
+                                    capture_output=True, text=True, timeout=60)
+            self.assertIn("nsc create failed", result.stderr, result.stderr)
+            return result, out
+
+        result, out = writes("--build-host", "h2", "--cargo-args", "--features text")
+        [build] = self.builds()
+        self.assertEqual(Path(build["home"]), self.hosts / "h2")
+        self.assertEqual(build["args"][4:], ["--features", "text"])
+        [entry] = (self.cache / "writes-v1" / "bin").iterdir()
+        record = json.loads((entry / "build.json").read_text())
+        self.assertEqual(record["build_host"], "h2")
+        self.assertEqual(record["rustc"], "rustc test\n")
+        self.assertIn("build host h2", record["command"])
+        self.assertIn("built on h2", (out / "manifest.txt").read_text())
+        self.assertEqual(self.scratch("h2"), [])
+        self.assertEqual(list((self.cache / "writes-v1" / "src").iterdir()), [])
+        # The verified entry is reused by a later run, which builds nothing.
+        result, out = writes("--build-host", "h1", "--cargo-args", "--features text")
+        self.assertEqual(len(self.builds()), 1)
+        self.assertIn("built on h2", (out / "manifest.txt").read_text())
+
+
+if __name__ == "__main__":
+    unittest.main()
