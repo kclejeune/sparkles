@@ -1501,6 +1501,12 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+A partial answer of the disjunctive rules no longer reports a class complete when the
+run stopped before it made that class's context. The class's answer then held only
+`owl:Thing` while its told superclasses were missing, and the ontology's consistency
+could be reported as known before the context of `owl:Thing` existed. Such a class is
+now left open, and an unmade context of `owl:Thing` leaves the consistency unknown.
+
 A quick query text no longer settles in its slower execution mode because of one cold
 run. The server's history ran a text's first run as an automatic cursor and its second
 eagerly, and kept whichever of those two single runs was faster for the server's whole
