@@ -756,6 +756,7 @@ sparkles ontology edit    --loc db --add new.json --remove old.json   # JSON axi
 sparkles ontology classify --loc db --format text   # OWL 2 EL taxonomy (exit 1 when unsatisfiable)
 sparkles ontology classify go.ofn > go-taxonomy.ofn  # classify a file without a database
 sparkles ontology classify --loc db --target http://ex.org/taxonomy   # write the taxonomy to a graph
+sparkles ontology classify dl.ofn --timeout 10 --partial --format json   # what 10 s proved (exit 2 when partial)
 sparkles ontology reason --input go.owl --output go-reasoned.ofn   # robot reason: the ontology with its inferred axioms
 sparkles ontology reason --input go.owl --reasoner ELK --output go-elk.ofn   # OWL 2 EL rules alone: ROBOT's output with ELK
 sparkles ontology reduce --input x.owl --output y.ofn   # robot reduce: without the entailed subclass axioms

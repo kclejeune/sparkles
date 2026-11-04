@@ -2111,7 +2111,7 @@ the rule it breaks. An axiom that the classifier uses only in part, such as one 
 individual in a class expression, a data range, an assertion on a property with a range
 or the top or bottom property, is listed with `partial` and the reason. An axiom with
 an expression nested more than 256 deep is left out and listed as partial too.
-`complete` is false when anything is listed. Every subsumption the answer gives
+`complete` is false when anything is listed, and for a partial answer. Every subsumption the answer gives
 is entailed, and a complete answer has every entailed subsumption between named classes.
 The answer counts the classes, the nodes of the taxonomy, the unsatisfiable classes and
 the excluded axioms, lists at most `limit` of the last two, 100 by default and at most
@@ -2140,6 +2140,24 @@ The kept state costs memory for the time the dataset is open, about 115 MB estim
 and 190 MB resident for GO, and it is dropped after a run whose estimate passes one
 gigabyte. A run is bounded by the request's deadline and memory budget, from indexing
 to the taxonomy, and answers `507` with `budget: "memory"` past the budget.
+
+`tier` names the rules that the ontology's axioms need, `el`, `horn` or `disjunctive`.
+`partial: true` in the body or the query string asks a run of the disjunctive rules that
+its deadline, cancellation or memory budget stops to answer what it proved instead of
+failing with `408` or `507`. Runs of the EL and Horn rules fail as before. The answer of
+such a run has `partial: true` and `complete: false`. Its subsumptions and unsatisfiable
+classes are entailed, `incomplete` lists the classes whose superclasses it may miss, at
+most `limit` of them in IRI order with `incompleteCount` counting them all, and every
+other class has its full answer. `consistency` is `consistent`, `inconsistent` or, for
+a run that stopped before it decided, `unknown`, and then every class is in
+`incomplete`. `consistent` is false only for an ontology proved inconsistent, so a
+caller that needs to know reads `consistency`. A finished run has `partial: false`,
+an empty `incomplete` and a `consistency` that is never `unknown`. A partial taxonomy
+builds after the deadline that stopped the run. It is never kept, so a later call runs
+again. `partial` is `400` with `target`, which writes a taxonomy as the classifier's,
+and with `format=ofn`, which has no place to say that the taxonomy is partial.
+`expansion` picks the expansion strategy of the disjunctive rules, `cautious` by default
+or `eager`, which give the same answer.
 
 `target` names a graph to write the taxonomy to, in one commit, with `message`. The
 graph must be a named graph that the classification does not read. The commit adds the
@@ -2260,7 +2278,11 @@ axiom with structural equality. Node.js's `dataset.ontology` has `summary`, `axi
 edit is its JSON form or a string in functional-style syntax with the dataset's
 prefixes. Manchester text that `parse` or `dl_query` cannot read raises Python's
 `InvalidInputError`, a `ValueError`, with `reason`, `start`, `end` and `candidates` as
-attributes, and Node.js's `InvalidInputError` with them under `details`.
+attributes, and Node.js's `InvalidInputError` with them under `details`. A
+classification's `partial` and `expansion` are keyword arguments in Python, options in
+Node.js and members of `ClassifyQuery` on the JVM, and the deadline that stops a partial
+run is the call's `timeout`, Node.js's `timeout` in milliseconds or the JVM's
+`SparklesOperation` timeout.
 
 Typed constructors build axioms without writing their syntax. Python's `sparkles.owl`
 and Node.js's `owl` namespace have one constructor per axiom type and per expression,
