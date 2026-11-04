@@ -85,8 +85,16 @@
   import ShapeForm from '$components/ShapeForm.svelte';
   import SkosLabels from '$components/SkosLabels.svelte';
   import SkosLinks from '$components/SkosLinks.svelte';
+  import EditorHistory from '$components/EditorHistory.svelte';
+  import { routes, THESAURUS_TABS, type ThesaurusTab } from '$lib/routes';
 
-  type Tab = 'concepts' | 'collections' | 'checks';
+  const TAB_LABEL: [ThesaurusTab, string][] = [
+    ['tree', 'Tree'],
+    ['history', 'History'],
+    ['validation', 'Validation'],
+  ];
+
+  type Tab = ThesaurusTab;
   type View = 'labels' | 'relations' | 'notes' | 'members';
   const GROUP = 'urn:x-sparkles:skos:';
 
@@ -97,10 +105,15 @@
   const target = $derived(onBranch(name, branch));
   const graph = $derived(q.get('graph') || null);
   const sel: Selection = $derived({ graph, imports: false });
+  // the page's one tab row: the tree, the history and the validation report (ROADMAP item
+  // 633); the tree lists concepts or collections by a control at its top
   const tab = $derived<Tab>(
-    q.get('tab') === 'collections' || q.get('tab') === 'checks'
+    (THESAURUS_TABS as readonly string[]).includes(q.get('tab') ?? '')
       ? (q.get('tab') as Tab)
-      : 'concepts',
+      : 'tree',
+  );
+  const list = $derived<'concepts' | 'collections'>(
+    q.get('kind') === 'collections' ? 'collections' : 'concepts',
   );
   const selected = $derived(q.get('iri'));
   const viewParam = $derived(q.get('view') as View | null);
@@ -117,7 +130,7 @@
       if (v == null || v === '') p.delete(k);
       else p.set(k, v);
     }
-    return `${resolve('/thesaurus')}?${p}`;
+    return routes.thesaurus(p.get('ds') ?? name, Object.fromEntries(p));
   }
   const nav = (over: Record<string, string | null>, replace = false) =>
     goto(withParams(over), { replaceState: replace, keepFocus: true, noScroll: true });
@@ -353,7 +366,7 @@
   });
   function pickHit(h: SearchHit) {
     search = '';
-    void nav({ iri: h.iri, tab: null });
+    void nav({ iri: h.iri, tab: null, kind: null });
     void reveal(h.iri);
   }
 
@@ -411,7 +424,8 @@
   // open the path to a selection made from a link
   $effect(() => {
     const iri = selected;
-    if (iri && loadedTarget && tab === 'concepts') untrack(() => void reveal(iri));
+    if (iri && loadedTarget && tab === 'tree' && list === 'concepts')
+      untrack(() => void reveal(iri));
   });
 
   const kind = $derived<'concept' | 'scheme' | 'collection' | 'other'>(
@@ -486,6 +500,14 @@
   });
   useCommands(() => [
     {
+      id: 'workbench.page',
+      label: 'Open page in Browse',
+      icon: 'book',
+      keywords: ['browse', 'page', 'read', 'open page'],
+      active: () => !!name && !!selected,
+      run: () => void goto(routes.browse(name, { iri: selected, graph })),
+    },
+    {
       id: 'thesaurus.session',
       label: 'Start session',
       icon: 'branch',
@@ -524,7 +546,7 @@
       icon: 'check',
       keywords: ['validate', 'quality'],
       active: () => !!name,
-      run: () => (tab === 'checks' ? runChecks() : void nav({ tab: 'checks' })),
+      run: () => (tab === 'validation' ? runChecks() : void nav({ tab: 'validation' })),
     },
     {
       id: 'thesaurus.undo',
@@ -711,8 +733,8 @@
       void nav({
         iri,
         view: null,
-        ...(createKind === 'scheme' ? { scheme: iri, tab: null } : {}),
-        ...(createKind === 'collection' ? { tab: 'collections' } : {}),
+        ...(createKind === 'scheme' ? { scheme: iri, tab: null, kind: null } : {}),
+        ...(createKind === 'collection' ? { tab: null, kind: 'collections' } : {}),
       });
     });
   }
@@ -775,7 +797,7 @@
     if (canAdmin) guard = await api.writeValidation(name).catch(() => undefined);
   }
   $effect(() => {
-    if (tab === 'checks' && loadedTarget) untrack(() => void runChecks());
+    if (tab === 'validation' && loadedTarget) untrack(() => void runChecks());
   });
   const severityOf = (r: api.ShaclResult) =>
     r.severity.type === 'uri' ? r.severity.value.replace(/.*#/, '') : '';
@@ -866,20 +888,23 @@
     </div>
     <div class="page-actions">
       <FollowState live={session.live} onretry={() => followRun++} />
-      <button
-        class="btn ghost"
-        disabled={!session.done.length || readonly}
-        onclick={() => session.undoLast()}
-        title={session.done.at(-1) ? `Undo: ${session.done.at(-1)?.label}` : 'Nothing to undo'}
-        >Undo{session.done.length ? ` (${session.done.length})` : ''}</button
-      >
-      <button
-        class="btn ghost"
-        disabled={!session.undone.length || readonly}
-        onclick={() => session.redoLast()}
-        title={session.undone.at(-1) ? `Redo: ${session.undone.at(-1)?.label}` : 'Nothing to redo'}
-        >Redo</button
-      >
+      {#if canWrite}
+        <button
+          class="btn ghost"
+          disabled={!session.done.length || readonly}
+          onclick={() => session.undoLast()}
+          title={session.done.at(-1) ? `Undo: ${session.done.at(-1)?.label}` : 'Nothing to undo'}
+          >Undo{session.done.length ? ` (${session.done.length})` : ''}</button
+        >
+        <button
+          class="btn ghost"
+          disabled={!session.undone.length || readonly}
+          onclick={() => session.redoLast()}
+          title={session.undone.at(-1)
+            ? `Redo: ${session.undone.at(-1)?.label}`
+            : 'Nothing to redo'}>Redo</button
+        >
+      {/if}
       {#if canWrite && !branch}
         <button
           class="btn"
@@ -957,7 +982,10 @@
       {branch ?? MAIN} is protected and takes changes through merges only. Start a session branch to edit.
     </p>
   {:else if !canWrite && name}
-    <p class="notice" role="status">You can read this dataset but not edit it.</p>
+    <p class="notice" role="status">
+      <strong>Read-only.</strong> You can read {name} but not edit it, so the editing controls are hidden.
+      The tree, the history and the validation report still read.
+    </p>
   {:else if noHead && name}
     <p class="notice" role="status">
       The page could not read the commit this graph is at, so it cannot guard its edits against
@@ -972,469 +1000,492 @@
   {/if}
 
   {#if name && head}
-    <div class="panes split-view">
-      <section class="panel side" aria-label="Thesaurus">
-        <div class="scheme-bar">
-          <label class="pick grow">
-            <span class="faint">Concept scheme</span>
-            <select
-              class="select"
-              value={scheme ?? '*'}
-              onchange={(e) => nav({ scheme: e.currentTarget.value, iri: null })}
-              aria-label="Concept scheme"
-            >
-              {#each schemes as s (s)}<option value={s}>{nameOf(s)}</option>{/each}
-              <option value="*">All concepts</option>
-            </select>
-          </label>
-          {#if scheme}
-            <button
-              class="btn sm"
-              onclick={() => nav({ iri: scheme, view: null, tab: null })}
-              title="The scheme's labels, top concepts and notes">Scheme</button
-            >
-          {/if}
-          {#if !readonly}
-            <button class="btn sm" onclick={() => openCreate('scheme')}
-              ><Icon name="plus" size={13} /> Scheme</button
-            >
-          {/if}
-        </div>
-        <div class="search-bar">
-          <input
-            class="input"
-            type="search"
-            placeholder="Search labels in any language"
-            aria-label="Search labels"
-            bind:this={searchInput}
-            bind:value={search}
+    <div class="tabs" role="tablist" aria-label="Thesaurus views">
+      {#each TAB_LABEL as [t, l] (t)}
+        <button
+          class="tab"
+          role="tab"
+          aria-selected={tab === t}
+          onclick={() => nav({ tab: t === 'tree' ? null : t })}>{l}</button
+        >
+      {/each}
+    </div>
+    {#if tab === 'history'}
+      <section class="panel" aria-label="History">
+        <div class="panel-body">
+          <EditorHistory
+            {name}
+            {target}
+            {branch}
+            {graph}
+            {langs}
+            {prefixes}
+            onopen={(iri) => nav({ tab: null, iri, view: null })}
+            refreshKey={head?.commit ?? 0}
           />
-          <select class="select sm" bind:value={searchLang} aria-label="Search language">
-            <option value="">any language</option>
-            {#each languages as l (l)}<option value={l}>{l}</option>{/each}
-          </select>
         </div>
-        {#if search.trim()}
-          <div class="results" role="region" aria-label="Search results">
-            {#if searching && !hits.length}<p class="faint pad">
-                <span class="spinner"></span> Searching…
-              </p>{/if}
-            {#if !searching && !hits.length}<p class="empty pad">No label matches.</p>{/if}
-            <ul>
-              {#each hits as h, i (`${h.iri}|${h.kind}|${h.label.value}|${i}`)}
-                <li>
-                  <button class="hit" onclick={() => pickHit(h)}>
-                    <span class="name">{nameOf(h.iri)}</span>
-                    <span class="faint small"
-                      >{h.kind} “{h.label.value}”{h.label.lang ? `@${h.label.lang}` : ''}</span
-                    >
-                  </button>
-                </li>
-              {/each}
-            </ul>
-          </div>
-        {:else}
-          <div class="tabs" role="tablist" aria-label="Views">
-            <button
-              class="tab"
-              role="tab"
-              aria-selected={tab === 'concepts'}
-              onclick={() => nav({ tab: null })}>Concepts</button
-            >
-            <button
-              class="tab"
-              role="tab"
-              aria-selected={tab === 'collections'}
-              onclick={() => nav({ tab: 'collections' })}
-              >Collections <span class="count">{collections.length || ''}</span></button
-            >
-            <button
-              class="tab"
-              role="tab"
-              aria-selected={tab === 'checks'}
-              onclick={() => nav({ tab: 'checks' })}>Checks</button
-            >
-          </div>
-          {#if tab === 'concepts'}
-            <div class="tree-bar">
-              {#if !readonly}
-                <button
-                  class="btn sm"
-                  onclick={() => openCreate('concept')}
-                  title={selected && kind === 'concept'
-                    ? 'New concept under the selection'
-                    : 'New top concept'}><Icon name="plus" size={13} /> Concept</button
-                >
-              {/if}
-              <span class="faint small">
-                {fmtInt(tree.roots.length)}
-                {scheme ? 'top concepts' : 'concepts without a broader one'}
-              </span>
-            </div>
-            {#if scheme && !readonly}
-              <div
-                class="top-drop"
-                class:over={topOver}
-                role="region"
-                aria-label="Top of the scheme"
-                ondragover={(e) => {
-                  if (!e.dataTransfer?.types.includes(TREE_DRAG)) return;
-                  e.preventDefault();
-                  topOver = true;
-                }}
-                ondragleave={() => (topOver = false)}
-                ondrop={(e) => {
-                  topOver = false;
-                  const raw = e.dataTransfer?.getData(TREE_DRAG);
-                  if (!raw || !scheme) return;
-                  e.preventDefault();
-                  const src = JSON.parse(raw) as { id: string; from: string | null };
-                  void move(src.id, src.from, { top: scheme }, e.ctrlKey || e.altKey);
-                }}
-              >
-                Drop a concept here to make it a top concept of {nameOf(scheme)}
-              </div>
-            {/if}
-            <div class="tree-scroll">
-              {#if tree.roots.length}
-                <OntoTree
-                  label="Concepts"
-                  roots={tree.roots}
-                  children={kidsOf}
-                  more={moreOf}
-                  name={nameOf}
-                  sub={subOf}
-                  badge={badgeOf}
-                  open={opened}
-                  {selected}
-                  onselect={(id) => nav({ iri: id })}
-                  ontoggle={toggle}
-                  ondrop={readonly
-                    ? undefined
-                    : (node, from, onto, copy) => void move(node, from, { parent: onto }, copy)}
-                />
-              {:else}
-                <p class="empty">
-                  {scheme ? 'The scheme has no concepts.' : 'The graph has no concepts.'}
-                </p>
-              {/if}
-            </div>
-            {#if !readonly && tree.roots.length}
-              <p class="faint small pad">
-                Drag a concept onto another to move it there. Hold Ctrl or Alt to add a broader
-                concept and keep the old one.
-              </p>
-            {/if}
-          {:else if tab === 'collections'}
-            <div class="tree-bar">
-              {#if !readonly}
-                <button class="btn sm" onclick={() => openCreate('collection')}
-                  ><Icon name="plus" size={13} /> Collection</button
-                >
-              {/if}
-            </div>
-            <ul class="plain-list" aria-label="Collections">
-              {#each collections as c (c.iri)}
-                <li>
-                  <button
-                    class="hit"
-                    class:sel={selected === c.iri}
-                    onclick={() => nav({ iri: c.iri, view: null })}
-                  >
-                    <span class="name">{nameOf(c.iri)}</span>
-                    {#if c.ordered}<span class="badge">ordered</span>{/if}
-                  </button>
-                </li>
-              {:else}
-                <li class="empty">The graph has no collections.</li>
-              {/each}
-            </ul>
-          {:else}
-            <div class="checks">
-              <div class="tree-bar">
-                <button class="btn sm" onclick={runChecks} disabled={checking}
-                  ><Icon name="refresh" size={13} /> Run the checks</button
-                >
-                <label class="small"
-                  ><input type="checkbox" bind:checked={showInfo} /> Information too</label
-                >
-              </div>
-              {#if checking && !report}<p class="faint pad">
-                  <span class="spinner"></span> Checking…
-                </p>{/if}
-              {#if checkError}<p class="error-box" role="alert">{checkError}</p>{/if}
-              {#if report}
-                <p class="pad small" role="status" data-conforms={report.conforms}>
-                  {#if !results.length}
-                    The thesaurus keeps the SKOS integrity conditions.
-                  {:else}
-                    {fmtInt(results.length)}
-                    {results.length === 1 ? 'result' : 'results'} of the built-in SKOS shapes.
-                  {/if}
-                </p>
-                <ul class="plain-list" aria-label="Check results">
-                  {#each results as r, i (i)}
-                    {@const f = r.focusNode.type === 'uri' ? r.focusNode.value : null}
-                    <li class="result" data-severity={severityOf(r)}>
-                      {#if f}<button class="link" onclick={() => nav({ iri: f, tab: null })}
-                          >{nameOf(f)}</button
-                        >{:else}<span class="mono">{r.focusNode.value}</span>{/if}
-                      <span class="small">{r.messages[0] ?? 'violates a shape'}</span>
-                      {#if r.value}<span class="mono faint xs">{r.value.value}</span>{/if}
-                    </li>
-                  {/each}
-                </ul>
-              {/if}
-              {#if canAdmin && guard === null}
-                <p class="pad small">
-                  The dataset has no write-time validation.
-                  <button class="btn sm" onclick={enforce}>Enforce the SKOS rules on writes</button>
-                </p>
-              {:else if guard}
-                <p class="pad faint small">
-                  The dataset validates writes with its own {guard.config.mode} guard.
-                </p>
-              {/if}
-            </div>
-          {/if}
-        {/if}
       </section>
-
-      <section class="panel detail" aria-label="Details">
-        {#if !selected}
-          <div class="panel-body">
-            <p class="empty">
-              Choose a concept in the tree, a collection or a search result to edit it.
-            </p>
-          </div>
-        {:else}
-          <div class="panel-head entity-head">
-            <div class="who">
-              <h2>{title}</h2>
-              <span class="mono faint iri">{selected}</span>
-              <span class="kinds">
-                {#each typeBadges as t (t)}<span class="badge">{t}</span>{/each}
-              </span>
-            </div>
-            <span class="spacer"></span>
-            {#if !readonly && details}
+    {:else}
+      <div class="panes split-view">
+        <section class="panel side" aria-label="Thesaurus">
+          <div class="scheme-bar">
+            <label class="pick grow">
+              <span class="faint">Concept scheme</span>
+              <select
+                class="select"
+                value={scheme ?? '*'}
+                onchange={(e) => nav({ scheme: e.currentTarget.value, iri: null })}
+                aria-label="Concept scheme"
+              >
+                {#each schemes as s (s)}<option value={s}>{nameOf(s)}</option>{/each}
+                <option value="*">All concepts</option>
+              </select>
+            </label>
+            {#if scheme}
               <button
                 class="btn sm"
-                onclick={() => {
-                  renameTo = selected ?? '';
-                  renameProblem = null;
-                  renameOpen = true;
-                }}><Icon name="pencil" size={13} /> Rename</button
+                onclick={() => nav({ iri: scheme, view: null, tab: null, kind: null })}
+                title="The scheme's labels, top concepts and notes">Scheme</button
               >
-              <button class="btn sm danger" onclick={remove}
-                ><Icon name="trash" size={13} /> Delete</button
+            {/if}
+            {#if !readonly}
+              <button class="btn sm" onclick={() => openCreate('scheme')}
+                ><Icon name="plus" size={13} /> Scheme</button
               >
             {/if}
           </div>
-          <div class="tabs sub" role="tablist" aria-label="Resource views">
-            <button
-              class="tab"
-              role="tab"
-              aria-selected={view === 'labels'}
-              onclick={() => nav({ view: null })}
-              >Labels <span class="count">{details?.labels.length || ''}</span></button
-            >
-            {#if kind === 'collection'}
-              <button
-                class="tab"
-                role="tab"
-                aria-selected={view === 'members'}
-                onclick={() => nav({ view: 'members' })}
-                >Members <span class="count">{details?.members.length || ''}</span></button
-              >
-            {:else}
-              <button
-                class="tab"
-                role="tab"
-                aria-selected={view === 'relations'}
-                onclick={() => nav({ view: 'relations' })}
-                >{kind === 'scheme' ? 'Top concepts' : 'Relations'}</button
-              >
-            {/if}
-            <button
-              class="tab"
-              role="tab"
-              aria-selected={view === 'notes'}
-              onclick={() => nav({ view: 'notes' })}>Notes</button
-            >
+          <div class="search-bar">
+            <input
+              class="input"
+              type="search"
+              placeholder="Search labels in any language"
+              aria-label="Search labels"
+              bind:this={searchInput}
+              bind:value={search}
+            />
+            <select class="select sm" bind:value={searchLang} aria-label="Search language">
+              <option value="">any language</option>
+              {#each languages as l (l)}<option value={l}>{l}</option>{/each}
+            </select>
           </div>
-          <div class="panel-body">
-            {#if detailsError}<p class="error-box" role="alert">{detailsError}</p>{/if}
-            {#if details && details.iri === selected}
-              {#if view === 'labels'}
-                <SkosLabels
-                  iri={selected}
-                  name={title}
-                  entries={details.labels}
-                  {graph}
-                  langs={languages}
-                  {readonly}
-                  onedit={edit}
-                  scope={`${target}|${graph ?? ''}`}
-                  isUsed={async (i) => {
-                    const r = await api.query(target, usedQuery(i, graph), { nocache: true });
-                    return !!r.boolean;
+          {#if search.trim()}
+            <div class="results" role="region" aria-label="Search results">
+              {#if searching && !hits.length}<p class="faint pad">
+                  <span class="spinner"></span> Searching…
+                </p>{/if}
+              {#if !searching && !hits.length}<p class="empty pad">No label matches.</p>{/if}
+              <ul>
+                {#each hits as h, i (`${h.iri}|${h.kind}|${h.label.value}|${i}`)}
+                  <li>
+                    <button class="hit" onclick={() => pickHit(h)}>
+                      <span class="name">{nameOf(h.iri)}</span>
+                      <span class="faint small"
+                        >{h.kind} “{h.label.value}”{h.label.lang ? `@${h.label.lang}` : ''}</span
+                      >
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            </div>
+          {:else}
+            {#if tab === 'tree'}
+              <div class="list-bar">
+                <select
+                  class="select sm"
+                  aria-label="List"
+                  value={list}
+                  onchange={(e) =>
+                    nav({
+                      kind: e.currentTarget.value === 'collections' ? 'collections' : null,
+                    })}
+                >
+                  <option value="concepts">Concepts</option>
+                  <option value="collections"
+                    >Collections{collections.length
+                      ? ` · ${fmtInt(collections.length)}`
+                      : ''}</option
+                  >
+                </select>
+              </div>
+            {/if}
+            {#if tab === 'tree' && list === 'concepts'}
+              <div class="tree-bar">
+                {#if !readonly}
+                  <button
+                    class="btn sm"
+                    onclick={() => openCreate('concept')}
+                    title={selected && kind === 'concept'
+                      ? 'New concept under the selection'
+                      : 'New top concept'}><Icon name="plus" size={13} /> Concept</button
+                  >
+                {/if}
+                <span class="faint small">
+                  {fmtInt(tree.roots.length)}
+                  {scheme ? 'top concepts' : 'concepts without a broader one'}
+                </span>
+              </div>
+              {#if scheme && !readonly}
+                <div
+                  class="top-drop"
+                  class:over={topOver}
+                  role="region"
+                  aria-label="Top of the scheme"
+                  ondragover={(e) => {
+                    if (!e.dataTransfer?.types.includes(TREE_DRAG)) return;
+                    e.preventDefault();
+                    topOver = true;
                   }}
-                />
-                {#if details.notations.length}
-                  <p class="small">
-                    <span class="faint">Notation:</span>
-                    <span class="mono">{details.notations.join(', ')}</span>
+                  ondragleave={() => (topOver = false)}
+                  ondrop={(e) => {
+                    topOver = false;
+                    const raw = e.dataTransfer?.getData(TREE_DRAG);
+                    if (!raw || !scheme) return;
+                    e.preventDefault();
+                    const src = JSON.parse(raw) as { id: string; from: string | null };
+                    void move(src.id, src.from, { top: scheme }, e.ctrlKey || e.altKey);
+                  }}
+                >
+                  Drop a concept here to make it a top concept of {nameOf(scheme)}
+                </div>
+              {/if}
+              <div class="tree-scroll">
+                {#if tree.roots.length}
+                  <OntoTree
+                    label="Concepts"
+                    roots={tree.roots}
+                    children={kidsOf}
+                    more={moreOf}
+                    name={nameOf}
+                    sub={subOf}
+                    badge={badgeOf}
+                    open={opened}
+                    {selected}
+                    onselect={(id) => nav({ iri: id })}
+                    ontoggle={toggle}
+                    ondrop={readonly
+                      ? undefined
+                      : (node, from, onto, copy) => void move(node, from, { parent: onto }, copy)}
+                  />
+                {:else}
+                  <p class="empty">
+                    {scheme ? 'The scheme has no concepts.' : 'The graph has no concepts.'}
                   </p>
                 {/if}
-              {:else if view === 'relations' && kind === 'scheme'}
-                <SkosLinks
-                  title="Top concepts"
-                  id="hasTopConcept"
-                  links={details.topConcepts}
-                  name={nameOf}
-                  sub={subOf}
-                  {readonly}
-                  paired
-                  {picker}
-                  onopen={(iri) => nav({ iri, view: null })}
-                  onadd={(iri, n) => void addLink('hasTopConcept', iri, n)}
-                  onremove={(iri) => removeLink('hasTopConcept', iri)}
-                  onrepair={(l) => repair('hasTopConcept', l)}
-                />
-              {:else if view === 'relations'}
-                <div class="relations">
+              </div>
+              {#if !readonly && tree.roots.length}
+                <p class="faint small pad">
+                  Drag a concept onto another to move it there. Hold Ctrl or Alt to add a broader
+                  concept and keep the old one.
+                </p>
+              {/if}
+            {:else if tab === 'tree' && list === 'collections'}
+              <div class="tree-bar">
+                {#if !readonly}
+                  <button class="btn sm" onclick={() => openCreate('collection')}
+                    ><Icon name="plus" size={13} /> Collection</button
+                  >
+                {/if}
+              </div>
+              <ul class="plain-list" aria-label="Collections">
+                {#each collections as c (c.iri)}
+                  <li>
+                    <button
+                      class="hit"
+                      class:sel={selected === c.iri}
+                      onclick={() => nav({ iri: c.iri, view: null })}
+                    >
+                      <span class="name">{nameOf(c.iri)}</span>
+                      {#if c.ordered}<span class="badge">ordered</span>{/if}
+                    </button>
+                  </li>
+                {:else}
+                  <li class="empty">The graph has no collections.</li>
+                {/each}
+              </ul>
+            {:else}
+              <div class="checks">
+                <div class="tree-bar">
+                  <button class="btn sm" onclick={runChecks} disabled={checking}
+                    ><Icon name="refresh" size={13} /> Run the checks</button
+                  >
+                  <label class="small"
+                    ><input type="checkbox" bind:checked={showInfo} /> Information too</label
+                  >
+                </div>
+                {#if checking && !report}<p class="faint pad">
+                    <span class="spinner"></span> Checking…
+                  </p>{/if}
+                {#if checkError}<p class="error-box" role="alert">{checkError}</p>{/if}
+                {#if report}
+                  <p class="pad small" role="status" data-conforms={report.conforms}>
+                    {#if !results.length}
+                      The thesaurus keeps the SKOS integrity conditions.
+                    {:else}
+                      {fmtInt(results.length)}
+                      {results.length === 1 ? 'result' : 'results'} of the built-in SKOS shapes.
+                    {/if}
+                  </p>
+                  <ul class="plain-list" aria-label="Check results">
+                    {#each results as r, i (i)}
+                      {@const f = r.focusNode.type === 'uri' ? r.focusNode.value : null}
+                      <li class="result" data-severity={severityOf(r)}>
+                        {#if f}<button class="link" onclick={() => nav({ iri: f })}
+                            >{nameOf(f)}</button
+                          >{:else}<span class="mono">{r.focusNode.value}</span>{/if}
+                        <span class="small">{r.messages[0] ?? 'violates a shape'}</span>
+                        {#if r.value}<span class="mono faint xs">{r.value.value}</span>{/if}
+                      </li>
+                    {/each}
+                  </ul>
+                {/if}
+                {#if canAdmin && guard === null}
+                  <p class="pad small">
+                    The dataset has no write-time validation.
+                    <button class="btn sm" onclick={enforce}
+                      >Enforce the SKOS rules on writes</button
+                    >
+                  </p>
+                {:else if guard}
+                  <p class="pad faint small">
+                    The dataset validates writes with its own {guard.config.mode} guard.
+                  </p>
+                {/if}
+              </div>
+            {/if}
+          {/if}
+        </section>
+
+        <section class="panel detail" aria-label="Details">
+          {#if !selected}
+            <div class="panel-body">
+              <p class="empty">
+                Choose a concept in the tree, a collection or a search result to edit it.
+              </p>
+            </div>
+          {:else}
+            <div class="panel-head entity-head">
+              <div class="who">
+                <h2>{title}</h2>
+                <span class="mono faint iri">{selected}</span>
+                <span class="kinds">
+                  {#each typeBadges as t (t)}<span class="badge">{t}</span>{/each}
+                </span>
+              </div>
+              <span class="spacer"></span>
+              <a
+                class="btn sm ghost"
+                href={routes.browse(name, { iri: selected, graph })}
+                title="Open this resource's page in Browse"
+                ><Icon name="book" size={13} /> Open page</a
+              >
+              {#if !readonly && details}
+                <button
+                  class="btn sm"
+                  onclick={() => {
+                    renameTo = selected ?? '';
+                    renameProblem = null;
+                    renameOpen = true;
+                  }}><Icon name="pencil" size={13} /> Rename</button
+                >
+                <button class="btn sm danger" onclick={remove}
+                  ><Icon name="trash" size={13} /> Delete</button
+                >
+              {/if}
+            </div>
+            <div class="view-bar">
+              <div class="segmented" role="group" aria-label="Resource views">
+                <button aria-pressed={view === 'labels'} onclick={() => nav({ view: null })}
+                  >Labels{details?.labels.length ? ` ${details.labels.length}` : ''}</button
+                >
+                {#if kind === 'collection'}
+                  <button aria-pressed={view === 'members'} onclick={() => nav({ view: 'members' })}
+                    >Members{details?.members.length ? ` ${details.members.length}` : ''}</button
+                  >
+                {:else}
+                  <button
+                    aria-pressed={view === 'relations'}
+                    onclick={() => nav({ view: 'relations' })}
+                    >{kind === 'scheme' ? 'Top concepts' : 'Relations'}</button
+                  >
+                {/if}
+                <button aria-pressed={view === 'notes'} onclick={() => nav({ view: 'notes' })}
+                  >Notes</button
+                >
+              </div>
+            </div>
+            <div class="panel-body">
+              {#if detailsError}<p class="error-box" role="alert">{detailsError}</p>{/if}
+              {#if details && details.iri === selected}
+                {#if view === 'labels'}
+                  <SkosLabels
+                    iri={selected}
+                    name={title}
+                    entries={details.labels}
+                    {graph}
+                    langs={languages}
+                    {readonly}
+                    onedit={edit}
+                    scope={`${target}|${graph ?? ''}`}
+                    isUsed={async (i) => {
+                      const r = await api.query(target, usedQuery(i, graph), { nocache: true });
+                      return !!r.boolean;
+                    }}
+                  />
+                  {#if details.notations.length}
+                    <p class="small">
+                      <span class="faint">Notation:</span>
+                      <span class="mono">{details.notations.join(', ')}</span>
+                    </p>
+                  {/if}
+                {:else if view === 'relations' && kind === 'scheme'}
                   <SkosLinks
-                    title="Broader"
-                    id="broader"
-                    links={details.broader}
+                    title="Top concepts"
+                    id="hasTopConcept"
+                    links={details.topConcepts}
                     name={nameOf}
                     sub={subOf}
                     {readonly}
                     paired
                     {picker}
                     onopen={(iri) => nav({ iri, view: null })}
-                    onadd={(iri, n) => void addLink('broader', iri, n)}
-                    onremove={(iri) => removeLink('broader', iri)}
-                    onrepair={(l) => repair('broader', l)}
+                    onadd={(iri, n) => void addLink('hasTopConcept', iri, n)}
+                    onremove={(iri) => removeLink('hasTopConcept', iri)}
+                    onrepair={(l) => repair('hasTopConcept', l)}
                   />
-                  <SkosLinks
-                    title="Narrower"
-                    id="narrower"
-                    links={details.narrower}
-                    name={nameOf}
-                    sub={subOf}
-                    {readonly}
-                    paired
-                    {picker}
-                    onopen={(iri) => nav({ iri, view: null })}
-                    onadd={(iri, n) => void addLink('narrower', iri, n)}
-                    onremove={(iri) => removeLink('narrower', iri)}
-                    onrepair={(l) => repair('narrower', l)}
-                  />
-                  <SkosLinks
-                    title="Related"
-                    id="related"
-                    links={details.related}
-                    name={nameOf}
-                    sub={subOf}
-                    {readonly}
-                    paired
-                    {picker}
-                    onopen={(iri) => nav({ iri, view: null })}
-                    onadd={(iri, n) => void addLink('related', iri, n)}
-                    onremove={(iri) => removeLink('related', iri)}
-                    onrepair={(l) => repair('related', l)}
-                  />
-                  {#each MAPPINGS as m (m)}
+                {:else if view === 'relations'}
+                  <div class="relations">
                     <SkosLinks
-                      title={MAPPING_NAME[m]}
-                      id={m}
-                      links={strLinks(
-                        details.mappings.filter((x) => x.property === m).map((x) => x.target),
-                      )}
-                      name={nameOf}
-                      sub={(iri) => iriName(iri, prefixes)}
-                      {readonly}
-                      {picker}
-                      onopen={(iri) => nav({ iri, view: null })}
-                      onadd={(iri, n) => void addLink(m, iri, n)}
-                      onremove={(iri) => removeLink(m, iri)}
-                    />
-                  {/each}
-                  <SkosLinks
-                    title="In scheme"
-                    id="inScheme"
-                    links={strLinks(details.inScheme)}
-                    name={nameOf}
-                    sub={subOf}
-                    {readonly}
-                    picker={{ ...picker }}
-                    onopen={(iri) => nav({ scheme: iri, iri, view: null })}
-                    onadd={(iri, n) => void addLink('inScheme', iri, n)}
-                    onremove={(iri) => removeLink('inScheme', iri)}
-                  />
-                  <SkosLinks
-                    title="Top concept of"
-                    id="topConceptOf"
-                    links={details.topConceptOf}
-                    name={nameOf}
-                    sub={subOf}
-                    {readonly}
-                    paired
-                    {picker}
-                    onopen={(iri) => nav({ scheme: iri, iri, view: null })}
-                    onadd={(iri, n) => void addLink('topConceptOf', iri, n)}
-                    onremove={(iri) => removeLink('topConceptOf', iri)}
-                    onrepair={(l) => repair('topConceptOf', l)}
-                  />
-                  {#if details.memberOf.length}
-                    <SkosLinks
-                      title="Member of"
-                      id="memberOf"
-                      links={strLinks(details.memberOf)}
+                      title="Broader"
+                      id="broader"
+                      links={details.broader}
                       name={nameOf}
                       sub={subOf}
-                      readonly
-                      onopen={(iri) => nav({ iri, view: null, tab: 'collections' })}
+                      {readonly}
+                      paired
+                      {picker}
+                      onopen={(iri) => nav({ iri, view: null })}
+                      onadd={(iri, n) => void addLink('broader', iri, n)}
+                      onremove={(iri) => removeLink('broader', iri)}
+                      onrepair={(l) => repair('broader', l)}
                     />
-                  {/if}
-                </div>
-              {:else if view === 'members' || view === 'notes'}
-                {#if formLock}<p class="notice small" role="status">{formLock}</p>{/if}
-                {#key formKey}
-                  <fieldset class="form-lock" disabled={!!formLock}>
-                    <ShapeForm
-                      ds={name}
-                      iri={selected}
-                      {branch}
-                      {prefixes}
-                      {title}
-                      shapes={formShapes}
-                      groups={formShapes === 'skos'
-                        ? view === 'members'
-                          ? [`${GROUP}Members`]
-                          : [`${GROUP}Notes`, `${GROUP}Documentation`]
-                        : undefined}
-                      onsaved={(a) =>
-                        formSaved(
-                          a,
-                          view === 'members'
-                            ? `Edit the members of ${title}`
-                            : `Edit the notes of ${title}`,
+                    <SkosLinks
+                      title="Narrower"
+                      id="narrower"
+                      links={details.narrower}
+                      name={nameOf}
+                      sub={subOf}
+                      {readonly}
+                      paired
+                      {picker}
+                      onopen={(iri) => nav({ iri, view: null })}
+                      onadd={(iri, n) => void addLink('narrower', iri, n)}
+                      onremove={(iri) => removeLink('narrower', iri)}
+                      onrepair={(l) => repair('narrower', l)}
+                    />
+                    <SkosLinks
+                      title="Related"
+                      id="related"
+                      links={details.related}
+                      name={nameOf}
+                      sub={subOf}
+                      {readonly}
+                      paired
+                      {picker}
+                      onopen={(iri) => nav({ iri, view: null })}
+                      onadd={(iri, n) => void addLink('related', iri, n)}
+                      onremove={(iri) => removeLink('related', iri)}
+                      onrepair={(l) => repair('related', l)}
+                    />
+                    {#each MAPPINGS as m (m)}
+                      <SkosLinks
+                        title={MAPPING_NAME[m]}
+                        id={m}
+                        links={strLinks(
+                          details.mappings.filter((x) => x.property === m).map((x) => x.target),
                         )}
-                      onmodel={(m) => (formModel = { key: formKey, m })}
+                        name={nameOf}
+                        sub={(iri) => iriName(iri, prefixes)}
+                        {readonly}
+                        {picker}
+                        onopen={(iri) => nav({ iri, view: null })}
+                        onadd={(iri, n) => void addLink(m, iri, n)}
+                        onremove={(iri) => removeLink(m, iri)}
+                      />
+                    {/each}
+                    <SkosLinks
+                      title="In scheme"
+                      id="inScheme"
+                      links={strLinks(details.inScheme)}
+                      name={nameOf}
+                      sub={subOf}
+                      {readonly}
+                      picker={{ ...picker }}
+                      onopen={(iri) => nav({ scheme: iri, iri, view: null })}
+                      onadd={(iri, n) => void addLink('inScheme', iri, n)}
+                      onremove={(iri) => removeLink('inScheme', iri)}
                     />
-                  </fieldset>
-                {/key}
+                    <SkosLinks
+                      title="Top concept of"
+                      id="topConceptOf"
+                      links={details.topConceptOf}
+                      name={nameOf}
+                      sub={subOf}
+                      {readonly}
+                      paired
+                      {picker}
+                      onopen={(iri) => nav({ scheme: iri, iri, view: null })}
+                      onadd={(iri, n) => void addLink('topConceptOf', iri, n)}
+                      onremove={(iri) => removeLink('topConceptOf', iri)}
+                      onrepair={(l) => repair('topConceptOf', l)}
+                    />
+                    {#if details.memberOf.length}
+                      <SkosLinks
+                        title="Member of"
+                        id="memberOf"
+                        links={strLinks(details.memberOf)}
+                        name={nameOf}
+                        sub={subOf}
+                        readonly
+                        onopen={(iri) => nav({ iri, view: null, tab: null, kind: 'collections' })}
+                      />
+                    {/if}
+                  </div>
+                {:else if view === 'members' || view === 'notes'}
+                  {#if formLock}<p class="notice small" role="status">{formLock}</p>{/if}
+                  {#key formKey}
+                    <fieldset class="form-lock" disabled={!!formLock}>
+                      <ShapeForm
+                        ds={name}
+                        iri={selected}
+                        {branch}
+                        {prefixes}
+                        {title}
+                        shapes={formShapes}
+                        groups={formShapes === 'skos'
+                          ? view === 'members'
+                            ? [`${GROUP}Members`]
+                            : [`${GROUP}Notes`, `${GROUP}Documentation`]
+                          : undefined}
+                        onsaved={(a) =>
+                          formSaved(
+                            a,
+                            view === 'members'
+                              ? `Edit the members of ${title}`
+                              : `Edit the notes of ${title}`,
+                          )}
+                        onmodel={(m) => (formModel = { key: formKey, m })}
+                      />
+                    </fieldset>
+                  {/key}
+                {/if}
+              {:else if !detailsError}
+                <p class="faint"><span class="spinner"></span> Reading the resource…</p>
               {/if}
-            {:else if !detailsError}
-              <p class="faint"><span class="spinner"></span> Reading the resource…</p>
-            {/if}
-          </div>
-        {/if}
-      </section>
-    </div>
+            </div>
+          {/if}
+        </section>
+      </div>
+    {/if}
   {:else if loading}
     <p class="faint"><span class="spinner"></span> Reading the thesaurus…</p>
   {:else if !name}
@@ -1605,9 +1656,9 @@
   .grow {
     flex: 1 1 12em;
   }
-  .side > .tabs {
-    padding: 0 8px;
-    border-bottom: 1px solid var(--border);
+  .list-bar {
+    display: flex;
+    padding: 8px 8px 0;
   }
   .tree-scroll,
   .results {
@@ -1698,8 +1749,9 @@
     gap: 4px;
     flex-wrap: wrap;
   }
-  .tabs.sub {
-    padding: 0 10px;
+  .view-bar {
+    display: flex;
+    padding: 8px 10px;
     border-bottom: 1px solid var(--border);
   }
   .relations {

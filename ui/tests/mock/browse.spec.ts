@@ -144,7 +144,7 @@ test('an individual has no tree, shows its types and edits in place or in the on
   await page.getByRole('button', { name: 'Edit', exact: true }).click();
   await expect(
     page.getByRole('toolbar', { name: 'Edit mode' }).getByRole('link', { name: 'Ontology editor' }),
-  ).toHaveAttribute('href', /\/ui\/ontology\?ds=uni&iri=.*ada&tab=NamedIndividual/);
+  ).toHaveAttribute('href', /\/ui\/workbench\/ontology\?ds=uni&iri=.*ada&kind=NamedIndividual/);
 });
 
 test('an IRI the graphs do not mention says so', async ({ page }) => {

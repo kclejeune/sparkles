@@ -75,7 +75,7 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ### Ontology editor
 
-The ontology editor phase is built as the UI's **Ontology** page, `/ui/ontology`. It reads
+The ontology editor phase is built as the UI's **Ontology** page, `/ui/workbench/ontology`. It reads
 and edits one graph of a dataset, the default graph unless the caller picks another, with
 the graphs that graph imports. Every read and write goes through the `/$/ontology/{ds}`
 routes of [F21](../F21-ontology-api.md#outcome), with the caller's grants, and through
@@ -241,7 +241,7 @@ the same engine to answer the entity accessors from the kept classification.
 ### Thesaurus editor
 
 The SKOS and SKOS-XL thesaurus editor phase is built as the UI's **Thesaurus** page,
-`/ui/thesaurus`. It reads and writes one graph of a dataset with SPARQL queries and
+`/ui/workbench/thesaurus`. It reads and writes one graph of a dataset with SPARQL queries and
 `DELETE DATA` and `INSERT DATA` updates, so it needs no routes of its own beyond the
 built-in shapes.
 

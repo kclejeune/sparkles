@@ -109,6 +109,21 @@ page's branch and past-state choices share one row under the title. On a phone, 
 dock at the bottom of the screen as sheets, toolbar and page-head buttons keep their icons,
 and the dataset settings and branch review pages no longer scroll sideways.
 
+The web UI separates reading from authoring (roadmap item 633). Browse is the reader with
+its edit mode, and a new **Workbench** group in the rail holds the Ontology and Thesaurus
+editors at `/ui/workbench/ontology` and `/ui/workbench/thesaurus`, which replace
+`/ui/ontology` and `/ui/thesaurus` without redirects. The rail shows the Workbench only to
+callers who may write the open dataset. Admin's Server, Backups and Tokens pages moved to
+`/ui/admin/server`, `/ui/admin/backups` and `/ui/admin/tokens`, and the embedding map moved
+to `/ui/similar/map`, under the Admin and Similar groups. A page has at most one row of tabs.
+The editors' entity kinds and the thesaurus's concepts and collections are selects, and an
+entity's views are a segmented control. The Ontology editor gains a **History** tab and the
+Thesaurus editor **History** and **Validation** tabs, where each commit opens as a change
+set named by labels. A term page links to its editor and to similar terms in the dataset's
+vector index, and an editor's entity panel and Explore's details panel link to the term's
+page. A data table pins its actions to the right edge when it scrolls, and on a phone shows
+each row as a card.
+
 Ontologies and thesauri have a typo-tolerant entity search for typeahead (spec U12,
 roadmap item 616). `GET /$/ontology/{ds}/search?q=` matches the labels, synonyms, short
 forms and definitions of OWL, RDFS and SKOS entities in any language, with up to two

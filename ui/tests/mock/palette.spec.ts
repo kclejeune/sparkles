@@ -48,8 +48,8 @@ test.describe('at 1440 pixels', () => {
     const pages: [string, string | null][] = [
       ['/ui/query', 'Run query'],
       ['/ui/explore?ds=uni', null],
-      ['/ui/ontology?ds=uni', 'New class…'],
-      ['/ui/thesaurus?ds=thes', 'New concept…'],
+      ['/ui/workbench/ontology?ds=uni', 'New class…'],
+      ['/ui/workbench/thesaurus?ds=thes', 'New concept…'],
       ['/ui/similar?ds=uni', null],
       ['/ui/memory?ds=uni', null],
       ['/ui/similar/map?ds=uni', null],
@@ -75,7 +75,7 @@ test.describe('at 1440 pixels', () => {
     page,
   }) => {
     await onDataset(page, 'foaf');
-    await visit(page, '/ui/ontology?ds=foaf');
+    await visit(page, '/ui/workbench/ontology?ds=foaf');
     await palette(page, '#');
     await expect(group(page, 'Branches of foaf')).toBeVisible();
     await page.keyboard.press('Escape');
@@ -167,7 +167,7 @@ test.describe('at 1440 pixels', () => {
 
   test('`#` switches the branch of the ontology editor', async ({ page }) => {
     await onDataset(page, 'foaf');
-    await visit(page, '/ui/ontology?ds=foaf');
+    await visit(page, '/ui/workbench/ontology?ds=foaf');
     await palette(page, '#');
     await expect(group(page, 'Branches of foaf')).toBeVisible();
     await option(page, 'dev').click();
@@ -204,7 +204,7 @@ test.describe('at 1440 pixels', () => {
 
   test('starts a session and opens the new class dialog', async ({ page }) => {
     await onDataset(page, 'uni');
-    await visit(page, '/ui/ontology?ds=uni');
+    await visit(page, '/ui/workbench/ontology?ds=uni');
     await palette(page, '>start');
     await page.keyboard.press('Enter');
     await expect(page).toHaveURL(/[?&]branch=/);
@@ -231,7 +231,7 @@ test.describe('at 1440 pixels', () => {
 
   test('`/` filters the ontology tree, and opens the palette elsewhere', async ({ page }) => {
     await onDataset(page, 'uni');
-    await visit(page, '/ui/ontology?ds=uni');
+    await visit(page, '/ui/workbench/ontology?ds=uni');
     await expect(page.getByRole('searchbox', { name: 'Filter' })).toBeVisible();
     await page.locator('main h1').click();
     await page.keyboard.press('/');
@@ -243,7 +243,7 @@ test.describe('at 1440 pixels', () => {
     await expect(option(page, 'Search this page')).toBeVisible();
     await page.keyboard.press('Escape');
 
-    await visit(page, '/ui/thesaurus?ds=thes');
+    await visit(page, '/ui/workbench/thesaurus?ds=thes');
     await page.locator('main h1').click();
     await page.keyboard.press('/');
     await expect(page.getByRole('searchbox', { name: 'Search labels' })).toBeFocused();
@@ -260,18 +260,20 @@ test.describe('at 1440 pixels', () => {
     await page.keyboard.press('Enter');
     await expect(page).toHaveURL(/\/ui\/admin\/server$/);
     await palette(page, 'thes');
-    await option(page, 'Thesaurus').click();
-    await expect(page).toHaveURL(/\/ui\/thesaurus/);
+    await option(page, 'Workbench › Thesaurus').click();
+    await expect(page).toHaveURL(/\/ui\/workbench\/thesaurus/);
     await page.reload();
     await expect(page.locator('main h1')).toBeAttached();
     await palette(page);
     const recent = group(page, 'Recent');
-    await expect(titles(page, recent)).toHaveText(['Thesaurus', 'Open server status']);
+    await expect(titles(page, recent)).toHaveText(['Workbench › Thesaurus', 'Open server status']);
     await expect(list(page).getByRole('group').first()).toHaveAccessibleName('Recent');
     // a row under Recent shows only there
-    await expect(group(page, 'Go to').getByRole('option', { name: /^Thesaurus/ })).toHaveCount(0);
+    await expect(
+      group(page, 'Go to').getByRole('option', { name: /^Workbench › Thesaurus/ }),
+    ).toHaveCount(0);
     await page.keyboard.press('Enter');
-    await expect(page).toHaveURL(/\/ui\/thesaurus/);
+    await expect(page).toHaveURL(/\/ui\/workbench\/thesaurus/);
   });
 
   test('an item stored twice shows once among the recent picks', async ({ page }) => {

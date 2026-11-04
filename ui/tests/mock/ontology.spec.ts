@@ -33,7 +33,7 @@ async function commitPreview(page: Page) {
 }
 
 test('the trees, the frame, the usage and the header', async ({ page }) => {
-  await page.goto('/ui/ontology?ds=uni');
+  await page.goto('/ui/workbench/ontology?ds=uni');
   const classes = page.getByRole('tree', { name: 'Classes (asserted)' });
   await expect(classes.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
     timeout: 30_000,
@@ -49,23 +49,23 @@ test('the trees, the frame, the usage and the header', async ({ page }) => {
   await expect(sub).toContainText('teaches some Course');
   await expect(frame).toContainText('Professeur');
   // the usage view lists every axiom that mentions the class
-  await page.getByRole('tab', { name: /Usage/ }).click();
+  await page.getByRole('button', { name: /^Usage/ }).click();
   await expect(page.getByRole('region', { name: 'ObjectPropertyRange' })).toContainText(
     'uni:advisor',
   );
-  await page.getByRole('tab', { name: 'Frame' }).click();
+  await page.getByRole('button', { name: 'Frame', exact: true }).click();
 
   // the property trees
-  await page.getByRole('tab', { name: /Object properties/ }).click();
+  await page.getByRole('combobox', { name: 'Entity kind' }).selectOption('ObjectProperty');
   await expand(page, 'member of');
   await expand(page, 'works for');
   await pick(page, 'Object properties (asserted)', 'head of');
   await expect(page.getByRole('checkbox', { name: 'Functional', exact: true })).toBeChecked();
   await expect(frame.locator('[data-section="superProperties"]')).toContainText('works for');
-  await page.getByRole('tab', { name: /Data properties/ }).click();
+  await page.getByRole('combobox', { name: 'Entity kind' }).selectOption('DataProperty');
   await pick(page, 'Data properties (asserted)', 'credits');
   await expect(frame.locator('[data-section="ranges"]')).toContainText('xsd:integer');
-  await page.getByRole('tab', { name: /Individuals/ }).click();
+  await page.getByRole('combobox', { name: 'Entity kind' }).selectOption('NamedIndividual');
   await expect(node(page, 'Ada Lovelace')).toContainText('Professor');
   await pick(page, 'Individuals (asserted)', 'Ada Lovelace');
   await expect(frame.locator('[data-section="objectAssertions"]')).toContainText('Logic 101');
@@ -82,7 +82,7 @@ test('the trees, the frame, the usage and the header', async ({ page }) => {
 });
 
 test('the inferred class tree sits beside the asserted one', async ({ page }) => {
-  await page.goto('/ui/ontology?ds=uni&tab=Class&inferred=1');
+  await page.goto('/ui/workbench/ontology?ds=uni&inferred=1');
   const inferred = page.getByRole('tree', { name: 'Classes (inferred)' });
   await expect(inferred).toBeVisible({ timeout: 30_000 });
   // Teacher is defined as a person who teaches a course, so Professor falls under it
@@ -99,7 +99,7 @@ test('edits on a session branch are previewed, committed, undone and redone', as
   page,
   request,
 }) => {
-  await page.goto('/ui/ontology?ds=uni');
+  await page.goto('/ui/workbench/ontology?ds=uni');
   await expect(page.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
     timeout: 30_000,
   });
@@ -215,7 +215,7 @@ test('a stale edit is refused and another writer’s commit refreshes the views'
   page,
   request,
 }) => {
-  await page.goto('/ui/ontology?ds=uni');
+  await page.goto('/ui/workbench/ontology?ds=uni');
   await expect(page.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
     timeout: 30_000,
   });

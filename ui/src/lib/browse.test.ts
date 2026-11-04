@@ -409,10 +409,10 @@ describe('links', () => {
       '/$/ontology/go%40dev/term?graph=default&iri=http%3A%2F%2Fexample.org%2Fa&format=ttl',
     );
     expect(editHref('/ui', 'go', EX + 'p', ['objectProperty'], { graph: null })).toBe(
-      '/ui/ontology?ds=go&iri=http%3A%2F%2Fexample.org%2Fp&tab=ObjectProperty',
+      '/ui/workbench/ontology?ds=go&iri=http%3A%2F%2Fexample.org%2Fp&kind=ObjectProperty',
     );
     expect(editHref('/ui', 'th', EX + 'c', ['concept'], { graph: 'urn:g' })).toBe(
-      '/ui/thesaurus?ds=th&iri=http%3A%2F%2Fexample.org%2Fc&graph=urn%3Ag',
+      '/ui/workbench/thesaurus?ds=th&iri=http%3A%2F%2Fexample.org%2Fc&graph=urn%3Ag',
     );
   });
 

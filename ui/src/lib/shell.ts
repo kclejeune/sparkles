@@ -26,8 +26,8 @@ export interface NavItem extends NavLink {
 const CARRIES_DATASET = new Set([
   '/explore',
   '/browse',
-  '/ontology',
-  '/thesaurus',
+  '/workbench/ontology',
+  '/workbench/thesaurus',
   '/similar',
   '/similar/map',
   '/memory',
@@ -42,13 +42,41 @@ export function adminPages(backupsVisible: boolean): NavLink[] {
   ];
 }
 
-export function navItems(backupsVisible = false): NavItem[] {
+/** The Workbench group's editors (ROADMAP item 633), the place for authoring tools. */
+export const WORKBENCH_PAGES: NavLink[] = [
+  { href: '/workbench/ontology', label: 'Ontology', icon: 'tree' },
+  { href: '/workbench/thesaurus', label: 'Thesaurus', icon: 'layers' },
+];
+
+/** What the caller may see in the rail. */
+export interface NavAccess {
+  /** Backups: server admins, and dataset admins in a reduced form. */
+  backupsVisible?: boolean;
+  /** The Workbench: callers who may write the open dataset. */
+  workbench?: boolean;
+}
+
+/**
+ * The rail's pages in order. Readers get Browse; writers also get the Workbench's editors.
+ * The Ask page of the ask-ui lane goes after Query.
+ */
+export function navItems({ backupsVisible = false, workbench = false }: NavAccess = {}): NavItem[] {
   return [
     { href: '/query', label: 'Query', icon: 'query', group: 'work' },
     { href: '/explore', label: 'Explore', icon: 'explore', group: 'work' },
     { href: '/browse', label: 'Browse', icon: 'book', group: 'work' },
-    { href: '/ontology', label: 'Ontology', icon: 'tree', group: 'work' },
-    { href: '/thesaurus', label: 'Thesaurus', icon: 'layers', group: 'work' },
+    ...(workbench
+      ? [
+          {
+            href: '/workbench/ontology',
+            label: 'Workbench',
+            icon: 'pencil',
+            group: 'work' as const,
+            match: '/workbench',
+            children: WORKBENCH_PAGES,
+          },
+        ]
+      : []),
     {
       href: '/similar',
       label: 'Similar',

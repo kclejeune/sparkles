@@ -21,7 +21,9 @@
   const backupsVisible = $derived(
     auth.hasServer('server-admin') || Object.values(auth.who?.datasets ?? {}).includes('admin'),
   );
-  const items = $derived(navItems(backupsVisible));
+  // the Workbench: callers who may write the open dataset, as edit mode decides
+  const workbench = $derived(!!app.current && auth.can(app.current, 'write'));
+  const items = $derived(navItems({ backupsVisible, workbench }));
   const review = $derived(reviewCounts.of(app.current));
 
   const isActive = (l: NavLink) =>

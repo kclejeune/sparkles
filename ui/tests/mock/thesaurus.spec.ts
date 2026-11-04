@@ -32,7 +32,7 @@ async function commitPreview(page: Page) {
 }
 
 async function open(page: Page, query = '') {
-  await page.goto(`/ui/thesaurus?ds=thes${query}`);
+  await page.goto(`/ui/workbench/thesaurus?ds=thes${query}`);
   await expect(node(page, 'Vertebrates')).toBeVisible({ timeout: 30_000 });
 }
 
@@ -79,13 +79,13 @@ test('the tree, search, labels and checks read the thesaurus', async ({ page }) 
   await expect(page.getByRole('list', { name: 'Label problems' })).toContainText('S13');
 
   // the SKOS-XL labels of Dogs
-  await page.goto(`/ui/thesaurus?ds=thes&iri=${encodeURIComponent(TH + 'dogs')}`);
+  await page.goto(`/ui/workbench/thesaurus?ds=thes&iri=${encodeURIComponent(TH + 'dogs')}`);
   const fr = labels(page).locator('tr[data-lang="fr"] [data-kind="pref"]');
   await expect(fr).toContainText('Chiens');
   await expect(fr.locator('.badge')).toHaveText('XL');
 
   // the checks of the built-in shapes
-  await page.getByRole('tab', { name: 'Checks' }).click();
+  await page.getByRole('tab', { name: 'Validation' }).click();
   const results = page.getByRole('list', { name: 'Check results' });
   await expect(results).toContainText('S13');
   await expect(results.getByRole('button', { name: 'Owls' })).toBeVisible();
@@ -170,7 +170,7 @@ test('edits on a session branch: labels, XL, a move, a mapping', async ({ page, 
 
   // a close match picked in the habitats scheme
   await node(page, 'Whales').click();
-  await page.getByRole('tab', { name: 'Relations' }).click();
+  await page.getByRole('button', { name: 'Relations', exact: true }).click();
   await expect(page.locator('[data-section="broader"]')).toContainText('Mammals');
   await page.getByRole('button', { name: 'Add close match' }).click();
   const picker = page.getByRole('group', { name: 'Close match picker' });
@@ -198,16 +198,16 @@ test('collections, notes, a new concept and a stale edit', async ({ page, reques
   const branch = (await (await request.get('/$/branches/thes')).json()).branches
     .map((b: { name: string }) => b.name)
     .find((n: string) => n.startsWith('skos.'));
-  await page.goto(`/ui/thesaurus?ds=thes&branch=${branch}`);
+  await page.goto(`/ui/workbench/thesaurus?ds=thes&branch=${branch}`);
   await expect(node(page, 'Vertebrates')).toBeVisible({ timeout: 30_000 });
 
   // the ordered collection's members in the list editor
-  await page.getByRole('tab', { name: /Collections/ }).click();
+  await page.getByRole('combobox', { name: 'List' }).selectOption('collections');
   await page
     .getByRole('list', { name: 'Collections' })
     .getByRole('button', { name: /Mammals by size/ })
     .click();
-  await page.getByRole('tab', { name: /Members/ }).click();
+  await page.getByRole('button', { name: /^Members/ }).click();
   const form = page.locator('.detail form').first();
   await expect(form).toContainText('Ordered members');
   // the dataset keeps no other graph, so the list's cells can be edited
@@ -216,9 +216,9 @@ test('collections, notes, a new concept and a stale edit', async ({ page, reques
   ).toBeEnabled();
 
   // the notes form of a concept, from the built-in SKOS shapes
-  await page.getByRole('tab', { name: 'Concepts' }).click();
+  await page.getByRole('combobox', { name: 'List' }).selectOption('concepts');
   await node(page, 'Vertebrates').click();
-  await page.getByRole('tab', { name: 'Notes' }).click();
+  await page.getByRole('button', { name: 'Notes', exact: true }).click();
   await expect(page.getByRole('region', { name: 'Details' })).toContainText('built-in SKOS shapes');
   await expect(page.getByRole('region', { name: 'Details' })).toContainText('Definition');
   await expect(page.getByRole('region', { name: 'Details' })).not.toContainText('Preferred label');
@@ -260,7 +260,7 @@ test('a protected branch is read-only', async ({ page, request }) => {
     await expect(page.getByRole('form', { name: 'Add a label' })).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Delete' })).toHaveCount(0);
     // the notes form follows the page
-    await page.getByRole('tab', { name: 'Notes' }).click();
+    await page.getByRole('button', { name: 'Notes', exact: true }).click();
     const details = page.getByRole('region', { name: 'Details' });
     await expect(details.getByRole('status')).toContainText('the form is too');
     await expect(details.getByRole('button', { name: /^\+ Add/ }).first()).toBeDisabled();
@@ -314,7 +314,7 @@ test('undo waits for the head tag', async ({ page }) => {
     await held;
     await route.fallback();
   });
-  await page.goto('/ui/thesaurus?ds=thes');
+  await page.goto('/ui/workbench/thesaurus?ds=thes');
   const undo = page.getByRole('button', { name: /^Undo/ });
   await expect(undo).toHaveText(/Undo \(1\)/);
   await expect(undo).toBeDisabled();
@@ -342,7 +342,7 @@ test('the forms are read-only for a caller whose grants cover some graphs', asyn
   const details = page.getByRole('region', { name: 'Details' });
   await expect(details.getByRole('status')).toContainText('covers only some graphs');
   // the page's own edits stay, scoped to its graph by their updates
-  await expect(page.getByRole('tab', { name: /Labels/ })).toBeVisible();
+  await expect(page.getByRole('button', { name: /^Labels/ })).toBeVisible();
 });
 
 test('under auth the forms are read-only on a branch whose grants the page cannot read', async ({
@@ -366,14 +366,16 @@ test('under auth the forms are read-only on a branch whose grants the page canno
     .map((b: { name: string }) => b.name)
     .find((n: string) => n.startsWith('skos.'));
   await page.goto(
-    `/ui/thesaurus?ds=thes&branch=${branch}&iri=${encodeURIComponent(TH + 'fish')}&view=notes`,
+    `/ui/workbench/thesaurus?ds=thes&branch=${branch}&iri=${encodeURIComponent(TH + 'fish')}&view=notes`,
   );
   const details = page.getByRole('region', { name: 'Details' });
   await expect(details.getByText(`your access covers on ${branch}`)).toBeVisible({
     timeout: 30_000,
   });
   // on main, where whoami answers, the same caller may edit the forms
-  await page.goto(`/ui/thesaurus?ds=thes&iri=${encodeURIComponent(TH + 'fish')}&view=notes`);
+  await page.goto(
+    `/ui/workbench/thesaurus?ds=thes&iri=${encodeURIComponent(TH + 'fish')}&view=notes`,
+  );
   await expect(details).toContainText('built-in SKOS shapes', { timeout: 30_000 });
   await expect(details.getByText('your access covers')).toHaveCount(0);
 });

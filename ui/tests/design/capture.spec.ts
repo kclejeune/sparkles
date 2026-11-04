@@ -35,8 +35,8 @@ export const PAGES: {
   { name: 'explore-entity', path: `/ui/explore?ds=demo&iri=${LUMEN}` },
   { name: 'explore-search', path: '/ui/explore?ds=demo&tab=search&q=university' },
   { name: 'explore-schema', path: '/ui/explore?ds=demo&tab=schema' },
-  { name: 'ontology', path: '/ui/ontology?ds=go' },
-  { name: 'thesaurus', path: '/ui/thesaurus?ds=unesco' },
+  { name: 'ontology', path: '/ui/workbench/ontology?ds=go' },
+  { name: 'thesaurus', path: '/ui/workbench/thesaurus?ds=unesco' },
   { name: 'browse-go', path: '/ui/browse?ds=go' },
   {
     name: 'browse-go-term',

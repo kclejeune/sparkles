@@ -259,7 +259,7 @@ test.describe('at 1440 pixels', () => {
   test('the rail names every page and marks the open one', async ({ page }) => {
     await visit(page, '/ui/admin/server');
     const rail = page.getByRole('navigation', { name: 'Pages' });
-    for (const name of ['Query', 'Explore', 'Ontology', 'Thesaurus', 'Similar', 'Memory'])
+    for (const name of ['Query', 'Explore', 'Browse', 'Workbench', 'Similar', 'Memory'])
       await expect(rail.getByRole('link', { name, exact: true })).toBeVisible();
     // a group shows its pages while one of them is open, and marks that page
     await expect(rail.getByRole('button', { name: 'Close Admin' })).toHaveAttribute(
@@ -274,14 +274,14 @@ test.describe('at 1440 pixels', () => {
   });
 
   test('choosing a dataset reopens a page that names its dataset', async ({ page }) => {
-    await visit(page, '/ui/ontology?ds=uni');
+    await visit(page, '/ui/workbench/ontology?ds=uni');
     await expect(page.getByRole('heading', { name: 'Ontology', exact: true })).toBeVisible();
     await page.locator('.ds-button').click();
     await page
       .getByRole('listbox', { name: 'Datasets' })
       .getByRole('option', { name: /^foaf / })
       .click();
-    await expect(page).toHaveURL(/\/ui\/ontology\?ds=foaf$/);
+    await expect(page).toHaveURL(/\/ui\/workbench\/ontology\?ds=foaf$/);
     await expect(page.locator('.ds-button')).toContainText('foaf');
   });
 
@@ -385,16 +385,7 @@ test.describe('at 390 pixels', () => {
     await expect(drawer.getByRole('listbox', { name: 'Datasets' })).toBeHidden();
     await expect(drawer).toBeVisible();
     await expect(drawer.locator('.ds-button')).toBeFocused();
-    for (const name of [
-      'Query',
-      'Explore',
-      'Browse',
-      'Ontology',
-      'Thesaurus',
-      'Similar',
-      'Memory',
-      'Datasets',
-    ])
+    for (const name of ['Query', 'Explore', 'Browse', 'Workbench', 'Similar', 'Memory', 'Datasets'])
       await expect(drawer.getByRole('link', { name, exact: true })).toBeVisible();
     await expect(drawer.getByRole('img', { name: /Connected|Connecting/ })).toBeVisible();
     await drawer.getByRole('link', { name: 'Datasets', exact: true }).click();
@@ -412,8 +403,8 @@ const PAGES = [
   '/ui/explore?ds=foaf',
   '/ui/browse?ds=uni',
   '/ui/browse?ds=uni&iri=http%3A%2F%2Fexample.org%2Funi%23Professor',
-  '/ui/ontology?ds=uni',
-  '/ui/thesaurus?ds=uni',
+  '/ui/workbench/ontology?ds=uni',
+  '/ui/workbench/thesaurus?ds=uni',
   '/ui/similar?ds=foaf',
   '/ui/memory?ds=foaf',
   '/ui/similar/map?ds=foaf',

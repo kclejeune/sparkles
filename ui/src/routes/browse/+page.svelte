@@ -118,6 +118,9 @@
   import TermUsage from '$components/browse/TermUsage.svelte';
   import TermXrefs from '$components/browse/TermXrefs.svelte';
   import TopTerms from '$components/browse/TopTerms.svelte';
+  import SimilarTerms from '$components/browse/SimilarTerms.svelte';
+  import { askHook } from '$lib/ask-hook.svelte';
+  import { editorOf } from '$lib/routes';
 
   const RDFS = WELL_KNOWN.rdfs;
   const SKOS = WELL_KNOWN.skos;
@@ -385,6 +388,17 @@
     const h = editHref(base, name, term.iri, term.kinds, sel);
     return branch ? `${h}&branch=${encodeURIComponent(branch)}` : h;
   });
+  /** The term in its Workbench editor, selected in the tree with its path open. */
+  const workbenchLink = $derived(editLink);
+  /** The kind of resource the Ask drawer's suggestions are for. */
+  const askType = (kinds: readonly string[]) =>
+    kinds.includes('class')
+      ? ('class' as const)
+      : kinds.some((k) => k.endsWith('Property'))
+        ? ('property' as const)
+        : kinds.includes('individual')
+          ? ('individual' as const)
+          : ('resource' as const);
 
   // --- edit mode (ROADMAP item 630) ------------------------------------------------------
   // A caller with write access switches the page into edit mode (`edit=1`), where its
@@ -776,6 +790,14 @@
   });
   useCommands(() => [
     {
+      id: 'browse.workbench',
+      label: isSkos ? 'Open in Thesaurus' : 'Open in Ontology',
+      icon: 'pencil',
+      keywords: ['workbench', 'editor', 'tree', 'open in ontology', 'open in thesaurus'],
+      active: () => !!iri && canWrite && !!workbenchLink,
+      run: () => void goto(workbenchLink),
+    },
+    {
       id: 'browse.edit',
       label: 'Edit this page',
       icon: 'pencil',
@@ -1096,6 +1118,26 @@
               <a class="btn sm" href={exploreHref}
                 ><Icon name="explore" size={14} />Open in Explore</a
               >
+              {#if canWrite && workbenchLink}
+                <a class="btn sm" href={workbenchLink}
+                  ><Icon name="pencil" size={14} />Open in {editorOf(term?.kinds ?? []) ===
+                  'thesaurus'
+                    ? 'Thesaurus'
+                    : 'Ontology'}</a
+                >
+              {/if}
+              {#if askHook.open}
+                <button
+                  type="button"
+                  class="btn sm"
+                  onclick={() =>
+                    askHook.open?.({
+                      iri: term!.iri,
+                      label: title,
+                      type: isSkos ? 'concept' : askType(term!.kinds),
+                    })}><Icon name="sparkle" size={14} />Ask about this</button
+                >
+              {/if}
               {#if canEdit && !editing}
                 <button
                   type="button"
@@ -1461,6 +1503,9 @@
               loading={reuse.loading}
               href={(d) => browseHref(base, d, term?.iri ?? null)}
             />
+            {#if !editing}
+              <SimilarTerms ds={target} iri={term.iri} href={(i) => hrefOf(i)} />
+            {/if}
             {#if sections.other.length && !editing}
               <section class="term-sec">
                 <details class="ann">

@@ -15,6 +15,7 @@ import {
   type Lit,
 } from './ontology';
 import { WELL_KNOWN, type PrefixMap } from './rdf';
+import { browsePath, editorOf, workbenchPath } from './routes';
 
 const enc = encodeURIComponent;
 const RDF = WELL_KNOWN.rdf;
@@ -183,10 +184,7 @@ export function browseHref(
   iri: string | null,
   extra: Record<string, string | null | undefined> = {},
 ): string {
-  const p = new URLSearchParams({ ds });
-  if (iri) p.set('iri', iri);
-  for (const [k, v] of Object.entries(extra)) if (v) p.set(k, v);
-  return `${base}/browse?${p}`;
+  return browsePath(base, ds, { iri, ...extra });
 }
 
 // --- names ----------------------------------------------------------------------------
@@ -242,7 +240,10 @@ export function editorKindOf(kinds: readonly string[]): EntityKind | null {
   return null;
 }
 
-/** Where Edit opens an entity: the thesaurus editor for SKOS, the ontology editor otherwise. */
+/**
+ * Where an entity opens in the Workbench: the Thesaurus editor for SKOS, the Ontology editor
+ * otherwise, on the tree of the entity's kind with the entity selected.
+ */
 export function editHref(
   base: string,
   ds: string,
@@ -250,10 +251,11 @@ export function editHref(
   kinds: readonly string[],
   sel: BrowseSelection,
 ) {
-  const p = new URLSearchParams({ ds, iri });
-  if (sel.graph) p.set('graph', sel.graph);
-  if (kinds.some((k) => k === 'concept' || k === 'conceptScheme' || k === 'collection'))
-    return `${base}/thesaurus?${p}`;
+  const editor = editorOf(kinds);
+  if (editor === 'thesaurus') {
+    const kind = kinds.includes('collection') ? 'collections' : null;
+    return workbenchPath(base, editor, ds, { iri, graph: sel.graph, kind });
+  }
   const tab: Record<string, string> = {
     objectProperty: 'ObjectProperty',
     dataProperty: 'DataProperty',
@@ -261,8 +263,8 @@ export function editHref(
     individual: 'NamedIndividual',
   };
   const t = kinds.find((k) => k in tab);
-  if (t && !kinds.includes('class')) p.set('tab', tab[t]);
-  return `${base}/ontology?${p}`;
+  const kind = t && !kinds.includes('class') ? tab[t] : null;
+  return workbenchPath(base, editor, ds, { iri, graph: sel.graph, kind });
 }
 
 // --- the sections of a page -----------------------------------------------------------

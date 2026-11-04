@@ -477,7 +477,7 @@ test('the palette enters edit mode and focuses the add fields', async ({ page })
   await page.keyboard.press('Control+k');
   await page.keyboard.type('>full editor');
   await list.getByRole('option', { name: /^Open in the full editor/ }).click();
-  await expect(page).toHaveURL(/\/ui\/ontology\?ds=uni&iri=/);
+  await expect(page).toHaveURL(/\/ui\/workbench\/ontology\?ds=uni&iri=/);
 });
 
 test.describe('on a phone', () => {

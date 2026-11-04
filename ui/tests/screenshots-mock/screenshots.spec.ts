@@ -205,9 +205,12 @@ test('memory', async ({ page }) => {
   await expect(page.getByRole('region', { name: 'Agents' })).toContainText('agent-7', {
     timeout: 30_000,
   });
-  const search = page.getByRole('region', { name: 'Search memory' });
-  await search.getByRole('textbox', { name: 'Search memory' }).fill('payments team');
-  await search.getByRole('button', { name: 'Search' }).click();
+  await page
+    .getByRole('search', { name: 'Search memory' })
+    .getByRole('searchbox', { name: 'Search memory' })
+    .fill('payments team');
+  await page.keyboard.press('Enter');
+  const search = page.getByRole('region', { name: 'Memory search results' });
   await expect(search.getByRole('region', { name: /Facts about/ }).first()).toBeVisible();
   await shoot(page, 'memory');
 });
@@ -1288,7 +1291,7 @@ test('reasoning-support-preview', async ({ page }) => {
 const UNI = 'http://example.org/uni#';
 
 test('ontology-editor', async ({ page }) => {
-  await page.goto(`/ui/ontology?ds=uni&tab=Class&iri=${encodeURIComponent(`${UNI}Professor`)}`);
+  await page.goto(`/ui/workbench/ontology?ds=uni&iri=${encodeURIComponent(`${UNI}Professor`)}`);
   const classes = page.getByRole('tree', { name: 'Classes (asserted)' });
   await expect(classes.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
     timeout: 30_000,
@@ -1303,7 +1306,7 @@ test('ontology-editor', async ({ page }) => {
 
 test('ontology-inferred', async ({ page }) => {
   await page.goto(
-    `/ui/ontology?ds=uni&tab=Class&inferred=1&iri=${encodeURIComponent(`${UNI}Teacher`)}`,
+    `/ui/workbench/ontology?ds=uni&inferred=1&iri=${encodeURIComponent(`${UNI}Teacher`)}`,
   );
   const asserted = page.getByRole('tree', { name: 'Classes (asserted)' });
   const inferred = page.getByRole('tree', { name: 'Classes (inferred)' });
@@ -1320,7 +1323,7 @@ test('ontology-dl-query', async ({ page }) => {
   // label, and the frame of the instance the answers link to
   const q = 'Person and (teaches some Course)';
   await page.goto(
-    `/ui/ontology?ds=uni&tab=dlquery&dl=${encodeURIComponent(q)}&iri=${encodeURIComponent(`${UNI}Professor`)}`,
+    `/ui/workbench/ontology?ds=uni&tab=dlquery&dl=${encodeURIComponent(q)}&iri=${encodeURIComponent(`${UNI}Professor`)}`,
   );
   const answers = page.getByRole('region', { name: 'DL query answers' });
   await expect(answers.getByRole('region', { name: 'Equivalent classes' })).toContainText(
@@ -1332,7 +1335,7 @@ test('ontology-dl-query', async ({ page }) => {
 });
 
 test('ontology-preview', async ({ page }) => {
-  await page.goto(`/ui/ontology?ds=uni&tab=Class&iri=${encodeURIComponent(`${UNI}Employee`)}`);
+  await page.goto(`/ui/workbench/ontology?ds=uni&iri=${encodeURIComponent(`${UNI}Employee`)}`);
   await expect(page.locator('.frame')).toBeVisible({ timeout: 30_000 });
   await page.getByRole('button', { name: 'New', exact: true }).click();
   const create = page.getByRole('dialog', { name: 'New class' });
@@ -1352,7 +1355,7 @@ const THES = 'http://example.org/thesaurus/';
 const thesTree = (page: Page) => page.getByRole('tree', { name: 'Concepts' });
 
 test('thesaurus-editor', async ({ page }) => {
-  await page.goto(`/ui/thesaurus?ds=thes&iri=${encodeURIComponent(`${THES}whales`)}`);
+  await page.goto(`/ui/workbench/thesaurus?ds=thes&iri=${encodeURIComponent(`${THES}whales`)}`);
   const tree = thesTree(page);
   await expect(page.getByRole('heading', { name: 'Whales' })).toBeVisible({ timeout: 30_000 });
   await expect(tree.getByRole('button', { name: 'Collapse Vertebrates' })).toBeVisible();
@@ -1366,19 +1369,19 @@ test('thesaurus-editor', async ({ page }) => {
 });
 
 test('thesaurus-checks', async ({ page }) => {
-  await page.goto('/ui/thesaurus?ds=thes');
+  await page.goto('/ui/workbench/thesaurus?ds=thes');
   await expect(
     thesTree(page).getByRole('button', { name: 'Vertebrates', exact: true }),
   ).toBeVisible({
     timeout: 30_000,
   });
-  await page.getByRole('tab', { name: 'Checks' }).click();
+  await page.getByRole('tab', { name: 'Validation' }).click();
   await expect(page.getByRole('list', { name: 'Check results' })).toContainText('S13');
   await shoot(page, 'thesaurus-checks');
 });
 
 test('thesaurus-move', async ({ page }) => {
-  await page.goto(`/ui/thesaurus?ds=thes&iri=${encodeURIComponent(`${THES}bats`)}`);
+  await page.goto(`/ui/workbench/thesaurus?ds=thes&iri=${encodeURIComponent(`${THES}bats`)}`);
   const tree = thesTree(page);
   await expect(page.getByRole('heading', { name: 'Bats' })).toBeVisible({ timeout: 30_000 });
   const node = (name: string) => tree.getByRole('button', { name, exact: true }).first();

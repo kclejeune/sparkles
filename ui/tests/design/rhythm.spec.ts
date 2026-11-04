@@ -211,14 +211,18 @@ test("Explore's graph tools stay inside a narrow canvas", async ({ browser }) =>
 
 const STRIP_PAGES = [
   ...PAGES,
-  '/ui/ontology?ds=go',
-  '/ui/thesaurus?ds=unesco',
+  '/ui/workbench/ontology?ds=go',
+  '/ui/workbench/thesaurus?ds=unesco',
   '/ui/browse?ds=go',
   `/ui/browse?ds=go&iri=${encodeURIComponent('http://purl.obolibrary.org/obo/GO_0005739')}`,
-  `/ui/ontology?ds=go&iri=${encodeURIComponent('http://purl.obolibrary.org/obo/GO_0005739')}`,
+  `/ui/workbench/ontology?ds=go&iri=${encodeURIComponent('http://purl.obolibrary.org/obo/GO_0005739')}`,
   `/ui/explore?ds=demo&iri=${encodeURIComponent('http://example.org/ns#City')}`,
   '/ui/memory?ds=demo&tab=inbox',
   '/ui/similar/map?ds=demo',
+  '/ui/query?ds=demo',
+  '/ui/datasets/demo',
+  '/ui/workbench/thesaurus?ds=unesco&tab=validation',
+  '/ui/admin/backups',
 ];
 
 for (const [w, h] of WIDTHS) {
@@ -271,6 +275,9 @@ for (const [w, h] of WIDTHS) {
           strips: strips.map((t) => t.getAttribute('aria-label') ?? t.className),
         };
       });
+      expect
+        .soft(m.strips.length, `${path}: tab rows ${m.strips.join(', ')}`)
+        .toBeLessThanOrEqual(1);
       expect.soft(m.wrapped, `${path}: wrapped tab strips`).toEqual([]);
       expect.soft(m.heights, `${path}: page action heights`).toEqual([]);
     }

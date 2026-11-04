@@ -84,8 +84,17 @@
   import OntoHeader from '$components/OntoHeader.svelte';
   import OntoPreview from '$components/OntoPreview.svelte';
   import OntoTree from '$components/OntoTree.svelte';
+  import EditorHistory from '$components/EditorHistory.svelte';
+  import { ONTOLOGY_TABS, routes, type OntologyTab } from '$lib/routes';
 
-  type Tab = EntityKind | 'header' | 'dlquery';
+  const TAB_LABEL: [OntologyTab, string][] = [
+    ['tree', 'Tree'],
+    ['dlquery', 'DL Query'],
+    ['header', 'Header'],
+    ['history', 'History'],
+  ];
+
+  type Tab = OntologyTab;
 
   // --- the URL's state ---------------------------------------------------------------
   const q = $derived(page.url.searchParams);
@@ -94,15 +103,20 @@
   const target = $derived(onBranch(name, branch));
   const graph = $derived(q.get('graph') || null);
   const sel: Selection = $derived({ graph, imports: true });
+  // the page's one tab row: the tree, DL Query, the header and the history (ROADMAP item 633)
   const tab = $derived<Tab>(
-    (TREE_KINDS as string[]).includes(q.get('tab') ?? '') ||
-      q.get('tab') === 'header' ||
-      q.get('tab') === 'dlquery'
+    (ONTOLOGY_TABS as readonly string[]).includes(q.get('tab') ?? '')
       ? (q.get('tab') as Tab)
+      : 'tree',
+  );
+  /** The tree's entity kind, a control at the top of the tree rather than a second tab row. */
+  const kind = $derived<EntityKind>(
+    (TREE_KINDS as string[]).includes(q.get('kind') ?? '')
+      ? (q.get('kind') as EntityKind)
       : 'Class',
   );
-  /** The entity kind of the tab, when it shows a tree. */
-  const kindTab = $derived<EntityKind | null>(tab === 'header' || tab === 'dlquery' ? null : tab);
+  /** The entity kind of the tree, when the page shows it. */
+  const kindTab = $derived<EntityKind | null>(tab === 'tree' ? kind : null);
   const selected = $derived(q.get('iri'));
   const view = $derived(q.get('view') === 'usage' ? 'usage' : 'frame');
   const inferredOn = $derived(q.get('inferred') === '1');
@@ -115,7 +129,7 @@
       if (v == null || v === '') p.delete(k);
       else p.set(k, v);
     }
-    return `${resolve('/ontology')}?${p}`;
+    return routes.ontology(p.get('ds') ?? name, Object.fromEntries(p));
   }
   const nav = (over: Record<string, string | null>, replace = false) =>
     goto(withParams(over), { replaceState: replace, keepFocus: true, noScroll: true });
@@ -417,7 +431,7 @@
   $effect(() => {
     if (
       inferredOn &&
-      tab === 'Class' &&
+      kindTab === 'Class' &&
       summary &&
       (!classification || classification.commit !== summary.commit)
     )
@@ -743,7 +757,7 @@
     createOpen = false;
     const what = `Create ${KIND_SINGULAR[createKind]} ${createLabel.trim() || iriName(iri, prefixes)}`;
     edit({ kind: 'axioms', add, remove: [] }, what, () =>
-      nav({ tab: createKind, iri, view: null }),
+      nav({ tab: null, kind: createKind, iri, view: null }),
     );
   }
 
@@ -833,6 +847,14 @@
         : null;
   useCommands(() => [
     {
+      id: 'workbench.page',
+      label: 'Open page in Browse',
+      icon: 'book',
+      keywords: ['browse', 'page', 'read', 'open page'],
+      active: () => !!name && !!selected,
+      run: () => void goto(routes.browse(name, { iri: selected, graph })),
+    },
+    {
       id: 'ontology.session',
       label: 'Start session',
       icon: 'branch',
@@ -916,20 +938,23 @@
     </div>
     <div class="page-actions">
       <FollowState live={session.live} onretry={() => followRun++} />
-      <button
-        class="btn ghost"
-        disabled={!session.done.length || readonly}
-        onclick={() => session.undoLast()}
-        title={session.done.at(-1) ? `Undo: ${session.done.at(-1)?.label}` : 'Nothing to undo'}
-        >Undo{session.done.length ? ` (${session.done.length})` : ''}</button
-      >
-      <button
-        class="btn ghost"
-        disabled={!session.undone.length || readonly}
-        onclick={() => session.redoLast()}
-        title={session.undone.at(-1) ? `Redo: ${session.undone.at(-1)?.label}` : 'Nothing to redo'}
-        >Redo</button
-      >
+      {#if canWrite}
+        <button
+          class="btn ghost"
+          disabled={!session.done.length || readonly}
+          onclick={() => session.undoLast()}
+          title={session.done.at(-1) ? `Undo: ${session.done.at(-1)?.label}` : 'Nothing to undo'}
+          >Undo{session.done.length ? ` (${session.done.length})` : ''}</button
+        >
+        <button
+          class="btn ghost"
+          disabled={!session.undone.length || readonly}
+          onclick={() => session.redoLast()}
+          title={session.undone.at(-1)
+            ? `Redo: ${session.undone.at(-1)?.label}`
+            : 'Nothing to redo'}>Redo</button
+        >
+      {/if}
       {#if canWrite && !branch}
         <button
           class="btn"
@@ -995,7 +1020,10 @@
       {branch ?? MAIN} is protected and takes changes through merges only. Start a session branch to edit.
     </p>
   {:else if !canWrite && name}
-    <p class="notice" role="status">You can read this dataset but not edit it.</p>
+    <p class="notice" role="status">
+      <strong>Read-only.</strong> You can read {name} but not edit it, so the editing controls are hidden.
+      The tree, DL Query, the header and the history still read.
+    </p>
   {/if}
   {#if loadError}
     <div class="error-box" role="alert">
@@ -1012,299 +1040,335 @@
   {/if}
 
   {#if name && summary}
-    <!-- one strip for the entity kinds and the ontology's views, which wraps rather than
-         hiding tabs past the edge -->
     <div class="tabs onto-tabs" role="tablist" aria-label="Ontology views">
-      {#each TREE_KINDS as k (k)}
-        <button class="tab" role="tab" aria-selected={tab === k} onclick={() => nav({ tab: k })}
-          >{KIND_LABEL[k]} <span class="count">{counts[k] ? fmtInt(counts[k]) : ''}</span></button
+      {#each TAB_LABEL as [t, l] (t)}
+        <button
+          class="tab"
+          role="tab"
+          aria-selected={tab === t}
+          onclick={() => nav({ tab: t === 'tree' ? null : t })}>{l}</button
         >
       {/each}
-      <span class="tab-sep" aria-hidden="true"></span>
-      <button
-        class="tab"
-        role="tab"
-        aria-selected={tab === 'dlquery'}
-        onclick={() => nav({ tab: 'dlquery' })}>DL Query</button
-      >
-      <button
-        class="tab"
-        role="tab"
-        aria-selected={tab === 'header'}
-        onclick={() => nav({ tab: 'header', iri: null })}>Header</button
-      >
     </div>
-    <div class="panes split-view">
-      <section class="panel trees" aria-label="Entities">
-        {#if kindTab && tree}
-          <div class="tree-bar">
-            <input
-              class="input"
-              type="search"
-              placeholder="Filter {KIND_LABEL[kindTab].toLowerCase()}"
-              aria-label="Filter"
-              bind:this={filterInput}
-              bind:value={filter}
-            />
-            {#if !readonly}
-              <button
-                class="btn sm"
-                onclick={() =>
-                  openCreate(
-                    kindTab,
-                    selected && kindTab !== 'NamedIndividual' && tree?.nodes.has(selected)
-                      ? selected
-                      : kindTab === 'NamedIndividual' &&
-                          selected &&
-                          (trees.get('Class')?.nodes.has(selected) ?? false)
+    {#if tab === 'header'}
+      <section class="panel" aria-label="Ontology header">
+        <div class="panel-head"><h2>Ontology header</h2></div>
+        <div class="panel-body">
+          <OntoHeader
+            {target}
+            {sel}
+            {summary}
+            name={nameOf}
+            {prefixes}
+            {annotationProperties}
+            {readonly}
+            onedit={(op, label) => edit(op, label)}
+            onrename={openRename}
+          />
+        </div>
+      </section>
+    {:else if tab === 'history'}
+      <section class="panel" aria-label="History">
+        <div class="panel-body">
+          <EditorHistory
+            {name}
+            {target}
+            {branch}
+            {graph}
+            {langs}
+            {prefixes}
+            onopen={(iri) => nav({ tab: null, iri, view: null })}
+            refreshKey={summary?.commit ?? 0}
+          />
+        </div>
+      </section>
+    {:else}
+      <div class="panes split-view">
+        <section class="panel trees" aria-label="Entities">
+          {#if kindTab && tree}
+            <div class="tree-bar">
+              <select
+                class="select sm kind-select"
+                aria-label="Entity kind"
+                value={kind}
+                onchange={(e) =>
+                  nav({
+                    kind: e.currentTarget.value === 'Class' ? null : e.currentTarget.value,
+                    iri: null,
+                    view: null,
+                  })}
+              >
+                {#each TREE_KINDS as k (k)}<option value={k}
+                    >{KIND_LABEL[k]}{counts[k] ? ` · ${fmtInt(counts[k])}` : ''}</option
+                  >{/each}
+              </select>
+              <input
+                class="input"
+                type="search"
+                placeholder="Filter {KIND_LABEL[kindTab].toLowerCase()}"
+                aria-label="Filter"
+                bind:this={filterInput}
+                bind:value={filter}
+              />
+              {#if !readonly}
+                <button
+                  class="btn sm"
+                  onclick={() =>
+                    openCreate(
+                      kindTab,
+                      selected && kindTab !== 'NamedIndividual' && tree?.nodes.has(selected)
                         ? selected
-                        : null,
-                  )}
-                title={selected
-                  ? `New ${KIND_SINGULAR[kindTab]} under the selection`
-                  : `New ${KIND_SINGULAR[kindTab]}`}><Icon name="plus" size={13} /> New</button
+                        : kindTab === 'NamedIndividual' &&
+                            selected &&
+                            (trees.get('Class')?.nodes.has(selected) ?? false)
+                          ? selected
+                          : null,
+                    )}
+                  title={selected
+                    ? `New ${KIND_SINGULAR[kindTab]} under the selection`
+                    : `New ${KIND_SINGULAR[kindTab]}`}><Icon name="plus" size={13} /> New</button
+                >
+              {/if}
+              {#if kindTab === 'Class'}
+                <label class="inferred-toggle"
+                  ><input
+                    type="checkbox"
+                    checked={inferredOn}
+                    onchange={(e) => nav({ inferred: e.currentTarget.checked ? '1' : null })}
+                  />
+                  Inferred</label
+                >
+              {/if}
+              <button
+                class="btn ghost icon sm"
+                aria-label="IRI policy"
+                title="How new entities get their IRIs"
+                onclick={() => ((policyDraft = { ...policy }), (policyOpen = true))}
+                ><Icon name="key" size={13} /></button
               >
-            {/if}
-            {#if tab === 'Class'}
-              <label class="inferred-toggle"
-                ><input
-                  type="checkbox"
-                  checked={inferredOn}
-                  onchange={(e) => nav({ inferred: e.currentTarget.checked ? '1' : null })}
-                />
-                Inferred</label
-              >
-            {/if}
-            <button
-              class="btn ghost icon sm"
-              aria-label="IRI policy"
-              title="How new entities get their IRIs"
-              onclick={() => ((policyDraft = { ...policy }), (policyOpen = true))}
-              ><Icon name="key" size={13} /></button
-            >
-          </div>
-          <div class="tree-cols" class:two={tab === 'Class' && inferredOn}>
-            <div class="tree-col">
-              {#if tab === 'Class' && inferredOn}<h2 class="col-title">Asserted</h2>{/if}
-              <div class="tree-scroll">
-                {#if level && filtered}
-                  {#if filtered.tree.roots.length}
+            </div>
+            <div class="tree-cols" class:two={kindTab === 'Class' && inferredOn}>
+              <div class="tree-col">
+                {#if kindTab === 'Class' && inferredOn}<h2 class="col-title">Asserted</h2>{/if}
+                <div class="tree-scroll">
+                  {#if level && filtered}
+                    {#if filtered.tree.roots.length}
+                      <OntoTree
+                        label="{KIND_LABEL[kindTab]} (asserted)"
+                        roots={filtered.tree.roots}
+                        children={(id) => filtered?.tree.children.get(id) ?? []}
+                        name={nameOf}
+                        sub={subOf}
+                        open={filtered.tree.nodes}
+                        {selected}
+                        keep={filtered.tree.nodes}
+                        onselect={(id) => nav({ iri: id })}
+                        ontoggle={() => {}}
+                      />
+                    {:else}
+                      <p class="empty">Nothing matches “{filtered.text}”.</p>
+                    {/if}
+                  {:else if level}
+                    {#if level.roots().length}
+                      <OntoTree
+                        label="{KIND_LABEL[kindTab]} (asserted)"
+                        roots={level.roots()}
+                        children={(id) => level?.children(id) ?? []}
+                        more={(id) => level?.more(id) ?? false}
+                        name={nameOf}
+                        sub={subOf}
+                        open={openSet(kindTab)}
+                        {selected}
+                        onselect={(id) => nav({ iri: id })}
+                        ontoggle={(id) => toggleLevel(kindTab!, id)}
+                      />
+                    {:else if level.loading}
+                      <p class="empty">Reading the {KIND_LABEL[kindTab].toLowerCase()}…</p>
+                    {:else if level.error}
+                      <p class="empty">{level.error}</p>
+                    {:else}
+                      <p class="empty">No {KIND_LABEL[kindTab].toLowerCase()}.</p>
+                    {/if}
+                  {:else if tree.roots.length}
                     <OntoTree
                       label="{KIND_LABEL[kindTab]} (asserted)"
-                      roots={filtered.tree.roots}
-                      children={(id) => filtered?.tree.children.get(id) ?? []}
+                      roots={tree.roots}
+                      children={(id) => tree?.children.get(id) ?? []}
                       name={nameOf}
                       sub={subOf}
-                      open={filtered.tree.nodes}
-                      {selected}
-                      keep={filtered.tree.nodes}
-                      onselect={(id) => nav({ iri: id })}
-                      ontoggle={() => {}}
-                    />
-                  {:else}
-                    <p class="empty">Nothing matches “{filtered.text}”.</p>
-                  {/if}
-                {:else if level}
-                  {#if level.roots().length}
-                    <OntoTree
-                      label="{KIND_LABEL[kindTab]} (asserted)"
-                      roots={level.roots()}
-                      children={(id) => level?.children(id) ?? []}
-                      more={(id) => level?.more(id) ?? false}
-                      name={nameOf}
-                      sub={subOf}
+                      badge={kindTab === 'NamedIndividual'
+                        ? (id) => (typesOf.get(id) ?? []).map(nameOf).join(', ') || null
+                        : undefined}
                       open={openSet(kindTab)}
                       {selected}
+                      {keep}
                       onselect={(id) => nav({ iri: id })}
-                      ontoggle={(id) => toggleLevel(kindTab!, id)}
+                      ontoggle={(id) => toggle(kindTab, id)}
                     />
-                  {:else if level.loading}
-                    <p class="empty">Reading the {KIND_LABEL[kindTab].toLowerCase()}…</p>
-                  {:else if level.error}
-                    <p class="empty">{level.error}</p>
                   {:else}
                     <p class="empty">No {KIND_LABEL[kindTab].toLowerCase()}.</p>
                   {/if}
-                {:else if tree.roots.length}
-                  <OntoTree
-                    label="{KIND_LABEL[kindTab]} (asserted)"
-                    roots={tree.roots}
-                    children={(id) => tree?.children.get(id) ?? []}
-                    name={nameOf}
-                    sub={subOf}
-                    badge={kindTab === 'NamedIndividual'
-                      ? (id) => (typesOf.get(id) ?? []).map(nameOf).join(', ') || null
-                      : undefined}
-                    open={openSet(kindTab)}
-                    {selected}
-                    {keep}
-                    onselect={(id) => nav({ iri: id })}
-                    ontoggle={(id) => toggle(kindTab, id)}
-                  />
-                {:else}
-                  <p class="empty">No {KIND_LABEL[kindTab].toLowerCase()}.</p>
-                {/if}
-              </div>
-            </div>
-            {#if tab === 'Class' && inferredOn}
-              <div class="tree-col">
-                <h2 class="col-title">
-                  Inferred
-                  {#if classification}<span class="faint">
-                      {classification.complete
-                        ? 'OWL 2 EL'
-                        : `${fmtInt(classification.excludedCount)} axioms outside OWL 2 EL`}</span
-                    >{/if}
-                </h2>
-                <div class="tree-scroll">
-                  {#if classifying && !inferred}<p class="faint">
-                      <span class="spinner"></span> Classifying…
-                    </p>{/if}
-                  {#if classifyError}<p class="error-box" role="alert">{classifyError}</p>{/if}
-                  {#if inferred}
-                    {#if classification && !classification.consistent}
-                      <p class="error-box" role="alert">
-                        The ontology is inconsistent, so every class is unsatisfiable.
-                      </p>
-                    {/if}
-                    <OntoTree
-                      label="Classes (inferred)"
-                      roots={inferred.tree.roots}
-                      children={(id) => inferred?.tree.children.get(id) ?? []}
-                      name={inferredName}
-                      badge={(id) => (id === 'n:1' ? 'unsatisfiable' : null)}
-                      open={openSet('inferred')}
-                      selected={selected ? (inferred.nodeOf.get(selected) ?? null) : null}
-                      keep={inferredKeep}
-                      onselect={(id) => {
-                        const c = inferred?.classesOf.get(id)?.[0];
-                        if (c) void nav({ iri: c });
-                      }}
-                      ontoggle={(id) => toggle('inferred', id)}
-                    />
-                  {/if}
                 </div>
               </div>
-            {/if}
-          </div>
-        {/if}
-        {#if tab === 'header'}
-          <p class="faint pad">The header describes the ontology of the graph as a whole.</p>
-        {/if}
-        {#if tab === 'dlquery'}
-          {@render dlPanel()}
-        {/if}
-      </section>
-
-      <section class="panel detail" aria-label="Details">
-        {#if tab === 'header' || !selected}
-          <div class="panel-head"><h2>Ontology header</h2></div>
-          <div class="panel-body">
-            <OntoHeader
-              {target}
-              {sel}
-              {summary}
-              name={nameOf}
-              {prefixes}
-              {annotationProperties}
-              {readonly}
-              onedit={(op, label) => edit(op, label)}
-              onrename={openRename}
-            />
-          </div>
-        {:else}
-          <div class="panel-head entity-head">
-            <div class="who">
-              <h2>{nameOf(selected)}</h2>
-              <span class="mono faint iri">{selected}</span>
-              <span class="kinds">
-                {#each frameKinds as k (k)}<span class="badge">{KIND_SINGULAR[k]}</span>{/each}
-              </span>
-            </div>
-            <span class="spacer"></span>
-            {#if !readonly && frameKinds.length}
-              <button class="btn sm" onclick={() => openRename(selected!)}
-                ><Icon name="pencil" size={13} /> Rename</button
-              >
-              <button class="btn sm danger" onclick={() => remove(selected!)}
-                ><Icon name="trash" size={13} /> Delete</button
-              >
-            {/if}
-          </div>
-          <div class="tabs sub" role="tablist" aria-label="Entity views">
-            <button
-              class="tab"
-              role="tab"
-              aria-selected={view === 'frame'}
-              onclick={() => nav({ view: null })}>Frame</button
-            >
-            <button
-              class="tab"
-              role="tab"
-              aria-selected={view === 'usage'}
-              onclick={() => nav({ view: 'usage' })}
-              >Usage <span class="count">{frameFor === selected ? frameItems.length : ''}</span
-              ></button
-            >
-          </div>
-          <div class="panel-body">
-            {#if frameError}<p class="error-box" role="alert">{frameError}</p>{/if}
-            {#if inferredOn && frameKind === 'Class' && inferred && selected}
-              {@const sup = inferredParents(selected)}
-              {#if sup.length}
-                <p class="inferred-sup">
-                  <span class="faint">Inferred direct superclasses:</span>
-                  {#each sup as c, i (c)}{#if i},
-                    {/if}<button class="link" onclick={() => nav({ iri: c })}>{nameOf(c)}</button
-                    >{/each}
-                </p>
+              {#if kindTab === 'Class' && inferredOn}
+                <div class="tree-col">
+                  <h2 class="col-title">
+                    Inferred
+                    {#if classification}<span class="faint">
+                        {classification.complete
+                          ? 'OWL 2 EL'
+                          : `${fmtInt(classification.excludedCount)} axioms outside OWL 2 EL`}</span
+                      >{/if}
+                  </h2>
+                  <div class="tree-scroll">
+                    {#if classifying && !inferred}<p class="faint">
+                        <span class="spinner"></span> Classifying…
+                      </p>{/if}
+                    {#if classifyError}<p class="error-box" role="alert">{classifyError}</p>{/if}
+                    {#if inferred}
+                      {#if classification && !classification.consistent}
+                        <p class="error-box" role="alert">
+                          The ontology is inconsistent, so every class is unsatisfiable.
+                        </p>
+                      {/if}
+                      <OntoTree
+                        label="Classes (inferred)"
+                        roots={inferred.tree.roots}
+                        children={(id) => inferred?.tree.children.get(id) ?? []}
+                        name={inferredName}
+                        badge={(id) => (id === 'n:1' ? 'unsatisfiable' : null)}
+                        open={openSet('inferred')}
+                        selected={selected ? (inferred.nodeOf.get(selected) ?? null) : null}
+                        keep={inferredKeep}
+                        onselect={(id) => {
+                          const c = inferred?.classesOf.get(id)?.[0];
+                          if (c) void nav({ iri: c });
+                        }}
+                        ontoggle={(id) => toggle('inferred', id)}
+                      />
+                    {/if}
+                  </div>
+                </div>
               {/if}
-            {/if}
-            {#if frameFor === selected && view === 'frame'}
-              {#key `${selected}|${frameKind}`}
-                <OntoFrame
-                  kind={frameKind}
-                  iri={selected}
-                  items={frameItems}
-                  name={nameOf}
-                  {prefixes}
-                  {options}
-                  {annotationProperties}
-                  {readonly}
-                  {names}
-                  {parse}
-                  onedit={(op, label) => edit(op, label)}
-                  onopen={(iri) => nav({ iri, view: null })}
-                />
-              {/key}
-            {:else if frameFor === selected && view === 'usage'}
-              {#if !usageGroups.length}<p class="empty">No axiom mentions this entity.</p>{/if}
-              {#each usageGroups as [type, items] (type)}
-                <section class="usage" aria-label={type}>
-                  <h3>{type} <span class="faint">{items.length}</span></h3>
-                  <ul>
-                    {#each items as it, i (it.ofn + i)}
-                      <li>
-                        <span class="mono small">{it.ofn}</span>
-                        <span class="refs">
-                          {#each mentionedBy(it).slice(0, 4) as m (m)}
-                            <button class="link" onclick={() => nav({ iri: m, view: null })}
-                              >{nameOf(m)}</button
-                            >
-                          {/each}
-                        </span>
-                      </li>
-                    {/each}
-                  </ul>
-                </section>
-              {/each}
-            {:else}
-              <p class="faint"><span class="spinner"></span> Reading the entity…</p>
-            {/if}
-          </div>
-        {/if}
-      </section>
-    </div>
+            </div>
+          {/if}
+          {#if tab === 'dlquery'}
+            {@render dlPanel()}
+          {/if}
+        </section>
+
+        <section class="panel detail" aria-label="Details">
+          {#if !selected}
+            <div class="panel-head"><h2>Ontology header</h2></div>
+            <div class="panel-body">
+              <OntoHeader
+                {target}
+                {sel}
+                {summary}
+                name={nameOf}
+                {prefixes}
+                {annotationProperties}
+                {readonly}
+                onedit={(op, label) => edit(op, label)}
+                onrename={openRename}
+              />
+            </div>
+          {:else}
+            <div class="panel-head entity-head">
+              <div class="who">
+                <h2>{nameOf(selected)}</h2>
+                <span class="mono faint iri">{selected}</span>
+                <span class="kinds">
+                  {#each frameKinds as k (k)}<span class="badge">{KIND_SINGULAR[k]}</span>{/each}
+                </span>
+              </div>
+              <span class="spacer"></span>
+              <a
+                class="btn sm ghost"
+                href={routes.browse(name, { iri: selected, graph })}
+                title="Open this entity's page in Browse"
+                ><Icon name="book" size={13} /> Open page</a
+              >
+              {#if !readonly && frameKinds.length}
+                <button class="btn sm" onclick={() => openRename(selected!)}
+                  ><Icon name="pencil" size={13} /> Rename</button
+                >
+                <button class="btn sm danger" onclick={() => remove(selected!)}
+                  ><Icon name="trash" size={13} /> Delete</button
+                >
+              {/if}
+            </div>
+            <div class="view-bar">
+              <div class="segmented" role="group" aria-label="Entity views">
+                <button aria-pressed={view === 'frame'} onclick={() => nav({ view: null })}
+                  >Frame</button
+                >
+                <button aria-pressed={view === 'usage'} onclick={() => nav({ view: 'usage' })}
+                  >Usage{frameFor === selected && frameItems.length
+                    ? ` ${fmtInt(frameItems.length)}`
+                    : ''}</button
+                >
+              </div>
+            </div>
+            <div class="panel-body">
+              {#if frameError}<p class="error-box" role="alert">{frameError}</p>{/if}
+              {#if inferredOn && frameKind === 'Class' && inferred && selected}
+                {@const sup = inferredParents(selected)}
+                {#if sup.length}
+                  <p class="inferred-sup">
+                    <span class="faint">Inferred direct superclasses:</span>
+                    {#each sup as c, i (c)}{#if i},
+                      {/if}<button class="link" onclick={() => nav({ iri: c })}>{nameOf(c)}</button
+                      >{/each}
+                  </p>
+                {/if}
+              {/if}
+              {#if frameFor === selected && view === 'frame'}
+                {#key `${selected}|${frameKind}`}
+                  <OntoFrame
+                    kind={frameKind}
+                    iri={selected}
+                    items={frameItems}
+                    name={nameOf}
+                    {prefixes}
+                    {options}
+                    {annotationProperties}
+                    {readonly}
+                    {names}
+                    {parse}
+                    onedit={(op, label) => edit(op, label)}
+                    onopen={(iri) => nav({ iri, view: null })}
+                  />
+                {/key}
+              {:else if frameFor === selected && view === 'usage'}
+                {#if !usageGroups.length}<p class="empty">No axiom mentions this entity.</p>{/if}
+                {#each usageGroups as [type, items] (type)}
+                  <section class="usage" aria-label={type}>
+                    <h3>{type} <span class="faint">{items.length}</span></h3>
+                    <ul>
+                      {#each items as it, i (it.ofn + i)}
+                        <li>
+                          <span class="mono small">{it.ofn}</span>
+                          <span class="refs">
+                            {#each mentionedBy(it).slice(0, 4) as m (m)}
+                              <button class="link" onclick={() => nav({ iri: m, view: null })}
+                                >{nameOf(m)}</button
+                              >
+                            {/each}
+                          </span>
+                        </li>
+                      {/each}
+                    </ul>
+                  </section>
+                {/each}
+              {:else}
+                <p class="faint"><span class="spinner"></span> Reading the entity…</p>
+              {/if}
+            </div>
+          {/if}
+        </section>
+      </div>
+    {/if}
   {:else if loading}
     <p class="faint"><span class="spinner"></span> Reading the ontology…</p>
   {:else if !name}
@@ -1657,14 +1721,6 @@
   .onto-tabs {
     border-bottom: 1px solid var(--border);
   }
-  .tab-sep {
-    width: 1px;
-    align-self: center;
-    height: 18px;
-    margin: 0 6px;
-    background: var(--border);
-    flex: none;
-  }
   .dl-form {
     display: grid;
     gap: 8px;
@@ -1817,8 +1873,9 @@
     gap: 4px;
     flex-wrap: wrap;
   }
-  .tabs.sub {
-    padding: 0 10px;
+  .view-bar {
+    display: flex;
+    padding: 8px 10px;
     border-bottom: 1px solid var(--border);
   }
   .inferred-sup {

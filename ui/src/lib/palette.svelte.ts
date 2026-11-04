@@ -74,22 +74,31 @@ const KEYWORDS: Record<string, string[]> = {
   '/similar/map': ['embedding map', 'vectors', 'projection', 'umap'],
   '/admin/tokens': ['access tokens', 'api keys'],
   '/admin/backups': ['backup', 'snapshots', 'restore'],
+  '/workbench/ontology': ['editor', 'owl', 'classes', 'dl query', 'edit ontology'],
+  '/workbench/thesaurus': ['editor', 'skos', 'concepts', 'edit thesaurus'],
 };
 
-export function pageProvider(base: string, backupsVisible: () => boolean): LauncherProvider {
+export function pageProvider(
+  base: string,
+  backupsVisible: () => boolean,
+  /** Whether the caller may write dataset `ds`, which shows the Workbench. */
+  canWrite: (ds: string | null) => boolean = () => false,
+): LauncherProvider {
   const pages = (ds: string | null) => {
     // the rail's pages, and each page of a group as its own row
-    const out: (LauncherItem & { keywords?: string[] })[] = navItems(backupsVisible()).flatMap(
-      (n) =>
-        n.children
-          ? n.children.map((c) => ({
-              id: c.href,
-              title: `${n.label} › ${c.label}`,
-              icon: c.icon,
-              href: navLink(base, c.href, ds),
-              keywords: [c.label.toLowerCase(), ...(KEYWORDS[c.href] ?? [])],
-            }))
-          : [{ id: n.href, title: n.label, icon: n.icon, href: navLink(base, n.href, ds) }],
+    const out: (LauncherItem & { keywords?: string[] })[] = navItems({
+      backupsVisible: backupsVisible(),
+      workbench: canWrite(ds),
+    }).flatMap((n) =>
+      n.children
+        ? n.children.map((c) => ({
+            id: c.href,
+            title: `${n.label} › ${c.label}`,
+            icon: c.icon,
+            href: navLink(base, c.href, ds),
+            keywords: [c.label.toLowerCase(), ...(KEYWORDS[c.href] ?? [])],
+          }))
+        : [{ id: n.href, title: n.label, icon: n.icon, href: navLink(base, n.href, ds) }],
     );
     if (ds) {
       out.push({

@@ -14,7 +14,14 @@ The SvelteKit UI is embedded in the server binary.
   segment switches the dataset and names the branch a page has open, the connection
   status, the theme and the account. The search field stays in the middle of the
   viewport on large and medium screens. A rail beside the page lists the working pages and,
-  below a rule, the administration pages. From 1200 pixels the rail shows labels, below
+  below a rule, the administration pages, in this order: Query, Explore, Browse,
+  Workbench, Similar and Memory, then Datasets and Admin. Workbench, Similar and Admin are
+  groups whose pages show under them while one of their pages is open or when the chevron
+  opens them. Workbench holds the Ontology and Thesaurus editors, Similar holds Search and
+  Map, and Admin holds Server, Backups and Tokens. The rail shows Workbench only to a caller
+  who may write the open dataset, so a reader's rail has Browse alone. A page has at most one
+  row of tabs, and a further choice inside a page, such as the editor's entity kind, is a
+  select or a segmented control. From 1200 pixels the rail shows labels, below
   that it shows icons with their names as tooltips, and from 760 pixels down it moves into
   a drawer that the menu button opens, together with the dataset switcher, the status,
   the theme and the account. Choosing a dataset on a page that names one in its address
@@ -32,9 +39,8 @@ The SvelteKit UI is embedded in the server binary.
   query also searches the open dataset's classes, properties, individuals and SKOS
   concepts through the [entity search](../search/README.md#entity-search), the shell's
   commands, the datasets, the open dataset's saved queries and, on the Query, Ontology,
-  Thesaurus and dataset pages, the dataset's branches. Enter opens a class or property in
-  the ontology editor, a concept in the thesaurus editor, any other entity in Explore and
-  a saved query in a new tab of the Query page
+  Thesaurus and dataset pages, the dataset's branches. Enter opens an entity's page in
+  Browse and a saved query in a new tab of the Query page
   ([screenshot](../images/shell-search.png)). On Explore the field is also the resource
   finder. Its placeholder says so, and its first group lists the dataset's resources by
   label or IRI, an **Open** row for a typed IRI or prefixed name and **Ask a question…**
@@ -84,6 +90,12 @@ The SvelteKit UI is embedded in the server binary.
   `.segmented` control, and the menus under a button share `.dropdown-menu`. At 760
   pixels and below a dialog docks at the bottom of the screen as a sheet whose body
   scrolls under a fixed head and footer.
+* A data table wider than its box scrolls inside the box with its actions column pinned to
+  the right edge. On a phone such a table shows each row as a card, with the first cell as
+  the card's title, the other cells under their column names and the actions in a row at
+  the bottom. A row of filters that no longer fits beside its search folds into a
+  **Filters** button that counts the active filters, and the search stays in view. A page's
+  own search, such as Browse's and Memory's, is one tall field across the content width.
 
 ### Query page
 
@@ -288,9 +300,38 @@ preparation and retention, while physical reader and mask preparation depend on
 [specification](../specs/U02-shape-driven-forms/SPEC.md#231-nested-read-models-in-the-rust-library)
 explains the unit calculation.
 
+### Browse and the Workbench
+
+Reading and authoring are separate places. **Browse** is the reader, with a page for each
+term and the edit mode of its pages. The **Workbench** holds the editors that work on a
+whole ontology or thesaurus, a tree beside the selected entity, and it is where further
+authoring tools such as SHACL shapes and forms go. A Browse term page has **Open in
+Ontology** or **Open in Thesaurus**, which lands on the same IRI selected in the editor's
+tree with its path open, and an editor's entity panel has **Open page**, which goes back to
+the term's page. The palette offers both, and Explore's details panel has **Open page** for
+a resource that is a class, a property or a concept.
+
+Every tab and control of these pages is part of the address, so a link, a reload and the
+Back button return to the same view. The `routes` module in `ui/src/lib/routes.ts` builds
+these addresses for the rail, the palette and the links.
+
+| Address | View |
+|---|---|
+| `/ui/browse?ds=NAME&iri=IRI` | The term page of an entity. `edit=1` opens edit mode and `view=graph` the term's graph. |
+| `/ui/workbench/ontology?ds=NAME` | The Ontology editor's tree. `kind=ObjectProperty`, `DataProperty`, `AnnotationProperty` or `NamedIndividual` picks the tree, `iri` the selected entity and `view=usage` its usage. |
+| `/ui/workbench/ontology?ds=NAME&tab=dlquery` | DL Query, with the query in `dl`. `tab=header` opens the header and `tab=history` the history. |
+| `/ui/workbench/thesaurus?ds=NAME` | The Thesaurus editor's tree. `kind=collections` lists collections, `scheme` picks the scheme and `view` the resource's labels, relations, members or notes. |
+| `/ui/workbench/thesaurus?ds=NAME&tab=history` | The thesaurus's history. `tab=validation` opens the validation report. |
+| `/ui/similar?ds=NAME` and `/ui/similar/map?ds=NAME` | Similar's Search and Map pages. |
+| `/ui/admin/server`, `/ui/admin/backups` and `/ui/admin/tokens` | The Admin pages. `tab=repositories`, `policies` or `activity` picks a Backups tab. |
+
+A caller who may read a dataset but not write it can still follow a link to the Workbench.
+The editor then says that it is read-only and hides its editing controls, while the tree,
+DL Query, the header, the history and the validation report still read.
+
 ### Ontology editor
 
-The **Ontology** page, `/ui/ontology`, browses and edits the OWL ontology of one graph
+The **Ontology** editor, `/ui/workbench/ontology`, browses and edits the OWL ontology of one graph
 and its imports
 ([U12](../specs/U12-ontology-workbench/SPEC.md#outcome),
 [reasoning guide](../reasoning/README.md#owl-2-ontologies),
@@ -299,8 +340,10 @@ annotation properties and individuals sit beside the selected entity's frame, wh
 lists its annotations, characteristics and axioms and adds and removes them. The frame's
 add fields take class expressions and whole axioms in Manchester syntax, with
 completion of entity names and labels and an underline under the part the server could
-not read, or in functional-style syntax. One strip of tabs holds the entity kinds, the
-DL Query tab and the header, and it wraps onto a second line in a narrow window.
+not read, or in functional-style syntax. The page's tabs are **Tree**, **DL Query**,
+**Header** and **History**. A select at the top of the tree picks the classes, object,
+data or annotation properties or individuals, and a segmented control on the entity panel
+switches between its frame and its usage.
 
 The **DL Query** tab answers a Manchester class expression with its equivalent classes,
 its direct and inferred superclasses and subclasses, and its instances
@@ -310,7 +353,10 @@ answers names the reasoning that found them, the EL classifier inside OWL 2 EL o
 OWL 2 RL rules outside it, says whether they are complete, and lists the axioms outside
 the profile that can leave them incomplete. The
 header tab edits the ontology IRI, version IRI, imports and header annotations, and the
-usage tab lists every axiom that mentions the entity. **Inferred** shows the EL
+usage view lists every axiom that mentions the entity. The **History** tab lists the
+branch's commits newest first in the manner of WebProtégé's changes. Each commit opens to
+what it changed in the graph as a change set, one block a subject named by its label with
+each added or removed property and value on a line, and links to the commit's full diff. **Inferred** shows the EL
 classifier's taxonomy beside the asserted class tree
 ([screenshot](../images/ontology-inferred.png)). Every edit is previewed as a dry run and
 committed with the commit it was previewed against
@@ -348,7 +394,9 @@ lists the axioms of other entities that mention it, grouped by the restriction t
 it as in "part of some mitochondrion", then the other statements that point at it by
 property, with their counts and further pages. **In other datasets** asks every other
 dataset the caller can read, up to 20, whether it mentions the IRI, and links its page
-there. The infobox lists the kind, status, identifiers, ontology, subsets and the counts
+there. **Similar terms** lists the entity's nearest neighbours in the dataset's first ready
+vector index, through the same search as Similar's Search page, and links to that page for
+more. A dataset without a vector index or a term without a vector shows no such section. The infobox lists the kind, status, identifiers, ontology, subsets and the counts
 of parents, children and instances, and downloads the entity in Turtle, RDF/XML, OWL
 functional syntax or JSON-LD. On a phone the page is one column with the header first, then the infobox, the
 hierarchy and the article ([screenshot](../images/browse-phone.png)).
@@ -356,8 +404,8 @@ hierarchy and the article ([screenshot](../images/browse-phone.png)).
 A caller who can write to the dataset gets an **Edit** button beside the title, and `E`
 or the palette's **Edit this page** does the same. Edit mode changes the page in place
 ([screenshot](../images/browse-edit.png)). A bar under the top bar names the branch the
-edits go to and holds **Undo**, **Redo**, **Start session**, a link to the full ontology
-or thesaurus editor and **Done**. The definition becomes a text field with its language
+edits go to and holds **Undo**, **Redo**, **Start session**, a link to the term in the
+Workbench's Ontology or Thesaurus editor and **Done**. The definition becomes a text field with its language
 and its sources as chips, and each synonym, annotation and parent gets edit and remove
 buttons with an add row below them. On an OWL page the parents are picked through the
 entity search and the axioms are added in Manchester syntax with completion and the
@@ -396,7 +444,7 @@ can reuse them.
 
 ### Thesaurus editor
 
-The **Thesaurus** page, `/ui/thesaurus`, edits the SKOS concept schemes, concepts and
+The **Thesaurus** editor, `/ui/workbench/thesaurus`, edits the SKOS concept schemes, concepts and
 collections of one graph, with their SKOS-XL labels
 ([U12](../specs/U12-ontology-workbench/SPEC.md#thesaurus-editor),
 [screenshot](../images/thesaurus-editor.png)). The concept tree of the chosen scheme
@@ -405,7 +453,9 @@ time, in both directions. A concept with several broader concepts appears under 
 them with a count of its broader concepts, and a concept of the scheme without a broader
 one is marked when it is not a top concept. The search finds concepts by any preferred,
 alternative or hidden label, SKOS-XL labels included, in every language or in one, and the
-tree can show its labels in a chosen language.
+tree can show its labels in a chosen language. The page's tabs are **Tree**, **History**
+and **Validation**, and a select at the top of the tree switches it between concepts and
+collections. The history is the Ontology editor's, a change set for each commit.
 
 Dragging a concept onto another moves it there, and holding Ctrl or Alt adds the new
 broader concept and keeps the old one. Each move writes both directions of the hierarchy
@@ -414,20 +464,21 @@ and is previewed as a commit before it is written
 top concept of the scheme. The page refuses a move under one of the concept's own
 narrower concepts.
 
-The **Labels** tab lists a resource's preferred, alternative and hidden labels by language,
+The **Labels** view lists a resource's preferred, alternative and hidden labels by language,
 marks the SKOS-XL ones and converts a label between its plain and SKOS-XL forms. It
 refuses a second preferred label in one language and a label that is both preferred and
-alternative, and it lists the clashes the data already has. The **Relations** tab edits
+alternative, and it lists the clashes the data already has. The **Relations** view edits
 broader, narrower, related and mapping links, with a picker that searches concepts by
 label in another scheme or another dataset. A link written in one direction only is
-marked, and its repair adds the other direction. The **Members** tab edits a collection's members and an
+marked, and its repair adds the other direction. The **Members** view edits a collection's members and an
 ordered collection's `skos:memberList` with the list editor of the
-[editing forms](#nested-forms-lists-and-alternatives), and the **Notes** tab edits notes
+[editing forms](#nested-forms-lists-and-alternatives), and the **Notes** view edits notes
 and documentation through a form of the built-in SKOS shapes.
 
-The **Checks** tab runs the built-in SKOS shapes over the graph
-([screenshot](../images/thesaurus-checks.png)), which check the integrity conditions of the
-SKOS Reference, and an administrator can install them as the dataset's write guard. The
+A segmented control on the resource panel chooses among these views. The **Validation**
+tab runs the built-in SKOS shapes, which check the integrity conditions of the SKOS
+Reference, over the graph ([screenshot](../images/thesaurus-checks.png)). Each result opens
+its resource beside the report, and an administrator can install them as the dataset's write guard. The
 page shares the session model of the [ontology editor](#ontology-editor). Every edit of
 the tree, labels and links is a dry run with `If-Match` before it commits, undo and redo
 revert commits, **Start session** creates a `skos.<user>.<date>` branch, another writer's
