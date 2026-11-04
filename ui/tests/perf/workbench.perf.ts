@@ -40,6 +40,7 @@ type Sidecar = {
   hubs: { iri: string; children: number }[];
   deepest: { iri: string };
   pastFirstPage: { iri: string; parent: string };
+  hubPath: string[];
 };
 const sidecar = (classes: number): Sidecar | null => {
   try {
@@ -178,9 +179,18 @@ test.describe('workbench scroll', () => {
       const cdp = await ctx.newCDPSession(page);
       const r: Record<string, unknown> = { status: 'ok', hub };
       try {
-        await page.goto(ontologyUrl(BASE, SCROLL_DS, `&iri=${encodeURIComponent(hub)}`));
-        await page.locator(rowOf(hub)).waitFor({ timeout: LOAD_TIMEOUT });
-        await page.locator(twistyOf(hub)).first().click();
+        // open the path down to the largest family by its twisties, without selecting the
+        // family, whose entity frame would list its 100,000 subclass axioms
+        await page.goto(ontologyUrl(BASE, SCROLL_DS));
+        const path = scrollTaxon!.hubPath;
+        for (const [i, iri] of path.entries()) {
+          await page.locator(rowOf(iri)).waitFor({ timeout: LOAD_TIMEOUT });
+          const row = page.locator(rowOf(iri)).first();
+          if ((await row.getAttribute('aria-expanded')) !== 'true')
+            await page.locator(twistyOf(iri)).first().click();
+          if (i + 1 < path.length)
+            await page.locator(rowOf(path[i + 1])).waitFor({ timeout: 60_000 });
+        }
         const pages: number[] = [];
         // read pages of the hub's children until 10,000 rows are loaded
         for (let i = 0; i < 14; i++) {

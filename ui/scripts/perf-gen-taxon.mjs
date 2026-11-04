@@ -25,6 +25,8 @@ const N = Number(arg('classes', '2600000'));
 const SEED = Number(arg('seed', '725'));
 const OUT = arg('out', join(homedir(), '.cache/sparkles-ui-seed', `taxon-synthetic-${N}.nt`));
 const MAX_DEPTH = 40;
+// --sidecar-only recomputes the JSON beside the file without writing the file
+const SIDECAR_ONLY = process.argv.includes('--sidecar-only');
 
 // mulberry32: a small deterministic generator
 function rng(seed) {
@@ -168,7 +170,7 @@ function word(n) {
 const iri = (n) => `<${OBO}NCBITaxon_${n}>`;
 
 mkdirSync(dirname(OUT), { recursive: true });
-const out = createWriteStream(OUT);
+const out = createWriteStream(SIDECAR_ONLY ? '/dev/null' : OUT);
 let buf = '';
 async function put(s) {
   buf += s;
@@ -219,6 +221,11 @@ for (let n = 1; n <= N; n++) {
   if (depth[n] > depth[deepest]) deepest = n;
   if (!firstChild && parent[n] === hubId) firstChild = n;
 }
+const hubPath = (n) => {
+  const out = [];
+  for (let c = n; c; c = parent[c]) out.unshift(c);
+  return out;
+};
 const at = (n) => `${OBO}NCBITaxon_${n}`;
 writeFileSync(
   OUT.replace(/\.nt$/, '.json'),
@@ -226,6 +233,8 @@ writeFileSync(
     {
       root: at(1),
       hubs: big.map((b) => ({ ...b, iri: at(b.id) })),
+      // the classes from the root down to the largest family, for opening it without selecting it
+      hubPath: hubPath(hubId).map(at),
       // a class at the bottom of the tree, and one in the middle of the largest family
       deepest: { iri: at(deepest), depth: depth[deepest] },
       pastFirstPage: { iri: at(firstChild + Math.floor(big[0].children / 2)), parent: at(hubId) },
@@ -238,7 +247,7 @@ console.log(
   JSON.stringify(
     {
       file: OUT,
-      bytes: statSync(OUT).size,
+      bytes: SIDECAR_ONLY ? 0 : statSync(OUT).size,
       classes: N,
       seed: SEED,
       maxDepth,
