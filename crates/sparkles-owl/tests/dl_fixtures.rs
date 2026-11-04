@@ -9,7 +9,7 @@
 //! and the Horn hand cases that the Horn rules take whole are listed in
 //! [`HORN_WHOLE`]'s count, so that a rule that stops taking a case shows.
 
-use sparkles_owl::classify::{Classifier, Limits};
+use sparkles_owl::classify::{Classifier, Expansion, Limits};
 use sparkles_owl::model::*;
 use sparkles_owl::ofn_read;
 use std::collections::{BTreeMap, BTreeSet};
@@ -120,11 +120,17 @@ fn the_classifier_is_sound_everywhere_and_complete_on_what_it_takes_whole() {
         let want = reference(&want, &classes);
         let mut answers = Vec::new();
         let mut whole = true;
-        for threads in [1, 4] {
+        // both expansion strategies of Tier D give one answer
+        for (threads, expansion) in [
+            (1, Expansion::Cautious),
+            (4, Expansion::Cautious),
+            (4, Expansion::Eager),
+        ] {
             let mut k = Classifier::of(&doc.axioms);
             let out = k
                 .classify(&Limits {
                     threads,
+                    expansion,
                     ..Limits::default()
                 })
                 .unwrap();
@@ -144,6 +150,11 @@ fn the_classifier_is_sound_everywhere_and_complete_on_what_it_takes_whole() {
         }
         if answers[0] != answers[1] {
             failures.push(format!("{stem}: the answer depends on the threads"));
+        }
+        if answers[1] != answers[2] {
+            failures.push(format!(
+                "{stem}: the answer depends on the expansion strategy"
+            ));
         }
         let got = &answers[0];
         let extra: Vec<_> = got.difference(&want).collect();

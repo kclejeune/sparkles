@@ -437,13 +437,23 @@ fn negations_move_to_their_side() {
 
 #[test]
 fn axioms_the_horn_rules_cannot_take_stay_left_out() {
+    // a data property keeps Tier D out, so the Horn rules take what they can
+    let (out, ex) = run("SubClassOf(:A ObjectAllValuesFrom(:r :B))
+         SubClassOf(:A ObjectUnionOf(:B :C))
+         SubClassOf(ObjectAllValuesFrom(:r :B) :D)
+         SubClassOf(:A ObjectMaxCardinality(2 :r :B))
+         SubClassOf(:E DataSomeValuesFrom(:d owl:real))");
+    assert_eq!(ex.len(), 3, "{ex:#?}");
+    assert_eq!(out.stats.outside_el.taken, 1);
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    // without it Tier D takes the union and the universals, and only the counting stays
+    // out
     let (out, ex) = run("SubClassOf(:A ObjectAllValuesFrom(:r :B))
          SubClassOf(:A ObjectUnionOf(:B :C))
          SubClassOf(ObjectAllValuesFrom(:r :B) :D)
          SubClassOf(:A ObjectMaxCardinality(2 :r :B))");
-    assert_eq!(ex.len(), 3, "{ex:#?}");
-    assert_eq!(out.stats.outside_el.taken, 1);
-    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert_eq!(ex.len(), 1, "{ex:#?}");
+    assert_eq!(out.stats.outside_el.taken, 3);
     // with an individual the run keeps the EL rules alone
     let (out, ex) = run("SubClassOf(:A ObjectAllValuesFrom(:r :B))
          ClassAssertion(:A :a)");
@@ -601,9 +611,16 @@ fn disjoint_roles_are_disjoint_on_their_inverses() {
 
 #[test]
 fn a_maximum_whose_dual_overflows_is_left_out() {
+    // a data property keeps Tier D out, so the Horn normalization meets the maximum
+    let (out, ex) = run("SubClassOf(ObjectMaxCardinality(4294967295 :r :B) :A)
+         SubClassOf(:C :A)
+         SubClassOf(:E DataSomeValuesFrom(:d owl:real))");
+    assert_eq!(ex.len(), 1, "{ex:#?}");
+    assert!(!out.taxonomy.is_subclass(&c("B"), &c("A")));
+    // Tier D reads it as ⊤ ⊑ A ⊔ ∃r.B, which no count changes without counting elsewhere
     let (out, ex) = run("SubClassOf(ObjectMaxCardinality(4294967295 :r :B) :A)
          SubClassOf(:C :A)");
-    assert_eq!(ex.len(), 1, "{ex:#?}");
+    assert!(ex.is_empty(), "{ex:#?}");
     assert!(!out.taxonomy.is_subclass(&c("B"), &c("A")));
 }
 

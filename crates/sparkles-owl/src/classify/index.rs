@@ -748,6 +748,8 @@ pub struct Axioms {
     pub classes: Vec<Ex>,
     /// what the Horn normalization adds, when the run takes axioms outside OWL 2 EL
     pub horn: Option<Box<super::horn::HornAx>>,
+    /// the clauses of Tier D, when the run takes disjunctive axioms
+    pub dl: Option<Box<super::dl_norm::DlAx>>,
 }
 
 impl Axioms {
@@ -842,6 +844,7 @@ impl Axioms {
             + self.individuals.capacity() * 4
             + self.classes.capacity() * 4
             + self.horn.as_ref().map_or(0, |h| h.bytes())
+            + self.dl.as_ref().map_or(0, |d| d.bytes())
     }
 }
 
@@ -1350,6 +1353,8 @@ pub struct Index {
     pub tops: [Option<Role>; 2],
     /// what the Horn rules read, when the run takes axioms outside OWL 2 EL
     pub horn: Option<Box<super::horn::HornIx>>,
+    /// what the rules of Tier D read, when the run takes disjunctive axioms
+    pub dl: Option<Box<super::dl_rules::DlIx>>,
 }
 
 impl Index {
@@ -1468,6 +1473,7 @@ impl Index {
             + self.nominals.capacity() * 4
             + self.roles.bytes()
             + self.horn.as_ref().map_or(0, |h| h.bytes())
+            + self.dl.as_ref().map_or(0, |d| d.bytes())
     }
 
     /// Builds the index of normalized axioms. It may intern new expressions: the
@@ -1507,6 +1513,14 @@ impl Index {
                 b.negative(e, it);
             }
         }
+        // the clauses of Tier D read their body atoms as the left sides of inclusions
+        if let Some(d) = &ax.dl {
+            for (body, _) in &d.clauses {
+                for &e in body {
+                    b.negative(e, it);
+                }
+            }
+        }
         for &(r, w, x) in &b.neg_data {
             ix.neg_data.entry(r).or_default().push((w, x));
         }
@@ -1515,6 +1529,13 @@ impl Index {
             b.positive(c, it, &mut ix);
             if a != c {
                 told.push((a, c));
+            }
+        }
+        if let Some(d) = &ax.dl {
+            for (_, head) in &d.clauses {
+                for &e in head {
+                    b.positive(e, it, &mut ix);
+                }
             }
         }
         // a reflexive role links every individual to itself, and a universal role every
@@ -1643,6 +1664,10 @@ impl Index {
         ix.keys = ax.keys.clone();
         ix.nominals = it.nominals().collect();
         ix.vals = it.vals.clone();
+        if let Some(d) = &ax.dl {
+            let dx = super::dl_rules::DlIx::new(d, &ax.disjoint, &ix, it.nodes.len());
+            ix.dl = Some(Box::new(dx));
+        }
         Ok(ix)
     }
 }
@@ -2292,6 +2317,7 @@ fn roles(
     // relate nothing
     let (inv, mut clash) = match &ax.horn {
         Some(h) => (super::horn::inverses(it), h.clash.clone()),
+        None if ax.dl.is_some() => (super::horn::inverses(it), Vec::new()),
         None => (Vec::new(), Vec::new()),
     };
     // two roles that clash clash on their inverses too
