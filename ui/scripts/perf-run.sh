@@ -48,9 +48,9 @@ group() {
   wait "$server" 2> /dev/null || true
 }
 
-PERF_ONLY=open-chebi,reveal-chebi-water,open-unesco-thesaurus group workbench -g open
-group explore
-PERF_ONLY=open-taxon PERF_LOAD_TIMEOUT_MS="${PERF_TAXON_TIMEOUT_MS:-240000}" group workbench -g open
-PERF_ONLY=reveal-taxon-deepest,reveal-taxon-past-first-page group workbench -g open
-group workbench -g scroll
+PERF_ONLY=open-chebi,reveal-chebi-water,open-unesco-thesaurus group workbench.perf -g open
+group explore.perf
+PERF_ONLY=open-taxon PERF_LOAD_TIMEOUT_MS="${PERF_TAXON_TIMEOUT_MS:-240000}" group workbench.perf -g open
+PERF_ONLY=reveal-taxon-deepest,reveal-taxon-past-first-page group workbench.perf -g open
+group workbench.perf -g scroll
 echo ALL_DONE | tee -a "$LOG"
