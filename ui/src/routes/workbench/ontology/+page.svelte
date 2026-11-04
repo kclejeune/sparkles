@@ -439,15 +439,24 @@
   );
   /** The level tree of the tab, when its kind has a hierarchy. */
   const level = $derived(kindTab ? (levelTrees.get(kindTab) ?? null) : null);
-  // a new target, graph or commit reads the open levels again
+  // a new target, graph or commit reads the open levels again, of the tree on screen now and
+  // of each other tree when its tab opens
+  let levelEpoch = $state(0);
+  const levelRead = new Map<EntityKind, number>();
   $effect(() => {
     void target;
     void graph;
-    const commit = summary?.commit;
-    if (commit == null) return;
-    untrack(() => {
-      for (const [k, t] of levelTrees) t.reset(openSet(k));
-    });
+    if (summary?.commit == null) return;
+    void summary.commit;
+    untrack(() => levelEpoch++);
+  });
+  $effect(() => {
+    const epoch = levelEpoch;
+    const k = kindTab;
+    const lt = level;
+    if (!k || !lt || !epoch || levelRead.get(k) === epoch) return;
+    levelRead.set(k, epoch);
+    untrack(() => lt.reset(openSet(k)));
   });
   function toggleLevel(k: EntityKind, id: string) {
     toggle(k, id);
@@ -514,6 +523,8 @@
     const k = kindTab;
     if (!iri || !lt || !k) return;
     void summary?.commit;
+    // after the levels were read again, which this reads the path of
+    void levelEpoch;
     untrack(() => {
       void lt.reveal(iri).then((anc) => {
         const cur = openSet(k);
