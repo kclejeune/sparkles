@@ -475,16 +475,30 @@ test('Identifiers groups the cross-references by database in the rail', async ({
   await page.goto(HEAVY);
   const facts = page.locator('.b-side').getByRole('region', { name: 'Metadata' });
   const ids = facts.getByRole('region', { name: 'Identifiers' });
-  await expect(ids.locator('dt')).toHaveText(['FMA', 'MESH', 'NCIT', 'PMID', 'Wikipedia'], {
-    timeout: 30_000,
-  });
-  // a database's ids share a row, and a well-known database links
-  const pmid = ids.locator('dd').nth(3);
-  await expect(pmid.getByRole('link')).toHaveText(['00000011', '00000012']);
-  await expect(ids.getByRole('link', { name: 'Border-associated_macrophage' })).toHaveAttribute(
+  await expect(ids.locator('dt')).toHaveText(
+    ['Other', 'FMA', 'MESH', 'NCIT', 'PMID', 'Wikipedia'],
+    {
+      timeout: 30_000,
+    },
+  );
+  // a database's ids share a row, and a well-known database links, with its id exact
+  const pmid = ids.locator('dd').nth(4);
+  const first = pmid.getByRole('link');
+  await expect(first).toHaveText(['00000011', '00000012']);
+  await expect(first.first()).toHaveAttribute('title', 'PMID:00000011');
+  // a name that reads better than its reference, with the reference kept
+  const wiki = ids.getByRole('link', { name: 'Border-associated macrophage' });
+  await expect(wiki).toHaveAttribute(
     'href',
     'https://en.wikipedia.org/wiki/Border-associated_macrophage',
   );
+  await expect(wiki).toHaveAttribute('title', 'Wikipedia:Border-associated_macrophage');
+  // an IRI this dataset knows says its label, and an outside one its readable last part
+  const known = ids.getByRole('link', { name: 'antigen-presenting border cell' });
+  await expect(known).toHaveAttribute('href', 'http://purl.obolibrary.org/obo/CL_0009006');
+  await expect(known).toHaveAttribute('title', 'http://purl.obolibrary.org/obo/CL_0009006');
+  const outside = ids.getByRole('link', { name: 'Foam cell' });
+  await expect(outside).toHaveAttribute('href', 'https://en.wikipedia.org/wiki/Foam_cell');
   await expect(ids.getByRole('button', { name: /more/ })).toHaveCount(0);
   // the identifiers left See also, and the rail keeps its order
   const also = page.getByRole('region', { name: 'See also' });
@@ -721,6 +735,71 @@ test('edit mode opens the other texts', async ({ page }) => {
   await expect(notes).toHaveAttribute('open');
   await expect(notes.locator('li[data-kind="History note"]')).toBeVisible();
   await expect(page.locator('details[data-more="comment"] li').first()).toBeVisible();
+});
+
+test('the header writes the IRI as the switch says and copies it in full', async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.goto(HEAVY);
+  const full = 'http://purl.obolibrary.org/obo/CL_0009001';
+  const iri = page.locator('.term-head .iri-text');
+  await expect(iri.locator('[aria-hidden="true"]')).toHaveText('obo:CL_0009001', {
+    timeout: 30_000,
+  });
+  await expect(iri).toHaveAttribute('title', full);
+  await expect(iri.locator('.sr-only')).toHaveText(full);
+  await page.getByRole('button', { name: 'Copy the IRI' }).click();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(full);
+  // who chose full IRIs sees the full form
+  await page.getByRole('button', { name: 'Prefixed' }).click();
+  await expect(iri).toHaveText(full);
+  await expect(iri.locator('[aria-hidden="true"]')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Full IRIs' }).click();
+  await expect(iri.locator('[aria-hidden="true"]')).toHaveText('obo:CL_0009001');
+  // with no prefix the IRI is whole, and copying gives the same
+  const none = 'http://example.org/no-prefix-here/Thing';
+  await page.route(/\/\$\/ontology\/cells\/term\?/, async (route) => {
+    const res = await route.fetch();
+    const t = await res.json();
+    await route.fulfill({ response: res, json: { ...t, iri: none } });
+  });
+  await page.reload();
+  await expect(iri).toHaveText(none, { timeout: 30_000 });
+  await expect(iri).toHaveAttribute('title', none);
+  await expect(iri.locator('.sr-only')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Copy the IRI' }).click();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(none);
+});
+
+test('a concept keeps its hidden labels behind their toggle', async ({ page }) => {
+  const concept = (l: string) =>
+    `/ui/browse?ds=thes&iri=${encodeURIComponent(`http://example.org/thesaurus/${l}`)}`;
+  await page.goto(concept('insects'));
+  const labels = page.getByRole('region', { name: 'Labels', exact: true });
+  await expect(labels.locator('dt').first()).toHaveText('Preferred', { timeout: 30_000 });
+  // off at first, and nothing else on the page says them or counts them
+  await expect(labels.locator('dt')).not.toContainText(['Hidden']);
+  await expect(labels).toContainText('1 hidden label is not shown.');
+  await expect(page.locator('main')).not.toContainText('insekts');
+  await expect(
+    page.getByRole('navigation', { name: 'Counts' }).getByRole('link', { name: /synonym/ }),
+  ).toHaveCount(0);
+  // on, a row of its own, and off again
+  await labels.getByRole('button', { name: 'Show them' }).click();
+  const row = labels.locator('.term-row', { hasText: 'Hidden' });
+  await expect(row.locator('dd')).toContainText('insekts');
+  await expect(row.locator('.lang-tag')).toHaveText('en');
+  await expect(labels).toContainText('Hidden labels are shown.');
+  await expect(page.locator('#syn-h')).toHaveCount(0);
+  await labels.getByRole('button', { name: 'Hide them' }).click();
+  await expect(page.locator('main')).not.toContainText('insekts');
+  // a concept with none has no toggle
+  await page.goto(concept('fish'));
+  await expect(labels.locator('dt').first()).toHaveText('Preferred', { timeout: 30_000 });
+  await expect(labels.getByRole('button')).toHaveCount(0);
+  await expect(labels).not.toContainText('hidden');
 });
 
 test('a concept lists its labels by kind, in every language', async ({ page }) => {

@@ -514,9 +514,13 @@ Double-clicking a node there adds that entity's neighbourhood, and **Open in Exp
 the entity there. **Ask about this** opens the Ask drawer with the entity as its
 context.
 
-A SKOS concept gets its **Labels** as rows in the style of the synonyms, Preferred, Alternative and
-Hidden, with every value in every language and its language tag, which replace the alternative and
-hidden labels in Synonyms, and its related concepts and mappings. Identifiers in well-known databases such as Wikipedia, PubMed and DOI are links. A class that is defined by an expression shows it as a **Logical definition**
+A SKOS concept gets its **Labels** as rows in the style of the synonyms, Preferred and Alternative,
+with every value in every language and its language tag, and its related concepts and mappings. Its
+hidden labels stay behind a **Show them** toggle that adds a Hidden row, and neither Synonyms nor the
+count of synonyms includes them. Identifiers in well-known databases such as Wikipedia, PubMed and DOI are links. An identifier says
+the label this dataset gives its target, or else its short id exactly, or for an IRI a prefixed name
+or its readable last part, and Wikipedia's names read as titles. Its title holds the exact value, and
+the page reads nothing from another host to name it. A class that is defined by an expression shows it as a **Logical definition**
 under its texts, and only class expressions count, never the other axioms.
 **What links here** lists the axioms of other entities that mention it, grouped under smaller
 headings by the restriction that holds it as in "part of some mitochondrion", then the other

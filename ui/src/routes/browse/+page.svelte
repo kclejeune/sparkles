@@ -330,16 +330,18 @@
 
   const sections = $derived(term ? termSections(term, langs) : null);
   // The term route names the entities its statements and axioms use, which leaves out a synonym
-  // type that only an axiom annotation's value names, so the labels it lacks are read here.
+  // type that only an axiom annotation's value names and a cross-reference written as a string, so
+  // the labels it lacks are read here, in one query from this dataset alone.
   let typeLabels = $state<Map<string, string>>(new Map());
   $effect(() => {
     const t = term;
     const names = t?.names ?? {};
     const want = [
       ...new Set(
-        (sections?.synonyms ?? [])
-          .flatMap((g) => g.values.flatMap((v) => v.types))
-          .filter((i) => !names[i]?.label && /^(https?|urn):/.test(i)),
+        [
+          ...(sections?.synonyms ?? []).flatMap((g) => g.values.flatMap((v) => v.types)),
+          ...(sections?.xrefs ?? []).map((x) => x.value),
+        ].filter((i) => !names[i]?.label && /^(https?|urn):/.test(i)),
       ),
     ];
     if (!want.length) {
@@ -475,7 +477,10 @@
       label: 'Synonyms',
       one: 'synonym',
       many: 'synonyms',
-      n: sections.synonyms.reduce((n, g) => n + g.values.length, 0),
+      // a SKOS resource's hidden labels wait behind their toggle, so the count leaves them out
+      n: sections.synonyms
+        .filter((g) => !isSkos || g.kind !== 'Hidden')
+        .reduce((n, g) => n + g.values.length, 0),
       href: synonymRows.length ? '#syn-h' : '#labels-h',
     });
     out.push({
@@ -1248,6 +1253,7 @@
         <div class="b-head">
           <TermHeader
             name={term}
+            {prefixes}
             {title}
             {kind}
             crumbs={[
@@ -1672,7 +1678,11 @@
           <div class="b-info">
             <TermInfobox rows={infoRows} {linker} heading="Metadata">
               {#snippet footer()}
-                <TermIdentifiers xrefs={sections!.xrefs} />
+                <TermIdentifiers
+                  xrefs={sections!.xrefs}
+                  {prefixes}
+                  label={(i) => term?.names[i]?.label ?? typeLabels.get(i) ?? null}
+                />
                 <DownloadButtons
                   noun="this {kind}"
                   href={(f) => branchPath(downloadHref(target, sel, term!.iri, f))}

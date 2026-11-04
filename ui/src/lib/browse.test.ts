@@ -26,6 +26,7 @@ import {
   leadDisclosures,
   labelKinds,
   hiddenRows,
+  xrefName,
   xrefsByDatabase,
   oboIri,
   parseCounts,
@@ -1060,5 +1061,57 @@ describe('the labels by kind', () => {
         ],
       },
     ]);
+  });
+});
+
+describe('the name of a cross-reference', () => {
+  const OBO_IRI = 'http://purl.obolibrary.org/obo/CL_1';
+  const prefixes = { obo: 'http://purl.obolibrary.org/obo/' };
+  const none = () => null;
+  const name = (
+    value: string,
+    database = '',
+    id = value,
+    label: (i: string) => string | null = none,
+  ) => xrefName({ database, id, value }, label, prefixes);
+
+  it('takes the label this dataset gives the target first', () => {
+    expect(name(OBO_IRI, '', OBO_IRI, () => 'a cell')).toBe('a cell');
+  });
+  it('keeps an opaque id exact', () => {
+    expect(name('PMID:00000011', 'PMID', '00000011')).toBe('00000011');
+    expect(name('MESH:D000001', 'MESH', 'D000001')).toBe('D000001');
+    expect(name('FIXTURE:a_b%20c', 'FIXTURE', 'a_b%20c')).toBe('a_b%20c');
+    expect(name('plain')).toBe('plain');
+  });
+  it('asks for a label only of an IRI', () => {
+    const asked: string[] = [];
+    name('PMID:1', 'PMID', '1', (i) => (asked.push(i), 'no'));
+    expect(asked).toEqual([]);
+  });
+  it('reads a Wikipedia name as a title, as a reference or as an IRI', () => {
+    expect(
+      name('Wikipedia:Border-associated_macrophage', 'Wikipedia', 'Border-associated_macrophage'),
+    ).toBe('Border-associated macrophage');
+    expect(name('https://en.wikipedia.org/wiki/Foam_cell')).toBe('Foam cell');
+    expect(name('https://en.wikipedia.org/wiki/AC/DC')).toBe('AC/DC');
+    expect(name('https://en.wikipedia.org/wiki/Caf%C3%A9_au_lait')).toBe('Café au lait');
+  });
+  it('gives an IRI a prefixed name, or else its last part', () => {
+    expect(name(OBO_IRI)).toBe('obo:CL_1');
+    expect(name('https://example.org/refs/a%20b/')).toBe('a b');
+    expect(name('https://example.org/vocab#Thing')).toBe('Thing');
+    expect(name('https://doi.org/10.1000/xyz')).toBe('10.1000/xyz');
+    // not on another host's /wiki/, whose underscores may mean themselves
+    expect(name('https://example.org/wiki/a_b')).toBe('a_b');
+  });
+  it('keeps an IRI whole when no part of it names the target or decoding is not faithful', () => {
+    expect(name('https://example.org/page?id=5')).toBe('https://example.org/page?id=5');
+    expect(name('https://example.org/')).toBe('https://example.org/');
+    expect(name('https://example.org/a%2Fb')).toBe('a%2Fb');
+    expect(name('https://example.org/%E0%A4%A')).toBe('%E0%A4%A');
+  });
+  it('leaves an unsafe scheme as text and never reads it as an IRI', () => {
+    expect(name('javascript:alert(1)', 'javascript', 'alert(1)', () => 'no')).toBe('alert(1)');
   });
 });

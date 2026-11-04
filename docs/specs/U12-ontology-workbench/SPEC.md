@@ -523,7 +523,8 @@ links here and In other datasets are sections on the page background with headin
 and Replaces stays a smaller group within What links here. In other datasets waits for the
 dataset list and for its answers, and a server with no other dataset has no such section. Counts of
 zero are hidden, a term with no text shows no line about it, and a concept's labels are rows by
-kind in place of a table. A phone puts Metadata and Hierarchy before Axioms.
+kind in place of a table, with hidden labels behind their toggle. Identifiers say the best name the
+page already has for them, and keep the exact value as their title. A phone puts Metadata and Hierarchy before Axioms.
 
 **Remaining work.** Inferred axioms and hierarchies beyond the card's click are items 622 and
 726, search at a past state item 658, rendering preferences item 625, metrics item 621

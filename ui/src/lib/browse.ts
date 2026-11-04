@@ -17,7 +17,7 @@ import {
   type Lit,
   type ManchesterToken,
 } from './ontology';
-import { localName, WELL_KNOWN, type PrefixMap } from './rdf';
+import { localName, shorten, WELL_KNOWN, type PrefixMap } from './rdf';
 import { browsePath, editorOf, workbenchPath } from './routes';
 
 const enc = encodeURIComponent;
@@ -1269,6 +1269,54 @@ export function xrefsByDatabase(xrefs: Sections['xrefs']) {
   const by = new Map<string, Sections['xrefs']>();
   for (const x of xrefs) by.set(x.database, [...(by.get(x.database) ?? []), x]);
   return [...by.entries()].map(([database, ids]) => ({ database, ids }));
+}
+
+/** A percent-decoded part of a reference, unchanged when decoding would not be faithful. */
+function decodedPart(s: string): string {
+  try {
+    const d = decodeURIComponent(s);
+    // an encoded slash or control character changes what the text says it is
+    return /[/\u0000-\u001f\u007f]/.test(d) ? s : d;
+  } catch {
+    return s;
+  }
+}
+
+/** A Wikipedia page's title from its name in a link, whose underscores stand for spaces. */
+const wikipediaTitle = (s: string) => decodedPart(s).replace(/_/g, ' ');
+
+/**
+ * A readable form of an http or https IRI: a Wikipedia title, a DOI whole, or else the fragment or
+ * last path segment. An IRI with a query or nothing after its host stays whole, since no part of
+ * it names what it points at.
+ */
+function readableIri(iri: string): string {
+  const m = /^https?:\/\/([^/?#]+)([^?#]*)(\?[^#]*)?(?:#(.*))?$/.exec(iri);
+  if (!m || m[3]) return iri;
+  const [, host, path, , fragment] = m;
+  const wiki = /^\/wiki\/(.+)$/.exec(path);
+  if (wiki && !fragment && /(^|\.)wikipedia\.org$/i.test(host)) return wikipediaTitle(wiki[1]);
+  if (!fragment && /(^|\.)doi\.org$/i.test(host) && path.length > 1) return path.slice(1);
+  if (fragment) return decodedPart(fragment);
+  const last = path.split('/').filter(Boolean).at(-1);
+  return last ? decodedPart(last) : iri;
+}
+
+/**
+ * What a cross-reference's link says: the label this dataset gives its target, or else its short
+ * id under the database's name, or for an IRI a prefixed name or `readableIri`. Only Wikipedia's
+ * names change, since its underscores are known to stand for spaces, and any other id stays exact.
+ */
+export function xrefName(
+  x: Pick<Sections['xrefs'][number], 'database' | 'id' | 'value'>,
+  label: (iri: string) => string | null | undefined,
+  prefixes: PrefixMap,
+): string {
+  const known = /^(https?|urn):/.test(x.value) ? label(x.value) : null;
+  if (known) return known;
+  if (/^https?:/.test(x.value)) return shorten(x.value, prefixes) ?? readableIri(x.value);
+  if (x.database.toLowerCase() === 'wikipedia') return wikipediaTitle(x.id);
+  return x.id;
 }
 
 /**

@@ -215,7 +215,8 @@ Note: this text was written for a test fixture and is not taken from a published
   skos:changeNote "The French label was added in the same release."@en ;
   oboInOwl:hasExactSynonym "BAM"@en , "CNS border macrophage"@en , "central nervous system border macrophage"@en ;
   oboInOwl:hasRelatedSynonym "meningeal macrophage"@en , "perivascular macrophage"@en , "choroid plexus macrophage"@en ;
-  oboInOwl:hasDbXref "PMID:00000011" , "PMID:00000012" , "FMA:00002" , "MESH:D000001" , "NCIT:C00001" , "Wikipedia:Border-associated_macrophage" ;
+  oboInOwl:hasDbXref "PMID:00000011" , "PMID:00000012" , "FMA:00002" , "MESH:D000001" , "NCIT:C00001" , "Wikipedia:Border-associated_macrophage" ,
+    obo:CL_0009006 , <https://en.wikipedia.org/wiki/Foam_cell> ;
   rdfs:seeAlso <http://example.org/reviews/brain-macrophages> .
 obo:CL_0009002 a owl:Class ; rdfs:subClassOf obo:CL_0009001 ; rdfs:label "meningeal macrophage"@en .
 obo:CL_0009003 a owl:Class ; rdfs:subClassOf obo:CL_0009001 ; rdfs:label "choroid plexus macrophage"@en .

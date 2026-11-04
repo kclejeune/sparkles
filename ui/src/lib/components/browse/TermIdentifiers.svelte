@@ -1,10 +1,23 @@
 <script lang="ts">
   // The identifiers of an entity in other databases, for the Metadata card: the database in a
   // short column and the ids after it as links, a database's ids on one line. The first rows
-  // show and the rest open on request.
-  import { hiddenRows, xrefsByDatabase, type Sections } from '$lib/browse';
+  // show and the rest open on request. Each says the best name there is, and keeps the exact
+  // value as its title and its link target.
+  import { hiddenRows, xrefName, xrefsByDatabase, type Sections } from '$lib/browse';
+  import type { PrefixMap } from '$lib/rdf';
 
-  let { xrefs, limit = 8 }: { xrefs: Sections['xrefs']; limit?: number } = $props();
+  let {
+    xrefs,
+    label,
+    prefixes,
+    limit = 8,
+  }: {
+    xrefs: Sections['xrefs'];
+    /** The label this dataset gives an IRI, which the page has already read. */
+    label: (iri: string) => string | null | undefined;
+    prefixes: PrefixMap;
+    limit?: number;
+  } = $props();
 
   const rows = $derived(xrefsByDatabase(xrefs));
   let all = $state(false);
@@ -20,9 +33,10 @@
         <dd>
           {#each r.ids as x, i (x.value)}{#if i > 0},{' '}{/if}{#if x.href}<a
                 href={x.href}
+                title={x.value}
                 rel="noopener noreferrer"
-                target="_blank">{x.id}</a
-              >{:else}{x.id}{/if}{/each}
+                target="_blank">{xrefName(x, label, prefixes)}</a
+              >{:else}<span title={x.value}>{xrefName(x, label, prefixes)}</span>{/if}{/each}
         </dd>
       {/each}
     </dl>

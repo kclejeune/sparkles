@@ -9,6 +9,7 @@
   import PageActions from '$components/PageActions.svelte';
   import LinkedText from './LinkedText.svelte';
   import { valueText } from '$lib/browse';
+  import { displayIri, type PrefixMap } from '$lib/rdf';
 
   let {
     name,
@@ -20,6 +21,7 @@
     consider = [],
     linker,
     curieIri,
+    prefixes = {},
     actions,
   }: {
     name: Pick<Name, 'iri' | 'shortForm' | 'deprecated'>;
@@ -32,8 +34,12 @@
     consider?: string[];
     linker: Linker;
     curieIri?: (curie: string) => string | null;
+    prefixes?: PrefixMap;
     actions?: Snippet;
   } = $props();
+
+  // as the Full/Prefixed switch writes it, with the prefix the rest of the page shows
+  const shownIri = $derived(displayIri(name.iri, prefixes));
 
   async function copy() {
     try {
@@ -62,7 +68,12 @@
     {#if name.shortForm && name.shortForm !== title}<span class="sf">{name.shortForm}</span>{/if}
     <span class="badge iri">{kind}</span>
     {#if name.deprecated}<span class="badge danger">deprecated</span>{/if}
-    <span class="iri-text">{name.iri}</span>
+    <!-- the prefixed form is for the eye, and a screen reader hears the full IRI that it copies -->
+    {#if shownIri === name.iri}<span class="iri-text" title={name.iri}>{name.iri}</span>{:else}<span
+        class="iri-text"
+        title={name.iri}
+        ><span class="sr-only">{name.iri}</span><span aria-hidden="true">{shownIri}</span></span
+      >{/if}
     <button
       class="btn icon sm ghost copy"
       type="button"
