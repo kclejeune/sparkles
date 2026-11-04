@@ -2193,9 +2193,49 @@ mod classification {
         (true, c)
     }
 
-    /// Classifies the cases under deadlines from a small fraction of a full run's time
-    /// upwards, each on a dataset of its own, and answers the consistencies of the
-    /// partial answers.
+    /// Finds the saturation of a classification by its deadline. The deadlines rise by 8
+    /// percent from 2 ms until one of them gives an answer instead of a timeout, which
+    /// has run out in the saturation, since that is the first part of a run that can stop
+    /// with an answer. The step may be longer than the saturation, so the milliseconds
+    /// between the last timeout and that answer are halved until they are one apart. The
+    /// deadlines go on until twenty have answered or `limit` is reached. A ladder fixed
+    /// from the time of a full run misses a saturation of some milliseconds on a loaded
+    /// machine. `answers` runs a classification under a deadline and says whether it
+    /// answered.
+    fn deadline_ladder(
+        limit: std::time::Duration,
+        mut answers: impl FnMut(std::time::Duration) -> bool,
+    ) {
+        let limit = limit.as_millis().max(2000) as u64;
+        let after = |ms: u64| ms + (ms * 8 / 100).max(1);
+        let answered = std::cell::Cell::new(0);
+        let mut run = |ms: u64| {
+            let ok = answers(std::time::Duration::from_millis(ms));
+            answered.set(answered.get() + ok as usize);
+            ok
+        };
+        let (mut lo, mut ms) = (0, 2);
+        while ms < limit && !run(ms) {
+            lo = ms;
+            ms = after(ms);
+        }
+        let mut hi = ms;
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if run(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        while answered.get() < 20 && ms < limit {
+            ms = after(ms);
+            run(ms);
+        }
+    }
+
+    /// Classifies the cases under deadlines that [`deadline_ladder`] finds, each on a
+    /// dataset of its own, and answers the consistencies of the partial answers.
     fn under_deadlines(inconsistent: bool) -> Vec<&'static str> {
         let n = if cfg!(debug_assertions) { 120 } else { 400 };
         let body = cases(n, inconsistent);
@@ -2218,20 +2258,62 @@ mod classification {
         assert_eq!(full.classification.consistent, !inconsistent);
         assert_eq!(full.classification.stats.tier.as_str(), "disjunctive");
         let mut partial = Vec::new();
-        let mut f = 0.02;
-        while f < 1.5 {
+        deadline_ladder(took * 20, |timeout| {
             let ds = dataset(&body);
             let o = QueryOptions {
-                timeout: Some(took.mul_f64(f)),
+                timeout: Some(timeout),
                 ..opts()
             };
-            if let Ok(part) = ds.ontology().classify(&req, &partial_request(), &o) {
-                let (p, c) = check_answer(&ds, &part, &full);
-                if p {
-                    partial.push(c);
-                }
+            let Ok(part) = ds.ontology().classify(&req, &partial_request(), &o) else {
+                return false;
+            };
+            let (p, c) = check_answer(&ds, &part, &full);
+            if p {
+                partial.push(c);
             }
-            f *= 1.25;
+            true
+        });
+        partial
+    }
+
+    /// Classifies the cases on one thread under memory budgets from a twentieth of the
+    /// full run's peak to nearly all of it, each on a dataset of its own, and answers the
+    /// consistencies of the partial answers. A run stops at the same place under the
+    /// same budget on every machine, where a deadline stops it at a place that depends on
+    /// the speed of the machine and its load, so this ladder is the proof that a stop
+    /// can leave the consistency unknown.
+    fn under_budgets(inconsistent: bool) -> Vec<&'static str> {
+        let n = if cfg!(debug_assertions) { 120 } else { 400 };
+        let body = cases(n, inconsistent);
+        let req = OntologyRequest::default();
+        let full = dataset(&body)
+            .ontology()
+            .classify(&req, &partial_request(), &opts())
+            .unwrap();
+        assert!(full.classification.complete);
+        assert_eq!(full.classification.consistent, !inconsistent);
+        assert_eq!(full.classification.stats.tier.as_str(), "disjunctive");
+        let peak = full.classification.stats.peak_memory as u64;
+        let mut partial = Vec::new();
+        for k in 1..20 {
+            let ds = dataset(&body);
+            let o = QueryOptions {
+                max_memory_bytes: Some(peak * k / 20),
+                ..opts()
+            };
+            // a budget under the size of the ontology and its index refuses the run
+            let Ok(part) = ds.ontology().classify(&req, &partial_request(), &o) else {
+                continue;
+            };
+            // a budget past the one of the disjunctive rules runs the EL rules instead,
+            // whose answer leaves the disjunctive axioms out and is no stop
+            if !part.excluded.is_empty() {
+                continue;
+            }
+            let (p, c) = check_answer(&ds, &part, &full);
+            if p {
+                partial.push(c);
+            }
         }
         partial
     }
@@ -2241,15 +2323,21 @@ mod classification {
         let seen = under_deadlines(false);
         assert!(!seen.is_empty(), "no deadline gave a partial answer");
         assert!(!seen.contains(&"inconsistent"));
+        let seen = under_budgets(false);
+        assert!(!seen.is_empty(), "no budget gave a partial answer");
+        assert!(!seen.contains(&"inconsistent"));
     }
 
     #[test]
     fn a_stop_before_the_inconsistency_is_found_leaves_it_unknown() {
-        let seen = under_deadlines(true);
+        let seen = under_budgets(true);
         assert!(
             seen.contains(&"unknown"),
-            "no partial answer left the consistency unknown: {seen:?}"
+            "no budget left the consistency unknown: {seen:?}"
         );
+        // the deadlines check every answer, and a stop of the clock may or may not come
+        // before the inconsistency is found
+        under_deadlines(true);
     }
 
     #[test]
@@ -2326,24 +2414,28 @@ mod classification {
             ds.ontology().classify(&req, &writes, &opts()),
             Err(Error::Invalid(_))
         ));
-        // the first deadline that answers in part, each on a dataset of its own
-        let mut t = std::time::Duration::from_millis(1);
-        let (ds, part) = loop {
-            assert!(
-                t < std::time::Duration::from_secs(120),
-                "no deadline answered in part"
-            );
-            let ds = dataset(&body);
-            let o = QueryOptions {
-                timeout: Some(t),
-                ..opts()
-            };
-            let r = ds.ontology().classify(&req, &partial_request(), &o);
-            match r {
-                Ok(c) if !c.classification.complete => break (ds, c),
-                _ => t = t.mul_f64(1.2),
-            }
-        };
+        // the first memory budget that answers in part, each on a dataset of its own, since
+        // a budget stops the run at the same place on every machine
+        let peak = dataset(&body)
+            .ontology()
+            .classify(&req, &partial_request(), &opts())
+            .unwrap()
+            .classification
+            .stats
+            .peak_memory as u64;
+        let (ds, part) = (1..20)
+            .find_map(|k| {
+                let ds = dataset(&body);
+                let o = QueryOptions {
+                    max_memory_bytes: Some(peak * k / 20),
+                    ..opts()
+                };
+                match ds.ontology().classify(&req, &partial_request(), &o) {
+                    Ok(c) if !c.classification.complete => Some((ds, c)),
+                    _ => None,
+                }
+            })
+            .expect("no budget answered in part");
         let h = ds.ontology();
         assert!(!part.complete());
         let next = h

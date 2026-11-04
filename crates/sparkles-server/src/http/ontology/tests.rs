@@ -697,10 +697,19 @@ fn cases(n: usize, inconsistent: bool) -> String {
 
 /// A server whose dataset `t` holds `data` in Turtle.
 fn server_of(data: &str) -> Server {
+    server_with_memory(data, None)
+}
+
+/// A server whose dataset `t` holds `data` in Turtle, and whose queries have a memory budget
+/// of `memory` bytes in place of the default one when it is given.
+fn server_with_memory(data: &str, memory: Option<u64>) -> Server {
     let dir = tempfile::tempdir().unwrap();
-    let state = Arc::new(
-        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
-    );
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    if memory.is_some() {
+        st.limits.query_memory_bytes = memory;
+    }
+    let state = Arc::new(st);
     let ds = state.attach("t", DbType::Mem, None).unwrap();
     ds.store
         .load(&[Source::from_bytes(
@@ -717,18 +726,20 @@ fn server_of(data: &str) -> Server {
     }
 }
 
-/// Classifies the cases over HTTP under deadlines from a small fraction of a full run's
-/// time upwards, checks each answer and returns the consistencies of the partial ones.
-async fn partial_over_http(inconsistent: bool) -> Vec<String> {
-    let n = if cfg!(debug_assertions) { 120 } else { 400 };
-    let s = server_of(&cases(n, inconsistent));
+/// The size of the cases that a debug build takes.
+fn case_count() -> usize {
+    if cfg!(debug_assertions) { 120 } else { 400 }
+}
+
+/// The full answer to the cases on one thread, from a server of its own, and the time of
+/// the call.
+async fn whole_over_http(inconsistent: bool) -> (serde_json::Value, f64) {
     let body = json!({"partial": true, "threads": 1, "limit": 10000});
     let t = std::time::Instant::now();
-    // a fresh server for the full run, since the dataset keeps a complete taxonomy
     let full = post(
-        &server_of(&cases(n, inconsistent)).app,
+        &server_of(&cases(case_count(), inconsistent)).app,
         "/$/ontology/t/classify",
-        body.clone(),
+        body,
     )
     .await
     .json();
@@ -743,49 +754,151 @@ async fn partial_over_http(inconsistent: bool) -> Vec<String> {
     };
     assert_eq!(full["consistency"], want, "{full}");
     assert_eq!(full["consistent"], !inconsistent, "{full}");
-    let classes = full["classes"].clone();
-    let mut seen = Vec::new();
-    let mut f = 0.02;
-    while f < 1.5 {
-        let r = post(
-            &s.app,
-            &format!("/$/ontology/t/classify?timeout={}", took * f),
-            body.clone(),
-        )
-        .await;
-        f *= 1.25;
-        if r.status == StatusCode::REQUEST_TIMEOUT {
-            continue;
+    (full, took)
+}
+
+/// Classifies the cases on one thread on a server of its own, which keeps a complete
+/// answer for the next call, with the query string `query` and the memory budget
+/// `memory`. Checks the answer against the full one and returns the consistency of a
+/// partial answer, `Some(None)` for a complete one, and `None` when the call ended with the
+/// status `refused`.
+async fn stopped_over_http(
+    inconsistent: bool,
+    full: &serde_json::Value,
+    query: &str,
+    memory: Option<u64>,
+    refused: StatusCode,
+) -> Option<Option<String>> {
+    let s = server_with_memory(&cases(case_count(), inconsistent), memory);
+    let r = post(
+        &s.app,
+        &format!("/$/ontology/t/classify{query}"),
+        json!({"partial": true, "threads": 1, "limit": 10000}),
+    )
+    .await;
+    if r.status == refused {
+        // a stop before the saturation fails as before: a deadline times out, and a
+        // budget under the size of the ontology and its index is refused
+        return None;
+    }
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let want = if inconsistent {
+        "inconsistent"
+    } else {
+        "consistent"
+    };
+    let j = r.json();
+    assert_eq!(j["classes"], full["classes"], "{j}");
+    if j["partial"] == false {
+        if j["complete"] == false {
+            // a budget past the one of the disjunctive rules runs the EL rules instead,
+            // whose answer leaves the disjunctive axioms out
+            assert!(j["excludedCount"].as_u64() > Some(0), "{j}");
+            return None;
         }
-        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-        let j = r.json();
-        assert_eq!(j["classes"], classes, "{j}");
-        if j["partial"] == false {
-            assert_eq!(j["complete"], true, "{j}");
-            assert_eq!(j["consistency"], want, "{j}");
-            assert_eq!(j["incompleteCount"], 0, "{j}");
-            continue;
-        }
-        assert_eq!(
-            j["complete"], false,
-            "a partial answer is presented as complete: {j}"
-        );
-        let open = j["incomplete"].as_array().unwrap();
-        assert_eq!(
-            j["incompleteCount"].as_u64(),
-            Some(open.len() as u64),
+        assert_eq!(j["consistency"], want, "{j}");
+        assert_eq!(j["incompleteCount"], 0, "{j}");
+        return Some(None);
+    }
+    assert_eq!(
+        j["complete"], false,
+        "a partial answer is presented as complete: {j}"
+    );
+    let open = j["incomplete"].as_array().unwrap();
+    assert_eq!(
+        j["incompleteCount"].as_u64(),
+        Some(open.len() as u64),
+        "{j}"
+    );
+    let c = j["consistency"].as_str().unwrap().to_string();
+    assert!(c == want || c == "unknown", "{j}");
+    if c == "unknown" {
+        // every class but owl:Thing and owl:Nothing is open
+        assert!(
+            open.len() as u64 + 2 >= j["classes"].as_u64().unwrap(),
             "{j}"
         );
-        let c = j["consistency"].as_str().unwrap().to_string();
-        assert!(c == want || c == "unknown", "{j}");
-        if c == "unknown" {
-            // every class but owl:Thing and owl:Nothing is open
-            assert!(
-                open.len() as u64 + 2 >= j["classes"].as_u64().unwrap(),
-                "{j}"
-            );
+    }
+    Some(Some(c))
+}
+
+/// Classifies the cases over HTTP under deadlines that find the saturation, checks each
+/// answer and returns the consistencies of the partial ones. The deadlines rise by 8
+/// percent from 2 ms until one of them gives an answer instead of a timeout, which has
+/// run out in the saturation, since that is the first part of a run that can stop with an
+/// answer. The step may be longer than the saturation, so the milliseconds between the
+/// last timeout and that answer are halved until they are one apart. The deadlines go on
+/// until twenty have answered. A ladder fixed from the time of a full run misses a
+/// saturation of some milliseconds on a loaded machine.
+async fn partial_over_http(inconsistent: bool) -> Vec<String> {
+    let (full, took) = whole_over_http(inconsistent).await;
+    let limit = ((took * 20000.0) as u64).max(2000);
+    let after = |ms: u64| ms + (ms * 8 / 100).max(1);
+    let mut seen = Vec::new();
+    let mut answered = 0;
+    // whether a classification under a deadline of `ms` milliseconds answered
+    async fn run(
+        inconsistent: bool,
+        full: &serde_json::Value,
+        ms: u64,
+        answered: &mut usize,
+        seen: &mut Vec<String>,
+    ) -> bool {
+        let query = format!("?timeout={}", ms as f64 / 1000.0);
+        let r = stopped_over_http(
+            inconsistent,
+            full,
+            &query,
+            None,
+            StatusCode::REQUEST_TIMEOUT,
+        )
+        .await;
+        if let Some(c) = &r {
+            *answered += 1;
+            seen.extend(c.clone());
         }
-        seen.push(c);
+        r.is_some()
+    }
+    let (mut lo, mut ms) = (0, 2);
+    while ms < limit && !run(inconsistent, &full, ms, &mut answered, &mut seen).await {
+        lo = ms;
+        ms = after(ms);
+    }
+    let mut hi = ms;
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if run(inconsistent, &full, mid, &mut answered, &mut seen).await {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    while answered < 20 && ms < limit {
+        ms = after(ms);
+        run(inconsistent, &full, ms, &mut answered, &mut seen).await;
+    }
+    seen
+}
+
+/// Classifies the cases over HTTP under the server's memory budget, from a twentieth of
+/// the full run's estimate to nearly all of it, checks each answer and returns the
+/// consistencies of the partial ones. A run stops at the same place under the same budget
+/// on every machine, where a deadline stops it at a place that depends on the speed of
+/// the machine and its load.
+async fn partial_over_http_under_budgets(inconsistent: bool) -> Vec<String> {
+    let (full, _) = whole_over_http(inconsistent).await;
+    let estimate = full["stats"]["estimatedBytes"].as_u64().unwrap();
+    let mut seen = Vec::new();
+    for k in 1..20 {
+        let r = stopped_over_http(
+            inconsistent,
+            &full,
+            "",
+            Some(estimate * k / 20),
+            StatusCode::INSUFFICIENT_STORAGE,
+        )
+        .await;
+        seen.extend(r.flatten());
     }
     seen
 }
@@ -794,6 +907,8 @@ async fn partial_over_http(inconsistent: bool) -> Vec<String> {
 async fn classify_answers_in_part_under_a_deadline() {
     let seen = partial_over_http(false).await;
     assert!(!seen.is_empty(), "no deadline gave a partial answer");
+    let seen = partial_over_http_under_budgets(false).await;
+    assert!(!seen.is_empty(), "no budget gave a partial answer");
     let s = server();
     // a partial answer cannot be written or answered as a functional-style document
     let r = post(
@@ -848,8 +963,14 @@ async fn classify_answers_in_part_under_a_deadline() {
 
 #[tokio::test]
 async fn classify_leaves_the_consistency_unknown_when_stopped_early() {
-    let seen = partial_over_http(true).await;
-    assert!(seen.iter().any(|c| c == "unknown"), "{seen:?}");
+    let seen = partial_over_http_under_budgets(true).await;
+    assert!(
+        seen.iter().any(|c| c == "unknown"),
+        "no budget left the consistency unknown: {seen:?}"
+    );
+    // the deadlines check every answer, and a stop of the clock may or may not come
+    // before the inconsistency is found
+    partial_over_http(true).await;
 }
 
 /// Every quad of dataset `t`, as sorted N-Quads lines.

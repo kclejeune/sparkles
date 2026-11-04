@@ -375,8 +375,15 @@ def cases(n: int, inconsistent: bool) -> str:
 
 
 def partial_answers(inconsistent: bool) -> list[str]:
-    """Classify the cases under deadlines from a fraction of a full run's time upwards,
-    check every answer and return the consistencies of the partial ones."""
+    """Classify the cases under deadlines that find the saturation, check every answer and
+    return the consistencies of the partial ones.
+
+    The deadlines rise by a few percent from a short one until one gives an answer instead
+    of a timeout, which has run out in the saturation, since that is the first part of a
+    run that can stop with an answer. The step may be longer than the saturation, so the
+    time between the last timeout and that answer is halved until the deadlines are a
+    millisecond apart. The deadlines go on until twenty have answered. A ladder fixed from
+    the time of a full run misses a saturation of some milliseconds on a loaded machine."""
     import time
 
     body = f"{PREFIXES} INSERT DATA {{ {cases(300, inconsistent)} }}"
@@ -389,29 +396,48 @@ def partial_answers(inconsistent: bool) -> list[str]:
     assert full["complete"] and not full["partial"]
     assert (full["consistency"], full["tier"]) == (want, "disjunctive")
     assert full["incomplete"] == [] and full["incompleteCount"] == 0
-    seen = []
-    f = 0.02
-    while f < 1.5:
+    seen: list[str] = []
+    answered = 0
+
+    def answers(timeout: float) -> bool:
+        nonlocal answered
         # a dataset of its own, whose read of the ontology takes as long as the full run's
         d = sparkles.Dataset()
         d.update(body)
         try:
-            r = d.ontology.classify(partial=True, threads=1, limit=10000, timeout=took * f)
+            r = d.ontology.classify(partial=True, threads=1, limit=10000, timeout=timeout)
         except sparkles.QueryTimeoutError:
-            r = None
-        f *= 1.25
-        if r is None:
-            continue
+            return False
+        answered += 1
         assert r["classes"] == full["classes"]
         if not r["partial"]:
             assert r["complete"] and r["consistency"] == want
-            continue
+            return True
         assert not r["complete"], "a partial answer is presented as complete"
         assert r["incompleteCount"] == len(r["incomplete"])
         assert r["consistency"] in (want, "unknown")
         if r["consistency"] == "unknown":
             assert len(r["incomplete"]) + 2 >= r["classes"]
         seen.append(r["consistency"])
+        return True
+
+    def after(ms: int) -> int:
+        return ms + max(1, round(0.08 * ms))
+
+    limit = round(20 * took * 1000)
+    lo, ms = 0, 2
+    while ms < limit and not answers(ms / 1000):
+        lo, ms = ms, after(ms)
+    hi = ms
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if answers(mid / 1000):
+            hi = mid
+        else:
+            lo = mid
+    while answered < 20 and ms < limit:
+        ms = after(ms)
+        answers(ms / 1000)
     return seen
 
 
