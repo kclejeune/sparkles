@@ -42,6 +42,12 @@ pub struct DlAx {
     /// for each existential restriction, the fresh class whose context is its
     /// hypothetical successor, with the empty core
     pub hyp: FxHashMap<Ex, Ex>,
+    /// the at-most restrictions `M ⊑ ≤n S.B`: the holder M, n, S and B, ⊤ when unqualified
+    pub atmost: Vec<(Ex, u32, Role, Ex)>,
+    /// the pairs of disjoint roles
+    pub rdis: Vec<(Role, Role)>,
+    /// whether the run takes a number restriction, so that successors can be equal
+    pub counting: bool,
 }
 
 impl DlAx {
@@ -51,6 +57,8 @@ impl DlAx {
             .map(|(b, h)| 48 + (b.capacity() + h.capacity()) * 4)
             .sum::<usize>()
             + super::saturate::table_bytes(self.hyp.capacity(), 8)
+            + self.atmost.capacity() * 16
+            + self.rdis.capacity() * 8
     }
 }
 
@@ -91,6 +99,10 @@ struct Out {
     role_subs: Vec<(Role, Role)>,
     chains: Vec<(Vec<Role>, Role)>,
     clauses: Vec<(Vec<Ex>, Vec<Ex>)>,
+    atmost: Vec<(Ex, u32, Role, Ex)>,
+    rdis: Vec<(Role, Role)>,
+    /// the irreflexive roles, which must be simple
+    irreflexive: Vec<Role>,
 }
 
 impl Out {
@@ -101,12 +113,62 @@ impl Out {
         self.role_subs.extend(o.role_subs);
         self.chains.extend(o.chains);
         self.clauses.extend(o.clauses);
+        self.atmost.extend(o.atmost);
+        self.rdis.extend(o.rdis);
+        self.irreflexive.extend(o.irreflexive);
     }
 }
 
 struct Norm<'a> {
     it: &'a mut Interner,
     out: Out,
+    /// whether the run takes number restrictions; without them a minimum is read as the
+    /// existential restriction, which keeps the models of ALCHI
+    counting: bool,
+}
+
+/// The largest minimum that becomes that many existential restrictions.
+const MAX_MIN: u32 = 64;
+
+/// Whether a class expression in a positive (`pos`) or negative position needs counting: a
+/// maximum above zero in a positive position or a minimum above one in a negative one.
+fn needs_counting(c: &ClassExpression, pos: bool) -> bool {
+    use ClassExpression as C;
+    let sub = |f: &Option<Box<ClassExpression>>, p: bool| {
+        f.as_deref().is_some_and(|f| needs_counting(f, p))
+    };
+    match c {
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+            cs.iter().any(|c| needs_counting(c, pos))
+        }
+        C::ObjectComplementOf(f) => needs_counting(f, !pos),
+        C::ObjectSomeValuesFrom(_, f) | C::ObjectAllValuesFrom(_, f) => needs_counting(f, pos),
+        C::ObjectMinCardinality(n, _, f) => (!pos && *n >= 2) || sub(f, pos),
+        C::ObjectMaxCardinality(n, _, f) => (pos && *n >= 1) || sub(f, !pos),
+        C::ObjectExactCardinality(n, _, f) => *n >= 1 || sub(f, pos) || sub(f, !pos),
+        _ => false,
+    }
+}
+
+/// Whether an axiom needs counting.
+fn axiom_counts(ax: &AxiomKind) -> bool {
+    use AxiomKind as K;
+    match ax {
+        K::SubClassOf(c, d) => needs_counting(c, false) || needs_counting(d, true),
+        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => cs
+            .iter()
+            .any(|c| needs_counting(c, false) || needs_counting(c, true)),
+        K::DisjointUnion(_, cs) => cs
+            .iter()
+            .any(|c| needs_counting(c, false) || needs_counting(c, true)),
+        K::ObjectPropertyDomain(_, c) | K::ObjectPropertyRange(_, c) => needs_counting(c, true),
+        // disjoint and asymmetric roles read the role literals of successor terms (DL9)
+        K::FunctionalObjectProperty(_)
+        | K::InverseFunctionalObjectProperty(_)
+        | K::DisjointObjectProperties(_)
+        | K::AsymmetricObjectProperty(_) => true,
+        _ => false,
+    }
 }
 
 impl Norm<'_> {
@@ -196,6 +258,9 @@ impl Norm<'_> {
                 }
             }
             C::ObjectMinCardinality(0, ..) => TOP,
+            C::ObjectMinCardinality(n, p, f) if self.counting && *n >= 2 => {
+                self.at_least(*n, p, f.as_deref(), d)?
+            }
             C::ObjectMinCardinality(_, p, f) => match f {
                 Some(f) => self.some(p, f, d)?,
                 None => self.some(p, &C::Class(Class::thing()), d)?,
@@ -212,6 +277,26 @@ impl Norm<'_> {
                 } else {
                     self.it.node(Node::Forall(r, nf))
                 }
+            }
+            C::ObjectMaxCardinality(n, p, f) if self.counting => {
+                // M ⊑ ≤n r.B with F ⊑ B, B the negative form of F
+                let r = self.role(p)?;
+                let b = match f {
+                    Some(f) => self.neg(f, d)?,
+                    None => TOP,
+                };
+                if b == BOTTOM {
+                    TOP
+                } else {
+                    let m = self.it.fresh_class();
+                    self.out.atmost.push((m, *n, r, b));
+                    m
+                }
+            }
+            C::ObjectExactCardinality(n, p, f) if self.counting => {
+                let lo = self.pos(&C::ObjectMinCardinality(*n, p.clone(), f.clone()), d)?;
+                let hi = self.pos(&C::ObjectMaxCardinality(*n, p.clone(), f.clone()), d)?;
+                self.conj(vec![lo, hi])
             }
             C::ObjectMaxCardinality(..) | C::ObjectExactCardinality(..) => {
                 return Err("a maximum cardinality above zero in a positive position");
@@ -238,8 +323,47 @@ impl Norm<'_> {
         })
     }
 
-    /// `¬f` in a positive position: `x` with `x ⊓ y ⊑ ⊥` for f's negative form y.
+    /// `≥n p.f` in a positive position, n ≥ 2: n existential restrictions with fresh,
+    /// pairwise disjoint fillers below f (Kazakov's Lemma 2, the paper's DL2 with the
+    /// inequalities of the witnesses read as the disjointness of their classes).
+    fn at_least(
+        &mut self,
+        n: u32,
+        p: &ObjectPropertyExpression,
+        f: Option<&ClassExpression>,
+        d: usize,
+    ) -> Result<Ex, Why> {
+        if n > MAX_MIN {
+            return Err("a minimum cardinality above 64");
+        }
+        let r = self.role(p)?;
+        let fill = match f {
+            Some(f) => self.pos(f, d)?,
+            None => TOP,
+        };
+        if fill == BOTTOM {
+            return Ok(BOTTOM);
+        }
+        let mut bs = Vec::with_capacity(n as usize);
+        let mut es = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let b = self.it.fresh_class();
+            if fill != TOP {
+                self.out.subs.push((b, fill));
+            }
+            bs.push(b);
+            es.push(self.it.node(Node::Exist(r, b)));
+        }
+        self.out.disjoint.push(bs);
+        Ok(self.conj(es))
+    }
+
+    /// `¬f` in a positive position: `x` with `x ⊓ y ⊑ ⊥` for f's negative form y, and
+    /// `g`'s positive form for `f = ¬g`.
     fn not(&mut self, f: &ClassExpression, d: usize) -> Result<Ex, Why> {
+        if let ClassExpression::ObjectComplementOf(g) = f {
+            return self.pos(g, d);
+        }
         let g = self.neg(f, d)?;
         Ok(match g {
             TOP => BOTTOM,
@@ -263,11 +387,45 @@ impl Norm<'_> {
         Ok(match c {
             C::Class(c) => self.it.class(c),
             C::ObjectIntersectionOf(cs) => {
-                let es = cs
+                // `D ⊓ ¬F ⊑ y` is the clause `D → y ⊔ F`, with a body, where the complement
+                // alone would give a clause of every context; so are `∀r.F` and `≤n r.F`,
+                // whose duals are `∃r.¬F` and `≥(n+1) r.F`
+                let (moved, plain): (Vec<&ClassExpression>, Vec<&ClassExpression>) =
+                    cs.iter().partition(|c| self.dual(c).is_some());
+                if moved.is_empty() || plain.is_empty() {
+                    let es = cs
+                        .iter()
+                        .map(|c| self.neg(c, d))
+                        .collect::<Result<_, _>>()?;
+                    return Ok(self.conj(es));
+                }
+                let mut body = plain
                     .iter()
                     .map(|c| self.neg(c, d))
-                    .collect::<Result<_, _>>()?;
-                self.conj(es)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut head = Vec::new();
+                for c in moved {
+                    let dual = self.dual(c).expect("a conjunct with a dual");
+                    head.push(self.pos(&dual, d)?);
+                }
+                if head.contains(&TOP) || body.contains(&BOTTOM) {
+                    return Ok(BOTTOM);
+                }
+                body.retain(|&e| e != TOP);
+                head.retain(|&e| e != BOTTOM);
+                let y = self.it.fresh_class();
+                if head.is_empty() {
+                    let b = self.conj(body);
+                    self.out.subs.push((b, y));
+                } else {
+                    head.push(y);
+                    head.sort_unstable();
+                    head.dedup();
+                    body.sort_unstable();
+                    body.dedup();
+                    self.out.clauses.push((body, head));
+                }
+                y
             }
             C::ObjectUnionOf(cs) => {
                 let mut es: Vec<Ex> = cs
@@ -308,6 +466,11 @@ impl Norm<'_> {
             C::ObjectSomeValuesFrom(p, f) => self.neg_some(p, Some(f), d)?,
             C::ObjectMinCardinality(0, ..) => TOP,
             C::ObjectMinCardinality(1, p, f) => self.neg_some(p, f.as_deref(), d)?,
+            C::ObjectMinCardinality(n, p, f) if self.counting => {
+                // ≥n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f
+                let m = self.pos(&C::ObjectMaxCardinality(n - 1, p.clone(), f.clone()), d)?;
+                self.global_or(m)?
+            }
             C::ObjectMinCardinality(..) => {
                 return Err("a minimum cardinality above one in a negative position");
             }
@@ -323,19 +486,38 @@ impl Norm<'_> {
                 self.out.clauses.push((Vec::new(), vec![e, y]));
                 y
             }
-            C::ObjectMaxCardinality(_, p, f) | C::ObjectExactCardinality(0, p, f) => {
-                // ≤n p.f ⊑ y is ⊤ ⊑ y ⊔ ≥(n+1) p.f, taken as ⊤ ⊑ y ⊔ ∃p.f; =0 is ≤0
-                let pf = match f {
-                    Some(f) => self.pos(f, d)?,
-                    None => TOP,
+            C::ObjectMaxCardinality(n, p, f) => {
+                // ≤n p.f ⊑ y is ⊤ ⊑ y ⊔ ≥(n+1) p.f, which without counting is ∃p.f
+                // without counting any minimum above zero reads as an existential restriction
+                let n1 = match n.checked_add(1) {
+                    Some(k) => k,
+                    None if self.counting => return Err("a cardinality too large"),
+                    None => *n,
                 };
-                if pf == BOTTOM {
+                let m = self.pos(&C::ObjectMinCardinality(n1, p.clone(), f.clone()), d)?;
+                self.global_or(m)?
+            }
+            C::ObjectExactCardinality(0, p, f) => {
+                let m = self.pos(&C::ObjectMinCardinality(1, p.clone(), f.clone()), d)?;
+                self.global_or(m)?
+            }
+            C::ObjectExactCardinality(n, p, f) if self.counting => {
+                // =n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f ⊔ ≥(n+1) p.f
+                let lo = self.pos(&C::ObjectMaxCardinality(n - 1, p.clone(), f.clone()), d)?;
+                let n1 = n.checked_add(1).ok_or("a cardinality too large")?;
+                let hi = self.pos(&C::ObjectMinCardinality(n1, p.clone(), f.clone()), d)?;
+                if lo == TOP || hi == TOP {
+                    return Ok(BOTTOM);
+                }
+                let mut head: Vec<Ex> = [lo, hi].into_iter().filter(|&e| e != BOTTOM).collect();
+                let y = self.it.fresh_class();
+                head.push(y);
+                head.sort_unstable();
+                head.dedup();
+                if head.len() == 1 {
                     return Ok(TOP);
                 }
-                let r = self.role(p)?;
-                let e = self.it.node(Node::Exist(r, pf));
-                let y = self.it.fresh_class();
-                self.out.clauses.push((Vec::new(), vec![e, y]));
+                self.out.clauses.push((Vec::new(), head));
                 y
             }
             C::ObjectExactCardinality(..) => {
@@ -344,6 +526,42 @@ impl Norm<'_> {
             C::ObjectOneOf(_) | C::ObjectHasValue(..) => return Err("individuals"),
             C::ObjectHasSelf(_) => return Err("self restrictions"),
             _ => return Err("data restrictions"),
+        })
+    }
+
+    /// The dual that a conjunct in a negative position moves to the head as: `F` for `¬F`,
+    /// `∃r.¬F` for `∀r.F` and `≥(n+1) r.F` for `≤n r.F`.
+    fn dual(&self, c: &ClassExpression) -> Option<ClassExpression> {
+        use ClassExpression as C;
+        match c {
+            C::ObjectMinCardinality(n, p, f) if self.counting && *n >= 2 => {
+                Some(C::ObjectMaxCardinality(n - 1, p.clone(), f.clone()))
+            }
+            C::ObjectComplementOf(f) => Some((**f).clone()),
+            C::ObjectAllValuesFrom(p, f) => Some(C::ObjectSomeValuesFrom(
+                p.clone(),
+                Box::new(C::ObjectComplementOf(f.clone())),
+            )),
+            C::ObjectMaxCardinality(n, p, f) => Some(C::ObjectMinCardinality(
+                n.checked_add(1)?,
+                p.clone(),
+                f.clone(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// `y` for an expression in a negative position whose dual, `m`, holds in every context
+    /// where it does not: `⊤ → y ⊔ m`.
+    fn global_or(&mut self, m: Ex) -> Result<Ex, Why> {
+        Ok(match m {
+            TOP => BOTTOM,
+            BOTTOM => TOP,
+            _ => {
+                let y = self.it.fresh_class();
+                self.out.clauses.push((Vec::new(), vec![m, y]));
+                y
+            }
         })
     }
 
@@ -381,7 +599,12 @@ impl Norm<'_> {
             if let Some(c) = todo_l.pop() {
                 match c {
                     C::ObjectIntersectionOf(cs) => todo_l.extend(cs),
-                    C::ObjectComplementOf(f) => todo_r.push(*f),
+                    // a complement, a universal or a maximum on the left is its dual on the
+                    // right, which keeps the clause's body
+                    c if self.dual(&c).is_some() => {
+                        let dual = self.dual(&c).expect("a dual");
+                        todo_r.push(dual)
+                    }
                     C::Class(ref k) if k.as_str() == vocab::OWL_THING => {}
                     c => left.push(c),
                 }
@@ -438,6 +661,11 @@ impl Norm<'_> {
                 | K::InverseObjectProperties(..)
                 | K::SymmetricObjectProperty(_)
                 | K::TransitiveObjectProperty(_)
+                | K::FunctionalObjectProperty(_)
+                | K::InverseFunctionalObjectProperty(_)
+                | K::DisjointObjectProperties(_)
+                | K::AsymmetricObjectProperty(_)
+                | K::IrreflexiveObjectProperty(_)
         )
     }
 
@@ -481,6 +709,47 @@ impl Norm<'_> {
             K::TransitiveObjectProperty(p) => {
                 let r = self.role(p)?;
                 self.out.chains.push((vec![r, r], r));
+            }
+            // these four read the counting rules, so a run that does not count leaves them out
+            K::FunctionalObjectProperty(_)
+            | K::InverseFunctionalObjectProperty(_)
+            | K::DisjointObjectProperties(_)
+            | K::AsymmetricObjectProperty(_)
+                if !self.counting =>
+            {
+                return Err("a role axiom that needs counting");
+            }
+            K::FunctionalObjectProperty(p) | K::InverseFunctionalObjectProperty(p) => {
+                let r = match ax {
+                    K::FunctionalObjectProperty(_) => self.role(p)?,
+                    _ => self.role(&p.inverse())?,
+                };
+                let m = self.it.fresh_class();
+                self.out.atmost.push((m, 1, r, TOP));
+                self.out.subs.push((TOP, m));
+            }
+            K::DisjointObjectProperties(ps) => {
+                let rs = ps
+                    .iter()
+                    .map(|p| self.role(p))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (i, &a) in rs.iter().enumerate() {
+                    for &b in &rs[i + 1..] {
+                        self.out.rdis.push((a, b));
+                    }
+                }
+            }
+            K::AsymmetricObjectProperty(p) => {
+                let (r, i) = (self.role(p)?, self.role(&p.inverse())?);
+                self.out.rdis.push((r, i));
+            }
+            // without self restrictions, reflexive properties or nominals, which Tier D
+            // leaves out, a model's tree unravelling has no loop on a simple property; a
+            // transitive and symmetric one makes a loop of every edge, so the role box
+            // checks that the role is simple
+            K::IrreflexiveObjectProperty(p) => {
+                let r = self.role(p)?;
+                self.out.irreflexive.push(r);
             }
             _ => return Err("not a role axiom"),
         }
@@ -554,15 +823,18 @@ impl Norm<'_> {
 /// clauses of case analysis, after the EL axioms are in `ax`. `None` when it takes no axiom
 /// that needs case analysis, or when the role inclusions are not regular or their automata
 /// pass the limit, and then `ax` is as it was, the interner aside. The answer's flags say
-/// which axioms were taken.
+/// which axioms were taken. A run that does not allow counting leaves the axioms that need
+/// it out, as the normalization did before it counted.
 pub fn normalize(
     axioms: &[&AxiomKind],
     it: &mut Interner,
     ax: &mut Axioms,
     limit: Option<usize>,
     stop: &dyn Fn() -> bool,
+    counting_allowed: bool,
 ) -> Result<Option<(Vec<bool>, DlAx)>, Halt> {
     let mut taken = vec![false; axioms.len()];
+    let counting = counting_allowed && axioms.iter().any(|k| axiom_counts(k));
     // every object property has its inverse
     let named: Vec<ObjectProperty> = it
         .roles
@@ -583,6 +855,7 @@ pub fn normalize(
         let mut n = Norm {
             it,
             out: Out::default(),
+            counting,
         };
         if n.role_axiom(k).is_ok() {
             all.extend(n.out);
@@ -597,6 +870,7 @@ pub fn normalize(
         let mut n = Norm {
             it,
             out: Out::default(),
+            counting,
         };
         if n.axiom(k).is_ok() {
             if !super::dl::shape(k).horn {
@@ -633,6 +907,16 @@ pub fn normalize(
         if !rb.simple(r) && rb.auto(r, &mut Vec::new()).is_none() {
             return Ok(None);
         }
+    }
+    // number restrictions and disjointness need simple roles, which OWL 2 DL asks
+    if all.atmost.iter().any(|&(_, _, r, _)| !rb.simple(r))
+        || all
+            .rdis
+            .iter()
+            .any(|&(a, b)| !rb.simple(a) || !rb.simple(b))
+        || all.irreflexive.iter().any(|&r| !rb.simple(r))
+    {
+        return Ok(None);
     }
     // the clauses read their atoms in place, so the axioms commit now
     ax.role_subs = role_subs;
@@ -674,6 +958,9 @@ pub fn normalize(
     unfold(it, ax, &all.clauses, &mut rb);
     let mut dl = DlAx {
         clauses: all.clauses,
+        atmost: all.atmost,
+        rdis: all.rdis,
+        counting,
         ..DlAx::default()
     };
     // the hypothetical successor of each existential restriction
@@ -773,7 +1060,7 @@ mod tests {
         let mut it = Interner::new();
         let mut ax = Axioms::default();
         let refs: Vec<&AxiomKind> = axioms.iter().collect();
-        normalize(&refs, &mut it, &mut ax, None, &|| false)
+        normalize(&refs, &mut it, &mut ax, None, &|| false, true)
             .unwrap()
             .map(|(t, d)| (t, d, ax, it))
     }
@@ -824,12 +1111,72 @@ mod tests {
     }
 
     #[test]
+    fn a_universal_beside_a_class_on_the_left_keeps_the_class_as_body() {
+        // D ⊓ ∀r.E ⊑ C is D → C ⊔ ∃r.¬E, a clause of D's contexts only (item 712)
+        let r = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/r"));
+        let (_, d, _, it) = run(&[AxiomKind::EquivalentClasses(
+            std::collections::BTreeSet::from([
+                c("C"),
+                ClassExpression::ObjectIntersectionOf(std::collections::BTreeSet::from([
+                    c("D"),
+                    ClassExpression::ObjectAllValuesFrom(r.clone(), Box::new(c("E"))),
+                ])),
+            ]),
+        )])
+        .unwrap();
+        assert!(!d.clauses.is_empty());
+        for (b, h) in &d.clauses {
+            assert!(!b.is_empty(), "a clause of every context");
+            assert!(
+                h.iter()
+                    .any(|&e| matches!(it.nodes[e as usize], Node::Exist(..)))
+            );
+        }
+        // inside an existential restriction on the left, the same with a fresh class
+        let (_, d, _, _) = run(&[AxiomKind::SubClassOf(
+            ClassExpression::ObjectSomeValuesFrom(
+                r.clone(),
+                Box::new(ClassExpression::ObjectIntersectionOf(
+                    std::collections::BTreeSet::from([
+                        c("D"),
+                        ClassExpression::ObjectComplementOf(Box::new(c("E"))),
+                    ]),
+                )),
+            ),
+            c("C"),
+        )])
+        .unwrap();
+        assert_eq!(d.clauses.len(), 1);
+        assert!(!d.clauses[0].0.is_empty());
+    }
+
+    #[test]
+    fn a_double_complement_on_the_right_is_its_class() {
+        let (t, d, _, _) = run(&[AxiomKind::SubClassOf(
+            c("A"),
+            ClassExpression::ObjectUnionOf(std::collections::BTreeSet::from([
+                c("B"),
+                ClassExpression::ObjectComplementOf(Box::new(ClassExpression::ObjectComplementOf(
+                    Box::new(c("C")),
+                ))),
+            ])),
+        )])
+        .unwrap();
+        assert_eq!(t, vec![true]);
+        assert_eq!(d.clauses.len(), 1);
+        assert_eq!(d.clauses[0].1.len(), 2);
+    }
+
+    #[test]
     fn horn_axioms_alone_take_nothing() {
         assert!(run(&[AxiomKind::SubClassOf(c("A"), c("B"))]).is_none());
     }
 
+    /// Phase 5 takes number restrictions: a maximum above zero becomes a fresh holder with
+    /// an at-most record, and the run counts. A run that counts leaves out a minimum above
+    /// 64, which a run without counting reads as an existential restriction.
     #[test]
-    fn counting_stays_out() {
+    fn counting_is_taken_up_to_a_bound() {
         let r = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/r"));
         let (t, _, _, _) = run(&[
             AxiomKind::SubClassOf(
@@ -842,7 +1189,24 @@ mod tests {
             ),
         ])
         .unwrap();
-        assert_eq!(t, vec![true, false]);
+        assert_eq!(t, vec![true, true]);
+        let r = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/r"));
+        let (t, _, _, _) = run(&[
+            AxiomKind::SubClassOf(
+                c("A"),
+                ClassExpression::ObjectUnionOf(std::collections::BTreeSet::from([c("B"), c("C")])),
+            ),
+            AxiomKind::SubClassOf(
+                c("A"),
+                ClassExpression::ObjectMaxCardinality(2, r.clone(), Some(Box::new(c("B")))),
+            ),
+            AxiomKind::SubClassOf(
+                c("A"),
+                ClassExpression::ObjectMinCardinality(65, r, Some(Box::new(c("B")))),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(t, vec![true, true, false]);
     }
 
     #[test]

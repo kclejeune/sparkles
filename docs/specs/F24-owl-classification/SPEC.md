@@ -654,13 +654,13 @@ covers ALCHI, which adds unions, complements and universal restrictions in every
 to the EL classifier's language, with inverse properties and property hierarchies.
 Transitive properties and chains are taken through the automata of Horrocks, Kutz and
 Sattler, which unfold the universal restrictions, negative existential restrictions and
-ranges on the properties they reach. An at-least restriction in a positive position and an
-at-most restriction in a negative one are read as the existential restriction they
-imply, which keeps ALCHI's models. The rules run when an axiom needs case analysis and the
-ontology has no individuals, data properties, self restrictions, reflexive properties or
-top and bottom properties. Otherwise the Horn rules take what they can, and the axioms
-that need case analysis stay left out and reported, as do counting, nominals and property
-hierarchies that are not regular. `Stats::tier` is `Disjunctive` for such a run, and
+ranges on the properties they reach. A run that does not count reads an at-least
+restriction in a positive position and an at-most restriction in a negative one as the
+existential restriction they imply, which keeps ALCHI's models. The rules run when an
+axiom needs case analysis and the ontology has no individuals, data properties, self
+restrictions, reflexive properties or top and bottom properties. Otherwise the Horn rules
+take what they can, and the axioms that need case analysis stay left out and reported, as
+do nominals and property hierarchies that are not regular. `Stats::tier` is `Disjunctive` for such a run, and
 `Stats::clauses`, `dl_contexts`, `dl_stored`, `dl_tests` and `dl_testing` count its
 clauses, the contexts that held them, the clauses they stored, the candidate subsumers it
 tested and the time the tests took.
@@ -731,6 +731,70 @@ it goes. A run without the partial flag that passes the budget classifies again 
 Horn rules, leaves the axioms that need case analysis out and reports them, and sets
 `Stats::dl_over_budget`. ore_ont_3215 of the ORE 2015 DL sample, with 18,323 unions over a
 transitive property, needs this, item 713.
+
+Counting is part of the same rules and is off by default. `Limits::counting` turns it on,
+and `el_classify --counting` does the same. A run that does not count leaves the axioms
+that need counting out and reports them, and takes a minimum as the existential
+restriction it implies, so it costs what the classifier cost before counting. The reason
+is the cost on real ontologies, since no file of the ORE 2015 DL development set finishes
+with counting and the five that attempt it spend 2 to 30 times the time of the run
+without it before they give up where that run finishes, item NEW-ITEM-2. Turning counting on is the work of
+that item. A run that counts when asked takes a number restriction that the Horn rules
+cannot take, a functional or inverse functional property, disjoint properties or an
+asymmetric property. The terms of a clause then include
+equalities of the successor terms and of a successor with the predecessor, and the order
+puts the literals of one function symbol above those of any smaller one, with the role
+literal above the atom, the atom above an inequality and the inequality above an equality.
+A minimum of two or more in a positive position becomes that many existential
+restrictions with fresh fillers below the original and pairwise disjoint, which is
+Kazakov's reading of the inequalities of the witnesses. A maximum in a positive position
+becomes a fresh class that holds the at-most restriction, counted over the neighbours
+of the qualified role that the filler defines. In a negative position a maximum or a
+minimum above one is replaced by its dual. The rules are Eq, Ineq, Factor and the at-most
+and qualified-role clauses of the paper's Table 1, with Succ and Pred reading the role
+literals. A certificate that two successor terms differ, taken from a disjointness of
+their atoms, cuts an equality between them from a clause whose body and head contain the
+certificate's, so that the equalities of products of counting restrictions are not made.
+An at-most clause that would equate more than 12 terms, make more than 16,384 subsets or
+hold more than 65,536 literals in its products passes the work bound at once. A number
+restriction on a role that is not simple declines the rules, as does an irreflexive role
+that is not simple. A minimum above 64 is left out and reported, as in the Horn tier.
+
+The equalities can make a context derive millions of conclusions that subsumption
+discards, which the memory budget does not see. A run that counts when asked therefore has a bound
+of 262,144 derived conclusions, kept or redundant, which `Limits::dl_work` sets. A run
+that passes it on several threads starts again on one, since how many conclusions a
+parallel run derives depends on the order in which the threads deliver them. When that
+run passes the bound too, the run starts again without counting. That run leaves the
+axioms that need counting out and reports them, as the classifier did before it counted,
+with a bound of 4 million conclusions of its own, and sets `Stats::dl_counting_over` and
+`Stats::dl_over_budget`. A run that passes the second bound falls back to the Horn rules
+as before. A run that does not count has no bound on its conclusions, only the memory
+budget. Of the 150 counting fixtures, all but three derive at most 190,000 conclusions on
+one thread, `shiq-046` derives 1.0 million and needs a raised `Limits::dl_work`, and
+`shq-041` and `shiq-028` pass any bound, item NEW-ITEM-3.
+
+The bound has a limit that this section states plainly. Near it, the thread schedule can
+decide whether a run answers in full or falls back, since the clauses stored at the
+fixpoint vary with the schedule, for example 3,229 to 6,762 on `sriq-010` at four threads
+against 3,253 on one. A fallback is always reported through the statistics and the axioms
+left out and is never a different complete answer, so a caller learns from
+`dl_counting_over` whether counting finished. A deterministic bound is item NEW-ITEM-1.
+
+The generated `shq`, `shiq` and `sriq` fixtures equal HermiT 1.4.5.519 on every case that
+Tier D takes whole with counting on, on one and four threads and under both strategies. Of 50 cases each,
+Tier D takes whole 49 of `shq`, 48 of `shiq` and 16 of `sriq`, where the others name
+individuals or pass the bound. Random tests of counting ontologies check that minimums of
+two answer as the existential restrictions they imply and that a functional property
+answers as a maximum of one on every class. No development file of the ORE 2015 DL
+sample is taken whole with counting. Its counting files fall back when counting is on,
+ore_ont_6485 after 205 ms on one thread against 7 ms without counting, and ore_ont_6952
+and ore_ont_10140 after 1.4 and 1.7 s against 0.6 and 0.5 s. The cost is not counting alone, since the same ontologies
+with every exact cardinality read as an existential restriction do not finish on the base
+either, item NEW-ITEM-2. The normalization of a clause with a universal or a maximum
+beside a class or an existential restriction keeps the class in the clause's body, which
+classifies BioTop in 56 ms on one thread and 27 ms on four against 940 and 350 ms before,
+item 712.
 
 The classifier's answers equal HermiT 1.4.5.519's on the generated and hand-written
 `alc`, `alch` and `shi` fixtures that the rules take whole, and are the same on one and

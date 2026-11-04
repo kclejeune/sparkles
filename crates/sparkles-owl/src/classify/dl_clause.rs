@@ -23,21 +23,60 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// One literal, packed: its kind in the top three bits, a function symbol in the next 29,
-/// and an atom or a role in the low 32. The packed order sorts a clause's literals.
+/// and an atom, a role or a term in the low 32. The packed order sorts a clause's literals.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Lit(u64);
 
 const KIND_SHIFT: u32 = 61;
 /// `A(y)`
 pub const Y: u64 = 0;
-/// `s(y, x)` in a body, read through the hierarchy
+/// `s(y, x)`: in a body read through the hierarchy, in a head the role itself
 pub const RY: u64 = 1;
 /// `A(x)`
 pub const X: u64 = 2;
-/// `A(f_e(x))`
+/// `A(f(x))`
 pub const F: u64 = 3;
-/// `R_e(x, f_e(x))`
-pub const RF: u64 = 4;
+/// `s(x, f(x))`, read through the hierarchy when it is a premise
+pub const RL: u64 = 4;
+/// `f(x) ≈ t`, with t a smaller successor term or y
+pub const EQ: u64 = 5;
+/// `f(x) ≉ t`, with t a smaller successor term or y
+pub const NE: u64 = 6;
+
+/// A term an equality relates to a successor term: the predecessor y or a successor
+/// term `g(x)`, coded as 0 for y and `g + 1`, so that the code orders the terms.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Term {
+    Y,
+    Fun(Ex),
+}
+
+impl Term {
+    #[inline]
+    fn code(self) -> u32 {
+        match self {
+            Term::Y => 0,
+            Term::Fun(g) => g + 1,
+        }
+    }
+    #[inline]
+    fn of(code: u32) -> Term {
+        if code == 0 {
+            Term::Y
+        } else {
+            Term::Fun(code - 1)
+        }
+    }
+}
+
+/// What a literal of an equality between two terms is: a literal, or true or false
+/// because the terms are the same.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Made {
+    Lit(Lit),
+    True,
+    False,
+}
 
 impl Lit {
     #[inline]
@@ -57,30 +96,74 @@ impl Lit {
         debug_assert!(e < 1 << 29);
         Lit((F << KIND_SHIFT) | ((e as u64) << 32) | a as u64)
     }
+    /// `s(x, f(x))`
     #[inline]
-    pub fn rf(e: Ex) -> Lit {
-        debug_assert!(e < 1 << 29);
-        Lit((RF << KIND_SHIFT) | ((e as u64) << 32))
+    pub fn rl(f: Ex, s: Role) -> Lit {
+        debug_assert!(f < 1 << 29);
+        Lit((RL << KIND_SHIFT) | ((f as u64) << 32) | s as u64)
+    }
+    fn pair(kind: u64, a: Term, b: Term) -> Made {
+        let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+        match hi {
+            _ if a == b => {
+                if kind == EQ {
+                    Made::True
+                } else {
+                    Made::False
+                }
+            }
+            Term::Fun(f) => {
+                debug_assert!(f < 1 << 29);
+                Made::Lit(Lit((kind << KIND_SHIFT)
+                    | ((f as u64) << 32)
+                    | lo.code() as u64))
+            }
+            // both y
+            Term::Y => unreachable!("two different terms of which y is the greater"),
+        }
+    }
+    /// `a ≈ b`, oriented with the greater term first
+    #[inline]
+    pub fn eq(a: Term, b: Term) -> Made {
+        Lit::pair(EQ, a, b)
+    }
+    /// `a ≉ b`, oriented with the greater term first
+    #[inline]
+    pub fn ne(a: Term, b: Term) -> Made {
+        Lit::pair(NE, a, b)
     }
     #[inline]
     pub fn kind(self) -> u64 {
         self.0 >> KIND_SHIFT
     }
-    /// the atom, or the role of an `RY` literal
+    /// the atom, or the role of an `RY` or `RL` literal
     #[inline]
     pub fn atom(self) -> u32 {
         self.0 as u32
     }
-    /// the existential restriction whose function symbol an `F` or `RF` literal has
+    /// the function symbol of a literal over a successor term
     #[inline]
     pub fn fun(self) -> Ex {
         ((self.0 >> 32) & ((1 << 29) - 1)) as Ex
     }
-    /// The key of the total order on the literals over successor terms: function
-    /// symbol, then `RF` above `F`, then atom.
+    /// the smaller term of an equality or inequality
     #[inline]
-    fn succ_key(self) -> (Ex, u64, u32) {
-        (self.fun(), self.kind(), self.atom())
+    pub fn term(self) -> Term {
+        Term::of(self.atom())
+    }
+    /// The key of the total order on the literals over successor terms, which is the
+    /// lexicographic path order with the function symbols above the predicates: the
+    /// greatest function symbol, then `RL ≻ F ≻ NE ≻ EQ`, then the role, the atom or
+    /// the smaller term.
+    #[inline]
+    fn succ_key(self) -> (Ex, u8, u32) {
+        let k = match self.kind() {
+            EQ => 0,
+            NE => 1,
+            F => 2,
+            _ => 3,
+        };
+        (self.fun(), k, self.atom())
     }
 }
 
@@ -249,6 +332,8 @@ pub struct Stored {
     pub done: bool,
     /// its id in the run's table, once sent to a predecessor
     pub sent: Option<u32>,
+    /// its maximal literal once processed, when it has one
+    pub max: Option<Lit>,
 }
 
 /// A context's clause store, with the indexes the rules read.
@@ -261,12 +346,22 @@ pub struct Store {
     pub by_x: FxHashMap<Ex, Vec<u32>>,
     /// the processed clauses whose maximal literal is over `f_e(x)`, by e
     pub by_f: FxHashMap<Ex, Vec<u32>>,
+    /// the processed clauses whose maximal literal is a role literal `s(x, f(x))`, by s
+    pub by_rl: FxHashMap<u32, Vec<u32>>,
+    /// the processed clauses whose maximal literal is an atom over a successor term that is
+    /// in a disjointness set, by the term's function symbol: the certificates that two
+    /// successor terms differ
+    pub by_cert: FxHashMap<Ex, Vec<u32>>,
+    /// the clauses with an equality or an inequality of successor terms in the head, by
+    /// each term's function symbol, which a new certificate simplifies
+    pub by_eq: FxHashMap<Ex, Vec<u32>>,
     /// the processed clauses whose head is over y alone
     pub preds: Vec<u32>,
     /// every clause by each literal of its head, for the clauses a new one subsumes
     by_lit: FxHashMap<Lit, Vec<u32>>,
-    /// every clause by the first literal of its head, for whether a new one is subsumed
-    by_first: FxHashMap<Lit, Vec<u32>>,
+    /// every clause by the last literal of its head, which is the most specific, for
+    /// whether a new one is subsumed
+    by_last: FxHashMap<Lit, Vec<u32>>,
     /// the clauses with an empty head
     empty: Vec<u32>,
     bytes: usize,
@@ -281,8 +376,11 @@ impl Store {
             + self.clauses.capacity() * std::mem::size_of::<Stored>()
             + table_bytes(self.by_x.capacity(), 32)
             + table_bytes(self.by_f.capacity(), 32)
+            + table_bytes(self.by_rl.capacity(), 32)
+            + table_bytes(self.by_cert.capacity(), 32)
+            + table_bytes(self.by_eq.capacity(), 32)
             + table_bytes(self.by_lit.capacity(), 32)
-            + table_bytes(self.by_first.capacity(), 32)
+            + table_bytes(self.by_last.capacity(), 32)
     }
 
     pub fn is_idle(&self) -> bool {
@@ -290,7 +388,7 @@ impl Store {
     }
 
     /// Whether a clause of the store that is not dead subsumes `c`, whose signature is
-    /// `sig`: a clause that does has its first head literal in `c`'s head.
+    /// `sig`: a clause that does has its last head literal in `c`'s head.
     fn subsumed(&self, c: &Clause, sig: u64) -> bool {
         let check = |ids: &[u32]| {
             ids.iter().any(|&i| {
@@ -303,7 +401,7 @@ impl Store {
         }
         c.head()
             .iter()
-            .any(|l| self.by_first.get(l).is_some_and(|ids| check(ids)))
+            .any(|l| self.by_last.get(l).is_some_and(|ids| check(ids)))
     }
 
     /// Adds a clause that is not subsumed, marks dead those it subsumes, and queues it.
@@ -333,21 +431,31 @@ impl Store {
         }
         let id = self.clauses.len() as u32;
         let bytes = c.bytes() + 8 * (c.head().len() + 2) + 8;
-        match c.head().first() {
+        match c.head().last() {
             None => self.empty.push(id),
-            Some(&l) => self.by_first.entry(l).or_default().push(id),
+            Some(&l) => self.by_last.entry(l).or_default().push(id),
         }
         for &l in c.head() {
             self.by_lit.entry(l).or_default().push(id);
+            if matches!(l.kind(), EQ | NE)
+                && let Term::Fun(g) = l.term()
+            {
+                for f in [l.fun(), g] {
+                    let v = self.by_eq.entry(f).or_default();
+                    if v.last() != Some(&id) {
+                        v.push(id);
+                    }
+                }
+            }
         }
-        self.queue
-            .push(std::cmp::Reverse((c.lits.len() as u32, id)));
+        self.queue.push(std::cmp::Reverse((priority(&c), id)));
         self.clauses.push(Stored {
             c,
             sig,
             dead: false,
             done: false,
             sent: None,
+            max: None,
         });
         self.bytes += bytes;
         Some(bytes)
@@ -363,14 +471,25 @@ impl Store {
             }
             s.done = true;
             s.c.maximal(ix, max);
+            s.max = max.first().copied();
             if max.is_empty() {
                 self.preds.push(id);
             }
             for &l in max.iter() {
                 match l.kind() {
                     X => self.by_x.entry(l.atom()).or_default().push(id),
+                    RL => {
+                        self.by_f.entry(l.fun()).or_default().push(id);
+                        self.by_rl.entry(l.atom()).or_default().push(id);
+                    }
                     _ => self.by_f.entry(l.fun()).or_default().push(id),
                 }
+            }
+            if let Some(l) = self.clauses[id as usize].max
+                && l.kind() == F
+                && !ix.disjoint_of(ix.head(l.atom())).is_empty()
+            {
+                self.by_cert.entry(l.fun()).or_default().push(id);
             }
             return Some(id);
         }
@@ -420,15 +539,31 @@ impl Store {
             .copied()
             .filter(move |&i| {
                 let s = &self.clauses[i as usize];
-                !s.dead
-                    && s.c
-                        .head()
-                        .iter()
-                        .filter(|m| m.kind() >= F)
-                        .max_by_key(|m| m.succ_key())
-                        == Some(&l)
+                !s.dead && s.max == Some(l)
             })
     }
+
+    /// The processed clauses that are not dead whose maximal literal is over `f(x)`, with
+    /// that literal.
+    pub fn over(&self, f: Ex) -> impl Iterator<Item = (u32, Lit)> + '_ {
+        self.by_f
+            .get(&f)
+            .into_iter()
+            .flatten()
+            .filter_map(move |&i| {
+                let s = &self.clauses[i as usize];
+                (!s.dead).then_some(())?;
+                s.max.map(|l| (i, l))
+            })
+    }
+}
+
+/// The order in which the store processes its clauses, least first: the Horn clauses before
+/// the others, as Sequoia does (Bate et al. 2018, Section 5.2.2), so that the clauses that
+/// simplify others come early, and then the shorter.
+fn priority(c: &Clause) -> u32 {
+    let horn = c.head().len() <= 1;
+    (!horn as u32) << 16 | c.lits.len() as u32
 }
 
 #[cfg(test)]
@@ -462,7 +597,18 @@ mod tests {
     fn literals_pack_and_unpack() {
         let l = Lit::f(123_456, 789);
         assert_eq!((l.kind(), l.fun(), l.atom()), (F, 123_456, 789));
-        assert!(Lit::rf(5) > Lit::f(5, u32::MAX));
+        assert!(Lit::rl(5, 0) > Lit::f(5, u32::MAX));
+        assert_eq!(Lit::eq(Term::Fun(3), Term::Fun(3)), Made::True);
+        assert_eq!(Lit::ne(Term::Y, Term::Y), Made::False);
+        let Made::Lit(e) = Lit::eq(Term::Y, Term::Fun(9)) else {
+            panic!()
+        };
+        assert_eq!((e.kind(), e.fun(), e.term()), (EQ, 9, Term::Y));
+        let Made::Lit(g) = Lit::eq(Term::Fun(9), Term::Fun(4)) else {
+            panic!()
+        };
+        assert!(g.succ_key() > e.succ_key());
+        assert!(Lit::f(9, 1).succ_key() > g.succ_key());
         assert!(Lit::x(1) > Lit::ry(u32::MAX));
     }
 

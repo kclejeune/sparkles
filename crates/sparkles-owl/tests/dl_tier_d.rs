@@ -75,6 +75,7 @@ fn whole(body: &str) -> Classification {
         let out = k
             .classify(&Limits {
                 threads,
+                counting: true,
                 ..Limits::default()
             })
             .unwrap();
@@ -105,6 +106,14 @@ fn check(body: &str, yes: &[(&str, &str)], no: &[(&str, &str)]) {
             !out.taxonomy.is_subclass(&c(a), &c(b)),
             "{a} ⊑ {b} is not entailed"
         );
+    }
+}
+
+/// The limits of a run that counts, which is off by default.
+fn counting() -> Limits {
+    Limits {
+        counting: true,
+        ..Limits::default()
     }
 }
 
@@ -972,5 +981,438 @@ fn waiting_case_analyses(ax: &[Axiom]) {
             );
             assert_eq!(out.stats.dl_over_budget, !partial);
         }
+    }
+}
+
+#[test]
+fn a_minimum_above_a_maximum_is_unsatisfiable() {
+    check(
+        &format!(
+            "SubClassOf(:A ObjectMinCardinality(2 :r :B)) SubClassOf(:A ObjectMaxCardinality(1 :r))
+             SubClassOf(:E ObjectMinCardinality(2 :r :B)) SubClassOf(:E ObjectMaxCardinality(2 :r))
+             SubClassOf(:D :Z) {UNION}"
+        ),
+        &[("A", "D"), ("A", "E")],
+        &[("E", "D"), ("E", "A")],
+    );
+}
+
+#[test]
+fn a_functional_role_merges_its_successors() {
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r :B)) SubClassOf(:A ObjectSomeValuesFrom(:r :C))
+             FunctionalObjectProperty(:r)
+             EquivalentClasses(:D ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :C))) {UNION}"
+        ),
+        &[("A", "D")],
+        &[("D", "A")],
+    );
+}
+
+#[test]
+fn an_inverse_functional_role_merges_a_successor_with_the_predecessor() {
+    // the r-successor of A has at most one r-predecessor, A itself, which is then an E
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r :C))
+             SubClassOf(:C ObjectSomeValuesFrom(ObjectInverseOf(:r) :E))
+             InverseFunctionalObjectProperty(:r) {UNION}"
+        ),
+        &[("A", "E")],
+        &[("C", "E"), ("E", "A")],
+    );
+}
+
+#[test]
+fn a_maximum_on_the_left_is_met_through_a_functional_role() {
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r :B)) FunctionalObjectProperty(:r)
+             SubClassOf(ObjectMaxCardinality(1 :r :B) :D) {UNION}"
+        ),
+        &[("A", "D")],
+        &[("D", "A")],
+    );
+}
+
+#[test]
+fn a_qualified_maximum_counts_only_its_filler() {
+    // two r-successors that are B and C: at most one B leaves both, at most one C too
+    check(
+        &format!(
+            "SubClassOf(:A ObjectMinCardinality(2 :r :B)) SubClassOf(:A ObjectMaxCardinality(1 :r :C))
+             DisjointClasses(:B :C)
+             SubClassOf(:F ObjectMinCardinality(2 :r :B)) SubClassOf(:F ObjectMaxCardinality(1 :r :G))
+             SubClassOf(:B :G) SubClassOf(:D :Z) {UNION}"
+        ),
+        &[("F", "D")],
+        &[("A", "D")],
+    );
+}
+
+#[test]
+fn disjoint_roles_with_a_common_edge_are_unsatisfiable() {
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r :B)) SubObjectPropertyOf(:r :s)
+             DisjointObjectProperties(:r :s)
+             SubClassOf(:E ObjectSomeValuesFrom(:t :B)) DisjointObjectProperties(:r :t)
+             SubClassOf(:D :Z) {UNION}"
+        ),
+        &[("A", "D")],
+        &[("E", "D")],
+    );
+}
+
+/// `body` with every existential restriction on the right of a subclass axiom read as a
+/// minimum of two. Without a maximum or a functional role over its role, a minimum of two
+/// has a model wherever the existential restriction has one, so the subsumptions agree.
+fn with_minimums(body: &str) -> String {
+    body.lines()
+        .map(|l| match l.split_once(' ') {
+            Some((head, rest))
+                if head.starts_with("SubClassOf(:A")
+                    && rest.starts_with("ObjectSomeValuesFrom(") =>
+            {
+                format!(
+                    "{head} ObjectMinCardinality(2 {}\n",
+                    &rest["ObjectSomeValuesFrom(".len()..]
+                )
+            }
+            _ => format!("{l}\n"),
+        })
+        .collect()
+}
+
+#[test]
+fn random_ontologies_answer_the_same_with_counting() {
+    // the counting run reads each minimum of two by two successors with disjoint fillers,
+    // and a functional role that nothing else names makes the run count
+    let seeds: u64 = std::env::var("DL_DIFF_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if cfg!(debug_assertions) { 60 } else { 300 });
+    let mut compared = 0;
+    for seed in 0..seeds {
+        let body = random_dl(seed);
+        let counted = with_minimums(&body);
+        if counted == body {
+            continue;
+        }
+        let d = axioms(&format!("{body}{UNION}"));
+        let n = axioms(&format!("{counted}{UNION}FunctionalObjectProperty(:q)\n"));
+        let cs: Vec<Class> = (0..6)
+            .map(|a| c(&format!("A{a}")))
+            .chain([Class::thing(), Class::nothing()])
+            .collect();
+        let mut kd = Classifier::of(&d);
+        let od = kd.classify(&counting()).unwrap();
+        if !kd.excluded().is_empty() || od.stats.dl_over_budget {
+            continue;
+        }
+        let want = pairs(&od.taxonomy, &cs);
+        for (threads, expansion) in [
+            (1, Expansion::Cautious),
+            (4, Expansion::Cautious),
+            (4, Expansion::Eager),
+        ] {
+            let mut kn = Classifier::of(&n);
+            let on = kn
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    ..counting()
+                })
+                .unwrap();
+            let got = pairs(&on.taxonomy, &cs);
+            let extra: Vec<_> = got.difference(&want).collect();
+            assert!(
+                extra.is_empty(),
+                "seed {seed}: counting adds {extra:?}\n{counted}"
+            );
+            if kn.excluded().is_empty() && !on.stats.dl_over_budget {
+                let missing: Vec<_> = want.difference(&got).collect();
+                assert!(
+                    missing.is_empty(),
+                    "seed {seed}: counting misses {missing:?}\n{counted}"
+                );
+                compared += 1;
+            }
+        }
+    }
+    assert!(compared > 0, "no case was compared");
+    eprintln!("compared {compared} runs");
+}
+
+#[test]
+fn a_functional_role_answers_as_a_maximum_of_one_on_every_class() {
+    // the role axiom and the class axiom state the same, and reach the at-most rule by
+    // different normalizations; both merge the successors of every random ontology's r0
+    let seeds: u64 = std::env::var("DL_DIFF_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if cfg!(debug_assertions) { 60 } else { 300 });
+    let mut compared = 0;
+    for seed in 0..seeds {
+        let body = with_minimums(&random_dl(seed));
+        let f = axioms(&format!("{body}{UNION}FunctionalObjectProperty(:r0)\n"));
+        let m = axioms(&format!(
+            "{body}{UNION}SubClassOf(owl:Thing ObjectMaxCardinality(1 :r0))\n"
+        ));
+        let cs: Vec<Class> = (0..6)
+            .map(|a| c(&format!("A{a}")))
+            .chain([Class::thing(), Class::nothing()])
+            .collect();
+        let mut kf = Classifier::of(&f);
+        let of = kf.classify(&counting()).unwrap();
+        let mut km = Classifier::of(&m);
+        let om = km
+            .classify(&Limits {
+                threads: 4,
+                ..counting()
+            })
+            .unwrap();
+        let whole = |k: &Classifier, o: &sparkles_owl::classify::Classification| {
+            k.excluded().is_empty() && !o.stats.dl_over_budget
+        };
+        if whole(&kf, &of) && whole(&km, &om) {
+            assert_eq!(
+                pairs(&of.taxonomy, &cs),
+                pairs(&om.taxonomy, &cs),
+                "seed {seed}\n{body}"
+            );
+            compared += 1;
+        }
+    }
+    assert!(compared > seeds / 2, "only {compared} cases were compared");
+}
+
+/// A run that either answers `a ⊑ b` or leaves an axiom out and says so.
+fn entailed_or_left_out(body: &str, a: &str, b: &str) {
+    let ax = axioms(body);
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&counting()).unwrap();
+    assert!(
+        out.taxonomy.is_subclass(&c(a), &c(b)) || !k.excluded().is_empty(),
+        "{a} ⊑ {b} is missing and no axiom is left out"
+    );
+}
+
+#[test]
+fn a_maximum_whose_dual_overflows_is_left_out() {
+    entailed_or_left_out(
+        &format!(
+            "SubClassOf(ObjectMaxCardinality(4294967295 :r) :D)
+             SubClassOf(:A ObjectMaxCardinality(0 :r))
+             SubClassOf(ObjectExactCardinality(4294967295 :s) :E) {UNION}"
+        ),
+        "A",
+        "D",
+    );
+}
+
+#[test]
+fn an_irreflexive_transitive_symmetric_role_has_no_edge() {
+    entailed_or_left_out(
+        &format!(
+            "TransitiveObjectProperty(:r) SymmetricObjectProperty(:r)
+             IrreflexiveObjectProperty(:r) SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+             SubClassOf(:D :Z) {UNION}"
+        ),
+        "A",
+        "D",
+    );
+}
+
+#[test]
+fn a_wide_maximum_passes_the_bound_instead_of_enumerating_its_subsets() {
+    let mut body = String::from("SubClassOf(:A :M) SubClassOf(:M ObjectMaxCardinality(20 :r))\n");
+    for i in 0..40 {
+        body.push_str(&format!("SubClassOf(:A ObjectSomeValuesFrom(:r :B{i}))\n"));
+    }
+    body.push_str(UNION);
+    let ax = axioms(&body);
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&counting()).unwrap();
+    // the answer is sound: A is satisfiable
+    assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
+    assert!(out.stats.dl_over_budget || out.complete);
+}
+
+#[test]
+fn a_maximum_of_many_passes_the_bound_instead_of_making_its_equalities() {
+    // one subset of a thousand successors has half a million equalities
+    let mut body = String::from("SubClassOf(:A :M) SubClassOf(:M ObjectMaxCardinality(999 :r))\n");
+    for i in 0..1001 {
+        body.push_str(&format!("SubClassOf(:A ObjectSomeValuesFrom(:r :B{i}))\n"));
+    }
+    body.push_str(UNION);
+    let ax = axioms(&body);
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&counting()).unwrap();
+    assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
+    assert!(out.stats.dl_over_budget || out.complete);
+}
+
+#[test]
+fn a_maximum_of_a_hundred_passes_the_bound_instead_of_factoring_its_equalities() {
+    // one subset of a hundred successors has about five thousand equalities
+    let mut body = String::from("SubClassOf(:A :M) SubClassOf(:M ObjectMaxCardinality(99 :r))\n");
+    for i in 0..101 {
+        body.push_str(&format!("SubClassOf(:A ObjectSomeValuesFrom(:r :B{i}))\n"));
+    }
+    body.push_str(UNION);
+    let ax = axioms(&body);
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&counting()).unwrap();
+    assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
+    assert!(out.stats.dl_over_budget || out.complete);
+}
+
+/// A counting ontology: A has at least three B-successors by r and at most two r-successors,
+/// so that A is unsatisfiable when the run counts, and the disjunction keeps Tier D in use.
+const COUNTING: &str = "SubClassOf(:A ObjectMinCardinality(3 :r :B))
+SubClassOf(:A ObjectMaxCardinality(2 :r owl:Thing))
+SubClassOf(:X ObjectUnionOf(:Y :Z))
+SubClassOf(:Y :W)
+SubClassOf(:Z :W)";
+
+#[test]
+fn a_counting_run_past_its_bound_classifies_again_without_counting() {
+    let ax = axioms(COUNTING);
+    let cs = classes(&ax);
+    let a = c("A");
+    // within the default bound the counting gives A no model and X below W
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                ..counting()
+            })
+            .unwrap();
+        assert!(!out.stats.dl_counting_over && !out.stats.dl_over_budget);
+        assert!(out.stats.dl_work > 0);
+        assert!(out.taxonomy.is_unsatisfiable(&a));
+        assert!(k.excluded().is_empty());
+    }
+    // a bound of one conclusion is passed on every schedule: the run starts again without
+    // counting, which leaves the maximum out and reports it, and the
+    // answer is sound, with X below W still found by the case analysis
+    let full = pairs(
+        &Classifier::of(&ax).classify(&counting()).unwrap().taxonomy,
+        &cs,
+    );
+    let mut answers = BTreeSet::new();
+    for threads in [1, 4] {
+        for expansion in [Expansion::Cautious, Expansion::Eager] {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    dl_work: Some(1),
+                    ..counting()
+                })
+                .unwrap();
+            assert!(out.stats.dl_counting_over, "{threads} {expansion:?}");
+            assert!(out.stats.dl_over_budget);
+            assert_eq!(out.stats.tier, Tier::Disjunctive);
+            assert!(!out.taxonomy.is_unsatisfiable(&a));
+            assert!(!k.excluded().is_empty(), "the maximum is left out");
+            let got = pairs(&out.taxonomy, &cs);
+            // sound: the full answer has A below ⊥, so below every class
+            assert!(full.contains(&("http://ex.org/A".into(), "⊥".into())));
+            assert!(!got.contains(&("http://ex.org/A".into(), "⊥".into())));
+            assert!(got.contains(&("http://ex.org/X".into(), "http://ex.org/W".into())));
+            answers.insert(got);
+        }
+    }
+    assert_eq!(answers.len(), 1);
+}
+
+#[test]
+fn the_bound_on_derived_conclusions_does_not_stop_a_run_that_does_not_count() {
+    let ax = axioms(
+        "SubClassOf(:X ObjectUnionOf(:Y :Z))
+SubClassOf(:Y :W)
+SubClassOf(:Z :W)",
+    );
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                dl_work: Some(1),
+                ..counting()
+            })
+            .unwrap();
+        assert!(!out.stats.dl_counting_over && !out.stats.dl_over_budget);
+        assert!(k.excluded().is_empty());
+        assert!(out.taxonomy.is_subclass(&c("X"), &c("W")));
+    }
+}
+
+#[test]
+fn a_run_without_counting_leaves_the_role_axioms_that_count_out() {
+    // Top has an r-successor, r is below s, and r and s are disjoint: every element has an
+    // edge that both roles hold, so the ontology is inconsistent when the run counts
+    let ax = axioms(
+        "SubClassOf(owl:Thing ObjectSomeValuesFrom(:r owl:Thing))
+SubObjectPropertyOf(:r :s)
+DisjointObjectProperties(:r :s)
+SubClassOf(:X ObjectUnionOf(:Y :Z))",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&counting()).unwrap();
+    assert!(!out.stats.dl_counting_over);
+    assert!(out.taxonomy.is_unsatisfiable(&c("X")));
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&Limits {
+            dl_work: Some(1),
+            ..counting()
+        })
+        .unwrap();
+    assert!(out.stats.dl_counting_over);
+    // the retry has no rule for the disjoint roles, so it must not report them as taken
+    assert!(
+        k.excluded()
+            .iter()
+            .any(|e| format!("{e:?}").contains("DisjointObjectProperties")),
+        "{:?}",
+        k.excluded()
+    );
+}
+
+#[test]
+fn counting_is_off_by_default_and_the_axioms_that_count_are_left_out() {
+    let ax = axioms(COUNTING);
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                ..Limits::default()
+            })
+            .unwrap();
+        // no attempt to count was made, so none passed a bound
+        assert!(!out.stats.dl_counting_over && !out.stats.dl_over_budget);
+        assert_eq!(out.stats.tier, Tier::Disjunctive);
+        assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+        assert!(!k.excluded().is_empty(), "the maximum is left out");
+        assert!(out.taxonomy.is_subclass(&c("X"), &c("W")));
+        // the bound sets nothing when the run does not count
+        let mut k = Classifier::of(&ax);
+        let again = k
+            .classify(&Limits {
+                threads,
+                dl_work: Some(1),
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(!again.stats.dl_counting_over);
+        assert_eq!(again.stats.dl_work, out.stats.dl_work);
     }
 }

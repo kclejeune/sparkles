@@ -112,6 +112,23 @@ fn drawing_on(
     })
 }
 
+/// The most conclusions a run of Tier D with counting derives, kept or redundant, before
+/// it passes its bound and the run starts again without counting.
+/// Number restrictions can make a context derive millions of conclusions that subsumption
+/// discards, which the memory budget does not see. A run that counts over a real ontology
+/// either finishes in a few thousand conclusions or runs on past millions, so the bound
+/// is the time a run spends before it gives up counting, about 0.2 s on one thread for a
+/// small ontology. Of the 150 counting fixtures all but three derive at most 190,000
+/// conclusions on one thread, one derives 1.0 million, which [`Limits::dl_work`] lets a
+/// caller allow, and two pass any bound.
+const DL_WORK_BOUND: usize = 1 << 18;
+
+/// The bound on the conclusions of the run that starts again without counting once the run
+/// that counts has passed its bound. The ontology has shown that its case analysis is
+/// heavy, and without a bound such a run can go on for minutes where the Horn rules answer
+/// in seconds. Four million conclusions take a few seconds.
+const DL_RETRY_WORK: usize = 1 << 22;
+
 /// The least memory budget, in estimated bytes, of a saturation with the Horn rules. The
 /// largest Horn run of the ORE 2015 DL sample's development set peaks at 666 MB, 139 times
 /// its index and axioms, on a small ontology.
@@ -149,6 +166,19 @@ pub struct Limits {
     pub partial: bool,
     /// the expansion strategy of Tier D's Succ rule
     pub expansion: Expansion,
+    /// the most conclusions, kept or redundant, that a run of Tier D with counting derives
+    /// before the run starts again without counting. `None` takes a bound of
+    /// [`DL_WORK_BOUND`] conclusions. It applies only with [`counting`](Limits::counting).
+    /// A run of Tier D without counting has no such bound, except the run that starts again
+    /// after this one passed it, whose bound is 4 million.
+    pub dl_work: Option<usize>,
+    /// whether Tier D counts, which is off by default. A run that counts takes number
+    /// restrictions, functional and inverse functional properties, disjoint properties and
+    /// asymmetric properties into the case analysis, and it is complete for them when it
+    /// finishes within [`dl_work`](Limits::dl_work). On real ontologies it rarely does, so
+    /// a run that does not count leaves those axioms out and reports them, as the
+    /// classifier did before it counted, and costs what that run costs.
+    pub counting: bool,
 }
 
 /// Which context the Succ rule of Tier D (roadmap item 603) gives a successor. Both
@@ -237,6 +267,11 @@ pub struct Stats {
     pub dl_contexts: usize,
     /// the clauses that the contexts of Tier D stored, those deleted as subsumed included
     pub dl_stored: usize,
+    /// the conclusions Tier D derived, kept or not, which its work bound counts
+    pub dl_work: usize,
+    /// Tier D with counting passed its bound on derived conclusions, so the run
+    /// classified again without counting and left the axioms that need it out
+    pub dl_counting_over: bool,
     /// the candidate subsumers that Tier D tested in contexts of their own
     pub dl_tests: usize,
     /// the tested candidates that hold
@@ -244,7 +279,9 @@ pub struct Stats {
     /// the part of [`saturation`](Stats::saturation) that the tests of Tier D took
     pub dl_testing: Duration,
     /// Tier D passed its memory budget, so the run classified with the Horn rules and
-    /// left the disjunctive axioms out
+    /// left the disjunctive axioms out, or Tier D with counting passed its bound on
+    /// derived conclusions and the run classified without counting
+    /// ([`dl_counting_over`](Stats::dl_counting_over))
     pub dl_over_budget: bool,
 }
 
@@ -382,6 +419,11 @@ pub struct Saturation {
     dl_tried: bool,
     /// set while a run classifies again without Tier D, past Tier D's memory budget
     skip_dl: bool,
+    /// set while a run classifies again without counting, past Tier D's bound on derived
+    /// conclusions, which leaves the axioms that need counting out
+    no_counting: bool,
+    /// set by a run of Tier D that passed its bound on derived conclusions
+    dl_worked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// set when a partial answer of Tier D passed the budget, so that the run fails with
     /// the error instead of classifying again without Tier D
     partial_over: bool,
@@ -701,6 +743,8 @@ impl Saturation {
             horn_tried: false,
             dl_tried: false,
             skip_dl: false,
+            no_counting: false,
+            dl_worked: Default::default(),
             partial_over: false,
             partial: None,
         }
@@ -774,7 +818,77 @@ impl Saturation {
             }
             _ => limits,
         };
+        self.dl_worked.store(false, Ordering::Relaxed);
         let mut r = self.run(axioms, changes, held_bytes, first, with_taxonomy);
+        if let Err(Error::Memory { .. }) = r
+            && self.dl_tried
+            && limits.threads != 1
+            && !limits.el_only
+            && !self.partial_over
+            && self.dl_worked.load(Ordering::Relaxed)
+        {
+            // Tier D passed its bound on derived conclusions, and how many it derives
+            // depends on the order in which the threads delivered the contexts'
+            // conclusions: the run starts again on one thread, whose order is fixed, before
+            // it falls back to the Horn rules. A schedule that stays within the bound where
+            // one thread does not still answers in full, which the roadmap's item on a
+            // deterministic bound covers. Its charges draw first on what the pool admitted
+            // for the first run.
+            self.reset();
+            self.dl_worked.store(false, Ordering::Relaxed);
+            let a = admitted.clone();
+            let counting = limits.charge.clone().map(|f| {
+                let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
+                    std::sync::Arc::new(move |bytes: usize| {
+                        let ok = f(bytes);
+                        if ok {
+                            a.fetch_add(bytes, Ordering::Relaxed);
+                        }
+                        ok
+                    });
+                drawing_on(admitted.load(Ordering::Relaxed), f)
+            });
+            let one = Limits {
+                threads: 1,
+                charge: counting,
+                ..limits.clone()
+            };
+            r = self.run(axioms, None, held_bytes, &one, with_taxonomy);
+        }
+        let mut counting_over = None;
+        if let Err(Error::Memory { used: counted, .. }) = r
+            && self.dl_tried
+            && !limits.el_only
+            && !self.partial_over
+            && self.dl_worked.load(Ordering::Relaxed)
+        {
+            // Tier D with counting passed its bound on derived conclusions, which a run
+            // without counting never does: the run starts again with the axioms that need
+            // counting left out and reported, as before counting was built, before it falls
+            // back to the Horn rules. Its charges draw first on what the pool admitted.
+            self.reset();
+            self.dl_worked.store(false, Ordering::Relaxed);
+            self.no_counting = true;
+            let a = admitted.clone();
+            let counting = limits.charge.clone().map(|f| {
+                let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
+                    std::sync::Arc::new(move |bytes: usize| {
+                        let ok = f(bytes);
+                        if ok {
+                            a.fetch_add(bytes, Ordering::Relaxed);
+                        }
+                        ok
+                    });
+                drawing_on(admitted.load(Ordering::Relaxed), f)
+            });
+            let without = Limits {
+                charge: counting,
+                ..limits.clone()
+            };
+            r = self.run(axioms, None, held_bytes, &without, with_taxonomy);
+            self.no_counting = false;
+            counting_over = Some(counted);
+        }
         let mut dl_over = None;
         if let Err(Error::Memory { used, .. }) = r
             && self.dl_tried
@@ -845,6 +959,14 @@ impl Saturation {
         }
         if r.is_err() && self.dirty {
             self.reset();
+        }
+        if let Some(counted) = counting_over
+            && let Ok((_, _, stats)) = &mut r
+        {
+            // the high-water mark of the run that counted, which the retry's may not reach
+            stats.peak_memory = stats.peak_memory.max(counted);
+            stats.dl_counting_over = true;
+            stats.dl_over_budget = true;
         }
         r
     }
@@ -1056,6 +1178,7 @@ impl Saturation {
                 &mut ax,
                 limits.max_memory,
                 &stop,
+                limits.counting && !self.no_counting,
             )
             .map_err(halt)?
             {
@@ -1255,10 +1378,9 @@ impl Saturation {
             None if disj => Some(saturate::Dynamic::new(n as Ex)),
             None => None,
         };
-        let dl_run = ix
-            .dl
-            .as_ref()
-            .map(|_| dl_rules::DlRun::new(limits.expansion == Expansion::Eager));
+        let dl_run = ix.dl.as_ref().map(|_| {
+            dl_rules::DlRun::new(limits.expansion == Expansion::Eager, self.dl_worked.clone())
+        });
         if let Some(scratch) = premises {
             stats.incremental = true;
             stats.cleared = self.invalidate(&scratch, &ix);
@@ -1291,6 +1413,16 @@ impl Saturation {
         // The Horn rules' contexts of conjunctions can need far more memory than the EL
         // rules on the same ontology, so a run with them has a budget of its own, past
         // which it classifies by the EL rules alone (run_with).
+        if let Some(d) = &dl_run {
+            // a run that counts has the bound of the limits, and the run that starts again
+            // without counting after it passed that bound has the larger one of a run that
+            // cannot expect to finish soon, before the Horn rules take over
+            if self.no_counting {
+                d.set_work_limit(DL_RETRY_WORK);
+            } else if ax.dl.as_ref().is_some_and(|d| d.counting) {
+                d.set_work_limit(limits.dl_work.unwrap_or(DL_WORK_BOUND).max(1));
+            }
+        }
         let max_memory = if horn || disj {
             let own = HORN_MEMORY_FLOOR.max(base.saturating_mul(HORN_MEMORY_FACTOR));
             Some(limits.max_memory.map_or(own, |m| m.min(own)))
@@ -1565,6 +1697,7 @@ impl Saturation {
                     stats.dl_stored += n.store.clauses.len();
                 }
             }
+            stats.dl_work = d.work();
             if open.is_some() {
                 // A partial answer has taken its record, and the next run starts again,
                 // so the clause stores and the clause table go before its taxonomy.
