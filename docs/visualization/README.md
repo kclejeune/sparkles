@@ -458,13 +458,14 @@ and every name on a page links to the page of that entity. `/ui/browse?ds=NAME` 
 landing page of the default graph's ontology, and `&iri=IRI` opens an entity. `graph`,
 `branch` and `at` choose what the pages read, as on the other pages.
 
-An entity's page leads with its label, short form, kind and IRI, and a row of counts under
-them, its parents, children, incoming links, synonyms and the other datasets that mention
-it, each a link to its section. The buttons that act on the page sit level with the title.
+An entity's page leads with its label, short form, kind and IRI, and a line of counts under
+them as text links, its parents, children, incoming links, synonyms and the other datasets
+that mention it, each leading to its section. The buttons that act on the page sit level with the title.
 **Open in Explore**, **Open in Ontology** or **Open in Thesaurus**, **Ask about this** and
 **Edit** show while they fit, and the rest fold into a **More** menu, so the title never
 shares a row with a wrapped column of buttons. A deprecated entity says so under its title and
-links its replacement. The rest of the page is cards. **Definition** leads with every
+links its replacement. The rest of the page is cards in two columns, the term's own on the left and a rail of its
+facts on the right. **Definition** leads with every
 definition, description, comment and scope note the entity has, in groups under a heading
 that names the kind and the predicate, such as "Definition · obo:IAO_0000115" and
 "Comment · rdfs:comment". The heading follows the **Prefixed** or **Full IRIs** switch and
@@ -476,30 +477,33 @@ languages, sources and its synonym type as a chip. **Axioms** gives the entity's
 Manchester syntax, with the names linked to their pages and a **Copy** button, and an
 **Inferred** section that a **Classify** button fills from the server's classification. A SKOS
 concept has no Axioms card, since SKOS statements are not axioms.
-**Hierarchy** gives the entity's place in its tree, and **References** its cross-references,
-what links here, the other datasets and, folded away under **All other statements**, every
-statement the other cards do not show. Beside them, in a column of the same width as on
-a dataset's page, **Metadata** lists the kind, status, identifiers, ontology and subsets,
-and **Download** downloads the entity in Turtle, RDF/XML, OWL functional syntax or JSON-LD.
-When one column grows longer than the other, References or Download moves to the shorter
-one so the two end close together, without moving a card that holds focus, and a shorter
-side column stays in view as the page scrolls.
+**References** holds See also, the mappings, what links here, the other datasets and,
+folded away under **All other statements**, every statement the other cards do not show,
+each under a stronger sub-heading.
 
-The Hierarchy card scrolls on its own within half the window's height with the entity in
-view. It shows the lineage from a root to the entity on one line, the entity's other direct
-parents under it, its children with their counts and its siblings behind one row, and it
-reads each further level when it opens. **Graph** in the card's header draws the entity's
-neighbourhood in the card in place of the tree, on the Explore canvas with Explore's
-lenses. An entity outside any hierarchy has **Graph** beside its title, which shows the
-graph in place of the cards. The graph holds its parents, its first children, the entities
-its axioms relate it to and those whose axioms hold it, with each edge named by its
-property. Double-clicking a node adds that entity's neighbourhood, and **Open in Explore**
-opens the entity there. **Ask about this** opens the Ask drawer with the entity as its
+The rail has the width of the side column on a dataset's page. **Metadata** lists the kind,
+status, ontology and subsets, then **Identifiers**, the entity's cross-references by database,
+with a database's ids on one line and the first eight databases shown and the rest on request.
+The downloads in Turtle, RDF/XML, OWL functional syntax or JSON-LD end the card. **Hierarchy**
+follows it. The rail stays in view as the page scrolls when it is the shorter column, and one
+taller than the window scrolls with the page until its bottom edge is in view and stays there,
+so all of it can be reached.
+
+The Hierarchy card keeps its place in both of its views. **Tree** scrolls on its own within
+half the window's height with the entity in view. It shows the lineage from a root to the
+entity on one line, the entity's other direct parents under it, its children with their
+counts and its siblings behind one row, and it reads each further level when it opens.
+**Graph** draws the entity's parents and first six children in the card on the Explore canvas
+with Explore's lenses, and **Expand** opens the whole neighbourhood in a large dialog. The
+dialog's graph, and the graph that an entity outside any hierarchy shows in place of the cards
+through **Graph** beside its title, hold its parents, its first children, the entities its
+axioms relate it to and those whose axioms hold it, with each edge named by its property.
+Double-clicking a node there adds that entity's neighbourhood, and **Open in Explore** opens
+the entity there. **Ask about this** opens the Ask drawer with the entity as its
 context.
 
 A SKOS concept gets a table of its labels by language and its related concepts and
-mappings. Cross-references to well-known databases such as Wikipedia, PubMed and DOI are
-links. A class that is defined by an expression shows it as a **Logical definition**
+mappings. Identifiers in well-known databases such as Wikipedia, PubMed and DOI are links. A class that is defined by an expression shows it as a **Logical definition**
 under its definition, and only class expressions count, never the other axioms.
 **What links here** lists the axioms of other entities that mention it, grouped by the
 restriction that holds it as in "part of some mitochondrion", then the other statements that
@@ -509,8 +513,8 @@ its page there. **Similar terms** lists the entity's nearest neighbours in the d
 first ready vector index, through the same search as Similar's Search page, and links to
 that page for more. A dataset without a vector index or a term without a vector shows no
 such section. Below 1,100 pixels the cards are one column, in the order Definition, Axioms,
-Metadata, Hierarchy, References and Download, and on a phone the Hierarchy card opens on
-request ([screenshot](../images/browse-phone.png)).
+Metadata, Hierarchy and References, and on a phone the Hierarchy card opens on request or when
+a view is chosen ([screenshot](../images/browse-phone.png)).
 
 A caller who can write to the dataset gets an **Edit** button beside the title, and `E`
 or the palette's **Edit this page** does the same. Edit mode changes the page in place

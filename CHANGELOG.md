@@ -418,6 +418,15 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+The web UI's Browse term page has a right rail (roadmap item 734). The rail holds Metadata, with
+the cross-references as Identifiers by database above the downloads, and then Hierarchy, whose
+place no longer changes between Tree and Graph. The graph in the rail shows the parents and
+first children, and **Expand** opens the whole neighbourhood in a dialog. References is the
+main column's one card for See also, the mappings, What links here, Replaces and In other
+datasets, under stronger sub-headings, and no card moves between the columns any more. The
+counts under the title are one line of text links, and a rail taller than the window sticks by
+its bottom edge.
+
 Release builds compile `sparkles-owl` as one codegen unit, and each rule set of the EL
 classifier's saturation has a worker that inlines its own activation (roadmap items 711
 and 715). Code that EL runs never reach no longer moves their time. On one thread on

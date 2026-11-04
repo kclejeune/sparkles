@@ -198,6 +198,8 @@
   /* in the rail the canvas is a column of the card's width and shorter */
   .canvas.card.compact {
     height: var(--term-graph-h, 400px);
+    /* the canvas may end the card, whose corners it then has to keep */
+    border-radius: 0 0 var(--r-lg) var(--r-lg);
   }
   @container browse (max-width: 639px) {
     .canvas.card.compact.shut {
