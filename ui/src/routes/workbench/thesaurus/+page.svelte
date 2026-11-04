@@ -86,6 +86,9 @@
   import SkosLabels from '$components/SkosLabels.svelte';
   import SkosLinks from '$components/SkosLinks.svelte';
   import EditorHistory from '$components/EditorHistory.svelte';
+  import TreeCrumbs from '$components/TreeCrumbs.svelte';
+  import TreeSticky from '$components/TreeSticky.svelte';
+
   import { scrollToRow } from '$lib/level-tree.svelte';
   import { routes, THESAURUS_TABS, type ThesaurusTab } from '$lib/routes';
 
@@ -1153,6 +1156,7 @@
                 </div>
               {/if}
               <div class="tree-scroll">
+                <TreeSticky />
                 {#if tree.roots.length}
                   <OntoTree
                     label="Concepts"
@@ -1260,6 +1264,15 @@
         </section>
 
         <section class="panel detail" aria-label="Details">
+          {#if tab === 'tree' && list === 'concepts' && selected}
+            <TreeCrumbs
+              roots={tree.roots}
+              children={kidsOf}
+              target={selected}
+              name={nameOf}
+              onselect={(id) => nav({ iri: id })}
+            />
+          {/if}
           {#if !selected}
             <div class="panel-body">
               <p class="empty">

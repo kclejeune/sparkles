@@ -332,6 +332,16 @@ A caller who may read a dataset but not write it can still follow a link to the 
 The editor then says that it is read-only and hides its editing controls, while the tree,
 DL Query, the header, the history and the validation report still read.
 
+The trees of both editors keep a deep hierarchy readable. Indentation is 14 pixels a level
+for the first four levels and 6 pixels a level below them, with a guide line under each open
+node of the first levels. A row gives its label the room first, hides the entity's short
+form when the row is narrow and then shortens the label, and the selected row shows its
+whole label and short form. When the tree scrolls, the ancestors of the first visible row
+stay at its top, in the manner of an editor's sticky scroll, and clicking one scrolls back to
+it. A breadcrumb above the entity panel gives the selected entity's path from a root of the
+tree. A level with more than 1,000 children shows its
+first 1,000 with a **Show more** row that reads the next 1,000 from the hierarchy route.
+
 ### Ontology editor
 
 The **Ontology** editor, `/ui/workbench/ontology`, browses and edits the OWL ontology of one graph

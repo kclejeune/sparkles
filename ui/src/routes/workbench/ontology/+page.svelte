@@ -85,6 +85,9 @@
   import OntoPreview from '$components/OntoPreview.svelte';
   import OntoTree from '$components/OntoTree.svelte';
   import EditorHistory from '$components/EditorHistory.svelte';
+  import TreeCrumbs from '$components/TreeCrumbs.svelte';
+  import TreeSticky from '$components/TreeSticky.svelte';
+
   import { ONTOLOGY_TABS, routes, type OntologyTab } from '$lib/routes';
 
   const TAB_LABEL: [OntologyTab, string][] = [
@@ -318,6 +321,7 @@
             iri: q.iri,
             ancestors: q.ancestors,
             limit: q.ancestors ? 1 : LEVEL_LIMIT,
+            offset: q.offset,
             lang: langs,
           }),
         takeNames,
@@ -1153,6 +1157,7 @@
               <div class="tree-col">
                 {#if kindTab === 'Class' && inferredOn}<h2 class="col-title">Asserted</h2>{/if}
                 <div class="tree-scroll">
+                  <TreeSticky />
                   {#if level && filtered}
                     {#if filtered.tree.roots.length}
                       <OntoTree
@@ -1177,6 +1182,8 @@
                         roots={level.roots()}
                         children={(id) => level?.children(id) ?? []}
                         more={(id) => level?.more(id) ?? false}
+                        clipped={(p) => level?.clippedOf(p) ?? null}
+                        onmore={(p) => level?.loadMore(p)}
                         name={nameOf}
                         sub={subOf}
                         open={openSet(kindTab)}
@@ -1260,6 +1267,15 @@
         </section>
 
         <section class="panel detail" aria-label="Details">
+          {#if kindTab && selected}
+            <TreeCrumbs
+              roots={level ? level.roots() : (tree?.roots ?? [])}
+              children={(id) => (level ? level.children(id) : (tree?.children.get(id) ?? []))}
+              target={selected}
+              name={nameOf}
+              onselect={(id) => nav({ iri: id })}
+            />
+          {/if}
           {#if !selected}
             <div class="panel-head"><h2>Ontology header</h2></div>
             <div class="panel-body">

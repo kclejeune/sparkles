@@ -9,7 +9,11 @@ import type { Hierarchy, TreeNode } from './browse';
 /** The children of one level that the tree reads at most. */
 export const LEVEL_LIMIT = 1000;
 
-export type LevelReader = (q: { iri?: string; ancestors?: boolean }) => Promise<Hierarchy>;
+export type LevelReader = (q: {
+  iri?: string;
+  ancestors?: boolean;
+  offset?: number;
+}) => Promise<Hierarchy>;
 
 export class LevelTree {
   /** The children of each read level, by parent, with `''` for the roots. */
@@ -60,6 +64,39 @@ export class LevelTree {
     for (const n of nodes) counts[n.iri] = n.children;
     this.counts = counts;
     this.onnames(nodes);
+  }
+
+  /** How many children of `id` (null: the roots) the tree shows and holds, when it holds more. */
+  clippedOf(id: string | null): { shown: number; total: number } | null {
+    const key = id ?? '';
+    const total = this.clipped[key];
+    return total ? { shown: this.levels[key]?.length ?? 0, total } : null;
+  }
+
+  /** Read the next page of a clipped level and add it to the level's children. */
+  loadMore(id: string | null): Promise<void> {
+    const key = id ?? '';
+    const have = this.levels[key];
+    if (!have || !this.clipped[key]) return Promise.resolve();
+    const pk = `more:${key}`;
+    const was = this.#pending.get(pk);
+    if (was) return was;
+    const gen = this.#generation;
+    const p = this.read({ ...(id ? { iri: id } : {}), offset: have.length })
+      .then((h) => {
+        if (gen !== this.#generation) return;
+        this.#take(h.children);
+        const seen = new Set(have);
+        const next = [...have, ...h.children.map((c) => c.iri).filter((i) => !seen.has(i))];
+        this.levels = { ...this.levels, [key]: next };
+        const clipped = { ...this.clipped };
+        if (next.length >= h.total || !h.children.length) delete clipped[key];
+        else clipped[key] = h.total;
+        this.clipped = clipped;
+      })
+      .finally(() => this.#pending.delete(pk));
+    this.#pending.set(pk, p);
+    return p;
   }
 
   /** Read the children of `id`, or the roots for null, once. */

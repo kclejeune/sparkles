@@ -114,3 +114,42 @@ describe('filteredTree', () => {
     expect(tree.children.get('b')).toEqual(['d']);
   });
 });
+
+describe('a clipped level', () => {
+  it('reads the rest a page at a time', async () => {
+    const all = Array.from({ length: 25 }, (_, i) => `urn:c${String(i).padStart(2, '0')}`);
+    const node = (iri: string) =>
+      ({
+        iri,
+        label: iri,
+        labelLang: null,
+        shortForm: null,
+        kinds: ['class'],
+        deprecated: false,
+        children: 0,
+        parents: 1,
+      }) as never;
+    const t = new LevelTree(async (q) => {
+      const off = q.offset ?? 0;
+      const page = q.iri ? all.slice(off, off + 10) : ['urn:p'];
+      return {
+        dataset: 'd',
+        commit: 1,
+        kind: 'class',
+        node: null,
+        children: page.map(node),
+        total: q.iri ? all.length : 1,
+        offset: off,
+        limit: 10,
+        next: null,
+        order: 'label',
+      };
+    });
+    await t.load('urn:p');
+    expect(t.clippedOf('urn:p')).toEqual({ shown: 10, total: 25 });
+    await t.loadMore('urn:p');
+    await t.loadMore('urn:p');
+    expect(t.children('urn:p')).toEqual(all);
+    expect(t.clippedOf('urn:p')).toBeNull();
+  });
+});

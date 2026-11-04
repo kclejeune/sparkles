@@ -122,7 +122,11 @@ Thesaurus editor **History** and **Validation** tabs, where each commit opens as
 set named by labels. A term page links to its editor and to similar terms in the dataset's
 vector index, and an editor's entity panel and Explore's details panel link to the term's
 page. A data table pins its actions to the right edge when it scrolls, and on a phone shows
-each row as a card.
+each row as a card. The editors' trees indent less below the fourth level, keep the
+ancestors of the first visible row at the top as the tree scrolls, show the selected
+entity's path above its panel, and give labels the room before short forms.
+A level with more than 1,000 children now says so and shows the rest with **Show more**,
+where it showed only the first 1,000 before.
 
 Ontologies and thesauri have a typo-tolerant entity search for typeahead (spec U12,
 roadmap item 616). `GET /$/ontology/{ds}/search?q=` matches the labels, synonyms, short

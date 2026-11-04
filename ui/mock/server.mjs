@@ -50,7 +50,13 @@ import { handleProjection } from './projection.mjs';
 import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
 import { WORLD, worldTurtle } from './world.mjs';
 import { handleForms } from './forms.mjs';
-import { handleOntology, UNI_PREFIXES, UNI_TURTLE } from './ontology.mjs';
+import {
+  DEEP_PREFIXES,
+  deepTurtle,
+  handleOntology,
+  UNI_PREFIXES,
+  UNI_TURTLE,
+} from './ontology.mjs';
 import { handleSkos, isSkosShapes, skosReport, THES_PREFIXES, THES_TURTLE } from './skos.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
 
@@ -242,6 +248,12 @@ function seedHistory(ds) {
   uni.store.load(UNI_TURTLE, { format: 'text/turtle' });
   uni.baseQuads = uni.store.size;
   addCommit(uni, 'upload', uni.store.size, 0, { bulk: true });
+  // a deep and a wide class tree for the Workbench's layout tests (mock/ontology.mjs)
+  const deep = makeDataset('deep', 'persistent');
+  deep.prefixes = { ...DEEP_PREFIXES };
+  deep.store.load(deepTurtle(), { format: 'text/turtle' });
+  deep.baseQuads = deep.store.size;
+  addCommit(deep, 'upload', deep.store.size, 0, { bulk: true });
   // the thesaurus editor's thesaurus (mock/skos.mjs)
   const thes = makeDataset('thes', 'persistent');
   thes.prefixes = { ...THES_PREFIXES };

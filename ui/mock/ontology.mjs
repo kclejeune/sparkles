@@ -198,6 +198,41 @@ const BUILTIN_ANNOTATIONS = new Set([
   DCT + 'description',
 ]);
 const BUILTIN_CLASSES = new Set([OWL + 'Thing', OWL + 'Nothing']);
+/**
+ * A tree for the Workbench's layout tests (ROADMAP item 633): a chain 20 levels deep with
+ * long labels, and a class with more children than one level of the hierarchy route reads.
+ */
+export const DEEP_PREFIXES = {
+  rdf: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+  rdfs: 'http://www.w3.org/2000/01/rdf-schema#',
+  owl: 'http://www.w3.org/2002/07/owl#',
+  deep: 'http://example.org/deep#',
+};
+export const DEEP_CHAIN = 20;
+export const DEEP_WIDE = 1050;
+export function deepTurtle() {
+  const out = [
+    '@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .',
+    '@prefix owl: <http://www.w3.org/2002/07/owl#> .',
+    '@prefix deep: <http://example.org/deep#> .',
+    '<http://example.org/deep> a owl:Ontology ; rdfs:label "Deep ontology"@en .',
+  ];
+  for (let i = 0; i < DEEP_CHAIN; i++) {
+    const sup = i ? ` ; rdfs:subClassOf deep:C${i - 1}` : '';
+    out.push(
+      `deep:C${i} a owl:Class${sup} ; rdfs:label "level ${i} of a deep chain of nested anatomical structures"@en .`,
+    );
+  }
+  out.push('deep:Wide a owl:Class ; rdfs:label "wide parent"@en .');
+  for (let i = 0; i < DEEP_WIDE; i++) {
+    const n = String(i).padStart(4, '0');
+    out.push(
+      `deep:W${n} a owl:Class ; rdfs:subClassOf deep:Wide ; rdfs:label "wide child ${n}"@en .`,
+    );
+  }
+  return out.join('\n') + '\n';
+}
+
 export const ASSERTION_TYPES = new Set([
   'ClassAssertion',
   'ObjectPropertyAssertion',
