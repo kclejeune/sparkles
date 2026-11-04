@@ -655,9 +655,6 @@ struct Out<'r, 'a> {
     outbox: &'r mut Outbox,
     /// the messages sent to other contexts since the last check
     sent: usize,
-    /// whether messages that their context already holds are dropped, which a congested
-    /// run does (roadmap item 695)
-    filter: bool,
 }
 
 /// A worker's messages for other contexts, which it delivers by destination, with the
@@ -763,15 +760,7 @@ impl Sink for Out<'_, '_> {
             // one worker meets no other at a to-do list, and sorting costs more than it
             // saves
             let ctx = self.run.get(to);
-            if self.filter && known(ctx, &c) {
-                return;
-            }
-            let mut t = ctx.todo.lock();
-            if self.filter {
-                make_room(self.run, &mut t, 1);
-            }
-            t.push(c);
-            drop(t);
+            ctx.todo.lock().push(c);
             self.sent += 1;
             if self.run.mark(ctx) {
                 self.woke.push_back(to);
@@ -991,27 +980,10 @@ impl<'a> Run<'a> {
             let to = outbox[at].0;
             let end = at + outbox[at..].iter().take_while(|m| m.0 == to).count();
             let ctx = self.get(to);
-            match ctx.st.try_lock().filter(|_| filter) {
-                // the messages the context already holds go no further (roadmap item 695)
-                Some(st) if st.init => {
-                    let mut t = ctx.todo.lock();
-                    make_room(self, &mut t, end - at);
-                    let before = t.len();
-                    t.extend(
-                        outbox[at..end]
-                            .iter()
-                            .map(|&(_, c)| c)
-                            .filter(|c| !(cheap(c) && st.holds(c))),
-                    );
-                    let dropped = (end - at) - (t.len() - before);
-                    if dropped > 0 {
-                        self.queued.fetch_sub(dropped as isize, Ordering::Relaxed);
-                    }
-                }
-                _ => ctx
-                    .todo
+            if !(filter && self.deliver_new(ctx, &outbox[at..end])) {
+                ctx.todo
                     .lock()
-                    .extend(outbox[at..end].iter().map(|&(_, c)| c)),
+                    .extend(outbox[at..end].iter().map(|&(_, c)| c));
             }
             if self.mark(ctx) {
                 mine.push_back(to);
@@ -1019,6 +991,40 @@ impl<'a> Run<'a> {
             at = end;
         }
         outbox.clear();
+    }
+
+    /// Delivers to a context the messages it does not already hold, and says whether it
+    /// could look, which it cannot while another worker holds the context (roadmap item
+    /// 695).
+    #[cold]
+    #[inline(never)]
+    fn deliver_new(&self, ctx: &Ctx, msgs: &[(Ex, Concl)]) -> bool {
+        let Some(st) = ctx.st.try_lock() else {
+            return false;
+        };
+        if !st.init {
+            return false;
+        }
+        let mut t = ctx.todo.lock();
+        let before = t.len();
+        t.extend(
+            msgs.iter()
+                .map(|&(_, c)| c)
+                .filter(|c| !(matches!(c, Concl::Sub(_) | Concl::Back(..)) && st.holds(c))),
+        );
+        let dropped = msgs.len() - (t.len() - before);
+        if dropped > 0 {
+            self.queued.fetch_sub(dropped as isize, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// Whether the messages waiting in to-do lists and outboxes take more than the stored
+    /// conclusions and [`CONGESTED_BYTES`], as of the workers' last checks.
+    fn congested(&self) -> bool {
+        let waiting = self.queued.load(Ordering::Relaxed).max(0) as usize;
+        waiting * std::mem::size_of::<Concl>()
+            > self.memory.load(Ordering::Relaxed).max(CONGESTED_BYTES)
     }
 
     /// Moves half of a worker's queue to the shared queue when a worker waits for it.
@@ -1043,15 +1049,6 @@ impl<'a> Run<'a> {
 
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed) != STOP_NONE
-    }
-
-    /// Whether the messages waiting in to-do lists and outboxes take more than the stored
-    /// conclusions and [`CONGESTED_BYTES`], as of the workers' last checks.
-    #[inline]
-    fn congested(&self) -> bool {
-        let waiting = self.queued.load(Ordering::Relaxed).max(0) as usize;
-        waiting * std::mem::size_of::<Concl>()
-            > self.memory.load(Ordering::Relaxed).max(CONGESTED_BYTES)
     }
 
     fn halt(&self, why: u8) {
@@ -1268,7 +1265,6 @@ impl<'a> Run<'a> {
             woke: mine,
             outbox,
             sent: 0,
-            filter: self.congested(),
         };
         if !st.init {
             tally.stored += CONTEXT_BYTES / CONCLUSION_BYTES;
@@ -1303,7 +1299,6 @@ impl<'a> Run<'a> {
                     if !self.flush(tally) {
                         break 'outer;
                     }
-                    out.filter = self.congested();
                     // a long activation gives idle workers what it woke as it goes
                     if self.idle.load(Ordering::Relaxed) > 0 {
                         self.deliver(out.outbox, out.woke);
@@ -1358,42 +1353,6 @@ impl<'a> Run<'a> {
             mine.push_back(me);
         }
     }
-}
-
-/// The waiting messages of a context below which a congested run keeps their repeats.
-const DEDUP_MIN: usize = 4096;
-
-/// Before the to-do list of a congested run grows past its capacity, drops its repeated
-/// messages, which a context that many others send to can hold millions of.
-#[inline]
-fn make_room(run: &Run<'_>, t: &mut Vec<Concl>, more: usize) {
-    if t.len() + more > t.capacity() && t.len() >= DEDUP_MIN {
-        dedup(run, t);
-    }
-}
-
-#[cold]
-#[inline(never)]
-fn dedup(run: &Run<'_>, t: &mut Vec<Concl>) {
-    let before = t.len();
-    t.sort_unstable();
-    t.dedup();
-    run.queued
-        .fetch_sub((before - t.len()) as isize, Ordering::Relaxed);
-}
-
-/// Whether a message is one that [`State::holds`] answers without a search of a list
-/// that grows with the context.
-#[inline]
-fn cheap(c: &Concl) -> bool {
-    matches!(c, Concl::Sub(_) | Concl::Back(..))
-}
-
-/// Whether a context already holds a message, so that sending it would change nothing.
-/// A context that another worker holds is not looked at (roadmap item 695).
-#[inline]
-fn known(ctx: &Ctx, c: &Concl) -> bool {
-    cheap(c) && ctx.st.try_lock().is_some_and(|st| st.init && st.holds(c))
 }
 
 /// Starts a context: its root, `owl:Thing`, the loops of the reflexive roles and the
