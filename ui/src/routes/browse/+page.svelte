@@ -68,6 +68,7 @@
     builtIn,
     countsQuery,
     definitionsQuery,
+    labelsWanted,
     namesQuery,
     DEFINITION_PROPS,
     displayName,
@@ -344,14 +345,13 @@
   $effect(() => {
     const t = term;
     const names = t?.names ?? {};
-    const want = [
-      ...new Set(
-        [
-          ...(sections?.synonyms ?? []).flatMap((g) => g.values.flatMap((v) => v.types)),
-          ...(sections?.xrefs ?? []).map((x) => x.value),
-        ].filter((i) => !names[i]?.label && /^(https?|urn):/.test(i)),
-      ),
-    ];
+    const want = labelsWanted(
+      [
+        ...(sections?.synonyms ?? []).flatMap((g) => g.values.flatMap((v) => v.types)),
+        ...(sections?.xrefs ?? []).map((x) => x.value),
+      ],
+      names,
+    );
     if (!want.length) {
       typeLabels = new Map();
       return;

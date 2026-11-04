@@ -16,8 +16,9 @@ import {
   type EntityKind,
   type Lit,
   type ManchesterToken,
+  validIri,
 } from './ontology';
-import { localName, shorten, WELL_KNOWN, type PrefixMap } from './rdf';
+import { localName, shorten, sparqlIri, WELL_KNOWN, type PrefixMap } from './rdf';
 import { browsePath, editorOf, workbenchPath } from './routes';
 
 const enc = encodeURIComponent;
@@ -1330,9 +1331,11 @@ export function xrefName(
   label: (iri: string) => string | null | undefined,
   prefixes: PrefixMap,
 ): string {
-  const known = /^(https?|urn):/.test(x.value) ? label(x.value) : null;
+  // a string that only starts like an IRI is not one, and keeps its exact value
+  const iri = queryableIri(x.value);
+  const known = iri && /^(https?|urn):/.test(x.value) ? label(x.value) : null;
   if (known) return known;
-  if (/^https?:/.test(x.value)) return shorten(x.value, prefixes) ?? readableIri(x.value);
+  if (iri && /^https?:/.test(x.value)) return shorten(x.value, prefixes) ?? readableIri(x.value);
   if (x.database.toLowerCase() === 'wikipedia') return wikipediaTitle(x.id);
   return x.id;
 }
@@ -1382,7 +1385,7 @@ const LICENSE_PROPS = [DCT + 'license', 'http://creativecommons.org/ns#license']
 /** The SPARQL of the headers of a graph: its ontologies and concept schemes with their annotations. */
 export function headQuery(graph: string | null): string {
   const body = `{ ?o a ?t . VALUES ?t { <${OWL}Ontology> <${SKOS}ConceptScheme> } ?o ?p ?v }`;
-  const g = graph ? `GRAPH <${graph}> ${body}` : body;
+  const g = graph ? `GRAPH ${sparqlIri(graph)} ${body}` : body;
   return `SELECT ?o ?t ?p ?v WHERE { ${g} } LIMIT 500`;
 }
 
@@ -1483,7 +1486,7 @@ export function countsQuery(graph: string | null): string {
   ].join(' ');
   const inner = `?s a ?t . VALUES ?t { ${types} }`;
   const dep = `?s a <${OWL}Class> ; <${OWL}deprecated> true .`;
-  const w = (b: string) => (graph ? `GRAPH <${graph}> { ${b} }` : b);
+  const w = (b: string) => (graph ? `GRAPH ${sparqlIri(graph)} { ${b} }` : b);
   return `SELECT ?t (COUNT(DISTINCT ?s) AS ?n) WHERE { { ${w(inner)} } UNION { ${w(dep)} BIND("deprecated" AS ?t) } } GROUP BY ?t`;
 }
 
@@ -1512,7 +1515,7 @@ export function parseCounts(rows: Row[]): { kind: string; label: string; count: 
 
 /** The SPARQL that finds where a dataset mentions `iri`: per graph, as subject or object. */
 export function reuseQuery(iri: string): string {
-  const x = `<${iri}>`;
+  const x = sparqlIri(iri);
   return `SELECT ?g (COUNT(*) AS ?n) (SAMPLE(?l) AS ?label) WHERE {
   { { ${x} ?p ?o } UNION { ?s ?p ${x} } BIND("" AS ?g) }
   UNION { GRAPH ?g { { ${x} ?p ?o } UNION { ?s ?p ${x} } } }
@@ -1553,7 +1556,7 @@ export const builtIn = (iri: string) => BUILT_IN.some((ns) => iri.startsWith(ns)
 
 /** Wrap a pattern in the page's graph, or leave it in the default graph. */
 const inGraph = (graph: string | null, body: string) =>
-  graph ? `GRAPH <${graph}> { ${body} }` : body;
+  graph ? `GRAPH ${sparqlIri(graph)} { ${body} }` : body;
 
 /**
  * A pattern over the graphs a term answer names, where `default` is the stored default
@@ -1565,7 +1568,7 @@ function overGraphs(graphs: readonly string[], body: string) {
   const parts = [
     ...(graphs.includes('default') ? [`{ GRAPH <urn:x-arq:DefaultGraph> { ${body} } }`] : []),
     ...(named.length
-      ? [`{ VALUES ?g { ${named.map((g) => `<${g}>`).join(' ')} } GRAPH ?g { ${body} } }`]
+      ? [`{ VALUES ?g { ${named.map(sparqlIri).join(' ')} } GRAPH ?g { ${body} } }`]
       : []),
   ];
   return parts.length ? parts.join(' UNION ') : `{ GRAPH <urn:x-arq:DefaultGraph> { ${body} } }`;
@@ -1585,17 +1588,35 @@ export function incomingQuery(
   offset: number,
   limit = PAGE,
 ) {
-  return `SELECT DISTINCT ?s WHERE { ${overGraphs(graphs, `?s <${property}> <${iri}> FILTER(isIRI(?s))`)} } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}`;
+  return `SELECT DISTINCT ?s WHERE { ${overGraphs(graphs, `?s ${sparqlIri(property)} ${sparqlIri(iri)} FILTER(isIRI(?s))`)} } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}`;
 }
 
 /** The SPARQL of a page of the named subjects that use the property `iri`, in IRI order. */
 export function usageQuery(iri: string, graphs: readonly string[], offset: number, limit = PAGE) {
-  return `SELECT DISTINCT ?s WHERE { ${overGraphs(graphs, `?s <${iri}> ?o FILTER(isIRI(?s))`)} } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}`;
+  return `SELECT DISTINCT ?s WHERE { ${overGraphs(graphs, `?s ${sparqlIri(iri)} ?o FILTER(isIRI(?s))`)} } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}`;
+}
+
+/** Whether a value from the data can stand as an IRI in a query as it is. */
+const queryableIri = (s: string) => validIri(s) && !/[\u0000-\u0020]/.test(s);
+
+/**
+ * Which of `values`, IRIs or cross-references that are only strings, a page should read labels
+ * for: each valid http, https or urn IRI once that `names` does not name.
+ */
+export function labelsWanted(
+  values: readonly string[],
+  names: Record<string, { label?: string | null } | undefined>,
+): string[] {
+  return [
+    ...new Set(
+      values.filter((i) => /^(https?|urn):/.test(i) && queryableIri(i) && !names[i]?.label),
+    ),
+  ];
 }
 
 /** The SPARQL of the definitions and labels of some IRIs, for lists such as the top classes. */
 export function definitionsQuery(iris: readonly string[], graph: string | null) {
-  const values = iris.map((i) => `<${i}>`).join(' ');
+  const values = iris.filter(queryableIri).map(sparqlIri).join(' ');
   const props = [...DEFINITION_PROPS, RDFS + 'comment'].map((p) => `<${p}>`).join('|');
   return `SELECT ?s ?d WHERE { VALUES ?s { ${values} } ${inGraph(graph, `?s ${props} ?d`)} }`;
 }
@@ -1609,7 +1630,7 @@ export function namesQuery(
   graph: string | null,
   over?: readonly string[],
 ) {
-  const values = iris.map((i) => `<${i}>`).join(' ');
+  const values = iris.filter(queryableIri).map(sparqlIri).join(' ');
   const props = [RDFS + 'label', SKOS + 'prefLabel'].map((p) => `<${p}>`).join('|');
   const body = `?s ${props} ?d`;
   // `over` is the graphs a term answer read, imports included, which a name may be in. A
@@ -1619,7 +1640,7 @@ export function namesQuery(
     ? [
         ...(over.includes('default') ? [`{ ${body} }`] : []),
         ...(named.length
-          ? [`{ VALUES ?g { ${named.map((g) => `<${g}>`).join(' ')} } GRAPH ?g { ${body} } }`]
+          ? [`{ VALUES ?g { ${named.map(sparqlIri).join(' ')} } GRAPH ?g { ${body} } }`]
           : []),
       ].join(' UNION ')
     : inGraph(graph, body);
