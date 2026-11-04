@@ -5,7 +5,7 @@
 // write, the keyboard and the palette commands, and the phone. Edits run on session
 // branches that each test deletes, so the other suites see the mock's data unchanged.
 
-import { expect, test, type Page, type APIRequestContext } from '@playwright/test';
+import { expect, test, type Locator, type Page, type APIRequestContext } from '@playwright/test';
 import { pageAction } from '../page-actions';
 import { expectNoSidewaysScroll } from '../phone';
 
@@ -301,6 +301,80 @@ test('SKOS edits: a label, a definition and a broader concept', async ({ page, r
     await expect(preview(page)).toContainText('broader');
     await commit(page);
     await expect(tree.locator('[data-section="narrower"]')).toContainText('Insects');
+    return branch;
+  });
+});
+
+test('the rail holds the parent editor and the SKOS links within its card', async ({
+  page,
+  request,
+}) => {
+  // the narrowest width with a rail
+  await page.setViewportSize({ width: 1320, height: 900 });
+  /** The box lies inside the card by at least the card's padding. */
+  const insideCard = async (card: Locator, el: Locator) => {
+    const c = (await card.boundingBox())!;
+    const b = (await el.boundingBox())!;
+    expect(b.x - c.x).toBeGreaterThanOrEqual(12);
+    expect(c.x + c.width - (b.x + b.width)).toBeGreaterThanOrEqual(12);
+  };
+  await onSession(request, 'uni', async () => {
+    await open(page, term('uni', UNI + 'Professor', '&edit=1'));
+    const branch = await startSession(page, 'onto');
+    const tree = page.locator('.b-side').getByRole('complementary', { name: 'Hierarchy' });
+    const input = tree.getByRole('combobox', { name: 'Add a parent class' });
+    await insideCard(tree, input.locator('xpath=ancestor::div[contains(@class,"box")][1]'));
+    // the choices open over the rail and can be read
+    await input.fill('Pers');
+    const option = tree.getByRole('option', { name: /Person/ }).first();
+    await expect(option).toBeVisible();
+    await insideCard(tree, option);
+    await option.click();
+    await commit(page);
+    await tree.getByRole('button', { name: 'Remove the parent Person' }).click();
+    await commit(page);
+    return branch;
+  });
+  await onSession(request, 'thes', async () => {
+    await open(page, term('thes', TH + 'owls', '&edit=1'));
+    const branch = await startSession(page, 'skos');
+    const tree = page.locator('.b-side').getByRole('complementary', { name: 'Hierarchy' });
+    await tree.getByRole('button', { name: 'Add broader' }).click();
+    const up = tree.getByRole('group', { name: 'Broader picker' });
+    await insideCard(tree, up);
+    await up.getByRole('searchbox').fill('Marine');
+    const hit = up.getByRole('button', { name: /Marine animals/ });
+    await expect(hit).toBeVisible();
+    await insideCard(tree, hit);
+    await hit.click();
+    await commit(page);
+    const broader = tree.locator('[data-section="broader"]');
+    await expect(broader).toContainText('Marine animals');
+    await tree.getByRole('button', { name: 'Add narrower' }).click();
+    const down = tree.getByRole('group', { name: 'Narrower picker' });
+    await insideCard(tree, down);
+    await down.getByRole('searchbox').fill('Bats');
+    await down.getByRole('button', { name: /Bats/ }).click();
+    await commit(page);
+    const narrower = tree.locator('[data-section="narrower"]');
+    await expect(narrower).toContainText('Bats');
+    await expect(tree.locator('.tree-body')).toBeVisible();
+    // nothing in the rail pushes the page sideways
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const m = document.querySelector('main') ?? document.documentElement;
+          return m.scrollWidth - m.clientWidth;
+        }),
+      )
+      .toBeLessThanOrEqual(0);
+    // the mock keeps a deleted branch's edits for the next session, so these go again
+    await narrower.getByRole('button', { name: /Remove.*Bats/ }).click();
+    await commit(page);
+    await expect(narrower).not.toContainText('Bats');
+    await broader.getByRole('button', { name: /Remove.*Marine animals/ }).click();
+    await commit(page);
+    await expect(broader).not.toContainText('Marine animals');
     return branch;
   });
 });

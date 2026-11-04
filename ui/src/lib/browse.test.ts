@@ -21,6 +21,9 @@ import {
   mergePieces,
   namesQuery,
   neighbourhood,
+  hierarchyOf,
+  hiddenRows,
+  xrefsByDatabase,
   oboIri,
   parseCounts,
   parseDefinitions,
@@ -840,5 +843,128 @@ describe('languageCount', () => {
     expect(languageCount([{ lang: 'fr' }, { lang: 'fr' }, { lang: 'FR' }])).toBe(1);
     expect(languageCount([{ lang: 'fr' }, { lang: 'de' }, { lang: null }])).toBe(3);
     expect(languageCount([])).toBe(0);
+  });
+});
+
+describe('hierarchyOf', () => {
+  const X = 'http://x/';
+  const node = (id: string, focus?: boolean) => ({ id, label: id, focus });
+  const edge = (source: string, label: string, target: string) => ({
+    id: `${source} ${label} ${target}`,
+    source,
+    target,
+    label,
+  });
+
+  it('keeps the parents and children of what neighbourhood emits, and not the axioms', () => {
+    const g = neighbourhood(
+      {
+        iri: X + 'c',
+        axioms: [
+          {
+            axiom: { type: 'SubClassOf', subClass: X + 'c', superClass: X + 'parent' },
+            ofn: '',
+            graph: 'default',
+          },
+          {
+            axiom: {
+              type: 'SubClassOf',
+              subClass: X + 'c',
+              superClass: { type: 'ObjectSomeValuesFrom', property: X + 'p', class: X + 'filler' },
+            },
+            ofn: '',
+            graph: 'default',
+          },
+        ],
+        mentions: { axioms: [], total: 0, truncated: false },
+        incoming: [
+          {
+            property: 'http://www.w3.org/2000/01/rdf-schema#subClassOf',
+            count: 1,
+            more: false,
+            subjects: [X + 'kid'],
+          },
+        ],
+        names: {},
+      } as never,
+      {},
+    );
+    expect(g.nodes.map((n) => n.id)).toContain(X + 'filler');
+    const h = hierarchyOf(g);
+    expect(h.nodes.map((n) => n.id).sort()).toEqual([X + 'c', X + 'kid', X + 'parent']);
+    // a child's edge has the entity as its target, and a parent's as its source
+    expect(h.edges.find((e) => e.source === X + 'kid')?.target).toBe(X + 'c');
+    expect(h.edges.find((e) => e.target === X + 'parent')?.source).toBe(X + 'c');
+  });
+
+  it('keeps the first children and every parent', () => {
+    const kids = Array.from({ length: 9 }, (_, i) => `k${i}`);
+    const h = hierarchyOf(
+      {
+        nodes: [node('c', true), node('p1'), node('p2'), ...kids.map((k) => node(k))],
+        edges: [
+          ...kids.map((k) => edge(k, 'subclass of', 'c')),
+          edge('c', 'subclass of', 'p1'),
+          edge('c', 'subclass of', 'p2'),
+        ],
+      },
+      6,
+    );
+    expect(h.edges.filter((e) => e.target === 'c')).toHaveLength(6);
+    expect(h.edges.filter((e) => e.source === 'c')).toHaveLength(2);
+    expect(h.nodes).toHaveLength(9);
+    expect(h.nodes.map((n) => n.id)).not.toContain('k6');
+  });
+
+  it('reads broader and subproperty edges, and leaves out the neighbours of a neighbour', () => {
+    const piece = {
+      nodes: [node('c', true), node('p'), node('k'), node('sib'), node('far')],
+      edges: [
+        edge('c', 'broader', 'p'),
+        edge('k', 'subproperty of', 'c'),
+        // added by expanding the parent
+        edge('sib', 'broader', 'p'),
+        edge('p', 'broader', 'far'),
+      ],
+    };
+    const h = hierarchyOf(piece);
+    expect(h.nodes.map((n) => n.id).sort()).toEqual(['c', 'k', 'p']);
+    expect(h.edges).toHaveLength(2);
+  });
+
+  it('keeps the entity alone when it has no hierarchy', () => {
+    const h = hierarchyOf({
+      nodes: [node('c', true), node('o')],
+      edges: [edge('c', 'part of', 'o')],
+    });
+    expect(h.nodes.map((n) => n.id)).toEqual(['c']);
+    expect(h.edges).toEqual([]);
+  });
+});
+
+describe('the identifiers rows', () => {
+  const x = (database: string, id: string) => ({
+    database,
+    id,
+    href: null,
+    value: `${database}:${id}`,
+  });
+  it('groups the references by database, in their order', () => {
+    expect(
+      xrefsByDatabase([x('FMA', '1'), x('PMID', '2'), x('PMID', '3'), x('Wikipedia', 'A')]).map(
+        (r) => [r.database, r.ids.map((i) => i.id)],
+      ),
+    ).toEqual([
+      ['FMA', ['1']],
+      ['PMID', ['2', '3']],
+      ['Wikipedia', ['A']],
+    ]);
+  });
+  it('hides rows past the limit, unless only one would hide', () => {
+    expect(hiddenRows(3, 8)).toBe(0);
+    expect(hiddenRows(8, 8)).toBe(0);
+    expect(hiddenRows(9, 8)).toBe(0);
+    expect(hiddenRows(10, 8)).toBe(2);
+    expect(hiddenRows(14, 8)).toBe(6);
   });
 });

@@ -804,6 +804,27 @@ a.stat-chip:hover {
   color: var(--text);
   border-color: var(--border-strong);
 }
+/* the counts as one line of text links, each figure with its words, split by a middle dot */
+.stat-chips.plain {
+  gap: 2px 0;
+  line-height: 20px;
+}
+.stat-chips.plain .stat-chip {
+  height: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+.stat-chips.plain a.stat-chip:hover {
+  border: 0;
+  text-decoration: underline;
+}
+.stat-chips.plain > :not(:last-child)::after {
+  content: '\00b7';
+  margin: 0 8px;
+  color: var(--text-3);
+}
 @media (max-width: 639px) {
   .stat-chips {
     gap: 4px;
@@ -811,6 +832,10 @@ a.stat-chip:hover {
   .stat-chip {
     height: 28px;
     padding: 0 9px;
+  }
+  .stat-chips.plain .stat-chip {
+    height: auto;
+    padding: 0;
   }
 }
 

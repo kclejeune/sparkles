@@ -91,8 +91,9 @@ test('an entity page shows its axioms as linked prose, its usage and its facts',
   const counts = page.getByRole('navigation', { name: 'Counts' });
   await expect(counts.getByRole('link', { name: '1 parent' })).toHaveAttribute('href', '#tree-h');
   await expect(counts.getByRole('link', { name: '0 subclasses' })).toBeVisible();
-  const download = page.getByRole('region', { name: 'Download' });
-  await expect(download.getByRole('link', { name: 'Turtle' })).toBeVisible();
+  // Download is the last part of Metadata, not a card of its own
+  await expect(facts.getByRole('link', { name: 'Turtle' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Download' })).toHaveCount(0);
 
   await logic.getByRole('link', { name: 'Employee' }).click();
   await expect(page.getByRole('heading', { level: 1, name: 'Employee' })).toBeVisible();
@@ -361,13 +362,13 @@ test('the phone page keeps the order head, counts, definition, metadata, hierarc
   await page.setViewportSize({ width: 390, height: 844 });
   await openTerm(page, 'Person');
   const y = async (sel: string) => (await page.locator(sel).first().boundingBox())!.y;
-  const order = ['.b-head', '.b-chips', '.b-def', '.b-info', '.b-tree', '.b-refs', '.b-dl'];
+  const order = ['.b-head', '.b-chips', '.b-def', '.b-info', '.b-tree', '.b-refs'];
   const ys = [];
   for (const sel of order) ys.push(await y(sel));
   for (let i = 1; i < ys.length; i++) expect(ys[i - 1]).toBeLessThan(ys[i]);
-  // the counts stay compact: at most two lines of chips
+  // the counts stay compact: at most two lines of text links
   const chips = (await page.locator('.b-chips').boundingBox())!;
-  expect(chips.height).toBeLessThanOrEqual(2 * 32 + 8);
+  expect(chips.height).toBeLessThanOrEqual(2 * 22 + 2);
   // the hierarchy card opens on request
   const card = page.getByRole('complementary', { name: 'Hierarchy' });
   await expect(card.locator('.tree-body')).toBeHidden();
@@ -394,26 +395,252 @@ test('a large screen shows the term in two columns of cards whose bottoms stay c
   // the side column is sized to its cards, narrower than the term's own
   expect(info.width).toBeLessThan(def.width);
   expect(info.width).toBeLessThanOrEqual(400);
-  // the bottoms of the two columns stay within a card of each other
-  const bottom = (sel: string) =>
-    page
-      .locator(sel)
-      .evaluate((c) => (c.lastElementChild as HTMLElement).getBoundingClientRect().bottom);
-  await expect
-    .poll(async () => Math.abs((await bottom('.b-main')) - (await bottom('.b-side'))))
-    .toBeLessThan(400);
-  // the cards keep their reading order: the term's own, then the side's
-  const order = await page.evaluate(() =>
-    [...document.querySelectorAll('.b-main > .panel, .b-side > *')].map((e) =>
-      e.classList.contains('b-info') ? 'meta' : e.className.match(/b-(def|ax|tree|refs|dl)/)?.[1],
-    ),
-  );
+  // the term's own cards, and the rail of facts in its order
+  const cards = (col: string) =>
+    page.evaluate(
+      (c) =>
+        [...document.querySelectorAll(`${c} > *`)]
+          .filter((e) => (e as HTMLElement).offsetParent)
+          .map((e) => e.className.match(/b-(def|ax|tree|refs|info|ids)/)?.[1]),
+      col,
+    );
   // Person states one axiom, so its Axioms card follows the definition
-  expect(order.slice(0, 3)).toEqual(['def', 'ax', 'tree']);
-  expect(order).toContain('meta');
+  expect(await cards('.b-main')).toEqual(['def', 'ax', 'refs']);
+  expect(await cards('.b-side')).toEqual(['info', 'tree']);
+  // no card of the term's page moves between the columns
+  await expect(page.locator('.browse [data-movable]')).toHaveCount(0);
   // at 1024 the cards are one column
   await page.setViewportSize({ width: 1024, height: 900 });
   await expect.poll(async () => (await box('.b-info')).x).toBeLessThan(def.x + 80);
+});
+
+const HEAVY = `/ui/browse?ds=cells&iri=${encodeURIComponent('http://purl.obolibrary.org/obo/CL_0009001')}`;
+const OIO_XREF = 'http://www.geneontology.org/formats/oboInOwl#hasDbXref';
+
+/** A term whose cross-references are `n` databases of one id each, and PMID with two. */
+async function withXrefs(page: Page, n: number) {
+  await page.route(/\/\$\/ontology\/cells\/term\?/, async (route) => {
+    const res = await route.fetch();
+    const t = await res.json();
+    t.statements = t.statements.filter((s: { property: string }) => s.property !== OIO_XREF);
+    const values = [
+      ...Array.from({ length: n }, (_, i) => `DB${String(i).padStart(2, '0')}:${i}`),
+      'PMID:1',
+      'PMID:2',
+    ];
+    for (const v of values)
+      t.statements.push({
+        property: OIO_XREF,
+        value: { '@value': v },
+        graph: 'default',
+        annotations: [],
+      });
+    await route.fulfill({ response: res, json: t });
+  });
+}
+
+test('Identifiers groups the cross-references by database in the rail', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(HEAVY);
+  const ids = page.locator('.b-side').getByRole('region', { name: 'Identifiers' });
+  await expect(ids.locator('dt')).toHaveText(['FMA', 'MESH', 'NCIT', 'PMID', 'Wikipedia'], {
+    timeout: 30_000,
+  });
+  // a database's ids share a row, and a well-known database links
+  const pmid = ids.locator('dd').nth(3);
+  await expect(pmid.getByRole('link')).toHaveText(['00000011', '00000012']);
+  await expect(ids.getByRole('link', { name: 'Border-associated_macrophage' })).toHaveAttribute(
+    'href',
+    'https://en.wikipedia.org/wiki/Border-associated_macrophage',
+  );
+  await expect(ids.getByRole('button', { name: /more/ })).toHaveCount(0);
+  // the identifiers left References, which keeps See also, and the rail keeps its order
+  const refs = page.getByRole('region', { name: 'References' });
+  await expect(refs).not.toContainText('Border-associated_macrophage');
+  await expect(refs.getByRole('heading', { name: 'See also' })).toBeVisible();
+  const ys: number[] = [];
+  for (const sel of ['.b-info', '.b-ids', '.b-tree'])
+    ys.push((await page.locator(sel).boundingBox())!.y);
+  expect(ys).toEqual([...ys].sort((a, b) => a - b));
+});
+
+test('Identifiers shows the first eight databases and the rest on request', async ({ page }) => {
+  await withXrefs(page, 11);
+  await page.goto(HEAVY);
+  const ids = page.getByRole('region', { name: 'Identifiers' });
+  // eleven databases and PMID are twelve rows
+  await expect(ids.locator('dt')).toHaveCount(8, { timeout: 30_000 });
+  await ids.getByRole('button', { name: 'and 4 more' }).click();
+  await expect(ids.locator('dt')).toHaveCount(12);
+  await expect(ids.getByRole('button', { name: /more/ })).toHaveCount(0);
+});
+
+test('Identifiers shows a ninth database rather than offering one more', async ({ page }) => {
+  await withXrefs(page, 8);
+  await page.goto(HEAVY);
+  const ids = page.getByRole('region', { name: 'Identifiers' });
+  await expect(ids.locator('dt')).toHaveCount(9, { timeout: 30_000 });
+  await expect(ids.getByRole('button', { name: /more/ })).toHaveCount(0);
+});
+
+test('See also, What links here and In other datasets share References under stronger headings', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(HEAVY);
+  const refs = page.locator('.b-main').getByRole('region', { name: 'References' });
+  await expect(refs.getByRole('heading', { name: 'See also' })).toBeVisible({ timeout: 30_000 });
+  for (const name of [/What links here/, /In other datasets/])
+    await expect(refs.getByRole('heading', { level: 2, name })).toBeVisible();
+  const style = (el: Element) => {
+    const s = getComputedStyle(el);
+    return { size: s.fontSize, weight: s.fontWeight, color: s.color };
+  };
+  const text = await page.evaluate(() =>
+    getComputedStyle(document.documentElement).getPropertyValue('--text').trim(),
+  );
+  const title = await refs.locator('.panel-head h2').evaluate(style);
+  const sub = await refs.locator('.term-sec > h2').first().evaluate(style);
+  expect(title.size).toBe('17px');
+  expect(sub.size).toBe('14px');
+  expect(sub.weight).toBe('600');
+  const rgb = (hex: string) =>
+    `rgb(${[1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16)).join(', ')})`;
+  expect(sub.color).toBe(rgb(text));
+});
+
+test('the counts are one line of text links', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(HEAVY);
+  const counts = page.getByRole('navigation', { name: 'Counts' });
+  await expect(counts.getByRole('link', { name: '3 subclasses' })).toBeVisible({ timeout: 30_000 });
+  const box = (await counts.boundingBox())!;
+  expect(box.height).toBeLessThanOrEqual(22);
+  const chip = counts.getByRole('link', { name: '3 subclasses' });
+  expect(await chip.evaluate((e) => getComputedStyle(e).borderTopStyle)).toBe('none');
+});
+
+test('the rail sticks, and one taller than the window stays by its bottom edge', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 500 });
+  await page.goto(HEAVY);
+  const side = page.locator('.b-side');
+  await expect(side).toHaveAttribute('data-stick', '', { timeout: 30_000 });
+  const measure = () =>
+    page.evaluate(() => {
+      const s = document.querySelector<HTMLElement>('.b-side')!;
+      const m = document.querySelector('main')!;
+      return {
+        top: parseFloat(getComputedStyle(s).top),
+        box: m.clientHeight,
+        height: s.getBoundingClientRect().height,
+        bottom: s.getBoundingClientRect().bottom - m.getBoundingClientRect().top,
+      };
+    });
+  await expect.poll(async () => (await measure()).top).toBeLessThan(0);
+  const a = await measure();
+  expect(a.height).toBeGreaterThan(a.box);
+  expect(a.top).toBeCloseTo(a.box - a.height - 24, 0);
+  // far down the page the rail's bottom edge rests a gutter above the window's bottom
+  await page.evaluate(() => document.querySelector('main')!.scrollTo(0, 1200));
+  await expect.poll(async () => Math.abs((await measure()).bottom - (a.box - 24))).toBeLessThan(2);
+  // a window tall enough for the rail holds it by its top
+  await page.setViewportSize({ width: 1440, height: 1400 });
+  await expect.poll(async () => (await measure()).top).toBe(24);
+});
+
+test('the hierarchy stays in the rail across Tree and Graph', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(HEAVY);
+  const rail = page.locator('.b-side');
+  const card = rail.getByRole('complementary', { name: 'Hierarchy' });
+  await expect(card.locator('.tree-body')).toBeVisible({ timeout: 30_000 });
+  await expect(card).not.toHaveAttribute('data-movable');
+  const before = (await card.boundingBox())!;
+  await card.getByRole('link', { name: 'Graph', exact: true }).click();
+  await expect(page).toHaveURL(/view=graph/);
+  await expect(card.locator('.canvas canvas').first()).toBeVisible({ timeout: 20_000 });
+  const graph = (await card.boundingBox())!;
+  expect(graph.x).toBe(before.x);
+  expect(graph.y).toBe(before.y);
+  expect(graph.width).toBe(before.width);
+  // the main column keeps its cards and the rail its height for a moment after the layout
+  await page.waitForTimeout(500);
+  await expect(page.locator('.b-side > .b-tree')).toHaveCount(1);
+  await card.getByRole('link', { name: 'Tree', exact: true }).click();
+  await expect(card.locator('.tree-body')).toBeVisible();
+  expect((await card.boundingBox())!.y).toBe(before.y);
+});
+
+test('the rail graph shows the parents and first children, and Expand opens the whole graph', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(`${HEAVY}&view=graph`);
+  const card = page.getByRole('complementary', { name: 'Hierarchy' });
+  const canvas = card.locator('.canvas');
+  await expect(canvas.locator('canvas').first()).toBeVisible({ timeout: 30_000 });
+  type Cy = { nodes: () => { map: (f: (n: { id: () => string }) => string) => string[] } };
+  const local = (host: import('@playwright/test').Locator) =>
+    expect.poll(
+      () =>
+        host.evaluate((el) => {
+          const w = [...el.querySelectorAll('*')].find((e) => '__cy' in e) as
+            | (Element & { __cy: Cy })
+            | undefined;
+          return (w?.__cy.nodes().map((n) => n.id().split('/').pop()!) ?? []).sort();
+        }),
+      { timeout: 20_000 },
+    );
+  await local(canvas).toEqual([
+    'CL_0000235',
+    'CL_0009001',
+    'CL_0009002',
+    'CL_0009003',
+    'CL_0009004',
+  ]);
+  // the rail's tools are Fit and Expand, and Explore waits in the dialog
+  await expect(canvas.getByRole('link', { name: 'Open in Explore' })).toHaveCount(0);
+  await canvas.getByRole('button', { name: 'Expand' }).click();
+  const dialog = page.getByRole('dialog', { name: /Graph of border-associated macrophage/ });
+  await expect(dialog.locator('canvas').first()).toBeVisible();
+  await expect(dialog.getByRole('link', { name: 'Open in Explore' })).toBeVisible();
+  // the whole neighbourhood: the axioms' fillers and the entities that mention this one
+  await local(dialog).toEqual(
+    expect.arrayContaining(['UBERON_0002360', 'GO_0006909', 'CL_0009006', 'CL_0009002']),
+  );
+  const box = (await dialog.boundingBox())!;
+  expect(box.width).toBeGreaterThan(900);
+  await dialog.getByRole('button', { name: 'Close' }).click();
+  await expect(dialog).toBeHidden();
+  await expect(canvas.locator('canvas').first()).toBeVisible();
+});
+
+test('a phone opens the graph at its width, and Expand takes the whole screen width', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(HEAVY);
+  const card = page.getByRole('complementary', { name: 'Hierarchy' });
+  await expect(card.locator('.tree-body')).toBeHidden({ timeout: 30_000 });
+  // choosing a view opens the card
+  await card.getByRole('link', { name: 'Graph', exact: true }).click();
+  await expect(page).toHaveURL(/view=graph/);
+  await expect(card.locator('.canvas canvas').first()).toBeVisible({ timeout: 20_000 });
+  await expectNoOverflow(page);
+  const c = (await card.boundingBox())!;
+  expect(c.width).toBeLessThanOrEqual(390);
+  await card.getByRole('button', { name: 'Expand' }).click();
+  const dialog = page.getByRole('dialog', { name: /Graph of/ });
+  await expect(dialog.locator('canvas').first()).toBeVisible();
+  const d = (await dialog.boundingBox())!;
+  expect(d.x).toBeGreaterThanOrEqual(0);
+  expect(d.x + d.width).toBeLessThanOrEqual(390);
+  await dialog.getByRole('button', { name: 'Close' }).click();
+  // an address that asks for the graph shows it open
+  await page.goto(`${HEAVY}&view=graph`);
+  await expect(card.locator('.canvas canvas').first()).toBeVisible({ timeout: 30_000 });
 });
 
 test('a list whose count is a lower bound pages on until a short page', async ({ page }) => {

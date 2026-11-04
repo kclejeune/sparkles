@@ -65,7 +65,7 @@ open(
       'href',
       new RegExp(encodeURIComponent(CELLO(11))),
     );
-    const xrefs = page.getByRole('region', { name: 'Cross-references' });
+    const xrefs = page.getByRole('region', { name: 'Identifiers' });
     await expect(xrefs.getByRole('link', { name: /Mitochondrion/ })).toHaveAttribute(
       'href',
       'https://en.wikipedia.org/wiki/Mitochondrion',

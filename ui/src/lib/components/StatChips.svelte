@@ -15,7 +15,13 @@
   // A page's headline counts as one row of chips, each its figure and what it counts, and a
   // link to the section it counts when it has one (ROADMAP item 633). The row is a navigation
   // landmark when a chip links, and a list otherwise. The styles are `.stat-chips` in app.css.
-  let { items, label = 'Counts' }: { items: StatChip[]; label?: string } = $props();
+  // With `plain` the counts read as one line of text links in place of pills, for a page whose
+  // head should stay quiet.
+  let {
+    items,
+    label = 'Counts',
+    plain = false,
+  }: { items: StatChip[]; label?: string; plain?: boolean } = $props();
   const links = $derived(items.some((c) => c.href));
 </script>
 
@@ -25,11 +31,11 @@
 
 {#if items.length}
   {#if links}
-    <nav class="stat-chips" aria-label={label}>
+    <nav class="stat-chips" class:plain aria-label={label}>
       {#each items as c (c.key)}{@render chip(c)}{/each}
     </nav>
   {:else}
-    <ul class="stat-chips" aria-label={label}>
+    <ul class="stat-chips" class:plain aria-label={label}>
       {#each items as c (c.key)}<li>{@render chip(c)}</li>{/each}
     </ul>
   {/if}

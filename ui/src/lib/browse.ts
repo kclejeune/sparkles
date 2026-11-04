@@ -1175,6 +1175,42 @@ export function neighbourhood(
   return { nodes: [...nodes.values()], edges: [...edges.values()] };
 }
 
+/** The edge words of the hierarchies, as `neighbourhood` and the hierarchy route's edges say them. */
+const HIERARCHY_WORDS = new Set(['subclass of', 'subproperty of', 'broader']);
+
+/**
+ * The entity's direct parents and its first children, which is what fits a narrow rail. An
+ * edge from the entity leads to a parent and an edge into it comes from a child. The edges
+ * between its neighbours, which expanding a node adds, stay out of this view.
+ */
+export function hierarchyOf(p: GraphPiece, kids = 6): GraphPiece {
+  const focus = p.nodes.find((n) => n.focus)?.id;
+  let children = 0;
+  const edges = p.edges.filter((e) => {
+    if (!HIERARCHY_WORDS.has(e.label)) return false;
+    if (e.source === focus) return true;
+    return e.target === focus && ++children <= kids;
+  });
+  const used = new Set(edges.flatMap((e) => [e.source, e.target]));
+  if (focus) used.add(focus);
+  return { nodes: p.nodes.filter((n) => used.has(n.id)), edges };
+}
+
+/** Cross-references by database, the databases in the order the references come in. */
+export function xrefsByDatabase(xrefs: Sections['xrefs']) {
+  const by = new Map<string, Sections['xrefs']>();
+  for (const x of xrefs) by.set(x.database, [...(by.get(x.database) ?? []), x]);
+  return [...by.entries()].map(([database, ids]) => ({ database, ids }));
+}
+
+/**
+ * How many rows of a list to hide behind "and N more": all past `limit`, unless only one row
+ * would hide, which then takes the room the control would.
+ */
+export function hiddenRows(total: number, limit: number): number {
+  return total <= limit + 1 ? 0 : total - limit;
+}
+
 /** Merge `b` into `a`, keeping `a`'s focus. */
 export function mergePieces(a: GraphPiece, b: GraphPiece): GraphPiece {
   const nodes = new Map(a.nodes.map((n) => [n.id, n]));

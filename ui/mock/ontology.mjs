@@ -166,7 +166,7 @@ Note: this text was written for a test fixture and is not taken from a published
 [] a owl:Axiom ; owl:annotatedSource obo:CL_0000129 ; owl:annotatedProperty oboInOwl:hasRelatedSynonym ;
   owl:annotatedTarget "MG.cns"@en ; oboInOwl:hasSynonymType cl:ABBREVIATION ; oboInOwl:hasDbXref "FIXTURE:panel" .
 
-# A heavy term for the layout review (browse-design-alt): several definitions from different
+# A heavy term for the layout review: several definitions from different
 # predicates, comments and notes of every kind, a logical definition, several restrictions, a
 # disjointness, many cross-references and entities that point at it. The text is invented.
 skos:definition a owl:AnnotationProperty . skos:scopeNote a owl:AnnotationProperty .
