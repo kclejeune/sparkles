@@ -1131,10 +1131,7 @@ impl<'a> Run<'a> {
             if round >= ROOTS_PER_ROUND && mine.is_empty() {
                 round = 0;
             }
-            // while the waiting messages take more than the stored conclusions, the worker
-            // works through the contexts it woke before it starts more roots (roadmap
-            // item 695)
-            let root = if round < ROOTS_PER_ROUND && (mine.is_empty() || !self.congested()) {
+            let root = if round < ROOTS_PER_ROUND {
                 self.next_root(&mut chunk)
             } else {
                 None
