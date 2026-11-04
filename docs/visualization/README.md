@@ -363,6 +363,17 @@ it. A breadcrumb above the entity panel gives the selected entity's path from a 
 tree. A level with more than 1,000 children shows its
 first 1,000 with a **Show more** row that reads the next 1,000 from the hierarchy route.
 
+A tree draws only the rows in view, with a few above and below them, however many nodes are
+open, so a level of thousands of children and an ontology of millions of classes scroll as
+smoothly as a short list. The tree is one tab stop, and the arrow keys move a cursor over
+the whole tree, including the rows that are not in the page. Up and Down move a row, Right
+opens a node or enters it, Left closes a node or goes to its parent, Home, End, Page Up and
+Page Down move further, typing a name jumps to the next row that starts with it, and Enter
+selects the row or reads the next page of a **Show more** row. Each row tells assistive
+technology its level and its place among its siblings. Keeping the rows out of the page costs
+a little memory for the list of rows, about the size of the open nodes' ids, in exchange for a
+page whose size does not grow with the tree.
+
 A change set is drawn the same way wherever the pages show one, in the edit previews and in
 the history tabs. Each subject is a block named by its label, with every added or removed
 property and value on a line of its own and a sign beside it, and the plain N-Quads are one
@@ -383,6 +394,16 @@ not read, or in functional-style syntax. The page's tabs are **Tree**, **DL Quer
 **Header** and **History**. A select at the top of the tree picks the classes, object,
 data or annotation properties or individuals, and a segmented control on the entity panel
 switches between its frame and its usage.
+
+The editor reads what its views show. Opening it reads the ontology's summary and the first
+level of the tree on screen, and the other trees read their levels when their tab opens.
+Names come from the labels of the hierarchy answers and from one query for the labels of the
+IRIs a panel names for the first time, so no read lists every label of the ontology. The
+entity lists behind the add fields' pickers and the new-entity checks are read once an entity,
+the header, the DL Query tab or the new-entity dialog needs them, for each kind of up to 5,000
+entities. A longer kind is completed by the entity search as a name is typed and is resolved by
+the server's Manchester reader. The Individuals tree has no hierarchy route, so it reads its
+individuals, up to 50,000, and their types when it opens.
 
 The **DL Query** tab answers a Manchester class expression with its equivalent classes,
 its direct and inferred superclasses and subclasses, and its instances

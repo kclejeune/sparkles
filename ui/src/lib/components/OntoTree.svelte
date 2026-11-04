@@ -175,12 +175,16 @@
     return null;
   }
 
+  /** The element that scrolls the tree: its nearest scrolling ancestor, or else the page. */
+  const viewport = () => scroller ?? (document.scrollingElement as HTMLElement | null);
+
   function readView() {
-    if (!scroller || !list) return;
-    scrollTop = scroller.scrollTop;
-    viewH = scroller.clientHeight || viewH;
-    listTop =
-      list.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
+    const el = viewport();
+    if (!el || !list) return;
+    scrollTop = el.scrollTop;
+    viewH = (scroller ? el.clientHeight : window.innerHeight) || viewH;
+    const top = scroller ? scroller.getBoundingClientRect().top : 0;
+    listTop = list.getBoundingClientRect().top - top + el.scrollTop;
   }
 
   onMount(() => {
@@ -194,9 +198,11 @@
           readView();
         });
     };
-    scroller?.addEventListener('scroll', later, { passive: true });
+    const target: HTMLElement | Window = scroller ?? window;
+    target.addEventListener('scroll', later, { passive: true });
     const ro = typeof ResizeObserver === 'function' ? new ResizeObserver(later) : null;
     if (scroller) ro?.observe(scroller);
+    else window.addEventListener('resize', later);
     ro?.observe(root);
     readView();
     const off = registerTree({
@@ -209,7 +215,8 @@
     });
     return () => {
       cancelAnimationFrame(queued);
-      scroller?.removeEventListener('scroll', later);
+      target.removeEventListener('scroll', later);
+      window.removeEventListener('resize', later);
       ro?.disconnect();
       off();
     };
@@ -248,11 +255,12 @@
 
   /** Scroll row `i` into view with the least movement, below the sticky rows. */
   function ensureVisible(i: number) {
-    if (!scroller) return;
+    const el = viewport();
+    if (!el) return;
     const pinned = (sticky.shown.length + (sticky.hidden ? 1 : 0)) * rowH;
     const want = scrollToRow(metrics, i, rel, viewH, pinned);
     if (want != null) {
-      scroller.scrollTop = want + listTop;
+      el.scrollTop = want + listTop;
       readView();
     }
   }
@@ -314,6 +322,8 @@
     const m = keyMove(rows, cursor, e.key, page);
     if (!m) return;
     e.preventDefault();
+    // a row's button that scrolls out of the window leaves the page, so the tree keeps the focus
+    if (document.activeElement !== list) list?.focus({ preventScroll: true });
     if ('to' in m) {
       cursorKey = rows[m.to].key;
       ensureVisible(m.to);
@@ -329,11 +339,12 @@
   }
 
   function goSticky(index: number) {
-    if (!scroller) return;
+    const el = viewport();
+    if (!el) return;
     // the ancestor's row at the top, under the sticky rows that stay above it
     const at = stickyRows.findIndex((r) => r.index === index);
     const offset = (sticky.hidden ? rowH : 0) + at * rowH;
-    scroller.scrollTop = listTop + metrics.top(index) - offset;
+    el.scrollTop = listTop + metrics.top(index) - offset;
     readView();
   }
 </script>
