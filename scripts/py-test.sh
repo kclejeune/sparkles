@@ -3,9 +3,9 @@
 # package in target/py, and run the pytest suite on it (`mise run py:test`).
 #
 # The build shares the root target directory, so it reuses the workspace's compiled
-# dependencies. The tests run with the `python3` on PATH when it has pytest, as the dev
-# shell's does; otherwise with a virtual environment in target/py-venv, where pytest is
-# installed with pip on first use.
+# dependencies. The tests run with the `python3` on PATH when it has the pinned versions
+# of crates/sparkles-py/tests/requirements-test.txt; otherwise with a virtual environment
+# in target/py-venv, where pip installs them. A missing mypy or rdflib fails the run.
 #
 # Usage: scripts/py-test.sh [pytest args]
 # PY_PROFILE=release tests a release build.
@@ -30,16 +30,35 @@ mkdir -p "$out"
 cp -r "$crate/python/sparkles" "$out/sparkles"
 cp "$lib" "$out/sparkles/_sparkles.abi3.so"
 
+# The pinned test dependencies, which the wheel workflow installs too. The python3 on
+# PATH runs the tests when it already has them at those versions, and a virtual
+# environment in target/py-venv otherwise.
+reqs="$crate/tests/requirements-test.txt"
+pinned_in() {
+  "$1" - "$reqs" << 'PY' 2> /dev/null
+import importlib.metadata as m
+import sys
+
+for line in open(sys.argv[1]):
+    line = line.split("#")[0].strip()
+    if line:
+        name, version = line.split("==")
+        if m.version(name) != version:
+            sys.exit(1)
+PY
+}
 python=python3
-if ! "$python" -c 'import pytest' 2> /dev/null; then
+if ! pinned_in "$python"; then
   venv=target/py-venv
-  if [ ! -x "$venv/bin/python" ]; then
-    echo "pytest is not installed: creating $venv" >&2
-    python3 -m venv "$venv"
-    "$venv/bin/python" -m pip install --quiet pytest
-  fi
   python="$venv/bin/python"
+  if [ ! -x "$python" ]; then
+    echo "creating $venv for the pinned test dependencies" >&2
+    python3 -m venv "$venv"
+  fi
+  if ! pinned_in "$python"; then
+    "$python" -m pip install --quiet --disable-pip-version-check -r "$reqs"
+  fi
 fi
 
 # no bytecode or pytest cache in the source tree
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/$out" exec "$python" -m pytest -p no:cacheprovider "$crate/tests" "$@"
+SPARKLES_PY_TEST_DEPS=required PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/$out" exec "$python" -m pytest -p no:cacheprovider "$crate/tests" "$@"

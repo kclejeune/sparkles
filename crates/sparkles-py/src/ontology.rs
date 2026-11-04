@@ -53,6 +53,7 @@ impl PyAxiom {
     }
     /// Read an axiom in its JSON form, as the HTTP API and `json()` give it.
     #[staticmethod]
+    #[pyo3(signature=(value, /))]
     fn from_json(value: &Bound<'_, PyAny>) -> PyResult<Self> {
         let v: J = admin::from_py(value, "axiom")?;
         let ax = owl::json::read_axiom(&v)

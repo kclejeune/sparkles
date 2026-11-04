@@ -1513,6 +1513,12 @@ glibc added in 2.30, so the archive's link failed with an undefined `gettid`. It
 makes the system call directly, as the compaction and embedding threads do, and Clippy
 refuses `libc::gettid` in the workspace.
 
+The Python type stubs match the module again. `Axiom.from_json` takes its argument by
+position only, as the stub and `Axiom.parse` say, and `owl.ObjectPropertyChain` has
+empty `__slots__`, so it adds no layout to `tuple` and mypy's stubtest no longer reports
+it as a disjoint base. A call that passed `from_json(value=...)` by keyword now raises
+`TypeError`.
+
 A quick query text no longer settles in its slower execution mode because of one cold
 run. The server's history ran a text's first run as an automatic cursor and its second
 eagerly, and kept whichever of those two single runs was faster for the server's whole

@@ -299,6 +299,10 @@ def ObjectInverseOf(property: Any) -> Json:
 class ObjectPropertyChain(tuple):
     """The chain of a ``SubObjectPropertyOf`` axiom."""
 
+    # No instance dictionary, so the class adds no layout to tuple's and stays a plain
+    # tuple subclass rather than a disjoint base.
+    __slots__ = ()
+
     def __new__(cls, *properties: Any) -> ObjectPropertyChain:
         if len(properties) < 2:
             raise ValueError("a property chain has at least two properties")

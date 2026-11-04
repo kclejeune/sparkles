@@ -564,9 +564,12 @@ is and fail while it lacks something the crate needs.
 `target` directory, so it reuses the workspace's compiled dependencies. It assembles the
 package in `target/py` and runs `crates/sparkles-py/tests` with pytest. The tests include
 mypy's `stubtest`, which checks the `.pyi` stubs against the compiled module, and rdflib
-interoperability tests. Both skip when mypy or rdflib is missing. The dev shell's
-`python3` has pytest, mypy and rdflib. With another `python3`, the script installs pytest
-into a virtual environment in `target/py-venv`. Extra arguments go to pytest, as in
+interoperability tests. `crates/sparkles-py/tests/requirements-test.txt` pins pytest, mypy
+and rdflib, and the wheel workflow's `scripts/py-wheel-test.sh` installs the same versions,
+so both run the same stubtest. The script uses the `python3` on PATH when it has those
+versions, and otherwise installs them into a virtual environment in `target/py-venv`.
+Both scripts set `SPARKLES_PY_TEST_DEPS=required`, which makes a missing mypy or rdflib
+fail the run. Without that variable, as under a bare `pytest`, those tests skip. Extra arguments go to pytest, as in
 `mise run py:test -- -k transaction`. `mise run py:lint` runs clippy on the crate with its
 default features and with none. Both tasks are part of `mise run ci`. The first run
 compiles the crate and the engine for the Python build, and later runs take seconds.
