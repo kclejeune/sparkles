@@ -367,7 +367,10 @@ export function labelKinds(
   return kinds
     .map(([kind, key]) => ({
       kind,
-      values: labels.flatMap((l) => l[key].map((text) => ({ text, lang: l.lang }))),
+      // one row per language and text, however many rows of `labels` state it
+      values: labels
+        .flatMap((l) => l[key].map((text) => ({ text, lang: l.lang })))
+        .filter((v, i, all) => all.findIndex((o) => o.lang === v.lang && o.text === v.text) === i),
     }))
     .filter((g) => g.values.length > 0);
 }

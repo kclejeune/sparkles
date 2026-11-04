@@ -1038,6 +1038,17 @@ describe('the texts after the lead', () => {
 });
 
 describe('the labels by kind', () => {
+  it('states a language and text once, and tells apart ones that run together', () => {
+    const [g] = labelKinds([
+      { lang: 'en', preferred: ['closure', 'closure'], alternative: [], hidden: [] },
+      { lang: '', preferred: ['enclosure'], alternative: [], hidden: [] },
+      { lang: 'en', preferred: ['closure'], alternative: [], hidden: [] },
+    ]);
+    expect(g.values).toEqual([
+      { text: 'closure', lang: 'en' },
+      { text: 'enclosure', lang: '' },
+    ]);
+  });
   it('keeps every language and leaves out a kind with none', () => {
     expect(
       labelKinds([

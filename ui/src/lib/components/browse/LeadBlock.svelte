@@ -85,7 +85,7 @@
           <details data-more={d.word} {open}>
             <summary>{d.label}</summary>
             <ul>
-              {#each d.rows as g (g.predicates.join(' ') + g.kind)}
+              {#each d.rows as g (JSON.stringify([g.kind, g.predicates]))}
                 {#each g.values as v, i (i)}
                   <li data-kind={g.kind}>
                     {@render value(v, d.word === 'note' ? g.kind : null, g.predicates)}

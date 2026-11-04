@@ -19,7 +19,7 @@
         <div class="term-row">
           <dt>{g.kind}</dt>
           <dd class="values">
-            {#each g.values as v (v.lang + v.text)}
+            {#each g.values as v (JSON.stringify([v.lang, v.text]))}
               <span data-lang={v.lang}
                 ><span dir={rtl(v.lang) ? 'rtl' : undefined}>{v.text}</span>{#if v.lang}<span
                     class="lang-tag">{v.lang}</span

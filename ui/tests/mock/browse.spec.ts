@@ -802,6 +802,39 @@ test('a concept keeps its hidden labels behind their toggle', async ({ page }) =
   await expect(labels).not.toContainText('hidden');
 });
 
+test('labels whose language and text run together both show', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  const pref = 'http://www.w3.org/2004/02/skos/core#prefLabel';
+  await page.route(/\/\$\/ontology\/thes\/term\?/, async (route) => {
+    const res = await route.fetch();
+    const t = await res.json();
+    const stated = (value: object) => ({
+      property: pref,
+      value,
+      graph: t.statements[0]?.graph ?? '',
+      annotations: [],
+    });
+    t.statements = [
+      ...t.statements,
+      stated({ '@value': 'enclosure' }),
+      stated({ '@value': 'closure', '@language': 'en' }),
+      // the same label twice, as two graphs can state it
+      stated({ '@value': 'closure', '@language': 'en' }),
+    ];
+    await route.fulfill({ response: res, json: t });
+  });
+  await page.goto(
+    `/ui/browse?ds=thes&iri=${encodeURIComponent('http://example.org/thesaurus/fish')}`,
+  );
+  const row = page
+    .getByRole('region', { name: 'Labels', exact: true })
+    .locator('.term-row', { hasText: 'Preferred' });
+  await expect(row).toContainText('enclosure', { timeout: 30_000 });
+  await expect(row.locator('[data-lang="en"]', { hasText: /^closure/ })).toHaveCount(1);
+  expect(errors).toEqual([]);
+});
+
 test('a concept lists its labels by kind, in every language', async ({ page }) => {
   await page.goto(
     `/ui/browse?ds=thes&iri=${encodeURIComponent('http://example.org/thesaurus/fish')}`,
