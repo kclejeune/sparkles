@@ -59,6 +59,8 @@ pub struct DlIx {
     /// for each role, whether the role of an existential restriction is below it, so that
     /// a universal on it can meet a successor
     reach: Vec<bool>,
+    /// for each role, the existential restrictions whose role is below it, by id
+    below: Vec<Vec<Ex>>,
 }
 
 impl DlIx {
@@ -84,6 +86,8 @@ impl DlIx {
                 .push((b.into_boxed_slice(), h.clone().into_boxed_slice()));
         }
         let mut roles: Vec<Role> = Vec::new();
+        let n = ix.roles.sup.len();
+        d.below = vec![Vec::new(); n];
         for e in 0..nodes as Ex {
             let h = ix.head(e);
             if let Node::Exist(r, _) = h.node {
@@ -92,11 +96,25 @@ impl DlIx {
                 d.cores.insert(e, core.into_boxed_slice());
                 d.by_succ.entry(h.succ).or_default().push(e);
                 roles.push(r);
+                for &s in ix
+                    .roles
+                    .sup
+                    .get(r as usize)
+                    .map_or(&[][..], |v| v.as_slice())
+                {
+                    if let Some(b) = d.below.get_mut(s as usize) {
+                        b.push(e);
+                    }
+                }
+                if let Some(b) = d.below.get_mut(r as usize)
+                    && b.last() != Some(&e)
+                {
+                    b.push(e);
+                }
             }
         }
         roles.sort_unstable();
         roles.dedup();
-        let n = ix.roles.sup.len();
         d.reach = vec![false; n];
         for &r in &roles {
             for &s in ix
@@ -139,6 +157,11 @@ impl DlIx {
                 .map(|v| 32 + v.capacity() * 4)
                 .sum::<usize>()
             + self.reach.len()
+            + self
+                .below
+                .iter()
+                .map(|v| 24 + v.capacity() * 4)
+                .sum::<usize>()
     }
 
     /// Whether a universal on `t` can meet a successor.
@@ -406,12 +429,27 @@ fn partners_rf(ix: &Index, st: &State, t: Role) -> Vec<(Ex, Side)> {
         return out;
     }
     let roles = &ix.roles;
-    for &e in &st.subs {
-        if let Some(r) = role_of(ix, e)
-            && roles.sub(r, t)
-        {
-            out.push((e, (Vec::new(), Vec::new())));
+    let below = dix(ix)
+        .below
+        .get(t as usize)
+        .map_or(&[][..], |v| v.as_slice());
+    if below.len() <= st.subs.len() {
+        for &e in below {
+            if st.subs.contains(&e) {
+                out.push((e, (Vec::new(), Vec::new())));
+            }
         }
+    } else {
+        let mut es: Vec<Ex> = Vec::new();
+        for &e in &st.subs {
+            if let Some(r) = role_of(ix, e)
+                && roles.sub(r, t)
+            {
+                es.push(e);
+            }
+        }
+        es.sort_unstable();
+        out.extend(es.into_iter().map(|e| (e, (Vec::new(), Vec::new()))));
     }
     if let Some(d) = dl(st) {
         let mut es: Vec<Ex> = d.store.by_f.keys().copied().collect();

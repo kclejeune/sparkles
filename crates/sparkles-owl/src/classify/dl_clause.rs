@@ -265,8 +265,9 @@ pub struct Store {
     pub preds: Vec<u32>,
     /// every clause by each literal of its head, for the clauses a new one subsumes
     by_lit: FxHashMap<Lit, Vec<u32>>,
-    /// every clause by the first literal of its head, for whether a new one is subsumed
-    by_first: FxHashMap<Lit, Vec<u32>>,
+    /// every clause by the last literal of its head, which is the most specific, for
+    /// whether a new one is subsumed
+    by_last: FxHashMap<Lit, Vec<u32>>,
     /// the clauses with an empty head
     empty: Vec<u32>,
     bytes: usize,
@@ -282,7 +283,7 @@ impl Store {
             + table_bytes(self.by_x.capacity(), 32)
             + table_bytes(self.by_f.capacity(), 32)
             + table_bytes(self.by_lit.capacity(), 32)
-            + table_bytes(self.by_first.capacity(), 32)
+            + table_bytes(self.by_last.capacity(), 32)
     }
 
     pub fn is_idle(&self) -> bool {
@@ -290,7 +291,7 @@ impl Store {
     }
 
     /// Whether a clause of the store that is not dead subsumes `c`, whose signature is
-    /// `sig`: a clause that does has its first head literal in `c`'s head.
+    /// `sig`: a clause that does has its last head literal in `c`'s head.
     fn subsumed(&self, c: &Clause, sig: u64) -> bool {
         let check = |ids: &[u32]| {
             ids.iter().any(|&i| {
@@ -303,7 +304,7 @@ impl Store {
         }
         c.head()
             .iter()
-            .any(|l| self.by_first.get(l).is_some_and(|ids| check(ids)))
+            .any(|l| self.by_last.get(l).is_some_and(|ids| check(ids)))
     }
 
     /// Adds a clause that is not subsumed, marks dead those it subsumes, and queues it.
@@ -333,9 +334,9 @@ impl Store {
         }
         let id = self.clauses.len() as u32;
         let bytes = c.bytes() + 8 * (c.head().len() + 2) + 8;
-        match c.head().first() {
+        match c.head().last() {
             None => self.empty.push(id),
-            Some(&l) => self.by_first.entry(l).or_default().push(id),
+            Some(&l) => self.by_last.entry(l).or_default().push(id),
         }
         for &l in c.head() {
             self.by_lit.entry(l).or_default().push(id);

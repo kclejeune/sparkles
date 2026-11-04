@@ -238,8 +238,12 @@ impl Norm<'_> {
         })
     }
 
-    /// `¬f` in a positive position: `x` with `x ⊓ y ⊑ ⊥` for f's negative form y.
+    /// `¬f` in a positive position: `x` with `x ⊓ y ⊑ ⊥` for f's negative form y, and
+    /// `g`'s positive form for `f = ¬g`.
     fn not(&mut self, f: &ClassExpression, d: usize) -> Result<Ex, Why> {
+        if let ClassExpression::ObjectComplementOf(g) = f {
+            return self.pos(g, d);
+        }
         let g = self.neg(f, d)?;
         Ok(match g {
             TOP => BOTTOM,
@@ -263,11 +267,45 @@ impl Norm<'_> {
         Ok(match c {
             C::Class(c) => self.it.class(c),
             C::ObjectIntersectionOf(cs) => {
-                let es = cs
+                // `D ⊓ ¬F ⊑ y` is the clause `D → y ⊔ F`, with a body, where the complement
+                // alone would give a clause of every context; so are `∀r.F` and `≤n r.F`,
+                // whose duals are `∃r.¬F` and `≥(n+1) r.F`
+                let (moved, plain): (Vec<&ClassExpression>, Vec<&ClassExpression>) =
+                    cs.iter().partition(|c| Self::dual(c).is_some());
+                if moved.is_empty() || plain.is_empty() {
+                    let es = cs
+                        .iter()
+                        .map(|c| self.neg(c, d))
+                        .collect::<Result<_, _>>()?;
+                    return Ok(self.conj(es));
+                }
+                let mut body = plain
                     .iter()
                     .map(|c| self.neg(c, d))
-                    .collect::<Result<_, _>>()?;
-                self.conj(es)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut head = Vec::new();
+                for c in moved {
+                    let dual = Self::dual(c).expect("a conjunct with a dual");
+                    head.push(self.pos(&dual, d)?);
+                }
+                if head.contains(&TOP) || body.contains(&BOTTOM) {
+                    return Ok(BOTTOM);
+                }
+                body.retain(|&e| e != TOP);
+                head.retain(|&e| e != BOTTOM);
+                let y = self.it.fresh_class();
+                if head.is_empty() {
+                    let b = self.conj(body);
+                    self.out.subs.push((b, y));
+                } else {
+                    head.push(y);
+                    head.sort_unstable();
+                    head.dedup();
+                    body.sort_unstable();
+                    body.dedup();
+                    self.out.clauses.push((body, head));
+                }
+                y
             }
             C::ObjectUnionOf(cs) => {
                 let mut es: Vec<Ex> = cs
@@ -347,6 +385,25 @@ impl Norm<'_> {
         })
     }
 
+    /// The dual that a conjunct in a negative position moves to the head as: `F` for `¬F`,
+    /// `∃r.¬F` for `∀r.F` and `≥(n+1) r.F` for `≤n r.F`.
+    fn dual(c: &ClassExpression) -> Option<ClassExpression> {
+        use ClassExpression as C;
+        match c {
+            C::ObjectComplementOf(f) => Some((**f).clone()),
+            C::ObjectAllValuesFrom(p, f) => Some(C::ObjectSomeValuesFrom(
+                p.clone(),
+                Box::new(C::ObjectComplementOf(f.clone())),
+            )),
+            C::ObjectMaxCardinality(n, p, f) => Some(C::ObjectMinCardinality(
+                n.checked_add(1)?,
+                p.clone(),
+                f.clone(),
+            )),
+            _ => None,
+        }
+    }
+
     fn neg_some(
         &mut self,
         p: &ObjectPropertyExpression,
@@ -381,7 +438,9 @@ impl Norm<'_> {
             if let Some(c) = todo_l.pop() {
                 match c {
                     C::ObjectIntersectionOf(cs) => todo_l.extend(cs),
-                    C::ObjectComplementOf(f) => todo_r.push(*f),
+                    // a complement, a universal or a maximum on the left is its dual on the
+                    // right, which keeps the clause's body
+                    c if Self::dual(&c).is_some() => todo_r.push(Self::dual(&c).expect("a dual")),
                     C::Class(ref k) if k.as_str() == vocab::OWL_THING => {}
                     c => left.push(c),
                 }
@@ -821,6 +880,63 @@ mod tests {
                 .iter()
                 .any(|&e| matches!(it.nodes[e as usize], Node::Exist(..)))
         );
+    }
+
+    #[test]
+    fn a_universal_beside_a_class_on_the_left_keeps_the_class_as_body() {
+        // D ⊓ ∀r.E ⊑ C is D → C ⊔ ∃r.¬E, a clause of D's contexts only (item 712)
+        let r = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/r"));
+        let (_, d, _, it) = run(&[AxiomKind::EquivalentClasses(
+            std::collections::BTreeSet::from([
+                c("C"),
+                ClassExpression::ObjectIntersectionOf(std::collections::BTreeSet::from([
+                    c("D"),
+                    ClassExpression::ObjectAllValuesFrom(r.clone(), Box::new(c("E"))),
+                ])),
+            ]),
+        )])
+        .unwrap();
+        assert!(!d.clauses.is_empty());
+        for (b, h) in &d.clauses {
+            assert!(!b.is_empty(), "a clause of every context");
+            assert!(
+                h.iter()
+                    .any(|&e| matches!(it.nodes[e as usize], Node::Exist(..)))
+            );
+        }
+        // inside an existential restriction on the left, the same with a fresh class
+        let (_, d, _, _) = run(&[AxiomKind::SubClassOf(
+            ClassExpression::ObjectSomeValuesFrom(
+                r.clone(),
+                Box::new(ClassExpression::ObjectIntersectionOf(
+                    std::collections::BTreeSet::from([
+                        c("D"),
+                        ClassExpression::ObjectComplementOf(Box::new(c("E"))),
+                    ]),
+                )),
+            ),
+            c("C"),
+        )])
+        .unwrap();
+        assert_eq!(d.clauses.len(), 1);
+        assert!(!d.clauses[0].0.is_empty());
+    }
+
+    #[test]
+    fn a_double_complement_on_the_right_is_its_class() {
+        let (t, d, _, _) = run(&[AxiomKind::SubClassOf(
+            c("A"),
+            ClassExpression::ObjectUnionOf(std::collections::BTreeSet::from([
+                c("B"),
+                ClassExpression::ObjectComplementOf(Box::new(ClassExpression::ObjectComplementOf(
+                    Box::new(c("C")),
+                ))),
+            ])),
+        )])
+        .unwrap();
+        assert_eq!(t, vec![true]);
+        assert_eq!(d.clauses.len(), 1);
+        assert_eq!(d.clauses[0].1.len(), 2);
     }
 
     #[test]
