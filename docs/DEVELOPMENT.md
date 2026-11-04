@@ -936,6 +936,15 @@ broke it in a follow-up commit and gate that commit as usual. A batch whose sele
 skipped the failing check gets a rule in `scripts/gate/select-checks.py` when the miss is
 one the rules should have caught.
 
+The GitHub workflows run on GitHub and not in either gate. Among them are the server
+artifact build against glibc 2.28, the wheel tests on several CPython versions and the CI
+test shards. `scripts/gate/github-runs.py` prints the newest finished run of each
+workflow on `main` with the failed jobs of a failed run. `gate.sh` prints it before it
+starts and warns when a run failed, and `GATE_GITHUB_RUNS=0` skips it. The nightly gate
+writes it to `github-runs.txt` beside its log and copies it to `GITHUB-FAILED` while a
+run failed. A failed run does not change either gate's exit status. Fix it in the next
+batch, or say in the batch why it can wait.
+
 ## Continuous integration
 
 The workflows in `.github/workflows` run on standard GitHub-hosted runners, which are free
