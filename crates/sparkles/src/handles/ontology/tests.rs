@@ -1990,8 +1990,10 @@ mod classification {
 
     #[test]
     fn the_json_operation_answers_counts_nodes_and_a_class() {
+        // a maximum of two needs counting, which the classifier leaves out
         let ds = dataset(&format!(
-            "{ONTO} :X rdfs:subClassOf [ owl:unionOf ( :Cell :Organelle ) ] ."
+            "{ONTO} :X rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :partOf ;
+                                         owl:maxCardinality 2 ] ."
         ));
         let j = wire::call(
             &ds,
