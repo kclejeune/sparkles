@@ -616,15 +616,15 @@ chunks of 1,024 classes. Cold runs of the 12 files take 0.74 of the
 time of the build before on four threads and 0.68 on eight, and a whole cold process of
 each on four threads takes 1.9 to 21.8 ms, under Konclude's times on the laptop. The
 item's estimates had come from the laptop while other work ran on it. Warm runs of five of
-the files take 0.4 to 0.6 ms longer on eight threads, item NEW-ITEM-1. On one thread
+the files take 0.4 to 0.6 ms longer on eight threads, item 720. On one thread
 ChEBI lite and `ore_ont_13482` classify 1.0 to 1.6% slower from code layout, item
-NEW-ITEM-3. Item 695 found that the peak memory of ore_ont_8737 is messages waiting in
+722. Item 695 found that the peak memory of ore_ont_8737 is messages waiting in
 to-do lists that repeat conclusions their contexts already hold. When the waiting messages
 take more memory than the stored conclusions and 256 MiB, a delivery to a context whose
 state is free drops the subsumptions and backward links that the context holds. The peak
 resident set falls from 10.5 to 7.5 GiB on four threads on `atlas` and the run from 32.3
 to 29.0 s, so the comparison's 10 GiB cap no longer stops it, while a run on one thread
-still peaks at 9.4 GiB, item NEW-ITEM-2. Every ORE 2015 EL ontology, GO, ChEBI lite and
+still peaks at 9.4 GiB, item 721. Every ORE 2015 EL ontology, GO, ChEBI lite and
 development file keeps its taxonomy byte for byte on one and eight threads, and
 the [small files and memory results](../../benchmarks/el-classification/RESULTS.md#small-files)
 give the numbers. Five variants that measured no better are in

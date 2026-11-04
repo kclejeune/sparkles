@@ -675,7 +675,7 @@ The 12 files take 41.9 ms on four threads against 50.6 ms. A whole process, whic
 takes 0.86 of the base's time on four and eight threads. On one thread the times are the
 base's within 0.1 ms. Five files whose saturation takes 1.8 to 4 ms on one thread became
 0.4 to 0.6 ms slower in warm runs on eight threads, since their helper threads start 0.5 ms later, and
-roadmap item NEW-ITEM-1 follows them. On four threads the warm runs take 0.86 of the
+roadmap item 720 follows them. On four threads the warm runs take 0.86 of the
 base's time. Seven more rounds of the base, commit 6b4c8e87 and the final commit
 47c13a51 gave the cold runs of 47c13a51 0.74 of the base's time on four threads and 0.67
 on eight, against 0.75 and 0.67 for 6b4c8e87 in the same rounds.
@@ -706,7 +706,7 @@ spread of its rounds, and a second run of five rounds put ChEBI lite 1.5% and
 `ore_ont_13482` 1.6% above the base. One thread runs none of the new code. A build whose
 one-thread worker leaves out the lazy start's check left them 0.9 and 1.4% slower and
 made `ore_ont_3836` 0.5% slower, so the difference comes from code layout, and roadmap
-item NEW-ITEM-3 follows it. [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md)
+item 722 follows it. [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md)
 records that build.
 
 A screen of the 161 development files under 20 MB on a Namespace instance, three rounds
@@ -748,7 +748,7 @@ the development set comparison, which it passed before. A run on one thread deli
 batches, since its activations put their messages in the to-do lists directly, so its
 peak is the base's. On four threads the peak estimate is still nine times the stored
 conclusions, and the run takes 29 s, where Konclude 0.7.0 took 11 s with 7 GB on the
-laptop. Roadmap item NEW-ITEM-2 follows both. Three other ways to bound the waiting
+laptop. Roadmap item 721 follows both. Three other ways to bound the waiting
 messages measured no better and are in
 [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md).
 
