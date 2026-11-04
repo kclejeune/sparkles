@@ -35,20 +35,28 @@ import {
   save,
 } from './measure';
 
-const taxon = (() => {
+type Sidecar = {
+  root: string;
+  hubs: { iri: string; children: number }[];
+  deepest: { iri: string };
+  pastFirstPage: { iri: string; parent: string };
+};
+const sidecar = (classes: number): Sidecar | null => {
   try {
     return JSON.parse(
-      readFileSync(join(homedir(), '.cache/sparkles-ui-seed/taxon-synthetic-2600000.json'), 'utf8'),
-    ) as {
-      root: string;
-      hubs: { iri: string; children: number }[];
-      deepest: { iri: string };
-      pastFirstPage: { iri: string; parent: string };
-    };
+      readFileSync(
+        join(homedir(), `.cache/sparkles-ui-seed/taxon-synthetic-${classes}.json`),
+        'utf8',
+      ),
+    ) as Sidecar;
   } catch {
     return null;
   }
-})();
+};
+const taxon = sidecar(2_600_000);
+/** The dataset of the scroll case: the 1 million class one opens in the baseline too. */
+const SCROLL_DS = process.env.PERF_SCROLL_DS ?? 'taxon1m';
+const scrollTaxon = sidecar(SCROLL_DS === 'taxon' ? 2_600_000 : 1_000_000);
 
 const CHEBI_WATER = 'http://purl.obolibrary.org/obo/CHEBI_15377';
 
@@ -154,9 +162,9 @@ test.describe('workbench open', () => {
 
 test.describe('workbench scroll', () => {
   test.beforeAll(need);
-  test.skip(!taxon, 'the synthetic taxon sidecar is missing');
-  test('scroll-taxon-10k', async ({ browser }, info) => {
-    const hub = taxon!.hubs[0].iri;
+  test.skip(!scrollTaxon, 'the synthetic taxon sidecar is missing');
+  test(`scroll-${SCROLL_DS}-10k`, async ({ browser }, info) => {
+    const hub = scrollTaxon!.hubs[0].iri;
     for (let rep = 1; rep <= REPEAT; rep++) {
       await calm();
       const ctx = await browser.newContext({
@@ -168,7 +176,7 @@ test.describe('workbench scroll', () => {
       const cdp = await ctx.newCDPSession(page);
       const r: Record<string, unknown> = { status: 'ok', hub };
       try {
-        await page.goto(ontologyUrl(BASE, 'taxon', `&iri=${encodeURIComponent(hub)}`));
+        await page.goto(ontologyUrl(BASE, SCROLL_DS, `&iri=${encodeURIComponent(hub)}`));
         await page.locator(rowOf(hub)).waitFor({ timeout: LOAD_TIMEOUT });
         await page.locator(twistyOf(hub)).first().click();
         const pages: number[] = [];
@@ -222,7 +230,7 @@ test.describe('workbench scroll', () => {
         r.status = 'failed';
         r.error = String(e).split('\n')[0];
       }
-      await save(page, info, 'scroll-taxon-10k', rep, r);
+      await save(page, info, `scroll-${SCROLL_DS}-10k`, rep, r);
       await ctx.close();
     }
   });

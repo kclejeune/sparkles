@@ -6,13 +6,14 @@
 // - `chebi`, ChEBI lite (~/.cache/sparkles-ui-seed/chebi_lite.owl, about 200,000 classes)
 // - `taxon`, a synthetic ontology with the shape of NCBITaxon, 2.6 million classes, from
 //   `node scripts/perf-gen-taxon.mjs`
+// - `taxon1m`, the same with 1 million classes, for the cases where 2.6 million do not open
 // - `hub`, a 100-ary tree and a resource with 20,000 neighbours, from `node scripts/perf-gen-hub.mjs`
 //
 // - `unesco`, the UNESCO Thesaurus of the design seed, for the thesaurus editor
 //
 // The generated files are written when they are missing. SPARKLES_BIN selects the binary
 // (default ../target/release/sparkles), SPARKLES_UI_DIR a UI build to serve instead of the
-// embedded one, SPARKLES_PERF_DATASETS the datasets to serve (default chebi,taxon,hub,unesco),
+// embedded one, SPARKLES_PERF_DATASETS the datasets to serve (default chebi,taxon,taxon1m,hub,unesco),
 // SPARKLES_PERF_DIR the data directory (default ~/.cache/sparkles-ui-seed/perf-data, where a
 // dataset that was loaded is kept), SPARKLES_SEED_PORT the port (default a free one) and
 // SPARKLES_PERF_MEM the memory cap of the load and of the server (default 12G, applied with
@@ -28,7 +29,7 @@ const ROOT = resolve(import.meta.dirname, '../..');
 const BIN = process.env.SPARKLES_BIN ?? join(ROOT, 'target/release/sparkles');
 const CACHE = join(homedir(), '.cache/sparkles-ui-seed');
 const DIR = process.env.SPARKLES_PERF_DIR ?? join(CACHE, 'perf-data');
-const WANT = (process.env.SPARKLES_PERF_DATASETS ?? 'chebi,taxon,hub,unesco')
+const WANT = (process.env.SPARKLES_PERF_DATASETS ?? 'chebi,taxon,taxon1m,hub,unesco')
   .split(',')
   .filter(Boolean);
 const MEM = process.env.SPARKLES_PERF_MEM ?? '12G';
@@ -38,6 +39,10 @@ const SOURCES = {
   taxon: {
     file: join(CACHE, 'taxon-synthetic-2600000.nt'),
     gen: ['scripts/perf-gen-taxon.mjs'],
+  },
+  taxon1m: {
+    file: join(CACHE, 'taxon-synthetic-1000000.nt'),
+    gen: ['scripts/perf-gen-taxon.mjs', '--classes', '1000000'],
   },
   hub: { file: join(CACHE, 'hub-synthetic.nt'), gen: ['scripts/perf-gen-hub.mjs'] },
   unesco: { file: join(CACHE, 'unesco-thesaurus.ttl'), gen: null },
@@ -66,7 +71,9 @@ function load(ds) {
   const src = SOURCES[ds];
   if (!existsSync(src.file)) {
     if (!src.gen) throw new Error(`${src.file} is missing`);
-    const r = spawnSync('node', [join(ROOT, 'ui', src.gen[0])], { stdio: 'inherit' });
+    const r = spawnSync('node', [join(ROOT, 'ui', src.gen[0]), ...src.gen.slice(1)], {
+      stdio: 'inherit',
+    });
     if (r.status !== 0) throw new Error(`${src.gen[0]} failed`);
   }
   rmSync(join(DIR, ds), { recursive: true, force: true });

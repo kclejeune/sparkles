@@ -8,7 +8,8 @@
 #     PERF_REPEAT=3 sh scripts/perf-run.sh
 #
 # PERF_UIS lists LABEL=DIR[:GROUPS] entries, where GROUPS limits a build to some of
-# chebi, explore, taxon-open, taxon-reveal and scroll (default all). PERF_COMMIT and
+# chebi, explore, taxon-open, taxon-reveal, scroll (the 1 million class taxon) and
+# scroll-taxon (the 2.6 million class one). The default is all but scroll-taxon. PERF_COMMIT and
 # PERF_NOTE are recorded. PERF_SERVER_MEM caps the server (default 14G) and PERF_BROWSER_MEM
 # the browser (default 6G), each in a systemd-run scope when systemd-run exists.
 # PERF_CHROMIUM names a Chromium. PERF_TAXON_TIMEOUT_MS bounds the open of the taxon.
@@ -67,7 +68,8 @@ while [ "$rep" -lt "$REPEAT" ]; do
     wants explore && group explore.perf
     wants taxon-open && PERF_ONLY=open-taxon PERF_LOAD_TIMEOUT_MS="${PERF_TAXON_TIMEOUT_MS:-240000}" group workbench.perf -g open
     wants taxon-reveal && PERF_ONLY=reveal-taxon-deepest,reveal-taxon-past-first-page group workbench.perf -g open
-    wants scroll && group workbench.perf -g scroll
+    wants scroll && PERF_SCROLL_DS=taxon1m group workbench.perf -g scroll
+    wants scroll-taxon && PERF_SCROLL_DS=taxon group workbench.perf -g scroll
   done
   rep=$((rep + 1))
 done
