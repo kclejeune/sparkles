@@ -40,6 +40,9 @@
   /* the page edge and the gap between panels, per breakpoint below */
   --gutter: 24px;
   --gap: 16px;
+  /* the side column of a page with content beside it (Browse, a dataset), one width on
+     every such page so it holds still between them (ROADMAP item 633) */
+  --side-column: clamp(300px, 28%, 400px);
 
   /* control heights: buttons, inputs, selects and tabs share them */
   --ctl-h: 30px;

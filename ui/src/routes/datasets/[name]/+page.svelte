@@ -1748,7 +1748,7 @@ ex:PersonShape a sh:NodeShape ;
   }
   .cols {
     display: grid;
-    grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) var(--side-column);
     gap: var(--gap);
     align-items: start;
   }

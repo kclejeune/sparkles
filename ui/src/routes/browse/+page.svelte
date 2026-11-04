@@ -12,6 +12,8 @@
   import { base } from '$app/paths';
   import { page } from '$app/state';
   import { onMount, tick, untrack } from 'svelte';
+  import { balance } from '$lib/balance';
+  import { fmtInt } from '$lib/format';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
@@ -346,6 +348,71 @@
           : [],
   );
 
+  /** The counts under a term's header, each a link to its section (ROADMAP item 633). */
+  const termCounts = $derived.by(() => {
+    if (!term || !sections) return [];
+    const out: {
+      key: string;
+      label: string;
+      one: string;
+      many: string;
+      n: number;
+      href: string;
+      loading?: boolean;
+    }[] = [];
+    if (treeKind && tree?.node) {
+      const w = treeWords(treeKind);
+      const concept = treeKind === 'concept';
+      out.push({
+        key: 'parents',
+        label: concept ? 'Broader concepts' : 'Parents',
+        one: concept ? 'broader' : 'parent',
+        many: concept ? 'broader' : 'parents',
+        n: tree.node.parents,
+        href: '#tree-h',
+      });
+      out.push({
+        key: 'children',
+        label: w.children[0].toUpperCase() + w.children.slice(1),
+        one: concept ? 'narrower' : w.child,
+        many: concept ? 'narrower' : w.children,
+        n: tree.node.children,
+        href: '#tree-h',
+      });
+    }
+    out.push({
+      key: 'incoming',
+      label: 'Incoming links',
+      one: 'incoming',
+      many: 'incoming',
+      // the count What links here shows: mentions, statements and uses as a property
+      n:
+        term.mentions.total +
+        term.incoming
+          .filter((i) => !skipIncoming.includes(i.property))
+          .reduce((n, i) => n + i.count, 0) +
+        (term.usage?.count ?? 0),
+      href: '#usage-h',
+    });
+    out.push({
+      key: 'synonyms',
+      label: 'Synonyms',
+      one: 'synonym',
+      many: 'synonyms',
+      n: sections.synonyms.reduce((n, g) => n + g.values.length, 0),
+      href: '#syn-h',
+    });
+    out.push({
+      key: 'reuse',
+      label: 'Other datasets',
+      one: 'dataset',
+      many: 'datasets',
+      n: reuse.found.length,
+      href: '#reuse-h',
+      loading: reuse.loading,
+    });
+    return out;
+  });
   const infoRows = $derived.by<InfoRow[]>(() => {
     if (!term || !sections) return [];
     const rows: InfoRow[] = [
@@ -371,13 +438,6 @@
         ]
           .filter(Boolean)
           .join(', '),
-      });
-    }
-    if (tree?.node) {
-      const w = treeWords(tree.kind);
-      rows.push({
-        label: 'Hierarchy',
-        text: `${tree.node.parents.toLocaleString('en-US')} ${tree.node.parents === 1 ? 'parent' : 'parents'}, ${tree.node.children.toLocaleString('en-US')} ${tree.node.children === 1 ? w.child : w.children}`,
       });
     }
     const inst = term.incoming.find((i) => i.property === WELL_KNOWN.rdf + 'type');
@@ -1103,6 +1163,7 @@
       {/if}
       <div
         class="browse"
+        use:balance
         class:graph={view === 'graph' && !treeKind}
         class:editing
         data-kind={treeKind ?? 'none'}
@@ -1116,7 +1177,7 @@
               { label: ontologyName, href: hrefOf(null) },
               { label: plural[kind] ?? 'Entities', href: null },
             ]}
-            definition={editing ? null : sections.definition}
+            definition={null}
             replacedBy={iris(OBO + 'IAO_0100001')}
             consider={values(OIO + 'consider')
               .map((v) => valueText(v))
@@ -1235,130 +1296,24 @@
           {/if}
         </div>
 
-        <!-- the side column: the hierarchy card above the facts card (ROADMAP item 633) -->
-        <div class="b-rail">
-          {#if treeKind}
-            <!-- the hierarchy is a card above the facts in the page's side column, and on a
-                 phone a card that opens on request (ROADMAP item 633) -->
-            {#snippet treeHead()}
-              {#if !editing}
-                <button
-                  type="button"
-                  class="btn sm ghost icon tree-toggle"
-                  aria-expanded={treeOpen}
-                  aria-controls="tree-body"
-                  aria-label={treeOpen ? 'Hide the hierarchy' : 'Show the hierarchy'}
-                  onclick={() => (treeOpen = !treeOpen)}
-                  ><Icon name={treeOpen ? 'chevronDown' : 'chevron'} size={16} /></button
-                >
-              {/if}
-              <h2 id="tree-h">Hierarchy</h2>
-              <span class="spacer"></span>
-              {#if !editing}
-                <span class="seg" role="group" aria-label="View">
-                  <a
-                    href={hrefOf(iri)}
-                    aria-current={view === 'tree' ? 'true' : undefined}
-                    data-sveltekit-noscroll>Tree</a
-                  ><a
-                    href={hrefOf(iri, { view: 'graph' })}
-                    aria-current={view === 'graph' ? 'true' : undefined}
-                    data-sveltekit-noscroll>Graph</a
-                  >
-                </span>
-              {/if}
-            {/snippet}
-            <aside class="panel b-tree" class:shut={!treeOpen && !editing} aria-labelledby="tree-h">
-              {#if view === 'graph' && piece && !editing}
-                <TermGraph
-                  ds={target}
-                  {piece}
-                  {linker}
-                  {exploreHref}
-                  onexpand={expand}
-                  epoch={graphEpoch}
-                  lead={treeHead}
-                  shut={!treeOpen}
-                />
-              {:else}
-                <div class="panel-head">{@render treeHead()}</div>
-                <div class="tree-edit">
-                  {#if editing && isSkos && treeKind === 'concept'}
-                    <div class="skos-parents">
-                      <SkosLinks
-                        title="Broader"
-                        id="broader"
-                        links={details?.broader ?? []}
-                        name={(i) => linker.name(i)}
-                        sub={(i) => linker.short(i)}
-                        {readonly}
-                        paired
-                        {picker}
-                        onopen={(i) => void goto(hrefOf(i))}
-                        onadd={(i, n) => addLink('broader', i, n)}
-                        onremove={(i) => removeLink('broader', i)}
-                        onrepair={(l) => addLink('broader', l.iri)}
-                      />
-                      <SkosLinks
-                        title="Narrower"
-                        id="narrower"
-                        links={details?.narrower ?? []}
-                        name={(i) => linker.name(i)}
-                        sub={(i) => linker.short(i)}
-                        {readonly}
-                        paired
-                        {picker}
-                        onopen={(i) => void goto(hrefOf(i))}
-                        onadd={(i, n) => addLink('narrower', i, n)}
-                        onremove={(i) => removeLink('narrower', i)}
-                        onrepair={(l) => addLink('narrower', l.iri)}
-                      />
-                    </div>
-                  {:else if editing && parentsEditable(treeKind)}
-                    <ParentEditor
-                      kind={treeKind}
-                      iri={term.iri}
-                      {title}
-                      rows={parents}
-                      {linker}
-                      {target}
-                      {graph}
-                      {prefixes}
-                      {readonly}
-                      {onedit}
-                    />
-                  {/if}
-                </div>
-                <div class="tree-body" id="tree-body" bind:this={treeBox}>
-                  {#if tree}
-                    <LineageTree
-                      {target}
-                      {sel}
-                      kind={treeKind}
-                      iri={term.iri}
-                      {title}
-                      answer={tree}
-                      href={(i) => hrefOf(i)}
-                    />
-                  {:else}
-                    <p class="faint">Loading…</p>
-                  {/if}
-                </div>
-              {/if}
-            </aside>
-          {/if}
-          <aside class="b-info" aria-label="About this entity">
-            <TermInfobox rows={infoRows} {linker}>
-              {#snippet footer()}
-                <DownloadButtons
-                  noun="this {kind}"
-                  href={(f) => branchPath(downloadHref(target, sel, term!.iri, f))}
-                />
-              {/snippet}
-            </TermInfobox>
-          </aside>
-        </div>
-
+        <!-- a stat strip, then the term's cards in two columns that balance their heights;
+             one column below a large screen (ROADMAP item 633) -->
+        <dl class="figures b-strip" aria-label="Counts" style:--n={termCounts.length}>
+          {#each termCounts as c (c.key)}
+            <div>
+              <dt><a href={c.href}>{c.label}</a></dt>
+              <dd>{c.loading ? '…' : fmtInt(c.n)}</dd>
+            </div>
+          {/each}
+        </dl>
+        <!-- the counts as one row of chips under the header, each a link to its section -->
+        <nav class="b-chips" aria-label="Counts">
+          {#each termCounts as c (c.key)}
+            <a class="chip" href={c.href}
+              >{c.loading ? '…' : fmtInt(c.n)} {c.n === 1 ? c.one : c.many}</a
+            >
+          {/each}
+        </nav>
         {#if view === 'graph' && piece && !treeKind}
           <div class="b-graph">
             <TermGraph
@@ -1371,240 +1326,392 @@
             />
           </div>
         {:else}
-          <div class="b-article">
-            {#if editing}
-              {#if !isSkos && editorKind}
-                <AxiomEditor
-                  {groups}
-                  kind={editorKind}
-                  iri={term.iri}
-                  {title}
-                  {linker}
-                  {prefixes}
-                  {graph}
-                  {readonly}
-                  names={() => completionNames}
-                  {parse}
-                  {onedit}
-                />
-                <SynonymEditor
-                  iri={term.iri}
-                  {title}
-                  synonyms={synonymStatements}
-                  kinds={SYNONYM_KINDS}
-                  {graph}
-                  lang={defaultLang}
-                  {readonly}
-                  {onedit}
-                />
-              {:else if details}
-                <section class="term-sec labels-edit" aria-labelledby="labels-edit-h">
-                  <h2 id="labels-edit-h">Labels and synonyms</h2>
-                  <!-- the editor's label table is wider than a phone, so it scrolls in place -->
-                  <div class="labels-scroll">
-                    <SkosLabels
+          <div class="b-main" data-col="main">
+            <section class="panel b-def" aria-labelledby="def-h">
+              <div class="panel-head"><h2 id="def-h">Definition</h2></div>
+              <div class="panel-body ruled">
+                {#if sections.definition}<p class="lede">
+                    {valueText(
+                      sections.definition.value,
+                    )}{#if sections.definition.sources.length}<span class="faint small">
+                        {sections.definition.sources.join(', ')}</span
+                      >{/if}
+                  </p>{/if}
+                {#if editing}
+                  {#if !isSkos && editorKind}
+                    <AxiomEditor
+                      {groups}
+                      kind={editorKind}
                       iri={term.iri}
-                      name={title}
-                      entries={details.labels}
+                      {title}
+                      {linker}
+                      {prefixes}
                       {graph}
-                      langs={skosLangs}
                       {readonly}
-                      onedit={skosEdit}
-                      scope={`${target}|${graph ?? ''}`}
-                      isUsed={async (i) => {
-                        const r = await api.query(target, usedQuery(i, graph), { nocache: true });
-                        return !!r.boolean;
+                      names={() => completionNames}
+                      {parse}
+                      {onedit}
+                    />
+                    <SynonymEditor
+                      iri={term.iri}
+                      {title}
+                      synonyms={synonymStatements}
+                      kinds={SYNONYM_KINDS}
+                      {graph}
+                      lang={defaultLang}
+                      {readonly}
+                      {onedit}
+                    />
+                  {:else if details}
+                    <section class="term-sec labels-edit" aria-labelledby="labels-edit-h">
+                      <h2 id="labels-edit-h">Labels and synonyms</h2>
+                      <!-- the editor's label table is wider than a phone, so it scrolls in place -->
+                      <div class="labels-scroll">
+                        <SkosLabels
+                          iri={term.iri}
+                          name={title}
+                          entries={details.labels}
+                          {graph}
+                          langs={skosLangs}
+                          {readonly}
+                          onedit={skosEdit}
+                          scope={`${target}|${graph ?? ''}`}
+                          isUsed={async (i) => {
+                            const r = await api.query(target, usedQuery(i, graph), {
+                              nocache: true,
+                            });
+                            return !!r.boolean;
+                          }}
+                        />
+                      </div>
+                    </section>
+                    <section class="term-sec links-edit" aria-labelledby="links-edit-h">
+                      <h2 id="links-edit-h">Related concepts and mappings</h2>
+                      <SkosLinks
+                        title="Related"
+                        id="related"
+                        links={details.related}
+                        name={(i) => linker.name(i)}
+                        sub={(i) => linker.short(i)}
+                        {readonly}
+                        paired
+                        {picker}
+                        onopen={(i) => void goto(hrefOf(i))}
+                        onadd={(i, n) => addLink('related', i, n)}
+                        onremove={(i) => removeLink('related', i)}
+                        onrepair={(l) => addLink('related', l.iri)}
+                      />
+                      {#each MAPPINGS.filter((m) => addedMappings.includes(m) || details?.mappings.some((x) => x.property === m)) as m (m)}
+                        <SkosLinks
+                          title={MAPPING_NAME[m]}
+                          id={m}
+                          links={details.mappings
+                            .filter((x) => x.property === m)
+                            .map((x) => ({ iri: x.target, forward: true, inverse: true }))}
+                          name={(i) => linker.name(i)}
+                          sub={(i) => linker.short(i)}
+                          {readonly}
+                          {picker}
+                          onopen={(i) => void goto(hrefOf(i))}
+                          onadd={(i, n) => addLink(m, i, n)}
+                          onremove={(i) => removeLink(m, i)}
+                        />
+                      {/each}
+                      {#if !readonly && MAPPINGS.some((m) => !addedMappings.includes(m) && !details?.mappings.some((x) => x.property === m))}
+                        <label class="add-map">
+                          <span class="sr-only">Add a mapping</span>
+                          <select
+                            class="select sm"
+                            value=""
+                            onchange={(e) => {
+                              const m = e.currentTarget.value;
+                              e.currentTarget.value = '';
+                              if (m) addedMappings = [...addedMappings, m];
+                            }}
+                          >
+                            <option value="">Add a mapping…</option>
+                            {#each MAPPINGS.filter((m) => !addedMappings.includes(m) && !details?.mappings.some((x) => x.property === m)) as m (m)}
+                              <option value={m}>{MAPPING_NAME[m]}</option>
+                            {/each}
+                          </select>
+                        </label>
+                      {/if}
+                    </section>
+                  {:else}
+                    <p class="faint" aria-live="polite">Loading the labels…</p>
+                  {/if}
+                  <section class="term-sec" aria-labelledby="ann-edit-h">
+                    <h2 id="ann-edit-h">
+                      Annotations {#if ownAnnotations.length}<span class="count-badge"
+                          >{ownAnnotations.length}</span
+                        >{/if}
+                    </h2>
+                    <p class="sec-note">
+                      {isSkos ? 'Notes' : 'The label, comments, cross-references'} and the other annotations.
+                      The definition and {isSkos ? 'labels' : 'synonyms'} are edited above.
+                    </p>
+                    <AnnotationRows
+                      annotations={ownAnnotations.map(toAnnotation)}
+                      name={shortName}
+                      {prefixes}
+                      properties={annotationProperties}
+                      {readonly}
+                      label={title}
+                      onchange={(next, what) => {
+                        if (!term) return;
+                        const op = annotationsOp(mode, term.iri, ownAnnotations, next, graph);
+                        if (op) onedit(op, what);
                       }}
                     />
-                  </div>
-                </section>
-                <section class="term-sec links-edit" aria-labelledby="links-edit-h">
-                  <h2 id="links-edit-h">Related concepts and mappings</h2>
-                  <SkosLinks
-                    title="Related"
-                    id="related"
-                    links={details.related}
-                    name={(i) => linker.name(i)}
-                    sub={(i) => linker.short(i)}
-                    {readonly}
-                    paired
-                    {picker}
-                    onopen={(i) => void goto(hrefOf(i))}
-                    onadd={(i, n) => addLink('related', i, n)}
-                    onremove={(i) => removeLink('related', i)}
-                    onrepair={(l) => addLink('related', l.iri)}
+                    {#if annotationStatements.length > ownAnnotations.length}
+                      <p class="sec-note">
+                        {annotationStatements.length - ownAnnotations.length} more come from other graphs
+                        and are not editable here.
+                      </p>
+                    {/if}
+                  </section>
+                {:else}
+                  <TermLogic {groups} {linker} {prefixes} />
+                  <TermSynonyms synonyms={sections.synonyms} {linker} />
+                  <TermNotes
+                    notes={sections.otherDefinitions.length
+                      ? [
+                          {
+                            kind: 'Definition in other languages',
+                            values: sections.otherDefinitions,
+                          },
+                          ...sections.notes,
+                        ]
+                      : sections.notes}
+                    {linker}
+                    {langs}
+                    {curieIri}
                   />
-                  {#each MAPPINGS.filter((m) => addedMappings.includes(m) || details?.mappings.some((x) => x.property === m)) as m (m)}
-                    <SkosLinks
-                      title={MAPPING_NAME[m]}
-                      id={m}
-                      links={details.mappings
-                        .filter((x) => x.property === m)
-                        .map((x) => ({ iri: x.target, forward: true, inverse: true }))}
-                      name={(i) => linker.name(i)}
-                      sub={(i) => linker.short(i)}
-                      {readonly}
-                      {picker}
-                      onopen={(i) => void goto(hrefOf(i))}
-                      onadd={(i, n) => addLink(m, i, n)}
-                      onremove={(i) => removeLink(m, i)}
-                    />
-                  {/each}
-                  {#if !readonly && MAPPINGS.some((m) => !addedMappings.includes(m) && !details?.mappings.some((x) => x.property === m))}
-                    <label class="add-map">
-                      <span class="sr-only">Add a mapping</span>
-                      <select
-                        class="select sm"
-                        value=""
-                        onchange={(e) => {
-                          const m = e.currentTarget.value;
-                          e.currentTarget.value = '';
-                          if (m) addedMappings = [...addedMappings, m];
-                        }}
-                      >
-                        <option value="">Add a mapping…</option>
-                        {#each MAPPINGS.filter((m) => !addedMappings.includes(m) && !details?.mappings.some((x) => x.property === m)) as m (m)}
-                          <option value={m}>{MAPPING_NAME[m]}</option>
-                        {/each}
-                      </select>
-                    </label>
+                  <TermLabels labels={sections.labels} />
+                  {#if sections.related.length}
+                    <section class="term-sec" aria-labelledby="rel-h">
+                      <h2 id="rel-h">
+                        Related concepts <span class="count-badge">{sections.related.length}</span>
+                      </h2>
+                      <div class="term-flow">
+                        {#each sections.related as r (r)}<a href={linker.href(r)}
+                            >{linker.name(r)}</a
+                          >{/each}
+                      </div>
+                    </section>
                   {/if}
-                </section>
-              {:else}
-                <p class="faint" aria-live="polite">Loading the labels…</p>
-              {/if}
-              <section class="term-sec" aria-labelledby="ann-edit-h">
-                <h2 id="ann-edit-h">
-                  Annotations {#if ownAnnotations.length}<span class="count-badge"
-                      >{ownAnnotations.length}</span
-                    >{/if}
-                </h2>
-                <p class="sec-note">
-                  {isSkos ? 'Notes' : 'The label, comments, cross-references'} and the other annotations.
-                  The definition and {isSkos ? 'labels' : 'synonyms'} are edited above.
-                </p>
-                <AnnotationRows
-                  annotations={ownAnnotations.map(toAnnotation)}
-                  name={shortName}
-                  {prefixes}
-                  properties={annotationProperties}
-                  {readonly}
-                  label={title}
-                  onchange={(next, what) => {
-                    if (!term) return;
-                    const op = annotationsOp(mode, term.iri, ownAnnotations, next, graph);
-                    if (op) onedit(op, what);
-                  }}
-                />
-                {#if annotationStatements.length > ownAnnotations.length}
-                  <p class="sec-note">
-                    {annotationStatements.length - ownAnnotations.length} more come from other graphs
-                    and are not editable here.
+                  {#if sections.members.length}
+                    <section class="term-sec" aria-labelledby="mem-h">
+                      <h2 id="mem-h">
+                        Members <span class="count-badge">{sections.members.length}</span>
+                      </h2>
+                      <div class="term-flow">
+                        {#each sections.members as r (r)}<a href={linker.href(r)}
+                            >{linker.name(r)}</a
+                          >{/each}
+                      </div>
+                    </section>
+                  {/if}
+                {/if}
+                {#if sections.other.length && !editing}
+                  <section class="term-sec">
+                    <details class="ann">
+                      <summary
+                        >All other annotations <span class="count-badge"
+                          >{sections.other.reduce((n, o) => n + o.values.length, 0)}</span
+                        ></summary
+                      >
+                      <div class="table-scroll">
+                        <table class="data">
+                          <tbody>
+                            {#each sections.other as o (o.property)}
+                              <tr>
+                                <th scope="row" class="mono">{iriName(o.property, prefixes)}</th>
+                                <td>
+                                  {#each o.values as v, i (i)}{#if i > 0}<br
+                                      />{/if}{#if isLiteral(v)}{v[
+                                        '@value'
+                                      ]}{#if v['@language']}<span class="lang-tag"
+                                          >{v['@language']}</span
+                                        >{/if}{:else if linker.href(v)}<a href={linker.href(v)}
+                                        >{linker.name(v)}</a
+                                      >{:else}<span class="mono">{v}</span>{/if}{/each}
+                                </td>
+                              </tr>
+                            {/each}
+                          </tbody>
+                        </table>
+                      </div>
+                    </details>
+                  </section>
+                {/if}
+                {#if term.statementsTruncated}
+                  <p class="faint">
+                    This entity has more statements than the page reads. The download has them all.
                   </p>
                 {/if}
-              </section>
-            {:else}
-              <TermLogic {groups} {linker} {prefixes} />
-              <TermSynonyms synonyms={sections.synonyms} {linker} />
-              <TermNotes
-                notes={sections.otherDefinitions.length
-                  ? [
-                      { kind: 'Definition in other languages', values: sections.otherDefinitions },
-                      ...sections.notes,
-                    ]
-                  : sections.notes}
-                {linker}
-                {langs}
-                {curieIri}
-              />
-              <TermLabels labels={sections.labels} />
-              {#if sections.related.length}
-                <section class="term-sec" aria-labelledby="rel-h">
-                  <h2 id="rel-h">
-                    Related concepts <span class="count-badge">{sections.related.length}</span>
-                  </h2>
-                  <div class="term-flow">
-                    {#each sections.related as r (r)}<a href={linker.href(r)}>{linker.name(r)}</a
-                      >{/each}
-                  </div>
-                </section>
-              {/if}
-              {#if sections.members.length}
-                <section class="term-sec" aria-labelledby="mem-h">
-                  <h2 id="mem-h">
-                    Members <span class="count-badge">{sections.members.length}</span>
-                  </h2>
-                  <div class="term-flow">
-                    {#each sections.members as r (r)}<a href={linker.href(r)}>{linker.name(r)}</a
-                      >{/each}
-                  </div>
-                </section>
-              {/if}
-              <TermXrefs
-                xrefs={sections.xrefs}
-                seeAlso={sections.seeAlso}
-                mappings={sections.mappings}
-                {linker}
-              />
-            {/if}
-            <TermUsage
-              iri={term.iri}
-              groups={mentions}
-              total={term.mentions.total}
-              truncated={term.mentions.truncated}
-              incoming={term.incoming}
-              usage={term.usage}
-              {linker}
-              {prefixes}
-              more={moreIncoming}
-              skip={skipIncoming}
-            />
-            <TermReuse
-              found={reuse.found}
-              checked={reuse.checked}
-              loading={reuse.loading}
-              href={(d) => browseHref(base, d, term?.iri ?? null)}
-            />
-            {#if !editing}
-              <SimilarTerms ds={target} iri={term.iri} href={(i) => hrefOf(i)} />
-            {/if}
-            {#if sections.other.length && !editing}
-              <section class="term-sec">
-                <details class="ann">
-                  <summary
-                    >All other annotations <span class="count-badge"
-                      >{sections.other.reduce((n, o) => n + o.values.length, 0)}</span
-                    ></summary
+              </div>
+            </section>
+            {#if treeKind}
+              <!-- the hierarchy is a card above the facts in the page's side column, and on a
+                 phone a card that opens on request (ROADMAP item 633) -->
+              {#snippet treeHead()}
+                {#if !editing}
+                  <button
+                    type="button"
+                    class="btn sm ghost icon tree-toggle"
+                    aria-expanded={treeOpen}
+                    aria-controls="tree-body"
+                    aria-label={treeOpen ? 'Hide the hierarchy' : 'Show the hierarchy'}
+                    onclick={() => (treeOpen = !treeOpen)}
+                    ><Icon name={treeOpen ? 'chevronDown' : 'chevron'} size={16} /></button
                   >
-                  <div class="table-scroll">
-                    <table class="data">
-                      <tbody>
-                        {#each sections.other as o (o.property)}
-                          <tr>
-                            <th scope="row" class="mono">{iriName(o.property, prefixes)}</th>
-                            <td>
-                              {#each o.values as v, i (i)}{#if i > 0}<br
-                                  />{/if}{#if isLiteral(v)}{v['@value']}{#if v['@language']}<span
-                                      class="lang-tag">{v['@language']}</span
-                                    >{/if}{:else if linker.href(v)}<a href={linker.href(v)}
-                                    >{linker.name(v)}</a
-                                  >{:else}<span class="mono">{v}</span>{/if}{/each}
-                            </td>
-                          </tr>
-                        {/each}
-                      </tbody>
-                    </table>
+                {/if}
+                <h2 id="tree-h">Hierarchy</h2>
+                <span class="spacer"></span>
+                {#if !editing}
+                  <span class="seg" role="group" aria-label="View">
+                    <a
+                      href={hrefOf(iri)}
+                      aria-current={view === 'tree' ? 'true' : undefined}
+                      data-sveltekit-noscroll>Tree</a
+                    ><a
+                      href={hrefOf(iri, { view: 'graph' })}
+                      aria-current={view === 'graph' ? 'true' : undefined}
+                      data-sveltekit-noscroll>Graph</a
+                    >
+                  </span>
+                {/if}
+              {/snippet}
+              <aside
+                class="panel b-tree"
+                class:shut={!treeOpen && !editing}
+                aria-labelledby="tree-h"
+              >
+                {#if view === 'graph' && piece && !editing}
+                  <TermGraph
+                    ds={target}
+                    {piece}
+                    {linker}
+                    {exploreHref}
+                    onexpand={expand}
+                    epoch={graphEpoch}
+                    lead={treeHead}
+                    shut={!treeOpen}
+                  />
+                {:else}
+                  <div class="panel-head">{@render treeHead()}</div>
+                  <div class="tree-edit">
+                    {#if editing && isSkos && treeKind === 'concept'}
+                      <div class="skos-parents">
+                        <SkosLinks
+                          title="Broader"
+                          id="broader"
+                          links={details?.broader ?? []}
+                          name={(i) => linker.name(i)}
+                          sub={(i) => linker.short(i)}
+                          {readonly}
+                          paired
+                          {picker}
+                          onopen={(i) => void goto(hrefOf(i))}
+                          onadd={(i, n) => addLink('broader', i, n)}
+                          onremove={(i) => removeLink('broader', i)}
+                          onrepair={(l) => addLink('broader', l.iri)}
+                        />
+                        <SkosLinks
+                          title="Narrower"
+                          id="narrower"
+                          links={details?.narrower ?? []}
+                          name={(i) => linker.name(i)}
+                          sub={(i) => linker.short(i)}
+                          {readonly}
+                          paired
+                          {picker}
+                          onopen={(i) => void goto(hrefOf(i))}
+                          onadd={(i, n) => addLink('narrower', i, n)}
+                          onremove={(i) => removeLink('narrower', i)}
+                          onrepair={(l) => addLink('narrower', l.iri)}
+                        />
+                      </div>
+                    {:else if editing && parentsEditable(treeKind)}
+                      <ParentEditor
+                        kind={treeKind}
+                        iri={term.iri}
+                        {title}
+                        rows={parents}
+                        {linker}
+                        {target}
+                        {graph}
+                        {prefixes}
+                        {readonly}
+                        {onedit}
+                      />
+                    {/if}
                   </div>
-                </details>
-              </section>
+                  <div class="tree-body" id="tree-body" bind:this={treeBox}>
+                    {#if tree}
+                      <LineageTree
+                        {target}
+                        {sel}
+                        kind={treeKind}
+                        iri={term.iri}
+                        {title}
+                        answer={tree}
+                        href={(i) => hrefOf(i)}
+                      />
+                    {:else}
+                      <p class="faint">Loading…</p>
+                    {/if}
+                  </div>
+                {/if}
+              </aside>
             {/if}
-            {#if term.statementsTruncated}
-              <p class="faint">
-                This entity has more statements than the page reads. The download has them all.
-              </p>
-            {/if}
+            <section class="panel b-refs" aria-labelledby="refs-h" data-movable>
+              <div class="panel-head"><h2 id="refs-h">References</h2></div>
+              <div class="panel-body ruled">
+                <TermXrefs
+                  xrefs={sections.xrefs}
+                  seeAlso={sections.seeAlso}
+                  mappings={sections.mappings}
+                  {linker}
+                />
+                <TermUsage
+                  iri={term.iri}
+                  groups={mentions}
+                  total={term.mentions.total}
+                  truncated={term.mentions.truncated}
+                  incoming={term.incoming}
+                  usage={term.usage}
+                  {linker}
+                  {prefixes}
+                  more={moreIncoming}
+                  skip={skipIncoming}
+                />
+                <TermReuse
+                  found={reuse.found}
+                  checked={reuse.checked}
+                  loading={reuse.loading}
+                  href={(d) => browseHref(base, d, term?.iri ?? null)}
+                />
+                {#if !editing}
+                  <SimilarTerms ds={target} iri={term.iri} href={(i) => hrefOf(i)} />
+                {/if}
+              </div>
+            </section>
           </div>
         {/if}
+        <div class="b-side" data-col="side">
+          <div class="b-info"><TermInfobox rows={infoRows} {linker} heading="Metadata" /></div>
+          <section class="panel b-dl" aria-labelledby="dl-h" data-movable>
+            <div class="panel-head"><h2 id="dl-h">Download</h2></div>
+            <div class="panel-body">
+              <DownloadButtons
+                noun="this {kind}"
+                href={(f) => branchPath(downloadHref(target, sel, term!.iri, f))}
+              />
+            </div>
+          </section>
+        </div>
       </div>
     {/if}
   {:else}
@@ -1795,63 +1902,163 @@
     container: browse / inline-size;
     min-width: 0;
   }
-  /* one column on a phone: the head with the description, the hierarchy and facts cards,
-     and the article */
+  /* one column on a phone and a medium screen: the head, the counts, Definition, Metadata,
+     Hierarchy, References and Download (ROADMAP item 633) */
   .browse {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: 'head' 'rail' 'article';
-    gap: var(--sp-6);
+    gap: var(--gap);
     padding: var(--gutter) var(--gutter) var(--sp-10);
     max-width: 1360px;
     min-width: 0;
   }
-  .browse.graph {
-    grid-template-areas: 'head' 'graph' 'rail';
-  }
   .b-head {
-    grid-area: head;
+    order: 0;
     min-width: 0;
   }
-  .b-article {
-    grid-area: article;
-    min-width: 0;
-    display: grid;
-    gap: var(--sp-8);
-    align-content: start;
+  .b-main,
+  .b-side {
+    display: contents;
   }
+  .b-strip {
+    order: 1;
+  }
+  .b-def,
   .b-graph {
-    grid-area: graph;
+    order: 2;
     min-width: 0;
   }
-  .b-rail {
-    grid-area: rail;
+  .b-info {
+    order: 3;
     min-width: 0;
-    align-self: start;
-    display: grid;
-    gap: var(--gap);
   }
   .b-tree {
+    order: 4;
     min-width: 0;
     display: flex;
     flex-direction: column;
   }
-  /* the head and the article, and a side column from the top of the page with the
-     hierarchy card above the facts card; a large screen and a medium one share the layout */
-  @container browse (min-width: 640px) {
-    .browse {
-      grid-template-columns: minmax(0, 1fr) 288px;
-      grid-template-areas: 'head rail' 'article rail';
-      grid-template-rows: auto 1fr;
-      gap: var(--sp-6) var(--sp-8);
-    }
-    .browse.graph {
-      grid-template-areas: 'head rail' 'graph rail';
+  .b-refs {
+    order: 5;
+  }
+  .b-dl {
+    order: 6;
+  }
+  /* the tiles share the row whatever their number, so no cell stands empty */
+  .b-strip {
+    grid-template-columns: repeat(var(--n, 5), minmax(0, 1fr));
+  }
+  .b-strip {
+    display: none;
+  }
+  .b-chips {
+    display: flex;
+    order: 1;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: calc(-1 * var(--sp-2));
+  }
+  .b-chips .chip {
+    display: inline-flex;
+    align-items: center;
+    height: 28px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface);
+    color: var(--text-2);
+    font-size: var(--fs-sm);
+    text-decoration: none;
+    font-variant-numeric: tabular-nums;
+  }
+  .b-chips .chip:hover {
+    color: var(--text);
+    border-color: var(--border-strong);
+  }
+  /* on a phone the definition's lead sits close under its heading */
+  @container browse (max-width: 639px) {
+    .b-def :global(.panel-body) {
+      padding-top: var(--sp-3);
     }
   }
-  @container browse (min-width: 1040px) {
+  .b-strip dt a {
+    color: inherit;
+    text-decoration: none;
+  }
+  .b-strip dt a:hover {
+    text-decoration: underline;
+  }
+  /* a card's sections, split by rules as in the Workbench's details panel */
+  .ruled {
+    display: grid;
+  }
+  .ruled > :global(*) {
+    min-width: 0;
+  }
+  .ruled > :global(:empty) {
+    display: none;
+  }
+  .ruled > :global(section) {
+    padding: var(--sp-4) 0;
+    border-top: 1px solid var(--border);
+  }
+  .ruled > :global(section:first-child),
+  .ruled > :global(.lede + section) {
+    border-top: 0;
+  }
+  .ruled > :global(section:first-child) {
+    padding-top: 0;
+  }
+  .ruled > :global(section:last-child) {
+    padding-bottom: 0;
+  }
+  .ruled :global(.term-sec > h2) {
+    font-size: var(--fs-sm);
+    font-weight: 600;
+    color: var(--text-2);
+    margin-bottom: var(--sp-2);
+  }
+  .ruled > .lede {
+    margin: 0 0 var(--sp-3);
+    font-size: 15px;
+    line-height: 1.6;
+  }
+  /* two columns on a large screen: the term's own cards on the left and Metadata and Download
+     on the right, with References or Download moving to the shorter column (balance.ts) */
+  @container browse (min-width: 1100px) {
     .browse {
-      grid-template-columns: minmax(0, 1fr) 320px;
+      /* the side column takes what its cards need, and the term's own cards the rest */
+      grid-template-columns: minmax(0, 1fr) var(--side-column);
+      grid-template-areas: 'head head' 'chips chips' 'main side';
+      align-items: start;
+    }
+    .b-head {
+      grid-area: head;
+    }
+    .b-strip {
+      grid-area: strip;
+    }
+    .b-chips {
+      grid-area: chips;
+    }
+    .b-main,
+    .b-side {
+      display: grid;
+      gap: var(--gap);
+      min-width: 0;
+      align-content: start;
+    }
+    .b-main,
+    .b-graph {
+      grid-area: main;
+    }
+    .b-side {
+      grid-area: side;
+    }
+    /* the shorter column stays in view while the page scrolls */
+    .b-side:global([data-stick]) {
+      position: sticky;
+      top: var(--gutter);
     }
   }
   .b-tree h2 {
@@ -1989,12 +2196,11 @@
   }
   @container browse (min-width: 640px) {
     .cols {
-      grid-template-columns: minmax(0, 1fr) 280px;
+      grid-template-columns: minmax(0, 1fr) var(--side-column);
     }
   }
   @container browse (min-width: 1040px) {
     .cols {
-      grid-template-columns: minmax(0, 1fr) 320px;
       gap: var(--sp-8);
     }
   }

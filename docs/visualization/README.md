@@ -388,22 +388,33 @@ and every name on a page links to the page of that entity. `/ui/browse?ds=NAME` 
 landing page of the default graph's ontology, and `&iri=IRI` opens an entity. `graph`,
 `branch` and `at` choose what the pages read, as on the other pages.
 
-An entity's page leads with its label, short form, kind, IRI and definition with the
-sources its axiom annotations name. A deprecated entity says so under its title and
-links its replacement. The **Hierarchy** card sits above the infobox in the column beside
-the article, scrolls on its own within half the window's height with the entity in view,
-and shows the lineage from a root to the entity on one line, the entity's other direct parents under it, its children with
-their counts and its siblings behind one row, and it reads each further level when it
-opens. **Graph** in the card's header draws the entity's neighbourhood in the card in place
-of the tree, on the Explore canvas with Explore's lenses, while the article stays beside it.
-An entity outside any hierarchy has **Graph** beside its title, which shows the graph in
-place of the article. The graph holds its parents, its first children, the entities its axioms relate it to
-and those whose axioms hold it, with each edge named by its property. Double-clicking a
-node adds that entity's neighbourhood, and **Open in Explore** opens the entity there.
+An entity's page leads with its label, short form, kind and IRI, and a row of counts under
+them, its parents, children, incoming links, synonyms and the other datasets that mention
+it, each a link to its section. A deprecated entity says so under its title and links its
+replacement. The rest of the page is cards. **Definition** gives the definition with the
+sources its axiom annotations name, the axioms, synonyms, comments and other annotations,
+**Hierarchy** the entity's place in its tree, and **References** its cross-references,
+what links here and the other datasets. Beside them, in a column of the same width as on
+a dataset's page, **Metadata** lists the kind, status, identifiers, ontology and subsets,
+and **Download** downloads the entity in Turtle, RDF/XML, OWL functional syntax or JSON-LD.
+When one column grows longer than the other, References or Download moves to the shorter
+one so the two end close together, without moving a card that holds focus, and a shorter
+side column stays in view as the page scrolls.
 
-The article gives the axioms about the entity in the sections of the ontology editor's
-frame, each one a line of Manchester prose whose names link to their pages. Synonyms
-follow by kind with their languages and sources, then comments and notes in the
+The Hierarchy card scrolls on its own within half the window's height with the entity in
+view. It shows the lineage from a root to the entity on one line, the entity's other direct
+parents under it, its children with their counts and its siblings behind one row, and it
+reads each further level when it opens. **Graph** in the card's header draws the entity's
+neighbourhood in the card in place of the tree, on the Explore canvas with Explore's
+lenses. An entity outside any hierarchy has **Graph** beside its title, which shows the
+graph in place of the cards. The graph holds its parents, its first children, the entities
+its axioms relate it to and those whose axioms hold it, with each edge named by its
+property. Double-clicking a node adds that entity's neighbourhood, and **Open in Explore**
+opens the entity there.
+
+The Definition card gives the axioms about the entity in the sections of the ontology
+editor's frame, each one a line of Manchester prose whose names link to their pages.
+Synonyms follow by kind with their languages and sources, then comments and notes in the
 reader's language, with the others behind **Other languages**. A SKOS concept gets a
 table of its labels by language and its related concepts and mappings. Cross-references
 to well-known databases such as Wikipedia, PubMed and DOI are links. **What links here**
@@ -413,10 +424,10 @@ property, with their counts and further pages. **In other datasets** asks every 
 dataset the caller can read, up to 20, whether it mentions the IRI, and links its page
 there. **Similar terms** lists the entity's nearest neighbours in the dataset's first ready
 vector index, through the same search as Similar's Search page, and links to that page for
-more. A dataset without a vector index or a term without a vector shows no such section. The infobox lists the kind, status, identifiers, ontology, subsets and the counts
-of parents, children and instances, and downloads the entity in Turtle, RDF/XML, OWL
-functional syntax or JSON-LD. On a phone the page is one column with the header first, then the Hierarchy card,
-which opens on request, the infobox and the article ([screenshot](../images/browse-phone.png)).
+more. A dataset without a vector index or a term without a vector shows no such section.
+Below a large screen the cards are one column, in the order Definition, Metadata,
+Hierarchy, References and Download, and on a phone the Hierarchy card opens on request
+([screenshot](../images/browse-phone.png)).
 
 A caller who can write to the dataset gets an **Edit** button beside the title, and `E`
 or the palette's **Edit this page** does the same. Edit mode changes the page in place

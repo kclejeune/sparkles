@@ -65,10 +65,16 @@ test('an entity page shows its axioms as linked prose, its usage and its facts',
   await expect(usage.getByRole('link', { name: 'Ada Lovelace' })).toBeVisible();
   await expect(usage.getByRole('heading', { name: /Range of/ })).toBeVisible();
 
-  const facts = page.getByRole('complementary', { name: 'About this entity' });
+  const facts = page.getByRole('region', { name: 'Metadata' });
+  await expect(facts.getByRole('heading', { name: 'Metadata' })).toBeVisible();
   await expect(facts).toContainText('Class');
-  await expect(facts).toContainText('1 parent, 0 subclasses');
-  await expect(facts.getByRole('link', { name: 'Turtle' })).toBeVisible();
+  // the counts under the header carry the hierarchy, so the card does not
+  await expect(facts).not.toContainText('1 parent');
+  const counts = page.getByRole('navigation', { name: 'Counts' });
+  await expect(counts.getByRole('link', { name: '1 parent' })).toHaveAttribute('href', '#tree-h');
+  await expect(counts.getByRole('link', { name: '0 subclasses' })).toBeVisible();
+  const download = page.getByRole('region', { name: 'Download' });
+  await expect(download.getByRole('link', { name: 'Turtle' })).toBeVisible();
 
   await logic.getByRole('link', { name: 'Employee' }).click();
   await expect(page.getByRole('heading', { level: 1, name: 'Employee' })).toBeVisible();
@@ -201,17 +207,19 @@ for (const [w, h] of [
   });
 }
 
-test('the phone page keeps the order head, hierarchy, facts, article', async ({ page }) => {
+test('the phone page keeps the order head, counts, definition, metadata, hierarchy', async ({
+  page,
+}) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await openTerm(page, 'Person');
   const y = async (sel: string) => (await page.locator(sel).first().boundingBox())!.y;
-  const head = await y('.b-head');
-  const info = await y('.b-info');
-  const tree = await y('.b-tree');
-  const article = await y('.b-article');
-  expect(head).toBeLessThan(tree);
-  expect(tree).toBeLessThan(info);
-  expect(info).toBeLessThan(article);
+  const order = ['.b-head', '.b-chips', '.b-def', '.b-info', '.b-tree', '.b-refs', '.b-dl'];
+  const ys = [];
+  for (const sel of order) ys.push(await y(sel));
+  for (let i = 1; i < ys.length; i++) expect(ys[i - 1]).toBeLessThan(ys[i]);
+  // the counts stay compact: at most two lines of chips
+  const chips = (await page.locator('.b-chips').boundingBox())!;
+  expect(chips.height).toBeLessThanOrEqual(2 * 32 + 8);
   // the hierarchy card opens on request
   const card = page.getByRole('complementary', { name: 'Hierarchy' });
   await expect(card.locator('.tree-body')).toBeHidden();
@@ -225,24 +233,38 @@ test('the phone page keeps the order head, hierarchy, facts, article', async ({ 
   await expect(page.getByRole('button', { name: 'Open search' })).toBeVisible();
 });
 
-test('the hierarchy is a card in the side column above the facts', async ({ page }) => {
-  for (const width of [1440, 1024]) {
-    await page.setViewportSize({ width, height: 900 });
-    await openTerm(page, 'Person');
-    const box = async (sel: string) => (await page.locator(sel).first().boundingBox())!;
-    const head = await box('.b-head');
-    const tree = await box('.b-tree');
-    const info = await box('.b-info');
-    const article = await box('.b-article');
-    // the content starts at the gutter, with the side column beside the head
-    expect(head.x).toBeLessThan(tree.x);
-    expect(Math.abs(tree.y - head.y)).toBeLessThan(24);
-    expect(tree.y + tree.height).toBeLessThanOrEqual(info.y);
-    expect(Math.abs(tree.x - info.x)).toBeLessThan(1);
-    expect(article.x + article.width).toBeLessThanOrEqual(tree.x);
-    await expect(page.locator('.b-tree .tree-toggle')).toBeHidden();
-    await expect(page.locator('.b-tree .tree-body')).toBeVisible();
-  }
+test('a large screen shows the term in two columns of cards whose bottoms stay close', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await openTerm(page, 'Person');
+  const box = async (sel: string) => (await page.locator(sel).first().boundingBox())!;
+  const def = await box('.b-def');
+  const info = await box('.b-info');
+  expect(def.x).toBeLessThan(info.x);
+  expect(Math.abs(def.y - info.y)).toBeLessThan(2);
+  // the side column is sized to its cards, narrower than the term's own
+  expect(info.width).toBeLessThan(def.width);
+  expect(info.width).toBeLessThanOrEqual(400);
+  // the bottoms of the two columns stay within a card of each other
+  const bottom = (sel: string) =>
+    page
+      .locator(sel)
+      .evaluate((c) => (c.lastElementChild as HTMLElement).getBoundingClientRect().bottom);
+  await expect
+    .poll(async () => Math.abs((await bottom('.b-main')) - (await bottom('.b-side'))))
+    .toBeLessThan(400);
+  // the cards keep their reading order: the term's own, then the side's
+  const order = await page.evaluate(() =>
+    [...document.querySelectorAll('.b-main > .panel, .b-side > *')].map((e) =>
+      e.classList.contains('b-info') ? 'meta' : e.className.match(/b-(def|tree|refs|dl)/)?.[1],
+    ),
+  );
+  expect(order.slice(0, 2)).toEqual(['def', 'tree']);
+  expect(order).toContain('meta');
+  // at 1024 the cards are one column
+  await page.setViewportSize({ width: 1024, height: 900 });
+  await expect.poll(async () => (await box('.b-info')).x).toBeLessThan(def.x + 80);
 });
 
 test('a list whose count is a lower bound pages on until a short page', async ({ page }) => {
@@ -301,4 +323,17 @@ test('a landing page at a past state has no search box', async ({ page }) => {
     timeout: 30_000,
   });
   await expect(page.locator('main').getByRole('searchbox')).toHaveCount(0);
+});
+
+test('the incoming count matches What links here', async ({ page }) => {
+  await openTerm(page, 'Professor');
+  const usage = page.getByRole('region', { name: /What links here/ });
+  const shown = (
+    await usage.getByRole('heading', { level: 2 }).locator('.count-badge').innerText()
+  ).trim();
+  await expect(
+    page
+      .getByRole('navigation', { name: 'Counts' })
+      .getByRole('link', { name: `${shown} incoming` }),
+  ).toBeVisible();
 });
