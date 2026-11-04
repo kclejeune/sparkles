@@ -136,11 +136,29 @@ ancestors of the first visible row at the top as the tree scrolls, show the sele
 entity's path above its panel, and give labels the room before short forms.
 A level with more than 1,000 children now says so and shows the rest with **Show more**,
 where it showed only the first 1,000 before. A Browse term page is a row of counts under its
-header and cards for its definition, hierarchy and references beside cards for its
+header and cards for its definition, axioms, hierarchy and references beside cards for its
 metadata and downloads, in two columns that balance their heights. The hierarchy card
 scrolls on its own, draws the graph in place of the tree, and on a phone opens on
 request. Pages with a side column, Browse and a dataset's page, share one side column
 width.
+
+The Browse term page and the page heads of the web UI changed again in the second stage of
+that review (roadmap item 633). The Definition card leads with every definition,
+description, comment and scope note, grouped under a heading that names the kind and the
+predicate, and an **Axioms** card shows the term's frame in Manchester syntax with the
+inferences of a classification that a **Classify** button runs. SKOS concepts get no
+Axioms card. Every page's title shares a row with its buttons, and buttons that do not fit
+fold into a **More** menu. A page's counts are one row of chips, on Browse and on a
+dataset's overview. The landing search spans the content. Edit previews and the history
+tabs show each change as one block for a subject, named by its label, with the N-Quads one
+tab away. Memory's facts are cards that show their source, quote, confidence and review
+status, a fact's history is a timeline that pairs each superseded value with its
+replacement, the Memory page heads its overview with counts and lists activity as a
+timeline, and a dataset's Communities tab can draw the hierarchy as a treemap. The top
+bar's dataset follows a dataset's own page, and choosing another dataset there opens that
+dataset's page. The ontology editor's asserted and inferred class trees share their pane
+in equal columns, where the asserted tree had been squeezed to a sliver. Every screenshot
+in `docs/images` was taken again.
 
 Ontologies and thesauri have a typo-tolerant entity search for typeahead (spec U12,
 roadmap item 616). `GET /$/ontology/{ds}/search?q=` matches the labels, synonyms, short

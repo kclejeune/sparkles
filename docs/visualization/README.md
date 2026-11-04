@@ -99,6 +99,10 @@ The SvelteKit UI is embedded in the server binary.
   the bottom. A row of filters that no longer fits beside its search folds into a
   **Filters** button that counts the active filters, and the search stays in view. A page's
   own search, such as Browse's and Memory's, is one tall field across the content width.
+  A page head is a grid from 640 pixels, with the title and what describes it on the left and
+  the page's buttons level with the title on the right. Buttons marked primary stay in view
+  and the others fold into a **More** menu once the buttons would take more than two fifths of
+  the head. A page's headline counts are one row of chips.
 
 ### Query page
 
@@ -248,9 +252,26 @@ The SvelteKit UI is embedded in the server binary.
   each value (screenshots of [nested forms](../images/forms-nested.png) and
   [lists](../images/forms-list.png)).
   `Dataset::forms()` and Python's `Dataset.forms` expose the same forms.
-* The Memory page shows what memory holds about an entity with each fact's source, quote
-  and history, and its Inbox tab reviews facts with **Accept all that pass**. The
-  Communities tab shows the GraphRAG hierarchy and reports.
+* Memory shows what agents recorded as cards. On Explore, a resource's Memory tab gives one
+  card for each predicate, with the values it holds, each with its review status, the
+  confidence the agent gave it and a line naming the agent, the source and the start of the
+  quote it cited. A value that several facts state shows a marker for each, a conflict marks the card it
+  belongs to, and a citation marker opens the graph, time and every other detail. The
+  history of facts that were superseded or retracted is a timeline, newest first, that pairs
+  each old value, struck through, with the value that replaced it and says when and by what
+  it was replaced ([screenshot](../images/memory-facts.png)). The Memory page heads its
+  overview with counts of facts, agents, sources, review branches and open inbox items. It
+  lists the agents and sources as tables, recent activity as a timeline, and the review
+  branches and settings, and a search across the page recalls facts as the same cards
+  ([screenshot](../images/memory.png)). Its Inbox tab reviews facts, with **Accept all that pass** to select them,
+  and **Promote selected** and **Reject selected** to act on the selection.
+* The Communities tab of a dataset shows the GraphRAG hierarchy as a tree or, with **Map**, as
+  a treemap in which each community is a box sized by its members and a parent holds its
+  sub-communities under its title ([screenshot](../images/communities-map.png)). A box is
+  tinted by its report's status, and says the status in words wherever it is large
+  enough to hold them. Choosing a box opens the community's members and report below the map,
+  and the choice of view is kept in the browser. A parent whose children would be too small
+  to read shows as one box that opens its own report.
 * The server page shows readiness, requests, caches, backups and a Models section for
   providers, the model configuration and write-only keys
   ([USAGE.md](../USAGE.md#changing-models-and-keys-at-runtime),
@@ -342,6 +363,11 @@ it. A breadcrumb above the entity panel gives the selected entity's path from a 
 tree. A level with more than 1,000 children shows its
 first 1,000 with a **Show more** row that reads the next 1,000 from the hierarchy route.
 
+A change set is drawn the same way wherever the pages show one, in the edit previews and in
+the history tabs. Each subject is a block named by its label, with every added or removed
+property and value on a line of its own and a sign beside it, and the plain N-Quads are one
+tab away.
+
 ### Ontology editor
 
 The **Ontology** editor, `/ui/workbench/ontology`, browses and edits the OWL ontology of one graph
@@ -390,11 +416,25 @@ landing page of the default graph's ontology, and `&iri=IRI` opens an entity. `g
 
 An entity's page leads with its label, short form, kind and IRI, and a row of counts under
 them, its parents, children, incoming links, synonyms and the other datasets that mention
-it, each a link to its section. A deprecated entity says so under its title and links its
-replacement. The rest of the page is cards. **Definition** gives the definition with the
-sources its axiom annotations name, the axioms, synonyms, comments and other annotations,
-**Hierarchy** the entity's place in its tree, and **References** its cross-references,
-what links here and the other datasets. Beside them, in a column of the same width as on
+it, each a link to its section. The buttons that act on the page sit level with the title.
+**Open in Explore**, **Open in Ontology** or **Open in Thesaurus**, **Ask about this** and
+**Edit** show while they fit, and the rest fold into a **More** menu, so the title never
+shares a row with a wrapped column of buttons. A deprecated entity says so under its title and
+links its replacement. The rest of the page is cards. **Definition** leads with every
+definition, description, comment and scope note the entity has, in groups under a heading
+that names the kind and the predicate, such as "Definition · obo:IAO_0000115" and
+"Comment · rdfs:comment". The heading follows the **Prefixed** or **Full IRIs** switch and
+shows the full IRI as its title. A group shows its first three values with a count of the
+rest, folds the other languages behind "In N other languages", and keeps blank lines as
+paragraphs. The same text under two predicates is one entry. A note leads only when the entity
+has nothing else, and an entity with none says so. Synonyms follow by kind, each with its
+languages, sources and its synonym type as a chip. **Axioms** gives the entity's frame in
+Manchester syntax, with the names linked to their pages and a **Copy** button, and an
+**Inferred** section that a **Classify** button fills from the server's classification. A SKOS
+concept has no Axioms card, since SKOS statements are not axioms.
+**Hierarchy** gives the entity's place in its tree, and **References** its cross-references,
+what links here, the other datasets and, folded away under **All other statements**, every
+statement the other cards do not show. Beside them, in a column of the same width as on
 a dataset's page, **Metadata** lists the kind, status, identifiers, ontology and subsets,
 and **Download** downloads the entity in Turtle, RDF/XML, OWL functional syntax or JSON-LD.
 When one column grows longer than the other, References or Download moves to the shorter
@@ -410,24 +450,23 @@ lenses. An entity outside any hierarchy has **Graph** beside its title, which sh
 graph in place of the cards. The graph holds its parents, its first children, the entities
 its axioms relate it to and those whose axioms hold it, with each edge named by its
 property. Double-clicking a node adds that entity's neighbourhood, and **Open in Explore**
-opens the entity there.
+opens the entity there. **Ask about this** opens the Ask drawer with the entity as its
+context.
 
-The Definition card gives the axioms about the entity in the sections of the ontology
-editor's frame, each one a line of Manchester prose whose names link to their pages.
-Synonyms follow by kind with their languages and sources, then comments and notes in the
-reader's language, with the others behind **Other languages**. A SKOS concept gets a
-table of its labels by language and its related concepts and mappings. Cross-references
-to well-known databases such as Wikipedia, PubMed and DOI are links. **What links here**
-lists the axioms of other entities that mention it, grouped by the restriction that holds
-it as in "part of some mitochondrion", then the other statements that point at it by
-property, with their counts and further pages. **In other datasets** asks every other
-dataset the caller can read, up to 20, whether it mentions the IRI, and links its page
-there. **Similar terms** lists the entity's nearest neighbours in the dataset's first ready
-vector index, through the same search as Similar's Search page, and links to that page for
-more. A dataset without a vector index or a term without a vector shows no such section.
-Below a large screen the cards are one column, in the order Definition, Metadata,
-Hierarchy, References and Download, and on a phone the Hierarchy card opens on request
-([screenshot](../images/browse-phone.png)).
+A SKOS concept gets a table of its labels by language and its related concepts and
+mappings. Cross-references to well-known databases such as Wikipedia, PubMed and DOI are
+links. A class that is defined by an expression shows it as a **Logical definition**
+under its definition, and only class expressions count, never the other axioms.
+**What links here** lists the axioms of other entities that mention it, grouped by the
+restriction that holds it as in "part of some mitochondrion", then the other statements that
+point at it by property, with their counts and further pages. **In other datasets** asks
+every other dataset the caller can read, up to 20, whether it mentions the IRI, and links
+its page there. **Similar terms** lists the entity's nearest neighbours in the dataset's
+first ready vector index, through the same search as Similar's Search page, and links to
+that page for more. A dataset without a vector index or a term without a vector shows no
+such section. Below 1,100 pixels the cards are one column, in the order Definition, Axioms,
+Metadata, Hierarchy, References and Download, and on a phone the Hierarchy card opens on
+request ([screenshot](../images/browse-phone.png)).
 
 A caller who can write to the dataset gets an **Edit** button beside the title, and `E`
 or the palette's **Edit this page** does the same. Edit mode changes the page in place
@@ -456,10 +495,11 @@ moves to the bottom of the screen with **Undo**, **Redo**, a menu and **Done**, 
 hierarchy comes before the article ([screenshot](../images/browse-edit-phone.png)).
 
 The landing page shows the ontology or scheme header with its title, version, license and
-description, a graph picker when named graphs hold ontologies or schemes, a search over
-the entity search with kind filters, the top classes or concepts with their definitions
-and child counts, and the counts of each kind of entity
-([screenshot](../images/browse-landing.png)). The top classes are the root terms the
+description, a graph picker when named graphs hold ontologies or schemes, a search field
+and its results across the full width of the content, with kind filters, the top classes or
+concepts with their definitions and child counts, and the counts of each kind of entity
+beside them ([screenshot](../images/browse-landing.png)). The ontology's own annotations
+are listed under **About this ontology** by their labels, with long names wrapped. The top classes are the root terms the
 ontology names with `IAO_0000700` when it names them, and the classes without a named
 parent otherwise.
 
@@ -581,6 +621,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   a query outside OWL 2 EL copies the ontology into memory for the RL rules, item
   662. Class answers under the RL rules can miss entailed subsumptions, and the
   label marks them as possibly incomplete.
+* The Axioms card of a Browse term page shows inferred superclasses only after a
+  **Classify** click, since no read-only route says whether a kept classification exists,
+  NEW-ITEM-6.
 * The thesaurus editor reads at most 2,000 narrower concepts of a concept and 5,000 roots
   of a scheme, and the label search scans the labels for a substring and answers
   its first 100 matches, 638. A mapping's target in another dataset is named by its
