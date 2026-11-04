@@ -362,10 +362,21 @@
   }
   // a filter reads the search's hits of the tab's kind and their ancestors
   let filtered = $state<{ text: string; tree: ReturnType<typeof filteredTree> } | null>(null);
+  // the dataset, branch and graph the filtered tree was read in
+  let filteredIn = '';
   $effect(() => {
     const text = filter.trim();
     const k = kindTab;
     const kind = k ? LEVEL_KIND[k] : undefined;
+    // the scope is read here, where the effect tracks it, not in the timer below
+    const scopeTarget = target;
+    const scopeGraph = graph;
+    const scope = `${scopeTarget}\u0000${scopeGraph ?? ''}`;
+    if (scope !== filteredIn) {
+      // another dataset, branch or graph must not keep showing the last scope's hits
+      filteredIn = scope;
+      filtered = null;
+    }
     if (!kind || text.length < 2) {
       filtered = null;
       return;
@@ -373,17 +384,17 @@
     const ctl = new AbortController();
     const t = setTimeout(async () => {
       try {
-        const r = await searchEntities(target, text, {
+        const r = await searchEntities(scopeTarget, text, {
           kind: [kind],
           limit: 20,
-          graph,
+          graph: scopeGraph,
           signal: ctl.signal,
         });
         const answers = await Promise.all(
           r.results.map((h) =>
             fetchHierarchy(
-              target,
-              sel,
+              scopeTarget,
+              { graph: scopeGraph, imports: true },
               { kind, iri: h.iri, ancestors: true, limit: 1 },
               ctl.signal,
             ),
@@ -874,7 +885,7 @@
       icon: 'book',
       keywords: ['browse', 'page', 'read', 'open page'],
       active: () => !!name && !!selected,
-      run: () => void goto(routes.browse(name, { iri: selected, graph })),
+      run: () => void goto(routes.browse(name, { iri: selected, graph, branch })),
     },
     {
       id: 'ontology.session',
@@ -1323,7 +1334,7 @@
               <span class="spacer"></span>
               <a
                 class="btn sm ghost"
-                href={routes.browse(name, { iri: selected, graph })}
+                href={routes.browse(name, { iri: selected, graph, branch })}
                 title="Open this entity's page in Browse"
                 ><Icon name="book" size={13} /> Open page</a
               >

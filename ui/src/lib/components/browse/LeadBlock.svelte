@@ -5,7 +5,14 @@
   // the first few values in the reader's languages show and the rest fold behind "N more",
   // and the translations fold behind "In N other languages". A value in another language
   // than the reader's best names it.
-  import { langRank, LEAD_SHOWN, type Lead, type Linker, type Sourced } from '$lib/browse';
+  import {
+    langRank,
+    languageCount,
+    LEAD_SHOWN,
+    type Lead,
+    type Linker,
+    type Sourced,
+  } from '$lib/browse';
   import type { PrefixMap } from '$lib/rdf';
   import PredicateName from './PredicateName.svelte';
   import SourcedValue from './SourcedValue.svelte';
@@ -53,12 +60,9 @@
           </details>
         {/if}
         {#if g.translations.length}
+          {@const n = languageCount(g.translations)}
           <details class="fold">
-            <summary
-              >In {g.translations.length} other {g.translations.length === 1
-                ? 'language'
-                : 'languages'}</summary
-            >
+            <summary>In {n} other {n === 1 ? 'language' : 'languages'}</summary>
             {#each g.translations as v, i (i)}{@render entry(v, cls)}{/each}
           </details>
         {/if}

@@ -412,6 +412,11 @@ function sourced(s: Statement): Sourced {
   };
 }
 
+/** The number of distinct languages among values, which a summary of translations says. */
+export function languageCount(values: readonly Pick<Sourced, 'lang'>[]): number {
+  return new Set(values.map((v) => (v.lang ?? '').toLowerCase())).size;
+}
+
 /** What a synonym type is called: its label when the page has one, else its local name. */
 export function synonymTypeName(
   iri: string,
@@ -869,9 +874,9 @@ export function manchesterFrame(
           g.id === 'negative' ? [{ text: 'not', role: 'kw' }, space] : [];
         sec.items.push([...neg, ...toks(it.values[0]), space, ...toks(it.values[1])]);
       } else if (g.id === 'keys' || g.id === 'disjointUnion') {
-        // one axiom names several entities: a key's properties and a union's classes
-        const sep: ManchesterToken[] =
-          g.id === 'keys' ? [space] : [{ text: ',', role: 'punct' }, space];
+        // one axiom names several entities: a key's properties and a union's classes, which
+        // Manchester syntax separates with commas
+        const sep: ManchesterToken[] = [{ text: ',', role: 'punct' }, space];
         sec.items.push(it.values.flatMap((v, i) => [...(i ? sep : []), ...toks(v)]));
       } else {
         for (const v of it.values) sec.items.push(toks(v));
@@ -888,6 +893,12 @@ export function manchesterFrame(
 export function frameText(frame: Frame, iri: string, name: (iri: string) => string): string {
   const lines = [`${frame.word}: ${manchesterName(name(iri))}`];
   for (const s of frame.sections) {
+    if (s.id === 'keys') {
+      // each key is its own clause, since one HasKey clause would join them into one key
+      for (const it of s.items)
+        lines.push('', `    ${s.word}: `, `        ${it.map((t) => t.text).join('')}`);
+      continue;
+    }
     lines.push('', `    ${s.word}: `);
     s.items.forEach((it, i) => {
       const text = it.map((t) => t.text).join('');

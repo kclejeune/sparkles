@@ -2733,7 +2733,11 @@
                   {#if ds && isTerm(types)}
                     <a
                       class="btn sm"
-                      href={routes.browse(ds, { iri: n.iri })}
+                      href={routes.browse(ds, {
+                        iri: n.iri,
+                        branch: overviewBranch,
+                        at: timeActive && exAt ? exAt : null,
+                      })}
                       title="This term's page in Browse"><Icon name="book" size={13} /> Open page</a
                     >
                   {/if}

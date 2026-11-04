@@ -8,6 +8,8 @@ import type { Hierarchy, TreeNode } from './browse';
 
 /** The children of one level that the tree reads at most. */
 export const LEVEL_LIMIT = 1000;
+/** The pages of a long level that revealing a selection reads at most. */
+export const REVEAL_PAGES = 50;
 
 export type LevelReader = (q: {
   iri?: string;
@@ -145,7 +147,28 @@ export class LevelTree {
     };
     walk(iri);
     await Promise.all([null, ...ids].map((a) => this.load(a)));
+    // a level past its first page may not hold the path's next node yet, so read further
+    // pages until it does, or the selection would never show in its tree
+    const path = new Set([iri, ...ids]);
+    const want: [string | null, string][] = [];
+    for (const n of path) {
+      const ps = parents.get(n) ?? [];
+      if (ps.length) for (const p of ps) want.push([p, n]);
+      else want.push([null, n]);
+    }
+    await Promise.all(want.map(([p, n]) => this.#reach(p, n, gen)));
     return [...ids];
+  }
+
+  /** Read pages of the clipped level of `parent` until it holds `child`, up to a bound. */
+  async #reach(parent: string | null, child: string, gen: number) {
+    const key = parent ?? '';
+    for (let i = 0; i < REVEAL_PAGES; i++) {
+      if (gen !== this.#generation) return;
+      const have = this.levels[key];
+      if (!have || have.includes(child) || !this.clipped[key]) return;
+      await this.loadMore(parent);
+    }
   }
 }
 

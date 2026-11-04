@@ -525,7 +525,7 @@
       icon: 'book',
       keywords: ['browse', 'page', 'read', 'open page'],
       active: () => !!name && !!selected,
-      run: () => void goto(routes.browse(name, { iri: selected, graph })),
+      run: () => void goto(routes.browse(name, { iri: selected, graph, branch })),
     },
     {
       id: 'thesaurus.session',
@@ -1308,7 +1308,7 @@
               <span class="spacer"></span>
               <a
                 class="btn sm ghost"
-                href={routes.browse(name, { iri: selected, graph })}
+                href={routes.browse(name, { iri: selected, graph, branch })}
                 title="Open this resource's page in Browse"
                 ><Icon name="book" size={13} /> Open page</a
               >

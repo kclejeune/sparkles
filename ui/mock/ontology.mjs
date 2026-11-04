@@ -1713,8 +1713,6 @@ export async function handleOntology(req, res, url, seg, ctx) {
           property: x.property,
           value: x.value,
         }));
-        // a synonym's type is named on the page, so its label comes with the names
-        for (const x of annotations) if (typeof x.value === 'string') note(x.value);
         return { property: q.predicate.value, value, graph, annotations };
       });
     // as on the server, an axiom is about the entity when one of its triples has it as subject

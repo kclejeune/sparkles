@@ -16,6 +16,17 @@ describe('change sets', () => {
     });
   });
 
+  it('closes a literal at the first unescaped quote, even after an escaped backslash', () => {
+    expect(parseNt('"C:\\\\"@en')).toEqual({ type: 'literal', value: 'C:\\', lang: 'en' });
+    expect(parseNt('"a\\\\\\"b"')).toEqual({ type: 'literal', value: 'a\\"b' });
+    // a quote inside the value is not the end, and a language tag that holds a quote is not read
+    expect(parseNt('"x\\"y"^^<http://www.w3.org/2001/XMLSchema#string>')).toEqual({
+      type: 'literal',
+      value: 'x"y',
+      datatype: 'http://www.w3.org/2001/XMLSchema#string',
+    });
+  });
+
   it('groups changes by subject, removals before additions of a property', () => {
     const gs = changeGroups([
       { op: '+', subject: `<${EX}a>`, predicate: `<${EX}label>`, object: '"new"', graph: null },

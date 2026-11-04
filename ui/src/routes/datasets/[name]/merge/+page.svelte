@@ -16,7 +16,14 @@
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
-  import { MAIN, mergeChanges, mergeCommands, ntShort, remainingConflicts } from '$lib/branches';
+  import {
+    MAIN,
+    mergeChanges,
+    onBranch,
+    mergeCommands,
+    ntShort,
+    remainingConflicts,
+  } from '$lib/branches';
   import { fmtInt } from '$lib/format';
   import {
     cellKey,
@@ -596,6 +603,7 @@
                 total={dry.changes.total}
                 label="Changes of the merge"
                 maxHeight={360}
+                ds={onBranch(name, target)}
               />
             {:else}
               <p class="faint">The merge changes no quads.</p>

@@ -5,6 +5,7 @@
   // a vector in it, shows nothing.
   import * as api from '$lib/api';
   import * as ex from '$lib/explore';
+  import { MAIN, splitTarget } from '$lib/branches';
   import { routes } from '$lib/routes';
   import { localName } from '$lib/rdf';
   import { LatestRun } from '$lib/supersede';
@@ -28,6 +29,8 @@
   let hits = $state<Hit[]>([]);
   let labels = $state<Map<string, string>>(new Map());
   const runs = new LatestRun();
+  // `ds` may name a branch, `name@branch`, which Similar takes as a dataset and a `branch`
+  const family = $derived(splitTarget(ds));
 
   $effect(() => {
     const name = ds;
@@ -81,8 +84,13 @@
         </li>
       {/each}
     </ol>
-    <a class="more small" href={routes.similar(ds, { iri, index: index.name })}
-      >More in Similar, by the {index.name} index</a
+    <a
+      class="more small"
+      href={routes.similar(family.name, {
+        iri,
+        index: index.name,
+        branch: family.branch === MAIN ? null : family.branch,
+      })}>More in Similar, by the {index.name} index</a
     >
   </section>
 {/if}

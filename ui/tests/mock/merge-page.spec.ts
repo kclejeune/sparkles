@@ -56,6 +56,13 @@ test('the merge page resolves conflicts per row and per subject, then merges', a
   await update(request, 'orchard', swap('a', 'age', 1, 2));
   await update(request, 'orchard', swap('b', 'height', 1, 2));
 
+  // another dataset is the shell's, and the change set must name its terms from orchard's
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'foaf'));
+  const asked: string[] = [];
+  page.on('request', (r) => {
+    const u = new URL(r.url());
+    if (/^\/(foaf|orchard)(@[^/]*)?\/sparql$/.test(u.pathname)) asked.push(u.pathname);
+  });
   await page.goto('/ui/datasets/orchard/merge?source=dev&target=main');
   const summary = page.getByRole('region', { name: 'Summary' });
   await expect(summary).toContainText('dev@', { timeout: 30_000 });
@@ -79,6 +86,8 @@ test('the merge page resolves conflicts per row and per subject, then merges', a
   const set = changes(page).getByRole('list', { name: 'Changes of the merge' });
   await expect(set.getByRole('listitem').first()).toContainText('urn:a');
   await expect(set).toContainText('height');
+  expect(asked.some((p) => p.startsWith('/orchard'))).toBe(true);
+  expect(asked.filter((p) => p.startsWith('/foaf'))).toEqual([]);
   // the changes as N-Quads lines rather than the change set
   await changes(page).getByRole('button', { name: 'N-Quads' }).click();
   const lines = changes(page).getByLabel('Changes of the merge');

@@ -211,6 +211,37 @@ test('OWL edits on a session branch: definition, synonym, annotation, parent and
   });
 });
 
+test('inferences follow an edit: a superclass made asserted leaves the inferred list', async ({
+  page,
+  request,
+}) => {
+  await onSession(request, 'uni', async () => {
+    await open(page, term('uni', UNI + 'Professor'));
+    const axioms = page.getByRole('region', { name: 'Axioms' });
+    await axioms.getByRole('button', { name: 'Classify' }).click();
+    const inferredSub = axioms.locator('[data-section="inferred-sub"]');
+    await expect(inferredSub.getByRole('link', { name: 'Teacher' })).toBeVisible();
+
+    await pageAction(page, 'Edit');
+    const branch = await startSession(page, 'onto');
+    const tree = page.getByRole('complementary', { name: 'Hierarchy' });
+    await tree.getByRole('combobox', { name: 'Add a parent class' }).fill('Teach');
+    await tree
+      .getByRole('option', { name: /Teacher/ })
+      .first()
+      .click();
+    await commit(page);
+    await bar(page).getByRole('button', { name: /^Done/ }).click();
+    await expect(page).not.toHaveURL(/edit=1/);
+    // the superclass is asserted now, so the card no longer lists it as inferred
+    await expect(
+      axioms.locator('[data-section="sub"]').getByRole('link', { name: 'Teacher' }),
+    ).toBeVisible();
+    await expect(inferredSub.getByRole('link', { name: 'Teacher' })).toHaveCount(0);
+    return branch;
+  });
+});
+
 test('SKOS edits: a label, a definition and a broader concept', async ({ page, request }) => {
   await onSession(request, 'thes', async () => {
     await open(page, term('thes', TH + 'fish', '&edit=1'));

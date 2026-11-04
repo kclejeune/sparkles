@@ -164,6 +164,18 @@ PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 `;
 
+/** The most rows the agents and sources listings read, which their headline counts say. */
+export const LISTING_LIMIT = 100;
+
+/**
+ * A count read from a listing that stops at `LISTING_LIMIT` rows: the number, with a plus
+ * sign when the listing was cut, since the dataset may hold more than it counted.
+ */
+export function listed(rows: number): string {
+  const n = rows.toLocaleString('en');
+  return rows >= LISTING_LIMIT ? `${n}+` : n;
+}
+
 /** The principals that wrote facts, with their graphs, fact counts and last write. */
 export const AGENTS_QUERY = `${PREFIXES}SELECT ?agent (COUNT(DISTINCT ?r) AS ?facts) (MAX(?time) AS ?last)
   (GROUP_CONCAT(DISTINCT STR(?g); separator=" ") AS ?graphs)
@@ -176,7 +188,7 @@ WHERE {
 }
 GROUP BY ?agent
 ORDER BY DESC(?facts)
-LIMIT 100`;
+LIMIT ${LISTING_LIMIT}`;
 
 /** The sources facts were derived from, with fact counts. */
 export const SOURCES_QUERY = `${PREFIXES}SELECT ?source (COUNT(DISTINCT ?r) AS ?facts)
@@ -185,7 +197,7 @@ WHERE {
 }
 GROUP BY ?source
 ORDER BY DESC(?facts)
-LIMIT 100`;
+LIMIT ${LISTING_LIMIT}`;
 
 /** The newest activities with their labels, principals and times. */
 export const ACTIVITY_QUERY = `${PREFIXES}SELECT ?act ?label ?time ?agent ?g

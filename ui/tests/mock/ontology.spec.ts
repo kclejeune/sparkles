@@ -102,6 +102,86 @@ test('the inferred class tree sits beside the asserted one', async ({ page }) =>
   ).toHaveCount(0);
 });
 
+test('a filtered tree is read again when the branch changes', async ({ page, request }) => {
+  const made = await request.post('/$/branches/uni', { data: { name: 'dr-filter' } });
+  expect(made.status()).toBe(201);
+  try {
+    const up = await request.post('/uni@dr-filter/update', {
+      headers: { 'Content-Type': 'application/sparql-update' },
+      data: `PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+INSERT DATA { <http://example.org/uni#Zebra> a owl:Class ; rdfs:label "Zebra"@en }`,
+    });
+    expect(up.ok()).toBe(true);
+    await page.goto('/ui/workbench/ontology?ds=uni');
+    const tree = page.getByRole('tree', { name: 'Classes (asserted)' });
+    await expect(tree.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
+      timeout: 30_000,
+    });
+    await page.getByRole('searchbox', { name: /^Filter/ }).fill('Zebra');
+    await expect(page.getByText('Nothing matches')).toBeVisible({ timeout: 10_000 });
+    // the same filter on the branch that has the class finds it
+    await page.getByRole('combobox', { name: 'Branch', exact: true }).selectOption('dr-filter');
+    await expect(tree.getByRole('treeitem', { name: /Zebra/ })).toBeVisible({ timeout: 10_000 });
+  } finally {
+    await request.delete('/$/branches/uni/dr-filter?force=true');
+  }
+});
+
+test('the history of the default graph leaves out what a commit changed in a named graph', async ({
+  page,
+  request,
+}) => {
+  const made = await request.post('/$/branches/uni', { data: { name: 'dr-hist' } });
+  expect(made.status()).toBe(201);
+  try {
+    const up = await request.post('/uni@dr-hist/update', {
+      headers: {
+        'Content-Type': 'application/sparql-update',
+        'Sparkles-Commit-Message': 'Add to two graphs',
+      },
+      data: `PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+INSERT DATA {
+  <http://example.org/uni#Newt> rdfs:comment "in the default graph" .
+  GRAPH <http://example.org/graphs/other> { <http://example.org/uni#Newt> rdfs:comment "in a named graph" }
+}`,
+    });
+    expect(up.ok()).toBe(true);
+    await page.goto('/ui/workbench/ontology?ds=uni&branch=dr-hist&tab=history');
+    const commits = page.getByRole('list', { name: 'Changes' });
+    await commits.getByRole('button', { name: /Add to two graphs/ }).click();
+    const changes = page.locator('.changeset').first();
+    await expect(changes).toContainText('in the default graph', { timeout: 10_000 });
+    await expect(changes).not.toContainText('in a named graph');
+    // a change set that reaches a named graph says which graph each change is in
+    await page.goto(
+      '/ui/workbench/ontology?ds=uni&branch=dr-hist&tab=history&graph=http%3A%2F%2Fexample.org%2Fgraphs%2Fother',
+    );
+    await page
+      .getByRole('list', { name: 'Changes' })
+      .getByRole('button', { name: /Add to two graphs/ })
+      .click();
+    const named = page.locator('.changeset').first();
+    await expect(named).toContainText('in a named graph', { timeout: 10_000 });
+    await expect(named).toContainText('in http://example.org/graphs/other');
+    await expect(named).not.toContainText('in the default graph');
+    // the viewer's choice of full IRIs reaches the names a change set falls back to
+    await expect(named).toContainText('rdfs:comment');
+    await page.evaluate(() => localStorage.setItem('sparkles.iris', 'full'));
+    await page.reload();
+    await page
+      .getByRole('list', { name: 'Changes' })
+      .getByRole('button', { name: /Add to two graphs/ })
+      .click();
+    await expect(page.locator('.changeset').first()).toContainText(
+      'http://www.w3.org/2000/01/rdf-schema#comment',
+      { timeout: 10_000 },
+    );
+  } finally {
+    await request.delete('/$/branches/uni/dr-hist?force=true');
+  }
+});
+
 test('edits on a session branch are previewed, committed, undone and redone', async ({
   page,
   request,

@@ -28,10 +28,11 @@ export function parseNt(s: string): CsTerm {
   if (t.startsWith('<') && t.endsWith('>')) return { type: 'iri', value: t.slice(1, -1) };
   if (t.startsWith('_:')) return { type: 'bnode', value: t.slice(2) };
   if (t.startsWith('"')) {
-    // the closing quote is the last one not escaped
-    let end = t.length - 1;
-    while (end > 0 && !(t[end] === '"' && t[end - 1] !== '\\')) end--;
-    if (end <= 0) return { type: 'literal', value: t };
+    // the closing quote is the first one that no backslash escapes, so a value that ends in
+    // an escaped backslash still closes where it should
+    let end = 1;
+    while (end < t.length && t[end] !== '"') end += t[end] === '\\' ? 2 : 1;
+    if (end >= t.length) return { type: 'literal', value: t };
     const raw = t.slice(0, end + 1);
     let value: string;
     try {

@@ -94,7 +94,8 @@
         to: String(c.seq),
         quads: true,
         limit: CHANGES,
-        graph: graph ?? undefined,
+        // no graph means every graph to the route, and the editor shows the default graph
+        graph: graph ?? 'default',
       });
       diffs = { ...diffs, [c.seq]: d };
       void loadNames(changeIris(d.quads ?? []));

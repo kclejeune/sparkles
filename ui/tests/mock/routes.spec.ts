@@ -106,6 +106,76 @@ test('a term page opens in the Workbench at the same IRI, and back to its page',
   await expect(page.getByRole('heading', { level: 1 })).toContainText(/Professor/);
 });
 
+test('Open page keeps the session branch the editor works on', async ({ page, request }) => {
+  const made = await request.post('/$/branches/uni', { data: { name: 'dr-link' } });
+  expect(made.status()).toBe(201);
+  try {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(
+      `/ui/workbench/ontology?ds=uni&branch=dr-link&iri=${encodeURIComponent(UNI + 'Professor')}`,
+    );
+    const open = page.getByRole('link', { name: 'Open page' });
+    await expect(open).toBeVisible({ timeout: 30_000 });
+    await expect(open).toHaveAttribute('href', /[?&]branch=dr-link(&|$)/);
+    await open.click();
+    await expect(page).toHaveURL(/\/ui\/browse\?.*branch=dr-link/);
+  } finally {
+    await request.delete('/$/branches/uni/dr-link?force=true');
+  }
+});
+
+test('Similar terms on a session branch link to Similar by dataset and branch', async ({
+  page,
+  request,
+}) => {
+  const made = await request.post('/$/branches/uni', { data: { name: 'dr-sim' } });
+  expect(made.status()).toBe(201);
+  try {
+    // the mock has no vector index on uni, so the index and its neighbours are stubbed
+    await page.route('**/$/vector/uni**', (route) =>
+      route.fulfill({
+        json: {
+          indexes: [
+            {
+              name: 'terms',
+              predicate: 'http://example.org/uni#embedding',
+              dimension: 8,
+              metric: 'cosine',
+              state: 'ready',
+              generation: 'g1',
+              rows: 3,
+              overlay: { inserts: 0, deletes: 0 },
+            },
+          ],
+        },
+      }),
+    );
+    await page.route(/\/uni((@|%40)[^/]*)?\/(sparql|query)/, (route) =>
+      route.fulfill({
+        json: {
+          vars: ['s', 'score'],
+          rows: [
+            [
+              { type: 'uri', value: UNI + 'Teacher' },
+              { type: 'literal', value: '0.9' },
+            ],
+          ],
+        },
+      }),
+    );
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(`/ui/browse?ds=uni&branch=dr-sim&iri=${encodeURIComponent(UNI + 'Professor')}`);
+    const more = page.getByRole('link', { name: /More in Similar/ });
+    await expect(more).toBeVisible({ timeout: 30_000 });
+    const href = new URL((await more.getAttribute('href'))!, 'http://x');
+    expect(href.pathname).toMatch(/\/similar$/);
+    expect(href.searchParams.get('ds')).toBe('uni');
+    expect(href.searchParams.get('branch')).toBe('dr-sim');
+  } finally {
+    await request.delete('/$/branches/uni/dr-sim?force=true');
+  }
+});
+
 test('the rail groups the Workbench editors and marks the open one', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto('/ui/workbench/thesaurus?ds=thes');

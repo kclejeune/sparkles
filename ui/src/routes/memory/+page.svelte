@@ -18,6 +18,8 @@
     AGENTS_QUERY,
     graphPrefixes,
     isReviewBranch,
+    LISTING_LIMIT,
+    listed,
     principalName,
     SOURCES_QUERY,
   } from '$lib/memory';
@@ -163,16 +165,24 @@
     if (agents.loading || sources.loading || activity.loading) return [];
     const facts = agents.rows.reduce((t, r) => t + n(r.facts), 0);
     const plural = (k: number, one: string, many: string) => (k === 1 ? one : many);
+    // the agents and sources are listings cut at LISTING_LIMIT rows, so their counts, and the
+    // facts of the agents listed, are lower bounds when a listing is full
+    const cut = agents.rows.length >= LISTING_LIMIT;
     const out: StatChip[] = [
-      { key: 'facts', value: fmtInt(facts), label: plural(facts, 'fact', 'facts') },
+      {
+        key: 'facts',
+        value: cut ? `${fmtInt(facts)}+` : fmtInt(facts),
+        label: plural(facts, 'fact', 'facts'),
+        title: cut ? 'The facts of the first agents the listing reads' : undefined,
+      },
       {
         key: 'agents',
-        value: fmtInt(agents.rows.length),
+        value: listed(agents.rows.length),
         label: plural(agents.rows.length, 'agent', 'agents'),
       },
       {
         key: 'sources',
-        value: fmtInt(sources.rows.length),
+        value: listed(sources.rows.length),
         label: plural(sources.rows.length, 'source', 'sources'),
       },
       {

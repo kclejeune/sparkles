@@ -26,6 +26,7 @@ import {
   parseHead,
   parseReuse,
   synonymTypeName,
+  languageCount,
   termSections,
   textBlocks,
   treeKindOf,
@@ -451,6 +452,12 @@ describe('axioms', () => {
         }),
         item({
           type: 'HasKey',
+          class: iri,
+          objectProperties: [EX + 'k3'],
+          dataProperties: [],
+        }),
+        item({
+          type: 'HasKey',
           class: EX + 'Other',
           objectProperties: [],
           dataProperties: [],
@@ -463,7 +470,7 @@ describe('axioms', () => {
     expect(f.sections.map((s) => [s.word, s.items.length])).toEqual([
       ['SubClassOf', 2],
       ['EquivalentTo', 1],
-      ['HasKey', 1],
+      ['HasKey', 2],
     ]);
     expect(f.other).toHaveLength(1);
     expect(frameText(f, iri, name)).toBe(
@@ -478,7 +485,10 @@ describe('axioms', () => {
         '        E',
         '',
         '    HasKey: ',
-        '        k1 k2',
+        '        k1, k2',
+        '',
+        '    HasKey: ',
+        '        k3',
         '',
       ].join('\n'),
     );
@@ -808,5 +818,13 @@ describe('SPARQL of the landing page and the further reads', () => {
     expect(usageQuery(EX + 'p', ['default'], 50)).toBe(
       `SELECT DISTINCT ?s WHERE { { GRAPH <urn:x-arq:DefaultGraph> { ?s <${EX}p> ?o FILTER(isIRI(?s)) } } } ORDER BY ?s LIMIT 50 OFFSET 50`,
     );
+  });
+});
+
+describe('languageCount', () => {
+  it('counts the distinct languages of translations, not their values', () => {
+    expect(languageCount([{ lang: 'fr' }, { lang: 'fr' }, { lang: 'FR' }])).toBe(1);
+    expect(languageCount([{ lang: 'fr' }, { lang: 'de' }, { lang: null }])).toBe(3);
+    expect(languageCount([])).toBe(0);
   });
 });

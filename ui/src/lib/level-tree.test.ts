@@ -76,6 +76,35 @@ describe('LevelTree', () => {
     expect(t.children('b')).toEqual(['d']);
   });
 
+  it('reads further pages of a long level until the selection shows in it', async () => {
+    // root r has 2,500 children c0..c2499 in pages of 1,000, and c2200 is the selection
+    const kids = Array.from({ length: 2500 }, (_, i) => `c${i}`);
+    const reader = async (q: { iri?: string; ancestors?: boolean; offset?: number }) => {
+      if (q.ancestors)
+        return answer({
+          node: node('c2200'),
+          ancestors: { nodes: [node('r', 2500)], edges: [['c2200', 'r']], truncated: false },
+        });
+      if (q.iri === 'r') {
+        const at = q.offset ?? 0;
+        const page = kids.slice(at, at + 1000);
+        return answer({
+          node: node('r', 2500),
+          children: page.map((k) => node(k)),
+          total: 2500,
+          offset: at,
+        });
+      }
+      return answer({ children: [node('r', 2500)] });
+    };
+    const t = new LevelTree(reader);
+    const anc = await t.reveal('c2200');
+    expect(anc).toEqual(['r']);
+    expect(t.children('r')).toContain('c2200');
+    expect(t.children('r')).toHaveLength(2500);
+    expect(t.clippedOf('r')).toBeNull();
+  });
+
   it('forgets its levels on reset and reads the open ones again', async () => {
     const log: string[] = [];
     const t = new LevelTree(reader(log));

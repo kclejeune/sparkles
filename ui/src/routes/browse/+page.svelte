@@ -13,6 +13,7 @@
   import { page } from '$app/state';
   import { onMount, tick, untrack } from 'svelte';
   import { balance } from '$lib/balance';
+  import { labels as exLabels } from '$lib/explore';
   import { fmtInt } from '$lib/format';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
@@ -311,6 +312,36 @@
   });
 
   const sections = $derived(term ? termSections(term, langs) : null);
+  // The term route names the entities its statements and axioms use, which leaves out a synonym
+  // type that only an axiom annotation's value names, so the labels it lacks are read here.
+  let typeLabels = $state<Map<string, string>>(new Map());
+  $effect(() => {
+    const t = term;
+    const names = t?.names ?? {};
+    const want = [
+      ...new Set(
+        (sections?.synonyms ?? [])
+          .flatMap((g) => g.values.flatMap((v) => v.types))
+          .filter((i) => !names[i]?.label && /^(https?|urn):/.test(i)),
+      ),
+    ];
+    if (!want.length) {
+      typeLabels = new Map();
+      return;
+    }
+    let live = true;
+    const ds = target;
+    void exLabels(ds, want)
+      .then((m) => {
+        if (live) typeLabels = m;
+      })
+      .catch(() => {
+        // the types keep their local names
+      });
+    return () => {
+      live = false;
+    };
+  });
   const groups = $derived(term ? axiomGroups(term.iri, term.kinds, term.axioms) : []);
   /** A class's EquivalentTo class expressions, the OBO genus and differentia, which the
    * Definition card also shows as its logical definition; the Axioms card holds every axiom. */
@@ -1479,7 +1510,7 @@
                   <TermSynonyms
                     synonyms={sections.synonyms}
                     {linker}
-                    typeName={(i) => synonymTypeName(i, term?.names)}
+                    typeName={(i) => typeLabels.get(i) ?? synonymTypeName(i, term?.names)}
                   />
                   <TermNotes
                     notes={sections.notes}
@@ -1548,6 +1579,7 @@
                 {prefixes}
                 {target}
                 {graph}
+                commit={term.commit}
                 historic={!!at}
                 editor={editing ? axiomEditor : undefined}
               />

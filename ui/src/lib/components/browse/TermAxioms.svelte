@@ -32,6 +32,7 @@
     prefixes,
     target,
     graph,
+    commit = null,
     historic = false,
     editor,
   }: {
@@ -42,6 +43,8 @@
     prefixes: PrefixMap;
     target: string;
     graph: string | null;
+    /** The commit the page shows, so that an edit asks the classification again. */
+    commit?: number | null;
     /** The page shows a past state, which the kept classification does not describe. */
     historic?: boolean;
     /** Edit mode's frame, which takes the card's body in place of the read-only one. */
@@ -51,7 +54,13 @@
   const frame = $derived(manchesterFrame(kind, groups, linker.name, prefixes));
   const isClass = $derived(kind === 'Class');
 
-  let inferred = $state<Inferred | null>(null);
+  type Classified = NonNullable<Awaited<ReturnType<typeof classifyAbout>>>;
+  /** What the classification answered, which the asserted groups are taken out of below. */
+  let answer = $state<Classified | null>(null);
+  /** The inferences that no axiom of the frame already asserts, so an edit updates them too. */
+  const inferred = $derived<Inferred | null>(
+    answer ? inferredOf(iri, groups, answer.class, answer.complete, answer.reused) : null,
+  );
   let names = $state(new Map<string, string>());
   const langs: readonly string[] = typeof navigator === 'undefined' ? [] : [...navigator.languages];
   const nameOf = (i: string) => names.get(i) ?? linker.name(i);
@@ -68,9 +77,8 @@
       const r = await classifyAbout(target, graph, iri);
       if (my !== seq) return;
       missing = !r;
-      const inf = r ? inferredOf(iri, groups, r.class, r.complete, r.reused) : null;
       // the inferred classes are not among the names the page read, so their labels are asked
-      const ask = inf ? [...inf.superClasses, ...inf.equivalents] : [];
+      const ask = r ? [...r.class.parentClasses, ...r.class.classes].filter((c) => c !== iri) : [];
       if (ask.length)
         try {
           const rows = await api.select(target, namesQuery(ask, graph));
@@ -79,7 +87,7 @@
         } catch {
           // the names stay as the page writes unknown IRIs
         }
-      inferred = inf;
+      answer = r;
     } catch (e) {
       if (my === seq) failure = api.errorMessage(e);
     } finally {
@@ -93,7 +101,9 @@
     void iri;
     void target;
     void graph;
-    inferred = null;
+    // an edit commits a new state, which the inferences are asked of again
+    void commit;
+    answer = null;
     missing = false;
     failure = null;
     if (isClass && !historic && classifiedHere(target)) void load();

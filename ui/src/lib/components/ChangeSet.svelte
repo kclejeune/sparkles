@@ -3,9 +3,9 @@
   // label, with each added or removed property and value on a line of its own. The raw
   // N-Quads stay one link away, in the full diff the caller links to.
   import type * as api from '$lib/api';
-  import { changeGroups, type CsTerm } from '$lib/changeset';
+  import { changeGroups, parseNt, type CsTerm } from '$lib/changeset';
   import { fmtInt } from '$lib/format';
-  import { shorten, type PrefixMap } from '$lib/rdf';
+  import { displayIri, type PrefixMap } from '$lib/rdf';
 
   let {
     quads,
@@ -28,7 +28,13 @@
   } = $props();
 
   const groups = $derived(changeGroups(quads));
-  const short = (iri: string) => shorten(iri, prefixes) ?? iri;
+  // names follow the viewer's choice of prefixed or full IRIs
+  const short = (iri: string) => displayIri(iri, prefixes);
+  // a change set that touches a named graph says which graph each change is in, the default
+  // graph included, so that moving a triple between graphs does not read as a no-op
+  // the diff names a graph as an N-Triples IRI or as a bare IRI
+  const graphIri = (g: string) => parseNt(g).value;
+  const graphed = $derived(quads.some((q) => q.graph != null));
   const named = (iri: string) => name(iri) ?? short(iri);
 </script>
 
@@ -65,7 +71,14 @@
                 >{c.op === '+' ? '+' : '−'}</span
               >
               <span class="prop" title={c.predicate}>{named(c.predicate)}</span>
-              <span class="val">{@render term(c.object)}</span>
+              <span class="val"
+                >{@render term(c.object)}{#if graphed}
+                  <span
+                    class="graph small faint"
+                    title={c.graph ? graphIri(c.graph) : 'the default graph'}
+                    >in {c.graph ? short(graphIri(c.graph)) : 'the default graph'}</span
+                  >{/if}</span
+              >
             </li>
           {/each}
         </ul>
@@ -147,6 +160,10 @@
   }
   .small {
     font-size: var(--fs-sm);
+  }
+  .graph {
+    margin-left: var(--sp-1);
+    white-space: nowrap;
   }
   /* a name that opens its entity reads as a link, not a button */
   .link {
