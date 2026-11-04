@@ -1941,6 +1941,11 @@
     if (!filtersOpen) toggleFilters();
   }
 
+  // the Communities section is offered where the dataset has GraphRAG communities
+  $effect(() => {
+    if (filtersOpen && nodeCount > 0) void lenses.loadAlgoOptions();
+  });
+
   /** The categories of the colour lens, such as communities, which the filters can hide. */
   const COMMUNITY_LENSES = new Set(['wcc', 'labelPropagation', 'louvain', 'leiden', 'graphrag']);
   const communityGroups = $derived.by((): GroupEntry[] => {

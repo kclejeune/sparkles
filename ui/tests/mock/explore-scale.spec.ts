@@ -182,6 +182,32 @@ test('the filters choose what is drawn and nothing is read again', async ({ page
   expect(reads).toEqual([]);
 });
 
+test('communities of the memory store group the graph, and a group can be hidden', async ({
+  page,
+}) => {
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'org'));
+  await page.goto(
+    `/ui/explore?ds=org&iri=${encodeURIComponent('http://example.org/resource/ana')}`,
+  );
+  await expect(counts(page)).toContainText(/\d+ nodes/, { timeout: 45_000 });
+  const nodesOf = async () =>
+    Number(/(\d+) nodes/.exec((await counts(page).textContent()) ?? '')?.[1]);
+  await expect.poll(nodesOf).toBeGreaterThan(3);
+  const before = await nodesOf();
+  await page.getByRole('button', { name: 'Filters', exact: true }).click();
+  const filters = page.getByTestId('explore-filters');
+  await filters.getByRole('button', { name: 'Group by communities' }).click();
+  const groups = filters.getByRole('list', { name: 'Communities' });
+  await expect(groups).toContainText('The payments team', { timeout: 15_000 });
+  // the focus is never hidden, so a group without it is the one to hide
+  await groups.getByRole('checkbox', { name: /no value/ }).uncheck();
+  await expect.poll(nodesOf).toBeLessThan(before);
+  // the hidden community stays in the list, so that it can come back
+  await expect(groups).toContainText('no value');
+  await groups.getByRole('checkbox', { name: /no value/ }).check();
+  await expect.poll(nodesOf).toBe(before);
+});
+
 test.describe('at 390 px', () => {
   test.use({ ...phone, viewport: { width: 390, height: 844 } });
 
