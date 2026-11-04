@@ -1,7 +1,9 @@
-// The Ask bar against the mock (C18 Phase 2): preview first and run then show, the step
-// indicator, a summary whose citations select rows, feedback and Try harder, an edit that
-// clears the summary and Summarize again, clarification choices, graph variables,
-// follow-ups, failure states, the server-side Asked list and the Explore hint.
+// The Ask thread on the Query page against the mock (C18 Phase 2): preview first and run
+// then show, the step indicator, a summary whose citations select rows, feedback and Try
+// harder, an edit that clears the summary and Summarize again, clarification choices,
+// graph variables, follow-ups, failure states, the server-side Asked list and the
+// palette's Ask row. Each question asked in the drawer docked beside the editor opens in
+// a tab, as the Ask bar's did. The thread itself is covered by ask-thread.spec.ts.
 //
 // mock/assistant.mjs scripts the pipeline by words in the question. Only `org` has an
 // assistant.
@@ -13,19 +15,33 @@ async function openQuery(page: Page, mode?: 'preview' | 'run') {
   await page.addInitScript((m) => {
     localStorage.setItem('sparkles.dataset', 'org');
     localStorage.removeItem('sparkles.queryTabs');
+    sessionStorage.clear();
     if (m) localStorage.setItem('sparkles.askPrefs.local', JSON.stringify({ mode: m }));
   }, mode ?? null);
   await page.goto('/ui/query?ds=org');
-  await expect(page.getByRole('region', { name: 'Ask bar' })).toBeVisible({
+  await expect(page.getByRole('button', { name: 'Ask', exact: true })).toBeVisible({
     timeout: 20_000,
   });
 }
 
+/** The Ask drawer docked beside the editor, or its sheet on a phone. */
+const drawer = (page: Page) =>
+  page.getByRole('complementary', { name: 'Ask' }).or(page.getByRole('dialog', { name: 'Ask' }));
+
 async function ask(page: Page, question: string) {
-  const bar = page.getByRole('region', { name: 'Ask bar' });
-  await bar.getByRole('textbox').fill(question);
-  await bar.getByRole('button', { name: 'Ask' }).click();
+  if (!(await drawer(page).isVisible())) {
+    await page.getByRole('button', { name: 'Ask', exact: true }).click();
+  }
+  const d = drawer(page);
+  await d.getByRole('textbox', { name: 'Question' }).fill(question);
+  await d
+    .getByRole('form', { name: 'Ask a question' })
+    .getByRole('button', { name: 'Ask' })
+    .click();
 }
+
+/** The tab's failure, apart from the thread's. */
+const tabAlert = (page: Page) => page.locator('main').getByRole('alert');
 
 test('preview first shows the checked query without running it (A22)', async ({ page }) => {
   const runs: string[] = [];
@@ -33,7 +49,8 @@ test('preview first shows the checked query without running it (A22)', async ({ 
     if (/\/org\/sparql$/.test(new URL(r.url()).pathname)) runs.push(r.url());
   });
   await openQuery(page);
-  await expect(page.getByRole('radio', { name: 'Preview first' })).toBeChecked();
+  await page.getByRole('button', { name: 'Ask', exact: true }).click();
+  await expect(drawer(page).getByRole('radio', { name: 'Preview' })).toBeChecked();
   await ask(page, 'Who is in the payments team?');
   await expect(page.getByRole('tab', { name: 'Who is in the payments team?' })).toHaveAttribute(
     'aria-selected',
@@ -54,7 +71,8 @@ test('run then show answers with rows, a cited summary and feedback (A23, A25)',
   page,
 }) => {
   await openQuery(page, 'run');
-  await expect(page.getByRole('radio', { name: 'Run, then show' })).toBeChecked();
+  await page.getByRole('button', { name: 'Ask', exact: true }).click();
+  await expect(drawer(page).getByRole('radio', { name: 'Run' })).toBeChecked();
   await ask(page, 'Who is in the payments team?');
   const answer = page.getByRole('region', { name: 'Answer' });
   await expect(answer).toContainText('is in the answer');
@@ -125,31 +143,36 @@ test('graph variables open the graph with the pickers set (A39 UI)', async ({ pa
   );
 });
 
-test('a follow-up carries the earlier turn, and New question drops it', async ({ page }) => {
+test('a follow-up carries the earlier turn, and New thread drops it', async ({ page }) => {
   await openQuery(page, 'run');
   await ask(page, 'Who is in the payments team?');
   await expect(page.getByRole('group', { name: 'Answer feedback' })).toBeVisible();
-  const bar = page.getByRole('region', { name: 'Ask bar' });
-  await expect(bar).toContainText('Following up on “Who is in the payments team?”');
+  const d = drawer(page);
+  await expect(d.getByRole('textbox', { name: 'Question' })).toHaveAttribute(
+    'placeholder',
+    'Ask a follow-up',
+  );
   const sent = page.waitForRequest((r) => r.url().endsWith('/org/ask'));
   await ask(page, 'and their start dates?');
-  expect((await sent).postDataJSON().context).toEqual([
-    {
-      question: 'Who is in the payments team?',
-      query: expect.stringContaining('res:payments'),
-    },
+  const body = (await sent).postDataJSON();
+  expect(body.context).toEqual([
+    { question: 'Who is in the payments team?', query: expect.stringContaining('res:payments') },
   ]);
-  await expect(page.getByRole('group', { name: 'Answer feedback' })).toBeVisible();
-  await bar.getByRole('button', { name: 'New question' }).click();
-  await expect(bar).not.toContainText('Following up on');
+  expect(typeof body.thread).toBe('string');
+  await expect(d.getByRole('heading', { name: 'and their start dates?' })).toBeVisible();
+  await d.getByRole('button', { name: 'New thread' }).click();
+  await expect(d.getByRole('heading', { level: 3 })).toHaveCount(0);
 });
 
 test('failure states say what went wrong', async ({ page }) => {
   await openQuery(page, 'run');
   await ask(page, 'Ask the provider something');
-  await expect(page.getByRole('alert')).toContainText('The model provider is not responding.');
+  await expect(tabAlert(page)).toContainText('The model provider is not responding.');
+  await expect(drawer(page).getByRole('alert')).toContainText(
+    'The model provider is not responding.',
+  );
   await ask(page, 'Spend the budget');
-  await expect(page.getByRole('alert')).toContainText(
+  await expect(tabAlert(page)).toContainText(
     "This dataset's question budget for today is used up.",
   );
 });
@@ -165,25 +188,30 @@ test('the Asked list comes from the server history (A34)', async ({ page }) => {
   await expect(asked.getByRole('menuitem', { name: /for the history\?/ })).toHaveCount(0);
 });
 
-test('Explore offers to ask the search text', async ({ page }) => {
-  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'org'));
+test('the palette offers to ask the search text, and the drawer asks it on the page', async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('sparkles.dataset', 'org');
+    sessionStorage.clear();
+  });
   await page.goto('/ui/explore?ds=org');
   const search = page.getByPlaceholder(/^Find a resource/);
   await search.fill('who leads payments');
   await page.getByRole('option', { name: /Ask a question/ }).click();
-  await expect(page).toHaveURL(/\/ui\/query/);
-  await expect(page.getByRole('region', { name: 'Ask bar' }).getByRole('textbox')).toHaveValue(
-    'who leads payments',
-  );
+  await expect(page).toHaveURL(/\/ui\/explore/);
+  await expect(
+    drawer(page).getByRole('heading', { name: 'who leads payments', level: 3 }),
+  ).toBeVisible();
 });
 
-test('a dataset without an assistant has no Ask bar (A19 UI)', async ({ page }) => {
+test('a dataset without an assistant offers no Ask (A19 UI)', async ({ page }) => {
   await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'foaf'));
   await page.goto('/ui/query?ds=foaf');
-  await expect(page.getByRole('region', { name: 'Results' })).toBeVisible({
-    timeout: 20_000,
-  });
-  await expect(page.getByRole('region', { name: 'Ask bar' })).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Results' })).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByRole('button', { name: 'Ask', exact: true })).toHaveCount(0);
+  await page.keyboard.press('Shift+A');
+  await expect(drawer(page)).toHaveCount(0);
 });
 
 test('a global question is answered from community reports, and switches to the data (C22 A6)', async ({
@@ -222,10 +250,14 @@ test.describe('a global answer on a phone', () => {
   test('fits the screen', async ({ page }) => {
     await openQuery(page, 'run');
     await ask(page, 'What are the main areas of work?');
+    // the sheet covers the page until it is closed
+    await expect(drawer(page).getByRole('group', { name: 'Feedback' })).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(drawer(page)).toHaveCount(0);
     const answer = page.getByTestId('global-answer');
     await expect(answer).toContainText('platform team');
     await answer.getByText('The payments team', { exact: true }).click();
-    // the query page's toolbar is wider than a phone with an Ask bar, so the answer
+    // the query page's toolbar can be wider than a phone, so the answer
     // itself is measured: nothing in it reaches past its own box
     const wide = await answer.evaluate((el) => {
       const box = el.getBoundingClientRect();

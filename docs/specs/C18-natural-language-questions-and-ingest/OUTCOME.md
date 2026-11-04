@@ -2033,3 +2033,69 @@ stage diagnostics count both attempts when a byte refusal requires fallback. The
 fixtures do not measure model accuracy, establish general contextual resolution or
 claim a latency improvement. Item 263 remains open for the broader evidence and
 model-dependent evaluation contract. No paid provider was called.
+
+## Ask threads in the web UI
+
+The Ask bar on the query page became one `AskThread` component, shown as a page at
+`/ui/ask` and as a drawer docked beside any page of the shell. The drawer opens with
+`Shift+A`, from the palette's Ask row and from the rail. It docks at the right of a window
+1200 pixels or wider, floats over a narrower one and is a bottom sheet on a phone, and
+**Open as page** moves the thread to the page. Browse, Ontology, Thesaurus and Explore
+pass the resource they show, and the Query page its tab's query, as a context chip with
+questions that suit the kind of resource. On the Query page the thread docks beside the
+editor and still opens each answer in a query tab, with the question header, retries,
+clarifications, **Try harder** and **Save as example** where the Ask bar had them.
+
+Each turn shows the answer with its numbered citations and folds for the query with its
+check, the rows as a table or a small graph, the sources and the steps with their
+diagnostics. The sources are the cited rows, the memory facts about the cited and linked
+entities from `POST /{ds}/recall` with their quotes, documents, status and confidence,
+and the community reports a global answer read. **Open in Query**, **Open in Explore**,
+**Save as query** and the feedback buttons act on a turn. A running turn shows its step
+and **Stop**, follow-ups carry the thread and its earlier turns, and **New thread**
+starts over. The history lists the threads by day and reopens one.
+
+The server changes are limited to the gaps the thread needed. `POST /{ds}/ask` takes an
+optional `thread` id and an optional `about` object with an absolute IRI, a kind and a
+label. The server renders `about` into the prompt exactly as the `(about <IRI>)` suffix
+a person could type, and stores the person's own words with the resource beside them,
+so the history shows the question as asked. Grounding could later seed entity linking
+and predicate use from `about` directly, which roadmap item 717 records, and that
+change would need an accuracy measurement because it alters what the model sees.
+
+Format 2 of `asks.json` stores a thread id, the `about` resource and the answer without
+its rows, with the explanation, the assumptions, the summary with its citations, the
+points of a global answer with their reports, the verdict, the diagnosis and the linked
+entities. Text is capped at 8000 characters and lists at 50 items. A reader of format 1
+refuses format 2 as an unsupported settings version, so downgrading a server after it
+has written format 2 makes that dataset's history unreadable to the older build until
+the file is removed. Format 2 reads format 1 records as threads of one question without
+an answer. A history file the server cannot read answers `409` on the list and delete
+routes and is left unchanged, instead of being replaced by a new history.
+
+A stored answer was written from the asker's view, so the record keeps an access
+footprint of the graphs the answer read in the one state every step of the ask read, a
+second footprint
+of the guarded reports graphs with their protections, and the branch. `GET /$/asks/{ds}`
+returns the answer only when the caller may query that branch and its current view of
+it, built with the same grants and masking as a query, covers both footprints, and
+otherwise returns the record with `answerWithheld` and no answer. An ask whose head
+moved while it ran, an ask pinned with `at` to any state other than the head's commit, a
+branch that is gone and a view over more than 512 graphs of either kind all fail closed,
+so that only unrestricted readers see such an answer again. Steps that take no `at` read
+the head, so the head is the one state a footprint can describe, and roadmap item
+718 records each state the steps read instead. Pages lend their branch and state to
+the questions asked on them whether or not a resource is chosen, and the browser keeps
+one thread per person and dataset and drops responses that arrive after either
+changed. This is the
+rule C22 §6.6 applies to the cleared global text. The route filters by `thread`, oldest
+first within a thread. Rows stay off the server, and **Show rows** reruns the stored
+query read-only at its commit, falling back to the head with a note when the commit is
+no longer kept, with no model call.
+
+The UI work did not change the prompts, grounding or model calls of an Ask without
+`about`, so it carries no accuracy measurement and no paid provider was called. Mock
+Playwright suites cover the turn, its folds and actions, follow-ups, history and a
+format 1 record, Stop, clarification, the drawer on Browse with the keyboard alone, and
+the phone sheet. Server tests cover threads, format 1 round trips, refusal of a newer or
+damaged history, and readers with fewer grants than the asker and with masking.

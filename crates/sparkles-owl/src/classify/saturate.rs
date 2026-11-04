@@ -22,6 +22,7 @@
 //! an instance; [`super::world`] classifies the classes that reach such a context.
 
 use super::data::DataVal;
+use super::dl_rules;
 use super::horn::HornIx;
 use super::horn_rules;
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
@@ -59,7 +60,18 @@ pub enum Concl {
     /// Tier H: an instance of this context has an instance of the target as an
     /// `r`-successor, which this context links to
     Succ(Role, Ex),
+    /// Tier D: the marker `A → A` of an atom that may hold of the context's instance
+    Hyp(Ex),
+    /// Tier D: the source context registers with this hypothetical successor by its
+    /// existential restriction
+    DEdge(Ex, Ex),
+    /// Tier D: the successor sent a clause over its predecessor, by its id in the run's
+    /// table
+    PredC(Ex, u32),
 }
+
+// a conclusion takes three words, so that the to-do lists and outboxes keep their size
+const _: () = assert!(std::mem::size_of::<Concl>() == 12);
 
 /// A set kept as a list in the order of insertion, with a hash set beside it once it
 /// has more than a few members, so that a small set takes one allocation.
@@ -290,6 +302,8 @@ pub struct Extra {
     pub groups: Vec<Group>,
     /// what the Horn rules keep
     pub horn: super::horn_rules::HornSt,
+    /// what Tier D keeps, once the context has a clause that is not a unit
+    pub dl: Option<Box<super::dl_rules::DlSt>>,
 }
 
 /// Data successors of a context that functional data roles make one value: the
@@ -313,6 +327,7 @@ impl Extra {
                 .map(|g| 96 + (g.funs.len() + g.roles.len() + g.val.opaque.len()) * 4)
                 .sum::<usize>()
             + self.horn.bytes()
+            + self.dl.as_ref().map_or(0, |d| d.bytes())
     }
 }
 
@@ -352,7 +367,16 @@ impl State {
                 .extra
                 .as_ref()
                 .is_some_and(|x| x.links.contains(&(r, n))),
-            Concl::SuccIn(..) | Concl::PredIn(..) | Concl::Succ(..) => false,
+            Concl::Hyp(a) => self
+                .extra
+                .as_ref()
+                .and_then(|x| x.dl.as_ref())
+                .is_some_and(|d| d.has_hyp(a)),
+            Concl::SuccIn(..)
+            | Concl::PredIn(..)
+            | Concl::Succ(..)
+            | Concl::DEdge(..)
+            | Concl::PredC(..) => false,
         }
     }
 
@@ -432,6 +456,11 @@ pub struct Bounds<'a> {
     pub peak_memory: usize,
     /// the contexts of conjunctions that the Horn rules create, in a run with them
     pub dynamic: Option<&'a Dynamic>,
+    /// what the contexts of Tier D share, in a run with it
+    pub dl: Option<&'a super::dl_rules::DlRun>,
+    /// whether a stop leaves every context's unapplied conclusions in its to-do list, for
+    /// a partial answer
+    pub partial: bool,
 }
 
 const STOP_NONE: u8 = 0;
@@ -453,6 +482,8 @@ const ROOTS_PER_ROUND: usize = 1024;
 pub const CONTEXT_BYTES: usize = 320;
 /// The messages a worker's outbox holds before it delivers them.
 const OUTBOX: usize = 4096;
+/// The clauses of Tier D a context processes between checks of the bounds.
+const DL_CLAUSES: usize = 256;
 
 struct Run<'a> {
     ix: &'a Index,
@@ -488,6 +519,8 @@ struct Run<'a> {
     plain: bool,
     /// whether the rules are those of Tier H
     horn: bool,
+    /// whether the rules are those of Tier D
+    disj: bool,
     dynamic: Option<&'a Dynamic>,
     bounds: &'a Bounds<'a>,
 }
@@ -524,6 +557,22 @@ pub fn saturate(
     universal: &[Ex],
     bounds: &Bounds<'_>,
 ) -> Result<Totals, Stop> {
+    match saturate_counted(ix, ctx, roots, seeds, universal, bounds) {
+        (t, None) => Ok(t),
+        (_, Some(s)) => Err(s),
+    }
+}
+
+/// Saturates as [`saturate`] does, and gives the totals of the work done with the reason
+/// the run stopped, for a partial answer.
+pub fn saturate_counted(
+    ix: &Index,
+    ctx: &Contexts,
+    roots: &[Ex],
+    seeds: &[Ex],
+    universal: &[Ex],
+    bounds: &Bounds<'_>,
+) -> (Totals, Option<Stop>) {
     let run = Run {
         ix,
         ctx,
@@ -543,6 +592,7 @@ pub fn saturate(
         batch: bounds.threads > 1,
         plain: plain(ix),
         horn: ix.horn.is_some() && bounds.dynamic.is_some(),
+        disj: ix.dl.is_some() && bounds.dl.is_some(),
         dynamic: bounds.dynamic,
         bounds,
     };
@@ -566,20 +616,21 @@ pub fn saturate(
         });
     }
     let memory = run.memory.load(Ordering::Relaxed);
-    match run.stop.load(Ordering::SeqCst) {
-        STOP_CANCEL => Err(Stop::Cancelled),
-        STOP_TIMEOUT => Err(Stop::Timeout),
+    let peak = run.peak.load(Ordering::Relaxed).max(memory);
+    let totals = Totals {
+        conclusions: run.applied.load(Ordering::Relaxed),
+        memory,
+        peak,
+        merged: run.merged.load(Ordering::Relaxed),
+    };
+    let stop = match run.stop.load(Ordering::SeqCst) {
+        STOP_CANCEL => Some(Stop::Cancelled),
+        STOP_TIMEOUT => Some(Stop::Timeout),
         // the most counted, waiting messages included, which is what passed the limit
-        STOP_MEMORY => Err(Stop::Memory {
-            used: run.peak.load(Ordering::Relaxed).max(memory),
-        }),
-        _ => Ok(Totals {
-            conclusions: run.applied.load(Ordering::Relaxed),
-            memory,
-            peak: run.peak.load(Ordering::Relaxed).max(memory),
-            merged: run.merged.load(Ordering::Relaxed),
-        }),
-    }
+        STOP_MEMORY => Some(Stop::Memory { used: peak }),
+        _ => None,
+    };
+    (totals, stop)
 }
 
 /// Where a context's rules send their conclusions: to itself, applied in the same pass,
@@ -671,6 +722,23 @@ pub trait Sink {
         let _ = core;
         unreachable!("the Horn rules run only in a saturation")
     }
+    /// what the contexts of Tier D share
+    fn dl(&self) -> &super::dl_rules::DlRun {
+        unreachable!("Tier D runs only in a saturation")
+    }
+    /// whether the context has conclusions of its own waiting
+    fn busy(&self) -> bool {
+        false
+    }
+    /// whether the run goes on, after a check of its bounds, for rules whose one
+    /// inference can make many conclusions
+    fn go_on(&self) -> bool {
+        true
+    }
+    /// whether the run has stopped, without a check of its bounds
+    fn stopped(&self) -> bool {
+        false
+    }
 }
 
 impl Sink for Out<'_, '_> {
@@ -721,6 +789,24 @@ impl Sink for Out<'_, '_> {
             .dynamic
             .expect("a run with the Horn rules")
             .intern(core)
+    }
+
+    fn dl(&self) -> &super::dl_rules::DlRun {
+        self.run.bounds.dl.expect("a run with Tier D")
+    }
+
+    #[inline]
+    fn busy(&self) -> bool {
+        !self.local.is_empty()
+    }
+
+    fn go_on(&self) -> bool {
+        self.run.check(0, 0, 0)
+    }
+
+    #[inline]
+    fn stopped(&self) -> bool {
+        self.run.stopped()
     }
 }
 
@@ -1012,10 +1098,17 @@ impl<'a> Run<'a> {
             };
             if self.stopped() {
                 self.flush(&mut tally);
+                // the messages the worker holds reach their contexts' to-do lists, which
+                // then show the work left for a partial answer
+                if self.bounds.partial {
+                    self.deliver(&mut outbox, &mut mine);
+                }
                 return;
             }
             if self.horn {
                 self.process::<Horn>(next, &mut mine, &mut tally, &mut local, &mut outbox);
+            } else if self.disj {
+                self.process::<Disj>(next, &mut mine, &mut tally, &mut local, &mut outbox);
             } else if self.plain {
                 self.process::<Plain>(next, &mut mine, &mut tally, &mut local, &mut outbox);
             } else {
@@ -1035,7 +1128,8 @@ impl<'a> Run<'a> {
         self.applied.fetch_add(applied, Ordering::Relaxed);
         let held = self.memory.fetch_add(bytes, Ordering::Relaxed) + bytes;
         let waiting = self.queued.fetch_add(queued, Ordering::Relaxed) + queued;
-        let dynamic = self.dynamic.map_or(0, |d| d.bytes());
+        let dynamic =
+            self.dynamic.map_or(0, |d| d.bytes()) + self.bounds.dl.map_or(0, |d| d.bytes());
         let used = held + dynamic + waiting.max(0) as usize * std::mem::size_of::<Concl>();
         let before = self.peak.fetch_max(used, Ordering::Relaxed);
         if self.stopped() {
@@ -1090,7 +1184,11 @@ impl<'a> Run<'a> {
         };
         if !st.init {
             tally.stored += CONTEXT_BYTES / CONCLUSION_BYTES;
-            if R::HORN && me as usize >= self.ctx.len() {
+            if R::DISJ && me as usize >= self.ctx.len() {
+                let core = self.dynamic.expect("a run with Tier D").core(me);
+                st.init = true;
+                dl_rules::init_test(&mut st, core, &mut out);
+            } else if R::HORN && me as usize >= self.ctx.len() {
                 let core = self.dynamic.expect("a run with the Horn rules").core(me);
                 st.init = true;
                 out.me(Concl::Sub(TOP));
@@ -1139,6 +1237,19 @@ impl<'a> Run<'a> {
                 if R::HORN && horn_rules::flush(self.ix, &mut st, &mut out) {
                     continue;
                 }
+                // Tier D's clauses wait for the units, which the EL rules take first
+                if R::DISJ {
+                    let n = dl_rules::flush(self.ix, me, &mut st, &mut out, DL_CLAUSES);
+                    if n > 0 {
+                        tally.applied += n;
+                        tally.queued += out.sent as isize;
+                        out.sent = 0;
+                        if !self.flush(tally) {
+                            break 'outer;
+                        }
+                        continue;
+                    }
+                }
                 break;
             };
             tally.queued -= batch.len() as isize;
@@ -1147,6 +1258,11 @@ impl<'a> Run<'a> {
             out.local.append(&mut batch);
         }
         tally.queued += out.sent as isize;
+        // A run that answers in part when it stops gives back the conclusions it did not
+        // apply, so that the context shows as not closed (roadmap item 603).
+        if self.bounds.partial && !out.local.is_empty() {
+            ctx.todo.lock().append(out.local);
+        }
         drop(st);
         ctx.active.store(false, Ordering::SeqCst);
         if !self.stopped() && !ctx.todo.lock().is_empty() && self.mark(ctx) {
@@ -1202,6 +1318,17 @@ trait Rules {
     const FULL: bool;
     /// the rules of Tier H (roadmap item 603)
     const HORN: bool = false;
+    /// the rules of Tier D (roadmap item 603)
+    const DISJ: bool = false;
+}
+
+/// The rules of Tier D over an index that [`plain`] accepts: the EL rules without those
+/// of individuals, with the rules of disjunctive clauses beside them.
+struct Disj;
+
+impl Rules for Disj {
+    const FULL: bool = false;
+    const DISJ: bool = true;
 }
 
 /// The rules of Tier H over an index that [`plain`] accepts: the EL rules without those
@@ -1250,6 +1377,9 @@ fn apply_rules<S: Sink, R: Rules>(
                         for &e in &srcs.list {
                             out.send(e, Concl::Sub(BOTTOM));
                         }
+                    }
+                    if R::DISJ {
+                        dl_rules::bottom(me, st, out);
                     }
                     if R::FULL && st.extra.is_some() {
                         give(st, BOTTOM, out);
@@ -1322,6 +1452,9 @@ fn apply_rules<S: Sink, R: Rules>(
             if R::HORN && ix.horn.as_ref().is_some_and(|h| h.is(d, HornIx::FILLER)) && d != TOP {
                 horn_rules::fill(ix, me, st, d, out);
             }
+            if R::DISJ {
+                dl_rules::sub(ix, me, st, d, out);
+            }
             true
         }
         Concl::Back(e, r) => {
@@ -1347,6 +1480,9 @@ fn apply_rules<S: Sink, R: Rules>(
             }
             if R::HORN {
                 horn_rules::back(ix, me, st, e, r, out);
+            }
+            if R::DISJ {
+                dl_rules::back(ix, me, st, e, r, out);
             }
             true
         }
@@ -1408,6 +1544,12 @@ fn apply_rules<S: Sink, R: Rules>(
         }
         Concl::SuccIn(..) | Concl::PredIn(..) | Concl::Succ(..) => {
             unreachable!("a conclusion of the Horn rules in a saturation without them")
+        }
+        Concl::Hyp(a) if R::DISJ => dl_rules::hyp(st, a, out),
+        Concl::DEdge(u, e) if R::DISJ => dl_rules::dedge(ix, me, st, u, e, out),
+        Concl::PredC(v, c) if R::DISJ => dl_rules::pred_c(ix, st, v, c, out),
+        Concl::Hyp(_) | Concl::DEdge(..) | Concl::PredC(..) => {
+            unreachable!("a conclusion of Tier D in a saturation without it")
         }
     }
 }

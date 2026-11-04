@@ -13364,6 +13364,8 @@ a term the caller cannot read.
 | `mode` | `auto` (the default) lets the draft classify the question, `local` always answers with a query, and `global` answers from the dataset's community reports. |
 | `explore`, `shapeCheck`, `drafts`, `typeHints` | The repair turns of this ask, over the dataset's `repairs`. `drafts` is 1 to 5. |
 | `query` | A query to check, run and summarize without a draft, for a query that the caller edited. |
+| `thread` | The `threadId` of an earlier ask, for a follow-up in the same thread: 1 to 64 letters, digits, `_` or `-`. Without it the ask starts a thread under its own id. |
+| `about` | The resource the question is about, `{iri, kind?, label?}`, such as the class on the page it was asked from. The pipeline reads the question with ` (about <iri>)` after it, and the [history](#ask-history) keeps the question as written with `about` beside it. `iri` is an absolute IRI, `kind` holds at most 32 characters and `label` at most 200. |
 
 The answer is a stream of server-sent events. Each event's data is one JSON object.
 
@@ -13382,7 +13384,7 @@ The answer is a stream of server-sent events. Each event's data is one JSON obje
 | `reports` | `{level, ranking, reports: [{iri, title, level, status, rating}]}`, the community reports a global answer reads. |
 | `global` | `{points: [{n, text, score, reports, findings}], reports: [{iri, title, level, status, rating, findings: [{iri, text, cites}]}], global: {level, ranking, reportsGraph, selected, batches}}`, sent before the summary of a global answer. |
 | `error` | `{code, message}`, such as `no-model`, `provider-unavailable`, `budget-exceeded` or `timeout`. A draft that says the data cannot answer ends with `unanswerable`, and a draft that still fails after its repairs ends with `no-valid-query` or the error of its last run. These two carry the last draft in `result`. |
-| `usage` | The last event. It holds the `outcome` of the ask, `askId`, the tokens, the estimated cost, the `complexity`, every model step with its pair, outcome and `signal`, the `escalations`, the `answeredBy` pair and `tryHarder`, which is `true` when the draft role has a later pair. |
+| `usage` | The last event. It holds the `outcome` of the ask, `askId`, `threadId`, the tokens, the estimated cost, the `complexity`, every model step with its pair, outcome and `signal`, the `escalations`, the `answeredBy` pair and `tryHarder`, which is `true` when the draft role has a later pair. |
 
 A client that sends `Accept: application/json` without `text/event-stream` gets one
 object instead. It holds `outcome`, `mode`, `result`, `summary`, `clarify` or `error`,
@@ -14107,13 +14109,40 @@ delivery is logged under `sparkles::notify` with an error that never holds a sec
 ### Ask history
 
 The server keeps each caller's asked questions for `historyDays` in
-`<db>/asks.json`. An entry holds the question, the final query, the commit, the
-outcome, the feedback and the routing record. Rows and summaries are never stored.
-Each caller sees and removes only their own entries.
+`<db>/asks.json`. An entry holds the question as written, the final query, the commit,
+the outcome, the feedback, the routing record with its steps, the entry's `thread` and
+the `about` resource the question was asked about. From format 2 of the file an entry
+also holds the `answer`, which is the summary's text and citations, the global answer's
+points, the explanation and assumptions, the diagnosis of an empty result, the notes, a
+clarification or error, and the linked entities and community reports. Rows are never
+stored. Each caller sees and removes only their own entries.
+
+An answer can repeat data from the graphs its ask read, so the entry also records what
+the asker's view read in the one state every step of the ask read, as the disclosure footprint of
+[GraphRAG community reports](#graphrag) does, with the reports graphs and their
+protections apart. `GET` lists the `answer` only while the caller may query the branch
+the ask read and the caller's current view of it reads every one of those graphs with
+the same protections in force. Otherwise it lists the entry with `answerWithheld: true`
+and without the answer. A caller whose view is unrestricted sees it unless the branch is
+gone. An entry records no footprint when the head moved while its ask ran, when the ask was
+pinned with `at` to a state other than the head's commit, or when its view read more
+than 512 named graphs or 512 reports graphs, and then only unrestricted callers see its
+answer. A global answer's text is also withheld while its reports graph is not
+proven for the caller. An entry of a branch other than `main` lists that `branch`.
+
+A thread groups an ask and its follow-ups. The first ask of a thread names none, and its
+own id becomes the thread's `threadId`, which the `usage` event and the JSON answer of
+`POST /{ds}/ask` carry. A follow-up sends it back as `thread`. An entry kept before
+threads is the thread of its own id.
+
+`asks.json` is format 2, and format 1 still reads. The list and delete routes refuse a
+file of a newer format, or one this server cannot parse, with `409`
+(`unsupported-format` or `unreadable-history`). An ask still answers and feedback on a
+recent ask still counts, but neither they nor the hourly prune write over such a file.
 
 | Method and path | Needs | Effect |
 |---|---|---|
-| `GET /$/asks/{ds}?limit=N` | `read` | `{dataset, historyDays, asks}`, newest first, at most `N` (100 by default). |
+| `GET /$/asks/{ds}?limit=N&thread=T` | `read` | `{dataset, historyDays, asks}`, newest first, at most `N` (100 by default). With `thread` only that thread's entries, oldest first. |
 | `DELETE /$/asks/{ds}?id=ID` | `read` | Removes the caller's entry `ID`, or all of the caller's entries without `id`, `204`. An unknown `ID` is a `404` with code `unknown-ask`. |
 | `POST /$/asks/{ds}/{id}/feedback` | `read` | Records `{outcome, note?}` for one of the caller's asks, `204`. `outcome` is `accepted`, `edited` or `rejected`, and `note` holds at most 1000 characters. |
 

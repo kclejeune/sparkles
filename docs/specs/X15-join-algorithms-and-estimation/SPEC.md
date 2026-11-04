@@ -200,6 +200,20 @@ them up. Interleaved runs on atlas, an Intel host like forge, found the same slo
 [engine results](../../benchmarks/engine/RESULTS.md#estimation-timing-on-forge) list every
 changed plan.
 
+The first query of a fresh server over a store that holds the correlation statistics pays
+for them once. On atlas at 1.05M triples, with one thread, the first run of the synthetic
+`expr-bind-group` took a median of 1.19 ms of server time over five fresh servers,
+against 0.98 ms without these estimates. Its plan was the same, it ran about the same instructions, and its later
+runs took the same time. The three switches off left it unchanged, and a store without
+the member did not show it. The server's history of quick texts compared that cold
+cursor run with the eager run after it and kept most fresh servers eager for their whole
+life, so the Namespace screen of the batch read the query at 1.465 of main. The history
+now gives the slower mode a second run before a quick text settles, as the
+[X06 outcome](../X06-benchmark-coverage.md#query-threads-on-hybrid-cores) describes, which
+removes that effect. The cold cost of the first query stays, and item 708 looks for it.
+The [synthetic results](../../benchmarks/synthetic/RESULTS.md#execution-mode-of-quick-texts-in-fresh-servers)
+give the measurements.
+
 Sampling of sources above 1,024 rows and of subplans, degree caps and full
 characteristic pairs are deferred to items 698, 699 and 697. The
 measurements above leave the far-end restrictions of a link and the overestimates of

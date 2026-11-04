@@ -203,7 +203,7 @@ editor and browser and the app shell. The collapsed panel below it has more work
   </tr>
   <tr>
     <td><img src="docs/images/explore-communities.png" alt="The Explore overview drawing seven GraphRAG communities of a freight network as circles sized by their members and coloured by report status, with the head office selected and its report, findings, sub-communities and members beside the picture"></td>
-    <td><img src="docs/images/ask-answer.png" alt="The Ask bar with a drafted SPARQL query, its results and a summary whose numbered citations point to result rows"></td>
+    <td><img src="docs/images/ask-answer.png" alt="The Ask page with a thread's answer, its checked query, its rows and its sources, with the first cited row marked and the memory facts about it quoted"></td>
   </tr>
   <tr>
     <td>GraphRAG communities with their reports</td>
@@ -335,7 +335,7 @@ editor and browser and the app shell. The collapsed panel below it has more work
   </tr>
   <tr>
     <td><img src="docs/images/handoff.png" alt="A query handed over by an agent, open in the query editor with its question, assumptions, the terms it uses and a clean check"></td>
-    <td><img src="docs/images/ask-steps.png" alt="The Ask bar while it works, showing Summarizing after the query results have arrived"></td>
+    <td><img src="docs/images/ask-steps.png" alt="The Ask drawer docked beside the Query page while it works, showing Summarizing after the query results have arrived, with Stop beside the field"></td>
   </tr>
   <tr>
     <td>A query an agent handed over for review</td>

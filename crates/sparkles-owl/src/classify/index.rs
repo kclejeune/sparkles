@@ -748,6 +748,8 @@ pub struct Axioms {
     pub classes: Vec<Ex>,
     /// what the Horn normalization adds, when the run takes axioms outside OWL 2 EL
     pub horn: Option<Box<super::horn::HornAx>>,
+    /// the clauses of Tier D, when the run takes disjunctive axioms
+    pub dl: Option<Box<super::dl_norm::DlAx>>,
 }
 
 impl Axioms {
@@ -842,6 +844,7 @@ impl Axioms {
             + self.individuals.capacity() * 4
             + self.classes.capacity() * 4
             + self.horn.as_ref().map_or(0, |h| h.bytes())
+            + self.dl.as_ref().map_or(0, |d| d.bytes())
     }
 }
 
@@ -1350,6 +1353,8 @@ pub struct Index {
     pub tops: [Option<Role>; 2],
     /// what the Horn rules read, when the run takes axioms outside OWL 2 EL
     pub horn: Option<Box<super::horn::HornIx>>,
+    /// what the rules of Tier D read, when the run takes disjunctive axioms
+    pub dl: Option<Box<super::dl_rules::DlIx>>,
 }
 
 impl Index {
@@ -1468,6 +1473,7 @@ impl Index {
             + self.nominals.capacity() * 4
             + self.roles.bytes()
             + self.horn.as_ref().map_or(0, |h| h.bytes())
+            + self.dl.as_ref().map_or(0, |d| d.bytes())
     }
 
     /// Builds the index of normalized axioms. It may intern new expressions: the
@@ -1507,6 +1513,14 @@ impl Index {
                 b.negative(e, it);
             }
         }
+        // the clauses of Tier D read their body atoms as the left sides of inclusions
+        if let Some(d) = &ax.dl {
+            for (body, _) in &d.clauses {
+                for &e in body {
+                    b.negative(e, it);
+                }
+            }
+        }
         for &(r, w, x) in &b.neg_data {
             ix.neg_data.entry(r).or_default().push((w, x));
         }
@@ -1515,6 +1529,13 @@ impl Index {
             b.positive(c, it, &mut ix);
             if a != c {
                 told.push((a, c));
+            }
+        }
+        if let Some(d) = &ax.dl {
+            for (_, head) in &d.clauses {
+                for &e in head {
+                    b.positive(e, it, &mut ix);
+                }
             }
         }
         // a reflexive role links every individual to itself, and a universal role every
@@ -1643,6 +1664,10 @@ impl Index {
         ix.keys = ax.keys.clone();
         ix.nominals = it.nominals().collect();
         ix.vals = it.vals.clone();
+        if let Some(d) = &ax.dl {
+            let dx = super::dl_rules::DlIx::new(d, &ax.disjoint, &ix, it.nodes.len());
+            ix.dl = Some(Box::new(dx));
+        }
         Ok(ix)
     }
 }
@@ -1709,6 +1734,45 @@ fn horn_index(
     // the role's inverse takes as a range.
     // a universal on a role with an automaton is unfolded on its holder: on F itself for
     // those of the negative existentials, and on the universal for the others
+    // A run whose Horn rules fire and that has no empty role composes only the chains
+    // that [`select_chains`] keeps (roadmap item 693): a negative existential whose
+    // role's inverse automaton no link runs against stays on composed links when its
+    // chains are left-linear, and every other one over a role that chains reach becomes
+    // a universal on the inverse, unfolded by the automaton.
+    let fires = !roles.clash.is_empty()
+        || !roles.reflexive.is_empty()
+        || it
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Node::Forall(..) | Node::AtMost1(..) | Node::SelfLoop(_)))
+        || b.exist.iter().any(|&(f, (r, _))| {
+            f != TOP
+                && roles.inv(r).is_some_and(|i| match h.autos.get(&i) {
+                    Some(a) => a.trans.iter().any(|t| t.1.is_some_and(linked)),
+                    None => linked(i),
+                })
+        });
+    let unlinked = |i: Role| {
+        h.autos
+            .get(&i)
+            .is_some_and(|a| !a.trans.iter().any(|t| t.1.is_some_and(linked)))
+    };
+    // a negative existential over a role that chains reach and whose inverse the run
+    // does not have cannot be unfolded, and keeps every chain composed
+    let invertible = b.exist.iter().all(|&(_, (r, _))| {
+        roles.inv(r).is_some() || !ax.chains.iter().any(|(_, v)| roles.sub(*v, r))
+    });
+    let selection = (fires && !roles.any_empty && invertible).then(|| {
+        let mut seeds: Vec<Role> = b
+            .exist
+            .iter()
+            .filter(|&&(f, (r, _))| f != TOP && roles.inv(r).is_some_and(unlinked))
+            .map(|&(_, (r, _))| r)
+            .collect();
+        seeds.sort_unstable();
+        seeds.dedup();
+        select_chains(roles, &ax.chains, &seeds)
+    });
     let mut unfold: Vec<(Ex, Role, Ex)> = Vec::new();
     let mut alls: Vec<(Ex, Ex)> = Vec::new();
     for &(f, (r, e)) in &b.exist {
@@ -1717,7 +1781,14 @@ fn horn_index(
         }
         let Some(i) = roles.inv(r) else { continue };
         match h.autos.get(&i) {
-            Some(a) if a.trans.iter().any(|t| t.1.is_some_and(linked)) => unfold.push((f, i, e)),
+            Some(a)
+                if a.trans.iter().any(|t| t.1.is_some_and(linked))
+                    || selection
+                        .as_ref()
+                        .is_some_and(|s| s.composed.binary_search(&r).is_err()) =>
+            {
+                unfold.push((f, i, e))
+            }
             Some(_) => {}
             None if linked(i) => {
                 let fa = it.node(Node::Forall(i, e));
@@ -1790,9 +1861,123 @@ fn horn_index(
             flags[f as usize] |= super::horn::HornIx::FILLER;
         }
     }
+    if let Some(sel) = selection {
+        ix.roles.comp = sel.comp;
+        ix.roles.left = sel.left;
+        ix.roles.right = sel.right;
+    }
     super::horn::HornIx {
         flags,
         base: it.nodes.len() as Ex,
+    }
+}
+
+/// The chains a run with the Horn rules composes, and the roles whose negative
+/// existentials stay on composed links.
+struct Selection {
+    /// the seeds kept on composed links, sorted
+    composed: Vec<Role>,
+    comp: FxHashMap<(Role, Role), Vec<Role>>,
+    left: Vec<bool>,
+    right: Vec<bool>,
+}
+
+/// Chooses the chains to compose for the negative existentials over `seeds`, the roles
+/// whose inverse automaton no link runs against (roadmap item 693).
+///
+/// The chains are the told ones and their mirror images. The closure `N(t)` of a seed
+/// starts with `t`, and each chain whose result is under a role of the closure adds its
+/// left operand. It adds its right operand too unless the chain is left-linear,
+/// `s1 ∘ s2 ⊑ v` with `v ⊑ s1`, and `s2` is letter-closed: every chain whose result is
+/// under `s2` has all its operands under `s2`. Then each `s2`-path is a path of links by
+/// roles under `s2`, and the links of `v` come from the complete links of `s1` and the
+/// direct links under `s2`, one at a time, so that no chain into `s2` is composed. A seed
+/// stays on composed links when every chain of its closure has two operands, and the
+/// others are unfolded as every negative existential over a role that chains reach is.
+/// The run composes the chains of the closures and no others.
+fn select_chains(roles: &Roles, told: &[(Vec<Role>, Role)], seeds: &[Role]) -> Selection {
+    let n = roles.sup.len();
+    let mut chains: Vec<(Vec<Role>, Role)> = Vec::with_capacity(2 * told.len());
+    for (ops, t) in told {
+        chains.push((ops.clone(), *t));
+        let mirror: Option<Vec<Role>> = ops.iter().rev().map(|&o| roles.inv(o)).collect();
+        if let (Some(m), Some(i)) = (mirror, roles.inv(*t)) {
+            chains.push((m, i));
+        }
+    }
+    chains.sort();
+    chains.dedup();
+    let letter_closed = |s2: Role| {
+        chains
+            .iter()
+            .filter(|(_, z)| roles.sub(*z, s2))
+            .all(|(ops, _)| ops.iter().all(|&o| roles.sub(o, s2)))
+    };
+    // the chains of a seed's closure
+    let closure = |t: Role| -> Option<Vec<usize>> {
+        let mut need = vec![t];
+        let mut picked: Vec<usize> = Vec::new();
+        loop {
+            let mut grew = false;
+            for (k, (ops, v)) in chains.iter().enumerate() {
+                if picked.contains(&k) || !need.iter().any(|&u| roles.sub(*v, u)) {
+                    continue;
+                }
+                let [s1, s2] = ops[..] else { return None };
+                picked.push(k);
+                grew = true;
+                let direct = roles.sub(*v, s1) && letter_closed(s2);
+                for o in [Some(s1), (!direct).then_some(s2)].into_iter().flatten() {
+                    if !need.contains(&o) {
+                        need.push(o);
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        Some(picked)
+    };
+    let mut composed: Vec<Role> = Vec::new();
+    let mut picked: Vec<usize> = Vec::new();
+    for &t in seeds {
+        if let Some(ks) = closure(t) {
+            composed.push(t);
+            picked.extend(ks);
+        }
+    }
+    picked.sort_unstable();
+    picked.dedup();
+    let mut sub: Vec<Vec<Role>> = vec![Vec::new(); n];
+    for (r, ss) in roles.sup.iter().enumerate() {
+        for &s in ss {
+            sub[s as usize].push(r as Role);
+        }
+    }
+    let mut comp: FxHashMap<(Role, Role), Vec<Role>> = FxHashMap::default();
+    let mut left = vec![false; n];
+    let mut right = vec![false; n];
+    for &k in &picked {
+        let (ops, v) = &chains[k];
+        for &r1 in &sub[ops[0] as usize] {
+            left[r1 as usize] = true;
+            for &r2 in &sub[ops[1] as usize] {
+                right[r2 as usize] = true;
+                comp.entry((r1, r2)).or_default().push(*v);
+            }
+        }
+    }
+    for v in comp.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    composed.sort_unstable();
+    Selection {
+        composed,
+        comp,
+        left,
+        right,
     }
 }
 
@@ -1949,7 +2134,29 @@ fn roles(
     // binarize chains: r1 ∘ r2 ∘ … ∘ rn ⊑ s becomes r1 ∘ r2 ⊑ u1, u1 ∘ r3 ⊑ u2, …
     let mut binary: Vec<(Role, Role, Role)> = Vec::new();
     let mut prefixes: FxHashMap<(Role, Role), Role> = FxHashMap::default();
-    for (rs, s) in &ax.chains {
+    // with the Horn rules, a chain holds in its mirror image too, r1⁻ ∘ … ∘ rn⁻ ⊑ s⁻ for
+    // r1 ∘ … ∘ rn ⊑ s reversed, which composes the links a told chain over inverses gives
+    let mirrors: Vec<(Vec<Role>, Role)> = match &ax.horn {
+        Some(_) => {
+            let told: FxHashSet<&(Vec<Role>, Role)> = ax.chains.iter().collect();
+            let inv = super::horn::inverses(it);
+            let inv = |r: Role| Some(inv[r as usize]).filter(|&i| i != NO_ROLE);
+            let mut m: Vec<(Vec<Role>, Role)> = ax
+                .chains
+                .iter()
+                .filter_map(|(rs, s)| {
+                    let m: Option<Vec<Role>> = rs.iter().rev().map(|&r| inv(r)).collect();
+                    Some((m?, inv(*s)?))
+                })
+                .filter(|c| !told.contains(c))
+                .collect();
+            m.sort();
+            m.dedup();
+            m
+        }
+        None => Vec::new(),
+    };
+    for (rs, s) in ax.chains.iter().chain(&mirrors) {
         let mut left = rs[0];
         for (k, &r) in rs.iter().enumerate().skip(1) {
             if k + 1 == rs.len() {
@@ -2110,6 +2317,7 @@ fn roles(
     // relate nothing
     let (inv, mut clash) = match &ax.horn {
         Some(h) => (super::horn::inverses(it), h.clash.clone()),
+        None if ax.dl.is_some() => (super::horn::inverses(it), Vec::new()),
         None => (Vec::new(), Vec::new()),
     };
     // two roles that clash clash on their inverses too

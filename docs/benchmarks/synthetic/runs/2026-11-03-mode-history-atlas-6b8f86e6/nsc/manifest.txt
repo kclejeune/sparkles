@@ -1,0 +1,17 @@
+A: file sparkles-125edd41, built on wally from 125edd41 with scripts/nsc-build.sh
+A sha256: 9af0131fa4215f251b392a561011fae8829dce2140b9ee37495411a3ce1dfba6
+A compilers: clang version 21.1.8; GCC: (GNU) 16.2.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); rustc version 1.99.1 (58cf8f9c3 2026-10-13)
+B: file sparkles-6b8f86e6, built on wally from 6b8f86e6 with scripts/nsc-build.sh
+B sha256: dde7a5a390d025dae553cee72258dd50052ccda14ea8d6e316150dda00c07768
+B compilers: clang version 21.1.8; GCC: (GNU) 16.2.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); rustc version 1.99.1 (58cf8f9c3 2026-10-13)
+data: 100000 people (scripts/gen-data.py), 6.0M compressed
+settings: 30 queries, 4 rounds of A,B,B,A, 3 warm-up and 20 timed requests per query and server, RAYON_NUM_THREADS=1, server CPU 2, client CPU 4, spinners on
+instance: 05ouhlgcunjrs (linux/amd64:8x16, capped at 2h), https://cloud.namespace.so/itohmrcedlsbs/instance/05ouhlgcunjrs
+phase create: 2.6 s
+phase upload: 13.2 s for 382M
+phase remote run: 212.7 s
+phase download: 1.4 s
+flagged at B/A >= 1.10: not-exists star-lookup
+rerun: 8 rounds of A,B,B,A, 40 timed requests per query and server
+phase rerun: 22.0 s
+instance lifetime: 275.6 s, billed as 5 minutes x 8 vCPUs = 40 vCPU-minutes ($0.060 at the overage rate)

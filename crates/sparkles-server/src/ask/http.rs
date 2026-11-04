@@ -72,6 +72,10 @@ struct AskBody {
     shape_check: Option<bool>,
     drafts: Option<usize>,
     type_hints: Option<bool>,
+    /// the thread a follow-up continues; the first ask of a thread names none
+    thread: Option<String>,
+    /// the resource on the page the question was asked from
+    about: Option<assistant::AskAbout>,
 }
 
 fn bad(m: impl Into<String>) -> crate::http::ApiError {
@@ -112,6 +116,22 @@ async fn ask_route(
     if question.is_empty() || question.chars().count() > 2000 {
         return Err(bad("question must hold 1 to 2000 characters"));
     }
+    if b.thread
+        .as_deref()
+        .is_some_and(|t| !assistant::valid_thread(t))
+    {
+        return Err(bad("thread must hold 1 to 64 letters, digits, '_' or '-'"));
+    }
+    if let Some(a) = &b.about {
+        a.check().map_err(bad)?;
+    }
+    // the person's words for the history, and with `about` the question the pipeline
+    // reads, as a question that named the resource would read
+    let written = question.clone();
+    let question = match &b.about {
+        Some(a) => a.render(&question),
+        None => question,
+    };
     if b.context.len() > super::MAX_CONTEXT {
         return Err(bad(format!(
             "context holds at most {} earlier turns",
@@ -230,6 +250,8 @@ async fn ask_route(
     let max_rows = b.max_rows.unwrap_or(1000).clamp(1, cfg.max_rows.max(1));
     let rows_allowed = settings.send >= Send::Rows;
     let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+    let thread = b.thread.clone().unwrap_or_else(|| id.clone());
+    let about = b.about.clone();
     let cancel = Arc::new(AtomicBool::new(false));
     let routing = settings.routing.clone().unwrap_or_default();
     let model_routing = models.config.routing.clone().unwrap_or_default();
@@ -288,17 +310,76 @@ async fn ask_route(
     };
     repairs.apply(&mut o);
     let server = crate::mcp::McpServer::new(st.clone(), cfg);
+    // the ground event's linked entities and communities, for the stored answer
+    let ground = Arc::new(parking_lot::Mutex::new(Value::Null));
+    // the state the ask reads: the head, which must not move while it runs, since steps
+    // that take no `at` read the head too; an `at` other than that head's commit, such as
+    // an earlier commit, a time or a named snapshot that can move, keeps no footprint
+    // (C18 §6.4)
+    let target = o
+        .branch
+        .as_deref()
+        .filter(|b| *b != sparkles::branch::MAIN)
+        .and_then(|b| st.branch_dataset(&ds, b).ok())
+        .unwrap_or_else(|| ds.clone());
+    let start = target.store.snapshot();
+    let pinned_to_head = match &o.at {
+        None => true,
+        Some(Value::String(s)) => match s.parse::<sparkles::history::At>() {
+            Ok(sparkles::history::At::Head) => true,
+            Ok(sparkles::history::At::Commit(c)) => c == start.commit,
+            _ => false,
+        },
+        Some(Value::Number(n)) => n.as_u64() == Some(start.commit),
+        Some(_) => false,
+    };
+    let start = pinned_to_head.then_some(start);
     let finish = {
         let st = st.clone();
         let ds = ds.clone();
         let id = id.clone();
         let me = me.clone();
+        let ground = ground.clone();
+        let thread = thread.clone();
+        let principal = principal.clone();
+        let branch = o.branch.clone();
         move |out: &Value| {
             let tokens = crate::models::budget_of(&out["usage"]);
             st.asks.add_tokens(&ds.name, &me, tokens);
             st.asks
                 .record(&id, assistant::recent_of(&ds.name, &me, out), &out["usage"]);
-            assistant::remember(&st, &ds, assistant::record_of(&id, &me, out));
+            // what the answer could read, from the asker's view of that state
+            let view_name = match branch.as_deref().filter(|b| *b != sparkles::branch::MAIN) {
+                Some(b) => format!("{}@{b}", ds.name),
+                None => ds.name.clone(),
+            };
+            // one state for every read: a head that did not move while the ask read it,
+            // and the result's commit, if any, is that state's; otherwise the record keeps
+            // no footprint
+            let read = start.clone().filter(|s| {
+                target.store.snapshot().commit == s.commit
+                    && out["result"]["commit"]
+                        .as_u64()
+                        .is_none_or(|c| c == s.commit)
+            });
+            let access = assistant::answer_access(
+                read.as_ref(),
+                principal
+                    .view(&view_name, crate::auth::Endpoint::Query)
+                    .as_ref(),
+                &principal.caller(),
+                &ds.name,
+                branch.as_deref(),
+                &me,
+            );
+            let rec = assistant::record_of(&id, &me, out).with_answer(
+                &thread,
+                &written,
+                about.clone(),
+                assistant::stored_answer(out, &ground.lock()),
+                access,
+            );
+            assistant::remember(&st, &ds, rec);
         }
     };
     let sse = headers
@@ -311,9 +392,15 @@ async fn ask_route(
         let out = tokio::task::spawn_blocking(move || {
             let _held = held;
             span.in_scope(|| {
-                let mut on = |_: &str, _: &Value| {};
-                let out = ask(&server, &models, &principal, &o, &mut on);
+                let mut on = |event: &str, data: &Value| {
+                    if event == "ground" {
+                        *ground.lock() = data.clone();
+                    }
+                };
+                let mut out = ask(&server, &models, &principal, &o, &mut on);
                 finish(&out);
+                out["threadId"] = thread.clone().into();
+                out["usage"]["threadId"] = thread.into();
                 out
             })
         })
@@ -331,6 +418,18 @@ async fn ask_route(
         let _held = held;
         span.in_scope(|| {
             let mut on = |event: &str, data: &Value| {
+                if event == "ground" {
+                    *ground.lock() = data.clone();
+                }
+                let with_thread;
+                let data = if event == "usage" {
+                    let mut d = data.clone();
+                    d["threadId"] = thread.clone().into();
+                    with_thread = d;
+                    &with_thread
+                } else {
+                    data
+                };
                 let e = Event::default().event(event).data(data.to_string());
                 if tx.send(e).is_err() {
                     // the client went away: stop at the next step

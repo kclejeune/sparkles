@@ -4278,10 +4278,12 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(GET, "/$/asks/{ds}", "listAsks", tag, "List your asked questions")
-            .doc("The caller's own asks on the dataset, newest first, kept for `historyDays`. An entry holds the question, the final query, the commit, the feedback and the routing record, never rows or summaries.")
+            .doc("The caller's own asks on the dataset, newest first, kept for `historyDays`. An entry holds the question, the final query, the commit, the feedback, the routing record with its steps, its thread and, from format 2 of the history, the answer's text, citations and explanation, never its rows. The answer is listed only while the caller's view covers every graph the ask read under the same protections, and otherwise the entry has `answerWithheld`. With `thread` the route lists that thread's entries oldest first. A history file of a newer format, or one this server cannot parse, is refused with `409` and left as it is.")
             .see("ask-history")
             .query("limit", json!({ "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 }), "The most entries listed.")
-            .json("200", "The entries.", "AskHistory"),
+            .query("thread", s(), "Only the entries of this thread, oldest first. An entry kept before threads is the thread of its own id.")
+            .json("200", "The entries.", "AskHistory")
+            .errors(&[400, 409]),
     );
     p.add(
         op(
@@ -4291,7 +4293,7 @@ fn assist(p: &mut Paths) {
             tag,
             "Forget your asked questions",
         )
-        .doc("Removes the caller's entries, or the one entry `id` names.")
+        .doc("Removes the caller's entries, or the one entry `id` names. A history file this server cannot read is refused with `409` and left as it is.")
         .see("ask-history")
         .query(
             "id",
@@ -4299,7 +4301,7 @@ fn assist(p: &mut Paths) {
             "The entry to remove. All of the caller's entries without it.",
         )
         .no_content("Removed.")
-        .errors(&[404]),
+        .errors(&[404, 409]),
     );
     p.add(
         op(POST, "/$/asks/{ds}/{id}/feedback", "askFeedback", tag, "Give feedback on an answer")

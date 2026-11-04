@@ -252,9 +252,25 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   ontologies never need, so these stay polynomial. A run with the Horn rules has a
   memory budget of 64 times its index and axioms, at least 1 GiB and no more than the
   caller's. A run that passes it classifies again by the EL rules alone, leaves the Horn
-  axioms out and reports them, and sets `Stats::horn_over_budget`. Any other axiom
-  outside OWL 2 EL is left out and reported with its rule, and Horn reasoning with
-  individuals is item 692. An axiom with a literal or datatype that the
+  axioms out and reports them, and sets `Stats::horn_over_budget`. No ontology measured
+  reaches it, since a run composes only the property chains that a negative existential
+  restriction needs and unfolds the others by their automata. In an ontology
+  without individuals, data properties, self restrictions, reflexive properties or top
+  properties, axioms that need case analysis, such as unions, complements and universal
+  restrictions on the left, take the disjunctive rules of the consequence-based calculus
+  for ALCHI, with transitive properties and chains through the same automata. Each
+  context keeps clauses under one total order of literals, and a named subsumer that only
+  a case analysis gives is found by a test context for the class with the candidate's
+  complement. `Limits::expansion` chooses the cautious or the eager successor strategy,
+  which give the same answers. These runs share the Horn rules' memory budget, and a run
+  that passes it classifies again by the Horn rules, leaves the disjunctive axioms out and
+  reports them, and sets `Stats::dl_over_budget`. With `Limits::partial`, a run of the
+  disjunctive rules that its deadline, cancellation or memory budget stops returns the
+  subsumptions it proved, with `Classification::complete` false, the classes it may have
+  left incomplete in `incomplete`, and a consistency of consistent, inconsistent or
+  unknown, which leaves every class incomplete when unknown. Any other axiom outside OWL 2
+  EL, such as counting and nominals, is left out and reported with its rule, and Horn
+  reasoning with individuals is item 692. An axiom with a literal or datatype that the
   classifier cannot compare, such as an XML literal, an ill-typed literal or a datatype
   outside the OWL 2 datatype map, or with a property chain through the top object
   property, is used as far as the calculus goes and reported as partial. Every answer is entailed, and it is complete for named classes
@@ -270,12 +286,12 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   the memory budget, and a run whose chunks would pass it normalizes on one thread. This
   and the saturation's message buffers raise the peak resident set on eight threads by
   up to 13% on some ontologies in exchange for the speed. On the benchmark host GO
-  classifies in 95 ms and ChEBI lite in 0.39 seconds on eight threads, and the
+  classifies in 91 ms and ChEBI lite in 0.39 seconds on eight threads, and the
   classifier is 3.1 to 20 times as fast as ELK on GO, ChEBI lite and the largest ORE
   2015 EL ontologies on one and eight threads. GO's `InverseObjectProperties(part_of
   has_part)` takes the Horn rules, which add the 14 subsumptions that Konclude and HermiT
-  entail and ELK misses and make GO 17 to 18% slower to classify than with the EL rules
-  alone, item 693. The classifier's direct hierarchy of GO is the one GO's release
+  entail and ELK misses and make GO 12% slower to classify on one thread than with the EL
+  rules alone, item 693. The classifier's direct hierarchy of GO is the one GO's release
   publishes with those 7 direct edges added, and its taxonomy of ChEBI entails every subsumption ChEBI asserts and
   gives no direct subsumption that ChEBI does not assert
   ([results](../benchmarks/el-classification/RESULTS.md)).
@@ -599,17 +615,26 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 664.
 * The classifier leaves out the Horn axioms outside OWL 2 EL in an ontology with
   individuals, functional data properties or top properties. Roadmap item 692.
-* GO's inverse properties take the Horn rules, which classify it 17 to 18% slower than
-  the EL rules and raise its peak resident set. Two Uberon-based ontologies of the ORE
-  2015 DL sample pass the Horn rules' memory budget and get the EL answer in 4.2 seconds
-  instead of 0.8. Roadmap item 693.
+* GO's inverse properties take the Horn rules, which classify it 12% slower than the EL
+  rules on one thread and raise its peak resident set from 196 to 223 MiB. Two
+  Uberon-based ontologies of the ORE 2015 DL sample classify with the Horn rules in 2.2
+  and 4.0 seconds on one thread, against 0.7 and 0.8 for the EL rules alone. Roadmap item
+  693.
 * The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
   restrictions passes 10 GiB. Roadmap item 695.
 * The ELK mode, which classifies by the OWL 2 EL rules alone, is an option of the Rust
   library and the ROBOT-compatible commands only, and HTTP, the other CLI commands and
   the bindings always take the Horn axioms. Roadmap item 694.
-* Axioms outside OWL 2 EL that are not Horn are left out, and an external DL reasoner
-  bridge is planned. Roadmap item 603.
+* Axioms outside OWL 2 EL that need counting or nominals, and axioms that need case
+  analysis in an ontology with individuals or data properties, are left out, and an
+  external DL reasoner bridge is planned. Roadmap item 603.
+* BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies slower with the
+  disjunctive rules than with Konclude, since each of its contexts derives the same
+  global case analysis again. Roadmap item 712.
+* ore_ont_3215 of the ORE 2015 DL sample passes the disjunctive rules' memory budget and
+  gets the Horn rules' answer without its 18,323 unions. Roadmap item 713.
+* `Limits::partial` applies only to runs of the disjunctive rules, and runs of the EL and
+  Horn rules still fail at a deadline. Roadmap item 714.
 * No MCP tool classifies, roadmap item 586, and the entity accessors and the
   inferred reads do not answer from a classification, nor does any surface answer the
   subclasses of a class expression, roadmap item 588.

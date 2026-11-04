@@ -70,8 +70,8 @@ build community reports.
 
 ### Questions in plain language
 
-* `sparkles ask`, `POST /{ds}/ask` and the query page's Ask bar turn a question into a
-  checked SPARQL query ([C18](../specs/C18-natural-language-questions-and-ingest/README.md),
+* `sparkles ask`, `POST /{ds}/ask` and the web UI's [Ask thread](#the-ask-thread) turn a
+  question into a checked SPARQL query ([C18](../specs/C18-natural-language-questions-and-ingest/README.md),
   [USAGE.md](../USAGE.md#asking-questions-with-a-model),
   [API.md](../API.md#natural-language-questions)). On DBpedia's billion quads, an Ask takes
   about two seconds with under 512 MiB of anonymous memory.
@@ -150,10 +150,39 @@ build community reports.
 * An agent hands a query it wrote to the web UI with the `share_query` tool, and the
   query page opens it with the question, the explanation and the terms it uses, without
   running it.
-* The server keeps each person's questions for `historyDays` in `/$/asks/{ds}`, records
-  feedback, and counts answers, escalations, tokens and cost in `GET /$/models/usage` and
+* The server keeps each person's questions for `historyDays` in `/$/asks/{ds}`, with
+  their threads and their answers without rows, records feedback, and counts answers, escalations, tokens and cost in `GET /$/models/usage` and
   `/$/metrics`. `scripts/eval-ask` measures each model on the 68 questions of
   `testsuite/ask/demo.json`.
+
+### The Ask thread
+
+The web UI asks through one thread component, shown as a page at `/ui/ask` and as a
+drawer docked beside any page
+([C18 §6.1](../specs/C18-natural-language-questions-and-ingest/SPEC.md#61-where-it-lives)).
+
+* `Shift+A`, the palette's Ask row and the rail's Ask page open it when the dataset has an
+  assistant. The drawer docks at the right of a wide window, floats over a medium one and
+  is a bottom sheet on a phone, and **Open as page** moves the thread to `/ui/ask`.
+* A Browse, Ontology, Thesaurus or Explore page passes its resource, and the Query page its
+  query, as a context chip with questions that suit it. The request carries the resource
+  as `about`, so the history keeps the person's own words, and the chip can be removed.
+* Each turn shows the answer with its citations, and folds for the query, the rows as a
+  table or a small graph, the sources and the steps with their diagnostics. The sources are
+  the cited rows, the memory facts about the cited entities with their quotes and documents,
+  and the community reports a global answer read. **Open in Query**, **Open in Explore**,
+  **Save as query** and **Right**, **Edited** or **Wrong** act on the turn.
+* A running turn shows its current step and **Stop**. Follow-ups carry the thread's id and
+  earlier turns, and **New thread** starts over. The run mode, the answer source and the
+  model stay beside the field.
+* On the Query page the thread docks beside the editor and opens each answer in a tab, as
+  the Ask bar did, with retries, clarifications and **Try harder** in place.
+* The history lists threads by day and reopens one from the answers the server keeps.
+  Rows are not kept, so **Show rows** reruns the stored query read-only at its commit
+  without a model. A reader whose grants do not cover every graph the answer read gets
+  the record without its answer ([API.md](../API.md#ask-history)).
+
+![The Ask drawer docked beside the Query page while it works, showing Summarizing after the query results have arrived, with Stop beside the field](../images/ask-steps.png)
 
 ### Ask stage diagnostics
 
@@ -533,6 +562,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 ### AI and agents
 
+* A question asked with a context chip reaches the model as the question followed by
+  `(about <IRI>)`, as a typed suffix would. Grounding does not yet seed entity linking or
+  predicate use from the structured `about` resource, which roadmap item 717 adds.
+* A stored Ask answer records what it read only when every step read one head that did
+  not move. An ask pinned to an earlier state, or one during which the dataset changed,
+  keeps its answer for unrestricted readers only, so a reader with limited grants sees
+  such a turn without its answer when the thread reopens. Roadmap item 718
+  records each state the steps read.
 * ChatGPT-plan model access is planned in [C28](../specs/C28-chatgpt-model-access.md),
   roadmap item 344. The existing OpenAI-compatible provider uses Chat Completions with
   configured API credentials. It does not accept a ChatGPT subscription as model access.

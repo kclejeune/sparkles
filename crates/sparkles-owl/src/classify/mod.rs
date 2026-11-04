@@ -58,6 +58,9 @@
 
 mod data;
 mod dl;
+mod dl_clause;
+mod dl_norm;
+mod dl_rules;
 mod horn;
 mod horn_rules;
 mod index;
@@ -139,6 +142,26 @@ pub struct Limits {
     /// told each growth of the estimated memory, in bytes: false stops the run as over
     /// its memory budget, as a server's memory pool refuses a grant
     pub charge: Option<std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync>>,
+    /// a run with Tier D (roadmap item 603) that its deadline, cancellation or memory
+    /// budget stops answers with what it proved, in a [`Classification`] whose
+    /// [`complete`](Classification::complete) is false, instead of failing. Runs of the
+    /// other tiers fail as before.
+    pub partial: bool,
+    /// the expansion strategy of Tier D's Succ rule
+    pub expansion: Expansion,
+}
+
+/// Which context the Succ rule of Tier D (roadmap item 603) gives a successor. Both
+/// strategies give the same answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Expansion {
+    /// the context of the existential restriction's filler with the role's range when
+    /// the restriction holds, and else a context with the empty core for each
+    /// restriction, as Sequoia's cautious strategy
+    #[default]
+    Cautious,
+    /// the context of what holds of the successor for certain, as the eager strategy
+    Eager,
 }
 
 /// Why a run stopped. The classifier keeps its axioms, and its next run starts the
@@ -208,6 +231,21 @@ pub struct Stats {
     /// the Horn rules passed their memory budget, so the run classified by the OWL 2 EL
     /// rules alone, as [`Limits::el_only`] does, and left the axioms outside OWL 2 EL out
     pub horn_over_budget: bool,
+    /// the clauses with two or more disjuncts that Tier D took, 0 for a run without it
+    pub clauses: usize,
+    /// the contexts that held clauses of Tier D
+    pub dl_contexts: usize,
+    /// the clauses that the contexts of Tier D stored, those deleted as subsumed included
+    pub dl_stored: usize,
+    /// the candidate subsumers that Tier D tested in contexts of their own
+    pub dl_tests: usize,
+    /// the tested candidates that hold
+    pub dl_tests_held: usize,
+    /// the part of [`saturation`](Stats::saturation) that the tests of Tier D took
+    pub dl_testing: Duration,
+    /// Tier D passed its memory budget, so the run classified with the Horn rules and
+    /// left the disjunctive axioms out
+    pub dl_over_budget: bool,
 }
 
 /// The result of a run that saturates without building a taxonomy
@@ -226,6 +264,56 @@ pub struct Classification {
     pub consistent: bool,
     pub taxonomy: Taxonomy,
     pub stats: Stats,
+    /// false for the partial answer of a run that stopped ([`Limits::partial`]): its
+    /// subsumptions are entailed, and those of the classes not in
+    /// [`incomplete`](Classification::incomplete) are all that hold
+    pub complete: bool,
+    /// the classes whose subsumers a partial answer may miss, in IRI order
+    pub incomplete: Vec<Class>,
+    /// whether the ontology has a model, as far as the run knows: a partial answer can
+    /// leave it unknown, and then no class is complete
+    pub consistency: Consistency,
+}
+
+/// Whether the ontology has a model, as far as a run knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Consistency {
+    Consistent,
+    Inconsistent,
+    /// a partial answer that did not decide it
+    Unknown,
+}
+
+impl Consistency {
+    fn of(consistent: bool) -> Consistency {
+        if consistent {
+            Consistency::Consistent
+        } else {
+            Consistency::Inconsistent
+        }
+    }
+}
+
+impl Classification {
+    fn new(
+        consistent: bool,
+        taxonomy: Option<Taxonomy>,
+        stats: Stats,
+        partial: Option<(Vec<Class>, Consistency)>,
+    ) -> Classification {
+        let (complete, incomplete, consistency) = match partial {
+            Some((incomplete, consistency)) => (false, incomplete, consistency),
+            None => (true, Vec::new(), Consistency::of(consistent)),
+        };
+        Classification {
+            consistent,
+            taxonomy: taxonomy.expect("a taxonomy was asked for"),
+            stats,
+            complete,
+            incomplete,
+            consistency,
+        }
+    }
 }
 
 /// An axiom the classifier leaves out or uses only in part, and why.
@@ -289,6 +377,17 @@ pub struct Saturation {
     /// whether the current run's axioms went to the Horn normalization, from its start
     /// until the normalization took none
     horn_tried: bool,
+    /// whether the current run's axioms went to the normalization of Tier D, from its
+    /// start until the normalization took none
+    dl_tried: bool,
+    /// set while a run classifies again without Tier D, past Tier D's memory budget
+    skip_dl: bool,
+    /// set when a partial answer of Tier D passed the budget, so that the run fails with
+    /// the error instead of classifying again without Tier D
+    partial_over: bool,
+    /// what the last run's partial answer leaves open: the classes not complete and the
+    /// consistency
+    partial: Option<(Vec<Class>, Consistency)>,
 }
 
 impl Default for Saturation {
@@ -503,12 +602,11 @@ impl Classifier {
     /// Classifies the axioms held, saturating again only what changed since the last
     /// run.
     pub fn classify(&mut self, limits: &Limits) -> Result<Classification, Error> {
-        self.run_held(limits, true)
-            .map(|(consistent, taxonomy, stats)| Classification {
-                consistent,
-                taxonomy: taxonomy.expect("a taxonomy was asked for"),
-                stats,
-            })
+        let r = self.run_held(limits, true);
+        let partial = self.sat.partial.take();
+        r.map(|(consistent, taxonomy, stats)| {
+            Classification::new(consistent, taxonomy, stats, partial)
+        })
     }
 
     /// Saturates the axioms held as [`classify`](Self::classify) does, again only what
@@ -589,6 +687,10 @@ impl Saturation {
             consistent: true,
             dynamic: None,
             horn_tried: false,
+            dl_tried: false,
+            skip_dl: false,
+            partial_over: false,
+            partial: None,
         }
     }
 
@@ -608,12 +710,11 @@ impl Saturation {
         changes: Option<Changes<'_>>,
         limits: &Limits,
     ) -> Result<Classification, Error> {
-        self.run_with(axioms, changes, 0, limits, true)
-            .map(|(consistent, taxonomy, stats)| Classification {
-                consistent,
-                taxonomy: taxonomy.expect("a taxonomy was asked for"),
-                stats,
-            })
+        let r = self.run_with(axioms, changes, 0, limits, true);
+        let partial = self.partial.take();
+        r.map(|(consistent, taxonomy, stats)| {
+            Classification::new(consistent, taxonomy, stats, partial)
+        })
     }
 
     /// Saturates `axioms` as [`classify`](Saturation::classify) does, but builds no
@@ -662,9 +763,46 @@ impl Saturation {
             _ => limits,
         };
         let mut r = self.run(axioms, changes, held_bytes, first, with_taxonomy);
+        let mut dl_over = None;
+        if let Err(Error::Memory { used, .. }) = r
+            && self.dl_tried
+            && !limits.el_only
+            && !self.partial_over
+        {
+            // Tier D passed its budget or the caller's: the run starts again with the Horn
+            // rules, which leave the disjunctive axioms out. Its charges draw first on
+            // what the pool admitted for the run of Tier D.
+            self.reset();
+            self.skip_dl = true;
+            let a = admitted.clone();
+            let counting = limits.charge.clone().map(|f| {
+                let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
+                    std::sync::Arc::new(move |bytes: usize| {
+                        let ok = f(bytes);
+                        if ok {
+                            a.fetch_add(bytes, Ordering::Relaxed);
+                        }
+                        ok
+                    });
+                drawing_on(admitted.load(Ordering::Relaxed), f)
+            });
+            let horn = Limits {
+                charge: counting,
+                ..limits.clone()
+            };
+            r = self.run(axioms, None, held_bytes, &horn, with_taxonomy);
+            self.skip_dl = false;
+            dl_over = Some(used);
+            r = r.map(|(consistent, taxonomy, mut stats)| {
+                stats.dl_over_budget = true;
+                stats.peak_memory = stats.peak_memory.max(used);
+                (consistent, taxonomy, stats)
+            });
+        }
         if let Err(Error::Memory { used, .. }) = r
             && self.horn_tried
             && !limits.el_only
+            && !self.partial_over
         {
             // The Horn rules passed their budget or the caller's: the run starts again by
             // the EL rules alone, which leave the axioms outside OWL 2 EL out, as the
@@ -683,6 +821,10 @@ impl Saturation {
             r = self.run(axioms, None, held_bytes, &el, with_taxonomy).map(
                 |(consistent, taxonomy, mut stats)| {
                     stats.horn_over_budget = true;
+                    if let Some(d) = dl_over {
+                        stats.dl_over_budget = true;
+                        stats.peak_memory = stats.peak_memory.max(d);
+                    }
                     // the Horn run's high-water mark, which the run reached first
                     stats.peak_memory = stats.peak_memory.max(used);
                     (consistent, taxonomy, stats)
@@ -885,7 +1027,38 @@ impl Saturation {
             },
             index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
         };
-        if !candidates.is_empty() && !limits.el_only && self.horn_allowed(&ax) {
+        // Tier D takes them instead when one is disjunctive and the EL part has nothing
+        // that its rules leave out
+        let mut dl_taken = false;
+        if !candidates.is_empty()
+            && !limits.el_only
+            && !self.skip_dl
+            && self.horn_allowed(&ax)
+            && candidates.iter().any(|k| !dl::shape(k).horn)
+            && dl_norm::eligible(&self.interner, &ax)
+        {
+            self.dl_tried = true;
+            if let Some((flags, d)) = dl_norm::normalize(
+                &candidates,
+                &mut self.interner,
+                &mut ax,
+                limits.max_memory,
+                &stop,
+            )
+            .map_err(halt)?
+            {
+                taken.extend(
+                    candidates
+                        .iter()
+                        .zip(flags)
+                        .filter(|(_, t)| *t)
+                        .map(|(k, _)| *k),
+                );
+                ax.dl = Some(Box::new(d));
+                dl_taken = true;
+            }
+        }
+        if !dl_taken && !candidates.is_empty() && !limits.el_only && self.horn_allowed(&ax) {
             self.horn_tried = true;
             let flags = horn::normalize(
                 &candidates,
@@ -981,6 +1154,8 @@ impl Saturation {
         // until the saturation ends, a stop leaves the state for a run that starts again
         self.dirty = true;
         self.horn_tried = false;
+        self.dl_tried = false;
+        self.partial_over = false;
         let changes = changes.filter(|_| !again);
         let full = self.entangled
             || changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)));
@@ -1017,7 +1192,7 @@ impl Saturation {
         .flatten()
         .collect();
         poll(limits)?;
-        let (ax, ix, normalized_peak, outside_el) =
+        let (ax, mut ix, normalized_peak, outside_el) =
             self.build(axioms, &outside, threads, held_bytes, limits)?;
         drop(outside);
         stats.outside_el = outside_el;
@@ -1030,18 +1205,47 @@ impl Saturation {
         // index's
         let horn = ax.horn.is_some();
         self.horn_tried = horn;
+        let disj = ax.dl.is_some();
+        self.dl_tried = disj;
+        if let Some(d) = &ax.dl {
+            stats.clauses = d.clauses.len();
+        }
         self.dynamic = None;
-        let premises = if horn {
+        let premises = if horn || disj {
             self.ctx = Vec::new();
             None
         } else {
             premises
         };
         self.ctx.resize_with(n, OnceLock::new);
-        let dynamic = ix.horn.as_ref().map(|h| {
-            debug_assert_eq!(h.base as usize, n);
-            saturate::Dynamic::new(n as Ex)
-        });
+        if ix.horn.is_some() {
+            // the stop the pass saw, which a cancellation polled once does not repeat
+            let stopped = std::cell::RefCell::new(None);
+            horn::absorb(&mut ix, &|| {
+                let r = poll(limits);
+                let stop = r.is_err();
+                if let Err(e) = r {
+                    *stopped.borrow_mut() = Some(e);
+                }
+                stop
+            });
+            if let Some(e) = stopped.into_inner() {
+                return Err(e);
+            }
+        }
+        let dynamic = match &ix.horn {
+            Some(h) => {
+                debug_assert_eq!(h.base as usize, n);
+                Some(saturate::Dynamic::new(n as Ex))
+            }
+            // the test contexts of Tier D get ids above the index's
+            None if disj => Some(saturate::Dynamic::new(n as Ex)),
+            None => None,
+        };
+        let dl_run = ix
+            .dl
+            .as_ref()
+            .map(|_| dl_rules::DlRun::new(limits.expansion == Expansion::Eager));
         if let Some(scratch) = premises {
             stats.incremental = true;
             stats.cleared = self.invalidate(&scratch, &ix);
@@ -1074,7 +1278,7 @@ impl Saturation {
         // The Horn rules' contexts of conjunctions can need far more memory than the EL
         // rules on the same ontology, so a run with them has a budget of its own, past
         // which it classifies by the EL rules alone (run_with).
-        let max_memory = if horn {
+        let max_memory = if horn || disj {
             let own = HORN_MEMORY_FLOOR.max(base.saturating_mul(HORN_MEMORY_FACTOR));
             Some(limits.max_memory.map_or(own, |m| m.min(own)))
         } else {
@@ -1089,6 +1293,8 @@ impl Saturation {
             base_memory: base,
             peak_memory: normalized_peak,
             dynamic: dynamic.as_ref(),
+            dl: dl_run.as_ref(),
+            partial: limits.partial && disj && with_taxonomy,
         };
         // the pool has been charged for the peak of a parallel normalization
         let more = base.saturating_sub(normalized_peak);
@@ -1109,8 +1315,127 @@ impl Saturation {
                 used,
             },
         };
-        let mut totals =
-            saturate::saturate(&ix, &self.ctx, &roots, &[], &[], &bounds).map_err(stopped)?;
+        // a run that answers in part keeps the reason it stopped and goes on to the answer
+        let mut halted: Option<Error> = None;
+        let partial = bounds.partial;
+        let mut totals = match saturate::saturate_counted(&ix, &self.ctx, &roots, &[], &[], &bounds)
+        {
+            (t, None) => t,
+            (t, Some(s)) if partial => {
+                halted = Some(stopped(s));
+                t
+            }
+            (_, Some(s)) => return Err(stopped(s)),
+        };
+        // the candidates whose tests ended without a contradiction
+        let mut refuted: FxHashSet<(Ex, Ex)> = FxHashSet::default();
+        // Tier D orders the atoms totally, which leaves the subsumers that only a case
+        // analysis gives as clauses: each named class that the canonical model of a
+        // class's context makes true is tested in a context of its own, and those that
+        // hold join the class's subsumers, until no class has a new candidate.
+        if disj && halted.is_none() {
+            let tests_start = Instant::now();
+            let d = dynamic
+                .as_ref()
+                .expect("the dynamic contexts of a run with Tier D");
+            let mut tested: FxHashSet<(Ex, Ex)> = FxHashSet::default();
+            // the candidates of a group test that failed, each tested alone next
+            let mut singles: Vec<(Ex, Ex)> = Vec::new();
+            // one round of the saturation, which records a stop for a partial answer
+            let round = |seeds: &[Ex], tests: &[Ex], totals: &mut saturate::Totals| {
+                let b = Bounds {
+                    base_memory: totals.memory,
+                    peak_memory: totals.peak,
+                    ..bounds
+                };
+                let (more, stop) =
+                    saturate::saturate_counted(&ix, &self.ctx, tests, seeds, &[], &b);
+                *totals = saturate::Totals {
+                    conclusions: totals.conclusions + more.conclusions,
+                    memory: more.memory,
+                    peak: totals.peak.max(more.peak),
+                    merged: false,
+                };
+                stop.map_or(Ok(()), |s| Err(stopped(s)))
+            };
+            loop {
+                if let Err(e) = poll(limits) {
+                    halted = Some(e);
+                    break;
+                }
+                let found = dl_rules::candidates(&ix, &self.ctx, &roots, &tested);
+                tested.extend(found.iter().copied());
+                // A class's candidates are tested together first, since most fail: a
+                // context where none holds shows that no one of them is a subsumer.
+                let mut tests: Vec<(Ex, Vec<Ex>)> = Vec::new();
+                for (x, b) in found {
+                    match tests.last_mut() {
+                        Some((y, bs)) if *y == x => bs.push(b),
+                        _ => tests.push((x, vec![b])),
+                    }
+                }
+                tests.extend(singles.drain(..).map(|(x, b)| (x, vec![b])));
+                if tests.is_empty() {
+                    break;
+                }
+                let ids: Vec<Ex> = tests
+                    .iter()
+                    .map(|(x, bs)| dl_rules::test(d, *x, bs))
+                    .collect();
+                if let Err(e) = round(&[], &ids, &mut totals) {
+                    halted = Some(e);
+                    break;
+                }
+                let mut seeds: Vec<Ex> = Vec::new();
+                for ((x, bs), &id) in tests.iter().zip(&ids) {
+                    if !d.ctx(id).st.lock().bottom {
+                        refuted.extend(bs.iter().map(|&b| (*x, b)));
+                        continue;
+                    }
+                    if let [b] = bs.as_slice() {
+                        if let Some(c) = self.ctx.get(*x as usize).and_then(|c| c.get()) {
+                            c.todo.lock().push(saturate::Concl::Sub(*b));
+                            seeds.push(*x);
+                            stats.dl_tests_held += 1;
+                        }
+                    } else {
+                        singles.extend(bs.iter().map(|&b| (*x, b)));
+                    }
+                }
+                stats.dl_tests += tests.len();
+                if seeds.is_empty() {
+                    continue;
+                }
+                seeds.sort_unstable();
+                seeds.dedup();
+                if let Err(e) = round(&seeds, &[], &mut totals) {
+                    halted = Some(e);
+                    break;
+                }
+            }
+            stats.dl_testing = tests_start.elapsed();
+        }
+        if !partial && let Some(h) = halted.take() {
+            return Err(h);
+        }
+        // the dependency record of a partial answer: the classes it leaves open and the
+        // consistency
+        let open = halted.as_ref().map(|_| {
+            let (complete, known) =
+                dl_rules::record(&ix, &self.ctx, dynamic.as_ref(), &roots, &refuted);
+            let incomplete: Vec<Ex> = roots
+                .iter()
+                .zip(complete)
+                .filter(|&(&r, c)| !c && r != TOP)
+                .map(|(&r, _)| r)
+                .collect();
+            let consistency = match known {
+                dl_rules::Known::Consistent => Consistency::Consistent,
+                dl_rules::Known::Inconsistent => Consistency::Inconsistent,
+                dl_rules::Known::Unknown => Consistency::Unknown,
+            };
+            (incomplete, consistency)
+        });
         // Which contexts are real matters only when a context derived an individual, for
         // keys and for universal roles. Then owl:Thing and the individuals become real,
         // and so does what they reach, between rounds of the saturation, with the facts
@@ -1217,26 +1542,66 @@ impl Saturation {
         } else {
             self.entangled = false;
         }
-        // a change after a run with the Horn normalization saturates everything again
-        self.entangled |= horn;
+        // a change after a run with the Horn normalization or Tier D saturates everything
+        // again
+        self.entangled |= horn || disj;
+        if let Some(d) = &dl_run {
+            for c in self.ctx.iter().filter_map(|c| c.get()) {
+                if let Some(n) = c.st.lock().extra.as_ref().and_then(|x| x.dl.as_ref()) {
+                    stats.dl_contexts += 1;
+                    stats.dl_stored += n.store.clauses.len();
+                }
+            }
+            if open.is_some() {
+                // A partial answer has taken its record, and the next run starts again,
+                // so the clause stores and the clause table go before its taxonomy.
+                totals.peak = totals.peak.max(totals.memory + d.bytes());
+                let base = self.ctx.len() as Ex;
+                let dynamic_ctx = dynamic
+                    .iter()
+                    .flat_map(|dy| (0..dy.len() as Ex).map(move |i| dy.ctx(base + i)));
+                for c in self
+                    .ctx
+                    .iter()
+                    .filter_map(|c| c.get().map(|c| &**c))
+                    .chain(dynamic_ctx)
+                {
+                    if let Some(x) = c.st.lock().extra.as_mut() {
+                        x.dl = None;
+                    }
+                }
+            } else {
+                totals.memory += d.bytes();
+                totals.peak = totals.peak.max(totals.memory);
+            }
+        }
+        drop(dl_run);
         if let Some(d) = &dynamic {
             totals.memory += d.bytes();
             totals.peak = totals.peak.max(totals.memory);
-            stats.conjunctions = d.len();
+            if horn {
+                stats.conjunctions = d.len();
+            }
         }
         self.dynamic = dynamic;
         stats.saturation = t.elapsed();
         stats.conclusions = totals.conclusions;
         totals.memory += world_bytes;
         totals.peak = totals.peak.max(totals.memory);
-        // the saturated state is complete: a stop from here on keeps it for the next run
-        self.dirty = false;
+        // the saturated state is complete: a stop from here on keeps it for the next run. A
+        // partial answer's is not, and the next run starts again.
+        self.dirty = open.is_some();
         let ix_nominals = ix.nominals.clone();
         self.index = Some(ix);
         let t = Instant::now();
-        let consistent = self.consistent(&ax, &ix_nominals);
-        self.consistent = consistent;
-        let held = totals.memory - ax.bytes();
+        let consistent = match &open {
+            Some((_, c)) => *c != Consistency::Inconsistent,
+            None => self.consistent(&ax, &ix_nominals),
+        };
+        if open.is_none() {
+            self.consistent = consistent;
+        }
+        let held = totals.memory.saturating_sub(ax.bytes());
         drop(ax);
         if !with_taxonomy {
             stats.memory = held;
@@ -1245,7 +1610,8 @@ impl Saturation {
             poll(limits)?;
             return Ok((consistent, None, stats));
         }
-        let stop = || poll(limits).is_err();
+        // a partial answer builds its taxonomy past the deadline that stopped it
+        let stop = || open.is_none() && poll(limits).is_err();
         // the taxonomy's bytes join those held, and the budget and the pool's grant cover
         // what passes the saturation's peak. The build asks again as its estimate grows,
         // and the pool is charged only for the growth.
@@ -1266,19 +1632,35 @@ impl Saturation {
             }
             ok
         };
-        let (taxonomy, tax_bytes) = taxonomy::build(self, consistent, threads, &stop, &budget)
-            .map_err(|h| match h {
-                taxonomy::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
-                taxonomy::Halt::Memory(bytes) => Error::Memory {
+        let built = taxonomy::build(self, consistent, threads, open.is_some(), &stop, &budget);
+        let (taxonomy, tax_bytes) = built.map_err(|h| match h {
+            taxonomy::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
+            taxonomy::Halt::Memory(bytes) => {
+                // a partial answer that does not fit is not a reason for another tier
+                self.partial_over = open.is_some();
+                Error::Memory {
                     limit: limits.max_memory.unwrap_or(usize::MAX),
                     used: held + bytes,
-                },
-            })?;
+                }
+            }
+        })?;
         stats.memory = held + tax_bytes;
         stats.taxonomy_memory = tax_bytes;
         stats.peak_memory = totals.peak.max(stats.memory);
         stats.taxonomy = t.elapsed();
         stats.contexts = self.context_count();
+        if let Some((incomplete, consistency)) = open {
+            let mut classes: Vec<Class> = incomplete
+                .into_iter()
+                .filter_map(|e| match self.interner.nodes[e as usize] {
+                    Node::Class(id) => Some(self.interner.classes[id as usize].clone()),
+                    _ => None,
+                })
+                .collect();
+            classes.sort();
+            self.partial = Some((classes, consistency));
+            return Ok((consistent, Some(taxonomy), stats));
+        }
         poll(limits)?;
         Ok((consistent, Some(taxonomy), stats))
     }
@@ -1738,11 +2120,136 @@ mod tests {
                     horn: 1,
                     disjunctive: 1,
                     global: 0,
-                    taken: 1
+                    // Tier D takes the union and the universal
+                    taken: 2
                 }
             );
             assert_eq!(out.stats.tier, Tier::Disjunctive);
         }
+    }
+
+    /// The run's index after classifying a functional-syntax body with the prefix `:`
+    /// for `http://ex.org/`, and the entailment of `A ⊑ C`.
+    fn horn_run(body: &str) -> (Index, bool) {
+        let doc = crate::ofn_read::parse(&format!(
+            "Prefix(:=<http://ex.org/>)\nOntology(\nSubClassOf(:X ObjectAllValuesFrom(:u :Y))\n{body}\n)"
+        ))
+        .unwrap();
+        let axioms: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let mut s = Saturation::default();
+        let out = s.classify(&axioms, None, &Limits::default()).unwrap();
+        assert_eq!(out.stats.tier, Tier::Horn);
+        let c = |n: &str| Class::new(format!("http://ex.org/{n}"));
+        let yes = out.taxonomy.is_subclass(&c("A"), &c("C"));
+        (s.index.take().unwrap(), yes)
+    }
+
+    #[test]
+    fn a_left_linear_chain_stays_composed_with_direct_right_operands() {
+        // regulates ∘ part of ⊑ regulates, with part of transitive: the negative
+        // existential over regulates stays on composed links, and part of's own chain
+        // is not composed, since the links of regulates take part of one link at a time
+        let (ix, yes) = horn_run(
+            "TransitiveObjectProperty(:part_of)
+             SubObjectPropertyOf(ObjectPropertyChain(:regulates :part_of) :regulates)
+             SubClassOf(:A ObjectSomeValuesFrom(:regulates ObjectSomeValuesFrom(:part_of ObjectSomeValuesFrom(:part_of :B))))
+             EquivalentClasses(:C ObjectSomeValuesFrom(:regulates :B))",
+        );
+        assert!(yes);
+        // one chain is composed, over the subroles of its operands
+        let results: std::collections::BTreeSet<index::Role> =
+            ix.roles.comp.values().flatten().copied().collect();
+        assert_eq!(results.len(), 1, "{:?}", ix.roles.comp);
+        let &(left, right) = ix.roles.comp.keys().next().unwrap();
+        // part of is a right operand, but no chain composes part of links
+        assert!(ix.roles.keeps_forward(right));
+        assert!(!results.contains(&right));
+        assert!(results.contains(&left));
+    }
+
+    #[test]
+    fn a_chain_of_three_falls_back_to_unfolding() {
+        let (ix, yes) = horn_run(
+            "SubObjectPropertyOf(ObjectPropertyChain(:p :q :s) :t)
+             SubClassOf(:A ObjectSomeValuesFrom(:p ObjectSomeValuesFrom(:q ObjectSomeValuesFrom(:s :B))))
+             EquivalentClasses(:C ObjectSomeValuesFrom(:t :B))",
+        );
+        assert!(yes);
+        assert!(ix.roles.comp.is_empty(), "{:?}", ix.roles.comp);
+        assert!(ix.roles.right.iter().all(|&r| !r));
+    }
+
+    #[test]
+    fn a_chain_that_is_not_left_linear_composes_its_right_operand_too() {
+        // negatively regulates ∘ negatively regulates ⊑ positively regulates: the right
+        // operand's links must be complete, so its own chain is composed as well
+        let (ix, yes) = horn_run(
+            "SubObjectPropertyOf(ObjectPropertyChain(:neg :neg) :C_pos)
+             SubObjectPropertyOf(ObjectPropertyChain(:neg :part_of) :neg)
+             TransitiveObjectProperty(:part_of)
+             SubClassOf(:A ObjectSomeValuesFrom(:neg ObjectSomeValuesFrom(:part_of ObjectSomeValuesFrom(:neg :B))))
+             EquivalentClasses(:C ObjectSomeValuesFrom(:C_pos :B))",
+        );
+        assert!(yes);
+        let results: std::collections::BTreeSet<index::Role> =
+            ix.roles.comp.values().flatten().copied().collect();
+        assert_eq!(results.len(), 2, "{:?}", ix.roles.comp);
+    }
+
+    /// The index of a Horn run over a functional-syntax body, before the saturation.
+    fn horn_index_of(body: &str) -> Index {
+        let doc =
+            crate::ofn_read::parse(&format!("Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n)"))
+                .unwrap();
+        let axioms: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let outside: Vec<(usize, (String, String))> = axioms
+            .iter()
+            .enumerate()
+            .filter_map(|(i, k)| {
+                let b = profiles::el_axiom(k).into_iter().next()?;
+                Some((i, (b.rule.to_string(), b.message)))
+            })
+            .collect();
+        let mut s = Saturation::default();
+        let (_, ix, _, _) = s
+            .build(&axioms, &outside, 1, 0, &Limits::default())
+            .unwrap();
+        assert!(ix.horn.is_some());
+        ix
+    }
+
+    #[test]
+    fn absorbed_fillers_take_linear_work_and_stop_when_asked() {
+        // C0 ⊑ C1 ⊑ … ⊑ Cn: every class is absorbed, unless Cn holds a universal, which
+        // rejects them all, one after another down the chain
+        let n = 50_000;
+        let chain: String = (0..n)
+            .map(|i| format!("SubClassOf(:C{i:05} :C{:05})\n", i + 1))
+            .collect();
+        let absorbed = |ix: &Index| {
+            let h = ix.horn.as_ref().unwrap();
+            (0..h.flags.len() as Ex)
+                .filter(|&e| h.is(e, horn::HornIx::ABSORBED))
+                .count()
+        };
+        let free = format!("{chain}SubClassOf(:X ObjectAllValuesFrom(:u :Y))");
+        let mut ix = horn_index_of(&free);
+        horn::absorb(&mut ix, &|| true);
+        assert_eq!(absorbed(&ix), 0, "a stopped pass marks nothing");
+        let mut ix = horn_index_of(&free);
+        horn::absorb(&mut ix, &|| false);
+        assert!(absorbed(&ix) > n, "{}", absorbed(&ix));
+        let held = format!("{chain}SubClassOf(:C{n:05} ObjectAllValuesFrom(:u :Y))");
+        let mut ix = horn_index_of(&held);
+        let polls = std::cell::Cell::new(0usize);
+        horn::absorb(&mut ix, &|| {
+            polls.set(polls.get() + 1);
+            false
+        });
+        // the universal's filler Y alone
+        assert_eq!(absorbed(&ix), 1);
+        // a pass per rejected class would poll thousands of times
+        assert!(polls.get() <= 16, "{}", polls.get());
     }
 
     /// Random axioms over a few hundred classes, with intersections whose operands come

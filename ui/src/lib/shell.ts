@@ -24,6 +24,7 @@ export interface NavItem extends NavLink {
 
 /** The pages whose link carries the open dataset as `?ds=`. */
 const CARRIES_DATASET = new Set([
+  '/ask',
   '/explore',
   '/browse',
   '/workbench/ontology',
@@ -63,6 +64,7 @@ export interface NavAccess {
 export function navItems({ backupsVisible = false, workbench = false }: NavAccess = {}): NavItem[] {
   return [
     { href: '/query', label: 'Query', icon: 'query', group: 'work' },
+    { href: '/ask', label: 'Ask', icon: 'sparkle', group: 'work' },
     { href: '/explore', label: 'Explore', icon: 'explore', group: 'work' },
     { href: '/browse', label: 'Browse', icon: 'book', group: 'work' },
     ...(workbench

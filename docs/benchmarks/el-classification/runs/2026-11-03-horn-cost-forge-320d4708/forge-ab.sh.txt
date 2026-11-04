@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Gate of item 693 on the benchmark host: the base (17d04145) with the Horn rules, the
+# base with the EL rules alone (--el-only), and the lane, on GO, ChEBI lite and four ORE
+# 2015 DL files and three ORE 2015 EL files, on one and eight threads, in rotating order over three rounds. Holds the
+# bench and heavy locks for every process. Runs no other reasoner.
+# Usage: forge-ab.sh DIR   (DIR holds bin/base, bin/lane and data/*)
+set -euo pipefail
+D=$1
+cd "$D"
+exec 9> "$HOME/lanes/.bench.lock" 8> "$HOME/lanes/.heavy.lock"
+flock 9
+flock 8
+OUT=out-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT"
+{
+  echo "host=$(hostname)"
+  echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')"
+  echo "cpus=$(nproc)"
+  echo "kernel=$(uname -r)"
+  for b in bin/*; do echo "binary_sha256 $b=$(sha256sum "$b" | cut -d' ' -f1)"; done
+  for f in data/*; do echo "data_sha256 $f=$(sha256sum "$f" | cut -d' ' -f1)"; done
+  echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)"
+} > "$OUT/env.txt"
+sides=(base el lane)
+for round in 1 2 3; do
+  for f in go.ofn chebi_lite.ofn ore_ont_9855.owl ore_ont_13581.owl ore_ont_9663.owl ore_ont_14817.owl ore_ont_3836.owl ore_ont_13482.owl ore_ont_2828.owl; do
+    n=${f%.*}
+    for t in 1 8; do
+      for k in 0 1 2; do
+        side=${sides[$(( (k + round) % 3 ))]}
+        bin=bin/$side; extra=()
+        if [ "$side" = el ]; then bin=bin/base; extra=(--el-only); fi
+        systemd-run --user --scope --quiet -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+          "$bin" "${extra[@]}" --threads $t --repeat 5 --taxonomy "$OUT/$n.$side.t$t.txt" "data/$f" |
+          python3 -c "import json,sys; r=json.load(sys.stdin); r.update(side='$side', round=$round); print(json.dumps(r))" \
+          >> "$OUT/runs.jsonl" 2>> "$OUT/err.txt" ||
+          echo "{\"side\":\"$side\",\"input\":\"data/$f\",\"threads\":$t,\"round\":$round,\"failed\":true}" >> "$OUT/runs.jsonl"
+      done
+    done
+  done
+done
+echo "ended=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OUT/env.txt"
+(cd "$OUT" && for x in *.txt; do [ "$x" = env.txt ] || [ "$x" = err.txt ] || printf '%s  %s\n' "$(sort "$x" | sha256sum | cut -d' ' -f1)" "$x"; done) > "$OUT/taxonomy.sha256"
+echo "AB-DONE $OUT"

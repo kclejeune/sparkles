@@ -589,7 +589,10 @@ because eager execution spreads more of its work over the query threads. When su
 text's cursor answers whole in 10 to 50 ms and no eager run of it is known, its next run
 is eager, on the pool. The server keeps the fastest eager run and the fastest cursor run
 of each text, and once both are known the text runs in the faster mode, so one slow run
-does not change it. The remembered times do not age. The server remembers up to 4,096
+does not change it. The first run in each mode is slower than the later ones, so a text
+whose runs in both modes are quick settles only once the slower mode has run twice, and
+until then its next run goes to the mode that lost with one run. A text therefore runs
+at most twice in its slower mode. The remembered times do not age. The server remembers up to 4,096
 texts and forgets all of them at once when a new text arrives after that, and roadmap
 item 577 covers aging. On forge, DBpedia's
 `births-by-decade` at 50M triples takes 3.2 ms as a cursor and 1.8 ms eagerly, and it
