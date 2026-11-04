@@ -59,6 +59,11 @@ open(
     await expect(page.getByRole('region', { name: 'Summary' })).toContainText('main@1');
     await page.getByRole('combobox', { name: 'Take for <urn:a>' }).selectOption('theirs');
     await expect(conflicts(page)).toContainText('Every conflict has a choice');
+    // the changes as N-Quads lines rather than the change set
+    await page
+      .getByRole('region', { name: 'Changes' })
+      .getByRole('button', { name: 'N-Quads' })
+      .click();
     const lines = page.getByRole('region', { name: 'Changes' }).getByLabel('Changes of the merge');
     await expect(lines).toContainText('+ <urn:a> <urn:age> "3"^^');
     const before = await mainHead(request, 'hedges');
@@ -126,6 +131,9 @@ open('the History graph draws the branches, their forks and merges', async ({ pa
   // fix's commit: its changes against the dev commit it started from
   await panel.getByRole('button', { name: /^Commit \d+ on fix$/ }).click();
   const detail = panel.getByRole('region', { name: /^Commit \d+ on fix$/ });
-  await expect(detail.getByLabel('Changes')).toContainText('+ <urn:f> <urn:p> "1"^^');
+  await detail.getByRole('button', { name: 'N-Quads' }).click();
+  await expect(detail.getByLabel('Changes', { exact: true })).toContainText(
+    '+ <urn:f> <urn:p> "1"^^',
+  );
   await expect(detail.getByRole('link', { name: /^Query at commit/ })).toBeVisible();
 });

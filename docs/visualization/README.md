@@ -356,7 +356,8 @@ header tab edits the ontology IRI, version IRI, imports and header annotations, 
 usage view lists every axiom that mentions the entity. The **History** tab lists the
 branch's commits newest first in the manner of WebProtégé's changes. Each commit opens to
 what it changed in the graph as a change set, one block a subject named by its label with
-each added or removed property and value on a line, and links to the commit's full diff. **Inferred** shows the EL
+each added or removed property and value on a line, and links to the commit's full diff. Every other view of a commit's, a merge's or a preview's changes shows the same change
+set, with the signed N-Quads lines behind a **N-Quads** switch. **Inferred** shows the EL
 classifier's taxonomy beside the asserted class tree
 ([screenshot](../images/ontology-inferred.png)). Every edit is previewed as a dry run and
 committed with the commit it was previewed against

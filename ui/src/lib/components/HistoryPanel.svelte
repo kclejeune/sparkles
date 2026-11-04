@@ -483,7 +483,7 @@
               {#if diff.method === 'compare'}· compared full states{/if}
             </p>
             {#if diff.quads}
-              <DiffLines quads={diff.quads} total={diff.added + diff.removed} />
+              <DiffLines quads={diff.quads} total={diff.added + diff.removed} ds={target} />
             {/if}
           {/if}
         </div>
