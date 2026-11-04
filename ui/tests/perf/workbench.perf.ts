@@ -176,6 +176,10 @@ test.describe('workbench scroll', () => {
         for (let i = 0; i < 14; i++) {
           const rows = await loadedRows(page);
           if (rows >= 10_000) break;
+          // a virtual tree draws the "Show more" row only when it is in view
+          await page.evaluate(
+            `(() => { const s = ${SCROLLER_JS}; s.scrollTop = s.scrollHeight; })()`,
+          );
           const more = page.locator(SHOW_MORE).first();
           await more.waitFor({ timeout: 60_000 }).catch(() => {});
           if (!(await more.count())) {
@@ -184,11 +188,9 @@ test.describe('workbench scroll', () => {
           }
           const t = Date.now();
           await more.click();
-          await page.waitForFunction(
-            (n) => document.querySelectorAll('[role="tree"] li').length > n,
-            rows,
-            { timeout: 60_000 },
-          );
+          const until = Date.now() + 60_000;
+          while ((await loadedRows(page)) <= rows && Date.now() < until)
+            await page.waitForTimeout(50);
           pages.push(Date.now() - t);
         }
         r.showMoreMs = pages;
@@ -196,6 +198,8 @@ test.describe('workbench scroll', () => {
         r.rowsInDomBefore = await rowsInDom(page);
         r.heapBefore = await heap(cdp);
         // scroll the tree from top to bottom and back, 700 px a frame
+        await page.evaluate(`(() => { const s = ${SCROLLER_JS}; s.scrollTop = 0; })()`);
+        await page.waitForTimeout(500);
         const down = (await page.evaluate(
           FRAME_STATS_JS(
             `(() => { const s = ${SCROLLER_JS}; return () => { s.scrollTop += 700; return s.scrollTop + s.clientHeight >= s.scrollHeight - 1; }; })()`,

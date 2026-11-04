@@ -10,6 +10,8 @@ import { join } from 'node:path';
 export const BASE = (process.env.PERF_URL ?? '').replace(/\/$/, '');
 export const OUT = process.env.PERF_OUT ?? join(tmpdir(), 'sparkles-perf');
 export const LABEL = process.env.PERF_LABEL ?? 'run';
+/** Added to the repetition number in file names, so that interleaved runs add up. */
+export const REP_BASE = Number(process.env.PERF_REP_BASE ?? 0);
 export const REPEAT = Number(process.env.PERF_REPEAT ?? 3);
 /** Waits longer than this fail a repetition, and the failure is recorded. */
 export const LOAD_TIMEOUT = Number(process.env.PERF_LOAD_TIMEOUT_MS ?? 300_000);
@@ -277,7 +279,7 @@ export async function save(
 ) {
   const dir = join(OUT, LABEL);
   mkdirSync(dir, { recursive: true });
-  const file = join(dir, `${name}.rep${rep}.json`);
+  const file = join(dir, `${name}.rep${rep + REP_BASE}.json`);
   writeFileSync(file, JSON.stringify({ name, rep, meta: await meta(page), ...data }, null, 1));
   info.annotations.push({ type: 'result', description: file });
   return file;

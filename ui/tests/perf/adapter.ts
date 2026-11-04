@@ -27,7 +27,13 @@ export async function loadedRows(page: Page): Promise<number> {
   return page.evaluate(() => {
     const tree = document.querySelector('[role="tree"]');
     const n = Number(tree?.getAttribute('aria-rowcount'));
-    return Number.isFinite(n) && n > 0 ? n : document.querySelectorAll('[role="tree"] li').length;
+    if (Number.isFinite(n) && n > 0) return n;
+    const inDom = document.querySelectorAll('[role="tree"] li').length;
+    // a virtual tree pads its list to the height of all its rows, so the rows are the
+    // list's height over a row's
+    const rowH = document.querySelector<HTMLElement>('[role="tree"] li > .node')?.offsetHeight;
+    const est = tree && rowH ? Math.round(tree.getBoundingClientRect().height / rowH) : 0;
+    return Math.max(inDom, est);
   });
 }
 

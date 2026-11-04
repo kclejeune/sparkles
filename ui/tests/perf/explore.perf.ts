@@ -24,6 +24,7 @@ import {
   need,
   Net,
   REPEAT,
+  REP_BASE,
   save,
 } from './measure';
 
@@ -129,7 +130,7 @@ test.describe('explore scale', () => {
           r.network = net.summary().api;
           r.heap = await heap(cdp);
           await page.screenshot({
-            path: `${process.env.PERF_OUT ?? '/tmp'}/${process.env.PERF_LABEL ?? 'run'}/explore-${target}.rep${rep}.png`,
+            path: `${process.env.PERF_OUT ?? '/tmp'}/${process.env.PERF_LABEL ?? 'run'}/explore-${target}.rep${rep + REP_BASE}.png`,
           });
         } catch (e) {
           r.status = 'failed';
