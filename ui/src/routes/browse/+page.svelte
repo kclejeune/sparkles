@@ -1233,6 +1233,8 @@
         class:graph={view === 'graph' && !treeKind}
         class:editing
         data-kind={treeKind ?? 'none'}
+        data-flat={q.get('flat') === '1' ? '' : undefined}
+        data-declutter={q.get('declutter') === '1' ? '' : undefined}
       >
         <div class="b-head">
           <TermHeader
@@ -2050,6 +2052,69 @@
     .b-def :global(.panel-body) {
       padding-top: var(--sp-3);
     }
+  }
+  /* CAPTURES ONLY: flat sections on the page background (?flat=1), from the exploration's
+     layouts C and D: headings with a hairline rule on the page's own background. The rail keeps
+     its cards. */
+  .browse[data-flat] .b-main {
+    gap: var(--sp-8);
+  }
+  .browse[data-flat] .b-main > :global(.panel) {
+    background: none;
+    border: 0;
+    border-radius: 0;
+  }
+  .browse[data-flat] .b-main > :global(.panel > .panel-head) {
+    padding: 0 0 var(--sp-1);
+    min-height: 0;
+    border-bottom: 1px solid var(--border-strong);
+  }
+  .browse[data-flat] .b-main > :global(.panel > .panel-head h2) {
+    font-size: var(--fs-xl);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .browse[data-flat] .b-main > :global(.panel > .panel-body) {
+    padding: var(--sp-4) 0 0;
+  }
+  .browse[data-flat] .b-def :global(.entry) {
+    max-width: 75ch;
+  }
+  /* CAPTURES ONLY: the Definition section with more room (?declutter=1). Each kind of text has a
+     heading of its own in the text colour with its predicate beside it, the kinds stand apart by
+     space and not by rules, and the text keeps a readable measure. */
+  .browse[data-declutter] .b-def .ruled {
+    gap: var(--sp-6);
+  }
+  .browse[data-declutter] .b-def .ruled > :global(section),
+  .browse[data-declutter] .b-def .ruled > :global(.lead + section) {
+    border-top: 0;
+    padding: 0;
+  }
+  .browse[data-declutter] .b-def .ruled > :global(.lead) {
+    margin: 0;
+    gap: var(--sp-6);
+  }
+  .browse[data-declutter] .b-def :global(.lead .group) {
+    gap: var(--sp-3);
+  }
+  .browse[data-declutter] .b-def :global(.lead .group > h3),
+  .browse[data-declutter] .b-def .ruled :global(.term-sec > h2) {
+    font-size: var(--fs-md);
+    font-weight: 600;
+    color: var(--text);
+    margin: 0 0 var(--sp-3);
+  }
+  .browse[data-declutter] .b-def :global(.lead .group > h3) {
+    margin: 0;
+  }
+  .browse[data-declutter] .b-def :global(.lead .entry),
+  .browse[data-declutter] .b-def :global(.note) {
+    max-width: 72ch;
+    line-height: 1.65;
+  }
+  .browse[data-declutter] .b-def :global(.syn) {
+    gap: var(--sp-3) var(--sp-4);
   }
   /* a card's sections, split by rules as in the Workbench's details panel */
   .ruled {

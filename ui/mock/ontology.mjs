@@ -229,6 +229,31 @@ obo:CL_0009008 a owl:Class ; rdfs:label "leptomeningeal cell"@en ;
   rdfs:subClassOf [ a owl:Restriction ; owl:onProperty obo:BFO_0000050 ; owl:someValuesFrom obo:CL_0009001 ] .
 obo:CL_0009009 a owl:Class ; rdfs:label "choroid plexus epithelial cell"@en ;
   rdfs:subClassOf [ a owl:Restriction ; owl:onProperty obo:RO_0002215 ; owl:someValuesFrom obo:CL_0009001 ] .
+
+# CAPTURES ONLY: a stand-in for the deep term GO:0000432. Its labels follow GO's, and the text and
+# some identifiers are invented.
+obo:GO_0008150 a owl:Class ; rdfs:label "biological_process"@en .
+obo:GO_0065007 a owl:Class ; rdfs:label "biological regulation"@en ; rdfs:subClassOf obo:GO_0008150 .
+obo:GO_0050789 a owl:Class ; rdfs:label "regulation of biological process"@en ; rdfs:subClassOf obo:GO_0065007 .
+obo:GO_0019222 a owl:Class ; rdfs:label "regulation of metabolic process"@en ; rdfs:subClassOf obo:GO_0050789 .
+obo:GO_0060255 a owl:Class ; rdfs:label "regulation of macromolecule metabolic process"@en ; rdfs:subClassOf obo:GO_0019222 .
+obo:GO_0010468 a owl:Class ; rdfs:label "regulation of gene expression"@en ; rdfs:subClassOf obo:GO_0060255 .
+obo:GO_0006355 a owl:Class ; rdfs:label "regulation of DNA-templated transcription"@en ; rdfs:subClassOf obo:GO_0010468 .
+obo:GO_0006357 a owl:Class ; rdfs:label "regulation of transcription by RNA polymerase II"@en ; rdfs:subClassOf obo:GO_0006355 .
+obo:GO_0045893 a owl:Class ; rdfs:label "positive regulation of DNA-templated transcription"@en ; rdfs:subClassOf obo:GO_0006355 .
+obo:GO_0045944 a owl:Class ; rdfs:label "positive regulation of transcription by RNA polymerase II"@en ; rdfs:subClassOf obo:GO_0006357 , obo:GO_0045893 .
+obo:GO_0046015 a owl:Class ; rdfs:label "regulation of transcription by glucose"@en ; rdfs:subClassOf obo:GO_0006355 .
+obo:GO_0046016 a owl:Class ; rdfs:label "positive regulation of transcription by glucose"@en ; rdfs:subClassOf obo:GO_0046015 , obo:GO_0045893 .
+obo:GO_0000430 a owl:Class ; rdfs:label "regulation of transcription by glucose at an RNA polymerase II promoter"@en ; rdfs:subClassOf obo:GO_0006357 , obo:GO_0046015 .
+obo:GO_0000432 a owl:Class ;
+  rdfs:label "positive regulation of transcription from RNA polymerase II promoter by glucose"@en ;
+  oboInOwl:id "GO:0000432" ;
+  oboInOwl:hasOBONamespace "biological_process" ;
+  rdfs:subClassOf obo:GO_0000430 , obo:GO_0045944 , obo:GO_0046016 ;
+  obo:IAO_0000115 "Any process involving glucose that activates or increases the rate of transcription from an RNA polymerase II promoter."@en ;
+  oboInOwl:hasExactSynonym "activation of transcription from RNA polymerase II promoter by glucose"@en , "glucose-induced transcription from RNA polymerase II promoter"@en ;
+  oboInOwl:hasRelatedSynonym "up regulation of transcription from RNA polymerase II promoter by glucose"@en ;
+  oboInOwl:hasDbXref "PMID:00000021" , "GOC:fixture" .
 `;
 
 // --- terms ---------------------------------------------------------------------------
