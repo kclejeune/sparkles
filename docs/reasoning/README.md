@@ -268,8 +268,15 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   disjunctive rules that its deadline, cancellation or memory budget stops returns the
   subsumptions it proved, with `Classification::complete` false, the classes it may have
   left incomplete in `incomplete`, and a consistency of consistent, inconsistent or
-  unknown, which leaves every class incomplete when unknown. Any other axiom outside OWL 2
-  EL, such as counting and nominals, is left out and reported with its rule, and Horn
+  unknown, which leaves every class incomplete when unknown. The same rules count: number
+  restrictions, functional and inverse functional properties, disjoint properties and
+  asymmetric properties take equalities of successors, and a run that counts has a bound
+  of 262,144 derived conclusions, `Limits::dl_work`. A run that passes it classifies
+  again without counting, leaves the axioms that need counting out and reports them, and
+  sets `Stats::dl_counting_over` and `Stats::dl_over_budget`. Near the bound the thread
+  schedule can decide whether a run answers in full or falls back, and the fallback is
+  always reported and never a different complete answer, item NEW-ITEM-1. Any other axiom
+  outside OWL 2 EL, such as nominals, is left out and reported with its rule, and Horn
   reasoning with individuals is item 692. An axiom with a literal or datatype that the
   classifier cannot compare, such as an XML literal, an ill-typed literal or a datatype
   outside the OWL 2 datatype map, or with a property chain through the top object
@@ -640,12 +647,16 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * The ELK mode, which classifies by the OWL 2 EL rules alone, is an option of the Rust
   library and the ROBOT-compatible commands only, and HTTP, the other CLI commands and
   the bindings always take the Horn axioms. Roadmap item 694.
-* Axioms outside OWL 2 EL that need counting or nominals, and axioms that need case
-  analysis in an ontology with individuals or data properties, are left out, and an
+* Axioms outside OWL 2 EL that need nominals, and axioms that need case analysis or
+  counting in an ontology with individuals or data properties, are left out, and an
   external DL reasoner bridge is planned. Roadmap item 603.
-* BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies slower with the
-  disjunctive rules than with Konclude, since each of its contexts derives the same
-  global case analysis again. Roadmap item 712.
+* Counting passes its bound of derived conclusions on the five counting files of the ORE
+  2015 DL development set that the disjunctive rules take, so those files get the answer
+  without counting. ore_ont_6485
+  spends 205 ms on the attempt against 7 ms for the run without it, and Konclude takes
+  8 ms. Roadmap items NEW-ITEM-2 and NEW-ITEM-3.
+* BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 27 ms on four threads
+  against 23 ms for Konclude. Roadmap item 712.
 * ore_ont_3215 of the ORE 2015 DL sample passes the disjunctive rules' memory budget and
   gets the Horn rules' answer without its 18,323 unions. Roadmap item 713.
 * `partial` applies only to runs of the disjunctive rules, and runs of the EL and Horn

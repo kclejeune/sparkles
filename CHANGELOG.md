@@ -24,6 +24,17 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+The disjunctive classification rules count. Number restrictions, functional and inverse
+functional properties, disjoint properties and asymmetric properties in an ontology
+without individuals or data properties take part in the consequence-based case analysis,
+with the equalities of successors, and a run of them equals HermiT on the generated
+counting fixtures that it takes whole. A run that counts stops at 262,144 derived
+conclusions, which `Limits::dl_work` changes, and classifies again without counting,
+leaving those axioms out and reporting them, and `dl_counting_over` and `dl_over_budget`
+say so. A run that does not count has no such bound. The normalization keeps the class
+beside a universal or a maximum in a clause's body, which classifies BioTop in 27 ms on
+four threads where it took 350 ms.
+
 A classification can answer in part on every surface. `partial` on
 `POST /$/ontology/{ds}/classify`, the JSON operation, Python's, Node.js's and the JVM's
 `classify` and `sparkles ontology classify --partial` asks a run of the disjunctive rules
