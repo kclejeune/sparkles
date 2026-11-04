@@ -269,6 +269,13 @@ test('members drawn from a group stay when the graph is read at an earlier commi
     .getByRole('button', { name: /^Draw this page/ })
     .click();
   await expect(counts(page)).toContainText('32 nodes');
+  // a member the person removed is not drawn again by the replay
+  await page
+    .getByRole('table', { name: 'Drawn nodes' })
+    .getByRole('button', { name: 'T5', exact: true })
+    .click();
+  await page.getByRole('button', { name: 'Remove from graph' }).click();
+  await expect(counts(page)).toContainText('31 nodes');
   await page.getByRole('button', { name: 'Graph history' }).click();
   const slider = page
     .getByRole('region', { name: 'Graph history time slider' })
@@ -280,7 +287,13 @@ test('members drawn from a group stay when the graph is read at an earlier commi
   // the graph is read again at commit 1, where every drawn member is a member too
   await expect.poll(() => new URL(page.url()).searchParams.get('at')).toBe('commit:1');
   await page.waitForTimeout(2000);
-  await expect(counts(page)).toContainText('32 nodes');
+  await expect(counts(page)).toContainText('31 nodes');
+  // and back at the head
+  await slider.focus();
+  await page.keyboard.press('ArrowRight');
+  await expect.poll(() => new URL(page.url()).searchParams.get('at')).not.toBe('commit:1');
+  await page.waitForTimeout(2000);
+  await expect(counts(page)).toContainText('31 nodes');
 });
 
 test.describe('at 390 px', () => {

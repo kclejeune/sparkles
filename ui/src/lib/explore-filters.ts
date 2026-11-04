@@ -33,6 +33,8 @@ export type FEdge = {
   /** The predicate IRI. */
   title?: string;
   isType?: boolean;
+  /** A path of the path finder's overlay runs along the edge, which keeps it drawn. */
+  paths?: readonly unknown[];
 };
 
 const pred = (e: FEdge) => e.title ?? '';
@@ -50,6 +52,11 @@ export type Filters = {
   hiddenIds: ReadonlySet<string>;
   /** The most nodes to draw. */
   budget: number;
+  /**
+   * Do not draw the `rdf:type` edges. They still give the nodes their classes, and they no
+   * longer count towards a node's degree.
+   */
+  hideTypes?: boolean;
 };
 
 export const NO_FILTERS: Filters = {
@@ -162,6 +169,7 @@ export function applyFilters<N extends FNode, E extends FEdge>(
   const live: E[] = [];
   for (const e of edges) {
     if (f.predicates.has(pred(e))) continue;
+    if (f.hideTypes && e.isType && !e.paths?.length) continue;
     if (!alive.has(e.source) || !alive.has(e.target)) continue;
     live.push(e);
   }

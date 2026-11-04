@@ -166,3 +166,25 @@ describe('the edges one line stands for', () => {
     expect(pairs.get('a|knows|b')!.map((x) => x.title)).toEqual(['knows', 'owns']);
   });
 });
+
+describe('hiding the type edges', () => {
+  const ns = [n('x'), n('y'), n('z'), n('C', 'iri')];
+  const es = [e('x', 'knows', 'y'), e('x', T, 'C'), e('y', T, 'C'), e('z', 'knows', 'y')];
+  it('keeps the classes of the nodes and counts only the edges that are drawn', () => {
+    const f = { ...NO_FILTERS, hideTypes: true, minDegree: 2 };
+    const out = applyFilters(ns, es, f);
+    // x has one drawn edge and one hidden type edge, so it is not drawn at degree 2
+    expect(out.nodes.map((x) => x.id)).toEqual(['y']);
+    expect(out.edges.some((x) => x.isType)).toBe(false);
+    // a class filter still sees the nodes' classes
+    const g = applyFilters(ns, es, { ...NO_FILTERS, hideTypes: true, classes: new Set(['C']) });
+    expect(g.nodes.map((x) => x.id)).toEqual(['z', 'C']);
+  });
+  it('keeps a type edge that a path runs along', () => {
+    const out = applyFilters(ns, [{ ...e('x', T, 'C'), paths: [0] }], {
+      ...NO_FILTERS,
+      hideTypes: true,
+    });
+    expect(out.edges).toHaveLength(1);
+  });
+});

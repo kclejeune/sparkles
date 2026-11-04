@@ -271,8 +271,18 @@
   let expandLog: string[] = [];
   /** Every resource the graph has drawn since it was focused, so that a replay can find it again. */
   let seenTerms = new Map<string, Term>();
-  /** The members the person drew from each group node, by group id, which a replay draws again. */
-  let drawLog = new Map<string, Map<string, grp.Member>>();
+  /**
+   * The members the person drew from each group node, by group id, with what the group
+   * stood for, so that a replay draws them again at a commit where the group exists.
+   */
+  type DrawnGroup = {
+    owner: string;
+    ownerTerm: Term;
+    predicate: string;
+    incoming: boolean;
+    members: Map<string, grp.Member>;
+  };
+  let drawLog = new Map<string, DrawnGroup>();
 
   function resetGraph() {
     graphGen.bump();
@@ -792,13 +802,12 @@
     hideLeaves: fstate.hideLeaves,
     hiddenIds: new Set([...fstate.hiddenGroups.values()].flatMap((g) => g.ids)),
     budget: webglOff ? Math.min(fstate.budget, WEBGL_FROM) : fstate.budget,
+    // the type edges give nodes their classes whether or not they are drawn
+    hideTypes,
   });
   const drawn = $derived(applyFilters(allNodes, allEdges, filters, keepIds));
   const gNodes = $derived(drawn.nodes);
-  // hiding the type edges changes what is drawn, and not what the filters know of a node
-  const gEdges = $derived(
-    hideTypes ? drawn.edges.filter((e) => !e.isType || e.paths != null) : drawn.edges,
-  );
+  const gEdges = $derived(drawn.edges);
   /** The visible node count at which the page draws with WebGL, `localStorage` for tests. */
   const webglFrom = loadPref<number>('sparkles.explore.webglFrom', WEBGL_FROM);
   let useWebgl = $state(false);
@@ -1352,12 +1361,19 @@
   function drawMembers(gid: string, members: grp.Member[]) {
     const g = nodes[gid]?.group;
     if (!g) return;
-    const logged = drawLog.get(gid) ?? new Map<string, grp.Member>();
-    drawLog.set(gid, logged);
+    const ownerTerm = nodes[g.owner]?.term;
+    const logged = drawLog.get(gid) ?? {
+      owner: g.owner,
+      ownerTerm: ownerTerm as Term,
+      predicate: g.predicate,
+      incoming: g.incoming,
+      members: new Map<string, grp.Member>(),
+    };
+    if (ownerTerm) drawLog.set(gid, logged);
     for (const m of members) {
       const lit = m.term.type === 'literal';
       const oid = lit ? `lit:${g.owner}|${g.predicate}|${termKey(m.term)}` : termKey(m.term);
-      logged.set(oid, m);
+      logged.members.set(oid, m);
       ensureNode(m.term, m.label, oid);
       if (lit) showLiterals = true;
       if (g.incoming) addEdge(oid, g.predicate, g.owner, false);
@@ -1511,20 +1527,15 @@
     at: string | undefined,
     signal?: AbortSignal,
   ): Promise<{ gid: string; owner: string; members: grp.Member[] }[]> {
-    const wanted: { gid: string; owner: string; m: grp.Member; triple: EdgeTriple }[] = [];
-    for (const [gid, logged] of drawLog) {
-      const g = nodes[gid]?.group;
-      const owner = g ? nodes[g.owner]?.term : undefined;
-      if (!g || !owner) continue;
-      for (const m of logged.values()) {
-        const p: Term = { type: 'uri', value: g.predicate };
+    const wanted: { gid: string; m: grp.Member; triple: EdgeTriple }[] = [];
+    for (const [gid, g] of drawLog) {
+      const p: Term = { type: 'uri', value: g.predicate };
+      for (const m of g.members.values())
         wanted.push({
           gid,
-          owner: g.owner,
           m,
-          triple: g.incoming ? [m.term, p, owner] : [owner, p, m.term],
+          triple: g.incoming ? [m.term, p, g.ownerTerm] : [g.ownerTerm, p, m.term],
         });
-      }
     }
     if (!wanted.length) return [];
     const found = await ex.presentEdges(
@@ -1535,8 +1546,10 @@
     );
     const by = new Map<string, { gid: string; owner: string; members: grp.Member[] }>();
     for (const w of wanted) {
-      if (!found.has(edgeIdOf(w.triple))) continue;
-      const d = by.get(w.gid) ?? { gid: w.gid, owner: w.owner, members: [] };
+      // a blank node or a triple term cannot be checked, so its member stays
+      const checkable = w.triple.every((t) => t.type === 'uri' || t.type === 'literal');
+      if (checkable && !found.has(edgeIdOf(w.triple))) continue;
+      const d = by.get(w.gid) ?? { gid: w.gid, owner: drawLog.get(w.gid)!.owner, members: [] };
       d.members.push(w.m);
       by.set(w.gid, d);
     }
@@ -1590,13 +1603,16 @@
       edges = {};
       const rn = ensureNode(rootTerm, keepLabels.get(root), root);
       const replayed = new Set<string>();
-      // an expansion makes its groups, whose drawn members can be expanded in turn
-      for (let pass = 0; pass < 4; pass++) {
+      // an expansion makes its groups, whose drawn members can be expanded in turn, so the
+      // passes go on until one expands nothing more
+      for (let more = true; more;) {
+        more = false;
         for (const id of expandLog) {
           const nh = fetched.get(id);
           const n = id === root ? rn : nodes[id];
           if (!nh || !n || replayed.has(id)) continue;
           replayed.add(id);
+          more = true;
           populate(n, nh.r);
           for (const f of nh.groups) addGroup(n, f);
           n.expanded = true;
@@ -1938,6 +1954,13 @@
     nodes = Object.fromEntries(
       Object.entries(rest).filter(([k, n]) => !k.startsWith(`lit:${id}|`) && n.group?.owner !== id),
     );
+    // what the person removed is not drawn again by a replay
+    for (const [gid, g] of drawLog) {
+      if (g.owner === id) drawLog.delete(gid);
+      else
+        for (const oid of [...g.members.keys()])
+          if (oid === id || oid.startsWith(`lit:${id}|`)) g.members.delete(oid);
+    }
     if (selectedId === id) selectedId = null;
     if (focusId === id) focusId = null;
   }
