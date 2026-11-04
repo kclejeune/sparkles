@@ -469,12 +469,23 @@ fn threads_of(limits: &Limits) -> usize {
     }
 }
 
-/// The items below which a parallel step runs on one thread.
-const MIN_CHUNK: usize = 1024;
+/// The classes below which a parallel step over classes or nodes runs on one thread.
+pub(crate) const MIN_CLASSES: usize = 1024;
+/// The axioms below which a parallel step over axioms runs on one thread, more than
+/// [`MIN_CLASSES`] since an axiom costs less than a class's step (roadmap item 709).
+// Tests keep the smaller chunks so that their few thousand axioms still split across
+// threads.
+const MIN_AXIOMS: usize = if cfg!(test) { 1024 } else { 4096 };
 
-/// Runs `f` on chunks of `items`, on up to `threads` scoped threads.
-pub(crate) fn par_chunks<T: Send>(items: &mut [T], threads: usize, f: impl Fn(&mut [T]) + Sync) {
-    let threads = threads.clamp(1, items.len().div_ceil(MIN_CHUNK).max(1));
+/// Runs `f` on chunks of `items` of at least `min` items, on up to `threads` scoped
+/// threads.
+pub(crate) fn par_chunks<T: Send>(
+    items: &mut [T],
+    threads: usize,
+    min: usize,
+    f: impl Fn(&mut [T]) + Sync,
+) {
+    let threads = threads.clamp(1, items.len().div_ceil(min).max(1));
     if threads == 1 {
         f(items);
         return;
@@ -488,14 +499,15 @@ pub(crate) fn par_chunks<T: Send>(items: &mut [T], threads: usize, f: impl Fn(&m
     });
 }
 
-/// The answers of `f` on chunks of `items`, in order, computed on up to `threads` scoped
-/// threads. `f` takes the offset of its chunk.
+/// The answers of `f` on chunks of `items` of at least `min` items, in order, computed on
+/// up to `threads` scoped threads. `f` takes the offset of its chunk.
 pub(crate) fn par_map<T: Sync, R: Send>(
     items: &[T],
     threads: usize,
+    min: usize,
     f: impl Fn(usize, &[T]) -> R + Sync,
 ) -> Vec<R> {
-    let threads = threads.clamp(1, items.len().div_ceil(MIN_CHUNK).max(1));
+    let threads = threads.clamp(1, items.len().div_ceil(min).max(1));
     if threads == 1 {
         return vec![f(0, items)];
     }
@@ -647,7 +659,7 @@ impl Classifier {
         }
         // the sizes of the axioms that came and went, which depend on each alone
         let size = |xs: &[&AxiomKind]| -> usize {
-            par_map(xs, threads, |_, c| {
+            par_map(xs, threads, MIN_AXIOMS, |_, c| {
                 c.iter().map(|a| held_bytes_of(a)).sum::<usize>()
             })
             .into_iter()
@@ -897,7 +909,7 @@ impl Saturation {
             };
             let definitions = &self.interner.ranges.definitions;
             let is_outside = &is_outside;
-            let parts = par_map(axioms, threads, |at, chunk| {
+            let parts = par_map(axioms, threads, MIN_AXIOMS, |at, chunk| {
                 let mut it = Interner::chunk(definitions);
                 let mut out = Normalized::default();
                 let r = normalize_axioms(
@@ -1177,20 +1189,21 @@ impl Saturation {
             _ => None,
         };
         // the profile check of each axiom, which depends on it alone
-        let outside: Vec<(usize, (String, String))> = par_map(axioms, threads, |at, chunk| {
-            let mut out = Vec::new();
-            for (i, k) in chunk.iter().enumerate() {
-                if logical(k)
-                    && let Some(b) = profiles::el_axiom(k).into_iter().next()
-                {
-                    out.push((at + i, (b.rule.to_string(), b.message)));
+        let outside: Vec<(usize, (String, String))> =
+            par_map(axioms, threads, MIN_AXIOMS, |at, chunk| {
+                let mut out = Vec::new();
+                for (i, k) in chunk.iter().enumerate() {
+                    if logical(k)
+                        && let Some(b) = profiles::el_axiom(k).into_iter().next()
+                    {
+                        out.push((at + i, (b.rule.to_string(), b.message)));
+                    }
                 }
-            }
-            out
-        })
-        .into_iter()
-        .flatten()
-        .collect();
+                out
+            })
+            .into_iter()
+            .flatten()
+            .collect();
         poll(limits)?;
         let (ax, mut ix, normalized_peak, outside_el) =
             self.build(axioms, &outside, threads, held_bytes, limits)?;
@@ -1516,7 +1529,7 @@ impl Saturation {
                     halted_at: AtomicUsize::new(0),
                 };
                 let bound = |delta: isize| budget.tell(delta);
-                let found = par_map(&classes, threads, |_, chunk| {
+                let found = par_map(&classes, threads, MIN_CLASSES, |_, chunk| {
                     let mut out = Vec::with_capacity(chunk.len());
                     for &d in chunk {
                         let w = world::World::new(&ix, &self.ctx, &universal, &real, &bound);

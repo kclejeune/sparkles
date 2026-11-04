@@ -636,7 +636,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   and 4.0 seconds on one thread, against 0.7 and 0.8 for the EL rules alone. Roadmap item
   693.
 * The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
-  restrictions passes 10 GiB. Roadmap item 695.
+  restrictions peaks at 7.5 GiB on four threads and 9.4 GiB on one, since most of its
+  waiting messages repeat what their contexts hold and take about nine times the memory
+  of the conclusions it keeps. Roadmap item NEW-ITEM-2.
+* A small ontology's classification on several threads starts its helper threads after
+  0.5 ms of work, which makes warm runs of some small files about 0.5 ms slower on eight
+  threads. Roadmap item NEW-ITEM-1.
 * The ELK mode, which classifies by the OWL 2 EL rules alone, is an option of the Rust
   library and the ROBOT-compatible commands only, and HTTP, the other CLI commands and
   the bindings always take the Horn axioms. Roadmap item 694.

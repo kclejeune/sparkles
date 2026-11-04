@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# mc1.sh: the taxonomy-sensitive files with main5, tip2 and mc1, then cold runs of the 12 small files with tip2 and mc1 on four and eight threads.
+set -uo pipefail
+cd ~/lanes/el-cost
+THREADS="4 8" PIN1=4 PINN=0-11 ./ab.sh $HOME/lanes/el-cost 5 "dev/ore_ont_9151.owl dev/ore_ont_7914.owl dev/ore_ont_12448.owl dev/ore_ont_13928.owl" "main5 tip2 mc1" bench
+S="dev/ore_ont_13581.owl dev/ore_ont_1445.owl dev/ore_ont_2775.owl dev/ore_ont_3231.owl dev/ore_ont_5564.owl dev/ore_ont_5940.owl dev/ore_ont_6855.owl dev/ore_ont_7584.owl dev/ore_ont_7663.owl dev/ore_ont_8203.owl dev/ore_ont_8273.owl dev/ore_ont_9096.owl"
+for t in 4 8; do THREADS=$t PIN1=4 PINN=0-11 LOCKS=bench ./cold.sh $HOME/lanes/el-cost 7 "$S" "main5 tip2 mc1"; done
+echo MC1-DONE
