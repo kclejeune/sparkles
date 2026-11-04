@@ -66,3 +66,18 @@ test('a phone can edit preferences and invalid language tags cannot be saved', a
   await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + 'Person')}`);
   await expect(page.locator('h1.term-title')).toHaveText('Personne');
 });
+
+test('expanded browser hierarchy levels keep the chosen language order', async ({ page }) => {
+  await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + 'Person')}`);
+  await preferences(page, 'label');
+  await expect(page.locator('h1.term-title')).toHaveText('Personne');
+  const request = page.waitForRequest((r) => {
+    const u = new URL(r.url());
+    return (
+      u.pathname.endsWith('/ontology/uni/hierarchy') &&
+      u.searchParams.get('iri') === UNI + 'Student'
+    );
+  });
+  await page.getByRole('button', { name: 'Open Étudiant', exact: true }).click();
+  expect(new URL((await request).url()).searchParams.get('lang')).toBe('fr,en');
+});

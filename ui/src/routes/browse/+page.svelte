@@ -1814,6 +1814,7 @@
                 <div class="tree-body" id="tree-body" bind:this={treeBox}>
                   {#if tree}
                     <LineageTree
+                      {langs}
                       {prefixes}
                       {target}
                       {sel}
