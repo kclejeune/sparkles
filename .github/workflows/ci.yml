@@ -298,6 +298,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with: { fetch-depth: 2 }
+      # The build's target, the uncompressed archive, the final archives, the cache and
+      # the swap file outgrow the free disk of GitHub's runner image. The removal of
+      # unused preinstalled toolchains runs in the background during the setup steps.
+      - name: Free disk space
+        run: &free-disk scripts/ci-free-disk.sh start
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
       # The test build can exceed the physical memory of a 16 GB runner. A larger runner
@@ -343,7 +348,7 @@ jobs:
       # placeholder ui/build, which debug builds read from disk at run time, so the shards
       # get it next to the archive. The Jena clients job gets the server binary alone.
       - name: Disk space before test archive
-        run: df -h "$GITHUB_WORKSPACE"
+        run: &free-disk-wait scripts/ci-free-disk.sh wait
       # One managed-target lease (scripts/cargo-sparkles-task) covers both archive commands
       # and the copy of the server binary. Without it Boxington collects the target after
       # the first command, and the second rebuilds the workspace.
@@ -366,7 +371,7 @@ jobs:
           ls -l "$RUNNER_TEMP"/archive/* "$RUNNER_TEMP"/heavy/* "$RUNNER_TEMP"/server/*
       - name: Disk space after test archive
         if: ${{ always() }}
-        run: df -h "$GITHUB_WORKSPACE"
+        run: &free-disk-report scripts/ci-free-disk.sh report
       # A persistent runner keeps the machine, so the job removes its own swap file.
       - name: Remove swap
         if: ${{ always() && env.CI_SWAPFILE != '' }}
@@ -454,6 +459,9 @@ jobs:
     runs-on: *runner
     steps:
       - uses: actions/checkout@v5
+      # The extracted archive and the tests' own files need more than the image leaves.
+      - name: Free disk space
+        run: *free-disk
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
@@ -471,6 +479,8 @@ jobs:
       # the server binary, the UI and their fixtures by paths fixed at compile time. When
       # the build ran on a runner with another checkout path, as when only one of the
       # runner variables is set, a link from that path leads to this checkout.
+      - name: Wait for the free disk space
+        run: *free-disk-wait
       - name: mbx nextest
         env:
           SHARD: ${{ matrix.shard }}
@@ -497,6 +507,9 @@ jobs:
           esac
           cargo-nextest nextest run --archive-file "$RUNNER_TEMP/tests.tar.zst" \
             --workspace-remap . --extract-to . --profile ci "${select[@]}"
+      - name: Disk space after the tests
+        if: ${{ always() }}
+        run: *free-disk-report
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:

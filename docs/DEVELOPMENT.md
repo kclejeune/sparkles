@@ -955,7 +955,7 @@ manual **compatibility-features** input.
 |---|---|
 | Checks | Formatting of the Rust, UI, JavaScript and shell sources, shellcheck, the cited doc paths, the benchmark scripts' tests, the license notices, the generated TypeScript client against `docs/openapi.json`, the API compatibility inventory and checker fixtures, and the UI's build, type check and unit tests. It compiles small tooling fixtures and leaves the workspace crates unbuilt. |
 | Clippy | Clippy with warnings as errors on the workspace, on the formatter's wasm32 build and on the three binding crates with and without their default features. |
-| Build tests | `mbx nextest archive` builds every test binary once and uploads three artifacts. These are the whole archive, a small archive of the binaries in `HEAVY_1` and `HEAVY_2`, and the debug server binary. |
+| Build tests | `mbx nextest archive` builds every test binary once and uploads three artifacts. These are the whole archive, a small archive of the binaries in `HEAVY_1` and `HEAVY_2`, and the debug server binary. `scripts/ci-free-disk.sh` first removes unused preinstalled toolchains from GitHub's runner and reports the least free disk the job reached. |
 | Doctests | The workspace's doctests, which nextest does not run. They build in parallel with the test archive, so the test jobs do not wait for them. |
 | Test | Two heavy shards run the binaries with the slowest tests from the small archive. The `timing` shard runs the `timing` group of `.config/nextest.toml`, which needs a machine to itself. Four more shards split the other tests by count, and the `SPARKLES_TEST_SLICES` variable changes how many. |
 | Jena clients | Jena's own HTTP clients against the debug server binary (`mise run test:jena-clients`). |
