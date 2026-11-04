@@ -385,6 +385,10 @@ impl DlRun {
     pub fn set_work_limit(&self, n: usize) {
         self.work_limit.store(n, Ordering::Relaxed);
     }
+    /// Passes the bound on derived conclusions at once, for an inference too wide to make.
+    fn exhaust(&self) {
+        self.work.fetch_add(usize::MAX / 4, Ordering::Relaxed);
+    }
     /// Whether the run derived more conclusions than its bound.
     pub fn over_work(&self) -> bool {
         let l = self.work_limit.load(Ordering::Relaxed);
@@ -702,6 +706,9 @@ fn partners_rf(ix: &Index, st: &State, t: Role) -> Vec<(Ex, Vec<Side>)> {
 struct Found {
     one: Vec<Side>,
     prods: Vec<(Vec<Vec<Side>>, Side)>,
+    /// set when an inference has more choices than a context enumerates, which passes the
+    /// run's bound on derived conclusions instead
+    over: bool,
 }
 
 impl Found {
@@ -749,8 +756,22 @@ const PRODUCT_POLL: usize = 256;
 /// and marks the context's store interrupted, a store made for the mark if the context has
 /// none, so that the dependency record of a partial answer counts the context as open.
 fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
+    if found.over {
+        out.dl().exhaust();
+        ds(st).store.interrupted = true;
+        return;
+    }
     for c in found.one {
         derive(ix, st, c, out);
+        let x = ds(st);
+        x.choices += 1;
+        if x.choices as usize >= PRODUCT_POLL {
+            x.choices = 0;
+            if !out.go_on() {
+                ds(st).store.interrupted = true;
+                return;
+            }
+        }
     }
     for (lists, base) in found.prods {
         let mut at = vec![0usize; lists.len()];
@@ -1147,6 +1168,15 @@ fn at_most(
     if cands.len() < k {
         return;
     }
+    // the subsets, with the fixed candidate when there is one, made one product each
+    let subsets = match must {
+        Some(_) => choose(cands.len() - 1, k - 1),
+        None => choose(cands.len(), k),
+    };
+    if subsets > AT_MOST_SUBSETS {
+        found.over = true;
+        return;
+    }
     // each subset of k candidates, with the fixed one when there is one
     let mut pick: Vec<usize> = (0..k).collect();
     loop {
@@ -1180,6 +1210,26 @@ fn at_most(
             }
         }
     }
+}
+
+/// The most subsets one application of the at-most rule makes before the run passes its
+/// bound on derived conclusions instead.
+const AT_MOST_SUBSETS: usize = 1 << 14;
+
+/// The number of k-element subsets of n, saturating.
+fn choose(n: usize, k: usize) -> usize {
+    if k > n {
+        return 0;
+    }
+    let k = k.min(n - k);
+    let mut c: usize = 1;
+    for i in 0..k {
+        c = match c.checked_mul(n - i) {
+            Some(x) => x / (i + 1),
+            None => return usize::MAX,
+        };
+    }
+    c
 }
 
 /// The rules of a new premise `prem` of `s(x, f(x))`: the universals over f, the at-most

@@ -1178,3 +1178,55 @@ fn a_functional_role_answers_as_a_maximum_of_one_on_every_class() {
     }
     assert!(compared > seeds / 2, "only {compared} cases were compared");
 }
+
+/// A run that either answers `a ⊑ b` or leaves an axiom out and says so.
+fn entailed_or_left_out(body: &str, a: &str, b: &str) {
+    let ax = axioms(body);
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(
+        out.taxonomy.is_subclass(&c(a), &c(b)) || !k.excluded().is_empty(),
+        "{a} ⊑ {b} is missing and no axiom is left out"
+    );
+}
+
+#[test]
+fn a_maximum_whose_dual_overflows_is_left_out() {
+    entailed_or_left_out(
+        &format!(
+            "SubClassOf(ObjectMaxCardinality(4294967295 :r) :D)
+             SubClassOf(:A ObjectMaxCardinality(0 :r))
+             SubClassOf(ObjectExactCardinality(4294967295 :s) :E) {UNION}"
+        ),
+        "A",
+        "D",
+    );
+}
+
+#[test]
+fn an_irreflexive_transitive_symmetric_role_has_no_edge() {
+    entailed_or_left_out(
+        &format!(
+            "TransitiveObjectProperty(:r) SymmetricObjectProperty(:r)
+             IrreflexiveObjectProperty(:r) SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+             SubClassOf(:D :Z) {UNION}"
+        ),
+        "A",
+        "D",
+    );
+}
+
+#[test]
+fn a_wide_maximum_passes_the_bound_instead_of_enumerating_its_subsets() {
+    let mut body = String::from("SubClassOf(:A :M) SubClassOf(:M ObjectMaxCardinality(20 :r))\n");
+    for i in 0..40 {
+        body.push_str(&format!("SubClassOf(:A ObjectSomeValuesFrom(:r :B{i}))\n"));
+    }
+    body.push_str(UNION);
+    let ax = axioms(&body);
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&Limits::default()).unwrap();
+    // the answer is sound: A is satisfiable
+    assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
+    assert!(out.stats.dl_over_budget || out.complete);
+}

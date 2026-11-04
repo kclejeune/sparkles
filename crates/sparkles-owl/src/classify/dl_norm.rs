@@ -101,6 +101,8 @@ struct Out {
     clauses: Vec<(Vec<Ex>, Vec<Ex>)>,
     atmost: Vec<(Ex, u32, Role, Ex)>,
     rdis: Vec<(Role, Role)>,
+    /// the irreflexive roles, which must be simple
+    irreflexive: Vec<Role>,
 }
 
 impl Out {
@@ -113,6 +115,7 @@ impl Out {
         self.clauses.extend(o.clauses);
         self.atmost.extend(o.atmost);
         self.rdis.extend(o.rdis);
+        self.irreflexive.extend(o.irreflexive);
     }
 }
 
@@ -485,7 +488,13 @@ impl Norm<'_> {
             }
             C::ObjectMaxCardinality(n, p, f) => {
                 // ≤n p.f ⊑ y is ⊤ ⊑ y ⊔ ≥(n+1) p.f, which without counting is ∃p.f
-                let m = self.pos(&C::ObjectMinCardinality(n + 1, p.clone(), f.clone()), d)?;
+                // without counting any minimum above zero reads as an existential restriction
+                let n1 = match n.checked_add(1) {
+                    Some(k) => k,
+                    None if self.counting => return Err("a cardinality too large"),
+                    None => *n,
+                };
+                let m = self.pos(&C::ObjectMinCardinality(n1, p.clone(), f.clone()), d)?;
                 self.global_or(m)?
             }
             C::ObjectExactCardinality(0, p, f) => {
@@ -495,7 +504,8 @@ impl Norm<'_> {
             C::ObjectExactCardinality(n, p, f) if self.counting => {
                 // =n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f ⊔ ≥(n+1) p.f
                 let lo = self.pos(&C::ObjectMaxCardinality(n - 1, p.clone(), f.clone()), d)?;
-                let hi = self.pos(&C::ObjectMinCardinality(n + 1, p.clone(), f.clone()), d)?;
+                let n1 = n.checked_add(1).ok_or("a cardinality too large")?;
+                let hi = self.pos(&C::ObjectMinCardinality(n1, p.clone(), f.clone()), d)?;
                 if lo == TOP || hi == TOP {
                     return Ok(BOTTOM);
                 }
@@ -725,9 +735,12 @@ impl Norm<'_> {
                 self.out.rdis.push((r, i));
             }
             // without self restrictions, reflexive properties or nominals, which Tier D
-            // leaves out, a model's tree unravelling has no loop on a simple property
+            // leaves out, a model's tree unravelling has no loop on a simple property; a
+            // transitive and symmetric one makes a loop of every edge, so the role box
+            // checks that the role is simple
             K::IrreflexiveObjectProperty(p) => {
-                self.role(p)?;
+                let r = self.role(p)?;
+                self.out.irreflexive.push(r);
             }
             _ => return Err("not a role axiom"),
         }
@@ -890,6 +903,7 @@ pub fn normalize(
             .rdis
             .iter()
             .any(|&(a, b)| !rb.simple(a) || !rb.simple(b))
+        || all.irreflexive.iter().any(|&r| !rb.simple(r))
     {
         return Ok(None);
     }
