@@ -1304,3 +1304,52 @@ describe('IRIs the SPARQL parser takes and refuses', () => {
     expect(labelsWanted([good], {})).toEqual([good]);
   });
 });
+
+describe('line and paragraph separators in an IRI', () => {
+  const OK = 'http://example.org/ok';
+  const SEPARATORS = [String.fromCodePoint(0x2028), String.fromCodePoint(0x2029)];
+  it.each(SEPARATORS)('finds a bad port whatever follows it, with %j', (sep) => {
+    for (const bad of [
+      `http://example.org:abc/a#b${sep}c`,
+      `http://example.org:abc/a${sep}b`,
+      `http://example.org:abc/a?b${sep}c`,
+    ]) {
+      expect(labelsWanted([bad, OK], {})).toEqual([OK]);
+    }
+  });
+  it.each(SEPARATORS)('finds a second fragment after %j', (sep) => {
+    expect(labelsWanted([`http://example.org/a#b${sep}c#d`, OK], {})).toEqual([OK]);
+  });
+  it.each(SEPARATORS)('keeps an IRI with %j in its path, query or fragment', (sep) => {
+    const good = [
+      `http://example.org/a${sep}b`,
+      `http://example.org/a?b${sep}c`,
+      `http://example.org/a#b${sep}c`,
+    ];
+    expect(labelsWanted(good, {})).toEqual(good);
+  });
+});
+
+describe('the time to check a long value from the data', () => {
+  // a quadratic check takes many seconds at this length and a linear one a few milliseconds
+  const n = 100_000;
+  const sep = String.fromCodePoint(0x2028);
+  it.each([
+    ['a long authority before a separator', `http://${'a'.repeat(n)}#b${sep}c`],
+    ['a long authority', `http://${'a'.repeat(n)}`],
+    ['many colons in an authority', `http://${'a:'.repeat(n)}/x`],
+    ['many at signs in an authority', `http://${'a@'.repeat(n)}/x`],
+    ['many fragments', `http://example.org/${'#'.repeat(n)}`],
+    ['a long scheme', `${'a'.repeat(n)}:b`],
+    ['a long value that ends badly', `http://example.org/${'a'.repeat(n)}>`],
+  ])(
+    'stays linear on %s',
+    (_, long) => {
+      const start = performance.now();
+      labelsWanted([long], {});
+      namesQuery([long], null);
+      expect(performance.now() - start).toBeLessThan(2000);
+    },
+    120_000,
+  );
+});

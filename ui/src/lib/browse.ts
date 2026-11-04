@@ -1596,13 +1596,21 @@ export function usageQuery(iri: string, graphs: readonly string[], offset: numbe
 }
 
 /** Whether a string is an absolute IRI by the IRIREF production of SPARQL. */
-const iriRef = (s: string) => /^[A-Za-z][A-Za-z0-9+.-]*:[^<>"{}|^`\\\x00-\x20]*$/.test(s);
+function iriRef(s: string): boolean {
+  const colon = s.indexOf(':');
+  return (
+    colon > 0 &&
+    /[A-Za-z]/.test(s[0]) &&
+    !/[^A-Za-z0-9+.-]/.test(s.slice(0, colon)) &&
+    !/[<>"{}|^`\\\x00-\x20]/.test(s)
+  );
+}
 
 /**
  * Whether a value from the data can stand as an IRI in a query as it is. The server's parser takes
  * an IRIREF and then checks it against RFC 3987, and a value that fails fails the whole query, so
  * this asks both. It can refuse a rare valid IRI, such as one with a bracketed host, which then
- * only goes without a label.
+ * only goes without a label. A value can be long, so every step here is a linear scan.
  */
 function queryableIri(s: string): boolean {
   if (!iriRef(s)) return false;
@@ -1613,12 +1621,22 @@ function queryableIri(s: string): boolean {
     )
   )
     return false;
-  if ([...s].some((c) => (c.codePointAt(0)! & 0xfffe) === 0xfffe)) return false;
-  if (/%(?![0-9A-Fa-f]{2})/.test(s) || /[[\]]/.test(s)) return false;
-  const [, authority = '', fragment = ''] =
-    /^[^:]*:(?:\/\/([^/?#]*))?[^#]*(?:#(.*))?$/.exec(s) ?? [];
-  // one fragment, then user info, a host and a port of digits
-  return !fragment.includes('#') && /^(?:[^@]*@)?[^@:]*(?::[0-9]*)?$/.test(authority);
+  for (const c of s) if ((c.codePointAt(0)! & 0xfffe) === 0xfffe) return false;
+  if (/%(?![0-9A-Fa-f]{2})/.test(s) || s.includes('[') || s.includes(']')) return false;
+  // one fragment at most
+  const hash = s.indexOf('#');
+  if (hash >= 0 && s.indexOf('#', hash + 1) >= 0) return false;
+  const start = s.indexOf(':') + 1;
+  if (!s.startsWith('//', start)) return true;
+  // the authority: one user info at most, a host and a port of digits
+  const tail = s.slice(start + 2);
+  const end = tail.search(/[/?#]/);
+  const authority = end < 0 ? tail : tail.slice(0, end);
+  const at = authority.indexOf('@');
+  if (at !== authority.lastIndexOf('@')) return false;
+  const host = authority.slice(at + 1);
+  const port = host.indexOf(':');
+  return port < 0 || !/[^0-9]/.test(host.slice(port + 1));
 }
 
 /**
