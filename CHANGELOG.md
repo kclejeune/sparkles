@@ -344,12 +344,12 @@ to 27 s to compile in a release build instead of 9 to 12 s on atlas, and a relea
 of the server takes the same time, since its dependents start from the crate's metadata.
 
 The EL classifier starts its helper threads once the first thread has worked for 0.5 ms,
-or at once for a run of 4,096 roots, and runs its parallel steps on one thread below
-4,096 items (roadmap item 709). Cold runs of 12 small ORE 2015 DL files take 0.74 of the
-time of the build before on four threads on forge and 0.68 on eight, with the same
-taxonomies. Warm runs of five of them take about 0.5 ms longer on eight threads, which
-roadmap item NEW-ITEM-1 follows, and ChEBI lite and `ore_ont_13482` classify 1.0 to 1.6%
-slower on one thread from code layout, item NEW-ITEM-3.
+or at once for a run of 4,096 roots, and runs the parallel steps of its normalization on
+one thread below 4,096 axioms (roadmap item 709). Cold runs of 12 small ORE 2015 DL
+files take 0.74 of the time of the build before on four threads on forge and 0.68 on
+eight, with the same taxonomies. Warm runs of five of them take about 0.5 ms longer on
+eight threads, which roadmap item NEW-ITEM-1 follows, and ChEBI lite and `ore_ont_13482`
+classify 1.0 to 1.6% slower on one thread from code layout, item NEW-ITEM-3.
 
 A congested EL saturation drops the subsumptions and backward links it delivers to a
 context that already holds them (roadmap item 695). The peak resident set of

@@ -611,7 +611,8 @@ Item 709 measured the 12 small files on the benchmark host. A cold run of the sm
 of them on four threads spent most of its time starting helper threads that a saturation
 of a few milliseconds does not need. The saturation now starts them once its first
 thread has worked for 0.5 ms, or at once for 4,096 roots, and the parallel steps of the
-normalization and the taxonomy run on one thread below 4,096 items. Cold runs of the 12 files take 0.74 of the
+normalization run on one thread below 4,096 axioms, while those of the taxonomy keep
+chunks of 1,024 classes. Cold runs of the 12 files take 0.74 of the
 time of the build before on four threads and 0.68 on eight, and a whole cold process of
 each on four threads takes 1.9 to 21.8 ms, under Konclude's times on the laptop. The
 item's estimates had come from the laptop while other work ran on it. Warm runs of five of

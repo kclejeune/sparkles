@@ -641,12 +641,14 @@ A classification on several threads starts its helper threads only once it needs
 The calling thread runs the saturation first. The others start at once when the run has
 4,096 roots or more, and otherwise once the first thread has worked for 0.5 ms, so that a
 saturation shorter than the threads' start runs on one thread. The parallel steps of the
-normalization and the taxonomy split their input into chunks of at least 4,096 items,
-against 1,024 before, so a small ontology's index stage runs as one chunk. Before these
+normalization split the axioms into chunks of at least 4,096, against 1,024 before, so a
+small ontology's index stage runs on one thread. The steps of the taxonomy keep chunks of
+at least 1,024 classes, since a class costs more than an axiom. Before these
 changes a cold run of `ore_ont_6855` on four threads spent 1.2 of its 1.4 ms in a
 saturation that takes 0.1 ms on one thread.
 
-An A/B on forge ran the base, commit ddfd453a, and the lane, commit 6b4c8e87, on the 12
+An A/B on forge ran the base, commit ddfd453a, and the lane, commit 6b4c8e87, whose
+taxonomy also took chunks of 4,096, on the 12
 small ORE 2015 DL files of roadmap item 709 in seven rounds of rotating order, one thread
 pinned to CPU 4 and four and eight threads pinned to the performance cores 0 to 11. Each
 round ran one process with one classification, whose time is the cold one, and one with
@@ -674,7 +676,9 @@ takes 0.86 of the base's time on four and eight threads. On one thread the times
 base's within 0.1 ms. Five files whose saturation takes 1.8 to 4 ms on one thread became
 0.4 to 0.6 ms slower in warm runs on eight threads, since their helper threads start 0.5 ms later, and
 roadmap item NEW-ITEM-1 follows them. On four threads the warm runs take 0.86 of the
-base's time.
+base's time. Seven more rounds of the base, commit 6b4c8e87 and the final commit
+47c13a51 gave the cold runs of 47c13a51 0.73 of the base's time on four threads and 0.67
+on eight, against 0.76 and 0.66 for 6b4c8e87 in the same rounds.
 
 A whole cold process of the lane on four threads takes less time on forge than Konclude
 0.7.0 took on the same file on the laptop in the comparison of item 709, from 1.9 ms for
@@ -704,6 +708,15 @@ one-thread worker leaves out the lazy start's check left them 0.9 and 1.4% slowe
 made `ore_ont_3836` 0.5% slower, so the difference comes from code layout, and roadmap
 item NEW-ITEM-3 follows it. [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md)
 records that build.
+
+A screen of the 161 development files under 20 MB on a Namespace instance, three rounds
+on eight threads, flagged files of 7,000 to 40,000 classes, and five rounds of six of
+them on forge on four and eight threads found one difference beyond the spread of the
+rounds. With chunks of 4,096 classes the taxonomy of `ore_ont_9151`, which has 16,448
+classes, took 5.5 ms on eight threads against 2.9 ms, and the whole classification 32.2
+against 30.0 ms. Commit 47c13a51 took 2.9 and 29.8 ms, which is why the taxonomy keeps
+chunks of 1,024 classes. `ore_ont_16680`, the longest of the six, takes 2.6 s on eight
+threads on every build.
 
 <a id="saturation-memory"></a>
 
@@ -741,10 +754,11 @@ messages measured no better and are in
 
 ## Records
 
-The [small files and memory record](runs/2026-11-04-el-small-files-forge-6b4c8e87/record.json)
+The [small files and memory record](runs/2026-11-04-el-small-files-forge-47c13a51/record.json)
 holds every cold and warm time of the 12 small files on one, four and eight threads, the
 rounds on GO, ChEBI lite, `ore_ont_3836` and `ore_ont_13482` with their taxonomy hashes,
-the run with the experimental one-thread worker, the runs of `ore_ont_8737` on `atlas`, the
+the run with the experimental one-thread worker, the rounds of six larger development
+files and of the final commit, the runs of `ore_ont_8737` on `atlas`, the
 taxonomy hashes of the identity sweep of 502 files on `atlas` and the scripts that ran.
 
 The [code layout record](runs/2026-11-04-el-layout-forge-f93ad3cb/record.json) holds every
