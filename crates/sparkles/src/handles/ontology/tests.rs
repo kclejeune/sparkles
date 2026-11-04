@@ -2286,30 +2286,26 @@ mod classification {
 
     #[test]
     fn a_cancellation_stops_a_classification_waiting_for_threads() {
-        // every slot of the algorithm pool is taken, so the classification waits for one,
-        // and a cancellation source beside the options' flag, as the bindings give a
-        // partial classification, ends the wait
+        // Every slot of the algorithm pool is taken, so admission waits for one. A
+        // cancellation source beside the options' flag, as the bindings give a partial
+        // classification, is set before the call, so only admission can see it, and it
+        // ends the wait at once instead of blocking until a slot frees.
         use sparkles_core::algo::{Control, pool};
         let held: Vec<pool::Par> = (0..pool::capacity())
             .map(|_| pool::Par::acquire(1, &Control::unlimited()).unwrap())
             .collect();
-        let ds = dataset(ONTO);
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let o = QueryOptions {
             cancel: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
-            cancellation: Some(crate::task::Cancellation::from_flags([flag.clone()])),
+            cancellation: Some(crate::task::Cancellation::from_flags([Arc::new(
+                std::sync::atomic::AtomicBool::new(true),
+            )])),
             ..opts()
         };
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let r = ds
-                .ontology()
-                .classify(&OntologyRequest::default(), &partial_request(), &o);
-            let _ = tx.send(r.err());
+            let _ = tx.send(classify::admit(1, &o).err());
         });
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        let r = rx.recv_timeout(std::time::Duration::from_secs(20));
+        let r = rx.recv_timeout(std::time::Duration::from_secs(10));
         drop(held);
         assert!(
             matches!(r, Ok(Some(Error::Cancelled))),
