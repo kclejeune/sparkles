@@ -50,7 +50,10 @@ uni:editorialNote a owl:AnnotationProperty ; rdfs:label "editorial note"@en ; rd
 
 uni:Agent a owl:Class ; rdfs:label "Agent"@en .
 uni:Person a owl:Class ; rdfs:subClassOf uni:Agent ; rdfs:label "Person"@en , "Personne"@fr ;
-  skos:definition "A human being who takes part in university life."@en .
+  skos:definition "A human being who takes part in university life."@en ,
+    "Un être humain qui prend part à la vie universitaire."@fr ;
+  rdfs:comment "Staff and students are both persons."@en ;
+  skos:scopeNote "Use for people in any role; prefer Student or Employee when the role is known."@en .
 uni:Student a owl:Class ; rdfs:subClassOf uni:Person ; rdfs:label "Student"@en , "Étudiant"@fr .
 uni:GraduateStudent a owl:Class ; rdfs:subClassOf uni:Student ; rdfs:label "Graduate student"@en .
 uni:Employee a owl:Class ; rdfs:subClassOf uni:Person ; rdfs:label "Employee"@en .

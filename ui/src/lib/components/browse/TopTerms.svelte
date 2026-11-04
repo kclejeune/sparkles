@@ -110,7 +110,6 @@
   p {
     color: var(--text-2);
     margin-top: 4px;
-    max-width: 72ch;
   }
   .foot {
     margin-top: var(--sp-3);

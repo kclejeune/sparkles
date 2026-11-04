@@ -37,6 +37,7 @@
   import BackupsPanel from '$components/BackupsPanel.svelte';
   import BranchesPanel from '$components/BranchesPanel.svelte';
   import CommunitiesPanel from '$components/CommunitiesPanel.svelte';
+  import StatChips from '$components/StatChips.svelte';
   import CloneDialog from '$components/CloneDialog.svelte';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
   import DatasetSettingsTab from '$components/DatasetSettingsTab.svelte';
@@ -871,38 +872,39 @@ ex:PersonShape a sh:NodeShape ;
       />
     </div>
   {:else if stats}
-    <!-- headline numbers -->
-    <dl class="figures">
-      <div>
-        <dt>Quads</dt>
-        <dd>{fmtInt(stats.quads)}</dd>
-      </div>
-      <div>
-        <dt>Terms</dt>
-        <dd>{fmtInt(stats.terms)}</dd>
-      </div>
-      <div>
-        <dt>Graphs</dt>
-        <dd>{fmtInt(stats.graphs.length)}</dd>
-      </div>
-      <div>
-        <dt>Predicates</dt>
-        <dd>{fmtInt(stats.predicates.length)}{stats.predicates.length >= 100 ? '+' : ''}</dd>
-      </div>
-      <div>
-        <dt>Classes</dt>
-        <dd>{fmtInt(stats.classes.length)}{stats.classes.length >= 100 ? '+' : ''}</dd>
-      </div>
-      <div>
-        <dt>On disk</dt>
-        <dd>
-          {info?.type === 'mem'
-            ? 'in memory'
-            : fmtBytes(stats.diskBytes)}{#if stats.quota?.maxBytes}
-            of {fmtBytes(stats.quota.maxBytes)}{/if}
-        </dd>
-      </div>
-    </dl>
+    <!-- headline numbers, as the chips of the Browse pages -->
+    <div class="ov-chips">
+      <StatChips
+        items={[
+          { key: 'quads', value: fmtInt(stats.quads), label: stats.quads === 1 ? 'quad' : 'quads' },
+          { key: 'terms', value: fmtInt(stats.terms), label: stats.terms === 1 ? 'term' : 'terms' },
+          {
+            key: 'graphs',
+            value: fmtInt(stats.graphs.length),
+            label: stats.graphs.length === 1 ? 'graph' : 'graphs',
+          },
+          {
+            key: 'predicates',
+            value: fmtInt(stats.predicates.length) + (stats.predicates.length >= 100 ? '+' : ''),
+            label: stats.predicates.length === 1 ? 'predicate' : 'predicates',
+          },
+          {
+            key: 'classes',
+            value: fmtInt(stats.classes.length) + (stats.classes.length >= 100 ? '+' : ''),
+            label: stats.classes.length === 1 ? 'class' : 'classes',
+          },
+          info?.type === 'mem'
+            ? { key: 'disk', value: 'In memory', label: '' }
+            : {
+                key: 'disk',
+                value: fmtBytes(stats.diskBytes),
+                label: stats.quota?.maxBytes
+                  ? `of ${fmtBytes(stats.quota.maxBytes)} on disk`
+                  : 'on disk',
+              },
+        ]}
+      />
+    </div>
 
     <div class="cols">
       <div class="col">
@@ -1734,17 +1736,6 @@ ex:PersonShape a sh:NodeShape ;
   }
   a.btn {
     text-decoration: none;
-  }
-  dt {
-    font-size: var(--fs-sm);
-    color: var(--text-2);
-  }
-  dd {
-    margin: 2px 0 0;
-    font-size: 20px;
-    font-weight: 600;
-    letter-spacing: -0.02em;
-    font-variant-numeric: tabular-nums;
   }
   .cols {
     display: grid;

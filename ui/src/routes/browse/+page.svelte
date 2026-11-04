@@ -73,6 +73,7 @@
     downloadHref,
     editHref,
     editorKindOf,
+    logicalDefinitionOf,
     fetchHierarchy,
     fetchTerm,
     headGraphsQuery,
@@ -117,6 +118,8 @@
   import TermLabels from '$components/browse/TermLabels.svelte';
   import AxiomProse from '$components/browse/AxiomProse.svelte';
   import TermAxioms from '$components/browse/TermAxioms.svelte';
+  import StatChips from '$components/StatChips.svelte';
+  import LeadBlock from '$components/browse/LeadBlock.svelte';
   import TermNotes from '$components/browse/TermNotes.svelte';
   import TermReuse from '$components/browse/TermReuse.svelte';
   import TermSynonyms from '$components/browse/TermSynonyms.svelte';
@@ -303,14 +306,10 @@
 
   const sections = $derived(term ? termSections(term, langs) : null);
   const groups = $derived(term ? axiomGroups(term.iri, term.kinds, term.axioms) : []);
-  /** A class's EquivalentTo axioms, the OBO genus and differentia, which the Definition card
-   * also shows as its logical definition; the Axioms card holds every axiom. */
+  /** A class's EquivalentTo class expressions, the OBO genus and differentia, which the
+   * Definition card also shows as its logical definition; the Axioms card holds every axiom. */
   const logicalDefinition = $derived(
-    term && editorKindOf(term.kinds) === 'Class'
-      ? groups
-          .filter((g) => g.id === 'equivalent')
-          .flatMap((g) => g.items.flatMap((it) => it.values))
-      : [],
+    term && editorKindOf(term.kinds) === 'Class' ? logicalDefinitionOf(groups) : [],
   );
   const mentions = $derived(term ? mentionGroups(term.iri, term.mentions.axioms) : []);
   const title = $derived(term ? (term.label ?? term.shortForm ?? iriName(term.iri, prefixes)) : '');
@@ -1306,24 +1305,18 @@
           {/if}
         </div>
 
-        <!-- a stat strip, then the term's cards in two columns that balance their heights;
-             one column below a large screen (ROADMAP item 633) -->
-        <dl class="figures b-strip" aria-label="Counts" style:--n={termCounts.length}>
-          {#each termCounts as c (c.key)}
-            <div>
-              <dt><a href={c.href}>{c.label}</a></dt>
-              <dd>{c.loading ? '…' : fmtInt(c.n)}</dd>
-            </div>
-          {/each}
-        </dl>
-        <!-- the counts as one row of chips under the header, each a link to its section -->
-        <nav class="b-chips" aria-label="Counts">
-          {#each termCounts as c (c.key)}
-            <a class="chip" href={c.href}
-              >{c.loading ? '…' : fmtInt(c.n)} {c.n === 1 ? c.one : c.many}</a
-            >
-          {/each}
-        </nav>
+        <!-- the counts as one row of chips under the header, each a link to its section, then
+             the term's cards in two columns that balance their heights (ROADMAP item 633) -->
+        <div class="b-chips">
+          <StatChips
+            items={termCounts.map((c) => ({
+              key: c.key,
+              value: c.loading ? '…' : fmtInt(c.n),
+              label: c.n === 1 ? c.one : c.many,
+              href: c.href,
+            }))}
+          />
+        </div>
         {#if view === 'graph' && piece && !treeKind}
           <div class="b-graph">
             <TermGraph
@@ -1340,17 +1333,12 @@
             <section class="panel b-def" aria-labelledby="def-h">
               <div class="panel-head"><h2 id="def-h">Definition</h2></div>
               <div class="panel-body ruled">
-                {#if sections.definition}<p class="lede">
-                    {#if sections.definitionKind}<span class="badge lede-kind"
-                        >{sections.definitionKind}</span
-                      >{/if}{valueText(
-                      sections.definition.value,
-                    )}{#if sections.definition.sources.length}<span class="faint small lede-src">
-                        {sections.definition.sources.join(', ')}</span
-                      >{/if}
-                  </p>{:else if !editing}<p class="lede none">
-                    No definition in this ontology.
-                  </p>{/if}
+                {#if sections.lead.first}<LeadBlock
+                    lead={sections.lead}
+                    {linker}
+                    {langs}
+                    {curieIri}
+                  />{:else if !editing}<p class="lede none">No definition in this ontology.</p>{/if}
                 {#if editing}
                   {#if !isSkos && editorKind}
                     <SynonymEditor
@@ -1481,20 +1469,7 @@
                     </section>
                   {/if}
                   <TermSynonyms synonyms={sections.synonyms} {linker} />
-                  <TermNotes
-                    notes={sections.otherDefinitions.length
-                      ? [
-                          {
-                            kind: 'Definition in other languages',
-                            values: sections.otherDefinitions,
-                          },
-                          ...sections.notes,
-                        ]
-                      : sections.notes}
-                    {linker}
-                    {langs}
-                    {curieIri}
-                  />
+                  <TermNotes notes={sections.notes} {linker} {langs} {curieIri} />
                   <TermLabels labels={sections.labels} />
                   {#if sections.related.length}
                     <section class="term-sec" aria-labelledby="rel-h">
@@ -1959,9 +1934,6 @@
   .b-side {
     display: contents;
   }
-  .b-strip {
-    order: 1;
-  }
   .b-def,
   .b-graph {
     order: 2;
@@ -1991,49 +1963,16 @@
   .b-dl {
     order: 7;
   }
-  /* the tiles share the row whatever their number, so no cell stands empty */
-  .b-strip {
-    grid-template-columns: repeat(var(--n, 5), minmax(0, 1fr));
-  }
-  .b-strip {
-    display: none;
-  }
   .b-chips {
-    display: flex;
     order: 1;
-    flex-wrap: wrap;
-    gap: 6px;
+    min-width: 0;
     margin-top: calc(-1 * var(--sp-2));
-  }
-  .b-chips .chip {
-    display: inline-flex;
-    align-items: center;
-    height: 28px;
-    padding: 0 10px;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    background: var(--surface);
-    color: var(--text-2);
-    font-size: var(--fs-sm);
-    text-decoration: none;
-    font-variant-numeric: tabular-nums;
-  }
-  .b-chips .chip:hover {
-    color: var(--text);
-    border-color: var(--border-strong);
   }
   /* on a phone the definition's lead sits close under its heading */
   @container browse (max-width: 639px) {
     .b-def :global(.panel-body) {
       padding-top: var(--sp-3);
     }
-  }
-  .b-strip dt a {
-    color: inherit;
-    text-decoration: none;
-  }
-  .b-strip dt a:hover {
-    text-decoration: underline;
   }
   /* a card's sections, split by rules as in the Workbench's details panel */
   .ruled {
@@ -2050,7 +1989,8 @@
     border-top: 1px solid var(--border);
   }
   .ruled > :global(section:first-child),
-  .ruled > :global(.lede + section) {
+  .ruled > :global(.lead + section),
+  .ruled > .lede + :global(section) {
     border-top: 0;
   }
   .ruled > :global(section:first-child) {
@@ -2065,22 +2005,24 @@
     color: var(--text-2);
     margin-bottom: var(--sp-2);
   }
-  /* the definition's sources follow it after a gap, whatever whitespace the markup keeps */
-  .lede-src {
-    margin-left: var(--sp-2);
-  }
-  .lede-kind {
-    margin-right: var(--sp-2);
-    vertical-align: 2px;
+  .ruled > :global(.lead) {
+    margin-bottom: var(--sp-3);
   }
   .ruled > .lede.none {
+    margin: 0 0 var(--sp-3);
     color: var(--text-3, var(--text-2));
     font-size: var(--fs-md);
   }
-  .ruled > .lede {
-    margin: 0 0 var(--sp-3);
-    font-size: 15px;
-    line-height: 1.6;
+  /* one wide column at a medium size: the cards' text runs to their edges, so their padding
+     opens a little to keep the measure in hand */
+  @container browse (min-width: 640px) and (max-width: 1099px) {
+    .browse :global(.panel-head),
+    .browse :global(.panel-body),
+    .browse .tree-body,
+    .browse .tree-edit:not(:empty) {
+      padding-left: var(--sp-5);
+      padding-right: var(--sp-5);
+    }
   }
   /* two columns on a large screen: the term's own cards on the left and Metadata and Download
      on the right, with References or Download moving to the shorter column (balance.ts) */
@@ -2093,9 +2035,6 @@
     }
     .b-head {
       grid-area: head;
-    }
-    .b-strip {
-      grid-area: strip;
     }
     .b-chips {
       grid-area: chips;

@@ -50,7 +50,6 @@
 
 <style>
   .note {
-    max-width: 72ch;
     color: var(--text-2);
     line-height: 1.55;
     border-left: 2px solid var(--border-strong);

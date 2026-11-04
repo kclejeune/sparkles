@@ -58,7 +58,7 @@ test('an entity page shows its axioms as linked prose, its usage and its facts',
   // with no definition, the comment leads the Definition card, marked as a comment
   const lede = page.locator('.lede');
   await expect(lede).toContainText('An academic who leads research');
-  await expect(lede.locator('.lede-kind')).toHaveText('Comment');
+  await expect(lede.locator('.lead-chip')).toHaveText('Comment');
   await expect(page.getByRole('region', { name: 'Comment' })).toHaveCount(0);
   // the frame in Manchester syntax: asserted clauses, then what the classification infers
   const logic = page.getByRole('region', { name: 'Axioms' });
@@ -98,6 +98,18 @@ test('an entity page shows its axioms as linked prose, its usage and its facts',
 test('a definition leads the page and a mention names its restriction', async ({ page }) => {
   await openTerm(page, 'Person');
   await expect(page.locator('.lede')).toContainText('A human being');
+  // the lead block holds the comment and the scope note with their chips, and folds French
+  const lead = page.locator('.lead');
+  await expect(lead.locator('.lede .lead-chip')).toHaveText('SKOS definition');
+  await expect(lead.locator('.more').first()).toContainText('Staff and students');
+  await expect(lead.locator(':scope > .more .lead-chip')).toHaveText(['Comment', 'Scope note']);
+  const fr = lead.locator('details.fold');
+  await expect(fr.locator('summary')).toContainText('In 1 other language');
+  await expect(fr.locator('.more')).toBeHidden();
+  await fr.locator('summary').click();
+  await expect(fr.locator('.more')).toContainText('Un être humain');
+  await expect(fr.locator('.lang-tag')).toHaveText('fr');
+  await expect(page.getByRole('region', { name: 'Comment' })).toHaveCount(0);
   await openTerm(page, 'Course');
   const usage = page.getByRole('region', { name: /What links here/ });
   await expect(usage.getByRole('heading', { name: /teaches some Course/ })).toBeVisible();

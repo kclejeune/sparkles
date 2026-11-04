@@ -275,6 +275,39 @@ export function editHref(
 export const LABEL_PROPS = [RDFS + 'label', SKOS + 'prefLabel'];
 export const DEFINITION_PROPS = [OBO + 'IAO_0000115', SKOS + 'definition'];
 
+/**
+ * The properties of a page's lead block, in priority order, with the chip of each: the
+ * definitions, then descriptions, comments and scope notes. Every value of them shows in the
+ * block, and the best leads.
+ */
+export const LEAD_KINDS: [string, string][] = [
+  [OBO + 'IAO_0000115', 'OBO definition'],
+  [SKOS + 'definition', 'SKOS definition'],
+  [DCT + 'description', 'Description'],
+  [DC + 'description', 'Description'],
+  [RDFS + 'comment', 'Comment'],
+  [SKOS + 'scopeNote', 'Scope note'],
+];
+
+/** The chips of a lead entry: the kind of each property that states its text, in order. */
+export function leadChips(v: Pick<Sourced, 'properties'>): string[] {
+  return [...new Set(LEAD_KINDS.filter(([p]) => v.properties.includes(p)).map(([, k]) => k))];
+}
+
+/** How many entries in the reader's languages the lead block shows before "N more". */
+export const LEAD_SHOWN = 3;
+
+/**
+ * The lead block of a page: the entry that leads, the others in the reader's languages in
+ * priority order, and the translations of each kind, which fold. A value states its
+ * language and the chips of every property that states its text.
+ */
+export type Lead = {
+  first: (Sourced & { chips: string[] }) | null;
+  more: (Sourced & { chips: string[] })[];
+  translations: { kind: string; values: (Sourced & { chips: string[] })[] }[];
+};
+
 /** Synonym properties, in display order, with their kind. */
 export const SYNONYM_KINDS: [string, string][] = [
   [OIO + 'hasExactSynonym', 'Exact'],
@@ -286,29 +319,13 @@ export const SYNONYM_KINDS: [string, string][] = [
   [SKOS + 'hiddenLabel', 'Hidden'],
 ];
 
+/** The notes after the lead block. A note leads the block only when nothing else does. */
 export const NOTE_KINDS: [string, string][] = [
-  [RDFS + 'comment', 'Comment'],
-  [SKOS + 'scopeNote', 'Scope note'],
   [SKOS + 'note', 'Note'],
   [SKOS + 'example', 'Example'],
   [SKOS + 'historyNote', 'History note'],
   [SKOS + 'editorialNote', 'Editorial note'],
   [SKOS + 'changeNote', 'Change note'],
-  [DCT + 'description', 'Description'],
-  [DC + 'description', 'Description'],
-];
-
-/**
- * The properties a page's lead falls back on when the entity has no definition, in order:
- * a description, a comment, a scope note and a note. The first that holds a value gives the
- * lead, in the caller's best language.
- */
-export const LEAD_FALLBACKS: [string, string][] = [
-  [DCT + 'description', 'Description'],
-  [DC + 'description', 'Description'],
-  [RDFS + 'comment', 'Comment'],
-  [SKOS + 'scopeNote', 'Scope note'],
-  [SKOS + 'note', 'Note'],
 ];
 
 export const MAPPING_KINDS: [string, string][] = [
@@ -348,6 +365,7 @@ const SHOWN = new Set([
   OWL + 'deprecated',
   ...LABEL_PROPS,
   ...DEFINITION_PROPS,
+  ...LEAD_KINDS.map(([p]) => p),
   ...SYNONYM_KINDS.map(([p]) => p),
   ...NOTE_KINDS.map(([p]) => p),
   ...MAPPING_KINDS.map(([p]) => p),
@@ -370,7 +388,14 @@ export const isLiteral = (v: Value): v is Lit => typeof v === 'object' && v !== 
 export const valueText = (v: Value) => (isLiteral(v) ? v['@value'] : v);
 
 /** A value with the sources its annotations name (`oboInOwl:hasDbXref` or `dc:source`). */
-export type Sourced = { value: Value; lang: string | null; sources: string[]; property: string };
+export type Sourced = {
+  value: Value;
+  lang: string | null;
+  sources: string[];
+  property: string;
+  /** every property that states this text, when several do */
+  properties: string[];
+};
 
 const SOURCE_PROPS = new Set([OIO + 'hasDbXref', DC + 'source', DCT + 'source', OIO + 'source']);
 
@@ -378,6 +403,7 @@ function sourced(s: Statement): Sourced {
   return {
     value: s.value,
     property: s.property,
+    properties: [s.property],
     lang: isLiteral(s.value) ? (s.value['@language'] ?? null) : null,
     sources: s.annotations
       .filter((a) => SOURCE_PROPS.has(a.property))
@@ -403,13 +429,10 @@ const byLang = (langs: readonly string[]) => (a: Sourced, b: Sourced) =>
   valueText(a.value).localeCompare(valueText(b.value));
 
 export type Sections = {
-  /** the definition in the best language, with its sources, or else the first value of
-   * `LEAD_FALLBACKS`, which the notes then leave out */
+  /** the value that leads the page: the best of the lead block, or else a note */
   definition: Sourced | null;
-  /** the kind of note the lead is, when it is not a definition */
-  definitionKind: string | null;
-  /** the definitions in the other languages */
-  otherDefinitions: Sourced[];
+  /** every definition, description, comment and scope note, as the Definition card shows them */
+  lead: Lead;
   synonyms: { kind: string; values: Sourced[] }[];
   notes: { kind: string; values: Sourced[] }[];
   /** preferred, alternative and hidden labels by language, for SKOS resources */
@@ -430,8 +453,11 @@ function uniqueSourced(list: Sourced[]): Sourced[] {
   for (const v of list) {
     const k = `${isLiteral(v.value) ? 'l' : 'i'}\u0000${valueText(v.value)}\u0000${v.lang ?? ''}`;
     const was = by.get(k);
-    if (!was) by.set(k, { ...v, sources: [...v.sources] });
-    else for (const src of v.sources) if (!was.sources.includes(src)) was.sources.push(src);
+    if (!was) by.set(k, { ...v, sources: [...v.sources], properties: [...v.properties] });
+    else {
+      for (const src of v.sources) if (!was.sources.includes(src)) was.sources.push(src);
+      for (const p of v.properties) if (!was.properties.includes(p)) was.properties.push(p);
+    }
   }
   return [...by.values()];
 }
@@ -469,6 +495,45 @@ const XL_PLAIN: Record<string, string> = {
 };
 
 /**
+ * The lead block of `stmts` in the reader's languages `langs`. Each text comes once with the
+ * chips of every property that states it. Entries in the reader's languages, or with none,
+ * show in priority order and the first leads. When none is, the best translation leads, and
+ * the other translations fold by kind.
+ */
+export function leadOf(stmts: Statement[], langs: readonly string[]): Lead {
+  const rank = new Map(LEAD_KINDS.map(([p], i) => [p, i]));
+  const prio = (v: Sourced) => Math.min(...v.properties.map((p) => rank.get(p) ?? 99));
+  const all = uniqueSourced(stmts.filter((s) => rank.has(s.property)).map(sourced))
+    .map((v) => ({ ...v, chips: leadChips(v) }))
+    .sort(
+      (a, b) =>
+        prio(a) - prio(b) ||
+        langRank(a.lang, langs) - langRank(b.lang, langs) ||
+        valueText(a.value).localeCompare(valueText(b.value)),
+    );
+  const own = (v: Sourced) => langRank(v.lang, langs) <= langs.length;
+  const mine = all.filter(own);
+  let rest = all.filter((v) => !own(v));
+  let first = mine[0] ?? null;
+  if (!first && rest.length) {
+    first = [...rest].sort(
+      (a, b) => langRank(a.lang, langs) - langRank(b.lang, langs) || prio(a) - prio(b),
+    )[0];
+    rest = rest.filter((v) => v !== first);
+  }
+  const translations: Lead['translations'] = [];
+  for (const v of rest) {
+    const kind = v.chips[0];
+    let g = translations.find((t) => t.kind === kind);
+    if (!g) translations.push((g = { kind, values: [] }));
+    g.values.push(v);
+  }
+  for (const g of translations)
+    g.values.sort((a, b) => langRank(a.lang, langs) - langRank(b.lang, langs));
+  return { first, more: mine.slice(1), translations };
+}
+
+/**
  * Sort a page's statements into its sections, in the caller's languages. A value that
  * several graphs state comes once, and the literal forms of SKOS-XL labels count as the
  * plain SKOS labels they stand for.
@@ -485,15 +550,7 @@ export function termSections(
         : [],
     ),
   ];
-  // in the best language first, and there the OBO definition before the SKOS one
-  const defs = uniqueSourced(
-    stmts.filter((s) => DEFINITION_PROPS.includes(s.property)).map(sourced),
-  ).sort(
-    (a, b) =>
-      langRank(a.lang, langs) - langRank(b.lang, langs) ||
-      DEFINITION_PROPS.indexOf(a.property) - DEFINITION_PROPS.indexOf(b.property) ||
-      valueText(a.value).localeCompare(valueText(b.value)),
-  );
+  const lead = leadOf(stmts, langs);
   const labelRows = new Map<
     string,
     { preferred: string[]; alternative: string[]; hidden: string[] }
@@ -552,29 +609,19 @@ export function termSections(
         property: s.property,
         value: s.value,
       });
-  // without a definition the lead is the first description, comment or note, once
-  let lead = defs[0] ?? null;
-  let leadKind: string | null = null;
+  // with nothing in the lead block a note leads it, and leaves the notes
   let notes = groupsOf(NOTE_KINDS, stmts, langs);
-  if (!lead)
-    for (const [p, kind] of LEAD_FALLBACKS) {
-      const vs = uniqueSourced(stmts.filter((s) => s.property === p).map(sourced)).sort(
-        byLang(langs),
-      );
-      if (!vs.length) continue;
-      lead = vs[0];
-      leadKind = kind;
-      const same = (v: Sourced) =>
-        valueText(v.value) === valueText(lead!.value) && v.lang === lead!.lang;
-      notes = notes
-        .map((g) => (g.kind === kind ? { ...g, values: g.values.filter((v) => !same(v)) } : g))
-        .filter((g) => g.values.length > 0);
-      break;
-    }
+  const note = notes.find((g) => g.kind === 'Note');
+  if (!lead.first && note) {
+    const [first, ...rest] = note.values;
+    lead.first = { ...first, chips: ['Note'] };
+    notes = notes
+      .map((g) => (g === note ? { ...g, values: rest } : g))
+      .filter((g) => g.values.length > 0);
+  }
   return {
-    definition: lead,
-    definitionKind: leadKind,
-    otherDefinitions: defs.slice(1),
+    definition: lead.first,
+    lead,
     synonyms: groupsOf(SYNONYM_KINDS, stmts, langs),
     notes,
     labels,
@@ -907,6 +954,18 @@ export async function classifyAbout(
     if (e instanceof ApiError && e.status === 404) return null;
     throw e;
   }
+}
+
+/**
+ * The class expressions a class is equivalent to, its logical definition: intersections,
+ * unions, restrictions, enumerations and complements. An equivalence to one named class is an
+ * alias, which only the Axioms card shows.
+ */
+export function logicalDefinitionOf(groups: AxiomGroup[]): unknown[] {
+  return groups
+    .filter((g) => g.id === 'equivalent')
+    .flatMap((g) => g.items.flatMap((it) => it.values))
+    .filter((v) => typeof v === 'object' && v !== null);
 }
 
 /** "SubClass Of" as "Subclass of". */

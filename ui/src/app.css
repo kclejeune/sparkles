@@ -735,6 +735,54 @@ label.field {
   overflow-wrap: anywhere;
 }
 
+/* Headline counts as a row of chips (StatChips.svelte): each its figure in the text colour and
+   what it counts in the secondary one, 32px tall, linking to the section it counts when it
+   has one. On a phone the chips tighten so that a page's five or six counts take two lines. */
+.stat-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+.stat-chips > li {
+  display: contents;
+}
+.stat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  text-decoration: none;
+  font-variant-numeric: tabular-nums;
+}
+.stat-chip b {
+  color: var(--text);
+  font-weight: 600;
+}
+a.stat-chip:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+@media (max-width: 639px) {
+  .stat-chips {
+    gap: 4px;
+  }
+  .stat-chip {
+    height: 28px;
+    padding: 0 9px;
+  }
+}
+
 /* A workspace page's tools (Query, Explore): one row at --gutter, its groups split by
    .toolbar-sep, and the .toolbar-end group with the primary action at the far end. Where the
    row does not fit, the end group takes a row of its own under the rest, flush right, so the
