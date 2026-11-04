@@ -600,8 +600,10 @@ test('a chip stays with the last word of its text at any width', async ({ page }
     await expect(page.locator('.lede .pred')).toBeVisible({ timeout: 30_000 });
     for (const s of await page.locator('details[data-more] > summary').all()) await s.click();
     const orphans = await page.evaluate(() =>
-      [...document.querySelectorAll('.lead .pred:first-of-type')].flatMap((chip) => {
+      [...document.querySelectorAll('.lead .pred')].flatMap((chip) => {
         const before = chip.previousElementSibling;
+        // a second chip of the same text follows the first
+        if (before?.classList.contains('pred')) return [];
         if (!before) return [chip.textContent];
         const range = document.createRange();
         range.selectNodeContents(before);
