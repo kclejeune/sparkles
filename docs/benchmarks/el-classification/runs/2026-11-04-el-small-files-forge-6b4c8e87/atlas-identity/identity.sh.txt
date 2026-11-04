@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# identity.sh BASE LANE OUTDIR: the base and lane el_classify (~/lanes/el-cost/bin/NAME) write
+# the same taxonomy for the 298 ORE 2015 EL files, GO, ChEBI lite and the 202 development
+# files of dev-names.txt, at one and at eight threads. Writes OUTDIR/sums.tN.tsv (file, base
+# sha, lane sha, tier) and ends OUTDIR/log.txt with IDENTITY-DONE. Holds the heavy lock.
+set -uo pipefail
+E=~/lanes/el-cost
+BASE=$E/bin/$1 LANE=$E/bin/$2 O=$3
+mkdir -p "$O"
+exec 8> "$HOME/lanes/.heavy.lock"
+flock 8
+T=$(mktemp -d)
+: > "$O/log.txt"
+{ echo "base=$1 $(sha256sum < $BASE | cut -c1-16)"; echo "lane=$2 $(sha256sum < $LANE | cut -c1-16)"; echo "started=$(date -u +%FT%TZ)"; } >> "$O/log.txt"
+files=($E/data/ore-el/* "$E/data/go.ofn" "$E/data/chebi_lite.ofn")
+while read -r n; do files+=("$E/data/dev/$n.owl"); done < "$E/dev-names.txt"
+for threads in ${THREADS:-1 8}; do
+  S=$O/sums.t$threads.tsv
+  : > "$S"
+  for f in "${files[@]}"; do
+    n=$(basename "$f")
+    for side in base lane; do
+      bin=$BASE; [ $side = lane ] && bin=$LANE
+      if systemd-run --user --scope --quiet -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+          timeout ${TIMEOUT:-600} "$bin" --threads $threads --taxonomy "$T/$side" "$f" > "$T/$side.json" 2>> "$O/log.txt"; then
+        eval "${side}_sum=$(sha256sum < "$T/$side" | cut -c1-16)"
+      else
+        eval "${side}_sum=failed$?"
+      fi
+    done
+    tier=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('tier','?'))" "$T/lane.json" 2>/dev/null || echo "?")
+    printf '%s\t%s\t%s\t%s\n' "$n" "$base_sum" "$lane_sum" "$tier" >> "$S"
+  done
+done
+rm -rf "$T"
+echo "ended=$(date -u +%FT%TZ)" >> "$O/log.txt"
+echo IDENTITY-DONE >> "$O/log.txt"

@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Writes the record.json of the small-file and memory A/B (items 709 and 695) from its run directories."""
+import json, re, statistics as st, sys
+from collections import defaultdict
+from pathlib import Path
+R = Path(sys.argv[1])
+small = {"ore_ont_13581": "f58d3c11abfbf7e58219d7a0bbe23f2136cf071eaadb6a31c74ad958a01d44ae", "ore_ont_1445": "93a5b8189d20fbc691b63ea693425f87c4e864d685aa3882e744890e776e745d",
+         "ore_ont_2775": "674f05d2420e700cc49d3bc0842c3c11083a7cd785bdfe5c348f8ea3fc08cd33", "ore_ont_3231": "f8e63362c7c7448362bd701bd170478da239b3cdc334d8c1436c7b3d1aff4304",
+         "ore_ont_5564": "2ed733ac71f6991f9e4fce403a57982ecb4af83021dd0387ae053cb20f78ce63", "ore_ont_5940": "e0911595e0782a559889d8ac62cc5a8f6f69219eb8dd58bff4bb27bd1f0c856e",
+         "ore_ont_6855": "2a3ebab8ec0e933f1e261d26740fdfc9e042156c6250007515452dbeed8fb9ec", "ore_ont_7584": "623acf0024da64fea4ffdcf76a0265d10b703b106a967782fa614537894ee57d",
+         "ore_ont_7663": "228b6e6ad34a8e35de85fab21da4940810b6ca2ccd61eb6712f4974f478836d0", "ore_ont_8203": "391049dc638f182392bb69bbe05cf09470b94079c0d6b4c07214dd9f35793769",
+         "ore_ont_8273": "10c15bd019500abd57d05b6277428ff113e81645da7ad4c10a116fe9ac6b5be4", "ore_ont_9096": "d5c9f1a970bb5faad25fe379415f74a2e7e62a288a96071e1f353e721a9cb207"}
+def lines(p):
+    return [l for l in (R / p).read_text().splitlines() if l.strip()]
+def env(d):
+    e = {}
+    for l in lines(f"{d}/env.txt"):
+        if l.startswith("binary_sha256 ") or l.startswith("data_sha256 "):
+            k, v = l.split(" ", 1)[1].split("=", 1); e.setdefault(l.split(" ")[0], {})[k] = v
+        elif l.startswith("rounds="):
+            m = re.match(r"rounds=(\d+) threads=([\d ]+?) repeat=(\d+) pin1=(\S+) pinn=(\S+)", l)
+            e.update(rounds=int(m.group(1)), threads=[int(x) for x in m.group(2).split()], pin1=m.group(4), pinn=m.group(5))
+        else:
+            for part in l.split(" "):
+                if "=" in part:
+                    k, v = part.split("=", 1); e.setdefault(k, v)
+    return e
+r2 = lambda x: round(x, 2)
+def gate(d="gate"):
+    g = defaultdict(list)
+    for l in lines(f"{d}/runs.jsonl"):
+        r = json.loads(l); g[(r["file"], r["threads"], r["side"])].append(r)
+    out = []
+    for (f, t, s), rs in g.items():
+        rs.sort(key=lambda r: r["round"])
+        meds = [r2(r["classifyMedianMs"]) for r in rs]
+        med = lambda k: r2(st.median([r[k] for r in rs]))
+        out.append({"ontology": f, "threads": t, "side": s, "rounds": len(rs), "classifyMedianMs": meds,
+                    "medianOfMediansMs": r2(st.median(meds)), "indexMs": med("indexMs"), "saturationMs": med("saturationMs"),
+                    "taxonomyMs": med("taxonomyMs"), "peakRssKib": int(st.median([r["peakRssKib"] for r in rs])),
+                    "conclusions": rs[0].get("conclusions"), "tier": rs[0].get("tier")})
+    return out
+def cold(d):
+    g = defaultdict(lambda: defaultdict(list))
+    for l in lines(f"{d}/runs.jsonl"):
+        r = json.loads(l)
+        assert r["failed"] is None, r
+        k = (r["file"], r["side"])
+        if r["repeat"] == 1:
+            for x in ("coldMs", "wallMs", "readMs", "indexMs", "saturationMs", "taxonomyMs"):
+                g[k][x].append(r[x])
+        else:
+            g[k]["warmMs"].append(r["warmMs"]); g[k]["tier"] = r["tier"]
+    t = int(env(d)["threads"])
+    return [{"ontology": f, "threads": t, "side": s, "rounds": len(v["coldMs"]), "coldMs": [r2(x) for x in v["coldMs"]],
+             "coldMedianMs": r2(st.median(v["coldMs"])), "warmMedianMs": r2(st.median(v["warmMs"])),
+             "wallMedianMs": r2(st.median(v["wallMs"])), "readMs": r2(st.median(v["readMs"])), "indexMs": r2(st.median(v["indexMs"])),
+             "saturationMs": r2(st.median(v["saturationMs"])), "taxonomyMs": r2(st.median(v["taxonomyMs"])), "tier": v["tier"]}
+            for (f, s), v in sorted(g.items())]
+def checks(d="gate"):
+    by = defaultdict(set)
+    for l in lines(f"{d}/taxonomy.sha256"):
+        h, n = l.split(); by[n.split(".")[0]].add(h)
+    return {f: (sorted(h)[0] if len(h) == 1 else sorted(h)) for f, h in sorted(by.items())}
+def memory():
+    out = []
+    for p in sorted((R / "atlas-8737").glob("*.json")):
+        side, t = p.stem.split(".")
+        j = json.loads(p.read_text())
+        out.append({"ontology": "ore_ont_8737", "side": side, "threads": int(t[1:]), "classifyMs": r2(j["classifyMs"][0]),
+                    "saturationMs": r2(j["saturationMs"]), "peakRssKib": j["peakRssKib"], "peakRssKibAfterRead": j["peakRssKibAfterRead"],
+                    "peakEstimatedBytes": j["peakEstimatedBytes"], "estimatedBytes": j["estimatedBytes"], "conclusions": j["conclusions"],
+                    "tier": j["tier"]})
+    return out
+cold_parts = ["cold-t1", "cold-t4", "cold-t8"]
+e = env("gate")
+c = checks()
+rec = {
+ "suite": "el-classification", "kind": "measurement",
+ "scale": "The 12 small ORE 2015 DL files of roadmap item 709, GO 2026-07-26, ChEBI lite 256 and ore_ont_3836 and 13482 of the ORE 2015 EL sample on the benchmark host, and ore_ont_8737 of the ORE 2015 development set on atlas",
+ "host": {"name": "forge", "cpu": e["cpu"], "cpus": int(e["cpus"]), "ram_mib": 15620, "kernel": e["kernel"]},
+ "manifest": {"commit": "6b4c8e87", "base_commit": "ddfd453a",
+   "binary": "crates/sparkles-owl/examples/el_classify.rs",
+   "binary_sha256": {**e["binary_sha256"], **env("ow1")["binary_sha256"]},
+   "build": "mbx build --release -p sparkles-owl --example el_classify on stanley. ow1 is the experiment d1a01988. main5 is local main at ddfd453a. tip2 is the lane's tree at 6b4c8e87, whose production code is the same as at b68c0e14, since b68c0e14 changes only a value under cfg(test).",
+   "sides": {"main5": "ddfd453a, the base with a worker per rule set and one codegen unit", "tip2": "the lane at 6b4c8e87: chunks of at least 4,096 items, helper threads started after 0.5 ms or at once for 4,096 roots, and the congestion filter of delivered messages", "ow1": "d1a01988, the lane with a separate instantiation of the first worker, so that one thread and the helpers run without the lazy start's check"},
+   "data": {**{k.split("/")[-1].rsplit(".", 1)[0]: {"sha256": v} for k, v in e["data_sha256"].items()}, **{k: {"sha256": v} for k, v in small.items()},
+            "ore_ont_8737": {"sha256": "2f5e2478a6a21f304d5c49fa65aa6fc447cf5fe907b3a68ec375da05320f1cc6"}}},
+ "settings": {"parts": {**{d: {"rounds": env(d)["rounds"], "threads": env(d)["threads"], "repeat": 5, "pin1": env(d)["pin1"], "pinn": env(d)["pinn"]} for d in ("gate", "ow1")},
+                         **{d: {"rounds": int(env(d)["rounds"]), "threads": [int(env(d)["threads"])], "repeat": [1, 10], "pin1": env(d)["pin1"], "pinn": env(d)["pinn"]} for d in cold_parts},
+                         "atlas-8737": {"host": "atlas", "rounds": 1, "threads": [1, 4], "repeat": 1, "memory_max": "13G"}}},
+ "method": "Every part held the heavy lock, and the forge parts also held the bench lock. gate: gate/ab.sh.txt ran one el_classify process per side, file and thread count with --repeat 5 in five rounds whose order of the sides rotates, one thread pinned to CPU 4 and eight threads pinned to the performance cores 0 to 11. Each round's value is the process's median classification time. ow1: the same as the gate with the experiment ow1 as a third side. cold-t1, cold-t4 and cold-t8: cold.sh.txt ran each small file in seven rounds of rotating order, one process with --repeat 1 for the cold classification and the wall time of the whole process, and one process with --repeat 10 whose last nine classifications give the warm median, pinned in the same way. atlas-8737: atlas-8737/mem695.sh.txt ran one classification of ore_ont_8737 per side on four and on one thread in a scope with a 13 GiB cap, and reports the peak RSS of the process and the classifier's peak estimate of its own memory.",
+ "started": e["started"], "ended": env("ow1")["ended"],
+ "results": {"gate": gate(), "ow1": gate("ow1"), **{d: cold(d) for d in cold_parts}, "atlas-8737": memory()},
+ "checks": {**{d: {"taxonomy_sha256": checks(d), "same_taxonomy_every_side_and_thread_count": all(isinstance(v, str) for v in checks(d).values())} for d in ("gate", "ow1")},
+            "identity": {"host": "atlas", "files": ["atlas-identity/sums.t1.tsv", "atlas-identity/sums.t8.tsv", "atlas-identity/log.txt", "atlas-identity/identity.sh.txt"],
+              "same_taxonomy_every_file_and_thread_count": all(l.split("\t")[1] == l.split("\t")[2] and not l.split("\t")[1].startswith("failed") for t in (1, 8) for l in lines(f"atlas-identity/sums.t{t}.tsv")),
+              "files_per_thread_count": len(lines("atlas-identity/sums.t1.tsv")),
+              "note": "The 298 ORE 2015 EL files, GO, ChEBI lite and the 202 development files, the 12 small files among them, on one and eight threads. Each line gives the file, the first 16 hex digits of the taxonomy hash of main5 and of tip2, and the rule set of the run."}},
+ "notes": "The cold parts give no taxonomy hashes, and the small files' taxonomies are checked by the identity sweep. On one thread the lane runs none of its new code, so its one-thread times differ from the base's by code layout only. The memory part ran each side once, since the peak memory of a run varies by a few percent with the interleaving of the threads.",
+}
+(R / "record.json").write_text(json.dumps(rec, indent=1, ensure_ascii=False) + "\n")
+print("ok")

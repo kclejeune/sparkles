@@ -633,7 +633,119 @@ depend on it start from its metadata and its code generation runs beside theirs.
 of the `el_classify` example after such a change takes about 46 s against 21 s. The
 debug and test builds of `scripts/ci.sh` are unchanged.
 
+<a id="small-files"></a>
+
+### Cold runs of small files
+
+A classification on several threads starts its helper threads only once it needs them.
+The calling thread runs the saturation first. The others start at once when the run has
+4,096 roots or more, and otherwise once the first thread has worked for 0.5 ms, so that a
+saturation shorter than the threads' start runs on one thread. The parallel steps of the
+normalization and the taxonomy split their input into chunks of at least 4,096 items,
+against 1,024 before, so a small ontology's index stage runs as one chunk. Before these
+changes a cold run of `ore_ont_6855` on four threads spent 1.2 of its 1.4 ms in a
+saturation that takes 0.1 ms on one thread.
+
+An A/B on forge ran the base, commit ddfd453a, and the lane, commit 6b4c8e87, on the 12
+small ORE 2015 DL files of roadmap item 709 in seven rounds of rotating order, one thread
+pinned to CPU 4 and four and eight threads pinned to the performance cores 0 to 11. Each
+round ran one process with one classification, whose time is the cold one, and one with
+ten, whose last nine give the warm time. The table gives the median over the rounds in ms.
+
+| File | Rules | 1 thread, base and lane | 4 threads, base | 4 threads, lane | 8 threads, base | 8 threads, lane | Warm, 8 threads, base | Warm, 8 threads, lane |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `ore_ont_1445` | disjunctive | 2.7 and 2.7 | 3.2 | 3.0 | 3.5 | 3.7 | 2.0 | 2.5 |
+| `ore_ont_2775` | Horn | 0.6 and 0.6 | 1.1 | 0.6 | 1.5 | 0.6 | 0.3 | 0.2 |
+| `ore_ont_3231` | disjunctive | 4.5 and 4.6 | 3.9 | 3.8 | 4.8 | 4.7 | 2.6 | 3.0 |
+| `ore_ont_5564` | disjunctive | 0.8 and 0.8 | 1.6 | 0.9 | 1.8 | 1.0 | 0.7 | 0.6 |
+| `ore_ont_5940` | disjunctive | 1.0 and 1.1 | 1.6 | 1.1 | 1.9 | 1.2 | 0.9 | 0.7 |
+| `ore_ont_6855` | Horn | 0.3 and 0.4 | 1.4 | 0.3 | 2.0 | 0.3 | 0.4 | 0.2 |
+| `ore_ont_7584` | disjunctive | 3.8 and 3.9 | 3.4 | 3.3 | 4.0 | 4.0 | 2.2 | 2.7 |
+| `ore_ont_7663` | Horn | 0.7 and 0.7 | 1.0 | 0.8 | 1.1 | 0.8 | 0.5 | 0.4 |
+| `ore_ont_8203` | Horn | 6.2 and 6.2 | 6.8 | 6.3 | 8.0 | 7.3 | 3.3 | 3.7 |
+| `ore_ont_8273` | disjunctive | 25.7 and 25.5 | 21.6 | 16.9 | 17.2 | 17.5 | 14.1 | 14.4 |
+| `ore_ont_9096` | disjunctive | 1.7 and 1.7 | 2.1 | 1.8 | 2.7 | 1.8 | 1.1 | 1.2 |
+| `ore_ont_13581` | Horn | 2.7 and 2.7 | 2.9 | 3.0 | 3.6 | 3.5 | 1.9 | 2.5 |
+
+The cold runs take 0.74 of the base's time in geometric mean on four threads and 0.68 on
+eight, from 0.25 to 1.07 times per file on four threads and from 0.17 to 1.05 on eight.
+The 12 files take 41.9 ms on four threads against 50.6 ms. A whole process, which reads the file and starts and ends the runtime,
+takes 0.86 of the base's time on four and eight threads. On one thread the times are the
+base's within 0.1 ms. Five files whose saturation takes 1.8 to 4 ms on one thread became
+0.4 to 0.6 ms slower in warm runs on eight threads, since their helper threads start 0.5 ms later, and
+roadmap item NEW-ITEM-1 follows them. On four threads the warm runs take 0.86 of the
+base's time.
+
+A whole cold process of the lane on four threads takes less time on forge than Konclude
+0.7.0 took on the same file on the laptop in the comparison of item 709, from 1.9 ms for
+`ore_ont_6855` to 21.8 ms for `ore_ont_8273` against Konclude's 11 and 82 ms, and so does
+the base's. The hosts differ, so this is not a published comparison. The item's estimates
+of cold runs came from the laptop while other work ran on it, and they were 2.4 to 14
+times the base's whole processes on forge.
+
+On GO, ChEBI lite, `ore_ont_3836` and `ore_ont_13482`, five rounds of the same sides gave
+the following times, in ms, with the same taxonomies.
+
+| Ontology | Threads | Base | Lane | Lane / base |
+|---|---:|---:|---:|---:|
+| GO | 1 | 303.3 | 302.1 | 1.00 |
+| | 8 | 79.6 | 79.6 | 1.00 |
+| ChEBI lite | 1 | 1,023 | 1,035 | 1.01 |
+| | 8 | 412 | 401 | 0.97 |
+| `ore_ont_3836` | 1 | 541.9 | 531.8 | 0.98 |
+| | 8 | 205.2 | 201.9 | 0.98 |
+| `ore_ont_13482` | 1 | 862.4 | 871.3 | 1.01 |
+| | 8 | 302.6 | 298.7 | 0.99 |
+
+On one thread ChEBI lite's saturation is 1.1% slower than the base's, beyond the 0.5%
+spread of its rounds, and a second run of five rounds put ChEBI lite 1.5% and
+`ore_ont_13482` 1.6% above the base. One thread runs none of the new code. A build whose
+one-thread worker leaves out the lazy start's check left them 0.9 and 1.4% slower and
+made `ore_ont_3836` 0.5% slower, so the difference comes from code layout, and roadmap
+item NEW-ITEM-3 follows it. [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md)
+records that build.
+
+<a id="saturation-memory"></a>
+
+### Saturation memory
+
+`ore_ont_8737` of the ORE 2015 DL sample has 136,612 classes and 2.5 million existential
+restrictions. Its saturation holds about 420 MiB of conclusions at the end, and its peak
+memory is the messages waiting in the contexts' to-do lists. Most of them repeat
+conclusions that their context already holds, since many classes send the same links to
+the same fillers. When the waiting messages take more memory than the stored conclusions
+and 256 MiB, a worker that delivers a batch to a context whose state is free checks each
+subsumption and backward link against that state and drops those the context holds. The
+check stays off while the waiting messages are fewer, so other runs deliver as before.
+
+One classification of each side on `atlas` in a scope with a 13 GiB cap gave the
+following times and memory. The peak resident set is that of the process, and the peak
+estimate is the classifier's own estimate of its memory. The conclusions are those the
+rules took from the to-do lists, repeats included.
+
+| Side | Threads | Time, s | Peak resident set, GiB | Peak estimate, GiB | Conclusions taken, billions |
+|---|---:|---:|---:|---:|---:|
+| Base | 4 | 32.3 | 10.5 | 5.7 | 3.00 |
+| Lane | 4 | 29.0 | 7.5 | 3.8 | 2.10 |
+| Base | 1 | 90.5 | 9.4 | 5.8 | 3.00 |
+| Lane | 1 | 90.2 | 9.4 | 5.8 | 3.00 |
+
+On four threads the peak resident set falls by 29%, and the run fits the 10 GiB cap of
+the development set comparison, which it passed before. A run on one thread delivers no
+batches, since its activations put their messages in the to-do lists directly, so its
+peak is the base's. On four threads the peak estimate is still nine times the stored
+conclusions, and the run takes 29 s, where Konclude 0.7.0 took 11 s with 7 GB on the
+laptop. Roadmap item NEW-ITEM-2 follows both. Three other ways to bound the waiting
+messages measured no better and are in
+[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md).
+
 ## Records
+
+The [small files and memory record](runs/2026-11-04-el-small-files-forge-6b4c8e87/record.json)
+holds every cold and warm time of the 12 small files on one, four and eight threads, the
+rounds on GO, ChEBI lite, `ore_ont_3836` and `ore_ont_13482` with their taxonomy hashes,
+the run with the experimental one-thread worker, the runs of `ore_ont_8737` on `atlas`, the
+taxonomy hashes of the identity sweep of 502 files on `atlas` and the scripts that ran.
 
 The [code layout record](runs/2026-11-04-el-layout-forge-f93ad3cb/record.json) holds every
 classification time of the gate, the screen with the reference builds, the pinned

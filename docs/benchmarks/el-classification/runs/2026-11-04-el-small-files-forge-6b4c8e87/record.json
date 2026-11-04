@@ -1,0 +1,2709 @@
+{
+ "suite": "el-classification",
+ "kind": "measurement",
+ "scale": "The 12 small ORE 2015 DL files of roadmap item 709, GO 2026-07-26, ChEBI lite 256 and ore_ont_3836 and 13482 of the ORE 2015 EL sample on the benchmark host, and ore_ont_8737 of the ORE 2015 development set on atlas",
+ "host": {
+  "name": "forge",
+  "cpu": "13th",
+  "cpus": 20,
+  "ram_mib": 15620,
+  "kernel": "7.2.9"
+ },
+ "manifest": {
+  "commit": "6b4c8e87",
+  "base_commit": "ddfd453a",
+  "binary": "crates/sparkles-owl/examples/el_classify.rs",
+  "binary_sha256": {
+   "main5": "aacace737cd22f6cb2903266dce74fc9eb68f8d9513457671e2ad649d9ca540d",
+   "tip2": "e32b1aa1e8aef87b3ea9b7600b412736e05648b54de7bbf63702719283d01125",
+   "ow1": "b66b343da4dc98ad57ee0133ea7dcfd4ec4b6e91bff4de0693a62cd2831e6b65"
+  },
+  "build": "mbx build --release -p sparkles-owl --example el_classify on stanley. ow1 is the experiment d1a01988. main5 is local main at ddfd453a. tip2 is the lane's tree at 6b4c8e87, whose production code is the same as at b68c0e14, since b68c0e14 changes only a value under cfg(test).",
+  "sides": {
+   "main5": "ddfd453a, the base with a worker per rule set and one codegen unit",
+   "tip2": "the lane at 6b4c8e87: chunks of at least 4,096 items, helper threads started after 0.5 ms or at once for 4,096 roots, and the congestion filter of delivered messages",
+   "ow1": "d1a01988, the lane with a separate instantiation of the first worker, so that one thread and the helpers run without the lazy start's check"
+  },
+  "data": {
+   "go": {
+    "sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+   },
+   "chebi_lite": {
+    "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+   },
+   "ore_ont_3836": {
+    "sha256": "fc559045f566b2837188505b707480dc3416b3e699c5188632fa5be3d4cf2473"
+   },
+   "ore_ont_13482": {
+    "sha256": "f732cc7d4ebdb45099e421d062e05d64837b22e60b53d6848a723aa8f0e8d971"
+   },
+   "ore_ont_13581": {
+    "sha256": "f58d3c11abfbf7e58219d7a0bbe23f2136cf071eaadb6a31c74ad958a01d44ae"
+   },
+   "ore_ont_1445": {
+    "sha256": "93a5b8189d20fbc691b63ea693425f87c4e864d685aa3882e744890e776e745d"
+   },
+   "ore_ont_2775": {
+    "sha256": "674f05d2420e700cc49d3bc0842c3c11083a7cd785bdfe5c348f8ea3fc08cd33"
+   },
+   "ore_ont_3231": {
+    "sha256": "f8e63362c7c7448362bd701bd170478da239b3cdc334d8c1436c7b3d1aff4304"
+   },
+   "ore_ont_5564": {
+    "sha256": "2ed733ac71f6991f9e4fce403a57982ecb4af83021dd0387ae053cb20f78ce63"
+   },
+   "ore_ont_5940": {
+    "sha256": "e0911595e0782a559889d8ac62cc5a8f6f69219eb8dd58bff4bb27bd1f0c856e"
+   },
+   "ore_ont_6855": {
+    "sha256": "2a3ebab8ec0e933f1e261d26740fdfc9e042156c6250007515452dbeed8fb9ec"
+   },
+   "ore_ont_7584": {
+    "sha256": "623acf0024da64fea4ffdcf76a0265d10b703b106a967782fa614537894ee57d"
+   },
+   "ore_ont_7663": {
+    "sha256": "228b6e6ad34a8e35de85fab21da4940810b6ca2ccd61eb6712f4974f478836d0"
+   },
+   "ore_ont_8203": {
+    "sha256": "391049dc638f182392bb69bbe05cf09470b94079c0d6b4c07214dd9f35793769"
+   },
+   "ore_ont_8273": {
+    "sha256": "10c15bd019500abd57d05b6277428ff113e81645da7ad4c10a116fe9ac6b5be4"
+   },
+   "ore_ont_9096": {
+    "sha256": "d5c9f1a970bb5faad25fe379415f74a2e7e62a288a96071e1f353e721a9cb207"
+   },
+   "ore_ont_8737": {
+    "sha256": "2f5e2478a6a21f304d5c49fa65aa6fc447cf5fe907b3a68ec375da05320f1cc6"
+   }
+  }
+ },
+ "settings": {
+  "parts": {
+   "gate": {
+    "rounds": 5,
+    "threads": [
+     1,
+     8
+    ],
+    "repeat": 5,
+    "pin1": "4",
+    "pinn": "0-11"
+   },
+   "ow1": {
+    "rounds": 5,
+    "threads": [
+     1,
+     8
+    ],
+    "repeat": 5,
+    "pin1": "4",
+    "pinn": "0-11"
+   },
+   "cold-t1": {
+    "rounds": 7,
+    "threads": [
+     1
+    ],
+    "repeat": [
+     1,
+     10
+    ],
+    "pin1": "4",
+    "pinn": "0-11"
+   },
+   "cold-t4": {
+    "rounds": 7,
+    "threads": [
+     4
+    ],
+    "repeat": [
+     1,
+     10
+    ],
+    "pin1": "4",
+    "pinn": "0-11"
+   },
+   "cold-t8": {
+    "rounds": 7,
+    "threads": [
+     8
+    ],
+    "repeat": [
+     1,
+     10
+    ],
+    "pin1": "4",
+    "pinn": "0-11"
+   },
+   "atlas-8737": {
+    "host": "atlas",
+    "rounds": 1,
+    "threads": [
+     1,
+     4
+    ],
+    "repeat": 1,
+    "memory_max": "13G"
+   }
+  }
+ },
+ "method": "Every part held the heavy lock, and the forge parts also held the bench lock. gate: gate/ab.sh.txt ran one el_classify process per side, file and thread count with --repeat 5 in five rounds whose order of the sides rotates, one thread pinned to CPU 4 and eight threads pinned to the performance cores 0 to 11. Each round's value is the process's median classification time. ow1: the same as the gate with the experiment ow1 as a third side. cold-t1, cold-t4 and cold-t8: cold.sh.txt ran each small file in seven rounds of rotating order, one process with --repeat 1 for the cold classification and the wall time of the whole process, and one process with --repeat 10 whose last nine classifications give the warm median, pinned in the same way. atlas-8737: atlas-8737/mem695.sh.txt ran one classification of ore_ont_8737 per side on four and on one thread in a scope with a 13 GiB cap, and reports the peak RSS of the process and the classifier's peak estimate of its own memory.",
+ "started": "2026-11-04T04:13:04Z",
+ "ended": "2026-11-04T04:38:37Z",
+ "results": {
+  "gate": [
+   {
+    "ontology": "go",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     302.11,
+     305.08,
+     301.66,
+     303.99,
+     300.91
+    ],
+    "medianOfMediansMs": 302.11,
+    "indexMs": 28.19,
+    "saturationMs": 246.87,
+    "taxonomyMs": 25.7,
+    "peakRssKib": 256596,
+    "conclusions": 2949854,
+    "tier": "horn"
+   },
+   {
+    "ontology": "go",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     304.47,
+     306.29,
+     302.71,
+     303.09,
+     303.31
+    ],
+    "medianOfMediansMs": 303.31,
+    "indexMs": 28.26,
+    "saturationMs": 247.61,
+    "taxonomyMs": 25.21,
+    "peakRssKib": 256528,
+    "conclusions": 2949854,
+    "tier": "horn"
+   },
+   {
+    "ontology": "go",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     79.22,
+     79.69,
+     79.56,
+     78.74,
+     79.8
+    ],
+    "medianOfMediansMs": 79.56,
+    "indexMs": 24.2,
+    "saturationMs": 43.46,
+    "taxonomyMs": 10.25,
+    "peakRssKib": 296244,
+    "conclusions": 2972995,
+    "tier": "horn"
+   },
+   {
+    "ontology": "go",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     79.63,
+     78.95,
+     79.26,
+     80.85,
+     80.2
+    ],
+    "medianOfMediansMs": 79.63,
+    "indexMs": 24.0,
+    "saturationMs": 43.46,
+    "taxonomyMs": 10.19,
+    "peakRssKib": 306452,
+    "conclusions": 2965771,
+    "tier": "horn"
+   },
+   {
+    "ontology": "chebi_lite",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     1034.6,
+     1038.76,
+     1037.68,
+     1033.63,
+     1033.94
+    ],
+    "medianOfMediansMs": 1034.6,
+    "indexMs": 109.02,
+    "saturationMs": 699.13,
+    "taxonomyMs": 222.28,
+    "peakRssKib": 678388,
+    "conclusions": 26995717,
+    "tier": "horn"
+   },
+   {
+    "ontology": "chebi_lite",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     1023.43,
+     1023.1,
+     1024.43,
+     1022.89,
+     1026.5
+    ],
+    "medianOfMediansMs": 1023.43,
+    "indexMs": 109.29,
+    "saturationMs": 686.45,
+    "taxonomyMs": 223.09,
+    "peakRssKib": 678400,
+    "conclusions": 26995717,
+    "tier": "horn"
+   },
+   {
+    "ontology": "chebi_lite",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     391.16,
+     378.37,
+     400.79,
+     497.66,
+     448.18
+    ],
+    "medianOfMediansMs": 400.79,
+    "indexMs": 72.24,
+    "saturationMs": 245.52,
+    "taxonomyMs": 65.76,
+    "peakRssKib": 950728,
+    "conclusions": 26995717,
+    "tier": "horn"
+   },
+   {
+    "ontology": "chebi_lite",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     412.52,
+     412.14,
+     404.2,
+     375.41,
+     423.68
+    ],
+    "medianOfMediansMs": 412.14,
+    "indexMs": 72.97,
+    "saturationMs": 233.36,
+    "taxonomyMs": 64.67,
+    "peakRssKib": 970864,
+    "conclusions": 26995717,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_3836",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     533.25,
+     531.82,
+     529.65,
+     530.91,
+     534.04
+    ],
+    "medianOfMediansMs": 531.82,
+    "indexMs": 370.61,
+    "saturationMs": 127.98,
+    "taxonomyMs": 14.13,
+    "peakRssKib": 1217144,
+    "conclusions": 3819091,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_3836",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     539.89,
+     559.7,
+     537.33,
+     541.94,
+     542.23
+    ],
+    "medianOfMediansMs": 541.94,
+    "indexMs": 380.19,
+    "saturationMs": 129.7,
+    "taxonomyMs": 14.09,
+    "peakRssKib": 1217080,
+    "conclusions": 3819091,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_3836",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     204.72,
+     201.6,
+     201.89,
+     206.36,
+     199.96
+    ],
+    "medianOfMediansMs": 201.89,
+    "indexMs": 155.46,
+    "saturationMs": 20.62,
+    "taxonomyMs": 10.99,
+    "peakRssKib": 1235704,
+    "conclusions": 3819091,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_3836",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     205.15,
+     203.42,
+     206.9,
+     204.94,
+     207.62
+    ],
+    "medianOfMediansMs": 205.15,
+    "indexMs": 164.2,
+    "saturationMs": 20.82,
+    "taxonomyMs": 11.16,
+    "peakRssKib": 1233688,
+    "conclusions": 3819091,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_13482",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     882.07,
+     878.43,
+     869.8,
+     871.27,
+     870.69
+    ],
+    "medianOfMediansMs": 871.27,
+    "indexMs": 298.17,
+    "saturationMs": 530.2,
+    "taxonomyMs": 17.56,
+    "peakRssKib": 1331748,
+    "conclusions": 15130982,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_13482",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     859.26,
+     862.36,
+     873.6,
+     874.2,
+     855.49
+    ],
+    "medianOfMediansMs": 862.36,
+    "indexMs": 297.98,
+    "saturationMs": 519.62,
+    "taxonomyMs": 17.52,
+    "peakRssKib": 1331740,
+    "conclusions": 15130982,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_13482",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     298.13,
+     299.56,
+     301.06,
+     298.02,
+     298.72
+    ],
+    "medianOfMediansMs": 298.72,
+    "indexMs": 178.08,
+    "saturationMs": 95.98,
+    "taxonomyMs": 16.05,
+    "peakRssKib": 1576248,
+    "conclusions": 15130982,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_13482",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     306.99,
+     300.43,
+     305.17,
+     300.67,
+     302.57
+    ],
+    "medianOfMediansMs": 302.57,
+    "indexMs": 177.33,
+    "saturationMs": 102.77,
+    "taxonomyMs": 16.13,
+    "peakRssKib": 1596372,
+    "conclusions": 15130982,
+    "tier": "el"
+   }
+  ],
+  "ow1": [
+   {
+    "ontology": "go",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     303.39,
+     305.65,
+     302.83,
+     301.03,
+     305.76
+    ],
+    "medianOfMediansMs": 303.39,
+    "indexMs": 28.34,
+    "saturationMs": 247.69,
+    "taxonomyMs": 25.71,
+    "peakRssKib": 256540,
+    "conclusions": 2949854,
+    "tier": "horn"
+   },
+   {
+    "ontology": "go",
+    "threads": 1,
+    "side": "ow1",
+    "rounds": 5,
+    "classifyMedianMs": [
+     303.6,
+     300.48,
+     301.34,
+     302.32,
+     301.3
+    ],
+    "medianOfMediansMs": 301.34,
+    "indexMs": 27.94,
+    "saturationMs": 245.77,
+    "taxonomyMs": 24.99,
+    "peakRssKib": 256732,
+    "conclusions": 2949854,
+    "tier": "horn"
+   },
+   {
+    "ontology": "go",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     303.22,
+     303.86,
+     304.23,
+     301.38,
+     304.04
+    ],
+    "medianOfMediansMs": 303.86,
+    "indexMs": 28.24,
+    "saturationMs": 247.17,
+    "taxonomyMs": 25.22,
+    "peakRssKib": 256540,
+    "conclusions": 2949854,
+    "tier": "horn"
+   },
+   {
+    "ontology": "go",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     80.42,
+     79.1,
+     79.43,
+     79.81,
+     79.14
+    ],
+    "medianOfMediansMs": 79.43,
+    "indexMs": 24.13,
+    "saturationMs": 44.24,
+    "taxonomyMs": 10.11,
+    "peakRssKib": 300280,
+    "conclusions": 2968174,
+    "tier": "horn"
+   },
+   {
+    "ontology": "go",
+    "threads": 8,
+    "side": "ow1",
+    "rounds": 5,
+    "classifyMedianMs": [
+     79.04,
+     79.61,
+     80.45,
+     79.36,
+     81.04
+    ],
+    "medianOfMediansMs": 79.61,
+    "indexMs": 24.38,
+    "saturationMs": 44.17,
+    "taxonomyMs": 10.15,
+    "peakRssKib": 306456,
+    "conclusions": 2968987,
+    "tier": "horn"
+   },
+   {
+    "ontology": "go",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     79.3,
+     80.04,
+     79.52,
+     79.5,
+     79.19
+    ],
+    "medianOfMediansMs": 79.5,
+    "indexMs": 24.6,
+    "saturationMs": 43.59,
+    "taxonomyMs": 10.26,
+    "peakRssKib": 298216,
+    "conclusions": 2965205,
+    "tier": "horn"
+   },
+   {
+    "ontology": "chebi_lite",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     1034.27,
+     1042.09,
+     1042.32,
+     1032.49,
+     1040.12
+    ],
+    "medianOfMediansMs": 1040.12,
+    "indexMs": 108.52,
+    "saturationMs": 704.71,
+    "taxonomyMs": 222.38,
+    "peakRssKib": 678300,
+    "conclusions": 26995717,
+    "tier": "horn"
+   },
+   {
+    "ontology": "chebi_lite",
+    "threads": 1,
+    "side": "ow1",
+    "rounds": 5,
+    "classifyMedianMs": [
+     1033.85,
+     1034.66,
+     1035.51,
+     1039.13,
+     1032.34
+    ],
+    "medianOfMediansMs": 1034.66,
+    "indexMs": 108.78,
+    "saturationMs": 698.76,
+    "taxonomyMs": 220.77,
+    "peakRssKib": 678572,
+    "conclusions": 26995717,
+    "tier": "horn"
+   },
+   {
+    "ontology": "chebi_lite",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     1025.26,
+     1030.46,
+     1020.86,
+     1027.41,
+     1022.42
+    ],
+    "medianOfMediansMs": 1025.26,
+    "indexMs": 109.43,
+    "saturationMs": 687.63,
+    "taxonomyMs": 223.41,
+    "peakRssKib": 678480,
+    "conclusions": 26995717,
+    "tier": "horn"
+   },
+   {
+    "ontology": "chebi_lite",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     398.74,
+     433.83,
+     433.13,
+     432.54,
+     357.73
+    ],
+    "medianOfMediansMs": 432.54,
+    "indexMs": 72.31,
+    "saturationMs": 258.6,
+    "taxonomyMs": 65.55,
+    "peakRssKib": 952596,
+    "conclusions": 26995717,
+    "tier": "horn"
+   },
+   {
+    "ontology": "chebi_lite",
+    "threads": 8,
+    "side": "ow1",
+    "rounds": 5,
+    "classifyMedianMs": [
+     446.49,
+     411.27,
+     394.46,
+     455.66,
+     405.39
+    ],
+    "medianOfMediansMs": 411.27,
+    "indexMs": 72.11,
+    "saturationMs": 250.66,
+    "taxonomyMs": 65.71,
+    "peakRssKib": 972700,
+    "conclusions": 26995717,
+    "tier": "horn"
+   },
+   {
+    "ontology": "chebi_lite",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     412.36,
+     431.23,
+     454.86,
+     453.13,
+     469.27
+    ],
+    "medianOfMediansMs": 453.13,
+    "indexMs": 73.48,
+    "saturationMs": 286.61,
+    "taxonomyMs": 65.55,
+    "peakRssKib": 997956,
+    "conclusions": 26995717,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_3836",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     534.91,
+     529.47,
+     530.43,
+     532.41,
+     531.46
+    ],
+    "medianOfMediansMs": 531.46,
+    "indexMs": 370.36,
+    "saturationMs": 127.61,
+    "taxonomyMs": 14.07,
+    "peakRssKib": 1217092,
+    "conclusions": 3819091,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_3836",
+    "threads": 1,
+    "side": "ow1",
+    "rounds": 5,
+    "classifyMedianMs": [
+     540.29,
+     538.44,
+     541.3,
+     542.8,
+     536.07
+    ],
+    "medianOfMediansMs": 540.29,
+    "indexMs": 378.82,
+    "saturationMs": 132.46,
+    "taxonomyMs": 14.78,
+    "peakRssKib": 1210416,
+    "conclusions": 3819091,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_3836",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     541.06,
+     537.01,
+     535.84,
+     541.41,
+     537.72
+    ],
+    "medianOfMediansMs": 537.72,
+    "indexMs": 377.15,
+    "saturationMs": 129.31,
+    "taxonomyMs": 14.06,
+    "peakRssKib": 1217064,
+    "conclusions": 3819091,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_3836",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     205.26,
+     201.54,
+     201.28,
+     202.87,
+     206.0
+    ],
+    "medianOfMediansMs": 202.87,
+    "indexMs": 160.5,
+    "saturationMs": 20.75,
+    "taxonomyMs": 11.26,
+    "peakRssKib": 1225520,
+    "conclusions": 3819091,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_3836",
+    "threads": 8,
+    "side": "ow1",
+    "rounds": 5,
+    "classifyMedianMs": [
+     201.85,
+     205.84,
+     207.79,
+     205.43,
+     208.32
+    ],
+    "medianOfMediansMs": 205.84,
+    "indexMs": 159.05,
+    "saturationMs": 21.52,
+    "taxonomyMs": 9.13,
+    "peakRssKib": 1215140,
+    "conclusions": 3819091,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_3836",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     206.6,
+     206.69,
+     208.17,
+     206.09,
+     205.02
+    ],
+    "medianOfMediansMs": 206.6,
+    "indexMs": 160.56,
+    "saturationMs": 20.5,
+    "taxonomyMs": 10.46,
+    "peakRssKib": 1233788,
+    "conclusions": 3819091,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_13482",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     872.95,
+     882.67,
+     869.7,
+     869.08,
+     880.69
+    ],
+    "medianOfMediansMs": 872.95,
+    "indexMs": 297.9,
+    "saturationMs": 529.11,
+    "taxonomyMs": 17.59,
+    "peakRssKib": 1331356,
+    "conclusions": 15130982,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_13482",
+    "threads": 1,
+    "side": "ow1",
+    "rounds": 5,
+    "classifyMedianMs": [
+     876.55,
+     867.75,
+     870.54,
+     876.95,
+     870.84
+    ],
+    "medianOfMediansMs": 870.84,
+    "indexMs": 294.81,
+    "saturationMs": 534.1,
+    "taxonomyMs": 17.53,
+    "peakRssKib": 1331316,
+    "conclusions": 15130982,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_13482",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     858.83,
+     856.08,
+     864.66,
+     859.2,
+     830.22
+    ],
+    "medianOfMediansMs": 858.83,
+    "indexMs": 298.53,
+    "saturationMs": 516.31,
+    "taxonomyMs": 17.48,
+    "peakRssKib": 1331724,
+    "conclusions": 15130982,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_13482",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 5,
+    "classifyMedianMs": [
+     296.04,
+     300.62,
+     299.78,
+     297.92,
+     297.45
+    ],
+    "medianOfMediansMs": 297.92,
+    "indexMs": 178.97,
+    "saturationMs": 97.1,
+    "taxonomyMs": 15.96,
+    "peakRssKib": 1584500,
+    "conclusions": 15130982,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_13482",
+    "threads": 8,
+    "side": "ow1",
+    "rounds": 5,
+    "classifyMedianMs": [
+     295.64,
+     295.6,
+     298.66,
+     296.58,
+     300.1
+    ],
+    "medianOfMediansMs": 296.58,
+    "indexMs": 175.41,
+    "saturationMs": 95.9,
+    "taxonomyMs": 16.09,
+    "peakRssKib": 1566260,
+    "conclusions": 15130982,
+    "tier": "el"
+   },
+   {
+    "ontology": "ore_ont_13482",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 5,
+    "classifyMedianMs": [
+     302.54,
+     299.68,
+     306.17,
+     305.4,
+     304.72
+    ],
+    "medianOfMediansMs": 304.72,
+    "indexMs": 178.12,
+    "saturationMs": 100.71,
+    "taxonomyMs": 15.94,
+    "peakRssKib": 1596064,
+    "conclusions": 15130982,
+    "tier": "el"
+   }
+  ],
+  "cold-t1": [
+   {
+    "ontology": "ore_ont_13581",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     2.68,
+     2.69,
+     2.65,
+     2.7,
+     2.64,
+     2.72,
+     2.66
+    ],
+    "coldMedianMs": 2.68,
+    "warmMedianMs": 2.43,
+    "wallMedianMs": 5.09,
+    "readMs": 1.42,
+    "indexMs": 0.82,
+    "saturationMs": 1.8,
+    "taxonomyMs": 0.05,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_13581",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     2.79,
+     2.67,
+     2.69,
+     2.65,
+     2.7,
+     2.67,
+     2.76
+    ],
+    "coldMedianMs": 2.69,
+    "warmMedianMs": 2.44,
+    "wallMedianMs": 5.21,
+    "readMs": 1.47,
+    "indexMs": 0.83,
+    "saturationMs": 1.8,
+    "taxonomyMs": 0.05,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_1445",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     2.7,
+     2.75,
+     2.7,
+     2.75,
+     2.74,
+     2.73,
+     2.74
+    ],
+    "coldMedianMs": 2.74,
+    "warmMedianMs": 2.46,
+    "wallMedianMs": 5.75,
+    "readMs": 1.96,
+    "indexMs": 0.87,
+    "saturationMs": 1.79,
+    "taxonomyMs": 0.05,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_1445",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     2.74,
+     2.72,
+     2.74,
+     2.7,
+     2.76,
+     2.73,
+     2.78
+    ],
+    "coldMedianMs": 2.74,
+    "warmMedianMs": 2.47,
+    "wallMedianMs": 5.83,
+    "readMs": 2.03,
+    "indexMs": 0.88,
+    "saturationMs": 1.79,
+    "taxonomyMs": 0.05,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_2775",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     0.58,
+     0.62,
+     0.58,
+     0.62,
+     0.57,
+     0.61,
+     0.57
+    ],
+    "coldMedianMs": 0.58,
+    "warmMedianMs": 0.17,
+    "wallMedianMs": 1.85,
+    "readMs": 0.32,
+    "indexMs": 0.43,
+    "saturationMs": 0.05,
+    "taxonomyMs": 0.03,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_2775",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     0.63,
+     0.56,
+     0.64,
+     0.57,
+     0.63,
+     0.57,
+     0.64
+    ],
+    "coldMedianMs": 0.63,
+    "warmMedianMs": 0.17,
+    "wallMedianMs": 2.02,
+    "readMs": 0.36,
+    "indexMs": 0.53,
+    "saturationMs": 0.05,
+    "taxonomyMs": 0.03,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_3231",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     4.52,
+     4.54,
+     4.57,
+     4.58,
+     4.53,
+     4.58,
+     4.54
+    ],
+    "coldMedianMs": 4.54,
+    "warmMedianMs": 4.27,
+    "wallMedianMs": 7.53,
+    "readMs": 1.83,
+    "indexMs": 0.87,
+    "saturationMs": 3.6,
+    "taxonomyMs": 0.05,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_3231",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     4.58,
+     4.57,
+     4.57,
+     4.54,
+     4.6,
+     4.53,
+     4.58
+    ],
+    "coldMedianMs": 4.57,
+    "warmMedianMs": 4.27,
+    "wallMedianMs": 7.65,
+    "readMs": 1.9,
+    "indexMs": 0.89,
+    "saturationMs": 3.62,
+    "taxonomyMs": 0.05,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_5564",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     0.81,
+     0.83,
+     0.82,
+     0.83,
+     0.81,
+     0.84,
+     0.81
+    ],
+    "coldMedianMs": 0.82,
+    "warmMedianMs": 0.56,
+    "wallMedianMs": 3.39,
+    "readMs": 1.53,
+    "indexMs": 0.47,
+    "saturationMs": 0.23,
+    "taxonomyMs": 0.11,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_5564",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     0.84,
+     0.8,
+     0.84,
+     0.81,
+     0.85,
+     0.81,
+     0.83
+    ],
+    "coldMedianMs": 0.83,
+    "warmMedianMs": 0.56,
+    "wallMedianMs": 3.42,
+    "readMs": 1.53,
+    "indexMs": 0.47,
+    "saturationMs": 0.24,
+    "taxonomyMs": 0.1,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_5940",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     1.04,
+     1.05,
+     1.02,
+     1.07,
+     1.03,
+     1.06,
+     1.01
+    ],
+    "coldMedianMs": 1.04,
+    "warmMedianMs": 0.66,
+    "wallMedianMs": 4.14,
+    "readMs": 2.04,
+    "indexMs": 0.59,
+    "saturationMs": 0.2,
+    "taxonomyMs": 0.23,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_5940",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     1.06,
+     1.02,
+     1.05,
+     1.02,
+     1.09,
+     1.02,
+     1.05
+    ],
+    "coldMedianMs": 1.05,
+    "warmMedianMs": 0.65,
+    "wallMedianMs": 4.17,
+    "readMs": 2.06,
+    "indexMs": 0.59,
+    "saturationMs": 0.2,
+    "taxonomyMs": 0.23,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_6855",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     0.3,
+     0.3,
+     0.29,
+     0.38,
+     0.3,
+     0.29,
+     0.3
+    ],
+    "coldMedianMs": 0.3,
+    "warmMedianMs": 0.19,
+    "wallMedianMs": 1.61,
+    "readMs": 0.38,
+    "indexMs": 0.16,
+    "saturationMs": 0.12,
+    "taxonomyMs": 0.01,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_6855",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     0.39,
+     0.31,
+     0.37,
+     0.3,
+     0.37,
+     0.3,
+     0.37
+    ],
+    "coldMedianMs": 0.37,
+    "warmMedianMs": 0.19,
+    "wallMedianMs": 1.81,
+    "readMs": 0.43,
+    "indexMs": 0.16,
+    "saturationMs": 0.12,
+    "taxonomyMs": 0.01,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_7584",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     3.84,
+     3.87,
+     3.81,
+     3.88,
+     3.82,
+     3.86,
+     3.83
+    ],
+    "coldMedianMs": 3.84,
+    "warmMedianMs": 3.59,
+    "wallMedianMs": 6.83,
+    "readMs": 1.97,
+    "indexMs": 0.89,
+    "saturationMs": 2.88,
+    "taxonomyMs": 0.05,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_7584",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     3.87,
+     3.82,
+     3.87,
+     3.84,
+     3.86,
+     3.85,
+     3.87
+    ],
+    "coldMedianMs": 3.86,
+    "warmMedianMs": 3.59,
+    "wallMedianMs": 6.92,
+    "readMs": 2.03,
+    "indexMs": 0.9,
+    "saturationMs": 2.89,
+    "taxonomyMs": 0.05,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_7663",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     0.71,
+     0.72,
+     0.67,
+     0.73,
+     0.68,
+     0.72,
+     0.67
+    ],
+    "coldMedianMs": 0.71,
+    "warmMedianMs": 0.34,
+    "wallMedianMs": 2.64,
+    "readMs": 0.89,
+    "indexMs": 0.6,
+    "saturationMs": 0.04,
+    "taxonomyMs": 0.06,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_7663",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     0.75,
+     0.67,
+     0.73,
+     0.68,
+     0.72,
+     0.74,
+     0.71
+    ],
+    "coldMedianMs": 0.72,
+    "warmMedianMs": 0.34,
+    "wallMedianMs": 2.65,
+    "readMs": 0.92,
+    "indexMs": 0.61,
+    "saturationMs": 0.04,
+    "taxonomyMs": 0.06,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_8203",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     6.2,
+     6.22,
+     6.27,
+     6.27,
+     6.23,
+     6.25,
+     6.23
+    ],
+    "coldMedianMs": 6.23,
+    "warmMedianMs": 5.38,
+    "wallMedianMs": 11.58,
+    "readMs": 4.02,
+    "indexMs": 1.52,
+    "saturationMs": 3.96,
+    "taxonomyMs": 0.72,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_8203",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     6.28,
+     6.24,
+     6.23,
+     6.26,
+     6.29,
+     6.23,
+     6.23
+    ],
+    "coldMedianMs": 6.24,
+    "warmMedianMs": 5.41,
+    "wallMedianMs": 11.57,
+    "readMs": 4.04,
+    "indexMs": 1.51,
+    "saturationMs": 3.98,
+    "taxonomyMs": 0.71,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_8273",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     25.57,
+     25.74,
+     25.66,
+     25.67,
+     25.57,
+     25.72,
+     25.54
+    ],
+    "coldMedianMs": 25.66,
+    "warmMedianMs": 24.54,
+    "wallMedianMs": 29.44,
+    "readMs": 2.53,
+    "indexMs": 6.47,
+    "saturationMs": 18.9,
+    "taxonomyMs": 0.22,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_8273",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     25.66,
+     25.44,
+     25.66,
+     25.53,
+     25.43,
+     25.36,
+     25.63
+    ],
+    "coldMedianMs": 25.53,
+    "warmMedianMs": 24.53,
+    "wallMedianMs": 29.32,
+    "readMs": 2.6,
+    "indexMs": 6.44,
+    "saturationMs": 18.86,
+    "taxonomyMs": 0.22,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_9096",
+    "threads": 1,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     1.64,
+     1.7,
+     1.64,
+     1.72,
+     1.67,
+     1.74,
+     1.64
+    ],
+    "coldMedianMs": 1.67,
+    "warmMedianMs": 1.14,
+    "wallMedianMs": 5.26,
+    "readMs": 2.46,
+    "indexMs": 1.03,
+    "saturationMs": 0.39,
+    "taxonomyMs": 0.23,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_9096",
+    "threads": 1,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     1.7,
+     1.66,
+     1.76,
+     1.66,
+     1.74,
+     4.07,
+     1.77
+    ],
+    "coldMedianMs": 1.74,
+    "warmMedianMs": 1.15,
+    "wallMedianMs": 5.47,
+    "readMs": 2.49,
+    "indexMs": 1.06,
+    "saturationMs": 0.41,
+    "taxonomyMs": 0.23,
+    "tier": "disjunctive"
+   }
+  ],
+  "cold-t4": [
+   {
+    "ontology": "ore_ont_13581",
+    "threads": 4,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     3.43,
+     3.07,
+     2.86,
+     2.82,
+     2.82,
+     2.6,
+     2.93
+    ],
+    "coldMedianMs": 2.86,
+    "warmMedianMs": 2.77,
+    "wallMedianMs": 5.86,
+    "readMs": 1.52,
+    "indexMs": 1.16,
+    "saturationMs": 1.65,
+    "taxonomyMs": 0.08,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_13581",
+    "threads": 4,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     3.03,
+     3.27,
+     3.17,
+     2.88,
+     3.05,
+     3.05,
+     3.17
+    ],
+    "coldMedianMs": 3.05,
+    "warmMedianMs": 2.38,
+    "wallMedianMs": 6.01,
+    "readMs": 1.51,
+    "indexMs": 0.86,
+    "saturationMs": 2.13,
+    "taxonomyMs": 0.06,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_1445",
+    "threads": 4,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     3.17,
+     2.95,
+     2.78,
+     2.77,
+     3.73,
+     3.17,
+     3.51
+    ],
+    "coldMedianMs": 3.17,
+    "warmMedianMs": 2.34,
+    "wallMedianMs": 7.21,
+    "readMs": 2.05,
+    "indexMs": 1.24,
+    "saturationMs": 1.63,
+    "taxonomyMs": 0.09,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_1445",
+    "threads": 4,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     2.95,
+     2.99,
+     3.17,
+     2.95,
+     3.2,
+     2.98,
+     3.36
+    ],
+    "coldMedianMs": 2.99,
+    "warmMedianMs": 2.46,
+    "wallMedianMs": 6.81,
+    "readMs": 2.16,
+    "indexMs": 0.96,
+    "saturationMs": 1.99,
+    "taxonomyMs": 0.06,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_2775",
+    "threads": 4,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     1.23,
+     1.14,
+     1.31,
+     1.14,
+     1.09,
+     1.05,
+     1.19
+    ],
+    "coldMedianMs": 1.14,
+    "warmMedianMs": 0.25,
+    "wallMedianMs": 2.91,
+    "readMs": 0.4,
+    "indexMs": 0.52,
+    "saturationMs": 0.57,
+    "taxonomyMs": 0.05,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_2775",
+    "threads": 4,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     0.67,
+     0.57,
+     0.69,
+     0.62,
+     0.61,
+     0.58,
+     0.63
+    ],
+    "coldMedianMs": 0.62,
+    "warmMedianMs": 0.2,
+    "wallMedianMs": 2.15,
+    "readMs": 0.39,
+    "indexMs": 0.51,
+    "saturationMs": 0.07,
+    "taxonomyMs": 0.03,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_3231",
+    "threads": 4,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     3.72,
+     3.75,
+     4.04,
+     4.88,
+     3.86,
+     3.9,
+     3.65
+    ],
+    "coldMedianMs": 3.86,
+    "warmMedianMs": 3.84,
+    "wallMedianMs": 7.81,
+    "readMs": 2.06,
+    "indexMs": 1.25,
+    "saturationMs": 2.49,
+    "taxonomyMs": 0.08,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_3231",
+    "threads": 4,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     4.49,
+     4.0,
+     3.86,
+     3.76,
+     3.57,
+     3.72,
+     3.68
+    ],
+    "coldMedianMs": 3.76,
+    "warmMedianMs": 2.86,
+    "wallMedianMs": 7.54,
+    "readMs": 1.99,
+    "indexMs": 0.93,
+    "saturationMs": 2.76,
+    "taxonomyMs": 0.05,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_5564",
+    "threads": 4,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     1.54,
+     1.41,
+     1.78,
+     1.73,
+     1.43,
+     1.63,
+     1.62
+    ],
+    "coldMedianMs": 1.62,
+    "warmMedianMs": 0.62,
+    "wallMedianMs": 4.67,
+    "readMs": 1.52,
+    "indexMs": 0.77,
+    "saturationMs": 0.64,
+    "taxonomyMs": 0.11,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_5564",
+    "threads": 4,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     0.91,
+     0.98,
+     0.9,
+     0.99,
+     0.9,
+     0.96,
+     0.94
+    ],
+    "coldMedianMs": 0.94,
+    "warmMedianMs": 0.6,
+    "wallMedianMs": 3.89,
+    "readMs": 1.63,
+    "indexMs": 0.53,
+    "saturationMs": 0.28,
+    "taxonomyMs": 0.11,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_5940",
+    "threads": 4,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     1.58,
+     1.84,
+     1.54,
+     1.88,
+     1.46,
+     1.59,
+     1.5
+    ],
+    "coldMedianMs": 1.58,
+    "warmMedianMs": 0.7,
+    "wallMedianMs": 5.2,
+    "readMs": 2.1,
+    "indexMs": 1.01,
+    "saturationMs": 0.45,
+    "taxonomyMs": 0.1,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_5940",
+    "threads": 4,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     1.11,
+     1.12,
+     1.15,
+     1.15,
+     1.15,
+     1.15,
+     1.14
+    ],
+    "coldMedianMs": 1.15,
+    "warmMedianMs": 0.68,
+    "wallMedianMs": 4.63,
+    "readMs": 2.22,
+    "indexMs": 0.65,
+    "saturationMs": 0.22,
+    "taxonomyMs": 0.25,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_6855",
+    "threads": 4,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     1.21,
+     1.52,
+     1.19,
+     1.17,
+     1.42,
+     1.53,
+     1.48
+    ],
+    "coldMedianMs": 1.42,
+    "warmMedianMs": 0.34,
+    "wallMedianMs": 3.23,
+    "readMs": 0.46,
+    "indexMs": 0.17,
+    "saturationMs": 1.22,
+    "taxonomyMs": 0.01,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_6855",
+    "threads": 4,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     0.33,
+     0.35,
+     0.32,
+     0.36,
+     0.36,
+     0.35,
+     0.33
+    ],
+    "coldMedianMs": 0.35,
+    "warmMedianMs": 0.23,
+    "wallMedianMs": 1.92,
+    "readMs": 0.46,
+    "indexMs": 0.17,
+    "saturationMs": 0.15,
+    "taxonomyMs": 0.01,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_7584",
+    "threads": 4,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     3.24,
+     3.14,
+     3.79,
+     3.4,
+     3.35,
+     3.61,
+     3.45
+    ],
+    "coldMedianMs": 3.4,
+    "warmMedianMs": 3.83,
+    "wallMedianMs": 7.22,
+    "readMs": 2.09,
+    "indexMs": 1.23,
+    "saturationMs": 2.0,
+    "taxonomyMs": 0.07,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_7584",
+    "threads": 4,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     3.32,
+     3.3,
+     4.05,
+     3.27,
+     3.59,
+     3.6,
+     3.29
+    ],
+    "coldMedianMs": 3.32,
+    "warmMedianMs": 2.52,
+    "wallMedianMs": 7.09,
+    "readMs": 2.31,
+    "indexMs": 1.02,
+    "saturationMs": 2.27,
+    "taxonomyMs": 0.06,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_7663",
+    "threads": 4,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     1.1,
+     1.02,
+     0.97,
+     0.93,
+     0.93,
+     0.98,
+     1.31
+    ],
+    "coldMedianMs": 0.98,
+    "warmMedianMs": 0.42,
+    "wallMedianMs": 3.37,
+    "readMs": 0.94,
+    "indexMs": 0.65,
+    "saturationMs": 0.24,
+    "taxonomyMs": 0.07,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_7663",
+    "threads": 4,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     0.76,
+     0.81,
+     0.72,
+     0.81,
+     0.84,
+     0.76,
+     0.73
+    ],
+    "coldMedianMs": 0.76,
+    "warmMedianMs": 0.37,
+    "wallMedianMs": 2.93,
+    "readMs": 0.92,
+    "indexMs": 0.64,
+    "saturationMs": 0.05,
+    "taxonomyMs": 0.06,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_8203",
+    "threads": 4,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     7.26,
+     6.64,
+     7.0,
+     6.66,
+     6.16,
+     6.85,
+     7.46
+    ],
+    "coldMedianMs": 6.85,
+    "warmMedianMs": 4.35,
+    "wallMedianMs": 13.4,
+    "readMs": 4.51,
+    "indexMs": 1.72,
+    "saturationMs": 4.35,
+    "taxonomyMs": 0.72,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_8203",
+    "threads": 4,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     6.32,
+     6.04,
+     6.34,
+     6.63,
+     6.26,
+     6.54,
+     6.21
+    ],
+    "coldMedianMs": 6.32,
+    "warmMedianMs": 3.98,
+    "wallMedianMs": 12.58,
+    "readMs": 4.21,
+    "indexMs": 1.6,
+    "saturationMs": 4.04,
+    "taxonomyMs": 0.53,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_8273",
+    "threads": 4,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     18.14,
+     22.72,
+     21.61,
+     21.66,
+     20.44,
+     19.76,
+     21.55
+    ],
+    "coldMedianMs": 21.55,
+    "warmMedianMs": 15.33,
+    "wallMedianMs": 26.29,
+    "readMs": 2.61,
+    "indexMs": 7.15,
+    "saturationMs": 13.61,
+    "taxonomyMs": 0.29,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_8273",
+    "threads": 4,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     18.19,
+     16.97,
+     16.83,
+     17.36,
+     16.44,
+     16.63,
+     16.91
+    ],
+    "coldMedianMs": 16.91,
+    "warmMedianMs": 14.63,
+    "wallMedianMs": 21.75,
+    "readMs": 2.83,
+    "indexMs": 6.98,
+    "saturationMs": 9.6,
+    "taxonomyMs": 0.23,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_9096",
+    "threads": 4,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     2.2,
+     1.95,
+     2.13,
+     2.19,
+     2.44,
+     1.94,
+     2.11
+    ],
+    "coldMedianMs": 2.13,
+    "warmMedianMs": 1.22,
+    "wallMedianMs": 6.55,
+    "readMs": 2.49,
+    "indexMs": 1.16,
+    "saturationMs": 0.65,
+    "taxonomyMs": 0.24,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_9096",
+    "threads": 4,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     1.74,
+     1.76,
+     1.76,
+     1.77,
+     1.81,
+     1.92,
+     1.75
+    ],
+    "coldMedianMs": 1.76,
+    "warmMedianMs": 1.18,
+    "wallMedianMs": 5.63,
+    "readMs": 2.51,
+    "indexMs": 1.08,
+    "saturationMs": 0.43,
+    "taxonomyMs": 0.23,
+    "tier": "disjunctive"
+   }
+  ],
+  "cold-t8": [
+   {
+    "ontology": "ore_ont_13581",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     4.31,
+     3.32,
+     3.93,
+     3.52,
+     3.62,
+     3.97,
+     3.35
+    ],
+    "coldMedianMs": 3.62,
+    "warmMedianMs": 1.9,
+    "wallMedianMs": 6.6,
+    "readMs": 1.48,
+    "indexMs": 1.15,
+    "saturationMs": 2.44,
+    "taxonomyMs": 0.07,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_13581",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     3.96,
+     3.36,
+     3.36,
+     3.55,
+     3.4,
+     3.61,
+     3.5
+    ],
+    "coldMedianMs": 3.5,
+    "warmMedianMs": 2.45,
+    "wallMedianMs": 6.43,
+    "readMs": 1.5,
+    "indexMs": 0.85,
+    "saturationMs": 2.6,
+    "taxonomyMs": 0.06,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_1445",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     3.89,
+     3.25,
+     3.37,
+     3.55,
+     3.35,
+     3.56,
+     3.49
+    ],
+    "coldMedianMs": 3.49,
+    "warmMedianMs": 2.02,
+    "wallMedianMs": 7.2,
+    "readMs": 2.1,
+    "indexMs": 1.15,
+    "saturationMs": 2.25,
+    "taxonomyMs": 0.07,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_1445",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     3.93,
+     3.61,
+     3.68,
+     3.67,
+     3.71,
+     3.79,
+     3.67
+    ],
+    "coldMedianMs": 3.68,
+    "warmMedianMs": 2.54,
+    "wallMedianMs": 7.31,
+    "readMs": 2.11,
+    "indexMs": 0.95,
+    "saturationMs": 2.65,
+    "taxonomyMs": 0.06,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_2775",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     1.29,
+     1.8,
+     1.42,
+     1.53,
+     1.27,
+     1.8,
+     1.65
+    ],
+    "coldMedianMs": 1.53,
+    "warmMedianMs": 0.29,
+    "wallMedianMs": 3.36,
+    "readMs": 0.39,
+    "indexMs": 0.53,
+    "saturationMs": 0.9,
+    "taxonomyMs": 0.04,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_2775",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     0.63,
+     0.59,
+     0.62,
+     0.72,
+     0.62,
+     0.58,
+     0.67
+    ],
+    "coldMedianMs": 0.62,
+    "warmMedianMs": 0.19,
+    "wallMedianMs": 2.28,
+    "readMs": 0.41,
+    "indexMs": 0.52,
+    "saturationMs": 0.07,
+    "taxonomyMs": 0.03,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_3231",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     4.61,
+     5.24,
+     4.89,
+     4.87,
+     4.39,
+     4.73,
+     4.83
+    ],
+    "coldMedianMs": 4.83,
+    "warmMedianMs": 2.64,
+    "wallMedianMs": 8.58,
+    "readMs": 1.97,
+    "indexMs": 1.16,
+    "saturationMs": 3.56,
+    "taxonomyMs": 0.07,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_3231",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     4.7,
+     4.25,
+     5.04,
+     4.27,
+     4.56,
+     5.38,
+     4.79
+    ],
+    "coldMedianMs": 4.7,
+    "warmMedianMs": 2.98,
+    "wallMedianMs": 8.91,
+    "readMs": 2.04,
+    "indexMs": 0.97,
+    "saturationMs": 3.5,
+    "taxonomyMs": 0.07,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_5564",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     2.48,
+     1.6,
+     1.87,
+     1.74,
+     1.78,
+     1.6,
+     1.9
+    ],
+    "coldMedianMs": 1.78,
+    "warmMedianMs": 0.72,
+    "wallMedianMs": 4.7,
+    "readMs": 1.56,
+    "indexMs": 0.77,
+    "saturationMs": 0.94,
+    "taxonomyMs": 0.12,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_5564",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     1.01,
+     1.02,
+     0.9,
+     0.93,
+     0.99,
+     0.94,
+     1.17
+    ],
+    "coldMedianMs": 0.99,
+    "warmMedianMs": 0.6,
+    "wallMedianMs": 4.01,
+    "readMs": 1.65,
+    "indexMs": 0.55,
+    "saturationMs": 0.31,
+    "taxonomyMs": 0.12,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_5940",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     1.67,
+     2.1,
+     1.7,
+     1.99,
+     1.58,
+     1.94,
+     2.06
+    ],
+    "coldMedianMs": 1.94,
+    "warmMedianMs": 0.87,
+    "wallMedianMs": 5.55,
+    "readMs": 2.05,
+    "indexMs": 1.04,
+    "saturationMs": 0.74,
+    "taxonomyMs": 0.1,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_5940",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     1.15,
+     1.21,
+     1.18,
+     1.17,
+     1.08,
+     1.18,
+     1.12
+    ],
+    "coldMedianMs": 1.17,
+    "warmMedianMs": 0.67,
+    "wallMedianMs": 4.71,
+    "readMs": 2.25,
+    "indexMs": 0.67,
+    "saturationMs": 0.23,
+    "taxonomyMs": 0.25,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_6855",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     2.09,
+     1.98,
+     2.34,
+     1.7,
+     1.79,
+     1.9,
+     2.07
+    ],
+    "coldMedianMs": 1.98,
+    "warmMedianMs": 0.37,
+    "wallMedianMs": 3.85,
+    "readMs": 0.48,
+    "indexMs": 0.18,
+    "saturationMs": 1.78,
+    "taxonomyMs": 0.02,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_6855",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     0.41,
+     0.34,
+     0.32,
+     0.34,
+     0.34,
+     0.38,
+     0.38
+    ],
+    "coldMedianMs": 0.34,
+    "warmMedianMs": 0.22,
+    "wallMedianMs": 2.05,
+    "readMs": 0.47,
+    "indexMs": 0.17,
+    "saturationMs": 0.15,
+    "taxonomyMs": 0.01,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_7584",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     4.24,
+     4.22,
+     3.89,
+     3.87,
+     3.71,
+     4.05,
+     4.47
+    ],
+    "coldMedianMs": 4.05,
+    "warmMedianMs": 2.17,
+    "wallMedianMs": 7.93,
+    "readMs": 2.16,
+    "indexMs": 1.23,
+    "saturationMs": 2.69,
+    "taxonomyMs": 0.08,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_7584",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     4.02,
+     4.13,
+     4.03,
+     3.76,
+     3.72,
+     4.39,
+     4.16
+    ],
+    "coldMedianMs": 4.03,
+    "warmMedianMs": 2.69,
+    "wallMedianMs": 7.74,
+    "readMs": 2.15,
+    "indexMs": 0.97,
+    "saturationMs": 2.97,
+    "taxonomyMs": 0.07,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_7663",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     1.76,
+     1.0,
+     1.34,
+     1.01,
+     1.11,
+     1.07,
+     1.09
+    ],
+    "coldMedianMs": 1.09,
+    "warmMedianMs": 0.47,
+    "wallMedianMs": 3.35,
+    "readMs": 0.9,
+    "indexMs": 0.63,
+    "saturationMs": 0.39,
+    "taxonomyMs": 0.07,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_7663",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     0.79,
+     0.83,
+     1.0,
+     0.77,
+     0.77,
+     0.77,
+     0.73
+    ],
+    "coldMedianMs": 0.77,
+    "warmMedianMs": 0.36,
+    "wallMedianMs": 3.03,
+    "readMs": 0.98,
+    "indexMs": 0.65,
+    "saturationMs": 0.05,
+    "taxonomyMs": 0.06,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_8203",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     7.78,
+     8.5,
+     8.14,
+     8.26,
+     8.04,
+     8.01,
+     7.63
+    ],
+    "coldMedianMs": 8.04,
+    "warmMedianMs": 3.28,
+    "wallMedianMs": 14.41,
+    "readMs": 4.12,
+    "indexMs": 1.75,
+    "saturationMs": 5.67,
+    "taxonomyMs": 0.61,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_8203",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     7.42,
+     7.3,
+     6.95,
+     7.09,
+     7.52,
+     7.91,
+     7.02
+    ],
+    "coldMedianMs": 7.3,
+    "warmMedianMs": 3.74,
+    "wallMedianMs": 13.17,
+    "readMs": 4.22,
+    "indexMs": 1.65,
+    "saturationMs": 5.03,
+    "taxonomyMs": 0.51,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_8273",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     15.04,
+     17.64,
+     16.43,
+     16.77,
+     18.14,
+     17.18,
+     17.6
+    ],
+    "coldMedianMs": 17.18,
+    "warmMedianMs": 14.13,
+    "wallMedianMs": 21.99,
+    "readMs": 2.69,
+    "indexMs": 7.11,
+    "saturationMs": 9.53,
+    "taxonomyMs": 0.27,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_8273",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     17.99,
+     16.83,
+     17.5,
+     18.11,
+     16.9,
+     17.5,
+     17.57
+    ],
+    "coldMedianMs": 17.5,
+    "warmMedianMs": 14.37,
+    "wallMedianMs": 22.13,
+    "readMs": 2.74,
+    "indexMs": 6.84,
+    "saturationMs": 10.45,
+    "taxonomyMs": 0.25,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_9096",
+    "threads": 8,
+    "side": "main5",
+    "rounds": 7,
+    "coldMs": [
+     2.52,
+     2.74,
+     2.73,
+     2.5,
+     3.11,
+     2.82,
+     2.5
+    ],
+    "coldMedianMs": 2.73,
+    "warmMedianMs": 1.13,
+    "wallMedianMs": 6.74,
+    "readMs": 2.47,
+    "indexMs": 1.22,
+    "saturationMs": 1.17,
+    "taxonomyMs": 0.24,
+    "tier": "disjunctive"
+   },
+   {
+    "ontology": "ore_ont_9096",
+    "threads": 8,
+    "side": "tip2",
+    "rounds": 7,
+    "coldMs": [
+     1.73,
+     1.75,
+     1.85,
+     1.83,
+     1.82,
+     1.75,
+     1.74
+    ],
+    "coldMedianMs": 1.75,
+    "warmMedianMs": 1.18,
+    "wallMedianMs": 5.57,
+    "readMs": 2.49,
+    "indexMs": 1.07,
+    "saturationMs": 0.43,
+    "taxonomyMs": 0.23,
+    "tier": "disjunctive"
+   }
+  ],
+  "atlas-8737": [
+   {
+    "ontology": "ore_ont_8737",
+    "side": "main5",
+    "threads": 1,
+    "classifyMs": 90478.15,
+    "saturationMs": 89690.47,
+    "peakRssKib": 9887232,
+    "peakRssKibAfterRead": 1992136,
+    "peakEstimatedBytes": 6271434617,
+    "estimatedBytes": 430865454,
+    "conclusions": 3000886920,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_8737",
+    "side": "main5",
+    "threads": 4,
+    "classifyMs": 32336.94,
+    "saturationMs": 31889.3,
+    "peakRssKib": 11039772,
+    "peakRssKibAfterRead": 1991824,
+    "peakEstimatedBytes": 6106542357,
+    "estimatedBytes": 442242126,
+    "conclusions": 3000886920,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_8737",
+    "side": "tip2",
+    "threads": 1,
+    "classifyMs": 90220.43,
+    "saturationMs": 89457.36,
+    "peakRssKib": 9870912,
+    "peakRssKibAfterRead": 1991912,
+    "peakEstimatedBytes": 6271434617,
+    "estimatedBytes": 430865454,
+    "conclusions": 3000886920,
+    "tier": "horn"
+   },
+   {
+    "ontology": "ore_ont_8737",
+    "side": "tip2",
+    "threads": 4,
+    "classifyMs": 29021.69,
+    "saturationMs": 28568.77,
+    "peakRssKib": 7877500,
+    "peakRssKibAfterRead": 1991956,
+    "peakEstimatedBytes": 4044131653,
+    "estimatedBytes": 442242126,
+    "conclusions": 2103362919,
+    "tier": "horn"
+   }
+  ]
+ },
+ "checks": {
+  "gate": {
+   "taxonomy_sha256": {
+    "chebi_lite": "d1f820f168c5a0142110f30f7ff053d6a418eae5f6831ec0ca048c16ccf1211a",
+    "go": "c5c09533e69db78153ec37ce93a333e7304b46cf6b0797863ebd04ec96059b03",
+    "ore_ont_13482": "78b2ae4e7369843ba9ef36a39b0e93b6542cb34b718f9c318dcbf6a41c3ff83f",
+    "ore_ont_3836": "bba7f3186df956dda50320a399d8280e43c6f2cfdabb6fbd8d83a7264714e78a"
+   },
+   "same_taxonomy_every_side_and_thread_count": true
+  },
+  "ow1": {
+   "taxonomy_sha256": {
+    "chebi_lite": "d1f820f168c5a0142110f30f7ff053d6a418eae5f6831ec0ca048c16ccf1211a",
+    "go": "c5c09533e69db78153ec37ce93a333e7304b46cf6b0797863ebd04ec96059b03",
+    "ore_ont_13482": "78b2ae4e7369843ba9ef36a39b0e93b6542cb34b718f9c318dcbf6a41c3ff83f",
+    "ore_ont_3836": "bba7f3186df956dda50320a399d8280e43c6f2cfdabb6fbd8d83a7264714e78a"
+   },
+   "same_taxonomy_every_side_and_thread_count": true
+  },
+  "identity": {
+   "host": "atlas",
+   "files": [
+    "atlas-identity/sums.t1.tsv",
+    "atlas-identity/sums.t8.tsv",
+    "atlas-identity/log.txt",
+    "atlas-identity/identity.sh.txt"
+   ],
+   "same_taxonomy_every_file_and_thread_count": true,
+   "files_per_thread_count": 502,
+   "note": "The 298 ORE 2015 EL files, GO, ChEBI lite and the 202 development files, the 12 small files among them, on one and eight threads. Each line gives the file, the first 16 hex digits of the taxonomy hash of main5 and of tip2, and the rule set of the run."
+  }
+ },
+ "notes": "The cold parts give no taxonomy hashes, and the small files' taxonomies are checked by the identity sweep. On one thread the lane runs none of its new code, so its one-thread times differ from the base's by code layout only. The memory part ran each side once, since the peak memory of a run varies by a few percent with the interleaving of the threads."
+}

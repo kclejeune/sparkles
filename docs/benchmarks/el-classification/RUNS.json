@@ -1011,6 +1011,168 @@
     }
    },
    "metadata_note": "A manual measurement record of the code layout of items 711 and 715 on the benchmark host: the gate, a screen with reference builds, pinned eight-thread rounds and pinned two-unit rounds, with build times and instruction counts from atlas."
+  },
+  {
+   "run_id": "sha256-9ec7d52528c3cdf48550679a076df0f04a407f979523b7525a945c87d7a2ec59",
+   "path": "runs/2026-11-04-el-small-files-forge-6b4c8e87/record.json",
+   "sha256": "9ec7d52528c3cdf48550679a076df0f04a407f979523b7525a945c87d7a2ec59",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "The 12 small ORE 2015 DL files of roadmap item 709, GO 2026-07-26, ChEBI lite 256 and ore_ont_3836 and 13482 of the ORE 2015 EL sample on the benchmark host, and ore_ont_8737 of the ORE 2015 development set on atlas",
+    "manifest": {
+     "commit": "6b4c8e87",
+     "base_commit": "ddfd453a",
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": {
+      "main5": "aacace737cd22f6cb2903266dce74fc9eb68f8d9513457671e2ad649d9ca540d",
+      "tip2": "e32b1aa1e8aef87b3ea9b7600b412736e05648b54de7bbf63702719283d01125",
+      "ow1": "b66b343da4dc98ad57ee0133ea7dcfd4ec4b6e91bff4de0693a62cd2831e6b65"
+     },
+     "build": "mbx build --release -p sparkles-owl --example el_classify on stanley. ow1 is the experiment d1a01988. main5 is local main at ddfd453a. tip2 is the lane's tree at 6b4c8e87, whose production code is the same as at b68c0e14, since b68c0e14 changes only a value under cfg(test).",
+     "sides": {
+      "main5": "ddfd453a, the base with a worker per rule set and one codegen unit",
+      "tip2": "the lane at 6b4c8e87: chunks of at least 4,096 items, helper threads started after 0.5 ms or at once for 4,096 roots, and the congestion filter of delivered messages",
+      "ow1": "d1a01988, the lane with a separate instantiation of the first worker, so that one thread and the helpers run without the lazy start's check"
+     },
+     "data": {
+      "go": {
+       "sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+      },
+      "chebi_lite": {
+       "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+      },
+      "ore_ont_3836": {
+       "sha256": "fc559045f566b2837188505b707480dc3416b3e699c5188632fa5be3d4cf2473"
+      },
+      "ore_ont_13482": {
+       "sha256": "f732cc7d4ebdb45099e421d062e05d64837b22e60b53d6848a723aa8f0e8d971"
+      },
+      "ore_ont_13581": {
+       "sha256": "f58d3c11abfbf7e58219d7a0bbe23f2136cf071eaadb6a31c74ad958a01d44ae"
+      },
+      "ore_ont_1445": {
+       "sha256": "93a5b8189d20fbc691b63ea693425f87c4e864d685aa3882e744890e776e745d"
+      },
+      "ore_ont_2775": {
+       "sha256": "674f05d2420e700cc49d3bc0842c3c11083a7cd785bdfe5c348f8ea3fc08cd33"
+      },
+      "ore_ont_3231": {
+       "sha256": "f8e63362c7c7448362bd701bd170478da239b3cdc334d8c1436c7b3d1aff4304"
+      },
+      "ore_ont_5564": {
+       "sha256": "2ed733ac71f6991f9e4fce403a57982ecb4af83021dd0387ae053cb20f78ce63"
+      },
+      "ore_ont_5940": {
+       "sha256": "e0911595e0782a559889d8ac62cc5a8f6f69219eb8dd58bff4bb27bd1f0c856e"
+      },
+      "ore_ont_6855": {
+       "sha256": "2a3ebab8ec0e933f1e261d26740fdfc9e042156c6250007515452dbeed8fb9ec"
+      },
+      "ore_ont_7584": {
+       "sha256": "623acf0024da64fea4ffdcf76a0265d10b703b106a967782fa614537894ee57d"
+      },
+      "ore_ont_7663": {
+       "sha256": "228b6e6ad34a8e35de85fab21da4940810b6ca2ccd61eb6712f4974f478836d0"
+      },
+      "ore_ont_8203": {
+       "sha256": "391049dc638f182392bb69bbe05cf09470b94079c0d6b4c07214dd9f35793769"
+      },
+      "ore_ont_8273": {
+       "sha256": "10c15bd019500abd57d05b6277428ff113e81645da7ad4c10a116fe9ac6b5be4"
+      },
+      "ore_ont_9096": {
+       "sha256": "d5c9f1a970bb5faad25fe379415f74a2e7e62a288a96071e1f353e721a9cb207"
+      },
+      "ore_ont_8737": {
+       "sha256": "2f5e2478a6a21f304d5c49fa65aa6fc447cf5fe907b3a68ec375da05320f1cc6"
+      }
+     }
+    },
+    "settings": {
+     "parts": {
+      "gate": {
+       "rounds": 5,
+       "threads": [
+        1,
+        8
+       ],
+       "repeat": 5,
+       "pin1": "4",
+       "pinn": "0-11"
+      },
+      "ow1": {
+       "rounds": 5,
+       "threads": [
+        1,
+        8
+       ],
+       "repeat": 5,
+       "pin1": "4",
+       "pinn": "0-11"
+      },
+      "cold-t1": {
+       "rounds": 7,
+       "threads": [
+        1
+       ],
+       "repeat": [
+        1,
+        10
+       ],
+       "pin1": "4",
+       "pinn": "0-11"
+      },
+      "cold-t4": {
+       "rounds": 7,
+       "threads": [
+        4
+       ],
+       "repeat": [
+        1,
+        10
+       ],
+       "pin1": "4",
+       "pinn": "0-11"
+      },
+      "cold-t8": {
+       "rounds": 7,
+       "threads": [
+        8
+       ],
+       "repeat": [
+        1,
+        10
+       ],
+       "pin1": "4",
+       "pinn": "0-11"
+      },
+      "atlas-8737": {
+       "host": "atlas",
+       "rounds": 1,
+       "threads": [
+        1,
+        4
+       ],
+       "repeat": 1,
+       "memory_max": "13G"
+      }
+     }
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "forge",
+      "cpu": "13th",
+      "cpus": 20,
+      "ram_mib": 15620,
+      "kernel": "7.2.9"
+     },
+     "method": "Every part held the heavy lock, and the forge parts also held the bench lock. gate: gate/ab.sh.txt ran one el_classify process per side, file and thread count with --repeat 5 in five rounds whose order of the sides rotates, one thread pinned to CPU 4 and eight threads pinned to the performance cores 0 to 11. Each round's value is the process's median classification time. ow1: the same as the gate with the experiment ow1 as a third side. cold-t1, cold-t4 and cold-t8: cold.sh.txt ran each small file in seven rounds of rotating order, one process with --repeat 1 for the cold classification and the wall time of the whole process, and one process with --repeat 10 whose last nine classifications give the warm median, pinned in the same way. atlas-8737: atlas-8737/mem695.sh.txt ran one classification of ore_ont_8737 per side on four and on one thread in a scope with a 13 GiB cap, and reports the peak RSS of the process and the classifier's peak estimate of its own memory.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual measurement record of items 709 and 695 on the benchmark host and atlas: cold and warm runs of the 12 small ORE 2015 DL files, rounds on GO, ChEBI lite and two ORE 2015 EL files, a run with an experimental one-thread worker, the memory of ore_ont_8737 and the identity sweep's taxonomy hashes."
   }
  ]
 }
