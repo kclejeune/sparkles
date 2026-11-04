@@ -620,9 +620,9 @@ while ! finished "$primary" "$name" || { [ "$helper" != none ] && ! finished "$h
   sleep 120
 done
 fetch
-cat "$dest/selection.txt" 2> /dev/null
-cat "$dest/steps.txt" 2> /dev/null
-cat "$dest/wall.txt" 2> /dev/null
+cat "$dest/selection.txt" 2> /dev/null || true
+cat "$dest/steps.txt" 2> /dev/null || true
+cat "$dest/wall.txt" 2> /dev/null || true
 code=$(cat "$dest/gate.exit" 2> /dev/null || echo 99)
 echo "gate exit $code"
 exit "$code"

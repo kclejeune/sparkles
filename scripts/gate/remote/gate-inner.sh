@@ -92,6 +92,7 @@ step() {
 }
 
 if [ "$part" = link ]; then
+  echo "the server artifact link check only" > "$out/selection.txt"
   {
     echo "host=$host commit=$full part=$part"
     podman --version 2> /dev/null

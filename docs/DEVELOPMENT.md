@@ -577,7 +577,9 @@ which it reads from `requires-python` in `crates/sparkles-py/pyproject.toml`, si
 stubs can differ there. The extension is built for the stable ABI, so the same build loads
 on that interpreter. `uv` makes the interpreter's virtual environment in
 `target/py-venv-<version>` with the same pinned dependencies, and only `test_stubtest`
-runs in it, which adds a few seconds. The extra arguments do not reach this run. Without
+runs in it, which adds a few seconds. The extra arguments do not reach this run. When
+the interpreter on PATH is already the oldest one, it runs the stub test a second time with
+that interpreter and needs no `uv`. Without
 `uv` a plain run prints a warning and goes on. The batch gate sets
 `SPARKLES_PY_OLDEST=required`, and there a missing `uv` fails the run. `mise run py:lint` runs clippy on the crate with its
 default features and with none. Both tasks are part of `mise run ci`. The first run

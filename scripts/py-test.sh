@@ -79,8 +79,12 @@ fi
 stubtest_oldest() {
   local current msg venv
   current=$("$python" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+  # On the oldest Python itself the full suite has run, unless the caller's arguments
+  # filtered the stub test out, so the dedicated run uses this interpreter and needs no uv.
   if [ "$current" = "$oldest" ]; then
-    return 0
+    SPARKLES_PY_TEST_DEPS=required PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/$out" \
+      "$python" -m pytest -p no:cacheprovider "$crate/tests/test_stubs.py" -k test_stubtest
+    return
   fi
   if ! command -v uv > /dev/null; then
     msg="uv is not installed, so the stub test on Python $oldest did not run. Install uv (https://docs.astral.sh/uv/)."
