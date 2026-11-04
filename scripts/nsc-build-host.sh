@@ -9,7 +9,7 @@
 # When every reachable host with the disk is busy, the build waits for the heavy lock of
 # the first of them, since a build on this machine is what the option exists to avoid, and
 # the message says that --build-host local builds here instead. When no listed host can be
-# reached, the run stops. Without --build-host the run uses auto when
+# reached, or the list names only the benchmark host, the run stops. Without --build-host the run uses auto when
 # SPARKLES_NSC_BUILD_HOSTS is set and local otherwise, so a machine without the setting
 # builds as it always has. The variables come from the environment, else from KEY=VALUE
 # lines in ${SPARKLES_NSC_BUILD_CONFIG:-~/.config/sparkles/nsc-build.env}. The benchmark
@@ -79,7 +79,7 @@ bh_probe() {
 # bh_resolve: set BH_HOST to local or a build host, once per run, and say which
 bh_resolve() {
   [ -z "$BH_HOST" ] || return 0
-  local want=$BH_ARG h p l u d min fallback='' hosts=()
+  local want=$BH_ARG h p l u d min listed fallback='' hosts=()
   bh_load_config
   min=${SPARKLES_NSC_BUILD_MIN_FREE_GB:-20}
   if [ -z "$want" ]; then
@@ -97,6 +97,12 @@ bh_resolve() {
           hosts+=("$h")
         fi
       done
+      # Hosts that were listed but are all the benchmark host do not fall back to a local
+      # build, which the setting exists to avoid.
+      listed=${SPARKLES_NSC_BUILD_HOSTS:-}
+      if [ ${#hosts[@]} = 0 ] && [ -n "${listed// /}" ]; then
+        die "SPARKLES_NSC_BUILD_HOSTS lists no host but the benchmark host; name a build host or pass --build-host local"
+      fi
       if [ ${#hosts[@]} = 0 ]; then
         echo "build host: none configured (SPARKLES_NSC_BUILD_HOSTS), building on this machine"
         BH_HOST=local
@@ -146,8 +152,8 @@ bh_mbx_pin() {
 bh_cleanup() {
   [ -n "$BH_RDIR" ] || return 0
   # shellcheck disable=SC2029 # the unit and directory are this run's and expand here
-  ssh "${bh_ssh_opts[@]}" "$BH_RHOST" "systemctl --user stop $BH_RUNIT > /dev/null 2>&1; rm -rf -- $BH_RDIR" < /dev/null ||
-    echo "could not remove $BH_RHOST:$BH_RDIR; remove it and stop the unit $BH_RUNIT there" >&2
+  ssh "${bh_ssh_opts[@]}" "$BH_RHOST" "systemctl --user stop $BH_RUNIT.scope > /dev/null 2>&1; rm -rf -- $BH_RDIR" < /dev/null ||
+    echo "could not remove $BH_RHOST:$BH_RDIR; remove it and stop the unit $BH_RUNIT.scope there" >&2
   BH_RDIR=
   BH_RUNIT=
 }

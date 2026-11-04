@@ -49,6 +49,7 @@ while a and a[0].startswith('-'):
 state=pathlib.Path(os.environ['FAKE_HOSTS'])/'units'
 state.mkdir(exist_ok=True)
 if unit:
+    if '.' not in unit:unit+='.scope'
     os.setsid()
     (state/unit).write_text(str(os.getpid())+'\\n'+' '.join(props)+'\\n')
 os.execvp(a[0],a)
@@ -63,7 +64,8 @@ if 'list-units' in a:
     for i in range(n):print(f'gate-{i}.service loaded active running gate')
     raise SystemExit(0)
 if 'stop' in a:
-    f=state/'units'/a[-1]
+    name=a[-1] if '.' in a[-1] else a[-1]+'.service'
+    f=state/'units'/name
     if f.exists():
         try:os.killpg(int(f.read_text().split()[0]),signal.SIGKILL)
         except ProcessLookupError:pass
@@ -243,6 +245,10 @@ class BuildHost(unittest.TestCase):
         self.assertIn("is reachable with 999999999 GiB free", result.stderr)
 
     def test_the_benchmark_host_never_builds(self):
+        # A list of the benchmark host alone does not fall back to a local build.
+        result, _ = self.bench(env=dict(self.env, SPARKLES_NSC_BUILD_HOSTS=" bench "), ok_stop=False)
+        self.assertIn("lists no host but the benchmark host", result.stderr)
+        self.assertEqual(self.builds(), [])
         env = dict(self.env, SPARKLES_NSC_BUILD_HOSTS="bench h1")
         result, _ = self.bench(env=env)
         self.assertIn("build host bench: skipped", result.stdout)
@@ -328,6 +334,7 @@ class BuildHost(unittest.TestCase):
         process.communicate(timeout=20)
         self.assertEqual(process.returncode, 130)
         self.assertEqual(self.scratch("h1"), [])
+        self.assertTrue(unit.name.endswith(".scope"))
         self.assertIn(f"stop {unit.name}", (self.hosts / "systemctl.log").read_text())
         time.sleep(0.2)
         with self.assertRaises(ProcessLookupError):
