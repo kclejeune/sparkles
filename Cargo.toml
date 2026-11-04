@@ -121,6 +121,16 @@ debug = 1
 [profile.release.package.sparkles-core]
 codegen-units = 1
 
+# The OWL crate is compiled as one codegen unit for the same reason. With four, the time of
+# the classifier's index stage moved by up to 7% with changes elsewhere in the crate that it
+# never runs (roadmap item 711). One unit classifies ore_ont_3836 2.7% faster on one thread
+# on forge, ore_ont_13482 4.1% and ChEBI lite 1.7%, with each rule set's saturation worker
+# inlining its own activation. A release rebuild after a change to the crate takes about
+# BUILD-TIME-TBD longer on atlas. docs/benchmarks/el-classification/RESULTS.md records the
+# measurements.
+[profile.release.package.sparkles-owl]
+codegen-units = 1
+
 # Full debug info made each test binary about 1.3 GB, so linking and writing the 130-odd
 # test binaries dominated `cargo test`. Line tables keep file and line numbers in
 # backtraces and panics. For a debugger session that needs variables, build with
