@@ -1527,12 +1527,13 @@
     at: string | undefined,
     signal?: AbortSignal,
   ): Promise<{ gid: string; owner: string; members: grp.Member[] }[]> {
-    const wanted: { gid: string; m: grp.Member; triple: EdgeTriple }[] = [];
+    const wanted: { gid: string; oid: string; m: grp.Member; triple: EdgeTriple }[] = [];
     for (const [gid, g] of drawLog) {
       const p: Term = { type: 'uri', value: g.predicate };
-      for (const m of g.members.values())
+      for (const [oid, m] of g.members)
         wanted.push({
           gid,
+          oid,
           m,
           triple: g.incoming ? [m.term, p, g.ownerTerm] : [g.ownerTerm, p, m.term],
         });
@@ -1546,10 +1547,13 @@
     );
     const by = new Map<string, { gid: string; owner: string; members: grp.Member[] }>();
     for (const w of wanted) {
+      // a member or a group the person removed while the read was out is not drawn
+      const log = drawLog.get(w.gid);
+      if (!log?.members.has(w.oid)) continue;
       // a blank node or a triple term cannot be checked, so its member stays
       const checkable = w.triple.every((t) => t.type === 'uri' || t.type === 'literal');
       if (checkable && !found.has(edgeIdOf(w.triple))) continue;
-      const d = by.get(w.gid) ?? { gid: w.gid, owner: drawLog.get(w.gid)!.owner, members: [] };
+      const d = by.get(w.gid) ?? { gid: w.gid, owner: log.owner, members: [] };
       d.members.push(w.m);
       by.set(w.gid, d);
     }
@@ -1603,6 +1607,7 @@
       edges = {};
       const rn = ensureNode(rootTerm, keepLabels.get(root), root);
       const replayed = new Set<string>();
+      const drawnGroups = new Set<string>();
       // an expansion makes its groups, whose drawn members can be expanded in turn, so the
       // passes go on until one expands nothing more
       for (let more = true; more;) {
@@ -1617,7 +1622,13 @@
           for (const f of nh.groups) addGroup(n, f);
           n.expanded = true;
         }
-        for (const d of drawnAt) drawMembers(d.gid, d.members);
+        // each group's members are drawn once, when the group exists
+        for (const d of drawnAt) {
+          if (drawnGroups.has(d.gid) || !nodes[d.gid]?.group) continue;
+          drawnGroups.add(d.gid);
+          drawMembers(d.gid, d.members);
+          more = true;
+        }
       }
       for (const [id, n] of Object.entries(nodes)) {
         const kept = keepLabels.get(id);
