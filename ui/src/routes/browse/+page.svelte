@@ -1672,7 +1672,9 @@
                             <th scope="row" class="mono">{iriName(o.property, prefixes)}</th>
                             <td>
                               {#each o.values as v, i (i)}{#if i > 0}<br
-                                  />{/if}{#if isLiteral(v)}{v['@value']}<DatatypeChip
+                                  />{/if}{#if isLiteral(v)}<span
+                                    class:lexical={!!literalDatatype(v)}>{v['@value']}</span
+                                  ><DatatypeChip
                                     iri={literalDatatype(v)}
                                     {prefixes}
                                   />{#if v['@language']}<span class="lang-tag"

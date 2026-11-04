@@ -1487,6 +1487,10 @@ kbd,
 .term-flow > * {
   overflow-wrap: anywhere;
 }
+/* A typed literal's exact lexical form, whose spaces, tabs and newlines are part of the data. */
+.lexical {
+  white-space: pre-wrap;
+}
 .lang-tag {
   font: 600 10px var(--font-ui);
   color: var(--text-3);

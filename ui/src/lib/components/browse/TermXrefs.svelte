@@ -30,9 +30,14 @@
           {#if !isLiteral(s.value) && linker.href(v) && !external(v)}
             <a href={linker.href(v)}>{linker.name(v)}</a>
           {:else if external(v)}
-            <a href={v} rel="noopener noreferrer" target="_blank">{v}</a>
+            <a
+              class:lexical={!!literalDatatype(s.value)}
+              href={v}
+              rel="noopener noreferrer"
+              target="_blank">{v}</a
+            >
           {:else}
-            <span>{v}</span>
+            <span class:lexical={!!literalDatatype(s.value)}>{v}</span>
           {/if}<DatatypeChip iri={literalDatatype(s.value)} {prefixes} />
         </li>
       {/each}

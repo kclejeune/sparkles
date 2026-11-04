@@ -20,10 +20,9 @@
           class="builtin"
           title={t.iri}>{linker.name(t.iri)}</span
         >{/if}{:else if t.role === 'kw'}<span class="kw">{t.text}</span
-      >{:else if t.role === 'lit'}<span class="lit">{t.value ?? t.text}</span><DatatypeChip
-        iri={t.datatype ?? null}
-        {prefixes}
-      />{:else}{t.text}{/if}{/each}</span
+      >{:else if t.role === 'lit'}<span class="lit" class:lexical={!!t.datatype}
+        >{t.value ?? t.text}</span
+      ><DatatypeChip iri={t.datatype ?? null} {prefixes} />{:else}{t.text}{/if}{/each}</span
 >
 
 <style>

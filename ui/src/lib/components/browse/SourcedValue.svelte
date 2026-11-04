@@ -28,11 +28,15 @@
 
 <span class="val"
   >{#if !isLiteral(v.value)}{#if iriHref}<a href={iriHref}>{linker.name(v.value as string)}</a
-      >{:else}<span class="mono">{v.value}</span>{/if}{:else}<LinkedText
-      text={valueText(v.value)}
-      {linker}
-      {curieIri}
-    /><DatatypeChip iri={literalDatatype(v.value)} {prefixes} />{/if}{#if showLang && v.lang}<span
+      >{:else}<span class="mono">{v.value}</span>{/if}{:else}<span
+      class:lexical={!!literalDatatype(v.value)}
+      ><LinkedText
+        text={valueText(v.value)}
+        {linker}
+        {curieIri}
+        exact={!!literalDatatype(v.value)}
+      /></span
+    ><DatatypeChip iri={literalDatatype(v.value)} {prefixes} />{/if}{#if showLang && v.lang}<span
       class="lang-tag">{v.lang}</span
     >{/if}{#each v.types ?? [] as t (t)}<span class="badge syn-type" title={t}>{typeName(t)}</span
     >{/each}{#if v.sources.length}<span class="src">{v.sources.join(', ')}</span>{/if}</span

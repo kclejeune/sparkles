@@ -865,6 +865,54 @@ test('a cross-reference that closes an IRI is plain text and reaches no query', 
   ).toEqual([]);
 });
 
+test('a typed literal keeps its spaces, tabs and newlines as they are', async ({ page }) => {
+  const XSD = 'http://www.w3.org/2001/XMLSchema#';
+  const value = '  a  b\tc\n\n  d';
+  const lexical = { '@value': value, '@type': XSD + 'token' };
+  await page.route(/\/\$\/ontology\/cells\/term\?/, async (route) => {
+    const res = await route.fetch();
+    const t = await res.json();
+    const graph = t.statements[0]?.graph ?? '';
+    const stated = (property: string) => ({ property, value: lexical, graph, annotations: [] });
+    t.statements = [
+      ...t.statements,
+      stated('http://www.w3.org/2000/01/rdf-schema#comment'),
+      stated('http://www.w3.org/2000/01/rdf-schema#seeAlso'),
+      stated('http://purl.org/dc/terms/created'),
+      stated('http://example.org/spaced'),
+    ];
+    t.axioms = [
+      ...t.axioms,
+      {
+        axiom: {
+          type: 'SubClassOf',
+          subClass: t.iri,
+          superClass: { type: 'DataHasValue', property: 'http://example.org/p', value: lexical },
+        },
+        ofn: '',
+        graph,
+      },
+    ];
+    await route.fulfill({ response: res, json: t });
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(HEAVY);
+  await expect(page.getByRole('region', { name: 'Axioms' })).toContainText('a', {
+    timeout: 30_000,
+  });
+  await page.locator('details[data-more="comment"] > summary').click();
+  await page.getByText('All other statements').click();
+  // the text a reader sees, in each place a typed literal shows
+  const seen = (l: Locator) =>
+    l.evaluate((chip) => {
+      const box = chip.parentElement!.closest('li, dd, td, .prose, .row, p') ?? chip.parentElement!;
+      return (box as HTMLElement).innerText;
+    });
+  const chips = page.locator('.browse .datatype', { hasText: 'xsd:token' });
+  await expect(chips).toHaveCount(5);
+  for (const chip of await chips.all()) expect(await seen(chip)).toContain(value);
+});
+
 test('a concept keeps its hidden labels behind their toggle', async ({ page }) => {
   const concept = (l: string) =>
     `/ui/browse?ds=thes&iri=${encodeURIComponent(`http://example.org/thesaurus/${l}`)}`;

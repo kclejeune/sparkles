@@ -39,10 +39,9 @@
           {#if r.badge}<span class="badge {r.badge}">{r.text}</span>{:else if r.text}{r.text}{/if}
           {#each all ? vs : vs.slice(0, limit) as v, i (i)}{#if i > 0 || r.text},{' '}{/if}{#if !isLiteral(v) && linker.href(v)}<a
                 href={linker.href(v)}>{linker.name(v)}</a
-              >{:else if !isLiteral(v)}{linker.name(v)}{:else}{valueText(v)}<DatatypeChip
-                iri={literalDatatype(v)}
-                {prefixes}
-              />{/if}{/each}
+              >{:else if !isLiteral(v)}{linker.name(v)}{:else}<span
+                class:lexical={!!literalDatatype(v)}>{valueText(v)}</span
+              ><DatatypeChip iri={literalDatatype(v)} {prefixes} />{/if}{/each}
           {#if !all}
             <button class="more-btn" type="button" onclick={() => (open[r.label] = true)}
               >and {vs.length - limit} more</button
