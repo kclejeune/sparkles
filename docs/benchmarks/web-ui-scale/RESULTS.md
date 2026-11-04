@@ -102,8 +102,9 @@ that case, which is about 1.1 s for each, against 7.8 s over the 19 expansions o
 build. Each expansion rebuilds the drawn graph from the held graph, and that work grows with
 the held graph.
 
-The frame times of the newer build at 5,000 drawn nodes are CPU times of software WebGL and
-say little about a graphics card. They show that the layout and the drawing compete for the
+The frame times of the newer build at 5,000 drawn nodes were measured with software WebGL in
+headless Chromium and say little about a graphics card. They need a measurement on a graphics
+card before they are treated as real. They show that the layout and the drawing compete for the
 processor when no graphics card is present.
 
 A resource with 20,000 neighbours is one group node in the newer build, so the first graph
