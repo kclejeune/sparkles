@@ -239,6 +239,12 @@ run after a run that stopped before its saturation ended. A run that stops later
 its saturated contexts. Property tests check that an incremental run after random
 additions and removals gives the taxonomy of a full run.
 
+This reuse applies to eligible EL edits. Normalization with Horn or disjunctive axioms
+currently clears the contexts and marks the run entangled, so a later edited source
+rebuilds those runs. Reusing the completed result at the same commit is separate from
+incremental maintenance. Item 753 delivers item 603's affected-module incremental DL
+requirement, as [the follow-up](#incremental-native-dl-classification) describes.
+
 **Bounds.** A run stops at its deadline, at a cancellation and when the estimated memory
 passes the budget. The deadline and the cancellation are checked while the axioms are
 normalized, while the property closure is built, between the stages and while the
@@ -264,9 +270,12 @@ ontology. `POST /$/ontology/{ds}/classify`, the `classify` operation of the shar
 surface, `sparkles ontology classify` and the Python, Node.js and JVM bindings run it. An
 inferred read is refused, since a classification reads the asserted axioms. The dataset
 keeps its last classification of an ontology for callers who read every graph, without
-assertions, keyed by the graphs, imports and mode. A classification at the same commit
-answers from it, and one at a later commit gives the kept classifier the axioms that
-changed. One kept classification runs at a time, and a second caller waits for it under
+assertions, keyed by the graphs, imports and mode. A compatible classification at the
+same commit answers from the retained result. At a later commit eligible EL additions
+and removals reuse affected contexts, while Horn and disjunctive runs rebuild after
+edits. Item 753 covers incremental native DL maintenance under item 603, and item 664
+covers the EL individual, merge, key and world invalidation gaps. One kept classification
+runs at a time, and a second caller waits for it under
 its own deadline. The dataset keeps the saturation and the ontology it read, whose axioms
 the open ontology shares, and at the next commit it passes the saturation the axioms
 that differ between the two. The threads are taken before that, so a run that times out
@@ -987,3 +996,44 @@ Manchester, OBO or OBO Graphs JSON (item 686), and refuse
 `--prevent-invalid-references true` (item 687). `reason --reasoner emr` asserts
 named superclasses only, as ELK does, not the class expressions that ROBOT's expression
 materializing reasoner adds, which item 691 follows.
+
+### Roadmap follow-ups
+
+#### Incremental native DL classification
+
+Item 753 delivers item 603's affected-module maintenance for axiom insertions and
+deletions. It first covers supported Horn and disjunctive constructs and extends
+eligibility with later phases of item 603. Dependencies must cover normalized rules,
+Horn conjunction contexts, disjunctive test contexts and taxonomy consequences,
+including consequences whose last support was removed. An edit with untracked effects
+must fall back to fresh full classification, including global role or chain changes,
+tier transitions and new constructs without complete dependency tracking. An affected
+module can be the whole ontology, and case analysis retains its exponential worst case.
+
+Item 590 owns assertion retention and item 664 owns EL individual, merge, key and world
+invalidation. Coordinate their dependency records before making those changes eligible
+for native DL reuse. Terminology-only maintenance can ship with a safe full fallback
+before those items finish. Item 589 owns durable automatic scheduling after item 339.
+
+A completed incremental run must equal a fresh full run at the same revision and
+options in subsumptions, equivalence groups, direct taxonomy edges, unsatisfiable
+classes, consistency, completeness and excluded-axiom reports. Partial results remain
+sound and preserve the existing incomplete-class and unknown-consistency contract.
+Retained state, invalidation scratch space and replacement state count against the
+applicable memory budgets. Deadlines and cancellation must preserve safe recovery and
+truthful completeness. Reuse must match the source history and producer options, and
+publication must preserve revision identity and reject stale writes.
+
+Acceptance compares fixed and randomized insertion and deletion histories with fresh
+full runs after every edit, plus reference checks on supported fragments. Cover lost
+supports, equivalence and unsatisfiability changes, consistency changes, global effects,
+tier transitions and full fallback, together with memory stops, cancellation, deadlines,
+interrupted-run recovery and concurrent source changes. Bounded runs may stop at
+different points but must remain sound and report completeness truthfully.
+
+Measure cold classification, fresh full runs and retained small insertions and deletions
+on identified Horn and disjunctive workloads with checked answers. Include normalization,
+invalidation and taxonomy costs, fallback edits, retained bytes and peak memory.
+Acceptance requires a measured benefit for localized edits and a documented memory
+tradeoff. Existing full-classification gates still apply, and accepted slowdowns get a
+roadmap follow-up. This does not promise cheap updates for arbitrary OWL 2 DL.

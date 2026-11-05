@@ -284,9 +284,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   classifier cannot compare, such as an XML literal, an ill-typed literal or a datatype
   outside the OWL 2 datatype map, or with a property chain through the top object
   property, is used as far as the calculus goes and reported as partial. Every answer is entailed, and it is complete for named classes
-  when nothing is reported. The classifier keeps its contexts between runs, and a run
-  after added or removed axioms saturates again only the contexts that those axioms can
-  reach. A change to the property hierarchy, chains, reflexivity or ranges, to an axiom
+  when nothing is reported. For eligible EL additions and removals, the classifier
+  keeps its contexts and saturates again only those the changes can reach. Horn and
+  disjunctive classifications rebuild after edits. Their incremental maintenance is
+  planned in item 753 under item 603. A change to the property hierarchy, chains,
+  reflexivity or ranges, to an axiom
   with an individual, a data property, a datatype or a key, and any change after a run
   that took that step or an axiom outside OWL 2 EL, saturates everything again. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
@@ -312,8 +314,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   run with `target` writes the taxonomy to a named graph in one commit, replaces the
   taxonomy that graph held, and records PROV-O provenance on the graph's ontology
   header. The dataset keeps its last classification of an ontology for callers who read
-  every graph, so a classification at the same commit answers at once and one at a
-  later commit is incremental. That kept state holds the classifier's contexts, index
+  every graph, so a compatible same-commit call can reuse a retained result. At a later
+  commit, eligible EL additions and removals reuse affected contexts. Horn and
+  disjunctive runs rebuild after edits, with affected-module reuse planned in item 753
+  under item 603. Same-commit reuse is separate from incremental reclassification.
+  That kept state holds the classifier's contexts, index
   and taxonomy in memory while the dataset is open and reads the axioms of the open
   ontology in place. It is about 74 MB for GO by the estimate, which a counted heap
   matches, and it trades that memory for fast reclassification. `sparkles ontology classify FILE` classifies a file without a
@@ -705,6 +710,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   subclasses of a class expression, roadmap item 588.
 * A classification runs within one request's deadline and is not kept up to date as
   commits land. Roadmap item 589.
+* Native Horn and disjunctive classifications rebuild after axiom insertions and
+  deletions. Incremental maintenance with safe full fallback and measured edit latency
+  and retained memory is planned in [item 753](../ROADMAP.md) under item 603.
 * A classification with the assertions saturates everything on each run, since the
   dataset keeps only classifications of the terminology. Roadmap item 590.
 
