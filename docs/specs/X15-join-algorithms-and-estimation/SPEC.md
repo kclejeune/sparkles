@@ -127,8 +127,11 @@ phases are not. [Item 454](../../ROADMAP.md) tracks the remaining work.
 
 The q-error of a plan node is `max(est, act) / min(est, act)`, both at least one row,
 over the nodes that ran to completion. `scripts/bench-estimates/qerror.py` recorded every
-join node of these workloads on the base build and on this change, on the laptop, with
-identical answers.
+join node of these workloads on the base build and on this change, on the laptop.
+The SELECT answer fingerprints agree. The check did not read graph triples or quads,
+so its matching fingerprints for the six BSBM Explore graph queries do not establish
+RDF graph equality. This limitation leaves the recorded node estimates and timings
+unchanged.
 
 | Workload | Joins | Geometric mean | 90th percentile | Largest |
 |---|---|---|---|---|
@@ -180,10 +183,13 @@ sets, of `F4-2` from 9 to 58 and of DBpedia's `film-director-optional` from 1.0 
 16,384 sets that of WatDiv `F4-1` rises from 2.1 to 7.0 and of DBpedia's `births-by-decade`
 from 1.0 to 2.1.
 
-On forge at 12 threads, with interleaved rounds of fresh servers and identical answers,
-the geometric mean of the query times against main without these estimates is 0.968 on
-WatDiv, 0.933 on BSBM BI, 0.946 on LUBM, 1.000 on BSBM explore, 1.028 on the synthetic
-workload and 0.993 on DBpedia. The plans of 41 queries change. WatDiv's `C` queries take
+On forge at 12 threads, with interleaved rounds of fresh servers and matching SELECT
+answer fingerprints, the geometric mean of the query times against main without these
+estimates is 0.968 on WatDiv, 0.933 on BSBM BI, 0.946 on LUBM, 1.000 on BSBM explore, 1.028 on the synthetic
+workload and 0.993 on DBpedia. This timing check also omitted RDF graph output from its
+fingerprints. Its six BSBM Explore graph markers are unverified, as the
+[manual run note](../../benchmarks/engine/runs/2026-11-03-estimation-ab-forge-e8e0e4cd/README.md)
+explains. The plans of 41 queries change. WatDiv's `C` queries take
 0.20 to 0.45 times as long, BSBM BI `q1-3` 0.23 times, LUBM `q2` 0.51 times and DBpedia's
 `costar-birthplace` 0.63 times. WatDiv `S4-2` and `S4-4` take 1.6 times as long, since an
 accurate estimate leads the planner to a 704-key index join that the cost model prices

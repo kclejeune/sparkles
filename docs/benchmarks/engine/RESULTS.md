@@ -354,7 +354,10 @@ of base, change, change and base. Each run was a fresh server pinned to 12 CPUs 
 threads and the result cache off, and each query got 3 warm-ups and 20 timed requests. A
 request's time is the server's planning and execution time, and the table gives the
 geometric mean of the per-query ratios of the medians. The change ran on stores that it
-loaded itself, and every query returned the same answers on both. The flagged synthetic
+loaded itself, and the SELECT answer fingerprints agreed. The digest did not inspect
+RDF graph output, so the six BSBM Explore CONSTRUCT and DESCRIBE comparisons do not
+establish graph equality. The [manual run note](runs/2026-11-03-estimation-ab-forge-e8e0e4cd/README.md)
+qualifies those historical markers without changing the timings. The flagged synthetic
 and DBpedia queries ran again in eight rounds. The
 [run record](runs/2026-11-03-estimation-ab-forge-e8e0e4cd/record.json) holds every query's
 medians, per-round ratios, changed plans and reruns, and its
