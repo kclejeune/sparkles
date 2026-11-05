@@ -4,6 +4,23 @@ This report was imported from the manually maintained benchmark page. Its tables
 qualifications are preserved, and are not regenerated from the JSON records. Read the
 [reference setup and answer rules](../reference/README.md) with each result.
 
+## Expression sort-key cost after the dependency refresh
+
+A matched-build control on forge compares `6d55f1e6` with `6724abe9` at 1.05M
+triples, with one query thread and result caching disabled. The `expr-order-key`
+execution median rises from 1.104797 to 1.120524 ms, a consistent 1.4235% cost
+of about 15.73 microseconds. The paired-round 95% ratio interval is 1.011584 to
+1.016480. Complete HTTP wall time remains 2.804 against 2.803 ms, with an interval
+that includes equal time. The standard TSV references and all 1,280 native answer
+checks agree within their respective fingerprint formats.
+
+The [manual run record](runs/2026-11-05-dependency-refresh-expr-order-key/README.md)
+retains the query, raw samples, build and input receipts, controls and reproducible
+analysis. The comparison includes the dependency and numeric correctness repairs,
+rendering preferences and documentation changes, so it does not identify a single
+cause. The cost is accepted while retaining the correctness repairs, and roadmap
+item 748 tracks attribution and recovery. It is not classified as noise.
+
 ## Query layout after the classification batch
 
 A pinned counter comparison of `ae8a6cd5` and `5b0acdf9` on forge, at 1.05M

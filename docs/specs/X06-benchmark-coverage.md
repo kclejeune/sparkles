@@ -1506,6 +1506,24 @@ q11 and q12 against the generated triples. BI q2 also passed a direct feature-in
 oracle. BI q3 and q8 and the full DBpedia births-by-decade disagreement still lack direct
 data-oracle checks. No minority engine's semantic error follows from a majority alone.
 
+### Expression sort-key cost after the dependency refresh
+
+The source comparison from `6d55f1e6` to `6724abe9` includes the dependency refresh,
+parser and numeric repairs, rendering preferences and documentation changes. A
+matched-build forge control at 1.05M triples runs eight A,B,B,A rounds with one query
+thread, five warm-ups and 40 timed requests in each fresh process. The
+`expr-order-key` execution median rises from 1.104797 to 1.120524 ms. The ratio is
+1.014235, with a paired-round 95% interval of 1.011584 to 1.016480. Complete HTTP
+wall time is unchanged within its interval. The standard TSV references agree, and
+all 1,280 native answer checks agree within the native fingerprint format.
+
+This consistent 15.73-microsecond cost is accepted while retaining the correctness
+repairs. It is not classified as noise and does not isolate a dependency as the
+cause. Item 748 tracks attribution and recovery. The
+[manual record](../benchmarks/synthetic/runs/2026-11-05-dependency-refresh-expr-order-key/README.md)
+preserves the inputs, build identities, raw samples, fingerprint limitations and
+analysis. Later performance work requires its own acceptance evidence.
+
 ### Small query costs in the integration screen
 
 The matching-compiler Namespace comparison of `a5847311` and `4f2e1633` returned the
