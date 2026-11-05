@@ -550,7 +550,8 @@ Changing the mode redraws names without reloading an editor or clearing its undo
 Changing the language order reloads browser names in place and editor hierarchy levels,
 preserving unsubmitted edits even if a name refresh fails. Complete multilingual label
 batches in the selected graph remain available, while hierarchy names use the server's
-choice over imported graphs too. Expanded graph nodes retain their names. Scheme pickers
+choice over imported graphs too. A blank hierarchy choice leaves usable local candidates
+available. Expanded graph nodes retain their names. Scheme pickers
 redraw their names without losing the chosen scheme. Query
 tables request only visible entities' labels, including those inside triple terms, in
 batches of 200 at the result's dataset, branch and commit. A replaced result cancels and

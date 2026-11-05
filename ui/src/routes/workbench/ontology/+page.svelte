@@ -434,16 +434,20 @@
   /** The labels the hierarchy answers carry, merged into the page's labels. */
   function takeNames(nodes: TreeNode[]) {
     for (const n of nodes) {
-      hierarchyNames.add(n.iri);
-      labels.set(
-        n.iri,
-        n.label
-          ? [{ '@value': n.label, ...(n.labelLang ? { '@language': n.labelLang } : {}) }]
-          : [],
-      );
+      if (n.label?.trim()) {
+        hierarchyNames.add(n.iri);
+        labels.set(n.iri, [
+          { '@value': n.label, ...(n.labelLang ? { '@language': n.labelLang } : {}) },
+        ]);
+      } else {
+        hierarchyNames.delete(n.iri);
+        labels.set(n.iri, graphLabels.get(n.iri) ?? []);
+        // A blank literal can rank ahead of usable literals in the server's choice.
+        if (n.label != null && !graphLabels.has(n.iri)) batch.want(n.iri);
+      }
     }
-    // a node the route gives no label has none to read
-    batch.know(nodes.filter((n) => !n.label).map((n) => n.iri));
+    // A missing label is known absent; a blank literal may have usable alternatives.
+    batch.know(nodes.filter((n) => n.label == null).map((n) => n.iri));
     const forms = nodes.filter((n) => n.shortForm && !shortForms.has(n.iri));
     if (forms.length)
       shortForms = new Map([...shortForms, ...forms.map((n) => [n.iri, n.shortForm!] as const)]);

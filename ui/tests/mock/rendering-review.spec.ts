@@ -22,6 +22,112 @@ async function localLabelsOnly(page: Page, wait?: () => Promise<void>) {
   });
   return () => batches;
 }
+
+async function blankHierarchy(page: Page, text: string, localFirst: boolean) {
+  let releaseLocal!: () => void;
+  let releaseHierarchy!: () => void;
+  const local = new Promise<void>((resolve) => {
+    releaseLocal = resolve;
+  });
+  const hierarchy = new Promise<void>((resolve) => {
+    releaseHierarchy = resolve;
+  });
+  let batches = 0;
+  let named = 0;
+  await page.route('**/uni/sparql**', async (route) => {
+    if (!route.request().postData()?.includes('?s ?p ?l')) return route.continue();
+    const response = await route.fetch();
+    const json = await response.json();
+    if (
+      !json.results.bindings.some((r: { s?: { value: string } }) => r.s?.value === UNI + 'Person')
+    )
+      return route.fulfill({ response, json });
+    json.results.bindings.push({
+      s: { type: 'uri', value: UNI + 'Person' },
+      p: { type: 'uri', value: 'http://www.w3.org/2000/01/rdf-schema#label' },
+      l: { type: 'literal', value: text, 'xml:lang': 'en' },
+    });
+    if (!localFirst) await hierarchy;
+    await route.fulfill({ response, json });
+    batches++;
+    releaseLocal();
+  });
+  await page.route('**/$/ontology/uni/hierarchy?**', async (route) => {
+    const response = await route.fetch();
+    const json = await response.json();
+    let found = false;
+    function blank(value: unknown) {
+      if (!value || typeof value !== 'object') return;
+      if ('iri' in value && value.iri === UNI + 'Person' && 'label' in value) {
+        Object.assign(value, { label: text, labelLang: 'en' });
+        found = true;
+      }
+      for (const child of Object.values(value)) blank(child);
+    }
+    blank(json);
+    if (localFirst) await local;
+    await route.fulfill({ response, json });
+    if (found) {
+      named++;
+      releaseHierarchy();
+    }
+  });
+  return {
+    batches: () => batches,
+    named: () => named,
+    close: () => {
+      releaseLocal();
+      releaseHierarchy();
+    },
+  };
+}
+
+for (const [label, text] of [
+  ['empty', ''],
+  ['whitespace', ' \t '],
+]) {
+  for (const localFirst of [true, false]) {
+    test(`${label} hierarchy text preserves a usable local label arriving ${localFirst ? 'first' : 'last'}`, async ({
+      page,
+    }) => {
+      const fixture = await blankHierarchy(page, text, localFirst);
+      try {
+        await page.goto(`/ui/workbench/ontology?ds=uni&iri=${encodeURIComponent(UNI + 'Person')}`);
+        await expect.poll(fixture.named).toBeGreaterThan(0);
+        await expect.poll(fixture.batches).toBeGreaterThan(0);
+        await page.evaluate(() => new Promise(requestAnimationFrame));
+        await expect(
+          page.getByRole('heading', { name: 'Person', exact: true }).first(),
+        ).toBeVisible();
+        await expect(
+          page
+            .getByRole('tree', { name: 'Classes (asserted)' })
+            .getByRole('button', { name: 'Person', exact: true }),
+        ).toBeVisible();
+      } finally {
+        fixture.close();
+      }
+    });
+  }
+}
+
+test('an unselected blank hierarchy row lazily reads its usable local labels', async ({ page }) => {
+  const fixture = await blankHierarchy(page, '', false);
+  try {
+    await page.goto('/ui/workbench/ontology?ds=uni');
+    await page.getByRole('button', { name: 'Expand Agent', exact: true }).click();
+    await expect.poll(fixture.named).toBeGreaterThan(0);
+    await expect(
+      page
+        .getByRole('tree', { name: 'Classes (asserted)' })
+        .getByRole('button', { name: 'Person', exact: true }),
+    ).toBeVisible();
+    expect(fixture.batches()).toBeGreaterThan(0);
+    expect(new URL(page.url()).searchParams.has('iri')).toBe(false);
+  } finally {
+    fixture.close();
+  }
+});
 async function preferences(page: Page, mode: 'label' | 'prefixed' | 'iri', languages = 'fr, en') {
   await page.getByRole('button', { name: 'Rendering preferences', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Rendering preferences' });
