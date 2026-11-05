@@ -148,3 +148,98 @@ test('a delayed reveal of the previous selection cannot open or scroll its type'
   );
   await expect(page.getByRole('heading', { name: 'Alan Turing', exact: true })).toBeVisible();
 });
+
+const individualAnswer = (commit: number, label: string) => ({
+  commit,
+  groups: [{ type: name('http://example.org/Type', 'Pinned type'), total: null }],
+  individuals: [
+    {
+      ...name('http://example.org/ada', label),
+      types: [name('http://example.org/Type', 'Pinned type')],
+    },
+  ],
+  total: 1,
+  next: null,
+});
+
+async function pinnedSummary(page: import('@playwright/test').Page) {
+  await page.route('**/$/ontology/uni?*', async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({ response, json: { ...(await response.json()), commit: 101 } });
+  });
+}
+
+test('filter membership stays at the displayed commit after a failed root read', async ({
+  page,
+}) => {
+  await pinnedSummary(page);
+  const lookups: URL[] = [];
+  await page.route('**/$/ontology/uni/search?*', (route) =>
+    route.fulfill({ json: { results: [{ iri: 'http://example.org/ada' }] } }),
+  );
+  await page.route('**/$/ontology/uni/individuals?*', async (route) => {
+    const url = new URL(route.request().url());
+    if (!url.searchParams.has('iri'))
+      return route.fulfill({ status: 500, body: 'root read failed' });
+    lookups.push(url);
+    const pinned = url.searchParams.get('at') === 'commit:101';
+    await route.fulfill({
+      json: individualAnswer(pinned ? 101 : 102, pinned ? 'Pinned Ada' : 'Head-only Ada'),
+    });
+  });
+  await page.goto('/ui/workbench/ontology?ds=uni&kind=NamedIndividual');
+  await expect(page.getByRole('alert')).toContainText('root read failed');
+  await page.getByRole('searchbox', { name: 'Filter', exact: true }).fill('ada');
+  await expect.poll(() => lookups.length).toBe(1);
+  expect(lookups[0].searchParams.get('at')).toBe('commit:101');
+  const tree = page.getByRole('tree', { name: 'Individuals (asserted)' });
+  await expect(tree.getByRole('button', { name: 'Pinned Ada', exact: true })).toBeVisible();
+  await expect(tree).not.toContainText('Head-only Ada');
+});
+
+for (const status of [404, 500]) {
+  test(`filter retains pinned matches when another head candidate returns ${status}`, async ({
+    page,
+  }) => {
+    await pinnedSummary(page);
+    await page.route('**/$/ontology/uni/search?*', (route) =>
+      route.fulfill({
+        json: { results: [{ iri: 'http://example.org/ada' }, { iri: 'http://example.org/new' }] },
+      }),
+    );
+    await page.route('**/$/ontology/uni/individuals?*', async (route) => {
+      const url = new URL(route.request().url());
+      if (!url.searchParams.has('iri'))
+        return route.fulfill({
+          json: {
+            commit: 101,
+            groups: [{ type: name('http://example.org/Type', 'Pinned type'), total: 1 }],
+            individuals: [],
+            total: 1,
+            next: null,
+          },
+        });
+      expect(url.searchParams.get('at')).toBe('commit:101');
+      if (url.searchParams.get('iri')?.endsWith('/new'))
+        return route.fulfill({
+          status,
+          body: status === 404 ? 'not present at pinned revision' : 'candidate read failed',
+        });
+      await route.fulfill({ json: individualAnswer(101, 'Pinned Ada') });
+    });
+    await page.goto('/ui/workbench/ontology?ds=uni&kind=NamedIndividual');
+    await expect(page.getByRole('tree', { name: 'Individuals (asserted)' })).toBeVisible();
+    await page.getByRole('searchbox', { name: 'Filter', exact: true }).fill('ada');
+    if (status === 500)
+      await expect(page.getByRole('alert')).toContainText('candidate read failed');
+    const tree = page.getByRole('tree', { name: 'Individuals (asserted)' });
+    await expect(tree.getByRole('button', { name: 'Pinned Ada', exact: true })).toBeVisible();
+    await expect(page.getByText(/Nothing matches/)).toHaveCount(0);
+    if (status === 404)
+      await expect(
+        page.getByText('Some search matches are absent at the displayed revision.', {
+          exact: true,
+        }),
+      ).toBeVisible();
+  });
+}

@@ -491,7 +491,13 @@
     if (openSet(k).has(id)) void levelTrees.get(k)?.load(id);
   }
   // a filter reads the search's hits of the tab's kind and their ancestors
-  let filtered = $state<{ text: string; tree: ReturnType<typeof filteredTree> } | null>(null);
+  let filtered = $state<{
+    text: string;
+    tree: ReturnType<typeof filteredTree>;
+    pending?: boolean;
+    error?: string;
+    absent?: boolean;
+  } | null>(null);
   // the dataset, branch and graph the filtered tree was read in
   let filteredIn = '';
   $effect(() => {
@@ -512,10 +518,10 @@
       filtered = null;
       return;
     }
+    filtered = { text, tree: filteredTree([]), pending: true };
     const ctl = new AbortController();
     const t = setTimeout(async () => {
       try {
-        if (kind === 'individual') await individualLevel.load(null);
         if (ctl.signal.aborted) return;
         const r = await searchEntities(scopeTarget, text, {
           kind: [kind],
@@ -524,15 +530,14 @@
           signal: ctl.signal,
         });
         if (kind === 'individual') {
-          const pages = await Promise.all(
+          const results = await Promise.allSettled(
             r.results.map((h) =>
               fetchIndividuals(
                 scopeTarget,
                 { graph: scopeGraph, imports: true },
                 {
                   iri: h.iri,
-                  at:
-                    individualLevel.commit != null ? `commit:${individualLevel.commit}` : undefined,
+                  at: `commit:${individualCommit}`,
                   lang: langs,
                 },
                 ctl.signal,
@@ -540,6 +545,18 @@
             ),
           );
           if (ctl.signal.aborted) return;
+          const pages: Awaited<ReturnType<typeof fetchIndividuals>>[] = [];
+          const errors: string[] = [];
+          let absent = false;
+          for (const result of results) {
+            if (result.status === 'rejected') {
+              if (result.reason instanceof api.ApiError && result.reason.status === 404)
+                absent = true;
+              else errors.push(api.errorMessage(result.reason));
+            } else if (result.value.commit !== individualCommit) {
+              errors.push('A matching entity was read from another revision.');
+            } else pages.push(result.value);
+          }
           const ids = new Set<string>();
           const edges: [string, string][] = [];
           for (const p of pages) {
@@ -556,7 +573,14 @@
               }
             }
           }
-          filtered = { text, tree: buildTree(ids, edges) };
+          filtered = {
+            text,
+            tree: buildTree(ids, edges),
+            absent,
+            ...(errors.length
+              ? { error: `Some matching entities could not be read. ${errors[0]}` }
+              : {}),
+          };
           return;
         }
         const answers = await Promise.all(
@@ -573,8 +597,9 @@
         for (const a of answers)
           takeNames([...(a.node ? [a.node] : []), ...(a.ancestors?.nodes ?? [])]);
         filtered = { text, tree: filteredTree(answers) };
-      } catch {
-        if (!ctl.signal.aborted) filtered = { text, tree: filteredTree([]) };
+      } catch (e) {
+        if (!ctl.signal.aborted)
+          filtered = { text, tree: filteredTree([]), error: api.errorMessage(e) };
       }
     }, 200);
     return () => {
@@ -1383,23 +1408,41 @@
               <div class="tree-col">
                 {#if kindTab === 'Class' && inferredOn}<h2 class="col-title">Asserted</h2>{/if}
                 <div class="tree-scroll">
-                  {#if level && filtered}
-                    {#if filtered.tree.roots.length}
-                      <OntoTree
-                        label="{KIND_LABEL[kindTab]} (asserted)"
-                        roots={filtered.tree.roots}
-                        children={(id) => filtered?.tree.children.get(id) ?? []}
-                        name={kindTab === 'NamedIndividual' ? individualName : treeName}
-                        sub={kindTab === 'NamedIndividual' ? individualSub : subOf}
-                        open={filtered.tree.nodes}
-                        {selected}
-                        keep={filtered.tree.nodes}
-                        onselect={(id) =>
-                          kindTab === 'NamedIndividual' ? individualSelect(id) : nav({ iri: id })}
-                        ontoggle={() => {}}
-                      />
+                  {#if (level || kindTab === 'NamedIndividual') && filtered}
+                    {#if kindTab === 'NamedIndividual'}<p class="faint small">
+                        Names are searched at the current branch head. Matching individuals stay at
+                        the displayed revision.
+                      </p>{/if}
+                    {#if filtered.pending}
+                      <p class="empty">Searching…</p>
                     {:else}
-                      <p class="empty">Nothing matches “{filtered.text}”.</p>
+                      {#if filtered.error}<p class="error-box" role="alert">
+                          {filtered.error}
+                        </p>{/if}
+                      {#if filtered.absent}<p class="faint small">
+                          Some search matches are absent at the displayed revision.
+                        </p>{/if}
+                      {#if filtered.tree.roots.length}
+                        <OntoTree
+                          label="{KIND_LABEL[kindTab]} (asserted)"
+                          roots={filtered.tree.roots}
+                          children={(id) => filtered?.tree.children.get(id) ?? []}
+                          name={kindTab === 'NamedIndividual' ? individualName : treeName}
+                          sub={kindTab === 'NamedIndividual' ? individualSub : subOf}
+                          open={filtered.tree.nodes}
+                          {selected}
+                          keep={filtered.tree.nodes}
+                          onselect={(id) =>
+                            kindTab === 'NamedIndividual' ? individualSelect(id) : nav({ iri: id })}
+                          ontoggle={() => {}}
+                        />
+                      {:else if !filtered.error}
+                        <p class="empty">
+                          {kindTab === 'NamedIndividual'
+                            ? 'No current search matches are present at the displayed revision.'
+                            : `Nothing matches “${filtered.text}”.`}
+                        </p>
+                      {/if}
                     {/if}
                   {:else if level}
                     {#if level.roots().length}

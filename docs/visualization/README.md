@@ -472,6 +472,11 @@ row is outside the loaded pages. Labels and type badges follow the shared render
 language preferences. The [Individuals screenshot](../images/ontology-individuals.png)
 shows the type groups and a selected member.
 
+The Individuals filter searches names at the current branch head and reads each candidate's
+memberships at the displayed commit. It skips candidates absent from that revision, keeps
+valid matches and displays hard read failures. Historical name search remains under item
+658.
+
 The paged HTTP response does not imply bounded server work. The individuals route reuses
 the ontology's terminology mapping, and discovers buckets and Untyped members by scanning
 the authorized graph scope. A typed member page scans that type's membership. The cold

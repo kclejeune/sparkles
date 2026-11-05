@@ -129,6 +129,11 @@ does not create a cycle. Names use the shared rendering and ordered language pre
 This is item 607. Server root discovery and Untyped pages scan the selected scope, and
 the route retains F21's cold terminology mapping cost tracked by item 736.
 
+The Individuals filter searches names at the current branch head and reads each candidate's
+memberships at the displayed commit. It skips candidates absent from that revision, keeps
+valid matches and displays hard read failures. Historical name search remains under item
+658.
+
 **Reads.** Opening the editor reads the summary and the first level of the tree on screen.
 The other trees read when their tab opens. Names come from the hierarchy answers and from
 batched reads of the labels of the IRIs a panel names for the first time. The entity lists
