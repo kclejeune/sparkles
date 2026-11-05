@@ -21,7 +21,8 @@ in place, as the server's does from an open ontology, and `--owned` gives them i
 to a `Classifier` that keeps its own copy. The line gives the counts of axioms, classes, nodes and unsatisfiable classes, the
 axioms outside OWL 2 EL and those used in part, the wall time of each classification, the
 median, the times of indexing, saturation and the taxonomy in the last run, the number of
-conclusions, the classifier's own memory estimate and its peak, and the peak resident
+attempted conclusion applications, including duplicate messages, the classifier's own
+memory estimate and its peak, and the peak resident
 memory of the process after reading and at the end. `--heap` also counts the bytes that
 the last classification held at once beyond the axioms read, which slows the run and
 checks the estimate. `--taxonomy FILE` writes the direct taxonomy as

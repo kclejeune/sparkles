@@ -156,10 +156,18 @@ fn send_core<S: Sink>(ix: &Index, to: Ex, n: Ex, out: &mut S) {
 }
 
 /// A successor by `r` in `n`, which the context links to unless `sent` says the EL rule
-/// of an existential restriction did.
-pub fn succ<S: Sink>(ix: &Index, me: Ex, st: &mut State, r: Role, n: Ex, sent: bool, out: &mut S) {
+/// of an existential restriction did. The answer says whether the successor was new.
+pub fn succ<S: Sink>(
+    ix: &Index,
+    me: Ex,
+    st: &mut State,
+    r: Role,
+    n: Ex,
+    sent: bool,
+    out: &mut S,
+) -> bool {
     if !hs(st).succ.insert((r, n)) {
-        return;
+        return false;
     }
     let roles = &ix.roles;
     if !sent {
@@ -184,6 +192,7 @@ pub fn succ<S: Sink>(ix: &Index, me: Ex, st: &mut State, r: Role, n: Ex, sent: b
             counted(ix, me, st, s, b, Member::Link(r, n), out);
         }
     }
+    true
 }
 
 /// R3: the successor by `r` in `n` with the fillers of the universals on the superroles

@@ -1640,6 +1640,10 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+Horn classification no longer charges repeated successor messages as newly stored
+conclusions in its memory estimate, avoiding false memory-budget stops from those
+duplicates. The attempted-application statistic remains unchanged.
+
 HTTP history and diff filters preserve numeric objects inside direct and nested
 RDF 1.2 triple terms. Integer, decimal and double objects no longer include the
 closing triple syntax in their lexical value, which caused matching recorded changes
