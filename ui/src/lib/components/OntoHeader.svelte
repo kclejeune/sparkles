@@ -21,6 +21,7 @@
   import type { PrefixMap } from '$lib/rdf';
   import AnnotationRows from './AnnotationRows.svelte';
   import Icon from './Icon.svelte';
+  import OntologyMetrics from './OntologyMetrics.svelte';
 
   const OWL = 'http://www.w3.org/2002/07/owl#';
   const TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
@@ -262,9 +263,10 @@
       />
     </section>
   {/if}
+  <OntologyMetrics {target} {sel} at={`commit:${summary.commit}`} />
   {#if error}<p class="error-box" role="alert">{error}</p>{/if}
   <section aria-label="Contents">
-    <h3>Contents at commit {summary.commit}</h3>
+    <h3>Terminology and declarations at commit {summary.commit}</h3>
     <div class="stats">
       <table>
         <tbody>
@@ -273,8 +275,7 @@
       </table>
       <table>
         <tbody>
-          {#each axiomCounts.slice(0, 12) as [k, n] (k)}<tr
-              ><th>{k}</th><td class="num">{fmtInt(n)}</td></tr
+          {#each axiomCounts as [k, n] (k)}<tr><th>{k}</th><td class="num">{fmtInt(n)}</td></tr
             >{/each}
         </tbody>
       </table>

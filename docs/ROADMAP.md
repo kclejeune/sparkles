@@ -168,9 +168,8 @@ the floor.
 
 The workbench UI runs as one stream of about two lanes beside the engine work. After the
 DL Query tab, the SKOS editor and the web UI shell of item 632 come these, in order:
-1. The ontology browser's metrics (621) and the editor's
-   trees on the hierarchy route (607), all on item 632's shell and item 631's command
-   palette.
+1. The editor's trees on the hierarchy route (607), all on item 632's shell and item
+   631's command palette.
 2. Inferred axioms in entity frames (622), with the inferred property and individual
    trees of item 609. Their explanation links wait for F24's justifications.
 3. The visual SHACL shape editor of item 617.
@@ -823,7 +822,6 @@ Rows that need backend work name it first.
 | 618 | **Discussions on entities.** Comment threads on an entity or axiom with mentions, resolve and reopen, shown in the entity frame and listed per ontology, as WebProtégé offers. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
 | 619 | **Watches on entities.** Let a user watch an entity or its subtree and be told of commits that change it, through the notifications of item 46. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | S–M |
 | 620 | **Entity history.** A history tab in the entity frame listing the commits that changed the entity's axioms and annotations, with diffs and revert. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | S–M |
-| 621 | **Ontology metrics and expressivity.** Show axiom counts by type, entity counts and the DL expressivity of an ontology, such as SROIQ(D), with its OWL 2 profile report. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | S |
 | 622 | **Inferred axioms in entity frames.** Show the classifier's inferences inline in the editor's frame and on the ontology browser's pages and hierarchy, marked as inferred, with an explanation link per axiom from F24's justifications. The hierarchy and term routes refuse `inferences`. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
 | 623 | **Pattern-based axiom generation.** Generate axioms from spreadsheet rows through templates and design patterns, in the manner of Cellfie, ROBOT template and DOSDP, previewed as one commit. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
 | 624 | **Import resolution.** Resolve `owl:imports` to local copies, catalog entries of C30 or XML catalogs, show the imports closure and let views include or exclude imported axioms. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
@@ -953,6 +951,7 @@ for them.
 These items are finished. [FEATURES.md](FEATURES.md) describes what they deliver, and the
 linked spec Outcome records how they landed.
 
+- **621.** Ontology metrics and expressivity. The Header and browser landing page show on-demand axiom counts by type, distinct signature entities, a conservative containing DL and bounded reports for all four OWL 2 profiles, at one authorized graph and revision scope including streamed assertions. Missing imports and invalid mappings leave overall expressivity unknown. [U12](specs/U12-ontology-workbench/SPEC.md#ontology-metrics-and-expressivity)
 - **625.** Rendering preferences. The editor, browser and query results share browser-local choices of label, prefixed name or full IRI and an ordered language list. Query tables read visible entities' labels in batches at the result's branch and commit. Missing labels fall back to prefixed names and complete IRIs. [U12](specs/U12-ontology-workbench/SPEC.md#rendering-preferences)
 - **734.** The Browse term page's second layout pass. The page has a right rail of cards with Metadata, Identifiers, Download and a Hierarchy that keeps its place across Tree and Graph, a main column of sections on the page background with headings of one size, one lead text with a disclosure for each other kind of text and a chip of the property on every value, one line of nonzero counts, and label rows on concept pages. [U12](specs/U12-ontology-workbench/SPEC.md#ontology-browser)
 - **725.** Explore and the Workbench at scale. The Workbench trees draw only the rows in view, with the keyboard, sticky ancestors, paging and selection reveal of item 633 intact, and the ontology editor opens on its first level of classes without reading every label, every subclass axiom or up to 50,000 entities, which takes ChEBI lite from 9.9 s to 0.9 s to its first row, from 23 requests and 68 MB to 9 requests and 0.2 MB, and its heap from 164 MB to 6 MB. Explore holds up to 100,000 nodes and draws a budget of 5,000, in WebGL past 1,000 visible nodes, with an "N via predicate" group node for a large fan-out and filters for edge types, classes, degree, leaves and communities that choose what is drawn and never what is loaded. The [web UI at scale benchmark](benchmarks/web-ui-scale/README.md) reports the opening, selection, scrolling and Explore measurements. [U12](specs/U12-ontology-workbench/SPEC.md#ontology-browser) records the trees and reads. The follow-ups are items 735 to 741 and the individuals list of item 607.

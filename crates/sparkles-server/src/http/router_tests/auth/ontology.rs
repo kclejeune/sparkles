@@ -347,3 +347,22 @@ async fn the_browser_routes_hold_only_what_the_caller_reads() {
     let r = call(&app, "GET", &tree, &[], "").await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
 }
+
+#[tokio::test]
+async fn ontology_metrics_respect_graph_grants_and_remain_read_only() {
+    let (_dir, app) = server();
+    let uri = format!("/$/ontology/ont?{OPEN}&metrics=true");
+    let full = as_user(&app, "oread", "GET", &uri, &json!(null)).await;
+    assert_eq!(full.status, StatusCode::OK, "{}", full.text());
+    assert_eq!(full.json()["metrics"]["entities"]["Class"], 3);
+    let limited = as_user(&app, "oopen", "GET", &uri, &json!(null)).await;
+    assert_eq!(limited.status, StatusCode::OK, "{}", limited.text());
+    assert_eq!(limited.json()["metrics"]["entities"]["Class"], 2);
+    assert_eq!(
+        limited.json()["metrics"]["graphs"],
+        json!(["http://ex/open"])
+    );
+    assert!(!limited.text().contains("Hidden"));
+    assert_eq!(limited.json()["metrics"]["scopeComplete"], false);
+    assert!(limited.json()["metrics"]["expressivity"]["notation"].is_null());
+}

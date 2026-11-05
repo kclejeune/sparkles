@@ -424,6 +424,24 @@ the IRI visible. Copying and navigation always keep the original IRI.
 
 ### Ontology editor
 
+The Header view and the ontology browser landing page have an **Ontology metrics**
+panel. **Read metrics** counts mapped axioms by type and distinct signature entities,
+streams instance assertions and checks all four OWL 2 profiles. The panel names its
+commit and graphs. Header metrics include dataset-local imports and pin the displayed
+commit. Browser metrics cover its selected graph and revision without imports.
+Terminology axioms count once and streamed assertions count occurrences, including
+repeats across graphs. Entities include undeclared references and built-ins and count
+once per kind and IRI.
+
+The expressivity label is a conservative containing DL, with EL for the simple fragment
+and extensions of ALC through SROIQ(D) for other constructors. It does not claim minimum
+expressivity. Unknown expressivity includes its reason and any supported observed
+fragment bound. Unresolved imports prevent a conclusion about the complete ontology.
+The panel lists up to 100 violations of each profile after checking the selected scope.
+Metrics retain a distinct entity signature set and refuse more than one million mapped
+axioms and assertion triples or signature entities. A limit or deadline reports an error
+rather than partial counts. Ordinary page opening does not request metrics.
+
 The **Ontology** editor, `/ui/workbench/ontology`, browses and edits the OWL ontology of one graph
 and its imports
 ([U12](../specs/U12-ontology-workbench/SPEC.md#outcome),

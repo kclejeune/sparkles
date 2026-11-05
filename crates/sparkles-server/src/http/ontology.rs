@@ -159,6 +159,11 @@ pub(super) async fn summary(
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let req = request_of(&params)?;
+    let metrics = match params.get("metrics") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(bad("metrics must be true or false")),
+    };
     let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
     blocking(move || {
         // one deadline for the read and everything after it
@@ -172,9 +177,17 @@ pub(super) async fn summary(
             .ontology()
             .open(&req, &opts)
             .map_err(ontology_error)?;
-        let j = summary_body(&ds.name, &o, &req, &renderer(&ds));
+        let mut j = summary_body(&ds.name, &o, &req, &renderer(&ds));
+        if metrics {
+            j["metrics"] = onto::metrics::body(&ds.name, &o, &req, &renderer(&ds), &opts)
+                .map_err(ontology_error)?;
+        }
         let seq = o.snapshot.commit;
-        let tag = conditional::etag(ds.store.dataset_id(), seq, "owl");
+        let tag = conditional::etag(
+            ds.store.dataset_id(),
+            seq,
+            if metrics { "owl-metrics" } else { "owl" },
+        );
         let resp = match conditional::check_read(&headers, ds.store.dataset_id(), seq, &tag)? {
             conditional::ReadOutcome::NotModified => conditional::not_modified(&tag),
             conditional::ReadOutcome::Send => {

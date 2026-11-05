@@ -24,6 +24,14 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+The ontology Header and browser landing page have on-demand metrics. They show axiom
+counts by type, distinct signature entities and four OWL 2 profile reports, including
+streamed instance assertions, at one authorized graph and revision scope. DL notation
+is a conservative containing logic with an explicit unknown state for incomplete
+imports, invalid mappings and unsupported notation. The summary accepts `metrics=true`
+over HTTP and through the shared Rust JSON operation. Ordinary summaries retain
+their existing work.
+
 The UI shares rendering preferences across the ontology and thesaurus editors, browser
 and query results. Viewers choose labels, prefixed names or complete IRIs and an ordered
 language list, saved in the browser. Query tables batch label lookups for visible rows

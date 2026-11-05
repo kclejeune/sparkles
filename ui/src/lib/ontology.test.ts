@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  ontologyMetrics,
   ancestorsOf,
   buildFrame,
   buildTree,
@@ -701,5 +702,36 @@ describe('typed literals', () => {
     expect(s).toEqual({ text: '"a"', role: 'lit' });
     const [l] = manchesterTokens({ '@value': 'a', '@language': 'fr' }, String, p);
     expect(l).toEqual({ text: '"a"@fr', role: 'lit' });
+  });
+});
+
+describe('ontology metrics reads', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it('pins scope and revision and keeps the abort signal', async () => {
+    const fetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ metrics: { commit: 42 } }), {
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetch);
+    const controller = new AbortController();
+    const result = await ontologyMetrics(
+      'uni@dev',
+      { graph: EX + 'g', imports: false },
+      'commit:42',
+      controller.signal,
+    );
+    expect(result.commit).toBe(42);
+    const [url, options] = fetch.mock.calls[0] as unknown as [string, RequestInit];
+    const parsed = new URL(url, 'http://example.test');
+    expect(parsed.pathname).toBe('/$/ontology/uni');
+    expect(parsed.searchParams.get('branch')).toBe('dev');
+    expect(parsed.searchParams.get('graph')).toBe(EX + 'g');
+    expect(parsed.searchParams.get('imports')).toBe('false');
+    expect(parsed.searchParams.get('metrics')).toBe('true');
+    expect(parsed.searchParams.get('at')).toBe('commit:42');
+    expect(options.signal).toBe(controller.signal);
+    expect(options.cache).toBe('no-store');
   });
 });
