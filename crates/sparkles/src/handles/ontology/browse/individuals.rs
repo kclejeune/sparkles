@@ -50,8 +50,8 @@ pub struct Individuals {
     pub warnings: Vec<String>,
 }
 
-// A pathological signature or one individual's types must fail visibly rather than
-// silently dropping buckets or memberships. This is independent of the page size.
+// Discovery and returned type lists fail visibly rather than silently dropping
+// buckets or types. Typed pages apply MAX_TYPES only to the rows they return.
 const MAX_GROUPS: usize = 100_000;
 const MAX_TYPES: usize = 1000;
 
@@ -65,6 +65,23 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn take_scan_rows() -> BTreeMap<String, usize> {
     SCAN_ROWS.with(|rows| std::mem::take(&mut *rows.borrow_mut()))
+}
+
+fn keep_member(
+    s: &Scope,
+    id: Id,
+    q: &IndividualsRequest,
+    total: &mut usize,
+    page: &mut BTreeMap<String, Id>,
+) {
+    *total += 1;
+    let iri = s.iri(id);
+    if q.after.as_ref().is_none_or(|after| iri > *after) {
+        page.insert(iri, id);
+        if page.len() > q.limit + 1 {
+            page.pop_last();
+        }
+    }
 }
 
 impl Ontologies {
@@ -129,62 +146,70 @@ impl Ontologies {
         let members = q.class.is_some() || q.untyped;
         let mut page = BTreeMap::<String, Id>::new();
         let mut groups = BTreeMap::<String, (Option<Id>, usize)>::new();
-        let mut visit = |s: &mut Scope, id: Id| -> Result<()> {
-            let types = s.individual_types(&o.ontology, id)?;
-            if members {
-                let matches = if q.untyped {
-                    types.is_empty()
-                } else {
-                    types
-                        .iter()
-                        .any(|t| Some(s.iri(*t)).as_ref() == q.class.as_ref())
-                };
-                if !matches {
-                    return Ok(());
-                }
-                result.total += 1;
-                let iri = s.iri(id);
-                if q.after.as_ref().is_none_or(|after| iri > *after) {
-                    page.insert(iri, id);
-                    if page.len() > q.limit + 1 {
-                        page.pop_last();
-                    }
-                }
-            } else {
-                let keys: Vec<(String, Option<Id>)> = if types.is_empty() {
-                    vec![(String::new(), None)]
-                } else {
-                    types.iter().map(|t| (s.iri(*t), Some(*t))).collect()
-                };
-                for (key, id) in keys {
-                    groups.entry(key).or_insert((id, 0)).1 += 1;
-                    if groups.len() > MAX_GROUPS {
-                        return Err(Error::invalid(format!(
-                            "individual type buckets exceed {MAX_GROUPS}"
-                        )));
-                    }
-                }
-            }
-            Ok(())
-        };
         if let Some(class) = &q.class {
             if let (Some(p), Some(t)) = (s.id(RDF_TYPE), s.lookup(class)) {
-                // POS groups duplicate memberships in different graphs together.
+                // The mapper's named-class eligibility is constant for this POS
+                // range. Use a real visible triple to preserve its strict/lenient
+                // and reserved-vocabulary rules without duplicating that predicate.
+                let mut class_eligible = None;
                 let mut last = None;
                 s.visit(Perm::Pos, &[p.0, t.0], |s, quad| {
                     if last == Some(quad[0]) {
                         return Ok(());
                     }
                     last = Some(quad[0]);
-                    if s.snap.term_kind(quad[0]) == TermKind::Iri
-                        && s.is_individual(&o.ontology, quad[0])?
-                    {
-                        visit(s, quad[0])?;
+                    if s.snap.term_kind(quad[0]) != TermKind::Iri {
+                        return Ok(());
+                    }
+                    let eligible = if let Some(eligible) = class_eligible {
+                        eligible
+                    } else {
+                        let Some(triple) = triple_of(&s.snap, &quad) else {
+                            return Ok(());
+                        };
+                        let eligible = matches!(
+                            o.ontology.map_assertion(&triple),
+                            Some(Axiom {
+                                kind: AxiomKind::ClassAssertion(
+                                    sparkles_owl::ClassExpression::Class(_),
+                                    _
+                                ),
+                                ..
+                            })
+                        );
+                        class_eligible = Some(eligible);
+                        eligible
+                    };
+                    if eligible && s.is_individual(&o.ontology, quad[0])? {
+                        keep_member(s, quad[0], q, &mut result.total, &mut page);
                     }
                     Ok(())
                 })?;
             }
         } else {
+            let mut visit = |s: &mut Scope, id: Id| -> Result<()> {
+                let types = s.individual_types(&o.ontology, id)?;
+                if q.untyped {
+                    if types.is_empty() {
+                        keep_member(s, id, q, &mut result.total, &mut page);
+                    }
+                } else {
+                    let keys: Vec<(String, Option<Id>)> = if types.is_empty() {
+                        vec![(String::new(), None)]
+                    } else {
+                        types.iter().map(|t| (s.iri(*t), Some(*t))).collect()
+                    };
+                    for (key, id) in keys {
+                        groups.entry(key).or_insert((id, 0)).1 += 1;
+                        if groups.len() > MAX_GROUPS {
+                            return Err(Error::invalid(format!(
+                                "individual type buckets exceed {MAX_GROUPS}"
+                            )));
+                        }
+                    }
+                }
+                Ok(())
+            };
             // Enumerate each named node once without retaining the whole signature:
             // subjects first, then object-only resources. Eligibility uses the same
             // mapper as F21's entity/accessor routes, including untyped assertions.
@@ -214,6 +239,8 @@ impl Ontologies {
                 page.pop_last();
                 result.next = page.last_key_value().map(|(iri, _)| iri.clone());
             }
+            // The typed-page type cap applies to returned lists. Discarded
+            // candidates contribute to the exact total without collecting their type lists.
             for (_, id) in page {
                 let types = s.individual_types(&o.ontology, id)?;
                 result.individuals.push(s.individual_node(id, &types)?);

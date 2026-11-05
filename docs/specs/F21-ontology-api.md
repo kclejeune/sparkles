@@ -600,10 +600,15 @@ branch, retained revision, cancellation and deadline. No classification runs.
 Responses hold at most 1,000 buckets or individuals, with 100 by default. Root discovery
 and Untyped reads scan the authorized scope, and typed reads scan that type's membership.
 The route uses F21's existing terminology mapper to preserve declarations, complex
-assertions and signature semantics. It does not bound server work by the response size. Item 749 covers repeated
-discovery,
-lexical-page selection and exact-total scans, independently of item 736's cold mapping.
-More than 100,000 buckets or 1,000 named types on one individual fails explicitly.
+assertions and signature semantics. It does not bound server work by the response size.
+Item 749 covers repeated discovery, lexical-page selection and exact-total scans,
+independently of item 736's cold mapping.
+Root discovery refuses more than 100,000 type buckets. A typed member page reads complete
+type lists only for returned rows and refuses a returned individual with more than
+1,000 named types. An individual before the cursor or outside that page does not trigger
+this type-list cap. Root discovery and Untyped reads apply the cap to every
+individual they examine, and direct lookup applies it to its individual. These limits
+fail explicitly and never return truncated type lists.
 Anonymous individuals stay outside this named-entity editor tree. The exact HTTP
 contract is in [the API reference](../API.md#ontology).
 

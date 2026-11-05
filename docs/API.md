@@ -2026,9 +2026,12 @@ returns one individual. The selected graph, dataset-local imports, branch, retai
 revision, grants, cancellation and deadline apply throughout. `lang` or
 `Accept-Language` chooses labels. Root discovery and Untyped pages scan the authorized
 scope. Typed pages scan the type's membership, and every mode retains F21's existing
-terminology mapping cost. A bounded page does not imply bounded server work. More than
-100,000 buckets or 1,000 named types on one individual fails with `400` rather than
-returning an incomplete answer.
+terminology mapping cost. A bounded page does not imply bounded server work. Root
+discovery refuses more than 100,000 type buckets with `400`. A typed page reads complete type lists only for
+returned individuals and fails with `400` if one of those lists exceeds 1,000 named types.
+A candidate before the cursor or outside the returned page does not trigger that cap.
+Root discovery and Untyped reads apply the type cap to every individual they
+examine, and direct lookup applies it to its individual. Type lists are never truncated.
 
 `GET /$/ontology/{ds}/term?iri=IRI` answers what the graphs read say about one entity
 for the ontology browser's pages, again from the store's indexes without reading the

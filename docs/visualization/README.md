@@ -490,6 +490,13 @@ terminology mapping cost remains under roadmap item 736. Repeated bucket discove
 lexical-page selection and exact-total scans remain under item 749, with grants, pinned
 views and bounded memory preserved.
 
+Typed pages read complete type lists for the members they return and reject a returned
+individual with more than 1,000 named types. An individual before the cursor or outside
+that page does not trigger this type-list limit. Root discovery and Untyped reads check
+all candidates, and direct lookup checks its individual, with the same limit and an
+explicit failure rather than truncated types. Root discovery also refuses more than
+100,000 type buckets.
+
 The **DL Query** tab answers a Manchester class expression with its equivalent classes,
 its direct and inferred superclasses and subclasses, and its instances
 ([screenshot](../images/ontology-dl-query.png)). Each answer opens the entity's frame
