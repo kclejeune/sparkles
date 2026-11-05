@@ -19,7 +19,7 @@ workloads where Sparkles loses. The tiers list remaining work, followed by a rec
 completed items.
 
 The current priorities are engine correctness, performance and standard features in
-Waves A and A2, followed by embedded agent memory and the ontology platform, including its
+Wave A, followed by embedded agent memory and the ontology platform, including its
 editor, in Waves B and C, which run alongside them. Shared entity representation follows
 memory. Packaging, recovery and the API compatibility contract advance alongside capability
 completion. The [delivery priorities](#delivery-priorities) explain their dependencies.
@@ -106,34 +106,38 @@ item 58, both after the format cutoff. The later encryption phases of item 65, s
 items 468 and 47, notifications in item 46, the per-crate Nix builds of item 92 and the
 replication refresh of item 280 follow the first release.
 
-### Wave A: engine quality
+<a id="wave-a-engine-quality"></a>
+<a id="wave-a2-engine-rewrites"></a>
 
-Wave A holds the work that most improves the engine against objective measures.
+### Wave A: engine quality and consolidation
 
-* Competitive benchmark losses come first, as
-  [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) records them.
-* The benchmark gates of item 452 exist before any engine rewrite starts. Items 469 to
-  473 add the eager-against-cursor forge matrix, the W3C suites under
-  `execution=streaming`, `incr_bench` as a mise task, a demand and RDFS-on-read latency
-  benchmark and an instruction-count screen. Each further loss that item 452's
-  competitive coverage finds becomes its own Wave A item.
-* Streaming execution follows through item 7.
-* The first three stages of the unified executor, item 453, follow. The deletions of
-  items 474 to 478 are complete, and items 480 to 483 have consolidated the execution
-  policy, the reasoning mode, request building and rank fusion. The first-release format
-  cutoff of item 479 and the commit publish tail of item 484 remain.
-* Stage A of item 17 is complete with items 416 and 417, the reasoner witnesses and
-  the fixed-point operator.
+Wave A holds engine quality, competitive recovery and the remaining executor, join,
+storage and reasoner core work. The rewrite gates have checked baselines, and the
+execution policy plumbing and initial accounting model are available. Independent
+phases proceed when their prerequisites are ready, in the order below.
+
+* Confirmed correctness failures and competitive benchmark losses come first.
+  [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) records the measured losses.
+* The benchmark gates of items 469 to 473 protect the rewrites. They cover the
+  eager-against-cursor forge matrix, the W3C suites under `execution=streaming`,
+  incremental views, demand and RDFS-on-read latency and instruction counts.
+  Item 452's competitive coverage remains, and each further loss it finds becomes
+  its own Wave A item.
+* Streaming execution continues through item 7 before the executor merge of item 453.
+  The remaining accounting work, shared kernels and merge follow X14's stage
+  dependencies. Item 675 follows item 192, and item 678 closes the decoding twins.
+* The remaining join algorithms of item 454 follow the executor merge. Its estimation
+  follow-ups retain their own prerequisites.
+* Storage consolidation in item 455 includes the first-release format cutoff of item
+  479 and the commit publish tail of item 484, with X16's phase dependencies.
+* The remaining reasoner core of item 456 ends with the incremental-maintenance core
+  it shares with views. Item 547 measures the rule plug-in on LUBM before that shared
+  maintenance work proceeds.
 * Small items that finish a capability run in free capacity, such as item 77.
 
-### Wave A2: engine rewrites
-
-Wave A2 holds the rewrites that the Wave A gates protect. These are the accounting model,
-shared kernels and executor merge of item 453, the join algorithms and estimation of item
-454, the storage consolidation of item 455 and the reasoner core of item 456, which ends
-with the incremental-maintenance core it shares with views. Each rewrite is measured on
-forge before it lands. No query may be 5% or more slower on forge at 12 threads, and no
-query under 0.3 ms may be slower on an Intel host.
+Each rewrite is measured on forge before it lands. No query may be 5% or more slower on
+forge at 12 threads, and no query under 0.3 ms may be slower on an Intel host. Each
+phase retains its spec's correctness, conformance, durability and resource gates.
 
 ### Wave B: memory and entities
 
@@ -149,7 +153,7 @@ model. The ontology syntax readers come first, followed by OWL classification an
 ontology workbench. The resource catalog of item 458 comes first on the data side,
 followed by checks and protected merges, linked-data publishing and git export.
 Fragment composition follows the storage consolidation of item 455. Wave C runs
-alongside Wave A2 on the policy plumbing of items 480 to 483.
+alongside Wave A and uses the policy plumbing of items 480 to 483.
 
 OWL classification continues in three streams once phase 4 of item 603 lands. Each
 stream is held to the same speed target, which is three to five times as fast as the
@@ -192,7 +196,7 @@ displace correctness repairs or performance recovery.
 
 ### How the waves share capacity
 
-The waves run in parallel, and each has its own capacity. Waves A2 and C take the
+The waves run in parallel, and each has its own capacity. Waves A and C take the
 capacity first, and Wave B runs when a stream is free of them. When work competes for gate, review or benchmark time, the
 dependency order and how ready the work is decide which goes first, not the wave it
 belongs to. The goal at the start of this section states what Sparkles optimizes
@@ -229,10 +233,14 @@ against the improved baseline.
 Several workstreams have hard orderings.
 
 * Item 7 lands before the executor merge of item 453.
+* The executor merge of item 453 lands before the remaining join algorithms of item 454.
+* Item 192 lands before the hierarchical budget of item 675.
 * Items 446 and 447 land before the commit-path merge of item 455, which is the long-term
   half of its shared publish tail.
+* Item 547 measures the rule plug-in on LUBM before item 456's shared maintenance core.
 * Storage consolidation in X16 lands before fragment composition in X18.
-* The format cutoff of item 479 lands before the release artifacts of items 58 and 59.
+* Item 343 lands before the format cutoff of item 479, which lands before the release
+  artifacts of items 58 and 59.
 * The Horn-rule work of items 693, 710 and 692 lands before or between item 603's phases
   5 to 8, since both change the classifier's index in `classify/index.rs`.
 * Item 753 follows the dependency rules of each supported tier of item 603. Support for
