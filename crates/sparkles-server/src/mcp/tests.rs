@@ -188,6 +188,10 @@ mod import;
 #[path = "ontology_tests.rs"]
 mod ontology;
 
+#[cfg(feature = "ontology")]
+#[path = "ontology_reads_tests.rs"]
+mod ontology_reads;
+
 fn head(s: &McpServer, ds: &str) -> u64 {
     s.state.get(ds).unwrap().store.head_commit().seq
 }
@@ -688,6 +692,14 @@ async fn a03_tool_list() {
             "lint",
             #[cfg(feature = "ontology")]
             "ontology_axioms",
+            #[cfg(feature = "ontology")]
+            "ontology_entities",
+            #[cfg(feature = "ontology")]
+            "ontology_classify",
+            #[cfg(feature = "ontology")]
+            "ontology_dl_query",
+            #[cfg(feature = "ontology")]
+            "ontology_parse",
             "read_chunks",
             "list_sources",
             "ingest_profile",
@@ -695,20 +707,19 @@ async fn a03_tool_list() {
         ]
     );
     let mut expected = expected_input_schemas();
-    // the listing-only ontology tool (its own tests check the schema's content)
+    // the read-only ontology tools (their own tests check the schemas' content)
     #[cfg(feature = "ontology")]
     {
         let at = expected
             .iter()
             .position(|(n, _)| *n == "read_chunks")
             .unwrap();
-        expected.insert(
-            at,
-            (
-                "ontology_axioms",
-                super::ontology::tool_def(&McpConfig::default()).input,
-            ),
-        );
+        let cfg = McpConfig::default();
+        let mut defs = vec![super::ontology::tool_def(&cfg)];
+        defs.extend(super::ontology_reads::tool_defs(&cfg));
+        for (i, d) in defs.into_iter().enumerate() {
+            expected.insert(at + i, (d.name, d.input));
+        }
     }
     // every tool that reads a dataset also takes `branch` (C17 §5.7)
     let br = json!({"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$","description":"Work on this branch of the dataset instead of main (see list_branches). Your grants apply on the branch as they do on main."});

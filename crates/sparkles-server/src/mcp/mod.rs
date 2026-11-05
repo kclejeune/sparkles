@@ -42,6 +42,8 @@ pub(crate) mod memory;
 mod notify;
 #[cfg(feature = "ontology")]
 mod ontology;
+#[cfg(feature = "ontology")]
+mod ontology_reads;
 mod paths;
 mod pins;
 pub(crate) mod relevance;

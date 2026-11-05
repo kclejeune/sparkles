@@ -42,7 +42,13 @@ build community reports.
   syntax. When updates are enabled it also adds and removes axioms in one commit, with
   `dryRun`, `ifHead` and a commit message as `sparql_update` takes them, and annotates
   each added axiom with PROV-O provenance that names the call's activity, its time and
-  its source ([OWL 2 ontologies](../reasoning/README.md#owl-2-ontologies)).
+  its source ([OWL 2 ontologies](../reasoning/README.md#owl-2-ontologies)). With
+  `inferences` a listing also reads the materialized inferences and says whether they
+  are stale.
+* `ontology_entities`, `ontology_classify`, `ontology_dl_query` and `ontology_parse` list
+  an ontology's entities and report on one, classify it, answer DL queries and read
+  Manchester syntax. When updates are enabled, `ontology_classify` with `target` also
+  writes the taxonomy to a graph in one commit, with `dryRun` and `ifHead`.
 * Every tool that reads or writes takes `branch`, and `list_branches`, `create_branch`,
   `merge_branch` and `delete_branch` manage scratch branches. Merges preview by default,
   need the previewed heads and refuse conflicts. `--mcp-scratch-branch-ttl` deletes idle

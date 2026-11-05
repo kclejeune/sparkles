@@ -176,6 +176,14 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "sparql_update" => t.sparql_update(args),
         #[cfg(feature = "ontology")]
         "ontology_axioms" => t.ontology_axioms(args),
+        #[cfg(feature = "ontology")]
+        "ontology_entities" => t.ontology_entities(args),
+        #[cfg(feature = "ontology")]
+        "ontology_classify" => t.ontology_classify(args),
+        #[cfg(feature = "ontology")]
+        "ontology_dl_query" => t.ontology_dl_query(args),
+        #[cfg(feature = "ontology")]
+        "ontology_parse" => t.ontology_parse(args),
         "assert_facts" => t.assert_facts(args),
         "register_source" => t.register_source(args),
         // `POST /$/ingest/{ds}`, never offered as a tool

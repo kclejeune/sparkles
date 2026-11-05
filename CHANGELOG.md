@@ -24,6 +24,14 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+The MCP server has four more ontology tools. `ontology_entities` lists a dataset's
+entities and reports on one, and `ontology_classify` classifies the ontology and, on a
+server that allows updates, writes the taxonomy to a graph with `dryRun` and `ifHead`.
+`ontology_dl_query` answers DL queries and `ontology_parse` reads Manchester syntax.
+`sparkles ontology` gains `entities`, `entity`, `dl-query` and `parse`. `ontology_axioms`
+and the CLI's `summary`, `axioms`, `classify`, `entities` and `entity` take
+`inferences`, and their answers say whether the materialized inferences are stale.
+
 The disjunctive classification rules can count, and `Limits::counting` turns it on. It is
 off by default, because counting finishes on no real ontology of the ORE 2015 DL
 development set and only delays the answer, so a default run leaves those axioms out and

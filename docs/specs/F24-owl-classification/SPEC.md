@@ -399,7 +399,8 @@ tests cover the answer, the functional-style form, dry runs and the caller's gra
 CLI test classifies a file and a database, and each binding's tests classify and write a
 taxonomy.
 
-**Roadmap follow-ups.** An MCP tool is item 586. Complete reasoning with
+**Roadmap follow-ups.** Item 586 added the MCP tool `ontology_classify`, which the
+[F21 Outcome](../F21-ontology-api.md#mcp-tools-and-cli-commands-for-the-remaining-reads) describes. Complete reasoning with
 individuals and datatypes was item 587, with item 605. The literals and datatypes the
 classifier cannot compare and chains through the top property are item 663, and
 incremental runs that follow merges, keys and worlds are item 664. Reads that

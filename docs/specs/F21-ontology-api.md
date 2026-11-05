@@ -800,7 +800,8 @@ an individual from the store, at most `limit` of each. Each stream reports an as
 once for every graph that holds it. Python's `Dataset.ontology`, Node.js's `dataset.ontology`
 and the JVM's `SparklesOnt` and `DatasetGraphSparkles.ontology()` have both operations.
 The JVM's `SparklesOnt` also gains `removeEntity`, which the bindings table now lists.
-The CLI and the MCP tool do not have the two operations, roadmap item 578.
+Item 578 later gave the CLI and MCP both operations, as
+[MCP tools and CLI commands for the remaining reads](#mcp-tools-and-cli-commands-for-the-remaining-reads) describes.
 
 Python's `sparkles.owl` and Node.js's `owl` namespace hold typed constructors named
 after the functional-style forms, one for each of the 37 axiom types and each class
@@ -875,6 +876,35 @@ binding, lists the axioms it added and removed as `addedAxioms` and `removedAxio
 10,000 of each with `axiomsTruncated`. An added n-ary axiom of which part was present is
 listed whole, so the lists are not an exact inverse, and the editor undoes a commit by
 reverting it instead.
+
+### MCP tools and CLI commands for the remaining reads
+
+Roadmap items 565, 578, 586 and 661 brought the reads that HTTP and the bindings answer
+to the MCP server and to `sparkles ontology`. Each new MCP tool answers through
+`wire::call`, so it gives its route's answer, and it runs as the caller with the query
+options, deadline and result byte budget of the other MCP tools. `ontology_entities`
+lists entities, or reports on one when the call names `iri`. `ontology_classify`
+classifies the ontology. With `target` it also writes the taxonomy, with `dryRun`,
+`changes`, `ifHead` and a commit message, when the server allows updates and the caller
+may write, and MCP admission counts that call as a write. `ontology_dl_query` answers a
+DL query and `ontology_parse` reads Manchester text. `ontology_axioms` takes
+`inferences` in a listing and refuses it beside an edit, as
+`POST /$/ontology/{ds}/axioms` does. A read with `inferences` carries the answer member
+of §7, which says whether the inferred graph was read and whether it is stale.
+
+`sparkles ontology` gains `entities`, `entity IRI`, `dl-query EXPRESSION` and
+`parse TEXT`. They answer through the same JSON operations on a database directory and
+through the routes on a server. `summary`, `axioms`, `classify`, `entities` and `entity`
+take `--inferences`, and the text form prints the freshness of the inferences as a line
+of the answer. A functional-style document has no place for it, so `axioms` and
+`classify` print it on standard error with `--format ofn`. On a server, `axioms` then
+reads it from a JSON page of one axiom. `classify FILE --inferences` is refused, since a
+file has no materialized inferences. The DL query tool and command take no
+`inferences`, as the route's JSON body does not.
+
+MCP tests cover each tool's answer, a missing, fresh and stale materialization, the
+taxonomy write with its preview and precondition, the refusals and the result byte
+budget. A CLI test runs the new commands and `--inferences` on a database.
 
 ### Decisions and departures from the design
 

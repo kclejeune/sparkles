@@ -249,6 +249,10 @@ The instances need a classification with the assertions, which the dataset does 
 keep, so an instance query classifies the ontology again. Roadmap item 588 can reuse
 the same engine to answer the entity accessors from the kept classification.
 
+Item 661 added the DL query and the Manchester reader to MCP as `ontology_dl_query` and
+`ontology_parse` and to the CLI as `sparkles ontology dl-query` and `parse`, which the
+[F21 Outcome](../F21-ontology-api.md#mcp-tools-and-cli-commands-for-the-remaining-reads) describes.
+
 ### Thesaurus editor
 
 The SKOS and SKOS-XL thesaurus editor phase is built as the UI's **Thesaurus** page,

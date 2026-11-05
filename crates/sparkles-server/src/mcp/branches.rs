@@ -46,8 +46,9 @@ pub(crate) const WRITE_TOOLS: [&str; 6] = [
     "delete_branch",
 ];
 
-/// Whether a call of tool `name` with `args` writes: a write tool, or `ontology_axioms`
-/// with axioms to add or remove. Admission charges and scope challenges follow it.
+/// Whether a call of tool `name` with `args` writes: a write tool, `ontology_axioms`
+/// with axioms to add or remove, or `ontology_classify` with a target graph for its
+/// taxonomy. Admission charges and scope challenges follow it.
 pub(crate) fn call_writes(name: &str, args: Option<&serde_json::Value>) -> bool {
     WRITE_TOOLS.contains(&name)
         || name == "ontology_axioms"
@@ -56,6 +57,10 @@ pub(crate) fn call_writes(name: &str, args: Option<&serde_json::Value>) -> bool 
                     .and_then(serde_json::Value::as_array)
                     .is_some_and(|v| !v.is_empty())
             })
+        || name == "ontology_classify"
+            && args
+                .and_then(|a| a.get("target"))
+                .is_some_and(|v| !v.is_null())
 }
 
 /// The tools listed after `sparql_update`, in `tools/list` order.

@@ -1,7 +1,9 @@
 //! `sparkles ontology`: the OWL 2 ontology of a database's graphs (spec F21) on a local
-//! database directory or on a server: its summary, its axioms, its profile checks,
-//! edits and OWL 2 EL classification, and the check and classification of an ontology
-//! file without a database.
+//! database directory or on a server: its summary, its axioms, its entities and entity
+//! reports, its profile checks, edits, OWL 2 EL classification, DL queries and the
+//! Manchester reader, and the check and classification of an ontology file without a
+//! database. A read can include the dataset's materialized inferences, and its answer
+//! then says how fresh they are.
 
 use crate::http::ontology::{
     AxiomQuery, ClassifyQuery, MAX_LIMIT, axiom_page, check_body, classify_body, edit_body,
@@ -31,6 +33,10 @@ pub enum OntologyCmd {
         at: Target,
         #[command(flatten)]
         read: Read,
+        /// Also read the materialized inferences of the dataset, and say how fresh
+        /// they are
+        #[arg(long)]
+        inferences: bool,
         /// text or json
         #[arg(long, default_value = "text")]
         format: String,
@@ -50,6 +56,10 @@ pub enum OntologyCmd {
         /// Also the assertions the store holds
         #[arg(long)]
         assertions: bool,
+        /// Also read the materialized inferences of the dataset, and say how fresh
+        /// they are
+        #[arg(long)]
+        inferences: bool,
         /// The most axioms listed
         #[arg(long, default_value_t = 1000)]
         limit: usize,
@@ -107,6 +117,10 @@ pub enum OntologyCmd {
         /// Also classify with the assertions the store holds
         #[arg(long)]
         assertions: bool,
+        /// Also read the materialized inferences of the dataset, and say how fresh
+        /// they are
+        #[arg(long)]
+        inferences: bool,
         /// Write the taxonomy to this named graph in one commit
         #[arg(long)]
         target: Option<String>,
@@ -157,6 +171,103 @@ pub enum OntologyCmd {
     /// other commands can follow in one chain. Exits with status 1 when the ontology is
     /// inconsistent or has an unsatisfiable class or property
     Materialize(ontology_chain::MaterializeArgs),
+    /// The entities the ontology declares or, in a lenient read, types by use
+    Entities {
+        #[command(flatten)]
+        at: Target,
+        #[command(flatten)]
+        read: Read,
+        /// Entity kinds, comma separated (Class,ObjectProperty,DataProperty,
+        /// AnnotationProperty,NamedIndividual,Datatype); all when none
+        #[arg(long)]
+        kind: Option<String>,
+        /// The most entities listed
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Also read the materialized inferences of the dataset, and say how fresh
+        /// they are
+        #[arg(long)]
+        inferences: bool,
+        /// text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// What the ontology says about one entity: its kinds, labels and annotations, and
+    /// for each kind its superclasses, domains, ranges, types and the other accessors
+    Entity {
+        /// The entity's IRI
+        iri: String,
+        #[command(flatten)]
+        at: Target,
+        #[command(flatten)]
+        read: Read,
+        /// Report the entity as this kind only
+        #[arg(long)]
+        kind: Option<String>,
+        /// Also list the instances, types and property assertions the store holds
+        #[arg(long)]
+        assertions: bool,
+        /// The most items of each list
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Also read the materialized inferences of the dataset, and say how fresh
+        /// they are
+        #[arg(long)]
+        inferences: bool,
+        /// text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Answer a DL query: the equivalent classes, superclasses, subclasses and instances
+    /// of a class expression
+    DlQuery {
+        /// The class expression, in Manchester syntax by default
+        expression: String,
+        #[command(flatten)]
+        at: Target,
+        #[command(flatten)]
+        read: Read,
+        /// manchester or functional
+        #[arg(long, default_value = "manchester")]
+        syntax: String,
+        /// auto, el or rl
+        #[arg(long, default_value = "auto")]
+        reasoning: String,
+        /// The lists wanted, comma separated: equivalents, superclasses,
+        /// directSuperclasses, subclasses, directSubclasses and instances (all when none)
+        #[arg(long)]
+        answers: Option<String>,
+        /// The most entries of each list
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+        /// Worker threads (0: the algorithm pool's share for one call)
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
+        /// With --reasoning rl, the most facts a run may derive
+        #[arg(long)]
+        max_derived: Option<usize>,
+        /// text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Read Manchester syntax against the ontology's names and the dataset's prefixes,
+    /// and write it in functional-style syntax
+    Parse {
+        /// The Manchester text
+        text: String,
+        #[command(flatten)]
+        at: Target,
+        #[command(flatten)]
+        read: Read,
+        /// classExpression (the default), dataRange, individual, literal or axiom
+        #[arg(long = "as")]
+        what: Option<String>,
+        /// text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
     /// Add and remove axioms in one commit
     Edit {
         #[command(flatten)]
@@ -245,6 +356,15 @@ impl Read {
         j
     }
 
+    /// The query parameters that name the ontology, with `inferences=true` when asked.
+    fn query_with(&self, inferences: bool) -> Vec<(String, String)> {
+        let mut q = self.query();
+        if inferences {
+            q.push(("inferences".into(), "true".into()));
+        }
+        q
+    }
+
     /// The query parameters that name the ontology.
     fn query(&self) -> Vec<(String, String)> {
         let mut q: Vec<(String, String)> = self
@@ -263,15 +383,21 @@ impl Read {
 /// Run a command; the exit status of `check` is 1 when a report does not conform.
 pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
     match cmd {
-        OntologyCmd::Summary { at, read, format } => {
+        OntologyCmd::Summary {
+            at,
+            read,
+            inferences,
+            format,
+        } => {
             let j = match local(&at)? {
                 Some(loc) => {
                     let ds = crate::open_dataset(loc, opts)?;
-                    let req = read.request()?;
+                    let mut req = read.request()?;
+                    req.inferences = inferences;
                     let o = ds.ontology().open(&req, &Default::default())?;
                     summary_body(&name_of(loc), &o, &req, &renderer(&ds))
                 }
-                None => remote_get(&at, "", &read.query())?,
+                None => remote_get(&at, "", &read.query_with(inferences))?,
             };
             print_summary(&j, &format)
         }
@@ -281,6 +407,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             types,
             about,
             assertions,
+            inferences,
             limit,
             offset,
             format,
@@ -291,7 +418,8 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             match local(&at)? {
                 Some(loc) => {
                     let ds = crate::open_dataset(loc, opts)?;
-                    let req = read.request()?;
+                    let mut req = read.request()?;
+                    req.inferences = inferences;
                     let o = ds.ontology().open(&req, &Default::default())?;
                     let q = AxiomQuery {
                         types: types.as_deref().map(onto::parse_axiom_types).transpose()?,
@@ -309,6 +437,12 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     }
                     let r = renderer(&ds);
                     if format == "ofn" {
+                        // a functional-style document has no place for the freshness
+                        if let Some(n) =
+                            inferences_note(&onto::wire::opened_json(&name_of(loc), &o, &req))
+                        {
+                            eprintln!("inferences: {n}");
+                        }
                         print!(
                             "{}",
                             owl::ofn::document(
@@ -331,7 +465,15 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     }
                 }
                 None => {
-                    let mut q = read.query();
+                    let mut q = read.query_with(inferences);
+                    if inferences && format == "ofn" {
+                        // the freshness of the inferences, from one axiom's JSON answer
+                        let mut one = q.clone();
+                        one.push(("limit".into(), "1".into()));
+                        if let Some(n) = inferences_note(&remote_get(&at, "/axioms", &one)?) {
+                            eprintln!("inferences: {n}");
+                        }
+                    }
                     if let Some(t) = types {
                         q.push(("type".into(), t));
                     }
@@ -426,6 +568,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             at,
             read,
             assertions,
+            inferences,
             target,
             message,
             about,
@@ -499,7 +642,8 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 local(&at)?
             };
             let local_run = |ds: &sparkles::Dataset, name: &str| -> Result<(J, String)> {
-                let req = read.request()?;
+                let mut req = read.request()?;
+                req.inferences = inferences;
                 let out = ds.ontology().classify(&req, &c, &qopts)?;
                 let r = renderer(ds);
                 let j = classify_body(name, &out, &req, &r, &q)?;
@@ -520,6 +664,11 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 }
                 (Some(_), None) if c.target.is_some() => {
                     bail!("--target writes to a database: name --loc or --server, not a FILE")
+                }
+                (Some(_), None) if inferences => {
+                    bail!(
+                        "--inferences reads a dataset's materialized inferences: name --loc or --server, not a FILE"
+                    )
                 }
                 (Some(f), None) => {
                     let req = read.request()?;
@@ -546,6 +695,9 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 (None, None) => {
                     let mut body = read.body();
                     body["assertions"] = json!(assertions);
+                    if inferences {
+                        body["inferences"] = json!(true);
+                    }
                     body["threads"] = json!(threads);
                     body["limit"] = json!(MAX_LIMIT);
                     if partial {
@@ -596,6 +748,135 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
         OntologyCmd::Relax(a) => ontology_chain::run(ontology_chain::Step::Relax(a), opts),
         OntologyCmd::Materialize(a) => {
             ontology_chain::run(ontology_chain::Step::Materialize(a), opts)
+        }
+        OntologyCmd::Entities {
+            at,
+            read,
+            kind,
+            limit,
+            offset,
+            inferences,
+            format,
+        } => {
+            text_or_json(&format)?;
+            let j = match local(&at)? {
+                Some(loc) => {
+                    let mut a = read.body();
+                    if let Some(k) = &kind {
+                        a["kind"] = json!(k);
+                    }
+                    a["limit"] = json!(limit);
+                    a["offset"] = json!(offset);
+                    a["inferences"] = json!(inferences);
+                    local_call(loc, opts, "entities", a)?
+                }
+                None => {
+                    let mut q = read.query_with(inferences);
+                    if let Some(k) = kind {
+                        q.push(("kind".into(), k));
+                    }
+                    q.push(("limit".into(), limit.to_string()));
+                    q.push(("offset".into(), offset.to_string()));
+                    remote_get(&at, "/entities", &q)?
+                }
+            };
+            print_entities(&j, &format)
+        }
+        OntologyCmd::Entity {
+            iri,
+            at,
+            read,
+            kind,
+            assertions,
+            limit,
+            inferences,
+            format,
+        } => {
+            text_or_json(&format)?;
+            let iri = iri
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string();
+            let j = match local(&at)? {
+                Some(loc) => {
+                    let mut a = read.body();
+                    a["iri"] = json!(iri);
+                    if let Some(k) = &kind {
+                        a["kind"] = json!(k);
+                    }
+                    a["assertions"] = json!(assertions);
+                    a["limit"] = json!(limit);
+                    a["inferences"] = json!(inferences);
+                    local_call(loc, opts, "entity", a)?
+                }
+                None => {
+                    let mut q = read.query_with(inferences);
+                    q.push(("iri".into(), iri));
+                    if let Some(k) = kind {
+                        q.push(("kind".into(), k));
+                    }
+                    if assertions {
+                        q.push(("assertions".into(), "true".into()));
+                    }
+                    q.push(("limit".into(), limit.to_string()));
+                    remote_get(&at, "/entity", &q)?
+                }
+            };
+            print_entity(&j, &format)
+        }
+        OntologyCmd::DlQuery {
+            expression,
+            at,
+            read,
+            syntax,
+            reasoning,
+            answers,
+            limit,
+            threads,
+            max_derived,
+            format,
+        } => {
+            text_or_json(&format)?;
+            let mut a = read.body();
+            a["expression"] = json!(expression);
+            a["syntax"] = json!(syntax);
+            a["reasoning"] = json!(reasoning);
+            if let Some(x) = answers {
+                a["answers"] = json!(x);
+            }
+            a["limit"] = json!(limit);
+            a["threads"] = json!(threads);
+            if let Some(m) = max_derived {
+                a["maxDerived"] = json!(m);
+            }
+            let j = match local(&at)? {
+                Some(loc) => local_call(loc, opts, "dlQuery", a)?,
+                None => remote_post(&at, "/dl-query", &a)?,
+            };
+            print_dl_query(&j, &format)
+        }
+        OntologyCmd::Parse {
+            text,
+            at,
+            read,
+            what,
+            format,
+        } => {
+            text_or_json(&format)?;
+            let mut a = read.body();
+            a["text"] = json!(text);
+            if let Some(w) = what {
+                a["as"] = json!(w);
+            }
+            let j = match local(&at)? {
+                Some(loc) => local_call(loc, opts, "parse", a)?,
+                None => remote_post(&at, "/parse", &a)?,
+            };
+            match format.as_str() {
+                "json" => println!("{}", serde_json::to_string_pretty(&j)?),
+                _ => println!("{}", j["ofn"].as_str().unwrap_or("")),
+            }
+            Ok(())
         }
         OntologyCmd::Edit {
             at,
@@ -752,7 +1033,13 @@ pub(crate) fn finish_classify(
     allow_unsatisfiable: bool,
 ) -> Result<bool> {
     match format {
-        "ofn" => print!("{doc}"),
+        "ofn" => {
+            // a functional-style document has no place for the freshness
+            if let Some(n) = inferences_note(j) {
+                eprintln!("inferences: {n}");
+            }
+            print!("{doc}")
+        }
         "json" => println!("{}", serde_json::to_string_pretty(j)?),
         "text" => print_classify(j),
         f => bail!("unknown --format {f}: ofn, json or text"),
@@ -795,6 +1082,212 @@ fn name_of(loc: &Path) -> String {
 
 fn renderer(ds: &sparkles::Dataset) -> Renderer {
     Renderer::new(ds.prefixes())
+}
+
+/// Answer `op` of the ontology's JSON surface on the database at `loc`, as the route of
+/// the same name answers it on a server.
+fn local_call(loc: &Path, opts: StoreOptions, op: &str, args: J) -> Result<J> {
+    let ds = crate::open_dataset(loc, opts)?;
+    let mut j = onto::wire::call(&ds, op, &args, &Default::default())?;
+    j["dataset"] = json!(name_of(loc));
+    Ok(j)
+}
+
+fn text_or_json(format: &str) -> Result<()> {
+    match format {
+        "text" | "json" => Ok(()),
+        f => bail!("unknown --format {f}: text or json"),
+    }
+}
+
+/// What an answer says about the inferences it read, or `None` when it did not ask
+/// for them.
+fn inferences_note(j: &J) -> Option<String> {
+    let i = j.get("inferences")?;
+    if i["included"].as_bool() != Some(true) {
+        return Some("none materialized, so the asserted axioms only".into());
+    }
+    let what = format!(
+        "{} closure from {}",
+        i["profile"].as_str().unwrap_or("materialized"),
+        i["graph"].as_str().unwrap_or("")
+    );
+    let reason = i["reason"]
+        .as_str()
+        .map(|r| format!(" ({r})"))
+        .unwrap_or_default();
+    Some(match (i["stale"].as_bool(), i["commitsSince"].as_u64()) {
+        (Some(false), _) => format!("{what}, fresh"),
+        (Some(true), Some(n)) => format!("{what}, stale by {n} commits{reason}"),
+        (Some(true), None) => format!("{what}, stale{reason}"),
+        (None, _) => format!("{what}, freshness unknown{reason}"),
+    })
+}
+
+/// One item of a list in an answer: a string, or the functional-style form of an
+/// expression or axiom.
+fn item_text(v: &J) -> String {
+    match v {
+        J::String(s) => s.clone(),
+        J::Object(o) => match o.get("ofn").and_then(J::as_str) {
+            Some(s) => s.to_string(),
+            None => v.to_string(),
+        },
+        v => v.to_string(),
+    }
+}
+
+fn print_entities(j: &J, format: &str) -> Result<()> {
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(j)?);
+        return Ok(());
+    }
+    if let Some(n) = inferences_note(j) {
+        println!("inferences: {n}");
+    }
+    let list = j["entities"].as_array().map_or(&[][..], Vec::as_slice);
+    for e in list {
+        println!(
+            "{:<20} {}",
+            e["kind"].as_str().unwrap_or(""),
+            e["iri"].as_str().unwrap_or("")
+        );
+    }
+    if let Some(next) = j["next"].as_u64() {
+        eprintln!(
+            "{} of {} entities listed; --offset {next} lists more",
+            list.len(),
+            j["total"]
+        );
+    }
+    Ok(())
+}
+
+/// The members of an entity report that hold the accessors of one kind.
+const KIND_MEMBERS: [&str; 6] = [
+    "class",
+    "objectProperty",
+    "dataProperty",
+    "annotationProperty",
+    "datatype",
+    "namedIndividual",
+];
+
+fn print_entity(j: &J, format: &str) -> Result<()> {
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(j)?);
+        return Ok(());
+    }
+    if let Some(n) = inferences_note(j) {
+        println!("inferences: {n}");
+    }
+    println!("{}", j["iri"].as_str().unwrap_or(""));
+    let kinds: Vec<&str> = j["kinds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(J::as_str)
+        .collect();
+    println!("  kinds: {}", kinds.join(" "));
+    for l in j["labels"].as_array().into_iter().flatten() {
+        let text = l["@value"]
+            .as_str()
+            .map_or_else(|| l.to_string(), str::to_string);
+        match l["@language"].as_str() {
+            Some(lang) => println!("  label: {text:?}@{lang}"),
+            None => println!("  label: {text:?}"),
+        }
+    }
+    for a in j["annotations"].as_array().into_iter().flatten() {
+        println!("  {}", item_text(a));
+    }
+    for k in KIND_MEMBERS {
+        let Some(o) = j[k].as_object() else { continue };
+        println!("{k}");
+        for (name, v) in o {
+            match v {
+                J::Array(a) if a.is_empty() => {}
+                J::Array(a) => {
+                    println!("  {name}");
+                    for x in a {
+                        println!("    {}", item_text(x));
+                    }
+                }
+                v => println!("  {name}: {v}"),
+            }
+        }
+    }
+    if j["truncated"].as_bool() == Some(true) {
+        println!("(some lists stop at --limit)");
+    }
+    Ok(())
+}
+
+/// The lists of a DL query's answer, in the order they are printed.
+const DL_LISTS: [&str; 6] = [
+    "equivalents",
+    "directSuperclasses",
+    "superclasses",
+    "directSubclasses",
+    "subclasses",
+    "instances",
+];
+
+fn print_dl_query(j: &J, format: &str) -> Result<()> {
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(j)?);
+        return Ok(());
+    }
+    let r = &j["reasoning"];
+    println!(
+        "query: {}",
+        j["expression"]["manchester"].as_str().unwrap_or("")
+    );
+    println!(
+        "reasoning: {}{}",
+        r["title"].as_str().unwrap_or(""),
+        if r["complete"].as_bool() == Some(true) {
+            ""
+        } else {
+            ", incomplete"
+        }
+    );
+    if j["consistent"].as_bool() == Some(false) {
+        println!("the ontology is inconsistent");
+    } else if j["satisfiable"].as_bool() == Some(false) {
+        println!("the expression is unsatisfiable");
+    }
+    for k in DL_LISTS {
+        let Some(list) = j[k].as_array() else {
+            continue;
+        };
+        let n = j["counts"][k].as_u64().unwrap_or(list.len() as u64);
+        println!("{k} ({n})");
+        for x in list {
+            println!("  {}", item_text(x));
+        }
+        if n > list.len() as u64 {
+            println!("  (more past --limit)");
+        }
+    }
+    let gaps = r["gapCount"].as_u64().unwrap_or(0);
+    if gaps > 0 {
+        println!("left out or used in part: {gaps} axioms");
+        for g in r["gaps"].as_array().into_iter().flatten() {
+            println!(
+                "  {}: {}",
+                g["rule"].as_str().unwrap_or(""),
+                g["message"].as_str().unwrap_or("")
+            );
+            if let Some(o) = g["ofn"].as_str() {
+                println!("    {o}");
+            }
+        }
+    }
+    for n in r["notes"].as_array().into_iter().flatten() {
+        println!("note: {}", item_text(n));
+    }
+    Ok(())
 }
 
 /// The axioms of JSON files, each a list of axioms or one axiom.
@@ -947,6 +1440,9 @@ fn print_summary(j: &J, format: &str) -> Result<()> {
                 .filter_map(J::as_str)
                 .collect();
             println!("graphs:    {}", graphs.join(" "));
+            if let Some(n) = inferences_note(j) {
+                println!("inferences: {n}");
+            }
             println!("axioms:    {}", j["axiomCount"]);
             for (t, n) in j["axioms"].as_object().into_iter().flatten() {
                 println!("  {t:<32} {n}");
@@ -1018,6 +1514,9 @@ fn print_check(j: &J, format: &str) -> Result<()> {
 
 fn print_classify(j: &J) {
     let n = |k: &str| j[k].as_u64().unwrap_or(0);
+    if let Some(n) = inferences_note(j) {
+        println!("inferences: {n}");
+    }
     let consistency = match j["consistency"].as_str() {
         Some("unknown") => "consistency unknown",
         _ if j["consistent"].as_bool().unwrap_or(false) => "consistent",

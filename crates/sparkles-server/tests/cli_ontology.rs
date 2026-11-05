@@ -487,3 +487,182 @@ fn classify_leaves_the_consistency_unknown_when_stopped_early() {
     let seen = partial_on_the_command_line(true);
     assert!(seen.iter().any(|c| c == "unknown"), "{seen:?}");
 }
+
+const TAXONOMY: &str = r#"@prefix : <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:o a owl:Ontology .
+:Professor a owl:Class ; rdfs:label "Professor"@en .
+:Person a owl:Class . :Agent a owl:Class . :Course a owl:Class .
+:teaches a owl:ObjectProperty .
+:Professor rdfs:subClassOf :Person . :Person rdfs:subClassOf :Agent .
+"#;
+
+/// Roadmap items 565, 578 and 661 on the command line: entity listings and reports, DL
+/// queries, the Manchester reader, and reads with the materialized inferences.
+#[test]
+fn entities_dl_queries_parses_and_inferences() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("onto.ttl"), TAXONOMY).unwrap();
+    let o = sparkles(dir, &["load", "--loc", "db", "onto.ttl"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let run = |args: &[&str]| {
+        let o = sparkles(dir, args);
+        assert_eq!(o.status.code(), Some(0), "{args:?}: {}", err(&o));
+        o
+    };
+    let json =
+        |args: &[&str]| -> serde_json::Value { serde_json::from_slice(&run(args).stdout).unwrap() };
+
+    // entities
+    let s = out(&run(&[
+        "ontology", "entities", "--loc", "db", "--kind", "Class",
+    ]));
+    assert_eq!(s.lines().count(), 4, "{s}");
+    assert!(
+        s.contains("Class                http://ex.org/Professor"),
+        "{s}"
+    );
+    let o = run(&[
+        "ontology", "entities", "--loc", "db", "--limit", "2", "--format", "json",
+    ]);
+    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["dataset"], "db", "{j}");
+    assert_eq!(j["next"], 2, "{j}");
+    assert!(err(&o).is_empty(), "json says where to resume: {}", err(&o));
+    let o = run(&["ontology", "entities", "--loc", "db", "--limit", "2"]);
+    assert!(err(&o).contains("--offset 2"), "{}", err(&o));
+
+    // an entity report
+    let s = out(&run(&[
+        "ontology",
+        "entity",
+        "http://ex.org/Professor",
+        "--loc",
+        "db",
+    ]));
+    assert!(s.contains("kinds: Class"), "{s}");
+    assert!(s.contains("label: \"Professor\"@en"), "{s}");
+    assert!(s.contains("superClasses\n    :Person"), "{s}");
+    let o = sparkles(
+        dir,
+        &["ontology", "entity", "http://ex.org/Nobody", "--loc", "db"],
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(err(&o).contains("neither declares nor uses"), "{}", err(&o));
+
+    // a DL query and the Manchester reader
+    let s = out(&run(&[
+        "ontology",
+        "dl-query",
+        "<http://ex.org/Professor>",
+        "--loc",
+        "db",
+        "--answers",
+        "superclasses",
+    ]));
+    assert!(s.contains("superclasses (3)"), "{s}");
+    assert!(s.contains("http://ex.org/Agent"), "{s}");
+    assert!(!s.contains("subclasses"), "{s}");
+    let s = out(&run(&[
+        "ontology",
+        "parse",
+        "<http://ex.org/Person> and (<http://ex.org/teaches> some <http://ex.org/Course>)",
+        "--loc",
+        "db",
+    ]));
+    assert!(s.starts_with("ObjectIntersectionOf("), "{s}");
+    let o = sparkles(dir, &["ontology", "parse", "and and", "--loc", "db"]);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+
+    // inferences: none materialized, then fresh, then stale
+    let s = out(&run(&[
+        "ontology",
+        "summary",
+        "--loc",
+        "db",
+        "--inferences",
+    ]));
+    assert!(s.contains("inferences: none materialized"), "{s}");
+    run(&["infer", "--loc", "db", "--profile", "rdfs"]);
+    let j = json(&[
+        "ontology",
+        "axioms",
+        "--loc",
+        "db",
+        "--type",
+        "SubClassOf",
+        "--about",
+        "http://ex.org/Professor",
+        "--inferences",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(j["inferences"]["included"], true, "{j}");
+    assert_eq!(j["inferences"]["stale"], false, "{j}");
+    assert_eq!(j["total"], 2, "the closure is read: {j}");
+    let o = run(&[
+        "ontology",
+        "axioms",
+        "--loc",
+        "db",
+        "--about",
+        "http://ex.org/Professor",
+        "--inferences",
+    ]);
+    assert!(
+        err(&o).contains("inferences: rdfs closure from"),
+        "{}",
+        err(&o)
+    );
+    assert!(err(&o).contains("fresh"), "{}", err(&o));
+    assert!(
+        out(&o).contains("SubClassOf(:Professor :Agent)"),
+        "{}",
+        out(&o)
+    );
+    let j = json(&[
+        "ontology",
+        "entity",
+        "http://ex.org/Professor",
+        "--loc",
+        "db",
+        "--inferences",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        j["class"]["superClasses"].as_array().unwrap().len(),
+        2,
+        "{j}"
+    );
+    let s = out(&run(&[
+        "ontology",
+        "classify",
+        "--loc",
+        "db",
+        "--inferences",
+        "--format",
+        "text",
+    ]));
+    assert!(s.contains("inferences: rdfs closure"), "{s}");
+    std::fs::write(
+        dir.join("more.ttl"),
+        "<http://ex.org/Room> a <http://www.w3.org/2002/07/owl#Class> .",
+    )
+    .unwrap();
+    run(&["load", "--loc", "db", "more.ttl"]);
+    let s = out(&run(&[
+        "ontology",
+        "summary",
+        "--loc",
+        "db",
+        "--inferences",
+    ]));
+    assert!(s.contains("stale by 1 commits"), "{s}");
+    // a file has no materialized inferences
+    let o = sparkles(dir, &["ontology", "classify", "onto.ttl", "--inferences"]);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(err(&o).contains("--inferences"), "{}", err(&o));
+}

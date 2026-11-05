@@ -54,7 +54,13 @@ pub fn all_tools() -> Vec<&'static str> {
         v.push("graphql_query");
     }
     if cfg!(feature = "ontology") {
-        v.push("ontology_axioms");
+        v.extend([
+            "ontology_axioms",
+            "ontology_entities",
+            "ontology_classify",
+            "ontology_dl_query",
+            "ontology_parse",
+        ]);
     }
     v.push("sparql_update");
     v.extend(super::branches::TOOLS_AFTER_UPDATE);
@@ -154,13 +160,15 @@ pub(super) fn prefixes() -> Value {
 }
 
 #[cfg(feature = "ontology")]
-fn ontology_tool(cfg: &McpConfig) -> Option<ToolDef> {
-    Some(super::ontology::tool_def(cfg))
+fn ontology_tools(cfg: &McpConfig) -> Vec<ToolDef> {
+    let mut v = vec![super::ontology::tool_def(cfg)];
+    v.extend(super::ontology_reads::tool_defs(cfg));
+    v
 }
 
 #[cfg(not(feature = "ontology"))]
-fn ontology_tool(_: &McpConfig) -> Option<ToolDef> {
-    None
+fn ontology_tools(_: &McpConfig) -> Vec<ToolDef> {
+    Vec::new()
 }
 
 pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
@@ -911,7 +919,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         },
     ]
     .into_iter()
-    .chain(ontology_tool(cfg))
+    .chain(ontology_tools(cfg))
     .chain(super::memory::assert_tool(cfg))
     .chain(super::memory::ingest_tools(cfg))
     .chain(super::branches::tool_defs(cfg))

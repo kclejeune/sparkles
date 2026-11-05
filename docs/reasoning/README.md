@@ -352,10 +352,12 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   and keeps the last four reads of up to two million triples each, keyed by commit, for
   callers who read every graph. `/$/ontology/{ds}` serves the summary, the axioms, the
   checks and edits over HTTP with the caller's grants
-  ([API.md](../API.md#ontology)). `sparkles ontology summary|axioms|check|edit` does the
-  same for a database directory or a server, and `sparkles ontology check FILE` checks
-  an ontology file without a database. The check exits with status 1 when the ontology
-  is outside a profile it names.
+  ([API.md](../API.md#ontology)). `sparkles ontology summary|axioms|entities|entity|check|edit`
+  does the same for a database directory or a server, and `sparkles ontology check FILE`
+  checks an ontology file without a database. The check exits with status 1 when the
+  ontology is outside a profile it names. `--inferences` adds the materialized
+  inferences to `summary`, `axioms`, `entities`, `entity` and `classify`, and the answer
+  says whether they are stale.
 * `sparkles ontology reason`, `reduce` and `relax` do what ROBOT 1.9.11's commands of the
   same names do in OBO release pipelines, with ROBOT's options, values and defaults.
   `reason` writes the whole ontology with the inferred axioms and, by default, without
@@ -441,16 +443,22 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   declared as annotation properties, so the ontology stays in OWL 2 DL, and an ontology
   that types them as object or data properties refuses the provenance. Removals are
   recorded by the activity and the commit, since an annotation cannot describe an axiom
-  that is gone.
+  that is gone. `ontology_axioms` also takes `inferences` in a listing.
+* The MCP tools `ontology_entities`, `ontology_classify`, `ontology_dl_query` and
+  `ontology_parse` list entities and report on one, classify, answer DL queries and read
+  Manchester syntax, each as its route answers and as the caller. On a server that
+  allows updates, `ontology_classify` with `target` writes the taxonomy to a graph with
+  the preview, `ifHead` precondition and commit message of `sparql_update`.
 * `sparkles_owl::manchester` reads OWL 2 Manchester syntax against an ontology's
-  prefixes, local names and labels. `POST /$/ontology/{ds}/parse` and the bindings'
-  `parse` read a class expression, data range, individual, literal or one-line axiom
+  prefixes, local names and labels. `POST /$/ontology/{ds}/parse`, the bindings'
+  `parse`, `sparkles ontology parse` and the MCP tool `ontology_parse` read a class expression, data range, individual, literal or one-line axiom
   with the caller's grants, and a name that several entities share is an error that
   lists them, with the span of the name ([API.md](../API.md#ontology)).
 * A DL query answers a class expression's equivalent classes, direct and inferred
   superclasses and subclasses, and instances, as Protégé's DL Query tab does.
-  `ds.ontology().dl_query()`, `POST /$/ontology/{ds}/dl-query` and the bindings'
-  `dl_query` or `dlQuery` run it. Inside OWL 2 EL it adds the expression as a fresh
+  `ds.ontology().dl_query()`, `POST /$/ontology/{ds}/dl-query`, the bindings'
+  `dl_query` or `dlQuery`, `sparkles ontology dl-query` and the MCP tool
+  `ontology_dl_query` run it. Inside OWL 2 EL it adds the expression as a fresh
   class to the dataset's kept classification, saturates only what that class reaches and
   removes it again, so the answers are complete and the kept taxonomy is unchanged.
   Outside EL the OWL 2 RL rules answer it by demand reasoning over a copy of the
@@ -623,11 +631,6 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 75.
 * An ontology read does not fetch an `owl:imports` target that is not a graph of the
   dataset. Roadmap item 559.
-* The MCP ontology tool and the CLI's ontology commands read the asserted axioms only,
-  without the materialized inferences that the library, the bindings and the HTTP routes
-  can include. Roadmap item 565.
-* The CLI's ontology commands and the MCP ontology tool have no entity listing or entity
-  report. Roadmap item 578.
 * An ontology read has no size budget of its own beyond the query deadline, and its cost
   on large ontologies is not measured. Roadmap item 539.
 * The EL classifier uses literals and datatypes it cannot compare, which are XML
@@ -671,9 +674,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   rules still fail at a deadline on every surface. Roadmap item 714.
 * The Workbench does not ask for a partial classification, so it shows no partial answers
   or incomplete classes. Roadmap item 719.
-* No MCP tool classifies, roadmap item 586, and the entity accessors and the
-  inferred reads do not answer from a classification, nor does any surface answer the
-  subclasses of a class expression, roadmap item 588.
+* The entity accessors and the inferred reads do not answer from a classification, nor
+  does any surface answer the subclasses of a class expression. Roadmap item 588.
 * A classification runs within one request's deadline and is not kept up to date as
   commits land. Roadmap item 589.
 * A classification with the assertions saturates everything on each run, since the
@@ -698,7 +700,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

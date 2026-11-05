@@ -753,6 +753,11 @@ sparkles ontology axioms  --loc db --type SubClassOf --about http://ex.org/Perso
 sparkles ontology check   --loc db --profile el,rl   # OWL 2 profile checks (exit 1 when outside one)
 sparkles ontology check   onto.ttl --profile all     # check a file without a database
 sparkles ontology edit    --loc db --add new.json --remove old.json   # JSON axioms, in one commit
+sparkles ontology entities --loc db --kind Class   # declared entities, a page at a time (--offset)
+sparkles ontology entity http://ex.org/Person --loc db   # kinds, labels, superclasses, domains, types, …
+sparkles ontology axioms  --loc db --inferences   # with the materialized inferences, and whether they are stale
+sparkles ontology dl-query 'Person and (teaches some Course)' --loc db   # DL query in Manchester syntax
+sparkles ontology parse 'Person and (teaches some Course)' --loc db   # Manchester text as functional-style syntax
 sparkles ontology classify --loc db --format text   # OWL 2 EL taxonomy (exit 1 when unsatisfiable)
 sparkles ontology classify go.ofn > go-taxonomy.ofn  # classify a file without a database
 sparkles ontology classify --loc db --target http://ex.org/taxonomy   # write the taxonomy to a graph
