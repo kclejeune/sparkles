@@ -1380,6 +1380,7 @@ test('ontology-inferred', async ({ page }) => {
   await page.goto(
     `/ui/workbench/ontology?ds=uni&inferred=1&iri=${encodeURIComponent(`${UNI}Teacher`)}`,
   );
+  await page.getByRole('button', { name: 'Classify tree', exact: true }).click();
   const asserted = page.getByRole('tree', { name: 'Classes (asserted)' });
   const inferred = page.getByRole('tree', { name: 'Classes (inferred)' });
   await expect(inferred).toBeVisible({ timeout: 30_000 });

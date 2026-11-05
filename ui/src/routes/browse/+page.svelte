@@ -1653,7 +1653,6 @@
                 {target}
                 {graph}
                 commit={term.commit}
-                historic={!!at}
                 editor={editing ? axiomEditor : undefined}
               />
             {/if}

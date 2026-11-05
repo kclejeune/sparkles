@@ -68,9 +68,95 @@ open.beforeAll(async ({ request }) => {
   expect(loaded.ok(), await loaded.text()).toBe(true);
 });
 
+open(
+  'kept class frames read without computing and pin their real backend pages',
+  async ({ page, request }, info) => {
+    const ds = `${DS}-kept`;
+    const created = await request.post('/$/datasets', {
+      data: { dbName: ds, dbType: 'persistent' },
+    });
+    expect(created.ok(), await created.text()).toBe(true);
+    const loaded = await request.post(`/${ds}/data`, {
+      headers: { 'Content-Type': 'text/turtle' },
+      data: TURTLE,
+    });
+    expect(loaded.ok(), await loaded.text()).toBe(true);
+    const posts: string[] = [];
+    const pages: {
+      url: string;
+      commit: number;
+      resultId: string;
+      part: string;
+      rows: number;
+      decodedBytes: number;
+    }[] = [];
+    const settled: Promise<void>[] = [];
+    page.on('request', (r) => {
+      if (r.method() === 'POST' && /\/classify(?:\?|$)/.test(r.url())) posts.push(r.url());
+    });
+    page.on('response', (r) => {
+      if (!/\/classification\?/.test(r.url())) return;
+      settled.push(
+        (async () => {
+          const body = await r.body();
+          const value = JSON.parse(body.toString());
+          if (value.status === 'available')
+            pages.push({
+              url: r.url(),
+              commit: value.commit,
+              resultId: value.result.resultId,
+              part: new URL(r.url()).searchParams.get('part') ?? 'status',
+              rows: value.page?.items.length ?? 0,
+              decodedBytes: body.length,
+            });
+        })(),
+      );
+    });
+    const region = page.getByRole('region', { name: 'Inferred class axioms', exact: true });
+    await page.goto(`/ui/browse?ds=${ds}&iri=${encodeURIComponent(UNI + 'Professor')}`);
+    await expect(region.getByRole('button', { name: 'Classify', exact: true })).toBeVisible();
+    expect(posts).toEqual([]);
+    const projected = page.waitForResponse(
+      (r) => r.request().method() === 'POST' && /\/classify(?:\?|$)/.test(r.url()),
+    );
+    await region.getByRole('button', { name: 'Classify', exact: true }).click();
+    const response = await projected;
+    expect(response.ok(), await response.text()).toBe(true);
+    const frame = (await response.json()).frame;
+    expect(frame.retention.kept).toBe(true);
+    await expect(region.getByRole('link', { name: 'Teacher', exact: true })).toBeVisible();
+    expect(posts).toHaveLength(1);
+
+    // A fresh editor with inferred=1 shares the completed read but never POSTs.
+    await page.goto(
+      `/ui/workbench/ontology?ds=${ds}&inferred=1&iri=${encodeURIComponent(UNI + 'Professor')}`,
+    );
+    await expect(region.getByRole('link', { name: 'Teacher', exact: true })).toBeVisible();
+    expect(posts).toHaveLength(1);
+    await Promise.all(settled);
+    expect(pages.map((p) => p.part).sort()).toEqual(['equivalents', 'parents', 'status']);
+    for (const p of pages) {
+      expect(p.commit).toBe(frame.result.classifiedCommit);
+      expect(p.resultId).toBe(frame.result.resultId);
+      expect(p.rows).toBeLessThanOrEqual(100);
+      expect(new URL(p.url).searchParams.get('at')).toBe(`commit:${p.commit}`);
+      if (p.part !== 'status') expect(new URL(p.url).searchParams.get('resultId')).toBe(p.resultId);
+    }
+    await info.attach('kept-frame-display.json', {
+      body: JSON.stringify(
+        { pages, explicitPosts: posts.length, domElements: await region.locator('*').count() },
+        null,
+        2,
+      ),
+      contentType: 'application/json',
+    });
+  },
+);
+
 open('the trees, the frame and the inferred tree read the ontology', async ({ page }) => {
   await page.goto(`/ui/workbench/ontology?ds=${DS}&inferred=1`);
   await expect(tree(page).getByRole('button', { name: 'Agent', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Classify tree', exact: true }).click();
   await expand(page, 'Agent');
   await expand(page, 'Person');
   await expand(page, 'Employee');

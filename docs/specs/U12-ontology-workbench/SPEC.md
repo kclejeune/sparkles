@@ -145,8 +145,9 @@ entities. The Manchester fields complete a longer kind through the entity search
 server's Manchester reader resolves its names. This is item 725, whose measurements are in
 the [web UI scale report](../../benchmarks/web-ui-scale/README.md).
 
-**Inferred tree.** The **Inferred** switch shows the class taxonomy of the EL classifier
-of [F24](../F24-owl-classification/README.md) beside the asserted tree. Its nodes are the
+**Inferred tree.** The **Inferred** switch reveals the class taxonomy pane beside the
+asserted tree without computing. A deliberate **Classify tree** action fills it with the
+actual EL, Horn or disjunctive result of [F24](../F24-owl-classification/README.md). Its nodes are the
 classifier's equivalence classes, so equivalent classes share a node, and the
 unsatisfiable classes sit under `owl:Nothing`. Property and individual trees show the
 asserted hierarchy only.
@@ -548,9 +549,23 @@ classification's inferences, and SKOS statements are kept out of axioms. The hea
 counts as one row of chips and a More menu for buttons that do not fit are shared by the pages
 of the UI. The Hierarchy card draws the graph in its own body. The Workbench editors' trees
 show labels before short forms and keep their ancestors in view, and the two columns of
-cards balance their heights. The Axioms card shows inferences only
-after a **Classify** click, since no read-only route says whether a kept classification
-exists, which item 726 adds.
+cards balance their heights. Item 726 adds the bounded read-only kept-classification
+route used by Browse and editor named-class frames. A page reads availability and then
+direct-parent/equivalence pages at its displayed branch/commit, with one immutable result
+pin and labels from that source. Automatic loading, retry, paging and toggles never POST
+to classify. Empty frames keep their outcome region visible, and partial page errors,
+replacement, exclusions, unsatisfiability and inconsistency have distinct notices.
+
+A deliberate **Classify** click asks for one bounded frame projection when no matching
+result is available. Restricted views retain useful authorized clauses from that explicit
+computation, with actual producer/source/outcome and bounded diagnostic samples. They do
+not advertise a shared continuation or silently recompute for more rows. An eligible
+publication supports bounded GET continuation. The separate explicit full-tree action
+retains its legacy multi-POST transfer, pins every page and name batch to its original
+commit and input, and compares complete deterministic content/outcome fingerprints
+before assembling pages. The full-tree transfer is not claimed bounded by frame limits.
+Each frame part has a 1,000-row browser display cap and reports unread totals. Historical
+names fall back to complete IRIs when no trustworthy prefix map is available.
 
 Item 734 reworked the term page's layout without a server change. A right rail of cards holds
 Metadata, with the cross-references as Identifiers by database and Download as the card's last
@@ -569,9 +584,12 @@ kind in place of a table, with hidden labels behind their toggle. Identifiers sa
 page already has for them, and keep the exact value as their title. Typed literals show their exact value with a datatype chip,
 and copied Manchester text keeps its syntax. A phone puts Metadata and Hierarchy before Axioms.
 
-**Remaining work.** Inferred axioms and hierarchies beyond the card's click are items 622 and
-726, search at a past state item 658, metrics item 621
-and other servers' term pages item 461.
+**Remaining work.** Item 622 still covers general inferred frames/hierarchy integration
+and explanation links dependent on F24 justifications. Property and individual trees
+remain in item 609, general entity/axiom reads with classification in item 588, search
+at a past state in item 658 and other servers' term pages in item 461. This named-class
+read phase does not expose generic entailments, run a classifier on a read miss or use
+RL witnesses as classification explanations.
 
 ### Rendering preferences
 

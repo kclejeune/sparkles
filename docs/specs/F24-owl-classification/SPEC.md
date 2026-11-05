@@ -86,6 +86,15 @@ as the ROBOT-compatible commands of items 634, 635 and 637, and the existential
 superclasses as `materialize`, item 636. The other phases remain under
 [item 457](../../ROADMAP.md).
 
+The bounded named-class read phase of items 588 and 622, and the availability route
+of item 726, publish an immutable completed result beside the incremental saturation.
+`GET /$/ontology/{ds}/classification` and the Rust, Python, Node.js and JVM read adapters
+return availability, producer/source identity, consistency and bounded direct-parent,
+equivalence, source/warning and exclusion pages without classifying on a miss. General
+entity accessors, inferred axiom listings, property/individual entailments and matching
+justifications remain in items 588, 622, 609 and F24's remaining phases. This phase adds
+no implicit classification, materialization or explanation source.
+
 ### The OWL 2 EL classifier
 
 **The calculus.** `sparkles_owl::classify` follows the consequence-based calculus of
@@ -264,6 +273,49 @@ that differ between the two. The threads are taken before that, so a run that ti
 while it waits for them leaves the kept state as it was. The kept state is dropped after
 a run whose estimated size passes one gigabyte, and it costs memory while the dataset is
 open, about 74 MB estimated for GO.
+
+The kept publication records the bound store/branch identity, snapshot family, commit,
+ordered normalized graphs, imports and mapping mode, with actual producer flags and
+streaming input/content/source fingerprints. Partial-request and expansion policies
+remain original producer metadata rather than compatibility keys. A later DL query can
+change the saturation's expression inputs while the published taxonomy and its source
+remain unchanged. Slot status/reference updates are short; classification, fingerprints,
+estimates and name reads run outside its lock. An owned flight clears active state on
+success, errors and unwind. Refusal before mutable work preserves the prior pair, while
+a mutating failure discards it, and subsequent callers can start a fresh flight.
+An idle exact legacy classify hit still reuses the completed publication without compute
+work under an expired compute deadline. Bounded frame projection and GET reads check
+their own read controls. After an actual stopped partial computation, immutable source
+hashing and response serialization finish using result-local options that preserve graph
+access without resetting shared cancellation flags. This read-only work can outlast the
+compute deadline but never resumes classification or retains partial state. Completed
+result serialization continues to honor its original cancellation and deadline.
+
+The between-run estimate includes retained source strings, the copied excluded axioms
+and taxonomy metadata. A DL query's retention decision includes its latest saturation
+and the still-published older taxonomy. Partial or oversized outcomes drop both retained
+owners. Old publications may remain live during a newer same-input run, and readers
+may hold an evicted publication until their requests finish. This increases peak memory
+beyond a single current estimate. The one-gigabyte retention cap is not a hard RSS cap
+or a combined active-flight/reader admission limit.
+
+Availability first validates the caller's access and requested history. Restricted graph
+or triple views and synthetic snapshots receive a stable unsupported-scope miss without
+observing shared state. A pinned read serves only its exact result ID, input and commit;
+it does not wait on a newer flight or substitute another result. Otherwise a matching
+publication takes precedence, then an exact active run, a same-input stale publication,
+and absence. Source warnings form a typed virtual sequence whose complete digest and
+counts agree with bounded page traversal. Page output and per-page labels are bounded,
+while counts/order can scan retained vectors. Names use the pinned authorized snapshot
+and complete IRI fallback for unproven historical prefixes.
+
+An optional explicit `projection=frame` on classify branches before legacy whole-node
+and ancestor arrays. It preserves useful direct-parent/equivalent clauses even for an
+isolated restricted computation, using its actual graph grant and already triple-masked
+snapshot for names. Its bounded samples report totals and truncation, with no shared
+continuation for a non-retained result. Legacy full-tree POST output remains available;
+its multi-request clients pin the commit and compare exact input and complete taxonomy/
+outcome fingerprints before appending, rather than comparing per-computation IDs.
 
 **Files without a store.** `sparkles ontology classify FILE` and `sparkles ontology check
 FILE` read a file of one graph straight into memory as `OntologyFile`

@@ -63,14 +63,16 @@ test('an entity page shows its axioms as linked prose, its usage and its facts',
   await expect(lede.locator('.sr-only')).toHaveText('Comment:');
   await expect(page.getByRole('region', { name: 'Comment' })).toHaveCount(0);
   // the frame in Manchester syntax: asserted clauses, then what the classification infers
-  const logic = page.getByRole('region', { name: 'Axioms' });
+  const logic = page.getByRole('region', { name: 'Axioms', exact: true });
   const sub = logic.locator('[data-section="sub"]');
   await expect(sub.locator('dt')).toHaveText('SubClassOf:');
   await expect(sub.getByRole('link', { name: 'Employee' })).toBeVisible();
   await expect(sub.locator('.kw', { hasText: 'some' })).toBeVisible();
   // a class with no EquivalentTo axiom has no logical definition
   await expect(page.getByRole('region', { name: 'Logical definition' })).toHaveCount(0);
-  await logic.getByRole('button', { name: 'Classify' }).click();
+  await expect(logic.getByRole('button', { name: 'Read again', exact: true })).toBeEnabled();
+  if (await logic.getByRole('button', { name: 'Classify', exact: true }).count())
+    await logic.getByRole('button', { name: 'Classify', exact: true }).click();
   const inferred = logic.locator('[data-section="inferred-sub"]');
   await expect(inferred.getByRole('link', { name: 'Teacher' })).toBeVisible();
   await expect(inferred).toContainText('Inferred');
@@ -178,7 +180,7 @@ test('the graph view draws the neighbourhood in the hierarchy card and switches 
   const card = page.getByRole('complementary', { name: 'Hierarchy' });
   await expect(card.locator('.canvas canvas').first()).toBeVisible({ timeout: 20_000 });
   await expect(card.locator('.tree-body')).toHaveCount(0);
-  await expect(page.getByRole('region', { name: 'Axioms' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Axioms', exact: true })).toBeVisible();
   // a reload keeps the view
   await page.reload();
   await expect(card.locator('.canvas canvas').first()).toBeVisible({ timeout: 20_000 });
@@ -191,7 +193,7 @@ test('the graph view draws the neighbourhood in the hierarchy card and switches 
   await expect(card.locator('.canvas')).toHaveCount(0);
 });
 
-test('a defined class keeps its logical definition, and a class with no axioms has no card', async ({
+test('a defined class keeps its logical definition, and an empty class keeps its inference notice', async ({
   page,
   context,
 }) => {
@@ -200,30 +202,34 @@ test('a defined class keeps its logical definition, and a class with no axioms h
   const def = page.getByRole('region', { name: 'Logical definition' });
   await expect(def.getByRole('link', { name: 'Person' })).toBeVisible();
   await expect(def.locator('.kw', { hasText: 'and' })).toBeVisible();
-  const axioms = page.getByRole('region', { name: 'Axioms' });
+  const axioms = page.getByRole('region', { name: 'Axioms', exact: true });
   await expect(axioms.locator('[data-section="equivalent"] dt')).toHaveText('EquivalentTo:');
   await axioms.getByRole('button', { name: 'Copy' }).click();
   const text = await page.evaluate(() => navigator.clipboard.readText());
   expect(text).toContain('Class: Teacher');
   expect(text).toContain('    EquivalentTo: ');
   expect(text).toContain('Person and (teaches some Course)');
-  await axioms.getByRole('button', { name: 'Classify' }).click();
-  await expect(axioms).toContainText('infers nothing more');
+  await expect(axioms.getByRole('button', { name: 'Read again', exact: true })).toBeEnabled();
+  if (await axioms.getByRole('button', { name: 'Classify', exact: true }).count())
+    await axioms.getByRole('button', { name: 'Classify', exact: true }).click();
+  await expect(axioms).toContainText('No additional direct named-class clauses');
 
-  // a classification run in this tab is asked again on the next class page
+  // A later class page reads the kept result without classifying again.
   await openTerm(page, 'Professor');
   await expect(
     page
-      .getByRole('region', { name: 'Axioms' })
+      .getByRole('region', { name: 'Axioms', exact: true })
       .locator('[data-section="inferred-sub"]')
       .getByRole('link', { name: 'Teacher' }),
   ).toBeVisible();
 
-  // Agent states no axiom of its own and the classification infers nothing more
+  // An empty class frame keeps its classification outcome visible.
   await openTerm(page, 'Agent');
   await expect(page.getByRole('heading', { level: 1, name: 'Agent' })).toBeVisible();
   await expect(page.locator('.lede')).toHaveCount(0);
-  await expect(page.getByRole('region', { name: 'Axioms' })).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Axioms', exact: true })).toContainText(
+    'No additional direct named-class clauses',
+  );
 });
 
 test('no section or card shows a heading without content', async ({ page }) => {
@@ -252,7 +258,7 @@ test('no section or card shows a heading without content', async ({ page }) => {
     expect(empty, url).toEqual([]);
   }
   // a concept's raw statements never show as axioms or a logical definition
-  await expect(page.getByRole('region', { name: 'Axioms' })).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Axioms', exact: true })).toHaveCount(0);
   await expect(page.getByRole('region', { name: 'Logical definition' })).toHaveCount(0);
 });
 
@@ -314,7 +320,7 @@ test('an individual has no tree, shows its types and edits in place or in the on
   await openTerm(page, 'ada');
   await expect(page.getByRole('complementary', { name: 'Hierarchy' })).toHaveCount(0);
   await expect(
-    page.getByRole('region', { name: 'Axioms' }).locator('[data-section="types"] dt'),
+    page.getByRole('region', { name: 'Axioms', exact: true }).locator('[data-section="types"] dt'),
   ).toHaveText('Types:');
   // Edit switches the page into edit mode (item 630), whose bar links the full editor
   await pageAction(page, 'Edit');
@@ -395,10 +401,10 @@ test('the phone page keeps the order head, counts, texts, metadata, hierarchy, a
   );
   // the shell's search icon stands in for the field
   await expect(page.getByRole('button', { name: 'Open search' })).toBeVisible();
-  // a term with no Axioms card keeps the same order without it
+  // An empty class retains its inference notice after the hierarchy on a phone.
   await openTerm(page, 'Agent');
-  await expect(page.locator('.b-ax')).toHaveCount(0);
-  await inOrder(['.b-head', '.b-chips', '.b-info', '.b-tree', links]);
+  await expect(page.locator('.b-ax')).toBeVisible();
+  await inOrder(['.b-head', '.b-chips', '.b-info', '.b-tree', '.b-ax', links]);
   // the width above a phone keeps Axioms before Metadata
   await page.setViewportSize({ width: 900, height: 900 });
   await openTerm(page, 'Person');
@@ -787,7 +793,7 @@ test('typed literals read as their value with a datatype chip, and copy as synta
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto(HEAVY);
-  const axioms = page.getByRole('region', { name: 'Axioms' });
+  const axioms = page.getByRole('region', { name: 'Axioms', exact: true });
   const sub = axioms.locator('[data-section="sub"]');
   await expect(sub).toContainText('first seen', { timeout: 30_000 });
   const chip = (scope: Locator, name: string) => scope.locator('.datatype', { hasText: name });
@@ -897,7 +903,7 @@ test('a typed literal keeps its spaces, tabs and newlines as they are', async ({
   });
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto(HEAVY);
-  await expect(page.getByRole('region', { name: 'Axioms' })).toContainText('a', {
+  await expect(page.getByRole('region', { name: 'Axioms', exact: true })).toContainText('a', {
     timeout: 30_000,
   });
   await page.locator('details[data-more="comment"] > summary').click();

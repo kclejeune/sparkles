@@ -177,8 +177,21 @@ export type TaxonomyNode = {
   children: number;
 };
 
+export type ClassificationSource = {
+  boundStoreId: string;
+  familyId: string;
+  commit: number;
+  inputFingerprint: string;
+  contentFingerprint: string;
+};
+
 export type Classification = {
   commit: number;
+  tier?: 'el' | 'horn' | 'disjunctive';
+  partial?: boolean;
+  classificationSource?: ClassificationSource;
+  /** The explicit tree's browser read cap, distinct from reasoning completeness. */
+  nodesTruncated?: boolean;
   consistent: boolean;
   complete: boolean;
   classes: number;
@@ -258,7 +271,7 @@ export async function ontologyEntities(
 export async function ontologyAxioms(
   target: string,
   sel: Selection,
-  q: { types?: string[]; about?: string; assertions?: boolean; cap?: number },
+  q: { types?: string[]; about?: string; assertions?: boolean; cap?: number; at?: string },
   signal?: AbortSignal,
 ): Promise<{ axioms: AxiomItem[]; total: number; truncated: boolean }> {
   const cap = q.cap ?? READ_CAP;
@@ -271,13 +284,21 @@ export async function ontologyAxioms(
       assertions: q.assertions || undefined,
       limit: Math.min(10_000, cap),
       offset,
+      at: q.at,
     });
     const res = await request(`/$/ontology/${enc(target)}/axioms?${p}`, {
       headers: { Accept: 'application/json' },
       cache: 'no-store',
       signal,
     });
-    const j = await readJson<{ axioms: AxiomItem[]; total: number; next: number | null }>(res);
+    const j = await readJson<{
+      commit?: number;
+      axioms: AxiomItem[];
+      total: number;
+      next: number | null;
+    }>(res);
+    if (q.at?.startsWith('commit:') && j.commit !== Number(q.at.slice(7)))
+      throw new Error('The axiom page changed the displayed commit.');
     out.push(...j.axioms);
     if (j.next == null) return { axioms: out, total: j.total, truncated: false };
     if (out.length >= cap) return { axioms: out, total: j.total, truncated: true };
@@ -389,8 +410,9 @@ export function individualLabelsQuery(sel: Selection): string {
   return `SELECT DISTINCT ?s ?p ?l WHERE { GRAPH ${sparqlIri(sel.graph ?? DEFAULT_GRAPH_IRI)} { ${pattern} } }`;
 }
 
-async function labelRows(target: string, query: string, signal?: AbortSignal) {
-  const res = await request(`/${enc(target)}/sparql`, {
+async function labelRows(target: string, query: string, signal?: AbortSignal, at?: string) {
+  const pin = at ? '?' + new URLSearchParams({ at }) : '';
+  const res = await request(`/${enc(target)}/sparql${pin}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/sparql-query',
@@ -409,9 +431,10 @@ export function ontologyLabelsFor(
   sel: Selection,
   iris: readonly string[],
   signal?: AbortSignal,
+  at?: string,
 ): Promise<Map<string, Lit[]>> {
   return iris.length
-    ? labelRows(target, labelsForQuery(sel, iris), signal)
+    ? labelRows(target, labelsForQuery(sel, iris), signal, at)
     : Promise.resolve(new Map());
 }
 
@@ -457,14 +480,18 @@ export async function ontologyEntity(
   sel: Selection,
   iri: string,
   signal?: AbortSignal,
+  at?: string,
 ): Promise<EntityReport | null> {
   try {
-    const res = await request(`/$/ontology/${enc(target)}/entity?${selParams(sel, { iri })}`, {
+    const res = await request(`/$/ontology/${enc(target)}/entity?${selParams(sel, { iri, at })}`, {
       headers: { Accept: 'application/json' },
       cache: 'no-store',
       signal,
     });
-    return await readJson<EntityReport>(res);
+    const report = await readJson<EntityReport & { commit: number }>(res);
+    if (at?.startsWith('commit:') && report.commit !== Number(at.slice(7)))
+      throw new Error('The entity report changed the displayed commit.');
+    return report;
   } catch (e) {
     if (e instanceof ApiError && e.status === 404) return null;
     throw e;
@@ -476,20 +503,52 @@ export async function classifyOntology(
   target: string,
   sel: Selection,
   signal?: AbortSignal,
+  at?: string,
 ): Promise<Classification> {
+  // This legacy full-tree action is explicit. Unlike bounded frame GET pages, its
+  // later POST pages may compute again if no result is retained. Pin their inputs
+  // and compare actual immutable content rather than per-computation UUIDs.
+  const input = { graph: sel.graph, imports: sel.imports };
+  let selected = at;
   let offset = 0;
   let first: Classification | null = null;
   for (;;) {
-    const res = await request(`/$/ontology/${enc(target)}/classify`, {
+    const query = selected ? '?' + new URLSearchParams({ at: selected }) : '';
+    const res = await request(`/$/ontology/${enc(target)}/classify${query}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ ...selBody(sel), nodes: true, limit: 10_000, offset }),
+      body: JSON.stringify({ ...selBody(input), nodes: true, limit: 10_000, offset }),
       signal,
     });
-    const j = await readJson<Classification & { next?: number }>(res);
-    if (!first) first = j;
-    else first.nodes.push(...j.nodes);
-    if (j.next == null || first.nodes.length >= READ_CAP) return first;
+    const j = await readJson<Classification & { next?: number; offset?: number }>(res);
+    if (j.partial) throw new Error('A partial classification cannot fill the inferred tree.');
+    const source = j.classificationSource;
+    if (!source?.inputFingerprint || !source.contentFingerprint || source.commit !== j.commit)
+      throw new Error('The classification has no stable source and content identity.');
+    if (j.offset != null && j.offset !== offset)
+      throw new Error('The classification page changed its requested offset.');
+    if (!first) {
+      if (selected?.startsWith('commit:') && j.commit !== Number(selected.slice(7)))
+        throw new Error('The classification changed the requested commit.');
+      first = { ...j, nodes: [...j.nodes] };
+      selected = `commit:${j.commit}`;
+    } else {
+      const before = first.classificationSource!;
+      if (
+        j.commit !== first.commit ||
+        source.boundStoreId !== before.boundStoreId ||
+        source.familyId !== before.familyId ||
+        source.inputFingerprint !== before.inputFingerprint ||
+        source.contentFingerprint !== before.contentFingerprint
+      )
+        throw new Error(
+          'The classification source or content changed between pages. Classify again.',
+        );
+      first.nodes.push(...j.nodes);
+    }
+    if (j.next == null) return first;
+    if (j.next <= offset) throw new Error('The classification continuation did not advance.');
+    if (first.nodes.length >= READ_CAP) return { ...first, nodesTruncated: true };
     offset = j.next;
   }
 }

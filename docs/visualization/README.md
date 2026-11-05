@@ -510,8 +510,9 @@ usage view lists every axiom that mentions the entity. The **History** tab lists
 branch's commits newest first in the manner of WebProtégé's changes. Each commit opens to
 what it changed in the graph as a change set, one block a subject named by its label with
 each added or removed property and value on a line, and links to the commit's full diff. Every other view of a commit's, a merge's or a preview's changes shows the same change
-set, with the signed N-Quads lines behind a **N-Quads** switch. **Inferred** shows the EL
-classifier's taxonomy beside the asserted class tree
+set, with the signed N-Quads lines behind a **N-Quads** switch. **Inferred** reveals the
+taxonomy pane beside the asserted class tree, and **Classify tree** explicitly fills it
+with the classifier's actual tier and outcome
 ([screenshot](../images/ontology-inferred.png)). Every edit is previewed as a dry run and
 committed with the commit it was previewed against
 ([screenshot](../images/ontology-preview.png)), on the current branch or on a session
@@ -563,8 +564,13 @@ every value can be reached. The sections after it are all headings of one size. 
 **Logical definition** and the **Synonyms** by kind stay in view
 under the row, each synonym with its languages, sources and its synonym type as a chip.
 **Axioms** gives the entity's frame in Manchester syntax, with the names linked to their pages and
-a **Copy** button beside its heading, and an **Inferred** section that a **Classify** button fills
-from the server's classification. A SKOS concept has no Axioms section, since SKOS statements are
+a **Copy** button beside its heading. Its named-class inference region reads the kept
+classification on load, at the displayed branch and commit, without computing. It stays
+visible for empty frames and distinguishes unavailable, running, mismatch, missing class,
+unsatisfiable, inconsistent, excluded and partial outcomes. A deliberate **Classify** click
+requests one bounded frame projection when no matching result is available, including
+useful authorized clauses for restricted views. Such isolated output has no implicit
+reclassification continuation. A SKOS concept has no Axioms section, since SKOS statements are
 not axioms. **See also**, **Mappings**, **What links here** and **In other datasets** follow as
 sections of their own, and **All other statements** folds away every statement the other sections
 do not show.
@@ -761,9 +767,18 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   a query outside OWL 2 EL copies the ontology into memory for the RL rules, item
   662. Class answers under the RL rules can miss entailed subsumptions, and the
   label marks them as possibly incomplete.
-* The Axioms section of a Browse term page shows inferred superclasses only after a
-  **Classify** click, since no read-only route says whether a kept classification exists.
-  Item 726 adds one.
+* Named-class frames in Browse and the ontology editor read bounded direct-parent and
+  equivalent clauses from kept state, with inferred badges and exact source/outcome.
+  Parent groups have one representative and an equivalence count. **Show more** and
+  **Read again** only read, preserve a result/commit pin and report errors or replacement
+  without presenting incomplete pages as an empty success. Each part displays at most
+  1,000 rows, and isolated projections report their smaller fixed samples and totals.
+  Property/individual entailments, inferred axiom listings and explanation links remain
+  in items 588, 622, 609 and F24. The full class-tree **Classify tree** action is explicit
+  and reads legacy POST pages; a toggle or `inferred=1` URL never starts it. Its later
+  pages and labels stay pinned to the original commit, and changed input/content refuses
+  assembly. The legacy transfer can include a large equivalence node and is distinct
+  from the bounded frame API.
 * The thesaurus editor reads at most 2,000 narrower concepts of a concept and 5,000 roots
   of a scheme, and the label search scans the labels for a substring and answers
   its first 100 matches, 638. A mapping's target in another dataset is named by its
@@ -788,7 +803,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the thesaurus editor, and property assertions, keys and chains have no form of their
   own and are added as an axiom, 706. Its first preview on a large
   ontology waits for the axioms route to open the whole ontology, 707. Its
-  pages and hierarchy show asserted axioms only, and inferred ones are item 622. Its search reads
+  hierarchy shows asserted axioms, while named-class frames add bounded kept taxonomy
+  reads and general inferred frames remain in item 622. Its search reads
   the head of a branch, so a page at a past state has no search box, item 658. It shows
   entities using the shared rendering preferences. Reuse is looked up in the other datasets of the same server,
   and other servers' term pages are item 461. The landing page offers axiom counts and
