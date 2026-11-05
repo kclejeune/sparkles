@@ -1524,6 +1524,35 @@ cause. Item 748 tracks attribution and recovery. The
 preserves the inputs, build identities, raw samples, fingerprint limitations and
 analysis. Later performance work requires its own acceptance evidence.
 
+### Query costs after Individuals and metrics
+
+The feature comparison from `d248f277d2219d171eb1904e76c88ba41b573e5b` to
+`87a139e2c7591661b49c14f66d50accae105fc6c` covers Individuals paging, on-demand
+ontology metrics and answer-checking repairs. Its standard query screen matched
+all answers and passed the normal execution threshold. Smaller execution or
+complete-request increases remain unconfirmed and are followed under item 750.
+Passing the screen does not establish zero cost or a production regression.
+
+The leads are `contains`, `count-all`, `distinct-join`, `employee-docs`,
+`expr-agg-arg`, `expr-bind-group`, `expr-order-key`, `lang-filter`, `not-exists`,
+`optional-chain`, `optional-count`, `order-by-full`, `predicate-subjects`,
+`range-topk`, `regex-iri`, `star-lookup`, `subquery-agg`, `two-hop-count` and
+`types-grouped`. Each remains in the follow-up even when only one timing measure
+increased. Their screen magnitudes are not benchmark-host results.
+
+Confirm this exact source pair on a quiet benchmark host with matching production
+build settings and compilers, pinned interleaved runs on one and twelve query
+threads, and complete answer checks that preserve ordering and LIMIT semantics.
+Record server execution and complete HTTP wall time separately, including the
+short queries and effects sensitive to code generation. Each lead needs its own
+recorded disposition, including a cost not reproduced or judged to be noise, and
+confirmed costs need attribution and recovery.
+
+The screen pair uses GCC 16.2.0, Clang 21.1.8 and Rust 1.99.1. Keep its evidence
+separate from comparisons built with GCC 15.3 and Clang 23. Items 696, 703, 747
+and 748 retain their earlier source comparisons. Their overlapping query names
+can guide attribution but do not establish the costs of this feature comparison.
+
 ### Small query costs in the integration screen
 
 The matching-compiler Namespace comparison of `a5847311` and `4f2e1633` returned the
