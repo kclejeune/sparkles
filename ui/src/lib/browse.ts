@@ -1177,6 +1177,8 @@ export function lineage(
 // --- the graph view -------------------------------------------------------------------
 
 export type GraphPiece = {
+  /** Raw names from every response, so captions can follow later display choices. */
+  names?: Record<string, Partial<Omit<Name, 'iri'>>>;
   nodes: { id: string; label: string; focus?: boolean }[];
   edges: {
     id: string;
@@ -1243,7 +1245,11 @@ export function neighbourhood(
   for (const s of (subs?.subjects ?? []).slice(0, maxChildren)) edge(s, t.iri, 'subclass of', true);
   const broader = t.incoming.find((i) => i.property === SKOS + 'broader');
   for (const s of (broader?.subjects ?? []).slice(0, maxChildren)) edge(s, t.iri, 'broader', true);
-  return { nodes: [...nodes.values()], edges: [...edges.values()] };
+  return {
+    nodes: [...nodes.values()],
+    edges: [...edges.values()],
+    names: { ...t.names, [t.iri]: { label: t.label ?? null, shortForm: t.shortForm ?? null } },
+  };
 }
 
 /**
@@ -1261,7 +1267,7 @@ export function hierarchyOf(p: GraphPiece, kids = 6): GraphPiece {
   });
   const used = new Set(edges.flatMap((e) => [e.source, e.target]));
   if (focus) used.add(focus);
-  return { nodes: p.nodes.filter((n) => used.has(n.id)), edges };
+  return { nodes: p.nodes.filter((n) => used.has(n.id)), edges, names: p.names };
 }
 
 /** Cross-references by database, the databases in the order the references come in. */
@@ -1364,7 +1370,11 @@ export function mergePieces(a: GraphPiece, b: GraphPiece): GraphPiece {
     const hierarchy = e.hierarchy || edges.get(e.id)?.hierarchy;
     edges.set(e.id, hierarchy ? { ...e, hierarchy } : e);
   }
-  return { nodes: [...nodes.values()], edges: [...edges.values()] };
+  return {
+    nodes: [...nodes.values()],
+    edges: [...edges.values()],
+    names: { ...a.names, ...b.names },
+  };
 }
 
 // --- the landing page and other datasets -----------------------------------------------

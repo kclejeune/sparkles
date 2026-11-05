@@ -1632,6 +1632,11 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+Rendering preference changes preserve unsubmitted Browse edits, retain individual and
+expanded graph labels, and update open scheme pickers without losing their selection.
+Equal-language labels follow the browser API's lexical ordering. Graph results retain
+label statements when their values are not displayed in node captions.
+
 A partial answer of the disjunctive rules no longer reports a class complete when the
 run stopped before it made that class's context. The class's answer then held only
 `owl:Thing` while its told superclasses were missing, and the ontology's consistency

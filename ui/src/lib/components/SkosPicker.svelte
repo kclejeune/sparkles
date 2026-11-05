@@ -52,12 +52,25 @@
   const on = $derived(here ? target : ds);
   const g = $derived(here ? graph : ANY_GRAPH);
 
-  let schemes = $state<{ iri: string; name: string }[]>([]);
+  let schemeLabels = $state<{ iri: string; labels: Label[] }[]>([]);
+  const schemes = $derived(
+    schemeLabels.map(({ iri, labels }) => ({
+      iri,
+      name: displayEntity(
+        iri,
+        prefixes,
+        labels.map((l) => ({ '@value': l.value, '@language': l.lang })),
+        langs,
+      ),
+    })),
+  );
   let scheme = $state('');
   $effect(() => {
     const t = on;
     const gg = g;
+    let current = true;
     scheme = '';
+    schemeLabels = [];
     void (async () => {
       try {
         const rows = await api.select(t, schemesQuery(gg), { nocache: true });
@@ -65,20 +78,14 @@
         const ls = iris.length
           ? labelMap(await api.select(t, labelsQuery(iris, gg), { nocache: true }))
           : new Map<string, Label[]>();
-        if (t === on)
-          schemes = iris.map((i) => ({
-            iri: i,
-            name: displayEntity(
-              i,
-              prefixes,
-              ls.get(i)?.map((l) => ({ '@value': l.value, '@language': l.lang })),
-              langs,
-            ),
-          }));
+        if (current) schemeLabels = iris.map((iri) => ({ iri, labels: ls.get(iri) ?? [] }));
       } catch {
-        schemes = [];
+        if (current) schemeLabels = [];
       }
     })();
+    return () => {
+      current = false;
+    };
   });
 
   let text = $state('');

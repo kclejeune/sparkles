@@ -5,6 +5,20 @@ export type Label = { '@value': string; '@language'?: string };
 export type RenderingPreferences = { version: 1; mode: EntityDisplay; languages: string[] };
 export const RENDERING_KEY = 'sparkles.rendering';
 
+/** Rust strings compare UTF-8 lexically, which orders valid Unicode scalar values. */
+export function lexicalCompare(a: string, b: string): number {
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    const x = a.codePointAt(i)!;
+    const y = b.codePointAt(j)!;
+    if (x !== y) return x - y;
+    i += x > 0xffff ? 2 : 1;
+    j += y > 0xffff ? 2 : 1;
+  }
+  return (i < a.length ? 1 : 0) - (j < b.length ? 1 : 0);
+}
+
 export function languageOrder(text: string): string[] | null {
   const tags = text
     .split(',')

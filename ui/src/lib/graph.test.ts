@@ -8,6 +8,22 @@ const lit = (v: string): Term => ({ type: 'literal', value: v });
 const type: Term = { type: 'uri', value: RDF_TYPE };
 const label: Term = { type: 'uri', value: RDFS_LABEL };
 
+it('retains label statements when an IRI caption does not display their value', async () => {
+  const { iriForm } = await import('./iri-form.svelte');
+  try {
+    for (const mode of ['prefixed', 'iri'] as const) {
+      iriForm.update(mode, ['en']);
+      const triples: Triple[] = [[u('a'), label, lit('Alice')]];
+      const g = triplesToGraph(triples, { ex: 'http://ex.org/' });
+      expect(g.nodes.filter((n) => n.kind === 'literal').map((n) => n.label)).toEqual(['Alice']);
+      expect(g.edges).toHaveLength(1);
+      expect(triplesToGraph(triples, {}, { hideLiterals: true }).edges).toHaveLength(0);
+    }
+  } finally {
+    iriForm.update('label', []);
+  }
+});
+
 describe('triplesToGraph', () => {
   it('uses labels as node labels instead of separate literal nodes', () => {
     const g = triplesToGraph(

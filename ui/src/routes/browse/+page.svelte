@@ -183,6 +183,7 @@
 
   // the page reads again when the target, graph, state or entity change, and not when
   // only the view or edit mode does
+  let termScope = '';
   $effect(() => {
     const t = target;
     const g = graph;
@@ -191,12 +192,25 @@
     const i = iri;
     if (!t || !i) return;
     const ctl = new AbortController();
-    untrack(() => void loadTerm(t, { graph: g, at: a }, i, ctl.signal));
+    untrack(() => {
+      const scope = JSON.stringify([t, g, a, i]);
+      const keepForms = scope === termScope;
+      termScope = scope;
+      void loadTerm(t, { graph: g, at: a }, i, ctl.signal, keepForms);
+    });
     return () => ctl.abort();
   });
 
-  async function loadTerm(t: string, s: BrowseSelection, i: string, signal: AbortSignal) {
-    term = null;
+  async function loadTerm(
+    t: string,
+    s: BrowseSelection,
+    i: string,
+    signal: AbortSignal,
+    keepForms = false,
+  ) {
+    if (!keepForms) term = null;
+    // Invalidate expansions as soon as a new read starts, including language refreshes.
+    graphEpoch++;
     termError = null;
     tree = null;
     piece = null;
@@ -206,6 +220,10 @@
       got = await fetchTerm(t, s, i, {}, signal);
     } catch (e) {
       if (signal.aborted) return;
+      if (keepForms && term) {
+        toasts.error('Could not refresh the entity names', e);
+        return;
+      }
       termError = {
         status: e instanceof api.ApiError ? e.status : null,
         text: api.errorMessage(e),
@@ -216,7 +234,6 @@
     term = got;
     termTarget = t;
     piece = neighbourhood(got, prefixes);
-    graphEpoch++;
     const kind = treeKindOf(got.kinds);
     treeKind = kind;
     if (kind)
@@ -244,10 +261,12 @@
    */
   function lineagePiece(h: Hierarchy): GraphPiece {
     const nodes = new Map<string, { id: string; label: string }>();
+    const names: NonNullable<GraphPiece['names']> = {};
     const edges: GraphPiece['edges'] = [];
     const word =
       h.kind === 'concept' ? 'broader' : h.kind === 'class' ? 'subclass of' : 'subproperty of';
     const shown = (x: { iri: string; label: string | null; shortForm: string | null }) => {
+      names[x.iri] = x;
       nodes.set(x.iri, {
         id: x.iri,
         label: displayName(x.iri, { [x.iri]: x }, prefixes),
@@ -269,7 +288,7 @@
         hierarchy: true,
       });
     }
-    return { nodes: [...nodes.values()], edges };
+    return { nodes: [...nodes.values()], edges, names };
   }
 
   async function loadReuse(i: string, signal: AbortSignal) {
@@ -298,9 +317,11 @@
 
   async function expand(id: string) {
     if (!piece || builtIn(id)) return;
+    const generation = graphEpoch;
     try {
       const t = await fetchTerm(target, sel, id, { mentions: 50, incoming: 10 });
-      if (piece) piece = mergePieces(piece, neighbourhood(t, prefixes, 10));
+      if (piece && generation === graphEpoch)
+        piece = mergePieces(piece, neighbourhood(t, prefixes, 10));
     } catch {
       // a node the graphs do not describe has no neighbourhood to add
     }
@@ -322,10 +343,11 @@
     return rows.flatMap((r) => (r.s && r.s.type === 'uri' ? [r.s.value] : []));
   }
 
+  const graphNames = $derived({ ...term?.names, ...piece?.names });
   const linker = $derived<Linker>({
     href: (i) => (builtIn(i) ? null : hrefOf(i)),
-    name: (i) => (term && i === term.iri ? title : displayName(i, term?.names, prefixes)),
-    short: (i) => term?.names[i]?.shortForm ?? (term?.iri === i ? term.shortForm : null),
+    name: (i) => (term && i === term.iri ? title : displayName(i, graphNames, prefixes)),
+    short: (i) => graphNames[i]?.shortForm ?? (term?.iri === i ? term.shortForm : null),
   });
 
   /** A predicate the texts name links to its page when the ontology

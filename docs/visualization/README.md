@@ -413,8 +413,13 @@ missing label uses a prefixed name, and an unknown namespace uses the complete I
 The browser saves these preferences locally. The thesaurus editor's **Label language**
 field can override the language order for that page.
 
+Changing these preferences preserves unsubmitted edits and the selected scheme in an open
+concept picker. A failed name refresh keeps the current editor and its drafts available.
+
 Query tables read labels for visible rows in batches from the result's branch and commit.
-Graph results use label literals present in their triples. A failed label lookup leaves
+Graph results use label literals present in their triples. When a caption shows an IRI,
+its label statements remain visible unless **Hide literals** is selected. Expanded Browse
+graphs retain the names supplied by each expansion. A failed label lookup leaves
 the IRI visible. Copying and navigation always keep the original IRI.
 
 ### Ontology editor

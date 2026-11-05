@@ -179,6 +179,8 @@
   let bigKinds = $state<Set<EntityKind>>(new Set());
   /** The labels the views know. A name read since the page opened is added in place. */
   const labels = new SvelteMap<string, Lit[]>();
+  /** Subjects whose labels were read in every language, rather than a hierarchy's choice. */
+  const completeLabels = new Set<string>();
   let typeAxioms = $state<AxiomItem[]>([]);
   let truncated = $state(false);
   /** Whether the individuals and their types are read for the Individuals tree. */
@@ -214,9 +216,12 @@
   const langs = $derived(iriForm.languages);
   /** The name of `iri` as a tree draws it: the tree's own levels carry the labels. */
   const treeName = (iri: string) => entityName(iri, labels, prefixes, langs);
-  /** Add the labels in `more` that the views do not have yet. */
+  /** A complete batch replaces any one-language name previously supplied by a hierarchy. */
   function addLabels(more: Map<string, Lit[]>) {
-    for (const [s, l] of more) if (!labels.get(s)?.length) labels.set(s, l);
+    for (const [s, l] of more) {
+      completeLabels.add(s);
+      labels.set(s, l);
+    }
   }
   const batch = new LabelBatch(
     (iris) => ontologyLabelsFor(target, sel, iris),
@@ -263,6 +268,7 @@
   function resetLazy() {
     batch.reset();
     labels.clear();
+    completeLabels.clear();
     entities = new Map();
     listed = new Set();
     bigKinds = new Set();
@@ -430,7 +436,7 @@
         more.set(n.iri, [
           { '@value': n.label, ...(n.labelLang ? { '@language': n.labelLang } : {}) },
         ]);
-    if (more.size) addLabels(more);
+    for (const [s, l] of more) labels.set(s, l);
     // a node the route gives no label has none to read
     batch.know(nodes.filter((n) => !n.label).map((n) => n.iri));
     const forms = nodes.filter((n) => n.shortForm && !shortForms.has(n.iri));
@@ -463,14 +469,23 @@
   // The tree reads at once, without waiting for the summary, which on a large ontology takes
   // longer than the first level. A later commit reads the levels again.
   let levelScope = '';
+  let levelContext = '';
   let levelCommit: number | null = null;
   $effect(() => {
-    const scope = `${target}\u0000${graph ?? ''}\u0000${langs.join(',')}`;
+    const context = `${target}\u0000${graph ?? ''}`;
+    const scope = `${context}\u0000${langs.join(',')}`;
     const commit = summary?.commit ?? null;
     untrack(() => {
       if (scope !== levelScope) {
         batch.reset();
-        labels.clear();
+        if (context !== levelContext) {
+          labels.clear();
+          completeLabels.clear();
+        } else {
+          for (const s of labels.keys()) if (!completeLabels.has(s)) labels.delete(s);
+          batch.know(completeLabels);
+        }
+        levelContext = context;
         for (const lt of levelTrees.values()) lt.drop();
         levelScope = scope;
         levelCommit = commit;

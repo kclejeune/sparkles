@@ -39,6 +39,23 @@ import {
 
 const EX = 'http://ex.org/';
 const RDFS = 'http://www.w3.org/2000/01/rdf-schema#';
+
+it('orders equal-language labels like the Rust browser, independent of locale', () => {
+  const rows = ['alpha', 'éclair', 'Zulu', '\u{10000}', '\uE000'].map((value) => ({
+    s: { type: 'uri', value: EX + 'a' },
+    p: { type: 'uri', value: RDFS + 'label' },
+    l: { type: 'literal', value, 'xml:lang': 'en' },
+  }));
+  const labels = labelsOfBindings(rows).get(EX + 'a')!;
+  expect(labels.map((l) => l['@value'])).toEqual([
+    'Zulu',
+    'alpha',
+    'éclair',
+    '\uE000',
+    '\u{10000}',
+  ]);
+  expect(pickLabel(labels, ['en'])).toBe('Zulu');
+});
 const item = (axiom: AxiomItem['axiom']): AxiomItem => ({ type: axiom.type, ofn: '', axiom });
 
 describe('trees', () => {

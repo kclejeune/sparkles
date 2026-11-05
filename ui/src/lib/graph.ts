@@ -75,6 +75,10 @@ export function triplesToGraph(
     c[m === 'added' ? 'added' : m === 'removed' ? 'removed' : 'kept']++;
     seen.set(id, c);
   };
+  const caption = (t: Term, id: string): string =>
+    t.type === 'uri'
+      ? displayEntity(t.value, prefixes, candidates.get(id))
+      : (labels.get(id) ?? nodeLabel(t, prefixes));
 
   const ensure = (t: Term, id: string): boolean => {
     seenNodeIds.add(id);
@@ -85,10 +89,7 @@ export function triplesToGraph(
     }
     nodes.set(id, {
       id,
-      label:
-        t.type === 'uri'
-          ? displayEntity(t.value, prefixes, candidates.get(id))
-          : (labels.get(id) ?? nodeLabel(t, prefixes)),
+      label: caption(t, id),
       kind: kindOf(t),
       title: t.type === 'uri' ? t.value : t.value.toString(),
       term: t,
@@ -104,8 +105,8 @@ export function triplesToGraph(
       (opts.hideLiterals ||
         (p.type === 'uri' && LABEL_PREDICATES.has(p.value) && labels.has(termKey(s))))
     ) {
-      // Label literals are already shown as the node label.
-      if (opts.hideLiterals || labels.get(termKey(s)) === o.value) {
+      // A label statement is redundant only when the caption actually displays it.
+      if (opts.hideLiterals || caption(s, termKey(s)) === o.value) {
         ensure(s, termKey(s));
         count(termKey(s), opts.marks?.[i]);
         return;

@@ -707,6 +707,43 @@ describe('the graph view', () => {
     expect(m.nodes.some((n) => n.id === EX + 'Cell')).toBe(true);
     expect(m.edges.some((e) => e.id === 'e')).toBe(true);
   });
+
+  it('keeps raw names from expanded pieces through compact hierarchy filtering', async () => {
+    const { iriForm } = await import('./iri-form.svelte');
+    const a = neighbourhood(t, { ex: EX });
+    const b = neighbourhood(
+      {
+        ...t,
+        iri: EX + 'Cyto',
+        label: 'cytoplasm',
+        incoming: [
+          { property: RDFS + 'subClassOf', count: 1, more: false, subjects: [EX + 'Cell'] },
+        ],
+        names: {
+          [EX + 'Cell']: {
+            label: 'cell',
+            labelLang: 'en',
+            shortForm: 'ex:Cell',
+            kinds: ['class'],
+            deprecated: false,
+          },
+        },
+      },
+      { ex: EX },
+    );
+    const merged = mergePieces(a, b);
+    try {
+      iriForm.update('label', ['en']);
+      expect(displayName(EX + 'Cell', merged.names, { ex: EX })).toBe('cell');
+      expect(hierarchyOf(merged).names).toEqual(merged.names);
+      iriForm.update('prefixed', ['en']);
+      expect(displayName(EX + 'Cell', merged.names, { ex: EX })).toBe('ex:Cell');
+      iriForm.update('iri', ['en']);
+      expect(displayName(EX + 'Cell', merged.names, { ex: EX })).toBe(EX + 'Cell');
+    } finally {
+      iriForm.update('label', []);
+    }
+  });
 });
 
 describe('links', () => {

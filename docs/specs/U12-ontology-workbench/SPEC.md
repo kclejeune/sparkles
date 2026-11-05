@@ -547,11 +547,16 @@ complete IRI. A prefixed-name choice also falls back to the complete IRI. The th
 editor's explicit language in its URL overrides the shared language list for that page.
 
 Changing the mode redraws names without reloading an editor or clearing its undo stack.
-Changing the language order reloads browser names and editor hierarchy levels. Query
+Changing the language order reloads browser names in place and editor hierarchy levels,
+preserving unsubmitted edits even if a name refresh fails. Complete multilingual label
+batches remain available, and expanded graph nodes retain their names. Scheme pickers
+redraw their names without losing the chosen scheme. Query
 tables request only visible entities' labels, including those inside triple terms, in
 batches of 200 at the result's dataset, branch and commit. A replaced result cancels and
 ignores its old requests. Failed lookups leave prefixed names or complete IRIs visible.
-Graph results use label literals they already contain. Display choices leave navigation,
+Graph results use label literals they already contain. A label statement remains visible
+when its literal is not shown in the subject's caption, unless literals are hidden.
+Display choices leave navigation,
 RDF identity, copied IRIs and generated query syntax unchanged.
 
 Unit tests cover preference records, language ranking, all modes and fallbacks, unchanged

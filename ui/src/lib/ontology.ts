@@ -14,7 +14,7 @@ import {
   WELL_KNOWN,
   type PrefixMap,
 } from './rdf';
-import { preferredLabel } from './rendering';
+import { lexicalCompare, preferredLabel } from './rendering';
 import type { WritePreview } from './validation-overlay';
 
 const enc = encodeURIComponent;
@@ -267,8 +267,8 @@ export function labelsOfBindings(rows: SparqlBinding[]): Map<string, Lit[]> {
   const ordered = [...rows].sort(
     (a, b) =>
       Number(a.p?.value !== RDFS_LABEL) - Number(b.p?.value !== RDFS_LABEL) ||
-      (a.l?.value ?? '').localeCompare(b.l?.value ?? '') ||
-      (a.l?.['xml:lang'] ?? '').localeCompare(b.l?.['xml:lang'] ?? ''),
+      lexicalCompare(a.l?.value ?? '', b.l?.value ?? '') ||
+      lexicalCompare(a.l?.['xml:lang'] ?? '', b.l?.['xml:lang'] ?? ''),
   );
   for (const r of ordered) {
     const s = r.s?.value;

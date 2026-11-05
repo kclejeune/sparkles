@@ -135,7 +135,7 @@
 {#if compact}
   <Modal
     bind:open={big}
-    title="Graph of {piece.nodes.find((n) => n.focus)?.label ?? 'the entity'}"
+    title="Graph of {linker.name(piece.nodes.find((n) => n.focus)?.id ?? '') || 'the entity'}"
     width={1100}
   >
     <Self {ds} {piece} {linker} {exploreHref} {onexpand} {epoch} fitOnOpen />
