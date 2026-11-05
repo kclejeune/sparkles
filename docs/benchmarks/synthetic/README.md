@@ -8,6 +8,15 @@ Read the [results](RESULTS.md), [run catalog](RUNS.json) and
 
 The eager-against-cursor matrix of the [rewrite gates](../../BENCHMARKING.md#rewrite-gates) records its baseline in [the results](RESULTS.md#eager-against-cursor-matrix). A change to an executor path runs `mise run bench:executors` on forge and compares the record with that baseline through `scripts/bench-gate.py compare`.
 
+The timed native checker accepts successful, complete SELECT and ASK answers whose
+result kind matches the query. SELECT counts must match the returned rows. ASK counts
+are one for either boolean value. Eager metadata may omit status, while an explicit
+status must be complete. Missing metadata, errors and truncated or stopped responses
+fail the check. A display `send` cap that leaves rows out is not a complete benchmark
+answer; a SPARQL LIMIT remains part of the query. Unordered LIMIT results retain the
+existing count, schema, distinctness and input-membership checks. A run's recorded
+harness identity determines which validation it performed.
+
 The result report is a manual import. A linked raw record supports only the measurements
 and metadata it contains. Missing build revisions, host details, durability settings or
 answer evidence remain unknown and must be supplied by a new run before a broader claim

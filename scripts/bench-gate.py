@@ -780,21 +780,78 @@ def build_config_cmd(args):
     print(json.dumps(out, sort_keys=True, separators=(",", ":")))
 
 
+def native_query_kind(query):
+    """Read the outer kind after a SPARQL prologue, without parsing the query body."""
+    pos = 1 if query.startswith("\ufeff") else 0
+
+    def space(at):
+        while at < len(query):
+            if query[at].isspace():
+                at += 1
+            elif query[at] == "#":
+                end = re.search(r"[\r\n]", query[at:])
+                at = at + end.start() + 1 if end else len(query)
+            else:
+                break
+        return at
+
+    while True:
+        pos = space(pos)
+        word = re.match(r"[A-Za-z]+\b", query[pos:])
+        if word is None:
+            raise ValueError("native-digest needs a SELECT or ASK query after its prologue")
+        kind = word[0].upper()
+        pos += word.end()
+        if kind in ("SELECT", "ASK"):
+            return kind
+        if kind not in ("BASE", "PREFIX"):
+            raise ValueError("native-digest supports SELECT and ASK queries only")
+        pos = space(pos)
+        if kind == "PREFIX":
+            prefix = re.match(r"[^\s:#<>]*:", query[pos:])
+            if prefix is None:
+                raise ValueError("incomplete PREFIX declaration")
+            pos = space(pos + prefix.end())
+        end = query.find(">", pos + 1)
+        if pos >= len(query) or query[pos] != "<" or end < 0 or any(c.isspace() for c in query[pos + 1:end]):
+            raise ValueError("incomplete BASE or PREFIX IRI")
+        pos = end + 1
+
+
 def native_digest(args):
     """A digest of each application/x-sparkles+json SELECT or ASK answer in `args.responses`, one
     line each in order, for the matrix's check of the timed format after the timed
     requests: "<rows> rows, <digest of the sorted rows>" and, for a query with a top-level
     ORDER BY, the order digest of `order-digest` over the rows as returned. Rows are
     written as JSON lists of their terms' type, value, datatype and language. The answers of one query share
-    one process, and the check against the input runs once for each distinct set of rows."""
+    one process, and the check against the input runs once for each distinct set of rows.
+    Every response must have successful, complete native count metadata before any
+    fingerprint or cached membership check is used. Eager status omission is valid.
+    Partial, malformed and unreadable responses fail the command."""
     root = Path(__file__).resolve().parent
     spec = importlib.util.spec_from_file_location("bench_answers", root / "bench-answers.py")
     ba = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ba)
     query = Path(args.query).read_text()
+    try:
+        query_kind = native_query_kind(query)
+    except ValueError as error:
+        fail(f"{args.query}: {error}")
     ordered = ba._after_order_by(query) is not None
     # the number of missing triples of each distinct answer, which depends only on its rows
     missing_of = {}
+
+    def complete(response, result, count):
+        meta = result.get("meta")
+        if "error" in result or not isinstance(meta, dict) or "error" in meta:
+            fail(f"{response}: native response has an error or missing completion metadata")
+        if meta.get("status", "complete") != "complete":
+            fail(f"{response}: native response did not complete")
+        if "describeTruncated" in meta and meta["describeTruncated"] is not False:
+            fail(f"{response}: native response is truncated or has an invalid truncation flag")
+        for field in ("sentRows", "totalRows"):
+            if type(meta.get(field)) is not int or meta[field] < 0 or meta[field] != count:
+                fail(f"{response}: native {field} must equal the complete result count {count}")
 
     def term(t):
         if t is None:
@@ -813,20 +870,24 @@ def native_digest(args):
     def digest(response):
         try:
             r = json.loads(Path(response).read_text())
-        except (OSError, ValueError):
-            return "unreadable"
+        except (OSError, ValueError) as error:
+            fail(f"{response}: unreadable native response: {error}")
         kind = r.get("queryType") if isinstance(r, dict) else None
         if kind not in ("SELECT", "ASK"):
             fail(f"{response}: native-digest supports SELECT and ASK, got {kind!r}; graph answers need an RDF checker")
+        if kind != query_kind:
+            fail(f"{response}: native {kind} response does not match {query_kind} query")
         names = r.get("vars") or []
         if kind == "ASK":
             if type(r.get("boolean")) is not bool:
                 fail(f"{response}: native ASK answer requires a boolean")
+            complete(response, r, 1)
             return f"ask {r['boolean']}"
         if not isinstance(r.get("vars"), list) or not isinstance(r.get("rows"), list):
             fail(f"{response}: native SELECT answer requires vars and rows arrays")
-        if any(len(row) != len(names) for row in r.get("rows") or []):
-            return "rows wider or narrower than vars"
+        if any(not isinstance(row, list) or len(row) != len(names) for row in r["rows"]):
+            fail(f"{response}: rows wider or narrower than vars, or not arrays")
+        complete(response, r, len(r["rows"]))
         rows = [show(row) for row in r.get("rows") or []]
         # the query type and the projected variables, in order, belong to the answer
         head = f"{r.get('queryType')} " + " ".join(names)
@@ -924,9 +985,9 @@ def main():
     p.add_argument("--data", help="the N-Triples input, to check three-column unordered answers against")
     p = sub.add_parser("compilers")
     p.add_argument("binary")
-    p = sub.add_parser("native-digest")
+    p = sub.add_parser("native-digest", help="fingerprint complete native SELECT/ASK answers; partial or malformed replies fail")
     p.add_argument("query")
-    p.add_argument("responses", nargs="+", help="the answers to the query, one output line each")
+    p.add_argument("responses", nargs="+", help="complete answers with sentRows/totalRows metadata, one output line each")
     p.add_argument("--data", help="the N-Triples input, to check three-column unordered answers against")
     p = sub.add_parser("build-config")
     p.add_argument("name", nargs="?", default="release", help="the Cargo profile")

@@ -3,6 +3,7 @@
     python3 -m unittest discover -s scripts/bench-tests
 """
 
+import copy
 import json
 import os
 import subprocess
@@ -19,6 +20,15 @@ def run(*args):
     return subprocess.run([sys.executable, str(GATE), *map(str, args)], capture_output=True, text=True)
 
 
+def native_complete(answer):
+    """A positive fixture uses the real uncapped native count contract."""
+    count = 1 if answer["queryType"] == "ASK" else len(answer.get("rows", []))
+    meta = answer.setdefault("meta", {})
+    meta.setdefault("sentRows", count)
+    meta.setdefault("totalRows", count)
+    return answer
+
+
 def metrics_record(d, name, rows, threshold=0.05, scale="1"):
     src = Path(d) / f"{name}.jsonl"
     src.write_text("".join(json.dumps(r) + "\n" for r in rows))
@@ -30,14 +40,128 @@ def metrics_record(d, name, rows, threshold=0.05, scale="1"):
 
 
 class GateTests(unittest.TestCase):
+    def test_native_digest_requires_complete_metadata_for_select_and_ask(self):
+        for kind in ("SELECT", "ASK"):
+            with tempfile.TemporaryDirectory() as d:
+                query, answer = Path(d) / "q.rq", Path(d) / "answer.json"
+                query.write_text("SELECT ?x WHERE { ?s ?p ?x }" if kind == "SELECT" else "ASK { ?s ?p ?o }")
+                base = native_complete({"queryType": kind, **(
+                    {"vars": ["x"], "rows": [[{"type": "literal", "value": "one"}]]}
+                    if kind == "SELECT" else {"boolean": False})})
+                changes = [
+                    lambda value: value.pop("meta"),
+                    lambda value: value.update(meta=None),
+                    lambda value: value.update(meta={}),
+                    lambda value: value.update(error="failed"),
+                    lambda value: value["meta"].update(error="failed"),
+                ]
+                for field in ("sentRows", "totalRows"):
+                    changes.append(lambda value, field=field: value["meta"].pop(field))
+                    for wrong in (None, True, False, 1.0, "1", -1, 0, 2):
+                        changes.append(lambda value, field=field, wrong=wrong: value["meta"].update({field: wrong}))
+                for status in ("stopped", "failed", "unknown", None, False):
+                    changes.append(lambda value, status=status: value["meta"].update(status=status))
+                for flag in (True, None, 0, "false"):
+                    changes.append(lambda value, flag=flag: value["meta"].update(describeTruncated=flag))
+                for index, change in enumerate(changes):
+                    value = copy.deepcopy(base)
+                    change(value)
+                    answer.write_text(json.dumps(value))
+                    result = run("native-digest", query, answer)
+                    with self.subTest(kind=kind, case=index):
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, "")
+                        self.assertIn(str(answer), result.stderr)
+
+    def test_native_digest_complete_results_preserve_fingerprints(self):
+        with tempfile.TemporaryDirectory() as d:
+            query, answer = Path(d) / "q.rq", Path(d) / "answer.json"
+            query.write_text("SELECT ?x WHERE { ?s ?p ?x }")
+            base = native_complete({"queryType": "SELECT", "vars": ["x"], "rows": [[{"type": "literal", "value": "one"}]]})
+            golden = "1 rows, schema 33bf2beb, distinct 1, 3fc6cab5c8664ec8\n"
+            for metadata in ({}, {"status": "complete"}, {"describeTruncated": False}, {"timing": {"execMs": 999}}):
+                value = copy.deepcopy(base)
+                value["meta"].update(metadata)
+                answer.write_text(json.dumps(value))
+                result = run("native-digest", query, answer)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, golden)
+            empty = native_complete({"queryType": "SELECT", "vars": ["x"], "rows": []})
+            answer.write_text(json.dumps(empty))
+            result = run("native-digest", query, answer)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(result.stdout.startswith("0 rows, "))
+
+    def test_native_digest_checks_completion_before_reusing_row_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            query, data = Path(d) / "q.rq", Path(d) / "data.nt"
+            query.write_text("SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 1")
+            data.write_text('<urn:s> <urn:p> "one" .\n')
+            good = native_complete({"queryType": "SELECT", "vars": ["s", "p", "o"], "rows": [[
+                {"type": "uri", "value": "urn:s"}, {"type": "uri", "value": "urn:p"}, {"type": "literal", "value": "one"},
+            ]]})
+            first, bad, last = [Path(d) / name for name in ("first.json", "bad.json", "last.json")]
+            first.write_text(json.dumps(good))
+            last.write_text(json.dumps(good))
+            broken = copy.deepcopy(good)
+            broken["meta"].update(status="stopped", totalRows=None)
+            bad.write_text(json.dumps(broken))
+            expected = run("native-digest", query, first, "--data", data)
+            result = run("native-digest", query, first, bad, last, "--data", data)
+            self.assertEqual(expected.returncode, 0, expected.stderr)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, expected.stdout)
+            self.assertIn(str(bad), result.stderr)
+
+    def test_native_digest_binds_kind_after_sparql_prologue(self):
+        prologues = (
+            "", "\ufeff", "# ASK SELECT\n", "BASE <urn:SELECT#ASK>\n",
+            "PREFIX ask: <urn:ASK>\n", "PREFIX select: <urn:SELECT>\n",
+            "PREFIX : <urn:default>\nPREFIX 前綴: <urn:unicode>\n",
+            "bAsE # SELECT\n <urn:ASK>\nPrEfIx # ASK\n ask: # SELECT\n <urn:SELECT>\n",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            query, answer = Path(d) / "q.rq", Path(d) / "answer.json"
+            for kind in ("SELECT", "ASK"):
+                value = native_complete({"queryType": kind, **(
+                    {"vars": ["x"], "rows": [[{"type": "literal", "value": "one"}]]}
+                    if kind == "SELECT" else {"boolean": False})})
+                answer.write_text(json.dumps(value))
+                for prologue in prologues:
+                    query.write_text(prologue + ("sElEcT ?x WHERE { ?s ?p ?x }" if kind == "SELECT" else "aSk { ?s ?p ?o }"))
+                    result = run("native-digest", query, answer)
+                    with self.subTest(kind=kind, prologue=prologue):
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    query.write_text(prologue + ("ASK { ?s ?p ?o }" if kind == "SELECT" else "SELECT ?x WHERE { ?s ?p ?x }"))
+                    result = run("native-digest", query, answer)
+                    with self.subTest(mismatch=kind, prologue=prologue):
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, "")
+
+    def test_native_digest_rejects_unreadable_and_unsupported_query_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            query, answer = Path(d) / "q.rq", Path(d) / "answer.json"
+            query.write_text("SELECT ?x WHERE { ?s ?p ?x }")
+            for text in (None, '{"queryType":"SELECT"'):
+                if text is not None:
+                    answer.write_text(text)
+                result = run("native-digest", query, answer)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(str(answer), result.stderr)
+            answer.write_text(json.dumps(native_complete({"queryType": "SELECT", "vars": [], "rows": []})))
+            for text in ("", "DESCRIBE <urn:s>", "CONSTRUCT {} WHERE {}", "PREFIX broken: SELECT ?x {}"):
+                query.write_text(text)
+                self.assertNotEqual(run("native-digest", query, answer).returncode, 0)
+
     def test_native_digest_refuses_directional_literals(self):
         with tempfile.TemporaryDirectory() as d:
             query, answer = Path(d) / "q.rq", Path(d) / "answer.json"
             query.write_text("SELECT ?x WHERE { ?s ?p ?x }")
             for direction in ("ltr", "rtl", "up", None):
-                answer.write_text(json.dumps({"queryType": "SELECT", "vars": ["x"], "rows": [[{
+                answer.write_text(json.dumps(native_complete({"queryType": "SELECT", "vars": ["x"], "rows": [[{
                     "type": "literal", "value": "text", "xml:lang": "en", "its:dir": direction,
-                }]]}))
+                }]]})))
                 result = run("native-digest", query, answer)
                 with self.subTest(direction=direction):
                     self.assertNotEqual(result.returncode, 0)
@@ -59,12 +183,12 @@ class GateTests(unittest.TestCase):
             query, answer = Path(d) / "q.rq", Path(d) / "answer.json"
             query.write_text("ASK { ?s ?p ?o }")
             for value in (True, False):
-                answer.write_text(json.dumps({"queryType": "ASK", "boolean": value}))
+                answer.write_text(json.dumps(native_complete({"queryType": "ASK", "boolean": value})))
                 result = run("native-digest", query, answer)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), f"ask {value}")
             for value in (None, 0, 1, "false"):
-                answer.write_text(json.dumps({"queryType": "ASK", "boolean": value}))
+                answer.write_text(json.dumps(native_complete({"queryType": "ASK", "boolean": value})))
                 with self.subTest(value=value):
                     self.assertNotEqual(run("native-digest", query, answer).returncode, 0)
 
@@ -498,8 +622,8 @@ class GateTests(unittest.TestCase):
             res.joinpath("answers.tsv").write_text("A\tsorted\t2\tx\tk\nB\tsorted\t2\tx\tk\n")
             def native(rows):
                 f = Path(d) / "resp.json"
-                f.write_text(json.dumps({"queryType": "SELECT", "vars": ["p", "n"], "rows": [
-                    [{"type": "uri", "value": p}, {"type": "literal", "value": n}] for p, n in rows]}))
+                f.write_text(json.dumps(native_complete({"queryType": "SELECT", "vars": ["p", "n"], "rows": [
+                    [{"type": "uri", "value": p}, {"type": "literal", "value": n}] for p, n in rows]})))
                 return run("native-digest", q, f).stdout.strip()
             good = native([("a", "x"), ("b", "y")])
             self.assertTrue(good.startswith("2 rows, "))
@@ -588,9 +712,9 @@ class GateTests(unittest.TestCase):
             self.assertNotIn("missing", run("order-digest", oc, t, "--data", data).stdout)
             f = Path(d) / "resp.json"
             def native(s_):
-                f.write_text(json.dumps({"queryType": "SELECT", "vars": ["s", "p", "o"], "rows": [
+                f.write_text(json.dumps(native_complete({"queryType": "SELECT", "vars": ["s", "p", "o"], "rows": [
                     [{"type": "uri", "value": s_}, {"type": "uri", "value": "p"},
-                     {"type": "literal", "value": "x", "xml:lang": "en"}]]}))
+                     {"type": "literal", "value": "x", "xml:lang": "en"}]]})))
                 return run("native-digest", q, f, "--data", data).stdout
             self.assertIn("missing 0", native("a"))
             self.assertIn("missing 1", native("z"))
@@ -599,18 +723,21 @@ class GateTests(unittest.TestCase):
             files = []
             for i, s_ in enumerate(["a", "z", "a"]):
                 g = Path(d) / f"timed-{i}.json"
-                g.write_text(json.dumps({"queryType": "SELECT", "vars": ["s", "p", "o"], "rows": [
+                g.write_text(json.dumps(native_complete({"queryType": "SELECT", "vars": ["s", "p", "o"], "rows": [
                     [{"type": "uri", "value": s_}, {"type": "uri", "value": "p"},
                      {"type": "literal", "value": "x", "xml:lang": "en"}]],
-                    "meta": {"timing": {"execMs": i}}}))
+                    "meta": {"timing": {"execMs": i}}})))
                 files.append(g)
             files.append(Path(d) / "absent.json")
-            lines = run("native-digest", q, *files, "--data", data).stdout.splitlines()
-            self.assertEqual(len(lines), 4)
+            result = run("native-digest", q, *files, "--data", data)
+            lines = result.stdout.splitlines()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(len(lines), 3)
             self.assertEqual(lines[0], lines[2])
             self.assertIn("missing 0", lines[0])
             self.assertIn("missing 1", lines[1])
-            self.assertEqual(lines[3], "unreadable")
+            self.assertIn(str(files[3]), result.stderr)
+            self.assertIn("unreadable", result.stderr)
             # values that hold the delimiters of a tab-joined encoding cannot make another
             # answer's rows look alike, nor share its check against the input
             u = lambda v: {"type": "uri", "value": v}
@@ -620,7 +747,7 @@ class GateTests(unittest.TestCase):
             pair = []
             for name, rows in (("ca", rows_a), ("cb", rows_b)):
                 g = Path(d) / f"{name}.json"
-                g.write_text(json.dumps({"queryType": "SELECT", "vars": ["s", "p", "o"], "rows": rows}))
+                g.write_text(json.dumps(native_complete({"queryType": "SELECT", "vars": ["s", "p", "o"], "rows": rows})))
                 pair.append(g)
             alone = [run("native-digest", q, g, "--data", data).stdout.strip() for g in pair]
             both = run("native-digest", q, *pair, "--data", data).stdout.splitlines()
