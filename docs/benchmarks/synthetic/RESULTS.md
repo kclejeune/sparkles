@@ -4,6 +4,39 @@ This report was imported from the manually maintained benchmark page. Its tables
 qualifications are preserved, and are not regenerated from the JSON records. Read the
 [reference setup and answer rules](../reference/README.md) with each result.
 
+## Horn classification and kept-frame screen leads
+
+The matched-compiler Namespace screen of `7070fa7c` against `aaa6f015` returns
+the same sorted TSV answers for all 30 synthetic queries at 100,000 generated
+people. Both binaries were built on atlas and ran on one AMD EPYC instance with
+one Rayon thread, four A,B,B,A rounds, three warm-ups and 20 timed requests per
+query and server process. No median execution or client-wall ratio reaches 1.10.
+These are observations about this source pair, not measurements of another build
+or confirmation that the integration has no query cost.
+
+Eight queries have a higher median in at least one measure. Ratios below divide
+the candidate median by the base median and retain both measures for each lead.
+
+| Query | Server execution B/A | HTTP wall time B/A |
+|---|---:|---:|
+| `class-predicate-list` | 1.0949 | 1.0794 |
+| `class-predicates` | 1.0854 | 1.0325 |
+| `count-all` | 1.0051 | 0.9615 |
+| `distinct-obj` | 1.0250 | 1.0675 |
+| `employee-docs` | 1.0113 | 1.0067 |
+| `lang-filter` | 0.9859 | 1.0152 |
+| `minus` | 1.0270 | 1.0414 |
+| `optional-count` | 1.0175 | 0.8773 |
+
+The [manual run record](runs/horn-kept-integration-screen-aaa6f015/README.md)
+preserves exact revisions, binary hashes, compiler identities, inputs, answers
+and samples. Namespace process spreads are larger than these differences and do
+not establish a cause or a cost on Intel. Item 752 retains every lead, including
+client-only and microsecond changes, for a quiet pinned Intel comparison of the
+exact accepted integration against `7070fa7c`. Any additional positive medians
+accepted from that build's own screen belong to the same follow-up. Confirmed
+costs require attribution across the integration before selecting a repair.
+
 ## Expression sort-key cost after the dependency refresh
 
 A matched-build control on forge compares `6d55f1e6` with `6724abe9` at 1.05M

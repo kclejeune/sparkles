@@ -1718,6 +1718,37 @@ optimization. Item 328 remains the broader follow-up for short-query calibration
 any reproducible costs; this check does not establish a cross-engine performance claim.
 
 
+### Query cost leads after Horn classification and kept frames
+
+The matched-compiler Namespace comparison of
+`7070fa7c1d01cf19d08895ce591dbffd2c6e7d34` with
+`aaa6f015d813816e1572a1fd2d021caae570b0cf` returned identical sorted TSV answers
+for all 30 queries at 100,000 generated people. No median server-execution or
+client-wall ratio reached 1.10. The
+[qualified report and immutable run record](../benchmarks/synthetic/RESULTS.md#horn-classification-and-kept-frame-screen-leads)
+retain the exact binaries, compiler identities, four A,B,B,A rounds and samples.
+
+Eight queries have a higher median in at least one measure, led by
+`class-predicate-list` and `class-predicates` in server execution and including
+`count-all`, `distinct-obj`, `employee-docs`, `lang-filter`, `minus` and
+`optional-count`. The geometric mean and configured push threshold do not remove
+those observations. Their Namespace process spreads do not establish a cost on
+Intel, a regression or a mechanism. Item 752 preserves every lead even when it
+is small, client-only or consistent with noise. These are separate from item
+736's cold OWL mapping, item 749's Individuals scans and the older comparisons
+of item 328.
+
+Item 752 compares the exact accepted integration with `7070fa7c` after the push
+on quiet pinned forge, preserving both timing measures, all queries under
+0.3 ms and every additional positive median accepted from that build's own
+screen. The same-host interleaved comparison retains matching compilers,
+source and binary identities, data, complete answer checks and host conditions.
+It uses the full 30-query set as controls and does not compare latency across
+hosts. Repeated costs are profiled and bisected across the integration before
+attributing them to execution bookkeeping, serialization, client variation or
+code placement. A lead cleared by that comparison keeps its qualification, and
+any confirmed accepted cost retains a named repair or further measurement.
+
 ### Short queries after evidence integration
 
 The matched `5a7e4238` to `adc2dcbe` integration screen initially flagged `minus`,

@@ -1,0 +1,14 @@
+A: commit 7070fa7c1d01cf19d08895ce591dbffd2c6e7d34 (7070fa7c1d01cf19d08895ce591dbffd2c6e7d34), built on atlas
+A sha256: abe9f7014f36a5fb141073fcfdc2a24b07d43f845b1a9112e2486c8cd93c6058
+A compilers: clang version 21.1.8; GCC: (GNU) 16.2.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); rustc version 1.99.1 (58cf8f9c3 2026-10-13)
+B: commit aaa6f015d813816e1572a1fd2d021caae570b0cf (aaa6f015d813816e1572a1fd2d021caae570b0cf), built on atlas
+B sha256: 5a3201786097e0fec47741e8b2b80d3700774046aec1e3c8f49b84bb181b4acf
+B compilers: clang version 21.1.8; GCC: (GNU) 16.2.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); rustc version 1.99.1 (58cf8f9c3 2026-10-13)
+data: 100000 people (scripts/gen-data.py), 6.0M compressed
+settings: 30 queries, 4 rounds of A,B,B,A, 3 warm-up and 20 timed requests per query and server, RAYON_NUM_THREADS=1, server CPU 2, client CPU 4, spinners on
+instance: mbg437l3rgma8 (linux/amd64:8x16, capped at 2h), https://cloud.namespace.so/itohmrcedlsbs/instance/mbg437l3rgma8
+phase create: 3.5 s
+phase upload: 14.5 s for 385M
+phase remote run: 330.7 s
+phase download: 1.5 s
+instance lifetime: 351.0 s, billed as 6 minutes x 8 vCPUs = 48 vCPU-minutes ($0.072 at the overage rate)
