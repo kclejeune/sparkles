@@ -192,6 +192,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/ontology/{ds}/diff", get(ontology::diff))
         .route("/$/ontology/{ds}/search", get(ontology::search))
         .route("/$/ontology/{ds}/hierarchy", get(ontology::hierarchy))
+        .route("/$/ontology/{ds}/individuals", get(ontology::individuals))
         .route("/$/ontology/{ds}/term", get(ontology::term))
         .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/graph/{ds}/facets", post(graph::facets))

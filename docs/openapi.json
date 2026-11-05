@@ -38667,6 +38667,303 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/$/ontology/{ds}/individuals": {
+      "get": {
+        "description": "Without a selector, list asserted named-type buckets and an Untyped bucket whose type is null. With type=IRI, page named members of that asserted class; with untyped=true, page named individuals without an asserted named class. With iri=IRI, locate one named individual and its memberships. These selectors are mutually exclusive. Anonymous individuals are excluded. Multiple types place a named individual once in each bucket, with duplicate memberships across graphs removed. Pages use lexical IRI order and an exclusive after/next cursor. Reuse the response commit as at for every continuation. Labels follow lang or Accept-Language. No classification runs and inferences is refused. The authorized scope and F21 terminology are read on the server; root discovery and Untyped pages scan the scope and typed pages scan that type's membership. A bounded response does not imply bounded server work. More than 100,000 type buckets or 1,000 named types on an individual fails explicitly.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "ontologyIndividuals",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "description": "The asserted named class whose members to list.",
+            "in": "query",
+            "name": "type",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "List named individuals without an asserted named class.",
+            "in": "query",
+            "name": "untyped",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Locate a named individual and its memberships.",
+            "in": "query",
+            "name": "iri",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The exclusive lexical IRI key from next, including an empty key after Untyped. Continue at the same commit.",
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most buckets or members listed, from 1 to 1,000, with 100 by default.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Preferred label languages, comma separated and most preferred first.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "dataset": {
+                      "type": "string"
+                    },
+                    "groups": {
+                      "items": {
+                        "properties": {
+                          "total": {
+                            "description": "Distinct named members, or null in a direct membership lookup.",
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "type": {
+                            "oneOf": [
+                              {
+                                "properties": {
+                                  "deprecated": {
+                                    "type": "boolean"
+                                  },
+                                  "iri": {
+                                    "type": "string"
+                                  },
+                                  "kinds": {
+                                    "items": {
+                                      "type": "string"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "label": {
+                                    "description": "The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language.",
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "labelLang": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "shortForm": {
+                                    "description": "The `oboInOwl:id`, `skos:notation`, prefixed name or local name.",
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  }
+                                },
+                                "type": "object"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "individuals": {
+                      "items": {
+                        "properties": {
+                          "deprecated": {
+                            "type": "boolean"
+                          },
+                          "iri": {
+                            "type": "string"
+                          },
+                          "kinds": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "label": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "labelLang": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "shortForm": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "types": {
+                            "items": {
+                              "properties": {
+                                "deprecated": {
+                                  "type": "boolean"
+                                },
+                                "iri": {
+                                  "type": "string"
+                                },
+                                "kinds": {
+                                  "items": {
+                                    "type": "string"
+                                  },
+                                  "type": "array"
+                                },
+                                "label": {
+                                  "description": "The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language.",
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
+                                },
+                                "labelLang": {
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
+                                },
+                                "shortForm": {
+                                  "description": "The `oboInOwl:id`, `skos:notation`, prefixed name or local name.",
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "next": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "order": {
+                      "enum": [
+                        "iri"
+                      ],
+                      "type": "string"
+                    },
+                    "total": {
+                      "type": "integer"
+                    },
+                    "warnings": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "One page or one individual's memberships."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Page named individuals by asserted type",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/ontology/{ds}/parse": {
       "post": {
         "description": "Reads `text` in OWL 2 Manchester syntax as `as` (`classExpression` by default, or `dataRange`, `individual`, `literal` or `axiom`) and answers its JSON form, its functional-style text and its Manchester rendering. Names are full IRIs in angle brackets, prefixed names with the dataset's prefixes, local names, and labels in single quotes when they hold a space. They resolve against the entities and the `rdfs:label` and `skos:prefLabel` values of the ontology. Text that does not read is `400` with `code` `invalid-manchester`, `reason` (`syntax`, `unknown`, `ambiguous` or `kind`), the span `start` and `end` in UTF-16 code units, and for an ambiguous name the `candidates` with their IRIs, kinds and labels.",

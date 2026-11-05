@@ -22,8 +22,9 @@
   import { branchParam, MAIN, onBranch } from '$lib/branches';
   import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
   import { fmtInt } from '$lib/format';
-  import { fetchHierarchy, type TreeKind, type TreeNode } from '$lib/browse';
+  import { fetchHierarchy, fetchIndividuals, type Name, type TreeKind } from '$lib/browse';
   import { searchEntities } from '$lib/entity-search';
+  import { IndividualTree, isGroup, groupIri } from '$lib/individual-tree.svelte';
   import { filteredTree, LEVEL_LIMIT, LevelTree, scrollToRow } from '$lib/level-tree.svelte';
   import { LabelBatch } from '$lib/label-batch';
   import { useCommands, usePageSearch, useProvider } from '$lib/launcher.svelte';
@@ -39,7 +40,6 @@
     declaration,
     entityName,
     filterTree,
-    hierarchyEdges,
     iriName,
     KIND_LABEL,
     KIND_SINGULAR,
@@ -50,10 +50,8 @@
     ONTOLOGY_GRAPHS,
     ontologyAxioms,
     ontologyEntities,
-    ontologyIndividualLabels,
     ontologyKindLabels,
     ontologyLabelsFor,
-    READ_CAP,
     ontologyEntity,
     ontologySummary,
     RDFS_LABEL,
@@ -82,7 +80,6 @@
     type Op,
     type OntologySummary,
     type Selection,
-    type Tree,
   } from '$lib/ontology';
   import Icon from '$components/Icon.svelte';
   import FollowState from '$components/FollowState.svelte';
@@ -170,8 +167,8 @@
   let loading = $state(false);
   // What the page reads is what its views show (ROADMAP item 725): the summary when it
   // opens, the levels of the tree on screen, the labels of the names it draws, and the
-  // lists of entities only when a picker, completion or the Individuals tree needs them.
-  /** The entities of the kinds listed so far, for the pickers and the Individuals tree. */
+  // lists of entities only when a picker or completion needs them.
+  /** The entities of the kinds listed so far, for the pickers. */
   let entities = $state<Map<EntityKind, string[]>>(new Map());
   /** The kinds whose list was read, or skipped for being longer than `LIST_MAX`. */
   let listed = $state<Set<EntityKind>>(new Set());
@@ -183,13 +180,8 @@
   const graphLabels = new Map<string, Lit[]>();
   /** The current language's authoritative hierarchy names, including imported labels. */
   const hierarchyNames = new Set<string>();
-  let typeAxioms = $state<AxiomItem[]>([]);
-  let truncated = $state(false);
-  /** Whether the individuals and their types are read for the Individuals tree. */
-  let individualsReady = $state(false);
   /** A failed read of the lists is not tried again until the person asks for a list anew. */
   let listFailed = $state(false);
-  let individualsFailed = $state(false);
   /** The most entities of a kind that the pickers list. A longer kind is searched instead. */
   const LIST_MAX = 5_000;
   /** The kinds the pickers and completion list. */
@@ -275,11 +267,7 @@
     entities = new Map();
     listed = new Set();
     bigKinds = new Set();
-    typeAxioms = [];
-    truncated = false;
-    individualsReady = false;
     listFailed = false;
-    individualsFailed = false;
     listSeq++;
   }
   let listSeq = 0;
@@ -325,45 +313,6 @@
     }
   }
 
-  /** Read the individuals and their types, for the Individuals tree. */
-  async function ensureIndividuals() {
-    if (!summary || individualsReady) return;
-    const my = listSeq;
-    const t = target;
-    const s = sel;
-    individualsReady = true;
-    try {
-      const [ents, types, more] = await Promise.all([
-        ontologyEntities(t, s, ['NamedIndividual']),
-        ontologyAxioms(t, s, { types: ['ClassAssertion'], assertions: true, cap: 10_000 }),
-        ontologyIndividualLabels(t, s).catch(() => new Map<string, Lit[]>()),
-      ]);
-      if (my !== listSeq) return;
-      // individuals that only their class assertions name
-      const inds = new Set(ents.entities.map((e) => e.iri));
-      for (const a of types.axioms)
-        if (typeof a.axiom.individual === 'string' && !a.axiom.individual.startsWith('_:'))
-          inds.add(a.axiom.individual);
-      entities = new Map(entities).set('NamedIndividual', [...inds]);
-      listed = new Set([...listed, 'NamedIndividual']);
-      typeAxioms = types.axioms;
-      truncated = ents.truncated || types.truncated;
-      addLabels(more);
-      batch.know(more.keys());
-      // the class names of the badges
-      for (const a of types.axioms) {
-        const c = a.axiom.class;
-        if (typeof c === 'string') batch.want(c);
-      }
-    } catch (e) {
-      if (my === listSeq) {
-        individualsReady = false;
-        individualsFailed = true;
-        loadError = e as Error;
-      }
-    }
-  }
-
   async function loadSide() {
     const ds = name;
     if (!ds) return;
@@ -392,6 +341,7 @@
       // tree not on screen must not bring them back
       resetLazy();
       for (const lt of levelTrees.values()) lt.drop();
+      individualLevel.drop();
       classification = null;
       session.reset(`sparkles.onto.undo.${target}|${graph ?? ''}`);
       void loadAll();
@@ -400,15 +350,6 @@
   });
 
   // --- trees ---------------------------------------------------------------------------
-  // the kinds without a hierarchy route, the individuals, are a flat list read on demand
-  const individualTree = $derived<Tree>(buildTree(entities.get('NamedIndividual') ?? [], []));
-  /** The individuals by their named types. */
-  const typesOf = $derived.by(() => {
-    const m = new Map<string, string[]>();
-    for (const [i, c] of hierarchyEdges('NamedIndividual', typeAxioms))
-      m.set(i, [...(m.get(i) ?? []), c]);
-    return m;
-  });
   let filter = $state('');
   let opened = $state<Record<string, Set<string>>>({});
   const openSet = (key: string) => opened[key] ?? new Set<string>();
@@ -418,10 +359,6 @@
     else s.add(id);
     opened = { ...opened, [key]: s };
   }
-  /** The flat tree of the tab, when its kind has no hierarchy route. */
-  const tree = $derived(kindTab === 'NamedIndividual' ? individualTree : null);
-  const keep = $derived(tree ? filterTree(tree, treeName, filter) : null);
-
   // --- the class and property trees, one level at a time (item 607) ----------------------
   // The hierarchy route reads a level from the store's indexes, so these trees are whole
   // however large the ontology, where the capped listings above stop at 50,000 entries.
@@ -432,7 +369,7 @@
     AnnotationProperty: 'annotationProperty',
   };
   /** The labels the hierarchy answers carry, merged into the page's labels. */
-  function takeNames(nodes: TreeNode[]) {
+  function takeNames(nodes: Name[]) {
     for (const n of nodes) {
       if (n.label?.trim()) {
         hierarchyNames.add(n.iri);
@@ -469,6 +406,22 @@
       ),
     ]),
   );
+  const individualLevel = new IndividualTree(
+    (q, signal) => fetchIndividuals(target, sel, { ...q, lang: langs }, signal),
+    takeNames,
+  );
+  function individualName(id: string): string {
+    return id === '@untyped' ? 'Untyped' : treeName(groupIri(id) ?? id);
+  }
+  function individualSub(id: string): string | null {
+    return id === '@untyped' ? null : subOf(groupIri(id) ?? id);
+  }
+  function individualSelect(id: string) {
+    if (isGroup(id)) {
+      toggle('NamedIndividual', id);
+      if (openSet('NamedIndividual').has(id)) void individualLevel.load(id);
+    } else nav({ iri: id });
+  }
   /** The level tree of the tab, when its kind has a hierarchy. */
   const level = $derived(kindTab ? (levelTrees.get(kindTab) ?? null) : null);
   // a new target, graph or commit reads the open levels again, of the tree on screen now and
@@ -497,6 +450,7 @@
         }
         levelContext = context;
         for (const lt of levelTrees.values()) lt.drop();
+        individualLevel.drop();
         levelScope = scope;
         levelCommit = commit;
         levelEpoch++;
@@ -506,6 +460,7 @@
         if (!first) {
           // a read of a tree not on screen, begun for the commit before, must not land
           for (const lt of levelTrees.values()) lt.drop();
+          individualLevel.drop();
           levelEpoch++;
         }
       }
@@ -514,7 +469,7 @@
   $effect(() => {
     const epoch = levelEpoch;
     const k = kindTab;
-    const lt = level;
+    const lt = k === 'NamedIndividual' ? individualLevel : level;
     if (!k || !lt || !epoch || levelRead.get(k) === epoch) return;
     levelRead.set(k, epoch);
     untrack(() => lt.reset(openSet(k)));
@@ -530,7 +485,7 @@
   $effect(() => {
     const text = filter.trim();
     const k = kindTab;
-    const kind = k ? LEVEL_KIND[k] : undefined;
+    const kind = k === 'NamedIndividual' ? 'individual' : k ? LEVEL_KIND[k] : undefined;
     // the scope is read here, where the effect tracks it, not in the timer below
     const scopeTarget = target;
     const scopeGraph = graph;
@@ -547,12 +502,50 @@
     const ctl = new AbortController();
     const t = setTimeout(async () => {
       try {
+        if (kind === 'individual') await individualLevel.load(null);
+        if (ctl.signal.aborted) return;
         const r = await searchEntities(scopeTarget, text, {
           kind: [kind],
           limit: 20,
           graph: scopeGraph,
           signal: ctl.signal,
         });
+        if (kind === 'individual') {
+          const pages = await Promise.all(
+            r.results.map((h) =>
+              fetchIndividuals(
+                scopeTarget,
+                { graph: scopeGraph, imports: true },
+                {
+                  iri: h.iri,
+                  at:
+                    individualLevel.commit != null ? `commit:${individualLevel.commit}` : undefined,
+                  lang: langs,
+                },
+                ctl.signal,
+              ),
+            ),
+          );
+          if (ctl.signal.aborted) return;
+          const ids = new Set<string>();
+          const edges: [string, string][] = [];
+          for (const p of pages) {
+            takeNames([
+              ...p.groups.flatMap((g) => (g.type ? [g.type] : [])),
+              ...p.individuals.flatMap((i) => [i, ...i.types]),
+            ]);
+            for (const i of p.individuals) {
+              ids.add(i.iri);
+              for (const g of p.groups) {
+                const key = g.type ? '@type:' + g.type.iri : '@untyped';
+                ids.add(key);
+                edges.push([i.iri, key]);
+              }
+            }
+          }
+          filtered = { text, tree: buildTree(ids, edges) };
+          return;
+        }
         const answers = await Promise.all(
           r.results.map((h) =>
             fetchHierarchy(
@@ -580,8 +573,8 @@
   // open the path to the selection: through the route's ancestors in a level tree
   $effect(() => {
     const iri = selected;
-    const lt = level;
     const k = kindTab;
+    const lt = k === 'NamedIndividual' ? individualLevel : level;
     if (!iri || !lt || !k) return;
     void summary?.commit;
     // after the levels were read again, which this reads the path of
@@ -592,18 +585,6 @@
         if (!anc.every((a) => cur.has(a))) opened = { ...opened, [k]: new Set([...cur, ...anc]) };
         scrollToRow(iri);
       });
-    });
-  });
-  $effect(() => {
-    const iri = selected;
-    const t = tree;
-    const k = kindTab;
-    if (!iri || !t || !k || levelTrees.has(k)) return;
-    const anc = ancestorsOf(t, iri);
-    untrack(() => {
-      const cur = openSet(k);
-      if (anc.every((a) => cur.has(a))) return;
-      opened = { ...opened, [k]: new Set([...cur, ...anc]) };
     });
   });
 
@@ -628,25 +609,6 @@
       if (need && ready && missing && !failed) void ensureKinds(PICKER_KINDS);
     });
   });
-  let individualsKey = '';
-  $effect(() => {
-    const on = kindTab === 'NamedIndividual';
-    const failed = individualsFailed;
-    const ready = !!summary;
-    const done = individualsReady;
-    untrack(() => {
-      // opening the tab again is a new try
-      if (on !== (individualsKey === 'on')) {
-        individualsKey = on ? 'on' : '';
-        if (failed) {
-          individualsFailed = false;
-          return;
-        }
-      }
-      if (on && ready && !done && !failed) void ensureIndividuals();
-    });
-  });
-
   // --- the inferred tree ---------------------------------------------------------------
   let classification = $state<Classification | null>(null);
   let classifyError = $state<string | null>(null);
@@ -1089,6 +1051,7 @@
   });
 
   onMount(() => session.keys(() => readonly));
+  onMount(() => () => individualLevel.drop());
 
   // the command palette (ROADMAP item 631): `/` filters the tree, and this page's commands
   let filterInput: HTMLInputElement | undefined = $state();
@@ -1295,14 +1258,6 @@
       {api.errorMessage(loadError)}
     </div>
   {/if}
-  <!-- the class and property trees read their levels as they open; the individuals list is capped -->
-  {#if truncated && kindTab === 'NamedIndividual'}
-    <p class="notice" role="status">
-      The ontology is larger than the editor reads at once. The list shows the first 50,000
-      individuals.
-    </p>
-  {/if}
-
   {#if name && (summary || (tab === 'tree' && !loadError))}
     <div class="tabs onto-tabs" role="tablist" aria-label="Ontology views">
       {#each TAB_LABEL as [t, l] (t)}
@@ -1415,12 +1370,13 @@
                         label="{KIND_LABEL[kindTab]} (asserted)"
                         roots={filtered.tree.roots}
                         children={(id) => filtered?.tree.children.get(id) ?? []}
-                        name={treeName}
-                        sub={subOf}
+                        name={kindTab === 'NamedIndividual' ? individualName : treeName}
+                        sub={kindTab === 'NamedIndividual' ? individualSub : subOf}
                         open={filtered.tree.nodes}
                         {selected}
                         keep={filtered.tree.nodes}
-                        onselect={(id) => nav({ iri: id })}
+                        onselect={(id) =>
+                          kindTab === 'NamedIndividual' ? individualSelect(id) : nav({ iri: id })}
                         ontoggle={() => {}}
                       />
                     {:else}
@@ -1449,26 +1405,35 @@
                     {:else}
                       <p class="empty">No {KIND_LABEL[kindTab].toLowerCase()}.</p>
                     {/if}
-                  {:else if tree?.roots.length}
-                    <OntoTree
-                      label="{KIND_LABEL[kindTab]} (asserted)"
-                      roots={tree.roots}
-                      children={(id) => tree?.children.get(id) ?? []}
-                      name={treeName}
-                      sub={subOf}
-                      badge={kindTab === 'NamedIndividual'
-                        ? (id) => (typesOf.get(id) ?? []).map(nameOf).join(', ') || null
-                        : undefined}
-                      open={openSet(kindTab)}
-                      {selected}
-                      {keep}
-                      onselect={(id) => nav({ iri: id })}
-                      ontoggle={(id) => toggle(kindTab, id)}
-                    />
-                  {:else if !individualsReady}
-                    <p class="empty">Reading the {KIND_LABEL[kindTab].toLowerCase()}…</p>
-                  {:else}
-                    <p class="empty">No {KIND_LABEL[kindTab].toLowerCase()}.</p>
+                  {:else if kindTab === 'NamedIndividual'}
+                    {#if individualLevel.error}<p class="error-box" role="alert">
+                        {individualLevel.error}
+                      </p>{/if}
+                    {#if individualLevel.roots().length}
+                      <OntoTree
+                        label="Individuals (asserted)"
+                        roots={individualLevel.roots()}
+                        children={(id) => individualLevel.children(id)}
+                        more={(id) => individualLevel.more(id)}
+                        clipped={(p) => individualLevel.clippedOf(p)}
+                        onmore={(p) => individualLevel.loadMore(p)}
+                        name={individualName}
+                        sub={individualSub}
+                        count={(id) => (isGroup(id) ? individualLevel.counts[id] : 0)}
+                        badge={(id) =>
+                          isGroup(id)
+                            ? null
+                            : (individualLevel.types[id] ?? []).map(nameOf).join(', ') || null}
+                        open={openSet(kindTab)}
+                        {selected}
+                        onselect={individualSelect}
+                        ontoggle={(id) => individualSelect(id)}
+                      />
+                    {:else if individualLevel.loading}
+                      <p class="empty">Reading the individuals…</p>
+                    {:else}
+                      <p class="empty">No individuals.</p>
+                    {/if}
                   {/if}
                 </div>
               </div>
@@ -1526,11 +1491,17 @@
         <section class="panel detail" aria-label="Details">
           {#if kindTab && selected}
             <TreeCrumbs
-              roots={level ? level.roots() : (tree?.roots ?? [])}
-              children={(id) => (level ? level.children(id) : (tree?.children.get(id) ?? []))}
+              roots={kindTab === 'NamedIndividual'
+                ? individualLevel.roots()
+                : (level?.roots() ?? [])}
+              children={(id) =>
+                kindTab === 'NamedIndividual'
+                  ? individualLevel.children(id)
+                  : (level?.children(id) ?? [])}
               target={selected}
-              name={nameOf}
-              onselect={(id) => nav({ iri: id })}
+              name={kindTab === 'NamedIndividual' ? individualName : nameOf}
+              onselect={(id) =>
+                kindTab === 'NamedIndividual' ? individualSelect(id) : nav({ iri: id })}
             />
           {/if}
           {#if !selected}

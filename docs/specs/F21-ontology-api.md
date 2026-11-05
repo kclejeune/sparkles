@@ -586,6 +586,23 @@ capabilities and remaining work are described by the spec status and Outcome.
 Phase 1 is delivered as roadmap item 71, Phase 2 as roadmap item 537 and Phase 3 as
 roadmap item 538.
 
+### Paged named individuals
+
+Item 607 adds `Ontologies::individuals` and `GET /$/ontology/{ds}/individuals` for
+U12's Individuals tab. The read pages asserted named-type buckets, their named members
+and an Untyped bucket. Direct lookup returns one individual's memberships without
+walking earlier pages. Lexical IRI continuations retain the response commit through
+`at=commit:N`. Every stage uses the caller's authorized graph and triple view, imports,
+branch, retained revision, cancellation and deadline. No classification runs.
+
+Responses hold at most 1,000 buckets or individuals, with 100 by default. Root discovery
+and Untyped reads scan the authorized scope, and typed reads scan that type's membership.
+The route uses F21's existing terminology mapper to preserve declarations, complex
+assertions and signature semantics. It does not bound server work by the response size.
+More than 100,000 buckets or 1,000 named types on one individual fails explicitly.
+Anonymous individuals stay outside this named-entity editor tree. The exact HTTP
+contract is in [the API reference](../API.md#ontology).
+
 ### Phase 1
 
 The `sparkles-owl` crate holds the structural model of §3, the reverse mapping of §4

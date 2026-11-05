@@ -2270,6 +2270,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ontology/{ds}/individuals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Page named individuals by asserted type
+         * @description Without a selector, list asserted named-type buckets and an Untyped bucket whose type is null. With type=IRI, page named members of that asserted class; with untyped=true, page named individuals without an asserted named class. With iri=IRI, locate one named individual and its memberships. These selectors are mutually exclusive. Anonymous individuals are excluded. Multiple types place a named individual once in each bucket, with duplicate memberships across graphs removed. Pages use lexical IRI order and an exclusive after/next cursor. Reuse the response commit as at for every continuation. Labels follow lang or Accept-Language. No classification runs and inferences is refused. The authorized scope and F21 terminology are read on the server; root discovery and Untyped pages scan the scope and typed pages scan that type's membership. A bounded response does not imply bounded server work. More than 100,000 type buckets or 1,000 named types on an individual fails explicitly.
+         */
+        get: operations["ontologyIndividuals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/ontology/{ds}/parse": {
         parameters: {
             query?: never;
@@ -18244,6 +18264,98 @@ export interface operations {
                          */
                         roots?: "ontology" | "scheme" | "computed";
                         total?: number;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    ontologyIndividuals: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description The asserted named class whose members to list. */
+                type?: string;
+                /** @description List named individuals without an asserted named class. */
+                untyped?: boolean;
+                /** @description Locate a named individual and its memberships. */
+                iri?: string;
+                /** @description The exclusive lexical IRI key from next, including an empty key after Untyped. Continue at the same commit. */
+                after?: string;
+                /** @description The most buckets or members listed, from 1 to 1,000, with 100 by default. */
+                limit?: number;
+                /** @description Preferred label languages, comma separated and most preferred first. */
+                lang?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page or one individual's memberships. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        commit?: number;
+                        dataset?: string;
+                        groups?: {
+                            /** @description Distinct named members, or null in a direct membership lookup. */
+                            total?: number | null;
+                            type?: {
+                                deprecated?: boolean;
+                                iri?: string;
+                                kinds?: string[];
+                                /** @description The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language. */
+                                label?: string | null;
+                                labelLang?: string | null;
+                                /** @description The `oboInOwl:id`, `skos:notation`, prefixed name or local name. */
+                                shortForm?: string | null;
+                            } | null;
+                        }[];
+                        individuals?: {
+                            deprecated?: boolean;
+                            iri?: string;
+                            kinds?: string[];
+                            label?: string | null;
+                            labelLang?: string | null;
+                            shortForm?: string | null;
+                            types?: {
+                                deprecated?: boolean;
+                                iri?: string;
+                                kinds?: string[];
+                                /** @description The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language. */
+                                label?: string | null;
+                                labelLang?: string | null;
+                                /** @description The `oboInOwl:id`, `skos:notation`, prefixed name or local name. */
+                                shortForm?: string | null;
+                            }[];
+                        }[];
+                        next?: string | null;
+                        /** @enum {string} */
+                        order?: "iri";
+                        total?: number;
+                        warnings?: string[];
                     };
                 };
             };

@@ -11,10 +11,12 @@ const DATA: &str = r#"@prefix : <http://ex/> .
 <http://ex/open> {
   <http://ex/open> a owl:Ontology ; owl:imports <http://ex/secret> .
   :A a owl:Class . :B a owl:Class .
+  :visibleIndividual a :A .
 }
 <http://ex/secret> {
   <http://ex/secret> a owl:Ontology .
   :Hidden a owl:Class . :A rdfs:subClassOf :Hidden .
+  :secretIndividual a :Hidden .
 }
 "#;
 
@@ -365,4 +367,29 @@ async fn ontology_metrics_respect_graph_grants_and_remain_read_only() {
     assert!(!limited.text().contains("Hidden"));
     assert_eq!(limited.json()["metrics"]["scopeComplete"], false);
     assert!(limited.json()["metrics"]["expressivity"]["notation"].is_null());
+}
+
+#[tokio::test]
+async fn individual_pages_preserve_graph_grants_and_read_only_access() {
+    let (_dir, app) = server();
+    let uri = format!("/$/ontology/ont/individuals?{OPEN}");
+    let full = as_user(&app, "oread", "GET", &uri, &json!(null)).await;
+    assert_eq!(full.status, StatusCode::OK, "{}", full.text());
+    assert_eq!(full.json()["groups"].as_array().unwrap().len(), 2);
+    let limited = as_user(&app, "oopen", "GET", &uri, &json!(null)).await;
+    assert_eq!(limited.status, StatusCode::OK, "{}", limited.text());
+    assert_eq!(limited.json()["groups"].as_array().unwrap().len(), 1);
+    assert!(!limited.text().contains("Hidden"));
+    let hidden = format!("{uri}&iri=http%3A%2F%2Fex%2FsecretIndividual");
+    let r = as_user(&app, "oopen", "GET", &hidden, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let public = format!("{uri}&type=http%3A%2F%2Fex%2FA");
+    let r = as_user(&app, "oread", "GET", &public, &json!(null)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        r.json()["individuals"][0]["iri"],
+        "http://ex/visibleIndividual"
+    );
+    let denied = call(&app, "GET", &uri, &[], "").await;
+    assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
 }

@@ -1871,6 +1871,67 @@ export async function handleOntology(req, res, url, seg, ctx) {
     );
     return true;
   }
+  if (req.method === 'GET' && sub === 'individuals') {
+    const o = readOntology(ds, graph);
+    const b = browseIndex(ds, graph, p.get('lang'));
+    const memberships = new Map();
+    for (const [iri, ks] of o.kinds)
+      if (ks.has('NamedIndividual') && !iri.startsWith('_:')) memberships.set(iri, new Set());
+    for (const a of o.axioms) {
+      const j = a.json;
+      if (j.type !== 'ClassAssertion' || j.individual.startsWith('_:')) continue;
+      const types = memberships.get(j.individual) ?? new Set();
+      if (typeof j.class === 'string') types.add(j.class);
+      memberships.set(j.individual, types);
+    }
+    const groups = new Map();
+    for (const [, types] of memberships)
+      for (const type of types.size ? types : ['']) groups.set(type, (groups.get(type) ?? 0) + 1);
+    const limit = Number(p.get('limit') ?? 100);
+    const after = p.get('after');
+    const iri = p.get('iri');
+    const type = p.get('type');
+    const untyped = p.get('untyped') === 'true';
+    const individual = (iri) => ({ ...b.name(iri), types: [...memberships.get(iri)].map(b.name) });
+    const group = (type, total) => ({ type: type ? b.name(type) : null, total });
+    let body = { commit: head(), groups: [], individuals: [], total: 0, next: null };
+    if (iri) {
+      if (!memberships.has(iri)) return (fail(res, 404, 'no named individual'), true);
+      const types = memberships.get(iri);
+      body = {
+        ...body,
+        groups: [...(types.size ? types : [''])].map((t) => group(t, null)),
+        individuals: [individual(iri)],
+        total: 1,
+      };
+    } else if (type || untyped) {
+      const all = [...memberships]
+        .filter(([, ts]) => (type ? ts.has(type) : ts.size === 0))
+        .map(([i]) => i)
+        .sort();
+      const remaining = all.filter((i) => after == null || i > after);
+      const page = remaining.slice(0, limit);
+      body = {
+        ...body,
+        individuals: page.map(individual),
+        total: all.length,
+        next: remaining.length > limit ? page.at(-1) : null,
+      };
+    } else {
+      const remaining = [...groups]
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .filter(([k]) => after == null || k > after);
+      const page = remaining.slice(0, limit);
+      body = {
+        ...body,
+        groups: page.map(([t, n]) => group(t, n)),
+        total: groups.size,
+        next: remaining.length > limit ? page.at(-1)[0] : null,
+      };
+    }
+    send(res, 200, body);
+    return true;
+  }
   if (req.method === 'GET' && sub === 'entities') {
     const o = readOntology(ds, graph);
     const want = p.get('kind')?.split(',');

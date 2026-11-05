@@ -463,8 +463,19 @@ IRIs a panel names for the first time, so no read lists every label of the ontol
 entity lists behind the add fields' pickers and the new-entity checks are read once an entity,
 the header, the DL Query tab or the new-entity dialog needs them, for each kind of up to 5,000
 entities. A longer kind is completed by the entity search as a name is typed and is resolved by
-the server's Manchester reader. The Individuals tree has no hierarchy route, so it reads its
-individuals, up to 50,000, and their types when it opens.
+the server's Manchester reader. The Individuals tab opens on a page of asserted named-type
+buckets. Expanding a type reads up to 100 named members, and **Show more** reads its next
+page at the same commit. Untyped holds named individuals without an asserted named class.
+An individual with several types appears once under each. Anonymous individuals are
+outside this named-entity tree. A selected individual is located directly even when its
+row is outside the loaded pages. Labels and type badges follow the shared rendering and
+language preferences. The [Individuals screenshot](../images/ontology-individuals.png)
+shows the type groups and a selected member.
+
+The paged HTTP response does not imply bounded server work. The individuals route reuses
+the ontology's terminology mapping, and discovers buckets and Untyped members by scanning
+the authorized graph scope. A typed member page scans that type's membership. The cold
+terminology mapping cost remains under roadmap item 736.
 
 The **DL Query** tab answers a Manchester class expression with its equivalent classes,
 its direct and inferred superclasses and subclasses, and its instances
@@ -719,11 +730,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   roadmap item 120. Under an incremental guard with other results in the dataset, a
   preview cannot say whether a fix resolves its result, item 121. Callers whose grants
   cover only some graphs get no overlay, item 75.
-* The ontology editor reads every entity and hierarchy axiom of a graph to draw its
-  trees, up to 50,000 of each, and its trees move onto the hierarchy route that the
-  browser reads under item 607. When that listing stops early, as on the Gene
-  Ontology, one SPARQL query reads the labels of the selected graph so the trees still
-  show labels, but the hierarchy above the cut is missing. Only the class tree has an inferred view, 609, and
+* The ontology editor pages class and property levels and individuals by asserted type.
+  Only the class tree has an inferred view, 609, and
   the IRI policy is kept in the browser per dataset, 610. Rename covers the graph the
   page reads and not IRIs inside triple terms, under item 457's refactoring phase. The
   editable schema diagram is a further U12 phase of item 457.
@@ -762,10 +770,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   pages and hierarchy show asserted axioms only, and inferred ones are item 622. Its search reads
   the head of a branch, so a page at a past state has no search box, item 658. It shows
   entities using the shared rendering preferences. Reuse is looked up in the other datasets of the same server,
-  and other servers' term pages are item 461. The landing page counts entities by kind
-  without axiom counts or expressivity, item 621.
-* The ontology editor's tree filter matches the names it has loaded and does not call the
-  entity search, item 660.
+  and other servers' term pages are item 461. The landing page offers axiom counts and
+  conservative expressivity through its on-demand metrics panel.
+* The ontology editor's tree filter uses entity search. The thesaurus label search and
+  DL Query's completion still use separate name lookups, item 660.
 
 ## Configuration and usage
 
@@ -789,7 +797,7 @@ A standalone desktop application is planned under [item 746](../ROADMAP.md), wit
 its framework comparison and parity requirements in [U13](../specs/U13-desktop-application/README.md).
 The current interface is served by the Sparkles server.
 
-The remaining work described above refers to [item 607](../ROADMAP.md), [item 621](../ROADMAP.md), [item 622](../ROADMAP.md), [item 630](../ROADMAP.md), [item 658](../ROADMAP.md), [item 461](../ROADMAP.md), [item 612](../ROADMAP.md), [item 613](../ROADMAP.md), [item 614](../ROADMAP.md), [item 615](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
+The remaining work described above refers to [item 622](../ROADMAP.md), [item 630](../ROADMAP.md), [item 658](../ROADMAP.md), [item 461](../ROADMAP.md), [item 612](../ROADMAP.md), [item 613](../ROADMAP.md), [item 614](../ROADMAP.md), [item 615](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

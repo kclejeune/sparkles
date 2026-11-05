@@ -653,3 +653,197 @@ fn many_skos_xl_labels_report_the_cut() {
     assert_eq!(t.xl_labels.len(), MAX_VALUES);
     assert!(t.statements_truncated);
 }
+
+fn individuals(ds: &Dataset, q: IndividualsRequest) -> Individuals {
+    ds.ontology()
+        .individuals(&req(), &q, &Default::default())
+        .unwrap()
+}
+
+#[test]
+fn individuals_page_memberships_without_losing_untyped_or_multiple_types() {
+    let mut data = String::from(
+        ":A a owl:Class ; rdfs:subClassOf :B . :B a owl:Class ; rdfs:subClassOf :A . :p a owl:ObjectProperty . :empty a owl:NamedIndividual . :onlySubject :p :onlyObject . :both a :A, :B . :A a owl:NamedIndividual, :A . [] a :A .",
+    );
+    for i in 0..1105 {
+        data.push_str(&format!(":i{i:04} a :A ."));
+    }
+    let ds = dataset(&data);
+    let roots = individuals(&ds, IndividualsRequest::default());
+    assert!(roots.individuals.is_empty());
+    assert_eq!(
+        roots
+            .groups
+            .iter()
+            .map(|g| (g.class.as_ref().map(|c| c.iri.clone()), g.total.unwrap()))
+            .collect::<Vec<_>>(),
+        vec![(None, 3), (Some(ex("A")), 1107), (Some(ex("B")), 1)]
+    );
+    let mut after = None;
+    let mut all = Vec::new();
+    loop {
+        let page = individuals(
+            &ds,
+            IndividualsRequest {
+                class: Some(ex("A")),
+                limit: 100,
+                after,
+                ..Default::default()
+            },
+        );
+        assert_eq!(page.total, 1107);
+        assert!(page.individuals.len() <= 100);
+        all.extend(page.individuals.iter().map(|i| i.name.iri.clone()));
+        after = page.next;
+        if after.is_none() {
+            break;
+        }
+    }
+    assert_eq!(all.len(), 1107);
+    assert!(all.windows(2).all(|p| p[0] < p[1]));
+    assert!(!all.iter().any(|i| i.starts_with("_:")));
+    let both = individuals(
+        &ds,
+        IndividualsRequest {
+            iri: Some(ex("both")),
+            ..Default::default()
+        },
+    );
+    assert_eq!(both.groups.len(), 2);
+    assert_eq!(both.individuals[0].types.len(), 2);
+    let untyped = individuals(
+        &ds,
+        IndividualsRequest {
+            untyped: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        untyped
+            .individuals
+            .iter()
+            .map(|i| i.name.iri.clone())
+            .collect::<Vec<_>>(),
+        [ex("empty"), ex("onlyObject"), ex("onlySubject")]
+    );
+    let root1 = individuals(
+        &ds,
+        IndividualsRequest {
+            limit: 1,
+            ..Default::default()
+        },
+    );
+    assert_eq!(root1.next, Some(String::new()));
+    let root2 = individuals(
+        &ds,
+        IndividualsRequest {
+            limit: 1,
+            after: root1.next,
+            ..Default::default()
+        },
+    );
+    assert_eq!(root2.groups[0].class.as_ref().unwrap().iri, ex("A"));
+}
+
+#[test]
+fn individual_pages_keep_graph_scope_imports_and_retained_revisions() {
+    let ds = dataset(
+        "GRAPH :g { :g a owl:Ontology ; owl:imports :h . :A a owl:Class . :i a :A . } GRAPH :h { :i a :A . :hidden a :A . }",
+    );
+    ds.snapshots()
+        .create(
+            "before-individuals",
+            &crate::history::At::Head,
+            &Default::default(),
+        )
+        .unwrap();
+    let req = OntologyRequest {
+        graphs: vec![GraphRef::parse(&ex("g")).unwrap()],
+        ..Default::default()
+    };
+    let q = IndividualsRequest {
+        class: Some(ex("A")),
+        limit: 1,
+        ..Default::default()
+    };
+    let read = |r: &OntologyRequest, q: &IndividualsRequest, opts: &QueryOptions| {
+        ds.ontology().individuals(r, q, opts).unwrap()
+    };
+    let page = read(&req, &q, &Default::default());
+    assert_eq!(page.total, 2); // :i is counted once across the two graphs
+    let no_imports = OntologyRequest {
+        imports: sparkles_reasoner::inputs::ImportMode::None,
+        ..req.clone()
+    };
+    assert_eq!(read(&no_imports, &q, &Default::default()).total, 1);
+    let g = Graphs::Only(GraphRule::new([ex("g").as_str()], &[]));
+    let opts = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::graphs(g.clone(), g))),
+        ..Default::default()
+    };
+    assert_eq!(read(&req, &q, &opts).total, 1);
+    ds.update(&format!(
+        "{PREFIXES} INSERT DATA {{ GRAPH :g {{ :new a :A }} }}"
+    ))
+    .unwrap();
+    assert_eq!(read(&req, &q, &Default::default()).total, 3);
+    let retained = OntologyRequest {
+        at: Some(crate::history::At::Snapshot("before-individuals".into())),
+        ..req.clone()
+    };
+    let old = read(
+        &retained,
+        &IndividualsRequest {
+            after: page.next,
+            ..q.clone()
+        },
+        &Default::default(),
+    );
+    assert_eq!(old.commit, page.commit);
+    assert_eq!(old.total, 2);
+    assert_eq!(old.individuals.len(), 1);
+    assert_eq!(old.individuals[0].name.iri, ex("i"));
+}
+
+#[test]
+fn individual_pages_honor_cancellation_and_deadlines() {
+    let ds = dataset(":a a owl:NamedIndividual .");
+    let cancelled = QueryOptions {
+        cancel: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        ..Default::default()
+    };
+    assert!(matches!(
+        ds.ontology()
+            .individuals(&req(), &Default::default(), &cancelled),
+        Err(Error::Cancelled)
+    ));
+    let late = QueryOptions {
+        deadline: Some(std::time::Instant::now()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        ds.ontology()
+            .individuals(&req(), &Default::default(), &late),
+        Err(Error::Timeout)
+    ));
+}
+
+#[test]
+fn individual_pages_fail_explicitly_on_excessive_type_memberships() {
+    let mut data = String::new();
+    for n in 0..1001 {
+        data.push_str(&format!(":a a :C{n} ."));
+    }
+    let ds = dataset(&data);
+    let result = ds.ontology().individuals(
+        &req(),
+        &IndividualsRequest {
+            iri: Some(ex("a")),
+            ..Default::default()
+        },
+        &Default::default(),
+    );
+    assert!(
+        matches!(result, Err(Error::Invalid(message)) if message.contains("more than 1000 named types"))
+    );
+}

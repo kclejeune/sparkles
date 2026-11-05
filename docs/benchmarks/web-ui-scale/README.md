@@ -72,3 +72,36 @@ node scripts/perf-summary.mjs DIR/baseline DIR/after
 `ui/tests/perf/README.txt` lists the variables that pick cases, repetitions and targets, and
 `scripts/perf-run.sh` runs the groups of two builds in turn on fresh servers. Run it on a
 quiet host with no other build or test running.
+
+## Individuals paging
+
+`ui/scripts/perf-individuals.mjs` compares two production UI builds against one server
+and a synthetic ontology with 50,250 named members of one type, a second asserted type,
+three untyped members and an anonymous assertion subject. It checks group counts,
+duplicate-free continuation, direct lookup of the final member, incoming-only entity
+selection and the number of rows drawn by the actual Individuals tab.
+
+The first root request records cold type-bucket discovery separately from the warm typed
+member and continuation requests. Browser trials then use fresh contexts against a
+shared warm terminology mapping. Both builds take turns, and the record distinguishes
+the first usable type buckets from the first displayed individual. It records API
+request bodies, request and response sizes, decoded bytes and exact source identities.
+The earlier UI's capped listing is the baseline. A member page bounds transfer and the
+browser's loaded rows, while bucket discovery and Untyped reads still scan their scope,
+and typed member pages scan that type's membership. The existing terminology mapping
+cost applies to this route too.
+
+Run the server alone on its host and provide its receipt with the host, compiler, source
+commit and binary checksum. Use a benchmark-host run for published timings. The harness
+refuses to overwrite a raw record.
+
+```sh
+cd ui
+INDIVIDUALS_BACKEND=http://127.0.0.1:45200 \
+INDIVIDUALS_BEFORE_UI=/path/to/before/ui/build \
+INDIVIDUALS_AFTER_UI=/path/to/after/ui/build \
+INDIVIDUALS_BEFORE_SOURCE=BASE_COMMIT \
+INDIVIDUALS_AFTER_SOURCE=TIP_COMMIT \
+INDIVIDUALS_SERVER_RECEIPT=/path/to/server-receipt.json \
+INDIVIDUALS_OUT=/path/to/new-run.json node scripts/perf-individuals.mjs
+```

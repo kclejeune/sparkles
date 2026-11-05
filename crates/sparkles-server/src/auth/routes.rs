@@ -80,6 +80,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ontology/{ds}/diff", &["GET"]),
     ("/$/ontology/{ds}/search", &["GET"]),
     ("/$/ontology/{ds}/hierarchy", &["GET"]),
+    ("/$/ontology/{ds}/individuals", &["GET"]),
     ("/$/ontology/{ds}/term", &["GET"]),
     ("/$/graph/{ds}/groups", &["POST"]),
     ("/$/graph/{ds}/facets", &["POST"]),
@@ -500,6 +501,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/ontology/{ds}/diff"
         | "/$/ontology/{ds}/search"
         | "/$/ontology/{ds}/hierarchy"
+        | "/$/ontology/{ds}/individuals"
         | "/$/ontology/{ds}/term"
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
@@ -695,6 +697,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/$/ontology/{ds}/entities"
         | "/$/ontology/{ds}/search"
         | "/$/ontology/{ds}/hierarchy"
+        | "/$/ontology/{ds}/individuals"
         | "/$/ontology/{ds}/term"
         | "/$/ontology/{ds}/entity" => Endpoint::Query,
         "/$/ontology/{ds}/axioms" if get => Endpoint::Query,

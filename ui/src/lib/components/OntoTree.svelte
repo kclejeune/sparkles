@@ -61,6 +61,7 @@
     name,
     sub,
     badge,
+    count,
     open,
     selected,
     keep = null,
@@ -79,6 +80,8 @@
     /** A second, fainter line: the prefixed name of a labelled entity. */
     sub?: (id: string) => string | null;
     badge?: (id: string) => string | null;
+    /** A known total child count when only one page is loaded. */
+    count?: (id: string) => number | undefined;
     open: Set<string>;
     selected: string | null;
     /** With a filter: the nodes it keeps, which open on their own. */
@@ -414,6 +417,7 @@
         {@const id = row.id}
         {@const s = sub?.(id)}
         {@const b = badge?.(id)}
+        {@const childCount = count?.(id) ?? row.kids}
         <li
           role="treeitem"
           id={rowDomId(i)}
@@ -493,7 +497,8 @@
               {#if s}<span class="iri" aria-hidden="true">{s}</span>{/if}
             </button>
             {#if b}<span class="badge">{b}</span>{/if}
-            {#if row.kids}<span class="kids faint">{row.kids}</span>{/if}
+            {#if childCount}<span class="kids faint">{childCount.toLocaleString('en-US')}</span
+              >{/if}
           </div>
         </li>
       {/if}

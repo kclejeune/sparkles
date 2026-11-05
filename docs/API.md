@@ -2004,6 +2004,32 @@ commit as its entity tag, and refuses `inferences`.
       "http://purl.obolibrary.org/obo/GO_0043231"]], "truncated": false } }
 ```
 
+`GET /$/ontology/{ds}/individuals` pages named individuals by asserted named type.
+Without a selector, `groups` holds type buckets as `{ type, total }`, where `type` is a
+name object with the hierarchy route's name fields. A null type identifies Untyped.
+With `type=IRI`, `individuals` lists named members of that asserted class. With
+`untyped=true`, it lists named individuals without an asserted named class. With
+`iri=IRI`, it locates one named individual and its memberships, with group totals null
+because the lookup does not count those groups. These selectors are mutually exclusive.
+Each individual carries its name fields and `types` as named-class name objects.
+Multiple types put a member once in each bucket. Duplicate memberships across graphs
+count once. Anonymous individuals are outside this named-entity editor tree. A named
+individual asserted only to a class expression belongs to Untyped unless it also has
+an asserted named class. No inferred membership is added and `inferences` is refused.
+
+`limit` is 100 by default and at most 1,000. Both buckets and members use lexical IRI
+order, independent of labels. Untyped sorts first, with the empty continuation key.
+`next` is an exclusive IRI key or null at the end. Send it as `after`, including an
+empty string, and pin every continuation to the answer's `commit` with `at=commit:N`.
+`total` counts all buckets or distinct members of the selected group. A direct lookup
+returns one individual. The selected graph, dataset-local imports, branch, retained
+revision, grants, cancellation and deadline apply throughout. `lang` or
+`Accept-Language` chooses labels. Root discovery and Untyped pages scan the authorized
+scope. Typed pages scan the type's membership, and every mode retains F21's existing
+terminology mapping cost. A bounded page does not imply bounded server work. More than
+100,000 buckets or 1,000 named types on one individual fails with `400` rather than
+returning an incomplete answer.
+
 `GET /$/ontology/{ds}/term?iri=IRI` answers what the graphs read say about one entity
 for the ontology browser's pages, again from the store's indexes without reading the
 whole ontology. `statements` are the entity's triples whose object is an IRI or a

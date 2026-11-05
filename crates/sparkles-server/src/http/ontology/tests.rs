@@ -1804,3 +1804,99 @@ async fn metrics_include_assertions_at_the_requested_revision_and_have_their_own
         StatusCode::BAD_REQUEST
     );
 }
+
+#[tokio::test]
+async fn individuals_route_pages_and_locates_with_revision_receipts() {
+    let s = server();
+    let root = get(&s.app, "/$/ontology/t/individuals").await;
+    assert_eq!(root.status, StatusCode::OK, "{}", root.text());
+    assert!(root.json()["individuals"].as_array().unwrap().is_empty());
+    assert_eq!(root.json()["groups"][0]["type"], J::Null); // :logic only occurs as an object
+    assert_eq!(
+        root.json()["groups"][1]["type"]["iri"],
+        "http://ex.org/Professor"
+    );
+    let uri = format!(
+        "/$/ontology/t/individuals?type={}&limit=1",
+        enc("http://ex.org/Professor")
+    );
+    let r = get(&s.app, &uri).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["individuals"][0]["iri"], "http://ex.org/ada");
+    assert_eq!(r.json()["next"], J::Null);
+    assert_eq!(
+        r.headers["sparkles-commit"],
+        root.headers["sparkles-commit"]
+    );
+    let located = get(
+        &s.app,
+        &format!("/$/ontology/t/individuals?iri={}", enc("http://ex.org/ada")),
+    )
+    .await;
+    assert_eq!(
+        located.json()["groups"][0]["type"]["iri"],
+        "http://ex.org/Professor"
+    );
+    let tag = r.headers[header::ETAG].to_str().unwrap();
+    let cached = send(&s.app, "GET", &uri, &[("If-None-Match", tag)], "").await;
+    assert_eq!(cached.status, StatusCode::NOT_MODIFIED);
+    for bad in [
+        "limit=0",
+        "limit=1001",
+        "limit=x",
+        "untyped=true&type=http%3A%2F%2Fex.org%2FProfessor",
+        "inferences=true",
+    ] {
+        let r = get(&s.app, &format!("/$/ontology/t/individuals?{bad}")).await;
+        assert!(
+            r.status.is_client_error(),
+            "{bad}: {} {}",
+            r.status,
+            r.text()
+        );
+    }
+    let absent = get(
+        &s.app,
+        &format!(
+            "/$/ontology/t/individuals?iri={}",
+            enc("http://ex.org/Professor")
+        ),
+    )
+    .await;
+    assert_eq!(absent.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn individual_pages_read_only_the_selected_branch_and_retained_revision() {
+    let s = persistent();
+    s._state
+        .get("h")
+        .unwrap()
+        .dataset
+        .create_branch("individual-dev", &Default::default())
+        .unwrap();
+    let before = get(&s.app, "/$/ontology/h/individuals?branch=individual-dev")
+        .await
+        .json()["commit"]
+        .as_u64()
+        .unwrap();
+    let r = post(&s.app, "/$/ontology/h/axioms?branch=individual-dev", json!({"add": [{"type":"ClassAssertion", "class":"http://ex.org/Person", "individual":"http://ex.org/new-person"}]})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let base = format!(
+        "/$/ontology/h/individuals?type={}",
+        enc("http://ex.org/Person")
+    );
+    let dev = get(&s.app, &format!("{base}&branch=individual-dev")).await;
+    assert_eq!(dev.headers["sparkles-branch"], "individual-dev");
+    assert!(dev.text().contains("new-person"), "{}", dev.text());
+    let main = get(&s.app, &base).await;
+    assert!(!main.text().contains("new-person"), "{}", main.text());
+    let old = get(
+        &s.app,
+        &format!("{base}&branch=individual-dev&at=commit:{before}"),
+    )
+    .await;
+    assert_eq!(old.status, StatusCode::OK, "{}", old.text());
+    assert!(!old.text().contains("new-person"));
+    assert_eq!(old.json()["commit"], before);
+}

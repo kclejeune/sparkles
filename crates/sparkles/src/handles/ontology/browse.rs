@@ -8,6 +8,10 @@
 //! maps the fragment it collects through the same reverse mapping as
 //! [`Ontologies::open`], so its axioms are those a full read gives for the entity.
 //!
+//! [`Ontologies::individuals`] pages named individuals and their asserted type buckets.
+//! It reuses F21's terminology mapper. Bucket discovery and Untyped reads scan the
+//! authorized scope, and typed member pages scan that type's membership.
+//!
 //! ```
 //! use sparkles::Dataset;
 //! use sparkles::handles::ontology::OntologyRequest;
@@ -31,6 +35,9 @@
 //! assert_eq!(t.axioms.len(), 3); // the declaration, the label and the subclass axiom
 //! # Ok::<_, sparkles::Error>(())
 //! ```
+
+mod individuals;
+pub use individuals::{IndividualGroup, IndividualNode, Individuals, IndividualsRequest};
 
 use super::{Ontologies, OntologyRequest, check};
 use crate::error::{Error, Result};
