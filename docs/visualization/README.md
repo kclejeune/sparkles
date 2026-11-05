@@ -465,7 +465,7 @@ the header, the DL Query tab or the new-entity dialog needs them, for each kind 
 entities. A longer kind is completed by the entity search as a name is typed and is resolved by
 the server's Manchester reader. The Individuals tab opens on a page of asserted named-type
 buckets. Expanding a type reads up to 100 named members, and **Show more** reads its next
-page at the same commit. Untyped holds named individuals without an asserted named class.
+page at the displayed summary commit. Untyped holds named individuals without an asserted named class.
 An individual with several types appears once under each. Anonymous individuals are
 outside this named-entity tree. A selected individual is located directly even when its
 row is outside the loaded pages. Labels and type badges follow the shared rendering and

@@ -407,7 +407,17 @@
     ]),
   );
   const individualLevel = new IndividualTree(
-    (q, signal) => fetchIndividuals(target, sel, { ...q, lang: langs }, signal),
+    (q, signal) =>
+      fetchIndividuals(
+        target,
+        sel,
+        {
+          ...q,
+          at: q.at ?? (summary ? `commit:${summary.commit}` : undefined),
+          lang: langs,
+        },
+        signal,
+      ),
     takeNames,
   );
   function individualName(id: string): string {
@@ -470,6 +480,8 @@
     const epoch = levelEpoch;
     const k = kindTab;
     const lt = k === 'NamedIndividual' ? individualLevel : level;
+    // Individuals keep the summary-first opening and anchor every page to its commit.
+    if (k === 'NamedIndividual' && summary?.commit == null) return;
     if (!k || !lt || !epoch || levelRead.get(k) === epoch) return;
     levelRead.set(k, epoch);
     untrack(() => lt.reset(openSet(k)));
@@ -489,13 +501,14 @@
     // the scope is read here, where the effect tracks it, not in the timer below
     const scopeTarget = target;
     const scopeGraph = graph;
-    const scope = `${scopeTarget}\u0000${scopeGraph ?? ''}\u0000${langs.join(',')}`;
+    const individualCommit = k === 'NamedIndividual' ? (summary?.commit ?? null) : null;
+    const scope = `${scopeTarget}\u0000${scopeGraph ?? ''}\u0000${langs.join(',')}\u0000${individualCommit ?? ''}`;
     if (scope !== filteredIn) {
       // another dataset, branch or graph must not keep showing the last scope's hits
       filteredIn = scope;
       filtered = null;
     }
-    if (!kind || text.length < 2) {
+    if (!kind || text.length < 2 || (kind === 'individual' && individualCommit == null)) {
       filtered = null;
       return;
     }
@@ -576,16 +589,22 @@
     const k = kindTab;
     const lt = k === 'NamedIndividual' ? individualLevel : level;
     if (!iri || !lt || !k) return;
+    if (k === 'NamedIndividual' && summary?.commit == null) return;
     void summary?.commit;
     // after the levels were read again, which this reads the path of
     void levelEpoch;
+    let active = true;
     untrack(() => {
       void lt.reveal(iri).then((anc) => {
+        if (!active) return;
         const cur = openSet(k);
         if (!anc.every((a) => cur.has(a))) opened = { ...opened, [k]: new Set([...cur, ...anc]) };
         scrollToRow(iri);
       });
     });
+    return () => {
+      active = false;
+    };
   });
 
   // the lists that the pickers and completion read: the page reads them once an entity, the
@@ -1429,7 +1448,7 @@
                         onselect={individualSelect}
                         ontoggle={(id) => individualSelect(id)}
                       />
-                    {:else if individualLevel.loading}
+                    {:else if individualLevel.loading || !summary}
                       <p class="empty">Reading the individuals…</p>
                     {:else}
                       <p class="empty">No individuals.</p>

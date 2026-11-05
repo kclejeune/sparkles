@@ -122,8 +122,8 @@ ontologies of millions of classes open and scroll at the speed of a screenful. T
 Individuals tab reads type buckets and named members through the paged individuals route.
 Each type expands independently, and Untyped holds named individuals without an asserted
 named class. Multiple types place an individual once under each asserted class. Anonymous
-individuals remain outside this named-entity tree. Pages carry their commit, and later
-reads stay at that revision. A link locates its individual without reading preceding
+individuals remain outside this named-entity tree. The first page uses the displayed
+summary commit, and later reads stay at that revision. A link locates its individual without reading preceding
 pages. Type buckets use separate row identities, so a class that is also an individual
 does not create a cycle. Names use the shared rendering and ordered language preferences.
 This is item 607. Server root discovery and Untyped pages scan the selected scope, and
