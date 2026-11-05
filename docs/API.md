@@ -2057,8 +2057,8 @@ in the graphs read, at most `limit` of each list, 100 by default, and `truncated
 whether a list was cut. `kind` answers one kind only. An IRI that the ontology neither
 declares nor uses as an entity, or as that `kind`, is `404`. An entity that only the
 stored assertions use is found as the class of a class assertion, the property of a
-property assertion, or the subject of an assertion or object of an equality for an
-individual. With `inferences=true` the lists include the
+property assertion, or the subject of an assertion or object of an equality or mapped object-property assertion
+for an individual. With `inferences=true` the lists include the
 materialized closure, such as the inferred superclasses of a class.
 
 ```json

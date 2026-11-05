@@ -781,7 +781,8 @@ lookups answer `NotFound` for an IRI that the ontology does not have as that kin
 §2.5 asks. An entity that only the stored assertions use is found by a probe of the
 graphs read that stops at its first match. A class is found as the class of a class
 assertion, a property as the property of a property or annotation assertion, and a named
-individual as the subject of an assertion or the object of an `owl:sameAs` or
+individual as the subject of an assertion, the object of a mapped object-property
+assertion or the object of an `owl:sameAs` or
 `owl:differentFrom` assertion. The probes keep the request's deadline and cancellation.
 
 `Ontologies::graph` and `Ontologies::graphs` start an `OntologyScope`, a builder over
