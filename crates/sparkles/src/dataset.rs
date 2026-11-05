@@ -205,7 +205,7 @@ pub struct DatasetState {
     /// the last OWL 2 EL classification of an ontology read by a caller who reads every
     /// graph, with the classifier's saturated state
     #[cfg(feature = "ontology")]
-    pub classify_cache: Mutex<Option<crate::handles::ontology::classify::CacheEntry>>,
+    pub(crate) classify_cache: Mutex<crate::handles::ontology::kept::KeptCache>,
     /// held while a kept classification runs, so that one runs at a time
     #[cfg(feature = "ontology")]
     pub classify_flight: Mutex<()>,
@@ -425,7 +425,7 @@ impl Dataset {
             #[cfg(feature = "ontology")]
             ontology_cache: Mutex::new(Vec::new()),
             #[cfg(feature = "ontology")]
-            classify_cache: Mutex::new(None),
+            classify_cache: Mutex::new(Default::default()),
             #[cfg(feature = "ontology")]
             classify_flight: Mutex::new(()),
             #[cfg(feature = "ontology")]

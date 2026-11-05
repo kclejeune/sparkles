@@ -791,7 +791,22 @@ fn ontology(p: &mut Paths) {
             .errors(&[400, 404, 408]),
     );
     p.add(
-        write_params(op(POST, "/$/ontology/{ds}/classify", "classifyOntology", "Ontology", "Classify an OWL 2 EL ontology"))
+        read(op(GET, "/$/ontology/{ds}/classification", "keptClassification", "Ontology", "Read an existing immutable classification"))
+            .doc("Reads kept state only. A miss never maps or classifies an ontology, reserves classifier workers or writes. Status is available, running, mismatch or unavailable. Restricted graph/triple views and synthetic snapshots return unavailable without observing the shared slot. A kept result names its exact store/branch, source commit, input/content/source fingerprints and original producer options. Named-class direct parents, equivalents and unsatisfiability are available; property/individual entailments and justifications are not. Outcome distinguishes partial, exclusions and consistency. Nonzero offsets require resultId and at=commit:N. Replacement or eviction refuses a pin instead of switching results. Sources pages include every typed requested graph, resolved graph, import and warning row in digest order. Page output and name buffers are bounded; counts and ordering can scan retained vectors. Historical names use the pinned authorized snapshot and full IRI fallback. Every response is Cache-Control: no-store and bypasses commit-only conditional 304. Unknown selectors, duplicate singleton selectors, inferences (even false), computing options and invalid pins are refused.")
+            .see("ontology")
+            .param("at")
+            .query("part", json!({"type":"string","enum":["status","parents","equivalents","sources","excluded"]}), "The bounded portion to read, status by default.")
+            .query("about", s(), "An absolute named-class IRI, required for parents/equivalents and optional for status.")
+            .query("resultId", json!({"type":"string","format":"uuid"}), "The immutable result to read, required for continuation.")
+            .query("offset", json!({"type":"integer","minimum":0}), "The first row, zero by default. Nonzero offsets require an exact commit and resultId.")
+            .query("limit", json!({"type":"integer","minimum":1,"maximum":1000}), "At most this many rows, 100 by default.")
+            .query("lang", s(), "Comma-separated preferred label languages, otherwise Accept-Language.")
+            .query("timeout", json!({"type":"number","minimum":0}), "The read deadline in milliseconds.")
+            .resp("200", "Availability and an optional bounded page from one immutable result.", Some(json!({"application/json":{"schema":sref("KeptClassification")}})))
+            .errors(&[400,403,404,408,410]),
+    );
+    p.add(
+        write_params(op(POST, "/$/ontology/{ds}/classify", "classifyOntology", "Ontology", "Classify an ontology and optionally project a bounded class frame"))
             .doc("Classifies the terminology with the OWL 2 EL classifier and answers whether it is consistent, the unsatisfiable classes, the axioms outside OWL 2 EL that the classification left out or used in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses and its equivalent classes, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. The dataset keeps the last classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what a run with the disjunctive rules proved before it stopped. The answer's `complete` is false for such a partial answer, `partial` is true, `incomplete` lists the classes whose superclasses it may miss and `consistency` is `consistent`, `inconsistent` or `unknown`. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.")
             .see("ontology")
             .query("format", json!({ "type": "string", "enum": ["json", "ofn"] }), "`json` (the default) or `ofn`.")
@@ -809,6 +824,8 @@ fn ontology(p: &mut Paths) {
                         "target": { "type": "string", "description": "A named graph outside the graphs read that takes the direct taxonomy." },
                         "message": { "type": "string", "description": "The commit message of the write, also kept as a comment on the header." },
                         "about": { "type": "string", "description": "A class IRI to describe." },
+                        "projection": { "type": ["string","null"], "enum": ["frame", null], "description": "With frame, require about and return bounded direct-parent/equivalence/source/exclusion samples with exact source/outcome. Limit is at most 1,000. False nodes, zero/null offset and null target retain their defaults. Effective nodes, offset, target and OFN output are refused before computing. Ineligible results remain local and advertise no shared continuation. Missing/null projection retains legacy output." },
+                        "lang": { "oneOf": [{"type":"string"},{"type":"array","items":{"type":"string"}},{"type":"null"}], "description": "Preferred labels for frame projection only." },
                         "nodes": { "type": "boolean", "description": "List the taxonomy's nodes." },
                         "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "The most nodes, unsatisfiable classes, incomplete classes and excluded axioms listed (100 by default)." },
                         "offset": { "type": "integer", "minimum": 0, "description": "The first node listed." },
@@ -822,7 +839,7 @@ fn ontology(p: &mut Paths) {
                 "200",
                 "The classification, with the receipt when a write asked for one.",
                 Some(json!({
-                    "application/json": { "schema": { "type": "object" } },
+                    "application/json": { "schema": { "oneOf": [{ "type": "object", "required": ["consistent","complete","classes"], "properties": {"consistent":{"type":"boolean"},"complete":{"type":"boolean"},"classes":{"type":"integer"}} }, sref("OntologyFrameClassification")] } },
                     "text/owl-functional": { "schema": { "type": "string" } }
                 })),
             )

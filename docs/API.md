@@ -2176,9 +2176,94 @@ the `diff` endpoint. A commit that the dataset's history no longer keeps is `410
   "removed": [], "changedQuads": 2, "method": "log" }
 ```
 
+`GET /$/ontology/{ds}/classification` reads an existing classification without running
+one. It never maps an ontology on a miss, reserves classifier workers, materializes
+inferences or writes. `graph`, `imports`, `mode`, `branch` and `at` select the asserted
+source. Its named-class capabilities are direct parent equivalence groups, equivalent
+named classes and unsatisfiability. General property and individual entailments,
+classification justifications and inferred axiom listings remain separate work.
+
+The response has `commit`, `status`, nullable `reason`, `result`, `outcome`, `entity`,
+`activity`, `page` and `staleCommit`. `available` describes an immutable completed result
+for the exact input and commit. `running` describes a matching active run, with no borrowed
+result or outcome. `mismatch` identifies a different retained commit or replaced result
+of the same input, without inference rows. `unavailable` includes an absent or evicted
+result. A graph- or triple-restricted view or a synthetic snapshot always returns
+`unavailable` with `reason: "unsupportedScope"`, without inspecting another view's cache.
+Ordinary permission, unknown-branch and pruned-history failures remain errors. A kept
+result cannot resurrect pruned history. Every response has `Cache-Control: no-store` and
+bypasses commit-only conditional 304, since availability can change at the same commit.
+
+An available `result` carries `resultId`, `classifiedCommit`, store and family identities,
+input, content and source fingerprints, normalized imports and mode, the actual producer's
+assertions, EL-only, partial-request and expansion options, source counts, finite
+capabilities and `justifications: "unavailable"`. Producer-only partial/expansion choices
+are reported as originally used, rather than replaced by a later compatible caller's
+options. A DL query may advance the mutable saturation without relabeling a previously
+published result. `outcome` gives the actual tier, consistency, partial/completeness flags
+and excluded/incomplete counts. Unknown outcomes are null. A completed run with exclusions
+has `partial: false` and `complete: false`. Stopped partial taxonomies are never retained.
+An available result with an unknown class returns `entity.present: false`, not an empty
+inference success.
+
+`part` is `status` by default, or `parents`, `equivalents`, `sources` or `excluded`.
+`about` is an absolute named-class IRI, required for parents and equivalents, optional
+for status and refused for sources or excluded. `offset` defaults to zero and `limit`
+to 100, with limits from 1 to 1,000. A page has `part`, `about`, `offset`, `limit`,
+`total`, `items` and nullable `nextOffset`. Continue with the same `resultId` and
+`at=commit:N`; both are required for nonzero offsets. Eviction or replacement refuses
+the pin instead of silently switching results. An old pinned result remains readable
+while a newer commit is being classified, if its history and publication remain retained.
+Unknown selectors, duplicate singleton selectors, computing/write options, unsigned
+overflow and any `inferences` selector, including false, are refused.
+
+Parents lists one canonical IRI and `equivalenceCount` for each direct parent group.
+Equivalents lists the selected node's named classes except self, in lexical IRI order.
+Each returned name has a label and label language from the pinned authorized snapshot.
+`lang`, or `Accept-Language` when absent, selects label preferences. Complete IRIs remain
+the fallback when historical prefixes cannot be established. Sources is one paged typed
+sequence of requested graphs, resolved graphs, imports and warnings. Every row has `kind`
+and `ordinal`; graph rows have `graph`, resolved rows also have `requested`, import rows
+have `iri` and nullable `location`/`graph`, and warning rows have `message`. The source
+fingerprint covers the complete canonical sequence, not just its displayed samples.
+Excluded rows contain the axiom type, OFN, structural JSON and a typed `gap`, either
+`omitted` with rule/message or `partiallyUsed` with its reason. These pages bound output
+and name buffers, not scan work or arbitrary scalar IRI/axiom sizes.
+
+The same read is `Ontologies::kept_classification`, `OntologyScope::kept_classification`,
+Python `Dataset.ontology.kept_classification`, Node.js
+`Dataset.ontology.keptClassification` and JVM `SparklesOntology.keptClassification`,
+with a `SparklesOnt` convenience and an operation/cancellation overload. These adapters
+omit the inherited false inferences default rather than sending a refused selector.
+The new JVM kept-read and frame-projection conveniences throw `JenaTransactionException`
+on pinned dataset wrappers and during active read or write transactions, before any native
+read, classification, write flush or cache warming. A live dataset with `OntologyRead.at`
+reads a retained committed view on its bound branch. Full wrapper-source integration
+remains in item 588; legacy ontology methods keep their existing behavior.
+
 `POST /$/ontology/{ds}/classify` classifies the ontology by OWL 2 EL, in the manner of
 the ELK reasoner. It takes `graph`, `imports` and `mode` in the body and `at` as a query
 parameter, and answers the inferred class hierarchy and the unsatisfiable classes.
+An optional `projection: "frame"` requires a valid `about` and returns bounded direct
+parents, equivalents, source/warning samples and exclusion samples with totals and
+truncation flags, exact immutable result/source identity and outcome. `limit` is from
+1 to 1,000 for this projection. It branches before constructing legacy ancestor or
+whole-equivalence arrays. It accepts harmless `nodes: false`, null/zero offset and null
+target defaults, but refuses `nodes: true`, nonzero offset, an effective write target or
+OFN output before mapping or worker admission. `lang` is available only with this
+projection. Missing or null projection preserves legacy output. Unknown projection
+values and duplicate/conflicting projection selectors are invalid.
+
+A restricted or otherwise non-retained explicit projection still returns the authorized
+clauses from that computation. Its `frame.retention.kept` is false and readable
+`resultId` is null. Truncated isolated samples have no shared GET continuation; reading
+more must not silently classify again. An eligible retained projection supplies its pin
+for bounded GET continuations. A display result ID alone does not grant such access.
+Legacy JSON also carries `classificationSource` with exact bound source and deterministic
+input/content fingerprints. Repeated explicit full-tree POST pages must pin their commit
+and compare these fingerprints before appending. Equal complete content from separate
+runs may append; different fallback, partial or outcome content must not.
+
 `consistent` is false when the ontology has no model, and every class is then
 unsatisfiable. An axiom outside OWL 2 EL is left out and listed under `excluded` with
 the rule it breaks. An axiom that the classifier uses only in part, such as one with an
@@ -2358,6 +2443,11 @@ Node.js and members of `ClassifyQuery` on the JVM. A partial run stops at the ca
 `timeout`, which is in milliseconds in Node.js and is the `SparklesOperation` timeout on the
 JVM, or when the caller cancels it with Python's `cancel` token, Node.js's `signal` or the
 JVM's `SparklesOperation.cancel()`. In Node.js, a dataset that closes before the caller stops the call still fails it.
+After an actual stopped partial run, source fingerprints and response serialization
+finish over the result already produced. This result-local read-only work can extend the
+response beyond the compute deadline. It neither resumes classification, resets shared
+cancellation flags nor retains the partial result. Completed results and later bounded
+reads continue to honor cancellation and deadlines.
 
 Typed constructors build axioms without writing their syntax. Python's `sparkles.owl`
 and Node.js's `owl` namespace have one constructor per axiom type and per expression,

@@ -107,6 +107,12 @@ public object SparklesOnt {
     public fun individuals(dataset: DatasetGraphSparkles, graphIri: String? = null, type: String? = null, untyped: Boolean = false, iri: String? = null, after: String? = null, limit: Int = 100): JsonObject =
         dataset.ontology().individuals(OntologyRead(graph = graphIri), type, untyped, iri, after, limit)
 
+    /** Read kept classification state without starting a classifier. */
+    @JvmStatic
+    @JvmOverloads
+    public fun keptClassification(dataset: DatasetGraphSparkles, graphIri: String? = null, query: KeptClassificationQuery = KeptClassificationQuery()): JsonObject =
+        dataset.ontology().keptClassification(OntologyRead(graph = graphIri), query)
+
     /** What the graph says about one entity, read without the whole ontology, as [SparklesOntology.term] answers it. */
     @JvmStatic
     @JvmOverloads
@@ -480,6 +486,21 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         return call("individuals", args, operation, false)
     }
 
+    /** Read existing immutable classification state only. Missing state never computes.
+     * A continuation needs [KeptClassificationQuery.resultId] and the returned commit
+     * in [OntologyRead.at]. Restricted views report unavailable. Use a live dataset
+     * outside a transaction; pinned dataset wrappers are refused rather than routed
+     * to head. Retained history is selected with [OntologyRead.at] on that live dataset. */
+    @JvmOverloads public fun keptClassification(read: OntologyRead = OntologyRead(), query: KeptClassificationQuery = KeptClassificationQuery()): JsonObject =
+        SparklesOperation().use { keptClassification(read, query, it) }
+    public fun keptClassification(read: OntologyRead, query: KeptClassificationQuery, operation: SparklesOperation): JsonObject {
+        owner.checkCapture("ontology.keptClassification (use OntologyRead.at for retained history)")
+        require(!read.inferences) { "kept classification reads asserted inputs" }
+        val args = read.value()
+        query.into(args)
+        return call("keptClassification", args, operation, false)
+    }
+
     /**
      * What the graphs say about the entity `iri`, read without reading the whole ontology:
      * its statements with their annotations, the axioms they map to, the axioms of other
@@ -573,6 +594,7 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
     @JvmOverloads public fun classify(read: OntologyRead = OntologyRead(), query: ClassifyQuery = ClassifyQuery()): JsonObject =
         SparklesOperation().use { classify(read, query, it) }
     public fun classify(read: OntologyRead, query: ClassifyQuery, operation: SparklesOperation): JsonObject {
+        if (query.projection != null) owner.checkCapture("ontology frame projection (use OntologyRead.at for retained history)")
         val args = read.value()
         query.into(args)
         return call("classify", args, operation, query.target != null)
@@ -648,6 +670,9 @@ public data class ClassifyQuery @JvmOverloads public constructor(
     public val partial: Boolean = false,
     /** the expansion strategy of the disjunctive rules, `cautious` (the default) or `eager` */
     public val expansion: String? = null,
+    /** `frame` returns bounded direct-parent/equivalence clauses instead of legacy arrays. */
+    public val projection: String? = null,
+    public val languages: List<String> = emptyList(),
 ) {
     init {
         require(limit > 0 && offset >= 0 && threads >= 0)
@@ -665,5 +690,27 @@ public data class ClassifyQuery @JvmOverloads public constructor(
         message?.let { j.put("message", it) }
         if (partial) j.put("partial", true)
         expansion?.let { j.put("expansion", it) }
+        projection?.let { j.put("projection", it) }
+        if (languages.isNotEmpty()) j.put("lang", languages.joinToString(","))
+    }
+}
+
+/** A bounded read from one kept classification. Nonzero offsets require an exact pin. */
+public data class KeptClassificationQuery @JvmOverloads public constructor(
+    public val part: String = "status",
+    public val about: String? = null,
+    public val offset: Long = 0,
+    public val limit: Int = 100,
+    public val resultId: String? = null,
+    public val languages: List<String> = emptyList(),
+) {
+    internal fun into(j: JsonObject) {
+        require(limit in 1..1000 && offset >= 0)
+        j.put("part", part)
+        about?.let { j.put("about", it) }
+        j.put("offset", offset)
+        j.put("limit", limit.toLong())
+        resultId?.let { j.put("resultId", it) }
+        if (languages.isNotEmpty()) j.put("lang", languages.joinToString(","))
     }
 }

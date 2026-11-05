@@ -485,6 +485,39 @@ impl PyOntologies {
         answer(py, j, &[])
     }
 
+    /// Read an existing kept classification without classifying on a miss. Page
+    /// continuations require its `result_id` and exact returned commit as `at`.
+    #[pyo3(signature=(graph=None, *, part="status", about=None, offset=0, limit=100, result_id=None, lang=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn kept_classification<'py>(
+        &self,
+        py: Python<'py>,
+        graph: Option<&Bound<'py, PyAny>>,
+        part: &str,
+        about: Option<&str>,
+        offset: usize,
+        limit: usize,
+        result_id: Option<&str>,
+        lang: Option<&Bound<'py, PyAny>>,
+        imports: bool,
+        mode: &str,
+        at: Option<&Bound<'py, PyAny>>,
+        cancel: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut a = base(graph, imports, mode, false)?;
+        a.remove("inferences");
+        a.insert("at".into(), at_json(at)?);
+        a.insert("part".into(), json!(part));
+        a.insert("about".into(), json!(about));
+        a.insert("offset".into(), json!(offset));
+        a.insert("limit".into(), json!(limit));
+        a.insert("resultId".into(), json!(result_id));
+        a.insert("lang".into(), names_json(lang)?);
+        let j = self.run(py, "keptClassification", a, cancel, timeout, false)?;
+        answer(py, j, &[])
+    }
+
     /// What the graphs say about the entity `iri`, as `GET /$/ontology/{ds}/term` answers
     /// it, read without reading the whole ontology: a dict with its `statements` and
     /// their annotations, the `axioms` they map to, the axioms of other entities that
@@ -683,7 +716,7 @@ impl PyOntologies {
     /// what a run with the disjunctive rules proved when `timeout` or `cancel` stops it,
     /// with `partial` true, the `incomplete` classes and the `consistency`, and
     /// `expansion` (`cautious` or `eager`) picks those rules' expansion strategy.
-    #[pyo3(signature=(graph=None, *, assertions=false, about=None, nodes=false, limit=None, offset=None, threads=None, target=None, message=None, partial=false, expansion=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
+    #[pyo3(signature=(graph=None, *, assertions=false, about=None, nodes=false, limit=None, offset=None, threads=None, target=None, message=None, partial=false, expansion=None, projection=None, lang=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn classify<'py>(
         &self,
@@ -699,6 +732,8 @@ impl PyOntologies {
         message: Option<String>,
         partial: bool,
         expansion: Option<String>,
+        projection: Option<String>,
+        lang: Option<&Bound<'py, PyAny>>,
         imports: bool,
         mode: &str,
         at: Option<&Bound<'py, PyAny>>,
@@ -711,6 +746,8 @@ impl PyOntologies {
         a.insert("assertions".into(), json!(assertions));
         a.insert("partial".into(), json!(partial));
         a.insert("expansion".into(), json!(expansion));
+        a.insert("projection".into(), json!(projection));
+        a.insert("lang".into(), names_json(lang)?);
         if let Some(c) = about {
             a.insert(
                 "about".into(),

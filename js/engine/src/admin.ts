@@ -525,6 +525,104 @@ export interface OntologyExcluded extends OntologyAxiom {
   message?: string;
   partial?: string;
 }
+
+/** Immutable producer identity of a kept or explicitly projected classification. */
+export interface ClassificationResult {
+  resultId: string;
+  classifiedCommit: bigint;
+  boundStoreId: string;
+  familyId: string;
+  inputFingerprint: string;
+  sourceFingerprint: string;
+  contentFingerprint: string;
+  imports: 'dataset' | 'none';
+  mode: 'lenient' | 'strict';
+  assertions: boolean;
+  elOnly: boolean;
+  partialRequested: boolean;
+  expansion: 'cautious' | 'eager';
+  sourceCounts: {
+    requestedGraphs: number;
+    resolvedGraphs: number;
+    imports: number;
+    warnings: number;
+  };
+  capabilities: string[];
+  justifications: 'unavailable';
+}
+export interface ClassificationOutcome {
+  tier: string;
+  partial: boolean;
+  complete: boolean;
+  consistency: 'consistent' | 'inconsistent' | 'unknown';
+  excludedCount: number;
+  incompleteCount: number;
+}
+export type ClassificationSourceRow =
+  | { kind: 'requestedGraph'; ordinal: number; graph: string }
+  | { kind: 'resolvedGraph'; ordinal: number; graph: string; requested: boolean }
+  | { kind: 'import'; ordinal: number; iri: string; location: string | null; graph: string | null }
+  | { kind: 'warning'; ordinal: number; message: string };
+export type ClassificationPart = 'status' | 'parents' | 'equivalents' | 'sources' | 'excluded';
+export type ClassificationName = Pick<OntologyName, 'iri' | 'label' | 'labelLang'>;
+export interface KeptClassification {
+  dataset: string;
+  commit: bigint;
+  status: 'available' | 'running' | 'mismatch' | 'unavailable';
+  reason: string | null;
+  result: ClassificationResult | null;
+  outcome: ClassificationOutcome | null;
+  entity: { iri: string; present: boolean; unsatisfiable: boolean | null } | null;
+  activity: { kind: string; commit: bigint } | null;
+  staleCommit: bigint | null;
+  page: {
+    part: ClassificationPart;
+    about: string | null;
+    offset: number;
+    limit: number;
+    total: number;
+    items: (
+      | ClassificationName
+      | (ClassificationName & { equivalenceCount: number })
+      | ClassificationSourceRow
+      | OntologyExcluded
+    )[];
+    nextOffset: number | null;
+  } | null;
+}
+export interface OntologyFrameClassification {
+  dataset: string;
+  commit: bigint;
+  classificationSource: {
+    boundStoreId: string;
+    familyId: string;
+    commit: bigint;
+    inputFingerprint: string;
+    contentFingerprint: string;
+    producer: {
+      assertions: boolean;
+      elOnly: boolean;
+      partialRequested: boolean;
+      expansion: string;
+    };
+  };
+  frame: {
+    iri: string;
+    result: ClassificationResult;
+    outcome: ClassificationOutcome;
+    unsatisfiable: boolean;
+    parents: {
+      total: number;
+      limit: number;
+      truncated: boolean;
+      items: (ClassificationName & { equivalenceCount: number })[];
+    };
+    equivalents: { total: number; limit: number; truncated: boolean; items: ClassificationName[] };
+    excluded: { total: number; limit: number; truncated: boolean; items: OntologyExcluded[] };
+    sources: { total: number; truncated: boolean; items: ClassificationSourceRow[] };
+    retention: { kept: boolean; resultId: string | null };
+  };
+}
 /** The OWL 2 EL classification of an ontology (spec F24). */
 export interface OntologyClassification extends OntologyState {
   /** false only when the ontology is proved inconsistent; see `consistency` */
@@ -790,6 +888,37 @@ export class Administration {
       };
     };
     this.ontology = {
+      /** Read kept state only. A miss never starts classification. Continuations
+       * require the returned resultId and exact commit as at. */
+      keptClassification: (
+        o: Omit<OntologyRead, 'inferences'> &
+          OperationOptions & {
+            part?: ClassificationPart;
+            about?: string;
+            resultId?: string;
+            offset?: number;
+            limit?: number;
+            lang?: string | string[];
+          } = {},
+      ) => {
+        if ((o as OntologyRead).inferences)
+          throw new TypeError('Kept classification reads asserted inputs.');
+        const { inferences: _inferences, ...selection } = readSelection(o);
+        return call<KeptClassification>(
+          'ontology.keptClassification',
+          {
+            ...selection,
+            part: o.part,
+            about: o.about,
+            resultId: o.resultId,
+            offset: o.offset,
+            limit: o.limit,
+            lang: o.lang,
+          },
+          o,
+          false,
+        );
+      },
       /** The header, the counts of entities and axioms, the graphs read and the diagnostics. */
       summary: (o: OntologyRead & OperationOptions = {}) =>
         call<OntologySummary>('ontology.summary', ontologyArgs(o), o, false),
@@ -1056,7 +1185,7 @@ export class Administration {
        * cancellation stops it, with `partial` true, the `incomplete` classes and the
        * `consistency`.
        */
-      classify: (
+      classify: <P extends 'frame' | undefined = undefined>(
         o: OntologySelection &
           UpdateOptions & {
             at?: string | number | bigint;
@@ -1072,9 +1201,11 @@ export class Administration {
             partial?: boolean;
             /** the expansion strategy of the disjunctive rules */
             expansion?: 'cautious' | 'eager';
+            projection?: P;
+            lang?: string | string[];
           } = {},
       ) =>
-        call<OntologyClassification>(
+        call<P extends 'frame' ? OntologyFrameClassification : OntologyClassification>(
           'ontology.classify',
           {
             graph: o.graph,
@@ -1091,6 +1222,8 @@ export class Administration {
             message: o.message,
             partial: o.partial,
             expansion: o.expansion,
+            projection: o.projection,
+            lang: o.lang,
           },
           // a partial answer comes after the timeout that stopped the run
           o.partial ? ({ ...o, answersWhenStopped: true } as typeof o) : o,
@@ -1532,6 +1665,8 @@ const counts = new Set([
   'removed',
   'commit',
   'firstCommit',
+  'classifiedCommit',
+  'staleCommit',
   'baseSeq',
   'endSeq',
   'bytes',

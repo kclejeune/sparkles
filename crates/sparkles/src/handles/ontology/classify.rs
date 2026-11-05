@@ -37,6 +37,9 @@
 //! # Ok::<_, sparkles::Error>(())
 //! ```
 
+use super::kept::{
+    InputKey, KeptClassification, KeptFlight, classification_retained_bytes, retention_cap,
+};
 use super::{
     EditOutcome, EditRequest, Extra, INFERRED_GRAPH, Ontologies, OntologyRequest, Opened, check,
 };
@@ -107,6 +110,13 @@ const COMMENT: &str = "The OWL 2 EL taxonomy that the Sparkles classifier comput
 pub struct Classified {
     pub opened: Opened,
     pub classification: Arc<Classification>,
+    /// Immutable source, producer policy and content identity of this computation.
+    pub(super) publication: Arc<KeptClassification>,
+    pub(super) retained: bool,
+    // Caller permissions and cancellation only. The snapshot has triple masks,
+    // while graph restrictions still need their immutable access rules. Do not
+    // hold a dataset owner or query memory-pool grant for projection reads.
+    pub(super) read_options: QueryOptions,
     /// the axioms left out, as outside OWL 2 EL, or used only in part
     pub excluded: Arc<Vec<Excluded>>,
     /// whether the dataset's kept classification of the same state answered
@@ -124,12 +134,30 @@ impl Classified {
     }
 }
 
+/// A completed run still obeys the caller's stop controls during projection.
+/// An actual partial result has already acknowledged the compute stop: finish
+/// its immutable metadata/answer as the existing partial API requires. This
+/// changes only result-local options, never the shared flags, workers or cache.
+pub(super) fn result_options(opts: &QueryOptions, complete: bool) -> QueryOptions {
+    QueryOptions {
+        graphs: opts.graphs.clone(),
+        cancel: if complete { opts.cancel.clone() } else { None },
+        cancellation: if complete {
+            opts.cancellation.clone()
+        } else {
+            None
+        },
+        deadline: if complete { opts.deadline } else { None },
+        ..Default::default()
+    }
+}
+
 /// The classification the dataset keeps: the saturated contexts and the open ontology
 /// they were saturated from, whose axioms the saturation reads in place rather than
 /// copying them.
 pub struct CacheEntry {
-    key: String,
-    commit: u64,
+    pub(super) key: InputKey,
+    pub(super) mutated: bool,
     ontology: Option<Arc<sparkles_owl::read::Ontology>>,
     /// the axioms beyond the ontology's that the saturation last read, such as a DL
     /// query's defining axiom, which the next run removes unless it reads them again
@@ -137,18 +165,27 @@ pub struct CacheEntry {
     pub(super) saturation: Saturation,
     /// the taxonomy of the ontology at `commit`, once a classification computed it,
     /// which a DL query's run over the saturation leaves as it is
-    result: Option<(Arc<Classification>, Arc<Vec<Excluded>>)>,
+    pub(super) result: Option<Arc<KeptClassification>>,
 }
 
 impl CacheEntry {
+    pub(super) fn new(key: InputKey) -> Self {
+        Self {
+            key,
+            mutated: false,
+            ontology: None,
+            extra: Vec::new(),
+            saturation: Saturation::new(),
+            result: None,
+        }
+    }
     /// The estimated bytes of the kept taxonomy, 0 when none is kept.
     pub(super) fn taxonomy_memory(&self) -> usize {
         self.result
             .as_ref()
-            .map_or(0, |(cl, _)| cl.stats.taxonomy_memory)
+            .map_or(0, |p| p.classification.stats.taxonomy_memory)
     }
-
-    /// Lets the kept taxonomy go, so that the next classification builds it again.
+    /// Lets both flight finalization and the next classification know it has gone.
     pub(super) fn drop_taxonomy(&mut self) {
         self.result = None;
     }
@@ -163,6 +200,7 @@ impl CacheEntry {
         extra: Vec<AxiomKind>,
         go: impl FnOnce(&mut Saturation, &[&AxiomKind], Option<Changes<'_>>) -> Result<R>,
     ) -> Result<R> {
+        self.mutated = true;
         let before = self.ontology.take();
         let before_extra = std::mem::take(&mut self.extra);
         let out = {
@@ -250,7 +288,7 @@ impl Ontologies {
         let (snap, opts) = self.state(req, opts)?;
         let o = self.open_at(&snap, req, &opts)?;
         let keep = opts.graphs.is_none() && snap.cacheable && !c.assertions && !c.el_only;
-        let (classification, excluded, reused) = if keep {
+        let (publication, reused) = if keep {
             self.classify_kept(&o, req, c, &opts)?
         } else {
             let mut assertions: Vec<Axiom> = Vec::new();
@@ -265,10 +303,22 @@ impl Ontologies {
             let mut axioms = logical_axioms(&o.ontology);
             axioms.extend(assertions.iter().map(|a| &a.kind).filter(|k| logical(k)));
             let (out, excluded) = classify_once(&axioms, c, &opts)?;
-            (Arc::new(out), Arc::new(excluded), false)
+            (
+                KeptClassification::capture(
+                    self,
+                    req,
+                    c,
+                    &o,
+                    Arc::new(out),
+                    Arc::new(excluded),
+                    &opts,
+                )?,
+                false,
+            )
         };
         if let Some(about) = &c.about
-            && classification
+            && publication
+                .classification
                 .taxonomy
                 .node_of(&sparkles_owl::Class::new(about.as_str()))
                 .is_none()
@@ -277,10 +327,23 @@ impl Ontologies {
                 "the taxonomy has no class <{about}>"
             )));
         }
+        let retained = keep
+            && self
+                .ds
+                .state()
+                .classify_cache
+                .lock()
+                .publication
+                .as_ref()
+                .is_some_and(|p| p.id == publication.id);
+        let classified_complete = publication.classification.complete;
         let mut classified = Classified {
             opened: o,
-            classification,
-            excluded,
+            classification: publication.classification.clone(),
+            excluded: publication.excluded.clone(),
+            publication,
+            retained,
+            read_options: result_options(&opts, classified_complete),
             reused,
             written: None,
         };
@@ -297,75 +360,97 @@ impl Ontologies {
         req: &OntologyRequest,
         c: &ClassifyRequest,
         opts: &QueryOptions,
-    ) -> Result<(Arc<Classification>, Arc<Vec<Excluded>>, bool)> {
-        let commit = o.snapshot.commit;
-        self.with_kept(req, opts, |e| {
-            if e.commit == commit
-                && let Some((cl, ex)) = &e.result
+    ) -> Result<(Arc<KeptClassification>, bool)> {
+        // Preserve the legacy no-work idle cache hit, including its past-compute-
+        // deadline behavior. An active flight still waits under caller controls;
+        // GET/frame name and page work has its own read checks.
+        let key = InputKey::of(self, req, &o.snapshot);
+        let state = self.ds.state();
+        if let Some(_idle) = state.classify_flight.try_lock() {
+            let cached = state.classify_cache.lock().publication.clone();
+            if let Some(p) =
+                cached.filter(|p| p.source.input == key && p.source.commit == o.snapshot.commit)
             {
-                return Ok(((cl.clone(), ex.clone(), true), true));
+                return Ok((p, true));
             }
-            // the threads come first: a wait that ends at the deadline leaves the kept
-            // state as it was
+        }
+        self.with_kept(o, req, opts, "classify", |e| {
+            if let Some(p) = &e.result
+                && p.source.commit == o.snapshot.commit
+            {
+                return Ok(((p.clone(), true), true));
+            }
+            // Admission precedes mutation, so a refused admission preserves a proven
+            // old entry/publication. Later errors conservatively discard both.
             let par = admit(c.threads, opts)?;
             let out = e.run_over(o, Vec::new(), |s, axioms, changes| {
                 run(s, axioms, changes, par, opts, c)
             })?;
-            let cl = Arc::new(out);
-            let ex = Arc::new(e.saturation.excluded().to_vec());
-            let keep = cl.stats.memory <= CACHE_MAX_BYTES;
-            e.commit = commit;
-            // a partial answer is never kept, so that no later call reuses it
-            e.result = (keep && cl.complete).then(|| (cl.clone(), ex.clone()));
-            Ok(((cl, ex, false), keep))
+            #[cfg(test)]
+            let out = if FORCE_PARTIAL.with(|f| f.replace(false)) {
+                let mut partial = out;
+                partial.complete = false;
+                partial.consistency = sparkles_owl::classify::Consistency::Unknown;
+                partial.incomplete = partial.taxonomy.classes().cloned().collect();
+                partial
+            } else {
+                out
+            };
+            let p = KeptClassification::capture(
+                self,
+                req,
+                c,
+                o,
+                Arc::new(out),
+                Arc::new(e.saturation.excluded().to_vec()),
+                opts,
+            )?;
+            let keep = p.classification.complete
+                && classification_retained_bytes(e, &p) <= retention_cap();
+            e.result = keep.then(|| p.clone());
+            Ok(((p, false), keep))
         })
     }
 
-    /// Runs `f` on the dataset's kept classification of the ontology `req` names: its
-    /// saturation, which [`CacheEntry::run_over`] brings to an open ontology's axioms,
-    /// and the taxonomy of the commit it last classified. One caller at a time holds it,
-    /// and a second waits under its own deadline. `f` answers whether the dataset keeps
-    /// the entry afterwards, and an error from `f` keeps it. Only callers who read every
-    /// graph of a state that can be kept use it.
+    /// One owned computing flight. Readers never take this lock or construct an
+    /// entry. Cancellation before mutation preserves the old state; mutating errors
+    /// and unwinds discard it. Publication changes are finalized as one pair.
     pub(super) fn with_kept<T>(
         &self,
+        o: &Opened,
         req: &OntologyRequest,
         opts: &QueryOptions,
+        kind: &'static str,
         f: impl FnOnce(&mut CacheEntry) -> Result<(T, bool)>,
     ) -> Result<T> {
-        let key = format!("{:?}|{:?}|{}", req.graphs(), req.imports, req.mode.as_str());
+        check(opts)?;
+        let key = InputKey::of(self, req, &o.snapshot);
         let state = self.ds.state();
-        // one run at a time: a second caller waits, then reads the first one's answer
-        let _flight = loop {
+        let lock = loop {
             if let Some(g) = state
                 .classify_flight
                 .try_lock_for(Duration::from_millis(50))
             {
                 break g;
             }
+            #[cfg(test)]
+            FLIGHT_WAIT_NOTIFY.with(|n| {
+                if let Some(tx) = n.borrow_mut().take() {
+                    let _ = tx.send(());
+                }
+            });
             check(opts)?;
         };
-        let kept = state.classify_cache.lock().take();
-        let mut e = match kept {
-            Some(e) if e.key == key => e,
-            _ => CacheEntry {
-                key,
-                commit: 0,
-                ontology: None,
-                extra: Vec::new(),
-                saturation: Saturation::new(),
-                result: None,
-            },
-        };
-        match f(&mut e) {
+        check(opts)?;
+        let mut flight = KeptFlight::begin(state, lock, key, o.snapshot.commit, kind);
+        match f(flight.entry()) {
             Ok((out, keep)) => {
-                if keep {
-                    *state.classify_cache.lock() = Some(e);
-                }
+                flight.finish(keep);
                 Ok(out)
             }
             Err(err) => {
-                *state.classify_cache.lock() = Some(e);
+                let preserve = !flight.entry().mutated;
+                flight.finish(preserve);
                 Err(err)
             }
         }
@@ -559,6 +644,8 @@ impl Ontologies {
 #[cfg(test)]
 thread_local! {
     /// Makes the next admission on this thread time out, as a full pool would.
+    pub(super) static FORCE_PARTIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static FLIGHT_WAIT_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static REFUSE_ADMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 

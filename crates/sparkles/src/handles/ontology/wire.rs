@@ -656,7 +656,7 @@ pub fn entity_body(
 // ------------------------------------------------------------- requests ------
 
 /// The operations [`call`] answers, in the names of the bindings' surface keys.
-pub const OPERATIONS: [&str; 15] = [
+pub const OPERATIONS: [&str; 16] = [
     "summary",
     "axioms",
     "entities",
@@ -671,6 +671,7 @@ pub const OPERATIONS: [&str; 15] = [
     "dlQuery",
     "hierarchy",
     "individuals",
+    "keptClassification",
     "term",
 ];
 
@@ -705,6 +706,8 @@ fn members(op: &str) -> &'static [&'static str] {
             "threads",
             "partial",
             "expansion",
+            "projection",
+            "lang",
         ],
         "parse" => &["text", "as"],
         "hierarchy" => &[
@@ -718,6 +721,7 @@ fn members(op: &str) -> &'static [&'static str] {
             "lang",
         ],
         "individuals" => &["type", "untyped", "iri", "after", "limit", "lang"],
+        "keptClassification" => &["part", "about", "offset", "limit", "resultId", "lang"],
         "term" => &["iri", "mentions", "incoming", "lang"],
         "dlQuery" => &[
             "expression",
@@ -931,9 +935,19 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
     {
         return Err(bad(format!("unknown member '{k}' of ontology.{op}")));
     }
+    if op == "keptClassification" && a.contains_key("inferences") {
+        return Err(bad(
+            "keptClassification does not take an inferences selector",
+        ));
+    }
     let req = request_of(a)?;
     let name = ds.name().unwrap_or("");
     let handle = ds.ontology();
+    if op == "keptClassification" {
+        let query = kept_query_of(a)?;
+        let answer = handle.kept_classification(&req, &query, opts)?;
+        return kept_body(name, &answer);
+    }
     let r = renderer(ds);
     let prefixes: Vec<(String, String)> = ds.prefixes().into_iter().collect();
     match op {
@@ -1077,7 +1091,14 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 nodes: boolean(a, "nodes")?.unwrap_or(false),
                 limit: number(a, "limit", 1, MAX_LIMIT)?.unwrap_or(DEFAULT_LIMIT),
                 offset: number(a, "offset", 0, usize::MAX)?.unwrap_or(0),
+                projection: projection_of(string(a, "projection")?)?,
+                languages: languages_of(a)?,
             };
+            q.validate_projection(
+                c.target.is_some(),
+                false,
+                a.get("lang").is_some_and(|v| !v.is_null()),
+            )?;
             let out = handle.classify(&req, &c, opts)?;
             classify_body(name, &out, &req, &r, &q)
         }
@@ -1194,7 +1215,7 @@ pub fn search_request_of(a: &Map<String, J>) -> Result<search::SearchRequest> {
     Ok(s)
 }
 
-fn languages_of(a: &Map<String, J>) -> Result<Vec<String>> {
+pub fn languages_of(a: &Map<String, J>) -> Result<Vec<String>> {
     let langs = list_of(a, "lang")?;
     for l in &langs {
         if oxilangtag::LanguageTag::parse(l.as_str()).is_err() {
@@ -1447,6 +1468,10 @@ pub fn search_body(name: &str, s: &search::SearchRequest, r: &search::SearchResu
 /// What the answer of a classification lists besides its counts.
 #[derive(Clone, Debug, Default)]
 pub struct ClassifyQuery {
+    /// Missing preserves legacy output. Frame avoids materializing legacy arrays.
+    pub projection: Option<ClassifyProjection>,
+    /// Frame-projection labels only; not part of semantic result compatibility.
+    pub languages: Vec<String>,
     /// a class whose equivalent classes, direct superclasses and subclasses and all
     /// superclasses the answer gives
     pub about: Option<String>,
@@ -1484,6 +1509,9 @@ pub fn classify_body(
     r: &Renderer,
     q: &ClassifyQuery,
 ) -> Result<J> {
+    if q.projection == Some(ClassifyProjection::Frame) {
+        return frame_body(name, c, req, q);
+    }
     let read = c.opened.view();
     let view = ClassificationView {
         read: &read,
@@ -1492,7 +1520,10 @@ pub fn classify_body(
         reused: c.reused,
         written: c.written.as_ref(),
     };
-    classification_body(name, &view, req, r, q)
+    let mut answer = classification_body(name, &view, req, r, q)?;
+    answer["classificationSource"] = c.publication.identity();
+    answer["resultId"] = json!(c.publication.id);
+    Ok(answer)
 }
 
 /// A classification and the read it classified, for [`classification_body`].
@@ -1845,4 +1876,184 @@ pub fn individuals_body(name: &str, r: &browse::Individuals) -> J {
         }).collect::<Vec<_>>(),
         "total": r.total, "next": r.next, "warnings": r.warnings,
     })
+}
+
+/// A bounded explicit frame projection, separate from legacy full taxonomy output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassifyProjection {
+    Frame,
+}
+pub fn projection_of(value: Option<&str>) -> Result<Option<ClassifyProjection>> {
+    match value {
+        None => Ok(None),
+        Some("frame") => Ok(Some(ClassifyProjection::Frame)),
+        Some(_) => Err(bad("projection must be frame or absent")),
+    }
+}
+impl ClassifyQuery {
+    /// Harmless adapter defaults (false nodes, zero/null offset, null target) stay
+    /// compatible. Effective computing/output conflicts fail before any admission.
+    pub fn validate_projection(&self, writes: bool, ofn: bool, has_language: bool) -> Result<()> {
+        if self.projection.is_none() {
+            if has_language {
+                return Err(bad("lang requires projection=frame"));
+            }
+            return Ok(());
+        }
+        if self.nodes || self.offset != 0 || writes || ofn {
+            return Err(bad(
+                "frame projection does not take nodes=true, a nonzero offset, target or OFN output",
+            ));
+        }
+        if !(1..=1000).contains(&self.limit) {
+            return Err(bad("frame projection limit must be from 1 to 1000"));
+        }
+        let iri = self
+            .about
+            .as_deref()
+            .ok_or_else(|| bad("frame projection requires about"))?;
+        oxrdf::NamedNode::new(iri).map_err(|_| bad("about must be an absolute named IRI"))?;
+        Ok(())
+    }
+}
+
+pub fn kept_query_of(a: &Map<String, J>) -> Result<super::kept::KeptQuery> {
+    use super::kept::{KeptQuery, Part};
+    if a.contains_key("inferences") {
+        return Err(bad("keptClassification does not take inferences"));
+    }
+    let part = match string(a, "part")?.unwrap_or("status") {
+        "status" => Part::Status,
+        "parents" => Part::Parents,
+        "equivalents" => Part::Equivalents,
+        "sources" => Part::Sources,
+        "excluded" => Part::Excluded,
+        _ => {
+            return Err(bad(
+                "part must be status, parents, equivalents, sources or excluded",
+            ));
+        }
+    };
+    let result_id = string(a, "resultId")?
+        .map(|s| {
+            let id =
+                uuid::Uuid::parse_str(s).map_err(|_| bad("resultId must be a canonical UUID"))?;
+            if id.to_string() != s {
+                return Err(bad("resultId must be a canonical UUID"));
+            }
+            Ok(id)
+        })
+        .transpose()?;
+    Ok(KeptQuery {
+        part,
+        about: iri_arg(a, "about")?,
+        offset: number(a, "offset", 0, usize::MAX)?.unwrap_or(0),
+        limit: number(a, "limit", 1, 1000)?.unwrap_or(100),
+        result_id,
+        languages: languages_of(a)?,
+    })
+}
+pub fn kept_body(name: &str, answer: &super::kept::KeptRead) -> Result<J> {
+    let mut value =
+        serde_json::to_value(answer).map_err(|e| bad(format!("kept classification: {e}")))?;
+    value["dataset"] = json!(name);
+    Ok(value)
+}
+
+fn frame_body(name: &str, c: &Classified, req: &OntologyRequest, q: &ClassifyQuery) -> Result<J> {
+    use super::kept::{KeptQuery, Part};
+    q.validate_projection(c.written.is_some(), false, !q.languages.is_empty())?;
+    let about = q.about.as_ref().expect("validated frame about");
+    let h = c.opened.snapshot.clone();
+    let handle = &c.publication;
+    // Query names through the exact already authorized snapshot. This never widens
+    // an isolated view or enters the shared cache to fetch its labels.
+    let mut query = KeptQuery {
+        about: Some(about.clone()),
+        part: Part::Parents,
+        limit: q.limit,
+        languages: q.languages.clone(),
+        ..Default::default()
+    };
+    let parents = super::Ontologies::kept_page(req, &query, &h, handle, &c.read_options)?;
+    query.part = Part::Equivalents;
+    let equivalents = super::Ontologies::kept_page(req, &query, &h, handle, &c.read_options)?;
+    let kept = c.retained;
+    query.part = Part::Excluded;
+    query.about = None;
+    let exclusions = super::Ontologies::kept_page(req, &query, &h, handle, &c.read_options)?;
+    let project = |page: super::kept::Page| json!({"total":page.total,"limit":q.limit,"truncated":page.next_offset.is_some(),"items":page.items});
+    let mut source_samples = Vec::new();
+    for i in 0..q.limit.min(handle.source.source_count()) {
+        super::check(&c.read_options)?;
+        #[cfg(test)]
+        super::kept::diagnostic::visit(super::kept::diagnostic::Visit::Source);
+        source_samples.push(handle.source.source_row(i).expect("source ordinal"));
+    }
+    let class = sparkles_owl::Class::new(about.as_str());
+    Ok(
+        json!({"dataset":name,"commit":h.commit,"classificationSource":handle.identity(),"frame":{
+            "iri":about,"result":handle.metadata(),"outcome":handle.outcome(),
+            "unsatisfiable":handle.classification.taxonomy.is_unsatisfiable(&class),
+            "parents":project(parents),"equivalents":project(equivalents),"excluded":project(exclusions),
+            "sources":{"items":source_samples,"total":handle.source.source_count(),"truncated":handle.source.source_count()>q.limit},
+            "retention":{"kept":kept,"resultId":if kept { Some(handle.id) } else { None::<uuid::Uuid> }}
+        }}),
+    )
+}
+
+/// Decode selector objects at raw JSON boundaries, before duplicate singleton keys
+/// disappear into a map. Legacy requests without a projection keep their old value
+/// normalization. Structured callers already have unique object keys.
+pub fn decode_arguments(op: &str, bytes: &[u8]) -> Result<J> {
+    decode_argument_object(bytes, op == "keptClassification", op == "classify")
+}
+/// Duplicate-sensitive selectors when the projection is supplied outside the body.
+pub fn decode_strict_arguments(bytes: &[u8]) -> Result<J> {
+    decode_argument_object(bytes, true, true)
+}
+fn decode_argument_object(
+    bytes: &[u8],
+    force_strict: bool,
+    projection_sensitive: bool,
+) -> Result<J> {
+    use serde::de::{MapAccess, Visitor};
+    struct Args {
+        value: Map<String, J>,
+        duplicate: Option<String>,
+    }
+    impl<'de> serde::Deserialize<'de> for Args {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Args;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("an ontology argument object")
+                }
+                fn visit_map<M: MapAccess<'de>>(
+                    self,
+                    mut map: M,
+                ) -> std::result::Result<Args, M::Error> {
+                    let mut value = Map::new();
+                    let mut duplicate = None;
+                    while let Some(key) = map.next_key::<String>()? {
+                        let v = map.next_value::<J>()?;
+                        if value.insert(key.clone(), v).is_some() {
+                            duplicate = Some(key);
+                        }
+                    }
+                    Ok(Args { value, duplicate })
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+    let args: Args =
+        serde_json::from_slice(bytes).map_err(|e| bad(format!("invalid ontology JSON: {e}")))?;
+    if (force_strict || (projection_sensitive && args.value.contains_key("projection")))
+        && let Some(key) = args.duplicate
+    {
+        return Err(bad(format!("duplicate selector '{key}'")));
+    }
+    Ok(J::Object(args.value))
 }

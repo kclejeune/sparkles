@@ -502,6 +502,28 @@ fn held_bytes_of(ax: &AxiomKind) -> usize {
     bytes
 }
 
+/// Rough additional ownership of a retained copy of exclusions. This uses the
+/// classifier's held-axiom estimate and is not a process RSS bound.
+pub fn excluded_copy_bytes(excluded: &Vec<Excluded>) -> usize {
+    use std::mem::size_of;
+    excluded
+        .capacity()
+        .saturating_mul(size_of::<Excluded>())
+        .saturating_add(
+            excluded
+                .iter()
+                .map(|e| {
+                    held_bytes_of(&e.axiom).saturating_add(match &e.gap {
+                        Gap::Outside { rule, message } => {
+                            rule.capacity().saturating_add(message.capacity())
+                        }
+                        Gap::Partial(_) => 0,
+                    })
+                })
+                .sum::<usize>(),
+        )
+}
+
 /// The threads a run takes.
 fn threads_of(limits: &Limits) -> usize {
     if limits.threads == 0 {

@@ -1058,6 +1058,13 @@ impl OntologyScope {
         self.handle.classify(&self.req, c, &self.opts)
     }
 
+    /// [`Ontologies::kept_classification`].
+    pub fn kept_classification(&self, query: &kept::KeptQuery) -> Result<kept::KeptRead> {
+        self.ready()?;
+        self.handle
+            .kept_classification(&self.req, query, &self.opts)
+    }
+
     /// [`Ontologies::dl_query`].
     pub fn dl_query(&self, q: &dl_query::DlQueryRequest) -> Result<dl_query::DlQueryAnswer> {
         self.ready()?;
@@ -2514,6 +2521,7 @@ pub mod browse;
 pub mod classify;
 pub mod dl_query;
 pub mod file;
+pub mod kept;
 pub mod metrics;
 pub mod search;
 pub mod transform;

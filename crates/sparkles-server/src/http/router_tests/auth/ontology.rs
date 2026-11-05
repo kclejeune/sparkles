@@ -5,6 +5,47 @@
 use super::*;
 use serde_json::json;
 
+#[tokio::test]
+async fn kept_classification_reads_do_not_disclose_shared_state_and_scoped_frame_stays_explicit() {
+    let (_dir, app) = server();
+    let uri = format!("/$/ontology/ont/classification?{OPEN}&about=http%3A%2F%2Fex%2FA");
+    let before = as_user(&app, "oopen", "GET", &uri, &json!(null)).await;
+    assert_eq!(before.status, StatusCode::OK, "{}", before.text());
+    assert_eq!(before.json()["reason"], "unsupportedScope");
+    let run = as_user(
+        &app,
+        "ofull",
+        "POST",
+        "/$/ontology/ont/classify",
+        &json!({"graph":"http://ex/open"}),
+    )
+    .await;
+    assert_eq!(run.status, StatusCode::OK, "{}", run.text());
+    let after = as_user(&app, "oopen", "GET", &uri, &json!(null)).await;
+    assert_eq!(after.json(), before.json());
+    assert_eq!(after.headers[header::CACHE_CONTROL], "no-store");
+    let scoped = as_user(
+        &app,
+        "oopen",
+        "POST",
+        "/$/ontology/ont/classify",
+        &json!({"graph":"http://ex/open","projection":"frame","about":"http://ex/A","limit":1}),
+    )
+    .await;
+    assert_eq!(scoped.status, StatusCode::OK, "{}", scoped.text());
+    let j = scoped.json();
+    assert_eq!(j["frame"]["retention"]["kept"], false);
+    assert_eq!(
+        j["frame"]["parents"]["items"][0]["iri"],
+        "http://www.w3.org/2002/07/owl#Thing"
+    );
+    assert_eq!(j["frame"]["result"]["sourceCounts"]["resolvedGraphs"], 1);
+    assert!(!scoped.text().contains("http://ex/Hidden"));
+    let denied = call(&app, "GET", &uri, &[], "").await;
+    assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(denied.headers[header::CACHE_CONTROL], "no-store");
+}
+
 const DATA: &str = r#"@prefix : <http://ex/> .
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .

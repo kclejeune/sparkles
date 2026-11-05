@@ -41,7 +41,7 @@
 //! # Ok::<_, sparkles::Error>(())
 //! ```
 
-use super::classify::{CACHE_MAX_BYTES, admit, logical_axioms, saturate};
+use super::classify::{admit, logical_axioms, saturate};
 use super::{Ontologies, OntologyRequest, Opened};
 use crate::Dataset;
 use crate::error::{Error, Result};
@@ -550,7 +550,7 @@ impl Ontologies {
                 answer.incremental = true;
                 // the kept saturation reads the defining axiom beside the ontology's, and
                 // the next run over it lets the axiom go
-                self.with_kept(req, opts, |e| {
+                self.with_kept(o, req, opts, "dlQuery", |e| {
                     // the threads come first: a wait that ends at the deadline leaves the
                     // kept state as it was
                     let par = admit(q.threads, opts)?;
@@ -558,13 +558,8 @@ impl Ontologies {
                         e.run_over(o, vec![ax.kind.clone()], |s, axioms, changes| {
                             describe(s, axioms, changes, par)
                         })?;
-                    // the kept taxonomy counts with the saturation against the bound, and
-                    // goes first when both do not fit
-                    let memory = memory as usize;
-                    if e.taxonomy_memory() + memory > CACHE_MAX_BYTES {
-                        e.drop_taxonomy();
-                    }
-                    Ok(((c, d, ex), memory <= CACHE_MAX_BYTES))
+                    let keep = super::kept::retain_dl(e, memory as usize);
+                    Ok(((c, d, ex), keep))
                 })?
             } else {
                 let mut axioms = logical_axioms(&o.ontology);

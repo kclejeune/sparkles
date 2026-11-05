@@ -51,6 +51,36 @@ def test_axioms_are_frozen_values_with_structural_equality() -> None:
         sparkles.Axiom.from_json({"type": "DisjointClasses", "classes": [EX + "A"]})
 
 
+def test_kept_classification_reads_pages_without_computing(ds: sparkles.Dataset) -> None:
+    onto = ds.ontology
+    assert onto.kept_classification()["status"] == "unavailable"
+    onto.edit(add=[f"EquivalentClasses(<{EX}Professor> <{EX}AliasA> <{EX}AliasB>)"])
+    for invalid in [
+        {"projection": "unknown"}, {"about": None}, {"about": "relative"},
+        {"limit": 0}, {"limit": 1001}, {"nodes": True}, {"offset": 1}, {"target": "urn:out"},
+    ]:
+        args = {"projection": "frame", "about": EX + "Professor", **invalid}
+        with pytest.raises(sparkles.InvalidInputError):
+            onto.classify(**args)
+        assert onto.kept_classification()["status"] == "unavailable"
+    cancel = sparkles.CancelToken()
+    cancel.cancel()
+    with pytest.raises(sparkles.CancelledError):
+        onto.kept_classification(cancel=cancel)
+    frame = onto.classify(projection="frame", about=EX + "Professor", limit=1)
+    assert "class" not in frame and "nodes" not in frame
+    assert frame["frame"]["equivalents"]["truncated"]
+    assert frame["frame"]["retention"]["kept"]
+    status = onto.kept_classification(about=EX + "Professor")
+    assert status["status"] == "available" and status["entity"]["present"]
+    pin = {"at": status["commit"], "result_id": status["result"]["resultId"]}
+    first = onto.kept_classification(part="equivalents", about=EX + "Professor", limit=1, **pin)
+    last = onto.kept_classification(part="equivalents", about=EX + "Professor", limit=1, offset=first["page"]["nextOffset"], **pin)
+    assert [first["page"]["items"][0]["iri"], last["page"]["items"][0]["iri"]] == [EX + "AliasA", EX + "AliasB"]
+    assert last["page"]["nextOffset"] is None
+    assert last["result"] == status["result"]
+
+
 def test_summary_and_axioms(ds: sparkles.Dataset) -> None:
     s = ds.ontology.summary()
     assert s["header"]["iri"] == EX + "o"

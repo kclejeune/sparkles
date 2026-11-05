@@ -2146,6 +2146,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ontology/{ds}/classification": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read an existing immutable classification
+         * @description Reads kept state only. A miss never maps or classifies an ontology, reserves classifier workers or writes. Status is available, running, mismatch or unavailable. Restricted graph/triple views and synthetic snapshots return unavailable without observing the shared slot. A kept result names its exact store/branch, source commit, input/content/source fingerprints and original producer options. Named-class direct parents, equivalents and unsatisfiability are available; property/individual entailments and justifications are not. Outcome distinguishes partial, exclusions and consistency. Nonzero offsets require resultId and at=commit:N. Replacement or eviction refuses a pin instead of switching results. Sources pages include every typed requested graph, resolved graph, import and warning row in digest order. Page output and name buffers are bounded; counts and ordering can scan retained vectors. Historical names use the pinned authorized snapshot and full IRI fallback. Every response is Cache-Control: no-store and bypasses commit-only conditional 304. Unknown selectors, duplicate singleton selectors, inferences (even false), computing options and invalid pins are refused.
+         */
+        get: operations["keptClassification"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/ontology/{ds}/classify": {
         parameters: {
             query?: never;
@@ -2156,7 +2176,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Classify an OWL 2 EL ontology
+         * Classify an ontology and optionally project a bounded class frame
          * @description Classifies the terminology with the OWL 2 EL classifier and answers whether it is consistent, the unsatisfiable classes, the axioms outside OWL 2 EL that the classification left out or used in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses and its equivalent classes, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. The dataset keeps the last classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what a run with the disjunctive rules proved before it stopped. The answer's `complete` is false for such a partial answer, `partial` is true, `incomplete` lists the classes whose superclasses it may miss and `consistency` is `consistent`, `inconsistent` or `unknown`. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.
          */
         post: operations["classifyOntology"];
@@ -5829,6 +5849,109 @@ export interface components {
             next: string | null;
             total: number;
         };
+        ClassificationExcluded: {
+            /** @description An OWL axiom in the public structural JSON form. */
+            axiom: Record<string, never>;
+            gap: {
+                /** @constant */
+                kind: "omitted";
+                message: string;
+                rule: string;
+            } | {
+                /** @constant */
+                kind: "partiallyUsed";
+                reason: string;
+            };
+            ofn: string;
+            type: string;
+        };
+        ClassificationName: {
+            iri: string;
+            label: string | null;
+            labelLang: string | null;
+        };
+        ClassificationOutcome: {
+            complete: boolean;
+            /** @enum {string} */
+            consistency: "consistent" | "inconsistent" | "unknown";
+            excludedCount: number;
+            incompleteCount: number;
+            partial: boolean;
+            /** @enum {string} */
+            tier: "el" | "horn" | "disjunctive";
+        };
+        ClassificationParent: {
+            equivalenceCount: number;
+            iri: string;
+            label: string | null;
+            labelLang: string | null;
+        };
+        ClassificationResult: {
+            assertions: boolean;
+            boundStoreId: string;
+            capabilities: ("namedClassDirectParents" | "namedClassEquivalents" | "namedClassUnsatisfiability")[];
+            classifiedCommit: number;
+            contentFingerprint: string;
+            elOnly: boolean;
+            /** @enum {string} */
+            expansion: "cautious" | "eager";
+            familyId: string;
+            /** @enum {string} */
+            imports: "dataset" | "none";
+            inputFingerprint: string;
+            /** @constant */
+            justifications: "unavailable";
+            /** @enum {string} */
+            mode: "lenient" | "strict";
+            partialRequested: boolean;
+            /** Format: uuid */
+            resultId: string;
+            sourceCounts: {
+                imports: number;
+                requestedGraphs: number;
+                resolvedGraphs: number;
+                warnings: number;
+            };
+            sourceFingerprint: string;
+        };
+        ClassificationSourceIdentity: {
+            boundStoreId: string;
+            commit: number;
+            contentFingerprint: string;
+            familyId: string;
+            inputFingerprint: string;
+            producer: {
+                assertions: boolean;
+                elOnly: boolean;
+                /** @enum {string} */
+                expansion: "cautious" | "eager";
+                partialRequested: boolean;
+            };
+        };
+        ClassificationSourceRow: {
+            graph: string;
+            /** @constant */
+            kind: "requestedGraph";
+            ordinal: number;
+        } | {
+            graph: string;
+            /** @constant */
+            kind: "resolvedGraph";
+            ordinal: number;
+            requested: boolean;
+        } | {
+            graph: string | null;
+            iri: string;
+            /** @constant */
+            kind: "import";
+            location: string | null;
+            ordinal: number;
+        } | {
+            /** @constant */
+            kind: "warning";
+            message: string;
+            ordinal: number;
+        };
         CloneRequest: {
             /** @description A point-in-time selector. */
             at?: string;
@@ -8365,6 +8488,35 @@ export interface components {
             timeout?: number;
             vocabularies?: string[];
         } & (unknown | unknown | unknown);
+        KeptClassification: {
+            activity: null | {
+                commit: number;
+                kind: string;
+            };
+            commit: number;
+            dataset: string;
+            entity: null | {
+                iri: string;
+                present: boolean;
+                unsatisfiable: boolean | null;
+            };
+            outcome: components["schemas"]["ClassificationOutcome"] | null;
+            page: null | {
+                about: string | null;
+                items: (components["schemas"]["ClassificationName"] | components["schemas"]["ClassificationParent"] | components["schemas"]["ClassificationSourceRow"] | components["schemas"]["ClassificationExcluded"])[];
+                limit: number;
+                nextOffset: number | null;
+                offset: number;
+                /** @enum {string} */
+                part: "status" | "parents" | "equivalents" | "sources" | "excluded";
+                total: number;
+            };
+            reason: string | null;
+            result: components["schemas"]["ClassificationResult"] | null;
+            staleCommit: number | null;
+            /** @enum {string} */
+            status: "available" | "running" | "mismatch" | "unavailable";
+        };
         /** @enum {string} */
         Level: "read" | "write" | "admin";
         /** @description The licence obligations of a version and the gate's verdict. */
@@ -9605,6 +9757,44 @@ export interface components {
              */
             error: string;
             error_description?: string;
+        };
+        OntologyFrameClassification: {
+            classificationSource: components["schemas"]["ClassificationSourceIdentity"];
+            commit: number;
+            dataset: string;
+            frame: {
+                equivalents: {
+                    items: components["schemas"]["ClassificationName"][];
+                    limit: number;
+                    total: number;
+                    truncated: boolean;
+                };
+                excluded: {
+                    items: components["schemas"]["ClassificationExcluded"][];
+                    limit: number;
+                    total: number;
+                    truncated: boolean;
+                };
+                iri: string;
+                outcome: components["schemas"]["ClassificationOutcome"];
+                parents: {
+                    items: components["schemas"]["ClassificationParent"][];
+                    limit: number;
+                    total: number;
+                    truncated: boolean;
+                };
+                result: components["schemas"]["ClassificationResult"];
+                retention: {
+                    kept: boolean;
+                    resultId: string | null;
+                };
+                sources: {
+                    items: components["schemas"]["ClassificationSourceRow"][];
+                    total: number;
+                    truncated: boolean;
+                };
+                unsatisfiable: boolean;
+            };
         };
         /** @description What applying an RDF Patch did. With `receipt=true` or `Accept: application/x-sparkles+json` the body also has the members of a `Receipt`. */
         PatchResult: {
@@ -17740,6 +17930,61 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    keptClassification: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description The bounded portion to read, status by default. */
+                part?: "status" | "parents" | "equivalents" | "sources" | "excluded";
+                /** @description An absolute named-class IRI, required for parents/equivalents and optional for status. */
+                about?: string;
+                /** @description The immutable result to read, required for continuation. */
+                resultId?: string;
+                /** @description The first row, zero by default. Nonzero offsets require an exact commit and resultId. */
+                offset?: number;
+                /** @description At most this many rows, 100 by default. */
+                limit?: number;
+                /** @description Comma-separated preferred label languages, otherwise Accept-Language. */
+                lang?: string;
+                /** @description The read deadline in milliseconds. */
+                timeout?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Availability and an optional bounded page from one immutable result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KeptClassification"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            410: components["responses"]["Gone"];
+            default: components["responses"]["Error"];
+        };
+    };
     classifyOntology: {
         parameters: {
             query?: {
@@ -17806,6 +18051,8 @@ export interface operations {
                     /** @description A graph IRI or `default`, or a list of them. */
                     graph?: unknown;
                     imports?: boolean;
+                    /** @description Preferred labels for frame projection only. */
+                    lang?: string | string[] | null;
                     /** @description The most nodes, unsatisfiable classes, incomplete classes and excluded axioms listed (100 by default). */
                     limit?: number;
                     /** @description The commit message of the write, also kept as a comment on the header. */
@@ -17818,6 +18065,11 @@ export interface operations {
                     offset?: number;
                     /** @description Answer what a run with the disjunctive rules proved when its deadline, cancellation or memory budget stops it, instead of failing. Runs of the other rules fail as before. */
                     partial?: boolean;
+                    /**
+                     * @description With frame, require about and return bounded direct-parent/equivalence/source/exclusion samples with exact source/outcome. Limit is at most 1,000. False nodes, zero/null offset and null target retain their defaults. Effective nodes, offset, target and OFN output are refused before computing. Ineligible results remain local and advertise no shared continuation. Missing/null projection retains legacy output.
+                     * @enum {string|null}
+                     */
+                    projection?: "frame" | null;
                     /** @description A named graph outside the graphs read that takes the direct taxonomy. */
                     target?: string;
                     /** @description The worker threads, within the algorithm pool's grant (0 for the grant). */
@@ -17832,7 +18084,11 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        classes: number;
+                        complete: boolean;
+                        consistent: boolean;
+                    } | components["schemas"]["OntologyFrameClassification"];
                     "text/owl-functional": string;
                 };
             };

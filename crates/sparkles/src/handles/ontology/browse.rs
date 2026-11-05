@@ -412,10 +412,25 @@ impl Ontologies {
             ));
         }
         let (snap, opts) = self.state(req, opts)?;
+        Self::browse_scope_at(req, languages, snap, opts, false, self.ds.prefixes())
+    }
+
+    fn browse_scope_at(
+        req: &OntologyRequest,
+        languages: &[String],
+        snap: Arc<Snapshot>,
+        opts: QueryOptions,
+        already_scoped: bool,
+        prefixes: BTreeMap<String, String>,
+    ) -> Result<Scope> {
         let access = opts.graphs.as_ref().map(|a| a.bound(&snap));
-        let view = match &access {
-            Some(a) => a.masked(&snap)?,
-            None => snap.clone(),
+        let view = if already_scoped {
+            snap.clone()
+        } else {
+            match &access {
+                Some(a) => a.masked(&snap)?,
+                None => snap.clone(),
+            }
         };
         let readable = |g: Id| access.as_ref().is_none_or(|a| a.readable_id(&snap, g));
         let inputs = Inputs {
@@ -438,11 +453,45 @@ impl Ontologies {
             imports: resolved.imports,
             warnings: resolved.warnings,
             languages: languages.iter().map(|l| l.to_ascii_lowercase()).collect(),
-            prefixes: self.ds.prefixes(),
+            prefixes,
             ids: FxHashMap::default(),
             opts,
             mode: req.mode,
         })
+    }
+
+    /// Names only for a returned kept-result page, at its already chosen view.
+    pub(super) fn kept_names_at(
+        req: &OntologyRequest,
+        snap: Arc<Snapshot>,
+        iris: &[String],
+        languages: &[String],
+        opts: QueryOptions,
+    ) -> Result<Vec<Name>> {
+        let mut scope = Self::browse_scope_at(req, languages, snap, opts, true, BTreeMap::new())?;
+        scope.prefixes.clear();
+        let mut names = Vec::with_capacity(iris.len());
+        for iri in iris {
+            check(&scope.opts)?;
+            #[cfg(test)]
+            super::kept::diagnostic::visit(super::kept::diagnostic::Visit::Name);
+            let name = if let Some(id) = scope.lookup(iri) {
+                let mut n = scope.name(id)?;
+                n.short_form = None;
+                n
+            } else {
+                Name {
+                    iri: iri.clone(),
+                    label: None,
+                    label_lang: None,
+                    short_form: None,
+                    kinds: Vec::new(),
+                    deprecated: false,
+                }
+            };
+            names.push(name);
+        }
+        Ok(names)
     }
 
     /// One level of the hierarchy of `h.kind` in the ontology `req` names: the children

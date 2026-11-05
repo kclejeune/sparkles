@@ -117,6 +117,65 @@ fn mismatch(doc: &J, schema: &J, v: &J, at: &str) -> Option<String> {
     None
 }
 
+#[cfg(feature = "ontology")]
+#[tokio::test]
+async fn kept_classification_and_projection_responses_match_typed_schemas() {
+    let dir = tempfile::tempdir().unwrap();
+    let state =
+        Arc::new(AppState::new(dir.path(), Default::default(), Duration::from_secs(30)).unwrap());
+    let ds = state.attach("kept", DbType::Mem, None).unwrap();
+    ds.dataset.update("PREFIX : <urn:> PREFIX owl: <http://www.w3.org/2002/07/owl#> INSERT DATA { :A a owl:Class ; owl:equivalentClass :B . :B a owl:Class . }").unwrap();
+    let app = crate::http::router(state);
+    let doc = build("test");
+    let path = "/$/ontology/{ds}/classification";
+    let missing = checked(
+        &doc,
+        &app,
+        "GET",
+        path,
+        "/$/ontology/kept/classification",
+        None,
+    )
+    .await;
+    assert_eq!(missing["status"], "unavailable");
+    let frame = checked(
+        &doc,
+        &app,
+        "POST",
+        "/$/ontology/{ds}/classify",
+        "/$/ontology/kept/classify",
+        Some(json!({"projection":"frame","about":"urn:A","limit":1})),
+    )
+    .await;
+    assert_eq!(frame["frame"]["equivalents"]["items"][0]["iri"], "urn:B");
+    let status = checked(
+        &doc,
+        &app,
+        "GET",
+        path,
+        "/$/ontology/kept/classification?about=urn%3AA",
+        None,
+    )
+    .await;
+    assert_eq!(status["status"], "available");
+    for part in ["parents", "equivalents", "sources", "excluded"] {
+        let about = if matches!(part, "parents" | "equivalents") {
+            "&about=urn%3AA"
+        } else {
+            ""
+        };
+        checked(
+            &doc,
+            &app,
+            "GET",
+            path,
+            &format!("/$/ontology/kept/classification?part={part}{about}&limit=1"),
+            None,
+        )
+        .await;
+    }
+}
+
 #[test]
 fn the_validator_checks_what_it_reads() {
     let doc = json!({ "components": { "schemas": { "N": { "type": "integer" } } } });

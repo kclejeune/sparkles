@@ -132,6 +132,32 @@ fn body_object(bytes: &[u8], allowed: &[&str]) -> ApiResult<serde_json::Map<Stri
     Ok(o)
 }
 
+fn classify_object(
+    bytes: &[u8],
+    query_projection: bool,
+    allowed: &[&str],
+) -> ApiResult<serde_json::Map<String, J>> {
+    let empty = b"{}";
+    let bytes = if bytes.iter().all(u8::is_ascii_whitespace) {
+        &empty[..]
+    } else {
+        bytes
+    };
+    let value = if query_projection {
+        onto::wire::decode_strict_arguments(bytes)
+    } else {
+        onto::wire::decode_arguments("classify", bytes)
+    }
+    .map_err(ontology_error)?;
+    let J::Object(object) = value else {
+        return Err(bad("the body is a JSON object"));
+    };
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(bad(format!("unknown member '{key}'")));
+    }
+    Ok(object)
+}
+
 fn renderer(ds: &Dataset) -> Renderer {
     Renderer::new(ds.store.prefixes())
 }
@@ -1073,6 +1099,63 @@ pub(super) async fn individuals(
     .await
 }
 
+/// Read existing kept state only. Availability changes without a data commit,
+/// so every handler response is no-store and bypasses commit-only conditional GET.
+pub(super) async fn kept_classification(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    let answer: ApiResult = async {
+        let ds = dataset(&st, &name)?;
+        let params = Params::from_query(&uri);
+        let allowed = [
+            "graph", "imports", "mode", "at", "part", "about", "offset", "limit", "resultId",
+            "lang", "timeout", "branch",
+        ];
+        for (key, _) in &params.0 {
+            if !allowed.contains(&key.as_str()) {
+                return Err(bad(format!("unknown selector '{key}'")));
+            }
+            if key != "graph" && params.all(key).len() != 1 {
+                return Err(bad(format!("duplicate selector '{key}'")));
+            }
+        }
+        let req = request_of(&params)?;
+        let mut a = browse_args(
+            &params,
+            &headers,
+            &["part", "about", "offset", "limit", "resultId"],
+            &[],
+        );
+        numbers(&mut a, &["offset", "limit"])?;
+        let query = onto::wire::kept_query_of(&a).map_err(ontology_error)?;
+        query.validate(&req).map_err(ontology_error)?;
+        let mut opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+        let (cancel, _guard) = cancel_on_drop();
+        opts.cancel = Some(cancel);
+        blocking(move || {
+            let found = ds
+                .dataset
+                .ontology()
+                .kept_classification(&req, &query, &opts)
+                .map_err(ontology_error)?;
+            let body = onto::wire::kept_body(&ds.name, &found).map_err(ontology_error)?;
+            Ok(with_commit(Json(body).into_response(), &ds, found.commit))
+        })
+        .await
+    }
+    .await;
+    let mut response = answer.into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
 /// The download formats of `GET /$/ontology/{ds}/term`.
 fn term_format(f: &str) -> ApiResult<Option<(oxrdfio::RdfFormat, &'static str, &'static str)>> {
     use oxrdfio::RdfFormat;
@@ -1221,8 +1304,9 @@ pub(super) async fn classify(
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
-    let o = body_object(
+    let o = classify_object(
         &bytes,
+        params.has("projection"),
         &[
             "graph",
             "imports",
@@ -1238,6 +1322,8 @@ pub(super) async fn classify(
             "threads",
             "partial",
             "expansion",
+            "projection",
+            "lang",
         ],
     )?;
     let req = request_body(&o, request_of(&params)?)?;
@@ -1278,7 +1364,38 @@ pub(super) async fn classify(
         partial: flag("partial")?,
         expansion: expansion_of(text("expansion")?.as_deref()).map_err(ontology_error)?,
     };
+    let projection =
+        onto::wire::projection_of(text("projection")?.as_deref()).map_err(ontology_error)?;
+    if projection.is_some() {
+        for key in [
+            "projection",
+            "about",
+            "nodes",
+            "limit",
+            "offset",
+            "threads",
+            "partial",
+            "expansion",
+            "target",
+            "message",
+            "lang",
+            "format",
+        ] {
+            if params.all(key).len() > 1 {
+                return Err(bad(format!("duplicate selector '{key}'")));
+            }
+            if params.has(key) && o.get(key).is_some_and(|v| !v.is_null()) {
+                return Err(bad(format!("'{key}' appears in both query and body")));
+            }
+        }
+    }
+    let mut display = browse_args(&params, &headers, &[], &[]);
+    if let Some(lang) = o.get("lang").filter(|v| !v.is_null()) {
+        display.insert("lang".into(), lang.clone());
+    }
     let q = ClassifyQuery {
+        projection,
+        languages: onto::wire::languages_of(&display).map_err(ontology_error)?,
         about,
         nodes: flag("nodes")?,
         limit: number("limit", DEFAULT_LIMIT, 1, MAX_LIMIT)?,
@@ -1289,6 +1406,12 @@ pub(super) async fn classify(
         Some("ofn") => true,
         Some(f) => return Err(bad(format!("format must be json or ofn, not '{f}'"))),
     };
+    q.validate_projection(
+        c.target.is_some(),
+        ofn,
+        params.has("lang") || o.get("lang").is_some_and(|v| !v.is_null()),
+    )
+    .map_err(ontology_error)?;
     if c.partial && ofn {
         return Err(bad(
             "format=ofn has no place to say that an answer is partial: leave out 'partial' or 'format'",
