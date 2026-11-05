@@ -1981,6 +1981,18 @@ random internal aggregate names are normalized. Four selected hot regex and
 key-filter functions retain their machine instructions and change their
 linked addresses.
 
+The same initial comparison gives `exists-join` a ratio of 1.0248, with a 95%
+interval of 1.0234 to 1.0271. The later six-query comparison retains that cost,
+with the original candidate at 1.0244, an interval of 1.0237 to 1.0252, and the
+rebuilt classifier merge at 1.0241, an interval of 1.0237 to 1.0245.
+
+The initial `lang-filter` ratio is 1.0036, with an interval of 1.0013 to 1.0061.
+The later original candidate reads 1.0009, with an interval of 0.9993 to 1.0027,
+which does not establish that small increase. The rebuilt classifier merge
+reads 1.0023, with an interval of 1.0008 to 1.0037. Both the persistent
+`exists-join` cost and the qualified `lang-filter` observations stay in the
+same roadmap follow-up as regex.
+
 These results support a layout explanation without additional query work.
 They do not isolate a particular cache conflict or branch alias. A later
 compiler-matched rebuild of `e951e2c3` retains the same selected hot instructions
