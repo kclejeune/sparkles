@@ -1,0 +1,15 @@
+{
+  "method": "Read ELF program headers independently on the captured local executable bytes with readelf -l; this identifies PT_INTERP, not the host system-loader probe or every resolved shared library.",
+  "variants": {
+    "batch": {
+      "program_header": "[Requesting program interpreter: /nix/store/lm3pknxi0ipypy3lxh1wmm8wvvavdwrn-glibc-2.42-84/lib/ld-linux-x86-64.so.2]",
+      "sha256": "a15cc9b3d2de293f3ceefec79ce975531fb34d2437d8201e5ced56f70dc9bc61",
+      "source_revision": "6724abe989b232e1b534d8b634b06ae3819d19b3"
+    },
+    "origin": {
+      "program_header": "[Requesting program interpreter: /nix/store/lm3pknxi0ipypy3lxh1wmm8wvvavdwrn-glibc-2.42-84/lib/ld-linux-x86-64.so.2]",
+      "sha256": "891fc6f6317372add5a237aa730fe01c1e2a59ea608ca703c7dca3d99f966016",
+      "source_revision": "6d55f1e6caadea5309558f2e27261e057d50d702"
+    }
+  }
+}

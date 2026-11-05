@@ -1,0 +1,35 @@
+{
+  "comparison": "6d55f1e6caadea5309558f2e27261e057d50d702 -> 6724abe989b232e1b534d8b634b06ae3819d19b3",
+  "data": {
+    "path": "/home/kclejeune/.cache/sparkles-nsc/data/people-100000.nt.zst",
+    "sha256": "befe6b2d417c379b1abf871abe95b8e8712637ad02f479c2aeffa735b188f4d3",
+    "uncompressed_sha256": "c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8"
+  },
+  "files": {
+    "build-batch/build-config.json": "edc09d7ecddd1c25ae7227e4c257dbc1d81c46e15b66f06c52bb1b2100dd1cb2",
+    "build-batch/compiler-comment.txt": "0b5c3d48e5ca1c415a3d0abef6895f17f4b4e20bd6bb9c2c1691f192bf70373c",
+    "build-batch/sha256": "7f5611bbd9ebf2523c9dc25270702a3638b95301033d103be57e9d1f4cc78b9d",
+    "build-batch/source-commit.txt": "41d161da0af7982f7919bdc09ef5fd73a9faaffe4bfa963506eedebe26dce557",
+    "build-origin/build-config.json": "edc09d7ecddd1c25ae7227e4c257dbc1d81c46e15b66f06c52bb1b2100dd1cb2",
+    "build-origin/compiler-comment.txt": "0b5c3d48e5ca1c415a3d0abef6895f17f4b4e20bd6bb9c2c1691f192bf70373c",
+    "build-origin/sha256": "c41d5268b7eda5a455ee83aae17906215fe509f326f1982b15430a5daa26feb8",
+    "build-origin/source-commit.txt": "66c93d87371752878aa396b8d09fcf9644b6def92db7f06d2e349866392b5f35",
+    "first-batch-control-run.sh": "ba9cbbd92fd34a228a7942a47e9291c223dc2c7f0185fe6bf3637f3d16aeca51",
+    "nsc-bench-remote.sh": "48a6e858f040a2ac60fb0561843e16b36f34ac795d1b5822ff888f0a6ffe781e",
+    "queries/expr-order-key.rq": "e4331de164d97e2f26250c4b85ebf20f5a17c747b25c199a294e56732417270c",
+    "run.env": "412ddf7e8e078674a8b66d219fabf4a40734ac76c15eb3bc7f1d0ca838d345d1",
+    "scripts/bench-answers.py": "4a3100696377af693a64be28f5e2a25a63ba07bffa11cdbf6068e7b4575daf2c",
+    "scripts/bench-gate.py": "b408b4f927fc33ed2aa86ee7695fcda11a8e2b4e9375121d78707ac4c0d95c7c"
+  },
+  "purpose": "pinned Intel follow-up of the first-batch expr-order-key Namespace lead; separate from 701 acceptance",
+  "variants": {
+    "A": {
+      "revision": "6d55f1e6caadea5309558f2e27261e057d50d702",
+      "sha256": "891fc6f6317372add5a237aa730fe01c1e2a59ea608ca703c7dca3d99f966016"
+    },
+    "B": {
+      "revision": "6724abe989b232e1b534d8b634b06ae3819d19b3",
+      "sha256": "a15cc9b3d2de293f3ceefec79ce975531fb34d2437d8201e5ced56f70dc9bc61"
+    }
+  }
+}
