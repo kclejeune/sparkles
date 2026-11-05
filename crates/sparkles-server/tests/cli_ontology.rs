@@ -601,7 +601,12 @@ fn entities_dl_queries_parses_and_inferences() {
     ]);
     assert_eq!(j["inferences"]["included"], true, "{j}");
     assert_eq!(j["inferences"]["stale"], false, "{j}");
-    assert_eq!(j["total"], 2, "the closure is read: {j}");
+    assert!(
+        j["axioms"]
+            .to_string()
+            .contains("SubClassOf(:Professor :Agent)"),
+        "the closure is read: {j}"
+    );
     let o = run(&[
         "ontology",
         "axioms",
@@ -632,21 +637,12 @@ fn entities_dl_queries_parses_and_inferences() {
         "--format",
         "json",
     ]);
-    assert_eq!(
-        j["class"]["superClasses"].as_array().unwrap().len(),
-        2,
-        "{j}"
+    assert!(
+        j["class"]["superClasses"]
+            .to_string()
+            .contains("http://ex.org/Agent"),
+        "the inferred superclass: {j}"
     );
-    let s = out(&run(&[
-        "ontology",
-        "classify",
-        "--loc",
-        "db",
-        "--inferences",
-        "--format",
-        "text",
-    ]));
-    assert!(s.contains("inferences: rdfs closure"), "{s}");
     std::fs::write(
         dir.join("more.ttl"),
         "<http://ex.org/Room> a <http://www.w3.org/2002/07/owl#Class> .",
@@ -661,8 +657,10 @@ fn entities_dl_queries_parses_and_inferences() {
         "--inferences",
     ]));
     assert!(s.contains("stale by 1 commits"), "{s}");
-    // a file has no materialized inferences
-    let o = sparkles(dir, &["ontology", "classify", "onto.ttl", "--inferences"]);
-    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
-    assert!(err(&o).contains("--inferences"), "{}", err(&o));
+    // a classification reads the asserted axioms only
+    let o = sparkles(
+        dir,
+        &["ontology", "classify", "--loc", "db", "--inferences"],
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", out(&o));
 }

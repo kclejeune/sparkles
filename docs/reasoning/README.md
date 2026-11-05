@@ -356,7 +356,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   does the same for a database directory or a server, and `sparkles ontology check FILE`
   checks an ontology file without a database. The check exits with status 1 when the
   ontology is outside a profile it names. `--inferences` adds the materialized
-  inferences to `summary`, `axioms`, `entities`, `entity` and `classify`, and the answer
+  inferences to `summary`, `axioms`, `entities` and `entity`, and the answer
   says whether they are stale.
 * `sparkles ontology reason`, `reduce` and `relax` do what ROBOT 1.9.11's commands of the
   same names do in OBO release pipelines, with ROBOT's options, values and defaults.

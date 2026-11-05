@@ -117,10 +117,6 @@ pub enum OntologyCmd {
         /// Also classify with the assertions the store holds
         #[arg(long)]
         assertions: bool,
-        /// Also read the materialized inferences of the dataset, and say how fresh
-        /// they are
-        #[arg(long)]
-        inferences: bool,
         /// Write the taxonomy to this named graph in one commit
         #[arg(long)]
         target: Option<String>,
@@ -568,7 +564,6 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             at,
             read,
             assertions,
-            inferences,
             target,
             message,
             about,
@@ -642,8 +637,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 local(&at)?
             };
             let local_run = |ds: &sparkles::Dataset, name: &str| -> Result<(J, String)> {
-                let mut req = read.request()?;
-                req.inferences = inferences;
+                let req = read.request()?;
                 let out = ds.ontology().classify(&req, &c, &qopts)?;
                 let r = renderer(ds);
                 let j = classify_body(name, &out, &req, &r, &q)?;
@@ -664,11 +658,6 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 }
                 (Some(_), None) if c.target.is_some() => {
                     bail!("--target writes to a database: name --loc or --server, not a FILE")
-                }
-                (Some(_), None) if inferences => {
-                    bail!(
-                        "--inferences reads a dataset's materialized inferences: name --loc or --server, not a FILE"
-                    )
                 }
                 (Some(f), None) => {
                     let req = read.request()?;
@@ -695,9 +684,6 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 (None, None) => {
                     let mut body = read.body();
                     body["assertions"] = json!(assertions);
-                    if inferences {
-                        body["inferences"] = json!(true);
-                    }
                     body["threads"] = json!(threads);
                     body["limit"] = json!(MAX_LIMIT);
                     if partial {
@@ -1033,13 +1019,7 @@ pub(crate) fn finish_classify(
     allow_unsatisfiable: bool,
 ) -> Result<bool> {
     match format {
-        "ofn" => {
-            // a functional-style document has no place for the freshness
-            if let Some(n) = inferences_note(j) {
-                eprintln!("inferences: {n}");
-            }
-            print!("{doc}")
-        }
+        "ofn" => print!("{doc}"),
         "json" => println!("{}", serde_json::to_string_pretty(j)?),
         "text" => print_classify(j),
         f => bail!("unknown --format {f}: ofn, json or text"),
@@ -1514,9 +1494,6 @@ fn print_check(j: &J, format: &str) -> Result<()> {
 
 fn print_classify(j: &J) {
     let n = |k: &str| j[k].as_u64().unwrap_or(0);
-    if let Some(n) = inferences_note(j) {
-        println!("inferences: {n}");
-    }
     let consistency = match j["consistency"].as_str() {
         Some("unknown") => "consistency unknown",
         _ if j["consistent"].as_bool().unwrap_or(false) => "consistent",

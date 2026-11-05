@@ -27,7 +27,7 @@ const LISTING: [&str; 4] = ["kind", "limit", "offset", "inferences"];
 /// The members of an entity report.
 const REPORT: [&str; 5] = ["iri", "kind", "assertions", "limit", "inferences"];
 /// The members of a classification that only reads.
-const CLASSIFY: [&str; 9] = [
+const CLASSIFY: [&str; 8] = [
     "assertions",
     "about",
     "nodes",
@@ -36,7 +36,6 @@ const CLASSIFY: [&str; 9] = [
     "threads",
     "partial",
     "expansion",
-    "inferences",
 ];
 /// The members of a classification that writes its taxonomy.
 const CLASSIFY_WRITE: [&str; 5] = ["target", "message", "dryRun", "changes", "ifHead"];
@@ -54,9 +53,23 @@ const DL_QUERY: [&str; 7] = [
 const PARSE: [&str; 2] = ["text", "as"];
 
 /// The tool error of a library error: an argument the library refuses is the caller's
-/// mistake, and a name the ontology does not know is `not-found`.
+/// mistake, and a name the ontology does not know is `not-found`. Manchester text that
+/// does not read is `invalid-manchester` with the reason, span and candidates that
+/// `POST /$/ontology/{ds}/parse` answers.
 fn error(ctx: &ErrorContext, e: sparkles::Error) -> ToolError {
+    use sparkles::handles::ontology::dl_query::ManchesterFailure;
     match e {
+        sparkles::Error::Component(c) if c.component == "owl" => {
+            let detail = c
+                .source
+                .as_ref()
+                .and_then(|s| s.downcast_ref::<ManchesterFailure>())
+                .map(ManchesterFailure::json);
+            match detail {
+                Some(d) => ToolError::new("invalid-manchester", 400, c.message).data(d),
+                None => ToolError::bad_argument(c.message),
+            }
+        }
         sparkles::Error::Invalid(m) => ToolError::bad_argument(m),
         sparkles::Error::NotFound(m) => ToolError::new("not-found", 404, m),
         e => ctx.engine(e),
@@ -368,7 +381,6 @@ fn classify_def(cfg: &super::McpConfig) -> super::schemas::ToolDef {
         "threads": {"type":"integer","minimum":0,"maximum":1024,"default":0,"description":"Worker threads (0: the algorithm pool's share for one call)"},
         "partial": {"type":"boolean","default":false,"description":"When the deadline stops a run with the disjunctive rules, answer what it proved, with the classes it left open"},
         "expansion": {"enum":["cautious","eager"],"default":"cautious","description":"The expansion strategy of the disjunctive rules"},
-        "inferences": inferences(),
         "target": {"type":"string","description":"Write the taxonomy to this named graph in one commit"},
         "message": {"type":"string","maxLength":1024,"description":"The commit message of the write"},
         "dryRun": {"type":"boolean","description":"With target: preview the write; nothing is written, and the result gives the commit it would make, its counts, the validation and the storage check"},

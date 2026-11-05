@@ -29,7 +29,7 @@ entities and reports on one, and `ontology_classify` classifies the ontology and
 server that allows updates, writes the taxonomy to a graph with `dryRun` and `ifHead`.
 `ontology_dl_query` answers DL queries and `ontology_parse` reads Manchester syntax.
 `sparkles ontology` gains `entities`, `entity`, `dl-query` and `parse`. `ontology_axioms`
-and the CLI's `summary`, `axioms`, `classify`, `entities` and `entity` take
+and the CLI's `summary`, `axioms`, `entities` and `entity` take
 `inferences`, and their answers say whether the materialized inferences are stale.
 
 The disjunctive classification rules can count, and `Limits::counting` turns it on. It is

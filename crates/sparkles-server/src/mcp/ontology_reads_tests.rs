@@ -128,7 +128,7 @@ async fn inferences_are_read_with_their_freshness() {
     let out = c.structured("ontology_axioms", inferred).await;
     assert_eq!(out["inferences"]["stale"], true, "{out}");
     assert_eq!(out["inferences"]["commitsSince"], 1, "{out}");
-    // the entity report and the classification read them too
+    // the entity report reads them too
     let out = c
         .structured(
             "ontology_entities",
@@ -136,11 +136,16 @@ async fn inferences_are_read_with_their_freshness() {
         )
         .await;
     assert_eq!(out["inferences"]["included"], true, "{out}");
-    assert_eq!(out["class"]["superClasses"].as_array().unwrap().len(), 2);
-    let out = c
-        .structured("ontology_classify", json!({"inferences": true}))
+    let supers = out["class"]["superClasses"].to_string();
+    assert!(
+        supers.contains("Agent"),
+        "the inferred superclass: {supers}"
+    );
+    // a classification reads the asserted axioms only
+    let (_, e) = c
+        .error("ontology_classify", json!({"inferences": true}))
         .await;
-    assert_eq!(out["inferences"]["included"], true, "{out}");
+    assert_eq!(e["code"], "bad-argument", "{e}");
     // an edit changes the asserted axioms only
     let (_, e) = c
         .error(
@@ -248,7 +253,7 @@ async fn dl_queries_and_manchester_text() {
         "{out}"
     );
     let (_, e) = c.error("ontology_parse", json!({"text": "and and"})).await;
-    assert_eq!(e["code"], "bad-argument", "{e}");
+    assert_eq!(e["code"], "invalid-manchester", "{e}");
 }
 
 #[test]

@@ -894,13 +894,13 @@ of §7, which says whether the inferred graph was read and whether it is stale.
 
 `sparkles ontology` gains `entities`, `entity IRI`, `dl-query EXPRESSION` and
 `parse TEXT`. They answer through the same JSON operations on a database directory and
-through the routes on a server. `summary`, `axioms`, `classify`, `entities` and `entity`
-take `--inferences`, and the text form prints the freshness of the inferences as a line
-of the answer. A functional-style document has no place for it, so `axioms` and
-`classify` print it on standard error with `--format ofn`. On a server, `axioms` then
-reads it from a JSON page of one axiom. `classify FILE --inferences` is refused, since a
-file has no materialized inferences. The DL query tool and command take no
-`inferences`, as the route's JSON body does not.
+through the routes on a server. `summary`, `axioms`, `entities` and `entity` take
+`--inferences`, and the text form prints the freshness of the inferences as a line of
+the answer. A functional-style document has no place for it, so `axioms` prints it on
+standard error with `--format ofn`. On a server, `axioms` then reads it from a JSON page
+of one axiom. A classification reads the asserted axioms only, as the library requires,
+so `ontology_classify` and `sparkles ontology classify` take no `inferences`. The DL
+query tool and command take none either, as the route's JSON body does not.
 
 MCP tests cover each tool's answer, a missing, fresh and stale materialization, the
 taxonomy write with its preview and precondition, the refusals and the result byte
