@@ -813,7 +813,9 @@ def native_query_kind(query):
                 raise ValueError("incomplete PREFIX declaration")
             pos = space(pos + prefix.end())
         end = query.find(">", pos + 1)
-        if pos >= len(query) or query[pos] != "<" or end < 0 or any(c.isspace() for c in query[pos + 1:end]):
+        # IRIREF excludes U+0000..U+0020, while raw Unicode whitespace may be
+        # legal IRI content. Full IRI syntax validation belongs to the server.
+        if pos >= len(query) or query[pos] != "<" or end < 0 or any(ord(c) <= 0x20 for c in query[pos + 1:end]):
             raise ValueError("incomplete BASE or PREFIX IRI")
         pos = end + 1
 

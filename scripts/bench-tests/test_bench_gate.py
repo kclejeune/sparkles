@@ -154,6 +154,37 @@ class GateTests(unittest.TestCase):
                 query.write_text(text)
                 self.assertNotEqual(run("native-digest", query, answer).returncode, 0)
 
+    def test_native_digest_prologue_iri_uses_ascii_control_boundary(self):
+        # SPARQL IRIREF excludes U+0000..U+0020, not Unicode whitespace such as
+        # U+00A0 and U+2003. UCHAR spellings are legal too and stay inside the IRI.
+        with tempfile.TemporaryDirectory() as d:
+            query, answer = Path(d) / "q.rq", Path(d) / "answer.json"
+            for kind in ("SELECT", "ASK"):
+                body = "SELECT ?x WHERE { ?s ?p ?x }" if kind == "SELECT" else "ASK { ?s ?p ?o }"
+                value = native_complete({"queryType": kind, **(
+                    {"vars": ["x"], "rows": [[{"type": "literal", "value": "one"}]]}
+                    if kind == "SELECT" else {"boolean": False})})
+                answer.write_text(json.dumps(value))
+                expected = "1 rows, schema 33bf2beb, distinct 1, 3fc6cab5c8664ec8\n" if kind == "SELECT" else "ask False\n"
+                for declaration in ("BASE", "PREFIX ex:"):
+                    for content in ("\u00a0", "\u2003", r"\u00A0", r"\U00002003"):
+                        query.write_text(f"{declaration} <http://example.org/{content}> {body}")
+                        result = run("native-digest", query, answer)
+                        with self.subTest(kind=kind, declaration=declaration, content=repr(content)):
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(result.stdout, expected)
+                    for content in (" ", "\n", "\x00", "\x1f"):
+                        query.write_text(f"{declaration} <http://example.org/{content}> {body}")
+                        result = run("native-digest", query, answer)
+                        with self.subTest(kind=kind, declaration=declaration, forbidden=repr(content)):
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertEqual(result.stdout, "")
+                    query.write_text(f"{declaration} <http://example.org/unclosed {body}")
+                    result = run("native-digest", query, answer)
+                    with self.subTest(kind=kind, declaration=declaration, missing_delimiter=True):
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, "")
+
     def test_native_digest_refuses_directional_literals(self):
         with tempfile.TemporaryDirectory() as d:
             query, answer = Path(d) / "q.rq", Path(d) / "answer.json"
