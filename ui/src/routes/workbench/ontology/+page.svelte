@@ -179,8 +179,10 @@
   let bigKinds = $state<Set<EntityKind>>(new Set());
   /** The labels the views know. A name read since the page opened is added in place. */
   const labels = new SvelteMap<string, Lit[]>();
-  /** Subjects whose labels were read in every language, rather than a hierarchy's choice. */
-  const completeLabels = new Set<string>();
+  /** All languages in the selected graph; hierarchy reads also include imported graphs. */
+  const graphLabels = new Map<string, Lit[]>();
+  /** The current language's authoritative hierarchy names, including imported labels. */
+  const hierarchyNames = new Set<string>();
   let typeAxioms = $state<AxiomItem[]>([]);
   let truncated = $state(false);
   /** Whether the individuals and their types are read for the Individuals tree. */
@@ -216,11 +218,11 @@
   const langs = $derived(iriForm.languages);
   /** The name of `iri` as a tree draws it: the tree's own levels carry the labels. */
   const treeName = (iri: string) => entityName(iri, labels, prefixes, langs);
-  /** A complete batch replaces any one-language name previously supplied by a hierarchy. */
+  /** A local batch never replaces the hierarchy's choice over its wider import scope. */
   function addLabels(more: Map<string, Lit[]>) {
     for (const [s, l] of more) {
-      completeLabels.add(s);
-      labels.set(s, l);
+      graphLabels.set(s, l);
+      if (!hierarchyNames.has(s)) labels.set(s, l);
     }
   }
   const batch = new LabelBatch(
@@ -268,7 +270,8 @@
   function resetLazy() {
     batch.reset();
     labels.clear();
-    completeLabels.clear();
+    graphLabels.clear();
+    hierarchyNames.clear();
     entities = new Map();
     listed = new Set();
     bigKinds = new Set();
@@ -430,13 +433,15 @@
   };
   /** The labels the hierarchy answers carry, merged into the page's labels. */
   function takeNames(nodes: TreeNode[]) {
-    const more = new Map<string, Lit[]>();
-    for (const n of nodes)
-      if (n.label && !labels.get(n.iri)?.length)
-        more.set(n.iri, [
-          { '@value': n.label, ...(n.labelLang ? { '@language': n.labelLang } : {}) },
-        ]);
-    for (const [s, l] of more) labels.set(s, l);
+    for (const n of nodes) {
+      hierarchyNames.add(n.iri);
+      labels.set(
+        n.iri,
+        n.label
+          ? [{ '@value': n.label, ...(n.labelLang ? { '@language': n.labelLang } : {}) }]
+          : [],
+      );
+    }
     // a node the route gives no label has none to read
     batch.know(nodes.filter((n) => !n.label).map((n) => n.iri));
     const forms = nodes.filter((n) => n.shortForm && !shortForms.has(n.iri));
@@ -478,12 +483,13 @@
     untrack(() => {
       if (scope !== levelScope) {
         batch.reset();
+        hierarchyNames.clear();
+        labels.clear();
         if (context !== levelContext) {
-          labels.clear();
-          completeLabels.clear();
+          graphLabels.clear();
         } else {
-          for (const s of labels.keys()) if (!completeLabels.has(s)) labels.delete(s);
-          batch.know(completeLabels);
+          for (const [s, l] of graphLabels) labels.set(s, l);
+          batch.know(graphLabels.keys());
         }
         levelContext = context;
         for (const lt of levelTrees.values()) lt.drop();

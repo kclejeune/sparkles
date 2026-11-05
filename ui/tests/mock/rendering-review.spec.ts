@@ -2,6 +2,26 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
 
 const UNI = 'http://example.org/uni#';
 const TH = 'http://example.org/thesaurus/';
+
+/** Simulate local English labels and an imported French label known to the hierarchy. */
+async function localLabelsOnly(page: Page, wait?: () => Promise<void>) {
+  let batches = 0;
+  await page.route('**/uni/sparql**', async (route) => {
+    if (!route.request().postData()?.includes('?s ?p ?l')) return route.continue();
+    const response = await route.fetch();
+    const json = await response.json();
+    if (json.results?.bindings) {
+      json.results.bindings = json.results.bindings.filter(
+        (r: { s?: { value: string }; l?: { 'xml:lang'?: string } }) =>
+          !(r.s?.value === UNI + 'Person' && r.l?.['xml:lang'] === 'fr'),
+      );
+    }
+    await wait?.();
+    await route.fulfill({ response, json });
+    batches++;
+  });
+  return () => batches;
+}
 async function preferences(page: Page, mode: 'label' | 'prefixed' | 'iri', languages = 'fr, en') {
   await page.getByRole('button', { name: 'Rendering preferences', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Rendering preferences' });
@@ -51,6 +71,59 @@ test('a failed language refresh also leaves the Browse draft mounted', async ({ 
     page.locator('.toast').filter({ hasText: 'Could not refresh the entity names' }),
   ).toBeVisible();
   await expect(synonym).toHaveValue('keep this draft');
+});
+
+test('a graph-local label batch cannot mask an imported hierarchy translation', async ({
+  page,
+}) => {
+  const batches = await localLabelsOnly(page);
+  await page.goto(`/ui/workbench/ontology?ds=uni&iri=${encodeURIComponent(UNI + 'Person')}`);
+  await expect(page.getByRole('heading', { name: 'Person', exact: true }).first()).toBeVisible();
+  await expect.poll(batches).toBeGreaterThan(0);
+  const translated = page.waitForResponse(
+    async (r) =>
+      r.url().includes('/hierarchy?') && JSON.stringify(await r.json()).includes('Personne'),
+  );
+  await preferences(page, 'label');
+  await translated;
+  await expect(
+    page
+      .getByRole('tree', { name: 'Classes (asserted)' })
+      .getByRole('button', { name: 'Personne', exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Personne', exact: true }).first()).toBeVisible();
+});
+
+test('a late local label batch cannot replace the hierarchy name from imports', async ({
+  page,
+}) => {
+  await page.addInitScript(() =>
+    localStorage.setItem(
+      'sparkles.rendering',
+      JSON.stringify({ version: 1, mode: 'label', languages: ['fr', 'en'] }),
+    ),
+  );
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const batches = await localLabelsOnly(page, () => gate);
+  try {
+    await page.goto(`/ui/workbench/ontology?ds=uni&iri=${encodeURIComponent(UNI + 'Person')}`);
+    const heading = page.getByRole('heading', { name: 'Personne', exact: true }).first();
+    await expect(heading).toBeVisible();
+    release();
+    await expect.poll(batches).toBeGreaterThan(0);
+    await page.evaluate(() => new Promise(requestAnimationFrame));
+    await expect(heading).toBeVisible();
+    await expect(
+      page
+        .getByRole('tree', { name: 'Classes (asserted)' })
+        .getByRole('button', { name: 'Personne', exact: true }),
+    ).toBeVisible();
+  } finally {
+    release();
+  }
 });
 
 type Cy = {
