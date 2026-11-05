@@ -1,4 +1,5 @@
 <script lang="ts">
+  import OntologyMetrics from '$lib/components/OntologyMetrics.svelte';
   import { iriForm } from '$lib/iri-form.svelte';
   // The ontology browser (docs/specs/U12-ontology-workbench/SPEC.md, "Ontology browser"):
   // a read-only page for each entity of a dataset's ontologies and thesauri, and a landing
@@ -1929,6 +1930,7 @@
             : 'Search by label, synonym, ID or definition'}
         />
       {/if}
+      <OntologyMetrics {target} sel={{ graph, imports: false }} {at} />
       <div class="cols">
         {#if roots}
           <TopTerms

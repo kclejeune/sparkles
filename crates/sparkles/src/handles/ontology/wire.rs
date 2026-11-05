@@ -676,7 +676,7 @@ pub const OPERATIONS: [&str; 14] = [
 /// The members each operation reads besides those that name the ontology.
 fn members(op: &str) -> &'static [&'static str] {
     match op {
-        "summary" => &[],
+        "summary" => &["metrics"],
         "axioms" => &["type", "about", "assertions", "limit", "offset"],
         "entities" => &["kind", "limit", "offset"],
         "entity" => &["iri", "kind", "assertions", "limit"],
@@ -879,7 +879,7 @@ fn profiles_of(a: &Map<String, J>) -> Result<Vec<Profile>> {
 /// Answer the ontology operation `op` with the arguments `args`, a JSON object, in the
 /// JSON forms of the HTTP routes. The operations and their members:
 ///
-/// - `summary`: the summary of `GET /$/ontology/{ds}`.
+/// - `summary`: the summary of `GET /$/ontology/{ds}`, with optional `metrics`.
 /// - `axioms`: a page of `GET /$/ontology/{ds}/axioms`, with `type` (a list such as
 ///   `SubClassOf,ClassAssertion`), `about` (an IRI), `assertions`, `limit` and
 ///   `offset`. `about` an IRI the ontology neither declares nor uses is `NotFound`.
@@ -938,7 +938,11 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
         "summary" => {
             let opts = handle.anchored(opts)?;
             let o = handle.open(&req, &opts)?;
-            Ok(summary_body(name, &o, &req, &r))
+            let mut j = summary_body(name, &o, &req, &r);
+            if boolean(a, "metrics")?.unwrap_or(false) {
+                j["metrics"] = super::metrics::body(name, &o, &req, &r, &opts)?;
+            }
+            Ok(j)
         }
         "axioms" => {
             let q = AxiomQuery {

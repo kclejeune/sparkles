@@ -107,6 +107,45 @@ export type OntologySummary = {
   };
 };
 
+export type OntologyMetrics = {
+  scopeComplete: boolean;
+  commit: number;
+  graphs: string[];
+  warnings: string[];
+  axioms: Record<string, number>;
+  terminologyAxioms: Record<string, number>;
+  assertionOccurrences: Record<string, number>;
+  axiomCount: number;
+  entities: Record<string, number>;
+  entityCount: number;
+  expressivity: { notation: string | null; observedBound: string | null; reasons: string[] };
+  reports: {
+    profile: string;
+    title: string;
+    conforms: boolean;
+    checked: number;
+    total: number;
+    truncated: boolean;
+    violations: { rule: string; message: string; graph?: string; axiom?: string }[];
+  }[];
+};
+
+/** An on-demand read at the displayed revision, with the ordinary summary kept cheap. */
+export async function ontologyMetrics(
+  target: string,
+  sel: Selection,
+  at: string | null,
+  signal?: AbortSignal,
+): Promise<OntologyMetrics> {
+  const params = selParams(sel, { metrics: true, at: at ?? undefined });
+  const res = await request('/$/ontology/' + enc(target) + '?' + params, {
+    headers: { Accept: 'application/json' },
+    cache: 'no-store',
+    signal,
+  });
+  return (await readJson<{ metrics: OntologyMetrics }>(res)).metrics;
+}
+
 export type EntityReport = {
   iri: string;
   kinds: EntityKind[];

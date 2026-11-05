@@ -1853,6 +1853,51 @@ the commit it read.
 }
 ```
 
+`metrics=true` adds an on-demand `metrics` object without changing the ordinary
+summary. The Rust JSON `summary` operation accepts the same boolean. Counts, signature entities, expressivity and the four OWL 2 profile reports
+read one authorized revision and the same graphs and resolved dataset-local imports.
+`at` pins a retained revision. The metrics representation has its own entity tag.
+
+`metrics.axioms` gives counts by type and `axiomCount` their sum. These combine distinct
+mapped terminology axioms with streamed assertion occurrences, as the existing axiom
+listing does. `terminologyAxioms` and `assertionOccurrences` separate the two. Repeated
+assertions in different graphs count once per occurrence. `entities` counts distinct
+structural signature entities by kind and IRI, including undeclared references and
+built-ins. A punned IRI counts in each kind. `entityCount` sums these counts. These are
+axiom counts rather than RDF triple counts, and signature counts rather than the ordinary
+summary's declaration counts. Header IRIs and annotation values are not automatically
+signature entities.
+
+`expressivity.notation` names a conservative containing description logic, not a minimum
+logic or a classification result. The basic conjunction and existential fragment uses
+`EL`. Other constructors extend `ALC` with transitivity `S`, property hierarchy `H`,
+complex role features `R`, nominals `O`, inverses `I`, functionality `F`, number
+restrictions `N`, qualified number restrictions `Q` and data ranges `(D)`. `R` subsumes
+`H` and transitivity, while `Q` subsumes `N` and `F`. Data cardinalities conservatively
+use `Q`. Declaration and annotation datatypes alone do not require `(D)`.
+
+`notation` is null when the selected mapping fails OWL 2 DL, has unmapped triples or
+mapping errors, includes stale inferences, or has unresolved imports or keys that this
+notation cannot represent. `reasons` explains why and `observedBound` preserves the
+bound of the mapped fragment when its constructors have a supported notation. An empty
+ontology with a header has zero counts and the `EL` bound. A graph without a header
+fails the existing DL check. Imports disabled by the caller are outside the selected
+scope, and imports unreadable under the caller's grants are not followed.
+
+`scopeComplete` is false for unresolved imports, incomplete mappings or stale selected
+inferences. Overall `conforms` is null when all mapped reports conform but this scope
+is incomplete. Individual profile reports always describe the mapped scope.
+
+`reports` contains the existing EL, QL, RL and DL reports, including assertions, with
+at most 100 listed violations per profile. The complete selected scope is checked even
+when a violation list is truncated. A conforming report applies to the mapped scope and
+resolved imports, and does not establish conformance of an unresolved imports closure.
+Metrics retain a distinct entity signature set but stream assertions without retaining
+them. This costs memory proportional to the signature. A read refuses more than
+1,000,000 mapped terminology axioms and assertion triples, or 1,000,000 signature
+entities, with an invalid-request error. The existing request deadline and cancellation
+also apply. A stopped read returns an error, never partial counts or conformance.
+
 `GET /$/ontology/{ds}/axioms` lists the axioms, 100 at a time by default and at most
 10,000 (`limit`, `offset`, and `next` in the answer). `type` keeps the axiom types it
 lists, comma separated, and `about` keeps the axioms that mention an IRI. An `about` IRI

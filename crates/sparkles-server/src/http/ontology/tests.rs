@@ -1761,3 +1761,46 @@ async fn the_browser_routes_read_the_branch_asked_for() {
     .await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn metrics_include_assertions_at_the_requested_revision_and_have_their_own_tag() {
+    let s = persistent();
+    let ordinary = get(&s.app, "/$/ontology/h").await;
+    let commit = ordinary.json()["commit"].as_u64().unwrap();
+    let tag = ordinary.headers[header::ETAG].to_str().unwrap();
+    let r = send(
+        &s.app,
+        "GET",
+        "/$/ontology/h?metrics=true",
+        &[("if-none-match", tag)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["metrics"]["commit"], commit);
+    assert_eq!(j["metrics"]["entities"]["NamedIndividual"], 2);
+    assert_eq!(j["metrics"]["assertionOccurrences"]["ClassAssertion"], 1);
+    assert_eq!(j["metrics"]["reports"].as_array().unwrap().len(), 4);
+    assert_ne!(r.headers[header::ETAG], ordinary.headers[header::ETAG]);
+    let update = send(
+        &s.app,
+        "POST",
+        "/h/update",
+        &[("content-type", "application/sparql-update")],
+        "INSERT DATA { <http://ex.org/new> a <http://www.w3.org/2002/07/owl#Class> }",
+    )
+    .await;
+    assert!(update.status.is_success(), "{}", update.text());
+    let pinned = get(
+        &s.app,
+        &format!("/$/ontology/h?metrics=true&at=commit:{commit}"),
+    )
+    .await;
+    assert_eq!(pinned.status, StatusCode::OK, "{}", pinned.text());
+    assert_eq!(pinned.json()["metrics"], j["metrics"]);
+    assert_eq!(
+        get(&s.app, "/$/ontology/h?metrics=maybe").await.status,
+        StatusCode::BAD_REQUEST
+    );
+}

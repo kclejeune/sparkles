@@ -73,6 +73,35 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
+### Ontology metrics and expressivity
+
+Item 621 adds an on-demand metrics panel to the ontology Header view and the ontology
+browser landing page. It shows axiom counts by type, distinct signature entities and
+EL, QL, RL and DL reports from one authorized read, including streamed assertions. The
+Header pins its displayed commit and includes dataset-local imports. The browser uses
+its selected graph and revision without imports, matching its landing page. A changed
+scope clears the panel and cancels its previous read.
+
+The panel labels its DL notation as a conservative containing logic rather than minimum
+expressivity. Simple conjunctions and existential restrictions use EL. Advanced
+constructors extend ALC through SROIQ(D). Mapping errors, unresolved imports, stale
+inferences, keys outside the notation or failed DL checks leave overall expressivity
+unknown and show the reason. An observed fragment bound remains available when sound.
+The profile reports apply to the mapped scope, without claiming an unresolved closure
+is complete.
+
+The opt-in summary read and the shared binding operation are documented in
+[the ontology API](../../API.md#ontology). Terminology counts are distinct axioms and
+streamed assertions count occurrences, with separate columns so repeats across graphs
+are explicit. Entities include undeclared references and built-ins and count once per
+kind and IRI. The read streams assertions and keeps an additional entity signature set,
+so its memory grows with the signature. It refuses scopes above one million mapped
+axioms and assertion triples or signature entities, and returns errors on a limit,
+deadline or cancellation rather than a partial profile proof. At most 100 violations
+per profile are listed after the full selected scope is checked. Ordinary summary
+reads do none of this additional work.
+
+
 ### Ontology editor
 
 The ontology editor phase is built as the UI's **Ontology** page, `/ui/workbench/ontology`. It reads
