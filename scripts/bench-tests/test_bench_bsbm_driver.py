@@ -60,13 +60,15 @@ else:
         self.env = dict(os.environ, CALLS=str(self.work / "calls"), CHILD_PID=str(self.work / "child-pid"),
                         DRIVER_PID=str(self.work / "driver-pid"), TERM_SEEN=str(self.work / "term-seen"))
 
-    def command(self, mode, timeout="0.5"):
+    # Functional cases allow for Python startup on a busy runner. Tests of the
+    # deadline itself pass their short wall budget explicitly.
+    def command(self, mode, timeout="5"):
         return [sys.executable, "-I", str(DRIVER), "--timeout", timeout, "--grace", "0.2",
                 "--cwd", str(self.work), "--xml", str(self.xml), "--out", str(self.out),
                 "--engine", "fake", "--clients", "1", "--name", "bi-mix", "--",
                 sys.executable, str(self.fake), "-o", str(self.xml), mode]
 
-    def run_driver(self, mode, timeout="0.5"):
+    def run_driver(self, mode, timeout="5"):
         started = time.monotonic()
         process = subprocess.run(self.command(mode, timeout), env=self.env,
                                  capture_output=True, text=True, timeout=10)
@@ -88,7 +90,7 @@ else:
                 self.assertIsNone(entry["qmph"])
 
     def test_wall_timeout_is_explicit(self):
-        entry = self.run_driver("hang")
+        entry = self.run_driver("hang", timeout="0.5")
         self.assertEqual(entry["status"], "timeout")
         self.assertIsNone(entry["qmph"])
         self.assertIn("wall budget", entry["status_reasons"][0])
@@ -201,22 +203,22 @@ else:
         script = function + """
 declare -A NAME=([slow]=slow [fast]=fast) URL=([slow]=localhost/hang [fast]=localhost/success)
 ENGINES='slow fast' MIXES=std CLIENTS='1 4' USECASE=bi UCF=bi.txt RDFXML_NRS='' DEAD_ENGINES=''
-BSBM_WARMUP=50 BSBM_RUNS=500 DRIVER_TIMEOUT_MS=300000 BSBM_MAX_TIME=0.5 BSBM_KILL_AFTER=0.2
+BSBM_WARMUP=50 BSBM_RUNS=500 DRIVER_TIMEOUT_MS=300000 BSBM_MAX_TIME=5 BSBM_KILL_AFTER=0.2
 revive() { echo "$1 $2" >> revived; }
 answering() { :; }
 bsbm_qmph
 """
         process = subprocess.run(["bash", "-euc", script], cwd=self.work,
                                  env=self.env | {"ROOT": str(ROOT), "WORK": str(self.work), "JAVA": str(self.fake)},
-                                 capture_output=True, text=True, timeout=10)
+                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(process.returncode, 0, process.stderr)
         data = json.loads((self.work / "results/qmph.json").read_text())
         self.assertEqual({c: e["status"] for c, e in data["slow"].items()}, {"1": "timeout", "4": "timeout"})
         self.assertEqual({c: e["status"] for c, e in data["fast"].items()}, {"1": "ok", "4": "ok"})
         self.assertEqual(len((self.work / "revived").read_text().splitlines()), 4)
-        self.assertIn("slow: bi-mix x1 (whole driver wall budget 0.5s)", process.stdout)
-        self.assertIn("fast: bi-mix x4 (whole driver wall budget 0.5s)", process.stdout)
-        expected = {"preserved": True, "bsbmMaxTimeSeconds": 0.5, "bsbmKillAfterSeconds": 0.2,
+        self.assertIn("slow: bi-mix x1 (whole driver wall budget 5s)", process.stdout)
+        self.assertIn("fast: bi-mix x4 (whole driver wall budget 5s)", process.stdout)
+        expected = {"preserved": True, "bsbmMaxTimeSeconds": 5, "bsbmKillAfterSeconds": 0.2,
                     "bsbmWarmup": 50, "bsbmRuns": 500, "bsbmClients": [1, 4]}
         self.assertEqual(json.loads(extra.read_text())["settings"], expected)
         self.assertEqual(json.loads(extra.read_text())["results"], [])
