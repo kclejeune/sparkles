@@ -195,92 +195,154 @@ async function serve(dir, port) {
 const servers = [await serve(before, 45230), await serve(after, 45231)];
 const browser = await chromium.launch({ channel: 'chromium' });
 result.browserVersion = browser.version();
+const errorRecord = (error) => ({
+  name: error?.name ?? 'Error',
+  message: String(error?.message ?? error),
+  stack: error?.stack ?? null,
+});
+result.correctness = null;
+result.cleanupErrors = [];
+let runError = null;
 try {
   for (let rep = 0; rep < repeats; rep++) {
     for (const which of rep % 2 ? ['after', 'before'] : ['before', 'after']) {
-      const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-      const page = await context.newPage();
-      const capture = captureFiniteReads(page, ds);
-      const { requests, pending } = capture;
-      const start = performance.now();
-      await page.goto(
-        `http://127.0.0.1:${which === 'before' ? 45230 : 45231}/ui/workbench/ontology?ds=${ds}&kind=NamedIndividual`,
-      );
-      const tree = page.getByRole('tree', { name: 'Individuals (asserted)' });
-      let firstBucketsMs = null;
-      if (which === 'after') {
-        await expect(tree.getByRole('button', { name: 'People', exact: true })).toBeVisible({
-          timeout: 120000,
-        });
-        firstBucketsMs = performance.now() - start;
-        await tree.getByRole('button', { name: 'Expand People', exact: true }).click();
+      const trial = {
+        which,
+        rep,
+        firstBucketsMs: null,
+        firstMemberMs: null,
+        rows: null,
+        requests: [],
+        complete: false,
+        error: null,
+        cleanupErrors: [],
+      };
+      let context = null;
+      let capture = null;
+      let trialError = null;
+      try {
+        context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+        const page = await context.newPage();
+        capture = captureFiniteReads(page, ds);
+        const { requests, pending } = capture;
+        const start = performance.now();
+        await page.goto(
+          `http://127.0.0.1:${which === 'before' ? 45230 : 45231}/ui/workbench/ontology?ds=${ds}&kind=NamedIndividual`,
+        );
+        const tree = page.getByRole('tree', { name: 'Individuals (asserted)' });
+        if (which === 'after') {
+          await expect(tree.getByRole('button', { name: 'People', exact: true })).toBeVisible({
+            timeout: 120000,
+          });
+          trial.firstBucketsMs = performance.now() - start;
+          await tree.getByRole('button', { name: 'Expand People', exact: true }).click();
+        }
+        await expect(
+          tree.getByRole('button', { name: 'individual 000000', exact: true }),
+        ).toBeVisible({ timeout: 120000 });
+        trial.firstMemberMs = performance.now() - start;
+        await expect.poll(() => pending.size, { timeout: 120000 }).toBe(0);
+        await capture.settle();
+        trial.rows = await tree.getByRole('treeitem').count();
+        expect(trial.rows).toBeLessThan(80);
+        if (which === 'after') {
+          expect(
+            requests.filter((r) => r.path.endsWith('/entities') || r.path.endsWith('/axioms')),
+          ).toHaveLength(0);
+          expect(requests.filter((r) => r.path.endsWith('/individuals'))).toHaveLength(2);
+        } else {
+          expect(
+            requests.some(
+              (r) => r.path.endsWith('/entities') && r.query.includes('NamedIndividual'),
+            ),
+          ).toBe(true);
+          expect(
+            requests.some((r) => r.path.endsWith('/axioms') && r.query.includes('ClassAssertion')),
+          ).toBe(true);
+          expect(requests.filter((r) => r.path.endsWith('/individuals'))).toHaveLength(0);
+        }
+      } catch (error) {
+        trialError = error;
+      } finally {
+        try {
+          await context?.close();
+        } catch (error) {
+          trial.cleanupErrors.push(errorRecord(error));
+          trialError ??= error;
+        }
+        try {
+          if (capture) {
+            await capture.settle();
+            Object.assign(trial, capture.summary(), { requests: capture.requests });
+          }
+        } catch (error) {
+          trial.cleanupErrors.push(errorRecord(error));
+          trialError ??= error;
+        }
+        trial.complete = trial.complete && trialError === null && trial.cleanupErrors.length === 0;
+        if (!trial.complete && trialError === null)
+          trialError = new Error('Incomplete finite-read accounting');
+        trial.error = trialError === null ? null : errorRecord(trialError);
+        result.browser.push(trial);
       }
-      await expect(
-        tree.getByRole('button', { name: 'individual 000000', exact: true }),
-      ).toBeVisible({ timeout: 120000 });
-      const firstMemberMs = performance.now() - start;
-      await expect.poll(() => pending.size, { timeout: 120000 }).toBe(0);
-      await capture.settle();
-      const rows = await tree.getByRole('treeitem').count();
-      expect(rows).toBeLessThan(80);
-      if (which === 'after') {
-        expect(
-          requests.filter((r) => r.path.endsWith('/entities') || r.path.endsWith('/axioms')),
-        ).toHaveLength(0);
-        expect(requests.filter((r) => r.path.endsWith('/individuals'))).toHaveLength(2);
-      } else {
-        expect(
-          requests.some((r) => r.path.endsWith('/entities') && r.query.includes('NamedIndividual')),
-        ).toBe(true);
-        expect(
-          requests.some((r) => r.path.endsWith('/axioms') && r.query.includes('ClassAssertion')),
-        ).toBe(true);
-        expect(requests.filter((r) => r.path.endsWith('/individuals'))).toHaveLength(0);
-      }
-      await context.close();
-      await capture.settle();
-      result.browser.push({
+      if (trialError !== null) throw trialError;
+    }
+  }
+} catch (error) {
+  runError = error;
+} finally {
+  const cleanup = await Promise.allSettled([
+    Promise.resolve().then(() => browser.close()),
+    ...servers.map(
+      (s) => new Promise((ok, reject) => s.close((error) => (error ? reject(error) : ok()))),
+    ),
+  ]);
+  for (const outcome of cleanup)
+    if (outcome.status === 'rejected') {
+      result.cleanupErrors.push(errorRecord(outcome.reason));
+      runError ??= outcome.reason;
+    }
+  result.complete =
+    runError === null &&
+    result.browser.length === repeats * 2 &&
+    result.browser.every((trial) => trial.complete);
+  result.error = runError === null ? null : errorRecord(runError);
+  if (result.complete)
+    result.correctness = `${count} typed named members, 3 untyped members, duplicate-free continuation, two memberships on the final individual, anonymous omission, incoming-only frame lookup and virtualized actual-tab display checked.`;
+  try {
+    writeFileSync(output, JSON.stringify(result, null, 2) + '\n', { flag: 'wx' });
+  } catch (error) {
+    if (runError !== null) {
+      // Keep the original exception identity and expose the secondary write failure
+      // even when an existing exclusive output prevents recording it in JSON.
+      if (runError instanceof Error) runError.persistenceError = error;
+      console.error('Raw measurement persistence failed:', error);
+    } else runError = error;
+  }
+}
+if (runError !== null) throw runError;
+console.log(
+  JSON.stringify(
+    result.browser.map(
+      ({
         which,
         rep,
         firstBucketsMs,
         firstMemberMs,
-        rows,
-        requests,
-        ...capture.summary(),
-      });
-    }
-  }
-  result.correctness = `${count} typed named members, 3 untyped members, duplicate-free continuation, two memberships on the final individual, anonymous omission, incoming-only frame lookup and virtualized actual-tab display checked.`;
-  result.complete = result.browser.every((trial) => trial.complete);
-  writeFileSync(output, JSON.stringify(result, null, 2) + '\n', { flag: 'wx' });
-  if (!result.complete)
-    throw new Error('Incomplete finite-read accounting. Raw trials preserved at ' + output);
-  console.log(
-    JSON.stringify(
-      result.browser.map(
-        ({
-          which,
-          rep,
-          firstBucketsMs,
-          firstMemberMs,
-          decodedBytes,
-          requestBytes,
-          responseWireBytes,
-        }) => ({
-          which,
-          rep,
-          firstBucketsMs,
-          firstMemberMs,
-          decodedBytes,
-          requestBytes,
-          responseWireBytes,
-        }),
-      ),
-      null,
-      2,
+        decodedBytes,
+        requestBytes,
+        responseWireBytes,
+      }) => ({
+        which,
+        rep,
+        firstBucketsMs,
+        firstMemberMs,
+        decodedBytes,
+        requestBytes,
+        responseWireBytes,
+      }),
     ),
-  );
-} finally {
-  await browser.close();
-  await Promise.all(servers.map((s) => new Promise((ok) => s.close(ok))));
-}
+    null,
+    2,
+  ),
+);
