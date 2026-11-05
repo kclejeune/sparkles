@@ -721,6 +721,9 @@ async fn kept_classification_get_is_fresh_read_only_and_pins_pages() {
 #[tokio::test]
 async fn kept_classification_http_selectors_refuse_ambiguous_or_computing_inputs() {
     let s = server();
+    let dataset =
+        crate::http::dataset(&s._state, "t").unwrap_or_else(|_| panic!("fixture dataset"));
+    let head = dataset.store.snapshot().commit;
     for query in [
         "inferences=false",
         "assertions=false",
@@ -738,6 +741,50 @@ async fn kept_classification_http_selectors_refuse_ambiguous_or_computing_inputs
     }
     let ct = [(header::CONTENT_TYPE.as_str(), "application/json")];
     for (query, body) in [
+        (
+            "?nodes=ture",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?assertions=maybe",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?partial=maybe",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?inferences=maybe",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?projection=frame&imports=false&imports=true",
+            r#"{"about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?imports=false",
+            r#"{"projection":"frame","imports":true,"about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?mode=strict",
+            r#"{"projection":"frame","mode":"lenient","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?assertions=false&assertions=false",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?inferences=false&inferences=false",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?unknown=ignored",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?graph=urn:query",
+            r#"{"projection":"frame","graph":"urn:body","about":"http://ex.org/Professor"}"#,
+        ),
         ("", "null"),
         (
             "",
@@ -790,6 +837,16 @@ async fn kept_classification_http_selectors_refuse_ambiguous_or_computing_inputs
     assert_eq!(
         get(&s.app, "/$/ontology/t/classification").await.json()["status"],
         "unavailable"
+    );
+    assert_eq!(dataset.store.snapshot().commit, head);
+    assert!(
+        !dataset
+            .dataset
+            .ontology()
+            .open(&Default::default(), &Default::default())
+            .unwrap()
+            .cached,
+        "invalid selectors must not map or warm the ontology"
     );
     let r = post(&s.app, "/$/ontology/t/classify", json!({"projection":"frame", "about":"http://ex.org/Professor", "nodes":false,"offset":0,"target":null,"limit":1,"lang":["en"]})).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());

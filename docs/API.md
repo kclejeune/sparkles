@@ -2252,10 +2252,13 @@ whole-equivalence arrays. It accepts harmless `nodes: false`, null/zero offset a
 target defaults, but refuses `nodes: true`, nonzero offset, an effective write target or
 OFN output before mapping or worker admission. `lang` is available only with this
 projection. Missing or null projection preserves legacy output. Unknown projection
-values and duplicate/conflicting projection selectors are invalid.
+values and duplicate/conflicting projection selectors are invalid. Query boolean
+selectors for frame projection use `true` or `false`; other spellings are invalid.
 
 A restricted or otherwise non-retained explicit projection still returns the authorized
-clauses from that computation. Its `frame.retention.kept` is false and readable
+clauses from that computation. Data-dependent graph guards are bound once against the
+original selected snapshot. Projection labels reuse that exact bound graph access and
+the already triple-masked snapshot, so hidden policy triples cannot change the decision. Its `frame.retention.kept` is false and readable
 `resultId` is null. Truncated isolated samples have no shared GET continuation; reading
 more must not silently classify again. An eligible retained projection supplies its pin
 for bounded GET continuations. A display result ID alone does not grant such access.

@@ -285,7 +285,12 @@ impl Ontologies {
                 "a classification that writes reads the head: leave out 'at'",
             ));
         }
-        let (snap, opts) = self.state(req, opts)?;
+        let (snap, mut opts) = self.state(req, opts)?;
+        let caller_graphs = opts.graphs.clone();
+        // Decide data-dependent graph guards once on the ORIGINAL snapshot.
+        // Projection names read the already triple-masked snapshot, where policy
+        // triples can be absent. Re-deciding there could widen the graph grant.
+        opts.graphs = opts.graphs.as_ref().map(|access| access.bound(&snap));
         let o = self.open_at(&snap, req, &opts)?;
         let keep = opts.graphs.is_none() && snap.cacheable && !c.assertions && !c.el_only;
         let (publication, reused) = if keep {
@@ -348,7 +353,14 @@ impl Ontologies {
             written: None,
         };
         if let Some(target) = &c.target {
-            classified.written = Some(self.write_taxonomy(req, &classified, target, c, &opts)?);
+            // Preserve the writer's existing authorization path with the original
+            // caller rules. A bound projection read is not a write capability.
+            let write_opts = QueryOptions {
+                graphs: caller_graphs,
+                ..opts
+            };
+            classified.written =
+                Some(self.write_taxonomy(req, &classified, target, c, &write_opts)?);
         }
         Ok(classified)
     }

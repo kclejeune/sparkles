@@ -1367,7 +1367,7 @@ pub(super) async fn classify(
     let projection =
         onto::wire::projection_of(text("projection")?.as_deref()).map_err(ontology_error)?;
     if projection.is_some() {
-        for key in [
+        let allowed = [
             "projection",
             "about",
             "nodes",
@@ -1380,12 +1380,32 @@ pub(super) async fn classify(
             "message",
             "lang",
             "format",
-        ] {
-            if params.all(key).len() > 1 {
+            "graph",
+            "imports",
+            "mode",
+            "inferences",
+            "assertions",
+            "at",
+            "timeout",
+            "branch",
+        ];
+        for (key, _) in &params.0 {
+            if !allowed.contains(&key.as_str()) {
+                return Err(bad(format!("unknown selector '{key}'")));
+            }
+            if key != "graph" && params.all(key).len() > 1 {
                 return Err(bad(format!("duplicate selector '{key}'")));
             }
             if params.has(key) && o.get(key).is_some_and(|v| !v.is_null()) {
                 return Err(bad(format!("'{key}' appears in both query and body")));
+            }
+        }
+        for key in ["inferences", "assertions", "nodes", "partial"] {
+            if params
+                .get(key)
+                .is_some_and(|value| !matches!(value, "true" | "false"))
+            {
+                return Err(bad(format!("{key}: true or false")));
             }
         }
     }

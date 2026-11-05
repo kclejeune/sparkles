@@ -2006,7 +2006,12 @@ fn frame_body(name: &str, c: &Classified, req: &OntologyRequest, q: &ClassifyQue
 /// disappear into a map. Legacy requests without a projection keep their old value
 /// normalization. Structured callers already have unique object keys.
 pub fn decode_arguments(op: &str, bytes: &[u8]) -> Result<J> {
-    decode_argument_object(bytes, op == "keptClassification", op == "classify")
+    if matches!(op, "classify" | "keptClassification") {
+        decode_argument_object(bytes, op == "keptClassification", op == "classify")
+    } else {
+        // Unrelated legacy operations accept null as an empty argument object.
+        serde_json::from_slice(bytes).map_err(|e| bad(format!("invalid ontology JSON: {e}")))
+    }
 }
 /// Duplicate-sensitive selectors when the projection is supplied outside the body.
 pub fn decode_strict_arguments(bytes: &[u8]) -> Result<J> {

@@ -657,6 +657,52 @@ fn raw_ontology_selectors_do_not_treat_a_null_body_as_an_empty_object() {
 }
 
 #[test]
+fn bounded_exclusions_have_typed_gaps_and_preserve_legacy_shape() {
+    let ds = ds(
+        ":A a owl:Class . :Opaque a rdfs:Datatype . :p a owl:DatatypeProperty ; rdfs:range :Opaque .",
+    );
+    let frame = super::super::wire::call(
+        &ds,
+        "classify",
+        &json!({"projection":"frame","about":"http://ex.org/A","limit":1}),
+        &opts(),
+    )
+    .unwrap();
+    assert!(frame["frame"]["outcome"]["excludedCount"].as_u64().unwrap() > 0);
+    assert_eq!(
+        frame["frame"]["excluded"]["items"][0]["gap"]["kind"],
+        "partiallyUsed"
+    );
+    assert!(frame["frame"]["excluded"]["items"][0]["gap"]["reason"].is_string());
+    let legacy = super::super::wire::call(
+        &ds,
+        "classify",
+        &json!({"about":"http://ex.org/A","limit":1}),
+        &opts(),
+    )
+    .unwrap();
+    assert!(legacy["excluded"][0]["partial"].is_string());
+    assert!(legacy["excluded"][0].get("gap").is_none());
+    assert_eq!(
+        legacy["classificationSource"],
+        frame["classificationSource"]
+    );
+}
+
+#[test]
+fn unrelated_legacy_raw_null_reads_keep_empty_argument_compatibility() {
+    let ds = ds(":A a owl:Class .");
+    // Compare equivalent cached reads, rather than the first call's cache-hit bit.
+    ds.ontology().open(&req(), &opts()).unwrap();
+    for operation in ["summary", "entities"] {
+        let arguments = super::super::wire::decode_arguments(operation, b"null").unwrap();
+        let actual = super::super::wire::call(&ds, operation, &arguments, &opts()).unwrap();
+        let empty = super::super::wire::call(&ds, operation, &json!({}), &opts()).unwrap();
+        assert_eq!(actual, empty);
+    }
+}
+
+#[test]
 fn sources_include_typed_warning_tail_and_reconstruct_the_status_digest() {
     let ds =
         ds(":o a owl:Ontology ; owl:imports <urn:missing:1>, <urn:missing:2> . :A a owl:Class .");
@@ -1036,6 +1082,184 @@ fn isolated_frame_records_actual_flags_and_never_advertises_a_shared_pin() {
             Status::Unavailable
         );
     }
+}
+
+#[test]
+fn projection_binding_does_not_upgrade_unprepared_write_guards() {
+    use crate::access::{Decider, GuardDecision};
+    struct WriteGuard;
+    impl GuardDecision for WriteGuard {
+        fn exempt(&self, _snap: &Arc<Snapshot>) -> Vec<String> {
+            vec!["http://ex.org/open".into(), "http://ex.org/output".into()]
+        }
+    }
+    let ds = ds("GRAPH :open { :A a owl:Class . }");
+    let guard = Arc::new(WriteGuard);
+    let options = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::graphs(
+            Graphs::All,
+            Graphs::All.guarded_by("http://ex.org/*", Decider(guard.clone())),
+        ))),
+        ..opts()
+    };
+    let request = OntologyRequest {
+        graphs: vec![sparkles_reasoner::inputs::GraphRef::Named(
+            "http://ex.org/open".into(),
+        )],
+        ..req()
+    };
+    let head = ds.snapshot().commit;
+    let outcome = ds.ontology().classify(
+        &request,
+        &ClassifyRequest {
+            target: Some(sparkles_reasoner::inputs::GraphRef::Named(
+                "http://ex.org/output".into(),
+            )),
+            ..Default::default()
+        },
+        &options,
+    );
+    assert!(matches!(outcome, Err(Error::NotPermitted(_))));
+    assert_eq!(ds.snapshot().commit, head);
+}
+
+#[test]
+fn isolated_names_never_redecide_graph_guards_after_triple_masking() {
+    use crate::access::{Decider, GuardDecision};
+    use crate::index::Perm;
+    struct Policy {
+        decisions: std::sync::Mutex<Vec<bool>>,
+    }
+    impl GuardDecision for Policy {
+        fn exempt(&self, snap: &Arc<Snapshot>) -> Vec<String> {
+            let policy_present = snap
+                .lookup_iri("http://ex.org/policy")
+                .is_some_and(|p| snap.count(Perm::Pos, &[p.0]).unwrap() > 0);
+            self.decisions.lock().unwrap().push(policy_present);
+            let mut allowed = vec!["http://ex.org/open".into()];
+            if !policy_present {
+                allowed.push("http://ex.org/other".into());
+            }
+            allowed
+        }
+    }
+    let ds = ds("GRAPH :open { :o a owl:Ontology ; owl:imports :other .
+        :o :policy true . :A a owl:Class ; owl:equivalentClass :E .
+        :E a owl:Class ; rdfs:label \"Visible\"@en . }
+        GRAPH :other { :other a owl:Ontology . :B a owl:Class .
+        :A rdfs:subClassOf :B . :E rdfs:label \"Hidden\"@en . }");
+    let policy = Arc::new(Policy {
+        decisions: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut options = crate::handles::ontology::tests::hiding("http://ex.org/policy");
+    let access = Arc::make_mut(options.graphs.as_mut().unwrap());
+    access.read = Graphs::All.guarded_by("http://ex.org/*", Decider(policy.clone()));
+    access.write = Graphs::none();
+    let request = OntologyRequest {
+        graphs: vec![sparkles_reasoner::inputs::GraphRef::Named(
+            "http://ex.org/open".into(),
+        )],
+        ..req()
+    };
+    let shared = ds
+        .ontology()
+        .classify(&request, &ClassifyRequest::default(), &opts())
+        .unwrap()
+        .publication;
+    assert_eq!(
+        ds.ontology()
+            .kept_classification(&request, &KeptQuery::default(), &options)
+            .unwrap()
+            .reason,
+        Some("unsupportedScope")
+    );
+    let mut c = ds
+        .ontology()
+        .classify(&request, &ClassifyRequest::default(), &options)
+        .unwrap();
+    assert_eq!(c.opened.graphs.len(), 1);
+    let frame = super::super::wire::classify_body(
+        "fixture",
+        &c,
+        &request,
+        &super::super::wire::renderer(&ds),
+        &super::super::wire::ClassifyQuery {
+            projection: Some(super::super::wire::ClassifyProjection::Frame),
+            about: Some("http://ex.org/A".into()),
+            languages: vec!["en".into()],
+            limit: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        frame["frame"]["equivalents"]["items"][0]["label"],
+        "Visible"
+    );
+    assert_eq!(
+        frame["frame"]["parents"]["items"][0]["iri"],
+        sparkles_owl::vocab::OWL_THING
+    );
+    assert_eq!(
+        frame["frame"]["result"]["sourceCounts"]["resolvedGraphs"],
+        1
+    );
+    assert_eq!(*policy.decisions.lock().unwrap(), vec![true]);
+    assert!(!frame.to_string().contains("Hidden"));
+    assert_eq!(frame["frame"]["retention"]["kept"], false);
+    // A deterministic terminal partial object exercises the same post-stop result
+    // options; the unchanged deadline cases separately execute real stopped runs.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut stopped_options = c.read_options.clone();
+    stopped_options.cancel = Some(stop.clone());
+    c.read_options = super::super::classify::result_options(&stopped_options, false);
+    let mut partial = (*c.classification).clone();
+    partial.complete = false;
+    partial.consistency = sparkles_owl::classify::Consistency::Unknown;
+    c.classification = Arc::new(partial);
+    c.publication = KeptClassification::capture(
+        &ds.ontology(),
+        &request,
+        &ClassifyRequest {
+            partial: true,
+            ..Default::default()
+        },
+        &c.opened,
+        c.classification.clone(),
+        c.excluded.clone(),
+        &c.read_options,
+    )
+    .unwrap();
+    let partial_frame = super::super::wire::classify_body(
+        "fixture",
+        &c,
+        &request,
+        &super::super::wire::renderer(&ds),
+        &super::super::wire::ClassifyQuery {
+            projection: Some(super::super::wire::ClassifyProjection::Frame),
+            about: Some("http://ex.org/A".into()),
+            languages: vec!["en".into()],
+            limit: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(partial_frame["frame"]["outcome"]["partial"], true);
+    assert_eq!(
+        partial_frame["frame"]["equivalents"]["items"][0]["label"],
+        "Visible"
+    );
+    assert!(!partial_frame.to_string().contains("Hidden"));
+    assert_eq!(*policy.decisions.lock().unwrap(), vec![true]);
+    assert!(stop.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(result(&ds).unwrap().id, shared.id);
+    assert_eq!(
+        ds.ontology()
+            .kept_classification(&request, &KeptQuery::default(), &options)
+            .unwrap()
+            .reason,
+        Some("unsupportedScope")
+    );
 }
 
 #[test]
