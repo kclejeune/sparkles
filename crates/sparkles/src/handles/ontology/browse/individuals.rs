@@ -55,6 +55,18 @@ pub struct Individuals {
 const MAX_GROUPS: usize = 100_000;
 const MAX_TYPES: usize = 1000;
 
+// Diagnostic accounting for the explicit large-fixture test. This counts only this
+// module's visitor, not mapper reads, bounded name reads or Scope::quads probes.
+#[cfg(test)]
+thread_local! {
+    static SCAN_ROWS: std::cell::RefCell<BTreeMap<String, usize>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+#[cfg(test)]
+pub(super) fn take_scan_rows() -> BTreeMap<String, usize> {
+    SCAN_ROWS.with(|rows| std::mem::take(&mut *rows.borrow_mut()))
+}
+
 impl Ontologies {
     pub fn individuals(
         &self,
@@ -259,6 +271,13 @@ impl Scope {
             }
             Ok(true)
         })?;
+        #[cfg(test)]
+        SCAN_ROWS.with(|rows| {
+            *rows
+                .borrow_mut()
+                .entry(format!("{perm:?}/{}", prefix.len()))
+                .or_default() += n;
+        });
         check(&self.opts)
     }
 

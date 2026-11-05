@@ -3,7 +3,14 @@
 // and records the cold root discovery and warm member scans separately.
 import { chromium, expect } from '@playwright/test';
 import { createServer, request as proxyRequest } from 'node:http';
-import { createReadStream, existsSync, statSync, writeFileSync } from 'node:fs';
+import {
+  createReadStream,
+  existsSync,
+  statSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+} from 'node:fs';
 import { resolve, extname } from 'node:path';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
@@ -18,6 +25,8 @@ if (existsSync(output))
   throw new Error('The output already exists. Keep raw run records immutable.');
 const count = Number(process.env.INDIVIDUALS_COUNT ?? 50250);
 const repeats = Number(process.env.INDIVIDUALS_REPEATS ?? 3);
+if (!Number.isInteger(count) || count < 200 || !Number.isInteger(repeats) || repeats < 1)
+  throw new Error('Use at least 200 individuals and one repetition.');
 const ds = 'individuals-perf607';
 const ns = 'http://example.org/individuals607/';
 const individual = (n) => ns + 'i' + String(n).padStart(6, '0');
@@ -32,11 +41,34 @@ for (let n = 0; n < count; n++)
   );
 parts.push(`<${individual(count - 1)}> a <${ns}Other> . [] a <${ns}People> .`);
 const turtle = parts.join('\n');
+function buildDigest(dir) {
+  const hash = createHash('sha256');
+  function walk(path, relative = '') {
+    for (const entry of readdirSync(path, { withFileTypes: true }).sort((a, b) =>
+      a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+    )) {
+      const child = resolve(path, entry.name);
+      const name = relative + entry.name;
+      if (entry.isDirectory()) walk(child, name + '/');
+      else if (entry.isFile()) hash.update(name + '\0').update(readFileSync(child));
+    }
+  }
+  walk(resolve(dir));
+  return hash.digest('hex');
+}
 const result = {
+  runAt: new Date().toISOString(),
+  node: process.version,
+  harnessSha256: createHash('sha256')
+    .update(readFileSync(import.meta.filename))
+    .digest('hex'),
+  uiBuilds: { before: buildDigest(before), after: buildDigest(after) },
   browserHost: { hostname: os.hostname(), cpu: os.cpus()[0].model, platform: os.platform() },
   beforeSource: process.env.INDIVIDUALS_BEFORE_SOURCE,
   afterSource: process.env.INDIVIDUALS_AFTER_SOURCE,
-  serverReceipt: process.env.INDIVIDUALS_SERVER_RECEIPT,
+  serverReceipt: process.env.INDIVIDUALS_SERVER_RECEIPT
+    ? JSON.parse(readFileSync(process.env.INDIVIDUALS_SERVER_RECEIPT, 'utf8'))
+    : null,
   fixture: {
     count,
     bytes: Buffer.byteLength(turtle),
@@ -125,8 +157,12 @@ async function serve(dir, port) {
           response.pipe(res);
         },
       );
+      res.on('close', () => {
+        if (!res.writableEnded) upstream.destroy();
+      });
       upstream.on('error', (e) => {
-        res.writeHead(502);
+        if (res.destroyed) return;
+        if (!res.headersSent) res.writeHead(502);
         res.end(String(e));
       });
       req.pipe(upstream);
@@ -214,6 +250,14 @@ try {
           requests.filter((r) => r.path.endsWith('/entities') || r.path.endsWith('/axioms')),
         ).toHaveLength(0);
         expect(requests.filter((r) => r.path.endsWith('/individuals'))).toHaveLength(2);
+      } else {
+        expect(
+          requests.some((r) => r.path.endsWith('/entities') && r.query.includes('NamedIndividual')),
+        ).toBe(true);
+        expect(
+          requests.some((r) => r.path.endsWith('/axioms') && r.query.includes('ClassAssertion')),
+        ).toBe(true);
+        expect(requests.filter((r) => r.path.endsWith('/individuals'))).toHaveLength(0);
       }
       result.browser.push({
         which,
@@ -236,8 +280,7 @@ try {
       await context.close();
     }
   }
-  result.correctness =
-    '50250 typed named members, 3 untyped members, duplicate-free continuation, two memberships on the final individual, anonymous omission, incoming-only frame lookup and virtualized actual-tab display checked.';
+  result.correctness = `${count} typed named members, 3 untyped members, duplicate-free continuation, two memberships on the final individual, anonymous omission, incoming-only frame lookup and virtualized actual-tab display checked.`;
   writeFileSync(output, JSON.stringify(result, null, 2) + '\n', { flag: 'wx' });
   console.log(
     JSON.stringify(

@@ -847,3 +847,68 @@ fn individual_pages_fail_explicitly_on_excessive_type_memberships() {
         matches!(result, Err(Error::Invalid(message)) if message.contains("more than 1000 named types"))
     );
 }
+
+/// Explicit diagnostic for item 607. Counts visitor rows, never a timing benchmark.
+#[test]
+#[ignore = "large-fixture scan accounting; run explicitly without other heavy work"]
+fn measure_individual_scan_work() {
+    let n = 50_250usize;
+    let mut body = String::from(
+        ":People a owl:Class ; rdfs:label \"People\"@en . :Other a owl:Class ; rdfs:label \"Other type\"@en . :untyped a owl:NamedIndividual . :knows a owl:ObjectProperty . :subjectOnly :knows :objectOnly . ",
+    );
+    for i in 0..n {
+        body.push_str(&format!(
+            ":i{i:06} a owl:NamedIndividual, :People ; rdfs:label \"individual {i:06}\"@en . "
+        ));
+    }
+    body.push_str(&format!(":i{:06} a :Other . [] a :People .", n - 1));
+    let ds = dataset(&body);
+    let opts = QueryOptions::default();
+    let run = |name: &str, query: IndividualsRequest| {
+        individuals::take_scan_rows();
+        let page = ds.ontology().individuals(&req(), &query, &opts).unwrap();
+        let rows = individuals::take_scan_rows();
+        println!(
+            "INDIVIDUAL_SCAN_WORK {}",
+            serde_json::json!({"operation": name, "visitorRows": rows, "total": page.total, "groups": page.groups.len(), "individuals": page.individuals.len(), "next": page.next})
+        );
+        page
+    };
+    let root = run("root", IndividualsRequest::default());
+    assert_eq!(root.groups.len(), 3);
+    assert_eq!(root.groups[0].total, Some(3));
+    let first = run(
+        "typed-first",
+        IndividualsRequest {
+            class: Some(ex("People")),
+            ..Default::default()
+        },
+    );
+    assert_eq!(first.total, n);
+    assert_eq!(first.individuals.len(), 100);
+    let second = run(
+        "typed-next",
+        IndividualsRequest {
+            class: Some(ex("People")),
+            after: first.next,
+            ..Default::default()
+        },
+    );
+    assert_eq!(second.individuals[0].name.iri, ex("i000100"));
+    let located = run(
+        "locate",
+        IndividualsRequest {
+            iri: Some(ex("i050249")),
+            ..Default::default()
+        },
+    );
+    assert_eq!(located.individuals[0].types.len(), 2);
+    let untyped = run(
+        "untyped",
+        IndividualsRequest {
+            untyped: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(untyped.total, 3);
+}

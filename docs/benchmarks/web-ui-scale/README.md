@@ -105,3 +105,14 @@ INDIVIDUALS_AFTER_SOURCE=TIP_COMMIT \
 INDIVIDUALS_SERVER_RECEIPT=/path/to/server-receipt.json \
 INDIVIDUALS_OUT=/path/to/new-run.json node scripts/perf-individuals.mjs
 ```
+
+The explicit Rust diagnostic counts index rows visited by the individuals module on the
+same fixture shape. It prints root discovery, first and subsequent typed pages, direct
+lookup and Untyped separately. The counters exclude terminology mapping, bounded name
+reads and existence probes through the shared quad helper, so they describe part of the
+server work. They are compiled only into tests and do not add work to the measured
+server binary.
+
+```sh
+mbx test -p sparkles --features ontology --lib measure_individual_scan_work -- --ignored --nocapture
+```
