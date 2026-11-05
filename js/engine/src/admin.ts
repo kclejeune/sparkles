@@ -381,6 +381,18 @@ export interface OntologyHierarchy {
     truncated: boolean;
   };
 }
+/** A lexical page of asserted named individuals or their type buckets. */
+export interface OntologyIndividuals {
+  dataset: string;
+  commit: bigint;
+  order: 'iri';
+  groups: { type: OntologyName | null; total: number | null }[];
+  individuals: (OntologyName & { types: OntologyName[] })[];
+  total: number;
+  /** A lexical cursor; the empty string continues after the Untyped bucket. */
+  next: string | null;
+  warnings: string[];
+}
 /** The statements of one predicate that point at an entity. */
 export interface OntologyIncoming {
   property: string;
@@ -922,6 +934,32 @@ export class Administration {
             lang: Array.isArray(o.lang) ? o.lang.join(',') : o.lang,
             limit: o.limit,
             offset: o.offset,
+          },
+          o,
+          false,
+        ),
+      /** Page type buckets, members of a type, Untyped members, or locate one individual. */
+      individuals: (
+        o: OntologyRead &
+          OperationOptions & {
+            type?: string | { termType: 'NamedNode'; value: string };
+            untyped?: boolean;
+            iri?: string | { termType: 'NamedNode'; value: string };
+            after?: string;
+            limit?: number;
+            lang?: string | string[];
+          } = {},
+      ) =>
+        call<OntologyIndividuals>(
+          'ontology.individuals',
+          {
+            ...readSelection(o),
+            type: o.type === undefined || typeof o.type === 'string' ? o.type : o.type.value,
+            untyped: o.untyped,
+            iri: o.iri === undefined || typeof o.iri === 'string' ? o.iri : o.iri.value,
+            after: o.after,
+            limit: o.limit,
+            lang: Array.isArray(o.lang) ? o.lang.join(',') : o.lang,
           },
           o,
           false,

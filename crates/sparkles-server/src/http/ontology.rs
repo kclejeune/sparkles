@@ -1041,6 +1041,38 @@ pub(super) async fn hierarchy(
     .await
 }
 
+/// Named individuals by asserted named type, with bounded keyset pages.
+pub(super) async fn individuals(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let req = request_of(&params)?;
+    let mut a = browse_args(
+        &params,
+        &headers,
+        &["type", "iri", "after", "limit"],
+        &["untyped"],
+    );
+    numbers(&mut a, &["limit"])?;
+    let q = onto::wire::individuals_request_of(&a).map_err(|e| bad(e.to_string()))?;
+    let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+    blocking(move || {
+        let found = ds
+            .dataset
+            .ontology()
+            .individuals(&req, &q, &opts)
+            .map_err(ontology_error)?;
+        let j = onto::wire::individuals_body(&ds.name, &found);
+        tagged(&ds, &headers, found.commit, "owl-individuals", j)
+    })
+    .await
+}
+
 /// The download formats of `GET /$/ontology/{ds}/term`.
 fn term_format(f: &str) -> ApiResult<Option<(oxrdfio::RdfFormat, &'static str, &'static str)>> {
     use oxrdfio::RdfFormat;

@@ -454,6 +454,37 @@ impl PyOntologies {
         answer(py, j, &[])
     }
 
+    /// A lexical page of asserted named individuals, their type buckets, or one
+    /// individual's memberships. Continue with `after` and the returned `commit` as `at`.
+    #[pyo3(signature=(graph=None, *, r#type=None, untyped=false, iri=None, after=None, limit=100, lang=None, imports=true, at=None, cancel=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn individuals<'py>(
+        &self,
+        py: Python<'py>,
+        graph: Option<&Bound<'py, PyAny>>,
+        r#type: Option<&str>,
+        untyped: bool,
+        iri: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+        lang: Option<&Bound<'py, PyAny>>,
+        imports: bool,
+        at: Option<&Bound<'py, PyAny>>,
+        cancel: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut a = base(graph, imports, "lenient", false)?;
+        a.insert("at".into(), at_json(at)?);
+        a.insert("type".into(), json!(r#type));
+        a.insert("untyped".into(), json!(untyped));
+        a.insert("iri".into(), json!(iri));
+        a.insert("after".into(), json!(after));
+        a.insert("limit".into(), json!(limit));
+        a.insert("lang".into(), names_json(lang)?);
+        let j = self.run(py, "individuals", a, cancel, timeout, false)?;
+        answer(py, j, &[])
+    }
+
     /// What the graphs say about the entity `iri`, as `GET /$/ontology/{ds}/term` answers
     /// it, read without reading the whole ontology: a dict with its `statements` and
     /// their annotations, the `axioms` they map to, the axioms of other entities that

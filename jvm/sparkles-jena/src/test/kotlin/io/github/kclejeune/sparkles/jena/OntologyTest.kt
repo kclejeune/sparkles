@@ -270,6 +270,36 @@ class OntologyTest {
         }
     }
 
+    @Test fun individual_pages_preserve_graph_cursor_and_revision(@TempDir dir: java.nio.file.Path) {
+        SparklesDatasets.open(dir.resolve("individual-pages")).use { ds ->
+            val graph = "http://ex.org/individuals"
+            UpdateAction.parseExecute("""$prefixes INSERT DATA { GRAPH <$graph> {
+              :Person a owl:Class . :loose a owl:NamedIndividual .
+              :a a :Person . :b a :Person . :c a :Person .
+            } GRAPH :hidden { :hidden a :Person } }""", ds)
+            val onto = ds.ontology()
+            val roots = SparklesOnt.individuals(ds, graph, limit = 1)
+            assertTrue(roots.get("groups").asArray[0].asObject.get("type").isNull)
+            assertEquals("", roots.getString("next"))
+            val commit = roots.getNumber("commit").toLong()
+            val read = OntologyRead(graphs = listOf(graph), imports = false, at = "commit:$commit")
+            val types = onto.individuals(read, after = roots.getString("next"), limit = 1)
+            assertEquals("http://ex.org/Person", types.get("groups").asArray[0].asObject.get("type").asObject.getString("iri"))
+            assertTrue(types.get("next").isNull)
+            val first = onto.individuals(read, type = "http://ex.org/Person", limit = 2)
+            assertEquals(listOf("http://ex.org/a", "http://ex.org/b"), first.get("individuals").asArray.map { it.asObject.getString("iri") })
+            assertEquals(3, first.getNumber("total").toInt())
+            assertEquals("http://ex.org/b", first.getString("next"))
+            UpdateAction.parseExecute("$prefixes INSERT DATA { GRAPH <$graph> { :d a :Person } }", ds)
+            val last = onto.individuals(read, type = "http://ex.org/Person", after = first.getString("next"), limit = 2)
+            assertEquals(commit, last.getNumber("commit").toLong())
+            assertEquals(listOf("http://ex.org/c"), last.get("individuals").asArray.map { it.asObject.getString("iri") })
+            assertTrue(last.get("next").isNull)
+            val located = onto.individuals(read, iri = "http://ex.org/c")
+            assertEquals("http://ex.org/Person", located.get("individuals").asArray[0].asObject.get("types").asArray[0].asObject.getString("iri"))
+        }
+    }
+
     /** Roadmap item 580: the OWL 2 EL classification of a graph, and its taxonomy written to another. */
     @Test fun the_native_handle_classifies_and_writes_the_taxonomy() {
         SparklesDatasets.memory().use { ds ->

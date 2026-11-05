@@ -470,6 +470,23 @@ impl Opened {
                     Ok(!hit)
                 })?;
             }
+            if !hit {
+                // A streamed object assertion can name an individual only as its
+                // object. Probe that incoming range under the same view, and require
+                // its mapped individual position rather than any RDF object IRI.
+                let rdf_type = stream.rdf_type;
+                stream.scan(Perm::Osp, &[id.0], |t, q| {
+                    if !read(q) || Some(q[1]) == rdf_type {
+                        return Ok(true);
+                    }
+                    hit = self.ontology.map_assertion(&t).is_some_and(|ax| {
+                        ax.signature()
+                            .iter()
+                            .any(|e| e.kind() == K::NamedIndividual && e.iri().as_str() == iri)
+                    });
+                    Ok(!hit)
+                })?;
+            }
             if hit {
                 found.push(K::NamedIndividual);
             }
@@ -2504,3 +2521,6 @@ pub mod wire;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod individual_lookup_tests;

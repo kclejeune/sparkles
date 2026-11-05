@@ -1767,3 +1767,26 @@ export const INCOMING_WORDS: Record<string, string> = {
 export function headGraphsQuery(): string {
   return `SELECT DISTINCT ?g WHERE { GRAPH ?g { ?o a ?t . VALUES ?t { <${OWL}Ontology> <${SKOS}ConceptScheme> } } } ORDER BY ?g LIMIT 200`;
 }
+
+/** Paged asserted types and named members, at one immutable revision. */
+export async function fetchIndividuals(
+  target: string,
+  sel: BrowseSelection,
+  q: import('./individual-tree.svelte').IndividualQuery & { lang?: readonly string[] } = {},
+  signal?: AbortSignal,
+): Promise<import('./individual-tree.svelte').IndividualPage> {
+  const p = params(sel, {
+    type: q.type,
+    untyped: q.untyped,
+    iri: q.iri,
+    after: q.after,
+    at: q.at,
+    limit: q.limit,
+    lang: (q.lang ?? iriForm.languages).join(',') || undefined,
+  });
+  const res = await request(`/$/ontology/${enc(target)}/individuals?${p}`, {
+    headers: { Accept: 'application/json' },
+    signal,
+  });
+  return await res.json();
+}

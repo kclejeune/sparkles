@@ -653,3 +653,635 @@ fn many_skos_xl_labels_report_the_cut() {
     assert_eq!(t.xl_labels.len(), MAX_VALUES);
     assert!(t.statements_truncated);
 }
+
+fn individuals(ds: &Dataset, q: IndividualsRequest) -> Individuals {
+    ds.ontology()
+        .individuals(&req(), &q, &Default::default())
+        .unwrap()
+}
+
+#[test]
+fn individuals_page_memberships_without_losing_untyped_or_multiple_types() {
+    let mut data = String::from(
+        ":A a owl:Class ; rdfs:subClassOf :B . :B a owl:Class ; rdfs:subClassOf :A . :p a owl:ObjectProperty . :empty a owl:NamedIndividual . :onlySubject :p :onlyObject . :both a :A, :B . :A a owl:NamedIndividual, :A . [] a :A .",
+    );
+    for i in 0..1105 {
+        data.push_str(&format!(":i{i:04} a :A ."));
+    }
+    let ds = dataset(&data);
+    let roots = individuals(&ds, IndividualsRequest::default());
+    assert!(roots.individuals.is_empty());
+    assert_eq!(
+        roots
+            .groups
+            .iter()
+            .map(|g| (g.class.as_ref().map(|c| c.iri.clone()), g.total.unwrap()))
+            .collect::<Vec<_>>(),
+        vec![(None, 3), (Some(ex("A")), 1107), (Some(ex("B")), 1)]
+    );
+    let mut after = None;
+    let mut all = Vec::new();
+    loop {
+        let page = individuals(
+            &ds,
+            IndividualsRequest {
+                class: Some(ex("A")),
+                limit: 100,
+                after,
+                ..Default::default()
+            },
+        );
+        assert_eq!(page.total, 1107);
+        assert!(page.individuals.len() <= 100);
+        all.extend(page.individuals.iter().map(|i| i.name.iri.clone()));
+        after = page.next;
+        if after.is_none() {
+            break;
+        }
+    }
+    assert_eq!(all.len(), 1107);
+    assert!(all.windows(2).all(|p| p[0] < p[1]));
+    assert!(!all.iter().any(|i| i.starts_with("_:")));
+    let both = individuals(
+        &ds,
+        IndividualsRequest {
+            iri: Some(ex("both")),
+            ..Default::default()
+        },
+    );
+    assert_eq!(both.groups.len(), 2);
+    assert_eq!(both.individuals[0].types.len(), 2);
+    let untyped = individuals(
+        &ds,
+        IndividualsRequest {
+            untyped: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        untyped
+            .individuals
+            .iter()
+            .map(|i| i.name.iri.clone())
+            .collect::<Vec<_>>(),
+        [ex("empty"), ex("onlyObject"), ex("onlySubject")]
+    );
+    let root1 = individuals(
+        &ds,
+        IndividualsRequest {
+            limit: 1,
+            ..Default::default()
+        },
+    );
+    assert_eq!(root1.next, Some(String::new()));
+    let root2 = individuals(
+        &ds,
+        IndividualsRequest {
+            limit: 1,
+            after: root1.next,
+            ..Default::default()
+        },
+    );
+    assert_eq!(root2.groups[0].class.as_ref().unwrap().iri, ex("A"));
+}
+
+#[test]
+fn individual_pages_keep_graph_scope_imports_and_retained_revisions() {
+    let ds = dataset(
+        "GRAPH :g { :g a owl:Ontology ; owl:imports :h . :A a owl:Class . :i a :A . } GRAPH :h { :i a :A . :hidden a :A . }",
+    );
+    ds.snapshots()
+        .create(
+            "before-individuals",
+            &crate::history::At::Head,
+            &Default::default(),
+        )
+        .unwrap();
+    let req = OntologyRequest {
+        graphs: vec![GraphRef::parse(&ex("g")).unwrap()],
+        ..Default::default()
+    };
+    let q = IndividualsRequest {
+        class: Some(ex("A")),
+        limit: 1,
+        ..Default::default()
+    };
+    let read = |r: &OntologyRequest, q: &IndividualsRequest, opts: &QueryOptions| {
+        ds.ontology().individuals(r, q, opts).unwrap()
+    };
+    let page = read(&req, &q, &Default::default());
+    assert_eq!(page.total, 2); // :i is counted once across the two graphs
+    let no_imports = OntologyRequest {
+        imports: sparkles_reasoner::inputs::ImportMode::None,
+        ..req.clone()
+    };
+    assert_eq!(read(&no_imports, &q, &Default::default()).total, 1);
+    let g = Graphs::Only(GraphRule::new([ex("g").as_str()], &[]));
+    let opts = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::graphs(g.clone(), g))),
+        ..Default::default()
+    };
+    assert_eq!(read(&req, &q, &opts).total, 1);
+    ds.update(&format!(
+        "{PREFIXES} INSERT DATA {{ GRAPH :g {{ :new a :A }} }}"
+    ))
+    .unwrap();
+    assert_eq!(read(&req, &q, &Default::default()).total, 3);
+    let retained = OntologyRequest {
+        at: Some(crate::history::At::Snapshot("before-individuals".into())),
+        ..req.clone()
+    };
+    let old = read(
+        &retained,
+        &IndividualsRequest {
+            after: page.next,
+            ..q.clone()
+        },
+        &Default::default(),
+    );
+    assert_eq!(old.commit, page.commit);
+    assert_eq!(old.total, 2);
+    assert_eq!(old.individuals.len(), 1);
+    assert_eq!(old.individuals[0].name.iri, ex("i"));
+}
+
+#[test]
+fn individual_pages_honor_cancellation_and_deadlines() {
+    let ds = dataset(":a a owl:NamedIndividual .");
+    let cancelled = QueryOptions {
+        cancel: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        ..Default::default()
+    };
+    let late = QueryOptions {
+        deadline: Some(std::time::Instant::now()),
+        ..Default::default()
+    };
+    for q in [
+        IndividualsRequest::default(),
+        IndividualsRequest {
+            class: Some("http://www.w3.org/2002/07/owl#NamedIndividual".into()),
+            ..Default::default()
+        },
+    ] {
+        assert!(matches!(
+            ds.ontology().individuals(&req(), &q, &cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            ds.ontology().individuals(&req(), &q, &late),
+            Err(Error::Timeout)
+        ));
+    }
+}
+
+#[test]
+fn individual_pages_fail_explicitly_on_excessive_type_memberships() {
+    let mut data = String::new();
+    for n in 0..1001 {
+        data.push_str(&format!(":a a :C{n} ."));
+    }
+    let ds = dataset(&data);
+    let result = ds.ontology().individuals(
+        &req(),
+        &IndividualsRequest {
+            iri: Some(ex("a")),
+            ..Default::default()
+        },
+        &Default::default(),
+    );
+    assert!(
+        matches!(result, Err(Error::Invalid(message)) if message.contains("more than 1000 named types"))
+    );
+}
+
+/// Explicit diagnostic for item 607. Counts visitor rows, never a timing benchmark.
+#[test]
+#[ignore = "large-fixture scan accounting; run explicitly without other heavy work"]
+fn measure_individual_scan_work() {
+    let n = 50_250usize;
+    let mut body = String::from(
+        ":People a owl:Class ; rdfs:label \"People\"@en . :Other a owl:Class ; rdfs:label \"Other type\"@en . :untyped a owl:NamedIndividual . :knows a owl:ObjectProperty . :subjectOnly :knows :objectOnly . ",
+    );
+    for i in 0..n {
+        body.push_str(&format!(
+            ":i{i:06} a owl:NamedIndividual, :People ; rdfs:label \"individual {i:06}\"@en . "
+        ));
+    }
+    body.push_str(&format!(":i{:06} a :Other . [] a :People .", n - 1));
+    let ds = dataset(&body);
+    let opts = QueryOptions::default();
+    let run = |name: &str, query: IndividualsRequest| {
+        individuals::take_scan_rows();
+        let page = ds.ontology().individuals(&req(), &query, &opts).unwrap();
+        let rows = individuals::take_scan_rows();
+        println!(
+            "INDIVIDUAL_SCAN_WORK {}",
+            serde_json::json!({"operation": name, "visitorRows": rows, "total": page.total, "groups": page.groups.len(), "individuals": page.individuals.len(), "next": page.next})
+        );
+        page
+    };
+    let root = run("root", IndividualsRequest::default());
+    assert_eq!(root.groups.len(), 3);
+    assert_eq!(root.groups[0].total, Some(3));
+    let first = run(
+        "typed-first",
+        IndividualsRequest {
+            class: Some(ex("People")),
+            ..Default::default()
+        },
+    );
+    assert_eq!(first.total, n);
+    assert_eq!(first.individuals.len(), 100);
+    let second = run(
+        "typed-next",
+        IndividualsRequest {
+            class: Some(ex("People")),
+            after: first.next,
+            ..Default::default()
+        },
+    );
+    assert_eq!(second.individuals[0].name.iri, ex("i000100"));
+    let located = run(
+        "locate",
+        IndividualsRequest {
+            iri: Some(ex("i050249")),
+            ..Default::default()
+        },
+    );
+    assert_eq!(located.individuals[0].types.len(), 2);
+    let untyped = run(
+        "untyped",
+        IndividualsRequest {
+            untyped: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(untyped.total, 3);
+}
+fn individual_overflow_fixture() -> Dataset {
+    let mut body = String::from(
+        ":C a owl:Class . :a a owl:NamedIndividual, :C . :z a owl:NamedIndividual, :C .",
+    );
+    for n in 0..1000 {
+        body.push_str(&format!(":D{n} a owl:Class . :z a :D{n} ."));
+    }
+    dataset(&body)
+}
+
+#[test]
+fn individual_typed_pages_ignore_off_page_type_overflow() {
+    let ds = individual_overflow_fixture();
+    let page = individuals(
+        &ds,
+        IndividualsRequest {
+            class: Some(ex("C")),
+            limit: 1,
+            ..Default::default()
+        },
+    );
+    assert_eq!(page.total, 2);
+    assert_eq!(page.individuals[0].name.iri, ex("a"));
+    assert_eq!(page.next, Some(ex("a")));
+    assert_eq!(
+        page.individuals[0]
+            .types
+            .iter()
+            .map(|n| n.iri.clone())
+            .collect::<Vec<_>>(),
+        vec![ex("C")]
+    );
+    // A returned overflow still fails, and the other discovery/lookup modes retain
+    // their existing view-wide resource checks rather than silently omitting a type.
+    for q in [
+        IndividualsRequest {
+            class: Some(ex("C")),
+            after: Some(ex("a")),
+            limit: 1,
+            ..Default::default()
+        },
+        IndividualsRequest::default(),
+        IndividualsRequest {
+            untyped: true,
+            ..Default::default()
+        },
+        IndividualsRequest {
+            iri: Some(ex("z")),
+            ..Default::default()
+        },
+    ] {
+        assert!(matches!(
+            ds.ontology().individuals(&req(), &q, &Default::default()),
+            Err(Error::Invalid(_))
+        ));
+    }
+}
+
+#[test]
+fn individual_typed_pages_ignore_before_cursor_type_overflow() {
+    let ds = individual_overflow_fixture();
+    let page = individuals(
+        &ds,
+        IndividualsRequest {
+            class: Some(ex("C")),
+            after: Some(ex("z")),
+            limit: 1,
+            ..Default::default()
+        },
+    );
+    assert_eq!(page.total, 2);
+    assert!(page.individuals.is_empty());
+    assert_eq!(page.next, None);
+    // Reserved metadata is not a class merely because it appears in rdf:type.
+    let metadata = individuals(
+        &ds,
+        IndividualsRequest {
+            class: Some("http://www.w3.org/2002/07/owl#NamedIndividual".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(metadata.total, 0);
+    assert!(metadata.individuals.is_empty());
+}
+
+#[test]
+fn individual_typed_pages_read_types_only_for_returned_rows() {
+    let mut body = String::from(":C a owl:Class .");
+    for n in 0..257 {
+        body.push_str(&format!(":i{n:03} a owl:NamedIndividual, :C ."));
+    }
+    let ds = dataset(&body);
+    for (after, start) in [(None, 0), (Some(ex("i120")), 121)] {
+        individuals::take_scan_rows();
+        let page = individuals(
+            &ds,
+            IndividualsRequest {
+                class: Some(ex("C")),
+                limit: 7,
+                after,
+                ..Default::default()
+            },
+        );
+        let counts = individuals::take_scan_rows();
+        assert_eq!(page.total, 257);
+        assert_eq!(
+            page.individuals
+                .iter()
+                .map(|n| n.name.iri.clone())
+                .collect::<Vec<_>>(),
+            (start..start + 7)
+                .map(|n| ex(&format!("i{n:03}")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(page.next, Some(ex(&format!("i{:03}", start + 6))));
+        assert!(
+            page.individuals
+                .iter()
+                .all(|n| n.types.len() == 1 && n.types[0].iri == ex("C"))
+        );
+        assert_eq!(counts.get("Pos/2"), Some(&257));
+        assert_eq!(
+            counts.get("Spo/2"),
+            Some(&14),
+            "type-list work must follow the returned page, not all candidates: {counts:?}"
+        );
+    }
+}
+
+#[test]
+fn individual_typed_pages_follow_mapper_class_eligibility() {
+    let owl = "http://www.w3.org/2002/07/owl#";
+    for mode in [Mode::Lenient, Mode::Strict] {
+        let request = OntologyRequest {
+            mode,
+            ..Default::default()
+        };
+        let ds = dataset(
+            ":C a owl:Class, owl:NamedIndividual, :C . :a a owl:NamedIndividual, :C, :Unknown, owl:Thing, owl:Nothing .",
+        );
+        let locate = ds
+            .ontology()
+            .individuals(
+                &request,
+                &IndividualsRequest {
+                    iri: Some(ex("a")),
+                    ..Default::default()
+                },
+                &Default::default(),
+            )
+            .unwrap();
+        let roots = ds
+            .ontology()
+            .individuals(
+                &request,
+                &IndividualsRequest::default(),
+                &Default::default(),
+            )
+            .unwrap();
+        let mapped = locate.individuals[0]
+            .types
+            .iter()
+            .map(|n| n.iri.clone())
+            .collect::<BTreeSet<_>>();
+        for class in [
+            ex("C"),
+            ex("Unknown"),
+            format!("{owl}Thing"),
+            format!("{owl}Nothing"),
+            format!("{owl}NamedIndividual"),
+            format!("{owl}Class"),
+        ] {
+            let page = ds
+                .ontology()
+                .individuals(
+                    &request,
+                    &IndividualsRequest {
+                        class: Some(class.clone()),
+                        ..Default::default()
+                    },
+                    &Default::default(),
+                )
+                .unwrap();
+            let expected = if class == ex("C") {
+                vec![ex("C"), ex("a")]
+            } else if mapped.contains(&class) {
+                vec![ex("a")]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                page.individuals
+                    .iter()
+                    .map(|n| n.name.iri.clone())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{mode:?} {class}"
+            );
+            assert_eq!(page.total, expected.len());
+            let root_total = roots
+                .groups
+                .iter()
+                .find(|g| g.class.as_ref().is_some_and(|n| n.iri == class))
+                .and_then(|g| g.total)
+                .unwrap_or(0);
+            assert_eq!(
+                page.total, root_total,
+                "typed page and root bucket disagree for {mode:?} {class}"
+            );
+            if class == ex("Unknown") {
+                assert_eq!(page.total, usize::from(mode == Mode::Lenient));
+            }
+        }
+        // This reserved IRI is explicitly a class in the selected mapper view.
+        let reserved = dataset("owl:NamedIndividual a owl:Class . :a a owl:NamedIndividual .");
+        let direct = reserved
+            .ontology()
+            .individuals(
+                &request,
+                &IndividualsRequest {
+                    iri: Some(ex("a")),
+                    ..Default::default()
+                },
+                &Default::default(),
+            )
+            .unwrap();
+        assert!(
+            direct.individuals[0]
+                .types
+                .iter()
+                .any(|n| n.iri == format!("{owl}NamedIndividual"))
+        );
+        let page = reserved
+            .ontology()
+            .individuals(
+                &request,
+                &IndividualsRequest {
+                    class: Some(format!("{owl}NamedIndividual")),
+                    ..Default::default()
+                },
+                &Default::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            page.individuals
+                .iter()
+                .map(|n| n.name.iri.clone())
+                .collect::<Vec<_>>(),
+            vec![ex("a")]
+        );
+    }
+}
+
+#[test]
+fn individual_typed_pages_keep_triple_masks_in_eligibility_and_membership() {
+    use crate::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+    let ds =
+        dataset(":C a owl:Class . :a a owl:NamedIndividual, :C . :b a owl:NamedIndividual, :C .");
+    let request = OntologyRequest {
+        mode: Mode::Strict,
+        ..Default::default()
+    };
+    let q = IndividualsRequest {
+        class: Some(ex("C")),
+        ..Default::default()
+    };
+    assert_eq!(
+        ds.ontology()
+            .individuals(&request, &q, &Default::default())
+            .unwrap()
+            .total,
+        2
+    );
+    let masked = |subject: &str, object: &str, bind: bool| QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::All,
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "typed-mask".into(),
+                        predicates: Some(vec![RDF_TYPE.into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: Some(format!(
+                            "{} FILTER(?s != <{subject}> || ?o != <{object}>)",
+                            if bind { "?s ?p ?o ." } else { "" }
+                        )),
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        ))),
+        ..Default::default()
+    };
+    let ask = |s: &str, o: &str, options: &QueryOptions| {
+        ds.query_with(&format!("ASK {{ <{s}> <{RDF_TYPE}> <{o}> }}"), options)
+            .unwrap()
+            .boolean
+    };
+    // The original fixture's standalone FILTER binds neither s nor o, so its
+    // protection has no permitting solution. Prove its actual visible view first.
+    let unbound = masked(&ex("a"), &ex("C"), false);
+    assert!(!ask(&ex("a"), &ex("C"), &unbound));
+    assert!(!ask(&ex("b"), &ex("C"), &unbound));
+    assert!(!ask(
+        &ex("C"),
+        "http://www.w3.org/2002/07/owl#Class",
+        &unbound
+    ));
+    let options = masked(&ex("a"), &ex("C"), true);
+    assert!(!ask(&ex("a"), &ex("C"), &options));
+    assert!(ask(&ex("b"), &ex("C"), &options));
+    assert!(ask(
+        &ex("C"),
+        "http://www.w3.org/2002/07/owl#Class",
+        &options
+    ));
+    let direct = ds
+        .ontology()
+        .individuals(
+            &request,
+            &IndividualsRequest {
+                iri: Some(ex("a")),
+                ..Default::default()
+            },
+            &options,
+        )
+        .unwrap();
+    assert!(direct.individuals[0].types.is_empty());
+    let membership = ds.ontology().individuals(&request, &q, &options).unwrap();
+    assert_eq!(membership.total, 1);
+    assert_eq!(membership.individuals[0].name.iri, ex("b"));
+    let options = masked(&ex("C"), "http://www.w3.org/2002/07/owl#Class", true);
+    assert!(!ask(
+        &ex("C"),
+        "http://www.w3.org/2002/07/owl#Class",
+        &options
+    ));
+    assert!(ask(&ex("a"), &ex("C"), &options));
+    assert!(ask(&ex("b"), &ex("C"), &options));
+    let direct = ds
+        .ontology()
+        .individuals(
+            &request,
+            &IndividualsRequest {
+                iri: Some(ex("b")),
+                ..Default::default()
+            },
+            &options,
+        )
+        .unwrap();
+    assert!(direct.individuals[0].types.is_empty());
+    let strict = ds.ontology().individuals(&request, &q, &options).unwrap();
+    assert_eq!(strict.total, 0);
+    let lenient = ds
+        .ontology()
+        .individuals(&OntologyRequest::default(), &q, &options)
+        .unwrap();
+    assert_eq!(lenient.total, 2);
+}

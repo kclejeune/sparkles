@@ -1365,6 +1365,17 @@ test('ontology-editor', async ({ page }) => {
   await shoot(page, 'ontology-editor');
 });
 
+test('ontology-individuals', async ({ page }) => {
+  await page.goto(
+    `/ui/workbench/ontology?ds=uni&kind=NamedIndividual&iri=${encodeURIComponent(UNI + 'ada')}`,
+  );
+  const individuals = page.getByRole('tree', { name: 'Individuals (asserted)' });
+  await expect(individuals.getByRole('button', { name: 'Ada Lovelace', exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
+  await shoot(page, 'ontology-individuals');
+});
+
 test('ontology-inferred', async ({ page }) => {
   await page.goto(
     `/ui/workbench/ontology?ds=uni&inferred=1&iri=${encodeURIComponent(`${UNI}Teacher`)}`,

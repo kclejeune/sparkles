@@ -586,6 +586,32 @@ capabilities and remaining work are described by the spec status and Outcome.
 Phase 1 is delivered as roadmap item 71, Phase 2 as roadmap item 537 and Phase 3 as
 roadmap item 538.
 
+### Paged named individuals
+
+Item 607 adds `Ontologies::individuals` and `GET /$/ontology/{ds}/individuals` for
+U12's Individuals tab. The shared wire dispatcher exposes `individuals`, and the Python,
+Node.js and JVM ontology handles provide the same read through their native adapters.
+The read pages asserted named-type buckets, their named members
+and an Untyped bucket. Direct lookup returns one individual's memberships without
+walking earlier pages. Lexical IRI continuations retain the response commit through
+`at=commit:N`. Every stage uses the caller's authorized graph and triple view, imports,
+branch, retained revision, cancellation and deadline. No classification runs.
+
+Responses hold at most 1,000 buckets or individuals, with 100 by default. Root discovery
+and Untyped reads scan the authorized scope, and typed reads scan that type's membership.
+The route uses F21's existing terminology mapper to preserve declarations, complex
+assertions and signature semantics. It does not bound server work by the response size.
+Item 749 covers repeated discovery, lexical-page selection and exact-total scans,
+independently of item 736's cold mapping.
+Root discovery refuses more than 100,000 type buckets. A typed member page reads complete
+type lists only for returned rows and refuses a returned individual with more than
+1,000 named types. An individual before the cursor or outside that page does not trigger
+this type-list cap. Root discovery and Untyped reads apply the cap to every
+individual they examine, and direct lookup applies it to its individual. These limits
+fail explicitly and never return truncated type lists.
+Anonymous individuals stay outside this named-entity editor tree. The exact HTTP
+contract is in [the API reference](../API.md#ontology).
+
 ### Phase 1
 
 The `sparkles-owl` crate holds the structural model of §3, the reverse mapping of §4
@@ -781,7 +807,8 @@ lookups answer `NotFound` for an IRI that the ontology does not have as that kin
 §2.5 asks. An entity that only the stored assertions use is found by a probe of the
 graphs read that stops at its first match. A class is found as the class of a class
 assertion, a property as the property of a property or annotation assertion, and a named
-individual as the subject of an assertion or the object of an `owl:sameAs` or
+individual as the subject of an assertion, the object of a mapped object-property
+assertion or the object of an `owl:sameAs` or
 `owl:differentFrom` assertion. The probes keep the request's deadline and cancellation.
 
 `Ontologies::graph` and `Ontologies::graphs` start an `OntologyScope`, a builder over

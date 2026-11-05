@@ -30,9 +30,10 @@ function turtle(): string {
       );
     }
   }
-  for (let i = 0; i < 40; i++) {
-    out.push(`l:ind${i} a owl:NamedIndividual, l:R0_${i} ; rdfs:label "individual ${i}"@en .`);
+  for (let i = 0; i < 240; i++) {
+    out.push(`l:ind${i} a owl:NamedIndividual, l:R0 ; rdfs:label "individual ${i}"@en .`);
   }
+  out.push('l:untyped a owl:NamedIndividual . l:ind239 a l:R1 . [] a l:R0 .');
   return out.join('\n');
 }
 
@@ -124,7 +125,7 @@ open('a selected class reads its frame and the names the frame draws', async ({ 
   expect(w.seen.filter(wholeLabelQuery), 'labels of the whole graph').toHaveLength(0);
 });
 
-open('the Individuals tab reads its list when it opens', async ({ page }) => {
+open('the Individuals tab opens buckets and pages only the expanded type', async ({ page }) => {
   const w = watch(page);
   await page.goto(`/ui/workbench/ontology?ds=${DS}`);
   await expect(tree(page).getByRole('button', { name: 'root 0', exact: true })).toBeVisible({
@@ -132,13 +133,54 @@ open('the Individuals tab reads its list when it opens', async ({ page }) => {
   });
   const before = w.mark();
   await page.getByLabel('Entity kind').selectOption('NamedIndividual');
+  const individuals = page.getByRole('tree', { name: 'Individuals (asserted)' });
+  await expect(individuals.getByRole('button', { name: 'root 0', exact: true })).toBeVisible({
+    timeout: 60_000,
+  });
+  expect(w.since(before).filter((s) => route(s, 'individuals'))).toHaveLength(1);
+  expect(w.since(before).filter((s) => route(s, 'entities') || route(s, 'axioms'))).toHaveLength(0);
+  await individuals.getByRole('button', { name: 'Expand root 0', exact: true }).click();
   await expect(
-    page
-      .getByRole('tree', { name: 'Individuals (asserted)' })
-      .getByRole('button', { name: 'individual 0', exact: true }),
-  ).toBeVisible({ timeout: 60_000 });
+    individuals.getByRole('button', { name: 'individual 0', exact: true }),
+  ).toBeVisible();
+  expect(await individuals.getByRole('treeitem').count()).toBeLessThan(80);
+  await individuals.focus();
+  await page.keyboard.press('End');
+  await individuals.getByRole('button', { name: 'Show more', exact: true }).click();
+  // End moves within loaded rows. Wait for the continuation to replace the first
+  // page's footer before asking it to navigate to the newly loaded page's end.
+  await expect(
+    individuals.getByRole('treeitem', { name: 'Show more, 100 of 240 shown' }),
+  ).not.toBeAttached();
+  await individuals.focus();
+  await page.keyboard.press('End');
+  await expect(
+    individuals.getByRole('treeitem', { name: 'Show more, 200 of 240 shown' }),
+  ).toBeAttached();
   const later = w.since(before);
-  expect(later.some((s) => route(s, 'entities') && s.query.includes('NamedIndividual'))).toBe(true);
+  expect(later.filter((s) => route(s, 'individuals')).length).toBe(3);
+  expect(later.filter((s) => route(s, 'entities') || route(s, 'axioms'))).toHaveLength(0);
+  expect(
+    later
+      .filter((s) => route(s, 'individuals') && s.query.includes('type='))
+      .every((s) => s.query.includes('at=')),
+  ).toBe(true);
   // the individuals' labels come in one query for the kind, not one for the graph
   expect(later.filter(wholeLabelQuery)).toHaveLength(0);
+});
+
+open('an individual beyond the first page reveals both asserted memberships', async ({ page }) => {
+  const w = watch(page);
+  await page.goto(
+    `/ui/workbench/ontology?ds=${DS}&kind=NamedIndividual&iri=${encodeURIComponent(NS + 'ind239')}`,
+  );
+  const individuals = page.getByRole('tree', { name: 'Individuals (asserted)' });
+  await expect(
+    individuals.getByRole('button', { name: 'individual 239', exact: true }).first(),
+  ).toBeVisible({ timeout: 60_000 });
+  await expect(page.getByRole('heading', { name: 'individual 239', exact: true })).toBeVisible();
+  const reads = w.seen.filter((s) => route(s, 'individuals'));
+  expect(reads.some((s) => s.query.includes('iri='))).toBe(true);
+  expect(reads.every((s) => !s.query.includes('after='))).toBe(true);
+  expect(reads.filter((s) => s.query.includes('type=')).length).toBe(2);
 });

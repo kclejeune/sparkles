@@ -68,6 +68,7 @@ test('the trees, the frame, the usage and the header', async ({ page }) => {
   await pick(page, 'Data properties (asserted)', 'credits');
   await expect(frame.locator('[data-section="ranges"]')).toContainText('xsd:integer');
   await page.getByRole('combobox', { name: 'Entity kind' }).selectOption('NamedIndividual');
+  await expand(page, 'Professor');
   await expect(node(page, 'Ada Lovelace')).toContainText('Professor');
   await pick(page, 'Individuals (asserted)', 'Ada Lovelace');
   await expect(frame.locator('[data-section="objectAssertions"]')).toContainText('Logic 101');

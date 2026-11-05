@@ -119,8 +119,22 @@ beside a label. A filter keeps the matching entities and their ancestors. A cycl
 asserted hierarchy is drawn once and not followed. The class and property trees read one
 level at a time from the hierarchy route, and every tree draws only the rows in view, so
 ontologies of millions of classes open and scroll at the speed of a screenful. The
-individuals tree has no hierarchy route and reads its individuals, up to 50,000, and their
-types when its tab opens.
+Individuals tab reads type buckets and named members through the paged individuals route.
+Each type expands independently, and Untyped holds named individuals without an asserted
+named class. Multiple types place an individual once under each asserted class. Anonymous
+individuals remain outside this named-entity tree. The first page uses the displayed
+summary commit, and later reads stay at that revision. A link locates its individual without reading preceding
+pages. Type buckets use separate row identities, so a class that is also an individual
+does not create a cycle. Names use the shared rendering and ordered language preferences.
+This is item 607. Item 749 covers the repeated discovery, lexical-page selection and
+exact-total scans that remain behind these bounded responses. Server root discovery and
+Untyped pages scan the selected scope, and the route retains F21's cold terminology
+mapping cost tracked by item 736.
+
+The Individuals filter searches names at the current branch head and reads each candidate's
+memberships at the displayed commit. It skips candidates absent from that revision, keeps
+valid matches and displays hard read failures. Historical name search remains under item
+658.
 
 **Reads.** Opening the editor reads the summary and the first level of the tree on screen.
 The other trees read when their tab opens. Names come from the hierarchy answers and from
@@ -220,9 +234,8 @@ through a form remains for later. Rename covers the one graph the page
 reads and does not reach IRIs inside triple terms. Real-time co-editing stays with the
 U05 §1 open question. The page decides whether the caller can write from its level on
 the dataset, so write grants on a branch alone leave the page read-only, roadmap item
-611. Roadmap item 607 moves the trees onto the
-[ontology browser](#ontology-browser)'s hierarchy route for large ontologies, 609
-inferred property trees and 610 an IRI policy kept on the server with
+611. Roadmap item 609 adds inferred property and individual trees, and 610 adds an IRI
+policy kept on the server with
 the resource catalog of [C30](../C30-resource-catalog/README.md).
 
 ### Manchester input
@@ -469,9 +482,9 @@ Item 616's pages are built as the UI's **Browse** page, `/ui/browse`, on two new
 `GET /$/ontology/{ds}/hierarchy` and `GET /$/ontology/{ds}/term`, with the Rust calls
 `Ontologies::hierarchy` and `Ontologies::term`, the `hierarchy` and `term` operations of
 the wire dispatcher, and `hierarchy` and `term` on the ontology handles of Python,
-Node.js and the JVM. The hierarchy route is the lazy hierarchy that item 607 asked for.
-The ontology editor's trees still read the whole graph, and item 607 now covers moving
-them onto it.
+Node.js and the JVM. The ontology editor reads its class and property levels through
+this hierarchy route. Item 607 adds the separate paged individuals route for its
+Individuals tab, with matching native reads on the three binding handles.
 
 **Why two routes.** The entity and summary routes open the whole ontology through the
 reverse mapping, which reads every quad of GO at the first call and is not cached for a

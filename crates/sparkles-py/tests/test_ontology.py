@@ -565,3 +565,28 @@ def test_hierarchy_and_term_read_one_entity() -> None:
     assert t["names"][EX + "Tail"]["shortForm"]
     with pytest.raises(sparkles.NotFoundError):
         d.ontology.term(EX + "Nothing")
+
+
+def test_individual_pages_preserve_graph_cursor_and_revision(tmp_path) -> None:
+    d = sparkles.Dataset(str(tmp_path / "individual-pages"))
+    graph = EX + "individuals"
+    d.update(f"""{PREFIXES} INSERT DATA {{ GRAPH <{graph}> {{
+      :Person a owl:Class . :loose a owl:NamedIndividual .
+      :a a :Person . :b a :Person . :c a :Person .
+    }} GRAPH :hidden {{ :hidden a :Person }} }}""")
+    roots = d.ontology.individuals(graph, imports=False, limit=1)
+    assert roots["groups"] == [{"type": None, "total": 1}]
+    assert roots["next"] == ""
+    at = roots["commit"]
+    types = d.ontology.individuals(graph, imports=False, limit=1, after=roots["next"], at=at)
+    assert [g["type"]["iri"] for g in types["groups"]] == [EX + "Person"]
+    assert types["next"] is None
+    first = d.ontology.individuals(graph, imports=False, type=EX + "Person", limit=2, at=at)
+    assert [i["iri"] for i in first["individuals"]] == [EX + "a", EX + "b"]
+    assert first["next"] == EX + "b" and first["total"] == 3
+    d.update(f"{PREFIXES} INSERT DATA {{ GRAPH <{graph}> {{ :d a :Person }} }}")
+    last = d.ontology.individuals(graph, imports=False, type=EX + "Person", limit=2, after=first["next"], at=at)
+    assert last["commit"] == at and last["next"] is None
+    assert [i["iri"] for i in last["individuals"]] == [EX + "c"]
+    located = d.ontology.individuals(graph, imports=False, iri=EX + "c", at=at)
+    assert [t["iri"] for t in located["individuals"][0]["types"]] == [EX + "Person"]

@@ -556,6 +556,14 @@ fn entries() -> Vec<(&'static str, Entry)> {
                 ds.ontology().hierarchy(&any(), &any(), &any());
             }
         ),
+        op_if!(
+            "ontology",
+            "ontologyIndividuals",
+            "ontology.individuals",
+            |ds| {
+                ds.ontology().individuals(&any(), &any(), &any());
+            }
+        ),
         op_if!("ontology", "ontologyTerm", "ontology.term", |ds| {
             ds.ontology().term(&any(), &any(), &any());
         }),

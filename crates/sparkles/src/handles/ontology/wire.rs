@@ -656,7 +656,7 @@ pub fn entity_body(
 // ------------------------------------------------------------- requests ------
 
 /// The operations [`call`] answers, in the names of the bindings' surface keys.
-pub const OPERATIONS: [&str; 14] = [
+pub const OPERATIONS: [&str; 15] = [
     "summary",
     "axioms",
     "entities",
@@ -670,6 +670,7 @@ pub const OPERATIONS: [&str; 14] = [
     "parse",
     "dlQuery",
     "hierarchy",
+    "individuals",
     "term",
 ];
 
@@ -716,6 +717,7 @@ fn members(op: &str) -> &'static [&'static str] {
             "deprecated",
             "lang",
         ],
+        "individuals" => &["type", "untyped", "iri", "after", "limit", "lang"],
         "term" => &["iri", "mentions", "incoming", "lang"],
         "dlQuery" => &[
             "expression",
@@ -1120,6 +1122,11 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
             let h = hierarchy_request_of(a)?;
             let found = handle.hierarchy(&req, &h, opts)?;
             Ok(hierarchy_body(name, &h, &found))
+        }
+        "individuals" => {
+            let i = individuals_request_of(a)?;
+            let found = handle.individuals(&req, &i, opts)?;
+            Ok(individuals_body(name, &found))
         }
         "term" => {
             let t = term_request_of(a)?;
@@ -1812,4 +1819,30 @@ pub fn dl_query_body(
     );
     j["counts"] = J::Object(counts);
     j
+}
+
+/// The individuals read's bounded page and membership lookup.
+pub fn individuals_request_of(a: &Map<String, J>) -> Result<browse::IndividualsRequest> {
+    Ok(browse::IndividualsRequest {
+        class: iri_arg(a, "type")?,
+        untyped: boolean(a, "untyped")?.unwrap_or(false),
+        iri: iri_arg(a, "iri")?,
+        after: string(a, "after")?.map(str::to_string),
+        limit: number(a, "limit", 1, browse::MAX_LIMIT)?.unwrap_or(browse::DEFAULT_LIMIT),
+        languages: languages_of(a)?,
+    })
+}
+
+/// The JSON page of named individuals or their type buckets.
+pub fn individuals_body(name: &str, r: &browse::Individuals) -> J {
+    json!({
+        "dataset": name, "commit": r.commit, "order": "iri",
+        "groups": r.groups.iter().map(|g| json!({"type": g.class.as_ref().map(name_members), "total": g.total})).collect::<Vec<_>>(),
+        "individuals": r.individuals.iter().map(|n| {
+            let mut m = name_members(&n.name);
+            m.insert("types".into(), json!(n.types.iter().map(name_members).collect::<Vec<_>>()));
+            J::Object(m)
+        }).collect::<Vec<_>>(),
+        "total": r.total, "next": r.next, "warnings": r.warnings,
+    })
 }

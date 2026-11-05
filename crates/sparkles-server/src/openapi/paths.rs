@@ -969,6 +969,37 @@ fn ontology(p: &mut Paths) {
     node_props["parents"] =
         json!({ "type": "integer", "description": "The number of direct parents." });
     let node = json!({ "type": "object", "properties": node_props });
+    let name = json!({"type": "object", "properties": name_props.clone()});
+    p.add(
+        read(op(GET, "/$/ontology/{ds}/individuals", "ontologyIndividuals", "Ontology", "Page named individuals by asserted type"))
+            .doc("Without a selector, list asserted named-type buckets and an Untyped bucket whose type is null. With type=IRI, page named members of that asserted class; with untyped=true, page named individuals without an asserted named class. With iri=IRI, locate one named individual and its memberships. These selectors are mutually exclusive. Anonymous individuals are excluded. Multiple types place a named individual once in each bucket, with duplicate memberships across graphs removed. Pages use lexical IRI order and an exclusive after/next cursor. Reuse the response commit as at for every continuation. Labels follow lang or Accept-Language. No classification runs and inferences is refused. The authorized scope and F21 terminology are read on the server; root discovery and Untyped pages scan the scope and typed pages scan that type's membership. A bounded response does not imply bounded server work. Root discovery refuses more than 100,000 type buckets. A typed page refuses more than 1,000 named types on a returned individual. Candidates before the cursor or outside that page do not trigger this type-list cap. Root discovery and Untyped reads apply the cap to every individual examined, and direct lookup applies it to its individual. No type list is truncated.")
+            .see("ontology")
+            .param("at")
+            .query("type", s(), "The asserted named class whose members to list.")
+            .query("untyped", boolean(), "List named individuals without an asserted named class.")
+            .query("iri", s(), "Locate a named individual and its memberships.")
+            .query("after", s(), "The exclusive lexical IRI key from next, including an empty key after Untyped. Continue at the same commit.")
+            .query("limit", int(), "The most buckets or members listed, from 1 to 1,000, with 100 by default.")
+            .query("lang", s(), "Preferred label languages, comma separated and most preferred first.")
+            .resp("200", "One page or one individual's memberships.", Some(json!({ "application/json": { "schema": {
+                "type": "object", "properties": {
+                    "dataset": {"type": "string"}, "commit": {"type": "integer"},
+                    "order": {"type": "string", "enum": ["iri"]},
+                    "groups": {"type": "array", "items": {"type": "object", "properties": {
+                        "type": {"oneOf": [name.clone(), {"type": "null"}]}, "total": {"type": ["integer", "null"], "description": "Distinct named members, or null in a direct membership lookup."}
+                    }}},
+                    "individuals": {"type": "array", "items": {"type": "object", "properties": {
+                        "iri": {"type": "string"}, "label": {"type": ["string", "null"]},
+                        "labelLang": {"type": ["string", "null"]}, "shortForm": {"type": ["string", "null"]},
+                        "kinds": {"type": "array", "items": {"type": "string"}}, "deprecated": {"type": "boolean"},
+                        "types": {"type": "array", "items": name.clone()}
+                    }}},
+                    "total": {"type": "integer"}, "next": {"type": ["string", "null"]},
+                    "warnings": {"type": "array", "items": {"type": "string"}}
+                }
+            }}})))
+            .errors(&[400, 404, 408]),
+    );
     p.add(
         read(op(GET, "/$/ontology/{ds}/hierarchy", "ontologyHierarchy", "Ontology", "List one level of an entity hierarchy"))
             .doc("One level of the class, object property, data property, annotation property or SKOS concept hierarchy, read from the store's indexes without reading the whole ontology: the direct children of `iri`, or the roots, a page at a time in label order with deprecated entities last, each with the numbers of its own children and parents. Classes follow `rdfs:subClassOf` between named classes, properties `rdfs:subPropertyOf`, and concepts `skos:broader` and `skos:narrower` in either direction. The roots of the class hierarchy are the ontology header's `IAO_0000700` root terms when it names some, and otherwise the classes without a parent; the roots of a scheme are its top concepts with its concepts that have no broader one. `ancestors=true` adds the ancestors of `iri` up to the roots, with the edges between them, at most 2,000. The caller sees only the graphs and triples their grants allow. `inferences` is refused.")

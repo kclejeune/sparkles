@@ -374,6 +374,15 @@ test.describe('browse', () => {
     await shoot(page, 'browse-landing');
   });
 
+  test('ontology-metrics', async ({ page }) => {
+    await page.goto(`/ui/workbench/ontology?ds=${BROWSE_DATASET}&tab=header`);
+    const metrics = page.getByRole('region', { name: 'Ontology metrics', exact: true });
+    await metrics.getByRole('button', { name: 'Read metrics', exact: true }).click();
+    await expect(metrics).toContainText('DL expressivity bound');
+    await metrics.scrollIntoViewIfNeeded();
+    await shoot(page, 'ontology-metrics');
+  });
+
   test('browse-phone', async ({ browser }) => {
     const ctx = await browser.newContext({
       viewport: { width: 390, height: 844 },
