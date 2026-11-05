@@ -488,7 +488,8 @@ the ontology's terminology mapping, and discovers buckets and Untyped members by
 the authorized graph scope. A typed member page scans that type's membership. The cold
 terminology mapping cost remains under roadmap item 736. Repeated bucket discovery,
 lexical-page selection and exact-total scans remain under item 749, with grants, pinned
-views and bounded memory preserved.
+views and bounded memory preserved. The first-member wait includes these scans even
+when the browser receives only a small page.
 
 Typed pages read complete type lists for the members they return and reject a returned
 individual with more than 1,000 named types. An individual before the cursor or outside

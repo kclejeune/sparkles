@@ -87,7 +87,10 @@ shared warm terminology mapping. Both builds take turns, and the record distingu
 the first usable type buckets from the first displayed individual. It records API
 request bodies, request and response sizes, decoded bytes and exact source identities.
 Transfer accounting covers finite ontology and query reads and excludes the long-lived
-change feed.
+change feed. Failed finite reads remain in the raw record, with unavailable sizes marked
+as null. Partial trials retain their errors and completed milestones. The harness saves
+incomplete trials before rejecting the run and reports full correctness only for complete
+runs.
 The earlier UI's capped listing is the baseline. A member page bounds transfer and the
 browser's loaded rows, while bucket discovery and Untyped reads still scan their scope,
 and typed member pages scan that type's membership. The existing terminology mapping
