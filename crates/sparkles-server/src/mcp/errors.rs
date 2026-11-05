@@ -11,7 +11,7 @@ pub const ERROR_META: &str = "io.github.kclejeune.sparkles/error";
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolError {
     /// stable machine-readable code, e.g. `timeout`
-    pub code: &'static str,
+    pub code: Box<str>,
     /// the equivalent HTTP status (for logs and tests)
     pub status: u16,
     pub message: String,
@@ -24,9 +24,9 @@ pub struct ToolError {
 }
 
 impl ToolError {
-    pub fn new(code: &'static str, status: u16, message: impl Into<String>) -> ToolError {
+    pub fn new(code: impl Into<Box<str>>, status: u16, message: impl Into<String>) -> ToolError {
         ToolError {
-            code,
+            code: code.into(),
             status,
             message: message.into(),
             hint: None,
@@ -262,4 +262,37 @@ pub fn syntax_summary(msg: &str) -> String {
         .trim_end()
         .to_string()
         + "…"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToolError;
+    use serde_json::json;
+
+    #[test]
+    fn tool_errors_stay_below_the_large_result_error_boundary() {
+        let size = std::mem::size_of::<ToolError>();
+        assert!(size < 128, "ToolError occupies {size} bytes");
+    }
+
+    #[test]
+    fn owned_http_error_codes_and_details_survive_cloning_and_serialization() {
+        let expected_code = format!("http-specific-{}", "refusal".repeat(32));
+        let mut error = ToolError::new(expected_code.clone(), 409, "conflict")
+            .hint("retry later")
+            .data(json!({"reference":"r"}));
+        error.budget = Some("memory");
+        let cloned = error.clone();
+        assert_eq!(cloned, error);
+        drop(error);
+        assert_eq!(cloned.code.as_ref(), expected_code);
+        assert_eq!(
+            cloned.meta(),
+            json!({"code":expected_code,"status":409,"budget":"memory","data":{"reference":"r"}})
+        );
+        assert_eq!(
+            cloned.text(),
+            "conflict\nHint: retry later\n{\"reference\":\"r\"}"
+        );
+    }
 }

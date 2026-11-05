@@ -58,6 +58,15 @@ fn counts() -> J {
     )
 }
 
+#[cfg(feature = "mcp")]
+pub(super) fn evidence_schemas() -> Map<String, J> {
+    let mut schemas = Map::new();
+    assist::evidence(&mut |name, value| {
+        schemas.insert(name.to_string(), value);
+    });
+    schemas
+}
+
 pub(super) fn schemas() -> Map<String, J> {
     let mut s = Map::new();
     let mut put = |name: &str, v: J| {

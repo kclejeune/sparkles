@@ -16,13 +16,11 @@
 
 use super::{StoredFactJson, bad, kind_name, named, parse_triple, policy, stored_fact_ref};
 use crate::auth::Principal;
-use crate::http::{AdminBody, ApiResult, blocking, dataset, err};
+use crate::http::{AdminBody, ApiResult, err};
 use crate::state::AppState;
 use axum::Extension;
-use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use oxrdf::{Literal, NamedNode, Term};
 use serde::Deserialize;
 use serde_json::{Value as J, json};
@@ -33,7 +31,6 @@ use sparkles::evidence::{
     RecordVersion, RenditionContent, RenditionInput, Scope, Sha256Digest, SourceContent,
     SourceLineage, SourceMetadata, SourceRevisionInput, SourceTimes,
 };
-use sparkles::task::Control;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -774,6 +771,16 @@ pub(super) async fn propose(
     Extension(p): Extension<Principal>,
     AdminBody(bytes): AdminBody,
 ) -> ApiResult {
+    super::run_http("propose", st, name, p, bytes).await
+}
+
+pub(super) fn propose_now(
+    st: Arc<AppState>,
+    name: String,
+    p: Principal,
+    bytes: axum::body::Bytes,
+    execution: super::Execution,
+) -> ApiResult<J> {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
@@ -791,82 +798,68 @@ pub(super) async fn propose(
         )
     })?;
     let (input, request) = input_of(request)?;
-    let branch =
-        crate::http::branches::current().unwrap_or_else(|| sparkles::branch::MAIN.to_string());
-    let logical = dataset(&st, &name)?;
+    let branch = execution.branch.clone();
+    let logical = execution.dataset(&st, &name)?;
     let main = if branch == sparkles::branch::MAIN {
         logical.clone()
     } else {
         crate::http::main_dataset(&st, &name)?
     };
-    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
-    blocking(move || {
-        use crate::auth::{Endpoint, on_branch};
-        let here = on_branch(&main.name, &branch);
-        let caller = crate::http::caller::CallerContext::for_caller(&st, &logical, &p);
-        let opts = caller.options_on(&crate::http::Params::empty(), &here, Endpoint::Update);
-        let control = Control {
-            deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
-            ..Control::with_cancel(cancel)
-        };
-        let mut options = ProposeOptions::new(principal_iri(&p));
-        options.idempotency_key = request.idempotency_key;
-        options.if_head = request.if_head;
-        options.dry_run = request.dry_run;
-        options.source_graph = request.source_graph;
-        options.proposal_graph = request.proposal_graph;
-        options.identity_graph = request.identity_graph;
-        options.message = request.message.map(Arc::from);
-        options.author = crate::http::author(&p);
-        options.write = opts.graphs.clone();
-        options.authority = Some(Arc::new(CallerFence {
-            st: st.clone(),
-            p: p.clone(),
-        }));
-        type Policy = Option<Arc<sparkles::access::GraphAccess>>;
-        let mut policies: std::collections::HashMap<(uuid::Uuid, String), Policy> =
-            std::collections::HashMap::new();
-        let mut read = |ds: &sparkles::Dataset, branch: &str| -> Policy {
-            policies
-                .entry((ds.dataset_id(), branch.to_string()))
-                .or_insert_with(|| policy(&st, &p, ds, branch))
-                .clone()
-        };
-        let proposed = match sparkles::evidence::propose(
-            Some(&st.catalog),
-            &main.dataset,
-            &logical.dataset,
-            &input,
-            &options,
-            &mut read,
-            &control,
-        ) {
-            Ok(v) => v,
-            Err(sparkles::Error::Managed(m)) if m.code == "authority-changed" => {
-                return Ok(crate::auth::routes::authority_changed_response());
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let mut out = json!({
-            "operation": proposed.operation.as_str(),
-            "committed": proposed.committed,
-            "replayed": proposed.replayed,
-            "commit": proposed.commit,
-            "branchId": proposed.branch,
-            "firstAvailableAt": proposed.first_available_at,
-            "hold": proposed.hold,
-            "records": proposed.records.iter().map(record_json).collect::<Vec<_>>(),
+    use crate::auth::{Endpoint, on_branch};
+    let here = on_branch(&main.name, &branch);
+    let caller = crate::http::caller::CallerContext::for_caller(&st, &logical, &p);
+    let opts = caller.options_on(&crate::http::Params::empty(), &here, Endpoint::Update);
+    let control = execution.control(&opts);
+    let mut options = ProposeOptions::new(principal_iri(&p));
+    options.idempotency_key = request.idempotency_key;
+    options.if_head = request.if_head;
+    options.dry_run = request.dry_run;
+    options.source_graph = request.source_graph;
+    options.proposal_graph = request.proposal_graph;
+    options.identity_graph = request.identity_graph;
+    options.message = request.message.map(Arc::from);
+    options.author = crate::http::author(&p);
+    options.write = opts.graphs.clone();
+    options.authority = Some(Arc::new(CallerFence {
+        st: st.clone(),
+        p: p.clone(),
+    }));
+    type Policy = Option<Arc<sparkles::access::GraphAccess>>;
+    let mut policies: std::collections::HashMap<(uuid::Uuid, String), Policy> =
+        std::collections::HashMap::new();
+    let mut read = |ds: &sparkles::Dataset, branch: &str| -> Policy {
+        policies
+            .entry((ds.dataset_id(), branch.to_string()))
+            .or_insert_with(|| policy(&st, &p, ds, branch))
+            .clone()
+    };
+    let proposed = sparkles::evidence::propose(
+        Some(&st.catalog),
+        &main.dataset,
+        &logical.dataset,
+        &input,
+        &options,
+        &mut read,
+        &control,
+    )?;
+    let mut out = json!({
+        "operation": proposed.operation.as_str(),
+        "committed": proposed.committed,
+        "replayed": proposed.replayed,
+        "commit": proposed.commit,
+        "branchId": proposed.branch,
+        "firstAvailableAt": proposed.first_available_at,
+        "hold": proposed.hold,
+        "records": proposed.records.iter().map(record_json).collect::<Vec<_>>(),
+    });
+    if let Some(preview) = &proposed.preview {
+        let commit = preview.receipt_commit();
+        out["dryRun"] = json!({
+            "wouldCommit": matches!(preview.outcome(), sparkles::preview::Outcome::Commit),
+            "inserted": commit.inserted,
+            "deleted": commit.deleted,
+            "error": preview.error(),
         });
-        if let Some(preview) = &proposed.preview {
-            let commit = preview.receipt_commit();
-            out["dryRun"] = json!({
-                "wouldCommit": matches!(preview.outcome(), sparkles::preview::Outcome::Commit),
-                "inserted": commit.inserted,
-                "deleted": commit.deleted,
-                "error": preview.error(),
-            });
-        }
-        Ok(Json(out).into_response())
-    })
-    .await
+    }
+    Ok(out)
 }

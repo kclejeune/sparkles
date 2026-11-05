@@ -10,6 +10,8 @@ use axum::http::HeaderMap;
 use clap::Parser;
 use serde_json::json;
 
+#[cfg(feature = "auth")]
+mod evidence;
 mod ingest;
 #[cfg(all(feature = "auth", feature = "shacl"))]
 mod memory_acceptance;

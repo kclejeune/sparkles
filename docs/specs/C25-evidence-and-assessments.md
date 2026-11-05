@@ -1287,8 +1287,46 @@ The rest of Phase 3 is planned as separate roadmap items. Recall and Ask citatio
 reviewed claims under their review state, identity resolution and access are
 650. Ingestion of extracted facts as claim proposals with their sources is
 651. Reports and community summaries that draw on accepted evidence are
-652. MCP tools for proposals, reviews, withdrawals, resolution, identities and
-dependents are 653. The bindings remain item 509.
+652. The bindings remain item 509.
+
+### Evidence operations over MCP
+
+Roadmap item 653 exposes `propose_claims`, `review_claims`, `withdraw_claims`,
+`resolve_evidence`, `resolve_identities` and `find_evidence_dependents`. They use the
+same typed payload parsers, JSON results and evidence operations as the HTTP routes.
+Proposal batches include identity proposals and assessment inputs, and reviews under
+matching policies retain map revisions and reversible decisions.
+
+Each tool runs as its caller on the selected dataset and branch. Its endpoint and
+graph grants, hidden-record refusals, protected writer, revision checks and credential
+fence are those of HTTP. The shared execution context carries the selected branch,
+absolute MCP deadline, cancellation and admitted grant into the blocking operation.
+HTTP captures its branch before that boundary too. The evidence resolver retains its
+shared preparation allowance. Write tools follow MCP's update switch and the server's
+read-only setting, while tool listing and disabling use the existing MCP controls.
+
+The three evidence writes advertise `idempotentHint: false`. Their explicit
+`idempotencyKey` provides receipt replay. Keyless proposals and withdrawals retain
+HTTP's behavior of publishing new operation metadata even when their records are
+already present. Reviews require the head they read, so an exact successful keyless
+review retry refuses the moved head. Error codes use owned boxed strings to preserve
+arbitrary HTTP refusal codes while keeping the shared tool error below Clippy's
+128-byte large-error boundary. This adds a small code allocation on static-code error
+paths in exchange for a smaller inline error value.
+
+The advertised input and output schemas reuse the evidence OpenAPI definitions, with
+MCP's dataset, branch and timeout arguments. A refused operation is an MCP tool result
+with `isError: true` and its HTTP code, status and body in error metadata. JSON-RPC
+success alone does not report successful publication. The HTTP authority-change
+response retains its authentication challenge. The adapter never adds evidence
+settings, administrative holds, job execution or domain entity semantics.
+
+Router tests exercise all six tools through actual JSON-RPC dispatch, HTTP parity,
+per-caller and graph grants, hidden records and stored facts, protected writes,
+previews, replay, head, target and policy refusals, withdrawal, matching-policy reversal,
+assessment dependents, Unicode passages, selected branches and credential revocation
+before publication. Tool advertisement tests cover payload schemas and update,
+read-only and disable controls.
 
 Retained-reference resolution uses C29's bounded history and controlled permission
 preparation. Guarded Dataset queries and U02 readers still adopt them under item 395.

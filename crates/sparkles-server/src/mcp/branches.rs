@@ -37,7 +37,10 @@ use std::time::{Duration, Instant};
 /// The tools that write: offered only with `--mcp-allow-update` (`--allow-update` over
 /// stdio), never on a read-only server, and listed only for a caller who may write to
 /// some dataset.
-pub(crate) const WRITE_TOOLS: [&str; 6] = [
+pub(crate) const WRITE_TOOLS: [&str; 9] = [
+    "propose_claims",
+    "review_claims",
+    "withdraw_claims",
     "sparql_update",
     "assert_facts",
     "register_source",
@@ -407,7 +410,7 @@ impl Tools<'_> {
         }
         let actor = crate::audit::Actor::tool(&p, &self.call.request_id);
         let at = match selector(None, a.at.as_ref()).inspect_err(|error| {
-            actor.failed_branch("branch_created", Some(&ds.name), &name, error.code);
+            actor.failed_branch("branch_created", Some(&ds.name), &name, &error.code);
         })? {
             Some(at) => at,
             None => At::Head,

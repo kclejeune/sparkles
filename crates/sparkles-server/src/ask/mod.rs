@@ -725,7 +725,7 @@ impl Asking<'_, '_> {
             );
         }
         if let Err(e) = self.server.dataset(self.principal, Some(&self.o.dataset)) {
-            return self.error(e.code, e.message);
+            return self.error(&e.code, e.message);
         }
         if let Some(q) = self.o.query.clone() {
             return self.given(&q);
@@ -1061,7 +1061,7 @@ impl Asking<'_, '_> {
                     true,
                 )
                 .or_else(|error| {
-                    if error.code == "budget-result-bytes" {
+                    if error.code.as_ref() == "budget-result-bytes" {
                         self.ground_tool(
                             profile::Stage::Linker,
                             "link_entities",
@@ -1768,7 +1768,7 @@ impl Asking<'_, '_> {
                     record["run"] = ev["error"].clone();
                     record["diagnosis"] = diagnosis.clone().into();
                     self.attempts.push(record);
-                    if repairs < MAX_REPAIRS && e.code != "cancelled" {
+                    if repairs < MAX_REPAIRS && e.code.as_ref() != "cancelled" {
                         self.failed_again(attempt, "check-failed");
                         repairs += 1;
                         repair = Some(repair_text(&run_query, &diagnosis));

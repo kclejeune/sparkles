@@ -138,6 +138,7 @@ const INBOX_TOOLS: &[&str] = &[
 
 fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, ToolError> {
     match name {
+        n if super::evidence::NAMES.contains(&n) => t.evidence(n, args),
         "list_datasets" => t.list_datasets(args),
         "describe_schema" => t.describe_schema(args),
         "draft_shapes" => t.draft_shapes(args),

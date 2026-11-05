@@ -604,6 +604,16 @@ async fn resolve(
     Extension(p): Extension<Principal>,
     AdminBody(bytes): AdminBody,
 ) -> ApiResult {
+    run_http("resolve", st, name, p, bytes).await
+}
+
+fn resolve_now(
+    st: Arc<AppState>,
+    name: String,
+    p: Principal,
+    bytes: axum::body::Bytes,
+    execution: Execution,
+) -> ApiResult<J> {
     if bytes.len() > MAX_RESOLVE_BYTES {
         return Err(err(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -617,69 +627,57 @@ async fn resolve(
         )
     })?;
     let references = parse_references(request)?;
-    let branch =
-        crate::http::branches::current().unwrap_or_else(|| sparkles::branch::MAIN.to_string());
-    let logical = dataset(&st, &name)?;
+    let branch = execution.branch.clone();
+    let logical = execution.dataset(&st, &name)?;
     let main = if branch == sparkles::branch::MAIN {
         logical.clone()
     } else {
         crate::http::main_dataset(&st, &name)?
     };
-    // A client that disconnects cancels the resolution; the guard stays in this future.
-    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
-    blocking(move || {
-        use crate::auth::{Endpoint, on_branch};
-        let here = on_branch(&main.name, &branch);
-        let opts = crate::http::caller::CallerContext::for_caller(&st, &logical, &p).options_on(
-            &crate::http::Params::empty(),
-            &here,
-            Endpoint::Query,
-        );
-        let control = Control {
-            deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
-            ..Control::with_cancel(cancel)
-        };
-        let mut resolution = Resolution::new(control)?;
-        // What the caller may read on a dataset and branch, by their current names. One
-        // policy per dataset and branch serves the whole request, so that its references
-        // share prepared views.
-        type Policy = Option<Arc<sparkles::access::GraphAccess>>;
-        let mut policies: std::collections::HashMap<(uuid::Uuid, String), Policy> =
-            std::collections::HashMap::new();
-        let mut access = |ds: &sparkles::Dataset, branch: &str| -> Policy {
-            policies
-                .entry((ds.dataset_id(), branch.to_string()))
-                .or_insert_with(|| policy(&st, &p, ds, branch))
-                .clone()
-        };
-        let mut resolved = Vec::with_capacity(references.len());
-        for (key, reference) in &references {
-            let one = [(key.clone(), reference.clone())];
-            match resolution.all(
-                Some(&st.catalog),
-                &main.dataset,
-                &logical.dataset,
-                &one,
-                &mut access,
-            ) {
-                Ok(mut v) => resolved.push(verified_json(key, &v.remove(0))),
-                Err(sparkles::Error::Managed(m))
-                    if sparkles::evidence::resolve::is_outcome(m.code) =>
-                {
-                    let status = StatusCode::from_u16(m.status())
-                        .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
-                    return Ok((
-                        status,
-                        Json(json!({ "error": m.message, "code": m.code, "reference": key })),
-                    )
-                        .into_response());
-                }
-                Err(e) => return Err(e.into()),
+    use crate::auth::{Endpoint, on_branch};
+    let here = on_branch(&main.name, &branch);
+    let opts = crate::http::caller::CallerContext::for_caller(&st, &logical, &p).options_on(
+        &crate::http::Params::empty(),
+        &here,
+        Endpoint::Query,
+    );
+    let control = execution.control(&opts);
+    let mut resolution = Resolution::new(control)?;
+    // What the caller may read on a dataset and branch, by their current names. One
+    // policy per dataset and branch serves the whole request, so that its references
+    // share prepared views.
+    type Policy = Option<Arc<sparkles::access::GraphAccess>>;
+    let mut policies: std::collections::HashMap<(uuid::Uuid, String), Policy> =
+        std::collections::HashMap::new();
+    let mut access = |ds: &sparkles::Dataset, branch: &str| -> Policy {
+        policies
+            .entry((ds.dataset_id(), branch.to_string()))
+            .or_insert_with(|| policy(&st, &p, ds, branch))
+            .clone()
+    };
+    let mut resolved = Vec::with_capacity(references.len());
+    for (key, reference) in &references {
+        let one = [(key.clone(), reference.clone())];
+        match resolution.all(
+            Some(&st.catalog),
+            &main.dataset,
+            &logical.dataset,
+            &one,
+            &mut access,
+        ) {
+            Ok(mut v) => resolved.push(verified_json(key, &v.remove(0))),
+            Err(sparkles::Error::Managed(m)) if sparkles::evidence::resolve::is_outcome(m.code) => {
+                let status =
+                    StatusCode::from_u16(m.status()).unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+                return Err(crate::http::err_body(
+                    status,
+                    json!({ "error": m.message, "code": m.code, "reference": key }),
+                ));
             }
+            Err(e) => return Err(e.into()),
         }
-        Ok(Json(json!({ "resolved": resolved })).into_response())
-    })
-    .await
+    }
+    Ok(json!({ "resolved": resolved }))
 }
 
 /// What `p` may read on branch `branch` of `ds` through the query endpoint, by their
@@ -709,4 +707,91 @@ fn policy(
         opts.graphs
             .unwrap_or_else(|| Arc::new(sparkles::access::GraphAccess::all())),
     )
+}
+
+/// Transport context captured before entering a blocking worker. Evidence keeps its
+/// own shared preparation allowance; the admitted grant stays alive for the operation.
+pub(crate) struct Execution {
+    pub(crate) branch: String,
+    pub(crate) cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) deadline: Option<std::time::Instant>,
+    pub(crate) grant: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
+}
+
+impl Execution {
+    fn dataset(&self, st: &AppState, name: &str) -> ApiResult<Arc<crate::state::Dataset>> {
+        let main = crate::http::main_dataset(st, name)?;
+        if self.branch == sparkles::branch::MAIN {
+            Ok(main)
+        } else {
+            Ok(st.branch_dataset(&main, &self.branch)?)
+        }
+    }
+
+    fn control(&self, opts: &sparkles::sparql::QueryOptions) -> Control {
+        let server = opts.timeout.map(|t| std::time::Instant::now() + t);
+        Control {
+            deadline: match (server, self.deadline) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+            ..Control::with_cancel(self.cancel.clone())
+        }
+    }
+}
+
+/// One typed operation shared by HTTP and MCP. Both transports perform their endpoint
+/// check; record access and protected writes are checked here by the existing writer.
+pub(crate) fn execute(
+    operation: &str,
+    st: Arc<AppState>,
+    name: String,
+    principal: Principal,
+    bytes: axum::body::Bytes,
+    execution: Execution,
+) -> ApiResult<J> {
+    // Keep admission ownership even when the caller drops its transport future.
+    let _grant = execution.grant.clone();
+    match operation {
+        "propose" => claims::propose_now(st, name, principal, bytes, execution),
+        "review" => review::review_now(st, name, principal, bytes, execution),
+        "withdraw" => review::withdraw_now(st, name, principal, bytes, execution),
+        "resolve" => resolve_now(st, name, principal, bytes, execution),
+        "identities" => review::identities_now(st, name, principal, bytes, execution),
+        "dependents" => review::dependents_now(st, name, principal, bytes, execution),
+        _ => unreachable!("unregistered evidence operation"),
+    }
+}
+
+async fn run_http(
+    operation: &'static str,
+    st: Arc<AppState>,
+    name: String,
+    principal: Principal,
+    bytes: axum::body::Bytes,
+) -> ApiResult {
+    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
+    let execution = Execution {
+        branch: crate::http::branches::current()
+            .unwrap_or_else(|| sparkles::branch::MAIN.to_string()),
+        cancel,
+        deadline: None,
+        grant: crate::server_memory::current_grant(),
+    };
+    match blocking(move || execute(operation, st, name, principal, bytes, execution)).await {
+        Ok(value) => Ok(Json(value).into_response()),
+        Err(error) if error.audit_code() == "authority-changed" => {
+            Ok(crate::auth::routes::authority_changed_response())
+        }
+        Err(error)
+            if operation == "resolve"
+                && sparkles::evidence::resolve::is_outcome(error.audit_code()) =>
+        {
+            // Reference outcomes have always used the resolver's exact JSON body,
+            // including its key, without decorating it with a per-request id.
+            let (status, body) = error.into_parts();
+            Ok((status, Json(body)).into_response())
+        }
+        Err(error) => Err(error),
+    }
 }
