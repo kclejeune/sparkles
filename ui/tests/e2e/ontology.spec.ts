@@ -131,7 +131,7 @@ open(
     await page.goto(
       `/ui/workbench/ontology?ds=${ds}&inferred=1&iri=${encodeURIComponent(UNI + 'Professor')}`,
     );
-    await expect(region.getByRole('link', { name: 'Teacher', exact: true })).toBeVisible();
+    await expect(region.getByRole('button', { name: 'Teacher', exact: true })).toBeVisible();
     expect(posts).toHaveLength(1);
     await Promise.all(settled);
     expect(pages.map((p) => p.part).sort()).toEqual(['equivalents', 'parents', 'status']);
