@@ -56,13 +56,21 @@ def test_kept_classification_reads_pages_without_computing(ds: sparkles.Dataset)
     assert onto.kept_classification()["status"] == "unavailable"
     onto.edit(add=[f"EquivalentClasses(<{EX}Professor> <{EX}AliasA> <{EX}AliasB>)"])
     for invalid in [
-        {"projection": "unknown"}, {"about": None}, {"about": "relative"},
+        {"projection": "unknown"}, {"about": None},
         {"limit": 0}, {"limit": 1001}, {"nodes": True}, {"offset": 1}, {"target": "urn:out"},
     ]:
         args = {"projection": "frame", "about": EX + "Professor", **invalid}
         with pytest.raises(sparkles.InvalidInputError):
             onto.classify(**args)
         assert onto.kept_classification()["status"] == "unavailable"
+    # The existing native IRI adapter rejects relative strings before wire dispatch.
+    with pytest.raises(
+        ValueError,
+        match=r"^invalid IRI <relative>: No scheme found in an absolute IRI$",
+    ) as invalid_iri:
+        onto.classify(projection="frame", about="relative")
+    assert type(invalid_iri.value) is ValueError
+    assert onto.kept_classification()["status"] == "unavailable"
     cancel = sparkles.CancelToken()
     cancel.cancel()
     with pytest.raises(sparkles.CancelledError):
