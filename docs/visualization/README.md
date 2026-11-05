@@ -820,6 +820,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   conservative expressivity through its on-demand metrics panel.
 * The ontology editor's tree filter uses entity search. The thesaurus label search and
   DL Query's completion still use separate name lookups, item 660.
+* Deleting the selected entity can leave an outstanding tree reveal with an unhandled
+  not-found rejection. Item 751 covers this navigation case while preserving selection,
+  revision pins and normal tree reveals.
 
 ## Configuration and usage
 

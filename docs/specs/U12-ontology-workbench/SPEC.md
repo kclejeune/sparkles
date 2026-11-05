@@ -24,13 +24,6 @@ The workbench edits entities, axioms and annotations through the axiom model of
 [F24](../F24-owl-classification/README.md). Term editing reuses the forms of
 [U02](../U02-shape-driven-forms/README.md) for the common case.
 
-Mounted frame drafts retain their original target, graph, entity and commit through a
-refresh. A stale or failed refresh disables submission at the form and central dispatch
-boundaries. When replacement data arrives, active drafts keep their older capped frame
-and text until explicitly discarded, while inactive frames update automatically. Delayed
-parse results cannot become edits at another source, and preview/commit share the
-precondition captured when an edit was accepted.
-
 ## Candidate phases
 
 **SKOS and SKOS-XL thesaurus editor.** Edit concept schemes, top concepts, collections, broader, narrower and related links, multilingual labels, SKOS-XL labels and mapping relations in a tree. SKOS is more common than OWL in enterprise taxonomies. No support exists. It depends on item 21.
@@ -116,6 +109,13 @@ and edits one graph of a dataset, the default graph unless the caller picks anot
 the graphs that graph imports. Every read and write goes through the `/$/ontology/{ds}`
 routes of [F21](../F21-ontology-api.md#outcome), with the caller's grants, and through
 `/{ds}/update` for renames and header edits.
+
+Mounted frame drafts retain their original target, graph, entity and commit through a
+refresh. A stale or failed refresh disables submission at the form and central dispatch
+boundaries. When replacement data arrives, active drafts keep their older capped frame
+and text until explicitly discarded, while inactive frames update automatically. Delayed
+parse results cannot become edits at another source, and preview/commit share the
+precondition captured when an edit was accepted.
 
 **Trees.** The page has trees of classes, object properties, data properties,
 annotation properties and individuals. Each tree shows the asserted hierarchy from the
