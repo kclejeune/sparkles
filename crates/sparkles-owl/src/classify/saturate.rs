@@ -1623,10 +1623,7 @@ fn apply_rules<S: Sink, R: Rules>(
         }
         Concl::SuccIn(n, b) if R::HORN => horn_rules::succ_in(ix, me, st, n, b, out),
         Concl::PredIn(m, b) if R::HORN => horn_rules::pred_in(ix, me, st, m, b, out),
-        Concl::Succ(r, n) if R::HORN => {
-            horn_rules::succ(ix, me, st, r, n, false, out);
-            true
-        }
+        Concl::Succ(r, n) if R::HORN => horn_rules::succ(ix, me, st, r, n, false, out),
         Concl::SuccIn(..) | Concl::PredIn(..) | Concl::Succ(..) => {
             unreachable!("a conclusion of the Horn rules in a saturation without them")
         }
@@ -1814,4 +1811,422 @@ fn functional<S: Sink>(ix: &Index, st: &mut State, r: Role, w: Ex, out: &mut S) 
     }
     x.groups.push(merged);
     x.groups.sort_by(|a, b| a.funs.cmp(&b.funs));
+}
+
+#[cfg(test)]
+mod horn_accounting_tests {
+    use super::*;
+    use crate::classify::horn::HornAx;
+    use crate::classify::index::{Axioms, Interner, RoleName};
+    use crate::model::{Class, ObjectProperty};
+
+    struct Fixture {
+        ix: Index,
+        size: usize,
+        root: Ex,
+        targets: Vec<Ex>,
+        r: Role,
+        s: Role,
+        exist: Ex,
+    }
+
+    fn fixture() -> Fixture {
+        let mut it = Interner::new();
+        let mut class = |name: &str| it.class(&Class::new(format!("urn:horn-accounting:{name}")));
+        let root = class("root");
+        let targets: Vec<Ex> = (0..SMALL + 3)
+            .map(|n| class(&format!("target{n}")))
+            .collect();
+        let mut role = |name: &str| {
+            it.role(RoleName::Object(ObjectProperty::new(format!(
+                "urn:horn-accounting:{name}"
+            ))))
+        };
+        let r = role("r");
+        let s = role("s");
+        let t = role("t");
+        let exist = it.node(Node::Exist(r, targets[0]));
+        let ax = Axioms {
+            subs: vec![(root, exist)],
+            // r is a right operand, so both the EL and Horn paths must retain Fwd.
+            chains: vec![(vec![s, r], t)],
+            horn: Some(Box::new(HornAx::default())),
+            ..Axioms::default()
+        };
+        let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+        assert!(ix.roles.keeps_forward(r));
+        assert!(!ix.roles.keeps_forward(s));
+        assert_eq!(ix.head(exist).succ, targets[0]);
+        Fixture {
+            ix,
+            size: it.len(),
+            root,
+            targets,
+            r,
+            s,
+            exist,
+        }
+    }
+
+    #[derive(Default)]
+    struct Recording {
+        sent: Vec<(Ex, Concl)>,
+        local: Vec<Concl>,
+    }
+
+    impl Sink for Recording {
+        fn send(&mut self, to: Ex, c: Concl) {
+            self.sent.push((to, c));
+        }
+        fn me(&mut self, c: Concl) {
+            self.local.push(c);
+        }
+    }
+
+    fn check_successor_set(hashed: bool) {
+        let f = fixture();
+        let mut st = State::default();
+        let targets = if hashed {
+            &f.targets[..]
+        } else {
+            &f.targets[..2]
+        };
+        for (i, &n) in targets.iter().enumerate() {
+            let mut out = Recording::default();
+            assert!(apply_rules::<_, Horn>(
+                &f.ix,
+                f.root,
+                &mut st,
+                Concl::Succ(f.r, n),
+                &mut out
+            ));
+            assert_eq!(out.sent, vec![(n, Concl::Back(f.root, f.r))]);
+            assert_eq!(out.local, vec![Concl::Fwd(f.r, n)]);
+            let h = &st.extra.as_ref().unwrap().horn;
+            assert_eq!(h.succ.list.len(), i + 1);
+            assert_eq!(h.succ.set.is_some(), i >= SMALL);
+        }
+        for &n in targets {
+            let mut duplicate = Recording::default();
+            assert!(
+                !apply_rules::<_, Horn>(
+                    &f.ix,
+                    f.root,
+                    &mut st,
+                    Concl::Succ(f.r, n),
+                    &mut duplicate
+                ),
+                "target {n}, hashed={hashed}"
+            );
+            assert!(duplicate.sent.is_empty());
+            assert!(duplicate.local.is_empty());
+            assert_eq!(
+                st.extra.as_ref().unwrap().horn.succ.list.len(),
+                targets.len()
+            );
+        }
+        let mut out = Recording::default();
+        assert!(apply_rules::<_, Horn>(
+            &f.ix,
+            f.root,
+            &mut st,
+            Concl::Succ(f.s, f.targets[0]),
+            &mut out
+        ));
+        assert_eq!(out.sent, vec![(f.targets[0], Concl::Back(f.root, f.s))]);
+        assert!(out.local.is_empty());
+        assert_eq!(
+            st.extra.as_ref().unwrap().horn.succ.list.len(),
+            targets.len() + 1
+        );
+    }
+
+    #[test]
+    fn duplicate_horn_successors_are_not_new_in_list_sets() {
+        check_successor_set(false);
+    }
+
+    #[test]
+    fn duplicate_horn_successors_are_not_new_in_hash_sets() {
+        check_successor_set(true);
+    }
+
+    #[test]
+    fn exist_and_direct_successors_keep_their_own_insertion_and_horn_bookkeeping() {
+        let f = fixture();
+        for exist_first in [true, false] {
+            let mut st = State::default();
+            let h = &mut st.extra().horn;
+            h.fills.push(f.targets[1]);
+            h.alls.push((f.r, f.targets[2]));
+            h.all_roles.push(f.r);
+            h.atmost.push((f.r, TOP));
+            let direct = Concl::Succ(f.r, f.targets[0]);
+            let existential = Concl::Sub(f.exist);
+            let mut first = Recording::default();
+            assert!(apply_rules::<_, Horn>(
+                &f.ix,
+                f.root,
+                &mut st,
+                if exist_first { existential } else { direct },
+                &mut first
+            ));
+            assert_eq!(
+                first.sent,
+                vec![
+                    (f.targets[0], Concl::Back(f.root, f.r)),
+                    (f.targets[0], Concl::PredIn(f.root, f.targets[1])),
+                ]
+            );
+            assert_eq!(first.local, vec![Concl::Fwd(f.r, f.targets[0])]);
+            let h = &st.extra.as_ref().unwrap().horn;
+            assert_eq!(h.succ.list, vec![(f.r, f.targets[0])]);
+            assert_eq!(h.pending, vec![(f.r, f.targets[0])]);
+            assert_eq!(h.merges, vec![(f.r, TOP)]);
+            let mut second = Recording::default();
+            let new = apply_rules::<_, Horn>(
+                &f.ix,
+                f.root,
+                &mut st,
+                if exist_first { direct } else { existential },
+                &mut second,
+            );
+            assert_eq!(new, !exist_first);
+            if exist_first {
+                assert!(second.sent.is_empty());
+                assert!(second.local.is_empty());
+            } else {
+                // A new Sub still emits its EL links, but sent=true must not repeat
+                // the already registered Horn predecessor, pending or merge work.
+                assert_eq!(second.sent, vec![(f.targets[0], Concl::Back(f.root, f.r))]);
+                assert_eq!(second.local, vec![Concl::Fwd(f.r, f.targets[0])]);
+            }
+            let h = &st.extra.as_ref().unwrap().horn;
+            assert_eq!(h.pending.len(), 1);
+            assert_eq!(h.merges.len(), 1);
+            let mut again = Recording::default();
+            assert!(!apply_rules::<_, Horn>(
+                &f.ix,
+                f.root,
+                &mut st,
+                existential,
+                &mut again
+            ));
+            assert!(again.sent.is_empty());
+            assert!(again.local.is_empty());
+        }
+    }
+
+    fn run<'a>(ix: &'a Index, ctx: &'a Contexts, bounds: &'a Bounds<'a>) -> Run<'a> {
+        Run {
+            ix,
+            ctx,
+            universal: &[],
+            roots: &[],
+            next_root: AtomicUsize::new(0),
+            queue: Mutex::default(),
+            ready: Condvar::new(),
+            pending: AtomicUsize::new(1),
+            idle: AtomicUsize::new(0),
+            stop: AtomicU8::new(STOP_NONE),
+            memory: AtomicUsize::new(bounds.base_memory),
+            queued: AtomicIsize::new(1),
+            peak: AtomicUsize::new(bounds.peak_memory),
+            applied: AtomicUsize::new(0),
+            merged: AtomicBool::new(false),
+            batch: false,
+            plain: false,
+            horn: true,
+            disj: false,
+            dynamic: None,
+            bounds,
+        }
+    }
+
+    #[test]
+    fn a_duplicate_successor_does_not_cross_the_storage_budget_after_flush() {
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let root = ctx[f.root as usize].get_or_init(Box::default);
+        root.st.lock().init = true;
+        root.st.lock().extra().horn.succ.insert((f.r, f.targets[0]));
+        root.todo.lock().push(Concl::Succ(f.r, f.targets[0]));
+        let base = 4096;
+        let cap = base + std::mem::size_of::<Concl>();
+        let bounds = Bounds {
+            threads: 1,
+            deadline: None,
+            max_memory: Some(cap),
+            cancelled: None,
+            charge: None,
+            base_memory: base,
+            peak_memory: cap,
+            dynamic: None,
+            dl: None,
+            partial: false,
+        };
+        let run = run(&f.ix, &ctx, &bounds);
+        let mut tally = Tally::default();
+        run.process::<Horn>(
+            f.root,
+            &mut VecDeque::new(),
+            &mut tally,
+            &mut Vec::new(),
+            &mut Outbox::default(),
+        );
+        let ok = run.flush(&mut tally);
+        eprintln!(
+            "duplicate budget boundary: cap={cap} held={} queued={} peak={} attempted={} ok={ok}",
+            run.memory.load(Ordering::Relaxed),
+            run.queued.load(Ordering::Relaxed),
+            run.peak.load(Ordering::Relaxed),
+            run.applied.load(Ordering::Relaxed)
+        );
+        assert!(ok, "a duplicate alone must not stop the run as over budget");
+        assert_eq!(run.memory.load(Ordering::Relaxed), base);
+        assert_eq!(run.queued.load(Ordering::Relaxed), 0);
+        assert_eq!(run.applied.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn real_horn_process_flush_counts_attempts_storage_queues_and_budget_refusals() {
+        let f = fixture();
+        let base = 4096;
+        let queued_bytes = std::mem::size_of::<Concl>();
+        for (label, c, held_pair, stored) in [
+            ("duplicate", Concl::Succ(f.r, f.targets[0]), true, 0),
+            ("first", Concl::Succ(f.r, f.targets[0]), false, 2),
+            ("new-role", Concl::Succ(f.s, f.targets[0]), true, 1),
+            ("new-target", Concl::Succ(f.r, f.targets[1]), true, 2),
+        ] {
+            for high_peak in [false, true] {
+                for bounded in [false, true] {
+                    let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+                    let root = ctx[f.root as usize].get_or_init(Box::default);
+                    root.st.lock().init = true;
+                    if held_pair {
+                        assert!(root.st.lock().extra().horn.succ.insert((f.r, f.targets[0])));
+                    }
+                    root.todo.lock().push(c);
+                    let initial_peak = if high_peak {
+                        base + 8192
+                    } else {
+                        base + queued_bytes
+                    };
+                    let charged = AtomicUsize::new(0);
+                    let charge = |bytes| {
+                        charged.fetch_add(bytes, Ordering::Relaxed);
+                        true
+                    };
+                    let bounds = Bounds {
+                        threads: 1,
+                        deadline: None,
+                        max_memory: bounded.then_some(base + queued_bytes),
+                        cancelled: None,
+                        charge: Some(&charge),
+                        base_memory: base,
+                        peak_memory: initial_peak,
+                        dynamic: None,
+                        dl: None,
+                        partial: false,
+                    };
+                    let run = run(&f.ix, &ctx, &bounds);
+                    let mut tally = Tally::default();
+                    run.process::<Horn>(
+                        f.root,
+                        &mut VecDeque::new(),
+                        &mut tally,
+                        &mut Vec::new(),
+                        &mut Outbox::default(),
+                    );
+                    let sent = usize::from(stored != 0);
+                    // The source is initialized. The only extra local application is
+                    // Fwd on r; the new remote Back remains in its target's todo.
+                    assert_eq!(tally.applied, if stored == 2 { 2 } else { 1 }, "{label}");
+                    assert_eq!(tally.stored, stored, "{label}");
+                    assert_eq!(tally.queued, sent as isize - 1, "{label}");
+                    assert_eq!(run.memory.load(Ordering::Relaxed), base);
+                    assert!(root.todo.lock().is_empty());
+                    assert_eq!(
+                        ctx.iter()
+                            .filter_map(|s| s.get())
+                            .map(|s| s.todo.lock().len())
+                            .sum::<usize>(),
+                        sent
+                    );
+                    let applied = tally.applied;
+                    let ok = run.flush(&mut tally);
+                    let held = base + stored * CONCLUSION_BYTES;
+                    let used = held + sent * queued_bytes;
+                    assert_eq!(run.applied.load(Ordering::Relaxed), applied);
+                    assert_eq!(run.memory.load(Ordering::Relaxed), held);
+                    assert_eq!(run.queued.load(Ordering::Relaxed), sent as isize);
+                    assert_eq!(run.peak.load(Ordering::Relaxed), initial_peak.max(used));
+                    assert_eq!(ok, !bounded || stored == 0, "{label}");
+                    assert_eq!(
+                        run.stop.load(Ordering::Relaxed),
+                        if ok { STOP_NONE } else { STOP_MEMORY }
+                    );
+                    let expected_charge = if ok {
+                        used.saturating_sub(initial_peak)
+                    } else {
+                        0
+                    };
+                    assert_eq!(charged.load(Ordering::Relaxed), expected_charge);
+                    assert_eq!((tally.applied, tally.stored, tally.queued), (0, 0, 0));
+                    eprintln!(
+                        "horn-accounting {label}: high_peak={high_peak} bounded={bounded} attempted={applied} stored={stored} held={held} queued={sent} peak={} ok={ok}",
+                        initial_peak.max(used)
+                    );
+                }
+            }
+        }
+        // An actual pool refusal must still stop genuine new storage, while a
+        // duplicate below its previous peak has no fresh grant to refuse.
+        for duplicate in [true, false] {
+            let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+            let root = ctx[f.root as usize].get_or_init(Box::default);
+            root.st.lock().init = true;
+            if duplicate {
+                root.st.lock().extra().horn.succ.insert((f.r, f.targets[0]));
+            }
+            root.todo.lock().push(Concl::Succ(f.r, f.targets[0]));
+            let calls = AtomicUsize::new(0);
+            let charge = |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                false
+            };
+            let bounds = Bounds {
+                threads: 1,
+                deadline: None,
+                max_memory: None,
+                cancelled: None,
+                charge: Some(&charge),
+                base_memory: base,
+                peak_memory: base + queued_bytes,
+                dynamic: None,
+                dl: None,
+                partial: false,
+            };
+            let run = run(&f.ix, &ctx, &bounds);
+            let mut tally = Tally::default();
+            run.process::<Horn>(
+                f.root,
+                &mut VecDeque::new(),
+                &mut tally,
+                &mut Vec::new(),
+                &mut Outbox::default(),
+            );
+            assert_eq!(run.flush(&mut tally), duplicate);
+            assert_eq!(calls.load(Ordering::Relaxed), usize::from(!duplicate));
+            assert_eq!(
+                run.memory.load(Ordering::Relaxed),
+                base + if duplicate { 0 } else { 2 * CONCLUSION_BYTES }
+            );
+            assert_eq!(
+                run.stop.load(Ordering::Relaxed),
+                if duplicate { STOP_NONE } else { STOP_MEMORY }
+            );
+        }
+    }
 }

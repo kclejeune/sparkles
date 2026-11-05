@@ -437,6 +437,12 @@ OWL 2 EL. `Stats::tier` says which rules a run needed, `Stats::outside_el` count
 axioms outside OWL 2 EL and those taken, and `Stats::conjunctions` counts the contexts
 the rules created.
 
+`Stats::conclusions` counts attempted rule applications, including duplicate messages,
+rather than distinct stored consequences. The memory estimate charges a Horn successor
+only when its role and target entry is new. Duplicate successor messages add no stored
+charge. The estimate remains approximate, with waiting messages and dynamic contexts
+accounted for separately.
+
 A universal restriction on a successor's property extends the successor to the
 conjunction of its classes and the restriction's filler, and at-most restrictions merge
 successors and identify a predecessor with a successor. These conjunctions get contexts
