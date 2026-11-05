@@ -728,17 +728,14 @@
     return () => classifyAbort?.abort();
   });
   const inferred = $derived(classification ? taxonomyTree(classification) : null);
+  const inferredIriName = (iri: string) => {
+    if (iriForm.mode !== 'label') return iri;
+    inferredBatch.want(iri);
+    return preferredLabel(inferredLabels.get(iri), langs) ?? iri;
+  };
   const inferredName = (id: string) => {
     const cs = inferred?.classesOf.get(id) ?? [];
-    return cs.length
-      ? cs
-          .map((iri) =>
-            iriForm.mode === 'label'
-              ? (preferredLabel(inferredLabels.get(iri), langs) ?? iri)
-              : iri,
-          )
-          .join(' ≡ ')
-      : id;
+    return cs.length ? cs.map(inferredIriName).join(' ≡ ') : id;
   };
   const inferredKeep = $derived(
     inferred && filter.trim() ? filterTree(inferred.tree, inferredName, filter) : null,
@@ -1025,6 +1022,20 @@
   }
 
   // --- edits, previews and the undo stack ---------------------------------------------------
+  let previewPin = $state.raw<{
+    op: Op;
+    target: string;
+    sel: Selection;
+    etag: string;
+    head: number | null;
+    frameContext: string | null;
+  } | null>(null);
+  const frameContext = $derived(
+    JSON.stringify([target, sel.graph, sel.imports, selected, frameKind]),
+  );
+  const frameSource = $derived(
+    JSON.stringify([target, sel.graph, sel.imports, selected, frameKind, frameCommit]),
+  );
   const session = new EditSession({
     reload: async () => {
       await loadAll();
@@ -1032,12 +1043,38 @@
     },
     staleText: 'Another commit landed since the editor read the ontology.',
   });
-  const edit = (op: Op, label: string, after?: () => void) => {
+  const edit = (op: Op, label: string, after?: () => void, fromFrame: string | null = null) => {
     // an edit names the commit the summary read, which a large ontology's summary may still be reading
-    if (!etag)
+    if (readonly || !etag)
       return void toasts.push('info', 'The ontology is still being read', 'Try again in a moment.');
-    return session.edit(op, label, after);
+    const origin = { target, sel: { ...sel }, etag, head: summary?.commit ?? null };
+    session.edit(op, label, after);
+    previewPin = { ...origin, op: session.previewOp!, frameContext: fromFrame };
   };
+  const editFrame = (op: Op, label: string, origin: string) => {
+    if (
+      readonly ||
+      origin !== frameSource ||
+      frameCommit !== summary?.commit ||
+      frameFor !== selected ||
+      frameError
+    )
+      return void toasts.push(
+        'info',
+        'The frame source changed',
+        'The draft must be reviewed on the current frame.',
+      );
+    return edit(op, label, undefined, frameContext);
+  };
+  $effect(() => {
+    const pin = previewPin;
+    if (
+      pin?.op === session.previewOp &&
+      pin?.frameContext != null &&
+      pin.frameContext !== frameContext
+    )
+      session.previewOpen = false;
+  });
 
   /** The labels the editor knows with those the previewed edit adds, for its axioms. */
   const previewLabels = $derived.by(() => {
@@ -1736,7 +1773,8 @@
                   <p class="inferred-sup">
                     <span class="faint">Inferred direct superclasses:</span>
                     {#each sup as c, i (c)}{#if i},
-                      {/if}<button class="link" onclick={() => nav({ iri: c })}>{nameOf(c)}</button
+                      {/if}<button class="link" onclick={() => nav({ iri: c })}
+                        >{inferredIriName(c)}</button
                       >{/each}
                   </p>
                 {/if}
@@ -1750,6 +1788,8 @@
                     kind={frameKind}
                     iri={selected}
                     items={frameItems}
+                    source={frameSource}
+                    commit={frameCommit}
                     name={nameOf}
                     {prefixes}
                     {options}
@@ -1758,7 +1798,7 @@
                     {names}
                     search={bigKinds.size ? searchNames : undefined}
                     {parse}
-                    onedit={(op, label) => edit(op, label)}
+                    onedit={editFrame}
                     onopen={(iri) => nav({ iri, view: null })}
                   />
                   {#if frameKind === 'Class'}
@@ -1817,6 +1857,7 @@
   op={session.previewOp}
   {etag}
   head={summary?.commit ?? null}
+  pin={previewPin}
   {describe}
   oncommitted={(op, a) => void session.committed(op, a)}
   onstale={() => void session.stale()}

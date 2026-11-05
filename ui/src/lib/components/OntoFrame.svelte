@@ -37,6 +37,7 @@
   import AnnotationRows from './AnnotationRows.svelte';
   import Icon from './Icon.svelte';
   import ManchesterEditor from './ManchesterEditor.svelte';
+  import { onDestroy, untrack } from 'svelte';
 
   let {
     kind,
@@ -46,7 +47,9 @@
     prefixes,
     options,
     annotationProperties,
-    readonly = false,
+    readonly: parentReadonly = false,
+    source,
+    commit,
     names,
     search,
     parse,
@@ -62,6 +65,9 @@
     options: (kind: EntityKind) => { iri: string; name: string }[];
     annotationProperties: string[];
     readonly?: boolean;
+    /** Exact target/selection/entity/commit identity of these asserted items. */
+    source: string;
+    commit: number | null;
     /** The entity names that Manchester fields complete. */
     names: () => NameOption[];
     /** Names found by the server as they are typed, for an ontology too large to list. */
@@ -71,13 +77,18 @@
       text: string,
       as: ParseAs,
     ) => Promise<{ ok: true; parsed: Parsed } | { ok: false; problem: ManchesterProblem }>;
-    onedit: (op: Op, label: string) => void;
+    onedit: (op: Op, label: string, source: string) => void;
     onopen: (iri: string) => void;
   } = $props();
 
-  const frame = $derived(buildFrame(kind, iri, items));
+  let acceptedSource = $state(untrack(() => source));
+  let acceptedCommit = $state(untrack(() => commit));
+  let acceptedItems = $state(untrack(() => items));
+  let annotationDrafts = $state(new Set<string>());
+  const frame = $derived(buildFrame(kind, iri, acceptedItems));
+  const readonly = $derived(parentReadonly || source !== acceptedSource);
   const label = $derived(name(iri));
-  const chars = $derived(characteristicsOf(iri, items));
+  const chars = $derived(characteristicsOf(iri, acceptedItems));
   /** The axiom rows whose annotations are open, by section and row. */
   let openAnn = $state<Set<string>>(new Set());
   /** The add form of each section: its text and its problem. */
@@ -91,6 +102,49 @@
   let assertValue = $state('');
   let assertLang = $state('');
   const uid = Math.random().toString(36).slice(2, 8);
+  let alive = true;
+  let parsing = 0;
+  const drafting = $derived(
+    annotationDrafts.size > 0 ||
+      Object.values(adding).some((s) => !!s.trim()) ||
+      !!assertProp.trim() ||
+      !!assertValue.trim() ||
+      busy !== null,
+  );
+  $effect(() => {
+    if (source === acceptedSource || !drafting) {
+      acceptedItems = items;
+      acceptedSource = source;
+      acceptedCommit = commit;
+    }
+  });
+  onDestroy(() => {
+    alive = false;
+    parsing++;
+  });
+  function annotationDraft(id: string, active: boolean) {
+    if (annotationDrafts.has(id) === active) return;
+    const next = new Set(annotationDrafts);
+    if (active) next.add(id);
+    else next.delete(id);
+    annotationDrafts = next;
+  }
+  function discardDraft() {
+    parsing++;
+    adding = {};
+    problems = {};
+    assertProp = assertValue = assertLang = '';
+    annotationDrafts = new Set();
+    openAnn = new Set();
+    busy = null;
+    acceptedItems = items;
+    acceptedSource = source;
+    acceptedCommit = commit;
+  }
+  function dispatch(op: Op, title: string, origin = acceptedSource) {
+    if (!alive || readonly || origin !== source || origin !== acceptedSource) return;
+    onedit(op, title, origin);
+  }
 
   const show = (x: unknown) => manchester(x, name, prefixes);
 
@@ -109,24 +163,25 @@
     }));
     const d = diffAxioms(before, after);
     if (d.add.length || d.remove.length)
-      onedit({ kind: 'axioms', add: d.add, remove: d.remove }, what);
+      dispatch({ kind: 'axioms', add: d.add, remove: d.remove }, what);
   }
 
   function axiomAnnotations(a: AxiomJson, next: Annotation[], what: string) {
-    onedit({ kind: 'axioms', remove: [a], add: [withAnnotations(a, next)] }, what);
+    dispatch({ kind: 'axioms', remove: [a], add: [withAnnotations(a, next)] }, what);
   }
 
   function removeAxiom(it: AxiomItem, what: string) {
-    onedit({ kind: 'axioms', add: [], remove: [it.axiom] }, what);
+    dispatch({ kind: 'axioms', add: [], remove: [it.axiom] }, what);
   }
 
   function toggleCharacteristic(type: string, on: boolean) {
     const ax = { type, property: iri };
     const word = type.replace(/(Object|Data)Property$/, '').toLowerCase();
-    if (on) onedit({ kind: 'axioms', add: [ax], remove: [] }, `Make ${label} ${word}`);
+    if (on) dispatch({ kind: 'axioms', add: [ax], remove: [] }, `Make ${label} ${word}`);
     else {
       const it = chars.get(type);
-      if (it) onedit({ kind: 'axioms', add: [], remove: [it.axiom] }, `Make ${label} not ${word}`);
+      if (it)
+        dispatch({ kind: 'axioms', add: [], remove: [it.axiom] }, `Make ${label} not ${word}`);
     }
   }
 
@@ -146,6 +201,9 @@
     target === 'Class' ? 'classExpression' : target === 'Datatype' ? 'dataRange' : null;
 
   async function addTo(section: string, title: string) {
+    if (readonly || !alive) return;
+    const origin = acceptedSource;
+    const generation = ++parsing;
     // the server reads the text as it is in the field, so a problem's span fits it
     const raw = adding[section] ?? '';
     const text = raw.trim();
@@ -161,23 +219,44 @@
       busy = section;
       try {
         const r = await parse(raw, as);
+        if (!alive || generation !== parsing) return;
+        if (readonly || source !== origin || acceptedSource !== origin)
+          return problem(
+            section,
+            'The frame source changed. The draft was preserved; discard it to load the current frame.',
+          );
         if (!r.ok) return problem(section, fromServer(r.problem));
         value = r.parsed.value;
       } catch (e) {
+        if (!alive || generation !== parsing) return;
         return problem(section, e instanceof Error ? e.message : String(e));
       } finally {
-        busy = null;
+        if (generation === parsing) busy = null;
       }
     }
+    if (
+      !alive ||
+      generation !== parsing ||
+      readonly ||
+      source !== origin ||
+      acceptedSource !== origin
+    )
+      return problem(
+        section,
+        'The frame source changed. The draft was preserved; discard it to load the current frame.',
+      );
     const ax = sectionAxiom(kind, section, iri, value as string);
     if (!ax) return problem(section, 'This section takes a named entity, not an expression.');
     problem(section, null);
     adding = { ...adding, [section]: '' };
-    onedit({ kind: 'axioms', add: [ax], remove: [] }, `${title}: add ${text} to ${label}`);
+    dispatch({ kind: 'axioms', add: [ax], remove: [] }, `${title}: add ${text} to ${label}`);
   }
 
   /** An axiom in Manchester or functional-style syntax, added as it is. */
   async function addAxiom() {
+    if (readonly || !alive) return;
+    const origin = acceptedSource;
+    const generation = ++parsing;
     const raw = adding.axiom ?? '';
     const text = raw.trim();
     if (!text) return;
@@ -186,23 +265,42 @@
       busy = 'axiom';
       try {
         const r = await parse(raw, 'axiom');
+        if (!alive || generation !== parsing) return;
+        if (readonly || source !== origin || acceptedSource !== origin)
+          return problem(
+            'axiom',
+            'The frame source changed. The draft was preserved; discard it to load the current frame.',
+          );
         if (!r.ok) return problem('axiom', fromServer(r.problem));
         ax = r.parsed.value;
       } catch (e) {
+        if (!alive || generation !== parsing) return;
         return problem('axiom', e instanceof Error ? e.message : String(e));
       } finally {
-        busy = null;
+        if (generation === parsing) busy = null;
       }
     }
+    if (
+      !alive ||
+      generation !== parsing ||
+      readonly ||
+      source !== origin ||
+      acceptedSource !== origin
+    )
+      return problem(
+        'axiom',
+        'The frame source changed. The draft was preserved; discard it to load the current frame.',
+      );
     problem('axiom', null);
     adding = { ...adding, axiom: '' };
-    onedit({ kind: 'axioms', add: [ax as AxiomJson | string], remove: [] }, `Add ${text}`);
+    dispatch({ kind: 'axioms', add: [ax as AxiomJson | string], remove: [] }, `Add ${text}`);
   }
 
   const objectProps = $derived(options('ObjectProperty'));
   const dataProps = $derived(options('DataProperty'));
 
   function addAssertion() {
+    if (readonly || !alive) return;
     const p = assertProp.trim();
     const op = objectProps.find((o) => o.name === p || o.iri === p);
     const dp = dataProps.find((o) => o.name === p || o.iri === p);
@@ -223,7 +321,7 @@
     }
     problem('assert', null);
     assertValue = '';
-    onedit({ kind: 'axioms', add: [ax], remove: [] }, `Assert ${p} of ${label}`);
+    dispatch({ kind: 'axioms', add: [ax], remove: [] }, `Assert ${p} of ${label}`);
   }
 
   /** The kinds of the entity a frame row's single shown value is, for its link. */
@@ -238,272 +336,287 @@
 </script>
 
 <div class="frame" data-iri={iri}>
-  <section class="block" aria-labelledby="ann-{uid}">
-    <h3 id="ann-{uid}">Annotations</h3>
-    <AnnotationRows
-      annotations={frame.annotations.map((a) => ({
-        property: String(a.axiom.property),
-        value: a.axiom.value as Annotation['value'],
-        ...(a.axiom.annotations ? { annotations: a.axiom.annotations } : {}),
-      }))}
-      {name}
-      {prefixes}
-      properties={annotationProperties}
-      {readonly}
-      {label}
-      onchange={entityAnnotations}
-    />
-  </section>
-
-  {#if characteristicList.length}
-    <section class="block" aria-labelledby="chars-{uid}">
-      <h3 id="chars-{uid}">Characteristics</h3>
-      <div class="chars">
-        {#each characteristicList as [type, word] (type)}
-          <label class="char">
-            <input
-              type="checkbox"
-              checked={chars.has(type)}
-              disabled={readonly}
-              onchange={(e) => toggleCharacteristic(type, e.currentTarget.checked)}
-            />
-            {word}
-          </label>
-        {/each}
-      </div>
-    </section>
+  {#if source !== acceptedSource}
+    <p class="faint" role="status">
+      Draft based on commit {acceptedCommit}; current frame commit {commit}. Draft text is preserved
+      until you discard it.
+    </p>
+    <button class="btn sm" disabled={parentReadonly} onclick={discardDraft}
+      >Discard draft and load current frame</button
+    >
   {/if}
+  {#key acceptedSource}
+    <section class="block" aria-labelledby="ann-{uid}">
+      <h3 id="ann-{uid}">Annotations</h3>
+      <AnnotationRows
+        annotations={frame.annotations.map((a) => ({
+          property: String(a.axiom.property),
+          value: a.axiom.value as Annotation['value'],
+          ...(a.axiom.annotations ? { annotations: a.axiom.annotations } : {}),
+        }))}
+        {name}
+        {prefixes}
+        properties={annotationProperties}
+        {readonly}
+        {label}
+        onchange={entityAnnotations}
+        ondraft={(active) => annotationDraft('entity', active)}
+      />
+    </section>
 
-  {#each frame.sections as s (s.id)}
-    {@const target = sectionTarget(kind, s.id)}
-    {@const addable =
-      !readonly &&
-      ![
-        'superOf',
-        'subProperties',
-        'disjointUnion',
-        'keys',
-        'chains',
-        'negative',
-        'objectAssertions',
-        'dataAssertions',
-      ].includes(s.id)}
-    {#if s.rows.length || addable || (kind === 'NamedIndividual' && s.id === 'objectAssertions' && !readonly)}
-      <section class="block" aria-labelledby="sec-{s.id}-{uid}" data-section={s.id}>
-        <h3 id="sec-{s.id}-{uid}">
-          {s.title} <span class="faint count">{s.rows.length || ''}</span>
-        </h3>
-        {#if s.rows.length}
-          <ul class="rows">
-            {#each s.rows as r, i (r.item.ofn + i)}
-              {@const id = `${s.id}:${i}`}
-              {@const anns = r.item.axiom.annotations ?? []}
-              <li class="axiom">
-                <div class="line">
-                  <span class="expr" title={r.item.ofn}>
-                    {#if r.shown.length === 1 && linkable(r.shown[0])}
-                      <button class="link" onclick={() => onopen(String(r.shown[0]))}
-                        >{name(String(r.shown[0]))}</button
-                      >
-                    {:else if s.id === 'objectAssertions' || s.id === 'dataAssertions' || s.id === 'negative'}
-                      <button class="link" onclick={() => onopen(String(r.shown[0]))}
-                        >{name(String(r.shown[0]))}</button
-                      >
-                      {#if linkable(r.shown[1])}
-                        <button class="link" onclick={() => onopen(String(r.shown[1]))}
-                          >{name(String(r.shown[1]))}</button
-                        >
-                      {:else}<span class="lit">{show(r.shown[1])}</span>{/if}
-                    {:else}
-                      {r.shown.map(show).join(', ')}
-                    {/if}
-                  </span>
-                  <span class="acts">
-                    <button
-                      class="btn ghost sm ann-toggle"
-                      class:has={anns.length}
-                      aria-expanded={openAnn.has(id)}
-                      aria-label="Annotations of {r.item.ofn}"
-                      onclick={() => toggleAnn(id)}
-                      ><Icon name="info" size={12} />{anns.length || ''}</button
-                    >
-                    {#if !readonly}
-                      <button
-                        class="btn ghost icon sm"
-                        aria-label="Remove {r.item.ofn}"
-                        onclick={() =>
-                          removeAxiom(
-                            r.item,
-                            `${s.title}: remove ${r.shown.map(show).join(', ')} from ${label}`,
-                          )}><Icon name="trash" size={13} /></button
-                      >
-                    {/if}
-                  </span>
-                </div>
-                {#if openAnn.has(id)}
-                  <div class="axiom-ann">
-                    <AnnotationRows
-                      annotations={anns}
-                      {name}
-                      {prefixes}
-                      properties={annotationProperties}
-                      {readonly}
-                      label={r.item.ofn}
-                      onchange={(next, what) => axiomAnnotations(r.item.axiom, next, what)}
-                    />
-                  </div>
-                {/if}
-              </li>
-            {/each}
-          </ul>
-        {/if}
-        {#if addable}
-          {@const as = parseAs(target)}
-          {@const p = problems[s.id]}
-          <form
-            class="add"
-            onsubmit={(e) => {
-              e.preventDefault();
-              void addTo(s.id, s.title);
-            }}
-          >
-            {#if as}
-              <ManchesterEditor
-                bind:value={() => adding[s.id] ?? '', (v) => (adding = { ...adding, [s.id]: v })}
-                {names}
-                {search}
-                label="Add to {s.title}"
-                placeholder={as === 'classExpression'
-                  ? 'Class name, IRI or class expression'
-                  : 'Datatype, IRI or data range'}
-                problem={p?.start != null
-                  ? { start: p.start, end: p.end ?? p.start, message: p.message }
-                  : null}
-                onsubmit={() => void addTo(s.id, s.title)}
-              />
-            {:else}
+    {#if characteristicList.length}
+      <section class="block" aria-labelledby="chars-{uid}">
+        <h3 id="chars-{uid}">Characteristics</h3>
+        <div class="chars">
+          {#each characteristicList as [type, word] (type)}
+            <label class="char">
               <input
-                class="input"
-                list={target ? `opts-${target}-${uid}` : undefined}
-                placeholder={target ? `${KIND_SINGULAR[target]} name or IRI` : 'IRI'}
-                aria-label="Add to {s.title}"
-                value={adding[s.id] ?? ''}
-                oninput={(e) => (adding = { ...adding, [s.id]: e.currentTarget.value })}
+                type="checkbox"
+                checked={chars.has(type)}
+                disabled={readonly}
+                onchange={(e) => toggleCharacteristic(type, e.currentTarget.checked)}
               />
-            {/if}
-            <button
-              class="btn sm"
-              type="submit"
-              disabled={!(adding[s.id] ?? '').trim() || busy === s.id}>Add</button
-            >
-            {#if p}{@render problemText(p)}{/if}
-          </form>
-        {/if}
-        {#if kind === 'NamedIndividual' && s.id === 'objectAssertions' && !readonly}
-          <form
-            class="add"
-            aria-label="Add a property assertion"
-            onsubmit={(e) => {
-              e.preventDefault();
-              addAssertion();
-            }}
-          >
-            <input
-              class="input"
-              list="opts-props-{uid}"
-              placeholder="Property"
-              aria-label="Property"
-              bind:value={assertProp}
-            />
-            <input
-              class="input"
-              list={objectProps.some((o) => o.name === assertProp)
-                ? `opts-NamedIndividual-${uid}`
-                : undefined}
-              placeholder="Individual or value"
-              aria-label="Value"
-              bind:value={assertValue}
-            />
-            {#if dataProps.some((o) => o.name === assertProp)}
-              <input
-                class="input lang"
-                placeholder="lang"
-                aria-label="Language"
-                bind:value={assertLang}
-                size="5"
-              />
-            {/if}
-            <button
-              class="btn sm"
-              type="submit"
-              disabled={!assertProp.trim() || !assertValue.trim()}>Add</button
-            >
-            {#if problems.assert}{@render problemText(problems.assert)}{/if}
-          </form>
-        {/if}
+              {word}
+            </label>
+          {/each}
+        </div>
       </section>
     {/if}
-  {/each}
 
-  {#if frame.other.length}
-    <section class="block" aria-labelledby="other-{uid}">
-      <h3 id="other-{uid}">Other axioms <span class="faint count">{frame.other.length}</span></h3>
-      <ul class="rows">
-        {#each frame.other as it, i (it.ofn + i)}
-          <li class="axiom">
-            <div class="line">
-              <span class="expr mono small">{it.ofn}</span>
-              {#if !readonly && it.type !== 'Declaration'}
-                <span class="acts">
-                  <button
-                    class="btn ghost icon sm"
-                    aria-label="Remove {it.ofn}"
-                    onclick={() => removeAxiom(it, `Remove ${it.type} of ${label}`)}
-                    ><Icon name="trash" size={13} /></button
-                  >
-                </span>
+    {#each frame.sections as s (s.id)}
+      {@const target = sectionTarget(kind, s.id)}
+      {@const addable =
+        (!readonly || !!adding[s.id]?.trim()) &&
+        ![
+          'superOf',
+          'subProperties',
+          'disjointUnion',
+          'keys',
+          'chains',
+          'negative',
+          'objectAssertions',
+          'dataAssertions',
+        ].includes(s.id)}
+      {#if s.rows.length || addable || (kind === 'NamedIndividual' && s.id === 'objectAssertions' && !readonly)}
+        <section class="block" aria-labelledby="sec-{s.id}-{uid}" data-section={s.id}>
+          <h3 id="sec-{s.id}-{uid}">
+            {s.title} <span class="faint count">{s.rows.length || ''}</span>
+          </h3>
+          {#if s.rows.length}
+            <ul class="rows">
+              {#each s.rows as r, i (r.item.ofn + i)}
+                {@const id = `${s.id}:${i}`}
+                {@const anns = r.item.axiom.annotations ?? []}
+                <li class="axiom">
+                  <div class="line">
+                    <span class="expr" title={r.item.ofn}>
+                      {#if r.shown.length === 1 && linkable(r.shown[0])}
+                        <button class="link" onclick={() => onopen(String(r.shown[0]))}
+                          >{name(String(r.shown[0]))}</button
+                        >
+                      {:else if s.id === 'objectAssertions' || s.id === 'dataAssertions' || s.id === 'negative'}
+                        <button class="link" onclick={() => onopen(String(r.shown[0]))}
+                          >{name(String(r.shown[0]))}</button
+                        >
+                        {#if linkable(r.shown[1])}
+                          <button class="link" onclick={() => onopen(String(r.shown[1]))}
+                            >{name(String(r.shown[1]))}</button
+                          >
+                        {:else}<span class="lit">{show(r.shown[1])}</span>{/if}
+                      {:else}
+                        {r.shown.map(show).join(', ')}
+                      {/if}
+                    </span>
+                    <span class="acts">
+                      <button
+                        class="btn ghost sm ann-toggle"
+                        class:has={anns.length}
+                        aria-expanded={openAnn.has(id)}
+                        aria-label="Annotations of {r.item.ofn}"
+                        onclick={() => toggleAnn(id)}
+                        ><Icon name="info" size={12} />{anns.length || ''}</button
+                      >
+                      {#if !readonly}
+                        <button
+                          class="btn ghost icon sm"
+                          aria-label="Remove {r.item.ofn}"
+                          onclick={() =>
+                            removeAxiom(
+                              r.item,
+                              `${s.title}: remove ${r.shown.map(show).join(', ')} from ${label}`,
+                            )}><Icon name="trash" size={13} /></button
+                        >
+                      {/if}
+                    </span>
+                  </div>
+                  {#if openAnn.has(id)}
+                    <div class="axiom-ann">
+                      <AnnotationRows
+                        annotations={anns}
+                        {name}
+                        {prefixes}
+                        properties={annotationProperties}
+                        {readonly}
+                        label={r.item.ofn}
+                        onchange={(next, what) => axiomAnnotations(r.item.axiom, next, what)}
+                        ondraft={(active) => annotationDraft(`${id}:${r.item.ofn}`, active)}
+                      />
+                    </div>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+          {#if addable}
+            {@const as = parseAs(target)}
+            {@const p = problems[s.id]}
+            <form
+              class="add"
+              onsubmit={(e) => {
+                e.preventDefault();
+                void addTo(s.id, s.title);
+              }}
+            >
+              {#if as}
+                <ManchesterEditor
+                  bind:value={() => adding[s.id] ?? '', (v) => (adding = { ...adding, [s.id]: v })}
+                  {names}
+                  {search}
+                  label="Add to {s.title}"
+                  placeholder={as === 'classExpression'
+                    ? 'Class name, IRI or class expression'
+                    : 'Datatype, IRI or data range'}
+                  problem={p?.start != null
+                    ? { start: p.start, end: p.end ?? p.start, message: p.message }
+                    : null}
+                  onsubmit={() => void addTo(s.id, s.title)}
+                />
+              {:else}
+                <input
+                  class="input"
+                  list={target ? `opts-${target}-${uid}` : undefined}
+                  placeholder={target ? `${KIND_SINGULAR[target]} name or IRI` : 'IRI'}
+                  aria-label="Add to {s.title}"
+                  value={adding[s.id] ?? ''}
+                  oninput={(e) => (adding = { ...adding, [s.id]: e.currentTarget.value })}
+                />
               {/if}
-            </div>
-          </li>
-        {/each}
-      </ul>
-    </section>
-  {/if}
+              <button
+                class="btn sm"
+                type="submit"
+                disabled={readonly || !(adding[s.id] ?? '').trim() || busy === s.id}>Add</button
+              >
+              {#if p}{@render problemText(p)}{/if}
+            </form>
+          {/if}
+          {#if kind === 'NamedIndividual' && s.id === 'objectAssertions' && (!readonly || !!assertProp.trim() || !!assertValue.trim())}
+            <form
+              class="add"
+              aria-label="Add a property assertion"
+              onsubmit={(e) => {
+                e.preventDefault();
+                addAssertion();
+              }}
+            >
+              <input
+                class="input"
+                list="opts-props-{uid}"
+                placeholder="Property"
+                aria-label="Property"
+                bind:value={assertProp}
+              />
+              <input
+                class="input"
+                list={objectProps.some((o) => o.name === assertProp)
+                  ? `opts-NamedIndividual-${uid}`
+                  : undefined}
+                placeholder="Individual or value"
+                aria-label="Value"
+                bind:value={assertValue}
+              />
+              {#if dataProps.some((o) => o.name === assertProp)}
+                <input
+                  class="input lang"
+                  placeholder="lang"
+                  aria-label="Language"
+                  bind:value={assertLang}
+                  size="5"
+                />
+              {/if}
+              <button
+                class="btn sm"
+                type="submit"
+                disabled={readonly || !assertProp.trim() || !assertValue.trim()}>Add</button
+              >
+              {#if problems.assert}{@render problemText(problems.assert)}{/if}
+            </form>
+          {/if}
+        </section>
+      {/if}
+    {/each}
 
-  {#if !readonly}
-    <section class="block" aria-labelledby="axiom-{uid}">
-      <h3 id="axiom-{uid}">Add an axiom</h3>
-      <form
-        class="add"
-        onsubmit={(e) => {
-          e.preventDefault();
-          void addAxiom();
-        }}
-      >
-        <ManchesterEditor
-          bind:value={() => adding.axiom ?? '', (v) => (adding = { ...adding, axiom: v })}
-          {names}
-          {search}
-          label="Add an axiom"
-          placeholder="An axiom, such as {label.includes(' ') ? `'${label}'` : label} SubClassOf …"
-          problem={problems.axiom?.start != null
-            ? {
-                start: problems.axiom.start,
-                end: problems.axiom.end ?? problems.axiom.start,
-                message: problems.axiom.message,
-              }
-            : null}
-          onsubmit={() => void addAxiom()}
-        />
-        <button
-          class="btn sm"
-          type="submit"
-          disabled={!(adding.axiom ?? '').trim() || busy === 'axiom'}>Add</button
+    {#if frame.other.length}
+      <section class="block" aria-labelledby="other-{uid}">
+        <h3 id="other-{uid}">Other axioms <span class="faint count">{frame.other.length}</span></h3>
+        <ul class="rows">
+          {#each frame.other as it, i (it.ofn + i)}
+            <li class="axiom">
+              <div class="line">
+                <span class="expr mono small">{it.ofn}</span>
+                {#if !readonly && it.type !== 'Declaration'}
+                  <span class="acts">
+                    <button
+                      class="btn ghost icon sm"
+                      aria-label="Remove {it.ofn}"
+                      onclick={() => removeAxiom(it, `Remove ${it.type} of ${label}`)}
+                      ><Icon name="trash" size={13} /></button
+                    >
+                  </span>
+                {/if}
+              </div>
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
+
+    {#if !readonly || !!adding.axiom?.trim()}
+      <section class="block" aria-labelledby="axiom-{uid}">
+        <h3 id="axiom-{uid}">Add an axiom</h3>
+        <form
+          class="add"
+          onsubmit={(e) => {
+            e.preventDefault();
+            void addAxiom();
+          }}
         >
-        {#if problems.axiom}{@render problemText(problems.axiom)}{/if}
-      </form>
-    </section>
-  {/if}
+          <ManchesterEditor
+            bind:value={() => adding.axiom ?? '', (v) => (adding = { ...adding, axiom: v })}
+            {names}
+            {search}
+            label="Add an axiom"
+            placeholder="An axiom, such as {label.includes(' ')
+              ? `'${label}'`
+              : label} SubClassOf …"
+            problem={problems.axiom?.start != null
+              ? {
+                  start: problems.axiom.start,
+                  end: problems.axiom.end ?? problems.axiom.start,
+                  message: problems.axiom.message,
+                }
+              : null}
+            onsubmit={() => void addAxiom()}
+          />
+          <button
+            class="btn sm"
+            type="submit"
+            disabled={readonly || !(adding.axiom ?? '').trim() || busy === 'axiom'}>Add</button
+          >
+          {#if problems.axiom}{@render problemText(problems.axiom)}{/if}
+        </form>
+      </section>
+    {/if}
+  {/key}
 </div>
 
 {#snippet problemText(p: Problem)}

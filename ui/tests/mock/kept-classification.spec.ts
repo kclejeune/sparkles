@@ -373,3 +373,101 @@ test('the explicit legacy tree pins both POST pages and refuses mixed content', 
   expect(posts[0].searchParams.get('at')).toBe(posts[1].searchParams.get('at'));
   await expect(page.getByRole('tree', { name: 'Classes (inferred)' })).toHaveCount(0);
 });
+
+test('the selected inferred superclass clause shares pinned tree labels across branch replacement', async ({
+  page,
+  request,
+}) => {
+  const reads: URL[] = [];
+  let holdSummary = false;
+  const heldSummaries: (() => Promise<void>)[] = [];
+  await page.route('**/$/ontology/uni?*', async (route) => {
+    if (holdSummary) heldSummaries.push(() => route.continue());
+    else await route.continue();
+  });
+  let delayOld = false;
+  const delayed: (() => Promise<void>)[] = [];
+  await page.route('**/uni*/sparql*', async (route) => {
+    const response = await route.fetch();
+    const query = route.request().postData() ?? '';
+    if (!query.includes('?l')) return route.fulfill({ response });
+    const url = new URL(route.request().url());
+    const value = await response.json();
+    const pinned = url.searchParams.has('at');
+    const branch =
+      url.searchParams.get('branch') ??
+      (url.pathname.includes('@') ? url.pathname.split('@')[1]?.split('/')[0] : null);
+    if (pinned) reads.push(url);
+    for (const row of value.results?.bindings ?? []) {
+      if (row.s?.value === UNI + 'Teacher' && row.l)
+        row.l.value = pinned
+          ? branch === 'pinned-names-next'
+            ? 'Branch teacher'
+            : 'Pinned teacher'
+          : 'Head teacher';
+    }
+    const fulfill = () => route.fulfill({ response, json: value });
+    if (pinned && branch !== 'pinned-names-next' && delayOld) delayed.push(fulfill);
+    else await fulfill();
+  });
+  expect(
+    (await request.post('/$/branches/uni', { data: { name: 'pinned-names-start' } })).ok(),
+  ).toBe(true);
+  await page.goto(
+    `/ui/workbench/ontology?ds=uni&branch=pinned-names-start&inferred=1&iri=${encodeURIComponent(UNI + 'Professor')}`,
+  );
+  await expect(page.locator('.frame[data-iri]')).toContainText('Employee');
+  await page.getByRole('button', { name: 'Classify tree', exact: true }).click();
+  const tree = page.getByRole('tree', { name: 'Classes (inferred)' });
+  await expect(tree.getByRole('button', { name: 'Pinned teacher', exact: true })).toBeVisible();
+  const clause = page.locator('.inferred-sup');
+  holdSummary = true;
+  const renamed = await request.post('/$/ontology/uni/axioms?branch=pinned-names-start', {
+    data: {
+      remove: [
+        {
+          type: 'AnnotationAssertion',
+          property: 'http://www.w3.org/2000/01/rdf-schema#label',
+          subject: UNI + 'Teacher',
+          value: { '@value': 'Teacher', '@language': 'en' },
+        },
+      ],
+      add: [
+        {
+          type: 'AnnotationAssertion',
+          property: 'http://www.w3.org/2000/01/rdf-schema#label',
+          subject: UNI + 'Teacher',
+          value: { '@value': 'Head teacher', '@language': 'en' },
+        },
+      ],
+    },
+  });
+  expect(renamed.ok(), await renamed.text()).toBe(true);
+  await expect.poll(() => heldSummaries.length).toBeGreaterThan(0);
+  await expect(clause.getByRole('button', { name: 'Pinned teacher', exact: true })).toBeVisible();
+  await expect(clause).not.toContainText('Head teacher');
+  expect(reads.length).toBeGreaterThan(0);
+  expect(new Set(reads.map((r) => r.searchParams.get('at'))).size).toBe(1);
+
+  // Release the asserted-summary refresh, then classify its new current commit.
+  holdSummary = false;
+  for (const release of heldSummaries) await release();
+  await expect(tree).toHaveCount(0);
+  // Delayed names from a second old-scope tree must not populate a replacement branch.
+  delayOld = true;
+  await page.getByRole('button', { name: 'Classify tree', exact: true }).click();
+  await expect.poll(() => delayed.length).toBeGreaterThan(0);
+  expect(
+    (await request.post('/$/branches/uni', { data: { name: 'pinned-names-next' } })).ok(),
+  ).toBe(true);
+  await page.goto(
+    `/ui/workbench/ontology?ds=uni&branch=pinned-names-next&inferred=1&iri=${encodeURIComponent(UNI + 'Professor')}`,
+  );
+  for (const release of delayed) await release().catch(() => {});
+  await expect(page.locator('.frame[data-iri]')).toContainText('Employee');
+  await expect(clause).toHaveCount(0);
+  await page.getByRole('button', { name: 'Classify tree', exact: true }).click();
+  await expect(tree.getByRole('button', { name: 'Branch teacher', exact: true })).toBeVisible();
+  await expect(clause.getByRole('button', { name: 'Branch teacher', exact: true })).toBeVisible();
+  await expect(clause).not.toContainText('Pinned teacher');
+});

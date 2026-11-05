@@ -519,6 +519,14 @@ committed with the commit it was previewed against
 branch that **Start session** creates. Undo and redo are previewed commits too, and
 another writer's commit reloads the page through the change feed.
 
+A frame draft belongs to the target, graph, entity and commit it displayed when editing
+began. A newer or failed frame refresh keeps its text but blocks preview and submission.
+If the new frame arrives while a draft is open, the editor keeps the older asserted
+frame beside an explicit stale-draft notice until the caller discards that draft and
+loads the current frame. This can retain both capped asserted frames temporarily.
+Asynchronous parsing cannot move an old draft to the new source. An accepted preview
+and its commit keep the original `If-Match` condition even if the summary refreshes.
+
 ### Ontology browser
 
 The **Browse** page, `/ui/browse`, is a reference to the ontologies and thesauri of a
@@ -708,6 +716,7 @@ and they are read-only for a caller whose grants cover only some graphs. With
 authentication on, they are also read-only on branches other than main, whose grants the
 page cannot read, for every caller but a server administrator. The [API reference](../API.md#skos-shapes) lists the shapes'
 conditions.
+
 
 ## Known gaps
 

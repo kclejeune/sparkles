@@ -19,6 +19,7 @@
   } from '$lib/ontology';
   import type { PrefixMap } from '$lib/rdf';
   import Icon from './Icon.svelte';
+  import { onDestroy } from 'svelte';
 
   let {
     annotations,
@@ -28,6 +29,7 @@
     readonly = false,
     label,
     onchange,
+    ondraft,
   }: {
     annotations: Annotation[];
     /** An IRI as the editor shows it. */
@@ -39,6 +41,8 @@
     /** What the annotations describe, for the accessible names. */
     label: string;
     onchange: (next: Annotation[], what: string) => void;
+    /** Preserve the owning frame's source while an annotation draft is open. */
+    ondraft?: (active: boolean) => void;
   } = $props();
 
   /** The key of the row being edited, `'new'` for a new row, or null. */
@@ -78,6 +82,7 @@
   }
 
   function begin(i: number | null) {
+    if (readonly) return;
     problem = null;
     const a = i == null ? undefined : annotations[i];
     editing = a ? annotationKey(a) : 'new';
@@ -97,9 +102,15 @@
       isIriValue = false;
     }
     started = fields();
+    ondraft?.(true);
   }
 
+  onDestroy(() => ondraft?.(false));
+
   function save() {
+    if (readonly)
+      return void (problem =
+        'This frame is read-only. Wait for the current source or cancel this draft.');
     const p = expand(property, true);
     if (!p) return void (problem = 'The property is not a known name, a prefixed name or an IRI.');
     let v: AnnValue;
@@ -128,10 +139,12 @@
     }
     editing = null;
     original = null;
+    ondraft?.(false);
     onchange(next, what);
   }
 
   function remove(i: number) {
+    if (readonly) return;
     const a = annotations[i];
     onchange(
       annotations.filter((_, j) => j !== i),
@@ -249,9 +262,10 @@
         onclick={() => {
           editing = null;
           original = null;
+          ondraft?.(false);
         }}>Cancel</button
       >
-      <button class="btn sm primary" type="submit" data-preview>Preview</button>
+      <button class="btn sm primary" type="submit" data-preview disabled={readonly}>Preview</button>
     </div>
   </form>
 {/snippet}
