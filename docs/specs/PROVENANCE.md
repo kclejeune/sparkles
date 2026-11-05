@@ -121,7 +121,8 @@ Read the [provenance record](shared/PROVENANCE.md#trix).
 
 ## Patched spargebra (vendored)
 
-Read the [provenance record](shared/PROVENANCE.md#patched-spargebra-vendored).
+Read the [provenance record](shared/PROVENANCE.md#patched-spargebra-vendored), which
+records the current 0.4.8 copy and its original 0.4.7 sources.
 
 ## GeoSPARQL
 

@@ -215,7 +215,7 @@ cache = { enabled = false }
 [tasks."ui:wasm"]
 description = "Build the formatter for the browser into ui/src/lib/wasm (optional: the UI uses it when present, else POST /$/format; later UI builds keep it up to date)"
 # the wasm-bindgen CLI must be the version of the wasm-bindgen crate in Cargo.lock
-tools = { "github:wasm-bindgen/wasm-bindgen" = "0.2.129" }
+tools = { "github:wasm-bindgen/wasm-bindgen" = "0.2.130" }
 # The lease keeps the module in the managed target until wasm-bindgen has read it.
 run = "mbx sparkles-task -- scripts/build-fmt-wasm.sh"
 sources = ["crates/sparkles-fmt/src/**/*", "crates/sparkles-fmt/Cargo.toml", "crates/sparkles-fmt-wasm/**/*", "Cargo.lock", "rust-toolchain.toml", "scripts/build-fmt-wasm.sh"]
@@ -381,7 +381,7 @@ sources = ["@group:rust"]
 outputs = []
 description = "Check that the formatter builds for the browser (wasm32-unknown-unknown, which rust-toolchain.toml installs), with Clippy, and run its entry points in node, where std has no clock"
 # the test runner must be the version of the wasm-bindgen crate in Cargo.lock
-tools = { "github:wasm-bindgen/wasm-bindgen" = "0.2.129" }
+tools = { "github:wasm-bindgen/wasm-bindgen" = "0.2.130" }
 run = [
   "mbx clippy -p sparkles-fmt-wasm --target wasm32-unknown-unknown -- -D warnings",
   "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner mbx test -p sparkles-fmt-wasm --target wasm32-unknown-unknown --test wasm_runtime",
@@ -769,7 +769,7 @@ run = "docker compose build"
 [tasks."server:artifact"]
 description = "Build an unpublished GNU x86_64 candidate inside the pinned manylinux job container"
 # The packer records this CLI after ui:wasm's child task has exited.
-tools = { "github:wasm-bindgen/wasm-bindgen" = "0.2.129" }
+tools = { "github:wasm-bindgen/wasm-bindgen" = "0.2.130" }
 cache = { enabled = false }
 usage = 'arg "[out]" default=".artifacts/server-candidate" help="fresh output directory outside target"'
 run = 'bash scripts/server-artifact-build.sh "$usage_out"'

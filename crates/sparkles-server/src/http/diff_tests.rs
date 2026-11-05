@@ -1957,3 +1957,86 @@ async fn grouped_diffs_of_a_gone_commit_are_410() {
     assert_eq!(r.status, StatusCode::GONE, "{}", r.text());
     assert_eq!(r.json()["code"], "history-gone", "{}", r.text());
 }
+
+/// Numeric triple-term objects retain only their token, including at nested levels.
+#[tokio::test]
+async fn numeric_triple_terms_filter_history_and_diff() {
+    fn enc(s: &str) -> String {
+        percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+    }
+    let s = server(|_| {}).await;
+    for (i, (number, datatype)) in [
+        ("1", oxrdf::vocab::xsd::INTEGER),
+        ("-2", oxrdf::vocab::xsd::INTEGER),
+        ("1.25", oxrdf::vocab::xsd::DECIMAL),
+        ("-0.25", oxrdf::vocab::xsd::DECIMAL),
+        ("1.2e3", oxrdf::vocab::xsd::DOUBLE),
+        ("-1.2e-3", oxrdf::vocab::xsd::DOUBLE),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let direct = format!("<<( <urn:s> <urn:p> {number} )>>");
+        let expected = oxrdf::Term::from(oxrdf::Triple::new(
+            oxrdf::NamedNode::new_unchecked("urn:s"),
+            oxrdf::NamedNode::new_unchecked("urn:p"),
+            oxrdf::Literal::new_typed_literal(number, datatype),
+        ));
+        assert_eq!(
+            super::hist::term_param("object", &direct)
+                .unwrap_or_else(|_| panic!("invalid triple term: {direct}")),
+            expected
+        );
+        for (depth, term) in [
+            direct.clone(),
+            format!("<<( <urn:outer> <urn:p> {direct} )>>"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let subject = format!("urn:numeric:{i}:{depth}");
+            update(
+                &s.app,
+                "h",
+                &format!("INSERT DATA {{ <{subject}> <urn:quoted> {term} }}"),
+            )
+            .await;
+            let history = get(&s.app, &format!("/h/history?object={}", enc(&term))).await;
+            assert_eq!(history.status, StatusCode::OK, "{}", history.text());
+            let history = history.json();
+            let changes = history["changes"].as_array().unwrap();
+            assert_eq!(changes.len(), 1, "{term}: {history}");
+            assert_eq!(changes[0]["subject"], format!("<{subject}>"));
+            let diff = get(
+                &s.app,
+                &format!("/h/diff?from=0&quads=true&term={}", enc(&term)),
+            )
+            .await;
+            assert_eq!(diff.status, StatusCode::OK, "{}", diff.text());
+            let diff = diff.json();
+            assert_eq!(diff["added"], 1, "{term}: {diff}");
+            assert_eq!(diff["removed"], 0);
+            assert_eq!(diff["quads"][0]["subject"], format!("<{subject}>"));
+        }
+    }
+    for malformed in [
+        "<<( <urn:s> <urn:p> 1.2e )>>",
+        "<<( <urn:s> <urn:p> 1.2.3 )>>",
+        "<<( <urn:s> <urn:p> 1 )>",
+        "<<( <urn:s> <urn:p> 1 )>> trailing",
+        "<<( <urn:s> <urn:p> <<( <urn:x> <urn:p> 2 )>> )>",
+    ] {
+        for endpoint in [
+            format!("/h/history?object={}", enc(malformed)),
+            format!("/h/diff?from=0&term={}", enc(malformed)),
+        ] {
+            let response = get(&s.app, &endpoint).await;
+            assert_eq!(
+                response.status,
+                StatusCode::BAD_REQUEST,
+                "{malformed}: {}",
+                response.text()
+            );
+        }
+    }
+}

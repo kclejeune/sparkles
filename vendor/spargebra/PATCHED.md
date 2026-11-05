@@ -1,13 +1,19 @@
-# spargebra 0.4.7, patched
+# spargebra 0.4.8, patched
 
-This is [spargebra](https://crates.io/crates/spargebra) 0.4.7 from the Oxigraph project
+This is [spargebra](https://crates.io/crates/spargebra) 0.4.8 from the Oxigraph project
 (<https://github.com/oxigraph/oxigraph>, `lib/spargebra`), copyright the Oxigraph
 developers, dual-licensed under MIT or Apache-2.0 (as stated in its `Cargo.toml`). It is
 used through `[patch.crates-io]` in the workspace `Cargo.toml`.
 
-The changes, all in `src/parser.rs` unless noted:
+The vendored release is 0.4.8. Its arithmetic associativity and OPTIONAL filter
+translation include the upstream fixes described below. The remaining changes are
+Sparkles patches, all in `src/parser.rs` unless noted. The package uses upstream's
+`oxrdf = "=0.3.5"`, which fixes numeric token slicing in nested triple terms.
+The workspace pins this package exactly so a later registry release cannot bypass
+these patches.
 
-- **Left-associative arithmetic.** `AdditiveExpression` and `MultiplicativeExpression`
+- **Left-associative arithmetic, supplied by upstream 0.4.8.** `AdditiveExpression`
+  and `MultiplicativeExpression`
   parse left-associatively, as SPARQL 1.1 §17.3 and the grammar's `( '+' … | '-' … )*`
   require. 0.4.7 parsed them right-associatively, so `1 - 2 - 3` evaluated to `2` instead
   of `-4`, `10 - 2 + 3` to `5` instead of `11` and `12 / 2 * 3` to `2` instead of `18`.
@@ -26,10 +32,11 @@ The changes, all in `src/parser.rs` unless noted:
   closing `>`, nothing changes. The lookahead uses the grammar's `IRIREF` character class
   (plus `\u` / `\U` escapes, §19.2) rather than the parser's more lenient `IRIREF` rule.
 
-- **FILTER scope in OPTIONAL.** Only the FILTERs written directly in an `OPTIONAL` group
+- **FILTER scope in OPTIONAL, supplied by upstream 0.4.8.** Only the FILTERs written
+  directly in an `OPTIONAL` group
   become the `LeftJoin` expression (SPARQL 1.1 §18.2.2.6, with §18.2.2.7 "Filters of
   Group"; SPARQL 1.2 §18.3.2.7–8). A group now yields its pattern and its own filter
-  conjunction separately (`GroupGraphPattern_parts`). 0.4.7 looked at the already
+  conjunction separately (`GroupGraphPatternWithFilters`). 0.4.7 looked at the already
   simplified pattern, so `OPTIONAL { { P FILTER(e) } }` (a group whose single element is a
   group with a filter) became `LeftJoin(G, P, e)`, letting `e` see the left-hand side's
   bindings. The simplification of `Join(Z, A)` to `A` (§18.2.2.8) happens after the
@@ -156,9 +163,16 @@ The changes, all in `src/parser.rs` unless noted:
   duplicate error, its text and the order of the variables are unchanged. The change is
   for speed only, for basic graph patterns at the plan limit.
 
-Upstream Oxigraph (the development version after 0.4.7) has a rewritten parser that
-follows the SPARQL 1.2 grammar rules [123] and [138] and moves an OPTIONAL group's own
-FILTERs into the `LeftJoin`; the changes here are written against 0.4.7's rust-peg
-grammar rather than ported.
+The 0.4.8 port uses upstream's arithmetic rules and retains the equivalent
+OPTIONAL group-filter translation under upstream's `GroupGraphPatternWithFilters`
+name. `src/algebra.rs` still preserves nested FILTER scope when serializing a
+LeftJoin. All other local grammar extensions, query and algebra variants, nesting
+checks and selected-variable tracking are retained.
 
-Drop this copy once a spargebra release has these fixes.
+The shared custom aggregate registry is also local. `SparqlParser` stores registered
+IRIs in an `Arc<HashSet<NamedNode>>` and `with_custom_aggregate_functions` accepts a
+shared registry, avoiding a copy on each parser construction. Registration through
+`with_custom_aggregate_function` keeps copy-on-write behavior.
+
+Drop this copy once a spargebra release supplies the remaining fixes and extensions,
+with the nesting check retained in Sparkles callers if upstream does not provide it.

@@ -1651,7 +1651,7 @@ parser! {
         }
         rule TriplesTemplate_inner() -> Vec<TriplePattern> = _ t:TriplesSameSubject() _ { t }
 
-        rule GroupGraphPattern() -> GraphPattern = p:GroupGraphPattern_parts() {
+        rule GroupGraphPattern() -> GraphPattern = p:GroupGraphPatternWithFilters() {
             match p {
                 (inner, Some(expr)) => GraphPattern::Filter { expr, inner: Box::new(inner) },
                 (inner, None) => inner,
@@ -1660,7 +1660,7 @@ parser! {
         // A group's pattern and the conjunction of the FILTERs written directly in it
         // (SPARQL 1.1 §18.2.2.7), kept apart so that OPTIONAL can tell them from a filter
         // of a nested group.
-        rule GroupGraphPattern_parts() -> (GraphPattern, Option<Expression>) =
+        rule GroupGraphPatternWithFilters() -> (GraphPattern, Option<Expression>) =
             "{" _ GroupGraphPattern_clear() p:GroupGraphPatternSub() GroupGraphPattern_clear() _ "}" { p } /
             "{" _ GroupGraphPattern_clear() p:SubSelect() GroupGraphPattern_clear() _ "}" { (p, None) }
         rule GroupGraphPattern_clear() = {
@@ -1802,7 +1802,7 @@ parser! {
         // Join(Z, A) to A (§18.2.2.8) comes after the translation, so in
         // `OPTIONAL { { P FILTER(e) } }` the filter stays inside the right-hand side, where
         // it only sees P's bindings, instead of becoming the LeftJoin expression.
-        rule OptionalGraphPattern() -> PartialGraphPattern = i("OPTIONAL") _ p:GroupGraphPattern_parts() {
+        rule OptionalGraphPattern() -> PartialGraphPattern = i("OPTIONAL") _ p:GroupGraphPatternWithFilters() {
             PartialGraphPattern::Optional(p.0, p.1)
         }
 
@@ -2461,26 +2461,25 @@ parser! {
 
         rule NumericExpression() -> Expression = AdditiveExpression()
 
-        // left-associative (SPARQL 1.1 §17.3: `a - b - c` is `(a - b) - c`)
-        rule AdditiveExpression() -> Expression = a:MultiplicativeExpression() o:AdditiveExpression_inner()* {
-            o.into_iter().fold(a, |a, (op, b)| match op {
+        rule AdditiveExpression() -> Expression = a:MultiplicativeExpression() _ o:AdditiveExpression_inner()* {
+            o.into_iter().fold(a, |a, (operator, b)| match operator {
                 "+" => Expression::Add(Box::new(a), Box::new(b)),
                 "-" => Expression::Subtract(Box::new(a), Box::new(b)),
                 _ => unreachable!(),
             })
         }
-        rule AdditiveExpression_inner() -> (&'input str, Expression) = _ s: $("+" / "-") _ e:MultiplicativeExpression() {
+        rule AdditiveExpression_inner() -> (&'input str, Expression) = s: $("+" / "-") _ e:MultiplicativeExpression() _ {
             (s, e)
         }
 
-        rule MultiplicativeExpression() -> Expression = a:UnaryExpression() o:MultiplicativeExpression_inner()* {
-            o.into_iter().fold(a, |a, (op, b)| match op {
+        rule MultiplicativeExpression() -> Expression = a:UnaryExpression() _ o:MultiplicativeExpression_inner()* {
+            o.into_iter().fold(a, |a, (operator, b)| match operator {
                 "*" => Expression::Multiply(Box::new(a), Box::new(b)),
                 "/" => Expression::Divide(Box::new(a), Box::new(b)),
                 _ => unreachable!(),
             })
         }
-        rule MultiplicativeExpression_inner() -> (&'input str, Expression) = _ s: $("*" / "/") _ e:UnaryExpression() {
+        rule MultiplicativeExpression_inner() -> (&'input str, Expression) = s: $("*" / "/") _ e:UnaryExpression() _ {
             (s, e)
         }
 

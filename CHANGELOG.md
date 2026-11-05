@@ -1626,6 +1626,13 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+HTTP history and diff filters preserve numeric objects inside direct and nested
+RDF 1.2 triple terms. Integer, decimal and double objects no longer include the
+closing triple syntax in their lexical value, which caused matching recorded changes
+to be missed. The dependency refresh ports the vendored spargebra patches to 0.4.8,
+requires oxrdf 0.3.5 and oxsdatatypes 0.2.4 across all binding graphs, and makes zero
+times the smallest fractional decimal return zero consistently.
+
 A partial answer of the disjunctive rules no longer reports a class complete when the
 run stopped before it made that class's context. The class's answer then held only
 `owl:Thing` while its told superclasses were missing, and the ontology's consistency

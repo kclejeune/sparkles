@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.87"
 name = "spargebra"
-version = "0.4.7"
+version = "0.4.8"
 authors = ["Tpt <thomas@pellissier-tanon.fr>"]
 build = false
 autolib = false
@@ -54,7 +54,7 @@ version = "0.1"
 version = "0.2.11"
 
 [dependencies.oxrdf]
-version = "=0.3.4"
+version = "=0.3.5"
 
 [dependencies.peg]
 version = "0.8"
@@ -121,7 +121,6 @@ fn_params_excessive_bools = "warn"
 fn_to_numeric_cast_any = "warn"
 format_collect = "warn"
 format_push_string = "warn"
-from_iter_instead_of_collect = "warn"
 get_unwrap = "warn"
 host_endian_bytes = "warn"
 if_not_else = "warn"

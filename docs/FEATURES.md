@@ -60,7 +60,8 @@ the [command line](querying/README.md#command-line) and
 Load RDF into [compressed indexes](storage/README.md#storage-and-indexes) with
 durable transactions, compaction, clones and integrity checks.
 [History and branches](storage/README.md#versioning-and-history) provide retained
-commits, time travel, diffs, change feeds, RDF Patch and merge review.
+commits, time travel, diffs, change feeds, RDF Patch and merge review. HTTP history
+and diff filters accept nested triple terms with numeric objects.
 
 <a id="search"></a>
 <a id="full-text-search"></a>

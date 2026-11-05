@@ -1402,6 +1402,13 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
+Item 745 updates HTTP history and diff term parsing to oxrdf 0.3.5. Numeric objects
+inside direct or nested RDF 1.2 triple terms retain their numeric lexical value and
+datatype, so the filters match the recorded quads. Regression tests cover signed
+integers, decimals and doubles, nested triple terms and malformed syntax through
+both endpoints. The spargebra 0.4.8 port preserves Sparkles' parser patches and
+nesting guards while retaining the upstream numeric-token fix.
+
 **Delivered.** Phase 1 landed on 2026-09-30 in two commits: the engine (`d866c0c`) and the
 server and CLI (`812dc3e`).
 

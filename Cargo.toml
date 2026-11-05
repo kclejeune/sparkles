@@ -27,13 +27,13 @@ sparkles-modelstore = { path = "crates/sparkles-modelstore" }
 sparkles-embed = { path = "crates/sparkles-embed" }
 sparkles-office = { path = "crates/sparkles-office" }
 sparkles-alloc = { path = "crates/sparkles-alloc" }
-oxrdf = { version = "0.3", features = ["rdfc-10", "rdf-12"] }
+oxrdf = { version = "0.3.5", features = ["rdfc-10", "rdf-12"] }
 oxrdfio = { version = "0.2", features = ["rdf-12"] }
 oxttl = { version = "0.2", features = ["rdf-12"] }
 oxiri = "0.2"
-spargebra = { version = "0.4", features = ["sparql-12", "sep-0006"] }
+spargebra = { version = "=0.4.8", features = ["sparql-12", "sep-0006"] }
 sparesults = { version = "0.3", features = ["sparql-12"] }
-oxsdatatypes = "0.2"
+oxsdatatypes = "0.2.4"
 oxilangtag = "0.1"
 imbl = "7"
 arc-swap = "1"
@@ -161,6 +161,6 @@ debug = false
 strip = true
 panic = "abort"
 
-# spargebra 0.4.7 with left-associative `+ -` and `* /` (see vendor/spargebra/PATCHED.md)
+# spargebra 0.4.8 with Sparkles parser fixes and guards (see vendor/spargebra/PATCHED.md)
 [patch.crates-io]
 spargebra = { path = "vendor/spargebra" }

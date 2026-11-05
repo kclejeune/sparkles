@@ -41,6 +41,13 @@ The [provenance index](../PROVENANCE.md) links the per-spec records.
 
 ## Patched spargebra (vendored)
 
+The current copy is spargebra 0.4.8 from crates.io under the same MIT OR Apache-2.0
+license. Its arithmetic associativity rules come from the 0.4.8 release. Its OPTIONAL
+translation is equivalent to the existing local fix, whose helper now uses upstream's
+name. The remaining Sparkles patches and guards are retained as described in
+[vendor/spargebra/PATCHED.md](../../../vendor/spargebra/PATCHED.md). The original
+adoption record below preserves the sources used to write those patches.
+
 - **Adopted:** `spargebra` 0.4.7 from crates.io (2026-09-30). Its `Cargo.toml` gives the
   license as MIT OR Apache-2.0, and the copyright belongs to the Oxigraph developers. The
   crate is copied to `vendor/spargebra` and used through `[patch.crates-io]` in the

@@ -430,24 +430,21 @@ pub(crate) fn exact_sum(sum: i128) -> Option<Value> {
 
 /// The decimal product or quotient of `a` and `b` in one `i128` operation, for the
 /// operands whose oxsdatatypes result it is known to equal, or `None` to use
-/// oxsdatatypes. Its `checked_mul` and `checked_div` strip and count trailing zeros
-/// with one 128-bit division per digit, about twenty for an integer operand.
+/// oxsdatatypes. The general operations cancel scale factors or strip trailing zeros
+/// with repeated 128-bit division.
 ///
-/// A product with a nonzero integer `j` is the other operand's value times `j`.
-/// oxsdatatypes then shifts by at least zero digits, computes the exact product and
-/// overflows exactly when the product does. A zero integer can fail there on a
-/// fractional operand, so it keeps the general path. The quotient of two integers
-/// `i / j` with `j` nonzero is `i × 10^18 / j` truncated toward zero. oxsdatatypes
-/// truncates twice, which gives the same result, and its shifts stay below 10^39 for
-/// 64-bit integers, so it never fails there.
+/// A product with an integer `j` is the other operand's value times `j`.
+/// oxsdatatypes 0.2.4 cancels the scale's factors before multiplying and returns
+/// zero for a zero operand. The exact product overflows exactly when it does.
+/// The quotient of two integers `i / j` with `j` nonzero is `i × 10^18 / j`
+/// truncated toward zero. oxsdatatypes truncates twice, which gives the same result,
+/// and its shifts stay below 10^39 for 64-bit integers, so it never fails there.
 fn exact_decimal(op: &NumOp, a: Num, b: Num) -> Option<Option<Decimal>> {
     let raw = |d: Decimal| i128::from_be_bytes(d.to_be_bytes());
     let decimal = |v: i128| Decimal::from_be_bytes(v.to_be_bytes());
     match (op, a, b) {
         (NumOp::Mul, Num::Decimal(d), Num::Integer(j))
-        | (NumOp::Mul, Num::Integer(j), Num::Decimal(d))
-            if i64::from(j) != 0 =>
-        {
+        | (NumOp::Mul, Num::Integer(j), Num::Decimal(d)) => {
             Some(raw(d).checked_mul(i128::from(i64::from(j))).map(decimal))
         }
         (NumOp::Div, Num::Integer(i), Num::Integer(j)) if i64::from(j) != 0 => Some(Some(decimal(
@@ -854,11 +851,13 @@ mod tests {
             }
         }
         assert!(checked > 500_000, "the fast paths are exercised: {checked}");
-        // oxsdatatypes fails on a zero integer times a fractional decimal, and on some
-        // quotients of a fractional decimal, so these keep its general path.
+        // Zero products are exact even for the smallest fractional decimal.
         let tiny = Num::Decimal(decimal(1));
-        assert!(exact_decimal(&NumOp::Mul, tiny, Num::Integer(0.into())).is_none());
-        assert!(arith(NumOp::Mul, &tiny.into_value(), &Value::Integer(0.into())).is_err());
+        assert_eq!(
+            exact_decimal(&NumOp::Mul, tiny, Num::Integer(0.into())),
+            Some(Some(Decimal::from(0)))
+        );
+        // Fractional quotients still use the general path and its precision limits.
         assert!(exact_decimal(&NumOp::Div, tiny, Num::Integer(10.into())).is_none());
         assert!(arith(NumOp::Div, &tiny.into_value(), &Value::Integer(10.into())).is_err());
         assert!(
@@ -869,6 +868,20 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn decimal_zero_product_is_zero() {
+        for sign in [-1i128, 1] {
+            let tiny = Value::Decimal(Decimal::from_be_bytes(sign.to_be_bytes()));
+            for zero in [Value::Integer(0.into()), Value::Decimal(Decimal::from(0))] {
+                for (a, b) in [(&tiny, &zero), (&zero, &tiny)] {
+                    assert!(
+                        matches!(arith(NumOp::Mul, a, b), Ok(Value::Decimal(d)) if d == Decimal::from(0))
+                    );
+                }
+            }
+        }
     }
 
     #[test]

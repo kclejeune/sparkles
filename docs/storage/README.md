@@ -290,6 +290,9 @@ If pruning removes the metadata needed to resolve its own state, the read return
   pattern's terms and the commit range can come from the rest of the join group.
   HTTP, CLI and library results report unrecorded commits within that range, including
   the covered portion of a gap that extends beyond the requested window.
+  HTTP history and diff term filters accept RDF 1.2 triple terms, including nested
+  triple terms with integer, decimal or double objects. Numeric lexical values and
+  datatypes are preserved when matching recorded quads. Malformed terms return 400.
 * History queries read a per-dataset change log that outlives compactions. It is written
   off the commit path, indexed by subject, predicate, object and graph, recovered from the
   write-ahead log after a crash, and trimmed by commit count, age or size. Diffs and the
