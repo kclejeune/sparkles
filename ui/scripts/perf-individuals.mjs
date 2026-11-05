@@ -14,6 +14,7 @@ import {
 import { resolve, extname } from 'node:path';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
+import { captureFiniteReads } from './finite-reads.mjs';
 
 const backend = process.env.INDIVIDUALS_BACKEND;
 const before = process.env.INDIVIDUALS_BEFORE_UI;
@@ -67,6 +68,9 @@ const result = {
   node: process.version,
   harnessSha256: createHash('sha256')
     .update(readFileSync(import.meta.filename))
+    .digest('hex'),
+  accountingSha256: createHash('sha256')
+    .update(readFileSync(new URL('./finite-reads.mjs', import.meta.url)))
     .digest('hex'),
   uiBuilds: { before: buildDigest(before), after: buildDigest(after) },
   browserHost: { hostname: os.hostname(), cpu: os.cpus()[0].model, platform: os.platform() },
@@ -196,41 +200,8 @@ try {
     for (const which of rep % 2 ? ['after', 'before'] : ['before', 'after']) {
       const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
       const page = await context.newPage();
-      const requests = [];
-      const pending = new Set();
-      const bodies = [];
-      const tracks = (r) =>
-        r.resourceType() !== 'eventsource' &&
-        !(r.headers().accept ?? '').includes('text/event-stream') &&
-        (new URL(r.url()).pathname.startsWith('/$/ontology/' + ds) ||
-          new URL(r.url()).pathname.startsWith('/' + ds + '/'));
-      page.on('request', (r) => {
-        if (tracks(r)) pending.add(r);
-      });
-      page.on('requestfailed', (r) => {
-        pending.delete(r);
-      });
-      page.on('requestfinished', (r) => {
-        if (!tracks(r)) return;
-        bodies.push(
-          (async () => {
-            try {
-              const response = await r.response();
-              const body = await response.body();
-              requests.push({
-                path: new URL(r.url()).pathname,
-                query: new URL(r.url()).search,
-                body: r.postData(),
-                decodedBytes: body.length,
-                status: response.status(),
-                ...(await r.sizes()),
-              });
-            } finally {
-              pending.delete(r);
-            }
-          })(),
-        );
-      });
+      const capture = captureFiniteReads(page, ds);
+      const { requests, pending } = capture;
       const start = performance.now();
       await page.goto(
         `http://127.0.0.1:${which === 'before' ? 45230 : 45231}/ui/workbench/ontology?ds=${ds}&kind=NamedIndividual`,
@@ -249,7 +220,7 @@ try {
       ).toBeVisible({ timeout: 120000 });
       const firstMemberMs = performance.now() - start;
       await expect.poll(() => pending.size, { timeout: 120000 }).toBe(0);
-      await Promise.all(bodies);
+      await capture.settle();
       const rows = await tree.getByRole('treeitem').count();
       expect(rows).toBeLessThan(80);
       if (which === 'after') {
@@ -266,6 +237,8 @@ try {
         ).toBe(true);
         expect(requests.filter((r) => r.path.endsWith('/individuals'))).toHaveLength(0);
       }
+      await context.close();
+      await capture.settle();
       result.browser.push({
         which,
         rep,
@@ -273,22 +246,15 @@ try {
         firstMemberMs,
         rows,
         requests,
-        decodedBytes: requests.reduce((n, r) => n + r.decodedBytes, 0),
-        requestBodyBytes: requests.reduce((n, r) => n + (r.requestBodySize ?? 0), 0),
-        requestBytes: requests.reduce(
-          (n, r) => n + (r.requestBodySize ?? 0) + (r.requestHeadersSize ?? 0),
-          0,
-        ),
-        responseWireBytes: requests.reduce(
-          (n, r) => n + (r.responseBodySize ?? 0) + (r.responseHeadersSize ?? 0),
-          0,
-        ),
+        ...capture.summary(),
       });
-      await context.close();
     }
   }
   result.correctness = `${count} typed named members, 3 untyped members, duplicate-free continuation, two memberships on the final individual, anonymous omission, incoming-only frame lookup and virtualized actual-tab display checked.`;
+  result.complete = result.browser.every((trial) => trial.complete);
   writeFileSync(output, JSON.stringify(result, null, 2) + '\n', { flag: 'wx' });
+  if (!result.complete)
+    throw new Error('Incomplete finite-read accounting. Raw trials preserved at ' + output);
   console.log(
     JSON.stringify(
       result.browser.map(
