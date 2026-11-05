@@ -15,7 +15,7 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     evidence(put);
 }
 
-fn evidence(put: &mut dyn FnMut(&str, J)) {
+pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
     let graphs = |d: &str| with_desc(strings(), d);
     put(
         "EvidenceSettings",

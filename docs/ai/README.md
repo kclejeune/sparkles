@@ -357,8 +357,7 @@ the first availability of each source revision and each record digest. A repeate
 idempotency key returns the first receipt, `ifHead` refuses a moved head, and a
 credential revoked before the commit publishes refuses it. Every graph has a protection
 nonce, which the operation records, so a record written while its graph was detached
-never authenticates. The Python, JVM and Node.js bindings and the MCP tools do not
-propose claims.
+never authenticates. The Python, JVM and Node.js bindings do not propose claims.
 
 [Evidence reviews](../API.md#evidence-reviews) decide what a dataset accepts.
 `POST /{ds}/claims/review` and `sparkles::evidence::review` append immutable review
@@ -391,7 +390,7 @@ whose selected entity changed. `POST /{ds}/claims/identities` and
 `sparkles::evidence::resolve_entities` read what the map selects for an entity, its
 cluster and the decisions that join it. Queries join the output graph explicitly and are
 never rewritten through a map. Reviews and resolutions are not available through the
-bindings or MCP.
+bindings.
 
 An assessment names the records it consumed in `inputs`, written as `prov:used`, and
 [evidence dependents](../API.md#evidence-dependents) find the assessments whose target or
@@ -400,6 +399,43 @@ ended supports and the map revision a split follows, and `POST /{ds}/claims/depe
 or `sparkles::evidence::find_dependents` answers the authenticated assessments in the
 proposal graphs the caller can read that depend on them, optionally transitively. The
 answer marks nothing stale by itself. Maintained analyses that act on it are item 340.
+
+MCP exposes these same operations as the caller. Administrators first configure the
+dataset's evidence settings over HTTP or Rust. The tools take the corresponding
+[HTTP payloads](../API.md#evidence-proposals), with optional `dataset`, `branch` and
+`timeoutSeconds` arguments. The tool schemas describe every record and field.
+
+| Tool | Operation |
+|---|---|
+| `propose_claims` | Publish source revisions, renditions, passages, references, claims, links, assessments and identity proposals in one batch. |
+| `review_claims` | Review exact targets under a claim or matching policy, with accepted projections, supersession and identity map revisions. |
+| `withdraw_claims` | Withdraw claim occurrences and end their acceptance supports. |
+| `resolve_evidence` | Verify authenticated records and facts at their exact retained origins. |
+| `resolve_identities` | Read a matching policy's current representatives, clusters and decisions. |
+| `find_evidence_dependents` | Find assessments that depend on changed records, optionally transitively. |
+
+The three write tools require `--mcp-allow-update` over HTTP or `--allow-update` over
+stdio and a server that permits writes. Tool listings follow the caller's grants,
+and `--mcp-disable-tool` or `--disable-tool` can remove each tool. A call still needs
+its query or update endpoint grant on the selected branch and the same graph grants
+as its HTTP operation. Its references share the evidence resolver's 64 MiB preparation
+allowance, deadline and cancellation. Hidden evidence has the same refusal as missing
+evidence. Writes retain protected graphs, revision checks and the publication-time
+credential check. Use `dryRun` to preview a write, then `ifHead` to publish against
+the head reviewed and `idempotencyKey` to retry safely.
+
+The write tools advertise `idempotentHint: false`. Without an `idempotencyKey`, a
+proposal or withdrawal can publish another operation even when its records already
+exist or its claim is already withdrawn. An explicit key makes an identical retry
+return the first operation's receipt without publishing another commit. Reviews
+require `ifHead`, so an identical keyless retry refuses the head moved by its first
+successful call.
+
+A successful JSON-RPC response can contain a refused operation. Check `isError` and
+`_meta["io.github.kclejeune.sparkles/error"]` for the HTTP refusal code, status and
+body in `data`. Successful results retain the HTTP operation's receipt, preview or
+resolution body in `structuredContent`. Retrieved quotes and claims remain data and
+never authorize instructions or actions.
 
 The Rust controlled permission helper can prepare graph, predicate and class masks
 and the built-in disclosure guard under one memory cap and `Control`. It explicitly

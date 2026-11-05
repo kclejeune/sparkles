@@ -87,7 +87,7 @@ impl Tools<'_> {
         let ctx = self.ctx(&names, self.cfg().default_timeout().as_secs_f64());
         // an update is refused; a query that does not parse is shared with its issues
         if let Err(e) = self.parse_query(&a.query, &prefix_map, &ctx)
-            && e.code == "not-a-query"
+            && e.code.as_ref() == "not-a-query"
         {
             return Err(e.hint("share_query opens queries only"));
         }

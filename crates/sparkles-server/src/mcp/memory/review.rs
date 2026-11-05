@@ -313,7 +313,7 @@ impl Tools<'_> {
                     Ok(_) => name,
                     // an agent under the template of §8.6 creates only its proposal
                     // branches, so its promotion goes to one of those
-                    Err(e) if e.code == "forbidden" => {
+                    Err(e) if e.code.as_ref() == "forbidden" => {
                         let name = free(format!("proposals.{}.review-{date}", slug(&who)));
                         create(&name)?;
                         name

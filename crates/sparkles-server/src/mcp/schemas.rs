@@ -56,6 +56,7 @@ pub fn all_tools() -> Vec<&'static str> {
     if cfg!(feature = "ontology") {
         v.push("ontology_axioms");
     }
+    v.extend(super::evidence::NAMES);
     v.push("sparql_update");
     v.extend(super::branches::TOOLS_AFTER_UPDATE);
     v
@@ -911,6 +912,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         },
     ]
     .into_iter()
+    .chain(super::evidence::tool_defs(cfg))
     .chain(ontology_tool(cfg))
     .chain(super::memory::assert_tool(cfg))
     .chain(super::memory::ingest_tools(cfg))

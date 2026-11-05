@@ -558,6 +558,10 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
+    pub(crate) fn into_parts(self) -> (StatusCode, J) {
+        (self.0, self.1)
+    }
+
     /// The response's status.
     pub(crate) fn status(&self) -> StatusCode {
         self.0

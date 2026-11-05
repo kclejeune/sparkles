@@ -19,6 +19,7 @@ mod context;
 mod draft;
 mod elicit;
 pub(crate) mod errors;
+mod evidence;
 pub(crate) mod explain;
 #[cfg(feature = "fmt")]
 mod format;

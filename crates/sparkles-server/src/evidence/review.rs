@@ -18,13 +18,11 @@
 use super::claims::{CallerFence, digest, principal_iri};
 use super::{bad, named, policy};
 use crate::auth::Principal;
-use crate::http::{AdminBody, ApiResult, blocking, dataset, err};
+use crate::http::{AdminBody, ApiResult, err};
 use crate::state::AppState;
 use axum::Extension;
-use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value as J, json};
 use sparkles::evidence::{Changed, DecisionInput, Disposition, ReviewOptions, WithdrawalInput};
@@ -189,14 +187,14 @@ fn prepare(
     name: &str,
     p: &Principal,
     branch: &str,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
+    execution: &super::Execution,
     idempotency_key: Option<String>,
     if_head: Option<u64>,
     dry_run: bool,
     message: Option<String>,
 ) -> ApiResult<Prepared> {
     use crate::auth::{Endpoint, on_branch};
-    let logical = dataset(st, name)?;
+    let logical = execution.dataset(st, name)?;
     let main = if branch == sparkles::branch::MAIN {
         logical.clone()
     } else {
@@ -205,10 +203,7 @@ fn prepare(
     let here = on_branch(&main.name, branch);
     let caller = crate::http::caller::CallerContext::for_caller(st, &logical, p);
     let opts = caller.options_on(&crate::http::Params::empty(), &here, Endpoint::Update);
-    let control = Control {
-        deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
-        ..Control::with_cancel(cancel)
-    };
+    let control = execution.control(&opts);
     let mut options = ReviewOptions::new(principal_iri(p));
     options.idempotency_key = idempotency_key;
     options.if_head = if_head;
@@ -258,65 +253,64 @@ pub(super) async fn review(
     Extension(p): Extension<Principal>,
     AdminBody(bytes): AdminBody,
 ) -> ApiResult {
+    super::run_http("review", st, name, p, bytes).await
+}
+
+pub(super) fn review_now(
+    st: Arc<AppState>,
+    name: String,
+    p: Principal,
+    bytes: axum::body::Bytes,
+    execution: super::Execution,
+) -> ApiResult<J> {
     let r: ReviewRequest = body_of(&st, &bytes, "review")?;
     let input = decisions(&r.decisions)?;
-    let branch =
-        crate::http::branches::current().unwrap_or_else(|| sparkles::branch::MAIN.to_string());
-    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
-    blocking(move || {
-        let prepared = prepare(
-            &st,
-            &name,
-            &p,
-            &branch,
-            cancel,
-            r.idempotency_key,
-            Some(r.if_head),
-            r.dry_run,
-            r.message,
-        )?;
-        let mut cache = ReadCache::default();
-        let mut read = |ds: &sparkles::Dataset, b: &str| cache.get(&st, &p, ds, b);
-        let reviewed = match sparkles::evidence::review(
-            Some(&st.catalog),
-            &prepared.main.dataset,
-            &prepared.logical.dataset,
-            &r.policy,
-            r.policy_version,
-            &input,
-            &prepared.options,
-            &mut read,
-            &prepared.control,
-        ) {
-            Ok(v) => v,
-            Err(sparkles::Error::Managed(m)) if m.code == "authority-changed" => {
-                return Ok(crate::auth::routes::authority_changed_response());
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let mut out = json!({
-            "operation": reviewed.operation.as_str(),
-            "committed": reviewed.committed,
-            "replayed": reviewed.replayed,
-            "commit": reviewed.commit,
-            "branchId": reviewed.branch,
-            "decisions": reviewed.decisions.iter().map(|d| json!({
-                "key": d.key,
-                "iri": d.iri.as_str(),
-                "target": d.target.as_str(),
-                "disposition": d.disposition.name(),
-                "supersedes": d.supersedes.as_ref().map(|s| s.as_str()),
-                "support": d.support.as_ref().map(|s| s.as_str()),
-                "notProjected": d.not_projected,
-                "conflicts": d.conflicts.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
-            "changed": changed_json(&reviewed.changed),
-            "mapRevision": reviewed.map_revision.as_ref().map(|m| m.as_str()),
-        });
-        preview_json(&mut out, reviewed.preview.as_deref());
-        Ok(Json(out).into_response())
-    })
-    .await
+    let branch = execution.branch.clone();
+    let prepared = prepare(
+        &st,
+        &name,
+        &p,
+        &branch,
+        &execution,
+        r.idempotency_key,
+        Some(r.if_head),
+        r.dry_run,
+        r.message,
+    )?;
+    let mut cache = ReadCache::default();
+    let mut read = |ds: &sparkles::Dataset, b: &str| cache.get(&st, &p, ds, b);
+    let reviewed = sparkles::evidence::review(
+        Some(&st.catalog),
+        &prepared.main.dataset,
+        &prepared.logical.dataset,
+        &r.policy,
+        r.policy_version,
+        &input,
+        &prepared.options,
+        &mut read,
+        &prepared.control,
+    )?;
+    let mut out = json!({
+        "operation": reviewed.operation.as_str(),
+        "committed": reviewed.committed,
+        "replayed": reviewed.replayed,
+        "commit": reviewed.commit,
+        "branchId": reviewed.branch,
+        "decisions": reviewed.decisions.iter().map(|d| json!({
+            "key": d.key,
+            "iri": d.iri.as_str(),
+            "target": d.target.as_str(),
+            "disposition": d.disposition.name(),
+            "supersedes": d.supersedes.as_ref().map(|s| s.as_str()),
+            "support": d.support.as_ref().map(|s| s.as_str()),
+            "notProjected": d.not_projected,
+            "conflicts": d.conflicts.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "changed": changed_json(&reviewed.changed),
+        "mapRevision": reviewed.map_revision.as_ref().map(|m| m.as_str()),
+    });
+    preview_json(&mut out, reviewed.preview.as_deref());
+    Ok(out)
 }
 
 /// `POST /{ds}/claims/withdraw`: withdraw claim occurrences. `200` with the operation,
@@ -330,57 +324,56 @@ pub(super) async fn withdraw(
     Extension(p): Extension<Principal>,
     AdminBody(bytes): AdminBody,
 ) -> ApiResult {
+    super::run_http("withdraw", st, name, p, bytes).await
+}
+
+pub(super) fn withdraw_now(
+    st: Arc<AppState>,
+    name: String,
+    p: Principal,
+    bytes: axum::body::Bytes,
+    execution: super::Execution,
+) -> ApiResult<J> {
     let r: WithdrawRequest = body_of(&st, &bytes, "withdrawal")?;
     let input = withdrawals(&r.withdrawals)?;
-    let branch =
-        crate::http::branches::current().unwrap_or_else(|| sparkles::branch::MAIN.to_string());
-    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
-    blocking(move || {
-        let prepared = prepare(
-            &st,
-            &name,
-            &p,
-            &branch,
-            cancel,
-            r.idempotency_key,
-            r.if_head,
-            r.dry_run,
-            r.message,
-        )?;
-        let mut cache = ReadCache::default();
-        let mut read = |ds: &sparkles::Dataset, b: &str| cache.get(&st, &p, ds, b);
-        let withdrawn = match sparkles::evidence::withdraw(
-            &prepared.main.dataset,
-            &prepared.logical.dataset,
-            &input,
-            &prepared.options,
-            &mut read,
-            &prepared.control,
-        ) {
-            Ok(v) => v,
-            Err(sparkles::Error::Managed(m)) if m.code == "authority-changed" => {
-                return Ok(crate::auth::routes::authority_changed_response());
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let mut out = json!({
-            "operation": withdrawn.operation.as_str(),
-            "committed": withdrawn.committed,
-            "replayed": withdrawn.replayed,
-            "commit": withdrawn.commit,
-            "branchId": withdrawn.branch,
-            "withdrawals": withdrawn.withdrawals.iter().map(|w| json!({
-                "key": w.key,
-                "iri": w.iri.as_ref().map(|s| s.as_str()),
-                "target": w.target.as_str(),
-                "existing": w.existing,
-            })).collect::<Vec<_>>(),
-            "changed": changed_json(&withdrawn.changed),
-        });
-        preview_json(&mut out, withdrawn.preview.as_deref());
-        Ok(Json(out).into_response())
-    })
-    .await
+    let branch = execution.branch.clone();
+    let prepared = prepare(
+        &st,
+        &name,
+        &p,
+        &branch,
+        &execution,
+        r.idempotency_key,
+        r.if_head,
+        r.dry_run,
+        r.message,
+    )?;
+    let mut cache = ReadCache::default();
+    let mut read = |ds: &sparkles::Dataset, b: &str| cache.get(&st, &p, ds, b);
+    let withdrawn = sparkles::evidence::withdraw(
+        &prepared.main.dataset,
+        &prepared.logical.dataset,
+        &input,
+        &prepared.options,
+        &mut read,
+        &prepared.control,
+    )?;
+    let mut out = json!({
+        "operation": withdrawn.operation.as_str(),
+        "committed": withdrawn.committed,
+        "replayed": withdrawn.replayed,
+        "commit": withdrawn.commit,
+        "branchId": withdrawn.branch,
+        "withdrawals": withdrawn.withdrawals.iter().map(|w| json!({
+            "key": w.key,
+            "iri": w.iri.as_ref().map(|s| s.as_str()),
+            "target": w.target.as_str(),
+            "existing": w.existing,
+        })).collect::<Vec<_>>(),
+        "changed": changed_json(&withdrawn.changed),
+    });
+    preview_json(&mut out, withdrawn.preview.as_deref());
+    Ok(out)
 }
 
 #[derive(Deserialize)]
@@ -402,6 +395,16 @@ pub(super) async fn identities(
     Extension(p): Extension<Principal>,
     AdminBody(bytes): AdminBody,
 ) -> ApiResult {
+    super::run_http("identities", st, name, p, bytes).await
+}
+
+pub(super) fn identities_now(
+    st: Arc<AppState>,
+    name: String,
+    p: Principal,
+    bytes: axum::body::Bytes,
+    execution: super::Execution,
+) -> ApiResult<J> {
     if bytes.len() > MAX_BYTES {
         return Err(err(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -425,51 +428,42 @@ pub(super) async fn identities(
         .enumerate()
         .map(|(i, e)| named(&format!("entities[{i}]"), e))
         .collect::<ApiResult<Vec<_>>>()?;
-    let branch =
-        crate::http::branches::current().unwrap_or_else(|| sparkles::branch::MAIN.to_string());
-    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
-    blocking(move || {
-        use crate::auth::{Endpoint, on_branch};
-        let logical = dataset(&st, &name)?;
-        let main = if branch == sparkles::branch::MAIN {
-            logical.clone()
-        } else {
-            crate::http::main_dataset(&st, &name)?
-        };
-        let here = on_branch(&main.name, &branch);
-        let caller = crate::http::caller::CallerContext::for_caller(&st, &logical, &p);
-        let opts = caller.options_on(&crate::http::Params::empty(), &here, Endpoint::Query);
-        let control = Control {
-            deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
-            ..Control::with_cancel(cancel)
-        };
-        let resolved = sparkles::evidence::resolve_entities(
-            &main.dataset,
-            &logical.dataset,
-            &r.policy,
-            &entities,
-            opts.graphs.clone(),
-            &control,
-        )?;
-        fn names(v: &[oxrdf::NamedNode]) -> Vec<&str> {
-            v.iter().map(|n| n.as_str()).collect()
-        }
-        Ok(Json(json!({
-            "policy": resolved.policy.as_str(),
-            "revision": resolved.revision.as_ref().map(|r| r.as_str()),
-            "number": resolved.number,
-            "commit": resolved.commit,
-            "entities": resolved.entities.iter().map(|e| json!({
-                "entity": e.entity.as_str(),
-                "representative": e.representative.as_str(),
-                "members": names(&e.members),
-                "membersComplete": e.members_complete,
-                "decisions": names(&e.decisions),
-            })).collect::<Vec<_>>(),
-        }))
-        .into_response())
-    })
-    .await
+    let branch = execution.branch.clone();
+    use crate::auth::{Endpoint, on_branch};
+    let logical = execution.dataset(&st, &name)?;
+    let main = if branch == sparkles::branch::MAIN {
+        logical.clone()
+    } else {
+        crate::http::main_dataset(&st, &name)?
+    };
+    let here = on_branch(&main.name, &branch);
+    let caller = crate::http::caller::CallerContext::for_caller(&st, &logical, &p);
+    let opts = caller.options_on(&crate::http::Params::empty(), &here, Endpoint::Query);
+    let control = execution.control(&opts);
+    let resolved = sparkles::evidence::resolve_entities(
+        &main.dataset,
+        &logical.dataset,
+        &r.policy,
+        &entities,
+        opts.graphs.clone(),
+        &control,
+    )?;
+    fn names(v: &[oxrdf::NamedNode]) -> Vec<&str> {
+        v.iter().map(|n| n.as_str()).collect()
+    }
+    Ok(json!({
+        "policy": resolved.policy.as_str(),
+        "revision": resolved.revision.as_ref().map(|r| r.as_str()),
+        "number": resolved.number,
+        "commit": resolved.commit,
+        "entities": resolved.entities.iter().map(|e| json!({
+            "entity": e.entity.as_str(),
+            "representative": e.representative.as_str(),
+            "members": names(&e.members),
+            "membersComplete": e.members_complete,
+            "decisions": names(&e.decisions),
+        })).collect::<Vec<_>>(),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -492,6 +486,16 @@ pub(super) async fn dependents(
     Extension(p): Extension<Principal>,
     AdminBody(bytes): AdminBody,
 ) -> ApiResult {
+    super::run_http("dependents", st, name, p, bytes).await
+}
+
+pub(super) fn dependents_now(
+    st: Arc<AppState>,
+    name: String,
+    p: Principal,
+    bytes: axum::body::Bytes,
+    execution: super::Execution,
+) -> ApiResult<J> {
     if bytes.len() > MAX_BYTES {
         return Err(err(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -515,45 +519,36 @@ pub(super) async fn dependents(
         .enumerate()
         .map(|(i, e)| named(&format!("changed[{i}]"), e))
         .collect::<ApiResult<Vec<_>>>()?;
-    let branch =
-        crate::http::branches::current().unwrap_or_else(|| sparkles::branch::MAIN.to_string());
-    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
-    blocking(move || {
-        use crate::auth::{Endpoint, on_branch};
-        let logical = dataset(&st, &name)?;
-        let main = if branch == sparkles::branch::MAIN {
-            logical.clone()
-        } else {
-            crate::http::main_dataset(&st, &name)?
-        };
-        let here = on_branch(&main.name, &branch);
-        let caller = crate::http::caller::CallerContext::for_caller(&st, &logical, &p);
-        let opts = caller.options_on(&crate::http::Params::empty(), &here, Endpoint::Query);
-        let control = Control {
-            deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
-            ..Control::with_cancel(cancel)
-        };
-        let found = sparkles::evidence::find_dependents(
-            &main.dataset,
-            &logical.dataset,
-            &changed,
-            r.transitive,
-            opts.graphs.clone(),
-            &control,
-        )?;
-        Ok(Json(json!({
-            "commit": found.commit,
-            "dependents": found.dependents.iter().map(|d| json!({
-                "assessment": d.assessment.as_str(),
-                "graph": d.graph.as_str(),
-                "on": d.on.as_str(),
-                "dependence": d.dependence.name(),
-                "depth": d.depth,
-            })).collect::<Vec<_>>(),
-        }))
-        .into_response())
-    })
-    .await
+    let branch = execution.branch.clone();
+    use crate::auth::{Endpoint, on_branch};
+    let logical = execution.dataset(&st, &name)?;
+    let main = if branch == sparkles::branch::MAIN {
+        logical.clone()
+    } else {
+        crate::http::main_dataset(&st, &name)?
+    };
+    let here = on_branch(&main.name, &branch);
+    let caller = crate::http::caller::CallerContext::for_caller(&st, &logical, &p);
+    let opts = caller.options_on(&crate::http::Params::empty(), &here, Endpoint::Query);
+    let control = execution.control(&opts);
+    let found = sparkles::evidence::find_dependents(
+        &main.dataset,
+        &logical.dataset,
+        &changed,
+        r.transitive,
+        opts.graphs.clone(),
+        &control,
+    )?;
+    Ok(json!({
+        "commit": found.commit,
+        "dependents": found.dependents.iter().map(|d| json!({
+            "assessment": d.assessment.as_str(),
+            "graph": d.graph.as_str(),
+            "on": d.on.as_str(),
+            "dependence": d.dependence.name(),
+            "depth": d.depth,
+        })).collect::<Vec<_>>(),
+    }))
 }
 
 type Policy = Option<Arc<sparkles::access::GraphAccess>>;

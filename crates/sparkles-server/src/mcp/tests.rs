@@ -686,6 +686,9 @@ async fn a03_tool_list() {
             "format",
             #[cfg(feature = "fmt")]
             "lint",
+            "resolve_evidence",
+            "resolve_identities",
+            "find_evidence_dependents",
             #[cfg(feature = "ontology")]
             "ontology_axioms",
             "read_chunks",
@@ -695,6 +698,18 @@ async fn a03_tool_list() {
         ]
     );
     let mut expected = expected_input_schemas();
+    // Evidence payloads are shared with HTTP; the router tests exercise their fields.
+    let at = expected
+        .iter()
+        .position(|(name, _)| *name == "read_chunks")
+        .unwrap();
+    for (offset, def) in super::evidence::tool_defs(&McpConfig::default())
+        .into_iter()
+        .filter(|def| def.read_only)
+        .enumerate()
+    {
+        expected.insert(at + offset, (def.name, def.input));
+    }
     // the listing-only ontology tool (its own tests check the schema's content)
     #[cfg(feature = "ontology")]
     {

@@ -1044,7 +1044,7 @@ pub(crate) fn numbered_branch(
         match create(&name) {
             Ok(_) => return Ok(name),
             // created meanwhile by another ingestion
-            Err(e) if e.code == "branch-exists" || e.status == 409 => continue,
+            Err(e) if e.code.as_ref() == "branch-exists" || e.status == 409 => continue,
             Err(e) => return Err(e.into()),
         }
     }

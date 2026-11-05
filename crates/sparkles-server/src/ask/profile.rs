@@ -183,7 +183,7 @@ pub(super) fn tool(
             "none",
             v["commit"].as_u64(),
         ),
-        Err(e) => timer.finish("error", error_code(e.code), None),
+        Err(e) => timer.finish("error", error_code(&e.code), None),
     }
     result
 }
@@ -236,7 +236,7 @@ pub(super) fn execution<T>(
     let result = call();
     match &result {
         Ok((v, _)) => timer.finish("ok", "none", v["commit"].as_u64()),
-        Err(e) => timer.finish("error", error_code(e.code), None),
+        Err(e) => timer.finish("error", error_code(&e.code), None),
     }
     result
 }

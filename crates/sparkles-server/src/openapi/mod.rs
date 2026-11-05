@@ -28,6 +28,12 @@ const DOCS: &str = "https://github.com/kclejeune/sparkles/blob/main/docs/API.md"
 #[cfg(test)]
 pub(crate) const UI_ROUTES: &[&str] = &["/", "/ui", "/ui/", "/ui/{*path}"];
 
+/// Typed evidence payloads shared with MCP, without building the full API document.
+#[cfg(feature = "mcp")]
+pub(crate) fn evidence_schemas() -> Map<String, J> {
+    schemas::evidence_schemas()
+}
+
 pub(crate) fn api_doc(anchor: &str) -> String {
     format!("{DOCS}#{anchor}")
 }

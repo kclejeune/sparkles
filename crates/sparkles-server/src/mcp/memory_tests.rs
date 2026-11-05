@@ -1412,7 +1412,7 @@ fn link_evidence_limits_large_term_construction_across_repeated_mentions() {
         Err(error) => error,
         Ok(_) => panic!("oversized evidence unexpectedly succeeded"),
     };
-    assert_eq!(error.code, "budget-result-bytes");
+    assert_eq!(error.code.as_ref(), "budget-result-bytes");
     assert_eq!(
         observation.largest_formatted_term, 0,
         "oversized evidence must be counted before allocating a formatted term: {observation:?}"
@@ -1501,7 +1501,7 @@ fn link_evidence_escaped_terms_keep_identity_and_exact_byte_acceptance() {
             }
             Err(error) => {
                 assert!(!accepted);
-                assert_eq!(error.code, "budget-result-bytes");
+                assert_eq!(error.code.as_ref(), "budget-result-bytes");
             }
         }
     }

@@ -489,7 +489,7 @@ async fn a57_server_models_need_the_grant() {
     .await
     .unwrap()
     .unwrap_err();
-    assert_eq!(e.code, "server-model-not-allowed");
+    assert_eq!(e.code.as_ref(), "server-model-not-allowed");
     assert!(mock.requests().is_empty());
     let st2 = st.clone();
     let v = tokio::task::spawn_blocking(move || {
