@@ -985,6 +985,37 @@ test('kept classifications read immutable pages and native frame defaults', asyn
   assert.equal(mismatch.staleCommit, status.commit);
 });
 
+test('kept and projected native exclusions carry typed gaps and legacy source identity', async (t) => {
+  const ds = t.resource(await Dataset.open(join(await temp(), 'kept-excluded-db')));
+  await ds.update(`PREFIX : <http://ex.org/> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    INSERT DATA { :A a owl:Class . :Opaque a rdfs:Datatype .
+      :p a owl:DatatypeProperty; rdfs:range :Opaque . }`);
+  const projection = await ds.ontology.classify({
+    projection: 'frame',
+    about: 'http://ex.org/A',
+    limit: 1,
+  });
+  assert.ok(projection.frame.outcome.excludedCount > 0);
+  const diagnostic = projection.frame.excluded.items[0];
+  assert.equal(diagnostic.gap.kind, 'partiallyUsed');
+  assert.equal(typeof diagnostic.gap.reason, 'string');
+  const status = await ds.ontology.keptClassification();
+  const page = await ds.ontology.keptClassification({
+    at: status.commit,
+    resultId: status.result.resultId,
+    part: 'excluded',
+    limit: 1,
+  });
+  assert.deepEqual(page.page.items[0], diagnostic);
+  const legacy = await ds.ontology.classify({ about: 'http://ex.org/A', limit: 1 });
+  assert.equal(legacy.classificationSource.commit, status.commit);
+  assert.equal(legacy.classificationSource.contentFingerprint, status.result.contentFingerprint);
+  assert.equal(typeof legacy.resultId, 'string');
+  assert.equal(typeof legacy.excluded[0].partial, 'string');
+  assert.equal(legacy.excluded[0].gap, undefined);
+});
+
 test('the ontology handle classifies by OWL 2 EL and writes the taxonomy', async (t) => {
   const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
   await ds.update(`PREFIX : <http://ex.org/>

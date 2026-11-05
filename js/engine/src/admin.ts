@@ -526,6 +526,26 @@ export interface OntologyExcluded extends OntologyAxiom {
   partial?: string;
 }
 
+/** Typed diagnostics on the new bounded kept-result surfaces. Legacy lists keep OntologyExcluded. */
+export interface ClassificationExcluded extends OntologyAxiom {
+  gap:
+    | { kind: 'omitted'; rule: string; message: string }
+    | { kind: 'partiallyUsed'; reason: string };
+}
+export interface ClassificationSource {
+  boundStoreId: string;
+  familyId: string;
+  commit: bigint;
+  inputFingerprint: string;
+  contentFingerprint: string;
+  producer: {
+    assertions: boolean;
+    elOnly: boolean;
+    partialRequested: boolean;
+    expansion: string;
+  };
+}
+
 /** Immutable producer identity of a kept or explicitly projected classification. */
 export interface ClassificationResult {
   resultId: string;
@@ -585,7 +605,7 @@ export interface KeptClassification {
       | ClassificationName
       | (ClassificationName & { equivalenceCount: number })
       | ClassificationSourceRow
-      | OntologyExcluded
+      | ClassificationExcluded
     )[];
     nextOffset: number | null;
   } | null;
@@ -593,19 +613,7 @@ export interface KeptClassification {
 export interface OntologyFrameClassification {
   dataset: string;
   commit: bigint;
-  classificationSource: {
-    boundStoreId: string;
-    familyId: string;
-    commit: bigint;
-    inputFingerprint: string;
-    contentFingerprint: string;
-    producer: {
-      assertions: boolean;
-      elOnly: boolean;
-      partialRequested: boolean;
-      expansion: string;
-    };
-  };
+  classificationSource: ClassificationSource;
   frame: {
     iri: string;
     result: ClassificationResult;
@@ -618,13 +626,15 @@ export interface OntologyFrameClassification {
       items: (ClassificationName & { equivalenceCount: number })[];
     };
     equivalents: { total: number; limit: number; truncated: boolean; items: ClassificationName[] };
-    excluded: { total: number; limit: number; truncated: boolean; items: OntologyExcluded[] };
+    excluded: { total: number; limit: number; truncated: boolean; items: ClassificationExcluded[] };
     sources: { total: number; truncated: boolean; items: ClassificationSourceRow[] };
     retention: { kept: boolean; resultId: string | null };
   };
 }
 /** The OWL 2 EL classification of an ontology (spec F24). */
 export interface OntologyClassification extends OntologyState {
+  classificationSource: ClassificationSource;
+  resultId: string;
   /** false only when the ontology is proved inconsistent; see `consistency` */
   consistent: boolean;
   /** whether the ontology has a model as far as the run knows: only a partial answer is `unknown` */

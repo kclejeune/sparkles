@@ -92,3 +92,32 @@ void tag;
 void geometry;
 void future;
 void catalogHelpers;
+
+// New bounded diagnostics and additive legacy provenance are public consumer types.
+import type {
+  ClassificationExcluded,
+  OntologyFrameClassification,
+  OntologyClassification,
+  KeptClassification,
+} from '@sparkles-rdf/engine';
+declare const frameClassification: OntologyFrameClassification;
+const excluded: ClassificationExcluded = frameClassification.frame.excluded.items[0]!;
+if (excluded.gap.kind === 'omitted') {
+  const rule: string = excluded.gap.rule;
+  void rule;
+} else {
+  const reason: string = excluded.gap.reason;
+  void reason;
+}
+declare const legacyClassification: OntologyClassification;
+const sourceCommit: bigint = legacyClassification.classificationSource.commit;
+const resultId: string = legacyClassification.resultId;
+declare const keptClassification: KeptClassification;
+for (const row of keptClassification.page?.items ?? []) {
+  if ('gap' in row) {
+    const kind: 'omitted' | 'partiallyUsed' = row.gap.kind;
+    void kind;
+  }
+}
+void sourceCommit;
+void resultId;
