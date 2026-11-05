@@ -477,6 +477,10 @@ memberships at the displayed commit. It skips candidates absent from that revisi
 valid matches and displays hard read failures. Historical name search remains under item
 658.
 
+The same read is available through `Dataset.ontology.individuals` in Python and Node.js
+and `SparklesOnt.individuals` or the ontology handle on the JVM. Their cursors and
+revision selectors follow the HTTP contract.
+
 The paged HTTP response does not imply bounded server work. The individuals route reuses
 the ontology's terminology mapping, and discovers buckets and Untyped members by scanning
 the authorized graph scope. A typed member page scans that type's membership. The cold

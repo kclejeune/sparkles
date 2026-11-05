@@ -656,7 +656,7 @@ pub fn entity_body(
 // ------------------------------------------------------------- requests ------
 
 /// The operations [`call`] answers, in the names of the bindings' surface keys.
-pub const OPERATIONS: [&str; 14] = [
+pub const OPERATIONS: [&str; 15] = [
     "summary",
     "axioms",
     "entities",
@@ -670,6 +670,7 @@ pub const OPERATIONS: [&str; 14] = [
     "parse",
     "dlQuery",
     "hierarchy",
+    "individuals",
     "term",
 ];
 
@@ -716,6 +717,7 @@ fn members(op: &str) -> &'static [&'static str] {
             "deprecated",
             "lang",
         ],
+        "individuals" => &["type", "untyped", "iri", "after", "limit", "lang"],
         "term" => &["iri", "mentions", "incoming", "lang"],
         "dlQuery" => &[
             "expression",
@@ -1120,6 +1122,11 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
             let h = hierarchy_request_of(a)?;
             let found = handle.hierarchy(&req, &h, opts)?;
             Ok(hierarchy_body(name, &h, &found))
+        }
+        "individuals" => {
+            let i = individuals_request_of(a)?;
+            let found = handle.individuals(&req, &i, opts)?;
+            Ok(individuals_body(name, &found))
         }
         "term" => {
             let t = term_request_of(a)?;

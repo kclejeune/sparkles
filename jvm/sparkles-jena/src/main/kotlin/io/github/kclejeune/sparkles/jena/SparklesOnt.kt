@@ -101,6 +101,12 @@ public object SparklesOnt {
     public fun hierarchy(dataset: DatasetGraphSparkles, iri: String? = null, graphIri: String? = null, kind: String = "class", ancestors: Boolean = false): JsonObject =
         dataset.ontology().hierarchy(iri, OntologyRead(graph = graphIri), kind, ancestors)
 
+    /** A page of asserted named individuals or type buckets, as [SparklesOntology.individuals] answers it. */
+    @JvmStatic
+    @JvmOverloads
+    public fun individuals(dataset: DatasetGraphSparkles, graphIri: String? = null, type: String? = null, untyped: Boolean = false, iri: String? = null, after: String? = null, limit: Int = 100): JsonObject =
+        dataset.ontology().individuals(OntologyRead(graph = graphIri), type, untyped, iri, after, limit)
+
     /** What the graph says about one entity, read without the whole ontology, as [SparklesOntology.term] answers it. */
     @JvmStatic
     @JvmOverloads
@@ -437,6 +443,41 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         args.put("limit", limit.toLong())
         args.put("offset", offset)
         return call("hierarchy", args, operation, false)
+    }
+
+    /**
+     * A lexical page of asserted named individuals or their type buckets. A type,
+     * Untyped selector or individual IRI is optional and mutually exclusive. Continue
+     * with the returned cursor and the returned commit in [OntologyRead.at].
+     */
+    @JvmOverloads public fun individuals(
+        read: OntologyRead = OntologyRead(),
+        type: String? = null,
+        untyped: Boolean = false,
+        iri: String? = null,
+        after: String? = null,
+        limit: Int = 100,
+        languages: List<String> = emptyList(),
+    ): JsonObject = SparklesOperation().use { individuals(read, type, untyped, iri, after, limit, languages, it) }
+    public fun individuals(
+        read: OntologyRead,
+        type: String?,
+        untyped: Boolean,
+        iri: String?,
+        after: String?,
+        limit: Int,
+        languages: List<String>,
+        operation: SparklesOperation,
+    ): JsonObject {
+        require(limit in 1..1000)
+        val args = read.value()
+        type?.let { args.put("type", it) }
+        args.put("untyped", untyped)
+        iri?.let { args.put("iri", it) }
+        after?.let { args.put("after", it) }
+        args.put("limit", limit.toLong())
+        if (languages.isNotEmpty()) args.put("lang", languages.joinToString(","))
+        return call("individuals", args, operation, false)
     }
 
     /**

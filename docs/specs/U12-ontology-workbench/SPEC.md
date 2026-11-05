@@ -482,7 +482,7 @@ Item 616's pages are built as the UI's **Browse** page, `/ui/browse`, on two new
 the wire dispatcher, and `hierarchy` and `term` on the ontology handles of Python,
 Node.js and the JVM. The ontology editor reads its class and property levels through
 this hierarchy route. Item 607 adds the separate paged individuals route for its
-Individuals tab.
+Individuals tab, with matching native reads on the three binding handles.
 
 **Why two routes.** The entity and summary routes open the whole ontology through the
 reverse mapping, which reads every quad of GO at the first call and is not cached for a

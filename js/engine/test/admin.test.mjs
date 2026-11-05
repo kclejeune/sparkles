@@ -1348,3 +1348,66 @@ test('the owl constructors build axioms an edit takes', async (t) => {
   assert.throws(() => owl.Declaration(EX + 'A'), TypeError);
   assert.throws(() => owl.ObjectMinCardinality(-1, EX + 'p'), TypeError);
 });
+
+test('individual pages preserve graph scope, empty cursors and retained revisions', async (t) => {
+  const ds = t.resource(await Dataset.open(join(await temp(), 'individual-pages')));
+  const ex = 'http://ex.org/';
+  const graph = ex + 'individuals';
+  const prefixes = `PREFIX : <${ex}> PREFIX owl: <http://www.w3.org/2002/07/owl#>`;
+  await ds.update(`${prefixes} INSERT DATA { GRAPH <${graph}> {
+    :Person a owl:Class . :loose a owl:NamedIndividual .
+    :a a :Person . :b a :Person . :c a :Person .
+  } GRAPH :hidden { :hidden a :Person } }`);
+  const scope = { graph, imports: false };
+  const roots = await ds.ontology.individuals({ ...scope, limit: 1 });
+  assert.deepEqual(roots.groups, [{ type: null, total: 1 }]);
+  assert.equal(roots.next, '');
+  assert.equal(typeof roots.commit, 'bigint');
+  const at = roots.commit;
+  const types = await ds.ontology.individuals({
+    ...scope,
+    limit: 1,
+    after: roots.next,
+    at,
+  });
+  assert.deepEqual(
+    types.groups.map((g) => g.type.iri),
+    [ex + 'Person'],
+  );
+  assert.equal(types.next, null);
+  const first = await ds.ontology.individuals({
+    ...scope,
+    type: ex + 'Person',
+    limit: 2,
+    at,
+  });
+  assert.deepEqual(
+    first.individuals.map((i) => i.iri),
+    [ex + 'a', ex + 'b'],
+  );
+  assert.equal(first.next, ex + 'b');
+  assert.equal(first.total, 3);
+  await ds.update(`${prefixes} INSERT DATA { GRAPH <${graph}> { :d a :Person } }`);
+  const last = await ds.ontology.individuals({
+    ...scope,
+    type: ex + 'Person',
+    limit: 2,
+    after: first.next,
+    at,
+  });
+  assert.equal(last.commit, at);
+  assert.equal(last.next, null);
+  assert.deepEqual(
+    last.individuals.map((i) => i.iri),
+    [ex + 'c'],
+  );
+  const located = await ds.ontology.individuals({
+    ...scope,
+    iri: ex + 'c',
+    at,
+  });
+  assert.deepEqual(
+    located.individuals[0].types.map((type) => type.iri),
+    [ex + 'Person'],
+  );
+});

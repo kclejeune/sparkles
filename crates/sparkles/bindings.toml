@@ -801,6 +801,11 @@ python = "Dataset.ontology.hierarchy"
 jvm = "SparklesOnt.hierarchy"
 node = "Dataset.ontology.hierarchy"
 
+["ontology.individuals"]
+python = "Dataset.ontology.individuals"
+jvm = "SparklesOnt.individuals"
+node = "Dataset.ontology.individuals"
+
 ["ontology.term"]
 python = "Dataset.ontology.term"
 jvm = "SparklesOnt.term"

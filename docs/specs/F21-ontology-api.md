@@ -589,7 +589,9 @@ roadmap item 538.
 ### Paged named individuals
 
 Item 607 adds `Ontologies::individuals` and `GET /$/ontology/{ds}/individuals` for
-U12's Individuals tab. The read pages asserted named-type buckets, their named members
+U12's Individuals tab. The shared wire dispatcher exposes `individuals`, and the Python,
+Node.js and JVM ontology handles provide the same read through their native adapters.
+The read pages asserted named-type buckets, their named members
 and an Untyped bucket. Direct lookup returns one individual's memberships without
 walking earlier pages. Lexical IRI continuations retain the response commit through
 `at=commit:N`. Every stage uses the caller's authorized graph and triple view, imports,
