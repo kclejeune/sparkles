@@ -180,6 +180,9 @@
     padding: var(--sp-1);
     display: grid;
   }
+  .drawer .ds-menu {
+    width: 100%;
+  }
   .ds-item {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;

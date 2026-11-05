@@ -302,6 +302,9 @@
     padding-top: var(--sp-3);
     border-top: 1px solid var(--border);
   }
+  .drawer-foot > .row {
+    flex-wrap: wrap;
+  }
   .drawer-foot .dot {
     margin-left: var(--sp-1);
   }
