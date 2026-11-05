@@ -501,12 +501,15 @@ impl NativeDataset {
         options: String,
         cancel: &Cancellation,
     ) -> napi::Result<String> {
+        #[cfg(feature = "ontology")]
         let a = if let Some(ontology_op) = op.strip_prefix("ontology.") {
             sparkles::handles::ontology::wire::decode_arguments(ontology_op, args.as_bytes())
                 .map_err(err)?
         } else {
             parse(&args)?
         };
+        #[cfg(not(feature = "ontology"))]
+        let a = parse(&args)?;
         // a classification writes only when it names a target graph
         let write = writes(&op)
             || (op == "ontology.classify" && a.get("target").is_some_and(|t| !t.is_null()));

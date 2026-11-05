@@ -6,6 +6,9 @@ Read the [results](RESULTS.md), [run catalog](RUNS.json) and
 [shared reference setup](../reference/README.md). The
 [harness guide](../../BENCHMARKING.md) documents commands and output formats.
 
+The [Horn classification and kept-frame screen](RESULTS.md#horn-classification-and-kept-frame-screen-leads)
+records unresolved per-query timing leads separately from the peer comparisons.
+
 The eager-against-cursor matrix of the [rewrite gates](../../BENCHMARKING.md#rewrite-gates) records its baseline in [the results](RESULTS.md#eager-against-cursor-matrix). A change to an executor path runs `mise run bench:executors` on forge and compares the record with that baseline through `scripts/bench-gate.py compare`.
 
 The timed native checker accepts successful, complete SELECT and ASK answers whose
