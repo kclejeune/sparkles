@@ -212,6 +212,7 @@ A completed phase does not imply every later extension or compatibility goal is 
 | [U10](U10-canvas-lenses.md) | Size, colour, badge and edge-style lenses on the graph views, inferred edges drawn dashed, PageRank, centrality and community lenses from view-only F14 runs cached on the server, and the derivation tree of an inferred edge from a search over the materialized closure | implemented (Phases 1, 2 and 3) |
 | [U11](U11-linked-views.md) | Arcs between located entities on the map, facet histograms computed on the server whose brushes filter the canvas and add filters to the query, and an embedding map of a vector index whose lasso becomes a `VALUES` block, all sharing one selection | implemented in part (Phases 1, 2 and 3 with recorded omissions) |
 | [U12](U12-ontology-workbench/README.md) | An ontology editor in the web UI with class, property and individual trees, entity frames, a SKOS thesaurus editor, a DL Query tab and an editable schema diagram | partially complete |
+| [U13](U13-desktop-application/README.md) | A standalone desktop application with local datasets and remote server connections, with framework selection gated by performance and parity with the web UI | specified |
 
 ### Interop and query surfaces
 

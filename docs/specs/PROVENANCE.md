@@ -400,6 +400,10 @@ Read the [design provenance](F28-ml-and-probabilistic-integration/SPEC.md#proven
 
 Read the [design provenance](U12-ontology-workbench/SPEC.md#provenance).
 
+## Standalone desktop application
+
+Read the [design provenance](U13-desktop-application/SPEC.md#provenance).
+
 ## Resource catalog
 
 Read the [design provenance](C30-resource-catalog/SPEC.md#provenance).

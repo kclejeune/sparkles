@@ -748,6 +748,10 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
+A standalone desktop application is planned under [item 746](../ROADMAP.md), with
+its framework comparison and parity requirements in [U13](../specs/U13-desktop-application/README.md).
+The current interface is served by the Sparkles server.
+
 The remaining work described above refers to [item 607](../ROADMAP.md), [item 621](../ROADMAP.md), [item 622](../ROADMAP.md), [item 625](../ROADMAP.md), [item 630](../ROADMAP.md), [item 658](../ROADMAP.md), [item 461](../ROADMAP.md), [item 612](../ROADMAP.md), [item 613](../ROADMAP.md), [item 614](../ROADMAP.md), [item 615](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)

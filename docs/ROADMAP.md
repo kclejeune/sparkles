@@ -182,6 +182,13 @@ DL Query tab, the SKOS editor and the web UI shell of item 632 come these, in or
 Tagging documents with concepts (628) belongs to Wave B's ingest work, and real-time
 co-editing (629) comes last.
 
+Item 746 adds a standalone desktop application after the shared shell and the first
+two workbench groups above. Its framework evaluation may run alongside later UI work
+when capacity is available. Prefer GPUI if measurements and a parity prototype show
+that the desktop and web interfaces can stay aligned. Otherwise evaluate Tauri or
+Electron with the existing UI. This work does not displace correctness repairs or
+performance recovery.
+
 ### How the waves share capacity
 
 The waves run in parallel, and each has its own capacity. Waves A2 and C take the
@@ -801,6 +808,7 @@ Rows that need backend work name it first.
 
 | # | Item | Spec | Size |
 |---|---|---|---|
+| 746 | **Standalone desktop application.** Package the Sparkles UI as a desktop application with local datasets and remote server connections. Prefer GPUI for a native interface if a prototype demonstrates performance gains and a sustainable way to preserve web feature and interaction parity. Evaluate Tauri or Electron with the existing UI if a separate interface would drift, then deliver installers and shared parity checks. | [U13](specs/U13-desktop-application/README.md) | L |
 | 101 | **Visual query builder, Phase 3.** `UNION`, `GRAPH`, inline `VALUES`, `MINUS` and `FILTER NOT EXISTS` join the editable subset, and **Build a query** opens the pane from a class of the Explore overview. | [U08](specs/U08-visual-query-builder.md#outcome) | L |
 | 120 | **The validation overlay on the quality record.** Once item 31 Phase 1 records the guard's results per commit, add `focus=` to `GET /$/validation/{ds}/results` and read the record at the head instead of validating. | [U07](specs/U07-data-quality-and-schema-diagram.md#outcome) §11 | S |
 | 121 | **Conclusive previews of a suggested fix.** Let a dry run name focus nodes to validate in full against the candidate state, so that the overlay can say a fix resolves a result while other results remain. | [U07](specs/U07-data-quality-and-schema-diagram.md#outcome) §11, [C15](specs/C15-write-previews.md) | S |
