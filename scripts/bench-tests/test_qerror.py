@@ -2,9 +2,11 @@ import contextlib
 import copy
 import importlib.util
 import io
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -48,6 +50,36 @@ def record(value):
 
 
 class QerrorAnswerTests(unittest.TestCase):
+    def test_directional_literals_are_explicitly_unsupported(self):
+        for direction in ("ltr", "rtl", "up", None):
+            value = response(vars=["x"], rows=[[literal("text", **{"xml:lang": "en", "its:dir": direction})]])
+            with self.subTest(direction=direction), self.assertRaisesRegex(ValueError, "direction"):
+                qerror.digest(value)
+
+    def test_post_refuses_eager_describe_truncation_header(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                body = json.dumps(response("DESCRIBE", triples=[])).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-sparkles+json")
+                self.send_header("sparkles-describe-truncated", "true")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with self.assertRaisesRegex(ValueError, "truncat"):
+                qerror.post(f"http://127.0.0.1:{server.server_port}/sparql", "DESCRIBE <urn:s>", 2)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_graph_content_is_compared(self):
         self.assertNotEqual(qerror.digest(graph("urn:a")), qerror.digest(graph("urn:b")))
 

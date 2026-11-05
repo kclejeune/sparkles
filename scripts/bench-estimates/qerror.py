@@ -25,7 +25,7 @@ node whose q-error rose. `summary` prints the distributions of each file.
 
 Answer format 1 compares SELECT multisets, ASK booleans and complete RDF graph sets.
 Blank-node relabeling is exact for at most eight nodes and one million renamed row
-visits. Larger searches and unsupported term or response kinds fail explicitly.
+visits. Larger searches, directional literals and unsupported term or response kinds fail explicitly.
 Legacy unversioned files remain readable for plan statistics, but their answer checks
 are unverified. Unknown answer-format versions are refused. A failed run retains its
 error records and exits unsuccessfully after stopping its own server.
@@ -59,6 +59,9 @@ def post(url, query, timeout):
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
+        for flag in r.headers.get_all("sparkles-describe-truncated", []):
+            if flag.strip().lower() != "false":
+                raise ValueError("native DESCRIBE response is truncated or has an invalid truncation header")
         return json.loads(r.read())
 
 
@@ -120,6 +123,8 @@ def _term(value, position=None):
     if not isinstance(value, dict) or not isinstance(value.get("value"), str):
         raise ValueError("malformed RDF term")
     kind, text = value.get("type"), value["value"]
+    if "its:dir" in value:
+        raise ValueError("directional RDF literals are not supported by this answer checker")
     allowed = {"uri", "bnode", "literal"}
     if position == "predicate":
         allowed = {"uri"}
