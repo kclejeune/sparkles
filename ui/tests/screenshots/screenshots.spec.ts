@@ -379,6 +379,7 @@ test.describe('browse', () => {
     const metrics = page.getByRole('region', { name: 'Ontology metrics', exact: true });
     await metrics.getByRole('button', { name: 'Read metrics', exact: true }).click();
     await expect(metrics).toContainText('DL expressivity bound');
+    await metrics.scrollIntoViewIfNeeded();
     await shoot(page, 'ontology-metrics');
   });
 

@@ -126,8 +126,10 @@ individuals remain outside this named-entity tree. The first page uses the displ
 summary commit, and later reads stay at that revision. A link locates its individual without reading preceding
 pages. Type buckets use separate row identities, so a class that is also an individual
 does not create a cycle. Names use the shared rendering and ordered language preferences.
-This is item 607. Server root discovery and Untyped pages scan the selected scope, and
-the route retains F21's cold terminology mapping cost tracked by item 736.
+This is item 607. Item 749 covers the repeated discovery, lexical-page selection and
+exact-total scans that remain behind these bounded responses. Server root discovery and
+Untyped pages scan the selected scope, and the route retains F21's cold terminology
+mapping cost tracked by item 736.
 
 The Individuals filter searches names at the current branch head and reads each candidate's
 memberships at the displayed commit. It skips candidates absent from that revision, keeps

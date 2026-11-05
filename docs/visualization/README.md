@@ -440,7 +440,9 @@ fragment bound. Unresolved imports prevent a conclusion about the complete ontol
 The panel lists up to 100 violations of each profile after checking the selected scope.
 Metrics retain a distinct entity signature set and refuse more than one million mapped
 axioms and assertion triples or signature entities. A limit or deadline reports an error
-rather than partial counts. Ordinary page opening does not request metrics.
+rather than partial counts. Ordinary page opening does not request metrics. The
+[metrics screenshot](../images/ontology-metrics.png) shows the Header panel at its pinned
+revision.
 
 The **Ontology** editor, `/ui/workbench/ontology`, browses and edits the OWL ontology of one graph
 and its imports
@@ -484,7 +486,9 @@ revision selectors follow the HTTP contract.
 The paged HTTP response does not imply bounded server work. The individuals route reuses
 the ontology's terminology mapping, and discovers buckets and Untyped members by scanning
 the authorized graph scope. A typed member page scans that type's membership. The cold
-terminology mapping cost remains under roadmap item 736.
+terminology mapping cost remains under roadmap item 736. Repeated bucket discovery,
+lexical-page selection and exact-total scans remain under item 749, with grants, pinned
+views and bounded memory preserved.
 
 The **DL Query** tab answers a Manchester class expression with its equivalent classes,
 its direct and inferred superclasses and subclasses, and its instances

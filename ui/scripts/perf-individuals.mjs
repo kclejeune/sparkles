@@ -23,6 +23,12 @@ if (!backend || !before || !output)
   throw new Error('Set INDIVIDUALS_BACKEND, INDIVIDUALS_BEFORE_UI and INDIVIDUALS_OUT.');
 if (existsSync(output))
   throw new Error('The output already exists. Keep raw run records immutable.');
+if (
+  ![process.env.INDIVIDUALS_BEFORE_SOURCE, process.env.INDIVIDUALS_AFTER_SOURCE].every(
+    (source) => typeof source === 'string' && /^[0-9a-f]{40}$/.test(source),
+  )
+)
+  throw new Error('Set both INDIVIDUALS source identities to full Git commit IDs.');
 const count = Number(process.env.INDIVIDUALS_COUNT ?? 50250);
 const repeats = Number(process.env.INDIVIDUALS_REPEATS ?? 3);
 if (!Number.isInteger(count) || count < 200 || !Number.isInteger(repeats) || repeats < 1)
@@ -74,7 +80,7 @@ const result = {
     bytes: Buffer.byteLength(turtle),
     sha256: createHash('sha256').update(turtle).digest('hex'),
   },
-  mode: 'Fresh browser contexts and production UI builds, shared warm server mapping; cold root discovery recorded separately.',
+  mode: 'Fresh browser contexts and production UI builds, shared warm server mapping; cold root discovery recorded separately. Long-lived change feeds excluded from transfer accounting.',
   api: [],
   browser: [],
 };
@@ -195,6 +201,7 @@ try {
       const bodies = [];
       const tracks = (r) =>
         r.resourceType() !== 'eventsource' &&
+        !(r.headers().accept ?? '').includes('text/event-stream') &&
         (new URL(r.url()).pathname.startsWith('/$/ontology/' + ds) ||
           new URL(r.url()).pathname.startsWith('/' + ds + '/'));
       page.on('request', (r) => {

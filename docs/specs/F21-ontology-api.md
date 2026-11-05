@@ -600,7 +600,9 @@ branch, retained revision, cancellation and deadline. No classification runs.
 Responses hold at most 1,000 buckets or individuals, with 100 by default. Root discovery
 and Untyped reads scan the authorized scope, and typed reads scan that type's membership.
 The route uses F21's existing terminology mapper to preserve declarations, complex
-assertions and signature semantics. It does not bound server work by the response size.
+assertions and signature semantics. It does not bound server work by the response size. Item 749 covers repeated
+discovery,
+lexical-page selection and exact-total scans, independently of item 736's cold mapping.
 More than 100,000 buckets or 1,000 named types on one individual fails explicitly.
 Anonymous individuals stay outside this named-entity editor tree. The exact HTTP
 contract is in [the API reference](../API.md#ontology).
