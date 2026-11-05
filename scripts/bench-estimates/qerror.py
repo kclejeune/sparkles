@@ -22,10 +22,18 @@ under both files, each query's largest join q-error and the geometric mean of it
 q-errors, and every query whose answers differ. It lists every query whose largest join
 q-error rose, and, for queries whose plans have the same shape in both files, every join
 node whose q-error rose. `summary` prints the distributions of each file.
+
+Answer format 1 compares SELECT multisets, ASK booleans and complete RDF graph sets.
+Blank-node relabeling is exact for at most eight nodes and one million renamed row
+visits. Larger searches and unsupported term or response kinds fail explicitly.
+Legacy unversioned files remain readable for plan statistics, but their answer checks
+are unverified. Unknown answer-format versions are refused. A failed run retains its
+error records and exits unsuccessfully after stopping its own server.
 """
 
 import argparse
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -100,16 +108,118 @@ def walk(node, path="0", depth=0, out=None):
     return out
 
 
+DIGEST_FORMAT = 1
+QUERY_KINDS = {"SELECT", "ASK", "CONSTRUCT", "DESCRIBE"}
+XSD_STRING = "http://www.w3.org/2001/XMLSchema#string"
+RDF_LANG_STRING = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+
+
+def _term(value, position=None):
+    if value is None and position is None:
+        return ("unbound",)
+    if not isinstance(value, dict) or not isinstance(value.get("value"), str):
+        raise ValueError("malformed RDF term")
+    kind, text = value.get("type"), value["value"]
+    allowed = {"uri", "bnode", "literal"}
+    if position == "predicate":
+        allowed = {"uri"}
+    elif position in {"subject", "graph"}:
+        allowed = {"uri", "bnode"}
+    if not isinstance(kind, str) or kind not in allowed:
+        raise ValueError(f"unsupported RDF term kind {kind!r} at {position or 'SELECT'}")
+    if kind != "literal":
+        if not text or "datatype" in value or "xml:lang" in value:
+            raise ValueError("malformed IRI or blank-node term")
+        return kind, text
+    datatype = value.get("datatype", XSD_STRING)
+    if not isinstance(datatype, str) or not datatype:
+        raise ValueError("malformed literal datatype")
+    language = value.get("xml:lang", "")
+    if "xml:lang" in value:
+        if not isinstance(language, str) or not re.fullmatch(r"[A-Za-z]+(?:-[A-Za-z0-9]+)*", language):
+            raise ValueError("malformed literal language tag")
+        if "datatype" in value and datatype != RDF_LANG_STRING:
+            raise ValueError("language literal has a conflicting datatype")
+        datatype = RDF_LANG_STRING
+    return "literal", text, datatype, language.lower()
+
+
+def _canonical(rows):
+    labels = sorted({term[1] for row in rows for term in row if term[0] == "bnode"})
+    if not labels:
+        return tuple(sorted(rows))
+    if len(labels) > 8 or math.factorial(len(labels)) * len(rows) > 1_000_000:
+        raise ValueError("blank-node canonicalization exceeds the supported search budget")
+    best = None
+    for permutation in itertools.permutations(range(len(labels))):
+        names = {label: str(n) for label, n in zip(labels, permutation)}
+        candidate = tuple(sorted(
+            tuple(("bnode", names[term[1]]) if term[0] == "bnode" else term for term in row)
+            for row in rows
+        ))
+        if best is None or candidate < best:
+            best = candidate
+    return best
+
+
+def _complete(resp, count):
+    meta = resp.get("meta")
+    if not isinstance(meta, dict) or meta.get("status", "complete") != "complete":
+        raise ValueError("native answer is incomplete or lacks completion metadata")
+    for record in (resp, meta):
+        if "describeTruncated" in record:
+            if type(record["describeTruncated"]) is not bool or record["describeTruncated"]:
+                raise ValueError("native graph answer was truncated")
+    for name in ("sentRows", "totalRows"):
+        if type(meta.get(name)) is not int or meta[name] != count:
+            raise ValueError(f"incomplete native answer: {name}")
+
+
 def digest(resp):
-    rows = resp.get("rows") or resp.get("results", {}).get("bindings") or []
-    lines = sorted(json.dumps(r, sort_keys=True) for r in rows)
-    h = hashlib.sha256("\n".join(lines).encode()).hexdigest()[:16]
-    if "boolean" in resp:
-        h = str(resp["boolean"])
-    return h, len(rows)
+    if not isinstance(resp, dict) or "error" in resp:
+        raise ValueError("native answer is an error or not an object")
+    kind = resp.get("queryType")
+    if not isinstance(kind, str) or kind not in QUERY_KINDS:
+        raise ValueError(f"unsupported native query kind: {kind!r}")
+    schema = []
+    if kind == "SELECT":
+        schema, values = resp.get("vars"), resp.get("rows")
+        if not isinstance(schema, list) or any(not isinstance(v, str) for v in schema) or len(set(schema)) != len(schema):
+            raise ValueError("invalid SELECT schema")
+        if not isinstance(values, list) or any(not isinstance(row, list) or len(row) != len(schema) for row in values):
+            raise ValueError("invalid SELECT rows")
+        _complete(resp, len(values))
+        order = sorted(range(len(schema)), key=lambda i: schema[i])
+        rows = [tuple(_term(row[i]) for i in order) for row in values]
+        schema = sorted(schema)
+    elif kind == "ASK":
+        if type(resp.get("boolean")) is not bool:
+            raise ValueError("ASK answer requires a boolean")
+        _complete(resp, 1)
+        rows = [(("boolean", str(resp["boolean"])),)]
+    else:
+        if "triples" not in resp and "quads" not in resp:
+            raise ValueError("native graph answer lacks triples or quads")
+        triples, quads = resp.get("triples", []), resp.get("quads", [])
+        if not isinstance(triples, list) or not isinstance(quads, list):
+            raise ValueError("invalid graph arrays")
+        _complete(resp, len(triples) + len(quads))
+        rows = set()
+        for width, values in ((3, triples), (4, quads)):
+            for row in values:
+                if not isinstance(row, list) or len(row) != width:
+                    raise ValueError("invalid graph row width")
+                triple = tuple(_term(term, position) for term, position in zip(row[:3], ("subject", "predicate", "object")))
+                graph = ("default",) if width == 3 or row[3] is None else _term(row[3], "graph")
+                rows.add(triple + (graph,))
+    canonical = _canonical(rows)
+    payload = json.dumps([kind, schema, canonical], ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest(), len(rows)
 
 
 def run(a):
+    if a.runs < 1:
+        raise ValueError("--runs must be positive")
     env = dict(os.environ)
     if a.disable:
         env["SPARKLES_DISABLE_OPTIMIZATIONS"] = a.disable
@@ -139,6 +249,9 @@ def run(a):
         if a.only:
             keep = set(a.only.split())
             names = [n for n in names if n.stem in keep]
+        if not names:
+            raise ValueError("no query files selected")
+        errors = 0
         with open(a.out, "w") as out:
             for q in names:
                 text = q.read_text()
@@ -154,9 +267,12 @@ def run(a):
                     rec["execMs"] = timing.get("execMs")
                     rec["planMs"] = timing.get("planMs")
                     rec["wall"] = wall
-                    rec["digest"], rec["rows"] = digest(resp)
                     rec["nodes"] = walk(plan) if plan else []
+                    rec["digest"], rec["rows"] = digest(resp)
+                    rec["digestFormat"] = DIGEST_FORMAT
+                    rec["queryType"] = resp["queryType"]
                 except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+                    errors += 1
                     rec["error"] = str(e)[:300]
                 out.write(json.dumps(rec) + "\n")
                 out.flush()
@@ -167,7 +283,11 @@ def run(a):
             srv.wait(timeout=60)
         except subprocess.TimeoutExpired:
             srv.kill()
+            srv.wait()
+        log.close()
         subprocess.run(["rm", "-rf", str(data)], check=False)
+    if errors:
+        sys.exit(f"{errors} queries failed execution or answer validation; see {a.out}")
 
 
 def qerr(n):
@@ -183,7 +303,24 @@ def is_join(n):
 
 
 def load(f):
-    return {r["query"]: r for r in map(json.loads, open(f)) if r}
+    with open(f) as source:
+        records = {r["query"]: r for r in map(json.loads, source) if r}
+    for record in records.values():
+        version = record.get("digestFormat")
+        if version is not None and (type(version) is not int or version != DIGEST_FORMAT):
+            raise ValueError(f"{f}: unsupported answer fingerprint format {record['digestFormat']!r}")
+    return records
+
+
+def answers_equal(base, candidate):
+    for record in (base, candidate):
+        if type(record.get("digestFormat")) is not int or record["digestFormat"] != DIGEST_FORMAT or "error" in record:
+            return None
+        if not isinstance(record.get("queryType"), str) or record["queryType"] not in QUERY_KINDS or type(record.get("rows")) is not int or record["rows"] < 0:
+            return None
+        if not isinstance(record.get("digest"), str) or not re.fullmatch(r"[0-9a-f]{64}", record["digest"]):
+            return None
+    return all(base.get(key) == candidate.get(key) for key in ("queryType", "rows", "digest"))
 
 
 def dist(vals):
@@ -234,7 +371,8 @@ def compare(a):
         if mb is None:
             mb, gb = per_query(rb, False)
             mc, gc = per_query(rc, False)
-        same = "same" if rb.get("digest") == rc.get("digest") else "DIFFER"
+        equal = answers_equal(rb, rc)
+        same = "unverified (legacy or missing fingerprint)" if equal is None else "same" if equal else "DIFFER"
         if "error" in rb or "error" in rc:
             same = f"error {rb.get('error', '')[:40]} / {rc.get('error', '')[:40]}"
         fmt = lambda x: "-" if x is None else f"{x:.2f}"
@@ -291,7 +429,10 @@ def main():
     c.add_argument("cand")
     c.add_argument("--md")
     a = p.parse_args()
-    {"run": run, "summary": summary, "compare": compare}[a.cmd](a)
+    try:
+        {"run": run, "summary": summary, "compare": compare}[a.cmd](a)
+    except ValueError as error:
+        p.error(str(error))
 
 
 if __name__ == "__main__":
