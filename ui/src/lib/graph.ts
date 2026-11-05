@@ -1,15 +1,9 @@
 import type { Term } from './api';
+import { iriForm } from './iri-form.svelte';
+import { preferredLabel, type Label } from './rendering';
 import type { GEdge, GNode } from './components/GraphView.svelte';
 import type { Mark } from './rowdiff';
-import {
-  displayIri,
-  literalText,
-  localName,
-  RDF_TYPE,
-  RDFS_LABEL,
-  termKey,
-  type PrefixMap,
-} from './rdf';
+import { displayEntity, literalText, RDF_TYPE, RDFS_LABEL, termKey, type PrefixMap } from './rdf';
 
 export type Triple = [Term, Term, Term];
 
@@ -35,8 +29,7 @@ export function nodeLabel(t: Term, prefixes: PrefixMap): string {
 
 export function shortLabel(iri: string, prefixes: PrefixMap): string {
   if (iri.startsWith('urn:var:')) return '?' + iri.slice(8);
-  const d = displayIri(iri, prefixes);
-  return d === iri ? localName(iri) : d;
+  return displayEntity(iri, prefixes);
 }
 
 export function kindOf(t: Term): GNode['kind'] {
@@ -55,11 +48,20 @@ export function triplesToGraph(
 ): GraphBuild {
   const max = opts.maxNodes ?? 500;
   const labels = new Map<string, string>();
+  const candidates = new Map<string, Label[]>();
   for (const [s, p, o] of triples) {
     if (p.type === 'uri' && LABEL_PREDICATES.has(p.value) && o.type === 'literal') {
       const k = termKey(s);
-      if (!labels.has(k) || p.value === RDFS_LABEL) labels.set(k, o.value);
+      const all = candidates.get(k) ?? [];
+      const label = { '@value': o.value, '@language': o['xml:lang'] };
+      if (p.value === RDFS_LABEL) all.unshift(label);
+      else all.push(label);
+      candidates.set(k, all);
     }
+  }
+  for (const [id, all] of candidates) {
+    const label = preferredLabel(all, iriForm.languages);
+    if (label) labels.set(id, label);
   }
   const nodes = new Map<string, GNode>();
   const edges: GEdge[] = [];
@@ -73,6 +75,10 @@ export function triplesToGraph(
     c[m === 'added' ? 'added' : m === 'removed' ? 'removed' : 'kept']++;
     seen.set(id, c);
   };
+  const caption = (t: Term, id: string): string =>
+    t.type === 'uri'
+      ? displayEntity(t.value, prefixes, candidates.get(id))
+      : (labels.get(id) ?? nodeLabel(t, prefixes));
 
   const ensure = (t: Term, id: string): boolean => {
     seenNodeIds.add(id);
@@ -83,7 +89,7 @@ export function triplesToGraph(
     }
     nodes.set(id, {
       id,
-      label: labels.get(id) ?? nodeLabel(t, prefixes),
+      label: caption(t, id),
       kind: kindOf(t),
       title: t.type === 'uri' ? t.value : t.value.toString(),
       term: t,
@@ -99,8 +105,8 @@ export function triplesToGraph(
       (opts.hideLiterals ||
         (p.type === 'uri' && LABEL_PREDICATES.has(p.value) && labels.has(termKey(s))))
     ) {
-      // Label literals are already shown as the node label.
-      if (opts.hideLiterals || labels.get(termKey(s)) === o.value) {
+      // A label statement is redundant only when the caption actually displays it.
+      if (opts.hideLiterals || caption(s, termKey(s)) === o.value) {
         ensure(s, termKey(s));
         count(termKey(s), opts.marks?.[i]);
         return;

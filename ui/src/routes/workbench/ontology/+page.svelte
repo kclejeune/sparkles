@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { iriForm } from '$lib/iri-form.svelte';
   // The ontology editor (docs/specs/U12-ontology-workbench/SPEC.md, "Ontology editor UI"):
   // the class, property and individual trees of a graph's ontology, an entity's frame and
   // its usage, the header, and the inferred class tree beside the asserted one. Every edit
@@ -178,6 +179,10 @@
   let bigKinds = $state<Set<EntityKind>>(new Set());
   /** The labels the views know. A name read since the page opened is added in place. */
   const labels = new SvelteMap<string, Lit[]>();
+  /** All languages in the selected graph; hierarchy reads also include imported graphs. */
+  const graphLabels = new Map<string, Lit[]>();
+  /** The current language's authoritative hierarchy names, including imported labels. */
+  const hierarchyNames = new Set<string>();
   let typeAxioms = $state<AxiomItem[]>([]);
   let truncated = $state(false);
   /** Whether the individuals and their types are read for the Individuals tree. */
@@ -210,12 +215,15 @@
   let frameSeq = 0;
   let classifySeq = 0;
 
-  const langs = typeof navigator === 'undefined' ? ['en'] : [...(navigator.languages ?? []), 'en'];
+  const langs = $derived(iriForm.languages);
   /** The name of `iri` as a tree draws it: the tree's own levels carry the labels. */
   const treeName = (iri: string) => entityName(iri, labels, prefixes, langs);
-  /** Add the labels in `more` that the views do not have yet. */
+  /** A local batch never replaces the hierarchy's choice over its wider import scope. */
   function addLabels(more: Map<string, Lit[]>) {
-    for (const [s, l] of more) if (!labels.get(s)?.length) labels.set(s, l);
+    for (const [s, l] of more) {
+      graphLabels.set(s, l);
+      if (!hierarchyNames.has(s)) labels.set(s, l);
+    }
   }
   const batch = new LabelBatch(
     (iris) => ontologyLabelsFor(target, sel, iris),
@@ -223,13 +231,15 @@
   );
   /** The name of `iri`, reading its label when the views name it for the first time. */
   const nameOf = (iri: string) => {
-    if (!labels.get(iri)?.length) batch.want(iri);
+    if (iriForm.mode === 'label' && !labels.get(iri)?.length) batch.want(iri);
     return treeName(iri);
   };
   /** The short forms the hierarchy route gives, such as GO:0008150, as the browse pages show them. */
   let shortForms = $state<Map<string, string>>(new Map());
   const subOf = (iri: string) =>
-    labels.get(iri)?.length ? (shortForms.get(iri) ?? iriName(iri, prefixes)) : null;
+    iriForm.mode === 'label' && labels.get(iri)?.length
+      ? (shortForms.get(iri) ?? iriName(iri, prefixes))
+      : null;
 
   async function loadAll() {
     const t = target;
@@ -260,6 +270,8 @@
   function resetLazy() {
     batch.reset();
     labels.clear();
+    graphLabels.clear();
+    hierarchyNames.clear();
     entities = new Map();
     listed = new Set();
     bigKinds = new Set();
@@ -421,15 +433,21 @@
   };
   /** The labels the hierarchy answers carry, merged into the page's labels. */
   function takeNames(nodes: TreeNode[]) {
-    const more = new Map<string, Lit[]>();
-    for (const n of nodes)
-      if (n.label && !labels.get(n.iri)?.length)
-        more.set(n.iri, [
+    for (const n of nodes) {
+      if (n.label?.trim()) {
+        hierarchyNames.add(n.iri);
+        labels.set(n.iri, [
           { '@value': n.label, ...(n.labelLang ? { '@language': n.labelLang } : {}) },
         ]);
-    if (more.size) addLabels(more);
-    // a node the route gives no label has none to read
-    batch.know(nodes.filter((n) => !n.label).map((n) => n.iri));
+      } else {
+        hierarchyNames.delete(n.iri);
+        labels.set(n.iri, graphLabels.get(n.iri) ?? []);
+        // A blank literal can rank ahead of usable literals in the server's choice.
+        if (n.label != null && !graphLabels.has(n.iri)) batch.want(n.iri);
+      }
+    }
+    // A missing label is known absent; a blank literal may have usable alternatives.
+    batch.know(nodes.filter((n) => n.label == null).map((n) => n.iri));
     const forms = nodes.filter((n) => n.shortForm && !shortForms.has(n.iri));
     if (forms.length)
       shortForms = new Map([...shortForms, ...forms.map((n) => [n.iri, n.shortForm!] as const)]);
@@ -460,12 +478,25 @@
   // The tree reads at once, without waiting for the summary, which on a large ontology takes
   // longer than the first level. A later commit reads the levels again.
   let levelScope = '';
+  let levelContext = '';
   let levelCommit: number | null = null;
   $effect(() => {
-    const scope = `${target}\u0000${graph ?? ''}`;
+    const context = `${target}\u0000${graph ?? ''}`;
+    const scope = `${context}\u0000${langs.join(',')}`;
     const commit = summary?.commit ?? null;
     untrack(() => {
       if (scope !== levelScope) {
+        batch.reset();
+        hierarchyNames.clear();
+        labels.clear();
+        if (context !== levelContext) {
+          graphLabels.clear();
+        } else {
+          for (const [s, l] of graphLabels) labels.set(s, l);
+          batch.know(graphLabels.keys());
+        }
+        levelContext = context;
+        for (const lt of levelTrees.values()) lt.drop();
         levelScope = scope;
         levelCommit = commit;
         levelEpoch++;
@@ -503,7 +534,7 @@
     // the scope is read here, where the effect tracks it, not in the timer below
     const scopeTarget = target;
     const scopeGraph = graph;
-    const scope = `${scopeTarget}\u0000${scopeGraph ?? ''}`;
+    const scope = `${scopeTarget}\u0000${scopeGraph ?? ''}\u0000${langs.join(',')}`;
     if (scope !== filteredIn) {
       // another dataset, branch or graph must not keep showing the last scope's hits
       filteredIn = scope;
@@ -1136,11 +1167,7 @@
     ),
   );
   const headerTitle = $derived(
-    summary?.header.iri
-      ? labels.get(summary.header.iri)?.length
-        ? nameOf(summary.header.iri)
-        : summary.header.iri
-      : 'Anonymous ontology',
+    summary?.header.iri ? nameOf(summary.header.iri) : 'Anonymous ontology',
   );
   // the ontology's own label is the one name the head asks for, once the summary is in
   $effect(() => {

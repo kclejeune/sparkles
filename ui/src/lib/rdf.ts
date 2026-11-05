@@ -1,5 +1,6 @@
 import type { Term } from './api';
 import { iriForm } from './iri-form.svelte';
+import { preferredLabel, type Label } from './rendering';
 
 export const WELL_KNOWN: Record<string, string> = {
   rdf: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
@@ -72,18 +73,37 @@ export function displayIri(iri: string, prefixes: PrefixMap): string {
   return shorten(iri, prefixes) ?? iri;
 }
 
+/** A viewer's entity name, falling back to a prefixed name and then the complete IRI. */
+export function displayEntity(
+  iri: string,
+  prefixes: PrefixMap,
+  labels?: readonly Label[],
+  langs: readonly string[] = iriForm.languages,
+): string {
+  if (iriForm.mode === 'iri') return iri;
+  if (iriForm.mode === 'label') {
+    const label = preferredLabel(labels, langs);
+    if (label) return label;
+  }
+  return shorten(iri, prefixes) ?? iri;
+}
+
 /** Compact, human display of any term. */
-export function displayTerm(t: Term | null | undefined, prefixes: PrefixMap): string {
+export function displayTerm(
+  t: Term | null | undefined,
+  prefixes: PrefixMap,
+  entity?: (iri: string) => string,
+): string {
   if (!t) return '';
   switch (t.type) {
     case 'uri':
-      return displayIri(t.value, prefixes);
+      return entity?.(t.value) ?? displayIri(t.value, prefixes);
     case 'bnode':
       return `_:${t.value}`;
     case 'literal':
       return literalText(t);
     case 'triple':
-      return `<< ${displayTerm(t.value.subject, prefixes)} ${displayTerm(t.value.predicate, prefixes)} ${displayTerm(t.value.object, prefixes)} >>`;
+      return `<< ${displayTerm(t.value.subject, prefixes, entity)} ${displayTerm(t.value.predicate, prefixes, entity)} ${displayTerm(t.value.object, prefixes, entity)} >>`;
   }
 }
 

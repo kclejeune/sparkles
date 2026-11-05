@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { displayName } from '$lib/browse';
+  import { iriForm } from '$lib/iri-form.svelte';
   // The Axioms card of an entity's page (ROADMAP item 633): its asserted frame in Manchester
   // syntax, one clause per keyword (SubClassOf, EquivalentTo, Domain, Characteristics and the
   // rest) with every name a link, axioms of a form the syntax has no clause for in
@@ -63,8 +65,9 @@
     answer ? inferredOf(iri, groups, answer.class, answer.complete, answer.reused) : null,
   );
   let names = $state(new Map<string, string>());
-  const langs: readonly string[] = typeof navigator === 'undefined' ? [] : [...navigator.languages];
-  const nameOf = (i: string) => names.get(i) ?? linker.name(i);
+  const langs = $derived(iriForm.languages);
+  const nameOf = (i: string) =>
+    names.has(i) ? displayName(i, { [i]: { label: names.get(i)! } }, prefixes) : linker.name(i);
   let missing = $state(false);
   let loading = $state(false);
   let failure = $state<string | null>(null);

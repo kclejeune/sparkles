@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { displayName } from '$lib/browse';
+  import { WELL_KNOWN, type PrefixMap } from '$lib/rdf';
   // The hierarchy around an entity as a lineage spine: its ancestors from a root down one
   // line without indentation, the entity on the line with its other direct parents named
   // under it, its children branching off, and its siblings folded into one row that opens a
@@ -19,6 +21,7 @@
 
   let {
     target,
+    prefixes = WELL_KNOWN,
     sel,
     kind,
     iri,
@@ -28,6 +31,7 @@
     langs = [],
     page = 50,
   }: {
+    prefixes?: PrefixMap;
     target: string;
     sel: BrowseSelection;
     kind: TreeKind;
@@ -108,7 +112,7 @@
     if (siblingsOpen && parent && !levels[parent.iri]) void load(parent.iri);
   }
 
-  const nodeName = (n: TreeNode) => n.label ?? n.shortForm ?? n.iri;
+  const nodeName = (n: TreeNode) => displayName(n.iri, { [n.iri]: n }, prefixes);
 </script>
 
 {#snippet rows(of: string, skip: string | null, path: string[])}

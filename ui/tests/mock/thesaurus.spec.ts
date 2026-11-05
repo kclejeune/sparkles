@@ -344,7 +344,7 @@ test('the forms are read-only for a caller whose grants cover some graphs', asyn
   const details = page.getByRole('region', { name: 'Details' });
   await expect(details.getByRole('status')).toContainText('covers only some graphs');
   // the page's own edits stay, scoped to its graph by their updates
-  await expect(page.getByRole('button', { name: /^Labels/ })).toBeVisible();
+  await expect(page.locator('main').getByRole('button', { name: /^Labels/ })).toBeVisible();
 });
 
 test('under auth the forms are read-only on a branch whose grants the page cannot read', async ({

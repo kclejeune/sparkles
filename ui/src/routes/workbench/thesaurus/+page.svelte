@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { iriForm } from '$lib/iri-form.svelte';
+  import { displayEntity } from '$lib/rdf';
   // The thesaurus editor (docs/specs/U12-ontology-workbench/SPEC.md, "SKOS and SKOS-XL
   // thesaurus editor"): the concept schemes, concepts and collections of one graph, with the
   // concept tree of a scheme read one level at a time, label search in any language, the
@@ -48,7 +50,6 @@
     createTypedEdit,
     deleteEdit,
     detailsQuery,
-    displayLabel,
     isCollection,
     isConcept,
     isScheme,
@@ -137,8 +138,7 @@
       : null,
   );
   useAskTarget(() => ({ branch }));
-  const browserLangs =
-    typeof navigator === 'undefined' ? ['en'] : [...(navigator.languages ?? []), 'en'];
+  const browserLangs = $derived(iriForm.languages);
   const langs = $derived(displayLang ? [displayLang, ...browserLangs] : browserLangs);
 
   function withParams(over: Record<string, string | null>) {
@@ -185,8 +185,15 @@
     schemeParam === '*' ? null : (schemeParam ?? (schemes.length ? schemes[0] : null)),
   );
 
-  const nameOf = (iri: string) => displayLabel(labels.get(iri), langs) ?? iriName(iri, prefixes);
-  const subOf = (iri: string) => (labels.get(iri)?.length ? iriName(iri, prefixes) : null);
+  const nameOf = (iri: string) =>
+    displayEntity(
+      iri,
+      prefixes,
+      labels.get(iri)?.map((l) => ({ '@value': l.value, '@language': l.lang })),
+      langs,
+    );
+  const subOf = (iri: string) =>
+    iriForm.mode === 'label' && labels.get(iri)?.length ? iriName(iri, prefixes) : null;
 
   const select = (sparql: string) => api.select(target, sparql, { nocache: true });
 
@@ -982,7 +989,7 @@
           onchange={(e) => nav({ lang: e.currentTarget.value || null })}
           aria-label="Label language"
         >
-          <option value="">the browser's language</option>
+          <option value="">the rendering preferences</option>
           {#each languages as l (l)}<option value={l}>{l}</option>{/each}
         </select>
       </label>

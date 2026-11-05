@@ -707,6 +707,43 @@ describe('the graph view', () => {
     expect(m.nodes.some((n) => n.id === EX + 'Cell')).toBe(true);
     expect(m.edges.some((e) => e.id === 'e')).toBe(true);
   });
+
+  it('keeps raw names from expanded pieces through compact hierarchy filtering', async () => {
+    const { iriForm } = await import('./iri-form.svelte');
+    const a = neighbourhood(t, { ex: EX });
+    const b = neighbourhood(
+      {
+        ...t,
+        iri: EX + 'Cyto',
+        label: 'cytoplasm',
+        incoming: [
+          { property: RDFS + 'subClassOf', count: 1, more: false, subjects: [EX + 'Cell'] },
+        ],
+        names: {
+          [EX + 'Cell']: {
+            label: 'cell',
+            labelLang: 'en',
+            shortForm: 'ex:Cell',
+            kinds: ['class'],
+            deprecated: false,
+          },
+        },
+      },
+      { ex: EX },
+    );
+    const merged = mergePieces(a, b);
+    try {
+      iriForm.update('label', ['en']);
+      expect(displayName(EX + 'Cell', merged.names, { ex: EX })).toBe('cell');
+      expect(hierarchyOf(merged).names).toEqual(merged.names);
+      iriForm.update('prefixed', ['en']);
+      expect(displayName(EX + 'Cell', merged.names, { ex: EX })).toBe('ex:Cell');
+      iriForm.update('iri', ['en']);
+      expect(displayName(EX + 'Cell', merged.names, { ex: EX })).toBe(EX + 'Cell');
+    } finally {
+      iriForm.update('label', []);
+    }
+  });
 });
 
 describe('links', () => {
@@ -726,10 +763,10 @@ describe('links', () => {
     );
   });
 
-  it('names an IRI by its label, short form or prefixed name, and knows the built-in vocabularies', () => {
+  it('names an IRI by its label, prefixed name or full IRI, and knows the built-in vocabularies', () => {
     const names = { [EX + 'a']: { label: 'Alpha' }, [EX + 'b']: { label: null, shortForm: 'B:1' } };
     expect(displayName(EX + 'a', names, {})).toBe('Alpha');
-    expect(displayName(EX + 'b', names, {})).toBe('B:1');
+    expect(displayName(EX + 'b', names, {})).toBe(EX + 'b');
     expect(displayName(EX + 'c', names, { ex: EX })).toBe('ex:c');
     expect(builtIn(OWL + 'Thing')).toBe(true);
     expect(builtIn(RDF + 'type')).toBe(true);

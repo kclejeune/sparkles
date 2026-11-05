@@ -3781,6 +3781,8 @@
             {:else if serverTable}
               {#if serverTable.rows.length}
                 <ResultTable
+                  target={onBranch(outcome.ds, outcome.branch)}
+                  at={resultState(r) ?? undefined}
                   vars={serverTable.vars}
                   rows={serverTable.rows}
                   marks={serverTable.marks}
@@ -3793,6 +3795,8 @@
             {:else if r.triples}
               {#if (shownDiff ? shownDiff.rows : r.triples).length}
                 <ResultTable
+                  target={onBranch(outcome.ds, outcome.branch)}
+                  at={resultState(r) ?? undefined}
                   vars={['subject', 'predicate', 'object']}
                   rows={shownDiff ? shownDiff.rows : r.triples}
                   marks={shownDiff?.marks}
@@ -3806,6 +3810,8 @@
               {/if}
             {:else if (shownDiff ? shownDiff.rows.length : r.rows?.length) ?? 0}
               <ResultTable
+                target={onBranch(outcome.ds, outcome.branch)}
+                at={resultState(r) ?? undefined}
                 vars={r.vars ?? []}
                 rows={shownDiff ? shownDiff.rows : (r.rows ?? [])}
                 marks={shownDiff?.marks}

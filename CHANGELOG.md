@@ -24,6 +24,12 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+The UI shares rendering preferences across the ontology and thesaurus editors, browser
+and query results. Viewers choose labels, prefixed names or complete IRIs and an ordered
+language list, saved in the browser. Query tables batch label lookups for visible rows
+at the result's branch and commit. Missing labels and failed lookups keep a prefixed
+name or the complete IRI visible, and copying keeps the original RDF term.
+
 The disjunctive classification rules can count, and `Limits::counting` turns it on. It is
 off by default, because counting finishes on no real ontology of the ORE 2015 DL
 development set and only delays the answer, so a default run leaves those axioms out and
@@ -1632,6 +1638,11 @@ closing triple syntax in their lexical value, which caused matching recorded cha
 to be missed. The dependency refresh ports the vendored spargebra patches to 0.4.8,
 requires oxrdf 0.3.5 and oxsdatatypes 0.2.4 across all binding graphs, and makes zero
 times the smallest fractional decimal return zero consistently.
+
+Rendering preference changes preserve unsubmitted Browse edits, retain individual and
+expanded graph labels, and update open scheme pickers without losing their selection.
+Equal-language labels follow the browser API's lexical ordering. Graph results retain
+label statements when their values are not displayed in node captions.
 
 A partial answer of the disjunctive rules no longer reports a class complete when the
 run stopped before it made that class's context. The class's answer then held only

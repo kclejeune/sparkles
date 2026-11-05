@@ -5,7 +5,16 @@
 // entities and the SPARQL of a rename and of header edits.
 import { ApiError, receiptOf, request, type Receipt } from './api';
 import { splitTarget } from './branches';
-import { localName, shorten, sparqlIri, sparqlString, WELL_KNOWN, type PrefixMap } from './rdf';
+import {
+  displayEntity,
+  localName,
+  shorten,
+  sparqlIri,
+  sparqlString,
+  WELL_KNOWN,
+  type PrefixMap,
+} from './rdf';
+import { lexicalCompare, preferredLabel } from './rendering';
 import type { WritePreview } from './validation-overlay';
 
 const enc = encodeURIComponent;
@@ -255,15 +264,20 @@ type SparqlBinding = Record<string, { type: string; value: string; 'xml:lang'?: 
 /** The labels of SPARQL JSON result rows of `labelsQuery`, `rdfs:label` first. */
 export function labelsOfBindings(rows: SparqlBinding[]): Map<string, Lit[]> {
   const out = new Map<string, Lit[]>();
-  for (const r of rows) {
+  const ordered = [...rows].sort(
+    (a, b) =>
+      Number(a.p?.value !== RDFS_LABEL) - Number(b.p?.value !== RDFS_LABEL) ||
+      lexicalCompare(a.l?.value ?? '', b.l?.value ?? '') ||
+      lexicalCompare(a.l?.['xml:lang'] ?? '', b.l?.['xml:lang'] ?? ''),
+  );
+  for (const r of ordered) {
     const s = r.s?.value;
     const l = r.l;
     if (!s || !l) continue;
     const lit: Lit = { '@value': l.value };
     if (l['xml:lang']) lit['@language'] = l['xml:lang'];
     const list = out.get(s) ?? [];
-    if (r.p?.value === RDFS_LABEL) list.unshift(lit);
-    else list.push(lit);
+    list.push(lit);
     out.set(s, list);
   }
   return out;
@@ -750,19 +764,7 @@ export function pickLabel(
   lits: Lit[] | undefined,
   langs: readonly string[] = ['en'],
 ): string | null {
-  if (!lits?.length) return null;
-  const lower = (s?: string) => (s ?? '').toLowerCase();
-  for (const want of langs.map(lower)) {
-    const hit =
-      lits.find((l) => lower(l['@language']) === want) ??
-      lits.find((l) => lower(l['@language']).split('-')[0] === want.split('-')[0]);
-    if (hit) return hit['@value'];
-  }
-  return (
-    lits.find((l) => !l['@language'])?.['@value'] ??
-    lits.find((l) => lower(l['@language']).startsWith('en'))?.['@value'] ??
-    lits[0]['@value']
-  );
+  return preferredLabel(lits, langs);
 }
 
 /** A short name for an IRI without a label: a prefixed name or the local name. */
@@ -777,7 +779,7 @@ export function entityName(
   prefixes: PrefixMap,
   langs?: readonly string[],
 ): string {
-  return pickLabel(labels.get(iri), langs) ?? iriName(iri, prefixes);
+  return displayEntity(iri, prefixes, labels.get(iri), langs);
 }
 
 // --- trees ---------------------------------------------------------------------------
@@ -1216,7 +1218,8 @@ export const MANCHESTER_KEYWORDS = [
  * that starts as an anonymous individual are quoted. A colon is left bare, since a
  * prefixed name holds one.
  */
-export function manchesterName(s: string): string {
+export function manchesterName(s: string, iri?: string): string {
+  if (iri && s === iri) return sparqlIri(iri);
   // a full IRI in angle brackets is a name as it is
   if (/^<[^\s<>]*>$/.test(s)) return s;
   const bare =
@@ -1259,7 +1262,8 @@ export function manchesterTokens(
   const kw = (text: string) => out.push({ text, role: 'kw' });
   const sp = () => out.push({ text: ' ', role: 'space' });
   const punct = (text: string) => out.push({ text, role: 'punct' });
-  const name = (iri: string) => out.push({ text: manchesterName(rawName(iri)), role: 'name', iri });
+  const name = (iri: string) =>
+    out.push({ text: manchesterName(rawName(iri), iri), role: 'name', iri });
   const m = (v: unknown) => out.push(...manchesterTokens(v, rawName, prefixes, true));
   const wrap = (body: () => void) => {
     if (nested) punct('(');

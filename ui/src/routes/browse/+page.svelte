@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { iriForm } from '$lib/iri-form.svelte';
   // The ontology browser (docs/specs/U12-ontology-workbench/SPEC.md, "Ontology browser"):
   // a read-only page for each entity of a dataset's ontologies and thesauri, and a landing
   // page for the ontology of a graph. An entity's page reads the term route and one level
@@ -153,7 +154,7 @@
   const view = $derived(q.get('view') === 'graph' && !wantEdit ? 'graph' : 'tree');
   const sel = $derived<BrowseSelection>({ graph, at });
   const prefixes = $derived(app.prefixes(name));
-  const langs: readonly string[] = typeof navigator === 'undefined' ? [] : [...navigator.languages];
+  const langs = $derived(iriForm.languages);
 
   $effect(() => {
     if (name && name !== app.current && app.datasets.some((d) => d.name === name))
@@ -182,19 +183,34 @@
 
   // the page reads again when the target, graph, state or entity change, and not when
   // only the view or edit mode does
+  let termScope = '';
   $effect(() => {
     const t = target;
     const g = graph;
     const a = at;
+    void langs;
     const i = iri;
     if (!t || !i) return;
     const ctl = new AbortController();
-    untrack(() => void loadTerm(t, { graph: g, at: a }, i, ctl.signal));
+    untrack(() => {
+      const scope = JSON.stringify([t, g, a, i]);
+      const keepForms = scope === termScope;
+      termScope = scope;
+      void loadTerm(t, { graph: g, at: a }, i, ctl.signal, keepForms);
+    });
     return () => ctl.abort();
   });
 
-  async function loadTerm(t: string, s: BrowseSelection, i: string, signal: AbortSignal) {
-    term = null;
+  async function loadTerm(
+    t: string,
+    s: BrowseSelection,
+    i: string,
+    signal: AbortSignal,
+    keepForms = false,
+  ) {
+    if (!keepForms) term = null;
+    // Invalidate expansions as soon as a new read starts, including language refreshes.
+    graphEpoch++;
     termError = null;
     tree = null;
     piece = null;
@@ -204,6 +220,10 @@
       got = await fetchTerm(t, s, i, {}, signal);
     } catch (e) {
       if (signal.aborted) return;
+      if (keepForms && term) {
+        toasts.error('Could not refresh the entity names', e);
+        return;
+      }
       termError = {
         status: e instanceof api.ApiError ? e.status : null,
         text: api.errorMessage(e),
@@ -214,7 +234,6 @@
     term = got;
     termTarget = t;
     piece = neighbourhood(got, prefixes);
-    graphEpoch++;
     const kind = treeKindOf(got.kinds);
     treeKind = kind;
     if (kind)
@@ -242,13 +261,15 @@
    */
   function lineagePiece(h: Hierarchy): GraphPiece {
     const nodes = new Map<string, { id: string; label: string }>();
+    const names: NonNullable<GraphPiece['names']> = {};
     const edges: GraphPiece['edges'] = [];
     const word =
       h.kind === 'concept' ? 'broader' : h.kind === 'class' ? 'subclass of' : 'subproperty of';
     const shown = (x: { iri: string; label: string | null; shortForm: string | null }) => {
+      names[x.iri] = x;
       nodes.set(x.iri, {
         id: x.iri,
-        label: x.label ?? x.shortForm ?? iriName(x.iri, prefixes),
+        label: displayName(x.iri, { [x.iri]: x }, prefixes),
       });
     };
     for (const [c, p] of h.ancestors?.edges ?? []) {
@@ -267,7 +288,7 @@
         hierarchy: true,
       });
     }
-    return { nodes: [...nodes.values()], edges };
+    return { nodes: [...nodes.values()], edges, names };
   }
 
   async function loadReuse(i: string, signal: AbortSignal) {
@@ -296,9 +317,11 @@
 
   async function expand(id: string) {
     if (!piece || builtIn(id)) return;
+    const generation = graphEpoch;
     try {
       const t = await fetchTerm(target, sel, id, { mentions: 50, incoming: 10 });
-      if (piece) piece = mergePieces(piece, neighbourhood(t, prefixes, 10));
+      if (piece && generation === graphEpoch)
+        piece = mergePieces(piece, neighbourhood(t, prefixes, 10));
     } catch {
       // a node the graphs do not describe has no neighbourhood to add
     }
@@ -320,10 +343,11 @@
     return rows.flatMap((r) => (r.s && r.s.type === 'uri' ? [r.s.value] : []));
   }
 
+  const graphNames = $derived({ ...term?.names, ...piece?.names });
   const linker = $derived<Linker>({
     href: (i) => (builtIn(i) ? null : hrefOf(i)),
-    name: (i) => (term && i === term.iri ? title : displayName(i, term?.names, prefixes)),
-    short: (i) => term?.names[i]?.shortForm ?? (term?.iri === i ? term.shortForm : null),
+    name: (i) => (term && i === term.iri ? title : displayName(i, graphNames, prefixes)),
+    short: (i) => graphNames[i]?.shortForm ?? (term?.iri === i ? term.shortForm : null),
   });
 
   /** A predicate the texts name links to its page when the ontology
@@ -382,7 +406,7 @@
     term && editorKindOf(term.kinds) === 'Class' ? logicalDefinitionOf(groups) : [],
   );
   const mentions = $derived(term ? mentionGroups(term.iri, term.mentions.axioms) : []);
-  const title = $derived(term ? (term.label ?? term.shortForm ?? iriName(term.iri, prefixes)) : '');
+  const title = $derived(term ? displayName(term.iri, { [term.iri]: term }, prefixes) : '');
   const kind = $derived(term ? kindWord(term.kinds) : '');
   // the term on screen is the context of a question asked from the Ask drawer
   useAskContext(() =>
@@ -832,7 +856,7 @@
           .map(([i]) => i)
       : [],
   );
-  const shortName = (i: string) => term?.names[i]?.label ?? iriName(i, prefixes);
+  const shortName = (i: string) => displayName(i, term?.names, prefixes);
   const parents = $derived(
     term && tree?.ancestors && treeKind && parentsEditable(treeKind)
       ? parentRows(treeKind, term.iri, tree.ancestors.edges, term.axioms, graph)
@@ -844,7 +868,7 @@
       const k = editorKindOf(n.kinds);
       if (!k) continue;
       const kind = KIND_SINGULAR[k];
-      const shown = n.label ?? n.shortForm ?? iriName(i, prefixes);
+      const shown = displayName(i, { [i]: n }, prefixes);
       out.push({ name: shown, iri: i, kind });
       const short = iriName(i, prefixes);
       if (short !== shown) out.push({ name: short, iri: i, kind });
@@ -1075,6 +1099,7 @@
     const t = target;
     const g = graph;
     const a = at;
+    void langs;
     if (!t || iri) return;
     const ctl = new AbortController();
     untrack(() => void loadLanding(t, { graph: g, at: a }, ctl.signal));
@@ -1203,7 +1228,11 @@
   const entityTotal = $derived(
     counts.filter((c) => c.kind !== 'deprecated').reduce((n, c) => n + c.count, 0),
   );
-  const landingTitle = $derived(head?.head.title ?? head?.head.iri ?? name);
+  const landingTitle = $derived(
+    head?.head.iri
+      ? displayName(head.head.iri, { [head.head.iri]: { label: head.head.title } }, prefixes)
+      : (head?.head.title ?? name),
+  );
   const pageTitle = $derived(iri ? (term ? title : 'Browse') : landingTitle);
 </script>
 
@@ -1807,6 +1836,8 @@
                 <div class="tree-body" id="tree-body" bind:this={treeBox}>
                   {#if tree}
                     <LineageTree
+                      {langs}
+                      {prefixes}
                       {target}
                       {sel}
                       kind={treeKind}
@@ -1888,6 +1919,7 @@
       <!-- the entity search reads a branch head, so a past state has no search box (item 658) -->
       {#if !at}
         <EntitySearchList
+          {prefixes}
           {target}
           {graph}
           href={(i) => hrefOf(i)}
@@ -1900,6 +1932,7 @@
       <div class="cols">
         {#if roots}
           <TopTerms
+            {prefixes}
             title={roots.kind === 'concept' ? 'Top concepts' : 'Top classes'}
             roots={rootItems}
             kind={roots.kind}
