@@ -2131,7 +2131,11 @@ fn encrypted_offline_zero_dataset_policy_provider_cancellation_is_reaped_and_red
     }
     let pidfile = h.join("provider-pid");
     let script = h.join("provider-script");
-    std::fs::write(&script, "echo $$ > \"$1\"\nexec sleep 30\n").unwrap();
+    std::fs::write(
+        &script,
+        "echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"\nexec sleep 30\n",
+    )
+    .unwrap();
     let (config, repo) = encrypted_policy_config(
         h,
         sparkles::backup::config::KeySource::Command {
