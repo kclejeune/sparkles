@@ -56,7 +56,7 @@ open(
     await expect(synonyms).toContainText('CELLO:plural');
     await expect(synonyms).toContainText('powerhouse of the cell');
 
-    const logic = page.getByRole('region', { name: 'Axioms' });
+    const logic = page.getByRole('region', { name: 'Axioms', exact: true });
     await expect(logic.getByRole('link', { name: 'membrane-bounded organelle' })).toBeVisible();
     await expect(logic.locator('[data-section="sub"]')).toContainText('part of some cytoplasm');
 
@@ -123,7 +123,7 @@ open('a property page shows its characteristics and inverse', async ({ page }) =
     `/ui/browse?ds=${DS}&iri=${encodeURIComponent('http://purl.obolibrary.org/obo/BFO_0000050')}`,
   );
   await expect(page.getByRole('heading', { level: 1, name: 'part of' })).toBeVisible();
-  const logic = page.getByRole('region', { name: 'Axioms' });
+  const logic = page.getByRole('region', { name: 'Axioms', exact: true });
   await expect(logic).toContainText('Transitive');
 });
 

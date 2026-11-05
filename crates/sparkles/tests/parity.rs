@@ -532,6 +532,14 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op_if!("ontology", "classifyOntology", "ontology.classify", |ds| {
             ds.ontology().classify(&any(), &any(), &any());
         }),
+        op_if!(
+            "ontology",
+            "keptClassification",
+            "ontology.kept_classification",
+            |ds| {
+                ds.ontology().kept_classification(&any(), &any(), &any());
+            }
+        ),
         op_if!("ontology", "parseManchester", "ontology.parse", |ds| {
             if let Ok(o) = ds.ontology().open(&any(), &any()) {
                 let _ = ds.ontology().parse_manchester(

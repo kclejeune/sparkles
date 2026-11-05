@@ -4580,6 +4580,438 @@
         ],
         "type": "object"
       },
+      "ClassificationExcluded": {
+        "properties": {
+          "axiom": {
+            "description": "An OWL axiom in the public structural JSON form.",
+            "type": "object"
+          },
+          "gap": {
+            "oneOf": [
+              {
+                "properties": {
+                  "kind": {
+                    "const": "omitted"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "rule": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "rule",
+                  "message"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "const": "partiallyUsed"
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "reason"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "ofn": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "ofn",
+          "axiom",
+          "gap"
+        ],
+        "type": "object"
+      },
+      "ClassificationName": {
+        "properties": {
+          "iri": {
+            "type": "string"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "labelLang": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "iri",
+          "label",
+          "labelLang"
+        ],
+        "type": "object"
+      },
+      "ClassificationOutcome": {
+        "properties": {
+          "complete": {
+            "type": "boolean"
+          },
+          "consistency": {
+            "enum": [
+              "consistent",
+              "inconsistent",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "excludedCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "incompleteCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "partial": {
+            "type": "boolean"
+          },
+          "tier": {
+            "enum": [
+              "el",
+              "horn",
+              "disjunctive"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "tier",
+          "partial",
+          "complete",
+          "consistency",
+          "excludedCount",
+          "incompleteCount"
+        ],
+        "type": "object"
+      },
+      "ClassificationParent": {
+        "properties": {
+          "equivalenceCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "iri": {
+            "type": "string"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "labelLang": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "iri",
+          "label",
+          "labelLang",
+          "equivalenceCount"
+        ],
+        "type": "object"
+      },
+      "ClassificationResult": {
+        "properties": {
+          "assertions": {
+            "type": "boolean"
+          },
+          "boundStoreId": {
+            "type": "string"
+          },
+          "capabilities": {
+            "items": {
+              "enum": [
+                "namedClassDirectParents",
+                "namedClassEquivalents",
+                "namedClassUnsatisfiability"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "classifiedCommit": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "contentFingerprint": {
+            "type": "string"
+          },
+          "elOnly": {
+            "type": "boolean"
+          },
+          "expansion": {
+            "enum": [
+              "cautious",
+              "eager"
+            ],
+            "type": "string"
+          },
+          "familyId": {
+            "type": "string"
+          },
+          "imports": {
+            "enum": [
+              "dataset",
+              "none"
+            ],
+            "type": "string"
+          },
+          "inputFingerprint": {
+            "type": "string"
+          },
+          "justifications": {
+            "const": "unavailable"
+          },
+          "mode": {
+            "enum": [
+              "lenient",
+              "strict"
+            ],
+            "type": "string"
+          },
+          "partialRequested": {
+            "type": "boolean"
+          },
+          "resultId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "sourceCounts": {
+            "properties": {
+              "imports": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "requestedGraphs": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "resolvedGraphs": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "warnings": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "requestedGraphs",
+              "resolvedGraphs",
+              "imports",
+              "warnings"
+            ],
+            "type": "object"
+          },
+          "sourceFingerprint": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "resultId",
+          "classifiedCommit",
+          "boundStoreId",
+          "familyId",
+          "inputFingerprint",
+          "sourceFingerprint",
+          "contentFingerprint",
+          "imports",
+          "mode",
+          "assertions",
+          "elOnly",
+          "partialRequested",
+          "expansion",
+          "sourceCounts",
+          "capabilities",
+          "justifications"
+        ],
+        "type": "object"
+      },
+      "ClassificationSourceIdentity": {
+        "properties": {
+          "boundStoreId": {
+            "type": "string"
+          },
+          "commit": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "contentFingerprint": {
+            "type": "string"
+          },
+          "familyId": {
+            "type": "string"
+          },
+          "inputFingerprint": {
+            "type": "string"
+          },
+          "producer": {
+            "properties": {
+              "assertions": {
+                "type": "boolean"
+              },
+              "elOnly": {
+                "type": "boolean"
+              },
+              "expansion": {
+                "enum": [
+                  "cautious",
+                  "eager"
+                ],
+                "type": "string"
+              },
+              "partialRequested": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "assertions",
+              "elOnly",
+              "partialRequested",
+              "expansion"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "boundStoreId",
+          "familyId",
+          "commit",
+          "inputFingerprint",
+          "contentFingerprint",
+          "producer"
+        ],
+        "type": "object"
+      },
+      "ClassificationSourceRow": {
+        "oneOf": [
+          {
+            "properties": {
+              "graph": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "requestedGraph"
+              },
+              "ordinal": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "ordinal",
+              "graph"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "graph": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "resolvedGraph"
+              },
+              "ordinal": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "requested": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "kind",
+              "ordinal",
+              "graph",
+              "requested"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "graph": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "iri": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "import"
+              },
+              "location": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ordinal": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "ordinal",
+              "iri",
+              "location",
+              "graph"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "warning"
+              },
+              "message": {
+                "type": "string"
+              },
+              "ordinal": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "ordinal",
+              "message"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "CloneRequest": {
         "properties": {
           "at": {
@@ -13371,6 +13803,201 @@
         },
         "type": "object"
       },
+      "KeptClassification": {
+        "properties": {
+          "activity": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "properties": {
+                  "commit": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "kind": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "commit"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "commit": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "entity": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "properties": {
+                  "iri": {
+                    "type": "string"
+                  },
+                  "present": {
+                    "type": "boolean"
+                  },
+                  "unsatisfiable": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "iri",
+                  "present",
+                  "unsatisfiable"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ClassificationOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "page": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "properties": {
+                  "about": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "items": {
+                    "items": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/ClassificationName"
+                        },
+                        {
+                          "$ref": "#/components/schemas/ClassificationParent"
+                        },
+                        {
+                          "$ref": "#/components/schemas/ClassificationSourceRow"
+                        },
+                        {
+                          "$ref": "#/components/schemas/ClassificationExcluded"
+                        }
+                      ]
+                    },
+                    "maxItems": 1000,
+                    "type": "array"
+                  },
+                  "limit": {
+                    "maximum": 1000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "nextOffset": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "offset": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "part": {
+                    "enum": [
+                      "status",
+                      "parents",
+                      "equivalents",
+                      "sources",
+                      "excluded"
+                    ],
+                    "type": "string"
+                  },
+                  "total": {
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "part",
+                  "about",
+                  "offset",
+                  "limit",
+                  "total",
+                  "items",
+                  "nextOffset"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ClassificationResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "staleCommit": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "enum": [
+              "available",
+              "running",
+              "mismatch",
+              "unavailable"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset",
+          "commit",
+          "status",
+          "reason",
+          "result",
+          "outcome",
+          "entity",
+          "activity",
+          "page",
+          "staleCommit"
+        ],
+        "type": "object"
+      },
       "Level": {
         "enum": [
           "read",
@@ -16932,6 +17559,187 @@
         },
         "required": [
           "error"
+        ],
+        "type": "object"
+      },
+      "OntologyFrameClassification": {
+        "properties": {
+          "classificationSource": {
+            "$ref": "#/components/schemas/ClassificationSourceIdentity"
+          },
+          "commit": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "frame": {
+            "properties": {
+              "equivalents": {
+                "properties": {
+                  "items": {
+                    "items": {
+                      "$ref": "#/components/schemas/ClassificationName"
+                    },
+                    "maxItems": 1000,
+                    "type": "array"
+                  },
+                  "limit": {
+                    "maximum": 1000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "truncated": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "total",
+                  "limit",
+                  "truncated",
+                  "items"
+                ],
+                "type": "object"
+              },
+              "excluded": {
+                "properties": {
+                  "items": {
+                    "items": {
+                      "$ref": "#/components/schemas/ClassificationExcluded"
+                    },
+                    "maxItems": 1000,
+                    "type": "array"
+                  },
+                  "limit": {
+                    "maximum": 1000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "truncated": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "total",
+                  "limit",
+                  "truncated",
+                  "items"
+                ],
+                "type": "object"
+              },
+              "iri": {
+                "type": "string"
+              },
+              "outcome": {
+                "$ref": "#/components/schemas/ClassificationOutcome"
+              },
+              "parents": {
+                "properties": {
+                  "items": {
+                    "items": {
+                      "$ref": "#/components/schemas/ClassificationParent"
+                    },
+                    "maxItems": 1000,
+                    "type": "array"
+                  },
+                  "limit": {
+                    "maximum": 1000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "truncated": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "total",
+                  "limit",
+                  "truncated",
+                  "items"
+                ],
+                "type": "object"
+              },
+              "result": {
+                "$ref": "#/components/schemas/ClassificationResult"
+              },
+              "retention": {
+                "properties": {
+                  "kept": {
+                    "type": "boolean"
+                  },
+                  "resultId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "kept",
+                  "resultId"
+                ],
+                "type": "object"
+              },
+              "sources": {
+                "properties": {
+                  "items": {
+                    "items": {
+                      "$ref": "#/components/schemas/ClassificationSourceRow"
+                    },
+                    "maxItems": 1000,
+                    "type": "array"
+                  },
+                  "total": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "truncated": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "total",
+                  "truncated",
+                  "items"
+                ],
+                "type": "object"
+              },
+              "unsatisfiable": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "iri",
+              "result",
+              "outcome",
+              "unsatisfiable",
+              "parents",
+              "equivalents",
+              "excluded",
+              "sources",
+              "retention"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dataset",
+          "commit",
+          "classificationSource",
+          "frame"
         ],
         "type": "object"
       },
@@ -37240,6 +38048,160 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/$/ontology/{ds}/classification": {
+      "get": {
+        "description": "Reads kept state only. A miss never maps or classifies an ontology, reserves classifier workers or writes. Status is available, running, mismatch or unavailable. Restricted graph/triple views and synthetic snapshots return unavailable without observing the shared slot. A kept result names its exact store/branch, source commit, input/content/source fingerprints and original producer options. Named-class direct parents, equivalents and unsatisfiability are available; property/individual entailments and justifications are not. Outcome distinguishes partial, exclusions and consistency. Nonzero offsets require resultId and at=commit:N. Replacement or eviction refuses a pin instead of switching results. Sources pages include every typed requested graph, resolved graph, import and warning row in digest order. Page output and name buffers are bounded; counts and ordering can scan retained vectors. Historical names use the pinned authorized snapshot and full IRI fallback. Every response is Cache-Control: no-store and bypasses commit-only conditional 304. Unknown selectors, duplicate singleton selectors, inferences (even false), computing options and invalid pins are refused.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "keptClassification",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "description": "The bounded portion to read, status by default.",
+            "in": "query",
+            "name": "part",
+            "schema": {
+              "enum": [
+                "status",
+                "parents",
+                "equivalents",
+                "sources",
+                "excluded"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "An absolute named-class IRI, required for parents/equivalents and optional for status.",
+            "in": "query",
+            "name": "about",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The immutable result to read, required for continuation.",
+            "in": "query",
+            "name": "resultId",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The first row, zero by default. Nonzero offsets require an exact commit and resultId.",
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "At most this many rows, 100 by default.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Comma-separated preferred label languages, otherwise Accept-Language.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The read deadline in milliseconds.",
+            "in": "query",
+            "name": "timeout",
+            "schema": {
+              "minimum": 0,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeptClassification"
+                }
+              }
+            },
+            "description": "Availability and an optional bounded page from one immutable result."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read an existing immutable classification",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/ontology/{ds}/classify": {
       "post": {
         "description": "Classifies the terminology with the OWL 2 EL classifier and answers whether it is consistent, the unsatisfiable classes, the axioms outside OWL 2 EL that the classification left out or used in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses and its equivalent classes, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. The dataset keeps the last classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what a run with the disjunctive rules proved before it stopped. The answer's `complete` is false for such a partial answer, `partial` is true, `incomplete` lists the classes whose superclasses it may miss and `consistency` is `consistent`, `inconsistent` or `unknown`. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.",
@@ -37396,6 +38358,23 @@
                   "imports": {
                     "type": "boolean"
                   },
+                  "lang": {
+                    "description": "Preferred labels for frame projection only.",
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "limit": {
                     "description": "The most nodes, unsatisfiable classes, incomplete classes and excluded axioms listed (100 by default).",
                     "maximum": 10000,
@@ -37426,6 +38405,17 @@
                     "description": "Answer what a run with the disjunctive rules proved when its deadline, cancellation or memory budget stops it, instead of failing. Runs of the other rules fail as before.",
                     "type": "boolean"
                   },
+                  "projection": {
+                    "description": "With frame, require about and return bounded direct-parent/equivalence/source/exclusion samples with exact source/outcome. Limit is at most 1,000. False nodes, zero/null offset and null target retain their defaults. Effective nodes, offset, target and OFN output are refused before computing. Ineligible results remain local and advertise no shared continuation. Missing/null projection retains legacy output.",
+                    "enum": [
+                      "frame",
+                      null
+                    ],
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
                   "target": {
                     "description": "A named graph outside the graphs read that takes the direct taxonomy.",
                     "type": "string"
@@ -37449,7 +38439,30 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "classes": {
+                          "type": "integer"
+                        },
+                        "complete": {
+                          "type": "boolean"
+                        },
+                        "consistent": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "consistent",
+                        "complete",
+                        "classes"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "$ref": "#/components/schemas/OntologyFrameClassification"
+                    }
+                  ]
                 }
               },
               "text/owl-functional": {
@@ -37503,7 +38516,7 @@
             "cloudflareAccess": []
           }
         ],
-        "summary": "Classify an OWL 2 EL ontology",
+        "summary": "Classify an ontology and optionally project a bounded class frame",
         "tags": [
           "Ontology"
         ],

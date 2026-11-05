@@ -18,6 +18,7 @@ uuid.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = { workspace = true, optional = true }
 tracing.workspace = true
 anyhow.workspace = true
 libc = "0.2"
@@ -70,7 +71,7 @@ failpoints = ["sparkles-core/failpoints"]
 # the reasoner's closure cache, and later its handle (RDFS on read needs no feature)
 reasoning = ["dep:sparkles-reasoner"]
 # the OWL 2 ontology of a dataset: `ds.ontology()` and `sparkles::owl` (spec F21)
-ontology = ["dep:sparkles-owl", "reasoning", "dep:levenshtein_automata", "dep:smallvec"]
+ontology = ["dep:sha2", "dep:sparkles-owl", "reasoning", "dep:levenshtein_automata", "dep:smallvec"]
 # SHACL write guards
 shacl = ["dep:sparkles-shacl"]
 # ShEx write guards

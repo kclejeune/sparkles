@@ -145,6 +145,7 @@ fn store_answers(
         nodes: true,
         limit: MAX_LIMIT,
         offset: 0,
+        ..Default::default()
     };
     let cl = ds.ontology().classify(req, c, &Default::default()).unwrap();
     let mut a = classify_body(&name, &cl, req, &r, &q).unwrap();
@@ -170,6 +171,7 @@ fn file_answers(
         nodes: true,
         limit: MAX_LIMIT,
         offset: 0,
+        ..Default::default()
     };
     let out = file.classify(c, &Default::default()).unwrap();
     let view = file.view();
@@ -204,8 +206,14 @@ fn taxonomy_doc(r: &sparkles::owl::ofn::Renderer, t: &sparkles::owl::classify::T
     sparkles::owl::ofn::document(r, &sparkles::owl::Header::default(), t.axioms().iter()).into()
 }
 
-/// The answer without the times of the run.
+/// Comparable classification content, excluding timing and store-only publication identity.
 fn timeless(mut j: J) -> J {
+    // File inputs have no bound store/publication UUID; compare their actual
+    // taxonomy, coverage and outcome rather than those deliberately distinct IDs.
+    if let Some(object) = j.as_object_mut() {
+        object.remove("classificationSource");
+        object.remove("resultId");
+    }
     for k in ["indexMs", "saturationMs", "taxonomyMs"] {
         if let Some(s) = j["stats"].as_object_mut() {
             s.remove(k);

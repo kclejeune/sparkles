@@ -330,6 +330,119 @@ class OntologyTest {
         }
     }
 
+    @Test fun kept_classification_reads_pinned_pages_and_accepts_native_frame_defaults() {
+        SparklesDatasets.memory().use { ds ->
+            val onto = ds.ontology()
+            assertEquals("unavailable", SparklesOnt.keptClassification(ds).getString("status"))
+            UpdateAction.parseExecute("""$prefixes INSERT DATA {
+              :A a owl:Class ; owl:equivalentClass :B, :C . :B a owl:Class . :C a owl:Class .
+            }""", ds)
+            val base = ClassifyQuery(about = "http://ex.org/A", projection = "frame")
+            for (invalid in listOf(base.copy(projection = "unknown"), base.copy(about = null), base.copy(about = "relative"), base.copy(limit = 1001), base.copy(nodes = true), base.copy(offset = 1), base.copy(target = "urn:out"))) {
+                assertThrows(SparklesInvalidException::class.java) { onto.classify(query = invalid) }
+                assertEquals("unavailable", onto.keptClassification().getString("status"))
+            }
+            assertThrows(IllegalArgumentException::class.java) { base.copy(limit = 0) }
+            SparklesOperation().use { operation ->
+                operation.cancel()
+                assertThrows(org.apache.jena.query.QueryCancelledException::class.java) {
+                    onto.keptClassification(OntologyRead(), KeptClassificationQuery(), operation)
+                }
+            }
+            // ClassifyQuery emits default false/zero values. They must retain their
+            // legacy meaning with the optional frame projection too.
+            val projected = onto.classify(query = ClassifyQuery(about = "http://ex.org/A", projection = "frame", limit = 1))
+            assertFalse(projected.hasKey("class"))
+            assertFalse(projected.hasKey("nodes"))
+            val frame = projected.get("frame").asObject
+            assertTrue(frame.get("equivalents").asObject.getBoolean("truncated"))
+            assertTrue(frame.get("retention").asObject.getBoolean("kept"))
+            val status = onto.keptClassification(query = KeptClassificationQuery(about = "http://ex.org/A"))
+            assertEquals("available", status.getString("status"))
+            val id = status.get("result").asObject.getString("resultId")
+            val read = OntologyRead(at = "commit:${status.getNumber("commit").toLong()}")
+            val query = KeptClassificationQuery(part = "equivalents", about = "http://ex.org/A", limit = 1, resultId = id)
+            val first = onto.keptClassification(read, query)
+            SparklesOperation().use { operation ->
+                val next = first.get("page").asObject.getNumber("nextOffset").toLong()
+                val last = onto.keptClassification(read, query.copy(offset = next), operation)
+                assertEquals("http://ex.org/B", first.get("page").asObject.get("items").asArray[0].asObject.getString("iri"))
+                assertEquals("http://ex.org/C", last.get("page").asObject.get("items").asArray[0].asObject.getString("iri"))
+                assertEquals(status.get("result"), last.get("result"))
+            }
+        }
+    }
+
+    @Test fun kept_conveniences_refuse_a_pinned_dataset_without_warming_head() {
+        SparklesDatasets.memory().use { ds ->
+            a1(ds)
+            val old = ds.headCommit().seq
+            ds.at(old).use { pinned ->
+                UpdateAction.parseExecute("$prefixes INSERT DATA { :OnlyAtHead a owl:Class }", ds)
+                assertAll(
+                    { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { pinned.ontology().keptClassification() } },
+                    { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { pinned.ontology().classify(OntologyRead(graph = "http://ex.org/onto"), ClassifyQuery(about = "http://ex.org/Professor", projection = "frame")) } },
+                    { assertEquals("unavailable", ds.ontology().keptClassification(OntologyRead(graph = "http://ex.org/onto")).getString("status")) },
+                )
+            }
+        }
+    }
+
+    @Test fun kept_conveniences_refuse_active_read_and_write_transactions_without_flushing() {
+        SparklesDatasets.memory().use { ds ->
+            a1(ds)
+            val read = OntologyRead(graph = "http://ex.org/onto")
+            for (mode in listOf(ReadWrite.READ, ReadWrite.WRITE)) {
+                val head = ds.headCommit().seq
+                ds.begin(mode)
+                try {
+                    if (mode == ReadWrite.WRITE) {
+                        ds.defaultGraph.add(org.apache.jena.graph.Triple.create(
+                            org.apache.jena.graph.NodeFactory.createURI("urn:uncommitted"),
+                            org.apache.jena.vocabulary.RDF.type.asNode(), org.apache.jena.vocabulary.OWL.Class.asNode(),
+                        ))
+                    }
+                    val before = ds.txn()!!.ops
+                    assertAll(
+                        { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { ds.ontology().keptClassification(read) } },
+                        { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { ds.ontology().classify(read, ClassifyQuery(about = "http://ex.org/Professor", projection = "frame")) } },
+                        { assertEquals(before, ds.txn()!!.ops, "the guard must not flush pending writes") },
+                        { assertTrue(ds.isInTransaction()) },
+                    )
+                } finally {
+                    ds.abort()
+                    ds.end()
+                }
+                assertEquals(head, ds.headCommit().seq)
+                assertEquals("unavailable", ds.ontology().keptClassification(read).getString("status"))
+            }
+        }
+    }
+
+    @Test fun kept_reads_on_live_datasets_pin_retained_branch_history_and_options(@TempDir dir: java.nio.file.Path) {
+        SparklesDatasets.open(dir.resolve("kept-branch")).use { main ->
+            a1(main)
+            val info = main.branches().create("kept-dev")
+            main.branch("kept-dev").use { branch ->
+                val old = branch.headCommit().seq
+                branch.snapshots().create("kept-before")
+                UpdateAction.parseExecute("$prefixes INSERT DATA { GRAPH <http://ex.org/onto> { :OnlyAtHead a owl:Class } }", branch)
+                val read = OntologyRead(graphs = listOf("http://ex.org/onto"), imports = false, mode = "strict", at = "commit:$old")
+                val projected = branch.ontology().classify(read, ClassifyQuery(about = "http://ex.org/Professor", projection = "frame"))
+                val result = projected.get("frame").asObject.get("result").asObject
+                assertEquals(old, result.getNumber("classifiedCommit").toLong())
+                assertEquals(info.id, result.getString("boundStoreId"))
+                val status = branch.ontology().keptClassification(read, KeptClassificationQuery(about = "http://ex.org/OnlyAtHead", resultId = result.getString("resultId")))
+                assertEquals("available", status.getString("status"))
+                assertFalse(status.get("entity").asObject.getBoolean("present"))
+                assertEquals("strict", status.get("result").asObject.getString("mode"))
+                assertEquals("none", status.get("result").asObject.getString("imports"))
+                assertEquals("mismatch", branch.ontology().keptClassification(read.copy(at = null)).getString("status"))
+                assertEquals("unavailable", main.ontology().keptClassification(read).getString("status"))
+            }
+        }
+    }
+
     /** Item 603's cases, as the Rust tests write them: a classification the disjunctive rules take. */
     private fun cases(n: Int, inconsistent: Boolean): String {
         fun some(p: String, c: String) = "[ a owl:Restriction ; owl:onProperty $p ; owl:someValuesFrom $c ]"

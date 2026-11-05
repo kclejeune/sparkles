@@ -319,6 +319,31 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   matches, and it trades that memory for fast reclassification. `sparkles ontology classify FILE` classifies a file without a
   database and exits with status 1 when the ontology is inconsistent or has an
   unsatisfiable class.
+* A kept classification has an immutable source and completed taxonomy separate from
+  the saturation a later DL query can change. `GET /$/ontology/{ds}/classification`,
+  Rust `kept_classification`, Python `kept_classification`, Node.js `keptClassification`
+  and JVM `keptClassification` read availability and bounded named-class direct parents,
+  equivalents and unsatisfiability without classifying on a miss. They preserve the exact
+  branch, commit, input/options and producer metadata, distinguish running, mismatch and
+  absence, and expose every captured source/import warning through typed pages. Continue
+  with the result ID and exact commit. Restricted views and synthetic snapshots do not
+  share this cache, and a retained result cannot resurrect pruned history.
+  The new JVM read and frame-projection conveniences refuse pinned dataset wrappers
+  and active transactions before native work. Use a live dataset with `OntologyRead.at`
+  for retained committed history; wrapper-source integration remains in item 588.
+* An explicit classify request with `projection: "frame"` returns bounded clause and
+  diagnostic samples with totals, outcome and actual source identity. Missing/null
+  projection keeps legacy output. False nodes, zero/null offset and null target defaults
+  are harmless, while effective nodes, offset, target or OFN output are incompatible.
+  An isolated restricted result remains useful but advertises no shared continuation.
+  General entity/axiom reads with classification, property/individual entailments and
+  justifications remain in items 588, 622, 609 and F24's later phases.
+* Retention counts auxiliary source/exclusion metadata and a published taxonomy alongside
+  a DL query's newer saturation. Readers and an active replacement can keep an older
+  publication alive. This memory tradeoff means the between-run one-gigabyte estimate
+  does not cap combined live RSS. Bounded pages limit output/name buffers, not server
+  scans or arbitrary scalar sizes. [API.md](../API.md#ontology) specifies the read states,
+  typed sources, pins and projection selectors.
 * Every classification answer gives `tier`, the rules the axioms need, and `consistency`,
   which is `consistent`, `inconsistent` or `unknown`. `partial` on the request, `--partial`
   on the command line and the bindings' `partial` option ask a run of the disjunctive rules
@@ -326,6 +351,10 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   `partial` true and `complete` false, lists the classes whose superclasses it may miss
   under `incomplete` and gives every other class its full answer. Its consistency is
   `unknown` when the run stopped before deciding it, and then every class is incomplete.
+  After a stopped run, immutable source hashing and response serialization finish over
+  its already produced partial result without resuming classification or resetting shared
+  cancellation flags. This read-only work can extend the response beyond the compute
+  deadline. Completed results and subsequent GET reads retain their cancellation controls.
   The dataset never keeps a partial answer, and a classification that writes its taxonomy
   to a graph, the functional-style answer and the ROBOT-compatible commands refuse or
   ignore `partial`, since none of them can say that the taxonomy is partial. `sparkles

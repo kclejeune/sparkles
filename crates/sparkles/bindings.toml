@@ -766,6 +766,11 @@ python = "Dataset.ontology.classify"
 jvm = "SparklesOnt.classify"
 node = "Dataset.ontology.classify"
 
+["ontology.kept_classification"]
+python = "Dataset.ontology.kept_classification"
+jvm = "SparklesOnt.keptClassification"
+node = "Dataset.ontology.keptClassification"
+
 ["ontology.diff"]
 python = "Dataset.ontology.diff"
 jvm = "SparklesOnt.diff"

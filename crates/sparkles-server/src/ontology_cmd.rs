@@ -488,6 +488,8 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 expansion,
             };
             let q = ClassifyQuery {
+                projection: None,
+                languages: Vec::new(),
                 about: about.clone(),
                 nodes: false,
                 limit: MAX_LIMIT,
@@ -713,6 +715,8 @@ pub(crate) fn classify_body_of_file(
 ) -> Result<(J, String)> {
     let req = read.request()?;
     let q = ClassifyQuery {
+        projection: None,
+        languages: Vec::new(),
         about,
         nodes: false,
         limit: MAX_LIMIT,

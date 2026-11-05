@@ -917,6 +917,105 @@ test('the ontology handle reads, checks, edits and diffs axioms', async (t) => {
   }, QueryTimeoutError);
 });
 
+test('kept classifications read immutable pages and native frame defaults', async (t) => {
+  const ds = t.resource(await Dataset.open(join(await temp(), 'kept-db')));
+  const onto = ds.ontology;
+  assert.equal((await onto.keptClassification()).status, 'unavailable');
+  assert.throws(() => onto.keptClassification({ inferences: true }), /asserted inputs/);
+  await ds.update(`PREFIX : <http://ex.org/> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    INSERT DATA { :A a owl:Class; owl:equivalentClass :B, :C . :B a owl:Class . :C a owl:Class . }`);
+  for (const invalid of [
+    { projection: 'unknown' },
+    { about: null },
+    { about: 'relative' },
+    { limit: 0 },
+    { limit: 1001 },
+    { nodes: true },
+    { offset: 1 },
+    { target: 'urn:out' },
+  ]) {
+    await assert.rejects(
+      onto.classify({ projection: 'frame', about: 'http://ex.org/A', ...invalid }),
+      InvalidInputError,
+    );
+    assert.equal((await onto.keptClassification()).status, 'unavailable');
+  }
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await assert.rejects(onto.keptClassification({ signal: cancelled.signal }));
+  const projected = await onto.classify({
+    projection: 'frame',
+    about: 'http://ex.org/A',
+    nodes: false,
+    offset: 0,
+    limit: 1,
+  });
+  assert.equal(projected.frame.equivalents.truncated, true);
+  assert.equal(projected.frame.retention.kept, true);
+  assert.equal(projected.class, undefined);
+  assert.equal(projected.nodes, undefined);
+  const status = await onto.keptClassification({ about: 'http://ex.org/A' });
+  assert.equal(status.status, 'available');
+  assert.equal(status.entity.present, true);
+  assert.equal(typeof status.result.classifiedCommit, 'bigint');
+  assert.equal(status.result.classifiedCommit, status.commit);
+  const pin = { at: status.commit, resultId: status.result.resultId };
+  const first = await onto.keptClassification({
+    ...pin,
+    part: 'equivalents',
+    about: 'http://ex.org/A',
+    limit: 1,
+  });
+  const last = await onto.keptClassification({
+    ...pin,
+    part: 'equivalents',
+    about: 'http://ex.org/A',
+    limit: 1,
+    offset: Number(first.page.nextOffset),
+  });
+  assert.deepEqual(
+    [first.page.items[0].iri, last.page.items[0].iri],
+    ['http://ex.org/B', 'http://ex.org/C'],
+  );
+  assert.equal(last.page.nextOffset, null);
+  assert.deepEqual(last.result, status.result);
+  await ds.update('INSERT DATA { <urn:New> a <http://www.w3.org/2002/07/owl#Class> }');
+  const mismatch = await onto.keptClassification();
+  assert.equal(mismatch.status, 'mismatch');
+  assert.equal(mismatch.staleCommit, status.commit);
+});
+
+test('kept and projected native exclusions carry typed gaps and legacy source identity', async (t) => {
+  const ds = t.resource(await Dataset.open(join(await temp(), 'kept-excluded-db')));
+  await ds.update(`PREFIX : <http://ex.org/> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    INSERT DATA { :A a owl:Class . :Opaque a rdfs:Datatype .
+      :p a owl:DatatypeProperty; rdfs:range :Opaque . }`);
+  const projection = await ds.ontology.classify({
+    projection: 'frame',
+    about: 'http://ex.org/A',
+    limit: 1,
+  });
+  assert.ok(projection.frame.outcome.excludedCount > 0);
+  const diagnostic = projection.frame.excluded.items[0];
+  assert.equal(diagnostic.gap.kind, 'partiallyUsed');
+  assert.equal(typeof diagnostic.gap.reason, 'string');
+  const status = await ds.ontology.keptClassification();
+  const page = await ds.ontology.keptClassification({
+    at: status.commit,
+    resultId: status.result.resultId,
+    part: 'excluded',
+    limit: 1,
+  });
+  assert.deepEqual(page.page.items[0], diagnostic);
+  const legacy = await ds.ontology.classify({ about: 'http://ex.org/A', limit: 1 });
+  assert.equal(legacy.classificationSource.commit, status.commit);
+  assert.equal(legacy.classificationSource.contentFingerprint, status.result.contentFingerprint);
+  assert.equal(typeof legacy.resultId, 'string');
+  assert.equal(typeof legacy.excluded[0].partial, 'string');
+  assert.equal(legacy.excluded[0].gap, undefined);
+});
+
 test('the ontology handle classifies by OWL 2 EL and writes the taxonomy', async (t) => {
   const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
   await ds.update(`PREFIX : <http://ex.org/>

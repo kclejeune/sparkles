@@ -684,6 +684,7 @@ fn the_kept_taxonomy_counts_beside_a_query_saturation() {
         ds.state()
             .classify_cache
             .lock()
+            .entry
             .as_ref()
             .map(|e| e.taxonomy_memory())
     };

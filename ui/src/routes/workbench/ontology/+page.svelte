@@ -16,7 +16,8 @@
   import { onMount, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import * as api from '$lib/api';
-  import { markClassified } from '$lib/browse';
+  import { preferredLabel } from '$lib/rendering';
+  import ClassificationFrame from '$components/ClassificationFrame.svelte';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { branchParam, MAIN, onBranch } from '$lib/branches';
@@ -657,34 +658,84 @@
   let classification = $state<Classification | null>(null);
   let classifyError = $state<string | null>(null);
   let classifying = $state(false);
+  let classifyAbort: AbortController | null = null;
+  let inferredScope: { target: string; selection: Selection; commit: number } | null = null;
+  const inferredLabels = new SvelteMap<string, Lit[]>();
+  const inferredBatch = new LabelBatch(
+    (iris) => {
+      const scope = inferredScope;
+      return scope
+        ? ontologyLabelsFor(
+            scope.target,
+            scope.selection,
+            iris,
+            undefined,
+            `commit:${scope.commit}`,
+          )
+        : Promise.resolve(new Map());
+    },
+    (more) => {
+      for (const [iri, labels] of more) inferredLabels.set(iri, labels);
+    },
+  );
+  function clearClassification() {
+    classifySeq++;
+    classifyAbort?.abort();
+    classifyAbort = null;
+    classification = null;
+    inferredScope = null;
+    inferredBatch.reset();
+    inferredLabels.clear();
+    classifying = false;
+    classifyError = null;
+  }
   async function classify() {
+    if (!summary || classifying) return;
     const my = ++classifySeq;
+    const input = { target, selection: { ...sel }, commit: summary.commit };
+    classifyAbort?.abort();
+    const abort = new AbortController();
+    classifyAbort = abort;
     classifying = true;
     classifyError = null;
     try {
-      const c = await classifyOntology(target, sel);
-      // the Browse pages of this tab now show what the kept classification infers
-      markClassified(target);
-      if (my === classifySeq) classification = c;
+      const c = await classifyOntology(
+        input.target,
+        input.selection,
+        abort.signal,
+        `commit:${input.commit}`,
+      );
+      if (my !== classifySeq) return;
+      inferredScope = { ...input, commit: c.commit };
+      inferredBatch.reset();
+      inferredLabels.clear();
+      classification = c;
     } catch (e) {
       if (my === classifySeq) classifyError = api.errorMessage(e);
     } finally {
-      if (my === classifySeq) classifying = false;
+      if (my === classifySeq) {
+        classifying = false;
+        classifyAbort = null;
+      }
     }
   }
+  // Reading/toggling the tree, including inferred=1, never starts classification.
   $effect(() => {
-    if (
-      inferredOn &&
-      kindTab === 'Class' &&
-      summary &&
-      (!classification || classification.commit !== summary.commit)
-    )
-      untrack(() => void classify());
+    void target;
+    void graph;
+    void summary?.commit;
+    untrack(clearClassification);
+    return () => classifyAbort?.abort();
   });
   const inferred = $derived(classification ? taxonomyTree(classification) : null);
+  const inferredIriName = (iri: string) => {
+    if (iriForm.mode !== 'label') return iri;
+    inferredBatch.want(iri);
+    return preferredLabel(inferredLabels.get(iri), langs) ?? iri;
+  };
   const inferredName = (id: string) => {
     const cs = inferred?.classesOf.get(id) ?? [];
-    return cs.length ? cs.map(treeName).join(' ≡ ') : id;
+    return cs.length ? cs.map(inferredIriName).join(' ≡ ') : id;
   };
   const inferredKeep = $derived(
     inferred && filter.trim() ? filterTree(inferred.tree, inferredName, filter) : null,
@@ -710,41 +761,83 @@
 
   // --- the selected entity ---------------------------------------------------------------
   let frameItems = $state<AxiomItem[]>([]);
+  let frameCommit = $state<number | null>(null);
   let frameKinds = $state<EntityKind[]>([]);
   let frameError = $state<string | null>(null);
   let frameFor = $state<string | null>(null);
+  let frameScope = '';
+  let framePending: { key: string; promise: Promise<void> } | null = null;
+  let frameAbort: AbortController | null = null;
   async function loadFrame() {
     const iri = selected;
     const t = target;
-    const my = ++frameSeq;
-    if (!iri) {
+    const commit = summary?.commit;
+    const selection = { ...sel };
+    const scope = JSON.stringify([t, selection.graph, selection.imports]);
+    if (!iri || commit == null) {
+      frameSeq++;
+      frameAbort?.abort();
+      framePending = null;
       frameItems = [];
       frameKinds = [];
       frameFor = null;
+      frameCommit = null;
       return;
     }
-    try {
-      const [report, ax] = await Promise.all([
-        ontologyEntity(t, sel, iri),
-        ontologyAxioms(t, sel, { about: iri, assertions: true, cap: 5_000 }).catch((e) => {
-          if (e instanceof api.ApiError && e.status === 404)
-            return { axioms: [], total: 0, truncated: false };
-          throw e;
-        }),
-      ]);
-      if (my !== frameSeq) return;
-      frameKinds = report?.kinds ?? [];
-      frameItems = ax.axioms;
-      frameFor = iri;
-      frameError = report ? null : 'The ontology neither declares nor uses this IRI.';
-    } catch (e) {
-      if (my === frameSeq) frameError = api.errorMessage(e);
+    const key = JSON.stringify([scope, iri, commit]);
+    if (frameScope === scope && frameFor === iri && frameCommit === commit) return;
+    if (framePending?.key === key) return framePending.promise;
+    const my = ++frameSeq;
+    frameAbort?.abort();
+    const abort = new AbortController();
+    frameAbort = abort;
+    if (frameScope !== scope || frameFor !== iri) {
+      frameFor = null;
+      frameCommit = null;
     }
+    frameError = null;
+    const pending = { key, promise: Promise.resolve() };
+    framePending = pending;
+    pending.promise = (async () => {
+      try {
+        const [report, ax] = await Promise.all([
+          ontologyEntity(t, selection, iri, abort.signal, `commit:${commit}`),
+          ontologyAxioms(
+            t,
+            selection,
+            { about: iri, assertions: true, cap: 5_000, at: `commit:${commit}` },
+            abort.signal,
+          ).catch((e) => {
+            if (e instanceof api.ApiError && e.status === 404)
+              return { axioms: [], total: 0, truncated: false };
+            throw e;
+          }),
+        ]);
+        if (my !== frameSeq) return;
+        frameKinds = report?.kinds ?? [];
+        frameItems = ax.axioms;
+        frameCommit = commit;
+        frameScope = scope;
+        frameFor = iri;
+        frameError = report ? null : 'The ontology neither declares nor uses this IRI.';
+      } catch (e) {
+        if (my === frameSeq) frameError = api.errorMessage(e);
+      } finally {
+        if (framePending === pending) framePending = null;
+        if (frameAbort === abort) frameAbort = null;
+      }
+    })();
+    return pending.promise;
   }
+  $effect(() => () => {
+    frameSeq++;
+    frameAbort?.abort();
+  });
   $effect(() => {
     void selected;
     void target;
     void graph;
+    void summary?.commit;
     untrack(() => void loadFrame());
   });
   /** The kind the frame shows: the tab's when the entity has it. */
@@ -929,6 +1022,20 @@
   }
 
   // --- edits, previews and the undo stack ---------------------------------------------------
+  let previewPin = $state.raw<{
+    op: Op;
+    target: string;
+    sel: Selection;
+    etag: string;
+    head: number | null;
+    frameContext: string | null;
+  } | null>(null);
+  const frameContext = $derived(
+    JSON.stringify([target, sel.graph, sel.imports, selected, frameKind]),
+  );
+  const frameSource = $derived(
+    JSON.stringify([target, sel.graph, sel.imports, selected, frameKind, frameCommit]),
+  );
   const session = new EditSession({
     reload: async () => {
       await loadAll();
@@ -936,12 +1043,38 @@
     },
     staleText: 'Another commit landed since the editor read the ontology.',
   });
-  const edit = (op: Op, label: string, after?: () => void) => {
+  const edit = (op: Op, label: string, after?: () => void, fromFrame: string | null = null) => {
     // an edit names the commit the summary read, which a large ontology's summary may still be reading
-    if (!etag)
+    if (readonly || !etag)
       return void toasts.push('info', 'The ontology is still being read', 'Try again in a moment.');
-    return session.edit(op, label, after);
+    const origin = { target, sel: { ...sel }, etag, head: summary?.commit ?? null };
+    session.edit(op, label, after);
+    previewPin = { ...origin, op: session.previewOp!, frameContext: fromFrame };
   };
+  const editFrame = (op: Op, label: string, origin: string) => {
+    if (
+      readonly ||
+      origin !== frameSource ||
+      frameCommit !== summary?.commit ||
+      frameFor !== selected ||
+      frameError
+    )
+      return void toasts.push(
+        'info',
+        'The frame source changed',
+        'The draft must be reviewed on the current frame.',
+      );
+    return edit(op, label, undefined, frameContext);
+  };
+  $effect(() => {
+    const pin = previewPin;
+    if (
+      pin?.op === session.previewOp &&
+      pin?.frameContext != null &&
+      pin.frameContext !== frameContext
+    )
+      session.previewOpen = false;
+  });
 
   /** The labels the editor knows with those the previewed edit adds, for its axioms. */
   const previewLabels = $derived.by(() => {
@@ -1505,10 +1638,19 @@
                     Inferred
                     {#if classification}<span class="faint">
                         {classification.complete
-                          ? 'OWL 2 EL'
-                          : `${fmtInt(classification.excludedCount)} axioms outside OWL 2 EL`}</span
+                          ? `${classification.tier?.toUpperCase() ?? 'Classification'} · commit ${classification.commit}`
+                          : `${fmtInt(classification.excludedCount)} omitted or partly used axioms · commit ${classification.commit}`}</span
                       >{/if}
                   </h2>
+                  <button
+                    class="btn sm ghost"
+                    disabled={classifying || !summary}
+                    onclick={() => void classify()}>Classify tree</button
+                  >
+                  <p class="faint">This explicit action reads the full taxonomy in POST pages.</p>
+                  {#if classification?.nodesTruncated}<p class="note">
+                      The browser's taxonomy display limit was reached.
+                    </p>{/if}
                   <div class="tree-scroll">
                     {#if classifying && !inferred}<p class="faint">
                         <span class="spinner"></span> Classifying…
@@ -1527,7 +1669,8 @@
                         name={inferredName}
                         onview={(ids) => {
                           for (const id of ids)
-                            for (const c of inferred?.classesOf.get(id) ?? []) batch.want(c);
+                            for (const c of inferred?.classesOf.get(id) ?? [])
+                              inferredBatch.want(c);
                         }}
                         badge={(id) => (id === 'n:1' ? 'unsatisfiable' : null)}
                         open={openSet('inferred')}
@@ -1630,28 +1773,45 @@
                   <p class="inferred-sup">
                     <span class="faint">Inferred direct superclasses:</span>
                     {#each sup as c, i (c)}{#if i},
-                      {/if}<button class="link" onclick={() => nav({ iri: c })}>{nameOf(c)}</button
+                      {/if}<button class="link" onclick={() => nav({ iri: c })}
+                        >{inferredIriName(c)}</button
                       >{/each}
                   </p>
                 {/if}
               {/if}
               {#if frameFor === selected && view === 'frame'}
-                {#key `${selected}|${frameKind}`}
+                {#key `${target}|${graph}|${selected}|${frameKind}`}
+                  {#if frameCommit !== summary?.commit}<p class="faint">
+                      Displaying frame commit {frameCommit}; reading commit {summary?.commit}.
+                    </p>{/if}
                   <OntoFrame
                     kind={frameKind}
                     iri={selected}
                     items={frameItems}
+                    source={frameSource}
+                    commit={frameCommit}
                     name={nameOf}
                     {prefixes}
                     {options}
                     {annotationProperties}
-                    {readonly}
+                    readonly={readonly || frameCommit !== summary?.commit}
                     {names}
                     search={bigKinds.size ? searchNames : undefined}
                     {parse}
-                    onedit={(op, label) => edit(op, label)}
+                    onedit={editFrame}
                     onopen={(iri) => nav({ iri, view: null })}
                   />
+                  {#if frameKind === 'Class'}
+                    <ClassificationFrame
+                      {target}
+                      {graph}
+                      imports={sel.imports}
+                      iri={selected}
+                      commit={frameCommit}
+                      items={frameItems}
+                      onopen={(iri) => nav({ iri, view: null })}
+                    />
+                  {/if}
                 {/key}
               {:else if frameFor === selected && view === 'usage'}
                 {#if !usageGroups.length}<p class="empty">No axiom mentions this entity.</p>{/if}
@@ -1697,6 +1857,7 @@
   op={session.previewOp}
   {etag}
   head={summary?.commit ?? null}
+  pin={previewPin}
   {describe}
   oncommitted={(op, a) => void session.committed(op, a)}
   onstale={() => void session.stale()}

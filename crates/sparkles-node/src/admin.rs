@@ -158,6 +158,8 @@ fn u64_field(k: &str) -> bool {
             | "removed"
             | "commit"
             | "firstCommit"
+            | "classifiedCommit"
+            | "staleCommit"
             | "baseSeq"
             | "endSeq"
             | "bytes"
@@ -201,6 +203,21 @@ fn config_numbers(v: Value, key: &str) -> Value {
                 .collect(),
         ),
         _ => v,
+    }
+}
+
+#[cfg(test)]
+mod kept_metadata_tests {
+    use super::*;
+    #[test]
+    fn immutable_and_stale_commits_keep_all_u64_bits() {
+        let encoded = meta(
+            json!({"result":{"classifiedCommit":u64::MAX},"staleCommit":u64::MAX,"page":{"offset":2}}),
+            "",
+        );
+        assert_eq!(encoded["result"]["classifiedCommit"], u64::MAX.to_string());
+        assert_eq!(encoded["staleCommit"], u64::MAX.to_string());
+        assert_eq!(encoded["page"]["offset"], 2);
     }
 }
 fn config<T: serde::de::DeserializeOwned>(v: &Value) -> sparkles::Result<T> {
@@ -347,6 +364,7 @@ fn writes(op: &str) -> bool {
             | "ontology.search"
             | "ontology.hierarchy"
             | "ontology.individuals"
+            | "ontology.keptClassification"
             | "ontology.term"
             | "ontology.check"
             | "ontology.diff"
@@ -483,7 +501,12 @@ impl NativeDataset {
         options: String,
         cancel: &Cancellation,
     ) -> napi::Result<String> {
-        let a = parse(&args)?;
+        let a = if let Some(ontology_op) = op.strip_prefix("ontology.") {
+            sparkles::handles::ontology::wire::decode_arguments(ontology_op, args.as_bytes())
+                .map_err(err)?
+        } else {
+            parse(&args)?
+        };
         // a classification writes only when it names a target graph
         let write = writes(&op)
             || (op == "ontology.classify" && a.get("target").is_some_and(|t| !t.is_null()));

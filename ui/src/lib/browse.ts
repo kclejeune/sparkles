@@ -3,7 +3,7 @@
 // (docs/API.md, "Ontology"), and the pure functions that turn their answers into the
 // sections of an entity's page. The page's components take what these return as props,
 // so the editor, DL Query and the term pages of item 461 can reuse them.
-import { ApiError, request, select } from './api';
+import { request, select } from './api';
 import {
   iriName,
   manchesterName,
@@ -1011,62 +1011,6 @@ export function inferredOf(
     complete,
     reused,
   };
-}
-
-/** Whether a classification ran for `target` in this tab, so later pages may ask it again. */
-export function classifiedHere(target: string): boolean {
-  try {
-    return sessionStorage.getItem(`sparkles.classified.${target}`) === '1';
-  } catch {
-    return false;
-  }
-}
-
-/** Notes that a classification ran for `target` in this tab. */
-export function markClassified(target: string): void {
-  try {
-    sessionStorage.setItem(`sparkles.classified.${target}`, '1');
-  } catch {
-    // the next page offers to classify again
-  }
-}
-
-/**
- * `POST /$/ontology/{ds}/classify` about one class: its node in the dataset's kept
- * classification, which a first call computes and later calls reuse incrementally. A class
- * the taxonomy does not have answers null.
- */
-export async function classifyAbout(
-  target: string,
-  graph: string | null,
-  iri: string,
-  signal?: AbortSignal,
-): Promise<{
-  complete: boolean;
-  reused: boolean;
-  class: { classes: string[]; parentClasses: string[] };
-} | null> {
-  try {
-    const res = await request(`/$/ontology/${enc(target)}/classify`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        graph: graph ?? 'default',
-        imports: true,
-        about: iri,
-        limit: 1,
-      }),
-      signal,
-    });
-    markClassified(target);
-    return await res.json();
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 404) return null;
-    throw e;
-  }
 }
 
 /**

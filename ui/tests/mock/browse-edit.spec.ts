@@ -74,7 +74,7 @@ test('a read-only caller sees no edit affordance', async ({ page }) => {
     }),
   );
   await open(page, term('uni', UNI + 'Professor', '&edit=1'));
-  await expect(page.getByRole('region', { name: 'Axioms' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Axioms', exact: true })).toBeVisible();
   await expect(page).not.toHaveURL(/edit=1/);
   await expect(page.getByRole('button', { name: 'Edit', exact: true })).toHaveCount(0);
   await expect(bar(page)).toHaveCount(0);
@@ -187,7 +187,7 @@ test('OWL edits on a session branch: definition, synonym, annotation, parent and
       .getByRole('button', { name: 'Add' })
       .click();
     await commit(page);
-    const logic = page.getByRole('region', { name: 'Axioms' });
+    const logic = page.getByRole('region', { name: 'Axioms', exact: true });
     await expect(logic.getByRole('link', { name: 'Agent', exact: true })).toBeVisible();
     await logic.getByRole('button', { name: /Remove the axiom SubClassOf\(.*Agent\)/ }).click();
     await commit(page);
@@ -211,13 +211,18 @@ test('OWL edits on a session branch: definition, synonym, annotation, parent and
   });
 });
 
-test('inferences follow an edit: a superclass made asserted leaves the inferred list', async ({
+test('an edit invalidates inferences until explicit classification reads the new source', async ({
   page,
   request,
 }) => {
   await onSession(request, 'uni', async () => {
+    const classifications: string[] = [];
+    page.on('request', (r) => {
+      if (r.method() === 'POST' && /\/classify(?:\?|$)/.test(r.url()))
+        classifications.push(r.url());
+    });
     await open(page, term('uni', UNI + 'Professor'));
-    const axioms = page.getByRole('region', { name: 'Axioms' });
+    const axioms = page.getByRole('region', { name: 'Axioms', exact: true });
     // the session starts first and the classification runs on its branch, so that the card
     // stays mounted through the edit and only its commit prop says the state changed
     await pageAction(page, 'Edit');
@@ -227,6 +232,7 @@ test('inferences follow an edit: a superclass made asserted leaves the inferred 
     await axioms.getByRole('button', { name: 'Classify' }).click();
     const inferredSub = axioms.locator('[data-section="inferred-sub"]');
     await expect(inferredSub.getByRole('link', { name: 'Teacher' })).toBeVisible();
+    expect(classifications).toHaveLength(1);
     await axioms.evaluate((el) => el.setAttribute('data-mounted', 'first'));
 
     await pageAction(page, 'Edit');
@@ -245,8 +251,13 @@ test('inferences follow an edit: a superclass made asserted leaves the inferred 
     await expect(
       axioms.locator('[data-section="sub"]').getByRole('link', { name: 'Teacher' }),
     ).toBeVisible();
-    // and the classification was asked again, not forgotten
-    await expect(axioms).toContainText('infers nothing more than these axioms state');
+    // An edit may reread availability, but must not compute implicitly or retain old clauses.
+    await expect(axioms).toContainText('The kept classification does not match this source');
+    await expect(inferredSub.getByRole('link', { name: 'Teacher' })).toHaveCount(0);
+    expect(classifications).toHaveLength(1);
+    await axioms.getByRole('button', { name: 'Classify', exact: true }).click();
+    await expect(axioms).toContainText('No additional direct named-class clauses');
+    expect(classifications).toHaveLength(2);
     await expect(axioms.getByRole('button', { name: 'Classify' })).toHaveCount(0);
     await expect(inferredSub.getByRole('link', { name: 'Teacher' })).toHaveCount(0);
     await expect(axioms).toHaveAttribute('data-mounted', 'first');

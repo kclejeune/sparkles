@@ -29,6 +29,7 @@
     op,
     etag,
     head,
+    pin,
     describe,
     oncommitted,
     onstale,
@@ -41,6 +42,14 @@
     etag: string | null;
     /** The head commit the editor shows, which a revert expects. */
     head: number | null;
+    /** Captured synchronously when the edit was accepted, before reactive refresh. */
+    pin?: {
+      op: Op;
+      target: string;
+      sel: Selection;
+      etag: string | null;
+      head: number | null;
+    } | null;
     /** An axiom as the editor shows it. */
     describe: (a: AxiomInput) => string;
     oncommitted: (op: Op, a: OpAnswer, message: string) => void;
@@ -75,10 +84,11 @@
   $effect(() => {
     if (!open || !op || ran === op) return;
     ran = op;
-    tag = etag;
-    at = head;
-    ranTarget = target;
-    ranSel = sel;
+    const origin = pin?.op === op ? pin : null;
+    tag = origin ? origin.etag : etag;
+    at = origin ? origin.head : head;
+    ranTarget = origin ? origin.target : target;
+    ranSel = { ...(origin ? origin.sel : sel) };
     message = title;
     void dry(op);
   });
@@ -107,7 +117,8 @@
   }
 
   async function commit() {
-    if (!op) return;
+    if (!op || ran !== op) return;
+    const operation = op;
     // the page moved to another dataset, branch or graph since the dry run
     if (ranTarget !== target || ranSel.graph !== sel.graph) {
       open = false;
@@ -116,21 +127,23 @@
     busy = true;
     error = null;
     try {
-      const r = await runOp(ranTarget, ranSel, op, {
+      const r = await runOp(ranTarget, ranSel, operation, {
         etag: tag,
         head: at,
         message: message.trim() || title,
       });
+      if (ran !== operation || !open) return;
       if (isPreview(r)) throw new Error('The server answered the write as a dry run.');
       open = false;
-      oncommitted(op, r, message.trim() || title);
+      oncommitted(operation, r, message.trim() || title);
     } catch (e) {
+      if (ran !== operation || !open) return;
       if (isStale(e)) {
         open = false;
         onstale();
       } else error = problemOf(e);
     } finally {
-      busy = false;
+      if (ran === operation) busy = false;
     }
   }
 

@@ -660,6 +660,247 @@ async fn classify_answers_the_taxonomy_and_writes_it() {
     assert!(j["total"].as_u64().unwrap() >= 1, "{j}");
 }
 
+#[tokio::test]
+async fn kept_classification_get_is_fresh_read_only_and_pins_pages() {
+    let s = server();
+    let uri = "/$/ontology/t/classification";
+    let first = get(&s.app, uri).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+    assert_eq!(first.headers[header::CACHE_CONTROL], "no-store");
+    assert!(!first.headers.contains_key(header::ETAG));
+    assert_eq!(first.json()["status"], "unavailable");
+    assert_eq!(first.json()["result"], J::Null);
+    let classified = post(&s.app, "/$/ontology/t/classify", json!({})).await;
+    assert_eq!(classified.status, StatusCode::OK, "{}", classified.text());
+    // A read miss must not have warmed the classifier. Availability changes
+    // without a commit and must not be hidden by conditional GET.
+    assert_eq!(classified.json()["reused"], false);
+    let read = send(&s.app, "GET", uri, &[("if-none-match", "*")], "").await;
+    assert_eq!(read.status, StatusCode::OK, "{}", read.text());
+    assert_eq!(read.headers[header::CACHE_CONTROL], "no-store");
+    let j = read.json();
+    assert_eq!(j["status"], "available");
+    assert_eq!(j["outcome"]["consistency"], "consistent");
+    let pin = format!(
+        "at=commit:{}&resultId={}",
+        j["commit"],
+        j["result"]["resultId"].as_str().unwrap()
+    );
+    let parents = get(
+        &s.app,
+        &format!(
+            "{uri}?{pin}&part=parents&about={}&limit=1",
+            enc("http://ex.org/Professor")
+        ),
+    )
+    .await;
+    assert_eq!(parents.status, StatusCode::OK, "{}", parents.text());
+    assert_eq!(
+        parents.json()["page"]["items"][0]["iri"],
+        "http://ex.org/Person"
+    );
+    let sources = get(&s.app, &format!("{uri}?{pin}&part=sources&limit=1")).await;
+    assert_eq!(sources.json()["page"]["items"][0]["kind"], "requestedGraph");
+    let next = sources.json()["page"]["nextOffset"].as_u64().unwrap();
+    let tail = get(
+        &s.app,
+        &format!("{uri}?{pin}&part=sources&limit=1&offset={next}"),
+    )
+    .await;
+    assert_eq!(tail.status, StatusCode::OK, "{}", tail.text());
+    assert_eq!(tail.json()["page"]["items"][0]["kind"], "resolvedGraph");
+    assert_eq!(tail.json()["result"]["resultId"], j["result"]["resultId"]);
+    let missing = get(
+        &s.app,
+        &format!("{uri}?about={}", enc("http://ex.org/Missing")),
+    )
+    .await;
+    assert_eq!(missing.json()["entity"]["present"], false);
+}
+
+#[tokio::test]
+async fn kept_classification_http_selectors_refuse_ambiguous_or_computing_inputs() {
+    let s = server();
+    let dataset =
+        crate::http::dataset(&s._state, "t").unwrap_or_else(|_| panic!("fixture dataset"));
+    let head = dataset.store.snapshot().commit;
+    for query in [
+        "inferences=false",
+        "assertions=false",
+        "part=status&part=status",
+        "limit=0",
+        "limit=18446744073709551616",
+        "offset=1&part=sources",
+        "part=parents",
+        "resultId=bogus",
+        "unknown=x",
+    ] {
+        let r = get(&s.app, &format!("/$/ontology/t/classification?{query}")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{query}: {}", r.text());
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store");
+    }
+    let ct = [(header::CONTENT_TYPE.as_str(), "application/json")];
+    for (query, body) in [
+        (
+            "?nodes=ture",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?assertions=maybe",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?partial=maybe",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?inferences=maybe",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?projection=frame&imports=false&imports=true",
+            r#"{"about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?imports=false",
+            r#"{"projection":"frame","imports":true,"about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?mode=strict",
+            r#"{"projection":"frame","mode":"lenient","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?assertions=false&assertions=false",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?inferences=false&inferences=false",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?unknown=ignored",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?graph=urn:query",
+            r#"{"projection":"frame","graph":"urn:body","about":"http://ex.org/Professor"}"#,
+        ),
+        ("", "null"),
+        (
+            "",
+            r#"{"projection":"frame","projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?projection=frame",
+            r#"{"about":"http://ex.org/Professor","limit":1,"limit":2}"#,
+        ),
+        (
+            "?projection=frame&projection=frame",
+            r#"{"about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "?projection=frame",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "",
+            r#"{"projection":"unknown","about":"http://ex.org/Professor"}"#,
+        ),
+        (
+            "",
+            r#"{"projection":"frame","about":"http://ex.org/Professor","nodes":true}"#,
+        ),
+        (
+            "",
+            r#"{"projection":"frame","about":"http://ex.org/Professor","target":"http://ex.org/out"}"#,
+        ),
+        (
+            "?format=ofn",
+            r#"{"projection":"frame","about":"http://ex.org/Professor"}"#,
+        ),
+    ] {
+        let r = send(
+            &s.app,
+            "POST",
+            &format!("/$/ontology/t/classify{query}"),
+            &ct,
+            body,
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::BAD_REQUEST,
+            "{query} {body}: {}",
+            r.text()
+        );
+    }
+    assert_eq!(
+        get(&s.app, "/$/ontology/t/classification").await.json()["status"],
+        "unavailable"
+    );
+    assert_eq!(dataset.store.snapshot().commit, head);
+    assert!(
+        !dataset
+            .dataset
+            .ontology()
+            .open(&Default::default(), &Default::default())
+            .unwrap()
+            .cached,
+        "invalid selectors must not map or warm the ontology"
+    );
+    let r = post(&s.app, "/$/ontology/t/classify", json!({"projection":"frame", "about":"http://ex.org/Professor", "nodes":false,"offset":0,"target":null,"limit":1,"lang":["en"]})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert!(j.get("nodes").is_none() && j.get("class").is_none(), "{j}");
+    assert_eq!(
+        j["frame"]["parents"]["items"][0]["iri"],
+        "http://ex.org/Person"
+    );
+    assert_eq!(j["frame"]["retention"]["kept"], true);
+}
+
+#[tokio::test]
+async fn kept_classification_http_branch_and_retained_history_are_exact() {
+    let s = persistent();
+    let ds = crate::http::dataset(&s._state, "h").unwrap_or_else(|_| panic!("fixture dataset"));
+    ds.dataset
+        .store()
+        .create_branch("kept-dev", &Default::default())
+        .unwrap();
+    let run = post(&s.app, "/$/ontology/h/classify?branch=kept-dev", json!({})).await;
+    assert_eq!(run.status, StatusCode::OK, "{}", run.text());
+    let read = get(&s.app, "/$/ontology/h/classification?branch=kept-dev").await;
+    assert_eq!(read.status, StatusCode::OK, "{}", read.text());
+    assert_eq!(read.headers["sparkles-branch"], "kept-dev");
+    let j = read.json();
+    assert_eq!(j["status"], "available");
+    assert_eq!(
+        get(&s.app, "/$/ontology/h/classification").await.json()["status"],
+        "unavailable"
+    );
+    let edit = post(
+        &s.app,
+        "/$/ontology/h/axioms?branch=kept-dev",
+        json!({"add":[sub("http://ex.org/Lecturer", json!("http://ex.org/Person"))]}),
+    )
+    .await;
+    assert_eq!(edit.status, StatusCode::OK, "{}", edit.text());
+    let current = get(&s.app, "/$/ontology/h/classification?branch=kept-dev").await;
+    assert_eq!(current.json()["status"], "mismatch");
+    let pinned = get(
+        &s.app,
+        &format!(
+            "/$/ontology/h/classification?branch=kept-dev&at=commit:{}&resultId={}",
+            j["commit"],
+            j["result"]["resultId"].as_str().unwrap()
+        ),
+    )
+    .await;
+    assert_eq!(pinned.status, StatusCode::OK, "{}", pinned.text());
+    assert_eq!(pinned.json()["status"], "available");
+    assert_eq!(pinned.json()["result"], j["result"]);
+}
+
 /// Item 603's cases in Turtle, as the `sparkles` crate's tests write them: a classification
 /// that the disjunctive rules take, long enough that a deadline stops it part way.
 fn cases(n: usize, inconsistent: bool) -> String {

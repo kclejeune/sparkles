@@ -86,6 +86,7 @@ test('the trees, the frame, the usage and the header', async ({ page }) => {
 
 test('the inferred class tree sits beside the asserted one', async ({ page }) => {
   await page.goto('/ui/workbench/ontology?ds=uni&inferred=1');
+  await page.getByRole('button', { name: 'Classify tree', exact: true }).click();
   const inferred = page.getByRole('tree', { name: 'Classes (inferred)' });
   await expect(inferred).toBeVisible({ timeout: 30_000 });
   // the two trees share the pane in equal columns, side by side

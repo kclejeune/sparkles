@@ -6595,6 +6595,23 @@ The library depends on `jena-arq`, JNA, the Kotlin standard library and JSpecify
 TDB2 import also needs `jena-tdb2` on the classpath. [Spec P04](specs/P04-jvm-bindings/README.md)
 is the design, and `jvm/sample-java` is a Java program written against the public API.
 
+### Reading a kept classification on the JVM
+
+`dsg.ontology().keptClassification()` reads availability without classifying on a miss.
+`KeptClassificationQuery` selects bounded direct-parent, equivalent-class, source or
+exclusion pages. Continue with the returned result ID and a matching
+`OntologyRead(at = "commit:N")`; the read stays on the live dataset's bound branch and
+uses its exact graphs, imports and mapping mode. An explicit
+`classify(read, ClassifyQuery(about = iri, projection = "frame"))` computes bounded
+frame clauses when the caller chooses to classify.
+
+These two new conveniences throw `JenaTransactionException` on a dataset returned by
+`at()` or during an active read or write transaction. The guard runs before native work
+or flushing buffered writes. For retained committed history, call them on the live
+dataset with `OntologyRead.at` instead. They do not read uncommitted changes. Wrapper-source
+integration remains in roadmap item 588; existing ontology methods retain their behavior.
+See the [ontology API](API.md#ontology) for read states, provenance and paging contracts.
+
 ### Opening a Jena dataset
 
 ```java

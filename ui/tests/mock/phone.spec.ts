@@ -54,7 +54,7 @@ async function run(page: Page, ds: string, query: string) {
   return results;
 }
 
-test('the query page, each result view and its menus', async ({ page }) => {
+test('the query page, each result view and its menus', async ({ page }, info) => {
   const results = await run(page, 'foaf', 'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 50');
   for (const view of [/Graph/, /Plan/, /Raw/, /Table/]) {
     await results.getByRole('tab', { name: view }).click();
@@ -75,6 +75,9 @@ test('the query page, each result view and its menus', async ({ page }) => {
   await page.getByRole('dialog', { name: 'Menu' }).locator('.ds-button').click();
   await expect(page.getByRole('listbox', { name: 'Datasets' })).toBeVisible();
   await expectNoSidewaysScroll(page, 'the dataset switcher');
+  const screenshot = info.outputPath('phone-dataset-drawer.png');
+  await page.screenshot({ path: screenshot });
+  await info.attach('phone-dataset-drawer.png', { path: screenshot, contentType: 'image/png' });
 });
 
 test('the Map view', async ({ page }) => {

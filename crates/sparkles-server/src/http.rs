@@ -193,6 +193,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/ontology/{ds}/search", get(ontology::search))
         .route("/$/ontology/{ds}/hierarchy", get(ontology::hierarchy))
         .route("/$/ontology/{ds}/individuals", get(ontology::individuals))
+        .route(
+            "/$/ontology/{ds}/classification",
+            get(ontology::kept_classification),
+        )
         .route("/$/ontology/{ds}/term", get(ontology::term))
         .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/graph/{ds}/facets", post(graph::facets))
@@ -660,8 +664,17 @@ pub(crate) struct ErrorJson(pub(crate) J);
 /// `default-src 'none'`: API responses are data, never a page that runs anything.
 async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     use header::HeaderValue;
+    // Outside authentication/admission too: an availability read can change at
+    // the same data commit, including a previously denied or failed request.
+    let kept_read = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .is_some_and(|p| p.as_str() == "/$/ontology/{ds}/classification");
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
+    if kept_read {
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),

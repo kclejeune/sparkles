@@ -13,6 +13,7 @@
 // tree. Functional-style axioms are parsed for the forms the editor sends.
 
 import ox from 'oxigraph';
+import { createHash, randomUUID } from 'node:crypto';
 import { linesOf } from './branches.mjs';
 import { stateLines } from './history.mjs';
 
@@ -1199,6 +1200,97 @@ function renderer(prefixes) {
 
 // --- classification --------------------------------------------------------------------
 
+// One immutable mock result per dataset/branch object. GET never calls classify.
+const keptClassifications = new WeakMap();
+const classificationKey = (graph, imports, mode) =>
+  JSON.stringify([graph, imports !== false && imports !== 'false', mode ?? 'lenient']);
+const fingerprint = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+function mockClassification(ds, graph, commit, body, taxonomy) {
+  const input = classificationKey(graph, body.imports, body.mode);
+  const boundStoreId = `mock:${ds.name}@${ds.branchName ?? 'main'}`;
+  const inputFingerprint = fingerprint([boundStoreId, commit, input, !!body.assertions]);
+  const contentFingerprint = fingerprint(taxonomy.nodes);
+  const sources = [
+    { kind: 'requestedGraph', ordinal: 0, graph },
+    { kind: 'resolvedGraph', ordinal: 1, graph, requested: true },
+  ];
+  const result = {
+    resultId: randomUUID(),
+    classifiedCommit: commit,
+    boundStoreId,
+    familyId: `mock:${ds.name}`,
+    inputFingerprint,
+    contentFingerprint,
+    sourceFingerprint: fingerprint(sources),
+    imports: body.imports === false ? 'none' : 'dataset',
+    mode: body.mode ?? 'lenient',
+    assertions: !!body.assertions,
+    elOnly: false,
+    partialRequested: !!body.partial,
+    expansion: body.expansion ?? 'cautious',
+    sourceCounts: { requestedGraphs: 1, resolvedGraphs: 1, imports: 0, warnings: 0 },
+    capabilities: [
+      'namedClassDirectParents',
+      'namedClassEquivalents',
+      'namedClassUnsatisfiability',
+    ],
+    justifications: 'unavailable',
+  };
+  const snapshot = { store: new ox.Store([...ds.store.match()]) };
+  const names = new Map();
+  const name = (iri, languages) => {
+    const key = Array.isArray(languages) ? languages.join(',') : (languages ?? '');
+    if (!names.has(key)) names.set(key, browseIndex(snapshot, graph, key));
+    return names.get(key).name(iri);
+  };
+  return {
+    input,
+    result,
+    taxonomy,
+    sources,
+    name,
+    outcome: {
+      tier: 'el',
+      partial: false,
+      complete: true,
+      consistency: 'consistent',
+      excludedCount: 0,
+      incompleteCount: 0,
+    },
+    identity: {
+      boundStoreId,
+      familyId: result.familyId,
+      commit,
+      inputFingerprint,
+      contentFingerprint,
+      producer: {
+        assertions: result.assertions,
+        elOnly: false,
+        partialRequested: result.partialRequested,
+        expansion: result.expansion,
+      },
+    },
+  };
+}
+function mockClassificationRows(kept, part, about, languages) {
+  if (part === 'sources') return kept.sources;
+  if (part === 'excluded') return [];
+  const node = kept.taxonomy.nodes.find((n) => n.classes.includes(about));
+  if (!node) return [];
+  const iris =
+    part === 'parents'
+      ? node.parents.map((p) => kept.taxonomy.nodes[p].classes[0])
+      : node.classes.filter((c) => c !== about);
+  return iris.toSorted().map((iri) => ({
+    ...kept.name(iri, languages),
+    ...(part === 'parents'
+      ? {
+          equivalenceCount: kept.taxonomy.nodes.find((n) => n.classes.includes(iri)).classes.length,
+        }
+      : {}),
+  }));
+}
+
 function classify(o) {
   const classes = new Set([...o.kinds].filter(([, k]) => k.has('Class')).map(([i]) => i));
   const told = new Map([...classes].map((c) => [c, new Set()]));
@@ -1646,6 +1738,51 @@ export async function handleOntology(req, res, url, seg, ctx) {
   });
   const terminology = (o) => o.axioms.filter((a) => !ASSERTION_TYPES.has(a.json.type));
 
+  if (req.method === 'GET' && sub === 'classification') {
+    res.setHeader('Cache-Control', 'no-store');
+    const kept = keptClassifications.get(ds);
+    const selected = /^commit:\d+$/.test(p.get('at') ?? '') ? Number(p.get('at').slice(7)) : head();
+    const matches = kept?.input === classificationKey(graph, p.get('imports'), p.get('mode'));
+    const available =
+      matches &&
+      kept.result.classifiedCommit === selected &&
+      (!p.has('resultId') || p.get('resultId') === kept.result.resultId);
+    const status = available ? 'available' : matches ? 'mismatch' : 'unavailable';
+    const about = p.get('about');
+    const present = available && kept.taxonomy.nodes.some((n) => n.classes.includes(about));
+    const part = p.get('part') ?? 'status';
+    const offset = Number(p.get('offset') ?? 0);
+    const limit = Number(p.get('limit') ?? 100);
+    const rows =
+      available && part !== 'status'
+        ? mockClassificationRows(kept, part, about, p.get('lang'))
+        : null;
+    send(res, 200, {
+      dataset: ds.name,
+      commit: selected,
+      status,
+      reason: available ? null : matches ? 'resultMismatch' : 'notKept',
+      result: available ? kept.result : null,
+      outcome: available ? kept.outcome : null,
+      entity:
+        available && about ? { iri: about, present, unsatisfiable: present ? false : null } : null,
+      activity: null,
+      staleCommit: matches && !available ? kept.result.classifiedCommit : null,
+      page: rows
+        ? {
+            part,
+            about,
+            offset,
+            limit,
+            total: rows.length,
+            items: rows.slice(offset, offset + limit),
+            nextOffset: offset + limit < rows.length ? offset + limit : null,
+          }
+        : null,
+    });
+    return true;
+  }
+
   if (req.method === 'GET' && sub === '') {
     const o = readOntology(ds, graph);
     const counts = {};
@@ -2082,6 +2219,13 @@ export async function handleOntology(req, res, url, seg, ctx) {
     const body = JSON.parse((await readBody(req)) || '{}');
     const o = readOntology(ds, body.graph ?? graph);
     const c = classify(o);
+    const cached = keptClassifications.get(ds);
+    const key = classificationKey(body.graph ?? graph, body.imports, body.mode);
+    const kept =
+      !body.assertions && cached?.input === key && cached.result.classifiedCommit === head()
+        ? cached
+        : mockClassification(ds, body.graph ?? graph, head(), body, c);
+    if (!body.assertions) keptClassifications.set(ds, kept);
     const limit = body.limit ?? 100;
     const offset = body.offset ?? 0;
     const nodes = c.nodes.slice(offset, offset + limit).map((n) => ({
@@ -2102,8 +2246,43 @@ export async function handleOntology(req, res, url, seg, ctx) {
         parentClasses: n.parents.map((x) => c.nodes[x].classes[0]),
       };
     }
+    if (body.projection === 'frame') {
+      if (!body.about) return (fail(res, 400, 'frame requires about'), true);
+      const projected = (part) => {
+        const rows = mockClassificationRows(kept, part, body.about, body.lang);
+        return {
+          items: rows.slice(0, limit),
+          total: rows.length,
+          limit,
+          truncated: rows.length > limit,
+        };
+      };
+      send(res, 200, {
+        dataset: ds.name,
+        commit: head(),
+        classificationSource: kept.identity,
+        frame: {
+          iri: body.about,
+          result: kept.result,
+          outcome: kept.outcome,
+          unsatisfiable: false,
+          parents: projected('parents'),
+          equivalents: projected('equivalents'),
+          excluded: projected('excluded'),
+          sources: projected('sources'),
+          retention: {
+            kept: !body.assertions,
+            resultId: body.assertions ? null : kept.result.resultId,
+          },
+        },
+      });
+      return true;
+    }
     send(res, 200, {
       ...opened(o),
+      classificationSource: kept.identity,
+      resultId: kept.result.resultId,
+      tier: 'el',
       consistent: true,
       complete: true,
       reused: false,
