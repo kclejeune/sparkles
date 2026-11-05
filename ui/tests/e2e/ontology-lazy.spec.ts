@@ -147,6 +147,11 @@ open('the Individuals tab opens buckets and pages only the expanded type', async
   await individuals.focus();
   await page.keyboard.press('End');
   await individuals.getByRole('button', { name: 'Show more', exact: true }).click();
+  // End moves within loaded rows. Wait for the continuation to replace the first
+  // page's footer before asking it to navigate to the newly loaded page's end.
+  await expect(
+    individuals.getByRole('treeitem', { name: 'Show more, 100 of 240 shown' }),
+  ).not.toBeAttached();
   await individuals.focus();
   await page.keyboard.press('End');
   await expect(
