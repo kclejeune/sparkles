@@ -781,7 +781,7 @@ def build_config_cmd(args):
 
 
 def native_digest(args):
-    """A digest of each application/x-sparkles+json SELECT answer in `args.responses`, one
+    """A digest of each application/x-sparkles+json SELECT or ASK answer in `args.responses`, one
     line each in order, for the matrix's check of the timed format after the timed
     requests: "<rows> rows, <digest of the sorted rows>" and, for a query with a top-level
     ORDER BY, the order digest of `order-digest` over the rows as returned. Rows are
@@ -799,6 +799,8 @@ def native_digest(args):
     def term(t):
         if t is None:
             return None
+        if "its:dir" in t:
+            fail("native-digest does not support directional RDF literals")
         if t.get("type") == "triple":
             v = t["value"]
             return ["triple"] + [term(v[k]) for k in ("subject", "predicate", "object")]
@@ -813,9 +815,16 @@ def native_digest(args):
             r = json.loads(Path(response).read_text())
         except (OSError, ValueError):
             return "unreadable"
+        kind = r.get("queryType") if isinstance(r, dict) else None
+        if kind not in ("SELECT", "ASK"):
+            fail(f"{response}: native-digest supports SELECT and ASK, got {kind!r}; graph answers need an RDF checker")
         names = r.get("vars") or []
-        if r.get("queryType") == "ASK":
-            return f"ask {r.get('boolean')}"
+        if kind == "ASK":
+            if type(r.get("boolean")) is not bool:
+                fail(f"{response}: native ASK answer requires a boolean")
+            return f"ask {r['boolean']}"
+        if not isinstance(r.get("vars"), list) or not isinstance(r.get("rows"), list):
+            fail(f"{response}: native SELECT answer requires vars and rows arrays")
         if any(len(row) != len(names) for row in r.get("rows") or []):
             return "rows wider or narrower than vars"
         rows = [show(row) for row in r.get("rows") or []]

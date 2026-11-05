@@ -30,6 +30,44 @@ def metrics_record(d, name, rows, threshold=0.05, scale="1"):
 
 
 class GateTests(unittest.TestCase):
+    def test_native_digest_refuses_directional_literals(self):
+        with tempfile.TemporaryDirectory() as d:
+            query, answer = Path(d) / "q.rq", Path(d) / "answer.json"
+            query.write_text("SELECT ?x WHERE { ?s ?p ?x }")
+            for direction in ("ltr", "rtl", "up", None):
+                answer.write_text(json.dumps({"queryType": "SELECT", "vars": ["x"], "rows": [[{
+                    "type": "literal", "value": "text", "xml:lang": "en", "its:dir": direction,
+                }]]}))
+                result = run("native-digest", query, answer)
+                with self.subTest(direction=direction):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("directional", result.stderr)
+
+    def test_native_digest_rejects_graph_and_unknown_kinds(self):
+        with tempfile.TemporaryDirectory() as d:
+            query, answer = Path(d) / "q.rq", Path(d) / "answer.json"
+            query.write_text("SELECT ?s WHERE { ?s ?p ?o }")
+            for kind in ("CONSTRUCT", "DESCRIBE", "UNKNOWN", None):
+                answer.write_text(json.dumps({"queryType": kind, "triples": []}))
+                result = run("native-digest", query, answer)
+                with self.subTest(kind=kind):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("SELECT and ASK", result.stderr)
+
+    def test_native_digest_requires_an_actual_ask_boolean(self):
+        with tempfile.TemporaryDirectory() as d:
+            query, answer = Path(d) / "q.rq", Path(d) / "answer.json"
+            query.write_text("ASK { ?s ?p ?o }")
+            for value in (True, False):
+                answer.write_text(json.dumps({"queryType": "ASK", "boolean": value}))
+                result = run("native-digest", query, answer)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), f"ask {value}")
+            for value in (None, 0, 1, "false"):
+                answer.write_text(json.dumps({"queryType": "ASK", "boolean": value}))
+                with self.subTest(value=value):
+                    self.assertNotEqual(run("native-digest", query, answer).returncode, 0)
+
     def test_metrics_builds_a_versioned_record(self):
         with tempfile.TemporaryDirectory() as d:
             out = metrics_record(d, "a", [
