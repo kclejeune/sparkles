@@ -4938,7 +4938,7 @@ impl Store {
         let mark = base.generation.dvocab.mark();
         let start_bnode = guard.next_bnode;
         WriteTxn {
-            _callback_owner: crate::sparql::extensions::WriterOwner::enter(self.owner_dataset_id()),
+            _callback_owner: crate::sparql::extensions::WriterOwner::enter(self),
             store: self,
             delta: base.delta.clone(),
             base,
