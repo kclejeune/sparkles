@@ -61,7 +61,9 @@ Load RDF into [compressed indexes](storage/README.md#storage-and-indexes) with
 durable transactions, compaction, clones and integrity checks.
 [History and branches](storage/README.md#versioning-and-history) provide retained
 commits, time travel, diffs, change feeds, RDF Patch and merge review. HTTP history
-and diff filters accept nested triple terms with numeric objects.
+and diff filters accept nested triple terms with numeric objects. Rust branch deletion and
+note changes refuse with a conflict when the calling thread holds a write transaction
+that the operation needs, leaving the transaction usable.
 
 <a id="search"></a>
 <a id="full-text-search"></a>

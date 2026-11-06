@@ -2031,3 +2031,361 @@ fn scratch_marks_persist() {
     s.set_branch_scratch("try", None).unwrap();
     assert!(s.branch_info("try").unwrap().scratch.is_none());
 }
+
+// Run potentially self-deadlocking operations in a child so the failing control
+// can always be killed and reaped without stranding a test worker or temp store.
+fn branch_reentrancy_subprocess(test: &str, scenario: &str) {
+    use std::time::{Duration, Instant};
+    let root = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env("SPARKLES_BRANCH_REENTRANCY", scenario)
+        .env("SPARKLES_BRANCH_REENTRANCY_ROOT", root.path())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "{scenario} failed: {status}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("{scenario} did not finish within 15 seconds; child killed and reaped");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn branch_reentrancy_case(operation: &str, memory: bool) {
+    let root =
+        std::path::PathBuf::from(std::env::var_os("SPARKLES_BRANCH_REENTRANCY_ROOT").unwrap());
+    let s = if memory {
+        Store::in_memory(Default::default())
+    } else {
+        Store::open(&root.join("ds"), Default::default()).unwrap()
+    };
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    s.set_branch_note("dev", Some("original".into())).unwrap();
+    let dev = s.branch("dev").unwrap();
+    let mut writer = dev.write();
+    let result = match operation {
+        "delete" => s.delete_branch("dev", false),
+        "force" => s.delete_branch_with(
+            "dev",
+            &crate::branch::DeleteOptions {
+                force: true,
+                ..Default::default()
+            },
+        ),
+        "note" => s
+            .set_branch_note("dev", Some("replacement".into()))
+            .map(|_| ()),
+        "clear" => s.set_branch_note("dev", None).map(|_| ()),
+        _ => panic!("unknown case {operation}"),
+    };
+    let error = result.unwrap_err();
+    assert!(matches!(error, Error::Conflict(_)), "{error:?}");
+    assert_eq!(error.code(), "conflict");
+    let q = oxttl::NQuadsParser::new()
+        .for_slice(b"<urn:retained> <urn:p> <urn:o> .")
+        .next()
+        .unwrap()
+        .unwrap();
+    let ids = writer.encode_quad(&q, &mut Default::default()).unwrap();
+    writer.insert(ids).unwrap();
+    writer.commit().unwrap();
+    assert!(has(&dev, "urn:retained"));
+    assert_eq!(
+        s.branch_info("dev").unwrap().note.as_deref(),
+        Some("original")
+    );
+    if operation == "note" || operation == "clear" {
+        let note = (operation == "note").then(|| "replacement".to_string());
+        assert_eq!(s.set_branch_note("dev", note.clone()).unwrap().note, note);
+    } else {
+        assert_eq!(
+            code(&s.delete_branch("dev", false).unwrap_err()),
+            "unmerged"
+        );
+        s.delete_branch("dev", true).unwrap();
+        assert_eq!(code(&s.branch_info("dev").unwrap_err()), "no-such-branch");
+    }
+}
+
+#[test]
+fn branch_reentrancy_delete() {
+    const TEST: &str = "store::branch_tests::branch_reentrancy_delete";
+    if let Ok(scenario) = std::env::var("SPARKLES_BRANCH_REENTRANCY") {
+        let (operation, storage) = scenario.split_once('-').unwrap();
+        branch_reentrancy_case(operation, storage == "memory");
+        return;
+    }
+    for scenario in [
+        "delete-persistent",
+        "force-persistent",
+        "delete-memory",
+        "force-memory",
+    ] {
+        branch_reentrancy_subprocess(TEST, scenario);
+    }
+}
+
+#[test]
+fn branch_reentrancy_note() {
+    const TEST: &str = "store::branch_tests::branch_reentrancy_note";
+    if let Ok(scenario) = std::env::var("SPARKLES_BRANCH_REENTRANCY") {
+        let (operation, storage) = scenario.split_once('-').unwrap();
+        branch_reentrancy_case(operation, storage == "memory");
+        return;
+    }
+    for scenario in [
+        "note-persistent",
+        "clear-persistent",
+        "note-memory",
+        "clear-memory",
+    ] {
+        branch_reentrancy_subprocess(TEST, scenario);
+    }
+}
+
+fn branch_reentrancy_controls(memory: bool) {
+    let root =
+        std::path::PathBuf::from(std::env::var_os("SPARKLES_BRANCH_REENTRANCY_ROOT").unwrap());
+    let s = if memory {
+        Store::in_memory(Default::default())
+    } else {
+        Store::open(&root.join("ds"), Default::default()).unwrap()
+    };
+    s.create_branch("dev", &Default::default()).unwrap();
+    s.create_branch("peer", &Default::default()).unwrap();
+    s.create_branch(
+        "child",
+        &BranchOptions {
+            from: "dev".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // A copied dataset has the same persistent UUIDs but distinct Store openings.
+    let copy = if memory {
+        Store::in_memory(Default::default())
+    } else {
+        super::compaction_tests::copy_dir(&root.join("ds"), &root.join("copy"));
+        let copy = Store::open(&root.join("copy"), Default::default()).unwrap();
+        assert_eq!(copy.dataset_id(), s.dataset_id());
+        copy
+    };
+    let dev = s.branch("dev").unwrap();
+    let writer = dev.write();
+    assert!(matches!(s.branch_info("dev"), Err(Error::Conflict(_))));
+    assert!(matches!(s.branch_info("child"), Err(Error::Conflict(_))));
+    assert!(matches!(
+        s.set_branch_note("child", Some("refused".into())),
+        Err(Error::Conflict(_))
+    ));
+    assert!(matches!(
+        s.set_branch_protected("dev", true),
+        Err(Error::Conflict(_))
+    ));
+    assert!(matches!(
+        s.set_branch_scratch("dev", None),
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(
+        code(
+            &s.set_branch_note("dev", Some("x".repeat(1025)))
+                .unwrap_err()
+        ),
+        "invalid-branch"
+    );
+    assert_eq!(
+        code(&s.set_branch_note("missing", None).unwrap_err()),
+        "no-such-branch"
+    );
+    assert_eq!(
+        code(&s.delete_branch("missing", false).unwrap_err()),
+        "no-such-branch"
+    );
+    assert_eq!(
+        code(&s.delete_branch("main", true).unwrap_err()),
+        "invalid-branch"
+    );
+    assert_eq!(
+        code(&s.delete_branch("dev", false).unwrap_err()),
+        "has-children"
+    );
+    assert_eq!(
+        s.set_branch_note("peer", Some("allowed".into()))
+            .unwrap()
+            .note
+            .as_deref(),
+        Some("allowed")
+    );
+    s.delete_branch("peer", false).unwrap();
+    // With no own commits, deleting child does not need dev's head. Only the
+    // optional cleanup tail encounters the unrelated caller-owned dev writer.
+    s.delete_branch("child", false).unwrap();
+    copy.set_branch_note("main", Some("independent".into()))
+        .unwrap();
+    if !memory {
+        copy.set_branch_note("dev", Some("independent".into()))
+            .unwrap();
+        copy.delete_branch("peer", false).unwrap();
+    }
+    drop(writer);
+    assert!(!s.branch_info("dev").unwrap().protected);
+    assert_eq!(s.set_branch_note("dev", None).unwrap().note, None);
+    let writer = s.write();
+    assert!(matches!(
+        s.set_branch_note("main", Some("refused".into())),
+        Err(Error::Conflict(_))
+    ));
+    assert!(matches!(
+        s.set_branch_note("dev", Some("refused".into())),
+        Err(Error::Conflict(_))
+    ));
+    drop(writer);
+    assert_eq!(s.branch_info("main").unwrap().note, None);
+    assert_eq!(s.branch_info("dev").unwrap().note, None);
+    // Drop and unwind both remove the ownership entry, without poisoning Store.
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _writer = dev.write();
+        panic!("release writer through unwind");
+    }));
+    assert!(refused.is_err());
+    s.set_branch_note("dev", Some("after unwind".into()))
+        .unwrap();
+    s.delete_branch("dev", false).unwrap();
+}
+
+fn branch_reentrancy_cross_thread(operation: &str, memory: bool) {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let root =
+        std::path::PathBuf::from(std::env::var_os("SPARKLES_BRANCH_REENTRANCY_ROOT").unwrap());
+    let s = if memory {
+        Store::in_memory(Default::default())
+    } else {
+        Store::open(&root.join("ds"), Default::default()).unwrap()
+    };
+    s.create_branch("dev", &Default::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    let writer = dev.write();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            started_tx.send(()).unwrap();
+            let result = if operation == "note" {
+                s.set_branch_note("dev", Some("waited".into())).map(|_| ())
+            } else {
+                s.delete_branch("dev", false)
+            };
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(100));
+        // Always release before assertions or the scoped worker could strand a
+        // failing control. The outer subprocess deadline bounds every other wait.
+        drop(writer);
+        assert!(
+            matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+            "{early:?}"
+        );
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+    });
+    if operation == "note" {
+        assert_eq!(
+            s.branch_info("dev").unwrap().note.as_deref(),
+            Some("waited")
+        );
+    } else {
+        assert_eq!(code(&s.branch_info("dev").unwrap_err()), "no-such-branch");
+    }
+}
+
+fn branch_reentrancy_cleanup(main: bool) {
+    let root =
+        std::path::PathBuf::from(std::env::var_os("SPARKLES_BRANCH_REENTRANCY_ROOT").unwrap());
+    let s = Store::open(&root.join("ds"), Default::default()).unwrap();
+    apply(&s, "+<urn:initial> <urn:p> <urn:o> .");
+    let dev = if main {
+        None
+    } else {
+        s.create_branch("dev", &Default::default()).unwrap();
+        let dev = s.branch("dev").unwrap();
+        apply(&dev, "+<urn:branch-own> <urn:p> <urn:o> .");
+        Some(dev)
+    };
+    let upstream: &Store = dev.as_ref().map_or(&s, |store| &**store);
+    // Build an owned generation so a child holds exactly these old files.
+    upstream.compact().unwrap();
+    let held = upstream
+        .root()
+        .unwrap()
+        .join(&upstream.snapshot().generation.name);
+    s.create_branch(
+        "child",
+        &BranchOptions {
+            from: if main { "main" } else { "dev" }.into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    apply(upstream, "+<urn:later> <urn:p> <urn:o> .");
+    upstream.compact().unwrap();
+    assert!(
+        held.exists(),
+        "child must retain the old upstream generation"
+    );
+    let writer = upstream.write();
+    s.delete_branch("child", false).unwrap();
+    assert!(
+        held.exists(),
+        "unrelated caller-owned writer postpones collection"
+    );
+    drop(writer);
+    assert_eq!(code(&s.branch_info("child").unwrap_err()), "no-such-branch");
+    upstream.compact().unwrap();
+    assert!(
+        !held.exists(),
+        "ordinary compaction collects the released generation"
+    );
+    assert!(has(upstream, "urn:initial") && has(upstream, "urn:later"));
+}
+
+#[test]
+fn branch_reentrancy_independence_and_cleanup() {
+    const TEST: &str = "store::branch_tests::branch_reentrancy_independence_and_cleanup";
+    if let Ok(scenario) = std::env::var("SPARKLES_BRANCH_REENTRANCY") {
+        match scenario.as_str() {
+            "controls-memory" => branch_reentrancy_controls(true),
+            "controls-persistent" => branch_reentrancy_controls(false),
+            "cleanup-main" => branch_reentrancy_cleanup(true),
+            "cleanup-branch" => branch_reentrancy_cleanup(false),
+            _ => {
+                let (operation, storage) = scenario.split_once('-').unwrap();
+                branch_reentrancy_cross_thread(operation, storage == "memory");
+            }
+        }
+        return;
+    }
+    for scenario in [
+        "controls-memory",
+        "controls-persistent",
+        "note-memory",
+        "note-persistent",
+        "delete-memory",
+        "delete-persistent",
+        "cleanup-main",
+        "cleanup-branch",
+    ] {
+        branch_reentrancy_subprocess(TEST, scenario);
+    }
+}

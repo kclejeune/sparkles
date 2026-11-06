@@ -1859,6 +1859,50 @@ grants that allow and refuse it, and the read-only server. The JVM and Node bind
 tests relink a persistent branch after `main` compacts and check its id, head and
 data.
 
+### Branch operations during a write transaction
+
+Roadmap item 443 is complete for direct Rust `Store` and `Dataset` calls. Branch
+deletion, note changes and branch information reads return the existing `conflict`
+error when they would wait for a write transaction held by the calling thread.
+Metadata changes check both the branch and upstream heads
+before saving, so a refused note, protection or scratch change leaves the metadata
+unchanged. The open transaction remains usable and can commit or abort normally.
+Operations from another thread keep their ordinary wait for the writer to finish.
+
+Ownership is tracked for the exact Store opening on its transaction's thread. Sibling
+branches and independent openings of copied datasets do not share that ownership.
+Deleting another branch still removes its directory and releases its holds. If the
+calling thread holds an unrelated writer, collection of that surviving store's old
+generations waits for its next normal collection, such as compaction or reopen. This
+can retain excess disk space until then and does not change WAL publication or the
+holds that protect readable history. Bounded subprocess regressions cover persistent
+and memory branches, transaction reuse, metadata preservation, copied dataset
+identities, cross-thread waiting and collection after transaction release.
+
+Python's synchronous branch get, update and delete methods check the existing caller
+ownership of the named branch before waiting for its transaction worker. Existing
+branch handles are resolved from the identity-checked cache before reading upstream
+information, including while a rename still has the old cache key. The metadata guard
+does not open a cold Store, so missing and corrupt branches keep their original
+metadata and forced-deletion behavior. JVM note changes use the same caller-thread branch capture
+guard as deletion and protection. These checks preserve genuine other-thread waiting.
+
+### Remaining binding transaction dependencies
+
+Roadmap item 754 covers the worker-mediated contexts that the named target checks do
+not identify. These include Node.js manual transactions, raw FFI administration,
+nested upstream head dependencies, Python and Node.js branch information listings,
+and deletion cleanup that encounters an unrelated transaction worker. Such calls can
+still wait for their logical caller's transaction, and they need refusal before any
+mutation. Node.js transaction callbacks already guard note and delete operations
+through their family context. The remaining work must preserve legitimate operations
+from another thread and on independent datasets.
+
+Python's `branches.update(name, note=None)` treats explicit `None` as omission and
+keeps the note. Rust's optional note and the JVM's nullable note can clear it. Roadmap
+item 755 separately owns Python argument presence and compatibility, as
+[P01](P01-python-bindings.md#python-note-argument-presence) records.
+
 ### Scope changes
 
 **Remotes with fetch, push and pull.** The non-goal in §1 excluded remote branches and push and pull between servers, leaving only a one-off clone. Two-way sync with remotes is now planned under [ROADMAP](../ROADMAP.md) item 460 and [F25](F25-git-sync-and-remotes/README.md).

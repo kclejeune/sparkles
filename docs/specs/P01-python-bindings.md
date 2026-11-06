@@ -1350,6 +1350,35 @@ one-triple one in a new process takes 6.4 ms instead of 2.7 ms, which roadmap it
 445 tracks. The [loading results](../benchmarks/loading/RESULTS.md#python-file-objects)
 record the measurements.
 
+### Branch administration ownership
+
+The synchronous branch get, update and delete methods use the existing transaction
+owner check for their named target before dispatching work that could wait for its
+writer. The check uses the shared DatasetState identity, so aliases of the target
+cannot bypass it. A refused operation leaves the transaction usable, and an operation
+from another Python thread retains its ordinary wait. Memory branch alias lookup
+returns an existing identity-checked handle before capturing upstream information,
+while concurrent opening keeps its later cache check. The metadata guard uses only a
+cached target identity, including a handle whose name is being changed. A cold branch
+keeps the original operation's validation, so an unopenable branch can still be
+force-deleted.
+
+Roadmap item 754 retains nested upstream dependencies, branch listings and deletion
+cleanup that meets an unrelated transaction worker. Those paths need the logical
+caller's ownership checked before any wait or mutation.
+
+### Python note argument presence
+
+`branches.update(name, note=None)` currently has the same effect as omitting `note`
+and leaves its existing value unchanged. PyO3 extracts either form as the outer
+`Option::None`, so the implementation does not reach its intended explicit clearing
+case. A string still sets the note. Roadmap item 755 owns the correction and needs a
+bounded presence or sentinel design that preserves existing calls and agrees with
+the runtime signature and type stub. Its acceptance covers omission, explicit
+clearing, string notes, invalid values, transaction-owner refusal and both memory and
+persistent datasets. The two post-release failures that exposed this distinction are
+separate from the branch ownership repair.
+
 ### Scope changes
 
 **Python client for a remote server.** The non-goal in §1 left a Python client for a remote server to existing SPARQL libraries. A client in the Python package with the same API as the embedded store is now planned under [ROADMAP](../ROADMAP.md) item 468 in this spec's Roadmap follow-ups.

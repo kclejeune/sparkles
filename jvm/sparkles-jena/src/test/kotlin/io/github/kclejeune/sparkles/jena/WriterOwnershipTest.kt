@@ -12,7 +12,7 @@ import java.util.concurrent.TimeUnit
 object OwnershipProbe {
     @JvmStatic
     fun main(args: Array<String>) {
-        val dataset = if (args[0] == "persistent-main-alias") SparklesDatasets.open(Path.of(args[1])) else SparklesDatasets.memory()
+        val dataset = if (args[0] == "persistent-main-alias" || args[0] == "branch-note-persistent") SparklesDatasets.open(Path.of(args[1])) else SparklesDatasets.memory()
         dataset.use { ds ->
             val sink = ds.bulkSink()
             try {
@@ -43,6 +43,44 @@ object OwnershipProbe {
                             try { ds.branches().list(); error("list accepted an owned branch writer") }
                             catch (_: JenaTransactionException) { }
                             branch.abort(); branch.end()
+                        }
+                    }
+                    "branch-note-memory", "branch-note-persistent" -> {
+                        val branches = ds.branches()
+                        branches.create("dev", note = "original")
+                        branches.create("peer")
+                        ds.branch("dev").use { branch ->
+                            branch.begin(TxnType.WRITE)
+                            assertThrows(JenaTransactionException::class.java) { branches.note("dev", "refused") }
+                            assertThrows(JenaTransactionException::class.java) { branches.note("dev", null) }
+                            assertThrows(JenaTransactionException::class.java) { branches.delete("dev") }
+                            branches.note("peer", "allowed")
+                            org.apache.jena.update.UpdateAction.parseExecute("INSERT DATA { <urn:pending> <urn:p> 3 }", branch)
+                            org.apache.jena.sparql.exec.QueryExec.dataset(branch).query("ASK { <urn:pending> <urn:p> 3 }").build().use { assertTrue(it.ask()) }
+                            branch.commit(); branch.end()
+                            assertEquals("original", branches.get("dev").note)
+                            branches.note("dev", "after release")
+                            branches.note("dev", null)
+                            assertNull(branches.get("dev").note)
+                            branch.begin(TxnType.WRITE)
+                            val entered = java.util.concurrent.CountDownLatch(1)
+                            val done = java.util.concurrent.CountDownLatch(1)
+                            val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+                            val other = Thread {
+                                entered.countDown()
+                                try { branches.note("dev", "other thread") }
+                                catch (error: Throwable) { failure.set(error) }
+                                finally { done.countDown() }
+                            }.apply { isDaemon = true; start() }
+                            assertTrue(entered.await(3, TimeUnit.SECONDS))
+                            val early = done.await(100, TimeUnit.MILLISECONDS)
+                            branch.abort(); branch.end()
+                            assertFalse(early)
+                            assertTrue(done.await(5, TimeUnit.SECONDS))
+                            other.join(5000)
+                            assertFalse(other.isAlive); assertNull(failure.get())
+                            assertEquals("other thread", branches.get("dev").note)
+                            branches.delete("dev", force = true)
                         }
                     }
                     "late-sink" -> {
@@ -81,7 +119,7 @@ object OwnershipProbe {
 class WriterOwnershipTest {
     @Test
     fun sink_and_transaction_dispatch_never_wait_on_their_own_writer(@TempDir directory: Path) {
-        for (case in listOf("late-sink", "active-sink", "closed-sink", "owner-close", "branch-preview", "memory-main-alias", "persistent-main-alias")) {
+        for (case in listOf("late-sink", "active-sink", "closed-sink", "owner-close", "branch-preview", "memory-main-alias", "persistent-main-alias", "branch-note-memory", "branch-note-persistent")) {
             val process = ProcessBuilder(File(System.getProperty("java.home"), "bin/java").path,
                 "-cp", System.getProperty("java.class.path"), OwnershipProbe::class.java.name, case, directory.resolve(case).toString())
                 .redirectErrorStream(true).start()
@@ -90,7 +128,10 @@ class WriterOwnershipTest {
                 val output = process.inputStream.bufferedReader().readText()
                 assertEquals(0, process.exitValue(), output)
                 assertTrue(output.contains("passed"), output)
-            } finally { process.destroyForcibly() }
+            } finally {
+                if (process.isAlive) process.destroyForcibly()
+                assertTrue(process.waitFor(10, TimeUnit.SECONDS), "ownership probe child was not reaped: $case")
+            }
         }
     }
 

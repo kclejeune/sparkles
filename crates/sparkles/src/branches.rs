@@ -27,6 +27,9 @@ impl Dataset {
             return Ok(self.clone());
         }
         let id = self.store().branch_id_of(name)?;
+        if let Some(ds) = self.cached_branch_by_id(name, id) {
+            return Ok(ds);
+        }
         let upstream = if self.store().root().is_none() {
             self.branch_info(name)?
                 .upstream
@@ -92,6 +95,34 @@ impl Dataset {
             .push(ds.state_reference());
         branches.insert(name.to_string(), ds.clone());
         Ok(ds)
+    }
+
+    /// An already cached handle for this currently listed branch. This host
+    /// ownership lookup never opens a Store or captures a writer-owned head.
+    #[doc(hidden)]
+    pub fn cached_branch(&self, name: &str) -> Result<Option<Dataset>> {
+        let _use = self
+            .inner
+            .reference
+            .link
+            .enter()
+            .ok_or_else(|| crate::Error::invalid("the dataset is closed"))?;
+        if name == crate::branch::MAIN {
+            return Ok(Some(self.clone()));
+        }
+        let id = self.store().branch_id_of(name)?;
+        Ok(self.cached_branch_by_id(name, id))
+    }
+
+    fn cached_branch_by_id(&self, name: &str, id: uuid::Uuid) -> Option<Dataset> {
+        let branches = self.state().branches.lock();
+        branches
+            .get(name)
+            .filter(|ds| ds.store().branch_id() == id)
+            // Rename publishes the table before it can rekey this cache. A
+            // live transaction still owns the same identity under the old key.
+            .or_else(|| branches.values().find(|ds| ds.store().branch_id() == id))
+            .cloned()
     }
 
     /// The branches, `main` first.

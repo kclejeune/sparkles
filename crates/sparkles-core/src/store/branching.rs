@@ -1678,9 +1678,48 @@ impl Store {
         Ok(out)
     }
 
-    /// One branch.
+    /// Refuse before a branch operation waits for this thread's own transaction.
+    /// Other threads retain the ordinary writer-mutex serialization.
+    fn check_branch_writer(&self, set: &BranchSet, id: uuid::Uuid) -> Result<()> {
+        let held = if id == self.dataset_id {
+            crate::sparql::extensions::owns_writer(self)
+        } else {
+            set.stores
+                .lock()
+                .get(&id)
+                .is_some_and(|store| crate::sparql::extensions::owns_writer(store))
+        };
+        if held {
+            return Err(Error::Conflict(
+                "branch operation would wait for this thread's open write transaction".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// BranchInfo reads both the branch and upstream heads. Metadata setters must
+    /// check these dependencies before persisting, rather than partially succeeding
+    /// and then refusing while constructing their return value.
+    fn check_branch_info_writers(&self, set: &BranchSet, name: &str) -> Result<()> {
+        if name == MAIN {
+            return self.check_branch_writer(set, self.dataset_id);
+        }
+        let entry = set.entry(name)?;
+        if set.broken.lock().contains(&entry.id) {
+            return Ok(());
+        }
+        self.check_branch_writer(set, entry.id)?;
+        if let Some(upstream) = set.upstream_of(entry.id) {
+            self.check_branch_writer(set, upstream)?;
+        }
+        Ok(())
+    }
+
+    /// One branch. Refuses with a conflict if its head or its upstream's head
+    /// needs a write transaction held by this thread.
     pub fn branch_info(&self, name: &str) -> Result<BranchInfo> {
         let set = self.owned_set()?;
+        self.check_branch_info_writers(set, name)?;
         if name == MAIN {
             let t = set.table.lock();
             let created_ms = commit::read_dataset_created(self.root.as_deref())
@@ -1868,7 +1907,8 @@ impl Store {
         Ok(set.exempt())
     }
 
-    /// Change a branch's note (`None` removes it).
+    /// Change a branch's note (`None` removes it). Refuses before changing it if
+    /// constructing the returned info would wait for this thread's transaction.
     pub fn set_branch_note(&self, name: &str, note: Option<String>) -> Result<BranchInfo> {
         if note.as_ref().is_some_and(|n| n.len() > 1024) {
             return Err(branch::invalid_branch("the note is longer than 1024 bytes"));
@@ -1905,6 +1945,7 @@ impl Store {
     ) -> Result<()> {
         let _family = self.shared_family(&Default::default())?;
         let set = self.owned_set()?;
+        self.check_branch_info_writers(set, name)?;
         let mut t = set.table.lock();
         let mut next = t.clone();
         if name == MAIN {
@@ -2474,11 +2515,13 @@ impl Store {
                 ),
             ));
         }
+        self.check_branch_writer(&set, e.id)?;
         if !o.force && !set.broken.lock().contains(&e.id) {
             let store = set.open_store(e.id)?;
             let head = store.head_commit().seq;
             if head > e.from.seq {
                 let up = set.upstream_of(e.id).unwrap_or(self.dataset_id);
+                self.check_branch_writer(&set, up)?;
                 let up_head = self.branch_by_id(up)?.head_commit().seq;
                 let f = set.frontiers(&[CommitRef {
                     branch_id: up,
@@ -2594,17 +2637,24 @@ impl Store {
                 std::fs::remove_dir_all(&doomed)?;
             }
         }
-        // the generations only the branch held can go
-        let head = self.head_commit().seq;
-        self.collect_history(
-            commit::generation_number(&self.snapshot().generation.name),
-            head,
-        );
-        for s in set.open_stores() {
-            s.collect_history(
-                commit::generation_number(&s.snapshot().generation.name),
-                s.head_commit().seq,
+        // The deleted branch's directory and holds are gone. Collection of other
+        // stores is opportunistic: an unrelated transaction on this thread must
+        // not make deletion self-deadlock. Its next normal collection (for example
+        // on compaction or reopen) removes any excess generations kept here.
+        if !crate::sparql::extensions::owns_writer(self) {
+            let head = self.head_commit().seq;
+            self.collect_history(
+                commit::generation_number(&self.snapshot().generation.name),
+                head,
             );
+        }
+        for s in set.open_stores() {
+            if !crate::sparql::extensions::owns_writer(&s) {
+                s.collect_history(
+                    commit::generation_number(&s.snapshot().generation.name),
+                    s.head_commit().seq,
+                );
+            }
         }
         self.quota.invalidate();
         tracing::info!(target: "sparkles::store::branching",

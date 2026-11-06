@@ -19,6 +19,17 @@ impl PyBranches {
         }
         Ok(ds)
     }
+
+    fn metadata(&self, py: Python<'_>, name: &str) -> PyResult<sparkles::Dataset> {
+        let ds = self.write(py)?;
+        // Every target transaction reachable through a live Python main handle
+        // retains its cached DatasetState. A cold branch must keep the original
+        // operation's validation, including forced deletion of a corrupt Store.
+        if let Some(branch) = py.detach(|| ds.cached_branch(name)).py(py)? {
+            crate::dataset::check_transaction(py, &branch)?;
+        }
+        Ok(ds)
+    }
 }
 #[pymethods]
 impl PyBranches {
@@ -33,7 +44,7 @@ impl PyBranches {
         admin::to_py(py, &py.detach(|| ds.branches()).py(py)?)
     }
     fn get<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
-        let ds = self.ds(py)?;
+        let ds = self.metadata(py, name)?;
         admin::to_py(py, &py.detach(|| ds.branch_info(name)).py(py)?)
     }
     #[pyo3(signature=(name,*,from_branch="main".to_string(),at=None,protected=false,note=None,cancel=None,progress=None,timeout=None))]
@@ -79,7 +90,7 @@ impl PyBranches {
         note: Option<&Bound<'py, PyAny>>,
         new_name: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let ds = self.write(py)?;
+        let ds = self.metadata(py, name)?;
         let note = note
             .map(|n| {
                 if n.is_none() {
@@ -108,7 +119,7 @@ impl PyBranches {
     }
     #[pyo3(signature=(name,*,force=false,reparent=false))]
     fn delete(&self, py: Python<'_>, name: &str, force: bool, reparent: bool) -> PyResult<()> {
-        let ds = self.write(py)?;
+        let ds = self.metadata(py, name)?;
         py.detach(|| {
             ds.delete_branch_with(
                 name,

@@ -78,7 +78,9 @@ durable consumer.
   from a file object streams it to the bulk loader once, with no temporary copy, and
   Ctrl-C stops it too.
   `sparkles.aio` provides async queries, bounded cursors and transactions, with owned
-  cancellation and explicit async cleanup.
+  cancellation and explicit async cleanup. Synchronous branch get, update and delete
+  refuse a named branch transaction owned by the calling Python thread before waiting
+  for its worker. Refusal leaves the transaction usable.
 * `sparkles-jena` is a Jena `DatasetGraph` backed by Sparkles for JVM programs
   ([USAGE.md](../USAGE.md#jvm-apache-jena)). It has Jena's transactions, query and update
   engines that run in Sparkles with ARQ as the fallback, bulk loads, historical reads,
@@ -183,9 +185,16 @@ environment and saved credentials remain under the same item.
   no Windows or Intel macOS packages, and Linux is the platform tested locally. The JVM
   library has no musl build. Roadmap item 58.
 * Python mapping runs cannot be cancelled and have no timeout. Roadmap item 404.
+* Python `branches.update(name, note=None)` leaves the note unchanged, as omitting the
+  argument does. Explicit clearing needs argument presence handling under roadmap
+  item 755.
 * Python async administration and bulk operations remain under roadmap item 58.
   The available async surface covers queries, updates, bounded cursors and transactions.
 * JVM functions registered in Java run through ARQ. Roadmap item 25.
+* Branch administration still needs logical caller ownership checks for Node.js manual
+  transactions and raw FFI calls, nested upstream dependencies, Python and Node.js
+  branch listings, and deletion cleanup beside an unrelated transaction worker.
+  Such a call can wait for its own transaction. Roadmap item 754.
 * The server and CLI need the host's system CA certificates, even for loopback commands
   such as `sparkles ping`, because the HTTP client loads them when it starts. Minimal
   images such as bare Debian leave them out. Roadmap item 59.

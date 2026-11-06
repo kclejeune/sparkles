@@ -34,7 +34,7 @@ public class SparklesBranches internal constructor(private val owner: DatasetGra
     @JvmOverloads public fun delete(name: String, force: Boolean = false, reparent: Boolean = false) { capture(listOf(name)); owner.checkNoTxn("branches.delete"); ffi { owner.handle.ffi.branchesDelete(name, force, reparent) } }
     public fun rename(name: String, to: String): BranchInfo { capture(listOf(name)); owner.checkNoTxn("branches.rename"); return ffi { owner.handle.ffi.branchesRename(name, to) }.toInfo() }
     public fun protect(name: String, on: Boolean): BranchInfo { capture(listOf(name)); owner.checkNoTxn("branches.protect"); return ffi { owner.handle.ffi.branchesProtect(name, on) }.toInfo() }
-    public fun note(name: String, note: String?): BranchInfo { owner.checkNoTxn("branches.note"); return ffi { owner.handle.ffi.branchesNote(name, note) }.toInfo() }
+    public fun note(name: String, note: String?): BranchInfo { capture(listOf(name)); owner.checkNoTxn("branches.note"); return ffi { owner.handle.ffi.branchesNote(name, note) }.toInfo() }
     /** Move persistent linked branch [name] onto main's current index. Its head, identity and state stay as they were. */
     public fun relink(name: String): RelinkReport = SparklesOperation().use { relink(name, it) }
     public fun relink(name: String, operation: SparklesOperation): RelinkReport { capture(listOf(name)); owner.checkNoTxn("branches.relink"); return ffi { owner.handle.ffi.branchesRelink(name, operation.native) }.toReport() }

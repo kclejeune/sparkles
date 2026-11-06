@@ -193,3 +193,222 @@ def test_catalog_pool_bounds_queries() -> None:
             "DELETE { ?a <urn:none> ?b } WHERE { SELECT ?a ?b WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y } ORDER BY ?x ?y }"
         )
     assert e.value.kind == "server-memory"  # type: ignore[attr-defined]
+
+
+# The Python caller owns the transaction logically; its Rust worker holds the
+# actual writer. Each child is killed and reaped by subprocess.run on a timeout.
+BRANCH_TRANSACTION_CALL = r'''
+import sys
+import threading
+from pathlib import Path
+from sparkles import Catalog, ConflictError
+
+path = Path(sys.argv[1])
+kind, operation = sys.argv[2:]
+with Catalog(path / "catalog") as cat:
+    ds = cat.create("wiki", kind=kind)
+    other = cat.create("other", kind=kind)
+    ds.branches.create("work", note="original")
+    ds.branches.create("peer")
+    aliases = []
+    opened = threading.Barrier(3)
+    def open_alias():
+        opened.wait(timeout=3)
+        aliases.append(ds.branch("work"))
+    openers = [threading.Thread(target=open_alias, daemon=True) for _ in range(2)]
+    for opener in openers:
+        opener.start()
+    opened.wait(timeout=3)
+    for opener in openers:
+        opener.join(5)
+        assert not opener.is_alive()
+    assert len(aliases) == 2
+    work = aliases[0]
+    alias = cat.get_by_id(ds.dataset_id)
+    calls = {
+        "note": lambda: alias.branches.update("work", note="replacement"),
+        "none": lambda: alias.branches.update("work", note=None),
+        "delete": lambda: alias.branches.delete("work"),
+        "force": lambda: alias.branches.delete("work", force=True),
+        "get": lambda: alias.branches.get("work"),
+    }
+    with work.transaction() as tx:
+        tx.update("INSERT DATA { <urn:pending> <urn:p> 3 }")
+        if operation.startswith("thread"):
+            entered = threading.Event()
+            done = threading.Event()
+            errors = []
+            def run():
+                entered.set()
+                try:
+                    if operation == "thread-note":
+                        alias.branches.update("work", note="waited")
+                    else:
+                        alias.branches.delete("work")
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    done.set()
+            # A daemon control cannot keep the child alive after a failing assertion;
+            # the outer deadline still bounds native or interpreter shutdown waits.
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            assert entered.wait(3)
+            early = done.wait(0.1)
+            # Roll back pending data so ordinary deletion is safe after release.
+            tx.rollback()
+            assert not early, errors
+            assert done.wait(5), "other thread did not finish after writer release"
+            worker.join(5)
+            assert not worker.is_alive() and not errors, errors
+        else:
+            try:
+                calls[operation]()
+            except ConflictError as error:
+                assert "open transaction" in str(error)
+            else:
+                raise AssertionError(operation + " accepted the transaction owner")
+            assert tx.query("ASK { <urn:pending> <urn:p> 3 }") is True
+            tx.update("INSERT DATA { <urn:continued> <urn:p> 4 }")
+            # Unrelated note changes and another dataset keep working.
+            ds.branches.update("peer", note="allowed")
+            other.branches.update("main", note="independent")
+    if operation.startswith("thread"):
+        if operation == "thread-note":
+            assert ds.branches.get("work")["note"] == "waited"
+        else:
+            assert [b["name"] for b in ds.branches.list()] == ["main", "peer"]
+    else:
+        assert ds.branches.get("work")["note"] == "original"
+        assert work.ask("ASK { <urn:continued> <urn:p> 4 }")
+        if operation in ("delete", "force"):
+            old_id = work.dataset_id
+            ds.branches.delete("work", force=True)
+            ds.branches.create("work")
+            assert ds.branch("work").dataset_id != old_id
+        else:
+            calls[operation]()
+            # Explicit None currently means omission, tracked by roadmap 755.
+            expected = "replacement" if operation == "note" else "original"
+            assert ds.branches.get("work")["note"] == expected
+'''
+
+
+@pytest.mark.parametrize("kind", ["mem", "persistent"])
+@pytest.mark.parametrize("operation", ["note", "none", "delete", "force", "get", "thread-note", "thread-delete"])
+def test_branch_transaction_owner(tmp_path: Path, kind: str, operation: str) -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", BRANCH_TRANSACTION_CALL, str(tmp_path), kind, operation],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+BROKEN_BRANCH_CALL = r'''
+import shutil
+import sys
+from pathlib import Path
+from sparkles import Catalog
+
+root = Path(sys.argv[1])
+damage = sys.argv[2]
+with Catalog(root / "catalog") as cat:
+    ds = cat.create("wiki", kind="persistent")
+    info = ds.branches.create("broken", note="original")
+    branch_path = Path(cat.info("wiki").path) / "branches" / info["id"]
+    ds.close()
+if damage == "missing":
+    shutil.rmtree(branch_path)
+with Catalog(root / "catalog") as cat:
+    ds = cat.get("wiki")
+    if damage == "missing":
+        assert ds.branches.get("broken")["broken"] is True
+        updated = ds.branches.update("broken", note="metadata only")
+        assert updated["broken"] is True and updated["note"] == "metadata only"
+    else:
+        # Damage only after main opens, so force-delete remains available even
+        # though opening this cold branch's Store will now fail.
+        (branch_path / "CURRENT").write_text("not-a-generation\n")
+    ds.branches.delete("broken", force=True)
+    assert [branch["name"] for branch in ds.branches.list()] == ["main"]
+'''
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_branch_transaction_guard_keeps_broken_branch_administration(tmp_path: Path, damage: str) -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", BROKEN_BRANCH_CALL, str(tmp_path), damage],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+CACHE_OWNER_CALL = r'''
+import sys
+from pathlib import Path
+from sparkles import Catalog, ConflictError, Dataset, DatasetLockedError
+
+root = Path(sys.argv[1])
+mode = sys.argv[2]
+if mode == "closed-parent":
+    ds = Dataset.open(root / "standalone")
+    ds.branches.create("work")
+    work = ds.branch("work")
+    tx = work.transaction()
+    ds.close()
+    work.close()
+    try:
+        Dataset.open(root / "standalone")
+    except DatasetLockedError:
+        pass
+    else:
+        raise AssertionError("reopened a main around its retained branch worker")
+    tx.rollback()
+    with Dataset.open(root / "standalone") as reopened:
+        reopened.branches.update("work", note="released")
+        assert reopened.branches.get("work")["note"] == "released"
+else:
+    for cycle in range(2):
+        with Catalog(root / "catalog") as cat:
+            ds = cat.create("wiki", kind="persistent") if cycle == 0 else cat.get("wiki")
+            if cycle == 0:
+                ds.branches.create("work", note="original")
+            assert cat.get_by_id(ds.dataset_id) is ds
+            # branch(main) constructs a distinct Python wrapper around the
+            # same cached main state, unlike Catalog's deduplicated wrapper.
+            alias = ds.branch("main")
+            assert alias is not ds
+            work = ds.branch("work")
+            before = alias.branches.get("work")["note"]
+            with work.transaction() as tx:
+                # Closing one Python main wrapper does not discard its catalog's
+                # shared main state or the live alias's cached target state.
+                ds.close()
+                replacement = cat.get_by_id(alias.dataset_id)
+                assert replacement is not ds
+                for current in (alias, replacement):
+                    try:
+                        current.branches.update("work", note="refused")
+                    except ConflictError:
+                        pass
+                    else:
+                        raise AssertionError("catalog alias missed the cached transaction")
+                tx.update("INSERT DATA { <urn:reopened> <urn:p> 1 }")
+            assert alias.branches.get("work")["note"] == before
+            alias.branches.update("work", note="cycle " + str(cycle))
+'''
+
+
+@pytest.mark.parametrize("mode", ["closed-parent", "catalog-reopen"])
+def test_branch_transaction_cache_ownership(tmp_path: Path, mode: str) -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", CACHE_OWNER_CALL, str(tmp_path), mode],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

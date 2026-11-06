@@ -523,3 +523,14 @@ JPMS descriptor, allocator changes and worker-free transaction design need recor
 scope decisions under 76 before being treated as part of a completion claim. A
 proposal to remove an accepted requirement needs maintainer approval. This avoids
 mistaking every optional JVM engineering alternative for required Jena parity.
+
+
+### Branch note transaction ownership
+
+Branch note changes use the existing capture guard for the named branch before
+entering FFI, as deletion and protection already do. An owning caller receives
+`JenaTransactionException` before mutation and keeps its transaction usable. Another
+thread waits for the transaction normally. Bounded subprocess controls cover memory
+and persistent datasets. Nested upstream and unrelated transaction-worker cleanup
+dependencies remain under [F09](../F09-branches-and-merges.md#remaining-binding-transaction-dependencies)
+and roadmap item 754.

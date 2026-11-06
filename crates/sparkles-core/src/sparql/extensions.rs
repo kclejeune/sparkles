@@ -27,7 +27,14 @@ struct CallbackFrame {
 }
 
 type CallbackStack = RefCell<Vec<CallbackFrame>>;
-type WriterStack = RefCell<Vec<(u64, uuid::Uuid, Failure)>>;
+struct WriterFrame {
+    token: u64,
+    family: uuid::Uuid,
+    store: usize,
+    failure: Failure,
+}
+
+type WriterStack = RefCell<Vec<WriterFrame>>;
 
 // These data keys stay accessible after the cleanup sentinel has been destroyed.
 const _: () = assert!(!std::mem::needs_drop::<ManuallyDrop<CallbackStack>>());
@@ -98,11 +105,18 @@ impl WriterOwner {
         }
     }
 
-    pub(crate) fn enter(family: uuid::Uuid) -> Self {
+    pub(crate) fn enter(store: &crate::store::Store) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let token = NEXT.fetch_add(1, Ordering::Relaxed);
         let failure: Failure = Default::default();
-        with_writers(|w| w.borrow_mut().push((token, family, failure.clone())));
+        with_writers(|w| {
+            w.borrow_mut().push(WriterFrame {
+                token,
+                family: store.owner_dataset_id(),
+                store: store as *const _ as usize,
+                failure: failure.clone(),
+            })
+        });
         Self {
             token,
             failure,
@@ -114,17 +128,29 @@ impl WriterOwner {
 impl Drop for WriterOwner {
     fn drop(&mut self) {
         with_writers(|w| {
-            w.borrow_mut().retain(|(token, _, _)| *token != self.token);
+            w.borrow_mut().retain(|frame| frame.token != self.token);
             release_during_teardown(w);
         });
     }
+}
+
+/// The exact opening whose non-Send WriteTxn is alive on this thread. Its borrow
+/// keeps the Store at this address until WriterOwner drops, including on unwind.
+/// Addresses are compared only, never dereferenced. A family UUID alone would
+/// conflate sibling branches and independent openings of a copied dataset.
+pub(crate) fn owns_writer(store: &crate::store::Store) -> bool {
+    with_writers(|w| {
+        w.borrow()
+            .iter()
+            .any(|frame| frame.store == store as *const _ as usize)
+    })
 }
 
 pub(crate) fn captured_writers() -> Vec<(uuid::Uuid, Failure)> {
     let mut writers: Vec<_> = with_writers(|w| {
         w.borrow()
             .iter()
-            .map(|(_, id, failure)| (*id, failure.clone()))
+            .map(|frame| (frame.family, frame.failure.clone()))
             .collect()
     });
     with_callbacks(|c| {
@@ -141,7 +167,7 @@ pub(crate) fn captured_writers() -> Vec<(uuid::Uuid, Failure)> {
 
 pub(crate) fn captured_families(family: uuid::Uuid) -> Vec<uuid::Uuid> {
     let mut families = vec![family];
-    with_writers(|w| families.extend(w.borrow().iter().map(|(_, id, _)| *id)));
+    with_writers(|w| families.extend(w.borrow().iter().map(|frame| frame.family)));
     with_callbacks(|c| {
         for frame in c.borrow().iter() {
             families.extend(&frame.families);
