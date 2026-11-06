@@ -11,6 +11,7 @@ fn counters(description: &str) -> J {
 
 pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     metrics(put);
+    derived_table_cache(put);
     server_memory(put);
     fuseki(put);
     compaction(put);
@@ -137,6 +138,36 @@ fn metrics(put: &mut dyn FnMut(&str, J)) {
     );
 }
 
+fn derived_table_cache(put: &mut dyn FnMut(&str, J)) {
+    put(
+        "DerivedTableCache",
+        doc(
+            obj(
+                &[
+                    "scope",
+                    "enabled",
+                    "capacityBytes",
+                    "estimatedBytes",
+                    "tables",
+                    "hits",
+                    "misses",
+                ],
+                json!({
+                    "scope": string_enum(&["process"]),
+                    "enabled": boolean(),
+                    "capacityBytes": int(),
+                    "estimatedBytes": { "type": "integer", "description": "The retained-table estimate, counting shared chunks per cached table and excluding caller-held evictions. Neither allocator usage nor RSS." },
+                    "tables": int(),
+                    "hits": int(),
+                    "misses": int(),
+                }),
+            ),
+            "Process-wide demand-table cache accounting. Present only when reasoning is built and the caller has the metrics permission.",
+            "query-memory-pool",
+        ),
+    );
+}
+
 fn server_memory(put: &mut dyn FnMut(&str, J)) {
     let cache_use = obj(
         &["capacityBytes", "bytes", "entries"],
@@ -173,6 +204,7 @@ fn server_memory(put: &mut dyn FnMut(&str, J)) {
                         "result": cache_use.clone(),
                         "service": cache_use,
                         "history": obj(&["capacityBytes", "bytes"], json!({ "capacityBytes": int(), "bytes": int() })),
+                        "derivedTable": sref("DerivedTableCache"),
                     })),
                     "datasets": array(obj(
                         &["name", "blockBytes", "blockEntries", "resultBytes", "resultEntries", "serviceBytes", "serviceEntries"],
@@ -230,6 +262,7 @@ fn fuseki(put: &mut dyn FnMut(&str, J)) {
             obj(
                 &["datasets"],
                 json!({
+                    "derivedTableCache": sref("DerivedTableCache"),
                     "datasets": {
                         "type": "object",
                         "additionalProperties": dataset,

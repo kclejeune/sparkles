@@ -13,6 +13,8 @@ mod algo_view;
 mod audit;
 mod branches;
 mod cli_grants;
+#[cfg(feature = "reasoning")]
+mod derived_table_cache;
 mod evidence;
 #[cfg(feature = "reasoning")]
 mod explain;

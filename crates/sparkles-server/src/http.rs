@@ -4766,9 +4766,19 @@ async fn delete_dataset_inner(
     .await
 }
 
-async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
+async fn stats(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let reasoning = crate::reasoning::status_json(&st, &ds);
+    let derived_table_cache = if p.has(crate::auth::ServerPerm::Metrics) {
+        crate::server_memory::derived_table_cache_stats()
+    } else {
+        None
+    };
     // Fuseki's form: `{datasets: {"/ds": counters}}`
     let fuseki = json!({ format!("/{name}"): fuseki::fuseki_stats(&st, &ds) });
     let params = Params::from_query(&uri);
@@ -4786,6 +4796,9 @@ async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
             .then(|| budgets::quota_json(&ds))
             .into();
         body["reasoning"] = reasoning;
+        if let Some(cache) = derived_table_cache {
+            body["derivedTableCache"] = cache;
+        }
         body["datasets"] = fuseki;
         body["geo"] = crate::geo::status_json(&ds);
         body["compaction"] = crate::compaction::status_json(&st, &ds);

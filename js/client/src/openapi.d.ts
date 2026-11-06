@@ -6427,6 +6427,7 @@ export interface components {
             compaction?: components["schemas"]["CompactionStatus"];
             deltaDeletes?: number;
             deltaInserts?: number;
+            derivedTableCache?: components["schemas"]["DerivedTableCache"];
             diskBytes?: number;
             graphs?: {
                 name: string | null;
@@ -6479,6 +6480,18 @@ export interface components {
             readAtHead?: boolean;
             /** @enum {string} */
             source: "materialized" | "rdfsOnRead" | "demand";
+        };
+        /** @description Process-wide demand-table cache accounting. Present only when reasoning is built and the caller has the metrics permission. */
+        DerivedTableCache: {
+            capacityBytes: number;
+            enabled: boolean;
+            /** @description The retained-table estimate, counting shared chunks per cached table and excluding caller-held evictions. Neither allocator usage nor RSS. */
+            estimatedBytes: number;
+            hits: number;
+            misses: number;
+            /** @enum {string} */
+            scope: "process";
+            tables: number;
         };
         DescribeSetting: {
             labels?: boolean;
@@ -7878,6 +7891,7 @@ export interface components {
                     };
                 };
             };
+            derivedTableCache?: components["schemas"]["DerivedTableCache"];
         };
         /** @description A garbage collection of a repository. */
         GcRequest: {
@@ -11123,6 +11137,7 @@ export interface components {
                     capacityBytes: number;
                     entries: number;
                 };
+                derivedTable?: components["schemas"]["DerivedTableCache"];
                 history?: {
                     bytes: number;
                     capacityBytes: number;

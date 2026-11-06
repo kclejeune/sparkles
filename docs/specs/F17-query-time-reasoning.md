@@ -321,9 +321,13 @@ cache keys a table by:
 - the adorned predicate and a hash of the sorted seeds.
 
 The tables of the free-adornment strata (§3.4, §3.5) are cached under their predicate
-alone, so every query on the snapshot shares them. The cache is in memory, charged to the
-dataset's result cache budget, and evicted least recently used. A table with fresh blank
-nodes is not cached.
+alone, so every query on the snapshot shares them. The cache is in memory, has a separate
+process-wide retained-table budget, and evicts the table used longest ago. The global
+`--derived-table-cache-mb` flag sets it, with a default of 256 MiB in both memory
+profiles and zero disabling retention. A table with fresh blank nodes is not cached.
+The configured capacity and retained-table estimates appear in `/$/stats` and
+`/$/server/memory` for callers with the metrics permission. Dataset-only readers do
+not receive process-wide cache activity.
 
 ### 6.2 Reuse across commits (Phase 2)
 
@@ -669,8 +673,23 @@ capabilities and remaining work are described by the spec status and Outcome.
 6. The engine ranks a group's patterns by the bound subjects and objects first, counting
    the class of an `rdf:type` pattern after them, then by bound positions, then patterns
    read without derivation, then the fewest stored facts.
-7. The table cache is process-wide with its own budget of 256 MiB rather than the
-   dataset's result cache budget of §6.1. Item 192 covers this.
+7. Item 192 keeps a separate process-wide table-cache budget rather than charging
+   individual dataset result caches. `--derived-table-cache-mb` preserves the 256 MiB
+   default, accepts zero to disable retention and rejects byte-conversion overflow.
+   Capacity changes and insertion admission share the cache lock, so a completed
+   shrink cannot be undone by a waiting insertion. Operators with the metrics
+   permission receive `derivedTableCache` in both statistics routes and the same
+   accounting under `caches.derivedTable` in `/$/server/memory`. The report includes
+   capacity, estimated bytes, tables, hits and misses and identifies its process scope.
+   The host-derived query pool subtracts this configured cache beside the other
+   caches, while explicit pool settings and the small profile's pool remain unchanged.
+   The estimate counts a shared chunk for each cached table that retains it and is
+   neither allocator usage nor RSS. A caller may keep an evicted table alive outside
+   retained-cache occupancy. Its weighting is 24 bytes per fact, 64 bytes per chunk,
+   each local term's byte length plus 40 bytes, and 64 bytes per table. Spare vector
+   capacity, cache-key strings, hash-table capacity and exact allocator metadata are
+   not counted. Item 757 covers measuring and calibrating that estimator, while
+   hierarchical live charging remains item 675.
 8. Lists that rules derive are complete in a lower stage, which derives every list the
    rules give rather than the lists a query reaches. This costs a derivation of all such
    lists for each query that reads one and keeps the answers equal to a fixpoint. Lists

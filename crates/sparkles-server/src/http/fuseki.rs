@@ -183,7 +183,13 @@ async fn stats_all(State(st): St, Extension(p): Extension<Principal>) -> Json<J>
     for ds in datasets.iter().filter(|d| p.can(&d.name, Level::Read)) {
         out.insert(format!("/{}", ds.name), fuseki_stats(&st, ds));
     }
-    Json(json!({ "datasets": out }))
+    let mut body = json!({ "datasets": out });
+    if p.has(crate::auth::ServerPerm::Metrics)
+        && let Some(cache) = crate::server_memory::derived_table_cache_stats()
+    {
+        body["derivedTableCache"] = cache;
+    }
+    Json(body)
 }
 
 // ----------------------------------------------------------------- backups ------
