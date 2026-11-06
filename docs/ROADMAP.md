@@ -586,8 +586,6 @@ workstream, and the spec that holds the design gives its gates. They run in Wave
   ORDER BY key, is still evaluated once per distinct outer key, and such plans stay
   eager under automatic execution. An OPTIONAL whose condition is an EXISTS stays eager
   until item 570 makes the cursor's conditional OPTIONAL as fast as the eager one.
-* A streamed body's reader may stall for as long as the request's timeout. A separate
-  `--stream-idle-timeout` would bound it on its own.
 * The UI's result table still asks for eager execution until it can show a streamed
   result's unknown total.
 * The parallel cursor filters and range top-k were measured on 8 vCPUs and still need a

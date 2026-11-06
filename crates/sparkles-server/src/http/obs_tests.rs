@@ -1904,7 +1904,7 @@ async fn a_slow_steady_reader_completes_a_stream() {
 #[tokio::test]
 async fn a_late_failure_of_a_default_stream_aborts_the_transfer() {
     use futures_util::StreamExt;
-    let s = server();
+    let s = server_with(|st| st.stream_idle_timeout = Duration::from_secs(5));
     million(&s);
     // A reader that takes nothing for longer than the timeout gets a cut-off transfer
     // after a successful status. The timeout leaves the scan room to send its first

@@ -9,6 +9,7 @@ pub(crate) struct Probe {
     pub events: Arc<Mutex<Vec<&'static str>>>,
     pub blocking: Option<Arc<Gate>>,
     pub producer: Option<Arc<Gate>>,
+    pub queued_producer: Option<Arc<Gate>>,
     pub cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 

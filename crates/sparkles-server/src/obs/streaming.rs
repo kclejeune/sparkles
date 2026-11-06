@@ -43,6 +43,10 @@ impl DeferredReport {
         self.complete();
     }
 
+    pub(crate) fn abort_body(&self) {
+        self.body_done(BodyEnd::Failed);
+    }
+
     fn body_done(&self, end: BodyEnd) {
         self.0.lock().body.get_or_insert(end);
         self.complete();

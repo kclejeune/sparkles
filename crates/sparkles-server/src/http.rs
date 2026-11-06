@@ -111,6 +111,14 @@ pub(crate) mod self_service;
 mod shex;
 mod sparql_diff;
 mod stream;
+pub(crate) use stream::Abort as StreamAbort;
+
+fn stream_timeouts(st: &AppState) -> stream::Timeouts {
+    stream::Timeouts {
+        idle: st.stream_idle_timeout,
+        transfer: st.stream_transfer_timeout,
+    }
+}
 mod tabular;
 mod timeline;
 mod validation;
@@ -1788,6 +1796,7 @@ pub(crate) async fn run_query(
         return cursor::run(
             ds,
             cursor::Request {
+                timeouts: stream_timeouts(&st),
                 query,
                 options: opts,
                 params,
@@ -1962,6 +1971,7 @@ pub(crate) async fn run_query(
                 seq,
                 resolved,
                 cursor::Serve {
+                    timeouts: stream_timeouts(&st),
                     params,
                     uri,
                     guard: _cancel_on_drop,
@@ -2093,12 +2103,13 @@ pub(crate) async fn run_query(
     // Try small answers in place; actual encoded bytes decide whether the answer
     // must switch to the blocking serializer, even with very few result cells.
     let body = if in_place && cells <= inline::QUICK_RESULT_CELLS {
-        stream::serialize_quick(limit, write, on_stream_end).await
+        stream::serialize_quick_timed(limit, stream_timeouts(&st), write, on_stream_end).await
     } else {
-        stream::serialize(limit, write, on_stream_end).await
+        stream::serialize_timed(limit, stream_timeouts(&st), write, on_stream_end).await
     };
     // a run whose answer could not be written is not known to be quick any more
     let body = body.inspect_err(|_| QUICK.record(quick_key, f64::INFINITY))?;
+    let abort = body.abort_handle();
     let (body, report, deferred) = match body {
         stream::Serialized::Whole { body, serialize_ms } => {
             let ms = if algorithmic {
@@ -2118,7 +2129,7 @@ pub(crate) async fn run_query(
             };
             (axum::body::Body::from(body), report, None)
         }
-        stream::Serialized::Streamed(body) => {
+        stream::Serialized::Streamed(body) | stream::Serialized::Timed { body, .. } => {
             QUICK.record(quick_key, f64::INFINITY);
             (body, report, Some(deferred))
         }
@@ -2141,6 +2152,9 @@ pub(crate) async fn run_query(
         Some(r) if r.historical => resp,
         _ => with_inferences(resp, &ds, with_extra && derived.is_none(), seq),
     };
+    if let Some(abort) = abort {
+        resp.extensions_mut().insert(abort);
+    }
     match deferred {
         Some(deferred) => {
             resp.extensions_mut().insert(deferred);
@@ -3318,7 +3332,7 @@ async fn graph_body(
     what: Export,
     fmt: OutFormat,
     view: Option<Arc<sparkles::access::GraphAccess>>,
-) -> ApiResult<(axum::body::Body, Option<(u64, u64)>)> {
+) -> ApiResult<(axum::body::Body, Option<(u64, u64)>, Option<StreamAbort>)> {
     let quads = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counted = quads.clone();
     // an export reads every block once: keep the blocks queries use cached
@@ -3380,9 +3394,10 @@ async fn graph_body(
         Ok(())
     };
     let limit = st.limits.max_export_bytes;
+    let timeouts = stream_timeouts(&st);
     let (name, st) = (ds.name.clone(), Arc::downgrade(&st));
     drop(ds);
-    let body = stream::serialize(limit, write, move |end| {
+    let body = stream::serialize_timed(limit, timeouts, write, move |end| {
         if let Some(st) = st.upgrade() {
             st.metrics
                 .add_response_bytes(Some(&name), Op::Gsp, end.bytes);
@@ -3390,15 +3405,18 @@ async fn graph_body(
         stream_end_log("graph store", &end);
     })
     .await?;
+    let abort = body.abort_handle();
     Ok(match body {
         stream::Serialized::Whole { body, .. } => {
             let whole = (
                 body.len() as u64,
                 quads.load(std::sync::atomic::Ordering::Relaxed),
             );
-            (axum::body::Body::from(body), Some(whole))
+            (axum::body::Body::from(body), Some(whole), abort)
         }
-        stream::Serialized::Streamed(body) => (body, None),
+        stream::Serialized::Streamed(body) | stream::Serialized::Timed { body, .. } => {
+            (body, None, abort)
+        }
     })
 }
 
@@ -3566,13 +3584,17 @@ async fn gsp_on(
                 conditional::ReadOutcome::NotModified => conditional::not_modified(&tag),
                 conditional::ReadOutcome::Send if head => ct.into_response(),
                 conditional::ReadOutcome::Send => {
-                    let (body, whole) =
+                    let (body, whole, abort) =
                         graph_body(st.clone(), ds.clone(), snap, what, fmt, view.clone()).await?;
                     if let Some((bytes, quads)) = whole {
                         report.response_bytes = Some(bytes);
                         report.rows = Some(quads);
                     }
-                    (ct, body).into_response()
+                    let mut response = (ct, body).into_response();
+                    if let Some(abort) = abort {
+                        response.extensions_mut().insert(abort);
+                    }
+                    response
                 }
             };
             let resp = with_commit(conditional::with_etag(resp, &tag, negotiated), &ds, seq);
@@ -6141,6 +6163,8 @@ mod reason_limit_tests;
 mod router_tests;
 #[cfg(test)]
 mod self_service_tests;
+#[cfg(test)]
+mod stream_idle_tests;
 #[cfg(all(test, feature = "text"))]
 mod text_tests;
 #[cfg(all(test, feature = "shacl"))]

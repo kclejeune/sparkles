@@ -389,6 +389,9 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
         deferred.observe(pending, resp.status().as_u16(), head);
         let body = std::mem::replace(resp.body_mut(), axum::body::Body::empty());
         *resp.body_mut() = deferred.wrap(body);
+        if let Some(abort) = resp.extensions().get::<crate::http::StreamAbort>() {
+            abort.bind_observation(move || deferred.abort_body());
+        }
     } else {
         pending.complete(resp.status().as_u16(), &report);
     }

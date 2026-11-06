@@ -238,6 +238,14 @@ check them against the W3C suites and Jena's own answers.
   ([USAGE.md](../USAGE.md#explaining-a-query), [API.md](../API.md#explaining-a-query)). Nodes
   say when they did not run and why, when a `LIMIT` stopped them, how often they reran,
   which filters a scan applied itself, and when a result came from the cache.
+* Finite HTTP response bodies have a separate 60-second idle limit, configured with
+  `serve --stream-idle-timeout`. It runs while application output or its final end is
+  ready but unread, and pauses while the engine has nothing ready. An optional
+  `--stream-transfer-timeout` bounds the whole transfer, even when it keeps progressing.
+  These limits observe uncompressed application chunks rather than remote receipt.
+  Expiry aborts the transfer and requests cancellation. Actual producer owners remain
+  until work stops, and only a successful transfer is a complete answer. The settings
+  also cover finite Graph Store, diff and changes bodies. See [server settings](../USAGE.md).
 * A query that a budget or its timeout stopped keeps its plan in the error body of the
   `application/x-sparkles+json` format.
 * `POST /{ds}/sparql/explain` explains an estimated plan, a read-only run or a plan the

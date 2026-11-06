@@ -2586,6 +2586,15 @@ response's media type or the file name extension, and asks for them in its `Acce
 header. The JSONP `callback` and XSLT `stylesheet` parameters of
 Fuseki are not supported.
 
+Finite streamed response bodies have separate server limits. `serve --stream-idle-timeout`
+defaults to 60 seconds while uncompressed application data or a final end is ready but
+unread by the downstream consumer. It is disarmed while the engine has no output ready.
+The optional `--stream-transfer-timeout` bounds the whole streamed transfer and never
+resets on progress. Neither measures physical socket receipt. These settings also cover
+finite Graph Store, diff and changes bodies. A late expiry aborts the transfer after its
+existing status, including compressed output, and is not a complete answer. Actual
+producer ownership remains until the producer stops. See [server settings](USAGE.md).
+
 Query parameters beyond the standard protocol:
 
 * `timeout=<seconds>` sets the query timeout. The default is 60 s
@@ -2650,10 +2659,12 @@ Query parameters beyond the standard protocol:
   A streamed answer differs from an eager one in what the caller sees. The memory and
   work budgets cover the whole cursor, including batches it still holds and terms it
   generates. The deadline counts the query's own time and not the time spent waiting for
-  the client, so a slow reader does not run it out. A client that reads nothing for
-  longer than the request's `timeout` ends the stream as a timeout. That limit applies to
-  each wait and not to the whole transfer, and the snapshot and the query's memory grant
-  stay held until the body ends. A request with `execution=streaming` starts its
+  the client, so a slow reader does not run it out. The independent server idle limit
+  instead bounds ready application output or its final end left unread by the downstream
+  consumer. It defaults to 60 seconds and pauses while the engine has no output ready.
+  An optional absolute transfer deadline also bounds a progressing response. Logical
+  abort discards queued data and releases body-side query admission, while real producer
+  owners and their grants remain until work stops. A request with `execution=streaming` starts its
   response after the cursor's first batch, or after 64 KiB when the batch is larger, so
   its first rows arrive while later batches are computed. An answer that automatic
   execution streams starts after 1 MiB, as an eager body does. An error before the
