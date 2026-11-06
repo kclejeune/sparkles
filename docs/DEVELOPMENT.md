@@ -820,6 +820,24 @@ turns. Its memory cap is the smaller of 24 GiB and the host's RAM less 2 GiB, wi
 swap. A passing run removes its worktree, and a failing one keeps the sources and drops the
 build directories.
 
+The CI half retains its task logs and summary in `ci-receipts` under the gate output
+before cleanup. While its original managed-target lease is held, the normal Rust `test`
+task also copies the actual nextest XML into
+`ci-receipts/junit/test/<profile>/junit.xml`, together with the target's adjacent MBX
+metadata when present. The versioned `junit/manifest.json` records the capture source,
+selection, profile, original task exit and hashes of the copied bytes. Failed tests keep
+their actual report. A report unchanged since the task started has unproven generation;
+its presence does not show that the cached task executed again. This retains the primary
+normal test report, rather than every intermediate report from the feature matrix.
+
+`ci.exit` keeps the original CI result. The separate `ci-receipts.exit` fails if a
+selected Rust task has no retained report or evidence cannot be copied and verified.
+Not-selected tasks, tasks that never started and selections with no Rust packages are
+recorded separately. No replacement XML is generated for a missing report. A successful
+cached task whose report has been collected can therefore have a passing task result and
+failed evidence retention. The gate does not rerun that task automatically. Compiler
+cache directories are not a store for validation evidence.
+
 `scripts/ci.sh` runs on the primary host, which is `GATE_PRIMARY` or the first gate host.
 When the batch needs a conformance step, the steps run on a second gate host for the same
 commit, the first one that is free: its heavy lock is free, it runs no gate unit and it has

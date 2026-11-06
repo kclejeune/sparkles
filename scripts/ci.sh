@@ -131,6 +131,9 @@ main() {
   rm -rf "$out"
   mkdir -p "$out/logs" "$out/state"
   summary="$out/summary.txt"
+  junit_selected=()
+  [[ " ${tasks[*]} " != *" test "* ]] || junit_selected=(--selected)
+  python3 scripts/ci-retain-junit.py init "${junit_selected[@]}" --base "$changed_base" --packages "${changed_packages:-all}" > "$out/junit-retention.log" 2>&1 || true
   start=$SECONDS
   started=$(date '+%H:%M:%S')
   # Each background task gets its own process group, so stopping it stops its cargo,
@@ -179,10 +182,18 @@ main() {
     echo "running since $(date '+%H:%M:%S')" > "$out/state/$key"
     local narrow=()
     case $t in lint | test) [ -z "$changed_packages" ] || narrow=(env "SPARKLES_CHANGED_PACKAGES=$changed_packages") ;; esac
+    if [ "$t" = test ]; then
+      python3 scripts/ci-retain-junit.py before >> "$out/junit-retention.log" 2>&1 || true
+    fi
     set +e
     "${narrow[@]}" mise run --output interleave "$@" "$t" > "$log" 2>&1
     rc=$?
     set -e
+    if [ "$t" = test ]; then
+      # The normal outer lease is still held. Preserve the original task status even
+      # when evidence retention fails; the gate checks evidence as a separate step.
+      python3 scripts/ci-retain-junit.py after --task-exit "$rc" >> "$out/junit-retention.log" 2>&1 || true
+    fi
     local secs=$((SECONDS - t0))
     if [ $rc -eq 0 ]; then
       echo "pass ${secs}s" > "$out/state/$key"

@@ -34,6 +34,7 @@ class CiProfiles(unittest.TestCase):
             (root / "scripts").mkdir()
             (root / "bin").mkdir()
             script = root / "scripts/ci.sh"
+            (root / "scripts/ci-retain-junit.py").write_bytes((ROOT / "scripts/ci-retain-junit.py").read_bytes())
             source = (ROOT / "scripts/ci.sh").read_text()
             if notify_completed:
                 # Retire completed job notifications before wait -n. Explicit wait
