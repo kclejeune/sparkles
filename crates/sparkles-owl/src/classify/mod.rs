@@ -65,6 +65,8 @@ mod horn;
 mod horn_rules;
 mod index;
 mod query;
+#[cfg(test)]
+mod retained_accounting_tests;
 mod saturate;
 mod taxonomy;
 mod world;
@@ -1769,8 +1771,12 @@ impl Saturation {
         if open.is_none() {
             self.consistent = consistent;
         }
-        let held = totals.memory.saturating_sub(ax.bytes());
+        // The saturation charges fixed allowances for new contexts/conclusions;
+        // reuse counts their retained tables instead. Reconcile once the workers
+        // have stopped so both paths report the same retained-state estimate.
+        let held = self.retained_bytes(held_bytes, roots.capacity() * 4, world_bytes);
         drop(ax);
+        totals.peak = Self::admit_retained(held, totals.peak, limits)?;
         if !with_taxonomy {
             stats.memory = held;
             stats.peak_memory = totals.peak.max(held);
@@ -1857,6 +1863,31 @@ impl Saturation {
             + self.interner.classes.bytes()
             + self.interner.classes.name_bytes()
             + ix.bytes()
+    }
+
+    fn retained_bytes(&self, held_bytes: usize, root_bytes: usize, world_bytes: usize) -> usize {
+        self.index_bytes(self.index.as_ref().expect("completed index"))
+            + held_bytes
+            + root_bytes
+            + self.context_bytes()
+            + self.dynamic.as_ref().map_or(0, |d| d.retained_bytes())
+            + world_bytes
+    }
+
+    fn admit_retained(held: usize, peak: usize, limits: &Limits) -> Result<usize, Error> {
+        let more = held.saturating_sub(peak);
+        if limits.max_memory.is_some_and(|limit| held > limit)
+            || limits
+                .charge
+                .as_ref()
+                .is_some_and(|charge| more > 0 && !charge(more))
+        {
+            return Err(Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used: held,
+            });
+        }
+        Ok(peak.max(held))
     }
 
     fn context_bytes(&self) -> usize {

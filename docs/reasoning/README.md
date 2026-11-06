@@ -292,7 +292,13 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   with an individual, a data property, a datatype or a key, and any change after a run
   that took that step or an axiom outside OWL 2 EL, saturates everything again. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
-  closure, saturates and builds the taxonomy. A run of 16,384 axioms or more on several
+  closure, saturates and builds the taxonomy. `Stats::memory` recounts retained index
+  and context storage when saturation ends, using the same estimates for fresh and
+  unchanged reused state. This adds a traversal of the retained tables. The final
+  estimate can differ from the allowances charged as conclusions arrive, while the
+  saturation peak remains in `Stats::peak_memory`. Any final growth past that peak
+  must fit the hard budget and the pool before the run returns. These are heap
+  estimates, not allocator measurements or RSS. A run of 16,384 axioms or more on several
   threads normalizes chunks of the axioms in parallel, with the same ids and taxonomy as
   on one thread. The chunks hold the names they meet until they merge and count against
   the memory budget, and a run whose chunks would pass it normalizes on one thread. This

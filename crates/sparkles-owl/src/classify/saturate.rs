@@ -935,6 +935,15 @@ impl Dynamic {
     pub fn bytes(&self) -> usize {
         self.bytes.load(Ordering::Relaxed)
     }
+
+    /// Tables/cores and the states of initialized contexts, without creating any.
+    pub fn retained_bytes(&self) -> usize {
+        self.bytes()
+            + (0..self.len() as Ex)
+                .filter_map(|i| self.slot(self.base + i).ctx.get())
+                .map(|c| c.st.lock().bytes())
+                .sum::<usize>()
+    }
 }
 
 impl<'a> Run<'a> {
@@ -1811,6 +1820,33 @@ fn functional<S: Sink>(ix: &Index, st: &mut State, r: Role, w: Ex, out: &mut S) 
     }
     x.groups.push(merged);
     x.groups.sort_by(|a, b| a.funs.cmp(&b.funs));
+}
+
+#[cfg(test)]
+mod retained_storage_tests {
+    use super::*;
+
+    #[test]
+    fn retained_dynamic_bytes_include_states_without_initializing_contexts() {
+        let dynamic = Dynamic::new(8);
+        assert_eq!(dynamic.retained_bytes(), 0);
+        let initialized = dynamic.intern(&[2, 3]);
+        let untouched = dynamic.intern(&[3, 4]);
+        let table_bytes = dynamic.bytes();
+        assert_eq!(dynamic.retained_bytes(), table_bytes);
+        assert!(dynamic.slot(initialized).ctx.get().is_none());
+        assert!(dynamic.slot(untouched).ctx.get().is_none());
+        let context = dynamic.ctx(initialized);
+        let state_bytes = {
+            let mut state = context.st.lock();
+            state.init = true;
+            state.subs.insert(2);
+            state.bytes()
+        };
+        assert!(state_bytes > 0);
+        assert_eq!(dynamic.retained_bytes(), table_bytes + state_bytes);
+        assert!(dynamic.slot(untouched).ctx.get().is_none());
+    }
 }
 
 #[cfg(test)]
