@@ -231,10 +231,7 @@ impl Ontologies {
                     && history.head >= scope.snap.commit
                     && history.changes.is_empty()
                     && history.unrecorded.is_empty()
-                    && !history.truncated =>
-            {
-                ()
-            }
+                    && !history.truncated => {}
             Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(Error::Timeout) => return Err(Error::Timeout),
             _ => return Err(changed()),

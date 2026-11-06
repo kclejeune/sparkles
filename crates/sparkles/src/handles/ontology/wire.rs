@@ -1235,9 +1235,11 @@ fn iri_arg(a: &Map<String, J>, k: &str) -> Result<Option<String>> {
 
 /// The hierarchy level a `hierarchy` request names.
 pub fn hierarchy_request_of(a: &Map<String, J>) -> Result<browse::HierarchyRequest> {
-    let mut h = browse::HierarchyRequest::default();
-    h.source_id = string(a, "sourceId")?.map(str::to_string);
-    h.after = iri_arg(a, "after")?;
+    let mut h = browse::HierarchyRequest {
+        source_id: string(a, "sourceId")?.map(str::to_string),
+        after: iri_arg(a, "after")?,
+        ..Default::default()
+    };
     if let Some(k) = string(a, "kind")? {
         h.kind = browse::TreeKind::parse(k).ok_or_else(|| {
             bad(format!(
