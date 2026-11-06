@@ -2389,3 +2389,180 @@ fn branch_reentrancy_independence_and_cleanup() {
         branch_reentrancy_subprocess(TEST, scenario);
     }
 }
+
+// Metadata that a rename or a refused rename must preserve. Head/size/divergence
+// fields may change when the deliberately retained transaction commits.
+fn rename_metadata(info: &crate::branch::BranchInfo) -> serde_json::Value {
+    serde_json::json!({
+        "id": info.id,
+        "ordinal": info.ordinal,
+        "from": info.from,
+        "upstream": info.upstream,
+        "mergeBase": info.merge_base,
+        "protected": info.protected,
+        "note": info.note,
+        "createdMs": info.created_ms,
+        "broken": info.broken,
+        "scratch": info.scratch,
+    })
+}
+
+fn branch_reentrancy_rename_case(owner: &str, memory: bool) {
+    let root =
+        std::path::PathBuf::from(std::env::var_os("SPARKLES_BRANCH_REENTRANCY_ROOT").unwrap());
+    let path = root.join("ds");
+    let s = if memory {
+        Store::in_memory(Default::default())
+    } else {
+        Store::open(&path, Default::default()).unwrap()
+    };
+    apply(&s, "+<urn:base> <urn:p> <urn:o> .");
+    let before = s
+        .create_branch(
+            "dev",
+            &BranchOptions {
+                note: Some("original".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    s.create_branch("taken", &BranchOptions::default()).unwrap();
+    let before_metadata = rename_metadata(&before);
+    let dev = s.branch("dev").unwrap();
+    let holds = |store: &Store| {
+        let set = store.branch_set().unwrap();
+        (set.holds_on(store.dataset_id()), set.holds_on(before.id))
+    };
+    let before_holds = holds(&s);
+    let table_path = path.join("branches.json");
+    let identity_path = path
+        .join("branches")
+        .join(before.id.to_string())
+        .join("branch.json");
+    let disk_bytes = || {
+        (!memory).then(|| {
+            (
+                std::fs::read(&table_path).unwrap(),
+                std::fs::read(&identity_path).unwrap(),
+            )
+        })
+    };
+    let before_bytes = disk_bytes();
+    let mut writer = if owner == "target" {
+        dev.write()
+    } else {
+        s.write()
+    };
+
+    // Existing name/source validation retains precedence over ownership refusal.
+    for (old, new, expected) in [
+        ("main", "bad/name", "invalid-branch"),
+        ("dev", "bad/name", "invalid-branch"),
+        ("dev", "taken", "branch-exists"),
+        ("missing", "taken", "branch-exists"),
+        ("dev", "dev", "branch-exists"),
+        ("missing", "renamed", "no-such-branch"),
+    ] {
+        assert_eq!(code(&s.rename_branch(old, new).unwrap_err()), expected);
+    }
+    let error = s.rename_branch("dev", "renamed").unwrap_err();
+    assert!(matches!(error, Error::Conflict(_)), "{error:?}");
+    assert_eq!(error.code(), "conflict");
+    // Observe all commit-point side effects before release, but prove transaction
+    // usability before asserting them so the red covers that property too.
+    let observations = [
+        ("old name/id", s.branch_id_of("dev").ok() == Some(before.id)),
+        ("new name absent", s.branch_id_of("renamed").is_err()),
+        ("resident name", dev.branch_name() == "dev"),
+        ("holds", holds(&s) == before_holds),
+        ("persistent metadata", disk_bytes() == before_bytes),
+    ];
+    let q = oxttl::NQuadsParser::new()
+        .for_slice(b"<urn:retained> <urn:p> <urn:o> .")
+        .next()
+        .unwrap()
+        .unwrap();
+    let ids = writer.encode_quad(&q, &mut Default::default()).unwrap();
+    writer.insert(ids).unwrap();
+    writer.commit().unwrap();
+    assert!(has(
+        if owner == "target" { &dev } else { &s },
+        "urn:retained"
+    ));
+    eprintln!(
+        "{owner}/memory={memory}: transaction committed; refusal observations {observations:?}"
+    );
+    assert!(
+        observations.iter().all(|(_, unchanged)| *unchanged),
+        "rename returned Conflict after mutation: {observations:?}"
+    );
+    assert_eq!(
+        rename_metadata(&s.branch_info("dev").unwrap()),
+        before_metadata
+    );
+    drop(dev);
+    // Reopening must independently see the refused old name before a successful retry.
+    let s = if memory {
+        s
+    } else {
+        drop(s);
+        Store::open(&path, Default::default()).unwrap()
+    };
+    assert_eq!(s.branch_id_of("dev").unwrap(), before.id);
+    assert_eq!(
+        code(&s.branch_id_of("renamed").unwrap_err()),
+        "no-such-branch"
+    );
+    assert_eq!(
+        rename_metadata(&s.branch_info("dev").unwrap()),
+        before_metadata
+    );
+    let renamed = s.rename_branch("dev", "renamed").unwrap();
+    assert_eq!(rename_metadata(&renamed), before_metadata);
+    assert_eq!(code(&s.branch_id_of("dev").unwrap_err()), "no-such-branch");
+    let renamed_store = s.branch("renamed").unwrap();
+    assert!(has(&renamed_store, "urn:base"));
+    assert!(has(
+        if owner == "target" {
+            &renamed_store
+        } else {
+            &s
+        },
+        "urn:retained"
+    ));
+    drop(renamed_store);
+    if !memory {
+        drop(s);
+        let s = Store::open(&path, Default::default()).unwrap();
+        assert_eq!(s.branch_id_of("renamed").unwrap(), before.id);
+        assert_eq!(code(&s.branch_id_of("dev").unwrap_err()), "no-such-branch");
+        assert_eq!(
+            rename_metadata(&s.branch_info("renamed").unwrap()),
+            before_metadata
+        );
+        assert!(has(&s.branch("renamed").unwrap(), "urn:base"));
+    }
+}
+
+#[test]
+fn branch_reentrancy_rename() {
+    const TEST: &str = "store::branch_tests::branch_reentrancy_rename";
+    if let Ok(scenario) = std::env::var("SPARKLES_BRANCH_REENTRANCY") {
+        let (owner, storage) = scenario.split_once('-').unwrap();
+        branch_reentrancy_rename_case(owner, storage == "memory");
+        return;
+    }
+    // Run every bounded control even when the unpatched implementation fails one.
+    let mut failed = Vec::new();
+    for scenario in [
+        "target-memory",
+        "target-persistent",
+        "upstream-memory",
+        "upstream-persistent",
+    ] {
+        if std::panic::catch_unwind(|| branch_reentrancy_subprocess(TEST, scenario)).is_err() {
+            failed.push(scenario);
+        }
+    }
+    assert!(failed.is_empty(), "failed rename scenarios: {failed:?}");
+}

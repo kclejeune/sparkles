@@ -322,11 +322,10 @@ Branches work like git branches on the quad store
   them, and limited by grants. `/$/branches`, `/$/merge`, `/$/revert`, `/$/cherry-pick`,
   `sparkles branch`, `merge`, `revert` and `cherry-pick` manage them, as do the web UI's
   Branches panel and merge page. A branch backup restores as an independent dataset.
-* Direct Rust `Store` and `Dataset` calls to delete a branch, change its note or read
-  its information return `conflict` when they would wait for a write transaction held
-  by the same thread. Refusal leaves the note and the transaction unchanged. Calls
-  from other threads wait for the
-  transaction to finish. Deleting an unrelated branch can postpone collection of old
+* Direct Rust `Store` and `Dataset` calls to delete or rename a branch, change its
+  note or read its information return `conflict` when they would wait for a write
+  transaction held by the same thread. Refusal leaves the names, metadata and
+  transaction unchanged. Calls from other threads wait for the transaction to finish. Deleting an unrelated branch can postpone collection of old
   generations in the store whose transaction is open until its next compaction or reopen.
   Python's named branch get, update and delete and JVM note changes use their existing
   caller ownership guards. Further worker-mediated branch dependencies remain under

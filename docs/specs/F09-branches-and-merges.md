@@ -1862,12 +1862,12 @@ data.
 ### Branch operations during a write transaction
 
 Roadmap item 443 is complete for direct Rust `Store` and `Dataset` calls. Branch
-deletion, note changes and branch information reads return the existing `conflict`
-error when they would wait for a write transaction held by the calling thread.
-Metadata changes check both the branch and upstream heads
-before saving, so a refused note, protection or scratch change leaves the metadata
-unchanged. The open transaction remains usable and can commit or abort normally.
-Operations from another thread keep their ordinary wait for the writer to finish.
+deletion, renames, note changes and branch information reads return the existing
+`conflict` error when they would wait for a write transaction held by the calling
+thread. Renames and metadata changes check both the branch and upstream heads before
+saving, so a refused rename, note, protection or scratch change leaves the names,
+identity and metadata unchanged. The open transaction remains usable and can commit
+or abort normally. Operations from another thread keep their ordinary wait for the writer to finish.
 
 Ownership is tracked for the exact Store opening on its transaction's thread. Sibling
 branches and independent openings of copied datasets do not share that ownership.

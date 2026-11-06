@@ -918,13 +918,18 @@ impl BranchSet {
     /// points: its upstream, or the upstream of a retired branch it started from (the
     /// dataset id for `main`; `None` for `main` itself and unknown branches).
     pub(crate) fn upstream_of(&self, id: uuid::Uuid) -> Option<uuid::Uuid> {
-        let t = self.table.lock();
-        let mut cur = self.start_of(&t, id)?.branch_id;
+        self.upstream_in(&self.table.lock(), id)
+    }
+
+    // Resolve against the caller's locked table so rename checks exactly the entry
+    // and upstream whose metadata it is about to publish.
+    fn upstream_in(&self, t: &TableFile, id: uuid::Uuid) -> Option<uuid::Uuid> {
+        let mut cur = self.start_of(t, id)?.branch_id;
         for _ in 0..1024 {
             if cur == self.dataset_id || t.by_id(cur).is_some() {
                 return Some(cur);
             }
-            cur = self.start_of(&t, cur)?.branch_id;
+            cur = self.start_of(t, cur)?.branch_id;
         }
         None
     }
@@ -2691,6 +2696,15 @@ impl Store {
                 .iter_mut()
                 .find(|e| e.name == name)
                 .ok_or_else(|| branch::no_such_branch(name))?;
+            // The returned BranchInfo reads these heads after publication. Refuse
+            // this thread's writer before changing metadata, without waiting for
+            // another thread's writer or releasing the validated table snapshot.
+            if !set.broken.lock().contains(&e.id) {
+                self.check_branch_writer(&set, e.id)?;
+                if let Some(upstream) = set.upstream_in(&t, e.id) {
+                    self.check_branch_writer(&set, upstream)?;
+                }
+            }
             e.name = new.to_string();
             let id = e.id;
             // the commit point
