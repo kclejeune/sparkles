@@ -7,9 +7,10 @@
 #
 # Usage: scripts/test-features.sh [set...]
 # Each set is a comma-separated feature list, or `none` for no feature. With no argument
-# the sets are none, auth, mcp, memory, graphql and shacl. Every set runs even after an
-# earlier one fails, a line for each set shows its result and time, and the exit status is
-# non-zero when any set failed. The sets share the workspace target directory, so
+# the sets are none, auth, reasoning+auth, mcp, memory, graphql and shacl. Every set
+# runs even after an earlier one fails, a line for each set shows its result and time,
+# and the exit status is non-zero when any set failed. The sets share the workspace
+# target directory, so
 # dependencies compile once, and CARGO_BUILD_JOBS limits the jobs as for any cargo run.
 # The tests run under cargo-nextest when it is installed and under cargo test otherwise.
 # Each set's output is in .artifacts/test-features/<set>.log.
@@ -19,7 +20,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 sets=("$@")
-[ ${#sets[@]} -gt 0 ] || sets=(none auth mcp memory graphql shacl)
+[ ${#sets[@]} -gt 0 ] || sets=(none auth "reasoning,auth" mcp memory graphql shacl)
 
 logs=.artifacts/test-features
 mkdir -p "$logs"

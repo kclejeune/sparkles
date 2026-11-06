@@ -647,7 +647,6 @@ async fn with_community(s: &AuthServer) {
 }
 
 /// `user`'s principal as a request has it, with the server's disclosure guard.
-#[cfg(feature = "mcp")]
 fn guarded(s: &AuthServer, user: &str) -> crate::auth::Principal {
     s.auth()
         .user_principal(user)

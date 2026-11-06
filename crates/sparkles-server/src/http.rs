@@ -72,6 +72,18 @@ mod ontology {
         not_built()
     }
 
+    pub(super) use self::summary as classify;
+    pub(super) use self::summary as dl_query;
+    pub(super) use self::summary as entities;
+    pub(super) use self::summary as entity;
+    pub(super) use self::summary as hierarchy;
+    pub(super) use self::summary as individuals;
+    pub(super) use self::summary as kept_classification;
+    pub(super) use self::summary as parse;
+    pub(super) use self::summary as remove_entity;
+    pub(super) use self::summary as search;
+    pub(super) use self::summary as term;
+
     pub(super) async fn axioms() -> ApiResult {
         not_built()
     }
@@ -950,6 +962,7 @@ impl From<Error> for ApiError {
             Error::Component(c) if c.component == "reasoner" => {
                 json!({ "error": msg, "code": c.code })
             }
+            #[cfg(feature = "ontology")]
             Error::Component(c) if c.component == "owl" => c
                 .source
                 .as_ref()
