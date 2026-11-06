@@ -1,0 +1,58 @@
+{
+  "observed_unix": 1793968210.818171,
+  "unit": "partial-memory-optional-feature-intel-v2.service",
+  "actual_invocation_before_stop": "125bde4571a9432ab8a7613f82623bce",
+  "before_stop": {
+    "LoadState": "loaded",
+    "ActiveState": "active",
+    "SubState": "exited",
+    "InvocationID": "125bde4571a9432ab8a7613f82623bce",
+    "MainPID": "0",
+    "Result": "success",
+    "ExecMainPID": "3783797",
+    "ExecMainCode": "1",
+    "ExecMainStatus": "0",
+    "ControlGroup": "",
+    "MemoryPeak": "5464104960",
+    "MemorySwapPeak": "0"
+  },
+  "stop_exit": 0,
+  "stop_stdout": "",
+  "stop_stderr": "",
+  "after_stop": {
+    "LoadState": "not-found",
+    "ActiveState": "inactive",
+    "SubState": "dead",
+    "InvocationID": "",
+    "MainPID": "0",
+    "Result": "success",
+    "ExecMainPID": "0",
+    "ExecMainCode": "0",
+    "ExecMainStatus": "0",
+    "ControlGroup": "",
+    "MemoryPeak": "[not set]",
+    "MemorySwapPeak": "[not set]"
+  },
+  "admitted_exact_cgroup_absent": true,
+  "all_recorded_PIDs_absent": {
+    "328774": true,
+    "328775": true,
+    "464924": true,
+    "3783797": true,
+    "3783799": true,
+    "4153189": true,
+    "4153190": true
+  },
+  "all_six_owned_groups_empty": {
+    "4153189": [],
+    "4153190": [],
+    "328775": [],
+    "3783799": [],
+    "328774": [],
+    "464924": []
+  },
+  "both_host_locks_held_during_exact_cleanup": true,
+  "only_completed_exact_unit_stopped": true,
+  "failed_v1_reset_or_new_measurement": false,
+  "both_host_locks_released": true
+}

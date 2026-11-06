@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "root": "/home/kclejeune/lanes/partial-memory-optional-feature-intel-v2",
+  "archive_sha256": "0196ba3b7d4f52131951b26364f2ddc8c1c0c7fda826b6d4c36541183bb1128f",
+  "all_payload_hashes_verified": true,
+  "members": 129,
+  "staged_at_unix": 1793964408.9001174,
+  "staging_only": true,
+  "execution_released": false,
+  "runtime_availability_verified": false
+}

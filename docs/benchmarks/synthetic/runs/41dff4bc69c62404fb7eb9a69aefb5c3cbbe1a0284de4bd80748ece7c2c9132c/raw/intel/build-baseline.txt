@@ -1,0 +1,6 @@
+built: 2026-11-06T07:11:03Z
+cargo args: 
+build host: atlas
+cc: clang version 21.1.8
+c++: clang version 21.1.8
+rustc 1.99.1 (58cf8f9c3 2026-10-13)

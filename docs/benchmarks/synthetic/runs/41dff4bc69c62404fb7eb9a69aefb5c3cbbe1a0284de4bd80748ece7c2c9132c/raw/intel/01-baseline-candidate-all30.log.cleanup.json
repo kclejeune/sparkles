@@ -1,0 +1,8 @@
+{
+  "leader_exit": 0,
+  "pgid": 3783799,
+  "remaining": [],
+  "signals": [
+    "SIGTERM"
+  ]
+}

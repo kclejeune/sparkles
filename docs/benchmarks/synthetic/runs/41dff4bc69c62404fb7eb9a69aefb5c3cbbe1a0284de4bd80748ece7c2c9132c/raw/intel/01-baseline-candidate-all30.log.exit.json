@@ -1,0 +1,8 @@
+{
+  "argv": [
+    "/run/current-system/sw/bin/bash",
+    "nsc-bench-remote.sh"
+  ],
+  "exit": 0,
+  "pid": 3783799
+}

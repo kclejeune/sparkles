@@ -1,0 +1,54 @@
+{
+  "assessment_version": 1,
+  "schema": "synthetic-interleaved-source-pair-assessment/v1",
+  "suite": "synthetic",
+  "scale": "1.05m",
+  "kind": "matched-source-pair-and-same-baseline-control",
+  "base_commit": "765fc956b3f4631f195119a67123241f2f68a00c",
+  "candidate_commit": "6e696f22204cc14d886ae3cce56c7628ee5473d6",
+  "host": {
+    "primary": "forge",
+    "cpu": "Intel Core i5-13500",
+    "screen": "Namespace AMD EPYC"
+  },
+  "settings": {
+    "people": 100000,
+    "threads": 1,
+    "server_cpu": 2,
+    "client_cpu": 4,
+    "result_cache": false,
+    "dynamic_loader_rewrite": false,
+    "spinners": true,
+    "warmups": 3,
+    "intel_rounds": 8,
+    "intel_reps": 40,
+    "memory_max_bytes": 12884901888,
+    "swap_max_bytes": 2147483648
+  },
+  "source": {
+    "baseline_elf_sha256": "38290f03cb726a8bb8d0dc5b14afbaa8be5b1767bd918d5b9e9a8ccac05d532d",
+    "candidate_elf_sha256": "9d22cb20d0c96343153b9e32b17fc690dd91cef0b8f7e41e937d01ccb1846997",
+    "intel_archive_sha256": "c991e027a59890ec3a76b1668767a73adb8573d52cadb12eda4b29f5796f92d1",
+    "namespace_first_archive_sha256": "6587228703b3cc364f67fcf5361ba9949c72f591248dc4e8b4c734a690ee9ca1",
+    "namespace_rerun_archive_sha256": "63f757ddaabbb7c6b1129008a1169f5781c15ac6defb452cf7c324e0ae4cda08",
+    "analysis_sha256": "da4f5ec38eb55cb8e31e9a05f88f159028666e9ea4e05cc849b5662fb785e792",
+    "harness_sha256": "48a6e858f040a2ac60fb0561843e16b36f34ac795d1b5822ff888f0a6ffe781e"
+  },
+  "method": "All timed-request medians, eight complete interleaved ABBA rounds in each source order, separate baseline/baseline eleven-query control. Raw BA results inverted to candidate/baseline; no pooled pass or trimmed process.",
+  "measurement_contract": "Sorted TSV references agree for all 30 queries in both orders and all11 same-baseline controls; no per-timed native-response answer proof. All 90,880 timed tuples retained.",
+  "scope": "Manual source-pair diagnostic; the surviving Namespace flag is retained. No cause, absence-of-cost or automatic publication acceptance claim. The failed first Intel attempt is excluded and uncombined.",
+  "measurement": {
+    "intel_timed_samples": 90880,
+    "namespace_first_samples": 9600,
+    "namespace_rerun_samples": 7680,
+    "benchmark_actual_exit": 0,
+    "collector_actual_os_exit": null,
+    "peak_bytes": 5464104960,
+    "swap_peak_bytes": 0,
+    "leaf_memory_events_all_zero": true,
+    "recorded_ancestor_event_deltas_zero": true,
+    "root_memory_event_file_unavailable": true
+  },
+  "followup": 759,
+  "generated_selection_changed": false
+}

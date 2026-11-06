@@ -4,6 +4,24 @@ This report was imported from the manually maintained benchmark page. Its tables
 qualifications are preserved, and are not regenerated from the JSON records. Read the
 [reference setup and answer rules](../reference/README.md) with each result.
 
+## Retained-memory and optional-feature comparison
+
+The [manual source-pair record](runs/41dff4bc69c62404fb7eb9a69aefb5c3cbbe1a0284de4bd80748ece7c2c9132c/README.md) compares
+`765fc956` with `6e696f22` at 1.05M triples, with one query thread and result caching
+disabled. Its Namespace rerun retains a `distinct-obj` execution ratio of 1.176406.
+The exact same binaries on forge read 1.092276 in the forward source order and 1.029931
+in the reversed order, after orienting both as later source over baseline. Intel’s
+`count-all` execution ratio is 1.119036 forward and 1.014420 reversed. No aggregate
+execution increase reaches 10% in both Intel source orders, and no aggregate wall
+increase reaches 10% in either order. The failed Namespace screen remains distinct.
+
+All 90,880 Intel timed samples and all 30+30+11 paired sorted TSV references are retained.
+The reference checks do not cover every timed native response. Fresh-process spreads
+and per-round ratios remain visible for every query and both metrics. Item 759 tracks
+all positive and tiny-query leads, whose union covers all 30 queries, without claiming
+that they are all confirmed costs or all noise. The record does not authorize publication
+or establish the performance of a different source or build.
+
 ## Horn classification and kept-frame screen leads
 
 The matched-compiler Namespace screen of `7070fa7c` against `aaa6f015` returns

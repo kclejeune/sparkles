@@ -1,0 +1,6 @@
+{
+  "queries": 30,
+  "timed_requests": 38400,
+  "answers_equal": true,
+  "same_A_control": false
+}

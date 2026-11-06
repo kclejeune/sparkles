@@ -1,0 +1,38 @@
+11:27:34 unpacking
+11:27:36 data: 1052807 triples
+11:27:36 A loaded in 0.63 s
+11:27:37 B loaded in 0.55 s
+11:27:37 queries: class-predicate-list class-predicates contains count-all distinct-join distinct-obj employee-docs exists-join expr-agg-arg expr-bind-group expr-order-key group-avg knows-reach lang-filter minus not-exists optional-chain optional-count order-by-full path-plus predicate-counts predicate-subjects range-topk regex-iri star-join star-lookup subquery-agg two-hop-count types-grouped values-star
+11:28:00 round 1 epoch 1 (A) done
+11:28:23 round 1 epoch 2 (B) done
+11:28:45 round 1 epoch 3 (B) done
+11:29:08 round 1 epoch 4 (A) done
+11:29:30 round 2 epoch 5 (A) done
+11:29:53 round 2 epoch 6 (B) done
+11:30:16 round 2 epoch 7 (B) done
+11:30:38 round 2 epoch 8 (A) done
+11:31:00 round 3 epoch 9 (A) done
+11:31:22 round 3 epoch 10 (B) done
+11:31:45 round 3 epoch 11 (B) done
+11:32:07 round 3 epoch 12 (A) done
+11:32:30 round 4 epoch 13 (A) done
+11:32:53 round 4 epoch 14 (B) done
+11:33:15 round 4 epoch 15 (B) done
+11:33:38 round 4 epoch 16 (A) done
+11:34:00 round 5 epoch 17 (A) done
+11:34:23 round 5 epoch 18 (B) done
+11:34:45 round 5 epoch 19 (B) done
+11:35:08 round 5 epoch 20 (A) done
+11:35:30 round 6 epoch 21 (A) done
+11:35:52 round 6 epoch 22 (B) done
+11:36:14 round 6 epoch 23 (B) done
+11:36:37 round 6 epoch 24 (A) done
+11:36:59 round 7 epoch 25 (A) done
+11:37:22 round 7 epoch 26 (B) done
+11:37:44 round 7 epoch 27 (B) done
+11:38:07 round 7 epoch 28 (A) done
+11:38:29 round 8 epoch 29 (A) done
+11:38:52 round 8 epoch 30 (B) done
+11:39:14 round 8 epoch 31 (B) done
+11:39:37 round 8 epoch 32 (A) done
+11:39:37 finished

@@ -1,0 +1,13 @@
+{
+  "released": true,
+  "host": "forge",
+  "root": "/home/kclejeune/lanes/partial-memory-optional-feature-intel-v2",
+  "unit": "partial-memory-optional-feature-intel-v2.service",
+  "start_unix": 1793964453,
+  "end_unix": 1793967153,
+  "trim_receipt_sha256": "d38f4b9c2bb5e09a23862b5bba2777b4c48aff8f0597e95fd6391c83540d096c",
+  "launcher_sha256": "42a53759283b0ea16fd5bbbf9531fe49f565acc4df8b729b8efd7e41002f01f9",
+  "inputs_sha256": "3817d05084d400f1d130a6ded869cfbdf2d20b060460d3798ebe1db1ae20a7e2",
+  "root_plan_review": "b22176a335abfb0d75fc29cc60f27ba82a916b7b3fcb7f027afe58cf43553fdd",
+  "released_at_unix": 1793964453.4682894
+}

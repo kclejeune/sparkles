@@ -1,0 +1,46 @@
+{
+  "host": "forge",
+  "root": "/home/kclejeune/lanes/partial-memory-optional-feature-intel-v2",
+  "unit": "partial-memory-optional-feature-intel-v2.service",
+  "parent_pid": 3783789,
+  "inputs_sha256": "3817d05084d400f1d130a6ded869cfbdf2d20b060460d3798ebe1db1ae20a7e2",
+  "launcher_sha256": "42a53759283b0ea16fd5bbbf9531fe49f565acc4df8b729b8efd7e41002f01f9",
+  "argv": [
+    "/run/wrappers/bin/sudo",
+    "-n",
+    "/run/current-system/sw/bin/fstrim",
+    "-v",
+    "/"
+  ],
+  "both_host_locks_held": true,
+  "start_unix": 1793964452.8354945,
+  "start_monotonic": 1090093.118337808,
+  "before_counters": {
+    "MemAvailable_kB": 14577144,
+    "disk_free": 118538526720,
+    "children_user_seconds": 0.010853999999999999,
+    "children_system_seconds": 0.007581999999999999,
+    "children_maxrss_kB": 22704
+  },
+  "exit": 0,
+  "timed_out": false,
+  "pid": 3783793,
+  "cleanup": {
+    "pgid": 3783793,
+    "signals": [],
+    "leader_exit": 0,
+    "remaining": []
+  },
+  "interrupted_signals": [],
+  "end_unix": 1793964453.4679441,
+  "end_monotonic": 1090093.750787527,
+  "after_counters": {
+    "MemAvailable_kB": 14566004,
+    "disk_free": 118538522624,
+    "children_user_seconds": 0.01441,
+    "children_system_seconds": 0.044375,
+    "children_maxrss_kB": 23024
+  },
+  "stdout_sha256": "13ee49082dde9637cc20218949ef8c4dd286b0a025b65d99c124ca2eae456912",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

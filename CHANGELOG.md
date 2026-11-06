@@ -24,6 +24,9 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+The derived-table cache has a process-wide `--derived-table-cache-mb` budget and
+metrics-protected capacity, occupancy, hit and miss counters in the server statistics.
+
 The ontology Header and browser landing page have on-demand metrics. They show axiom
 counts by type, distinct signature entities and four OWL 2 profile reports, including
 streamed instance assertions, at one authorized graph and revision scope. DL notation
@@ -1639,6 +1642,12 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 (X14, item 478).
 
 ### Fixed
+
+Classification recounts retained index and context estimates consistently for fresh and
+reused state. A requested partial classification preserves its tier when final retained
+or taxonomy admission refuses memory, reports the original memory error and leaves
+state ready for a clean retry. Server builds without ontology or MCP features compile
+through their supported optional-feature routes.
 
 Horn classification no longer charges repeated successor messages as newly stored
 conclusions in its memory estimate, avoiding false memory-budget stops from those

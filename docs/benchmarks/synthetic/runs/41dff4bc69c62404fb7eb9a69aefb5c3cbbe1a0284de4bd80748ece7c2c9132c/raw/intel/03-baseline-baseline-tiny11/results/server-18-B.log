@@ -1,0 +1,5 @@
+[2m2026-11-06T11:53:09.889874Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m memory profile default: block cache 1024 MiB, result cache 0 MiB, SERVICE cache 64 MiB, history cache 512 MiB, query budget 8192 MiB, query pool 5344 MiB
+[2m2026-11-06T11:53:09.902243Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m spill directory /home/kclejeune/lanes/partial-memory-optional-feature-intel-v2/03-baseline-baseline-tiny11/srv/.spill/890faff8382545f29098db509101231a-401293-378f7ed5a1b3a198, 26800 MiB for all queries
+[2m2026-11-06T11:53:09.907498Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m Sparkles 0.1.0 listening on http://127.0.0.1:3999/ (UI at /ui/), opening 0 datasets
+[2m2026-11-06T11:53:09.915852Z[0m [32m INFO[0m [2msparkles::startup[0m[2m:[0m datasets opened in 6.8ms: status ready, ready true
+[2m2026-11-06T11:53:14.816038Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m shutting down: finishing requests in flight (up to 20s)

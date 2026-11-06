@@ -1,0 +1,10 @@
+{
+  "argv": [
+    "/etc/profiles/per-user/kclejeune/bin/python3",
+    "-B",
+    "/home/kclejeune/lanes/partial-memory-optional-feature-intel-v2/nsc-bench-summary.py",
+    "/home/kclejeune/lanes/partial-memory-optional-feature-intel-v2/03-baseline-baseline-tiny11"
+  ],
+  "exit": 0,
+  "pid": 464924
+}

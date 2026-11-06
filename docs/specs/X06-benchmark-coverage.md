@@ -2260,3 +2260,14 @@ These phases belong to [ROADMAP](../ROADMAP.md) item 452, the benchmark gates an
 **Loader format coverage for peers.** Measure RDF Thrift, RDF Protobuf, TriX and RDF/JSON loads for Jena and Oxigraph where they support them. The loading table leaves these peer cells unmeasured. It depends on item 1.
 
 **ShEx validation performance gap.** Profile and close the full-validation cost of 3.4 times SHACL in parallel and 2.3 times sequentially, and re-measure persisted-typing restarts. It depends on item 54.
+
+### Retained-memory and optional-feature comparison
+
+The matched `765fc956` and `6e696f22` comparison preserves the Namespace screen and
+rerun separately from both source orders and the same-baseline tiny control on forge.
+The [manual report](../benchmarks/synthetic/RESULTS.md#retained-memory-and-optional-feature-comparison)
+retains the surviving flag, complete execution and HTTP-wall statistics, reference
+answer limits and process spreads. Item 759 covers every positive and tiny lead,
+without replacing earlier follow-ups or establishing a cost’s cause. Item 760 covers
+retaining the normal gate’s actual per-case JUnit before target cleanup. Neither
+follow-up completes the broader benchmark refresh.
