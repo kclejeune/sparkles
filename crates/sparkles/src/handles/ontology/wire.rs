@@ -711,6 +711,8 @@ fn members(op: &str) -> &'static [&'static str] {
         ],
         "parse" => &["text", "as"],
         "hierarchy" => &[
+            "sourceId",
+            "after",
             "kind",
             "iri",
             "ancestors",
@@ -720,9 +722,11 @@ fn members(op: &str) -> &'static [&'static str] {
             "deprecated",
             "lang",
         ],
-        "individuals" => &["type", "untyped", "iri", "after", "limit", "lang"],
+        "individuals" => &[
+            "type", "untyped", "iri", "after", "limit", "lang", "sourceId",
+        ],
         "keptClassification" => &["part", "about", "offset", "limit", "resultId", "lang"],
-        "term" => &["iri", "mentions", "incoming", "lang"],
+        "term" => &["iri", "mentions", "incoming", "lang", "sourceId"],
         "dlQuery" => &[
             "expression",
             "syntax",
@@ -1232,6 +1236,8 @@ fn iri_arg(a: &Map<String, J>, k: &str) -> Result<Option<String>> {
 /// The hierarchy level a `hierarchy` request names.
 pub fn hierarchy_request_of(a: &Map<String, J>) -> Result<browse::HierarchyRequest> {
     let mut h = browse::HierarchyRequest::default();
+    h.source_id = string(a, "sourceId")?.map(str::to_string);
+    h.after = iri_arg(a, "after")?;
     if let Some(k) = string(a, "kind")? {
         h.kind = browse::TreeKind::parse(k).ok_or_else(|| {
             bad(format!(
@@ -1254,6 +1260,7 @@ pub fn hierarchy_request_of(a: &Map<String, J>) -> Result<browse::HierarchyReque
 pub fn term_request_of(a: &Map<String, J>) -> Result<browse::TermRequest> {
     let iri = iri_arg(a, "iri")?.ok_or_else(|| bad("iri names the entity"))?;
     let mut t = browse::TermRequest::new(iri);
+    t.source_id = string(a, "sourceId")?.map(str::to_string);
     t.mentions =
         number(a, "mentions", 0, browse::MAX_MENTIONS)?.unwrap_or(browse::DEFAULT_MENTIONS);
     t.incoming =
@@ -1278,6 +1285,9 @@ pub fn hierarchy_node(n: &browse::Node) -> J {
     let mut m = name_members(&n.name);
     m.insert("children".into(), json!(n.children));
     m.insert("parents".into(), json!(n.parents));
+    if n.equivalence_count > 1 {
+        m.insert("equivalenceCount".into(), json!(n.equivalence_count));
+    }
     J::Object(m)
 }
 
@@ -1299,6 +1309,12 @@ pub fn hierarchy_body(name: &str, h: &browse::HierarchyRequest, r: &browse::Hier
         "next": if next < r.total { json!(next) } else { J::Null },
         "order": if r.sorted { "label" } else { "iri" },
     });
+    if let Some(source) = &r.inference_source {
+        j["nextAfter"] = json!(r.next_after);
+        j["hierarchyBasis"] = json!("directEquivalenceGroups");
+        j["inferenceSource"] =
+            serde_json::to_value(source).expect("materialization metadata serializes");
+    }
     if let Some(from) = r.roots_from {
         j["roots"] = json!(from.name());
         j["deprecatedRoots"] = json!(r.deprecated_roots);
@@ -1346,6 +1362,10 @@ pub fn term_body(name: &str, t: &browse::TermPage, r: &Renderer) -> J {
         "imports": t.imports.iter().map(|i| json!({"iri": i.iri, "graph": i.graph})).collect::<Vec<_>>(),
         "warnings": t.warnings,
     });
+    if let Some(source) = &t.inference_source {
+        j["inferenceSource"] =
+            serde_json::to_value(source).expect("materialization metadata serializes");
+    }
     for (k, v) in name_members(&t.name) {
         j[k] = v;
     }
@@ -1855,6 +1875,7 @@ pub fn dl_query_body(
 /// The individuals read's bounded page and membership lookup.
 pub fn individuals_request_of(a: &Map<String, J>) -> Result<browse::IndividualsRequest> {
     Ok(browse::IndividualsRequest {
+        source_id: string(a, "sourceId")?.map(str::to_string),
         class: iri_arg(a, "type")?,
         untyped: boolean(a, "untyped")?.unwrap_or(false),
         iri: iri_arg(a, "iri")?,
@@ -1866,7 +1887,7 @@ pub fn individuals_request_of(a: &Map<String, J>) -> Result<browse::IndividualsR
 
 /// The JSON page of named individuals or their type buckets.
 pub fn individuals_body(name: &str, r: &browse::Individuals) -> J {
-    json!({
+    let mut body = json!({
         "dataset": name, "commit": r.commit, "order": "iri",
         "groups": r.groups.iter().map(|g| json!({"type": g.class.as_ref().map(name_members), "total": g.total})).collect::<Vec<_>>(),
         "individuals": r.individuals.iter().map(|n| {
@@ -1875,7 +1896,13 @@ pub fn individuals_body(name: &str, r: &browse::Individuals) -> J {
             J::Object(m)
         }).collect::<Vec<_>>(),
         "total": r.total, "next": r.next, "warnings": r.warnings,
-    })
+    });
+    if let Some(source) = &r.inference_source {
+        body["typeBasis"] = json!("materializedNamedTypes");
+        body["inferenceSource"] =
+            serde_json::to_value(source).expect("materialization metadata serializes");
+    }
+    body
 }
 
 /// A bounded explicit frame projection, separate from legacy full taxonomy output.
@@ -1925,12 +1952,14 @@ pub fn kept_query_of(a: &Map<String, J>) -> Result<super::kept::KeptQuery> {
     let part = match string(a, "part")?.unwrap_or("status") {
         "status" => Part::Status,
         "parents" => Part::Parents,
+        "children" => Part::Children,
+        "roots" => Part::Roots,
         "equivalents" => Part::Equivalents,
         "sources" => Part::Sources,
         "excluded" => Part::Excluded,
         _ => {
             return Err(bad(
-                "part must be status, parents, equivalents, sources or excluded",
+                "part must be status, roots, parents, children, equivalents, sources or excluded",
             ));
         }
     };

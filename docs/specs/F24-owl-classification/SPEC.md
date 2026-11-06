@@ -318,6 +318,16 @@ counts agree with bounded page traversal. Page output and per-page labels are bo
 while counts/order can scan retained vectors. Names use the pinned authorized snapshot
 and complete IRI fallback for unproven historical prefixes.
 
+Kept roots and direct-child pages expose the taxonomy's existing retained vectors without
+adding another reverse index or downloading a whole taxonomy. Each bounded row includes
+one representative, its equivalence count and direct child/parent counts. Nontrivial top
+and bottom groups remain explicit. Entity status identifies a selected equivalent name's
+representative without changing its asserted edit target. The same revision, publication,
+source and access checks apply to hierarchy continuation and frame clauses. Materialized
+property/individual views use a separate recorded-profile source and never advertise the
+class-only publication as their producer. General classifier-backed entity/axiom reads
+and matching arbitrary-axiom justifications remain open under items 588 and 622.
+
 An optional explicit `projection=frame` on classify branches before legacy whole-node
 and ancestor arrays. It preserves useful direct-parent/equivalent clauses even for an
 isolated restricted computation, using its actual graph grant and already triple-masked

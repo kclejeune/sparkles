@@ -84,7 +84,7 @@ open(
 
 open('the lineage tree follows one path and names the other parent', async ({ page }) => {
   await page.goto(term(5));
-  const tree = page.getByRole('complementary', { name: 'Hierarchy' });
+  const tree = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
   const spine = tree.getByRole('list', { name: 'Lineage' });
   await expect(spine.getByRole('link', { name: 'cellular component' })).toBeVisible();
   await expect(spine.getByRole('link', { name: /^organelle/ })).toBeVisible();
@@ -163,7 +163,7 @@ open('a cycle in the hierarchy stops at the class it returns to', async ({ page,
   });
   expect(loaded.ok(), await loaded.text()).toBe(true);
   await page.goto(`/ui/browse?ds=${ds}&iri=${encodeURIComponent(ex + 'Root')}`);
-  const tree = page.getByRole('complementary', { name: 'Hierarchy' });
+  const tree = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
   await tree.getByRole('button', { name: 'Open alpha' }).click();
   await tree.getByRole('button', { name: 'Open beta' }).click();
   // alpha comes again under beta, marked as a cycle, with nothing further to open

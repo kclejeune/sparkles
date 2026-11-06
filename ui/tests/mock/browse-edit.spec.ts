@@ -156,7 +156,7 @@ test('OWL edits on a session branch: definition, synonym, annotation, parent and
     await expect(ann).toContainText('Holds a chair.');
 
     // a parent: add Person, then remove it
-    const tree = page.getByRole('complementary', { name: 'Hierarchy' });
+    const tree = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
     await tree.getByRole('combobox', { name: 'Add a parent class' }).fill('Pers');
     await tree
       .getByRole('option', { name: /Person/ })
@@ -237,7 +237,7 @@ test('an edit invalidates inferences until explicit classification reads the new
 
     await pageAction(page, 'Edit');
     await expect(page).toHaveURL(/edit=1/);
-    const tree = page.getByRole('complementary', { name: 'Hierarchy' });
+    const tree = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
     await tree.getByRole('combobox', { name: 'Add a parent class' }).fill('Teach');
     await tree
       .getByRole('option', { name: /Teacher/ })
@@ -290,7 +290,7 @@ test('SKOS edits: a label, a definition and a broader concept', async ({ page, r
     await commit(page);
 
     // a second broader concept through the picker, then its removal
-    const tree = page.getByRole('complementary', { name: 'Hierarchy' });
+    const tree = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
     await tree.getByRole('button', { name: 'Add broader' }).click();
     const picker = tree.getByRole('group', { name: 'Broader picker' });
     await picker.getByRole('searchbox').fill('Marine');
@@ -332,7 +332,9 @@ test('the rail holds the parent editor and the SKOS links within its card', asyn
   await onSession(request, 'uni', async () => {
     await open(page, term('uni', UNI + 'Professor', '&edit=1'));
     const branch = await startSession(page, 'onto');
-    const tree = page.locator('.b-side').getByRole('complementary', { name: 'Hierarchy' });
+    const tree = page
+      .locator('.b-side')
+      .getByRole('complementary', { name: 'Hierarchy', exact: true });
     const input = tree.getByRole('combobox', { name: 'Add a parent class' });
     await insideCard(tree, input.locator('xpath=ancestor::div[contains(@class,"box")][1]'));
     // the choices open over the rail and can be read
@@ -349,7 +351,9 @@ test('the rail holds the parent editor and the SKOS links within its card', asyn
   await onSession(request, 'thes', async () => {
     await open(page, term('thes', TH + 'owls', '&edit=1'));
     const branch = await startSession(page, 'skos');
-    const tree = page.locator('.b-side').getByRole('complementary', { name: 'Hierarchy' });
+    const tree = page
+      .locator('.b-side')
+      .getByRole('complementary', { name: 'Hierarchy', exact: true });
     // an edit waits for the labels of the new commit, so the next one starts after they are read
     const commitAndRead = async () => {
       const read = page.waitForResponse(

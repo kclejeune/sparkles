@@ -1967,7 +1967,8 @@ starts does.
 
 `GET /$/ontology/{ds}/hierarchy` answers one level of a hierarchy for the ontology
 browser and for trees that open one level at a time. It reads the store's indexes and
-not the whole ontology, so its cost does not grow with the ontology's size. `kind` is
+not the whole ontology for the ordinary asserted path. Strict materialized hierarchy
+counts and reduction can inspect more rows than the returned page. `kind` is
 `class` (the default), `objectProperty`, `dataProperty`, `annotationProperty` or
 `concept`. Classes follow `rdfs:subClassOf` between named classes, properties
 `rdfs:subPropertyOf`, and concepts `skos:broader` and `skos:narrower` in either
@@ -1988,7 +1989,8 @@ prefixed name or the local name), the `kinds`, `deprecated`, and its numbers of 
 `children` and `parents`. `ancestors=true` adds the ancestors of `iri` up to the roots as
 `nodes` and `[child, parent]` `edges`, at most 2,000 nodes, with `truncated`. A cycle is
 followed once. The route takes `graph`, `imports`, `branch` and `at`, answers with the
-commit as its entity tag, and refuses `inferences`.
+commit as its entity tag for asserted reads. Strict materialized reads use the separate
+source-pinned contract below.
 
 ```json
 { "dataset": "go", "commit": 1, "kind": "class",
@@ -2015,7 +2017,8 @@ Each individual carries its name fields and `types` as named-class name objects.
 Multiple types put a member once in each bucket. Duplicate memberships across graphs
 count once. Anonymous individuals are outside this named-entity editor tree. A named
 individual asserted only to a class expression belongs to Untyped unless it also has
-an asserted named class. No inferred membership is added and `inferences` is refused.
+an asserted named class. These are the default asserted semantics. The strict
+materialized path below includes indirect named types.
 
 `limit` is 100 by default and at most 1,000. Both buckets and members use lexical IRI
 order, independent of labels. Untyped sorts first, with the empty continuation key.
@@ -2065,8 +2068,8 @@ link them without more requests. The answer also has the entity's own name membe
 `jsonld` give the triples about the entity, the blank nodes they reach and the
 reifications of its annotated triples, and `ofn` gives its axioms in functional-style
 syntax. An IRI that the graphs read do not mention is `404`. The route takes `graph`,
-`imports`, `mode`, `branch`, `at` and `lang`, and refuses `inferences`. A JSON answer
-carries the commit as its entity tag and answers `If-None-Match` and `If-Match`, and a
+`imports`, `mode`, `branch`, `at` and `lang`. JSON also supports the strict materialized
+contract below. An asserted JSON answer carries the commit as its entity tag and answers `If-None-Match` and `If-Match`, and a
 download carries the commit in its headers without an entity tag.
 
 `GET /$/ontology/{ds}/entity?iri=IRI` answers what the ontology says about one entity.
@@ -2176,11 +2179,43 @@ the `diff` endpoint. A commit that the dataset's history no longer keeps is `410
   "removed": [], "changedQuads": 2, "method": "log" }
 ```
 
+The `hierarchy`, `individuals` and JSON `term` routes also accept strict materialized
+reads with `inferences=true` and an explicit `at=commit:N`. A matching recorded RDFS or
+OWL RL materialization must already exist. These reads never run reasoning. They refuse
+graph or triple restrictions, synthetic snapshots, a graph/import scope different from
+the producer's complete input graph set, unknown producer metadata and stale or
+unverifiable evidence. A grant on the inferred graph alone does not authorize its hidden
+inputs. Unrelated commits are allowed only when bounded history comparison proves that
+all producer inputs and the inferred graph have no recorded changes. Disabled or
+incomplete change logs and input edits later reverted are conservatively refused.
+
+`inferenceSource` identifies the profile, producer and displayed commits, bound store and
+family, a SHA-256 `sourceId`, bounded input-graph and warning samples with complete counts,
+and unknown completeness and consistency. `justifications` is `unavailable`. The source
+identity binds the exact revision, scope and producer record. Supply `sourceId` on later
+reads to preserve that identity across a hierarchy and frame. Continuations require it.
+Clear, replacement, missing history or stale data fail explicitly. Every inferred response
+uses `Cache-Control: no-store` and bypasses commit-only conditional caching, including
+errors. Inferred term downloads are refused because they cannot carry this metadata.
+
+The materialized hierarchy supports named classes, object properties and data properties.
+It collapses mutual-subsumption groups to their lexical representative and removes
+transitive edges between groups. `hierarchyBasis` is `directEquivalenceGroups`. It pages
+in lexical IRI order with `after` and nullable `nextAfter`, rather than a nonzero `offset`.
+The returned `offset` counts groups at or before the cursor. Page buffers hold at most
+`limit + 1` members, but exact totals, equivalence checks and reduction can scan more rows
+than the output. Ancestor output has the ordinary bound and reports truncation.
+Materialized individuals retain lexical cursors and report
+`typeBasis: "materializedNamedTypes"`, including indirect named types. Their existing
+terminology mapping cost and type/bucket budgets still apply. Term axioms and statements
+retain their actual graph provenance, including facts also asserted in an input graph.
+These facts do not establish classifier completeness or provide entailment proofs.
+
 `GET /$/ontology/{ds}/classification` reads an existing classification without running
 one. It never maps an ontology on a miss, reserves classifier workers, materializes
 inferences or writes. `graph`, `imports`, `mode`, `branch` and `at` select the asserted
-source. Its named-class capabilities are direct parent equivalence groups, equivalent
-named classes and unsatisfiability. General property and individual entailments,
+source. Its named-class capabilities are direct parent and child equivalence groups, roots,
+equivalent named classes and unsatisfiability. General property and individual entailments,
 classification justifications and inferred axiom listings remain separate work.
 
 The response has `commit`, `status`, nullable `reason`, `result`, `outcome`, `entity`,
@@ -2206,9 +2241,11 @@ has `partial: false` and `complete: false`. Stopped partial taxonomies are never
 An available result with an unknown class returns `entity.present: false`, not an empty
 inference success.
 
-`part` is `status` by default, or `parents`, `equivalents`, `sources` or `excluded`.
-`about` is an absolute named-class IRI, required for parents and equivalents, optional
-for status and refused for sources or excluded. `offset` defaults to zero and `limit`
+`part` is `status` by default, or `parents`, `children`, `roots`, `equivalents`, `sources`
+or `excluded`. `about` is an absolute named-class IRI, required for parents, children and
+equivalents, optional for status and refused for roots, sources or excluded. Roots omit
+a trivial top group and include a nontrivial unsatisfiable group. Hierarchy rows report
+child and parent counts and one representative per equivalence group. `offset` defaults to zero and `limit`
 to 100, with limits from 1 to 1,000. A page has `part`, `about`, `offset`, `limit`,
 `total`, `items` and nullable `nextOffset`. Continue with the same `resultId` and
 `at=commit:N`; both are required for nonzero offsets. Eviction or replacement refuses

@@ -194,7 +194,7 @@ open(
   'a parent through the entity search and an axiom through the Manchester parser',
   async ({ page }) => {
     await openEdit(page, DS, 9);
-    const tree = page.getByRole('complementary', { name: 'Hierarchy' });
+    const tree = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
     await expect(
       tree.getByRole('button', { name: 'Remove the parent membrane-bounded organelle' }),
     ).toBeVisible();

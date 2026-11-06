@@ -1376,13 +1376,17 @@ test('ontology-individuals', async ({ page }) => {
   await shoot(page, 'ontology-individuals');
 });
 
-test('ontology-inferred', async ({ page }) => {
+test('ontology-inferred', async ({ page, request }) => {
+  // Fixture preparation is explicit. The newly loaded page reads kept levels through GET.
+  const classified = await request.post('/$/ontology/uni/classify', {
+    data: { imports: 'dataset', mode: 'lenient' },
+  });
+  expect(classified.ok(), await classified.text()).toBe(true);
   await page.goto(
     `/ui/workbench/ontology?ds=uni&inferred=1&iri=${encodeURIComponent(`${UNI}Teacher`)}`,
   );
-  await page.getByRole('button', { name: 'Classify tree', exact: true }).click();
   const asserted = page.getByRole('tree', { name: 'Classes (asserted)' });
-  const inferred = page.getByRole('tree', { name: 'Classes (inferred)' });
+  const inferred = page.getByRole('tree', { name: 'Classes (kept inferred)', exact: true });
   await expect(inferred).toBeVisible({ timeout: 30_000 });
   for (const n of ['Agent', 'Person', 'Employee'])
     await asserted.getByRole('button', { name: `Expand ${n}` }).click();

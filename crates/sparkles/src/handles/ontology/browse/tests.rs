@@ -1,6 +1,192 @@
 use super::*;
 use crate::Dataset;
 use crate::access::{GraphAccess, GraphRule, Graphs};
+use sparkles_reasoner::inputs::ImportMode;
+
+fn strict_named_individual_fixture() -> Dataset {
+    let ds = dataset(
+        "GRAPH <urn:input> {
+        <urn:A> a owl:Class; rdfs:subClassOf <urn:B> .
+        <urn:B> a owl:Class; rdfs:subClassOf <urn:C> . <urn:C> a owl:Class .
+        <urn:i> a owl:NamedIndividual, <urn:A> .
+    }",
+    );
+    ds.reasoning()
+        .run(&crate::reasoning::ReasonRequest {
+            profile: sparkles_reasoner::Profile::Rdfs,
+            inputs: Inputs {
+                data_graphs: vec![GraphRef::Named("urn:input".into())],
+                imports: ImportMode::None,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    ds.update("INSERT DATA { GRAPH <urn:unrelated> { <urn:other> <urn:p> 1 } }")
+        .unwrap();
+    ds
+}
+
+fn strict_named_individual_request(ds: &Dataset) -> OntologyRequest {
+    OntologyRequest {
+        graphs: vec![GraphRef::Named("urn:input".into())],
+        imports: ImportMode::None,
+        at: Some(crate::history::At::Commit(ds.head_commit().seq)),
+        inferences: true,
+        ..Default::default()
+    }
+}
+
+fn strict_named_mapper_does_not_reenter_legacy_freshness(warm: bool) {
+    use std::sync::{Arc, atomic::AtomicBool};
+    let ds = strict_named_individual_fixture();
+    let request = strict_named_individual_request(&ds);
+    let primary = Arc::new(AtomicBool::new(false));
+    let secondary = Arc::new(AtomicBool::new(false));
+    let options = QueryOptions {
+        cancel: Some(primary.clone()),
+        cancellation: Some(crate::task::Cancellation::from_flags([secondary.clone()])),
+        deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        ..Default::default()
+    };
+    let mut query = IndividualsRequest {
+        iri: Some("urn:i".into()),
+        ..Default::default()
+    };
+    if warm {
+        let page = ds
+            .ontology()
+            .individuals(&request, &query, &options)
+            .unwrap();
+        query.source_id = Some(page.inference_source.unwrap().source_id);
+        assert_eq!(
+            ds.state().ontology_cache.lock().len(),
+            1,
+            "the actual mapper is warm"
+        );
+    } else {
+        assert!(
+            ds.state().ontology_cache.lock().is_empty(),
+            "the actual mapper is cold"
+        );
+    }
+    crate::reasoning::freshness::take_test_calls();
+    let page = ds
+        .ontology()
+        .individuals(&request, &query, &options)
+        .unwrap();
+    let names: Vec<_> = page.individuals[0]
+        .types
+        .iter()
+        .map(|name| name.iri.as_str())
+        .collect();
+    assert!(names.contains(&"urn:A") && names.contains(&"urn:B") && names.contains(&"urn:C"));
+    assert_eq!(page.inference_source.as_ref().unwrap().profile, "rdfs");
+    assert_eq!(page.commit, ds.head_commit().seq);
+    assert!(!primary.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(!secondary.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(
+        crate::reasoning::freshness::take_test_calls(),
+        0,
+        "strict source-verified mapping must not re-enter generic uncontrolled freshness"
+    );
+}
+
+#[test]
+fn strict_named_inferred_individuals_skip_legacy_freshness_on_cold_mapping() {
+    strict_named_mapper_does_not_reenter_legacy_freshness(false);
+}
+
+#[test]
+fn strict_named_inferred_individuals_skip_legacy_freshness_on_mapper_cache_hit() {
+    strict_named_mapper_does_not_reenter_legacy_freshness(true);
+}
+
+#[test]
+fn strict_named_inferred_individuals_reject_expired_and_cancelled_request_controls() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    let ds = strict_named_individual_fixture();
+    let request = strict_named_individual_request(&ds);
+    for options in [
+        QueryOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            ..Default::default()
+        },
+        QueryOptions {
+            cancellation: Some(crate::task::Cancellation::from_flags([Arc::new(
+                AtomicBool::new(true),
+            )])),
+            ..Default::default()
+        },
+        QueryOptions {
+            deadline: Some(std::time::Instant::now()),
+            ..Default::default()
+        },
+    ] {
+        crate::reasoning::freshness::take_test_calls();
+        let result = ds
+            .ontology()
+            .individuals(&request, &IndividualsRequest::default(), &options);
+        assert!(matches!(result, Err(Error::Cancelled | Error::Timeout)));
+        assert_eq!(crate::reasoning::freshness::take_test_calls(), 0);
+    }
+}
+
+#[test]
+fn strict_named_inferred_individuals_preserve_resolved_import_types() {
+    let ds = dataset(
+        "GRAPH <urn:input> {
+        <urn:input> a owl:Ontology; owl:imports <urn:types> .
+        <urn:A> a owl:Class; rdfs:subClassOf <urn:B> .
+        <urn:i> a owl:NamedIndividual, <urn:A> .
+    } GRAPH <urn:types> {
+        <urn:types> a owl:Ontology . <urn:B> a owl:Class; rdfs:subClassOf <urn:C> .
+        <urn:C> a owl:Class .
+    }",
+    );
+    ds.reasoning()
+        .run(&crate::reasoning::ReasonRequest {
+            profile: sparkles_reasoner::Profile::Rdfs,
+            inputs: Inputs {
+                data_graphs: vec![GraphRef::Named("urn:input".into())],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    ds.update("INSERT DATA { GRAPH <urn:other> { <urn:s> <urn:p> 1 } }")
+        .unwrap();
+    let mut request = strict_named_individual_request(&ds);
+    request.imports = ImportMode::Dataset;
+    let page = ds
+        .ontology()
+        .individuals(
+            &request,
+            &IndividualsRequest {
+                iri: Some("urn:i".into()),
+                ..Default::default()
+            },
+            &QueryOptions::default(),
+        )
+        .unwrap();
+    assert!(
+        page.individuals[0]
+            .types
+            .iter()
+            .any(|name| name.iri == "urn:C")
+    );
+    let source = page.inference_source.unwrap();
+    assert!(source.input_graphs.iter().any(|graph| graph == "urn:types"));
+    request.imports = ImportMode::None;
+    assert!(matches!(
+        ds.ontology().individuals(
+            &request,
+            &IndividualsRequest::default(),
+            &QueryOptions::default()
+        ),
+        Err(Error::NotPermitted(_))
+    ));
+}
 
 const PREFIXES: &str = "PREFIX : <http://ex.org/>
 PREFIX owl: <http://www.w3.org/2002/07/owl#>

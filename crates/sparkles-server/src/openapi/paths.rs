@@ -792,10 +792,10 @@ fn ontology(p: &mut Paths) {
     );
     p.add(
         read(op(GET, "/$/ontology/{ds}/classification", "keptClassification", "Ontology", "Read an existing immutable classification"))
-            .doc("Reads kept state only. A miss never maps or classifies an ontology, reserves classifier workers or writes. Status is available, running, mismatch or unavailable. Restricted graph/triple views and synthetic snapshots return unavailable without observing the shared slot. A kept result names its exact store/branch, source commit, input/content/source fingerprints and original producer options. Named-class direct parents, equivalents and unsatisfiability are available; property/individual entailments and justifications are not. Outcome distinguishes partial, exclusions and consistency. Nonzero offsets require resultId and at=commit:N. Replacement or eviction refuses a pin instead of switching results. Sources pages include every typed requested graph, resolved graph, import and warning row in digest order. Page output and name buffers are bounded; counts and ordering can scan retained vectors. Historical names use the pinned authorized snapshot and full IRI fallback. Every response is Cache-Control: no-store and bypasses commit-only conditional 304. Unknown selectors, duplicate singleton selectors, inferences (even false), computing options and invalid pins are refused.")
+            .doc("Reads kept state only. A miss never maps or classifies an ontology, reserves classifier workers or writes. Status is available, running, mismatch or unavailable. Restricted graph/triple views and synthetic snapshots return unavailable without observing the shared slot. A kept result names its exact store/branch, source commit, input/content/source fingerprints and original producer options. Named-class roots, direct children/parents, equivalents and unsatisfiability are available; property/individual entailments and justifications are not. Outcome distinguishes partial, exclusions and consistency. Nonzero offsets require resultId and at=commit:N. Replacement or eviction refuses a pin instead of switching results. Sources pages include every typed requested graph, resolved graph, import and warning row in digest order. Page output and name buffers are bounded; counts and ordering can scan retained vectors. Historical names use the pinned authorized snapshot and full IRI fallback. Every response is Cache-Control: no-store and bypasses commit-only conditional 304. Unknown selectors, duplicate singleton selectors, inferences (even false), computing options and invalid pins are refused.")
             .see("ontology")
             .param("at")
-            .query("part", json!({"type":"string","enum":["status","parents","equivalents","sources","excluded"]}), "The bounded portion to read, status by default.")
+            .query("part", json!({"type":"string","enum":["status","roots","parents","children","equivalents","sources","excluded"]}), "The bounded portion to read, status by default.")
             .query("about", s(), "An absolute named-class IRI, required for parents/equivalents and optional for status.")
             .query("resultId", json!({"type":"string","format":"uuid"}), "The immutable result to read, required for continuation.")
             .query("offset", json!({"type":"integer","minimum":0}), "The first row, zero by default. Nonzero offsets require an exact commit and resultId.")
@@ -985,12 +985,16 @@ fn ontology(p: &mut Paths) {
         json!({ "type": "integer", "description": "The number of direct children." });
     node_props["parents"] =
         json!({ "type": "integer", "description": "The number of direct parents." });
+    node_props["equivalenceCount"] = json!({"type":"integer","minimum":1});
     let node = json!({ "type": "object", "properties": node_props });
     let name = json!({"type": "object", "properties": name_props.clone()});
     p.add(
         read(op(GET, "/$/ontology/{ds}/individuals", "ontologyIndividuals", "Ontology", "Page named individuals by asserted type"))
-            .doc("Without a selector, list asserted named-type buckets and an Untyped bucket whose type is null. With type=IRI, page named members of that asserted class; with untyped=true, page named individuals without an asserted named class. With iri=IRI, locate one named individual and its memberships. These selectors are mutually exclusive. Anonymous individuals are excluded. Multiple types place a named individual once in each bucket, with duplicate memberships across graphs removed. Pages use lexical IRI order and an exclusive after/next cursor. Reuse the response commit as at for every continuation. Labels follow lang or Accept-Language. No classification runs and inferences is refused. The authorized scope and F21 terminology are read on the server; root discovery and Untyped pages scan the scope and typed pages scan that type's membership. A bounded response does not imply bounded server work. Root discovery refuses more than 100,000 type buckets. A typed page refuses more than 1,000 named types on a returned individual. Candidates before the cursor or outside that page do not trigger this type-list cap. Root discovery and Untyped reads apply the cap to every individual examined, and direct lookup applies it to its individual. No type list is truncated.")
+            .doc("Without a selector, list asserted named-type buckets and an Untyped bucket whose type is null. With type=IRI, page named members of that asserted class; with untyped=true, page named individuals without an asserted named class. With iri=IRI, locate one named individual and its memberships. These selectors are mutually exclusive. Anonymous individuals are excluded. Multiple types place a named individual once in each bucket, with duplicate memberships across graphs removed. Pages use lexical IRI order and an exclusive after/next cursor. Reuse the response commit as at for every continuation. Labels follow lang or Accept-Language. No classification or materialization runs. With inferences=true, buckets and memberships include all named types in the fresh recorded materialization, including indirect types, and continuation also requires sourceId. The authorized scope and F21 terminology are read on the server; root discovery and Untyped pages scan the scope and typed pages scan that type's membership. A bounded response does not imply bounded server work. Root discovery refuses more than 100,000 type buckets. A typed page refuses more than 1,000 named types on a returned individual. Candidates before the cursor or outside that page do not trigger this type-list cap. Root discovery and Untyped reads apply the cap to every individual examined, and direct lookup applies it to its individual. No type list is truncated.")
             .see("ontology")
+            .param("timeout")
+            .query("inferences", boolean(), "Strict fresh recorded materialization browsing. Requires an exact at=commit:N and a complete authorized producer input scope. Never computes on a miss. Source replacement, stale/unknown evidence and hidden inputs are refused.")
+            .query("sourceId", s(), "Reuse inferenceSource.sourceId with the exact commit for a continuation or a matching frame/tree source.")
             .param("at")
             .query("type", s(), "The asserted named class whose members to list.")
             .query("untyped", boolean(), "List named individuals without an asserted named class.")
@@ -1000,6 +1004,8 @@ fn ontology(p: &mut Paths) {
             .query("lang", s(), "Preferred label languages, comma separated and most preferred first.")
             .resp("200", "One page or one individual's memberships.", Some(json!({ "application/json": { "schema": {
                 "type": "object", "properties": {
+                        "inferenceSource": sref("OntologyMaterializationSource"),
+                        "typeBasis": {"type":"string","const":"materializedNamedTypes"},
                     "dataset": {"type": "string"}, "commit": {"type": "integer"},
                     "order": {"type": "string", "enum": ["iri"]},
                     "groups": {"type": "array", "items": {"type": "object", "properties": {
@@ -1015,12 +1021,16 @@ fn ontology(p: &mut Paths) {
                     "warnings": {"type": "array", "items": {"type": "string"}}
                 }
             }}})))
-            .errors(&[400, 404, 408]),
+            .errors(&[400, 403, 404, 408, 409, 507]),
     );
     p.add(
         read(op(GET, "/$/ontology/{ds}/hierarchy", "ontologyHierarchy", "Ontology", "List one level of an entity hierarchy"))
-            .doc("One level of the class, object property, data property, annotation property or SKOS concept hierarchy, read from the store's indexes without reading the whole ontology: the direct children of `iri`, or the roots, a page at a time in label order with deprecated entities last, each with the numbers of its own children and parents. Classes follow `rdfs:subClassOf` between named classes, properties `rdfs:subPropertyOf`, and concepts `skos:broader` and `skos:narrower` in either direction. The roots of the class hierarchy are the ontology header's `IAO_0000700` root terms when it names some, and otherwise the classes without a parent; the roots of a scheme are its top concepts with its concepts that have no broader one. `ancestors=true` adds the ancestors of `iri` up to the roots, with the edges between them, at most 2,000. The caller sees only the graphs and triples their grants allow. `inferences` is refused.")
+            .doc("One level of the class, object property, data property, annotation property or SKOS concept hierarchy, read from the store's indexes without reading the whole ontology: the direct children of `iri`, or the roots, a page at a time in label order with deprecated entities last, each with the numbers of its own children and parents. Classes follow `rdfs:subClassOf` between named classes, properties `rdfs:subPropertyOf`, and concepts `skos:broader` and `skos:narrower` in either direction. The roots of the class hierarchy are the ontology header's `IAO_0000700` root terms when it names some, and otherwise the classes without a parent; the roots of a scheme are its top concepts with its concepts that have no broader one. `ancestors=true` adds the ancestors of `iri` up to the roots, with the edges between them, at most 2,000. The caller sees only the graphs and triples their grants allow. Materialized reads collapse equivalence groups and reduce transitive edges, use lexical after pages and never classify or materialize.")
             .see("ontology")
+            .param("at")
+            .param("timeout")
+            .query("inferences", boolean(), "Strict fresh recorded materialization browsing. Requires an exact at=commit:N and a complete authorized producer input scope. Never computes on a miss. Source replacement, stale/unknown evidence and hidden inputs are refused.")
+            .query("sourceId", s(), "Reuse inferenceSource.sourceId with the exact commit for a continuation or a matching frame/tree source.")
             .query("kind", json!({ "type": "string", "enum": ["class", "objectProperty", "dataProperty", "annotationProperty", "concept"] }), "The hierarchy (`class` by default).")
             .query("iri", s(), "The node whose children to list; the roots when absent.")
             .query("ancestors", boolean(), "Also list the ancestors of `iri`.")
@@ -1028,7 +1038,8 @@ fn ontology(p: &mut Paths) {
             .query("deprecated", boolean(), "List deprecated children (true by default, after the others).")
             .query("lang", s(), "The caller's languages for labels, comma separated and most preferred first. `Accept-Language` is read when it is absent.")
             .query("limit", int(), "The most children listed, from 1 to 1,000 (100 by default).")
-            .query("offset", int(), "The children skipped.")
+            .query("offset", int(), "The asserted children skipped. Materialized hierarchy pages use after instead and refuse nonzero offset.")
+            .query("after", s(), "Exclusive canonical IRI key from nextAfter for a materialized hierarchy. Requires sourceId and the exact commit.")
             .resp(
                 "200",
                 "The node, a page of its children or of the roots, and its ancestors when asked for.",
@@ -1045,6 +1056,9 @@ fn ontology(p: &mut Paths) {
                         "offset": { "type": "integer" },
                         "limit": { "type": "integer" },
                         "next": { "type": ["integer", "null"] },
+                        "nextAfter": { "type": ["string", "null"] },
+                        "hierarchyBasis": { "type":"string", "const":"directEquivalenceGroups" },
+                        "inferenceSource": sref("OntologyMaterializationSource"),
                         "order": { "type": "string", "enum": ["label", "iri"], "description": "`iri` for a node with more than 20,000 children, which are listed in IRI order." },
                         "roots": { "type": "string", "enum": ["ontology", "scheme", "computed"], "description": "Where the roots came from, for a list of roots." },
                         "deprecatedRoots": { "type": "integer", "description": "The deprecated roots `deprecated=false` left out." },
@@ -1056,7 +1070,7 @@ fn ontology(p: &mut Paths) {
                     }
                 } } })),
             )
-            .errors(&[400, 404, 408]),
+            .errors(&[400, 403, 404, 408, 409, 507]),
     );
     let incoming = json!({ "type": "object", "properties": {
         "property": { "type": "string" },
@@ -1066,8 +1080,12 @@ fn ontology(p: &mut Paths) {
     } });
     p.add(
         read(op(GET, "/$/ontology/{ds}/term", "ontologyTerm", "Ontology", "Describe one entity"))
-            .doc("What the graphs read say about one entity, read from the store's indexes without reading the whole ontology: its triples with a named or literal object and the annotations their reifications give (`statements`), the axioms the triples about it map to by the OWL 2 reverse mapping (`axioms`), the axioms of other entities that hold it inside a class expression (`mentions`), the statements of named subjects that point at it by predicate (`incoming`), the statements that use it as their predicate (`usage`), and the label, short form and kinds of every IRI the answer uses (`names`). `format` downloads the triples about the entity, its blank nodes and the reifications of its annotated triples in Turtle, N-Triples, RDF/XML or JSON-LD, or its axioms in functional-style syntax, as an attachment. The caller sees only the graphs and triples their grants allow. `inferences` is refused.")
+            .doc("What the graphs read say about one entity, read from the store's indexes without reading the whole ontology: its triples with a named or literal object and the annotations their reifications give (`statements`), the axioms the triples about it map to by the OWL 2 reverse mapping (`axioms`), the axioms of other entities that hold it inside a class expression (`mentions`), the statements of named subjects that point at it by predicate (`incoming`), the statements that use it as their predicate (`usage`), and the label, short form and kinds of every IRI the answer uses (`names`). `format` downloads the triples about the entity, its blank nodes and the reifications of its annotated triples in Turtle, N-Triples, RDF/XML or JSON-LD, or its axioms in functional-style syntax, as an attachment. The caller sees only the graphs and triples their grants allow. With inferences=true only JSON is supported, the answer carries a strict materialization source and every statement/axiom retains its graph provenance.")
             .see("ontology")
+            .param("at")
+            .param("timeout")
+            .query("inferences", boolean(), "Strict fresh recorded materialization browsing. Requires an exact at=commit:N and a complete authorized producer input scope. Never computes on a miss. Source replacement, stale/unknown evidence and hidden inputs are refused.")
+            .query("sourceId", s(), "Reuse inferenceSource.sourceId with the exact commit for a continuation or a matching frame/tree source.")
             .query("iri", s(), "The entity.")
             .query("mentions", int(), "The most axioms of other entities listed, from 0 to 2,000 (200 by default).")
             .query("incoming", int(), "The subjects listed per incoming predicate, from 0 to 200 (20 by default).")
@@ -1080,6 +1098,7 @@ fn ontology(p: &mut Paths) {
                     "application/json": { "schema": {
                         "type": "object",
                         "properties": {
+                            "inferenceSource": sref("OntologyMaterializationSource"),
                             "dataset": { "type": "string" },
                             "commit": { "type": "integer" },
                             "graphs": { "type": "array", "items": { "type": "string" } },
@@ -1121,7 +1140,7 @@ fn ontology(p: &mut Paths) {
                     "text/owl-functional": { "schema": { "type": "string" } }
                 })),
             )
-            .errors(&[400, 404, 408]),
+            .errors(&[400, 403, 404, 408, 409, 507]),
     );
     // an axiom an edit takes: its JSON form, or a string in functional-style syntax
     let axiom_in = json!({ "oneOf": [

@@ -37,7 +37,10 @@
 //! ```
 
 mod individuals;
+mod materialized;
+mod materialized_tree;
 pub use individuals::{IndividualGroup, IndividualNode, Individuals, IndividualsRequest};
+pub use materialized::MaterializationSource;
 
 use super::{Ontologies, OntologyRequest, check};
 use crate::error::{Error, Result};
@@ -172,6 +175,10 @@ impl TreeKind {
 /// What [`Ontologies::hierarchy`] answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HierarchyRequest {
+    /// Pin the exact materialization returned by a previous inferred read.
+    pub source_id: Option<String>,
+    /// Exclusive lexical continuation for a materialized hierarchy.
+    pub after: Option<String>,
     pub kind: TreeKind,
     /// the node whose children to list; `None` lists the roots
     pub iri: Option<String>,
@@ -191,6 +198,8 @@ pub struct HierarchyRequest {
 impl Default for HierarchyRequest {
     fn default() -> HierarchyRequest {
         HierarchyRequest {
+            source_id: None,
+            after: None,
             kind: TreeKind::Class,
             iri: None,
             ancestors: false,
@@ -220,6 +229,7 @@ pub struct Name {
 /// A node of a hierarchy: its name and the numbers of its direct children and parents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Node {
+    pub equivalence_count: usize,
     pub name: Name,
     pub children: usize,
     pub parents: usize,
@@ -256,6 +266,8 @@ impl RootsFrom {
 /// The answer of [`Ontologies::hierarchy`].
 #[derive(Clone, Debug)]
 pub struct Hierarchy {
+    pub next_after: Option<String>,
+    pub inference_source: Option<MaterializationSource>,
     pub commit: u64,
     pub kind: TreeKind,
     /// the node asked for; `None` for the roots
@@ -290,6 +302,7 @@ pub struct Ancestors {
 /// What [`Ontologies::term`] reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TermRequest {
+    pub source_id: Option<String>,
     pub iri: String,
     /// the axioms of other entities that mention it, at most [`MAX_MENTIONS`]
     pub mentions: usize,
@@ -301,6 +314,7 @@ pub struct TermRequest {
 impl TermRequest {
     pub fn new(iri: impl Into<String>) -> TermRequest {
         TermRequest {
+            source_id: None,
             iri: iri.into(),
             mentions: DEFAULT_MENTIONS,
             incoming: DEFAULT_INCOMING,
@@ -340,6 +354,7 @@ pub struct Incoming {
 /// The answer of [`Ontologies::term`].
 #[derive(Clone, Debug)]
 pub struct TermPage {
+    pub inference_source: Option<MaterializationSource>,
     pub commit: u64,
     pub name: Name,
     /// the IRI's types in the graphs read
@@ -385,6 +400,7 @@ impl TermPage {
 /// The view of the graphs a request reads: the snapshot through the caller's grants and
 /// the ids of the readable graphs, numbered in the order of the request.
 pub(super) struct Scope {
+    inference_source: Option<MaterializationSource>,
     snap: Arc<Snapshot>,
     graphs: FxHashMap<Id, u32>,
     refs: Vec<GraphRef>,
@@ -404,15 +420,25 @@ impl Ontologies {
         req: &OntologyRequest,
         languages: &[String],
         opts: &QueryOptions,
+        source_id: Option<&str>,
+        continuation: bool,
     ) -> Result<Scope> {
         req.validate()?;
-        if req.inferences {
-            return Err(Error::invalid(
-                "the browser reads the asserted triples and does not take inferences",
+        if req.inferences && opts.graphs.is_some() {
+            return Err(Error::NotPermitted(
+                "materialized browsing requires a complete input view".into(),
             ));
         }
+        if !req.inferences && source_id.is_some() {
+            return Err(Error::invalid("sourceId requires inferences=true"));
+        }
         let (snap, opts) = self.state(req, opts)?;
-        Self::browse_scope_at(req, languages, snap, opts, false, self.ds.prefixes())
+        let mut scope =
+            Self::browse_scope_at(req, languages, snap, opts, false, self.ds.prefixes())?;
+        if req.inferences {
+            self.include_materialization(&mut scope, req, source_id, continuation)?;
+        }
+        Ok(scope)
     }
 
     fn browse_scope_at(
@@ -447,6 +473,7 @@ impl Ontologies {
             }
         }
         Ok(Scope {
+            inference_source: None,
             snap: view,
             graphs,
             refs: resolved.graphs,
@@ -508,7 +535,19 @@ impl Ontologies {
                 "limit must be an integer from 1 to {MAX_LIMIT}"
             )));
         }
-        let mut s = self.browse_scope(req, &h.languages, opts)?;
+        if req.inferences {
+            return self.materialized_hierarchy(req, h, opts);
+        }
+        if h.after.is_some() {
+            return Err(Error::invalid("after requires an inferred hierarchy"));
+        }
+        let mut s = self.browse_scope(
+            req,
+            &h.languages,
+            opts,
+            h.source_id.as_deref(),
+            h.offset != 0,
+        )?;
         let scheme = match &h.scheme {
             None => None,
             Some(iri) => Some(
@@ -590,7 +629,10 @@ impl Ontologies {
             }
             _ => None,
         };
+        self.verify_browse_source(&s)?;
         Ok(Hierarchy {
+            next_after: None,
+            inference_source: s.inference_source,
             commit: s.snap.commit,
             kind: h.kind,
             node,
@@ -627,7 +669,7 @@ impl Ontologies {
             )));
         }
         let iri = t.iri.trim_start_matches('<').trim_end_matches('>');
-        let mut s = self.browse_scope(req, &t.languages, opts)?;
+        let mut s = self.browse_scope(req, &t.languages, opts, t.source_id.as_deref(), false)?;
         let Some(x) = s.lookup(iri).filter(|id| s.mentioned(*id).unwrap_or(false)) else {
             return Err(Error::NotFound(format!(
                 "the graphs read do not mention <{iri}>"
@@ -848,7 +890,9 @@ impl Ontologies {
                 "the entity has more than {MAX_VALUES} values of a property or {MAX_ABOUT_QUADS} triples, and the first ones are read"
             ));
         }
+        self.verify_browse_source(&s)?;
         Ok(TermPage {
+            inference_source: s.inference_source,
             commit: s.snap.commit,
             name,
             types,
@@ -1737,6 +1781,7 @@ impl Scope {
 
     fn node(&mut self, tree: &Tree, id: Id) -> Result<Node> {
         Ok(Node {
+            equivalence_count: 1,
             name: self.name(id)?,
             children: tree.children(self, id)?.len(),
             parents: tree.parents(self, id)?.len(),

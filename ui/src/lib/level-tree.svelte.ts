@@ -17,6 +17,7 @@ export type LevelReader = (q: {
   ancestors?: boolean;
   offset?: number;
 }) => Promise<Hierarchy>;
+type ReadControl = { signal?: AbortSignal; read?: LevelReader };
 
 export class LevelTree {
   /** The children of each read level, by parent, with `''` for the roots. */
@@ -28,7 +29,7 @@ export class LevelTree {
   /** Whether the roots are being read. */
   loading = $state(false);
   error = $state<string | null>(null);
-  #pending = new Map<string, Promise<void>>();
+  #pending = new Map<string, { promise: Promise<void>; signal?: AbortSignal }>();
   #generation = 0;
 
   constructor(
@@ -91,17 +92,18 @@ export class LevelTree {
   }
 
   /** Read the next page of a clipped level and add it to the level's children. */
-  loadMore(id: string | null): Promise<void> {
+  loadMore(id: string | null, control: ReadControl = {}): Promise<void> {
+    if (control.signal?.aborted) return Promise.resolve();
     const key = id ?? '';
     const have = this.levels[key];
     if (!have || !this.clipped[key]) return Promise.resolve();
     const pk = `more:${key}`;
     const was = this.#pending.get(pk);
-    if (was) return was;
+    if (was && !was.signal?.aborted) return was.promise;
     const gen = this.#generation;
-    const p = this.read({ ...(id ? { iri: id } : {}), offset: have.length })
+    const p = (control.read ?? this.read)({ ...(id ? { iri: id } : {}), offset: have.length })
       .then((h) => {
-        if (gen !== this.#generation) return;
+        if (gen !== this.#generation || control.signal?.aborted) return;
         this.#take(h.children);
         const seen = new Set(have);
         const next = [...have, ...h.children.map((c) => c.iri).filter((i) => !seen.has(i))];
@@ -111,35 +113,41 @@ export class LevelTree {
         else clipped[key] = h.total;
         this.clipped = clipped;
       })
-      .finally(() => this.#pending.delete(pk));
-    this.#pending.set(pk, p);
+      .finally(() => {
+        if (this.#pending.get(pk)?.promise === p) this.#pending.delete(pk);
+      });
+    this.#pending.set(pk, { promise: p, signal: control.signal });
     return p;
   }
 
   /** Read the children of `id`, or the roots for null, once. */
-  load(id: string | null): Promise<void> {
+  load(id: string | null, control: ReadControl = {}): Promise<void> {
+    if (control.signal?.aborted) return Promise.resolve();
     const key = id ?? '';
     if (key in this.levels) return Promise.resolve();
     const was = this.#pending.get(key);
-    if (was) return was;
+    if (was && !was.signal?.aborted) return was.promise;
     const gen = this.#generation;
     if (!id) this.loading = true;
-    const p = this.read(id ? { iri: id } : {})
+    const p = (control.read ?? this.read)(id ? { iri: id } : {})
       .then((h) => {
-        if (gen !== this.#generation) return;
+        if (gen !== this.#generation || control.signal?.aborted) return;
         this.#take([...(h.node ? [h.node] : []), ...h.children]);
         this.levels = { ...this.levels, [key]: h.children.map((c) => c.iri) };
         if (h.total > h.children.length) this.clipped = { ...this.clipped, [key]: h.total };
         if (!id) this.error = null;
       })
       .catch((e: unknown) => {
-        if (gen === this.#generation && !id) this.error = (e as Error).message ?? String(e);
+        if (gen === this.#generation && !control.signal?.aborted && !id)
+          this.error = (e as Error).message ?? String(e);
       })
       .finally(() => {
-        this.#pending.delete(key);
-        if (!id && gen === this.#generation) this.loading = false;
+        if (this.#pending.get(key)?.promise === p) {
+          this.#pending.delete(key);
+          if (!id && gen === this.#generation) this.loading = false;
+        }
       });
-    this.#pending.set(key, p);
+    this.#pending.set(key, { promise: p, signal: control.signal });
     return p;
   }
 
@@ -147,10 +155,12 @@ export class LevelTree {
    * Read the path from a root to `iri`: its ancestors from the route, and the level of each
    * so the path shows in place. Answers the ancestors to open, nearest last.
    */
-  async reveal(iri: string): Promise<string[]> {
+  async reveal(iri: string, control: ReadControl & { answer?: Hierarchy } = {}): Promise<string[]> {
     const gen = this.#generation;
-    const h = await this.read({ iri, ancestors: true });
-    if (gen !== this.#generation) return [];
+    const active = () => gen === this.#generation && !control.signal?.aborted;
+    if (!active()) return [];
+    const h = control.answer ?? (await (control.read ?? this.read)({ iri, ancestors: true }));
+    if (!active()) return [];
     const anc = h.ancestors;
     if (!anc) return [];
     this.#take(anc.nodes);
@@ -161,7 +171,10 @@ export class LevelTree {
       for (const p of parents.get(n) ?? []) if (!ids.has(p)) (ids.add(p), walk(p));
     };
     walk(iri);
-    await Promise.all([null, ...ids].map((a) => this.load(a)));
+    // Roots belong to the source view. Selection-owned path reads have their own
+    // controls so an obsolete error cannot invalidate a newer reveal.
+    await Promise.all([null, ...ids].map((a) => this.load(a, a == null ? {} : control)));
+    if (!active()) return [];
     // a level past its first page may not hold the path's next node yet, so read further
     // pages until it does, or the selection would never show in its tree
     const path = new Set([iri, ...ids]);
@@ -171,18 +184,18 @@ export class LevelTree {
       if (ps.length) for (const p of ps) want.push([p, n]);
       else want.push([null, n]);
     }
-    await Promise.all(want.map(([p, n]) => this.#reach(p, n, gen)));
-    return [...ids];
+    await Promise.all(want.map(([p, n]) => this.#reach(p, n, gen, control)));
+    return active() ? [...ids] : [];
   }
 
   /** Read pages of the clipped level of `parent` until it holds `child`, up to a bound. */
-  async #reach(parent: string | null, child: string, gen: number) {
+  async #reach(parent: string | null, child: string, gen: number, control: ReadControl) {
     const key = parent ?? '';
     for (let i = 0; i < REVEAL_PAGES; i++) {
-      if (gen !== this.#generation) return;
+      if (gen !== this.#generation || control.signal?.aborted) return;
       const have = this.levels[key];
       if (!have || have.includes(child) || !this.clipped[key]) return;
-      await this.loadMore(parent);
+      await this.loadMore(parent, control);
     }
   }
 }

@@ -5,7 +5,7 @@ import {
   CLASSIFICATION_PAGE_SIZE,
   projectClassification,
   readKeptClassification,
-  type ClassificationPart,
+  type ClassificationFramePart as ClassificationPart,
   type ClassificationResult,
   type ClassificationRow,
   type ClassificationView,
@@ -68,6 +68,11 @@ export class ClassificationFrame {
   #epoch = 0;
   #abort = new AbortController();
 
+  constructor(
+    private selectedPin: () => string | undefined = () => undefined,
+    private acceptResult: (result: ClassificationResult) => boolean = () => true,
+  ) {}
+
   drop() {
     this.#epoch++;
     this.#abort.abort();
@@ -102,6 +107,7 @@ export class ClassificationFrame {
   async refresh(resultId?: string) {
     const view = this.#view;
     if (!view) return;
+    resultId ??= this.selectedPin();
     this.#epoch++;
     this.#abort.abort();
     this.#abort = new AbortController();
@@ -117,6 +123,10 @@ export class ClassificationFrame {
       this.#validateStatus(reply, view);
       if (resultId && reply.result && reply.result.resultId !== resultId)
         throw new Error('The kept read changed its selected result pin.');
+      if (reply.status === 'available' && reply.result && !this.acceptResult(reply.result))
+        throw new Error(
+          'The class frame and hierarchy sources differ. Reload this view to select a new source.',
+        );
       this.reply = reply;
       if (
         reply.status === 'available' &&
@@ -154,6 +164,10 @@ export class ClassificationFrame {
       const kept = frame.retention.kept;
       if (kept && frame.retention.resultId !== frame.result.resultId)
         throw new Error('The classification returned an invalid retained pin.');
+      if (kept && !this.acceptResult(frame.result))
+        throw new Error(
+          'The class frame and hierarchy sources differ. Reload this view to select a new source.',
+        );
       this.isolated = !kept;
       this.reply = {
         commit: projected.commit,

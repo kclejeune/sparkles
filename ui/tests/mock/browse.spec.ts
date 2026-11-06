@@ -150,7 +150,7 @@ test('a definition leads the page and a mention names its restriction', async ({
 
 test('the lineage tree opens children and siblings a level at a time', async ({ page }) => {
   await openTerm(page, 'Person');
-  const tree = page.getByRole('complementary', { name: 'Hierarchy' });
+  const tree = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
   await expect(tree.getByRole('link', { name: 'Agent' })).toBeVisible();
   await expect(tree.locator('[aria-current="page"]')).toContainText('Person');
   await expect(tree.getByRole('link', { name: /Student/ }).first()).toBeVisible();
@@ -177,7 +177,7 @@ test('the graph view draws the neighbourhood in the hierarchy card and switches 
   await page.getByRole('link', { name: 'Graph', exact: true }).click();
   await expect(page).toHaveURL(/view=graph/);
   // the graph replaces the card's tree, and the article stays
-  const card = page.getByRole('complementary', { name: 'Hierarchy' });
+  const card = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
   await expect(card.locator('.canvas canvas').first()).toBeVisible({ timeout: 20_000 });
   await expect(card.locator('.tree-body')).toHaveCount(0);
   await expect(page.getByRole('region', { name: 'Axioms', exact: true })).toBeVisible();
@@ -318,7 +318,7 @@ test('an individual has no tree, shows its types and edits in place or in the on
   page,
 }) => {
   await openTerm(page, 'ada');
-  await expect(page.getByRole('complementary', { name: 'Hierarchy' })).toHaveCount(0);
+  await expect(page.getByRole('complementary', { name: 'Hierarchy', exact: true })).toHaveCount(0);
   await expect(
     page.getByRole('region', { name: 'Axioms', exact: true }).locator('[data-section="types"] dt'),
   ).toHaveText('Types:');
@@ -391,7 +391,7 @@ test('the phone page keeps the order head, counts, texts, metadata, hierarchy, a
   const chips = (await page.locator('.b-chips').boundingBox())!;
   expect(chips.height).toBeLessThanOrEqual(2 * 22 + 2);
   // the hierarchy card opens on request
-  const card = page.getByRole('complementary', { name: 'Hierarchy' });
+  const card = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
   await expect(card.locator('.tree-body')).toBeHidden();
   await card.getByRole('button', { name: 'Show the hierarchy' }).click();
   await expect(card.locator('.tree-body')).toBeVisible();
@@ -1060,7 +1060,7 @@ test('the hierarchy stays in the rail across Tree and Graph', async ({ page }) =
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto(HEAVY);
   const rail = page.locator('.b-side');
-  const card = rail.getByRole('complementary', { name: 'Hierarchy' });
+  const card = rail.getByRole('complementary', { name: 'Hierarchy', exact: true });
   await expect(card.locator('.tree-body')).toBeVisible({ timeout: 30_000 });
   await expect(card).not.toHaveAttribute('data-movable');
   const before = (await card.boundingBox())!;
@@ -1084,7 +1084,7 @@ test('the rail graph shows the parents and first children, and Expand opens the 
 }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto(`${HEAVY}&view=graph`);
-  const card = page.getByRole('complementary', { name: 'Hierarchy' });
+  const card = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
   const canvas = card.locator('.canvas');
   await expect(canvas.locator('canvas').first()).toBeVisible({ timeout: 30_000 });
   type Cy = { nodes: () => { map: (f: (n: { id: () => string }) => string) => string[] } };
@@ -1128,7 +1128,7 @@ test('a phone opens the graph at its width, and Expand takes the whole screen wi
 }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(HEAVY);
-  const card = page.getByRole('complementary', { name: 'Hierarchy' });
+  const card = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
   await expect(card.locator('.tree-body')).toBeHidden({ timeout: 30_000 });
   // choosing a view opens the card
   await card.getByRole('link', { name: 'Graph', exact: true }).click();

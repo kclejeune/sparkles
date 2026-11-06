@@ -317,7 +317,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   every graph, so a compatible same-commit call can reuse a retained result. At a later
   commit, eligible EL additions and removals reuse affected contexts. Horn and
   disjunctive runs rebuild after edits, with affected-module reuse planned in item 753
-  under item 603. Same-commit reuse is separate from incremental reclassification.
+  under item 603. EL individual, merge, key and world invalidation remains under item
+  664. Same-commit reuse is separate from incremental reclassification.
   That kept state holds the classifier's contexts, index
   and taxonomy in memory while the dataset is open and reads the axioms of the open
   ontology in place. It is about 74 MB for GO by the estimate, which a counted heap
@@ -705,9 +706,16 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   rules still fail at a deadline on every surface. Roadmap item 714.
 * The Workbench does not ask for a partial classification, so it shows no partial answers
   or incomplete classes. Roadmap item 719.
-* No MCP tool classifies, roadmap item 586, and the entity accessors and the
-  inferred reads do not answer from a classification, nor does any surface answer the
-  subclasses of a class expression, roadmap item 588.
+* Cold retained-snapshot preparation polls primary cancellation and deadlines. Additional
+  composed cancellation is checked around preparation, and during strict materialization
+  freshness queries and later index/hash work. Item 539 covers propagation through all
+  cold resolution, cache, decoding and replay work and its request/server admission.
+  Historical reads remain available, with this interruption limitation.
+* No MCP tool classifies, roadmap item 586. Bounded kept reads supply named-class
+  roots, direct parents and children, equivalence and unsatisfiability. General entity
+  accessors, inferred axiom listings and subclasses of a class expression remain under
+  item 588. Browser materialized views are separate recorded-profile facts and do not
+  answer from the class-only classifier or establish arbitrary-axiom proofs.
 * A classification runs within one request's deadline and is not kept up to date as
   commits land. Roadmap item 589.
 * Native Horn and disjunctive classifications rebuild after axiom insertions and

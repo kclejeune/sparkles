@@ -2155,7 +2155,7 @@ export interface paths {
         };
         /**
          * Read an existing immutable classification
-         * @description Reads kept state only. A miss never maps or classifies an ontology, reserves classifier workers or writes. Status is available, running, mismatch or unavailable. Restricted graph/triple views and synthetic snapshots return unavailable without observing the shared slot. A kept result names its exact store/branch, source commit, input/content/source fingerprints and original producer options. Named-class direct parents, equivalents and unsatisfiability are available; property/individual entailments and justifications are not. Outcome distinguishes partial, exclusions and consistency. Nonzero offsets require resultId and at=commit:N. Replacement or eviction refuses a pin instead of switching results. Sources pages include every typed requested graph, resolved graph, import and warning row in digest order. Page output and name buffers are bounded; counts and ordering can scan retained vectors. Historical names use the pinned authorized snapshot and full IRI fallback. Every response is Cache-Control: no-store and bypasses commit-only conditional 304. Unknown selectors, duplicate singleton selectors, inferences (even false), computing options and invalid pins are refused.
+         * @description Reads kept state only. A miss never maps or classifies an ontology, reserves classifier workers or writes. Status is available, running, mismatch or unavailable. Restricted graph/triple views and synthetic snapshots return unavailable without observing the shared slot. A kept result names its exact store/branch, source commit, input/content/source fingerprints and original producer options. Named-class roots, direct children/parents, equivalents and unsatisfiability are available; property/individual entailments and justifications are not. Outcome distinguishes partial, exclusions and consistency. Nonzero offsets require resultId and at=commit:N. Replacement or eviction refuses a pin instead of switching results. Sources pages include every typed requested graph, resolved graph, import and warning row in digest order. Page output and name buffers are bounded; counts and ordering can scan retained vectors. Historical names use the pinned authorized snapshot and full IRI fallback. Every response is Cache-Control: no-store and bypasses commit-only conditional 304. Unknown selectors, duplicate singleton selectors, inferences (even false), computing options and invalid pins are refused.
          */
         get: operations["keptClassification"];
         put?: never;
@@ -2279,7 +2279,7 @@ export interface paths {
         };
         /**
          * List one level of an entity hierarchy
-         * @description One level of the class, object property, data property, annotation property or SKOS concept hierarchy, read from the store's indexes without reading the whole ontology: the direct children of `iri`, or the roots, a page at a time in label order with deprecated entities last, each with the numbers of its own children and parents. Classes follow `rdfs:subClassOf` between named classes, properties `rdfs:subPropertyOf`, and concepts `skos:broader` and `skos:narrower` in either direction. The roots of the class hierarchy are the ontology header's `IAO_0000700` root terms when it names some, and otherwise the classes without a parent; the roots of a scheme are its top concepts with its concepts that have no broader one. `ancestors=true` adds the ancestors of `iri` up to the roots, with the edges between them, at most 2,000. The caller sees only the graphs and triples their grants allow. `inferences` is refused.
+         * @description One level of the class, object property, data property, annotation property or SKOS concept hierarchy, read from the store's indexes without reading the whole ontology: the direct children of `iri`, or the roots, a page at a time in label order with deprecated entities last, each with the numbers of its own children and parents. Classes follow `rdfs:subClassOf` between named classes, properties `rdfs:subPropertyOf`, and concepts `skos:broader` and `skos:narrower` in either direction. The roots of the class hierarchy are the ontology header's `IAO_0000700` root terms when it names some, and otherwise the classes without a parent; the roots of a scheme are its top concepts with its concepts that have no broader one. `ancestors=true` adds the ancestors of `iri` up to the roots, with the edges between them, at most 2,000. The caller sees only the graphs and triples their grants allow. Materialized reads collapse equivalence groups and reduce transitive edges, use lexical after pages and never classify or materialize.
          */
         get: operations["ontologyHierarchy"];
         put?: never;
@@ -2299,7 +2299,7 @@ export interface paths {
         };
         /**
          * Page named individuals by asserted type
-         * @description Without a selector, list asserted named-type buckets and an Untyped bucket whose type is null. With type=IRI, page named members of that asserted class; with untyped=true, page named individuals without an asserted named class. With iri=IRI, locate one named individual and its memberships. These selectors are mutually exclusive. Anonymous individuals are excluded. Multiple types place a named individual once in each bucket, with duplicate memberships across graphs removed. Pages use lexical IRI order and an exclusive after/next cursor. Reuse the response commit as at for every continuation. Labels follow lang or Accept-Language. No classification runs and inferences is refused. The authorized scope and F21 terminology are read on the server; root discovery and Untyped pages scan the scope and typed pages scan that type's membership. A bounded response does not imply bounded server work. Root discovery refuses more than 100,000 type buckets. A typed page refuses more than 1,000 named types on a returned individual. Candidates before the cursor or outside that page do not trigger this type-list cap. Root discovery and Untyped reads apply the cap to every individual examined, and direct lookup applies it to its individual. No type list is truncated.
+         * @description Without a selector, list asserted named-type buckets and an Untyped bucket whose type is null. With type=IRI, page named members of that asserted class; with untyped=true, page named individuals without an asserted named class. With iri=IRI, locate one named individual and its memberships. These selectors are mutually exclusive. Anonymous individuals are excluded. Multiple types place a named individual once in each bucket, with duplicate memberships across graphs removed. Pages use lexical IRI order and an exclusive after/next cursor. Reuse the response commit as at for every continuation. Labels follow lang or Accept-Language. No classification or materialization runs. With inferences=true, buckets and memberships include all named types in the fresh recorded materialization, including indirect types, and continuation also requires sourceId. The authorized scope and F21 terminology are read on the server; root discovery and Untyped pages scan the scope and typed pages scan that type's membership. A bounded response does not imply bounded server work. Root discovery refuses more than 100,000 type buckets. A typed page refuses more than 1,000 named types on a returned individual. Candidates before the cursor or outside that page do not trigger this type-list cap. Root discovery and Untyped reads apply the cap to every individual examined, and direct lookup applies it to its individual. No type list is truncated.
          */
         get: operations["ontologyIndividuals"];
         put?: never;
@@ -2359,7 +2359,7 @@ export interface paths {
         };
         /**
          * Describe one entity
-         * @description What the graphs read say about one entity, read from the store's indexes without reading the whole ontology: its triples with a named or literal object and the annotations their reifications give (`statements`), the axioms the triples about it map to by the OWL 2 reverse mapping (`axioms`), the axioms of other entities that hold it inside a class expression (`mentions`), the statements of named subjects that point at it by predicate (`incoming`), the statements that use it as their predicate (`usage`), and the label, short form and kinds of every IRI the answer uses (`names`). `format` downloads the triples about the entity, its blank nodes and the reifications of its annotated triples in Turtle, N-Triples, RDF/XML or JSON-LD, or its axioms in functional-style syntax, as an attachment. The caller sees only the graphs and triples their grants allow. `inferences` is refused.
+         * @description What the graphs read say about one entity, read from the store's indexes without reading the whole ontology: its triples with a named or literal object and the annotations their reifications give (`statements`), the axioms the triples about it map to by the OWL 2 reverse mapping (`axioms`), the axioms of other entities that hold it inside a class expression (`mentions`), the statements of named subjects that point at it by predicate (`incoming`), the statements that use it as their predicate (`usage`), and the label, short form and kinds of every IRI the answer uses (`names`). `format` downloads the triples about the entity, its blank nodes and the reifications of its annotated triples in Turtle, N-Triples, RDF/XML or JSON-LD, or its axioms in functional-style syntax, as an attachment. The caller sees only the graphs and triples their grants allow. With inferences=true only JSON is supported, the answer carries a strict materialization source and every statement/axiom retains its graph provenance.
          */
         get: operations["ontologyTerm"];
         put?: never;
@@ -5865,6 +5865,14 @@ export interface components {
             ofn: string;
             type: string;
         };
+        ClassificationHierarchyNode: {
+            children: number;
+            equivalenceCount: number;
+            iri: string;
+            label: string | null;
+            labelLang: string | null;
+            parents: number;
+        };
         ClassificationName: {
             iri: string;
             label: string | null;
@@ -5889,7 +5897,7 @@ export interface components {
         ClassificationResult: {
             assertions: boolean;
             boundStoreId: string;
-            capabilities: ("namedClassDirectParents" | "namedClassEquivalents" | "namedClassUnsatisfiability")[];
+            capabilities: ("namedClassDirectParents" | "namedClassDirectChildren" | "namedClassRoots" | "namedClassEquivalents" | "namedClassUnsatisfiability")[];
             classifiedCommit: number;
             contentFingerprint: string;
             elOnly: boolean;
@@ -8496,19 +8504,23 @@ export interface components {
             commit: number;
             dataset: string;
             entity: null | {
+                children?: number | null;
+                equivalenceCount?: number | null;
                 iri: string;
+                parents?: number | null;
                 present: boolean;
+                representative?: string | null;
                 unsatisfiable: boolean | null;
             };
             outcome: components["schemas"]["ClassificationOutcome"] | null;
             page: null | {
                 about: string | null;
-                items: (components["schemas"]["ClassificationName"] | components["schemas"]["ClassificationParent"] | components["schemas"]["ClassificationSourceRow"] | components["schemas"]["ClassificationExcluded"])[];
+                items: (components["schemas"]["ClassificationName"] | components["schemas"]["ClassificationParent"] | components["schemas"]["ClassificationHierarchyNode"] | components["schemas"]["ClassificationSourceRow"] | components["schemas"]["ClassificationExcluded"])[];
                 limit: number;
                 nextOffset: number | null;
                 offset: number;
                 /** @enum {string} */
-                part: "status" | "parents" | "equivalents" | "sources" | "excluded";
+                part: "status" | "roots" | "parents" | "children" | "equivalents" | "sources" | "excluded";
                 total: number;
             };
             reason: string | null;
@@ -9795,6 +9807,29 @@ export interface components {
                 };
                 unsatisfiable: boolean;
             };
+        };
+        OntologyMaterializationSource: {
+            boundStoreId: string;
+            commit: number;
+            /** @enum {boolean|null} */
+            complete: null;
+            /** @constant */
+            consistency: "unknown";
+            familyId: string;
+            inputGraphCount: number;
+            inputGraphs: string[];
+            inputGraphsTruncated: boolean;
+            /** @constant */
+            justifications: "unavailable";
+            /** @constant */
+            kind: "materialization";
+            producerCommit: number;
+            /** @enum {string} */
+            profile: "rdfs" | "owl-rl";
+            sourceId: string;
+            warningCount: number;
+            warnings: string[];
+            warningsTruncated: boolean;
         };
         /** @description What applying an RDF Patch did. With `receipt=true` or `Accept: application/x-sparkles+json` the body also has the members of a `Receipt`. */
         PatchResult: {
@@ -17944,7 +17979,7 @@ export interface operations {
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The bounded portion to read, status by default. */
-                part?: "status" | "parents" | "equivalents" | "sources" | "excluded";
+                part?: "status" | "roots" | "parents" | "children" | "equivalents" | "sources" | "excluded";
                 /** @description An absolute named-class IRI, required for parents/equivalents and optional for status. */
                 about?: string;
                 /** @description The immutable result to read, required for continuation. */
@@ -18420,6 +18455,14 @@ export interface operations {
                 imports?: boolean;
                 /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
                 mode?: "lenient" | "strict";
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Strict fresh recorded materialization browsing. Requires an exact at=commit:N and a complete authorized producer input scope. Never computes on a miss. Source replacement, stale/unknown evidence and hidden inputs are refused. */
+                inferences?: boolean;
+                /** @description Reuse inferenceSource.sourceId with the exact commit for a continuation or a matching frame/tree source. */
+                sourceId?: string;
                 /** @description The hierarchy (`class` by default). */
                 kind?: "class" | "objectProperty" | "dataProperty" | "annotationProperty" | "concept";
                 /** @description The node whose children to list; the roots when absent. */
@@ -18434,8 +18477,10 @@ export interface operations {
                 lang?: string;
                 /** @description The most children listed, from 1 to 1,000 (100 by default). */
                 limit?: number;
-                /** @description The children skipped. */
+                /** @description The asserted children skipped. Materialized hierarchy pages use after instead and refuse nonzero offset. */
                 offset?: number;
+                /** @description Exclusive canonical IRI key from nextAfter for a materialized hierarchy. Requires sourceId and the exact commit. */
+                after?: string;
             };
             header?: never;
             path: {
@@ -18460,6 +18505,7 @@ export interface operations {
                                 /** @description The number of direct children. */
                                 children?: number;
                                 deprecated?: boolean;
+                                equivalenceCount?: number;
                                 iri?: string;
                                 kinds?: string[];
                                 /** @description The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language. */
@@ -18476,6 +18522,7 @@ export interface operations {
                             /** @description The number of direct children. */
                             children?: number;
                             deprecated?: boolean;
+                            equivalenceCount?: number;
                             iri?: string;
                             kinds?: string[];
                             /** @description The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language. */
@@ -18491,13 +18538,18 @@ export interface operations {
                         /** @description The deprecated roots `deprecated=false` left out. */
                         deprecatedRoots?: number;
                         graphs?: string[];
+                        /** @constant */
+                        hierarchyBasis?: "directEquivalenceGroups";
+                        inferenceSource?: components["schemas"]["OntologyMaterializationSource"];
                         kind?: string;
                         limit?: number;
                         next?: number | null;
+                        nextAfter?: string | null;
                         node?: {
                             /** @description The number of direct children. */
                             children?: number;
                             deprecated?: boolean;
+                            equivalenceCount?: number;
                             iri?: string;
                             kinds?: string[];
                             /** @description The `rdfs:label`, `skos:prefLabel` or SKOS-XL preferred label in the caller's best language. */
@@ -18528,6 +18580,8 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };
@@ -18542,6 +18596,12 @@ export interface operations {
                 imports?: boolean;
                 /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
                 mode?: "lenient" | "strict";
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Strict fresh recorded materialization browsing. Requires an exact at=commit:N and a complete authorized producer input scope. Never computes on a miss. Source replacement, stale/unknown evidence and hidden inputs are refused. */
+                inferences?: boolean;
+                /** @description Reuse inferenceSource.sourceId with the exact commit for a continuation or a matching frame/tree source. */
+                sourceId?: string;
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The asserted named class whose members to list. */
@@ -18607,10 +18667,13 @@ export interface operations {
                                 shortForm?: string | null;
                             }[];
                         }[];
+                        inferenceSource?: components["schemas"]["OntologyMaterializationSource"];
                         next?: string | null;
                         /** @enum {string} */
                         order?: "iri";
                         total?: number;
+                        /** @constant */
+                        typeBasis?: "materializedNamedTypes";
                         warnings?: string[];
                     };
                 };
@@ -18620,6 +18683,8 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };
@@ -18777,6 +18842,14 @@ export interface operations {
                 imports?: boolean;
                 /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
                 mode?: "lenient" | "strict";
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Strict fresh recorded materialization browsing. Requires an exact at=commit:N and a complete authorized producer input scope. Never computes on a miss. Source replacement, stale/unknown evidence and hidden inputs are refused. */
+                inferences?: boolean;
+                /** @description Reuse inferenceSource.sourceId with the exact commit for a continuation or a matching frame/tree source. */
+                sourceId?: string;
                 /** @description The entity. */
                 iri?: string;
                 /** @description The most axioms of other entities listed, from 0 to 2,000 (200 by default). */
@@ -18816,6 +18889,7 @@ export interface operations {
                             property?: string;
                             subjects?: string[];
                         }[];
+                        inferenceSource?: components["schemas"]["OntologyMaterializationSource"];
                         iri?: string;
                         kinds?: string[];
                         label?: string | null;
@@ -18881,6 +18955,8 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };

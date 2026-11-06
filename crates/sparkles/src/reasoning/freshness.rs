@@ -13,6 +13,17 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::HashMap;
 
+#[cfg(all(test, feature = "ontology"))]
+thread_local! {
+    static TEST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only observation of entry into the generic legacy freshness path.
+#[cfg(all(test, feature = "ontology"))]
+pub(crate) fn take_test_calls() -> usize {
+    TEST_CALLS.with(|calls| calls.replace(0))
+}
+
 /// How the recorded inferences relate to a commit of the dataset.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +39,8 @@ pub struct Freshness {
 
 /// The freshness of the inferences `record` describes at commit `at` of `store`.
 pub fn freshness(record: &ReasoningRecord, store: &Store, at: u64) -> Freshness {
+    #[cfg(all(test, feature = "ontology"))]
+    TEST_CALLS.with(|calls| calls.set(calls.get() + 1));
     let unknown = |why: &str| Freshness {
         stale: None,
         commits_since: None,

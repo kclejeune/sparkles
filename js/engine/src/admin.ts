@@ -241,6 +241,29 @@ export interface OntologyAxiom {
   /** the graph the axiom was read from */
   graph?: string;
 }
+/** Strict materialized browse reads require an exact commit and reuse sourceId on continuation. */
+export interface OntologyMaterializedRead extends OntologyRead {
+  sourceId?: string;
+}
+export interface OntologyMaterializationSource {
+  kind: 'materialization';
+  sourceId: string;
+  profile: 'rdfs' | 'owl-rl';
+  producerCommit: bigint;
+  commit: bigint;
+  boundStoreId: string;
+  familyId: string;
+  inputGraphs: string[];
+  inputGraphCount: number;
+  inputGraphsTruncated: boolean;
+  warnings: string[];
+  warningCount: number;
+  warningsTruncated: boolean;
+  complete: null;
+  consistency: 'unknown';
+  justifications: 'unavailable';
+}
+
 /** The inferences an inferred read included, and their freshness. */
 export interface OntologyInferences {
   included: boolean;
@@ -352,11 +375,15 @@ export interface OntologyName {
 }
 /** A node of a hierarchy, with the numbers of its direct children and parents. */
 export interface OntologyHierarchyNode extends OntologyName {
+  equivalenceCount?: number;
   children: number;
   parents: number;
 }
 /** One level of a hierarchy, as `GET /$/ontology/{ds}/hierarchy` answers it. */
 export interface OntologyHierarchy {
+  inferenceSource?: OntologyMaterializationSource;
+  nextAfter?: string | null;
+  hierarchyBasis?: 'directEquivalenceGroups';
   dataset: string;
   commit: bigint;
   graphs: string[];
@@ -383,6 +410,8 @@ export interface OntologyHierarchy {
 }
 /** A lexical page of asserted named individuals or their type buckets. */
 export interface OntologyIndividuals {
+  inferenceSource?: OntologyMaterializationSource;
+  typeBasis?: 'materializedNamedTypes';
   dataset: string;
   commit: bigint;
   order: 'iri';
@@ -402,6 +431,7 @@ export interface OntologyIncoming {
 }
 /** What the graphs say about one entity, as `GET /$/ontology/{ds}/term` answers it. */
 export interface OntologyTerm extends OntologyName {
+  inferenceSource?: OntologyMaterializationSource;
   dataset: string;
   commit: bigint;
   graphs: string[];
@@ -583,7 +613,14 @@ export type ClassificationSourceRow =
   | { kind: 'resolvedGraph'; ordinal: number; graph: string; requested: boolean }
   | { kind: 'import'; ordinal: number; iri: string; location: string | null; graph: string | null }
   | { kind: 'warning'; ordinal: number; message: string };
-export type ClassificationPart = 'status' | 'parents' | 'equivalents' | 'sources' | 'excluded';
+export type ClassificationPart =
+  | 'status'
+  | 'roots'
+  | 'parents'
+  | 'children'
+  | 'equivalents'
+  | 'sources'
+  | 'excluded';
 export type ClassificationName = Pick<OntologyName, 'iri' | 'label' | 'labelLang'>;
 export interface KeptClassification {
   dataset: string;
@@ -592,7 +629,15 @@ export interface KeptClassification {
   reason: string | null;
   result: ClassificationResult | null;
   outcome: ClassificationOutcome | null;
-  entity: { iri: string; present: boolean; unsatisfiable: boolean | null } | null;
+  entity: {
+    iri: string;
+    present: boolean;
+    unsatisfiable: boolean | null;
+    representative?: string | null;
+    equivalenceCount?: number | null;
+    children?: number | null;
+    parents?: number | null;
+  } | null;
   activity: { kind: string; commit: bigint } | null;
   staleCommit: bigint | null;
   page: {
@@ -1048,7 +1093,7 @@ export class Administration {
        * when it is absent, a page at a time, and its ancestors with `ancestors`.
        */
       hierarchy: (
-        o: OntologyRead &
+        o: OntologyMaterializedRead &
           OperationOptions & {
             iri?: string | { termType: 'NamedNode'; value: string };
             kind?: 'class' | 'objectProperty' | 'dataProperty' | 'annotationProperty' | 'concept';
@@ -1058,12 +1103,14 @@ export class Administration {
             lang?: string | string[];
             limit?: number;
             offset?: number;
+            after?: string;
           } = {},
       ) =>
         call<OntologyHierarchy>(
           'ontology.hierarchy',
           {
             ...readSelection(o),
+            sourceId: o.sourceId,
             iri: o.iri === undefined || typeof o.iri === 'string' ? o.iri : o.iri.value,
             kind: o.kind,
             ancestors: o.ancestors,
@@ -1073,13 +1120,14 @@ export class Administration {
             lang: Array.isArray(o.lang) ? o.lang.join(',') : o.lang,
             limit: o.limit,
             offset: o.offset,
+            after: o.after,
           },
           o,
           false,
         ),
       /** Page type buckets, members of a type, Untyped members, or locate one individual. */
       individuals: (
-        o: OntologyRead &
+        o: OntologyMaterializedRead &
           OperationOptions & {
             type?: string | { termType: 'NamedNode'; value: string };
             untyped?: boolean;
@@ -1093,6 +1141,7 @@ export class Administration {
           'ontology.individuals',
           {
             ...readSelection(o),
+            sourceId: o.sourceId,
             type: o.type === undefined || typeof o.type === 'string' ? o.type : o.type.value,
             untyped: o.untyped,
             iri: o.iri === undefined || typeof o.iri === 'string' ? o.iri : o.iri.value,
@@ -1110,7 +1159,7 @@ export class Administration {
        */
       term: (
         iri: string | { termType: 'NamedNode'; value: string },
-        o: OntologyRead &
+        o: OntologyMaterializedRead &
           OperationOptions & {
             mentions?: number;
             incoming?: number;
@@ -1121,6 +1170,7 @@ export class Administration {
           'ontology.term',
           {
             ...readSelection(o),
+            sourceId: o.sourceId,
             iri: typeof iri === 'string' ? iri : iri.value,
             mentions: o.mentions,
             incoming: o.incoming,
@@ -1676,6 +1726,7 @@ const counts = new Set([
   'commit',
   'firstCommit',
   'classifiedCommit',
+  'producerCommit',
   'staleCommit',
   'baseSeq',
   'endSeq',
