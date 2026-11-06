@@ -2141,3 +2141,73 @@ async fn individual_pages_read_only_the_selected_branch_and_retained_revision() 
     assert!(!old.text().contains("new-person"));
     assert_eq!(old.json()["commit"], before);
 }
+
+#[tokio::test]
+async fn inferred_browse_materialization_sources_are_read_only_pinned_and_never_commit_cached() {
+    let s = server();
+    let ds = s._state.get("t").unwrap();
+    let outcome = ds
+        .dataset
+        .reasoning()
+        .run(&sparkles::reasoning::ReasonRequest {
+            profile: sparkles_reasoner::Profile::Rdfs,
+            ..Default::default()
+        })
+        .unwrap();
+    let _ = outcome;
+    let commit = ds.store.head_commit().seq;
+    let uri = format!(
+        "/$/ontology/t/hierarchy?inferences=true&at=commit:{commit}&iri={}",
+        enc("http://ex.org/Person")
+    );
+    let page = send(&s.app, "GET", &uri, &[("if-none-match", "*")], "").await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.text());
+    assert_eq!(page.headers[header::CACHE_CONTROL], "no-store");
+    assert!(page.headers.get(header::ETAG).is_none());
+    let source = page.json()["inferenceSource"].clone();
+    assert_eq!(source["kind"], "materialization");
+    assert_eq!(source["profile"], "rdfs");
+    let pin = enc(source["sourceId"].as_str().unwrap());
+    let term = get(
+        &s.app,
+        &format!(
+            "/$/ontology/t/term?inferences=true&at=commit:{commit}&sourceId={pin}&iri={}",
+            enc("http://ex.org/ada")
+        ),
+    )
+    .await;
+    assert_eq!(term.status, StatusCode::OK, "{}", term.text());
+    assert_eq!(term.json()["inferenceSource"], source);
+    assert_eq!(term.headers[header::CACHE_CONTROL], "no-store");
+    let kept = get(
+        &s.app,
+        &format!("/$/ontology/t/classification?at=commit:{commit}"),
+    )
+    .await;
+    assert_eq!(kept.json()["status"], "unavailable");
+    assert_eq!(ds.store.head_commit().seq, commit);
+    ds.dataset.reasoning().clear().unwrap();
+    let missing = get(&s.app, &uri).await;
+    assert_ne!(missing.status, StatusCode::OK);
+    assert_eq!(missing.headers[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
+async fn inferred_browse_rejects_ambiguous_and_non_json_selectors_before_reading() {
+    let s = server();
+    for uri in [
+        "/$/ontology/t/hierarchy?inferences=false&inferences=true&at=commit:1",
+        "/$/ontology/t/hierarchy?inferences=true&at=commit:1&at=commit:2",
+        "/$/ontology/t/hierarchy?inferences=true&at=commit:1&unknown=true",
+        "/$/ontology/t/term?inferences=true&at=commit:1&iri=urn:A&format=ttl",
+    ] {
+        let response = get(&s.app, uri).await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            response.text()
+        );
+        assert_eq!(response.headers[header::CACHE_CONTROL], "no-store");
+    }
+}

@@ -83,7 +83,7 @@ test('edit mode previews on GO and UNESCO', async ({ browser }) => {
       await shot('browse-edit-preview');
       await page.getByRole('dialog').getByRole('button', { name: 'Cancel' }).click();
 
-      const tree = page.getByRole('complementary', { name: 'Hierarchy' });
+      const tree = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
       await tree.getByRole('combobox', { name: 'Add a parent class' }).fill('membrane-bounded');
       await tree.getByRole('option').first().waitFor({ timeout: 30_000 });
       await shot('browse-edit-parent');

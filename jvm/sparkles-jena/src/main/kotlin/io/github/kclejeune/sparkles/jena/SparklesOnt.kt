@@ -269,6 +269,7 @@ public data class OntologyRead @JvmOverloads public constructor(
     public val mode: String = "lenient",
     public val at: String? = null,
     public val inferences: Boolean = false,
+    public val sourceId: String? = null,
 ) {
     public constructor(graph: String?) : this(graphs = listOfNotNull(graph))
 
@@ -278,12 +279,14 @@ public data class OntologyRead @JvmOverloads public constructor(
         j.put("mode", mode)
         at?.let { j.put("at", it) }
         if (inferences) j.put("inferences", true)
+        sourceId?.let { j.put("sourceId", it) }
     }
 
     /** The members that name the ontology, without the state and the inferences, as edits and diffs take them. */
     internal fun selection(): JsonObject {
         require(at == null) { "an edit or a diff names its states itself: leave out at" }
         require(!inferences) { "an edit or a diff reads the asserted axioms: leave out inferences" }
+        require(sourceId == null) { "an edit or a diff does not take a materialization sourceId" }
         return value()
     }
 }
@@ -425,7 +428,8 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         languages: List<String> = emptyList(),
         limit: Int = 100,
         offset: Long = 0,
-    ): JsonObject = SparklesOperation().use { hierarchy(iri, read, kind, ancestors, scheme, deprecated, languages, limit, offset, it) }
+        after: String? = null,
+    ): JsonObject = SparklesOperation().use { hierarchy(iri, read, kind, ancestors, scheme, deprecated, languages, limit, offset, after, it) }
     public fun hierarchy(
         iri: String?,
         read: OntologyRead,
@@ -437,8 +441,22 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         limit: Int,
         offset: Long,
         operation: SparklesOperation,
+    ): JsonObject = hierarchy(iri, read, kind, ancestors, scheme, deprecated, languages, limit, offset, null, operation)
+    public fun hierarchy(
+        iri: String?,
+        read: OntologyRead,
+        kind: String,
+        ancestors: Boolean,
+        scheme: String?,
+        deprecated: Boolean,
+        languages: List<String>,
+        limit: Int,
+        offset: Long,
+        after: String?,
+        operation: SparklesOperation,
     ): JsonObject {
         require(limit > 0 && offset >= 0)
+        if (read.inferences || read.sourceId != null) owner.checkCapture("ontology materialized hierarchy (use OntologyRead.at for retained history)")
         val args = read.value()
         if (iri != null) args.put("iri", iri)
         args.put("kind", kind)
@@ -448,6 +466,7 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         if (languages.isNotEmpty()) args.put("lang", languages.joinToString(","))
         args.put("limit", limit.toLong())
         args.put("offset", offset)
+        after?.let { args.put("after", it) }
         return call("hierarchy", args, operation, false)
     }
 
@@ -476,6 +495,7 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         operation: SparklesOperation,
     ): JsonObject {
         require(limit in 1..1000)
+        if (read.inferences || read.sourceId != null) owner.checkCapture("ontology materialized individuals (use OntologyRead.at for retained history)")
         val args = read.value()
         type?.let { args.put("type", it) }
         args.put("untyped", untyped)
@@ -523,6 +543,7 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         operation: SparklesOperation,
     ): JsonObject {
         require(mentions >= 0 && incoming >= 0)
+        if (read.inferences || read.sourceId != null) owner.checkCapture("ontology materialized term (use OntologyRead.at for retained history)")
         val args = read.value()
         args.put("iri", iri)
         args.put("mentions", mentions.toLong())

@@ -12,6 +12,8 @@
   import type { PrefixMap } from '$lib/rdf';
   import Icon from '$components/Icon.svelte';
   import ClassificationFrame from '$components/ClassificationFrame.svelte';
+  import MaterializedFrame from '$components/MaterializedFrame.svelte';
+  import type { InferredPins } from '$lib/inferred-read';
   import type { Snippet } from 'svelte';
 
   let {
@@ -23,6 +25,8 @@
     target,
     graph,
     commit = null,
+    imports = true,
+    pins,
     editor,
   }: {
     kind: EntityKind;
@@ -34,15 +38,20 @@
     graph: string | null;
     /** The exact displayed commit for read-only classification pages. */
     commit?: number | null;
+    imports?: boolean;
+    pins?: InferredPins;
     /** Edit mode's frame, which takes the card's body in place of the read-only one. */
     editor?: Snippet;
   } = $props();
 
   const frame = $derived(manchesterFrame(kind, groups, linker.name, prefixes));
   const isClass = $derived(kind === 'Class');
+  const hasMaterializedFrame = $derived(
+    ['ObjectProperty', 'DataProperty', 'NamedIndividual'].includes(kind),
+  );
 
   const asserted = $derived(frame.sections.length > 0 || frame.other.length > 0);
-  const shown = $derived(asserted || isClass || !!editor);
+  const shown = $derived(asserted || isClass || hasMaterializedFrame || !!editor);
 
   async function copy() {
     try {
@@ -115,8 +124,20 @@
           {graph}
           {iri}
           {commit}
+          {imports}
+          {pins}
           items={groups.flatMap((g) => g.items.map((it) => it.axiom))}
           href={linker.href}
+        />
+      {:else if hasMaterializedFrame}
+        <MaterializedFrame
+          {target}
+          {graph}
+          {imports}
+          {iri}
+          {commit}
+          {pins}
+          items={groups.flatMap((g) => g.items.map((it) => it.axiom))}
         />
       {/if}
     </div>

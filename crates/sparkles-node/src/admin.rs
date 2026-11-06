@@ -159,6 +159,7 @@ fn u64_field(k: &str) -> bool {
             | "commit"
             | "firstCommit"
             | "classifiedCommit"
+            | "producerCommit"
             | "staleCommit"
             | "baseSeq"
             | "endSeq"

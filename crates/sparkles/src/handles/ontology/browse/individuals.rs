@@ -5,6 +5,7 @@ use sparkles_owl::{AxiomKind, EntityKind};
 /// A page of type buckets, members of a type, or the memberships of one individual.
 #[derive(Clone, Debug)]
 pub struct IndividualsRequest {
+    pub source_id: Option<String>,
     pub class: Option<String>,
     pub untyped: bool,
     pub iri: Option<String>,
@@ -17,6 +18,7 @@ pub struct IndividualsRequest {
 impl Default for IndividualsRequest {
     fn default() -> Self {
         Self {
+            source_id: None,
             class: None,
             untyped: false,
             iri: None,
@@ -42,6 +44,7 @@ pub struct IndividualNode {
 
 #[derive(Clone, Debug)]
 pub struct Individuals {
+    pub inference_source: Option<MaterializationSource>,
     pub commit: u64,
     pub groups: Vec<IndividualGroup>,
     pub individuals: Vec<IndividualNode>,
@@ -103,12 +106,28 @@ impl Ontologies {
                 "type, untyped and iri are mutually exclusive",
             ));
         }
-        let mut s = self.browse_scope(req, &q.languages, opts)?;
+        let mut s = self.browse_scope(
+            req,
+            &q.languages,
+            opts,
+            q.source_id.as_deref(),
+            q.after.is_some(),
+        )?;
         // Reuse the owning F21 mapper, including declarations, punning, complex
         // assertions and individuals used inside class expressions. This deliberately
         // retains the existing cold terminology-mapping cost, not a bounded store read.
-        let o = self.open_at(&s.snap, req, &s.opts)?;
+        // Strict inferred reads already proved this complete graph scope and
+        // producer. Map those exact immutable graphs, including inferred facts,
+        // without re-entering generic freshness's uncontrolled historical diff.
+        let verified = s.inference_source.as_ref().map(|_| OntologyRequest {
+            graphs: s.refs.clone(),
+            imports: sparkles_reasoner::inputs::ImportMode::None,
+            inferences: false,
+            ..req.clone()
+        });
+        let o = self.open_at(&s.snap, verified.as_ref().unwrap_or(req), &s.opts)?;
         let mut result = Individuals {
+            inference_source: s.inference_source.clone(),
             commit: s.snap.commit,
             groups: Vec::new(),
             individuals: Vec::new(),
@@ -141,6 +160,7 @@ impl Ontologies {
             }
             result.individuals.push(s.individual_node(id, &types)?);
             result.total = 1;
+            self.verify_browse_source(&s)?;
             return Ok(result);
         }
         let members = q.class.is_some() || q.untyped;
@@ -262,13 +282,14 @@ impl Ontologies {
                 result.next = last;
             }
         }
+        self.verify_browse_source(&s)?;
         Ok(result)
     }
 }
 
 impl Scope {
     /// Visit visible quads without collecting the scanned range.
-    fn visit(
+    pub(super) fn visit(
         &mut self,
         perm: Perm,
         prefix: &[u64],

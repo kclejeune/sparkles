@@ -450,6 +450,8 @@ pub enum Part {
     #[default]
     Status,
     Parents,
+    Children,
+    Roots,
     Equivalents,
     Sources,
     Excluded,
@@ -490,11 +492,16 @@ impl KeptQuery {
             oxrdf::NamedNode::new(iri)
                 .map_err(|_| Error::invalid("about must be an absolute named IRI"))?;
         }
-        if matches!(self.part, Part::Parents | Part::Equivalents) && self.about.is_none() {
-            return Err(Error::invalid("parents/equivalents require about"));
+        if matches!(
+            self.part,
+            Part::Parents | Part::Children | Part::Equivalents
+        ) && self.about.is_none()
+        {
+            return Err(Error::invalid("parents/children/equivalents require about"));
         }
-        if matches!(self.part, Part::Sources | Part::Excluded) && self.about.is_some() {
-            return Err(Error::invalid("sources/excluded do not take about"));
+        if matches!(self.part, Part::Sources | Part::Excluded | Part::Roots) && self.about.is_some()
+        {
+            return Err(Error::invalid("sources/excluded/roots do not take about"));
         }
         if self.part == Part::Status && self.offset != 0 {
             return Err(Error::invalid("status has no offset"));
@@ -542,7 +549,7 @@ pub struct ResultMetadata {
     pub partial_requested: bool,
     pub expansion: &'static str,
     pub source_counts: SourceCounts,
-    pub capabilities: [&'static str; 3],
+    pub capabilities: [&'static str; 5],
     pub justifications: &'static str,
 }
 impl KeptClassification {
@@ -570,6 +577,8 @@ impl KeptClassification {
             },
             capabilities: [
                 "namedClassDirectParents",
+                "namedClassDirectChildren",
+                "namedClassRoots",
                 "namedClassEquivalents",
                 "namedClassUnsatisfiability",
             ],
@@ -604,6 +613,10 @@ pub struct EntityStatus {
     pub iri: String,
     pub present: bool,
     pub unsatisfiable: Option<bool>,
+    pub representative: Option<String>,
+    pub equivalence_count: Option<usize>,
+    pub children: Option<usize>,
+    pub parents: Option<usize>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -724,11 +737,19 @@ impl Ontologies {
         });
         if let Some(iri) = &query.about {
             let class = sparkles_owl::Class::new(iri.as_str());
-            let present = p.classification.taxonomy.node_of(&class).is_some();
+            let taxonomy = &p.classification.taxonomy;
+            let node = taxonomy.node_of(&class).map(|id| taxonomy.node(id));
+            let present = node.is_some();
             reply.entity = Some(EntityStatus {
                 iri: iri.clone(),
                 present,
-                unsatisfiable: present.then(|| p.classification.taxonomy.is_unsatisfiable(&class)),
+                unsatisfiable: present.then(|| taxonomy.is_unsatisfiable(&class)),
+                representative: node
+                    .and_then(|node| node.classes.first())
+                    .map(|class| class.as_str().to_string()),
+                equivalence_count: node.map(|node| node.classes.len()),
+                children: node.map(|node| node.children.len()),
+                parents: node.map(|node| node.parents.len()),
             });
         }
         if query.part != Part::Status {
@@ -778,6 +799,53 @@ impl Ontologies {
                     page.items.push(json!({"type":ax.axiom_type().name(),"ofn":renderer.axiom(&ax),"axiom":sparkles_owl::json::axiom(&ax),"gap":gap_json(&e.gap)}));
                 }
             }
+            Part::Roots | Part::Children => {
+                let t = &p.classification.taxonomy;
+                let top_group = [0usize];
+                let relatives = if q.part == Part::Roots {
+                    // A nontrivial top-equivalence group is a root of its own.
+                    // Otherwise expose its direct children without a redundant
+                    // owl:Thing row. Bottom is a separate diagnostic root.
+                    Some(if t.top().classes.len() > 1 {
+                        top_group.as_slice()
+                    } else {
+                        t.top().children.as_slice()
+                    })
+                } else {
+                    q.about
+                        .as_deref()
+                        .and_then(|iri| t.node_of(&sparkles_owl::Class::new(iri)))
+                        .map(|node| t.node(node).children.as_slice())
+                };
+                let bottom =
+                    (q.part == Part::Roots && t.bottom().classes.len() > 1).then_some(1usize);
+                let relatives = relatives.unwrap_or_default();
+                page.total = relatives.len() + usize::from(bottom.is_some());
+                let ids: Vec<_> = relatives
+                    .iter()
+                    .copied()
+                    .chain(bottom)
+                    .skip(q.offset)
+                    .take(q.limit)
+                    .collect();
+                let mut iris = Vec::with_capacity(ids.len());
+                for &id in &ids {
+                    check(opts)?;
+                    if let Some(class) = t.node(id).classes.first() {
+                        iris.push(class.as_str().to_string());
+                    }
+                }
+                let names =
+                    Self::kept_names_at(req, snapshot.clone(), &iris, &q.languages, opts.clone())?;
+                for (id, name) in ids.into_iter().zip(names) {
+                    let node = t.node(id);
+                    page.items.push(json!({
+                        "iri":name.iri,"label":name.label,"labelLang":name.label_lang,
+                        "equivalenceCount":node.classes.len(),
+                        "children":node.children.len(),"parents":node.parents.len(),
+                    }));
+                }
+            }
             Part::Parents | Part::Equivalents => {
                 let about = q.about.as_deref().expect("validated about");
                 let t = &p.classification.taxonomy;
@@ -795,7 +863,7 @@ impl Ontologies {
                             let n = t.node(parent);
                             if let Some(c) = n.classes.first() {
                                 iris.push(c.as_str().to_string());
-                                counts.push(n.classes.len());
+                                counts.push((n.classes.len(), n.children.len(), n.parents.len()));
                             }
                         }
                     } else {
@@ -828,7 +896,9 @@ impl Ontologies {
                         let mut name =
                             json!({"iri":n.iri,"label":n.label,"labelLang":n.label_lang});
                         if q.part == Part::Parents {
-                            name["equivalenceCount"] = json!(counts[i]);
+                            name["equivalenceCount"] = json!(counts[i].0);
+                            name["children"] = json!(counts[i].1);
+                            name["parents"] = json!(counts[i].2);
                         }
                         page.items.push(name);
                     }

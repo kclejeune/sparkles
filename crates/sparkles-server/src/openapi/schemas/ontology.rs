@@ -14,6 +14,59 @@ pub(super) fn put_all(put: &mut impl FnMut(&str, J)) {
     );
     put("ClassificationName", name);
     put(
+        "ClassificationHierarchyNode",
+        obj(
+            &[
+                "iri",
+                "label",
+                "labelLang",
+                "equivalenceCount",
+                "children",
+                "parents",
+            ],
+            json!({
+                "iri":text,"label":nullable("string"),"labelLang":nullable("string"),
+                "equivalenceCount":n,"children":n,"parents":n
+            }),
+        ),
+    );
+    put(
+        "OntologyMaterializationSource",
+        obj(
+            &[
+                "kind",
+                "sourceId",
+                "profile",
+                "producerCommit",
+                "commit",
+                "boundStoreId",
+                "familyId",
+                "inputGraphs",
+                "inputGraphCount",
+                "inputGraphsTruncated",
+                "warnings",
+                "warningCount",
+                "warningsTruncated",
+                "complete",
+                "consistency",
+                "justifications",
+            ],
+            json!({
+                "kind":{"type":"string","const":"materialization"},
+                "sourceId":{"type":"string","pattern":"^sha256:[a-f0-9]{64}$"},
+                "profile":string_enum(&["rdfs","owl-rl"]),"producerCommit":n,"commit":n,
+                "boundStoreId":text,"familyId":text,
+                "inputGraphs":{"type":"array","maxItems":64,"items":text},
+                "inputGraphCount":n,"inputGraphsTruncated":{"type":"boolean"},
+                "warnings":{"type":"array","maxItems":100,"items":text},
+                "warningCount":n,"warningsTruncated":{"type":"boolean"},
+                "complete":{"type":["boolean","null"],"enum":[null]},
+                "consistency":{"type":"string","const":"unknown"},
+                "justifications":{"type":"string","const":"unavailable"}
+            }),
+        ),
+    );
+    put(
         "ClassificationParent",
         obj(
             &["iri", "label", "labelLang", "equivalenceCount"],
@@ -94,7 +147,7 @@ pub(super) fn put_all(put: &mut impl FnMut(&str, J)) {
                 "assertions":{"type":"boolean"},"elOnly":{"type":"boolean"},"partialRequested":{"type":"boolean"},
                 "expansion":string_enum(&["cautious","eager"]),
                 "sourceCounts":obj(&["requestedGraphs","resolvedGraphs","imports","warnings"],json!({"requestedGraphs":n,"resolvedGraphs":n,"imports":n,"warnings":n})),
-                "capabilities":array(string_enum(&["namedClassDirectParents","namedClassEquivalents","namedClassUnsatisfiability"])),
+                "capabilities":array(string_enum(&["namedClassDirectParents","namedClassDirectChildren","namedClassRoots","namedClassEquivalents","namedClassUnsatisfiability"])),
                 "justifications":{"const":"unavailable"}
             }),
         ),
@@ -116,7 +169,15 @@ pub(super) fn put_all(put: &mut impl FnMut(&str, J)) {
             }),
         ),
     );
-    let parts = string_enum(&["status", "parents", "equivalents", "sources", "excluded"]);
+    let parts = string_enum(&[
+        "status",
+        "roots",
+        "parents",
+        "children",
+        "equivalents",
+        "sources",
+        "excluded",
+    ]);
     put(
         "KeptClassification",
         obj(
@@ -135,12 +196,12 @@ pub(super) fn put_all(put: &mut impl FnMut(&str, J)) {
             json!({
                 "dataset":text,"commit":n,"status":string_enum(&["available","running","mismatch","unavailable"]),
                 "reason":nullable("string"),"result":null_ref("ClassificationResult"),"outcome":null_ref("ClassificationOutcome"),
-                "entity":{"anyOf":[{"type":"null"},obj(&["iri","present","unsatisfiable"],json!({"iri":text,"present":{"type":"boolean"},"unsatisfiable":nullable("boolean")}))]},
+                "entity":{"anyOf":[{"type":"null"},obj(&["iri","present","unsatisfiable"],json!({"iri":text,"present":{"type":"boolean"},"unsatisfiable":nullable("boolean"),"representative":nullable("string"),"equivalenceCount":{"type":["integer","null"]},"children":{"type":["integer","null"]},"parents":{"type":["integer","null"]}}))]},
                 "activity":{"anyOf":[{"type":"null"},obj(&["kind","commit"],json!({"kind":text,"commit":n}))]},
                 "staleCommit":{"type":["integer","null"],"minimum":0},
                 "page":{"anyOf":[{"type":"null"},obj(&["part","about","offset","limit","total","items","nextOffset"],json!({
                     "part":parts,"about":nullable("string"),"offset":n,"limit":{"type":"integer","minimum":1,"maximum":1000},"total":n,
-                    "items":{"type":"array","maxItems":1000,"items":{"anyOf":[sref("ClassificationName"),sref("ClassificationParent"),sref("ClassificationSourceRow"),sref("ClassificationExcluded")]}},
+                    "items":{"type":"array","maxItems":1000,"items":{"anyOf":[sref("ClassificationName"),sref("ClassificationParent"),sref("ClassificationHierarchyNode"),sref("ClassificationSourceRow"),sref("ClassificationExcluded")]}},
                     "nextOffset":{"type":["integer","null"],"minimum":0}
                 }))]}
             }),

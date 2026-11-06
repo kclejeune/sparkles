@@ -125,6 +125,9 @@
   import AxiomProse from '$components/browse/AxiomProse.svelte';
   import DatatypeChip from '$components/browse/DatatypeChip.svelte';
   import TermAxioms from '$components/browse/TermAxioms.svelte';
+  import InferredTreeView from '$components/InferredTree.svelte';
+  import { InferredPins } from '$lib/inferred-read';
+  import type { InferredKind } from '$lib/inferred-tree.svelte';
   import StatChips from '$components/StatChips.svelte';
   import LeadBlock from '$components/browse/LeadBlock.svelte';
   import PageActions from '$components/PageActions.svelte';
@@ -588,6 +591,15 @@
   let termTarget = $state('');
   const mode = $derived<EditMode>(isSkos ? 'skos' : 'owl');
   const editorKind = $derived(term ? editorKindOf(term.kinds) : null);
+  const inferredKind = $derived<InferredKind | null>(
+    editorKind &&
+      ['Class', 'ObjectProperty', 'DataProperty', 'NamedIndividual'].includes(editorKind)
+      ? (editorKind as InferredKind)
+      : null,
+  );
+  const inferredPins = $derived(
+    new InferredPins(JSON.stringify([target, graph, sel.imports, term?.commit])),
+  );
   const canWrite = $derived(auth.loaded && auth.can(name, 'write'));
   /** Edit mode needs write access, a branch head (not a past state) and the term's tag. */
   const canEdit = $derived(
@@ -1653,6 +1665,8 @@
                 {target}
                 {graph}
                 commit={term.commit}
+                imports={sel.imports}
+                pins={inferredPins}
                 editor={editing ? axiomEditor : undefined}
               />
             {/if}
@@ -1851,6 +1865,20 @@
                   {/if}
                 </div>
               {/if}
+            </aside>
+          {/if}
+          {#if inferredKind}
+            <aside class="panel" aria-label="Inferred hierarchy">
+              <InferredTreeView
+                {target}
+                {graph}
+                imports={sel.imports}
+                commit={term.commit}
+                kind={inferredKind}
+                selected={term.iri}
+                pins={inferredPins}
+                onopen={(i) => void goto(hrefOf(i))}
+              />
             </aside>
           {/if}
         </div>

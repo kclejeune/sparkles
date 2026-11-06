@@ -38,6 +38,58 @@ import {
   QueryTimeoutError,
   owl,
 } from '../dist/index.js';
+
+test('strict inferred browse retains materialization source and bigint commits', async (t) => {
+  const ds = t.resource(await Dataset.memory());
+  await ds.update(`PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    INSERT DATA {
+      <urn:A> a owl:Class; rdfs:subClassOf <urn:B> . <urn:B> a owl:Class; rdfs:subClassOf <urn:C> . <urn:C> a owl:Class .
+      <urn:p> a owl:ObjectProperty; rdfs:subPropertyOf <urn:q> . <urn:q> a owl:ObjectProperty; rdfs:subPropertyOf <urn:r> . <urn:r> a owl:ObjectProperty .
+      <urn:i> a owl:NamedIndividual, <urn:A> .
+    }`);
+  await ds.ontology.classify({ threads: 1 });
+  const classified = (await ds.history.commit()).seq;
+  const roots = await ds.ontology.keptClassification({ part: 'roots', at: classified });
+  const children = await ds.ontology.keptClassification({
+    part: 'children',
+    about: 'urn:C',
+    at: classified,
+    resultId: roots.result.resultId,
+  });
+  assert.deepEqual(
+    children.page.items.map((row) => row.iri),
+    ['urn:B'],
+  );
+  await ds.reasoning.run({ profile: 'rdfs' });
+  const at = (await ds.history.commit()).seq;
+  const page = await ds.ontology.hierarchy({
+    kind: 'objectProperty',
+    iri: 'urn:r',
+    inferences: true,
+    at,
+  });
+  assert.deepEqual(
+    page.children.map((row) => row.iri),
+    ['urn:q'],
+  );
+  assert.equal(typeof page.inferenceSource.producerCommit, 'bigint');
+  assert.equal(page.inferenceSource.producerCommit, at);
+  const read = { inferences: true, at, sourceId: page.inferenceSource.sourceId };
+  const types = await ds.ontology.individuals({ ...read, iri: 'urn:i' });
+  const names = types.individuals[0].types.map((row) => row.iri);
+  for (const iri of ['urn:A', 'urn:B', 'urn:C']) assert(names.includes(iri));
+  const frame = await ds.ontology.term('urn:i', read);
+  assert.deepEqual(frame.inferenceSource, page.inferenceSource);
+  assert(
+    frame.axioms.some(
+      (row) => row.graph === 'urn:x-sparkles:inferred' && row.ofn.includes('urn:C'),
+    ),
+  );
+  assert.equal((await ds.history.commit()).seq, at);
+  await ds.reasoning.clear();
+  await assert.rejects(ds.ontology.hierarchy(read));
+});
 import { native } from '../dist/native.js';
 const temp = () => mkdtemp(join(tmpdir(), 'sparkles-node-admin-'));
 for (const mode of ['compute-cancel', 'compute-timeout', 'slot-cancel', 'slot-timeout']) {

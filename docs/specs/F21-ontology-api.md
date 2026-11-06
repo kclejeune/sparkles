@@ -586,6 +586,25 @@ capabilities and remaining work are described by the spec status and Outcome.
 Phase 1 is delivered as roadmap item 71, Phase 2 as roadmap item 537 and Phase 3 as
 roadmap item 538.
 
+### Strict materialized browser reads
+
+The hierarchy, individual and JSON term reads accept an exact commit and optional source
+pin for a fresh recorded RDFS or OWL RL materialization. They require the caller's complete
+input view to match the producer's graph closure, refuse masked or synthetic views before
+revealing producer metadata, and verify input and inferred-graph freshness through bounded
+history comparison. A changed or cleared producer refuses a continuation. Their source
+metadata binds branch, family, revision, scope and producer, with bounded input/warning
+samples and unknown completeness and consistency. GET never classifies or materializes.
+
+Materialized hierarchy pages collapse mutual-subsumption groups, remove transitive edges
+and stream bounded lexical pages for classes and object/data properties. Named individual
+types include the materialized indirect types, with the existing mapper and admission
+limits. Term statements and axioms retain inferred-graph provenance. These reads do not
+turn F18 fact witnesses into arbitrary-axiom explanations or answer from the class-only
+kept classifier. General classifier-backed entity/axiom reads remain under item 588.
+The exact selectors, source metadata and refusal behavior are documented in the
+[ontology API reference](../API.md#ontology).
+
 ### Paged named individuals
 
 Item 607 adds `Ontologies::individuals` and `GET /$/ontology/{ds}/individuals` for
@@ -949,6 +968,15 @@ callers who can read every graph share it. The size budget of §4.5 and its `507
 are not enforced, and reads are bounded by the query deadline. Roadmap item 539
 adds the budget and the A7 measurement on LUBM.
 
+Retained-state preparation still uses the legacy resolution, cache, generation-open and
+replay paths. It polls primary cancellation and deadlines, while an additional composed
+cancellation source is checked around preparation. The strict materialized freshness
+query and subsequent index/hash work poll that composition themselves. A field forwarded
+only into one helper would leave legacy cold generation decoding unchecked. Item 539
+also owns complete control propagation through preparation and request/server admission
+for that work, preserving exact retained revisions and access semantics. These reads do
+not promise fully interruptible cold historical preparation.
+
 **Assertions.** A check covers all the assertions the store holds by default, not only
 the restricted forms, and `assertions: false` restricts it to the terminology. The
 assertions stream from the store and are never held by the ontology.
@@ -993,8 +1021,9 @@ read then shows later commits to them too. A program builds a new model to read 
 commits.
 
 **Inferences of other graphs.** The inferred graph holds the inferences of every input of
-the materialization, so a read with inferences of one graph also reads what the run
-derived from the other graphs it read.
+the materialization, so a general ontology read with inferences of one graph also reads
+what the run derived from the other graphs it read. Strict materialized browser reads
+refuse that ambiguous scope instead of displaying cross-input consequences.
 
 **F17's QL check.** F17's `owl-ql` mode is not built, roadmap item 19. Phase 2 provides
 the partition that its rewriting reads and the QL half of A6, and the fallback half of A6

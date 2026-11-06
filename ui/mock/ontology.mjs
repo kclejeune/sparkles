@@ -1231,6 +1231,8 @@ function mockClassification(ds, graph, commit, body, taxonomy) {
     sourceCounts: { requestedGraphs: 1, resolvedGraphs: 1, imports: 0, warnings: 0 },
     capabilities: [
       'namedClassDirectParents',
+      'namedClassDirectChildren',
+      'namedClassRoots',
       'namedClassEquivalents',
       'namedClassUnsatisfiability',
     ],
@@ -1275,19 +1277,26 @@ function mockClassification(ds, graph, commit, body, taxonomy) {
 function mockClassificationRows(kept, part, about, languages) {
   if (part === 'sources') return kept.sources;
   if (part === 'excluded') return [];
-  const node = kept.taxonomy.nodes.find((n) => n.classes.includes(about));
-  if (!node) return [];
-  const iris =
-    part === 'parents'
-      ? node.parents.map((p) => kept.taxonomy.nodes[p].classes[0])
-      : node.classes.filter((c) => c !== about);
-  return iris.toSorted().map((iri) => ({
-    ...kept.name(iri, languages),
-    ...(part === 'parents'
-      ? {
-          equivalenceCount: kept.taxonomy.nodes.find((n) => n.classes.includes(iri)).classes.length,
-        }
-      : {}),
+  const nodes = kept.taxonomy.nodes;
+  const node = nodes.find((n) => n.classes.includes(about));
+  const rows =
+    part === 'roots'
+      ? nodes.filter((n) => n.node > 1 && n.parents.every((p) => p === 0))
+      : part === 'children' && node
+        ? nodes.filter((n) => n.node > 1 && n.parents.includes(node.node))
+        : part === 'parents' && node
+          ? node.parents.map((p) => nodes[p])
+          : [];
+  if (part === 'equivalents')
+    return (node?.classes ?? [])
+      .filter((c) => c !== about)
+      .toSorted()
+      .map((iri) => kept.name(iri, languages));
+  return rows.map((n) => ({
+    ...kept.name(n.classes[0], languages),
+    equivalenceCount: n.classes.length,
+    children: n.children,
+    parents: n.parents.length,
   }));
 }
 
@@ -1749,7 +1758,10 @@ export async function handleOntology(req, res, url, seg, ctx) {
       (!p.has('resultId') || p.get('resultId') === kept.result.resultId);
     const status = available ? 'available' : matches ? 'mismatch' : 'unavailable';
     const about = p.get('about');
-    const present = available && kept.taxonomy.nodes.some((n) => n.classes.includes(about));
+    const entityNode = available
+      ? kept.taxonomy.nodes.find((n) => n.classes.includes(about))
+      : null;
+    const present = !!entityNode;
     const part = p.get('part') ?? 'status';
     const offset = Number(p.get('offset') ?? 0);
     const limit = Number(p.get('limit') ?? 100);
@@ -1765,7 +1777,17 @@ export async function handleOntology(req, res, url, seg, ctx) {
       result: available ? kept.result : null,
       outcome: available ? kept.outcome : null,
       entity:
-        available && about ? { iri: about, present, unsatisfiable: present ? false : null } : null,
+        available && about
+          ? {
+              iri: about,
+              present,
+              unsatisfiable: present ? false : null,
+              representative: entityNode?.classes[0] ?? null,
+              equivalenceCount: entityNode?.classes.length ?? null,
+              children: entityNode?.children ?? null,
+              parents: entityNode?.parents.length ?? null,
+            }
+          : null,
       activity: null,
       staleCommit: matches && !available ? kept.result.classifiedCommit : null,
       page: rows

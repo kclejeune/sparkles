@@ -7,6 +7,8 @@ export const groupKey = (iri: string | null) => (iri == null ? '@untyped' : `@ty
 export const groupIri = (key: string) => (key.startsWith('@type:') ? key.slice(6) : null);
 export const isGroup = (key: string) => key === '@untyped' || key.startsWith('@type:');
 export type IndividualPage = {
+  inferenceSource?: import('./inferred-read').MaterializationSource;
+  typeBasis?: 'materializedNamedTypes';
   commit: number;
   groups: { type: Name | null; total: number | null }[];
   individuals: (Name & { types: Name[] })[];
@@ -22,6 +24,7 @@ export type IndividualQuery = {
   limit?: number;
 };
 export type IndividualReader = (q: IndividualQuery, signal: AbortSignal) => Promise<IndividualPage>;
+type ReadControl = { signal?: AbortSignal; read?: IndividualReader };
 
 export class IndividualTree {
   levels = $state<Record<string, string[]>>({});
@@ -30,7 +33,7 @@ export class IndividualTree {
   loading = $state(false);
   error = $state<string | null>(null);
   #next = new Map<string, string | null>();
-  #pending = new Map<string, Promise<void>>();
+  #pending = new Map<string, { promise: Promise<void>; signal: AbortSignal }>();
   #ctl = new AbortController();
   #generation = 0;
   #commit: number | null = null;
@@ -94,29 +97,33 @@ export class IndividualTree {
     this.types = types;
   }
 
-  load(id: string | null): Promise<void> {
+  load(id: string | null, control: ReadControl = {}): Promise<void> {
+    if (control.signal?.aborted) return Promise.resolve();
     const key = id ?? '';
     if (key in this.levels || (id != null && !isGroup(id))) return Promise.resolve();
-    return this.#load(id, false);
+    return this.#load(id, false, control);
   }
 
-  loadMore(id: string | null): Promise<void> {
+  loadMore(id: string | null, control: ReadControl = {}): Promise<void> {
+    if (control.signal?.aborted) return Promise.resolve();
     if (this.#next.get(id ?? '') == null) return Promise.resolve();
-    return this.#load(id, true);
+    return this.#load(id, true, control);
   }
 
-  #load(id: string | null, append: boolean): Promise<void> {
+  #load(id: string | null, append: boolean, control: ReadControl): Promise<void> {
     const key = id ?? '';
     const pending = this.#pending.get(key);
-    if (pending) return pending;
+    if (pending && !pending.signal.aborted) return pending.promise;
     const gen = this.#generation;
-    const signal = this.#ctl.signal;
+    const signal = control.signal
+      ? AbortSignal.any([this.#ctl.signal, control.signal])
+      : this.#ctl.signal;
     if (id == null) this.loading = true;
     const p = (async () => {
       // A child never races the root's revision anchor.
       if (id != null && this.#commit == null) await this.load(null);
       if (gen !== this.#generation || signal.aborted) return;
-      const page = await this.read(
+      const page = await (control.read ?? this.read)(
         {
           ...(id ? (id === '@untyped' ? { untyped: true } : { type: groupIri(id)! }) : {}),
           ...(append ? { after: this.#next.get(key)! } : {}),
@@ -150,26 +157,33 @@ export class IndividualTree {
       })
       .finally(() => {
         if (gen !== this.#generation) return;
-        this.#pending.delete(key);
-        if (id == null) this.loading = false;
+        if (this.#pending.get(key)?.promise === p) {
+          this.#pending.delete(key);
+          if (id == null) this.loading = false;
+        }
       });
-    this.#pending.set(key, p);
+    this.#pending.set(key, { promise: p, signal });
     return p;
   }
 
-  async reveal(iri: string): Promise<string[]> {
+  async reveal(iri: string, control: ReadControl = {}): Promise<string[]> {
     const gen = this.#generation;
-    const signal = this.#ctl.signal;
+    const signal = control.signal
+      ? AbortSignal.any([this.#ctl.signal, control.signal])
+      : this.#ctl.signal;
     await this.load(null);
     if (gen !== this.#generation || signal.aborted || this.#commit == null) return [];
     try {
-      const page = await this.read({ iri, at: `commit:${this.#commit}`, limit: 1 }, signal);
+      const page = await (control.read ?? this.read)(
+        { iri, at: `commit:${this.#commit}`, limit: 1 },
+        signal,
+      );
       if (gen !== this.#generation || signal.aborted || page.commit !== this.#commit) return [];
       this.#take(page);
       const groups = page.groups.map((g) => groupKey(g.type?.iri ?? null));
       // Read just the first page of each selected membership. No earlier member pages
       // are required even when this individual sorts after millions of other rows.
-      await Promise.all(groups.map((g) => this.load(g)));
+      await Promise.all(groups.map((g) => this.load(g, control)));
       if (gen !== this.#generation || signal.aborted) return [];
       const levels: Record<string, string[]> = {
         ...this.levels,

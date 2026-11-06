@@ -239,6 +239,12 @@ run after a run that stopped before its saturation ended. A run that stops later
 its saturated contexts. Property tests check that an incremental run after random
 additions and removals gives the taxonomy of a full run.
 
+This reuse applies to eligible EL edits. Normalization with Horn or disjunctive axioms
+currently clears the contexts and marks the run entangled, so a later edited source
+rebuilds those runs. Reusing the completed result at the same commit does not establish
+incremental Horn or DL maintenance. The planned affected-module behavior remains in
+item 603 rather than being inferred from the EL incremental tests.
+
 **Bounds.** A run stops at its deadline, at a cancellation and when the estimated memory
 passes the budget. The deadline and the cancellation are checked while the axioms are
 normalized, while the property closure is built, between the stages and while the
@@ -264,9 +270,11 @@ ontology. `POST /$/ontology/{ds}/classify`, the `classify` operation of the shar
 surface, `sparkles ontology classify` and the Python, Node.js and JVM bindings run it. An
 inferred read is refused, since a classification reads the asserted axioms. The dataset
 keeps its last classification of an ontology for callers who read every graph, without
-assertions, keyed by the graphs, imports and mode. A classification at the same commit
-answers from it, and one at a later commit gives the kept classifier the axioms that
-changed. One kept classification runs at a time, and a second caller waits for it under
+assertions, keyed by the graphs, imports and mode. A compatible classification at the same commit
+answers from the retained result. At a later commit eligible EL additions and removals
+reuse affected contexts, while current Horn and disjunctive runs rebuild after edits.
+Item 603 retains affected-module incremental DL work, and item 664 covers the EL
+individual, merge, key and world invalidation gaps. One kept classification runs at a time, and a second caller waits for it under
 its own deadline. The dataset keeps the saturation and the ontology it read, whose axioms
 the open ontology shares, and at the next commit it passes the saturation the axioms
 that differ between the two. The threads are taken before that, so a run that times out
@@ -308,6 +316,16 @@ and absence. Source warnings form a typed virtual sequence whose complete digest
 counts agree with bounded page traversal. Page output and per-page labels are bounded,
 while counts/order can scan retained vectors. Names use the pinned authorized snapshot
 and complete IRI fallback for unproven historical prefixes.
+
+Kept roots and direct-child pages expose the taxonomy's existing retained vectors without
+adding another reverse index or downloading a whole taxonomy. Each bounded row includes
+one representative, its equivalence count and direct child/parent counts. Nontrivial top
+and bottom groups remain explicit. Entity status identifies a selected equivalent name's
+representative without changing its asserted edit target. The same revision, publication,
+source and access checks apply to hierarchy continuation and frame clauses. Materialized
+property/individual views use a separate recorded-profile source and never advertise the
+class-only publication as their producer. General classifier-backed entity/axiom reads
+and matching arbitrary-axiom justifications remain open under items 588 and 622.
 
 An optional explicit `projection=frame` on classify branches before legacy whole-node
 and ancestor arrays. It preserves useful direct-parent/equivalent clauses even for an

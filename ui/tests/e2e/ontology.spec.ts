@@ -134,13 +134,19 @@ open(
     await expect(region.getByRole('button', { name: 'Teacher', exact: true })).toBeVisible();
     expect(posts).toHaveLength(1);
     await Promise.all(settled);
-    expect(pages.map((p) => p.part).sort()).toEqual(['equivalents', 'parents', 'status']);
+    // The frame still reads its same three bounded parts. The adjacent hierarchy
+    // now also reads kept roots/children and bounded ancestor paths.
+    const framePages = pages.filter((p) => ['equivalents', 'parents', 'status'].includes(p.part));
+    expect(framePages.filter((p) => p.part === 'equivalents')).toHaveLength(1);
+    expect(framePages.filter((p) => p.part === 'status')).toHaveLength(1);
+    expect(framePages.some((p) => p.part === 'parents')).toBe(true);
     for (const p of pages) {
       expect(p.commit).toBe(frame.result.classifiedCommit);
       expect(p.resultId).toBe(frame.result.resultId);
       expect(p.rows).toBeLessThanOrEqual(100);
       expect(new URL(p.url).searchParams.get('at')).toBe(`commit:${p.commit}`);
-      if (p.part !== 'status') expect(new URL(p.url).searchParams.get('resultId')).toBe(p.resultId);
+      if (!['status', 'roots'].includes(p.part))
+        expect(new URL(p.url).searchParams.get('resultId')).toBe(p.resultId);
     }
     await info.attach('kept-frame-display.json', {
       body: JSON.stringify(

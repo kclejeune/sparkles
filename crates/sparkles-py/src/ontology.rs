@@ -421,7 +421,7 @@ impl PyOntologies {
     /// of the roots when `iri` is None), each with its own numbers of `children` and
     /// `parents`, and its `ancestors` with `ancestors=True`. `kind` is `class`,
     /// `objectProperty`, `dataProperty`, `annotationProperty` or `concept`.
-    #[pyo3(signature=(iri=None, graph=None, *, kind="class", ancestors=false, scheme=None, deprecated=true, lang=None, limit=100, offset=0, imports=true, at=None, cancel=None, timeout=None))]
+    #[pyo3(signature=(iri=None, graph=None, *, kind="class", ancestors=false, scheme=None, deprecated=true, lang=None, limit=100, offset=0, imports=true, at=None, inferences=false, source_id=None, after=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn hierarchy<'py>(
         &self,
@@ -437,11 +437,16 @@ impl PyOntologies {
         offset: usize,
         imports: bool,
         at: Option<&Bound<'py, PyAny>>,
+        inferences: bool,
+        source_id: Option<&str>,
+        after: Option<&str>,
         cancel: Option<&Bound<'py, PyAny>>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mut a = base(graph, imports, "lenient", false)?;
+        let mut a = base(graph, imports, "lenient", inferences)?;
         a.insert("at".into(), at_json(at)?);
+        a.insert("sourceId".into(), json!(source_id));
+        a.insert("after".into(), json!(after));
         a.insert("kind".into(), json!(kind));
         a.insert("iri".into(), json!(iri));
         a.insert("ancestors".into(), json!(ancestors));
@@ -456,7 +461,7 @@ impl PyOntologies {
 
     /// A lexical page of asserted named individuals, their type buckets, or one
     /// individual's memberships. Continue with `after` and the returned `commit` as `at`.
-    #[pyo3(signature=(graph=None, *, r#type=None, untyped=false, iri=None, after=None, limit=100, lang=None, imports=true, at=None, cancel=None, timeout=None))]
+    #[pyo3(signature=(graph=None, *, r#type=None, untyped=false, iri=None, after=None, limit=100, lang=None, imports=true, at=None, inferences=false, source_id=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn individuals<'py>(
         &self,
@@ -470,11 +475,14 @@ impl PyOntologies {
         lang: Option<&Bound<'py, PyAny>>,
         imports: bool,
         at: Option<&Bound<'py, PyAny>>,
+        inferences: bool,
+        source_id: Option<&str>,
         cancel: Option<&Bound<'py, PyAny>>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mut a = base(graph, imports, "lenient", false)?;
+        let mut a = base(graph, imports, "lenient", inferences)?;
         a.insert("at".into(), at_json(at)?);
+        a.insert("sourceId".into(), json!(source_id));
         a.insert("type".into(), json!(r#type));
         a.insert("untyped".into(), json!(untyped));
         a.insert("iri".into(), json!(iri));
@@ -523,7 +531,7 @@ impl PyOntologies {
     /// their annotations, the `axioms` they map to, the axioms of other entities that
     /// mention it (`mentions`), the statements that point at it (`incoming`), and the
     /// label, short form and kinds of every IRI used (`names`).
-    #[pyo3(signature=(iri, graph=None, *, mentions=200, incoming=20, lang=None, imports=true, at=None, cancel=None, timeout=None))]
+    #[pyo3(signature=(iri, graph=None, *, mentions=200, incoming=20, lang=None, imports=true, at=None, inferences=false, source_id=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn term<'py>(
         &self,
@@ -535,11 +543,14 @@ impl PyOntologies {
         lang: Option<&Bound<'py, PyAny>>,
         imports: bool,
         at: Option<&Bound<'py, PyAny>>,
+        inferences: bool,
+        source_id: Option<&str>,
         cancel: Option<&Bound<'py, PyAny>>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mut a = base(graph, imports, "lenient", false)?;
+        let mut a = base(graph, imports, "lenient", inferences)?;
         a.insert("at".into(), at_json(at)?);
+        a.insert("sourceId".into(), json!(source_id));
         a.insert("iri".into(), json!(iri));
         a.insert("mentions".into(), json!(mentions));
         a.insert("incoming".into(), json!(incoming));

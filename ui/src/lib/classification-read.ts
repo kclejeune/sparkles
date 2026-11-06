@@ -4,12 +4,15 @@ import type { AxiomItem, Selection } from './ontology';
 
 export const CLASSIFICATION_PAGE_SIZE = 100;
 export const CLASSIFICATION_DISPLAY_CAP = 1000;
-export type ClassificationPart = 'parents' | 'equivalents' | 'sources' | 'excluded';
+export type ClassificationFramePart = 'parents' | 'equivalents' | 'sources' | 'excluded';
+export type ClassificationPart = ClassificationFramePart | 'roots' | 'children';
 export type ClassificationName = {
   iri: string;
   label: string | null;
   labelLang: string | null;
   equivalenceCount?: number;
+  children?: number;
+  parents?: number;
 };
 export type ClassificationSourceRow =
   | { kind: 'requestedGraph'; ordinal: number; graph: string }
@@ -71,7 +74,15 @@ export type KeptClassification = {
   reason: string | null;
   result: ClassificationResult | null;
   outcome: ClassificationOutcome | null;
-  entity: { iri: string; present: boolean; unsatisfiable: boolean | null } | null;
+  entity: {
+    iri: string;
+    present: boolean;
+    unsatisfiable: boolean | null;
+    representative?: string | null;
+    equivalenceCount?: number | null;
+    children?: number | null;
+    parents?: number | null;
+  } | null;
   activity: { kind: string; commit: number } | null;
   page: ClassificationPage | null;
   staleCommit: number | null;
@@ -113,13 +124,16 @@ export async function readKeptClassification(
     part?: ClassificationPart;
     offset?: number;
     resultId?: string;
+    about?: string;
+    limit?: number;
   } = {},
   signal?: AbortSignal,
 ): Promise<KeptClassification> {
   const params = scope(view);
   params.set('part', query.part ?? 'status');
-  if (query.part !== 'sources' && query.part !== 'excluded') params.set('about', view.iri);
-  params.set('limit', String(CLASSIFICATION_PAGE_SIZE));
+  if (query.part !== 'sources' && query.part !== 'excluded' && query.part !== 'roots')
+    params.set('about', query.about ?? view.iri);
+  params.set('limit', String(query.limit ?? CLASSIFICATION_PAGE_SIZE));
   if (query.resultId) params.set('resultId', query.resultId);
   if (query.offset != null) params.set('offset', String(query.offset));
   const res = await request(

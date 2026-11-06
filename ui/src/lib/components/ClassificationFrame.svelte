@@ -4,12 +4,13 @@
   import {
     CLASSIFICATION_DISPLAY_CAP,
     type ClassificationName,
-    type ClassificationPart,
+    type ClassificationFramePart as ClassificationPart,
     type ClassificationExcluded,
     type ClassificationSourceRow,
   } from '$lib/classification-read';
   import { iriForm } from '$lib/iri-form.svelte';
   import { OWL_THING, type AxiomItem } from '$lib/ontology';
+  import type { InferredPins } from '$lib/inferred-read';
 
   let {
     target,
@@ -21,6 +22,7 @@
     items,
     onopen,
     href,
+    pins,
   }: {
     target: string;
     graph: string | null;
@@ -31,8 +33,12 @@
     items: AxiomItem[];
     onopen?: (iri: string) => void;
     href?: (iri: string) => string | null;
+    pins?: InferredPins;
   } = $props();
-  const model = new ClassificationFrame();
+  const model = new ClassificationFrame(
+    () => pins?.classificationId,
+    (result) => pins?.acceptClassification(result.resultId) ?? true,
+  );
   // The read has pinned labels but no proven historical prefix map. Rendering
   // preferences therefore fall back to the complete IRI outside label mode.
   const display = (row: ClassificationName) =>

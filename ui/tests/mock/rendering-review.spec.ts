@@ -257,7 +257,7 @@ test('expanded graph nodes retain their names and respond to display mode change
 }) => {
   await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + 'Person')}&view=graph`);
   await preferences(page, 'label', 'en');
-  const card = page.getByRole('complementary', { name: 'Hierarchy' });
+  const card = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
   await expect.poll(() => captions(card)).toContain('Student');
   await card.getByRole('button', { name: 'Expand', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Graph of Person', exact: true });
@@ -321,7 +321,7 @@ test('an expansion completing after navigation cannot change the new entity grap
   });
   try {
     await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + 'Person')}&view=graph`);
-    const card = page.getByRole('complementary', { name: 'Hierarchy' });
+    const card = page.getByRole('complementary', { name: 'Hierarchy', exact: true });
     await expect.poll(() => captions(card)).toContain('Student');
     await card.getByRole('button', { name: 'Expand', exact: true }).click();
     const dialog = page.getByRole('dialog', { name: /Graph of/ });

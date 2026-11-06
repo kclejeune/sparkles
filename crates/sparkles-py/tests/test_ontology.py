@@ -156,6 +156,36 @@ def test_inferred_views() -> None:
     ]
 
 
+def test_strict_materialized_browse_and_kept_hierarchy_sources() -> None:
+    d = sparkles.Dataset()
+    d.update(f"""{PREFIXES} INSERT DATA {{
+        :A a owl:Class; rdfs:subClassOf :B . :B a owl:Class; rdfs:subClassOf :C . :C a owl:Class .
+        :p a owl:ObjectProperty; rdfs:subPropertyOf :q .
+        :q a owl:ObjectProperty; rdfs:subPropertyOf :r . :r a owl:ObjectProperty .
+        :i a owl:NamedIndividual, :A . }}""")
+    d.ontology.classify(threads=1)
+    before = d.head_commit.seq
+    roots = d.ontology.kept_classification(part="roots", at=before)
+    child = d.ontology.kept_classification(part="children", about=EX + "C", at=before,
+        result_id=roots["result"]["resultId"])
+    assert [row["iri"] for row in child["page"]["items"]] == [EX + "B"]
+    d.reasoning.run(profile="rdfs")
+    at = d.head_commit.seq
+    page = d.ontology.hierarchy(EX + "r", kind="objectProperty", inferences=True, at=at)
+    assert [row["iri"] for row in page["children"]] == [EX + "q"]
+    source = page["inferenceSource"]
+    assert source["profile"] == "rdfs" and source["producerCommit"] == at
+    types = d.ontology.individuals(iri=EX + "i", inferences=True, at=at, source_id=source["sourceId"])
+    assert {row["iri"] for row in types["individuals"][0]["types"]} >= {EX + "A", EX + "B", EX + "C"}
+    frame = d.ontology.term(EX + "i", inferences=True, at=at, source_id=source["sourceId"])
+    assert frame["inferenceSource"] == source
+    assert any(row["graph"] == "urn:x-sparkles:inferred" and EX + "C" in row["ofn"] for row in frame["axioms"])
+    assert d.head_commit.seq == at
+    d.reasoning.clear()
+    with pytest.raises(sparkles.NotFoundError):
+        d.ontology.hierarchy(inferences=True, at=at, source_id=source["sourceId"])
+
+
 # --------------------------------------------------- roadmap item 540: accessors ----
 
 

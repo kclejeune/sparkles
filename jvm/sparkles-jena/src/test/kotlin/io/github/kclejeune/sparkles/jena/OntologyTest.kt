@@ -10,6 +10,40 @@ import org.junit.jupiter.api.io.TempDir
 
 /** Spec F21 Phase 2 on the JVM: jena-ontapi over a Sparkles graph, and the native handle. */
 class OntologyTest {
+    @Test fun strict_materialized_browse_preserves_source_and_read_only_hierarchy() {
+        SparklesDatasets.memory().use { ds ->
+            UpdateAction.parseExecute("""$prefixes INSERT DATA {
+                :A a owl:Class; rdfs:subClassOf :B . :B a owl:Class; rdfs:subClassOf :C . :C a owl:Class .
+                :p a owl:ObjectProperty; rdfs:subPropertyOf :q .
+                :q a owl:ObjectProperty; rdfs:subPropertyOf :r . :r a owl:ObjectProperty .
+                :i a owl:NamedIndividual, :A .
+            }""", ds)
+            val onto = ds.ontology()
+            onto.classify(query = ClassifyQuery(threads = 1))
+            val classified = ds.headCommit().seq
+            val roots = onto.keptClassification(OntologyRead(at = "commit:$classified"), KeptClassificationQuery(part = "roots"))
+            val children = onto.keptClassification(OntologyRead(at = "commit:$classified"), KeptClassificationQuery(part = "children", about = "http://ex.org/C", resultId = roots.get("result").asObject.getString("resultId")))
+            assertEquals(listOf("http://ex.org/B"), children.get("page").asObject.get("items").asArray.map { it.asObject.getString("iri") })
+            ds.reasoning().run()
+            val at = ds.headCommit().seq
+            val read = OntologyRead(at = "commit:$at", inferences = true)
+            val page = onto.hierarchy("http://ex.org/r", read, kind = "objectProperty")
+            assertEquals(listOf("http://ex.org/q"), page.get("children").asArray.map { it.asObject.getString("iri") })
+            val source = page.get("inferenceSource").asObject
+            assertEquals(at, source.getNumber("producerCommit").toLong())
+            val pinned = read.copy(sourceId = source.getString("sourceId"))
+            val individual = onto.individuals(pinned, iri = "http://ex.org/i")
+            val types = individual.get("individuals").asArray[0].asObject.get("types").asArray.map { it.asObject.getString("iri") }
+            assertTrue(types.containsAll(listOf("http://ex.org/A", "http://ex.org/B", "http://ex.org/C")))
+            val frame = onto.term("http://ex.org/i", pinned)
+            assertEquals(source.toString(), frame.get("inferenceSource").toString())
+            assertTrue(frame.get("axioms").asArray.any { it.asObject.getString("graph") == "urn:x-sparkles:inferred" && it.asObject.getString("ofn").contains("http://ex.org/C") })
+            assertEquals(at, ds.headCommit().seq)
+            ds.reasoning().clear()
+            assertThrows(RuntimeException::class.java) { onto.hierarchy(read = pinned) }
+        }
+    }
+
     private val prefixes = """
         PREFIX : <http://ex.org/>
         PREFIX owl: <http://www.w3.org/2002/07/owl#>
@@ -381,6 +415,9 @@ class OntologyTest {
                 UpdateAction.parseExecute("$prefixes INSERT DATA { :OnlyAtHead a owl:Class }", ds)
                 assertAll(
                     { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { pinned.ontology().keptClassification() } },
+                    { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { pinned.ontology().hierarchy(read = OntologyRead(inferences = true, at = "commit:$old")) } },
+                    { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { pinned.ontology().individuals(OntologyRead(inferences = true, at = "commit:$old")) } },
+                    { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { pinned.ontology().term("http://ex.org/A", OntologyRead(inferences = true, at = "commit:$old")) } },
                     { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { pinned.ontology().classify(OntologyRead(graph = "http://ex.org/onto"), ClassifyQuery(about = "http://ex.org/Professor", projection = "frame")) } },
                     { assertEquals("unavailable", ds.ontology().keptClassification(OntologyRead(graph = "http://ex.org/onto")).getString("status")) },
                 )
@@ -405,6 +442,9 @@ class OntologyTest {
                     val before = ds.txn()!!.ops
                     assertAll(
                         { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { ds.ontology().keptClassification(read) } },
+                        { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { ds.ontology().hierarchy(read = read.copy(inferences = true, at = "commit:$head")) } },
+                        { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { ds.ontology().individuals(read.copy(inferences = true, at = "commit:$head")) } },
+                        { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { ds.ontology().term("http://ex.org/A", read.copy(inferences = true, at = "commit:$head")) } },
                         { assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) { ds.ontology().classify(read, ClassifyQuery(about = "http://ex.org/Professor", projection = "frame")) } },
                         { assertEquals(before, ds.txn()!!.ops, "the guard must not flush pending writes") },
                         { assertTrue(ds.isInTransaction()) },

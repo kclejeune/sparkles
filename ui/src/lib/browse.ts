@@ -48,7 +48,7 @@ export type Name = {
   deprecated: boolean;
 };
 
-export type TreeNode = Name & { children: number; parents: number };
+export type TreeNode = Name & { children: number; parents: number; equivalenceCount?: number };
 
 export type TreeKind =
   | 'class'
@@ -58,6 +58,10 @@ export type TreeKind =
   | 'concept';
 
 export type Hierarchy = {
+  inferenceSource?: import('./inferred-read').MaterializationSource;
+  nextAfter?: string | null;
+  hierarchyBasis?: 'directEquivalenceGroups';
+  graphs?: string[];
   dataset: string;
   commit: number;
   kind: TreeKind;
@@ -84,6 +88,7 @@ export type Statement = {
 export type Incoming = { property: string; count: number; more: boolean; subjects: string[] };
 
 export type TermPage = Name & {
+  inferenceSource?: import('./inferred-read').MaterializationSource;
   dataset: string;
   commit: number;
   graphs: string[];
@@ -104,7 +109,12 @@ export type TermPage = Name & {
 };
 
 /** What the browser reads: one graph (null for the default graph), its imports and a state. */
-export type BrowseSelection = { graph: string | null; imports?: boolean; at?: string | null };
+export type BrowseSelection = {
+  graph: string | null;
+  imports?: boolean;
+  at?: string | null;
+  inferences?: boolean;
+};
 
 function params(
   sel: BrowseSelection,
@@ -114,6 +124,7 @@ function params(
   p.set('graph', sel.graph ?? 'default');
   if (sel.imports === false) p.set('imports', 'false');
   if (sel.at) p.set('at', sel.at);
+  if (sel.inferences) p.set('inferences', 'true');
   for (const [k, v] of Object.entries(more)) if (v !== undefined && v !== null) p.set(k, String(v));
   return p;
 }
@@ -130,6 +141,8 @@ export async function fetchHierarchy(
     deprecated?: boolean;
     limit?: number;
     offset?: number;
+    after?: string;
+    sourceId?: string;
     lang?: readonly string[];
   } = {},
   signal?: AbortSignal,
@@ -142,10 +155,13 @@ export async function fetchHierarchy(
     deprecated: q.deprecated === false ? false : undefined,
     limit: q.limit,
     offset: q.offset || undefined,
+    after: q.after,
+    sourceId: q.sourceId,
     lang: (q.lang ?? iriForm.languages).join(',') || undefined,
   });
   const res = await request(`/$/ontology/${enc(target)}/hierarchy?${p}`, {
     headers: { Accept: 'application/json' },
+    cache: sel.inferences ? 'no-store' : 'default',
     signal,
   });
   return (await res.json()) as Hierarchy;
@@ -156,17 +172,19 @@ export async function fetchTerm(
   target: string,
   sel: BrowseSelection,
   iri: string,
-  q: { lang?: readonly string[]; mentions?: number; incoming?: number } = {},
+  q: { lang?: readonly string[]; mentions?: number; incoming?: number; sourceId?: string } = {},
   signal?: AbortSignal,
 ): Promise<TermPage> {
   const p = params(sel, {
     iri,
+    sourceId: q.sourceId,
     mentions: q.mentions,
     incoming: q.incoming,
     lang: (q.lang ?? iriForm.languages).join(',') || undefined,
   });
   const res = await request(`/$/ontology/${enc(target)}/term?${p}`, {
     headers: { Accept: 'application/json' },
+    cache: sel.inferences ? 'no-store' : 'default',
     signal,
   });
   return { ...((await res.json()) as TermPage), etag: res.headers.get('ETag') };
@@ -1716,10 +1734,14 @@ export function headGraphsQuery(): string {
 export async function fetchIndividuals(
   target: string,
   sel: BrowseSelection,
-  q: import('./individual-tree.svelte').IndividualQuery & { lang?: readonly string[] } = {},
+  q: import('./individual-tree.svelte').IndividualQuery & {
+    lang?: readonly string[];
+    sourceId?: string;
+  } = {},
   signal?: AbortSignal,
 ): Promise<import('./individual-tree.svelte').IndividualPage> {
   const p = params(sel, {
+    sourceId: q.sourceId,
     type: q.type,
     untyped: q.untyped,
     iri: q.iri,
@@ -1730,6 +1752,7 @@ export async function fetchIndividuals(
   });
   const res = await request(`/$/ontology/${enc(target)}/individuals?${p}`, {
     headers: { Accept: 'application/json' },
+    cache: sel.inferences ? 'no-store' : 'default',
     signal,
   });
   return await res.json();

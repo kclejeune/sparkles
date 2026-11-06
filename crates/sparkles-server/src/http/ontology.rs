@@ -1036,7 +1036,115 @@ fn tagged(
 /// (`limit`, `offset`), with their own numbers of children and parents, and the
 /// ancestors of `iri` with `ancestors=true`. `kind`, `scheme`, `deprecated` and `lang`
 /// or `Accept-Language` refine it.
+fn materialized_selectors(params: &Params, members: &[&str]) -> ApiResult<()> {
+    if params.get("inferences").is_none() && params.get("sourceId").is_none() {
+        return Ok(());
+    }
+    if params
+        .get("inferences")
+        .is_some_and(|value| !matches!(value, "true" | "false" | "1" | "0"))
+    {
+        return Err(bad("inferences must be true or false"));
+    }
+    let shared = [
+        "graph",
+        "imports",
+        "mode",
+        "at",
+        "inferences",
+        "sourceId",
+        "lang",
+        "timeout",
+        "branch",
+        "nocache",
+    ];
+    for (key, _) in &params.0 {
+        if !shared.contains(&key.as_str()) && !members.contains(&key.as_str()) {
+            return Err(bad(format!("unknown inferred browse selector '{key}'")));
+        }
+        if key != "graph" && params.all(key).len() != 1 {
+            return Err(bad(format!("duplicate inferred browse selector '{key}'")));
+        }
+    }
+    Ok(())
+}
+
+fn materialized_response(result: ApiResult, inferred: bool) -> ApiResult {
+    if !inferred {
+        return result;
+    }
+    let mut response = result.into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+fn browse_tagged(
+    ds: &Dataset,
+    headers: &HeaderMap,
+    commit: u64,
+    kind: &str,
+    body: J,
+    inferred: bool,
+) -> ApiResult {
+    if inferred {
+        Ok(with_commit(Json(body).into_response(), ds, commit))
+    } else {
+        tagged(ds, headers, commit, kind, body)
+    }
+}
+
 pub(super) async fn hierarchy(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    let params = Params::from_query(&uri);
+    let inferred = params.all("inferences").iter().any(|value| truthy(value))
+        || params.get("sourceId").is_some();
+    materialized_response(
+        hierarchy_read(State(st), Path(name), Extension(p), uri, headers).await,
+        inferred,
+    )
+}
+
+pub(super) async fn individuals(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    let params = Params::from_query(&uri);
+    let inferred = params.all("inferences").iter().any(|value| truthy(value))
+        || params.get("sourceId").is_some();
+    materialized_response(
+        individuals_read(State(st), Path(name), Extension(p), uri, headers).await,
+        inferred,
+    )
+}
+
+pub(super) async fn term(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    let params = Params::from_query(&uri);
+    let inferred = params.all("inferences").iter().any(|value| truthy(value))
+        || params.get("sourceId").is_some();
+    materialized_response(
+        term_read(State(st), Path(name), Extension(p), uri, headers).await,
+        inferred,
+    )
+}
+
+async fn hierarchy_read(
     State(st): St,
     Path(name): Path<String>,
     Extension(p): Extension<Principal>,
@@ -1045,11 +1153,26 @@ pub(super) async fn hierarchy(
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
+    materialized_selectors(
+        &params,
+        &[
+            "kind",
+            "iri",
+            "scheme",
+            "limit",
+            "offset",
+            "after",
+            "ancestors",
+            "deprecated",
+        ],
+    )?;
     let req = request_of(&params)?;
     let mut a = browse_args(
         &params,
         &headers,
-        &["kind", "iri", "scheme", "limit", "offset"],
+        &[
+            "kind", "iri", "scheme", "limit", "offset", "after", "sourceId",
+        ],
         &["ancestors", "deprecated"],
     );
     numbers(&mut a, &["limit", "offset"])?;
@@ -1062,13 +1185,13 @@ pub(super) async fn hierarchy(
             .hierarchy(&req, &h, &opts)
             .map_err(ontology_error)?;
         let j = onto::wire::hierarchy_body(&ds.name, &h, &found);
-        tagged(&ds, &headers, found.commit, "owl-tree", j)
+        browse_tagged(&ds, &headers, found.commit, "owl-tree", j, req.inferences)
     })
     .await
 }
 
 /// Named individuals by asserted named type, with bounded keyset pages.
-pub(super) async fn individuals(
+async fn individuals_read(
     State(st): St,
     Path(name): Path<String>,
     Extension(p): Extension<Principal>,
@@ -1077,11 +1200,12 @@ pub(super) async fn individuals(
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
+    materialized_selectors(&params, &["type", "iri", "after", "limit", "untyped"])?;
     let req = request_of(&params)?;
     let mut a = browse_args(
         &params,
         &headers,
-        &["type", "iri", "after", "limit"],
+        &["type", "iri", "after", "limit", "sourceId"],
         &["untyped"],
     );
     numbers(&mut a, &["limit"])?;
@@ -1094,7 +1218,14 @@ pub(super) async fn individuals(
             .individuals(&req, &q, &opts)
             .map_err(ontology_error)?;
         let j = onto::wire::individuals_body(&ds.name, &found);
-        tagged(&ds, &headers, found.commit, "owl-individuals", j)
+        browse_tagged(
+            &ds,
+            &headers,
+            found.commit,
+            "owl-individuals",
+            j,
+            req.inferences,
+        )
     })
     .await
 }
@@ -1224,7 +1355,7 @@ fn download_name(t: &onto::browse::TermPage, ext: &str) -> String {
 /// that point at it, and the labels of every IRI used. `format` downloads the triples
 /// about it in Turtle, N-Triples, RDF/XML or JSON-LD, or its axioms in functional-style
 /// syntax.
-pub(super) async fn term(
+async fn term_read(
     State(st): St,
     Path(name): Path<String>,
     Extension(p): Extension<Principal>,
@@ -1233,11 +1364,20 @@ pub(super) async fn term(
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
+    materialized_selectors(&params, &["iri", "mentions", "incoming", "format"])?;
     let req = request_of(&params)?;
-    let mut a = browse_args(&params, &headers, &["iri", "mentions", "incoming"], &[]);
+    let mut a = browse_args(
+        &params,
+        &headers,
+        &["iri", "mentions", "incoming", "sourceId"],
+        &[],
+    );
     numbers(&mut a, &["mentions", "incoming"])?;
     let t = onto::wire::term_request_of(&a).map_err(|e| bad(e.to_string()))?;
     let format = term_format(params.get("format").unwrap_or("json"))?;
+    if req.inferences && format.is_some() {
+        return Err(bad("materialized term reads require JSON source metadata"));
+    }
     let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
     blocking(move || {
         let page = ds
@@ -1248,7 +1388,7 @@ pub(super) async fn term(
         let r = renderer(&ds);
         let Some((fmt, mime, ext)) = format else {
             let j = onto::wire::term_body(&ds.name, &page, &r);
-            return tagged(&ds, &headers, page.commit, "owl-term", j);
+            return browse_tagged(&ds, &headers, page.commit, "owl-term", j, req.inferences);
         };
         let body: Vec<u8> = if ext == "ofn" {
             let header = owl::Header::default();

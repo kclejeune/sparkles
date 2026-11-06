@@ -152,12 +152,13 @@ entities. The Manchester fields complete a longer kind through the entity search
 server's Manchester reader resolves its names. This is item 725, whose measurements are in
 the [web UI scale report](../../benchmarks/web-ui-scale/README.md).
 
-**Inferred tree.** The **Inferred** switch reveals the class taxonomy pane beside the
-asserted tree without computing. A deliberate **Classify tree** action fills it with the
-actual EL, Horn or disjunctive result of [F24](../F24-owl-classification/README.md). Its nodes are the
-classifier's equivalence classes, so equivalent classes share a node, and the
-unsatisfiable classes sit under `owl:Nothing`. Property and individual trees show the
-asserted hierarchy only.
+**Inferred tree.** The **Inferred** switch reads kept named-class roots and expanded
+levels beside the asserted tree without computing. Equivalent classes share a node,
+and unsatisfiable classes sit under `owl:Nothing`. A deliberate **Classify tree** action
+retains the full-taxonomy POST flow with the actual EL, Horn or disjunctive result of
+[F24](../F24-owl-classification/README.md). Matching fresh RDFS or OWL RL materializations
+also supply bounded property hierarchies and named individual types. General
+classifier-backed property and individual entailments remain under items 588 and 609.
 
 **Frame.** Selecting an entity opens its frame. The frame lists the entity's annotations,
 its characteristics as checkboxes for properties, and its axioms in sections such as
@@ -574,6 +575,20 @@ before assembling pages. The full-tree transfer is not claimed bounded by frame 
 Each frame part has a 1,000-row browser display cap and reports unread totals. Historical
 names fall back to complete IRIs when no trustworthy prefix map is available.
 
+The inferred class hierarchy now reads kept roots and expanded children in bounded GET
+pages. Equivalent selections reveal their canonical group while retaining the actual
+selected IRI. Browse and Workbench also show materialized object/data-property hierarchies,
+individual named-type groups and read-only derived frame rows from a matching fresh RDFS
+or OWL RL producer. The hierarchy reduces transitive closure edges between equivalence
+groups. Regions at one displayed revision share a producer pin and refuse replacement,
+while source and entity changes abort and discard prior reads. Missing or stale sources
+remain visible failures and never start implicit computation. Actual inferred-graph
+provenance and duplicate asserted facts are shown. Profile completeness, consistency and
+arbitrary-axiom explanations remain unknown or unavailable. General classifier-backed
+entailments and matching F24 justifications remain in items 588, 622 and 609. The existing
+mapper and exact-total scans can cost more than a page's output size, and this phase
+establishes no new cold or warm latency claim.
+
 Item 734 reworked the term page's layout without a server change. A right rail of cards holds
 Metadata, with the cross-references as Identifiers by database and Download as the card's last
 part, and then Hierarchy, which keeps its place across Tree and Graph and no longer moves between
@@ -591,12 +606,13 @@ kind in place of a table, with hidden labels behind their toggle. Identifiers sa
 page already has for them, and keep the exact value as their title. Typed literals show their exact value with a datatype chip,
 and copied Manchester text keeps its syntax. A phone puts Metadata and Hierarchy before Axioms.
 
-**Remaining work.** Item 622 still covers general inferred frames/hierarchy integration
-and explanation links dependent on F24 justifications. Property and individual trees
-remain in item 609, general entity/axiom reads with classification in item 588, search
-at a past state in item 658 and other servers' term pages in item 461. This named-class
-read phase does not expose generic entailments, run a classifier on a read miss or use
-RL witnesses as classification explanations.
+**Remaining work.** Item 622 still covers general classifier-backed inferred axiom
+frames and explanation links dependent on matching F24 justifications. Classifier-backed
+property and individual entailments remain in item 609, general entity and axiom reads
+with classification in item 588, search at a past state in item 658 and other servers'
+term pages in item 461. The kept named-class and strict materialization-backed slices
+do not complete these parent items, compute on a read miss or use RL witnesses as
+classification explanations.
 
 ### Rendering preferences
 

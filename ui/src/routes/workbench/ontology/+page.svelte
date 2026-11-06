@@ -18,6 +18,10 @@
   import * as api from '$lib/api';
   import { preferredLabel } from '$lib/rendering';
   import ClassificationFrame from '$components/ClassificationFrame.svelte';
+  import InferredTreeView from '$components/InferredTree.svelte';
+  import MaterializedFrame from '$components/MaterializedFrame.svelte';
+  import { InferredPins } from '$lib/inferred-read';
+  import type { InferredKind } from '$lib/inferred-tree.svelte';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { branchParam, MAIN, onBranch } from '$lib/branches';
@@ -129,6 +133,11 @@
   const selected = $derived(q.get('iri'));
   const view = $derived(q.get('view') === 'usage' ? 'usage' : 'frame');
   const inferredOn = $derived(q.get('inferred') === '1');
+  const inferredKind = $derived<InferredKind | null>(
+    kindTab && ['Class', 'ObjectProperty', 'DataProperty', 'NamedIndividual'].includes(kindTab)
+      ? (kindTab as InferredKind)
+      : null,
+  );
   const prefixes = $derived(app.prefixes(name));
   // the entity on screen is the context of a question asked from the Ask drawer
   useAskContext(() =>
@@ -163,6 +172,9 @@
 
   // --- what the page read -------------------------------------------------------------
   let summary = $state<OntologySummary | null>(null);
+  const inferredPins = $derived(
+    new InferredPins(JSON.stringify([target, graph, sel.imports, summary?.commit])),
+  );
   let etag = $state<string | null>(null);
   let loadError = $state<api.ApiError | Error | null>(null);
   let loading = $state(false);
@@ -1519,7 +1531,7 @@
                     : `New ${KIND_SINGULAR[kindTab]}`}><Icon name="plus" size={13} /> New</button
                 >
               {/if}
-              {#if kindTab === 'Class'}
+              {#if inferredKind}
                 <label class="inferred-toggle"
                   ><input
                     type="checkbox"
@@ -1537,9 +1549,9 @@
                 ><Icon name="key" size={13} /></button
               >
             </div>
-            <div class="tree-cols" class:dual={kindTab === 'Class' && inferredOn}>
+            <div class="tree-cols" class:dual={!!inferredKind && inferredOn}>
               <div class="tree-col">
-                {#if kindTab === 'Class' && inferredOn}<h2 class="col-title">Asserted</h2>{/if}
+                {#if inferredKind && inferredOn}<h2 class="col-title">Asserted</h2>{/if}
                 <div class="tree-scroll">
                   {#if (level || kindTab === 'NamedIndividual') && filtered}
                     {#if kindTab === 'NamedIndividual'}<p class="faint small">
@@ -1632,58 +1644,72 @@
                   {/if}
                 </div>
               </div>
-              {#if kindTab === 'Class' && inferredOn}
+              {#if inferredKind && inferredOn}
                 <div class="tree-col">
-                  <h2 class="col-title">
-                    Inferred
-                    {#if classification}<span class="faint">
-                        {classification.complete
-                          ? `${classification.tier?.toUpperCase() ?? 'Classification'} · commit ${classification.commit}`
-                          : `${fmtInt(classification.excludedCount)} omitted or partly used axioms · commit ${classification.commit}`}</span
-                      >{/if}
-                  </h2>
-                  <button
-                    class="btn sm ghost"
-                    disabled={classifying || !summary}
-                    onclick={() => void classify()}>Classify tree</button
-                  >
-                  <p class="faint">This explicit action reads the full taxonomy in POST pages.</p>
-                  {#if classification?.nodesTruncated}<p class="note">
-                      The browser's taxonomy display limit was reached.
-                    </p>{/if}
                   <div class="tree-scroll">
-                    {#if classifying && !inferred}<p class="faint">
-                        <span class="spinner"></span> Classifying…
-                      </p>{/if}
-                    {#if classifyError}<p class="error-box" role="alert">{classifyError}</p>{/if}
-                    {#if inferred}
-                      {#if classification && !classification.consistent}
-                        <p class="error-box" role="alert">
-                          The ontology is inconsistent, so every class is unsatisfiable.
-                        </p>
-                      {/if}
-                      <OntoTree
-                        label="Classes (inferred)"
-                        roots={inferred.tree.roots}
-                        children={(id) => inferred?.tree.children.get(id) ?? []}
-                        name={inferredName}
-                        onview={(ids) => {
-                          for (const id of ids)
-                            for (const c of inferred?.classesOf.get(id) ?? [])
-                              inferredBatch.want(c);
-                        }}
-                        badge={(id) => (id === 'n:1' ? 'unsatisfiable' : null)}
-                        open={openSet('inferred')}
-                        selected={selected ? (inferred.nodeOf.get(selected) ?? null) : null}
-                        keep={inferredKeep}
-                        onselect={(id) => {
-                          const c = inferred?.classesOf.get(id)?.[0];
-                          if (c) void nav({ iri: c });
-                        }}
-                        ontoggle={(id) => toggle('inferred', id)}
-                      />
-                    {/if}
+                    <InferredTreeView
+                      {target}
+                      {graph}
+                      imports={sel.imports}
+                      commit={summary?.commit ?? null}
+                      kind={inferredKind}
+                      {selected}
+                      pins={inferredPins}
+                      onopen={(iri) => nav({ iri })}
+                    />
                   </div>
+                  {#if kindTab === 'Class'}
+                    <h2 class="col-title">
+                      Inferred
+                      {#if classification}<span class="faint">
+                          {classification.complete
+                            ? `${classification.tier?.toUpperCase() ?? 'Classification'} · commit ${classification.commit}`
+                            : `${fmtInt(classification.excludedCount)} omitted or partly used axioms · commit ${classification.commit}`}</span
+                        >{/if}
+                    </h2>
+                    <button
+                      class="btn sm ghost"
+                      disabled={classifying || !summary}
+                      onclick={() => void classify()}>Classify tree</button
+                    >
+                    <p class="faint">This explicit action reads the full taxonomy in POST pages.</p>
+                    {#if classification?.nodesTruncated}<p class="note">
+                        The browser's taxonomy display limit was reached.
+                      </p>{/if}
+                    <div class="tree-scroll">
+                      {#if classifying && !inferred}<p class="faint">
+                          <span class="spinner"></span> Classifying…
+                        </p>{/if}
+                      {#if classifyError}<p class="error-box" role="alert">{classifyError}</p>{/if}
+                      {#if inferred}
+                        {#if classification && !classification.consistent}
+                          <p class="error-box" role="alert">
+                            The ontology is inconsistent, so every class is unsatisfiable.
+                          </p>
+                        {/if}
+                        <OntoTree
+                          label="Classes (inferred)"
+                          roots={inferred.tree.roots}
+                          children={(id) => inferred?.tree.children.get(id) ?? []}
+                          name={inferredName}
+                          onview={(ids) => {
+                            for (const id of ids)
+                              for (const c of inferred?.classesOf.get(id) ?? [])
+                                inferredBatch.want(c);
+                          }}
+                          badge={(id) => (id === 'n:1' ? 'unsatisfiable' : null)}
+                          open={openSet('inferred')}
+                          selected={selected ? (inferred.nodeOf.get(selected) ?? null) : null}
+                          keep={inferredKeep}
+                          onselect={(id) => {
+                            const c = inferred?.classesOf.get(id)?.[0];
+                            if (c) void nav({ iri: c });
+                          }}
+                          ontoggle={(id) => toggle('inferred', id)}
+                        />
+                      {/if}
+                    </div>
+                  {/if}
                 </div>
               {/if}
             </div>
@@ -1809,7 +1835,18 @@
                       iri={selected}
                       commit={frameCommit}
                       items={frameItems}
+                      pins={frameCommit === summary?.commit ? inferredPins : undefined}
                       onopen={(iri) => nav({ iri, view: null })}
+                    />
+                  {:else if ['ObjectProperty', 'DataProperty', 'NamedIndividual'].includes(frameKind)}
+                    <MaterializedFrame
+                      {target}
+                      {graph}
+                      imports={sel.imports}
+                      iri={selected}
+                      commit={frameCommit}
+                      items={frameItems}
+                      pins={frameCommit === summary?.commit ? inferredPins : undefined}
                     />
                   {/if}
                 {/key}

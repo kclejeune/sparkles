@@ -511,9 +511,10 @@ branch's commits newest first in the manner of WebProtégé's changes. Each comm
 what it changed in the graph as a change set, one block a subject named by its label with
 each added or removed property and value on a line, and links to the commit's full diff. Every other view of a commit's, a merge's or a preview's changes shows the same change
 set, with the signed N-Quads lines behind a **N-Quads** switch. **Inferred** reveals the
-taxonomy pane beside the asserted class tree, and **Classify tree** explicitly fills it
-with the classifier's actual tier and outcome
-([screenshot](../images/ontology-inferred.png)). Every edit is previewed as a dry run and
+kept hierarchy beside the asserted class tree. It reads roots and expanded levels from
+an existing result, with the classifier's actual tier and outcome
+([screenshot](../images/ontology-inferred.png)). **Classify tree** remains a deliberate
+action that computes and displays a full taxonomy through bounded POST pages. Every edit is previewed as a dry run and
 committed with the commit it was previewed against
 ([screenshot](../images/ontology-preview.png)), on the current branch or on a session
 branch that **Start session** creates. Undo and redo are previewed commits too, and
@@ -578,8 +579,18 @@ visible for empty frames and distinguishes unavailable, running, mismatch, missi
 unsatisfiable, inconsistent, excluded and partial outcomes. A deliberate **Classify** click
 requests one bounded frame projection when no matching result is available, including
 useful authorized clauses for restricted views. Such isolated output has no implicit
-reclassification continuation. A SKOS concept has no Axioms section, since SKOS statements are
-not axioms. **See also**, **Mappings**, **What links here** and **In other datasets** follow as
+reclassification continuation. Property and individual pages also read materialized frames and hierarchies from an
+existing fresh RDFS or OWL RL producer. These views require complete readable inputs
+matching the producer scope. They retain an exact source/revision pin, label actual
+inferred-graph provenance and distinguish facts also asserted. Disabled or incomplete
+change logs and reverted input changes are conservatively refused when freshness cannot
+be proved. Counts and direct-edge reduction can inspect more facts than the bounded
+output, and no new latency guarantee follows from the page size. The
+[materialized property view](../images/ontology-materialized-properties.png) shows a
+direct property hierarchy beside its read-only inferred axioms. The
+[individual page](../images/browse-materialized-individual.png) shows indirect named
+types and the recorded producer's scope and revision. A SKOS concept has no
+Axioms section, since SKOS statements are not axioms. **See also**, **Mappings**, **What links here** and **In other datasets** follow as
 sections of their own, and **All other statements** folds away every statement the other sections
 do not show.
 
@@ -767,8 +778,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   preview cannot say whether a fix resolves its result, item 121. Callers whose grants
   cover only some graphs get no overlay, item 75.
 * The ontology editor pages class and property levels and individuals by asserted type.
-  Only the class tree has an inferred view, 609, and
-  the IRI policy is kept in the browser per dataset, 610. Rename covers the graph the
+  Its inferred class tree reads kept roots and expanded levels. Fresh recorded RDFS or
+  OWL RL materializations supply object/data-property groups and indirect named
+  individual types beside asserted data. Classifier-backed property and individual
+  entailments remain under item 609 and F24. The IRI policy is kept in the browser per
+  dataset, 610. Rename covers the graph the
   page reads and not IRIs inside triple terms, under item 457's refactoring phase. The
   editable schema diagram is a further U12 phase of item 457.
 * The DL Query tab's instances come from a classification with the assertions, which
@@ -782,8 +796,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   **Read again** only read, preserve a result/commit pin and report errors or replacement
   without presenting incomplete pages as an empty success. Each part displays at most
   1,000 rows, and isolated projections report their smaller fixed samples and totals.
-  Property/individual entailments, inferred axiom listings and explanation links remain
-  in items 588, 622, 609 and F24. The full class-tree **Classify tree** action is explicit
+  Property and individual frames separately show materialized facts with actual
+  inferred-graph provenance, including duplicates also asserted. The displayed tree and
+  frame share an exact producer/revision pin. Restricted, missing, stale or replaced
+  sources fail visibly and never run reasoning. Producer completeness and consistency
+  are unknown, and explanations are unavailable. General classifier-backed inferred
+  axiom listings and explanation links remain in items 588, 622, 609 and F24. The full class-tree **Classify tree** action is explicit
   and reads legacy POST pages; a toggle or `inferred=1` URL never starts it. Its later
   pages and labels stay pinned to the original commit, and changed input/content refuses
   assembly. The legacy transfer can include a large equivalence node and is distinct
@@ -812,8 +830,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the thesaurus editor, and property assertions, keys and chains have no form of their
   own and are added as an axiom, 706. Its first preview on a large
   ontology waits for the axioms route to open the whole ontology, 707. Its
-  hierarchy shows asserted axioms, while named-class frames add bounded kept taxonomy
-  reads and general inferred frames remain in item 622. Its search reads
+  hierarchy shows asserted axioms alongside bounded kept class groups or strict
+  materialization-backed property/individual groups. Derived frames remain read only,
+  and general classifier-backed inferred frames remain in item 622. Its search reads
   the head of a branch, so a page at a past state has no search box, item 658. It shows
   entities using the shared rendering preferences. Reuse is looked up in the other datasets of the same server,
   and other servers' term pages are item 461. The landing page offers axiom counts and

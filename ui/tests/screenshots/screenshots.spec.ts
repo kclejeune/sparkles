@@ -335,6 +335,85 @@ test('shell-phone', async ({ browser }) => {
   await ctx.close();
 });
 
+// A deliberately prepared producer supplies the materialized views. Loading either page
+// only reads it; it does not start a classification or rule job.
+test.describe('materialized ontology views', () => {
+  const ds = 'screenshots-inferred';
+  const ns = 'http://example.org/music#';
+  test.beforeAll(async ({ request }) => {
+    const made = await request.post('/$/datasets', {
+      data: { dbName: ds, dbType: 'persistent' },
+    });
+    expect(made.ok(), await made.text()).toBe(true);
+    const loaded = await request.post(`/${ds}/data`, {
+      headers: { 'Content-Type': 'text/turtle' },
+      data: `@prefix : <${ns}> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:relatedTo a owl:ObjectProperty; rdfs:label "related to" .
+:associatedWith a owl:ObjectProperty; rdfs:label "associated with";
+  rdfs:subPropertyOf :relatedTo .
+:performsIn a owl:ObjectProperty; rdfs:label "performs in";
+  rdfs:comment "Relates a musician to an ensemble in which they perform.";
+  rdfs:subPropertyOf :associatedWith .
+:Artist a owl:Class; rdfs:label "Artist" .
+:Musician a owl:Class; rdfs:label "Musician"; rdfs:subClassOf :Artist .
+:Pianist a owl:Class; rdfs:label "Pianist"; rdfs:subClassOf :Musician .
+:ada a owl:NamedIndividual, :Pianist; rdfs:label "Ada";
+  rdfs:comment "A pianist whose indirect named types come from the recorded RDFS result.";
+  :performsIn :quartet .
+:quartet a owl:NamedIndividual; rdfs:label "The quartet" .`,
+    });
+    expect(loaded.ok(), await loaded.text()).toBe(true);
+    const reasoned = await request.post(`/$/reason/${ds}`, { data: { profile: 'rdfs' } });
+    expect(reasoned.ok(), await reasoned.text()).toBe(true);
+    const task = await reasoned.json();
+    await expect
+      .poll(async () => (await (await request.get(`/$/tasks/${task.id}`)).json()).state)
+      .toBe('done');
+  });
+  test.afterAll(async ({ request }) => {
+    const removed = await request.delete(`/$/datasets/${ds}`);
+    expect(removed.ok(), await removed.text()).toBe(true);
+  });
+
+  test('ontology-materialized-properties', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1100 });
+    await page.goto(
+      `/ui/workbench/ontology?ds=${ds}&kind=ObjectProperty&inferred=1&iri=${encodeURIComponent(ns + 'performsIn')}`,
+    );
+    const tree = page.getByRole('tree', {
+      name: 'Object properties (materialized inferred)',
+      exact: true,
+    });
+    await expect(tree.getByRole('button', { name: 'performs in', exact: true })).toBeVisible();
+    const frame = page.getByRole('region', { name: 'Materialized inferred axioms', exact: true });
+    await expect(frame).toContainText('SubObjectPropertyOf');
+    await expect(frame).toContainText('Completeness and consistency are unknown');
+    await frame.scrollIntoViewIfNeeded();
+    await expect(
+      frame.getByRole('heading', { name: 'Materialized inferred axioms' }),
+    ).toBeVisible();
+    await expect(
+      frame.locator('li code').filter({ hasText: 'SubObjectPropertyOf' }).first(),
+    ).toBeVisible();
+    await shoot(page, 'ontology-materialized-properties');
+  });
+
+  test('browse-materialized-individual', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1100 });
+    await page.goto(`/ui/browse?ds=${ds}&iri=${encodeURIComponent(ns + 'ada')}`);
+    const frame = page.getByRole('region', { name: 'Materialized inferred axioms', exact: true });
+    await expect(frame).toContainText('ClassAssertion');
+    await expect(frame).toContainText('ClassAssertion(:Artist :ada)');
+    await expect(frame).toContainText('read only');
+    await expect(
+      page.getByRole('region', { name: 'Individuals (materialized inferred types)', exact: true }),
+    ).toContainText('Musician');
+    await shoot(page, 'browse-materialized-individual');
+  });
+});
+
 // The ontology browser on a small OBO-style ontology of its own (tests/browse-fixture.ts):
 // an entity's page at 1440 pixels, the landing page, and the entity's page on a phone.
 test.describe('browse', () => {
@@ -396,7 +475,7 @@ test.describe('browse', () => {
     const page = await ctx.newPage();
     await page.goto(term);
     await expect(page.getByRole('heading', { level: 1, name: 'mitochondrion' })).toBeVisible();
-    await expect(page.getByRole('complementary', { name: 'Hierarchy' })).toContainText(
+    await expect(page.getByRole('complementary', { name: 'Hierarchy', exact: true })).toContainText(
       'cellular component',
     );
     await shoot(page, 'browse-phone');

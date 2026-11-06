@@ -91,6 +91,12 @@ datasets = {{ ont = "read" }}
 }
 
 fn server() -> (tempfile::TempDir, Router) {
+    let (dir, st, app) = server_state();
+    drop(st);
+    (dir, app)
+}
+
+fn server_state() -> (tempfile::TempDir, Arc<AppState>, Router) {
     let dir = tempfile::tempdir().unwrap();
     let f = Fixture {
         extra: users(),
@@ -111,7 +117,57 @@ fn server() -> (tempfile::TempDir, Router) {
         )])
         .unwrap();
     st.set_phase(crate::obs::Phase::Ready);
-    (dir, router(st))
+    (dir, st.clone(), router(st))
+}
+
+#[tokio::test]
+async fn strict_materialized_browser_never_reveals_hidden_import_inputs() {
+    let (_dir, state, app) = server_state();
+    let ds = state.get("ont").unwrap();
+    ds.dataset
+        .reasoning()
+        .run(&sparkles::reasoning::ReasonRequest {
+            profile: sparkles_reasoner::Profile::Rdfs,
+            inputs: sparkles_reasoner::inputs::Inputs {
+                data_graphs: vec![sparkles_reasoner::inputs::GraphRef::Named(
+                    "http://ex/open".into(),
+                )],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    let commit = ds.store.head_commit().seq;
+    let selection = format!("{OPEN}&at=commit:{commit}&inferences=true");
+    let full = as_user(
+        &app,
+        "ofull",
+        "GET",
+        &format!("/$/ontology/ont/hierarchy?{selection}"),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(full.status, StatusCode::OK, "{}", full.text());
+    assert!(full.text().contains("http://ex/secret"));
+    let pin = full.json()["inferenceSource"]["sourceId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for route in ["hierarchy", "individuals", "term"] {
+        let extra = if route == "term" {
+            "&iri=http%3A%2F%2Fex%2FvisibleIndividual"
+        } else {
+            ""
+        };
+        let uri = format!("/$/ontology/ont/{route}?{selection}&sourceId={pin}{extra}");
+        let denied = as_user(&app, "oopen", "GET", &uri, &json!(null)).await;
+        assert_eq!(denied.status, StatusCode::FORBIDDEN, "{}", denied.text());
+        assert_eq!(denied.headers[header::CACHE_CONTROL], "no-store");
+        for hidden in ["http://ex/secret", "Hidden", "sourceId", "sha256:"] {
+            assert!(!denied.text().contains(hidden), "{}", denied.text());
+        }
+    }
+    assert_eq!(ds.store.head_commit().seq, commit);
 }
 
 const OPEN: &str = "graph=http%3A%2F%2Fex%2Fopen";
