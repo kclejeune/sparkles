@@ -813,6 +813,151 @@ fn a_memory_stop_answers_in_part() {
     assert!(answered > 0, "no cap gave a partial answer");
 }
 
+/// A refused completion must release its unadmitted state before unrestricted reuse.
+fn check_memory_recovery(k: &mut Classifier, full: &Classification, cs: &[Class], threads: usize) {
+    let recovered = k
+        .classify(&Limits {
+            threads,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(k.excluded().is_empty());
+    assert!(recovered.complete && recovered.incomplete.is_empty());
+    assert_eq!(recovered.consistent, full.consistent);
+    assert_eq!(recovered.consistency, full.consistency);
+    assert_eq!(pairs(&recovered.taxonomy, cs), pairs(&full.taxonomy, cs));
+    assert_eq!(
+        recovered.taxonomy.unsatisfiable().collect::<BTreeSet<_>>(),
+        full.taxonomy.unsatisfiable().collect::<BTreeSet<_>>()
+    );
+    assert_eq!(recovered.stats.memory, full.stats.memory);
+    assert!(recovered.stats.peak_memory >= recovered.stats.memory);
+    assert_eq!(recovered.stats.tier, Tier::Disjunctive);
+    assert!(!recovered.stats.dl_over_budget);
+}
+
+#[test]
+fn partial_memory_completion_preserves_tier_and_reuse() {
+    let ax = axioms(&many(if cfg!(debug_assertions) { 40 } else { 120 }, false));
+    let cs = classes(&ax);
+    for threads in [1, 8] {
+        let full = Classifier::of(&ax)
+            .classify(&Limits {
+                threads,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(full.complete);
+        assert_eq!(full.stats.tier, Tier::Disjunctive);
+        let mut partials = 0;
+        let mut refused = 0;
+        // Keep the original finite grid, and include the observed completed-saturation refusal.
+        for cap in (1..20)
+            .map(|f| full.stats.peak_memory * f / 20)
+            .chain([1_635_748])
+        {
+            let mut k = Classifier::of(&ax);
+            match k.classify(&Limits {
+                threads,
+                partial: true,
+                max_memory: Some(cap),
+                ..Limits::default()
+            }) {
+                Err(sparkles_owl::classify::Error::Memory { limit, used }) => {
+                    assert_eq!(limit, cap);
+                    assert!(used > cap);
+                    refused += 1;
+                }
+                Err(e) => panic!("threads {threads}, cap {cap}: {e:?}"),
+                Ok(out) => {
+                    assert!(
+                        !out.stats.dl_over_budget,
+                        "threads {threads}, cap {cap}: weaker tier"
+                    );
+                    assert_eq!(out.stats.tier, Tier::Disjunctive);
+                    assert!(k.excluded().is_empty());
+                    check_partial(&out, &full, &cs);
+                    if !out.complete {
+                        partials += 1;
+                        assert!(out.stats.conclusions > 0);
+                        assert!(out.stats.peak_memory > cap);
+                    }
+                }
+            }
+            check_memory_recovery(&mut k, &full, &cs, threads);
+        }
+        eprintln!("partial completion: threads={threads} partials={partials} refused={refused}");
+        assert!(partials > 0, "threads {threads}: no genuine partial answer");
+        assert!(refused > 0);
+    }
+}
+
+#[test]
+fn partial_memory_pool_and_taxonomy_refusals_preserve_tier_and_reuse() {
+    let ax = axioms(&many(if cfg!(debug_assertions) { 40 } else { 120 }, false));
+    let cs = classes(&ax);
+    for threads in [1, 8] {
+        let limits = Limits {
+            threads,
+            ..Limits::default()
+        };
+        let full = Classifier::of(&ax).classify(&limits).unwrap();
+        let saturated = Classifier::of(&ax).saturate(&limits).unwrap();
+        // This cap admits completed saturation's retained state, but not its taxonomy.
+        let taxonomy_cap = full.stats.memory - 1;
+        assert!(taxonomy_cap >= saturated.stats.memory);
+        assert!(full.stats.taxonomy_memory > 0);
+        let mut k = Classifier::of(&ax);
+        assert!(
+            matches!(k.classify(&Limits { partial: true, max_memory: Some(taxonomy_cap), ..limits.clone() }),
+            Err(sparkles_owl::classify::Error::Memory { limit, used }) if limit == taxonomy_cap && used > limit)
+        );
+        check_memory_recovery(&mut k, &full, &cs, threads);
+
+        // Model a cumulative shared grant, without a hard-limit shortcut.
+        let cap = 1_635_748;
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let denied = Arc::new(AtomicUsize::new(0));
+        let (granted, rejected) = (accepted.clone(), denied.clone());
+        let mut k = Classifier::of(&ax);
+        let out = k.classify(&Limits {
+            partial: true,
+            charge: Some(Arc::new(move |n| {
+                let ok = granted
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
+                        old.checked_add(n).filter(|next| *next <= cap)
+                    })
+                    .is_ok();
+                if !ok {
+                    rejected.fetch_add(1, Ordering::SeqCst);
+                }
+                ok
+            })),
+            ..limits
+        });
+        assert!(accepted.load(Ordering::SeqCst) <= cap);
+        assert!(denied.load(Ordering::SeqCst) > 0);
+        match out {
+            Err(sparkles_owl::classify::Error::Memory { limit, .. }) => {
+                assert_eq!(limit, usize::MAX)
+            }
+            Err(e) => panic!("threads {threads}: {e:?}"),
+            Ok(out) => {
+                assert_eq!(out.stats.tier, Tier::Disjunctive);
+                assert!(!out.stats.dl_over_budget);
+                assert!(k.excluded().is_empty());
+                check_partial(&out, &full, &cs);
+            }
+        }
+        eprintln!(
+            "pool completion: threads={threads} accepted={} denials={}",
+            accepted.load(Ordering::SeqCst),
+            denied.load(Ordering::SeqCst)
+        );
+        check_memory_recovery(&mut k, &full, &cs, threads);
+    }
+}
+
 /// An intersection of `n` classes Z below a union, each of which holds of A in two cases,
 /// so that Hyper has 2^n choices of premises. The other cases' classes come first, so that
 /// they rank below the Z classes.

@@ -426,8 +426,8 @@ pub struct Saturation {
     no_counting: bool,
     /// set by a run of Tier D that passed its bound on derived conclusions
     dl_worked: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// set when a partial answer of Tier D passed the budget, so that the run fails with
-    /// the error instead of classifying again without Tier D
+    /// set when a Tier D classification requesting partial answers cannot fit its
+    /// completed or stopped result, so the error does not retry without Tier D
     partial_over: bool,
     /// what the last run's partial answer leaves open: the classes not complete and the
     /// consistency
@@ -1776,7 +1776,12 @@ impl Saturation {
         // have stopped so both paths report the same retained-state estimate.
         let held = self.retained_bytes(held_bytes, roots.capacity() * 4, world_bytes);
         drop(ax);
-        totals.peak = Self::admit_retained(held, totals.peak, limits)?;
+        totals.peak = Self::admit_retained(held, totals.peak, limits).inspect_err(|_| {
+            if partial {
+                self.partial_over = true;
+                self.dirty = true;
+            }
+        })?;
         if !with_taxonomy {
             stats.memory = held;
             stats.peak_memory = totals.peak.max(held);
@@ -1810,8 +1815,11 @@ impl Saturation {
         let (taxonomy, tax_bytes) = built.map_err(|h| match h {
             taxonomy::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
             taxonomy::Halt::Memory(bytes) => {
-                // a partial answer that does not fit is not a reason for another tier
-                self.partial_over = open.is_some();
+                // The requested partial contract also applies after saturation completed.
+                if partial {
+                    self.partial_over = true;
+                    self.dirty = true;
+                }
                 Error::Memory {
                     limit: limits.max_memory.unwrap_or(usize::MAX),
                     used: held + bytes,
