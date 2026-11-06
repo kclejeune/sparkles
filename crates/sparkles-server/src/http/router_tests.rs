@@ -1466,3 +1466,49 @@ async fn shacl_targets_name_stored_blank_nodes() {
     .await;
     assert_eq!(many["results"].as_array().unwrap().len(), 1, "{many}");
 }
+
+/// Every ontology route retains the explicit feature-disabled response.
+#[cfg(not(feature = "ontology"))]
+#[tokio::test]
+async fn ontology_routes_report_the_disabled_feature() {
+    let s = server();
+    for (method, suffix) in [
+        ("GET", ""),
+        ("GET", "/axioms"),
+        ("POST", "/axioms"),
+        ("GET", "/entities"),
+        ("GET", "/entity"),
+        ("DELETE", "/entity"),
+        ("POST", "/check"),
+        ("POST", "/classify"),
+        ("POST", "/parse"),
+        ("POST", "/dl-query"),
+        ("GET", "/diff"),
+        ("GET", "/search"),
+        ("GET", "/hierarchy"),
+        ("GET", "/individuals"),
+        ("GET", "/classification"),
+        ("GET", "/term"),
+    ] {
+        let uri = format!("/$/ontology/ds{suffix}");
+        let response = send(
+            &s.app,
+            Request::builder()
+                .method(method)
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::NOT_IMPLEMENTED,
+            "{method} {uri}: {}",
+            response.text()
+        );
+        assert_eq!(
+            response.json()["error"],
+            "built without the `ontology` feature"
+        );
+    }
+}

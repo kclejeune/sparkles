@@ -425,7 +425,7 @@ minute or two.
 
 `mise run test:features` (`scripts/test-features.sh`) runs the server's unit and
 integration tests with the default features off and one optional feature set on, for
-each of `none`, `auth`, `mcp`, `memory`, `graphql` and `shacl`. The ordinary test run
+each of `none`, `auth`, `reasoning,auth`, `mcp`, `memory`, `graphql` and `shacl`. The ordinary test run
 builds the server with its default features only, so a test that asserts a route or
 command that exists only with some feature passes there and fails under another build.
 This task is the test counterpart of `lint:features`. The script runs every set even
@@ -441,10 +441,10 @@ and `mise run ci:fast` leaves it out, because every set compiles the server crat
 A set takes one to two minutes when the dependencies are warm, and the first run of a set
 takes several minutes more.
 
-The server currently fails to compile with ontology disabled because its HTTP route
-list references handlers absent from that build. Reasoning/auth-only unit tests also
-reference an MCP-only GraphRAG helper. Roadmap item 758 covers restoring these optional
-builds and their regression coverage.
+Without the `ontology` feature, the ontology HTTP routes remain registered and answer
+`501` after the usual request authorization. The `reasoning,auth` test set exercises
+reasoning and authorization with ontology and MCP disabled, including cached reasoning
+and stored-answer visibility.
 
 `mise run lint:doc-paths` (`scripts/check-doc-paths.py`) checks that every
 `crates/sparkles…` path cited in the README, `docs/*.md`, `docs/specs` and the comments of

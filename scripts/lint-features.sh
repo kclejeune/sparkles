@@ -35,6 +35,7 @@ server=(
   embed-local
   mapping-sqlite
   mapping-parquet
+  "reasoning,auth"
   "mcp,shacl"
   "mcp,shex"
   "mcp,fmt"

@@ -405,7 +405,7 @@ mbx clippy $pkgs --all-targets -- -D warnings
 [tasks."lint:features"]
 sources = ["@group:rust", "@group:ui", "scripts/lint-features.sh"]
 outputs = []
-description = "Clippy (warnings are errors) over feature combinations: the server with no optional feature, each default feature alone (geo-epsg included), and the pairs that share code such as mcp with shacl, shex or fmt and graphql with shacl; the library crates with their features off"
+description = "Clippy (warnings are errors) over feature combinations: the server with no optional feature, each default feature alone (geo-epsg included), and the pairs that share code such as reasoning with auth, mcp with shacl, shex or fmt and graphql with shacl; the library crates with their features off"
 # ui:build first, as for lint: the server embeds ui/build
 depends = ["ui:build"]
 run = "scripts/lint-features.sh"
@@ -413,7 +413,7 @@ run = "scripts/lint-features.sh"
 [tasks."test:features"]
 sources = ["@group:rust", "@group:ui", "@group:docs", "testsuite/**", "scripts/test-features.sh"]
 outputs = []
-description = "The server's unit and integration tests with the default features off and one optional feature set on: none, auth, mcp, memory, graphql and shacl. Not part of ci:fast"
+description = "The server's unit and integration tests with the default features off and one optional feature set on: none, auth, reasoning+auth, mcp, memory, graphql and shacl. Not part of ci:fast"
 # ui:build first, as for lint: the server embeds ui/build
 depends = ["ui:build"]
 run = "scripts/test-features.sh"
