@@ -71,6 +71,40 @@ pub fn cache_sizes(cli: &Cli) -> CacheSizes {
     }
 }
 
+/// The separate process-wide table cache, when query-time reasoning is built.
+pub fn derived_table_cache_bytes(cli: &Cli) -> u64 {
+    #[cfg(feature = "reasoning")]
+    {
+        cli.derived_table_cache_mb << 20
+    }
+    #[cfg(not(feature = "reasoning"))]
+    {
+        let _ = cli;
+        0
+    }
+}
+
+/// Process-wide retained table estimates, rather than per-dataset usage or RSS.
+pub fn derived_table_cache_stats() -> Option<J> {
+    #[cfg(feature = "reasoning")]
+    {
+        let s = sparkles_reasoner::tables::snapshot();
+        Some(json!({
+            "scope": "process",
+            "enabled": s.capacity_bytes > 0,
+            "capacityBytes": s.capacity_bytes,
+            "estimatedBytes": s.estimated_bytes,
+            "tables": s.tables,
+            "hits": s.hits,
+            "misses": s.misses,
+        }))
+    }
+    #[cfg(not(feature = "reasoning"))]
+    {
+        None
+    }
+}
+
 /// The smallest pool the host-derived default produces.
 const MIN_POOL: u64 = 256 << 20;
 
@@ -114,7 +148,12 @@ pub fn available_memory() -> Option<u64> {
 /// The pool's capacity in bytes, or `None` for no pool. `flag` is
 /// `--total-query-memory-mb` (0 turns the pool off), `profile` the memory profile and
 /// `caches` the configured caches, which the default leaves out.
-pub fn pool_capacity(flag: Option<u64>, profile: Profile, caches: &CacheSizes) -> Option<u64> {
+pub fn pool_capacity(
+    flag: Option<u64>,
+    profile: Profile,
+    caches: &CacheSizes,
+    derived_tables: u64,
+) -> Option<u64> {
     if let Some(mb) = flag.or(profile.total_query_memory_mb()) {
         return (mb > 0).then_some(mb << 20);
     }
@@ -124,7 +163,8 @@ pub fn pool_capacity(flag: Option<u64>, profile: Profile, caches: &CacheSizes) -
         );
         return None;
     };
-    let caches = caches.blocks + caches.results + caches.service + caches.history;
+    let capacity = pool_capacity_for_memory(avail, caches, derived_tables);
+    let caches = configured_cache_bytes(caches, derived_tables);
     let half = avail.saturating_sub(caches) / 2;
     if half < MIN_POOL {
         tracing::warn!(
@@ -133,9 +173,24 @@ pub fn pool_capacity(flag: Option<u64>, profile: Profile, caches: &CacheSizes) -
             avail >> 20,
             caches >> 20
         );
-        return Some(MIN_POOL);
     }
-    Some(half)
+    Some(capacity)
+}
+
+fn configured_cache_bytes(caches: &CacheSizes, derived_tables: u64) -> u64 {
+    [
+        caches.blocks,
+        caches.results,
+        caches.service,
+        caches.history,
+        derived_tables,
+    ]
+    .into_iter()
+    .fold(0u64, u64::saturating_add)
+}
+
+fn pool_capacity_for_memory(available: u64, caches: &CacheSizes, derived_tables: u64) -> u64 {
+    (available.saturating_sub(configured_cache_bytes(caches, derived_tables)) / 2).max(MIN_POOL)
 }
 
 // ----------------------------------------------------------------- admission ------
@@ -506,6 +561,9 @@ pub fn report(st: &AppState) -> J {
             }));
         }
     }
+    if let Some(derived) = derived_table_cache_stats() {
+        caches["derivedTable"] = derived;
+    }
     let spill = match &st.spill {
         Some(s) => json!({
             "enabled": true,
@@ -660,14 +718,87 @@ mod tests {
     fn the_pool_size_comes_from_the_flag_then_the_profile_then_the_host() {
         let c = CacheSizes::default();
         assert_eq!(
-            pool_capacity(Some(64), Profile::Default, &c),
+            pool_capacity(Some(64), Profile::Default, &c, 0),
             Some(64 << 20)
         );
-        assert_eq!(pool_capacity(Some(0), Profile::Small, &c), None);
-        assert_eq!(pool_capacity(None, Profile::Small, &c), Some(2048 << 20));
+        assert_eq!(pool_capacity(Some(0), Profile::Small, &c, u64::MAX), None);
+        assert_eq!(
+            pool_capacity(None, Profile::Small, &c, u64::MAX),
+            Some(2048 << 20)
+        );
+        assert_eq!(
+            pool_capacity(Some(64), Profile::Default, &c, u64::MAX),
+            Some(64 << 20)
+        );
         if let Some(avail) = available_memory() {
-            let got = pool_capacity(None, Profile::Default, &c).unwrap();
+            let got = pool_capacity(None, Profile::Default, &c, 0).unwrap();
             assert!(got >= MIN_POOL && got <= avail.max(MIN_POOL), "{got}");
         }
+    }
+
+    #[test]
+    fn host_pool_reserves_the_derived_cache_without_overflow_or_underflow() {
+        let c = CacheSizes {
+            blocks: 0,
+            results: 0,
+            service: 0,
+            history: 0,
+        };
+        assert_eq!(pool_capacity_for_memory(2 << 30, &c, 512 << 20), 768 << 20);
+        assert_eq!(pool_capacity_for_memory(2 << 30, &c, 0), 1 << 30);
+        assert_eq!(pool_capacity_for_memory(64 << 20, &c, 128 << 20), MIN_POOL);
+        assert_eq!(
+            pool_capacity_for_memory(u64::MAX, &CacheSizes::default(), u64::MAX),
+            MIN_POOL
+        );
+    }
+
+    #[cfg(feature = "reasoning")]
+    #[test]
+    fn derived_table_cache_flag_preserves_defaults_and_rejects_overflow() {
+        std::thread::Builder::new()
+            .stack_size(crate::THREAD_STACK)
+            .spawn(|| {
+                for profile in ["default", "small"] {
+                    let cli =
+                        Cli::try_parse_from(["sparkles", "--memory-profile", profile, "serve"])
+                            .unwrap();
+                    assert_eq!(
+                        derived_table_cache_bytes(&cli),
+                        sparkles_reasoner::tables::DEFAULT_CAPACITY
+                    );
+                }
+                let cli =
+                    Cli::try_parse_from(["sparkles", "serve", "--derived-table-cache-mb", "0"])
+                        .unwrap();
+                assert_eq!(derived_table_cache_bytes(&cli), 0);
+                let maximum = (u64::MAX >> 20).to_string();
+                let cli = Cli::try_parse_from([
+                    "sparkles",
+                    "serve",
+                    "--derived-table-cache-mb",
+                    maximum.as_str(),
+                ])
+                .unwrap();
+                assert_eq!(derived_table_cache_bytes(&cli), (u64::MAX >> 20) << 20);
+                for bad in [
+                    "-1".to_string(),
+                    "not-a-size".to_string(),
+                    ((u64::MAX >> 20) + 1).to_string(),
+                ] {
+                    assert!(
+                        Cli::try_parse_from([
+                            "sparkles",
+                            "serve",
+                            "--derived-table-cache-mb",
+                            bad.as_str()
+                        ])
+                        .is_err()
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

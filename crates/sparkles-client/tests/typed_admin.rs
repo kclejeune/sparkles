@@ -272,3 +272,25 @@ async fn blocking_typed_calls_use_the_same_models() {
     .unwrap();
     task.abort();
 }
+
+#[test]
+fn derived_table_cache_accounting_is_optional_and_retains_full_width_counters() {
+    let cache = json!({
+        "scope": "process", "enabled": true, "capacityBytes": 268435456,
+        "estimatedBytes": 152, "tables": 1, "hits": u64::MAX, "misses": 2
+    });
+    let value = json!({"name": "ds", "quads": 3, "derivedTableCache": cache});
+    let stats: DatasetStats = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        stats.derived_table_cache.as_ref().unwrap().hits,
+        u64::MAX as i128
+    );
+    assert_eq!(serde_json::to_value(stats).unwrap(), value);
+    let global = json!({"datasets": {}, "derivedTableCache": cache});
+    let stats: sparkles_client::admin_types::FusekiStats =
+        serde_json::from_value(global.clone()).unwrap();
+    assert_eq!(serde_json::to_value(stats).unwrap(), global);
+    let restricted: DatasetStats =
+        serde_json::from_value(json!({"name": "ds", "quads": 3})).unwrap();
+    assert!(restricted.derived_table_cache.is_none());
+}

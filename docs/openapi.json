@@ -6609,6 +6609,9 @@
           "deltaInserts": {
             "type": "integer"
           },
+          "derivedTableCache": {
+            "$ref": "#/components/schemas/DerivedTableCache"
+          },
           "diskBytes": {
             "type": "integer"
           },
@@ -6798,6 +6801,49 @@
         "required": [
           "commit",
           "source"
+        ],
+        "type": "object"
+      },
+      "DerivedTableCache": {
+        "description": "Process-wide demand-table cache accounting. Present only when reasoning is built and the caller has the metrics permission.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#query-memory-pool"
+        },
+        "properties": {
+          "capacityBytes": {
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "estimatedBytes": {
+            "description": "The retained-table estimate, counting shared chunks per cached table and excluding caller-held evictions. Neither allocator usage nor RSS.",
+            "type": "integer"
+          },
+          "hits": {
+            "type": "integer"
+          },
+          "misses": {
+            "type": "integer"
+          },
+          "scope": {
+            "enum": [
+              "process"
+            ],
+            "type": "string"
+          },
+          "tables": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "scope",
+          "enabled",
+          "capacityBytes",
+          "estimatedBytes",
+          "tables",
+          "hits",
+          "misses"
         ],
         "type": "object"
       },
@@ -11557,6 +11603,9 @@
             },
             "description": "The counters of each dataset the caller may read, keyed by its path, such as `/ds`.",
             "type": "object"
+          },
+          "derivedTableCache": {
+            "$ref": "#/components/schemas/DerivedTableCache"
           }
         },
         "required": [
@@ -22100,6 +22149,9 @@
                   "entries"
                 ],
                 "type": "object"
+              },
+              "derivedTable": {
+                "$ref": "#/components/schemas/DerivedTableCache"
               },
               "history": {
                 "properties": {

@@ -82,6 +82,13 @@ callers and records the selected numeric user in its receipt.
   by all datasets, with per-dataset bytes, hits and misses
   ([X08](../specs/X08-disk-spill-and-server-memory.md#gates)). The `small` memory profile,
   set with `--memory-profile`, saves about 70 MiB of RSS at 10.5M triples.
+* Demand reasoning keeps derived tables in a separate process-wide cache.
+  `--derived-table-cache-mb` sets its retained-table estimate budget, with the existing
+  256 MiB default in both profiles and zero disabling retention. `/$/stats` and
+  `/$/server/memory` report its capacity, estimated bytes, tables, hits and misses to
+  callers with the metrics permission. A shared chunk counts for every cached table
+  retaining it, and a caller may keep an evicted table alive. These estimates do not
+  measure RSS or replace the memory budget of a derivation.
 * A query memory pool, set with `--total-query-memory-mb`, bounds the estimated memory of
   all queries and updates together. Requests wait in arrival order for a share, answer
   `503` with `Retry-After` after `--query-admission-wait`, and fail with the

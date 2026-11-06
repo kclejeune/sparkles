@@ -441,6 +441,11 @@ and `mise run ci:fast` leaves it out, because every set compiles the server crat
 A set takes one to two minutes when the dependencies are warm, and the first run of a set
 takes several minutes more.
 
+The server currently fails to compile with ontology disabled because its HTTP route
+list references handlers absent from that build. Reasoning/auth-only unit tests also
+reference an MCP-only GraphRAG helper. Roadmap item 758 covers restoring these optional
+builds and their regression coverage.
+
 `mise run lint:doc-paths` (`scripts/check-doc-paths.py`) checks that every
 `crates/sparkles…` path cited in the README, `docs/*.md`, `docs/specs` and the comments of
 the Rust sources exists. It expands `{a,b}` groups and ignores line numbers. A file that a

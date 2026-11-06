@@ -537,6 +537,7 @@ happens to materialized inferences, and the limits.
 | `--prewarm` | off | Record the decoded blocks and file pages each persistent dataset used, and read the recorded ones again in the background after the next start is ready. See [Memory and caches](#memory-and-caches). |
 | `--prewarm-interval S` | `300` | Seconds between two recordings of the prewarm lists while the server runs, with `--prewarm`, from 1 to 1e9. The shutdown records them too. |
 | `--result-cache-mb N` | `256` (`small`: `64`) | The query result cache, for the whole server. `0` turns it off. A global flag. |
+| `--derived-table-cache-mb N` | `256` | The retained-table estimate budget for demand reasoning, shared by the process. `0` disables retention. A global flag when reasoning is built, with the same default in both memory profiles. |
 | `--history-cache-mb N` | `512` (`small`: `128`) | Materialized past states for point-in-time reads, for the whole server. A global flag. |
 | `--memory-profile NAME` | `default` | `default` or `small`. A profile sets the defaults of the cache, query budget and pool flags above, and a flag given on the command line overrides it. A global flag. |
 | `--shex-max-imports N` | `64` | Most schemas that the imports of one ShEx schema may bring in, directly or through other imports. `shex validate` and `validation` take it too. |
@@ -634,7 +635,7 @@ pool's size in either mode.
 
 ### Memory and caches
 
-The server keeps four caches for all its datasets together. The block cache holds decoded
+The server keeps storage caches for all its datasets together. The block cache holds decoded
 index blocks (`--cache-mb`), the result cache holds results of query subtrees
 (`--result-cache-mb`), the SERVICE cache holds remote results (`--service-cache-mb`), and
 the history cache holds materialized past states (`--history-cache-mb`). Their memory
@@ -642,6 +643,15 @@ therefore does not grow with the number of datasets. A dataset that is queried k
 blocks, and one that is idle loses them to the others. `/$/server/memory` shows how much of
 each cache every dataset holds, and `POST /$/cache/clear/{ds}` empties the result and
 SERVICE entries of one dataset only.
+
+Demand reasoning has a separate process-wide cache of derived tables, set by
+`--derived-table-cache-mb`. Its default is 256 MiB in either profile, and zero disables
+retention. This limit bounds the retained-table estimate, which counts a shared chunk
+for each cached table holding it and is not RSS. Queries may keep tables alive after
+eviction. Operators with the metrics permission see its configured capacity, estimated
+bytes, table count, hits and misses in `/$/stats` and `/$/server/memory`. Other dataset
+readers do not receive those process-wide counters. The host-derived query pool leaves
+out this configured cache beside the storage caches.
 
 `--memory-profile small` is for hosts with little memory. It shrinks the caches to 256 MiB
 of blocks, 64 MiB of results, 16 MiB of SERVICE results and 128 MiB of history, lowers the

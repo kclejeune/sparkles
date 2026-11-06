@@ -707,8 +707,8 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | POST   | `/$/datasets/{ds}/rename`    | Renames the dataset with the JSON body `{ "name": "new-name" }`, keeping its identity and data. Returns `200` with `{ "name", "renamedFrom" }` and `Location`. Requires server administration. `400` for invalid names, `404` for a missing source. `409` for an existing target, live requests or views, reservations, a running compaction or reasoning task, a backup policy of the config file that names the dataset, or a grant, protection or active minted token scope that covers one of the two names and not the other. A pattern that covers both names, such as `*`, does not block a rename. Live requests block it only if they still hold the dataset after a wait of up to two seconds. The dataset's own views worker does not block it, since a round in progress gets up to two more seconds to end and no new round starts during the rename. The conflict lists the blockers. The rename carries the dataset's request metrics, compaction scheduler state and pending automatic reasoning run over to the new name, and rewrites the backup policies made through the API that name the dataset exactly. A policy that selects it with a glob is left as written, so it selects the dataset afterwards only if the glob matches the new name. |
 | DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. Requests to the dataset that arrive meanwhile answer `404`. A persistent dataset that a running request or task still holds after a wait of up to two seconds answers `409`, so that no old handle can write into a dataset later created under the same name. The dataset's own views worker does not count, as for a rename. A dataset of the server's command line (`--loc` or `--mem`) answers `409` with the code `declared-dataset` and stays as it is, since the next start would attach it again. Its `DatasetInfo` has `declared: true`. SPARQL Update and the Graph Store Protocol still clear its data. A copy that `sparkles migrate --keep-old` kept in `.pre-migrate-<version>-<name>` is not removed. |
 | POST   | `/$/datasets/{ds}/clone`     | Copies the dataset, or some of its graphs, into a new persistent or in-memory dataset. Returns `202` with a `Task`. See [Clone](#clone). |
-| GET/POST | `/$/stats/{ds}`            | `DatasetStats`, which includes Fuseki's request counters in `datasets`. |
-| GET/POST | `/$/stats`                 | Fuseki's statistics: `{ "datasets": { "/ds": FusekiCounters } }` for every dataset the caller may read. |
+| GET/POST | `/$/stats/{ds}`            | `DatasetStats`, which includes Fuseki's request counters in `datasets`. A caller with the metrics permission also receives process-wide `derivedTableCache` accounting when reasoning is built. |
+| GET/POST | `/$/stats`                 | Fuseki's statistics: `{ "datasets": { "/ds": FusekiCounters } }` for every dataset the caller may read. A caller with the metrics permission also receives process-wide `derivedTableCache` accounting when reasoning is built. |
 | GET    | `/$/quota/{ds}`              | *Extension.* `DatasetQuota`: the storage quota in effect and the bytes the dataset uses. See [Storage quotas](#storage-quotas). |
 | PUT    | `/$/quota/{ds}`              | *Extension.* Gives a persistent dataset a quota of its own. The JSON body is `{ "maxBytes": number }` or `{ "maxMb": number }`, and `0` means unlimited. Returns `DatasetQuota`. Needs `server-admin`. `400` for an in-memory dataset or a malformed body. |
 | DELETE | `/$/quota/{ds}`              | *Extension.* Removes the dataset's own quota, so `--max-dataset-mb` applies again. Returns `DatasetQuota`. Needs `server-admin`. |
@@ -10421,7 +10421,14 @@ wait for the pool, because their bodies stream into the store and the memory of 
 is not counted in the pool. A query that such a request runs grows the empty grant.
 
 `GET /$/server/memory` needs the `metrics` permission and returns the pool and the shared
-caches.
+caches. With reasoning enabled, `caches.derivedTable` reports the process-wide derived
+table cache, and both `/$/stats` routes include it as `derivedTableCache` for callers
+with that permission. Its `capacityBytes` is set by `--derived-table-cache-mb`, which
+defaults to 256 MiB in both memory profiles. `estimatedBytes` and `tables` describe retained entries, `hits` and `misses` count
+lookups over the process lifetime, and `scope` is `process`. A shared chunk counts
+once per cached table retaining it, and a caller may keep an evicted table alive.
+The estimate is neither allocator usage nor RSS. Zero disables retention. The
+host-derived query pool leaves out this configured capacity beside the other caches.
 
 ```json
 { "profile": "default", "queryMemoryBytes": 8589934592,
@@ -10433,7 +10440,10 @@ caches.
               "block": { "capacityBytes": 1073741824, "bytes": 402653184, "entries": 1536 },
               "result": { "capacityBytes": 268435456, "bytes": 0, "entries": 0 },
               "service": { "capacityBytes": 67108864, "bytes": 0, "entries": 0 },
-              "history": { "capacityBytes": 536870912, "bytes": 0 } },
+              "history": { "capacityBytes": 536870912, "bytes": 0 },
+              "derivedTable": { "scope": "process", "enabled": true,
+                                "capacityBytes": 268435456, "estimatedBytes": 0,
+                                "tables": 0, "hits": 0, "misses": 0 } },
   "datasets": [ { "name": "ds", "blockBytes": 402653184, "blockEntries": 1536,
                   "resultBytes": 0, "resultEntries": 0,
                   "serviceBytes": 0, "serviceEntries": 0 } ] }

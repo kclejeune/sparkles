@@ -68,6 +68,20 @@ request or on every write, and the schema report counts what the data holds.
   schema expansion creates thousands of rules can use a bounded temporary closure of
   the original rules. This retains intermediate facts within the session and uses the
   same resource limits. EXPLAIN shows a `Derive` node per pattern.
+* Demand tables share a process-wide retained-table estimate budget. The global
+  `--derived-table-cache-mb` flag sets it to 256 MiB by default in both memory profiles,
+  and zero disables retention. Library callers use `sparkles_reasoner::tables::set_capacity`
+  and read a coherent report with `tables::snapshot`. Operators with the metrics
+  permission see `derivedTableCache` in `/$/stats` and `caches.derivedTable` in
+  `/$/server/memory`, with capacity, estimated bytes, table count, hits and misses.
+  A shared chunk counts for each cached table retaining it. A query may keep a table
+  alive after eviction, so retained-cache estimates are not allocator usage or RSS.
+  The estimator counts 24 bytes per fact, 64 bytes per chunk, each local term's
+  byte length plus 40 bytes, and 64 bytes per table. It omits spare vector capacity,
+  cache-key strings, hash-table capacity and exact allocator metadata. Item 757
+  covers measuring and calibrating these allowances.
+  Derivation and replay still use the query's own memory budget, and the host-derived
+  query pool leaves out this configured cache beside the storage caches.
 * The library names the reasoning of a query with `sparkles::reasoning::ReasoningMode`,
   which is `Off`, `Materialized`, `Demand` with a profile and a limit, or `Auto`.
   `Dataset::inference_view` turns a mode into an `InferenceView`, which gives the query
@@ -635,8 +649,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 190 covers these costs and matched Forge measurement. The
   [recorded demand measurements](../specs/F17-query-time-reasoning.md#outcome) identify
   their source revision and do not establish current-head performance.
-* The derived-table cache's budget accounting is item 192. DESCRIBE is refused under
-  derivation on demand, item 193.
+* DESCRIBE is refused under derivation on demand, item 193. Hierarchical budgeting
+  that links reasoning, incremental views and the query pool remains item 675.
 * Provenance-based inferred visibility, which reads the reasoner's witnesses, remains
   roadmap item 18. Witness builds and updates take much longer than the closure, item
   555, and their memory and their rebuild after the closure is read back from the

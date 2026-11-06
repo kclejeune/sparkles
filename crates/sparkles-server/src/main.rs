@@ -133,6 +133,12 @@ struct Cli {
     /// `small`: 64)
     #[arg(long, global = true)]
     result_cache_mb: Option<u64>,
+    /// Derived reasoning table cache in MiB, shared by the process (0 disables it;
+    /// default 256 for either memory profile)
+    #[cfg(feature = "reasoning")]
+    #[arg(long, global = true, default_value_t = 256,
+        value_parser = clap::value_parser!(u64).range(..=(u64::MAX >> 20)))]
+    derived_table_cache_mb: u64,
     /// Cache of remote SERVICE results (`SERVICE <cache:…>`) for the whole server, in MiB
     /// (0 disables it; default 64, `small`: 16)
     #[arg(long, global = true)]
@@ -2247,6 +2253,8 @@ enum Cmd {
 }
 
 fn store_opts(cli: &Cli) -> StoreOptions {
+    #[cfg(feature = "reasoning")]
+    sparkles_reasoner::tables::set_capacity(server_memory::derived_table_cache_bytes(cli));
     sparkles::vector::set_budget(cli.vector_memory_mb << 20);
     let sizes = server_memory::cache_sizes(cli);
     sparkles::algo::pool::configure(cli.algo_threads, cli.algo_max_threads_per_call);
@@ -2721,6 +2729,7 @@ fn run() -> Result<()> {
     let opts = store_opts(&cli);
     let cli_memory_profile = cli.memory_profile;
     let cli_cache_sizes = server_memory::cache_sizes(&cli);
+    let cli_derived_table_cache_bytes = server_memory::derived_table_cache_bytes(&cli);
     let no_validate = cli.no_validate;
     match cli.cmd {
         Cmd::Serve {
@@ -2936,16 +2945,21 @@ fn run() -> Result<()> {
                 Vec::new()
             };
             let caches = cli_cache_sizes;
-            let pool_bytes =
-                server_memory::pool_capacity(total_query_memory_mb, cli_memory_profile, &caches);
+            let pool_bytes = server_memory::pool_capacity(
+                total_query_memory_mb,
+                cli_memory_profile,
+                &caches,
+                cli_derived_table_cache_bytes,
+            );
             if !(query_admission_wait.is_finite() && query_admission_wait >= 0.0) {
                 bail!("--query-admission-wait must be a number of seconds, 0 or more");
             }
             tracing::info!(
-                "memory profile {}: block cache {} MiB, result cache {} MiB, SERVICE cache {} MiB, history cache {} MiB, query budget {} MiB, query pool {}",
+                "memory profile {}: block cache {} MiB, result cache {} MiB, derived table cache {} MiB, SERVICE cache {} MiB, history cache {} MiB, query budget {} MiB, query pool {}",
                 cli_memory_profile.name(),
                 caches.blocks >> 20,
                 caches.results >> 20,
+                cli_derived_table_cache_bytes >> 20,
                 caches.service >> 20,
                 caches.history >> 20,
                 query_memory_mb.unwrap_or_else(|| cli_memory_profile.query_memory_mb()),
