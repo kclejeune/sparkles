@@ -188,6 +188,14 @@ check them against the W3C suites and Jena's own answers.
 * Rust, Python and Node have snapshot-owning SELECT and graph cursors, and the JVM
   library pulls SELECT results. Result writers use bounded buffers with backpressure and
   stop when the client disconnects.
+* Native SELECT output and standard JSON, XML, CSV and TSV solution responses of at
+  most 65,536 rows check a complete decoded row before writing its cells. Row storage
+  and decoded terms retain query memory credit while they are written. A required
+  memory refusal stops output with its original local or shared-pool budget error and
+  preserves the count of earlier complete rows. Native output holds one decoded row
+  rather than one cell, so a tight budget can refuse the additional live storage.
+  Ownership across public results, native buffers, reasoners and views remains in
+  [roadmap item 675](../ROADMAP.md).
 * Streaming joins run batch by batch with column kernels. ORDER BY with LIMIT keeps only
   its best rows in a bounded heap. A cursor filter over an index scan filters whole blocks
   in parallel, and a range top-k ranks its range a part at a time. FOLD and registered

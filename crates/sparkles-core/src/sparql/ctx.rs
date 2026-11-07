@@ -2151,6 +2151,74 @@ impl Ctx {
         }
     }
 
+    /// Decode one private writer cell after admitting its owned payload. Unlike the
+    /// public compatibility decoder, this route cannot turn a refusal into UNDEF.
+    /// The row's charge outlives every returned term; no owning value escapes it.
+    pub(super) fn output_term(&self, id: Id, row: &Charge<'_>) -> Result<Option<Term>> {
+        assert!(
+            std::ptr::eq(self, row.ctx),
+            "output credit belongs to its query"
+        );
+        self.check_memory_failure()?;
+        let decode = |key: &[u8]| -> Result<Term> {
+            row.add(output_key_bytes(self, key, 0)?)?;
+            Ok(id::key_to_term(key))
+        };
+        let term = match id.tag() {
+            Tag::Undef => None,
+            Tag::Local => {
+                // Keys are append-only. Read the estimate, leave the vocabulary lock,
+                // then admit before taking the lock again to allocate the term.
+                let bytes = self
+                    .local
+                    .read()
+                    .get(id.payload())
+                    .map(|key| output_key_bytes(self, key, 0))
+                    .transpose()?;
+                match bytes {
+                    None => None,
+                    Some(bytes) => {
+                        row.add(bytes)?;
+                        self.local.read().get(id.payload()).map(id::key_to_term)
+                    }
+                }
+            }
+            Tag::Delta => {
+                let bytes = self
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|vocab| {
+                        vocab
+                            .get(id.payload())
+                            .map(|key| output_key_bytes(self, key, 0))
+                    })
+                    .transpose()?;
+                match bytes {
+                    None => None,
+                    Some(bytes) => {
+                        row.add(bytes)?;
+                        self.snap
+                            .generation
+                            .dvocab
+                            .with(|vocab| vocab.get(id.payload()).map(id::key_to_term))
+                    }
+                }
+            }
+            Tag::Vocab => self
+                .with_cursor_vocab_key(id.payload(), decode)?
+                .transpose()?,
+            // Inline numbers/calendar values and blank-node labels have bounded
+            // formatted text. This covers their strings and construction overlap.
+            _ => {
+                row.add(256)?;
+                self.snap.term(id)
+            }
+        };
+        self.check_memory_failure()?;
+        Ok(term)
+    }
+
     /// Reconstruction scratch is query-owned even when the vocabulary is mapped.
     /// Twice the requested size covers old and new buffers during reallocation.
     pub(super) fn with_cursor_vocab_key<T>(
@@ -2578,6 +2646,95 @@ impl Ctx {
     pub fn local_len(&self) -> u64 {
         self.local.read().len()
     }
+}
+
+/// Heap and construction overlap of one decoded vocabulary key, excluding the
+/// outer Term slot already covered by its row. Ordinary lexical bytes are charged
+/// once, independently of the existing reconstruction envelope's eightfold policy.
+/// RDF-star nodes also cover their temporary component Vec and final boxed Triple.
+fn output_key_bytes(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
+    let overflow = || ctx.memory_exceeded(u64::MAX);
+    let malformed = || Error::Corrupt("invalid vocabulary triple-term key".into());
+    if depth > crate::nesting::MAX_TRIPLE_TERMS {
+        return Err(malformed());
+    }
+    if key.first() != Some(&b'(') {
+        // UTF-8 text is copied into String. The fixed allowance covers
+        // a datatype/language string, blank-node formatting and string construction.
+        // A damaged key's lossy UTF-8 route can expand each byte to three bytes.
+        let bytes = (key.len() as u64).checked_mul(3).ok_or_else(overflow)?;
+        // Literal separators and blank-node binary IDs are not UTF-8 text.
+        let mut overlap = 64u64;
+        let valid = match key.first() {
+            Some(b'"') => {
+                let sep = key
+                    .iter()
+                    .rposition(|&b| b == id::KEY_SEP)
+                    .unwrap_or(key.len());
+                let suffix = key.get(sep + 1..).unwrap_or(&[]);
+                if suffix.first() == Some(&b'@') {
+                    // lang_literal borrows a temporary decoded tag while oxrdf
+                    // copies that tag into its final owned String.
+                    let tag = &suffix[1..];
+                    let copies = if std::str::from_utf8(tag).is_ok() {
+                        1
+                    } else {
+                        3
+                    };
+                    overlap = overlap
+                        .checked_add(
+                            (tag.len() as u64)
+                                .checked_mul(copies)
+                                .ok_or_else(overflow)?,
+                        )
+                        .ok_or_else(overflow)?;
+                }
+                std::str::from_utf8(&key[1..sep]).is_ok() && std::str::from_utf8(suffix).is_ok()
+            }
+            Some(b'_') => true,
+            _ => std::str::from_utf8(key).is_ok(),
+        };
+        return (if valid { key.len() as u64 } else { bytes })
+            .checked_add(overlap)
+            .ok_or_else(overflow);
+    }
+    let mut bytes =
+        (3 * std::mem::size_of::<Term>()) as u64 + std::mem::size_of::<oxrdf::Triple>() as u64;
+    let mut pos = 1usize;
+    for _ in 0..3 {
+        // Only existing three-component headers are walked, without allocation.
+        // Invalid lengths are corruption; they are not relabeled budget failures.
+        let mut len = 0u64;
+        let mut shift = 0;
+        loop {
+            let next = *key.get(pos).ok_or_else(malformed)?;
+            pos += 1;
+            if shift == 63 && next > 1 {
+                return Err(malformed());
+            }
+            len |= u64::from(next & 127)
+                .checked_shl(shift)
+                .ok_or_else(malformed)?;
+            if next & 128 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift >= 64 {
+                return Err(malformed());
+            }
+        }
+        let len = usize::try_from(len).map_err(|_| malformed())?;
+        let end = pos.checked_add(len).ok_or_else(malformed)?;
+        let part = key.get(pos..end).ok_or_else(malformed)?;
+        bytes = bytes
+            .checked_add(output_key_bytes(ctx, part, depth + 1)?)
+            .ok_or_else(overflow)?;
+        pos = end;
+    }
+    if pos != key.len() {
+        return Err(malformed());
+    }
+    Ok(bytes)
 }
 
 /// Estimated bytes of `rows` rows of `width` ids (a row of a zero-width table still
