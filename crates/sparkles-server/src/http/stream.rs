@@ -513,6 +513,13 @@ where
             .queued_producer
             .clone()
             .map(super::algo::probe::Completion);
+        #[cfg(test)]
+        let _completion_only = probe.completion.clone().map(super::algo::probe::Completion);
+        #[cfg(test)]
+        let _after_write_completion = probe
+            .after_write
+            .clone()
+            .map(super::algo::probe::Completion);
         // A local binding drops the permit before the test completion observer,
         // including unwinding. Ordinary builds keep the original capture/drop path.
         #[cfg(test)]
@@ -551,6 +558,10 @@ where
         } else {
             write(&mut w)
         };
+        #[cfg(test)]
+        if let Some(gate) = &probe.after_write {
+            gate.wait();
+        }
         let result = result
             .map_err(|e| w.classify(e))
             .map_err(|e| match &control {
