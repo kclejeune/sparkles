@@ -942,6 +942,14 @@ fn activation_branch(root: &Path, preparation: &Preparation) -> Result<Activatio
     }
     head.checked_add(1)
         .ok_or_else(|| unavailable("activation cutoff overflows"))?;
+    // Activation covers the physical branch, including pinned/retired
+    // generations. It must not bless a previously unanchored reference merely
+    // because compaction moved that reference out of CURRENT.
+    drop(cursor);
+    drop(physical);
+    drop(budget);
+    drop(_decode);
+    activation_retained_generations(root, id, preparation)?;
     Ok(ActivationBranch {
         root: root.to_path_buf(),
         id,
@@ -949,6 +957,110 @@ fn activation_branch(root: &Path, preparation: &Preparation) -> Result<Activatio
         hot,
         _held: held,
     })
+}
+
+fn activation_retained_generations(root: &Path, id: Uuid, preparation: &Preparation) -> Result<()> {
+    use super::{WAL_COMMIT, WAL_CONFIGURATION, WAL_HEADER, WAL_REC};
+    use std::io::{BufReader, Seek, SeekFrom};
+
+    for entry in std::fs::read_dir(root)? {
+        preparation.check()?;
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.strip_prefix("gen-").is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        }) {
+            continue;
+        }
+        if !entry.file_type()?.is_dir() {
+            return Err(unavailable("activation generation is not a directory"));
+        }
+        let _scratch = preparation.reserve(
+            (root.as_os_str().len() as u64)
+                .saturating_add(name.len() as u64)
+                .saturating_mul(8)
+                .saturating_add((64 << 10) + 4096),
+        )?;
+        let directory = entry.path();
+        let allowance = preparation.room();
+        let strict_from = {
+            let _decode = preparation.reserve(allowance)?;
+            let options = crate::history::HistoryOptions {
+                cancel: Some(preparation.control().cancel.flag()),
+                deadline: preparation.control().deadline,
+            };
+            let mut budget = super::cold::ColdBudget::new(crate::history::ReadLimit {
+                options: &options,
+                memory: Some(allowance),
+                held: 0,
+            })?;
+            let physical = crate::commit::read_gen_commit_controlled(&directory, &mut budget)?;
+            if let Some(physical) = &physical
+                && (physical.value.dataset_id != id
+                    || physical.value.configuration != ConfigurationBinding::LegacyUnbound)
+            {
+                return Err(unavailable(
+                    "activation found a foreign or unpublished retained generation binding",
+                ));
+            }
+            physical.and_then(|physical| physical.value.wal_strict_from)
+        };
+        let path = directory.join("wal.log");
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && strict_from.is_none() => {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(unavailable("activation retained WAL is not a regular file"));
+        }
+        // Reuse the version and seal decoders. This is a negative preflight,
+        // not a replacement recovery parser or a reconstructed commit catalog.
+        super::wal::descriptor_version(&mut file, &path)?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::with_capacity(64 << 10, file);
+        let mut crc = flate2::Crc::new();
+        let mut record = [0; WAL_REC];
+        let mut first = true;
+        loop {
+            preparation.check()?;
+            match reader.read_exact(&mut record) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error.into()),
+            }
+            if record[0] == WAL_CONFIGURATION {
+                return Err(unavailable(
+                    "activation found unpublished retained WAL configuration data",
+                ));
+            }
+            if record[0] == WAL_COMMIT {
+                if let Some(Ok((_, _, _, flags))) =
+                    crate::commit::open_wal_commit_with_crc(&record, crc)
+                    && flags & crate::commit::WAL_FLAG_CONFIGURATION != 0
+                {
+                    return Err(unavailable(
+                        "activation found an unpublished retained WAL configuration flag",
+                    ));
+                }
+                crc = flate2::Crc::new();
+            } else if !(first && record[0] == WAL_HEADER) {
+                crc.update(&record);
+            }
+            first = false;
+        }
+    }
+    preparation.check()
 }
 
 /// Inventory all physical branch roots, including retired roots. This reads only;

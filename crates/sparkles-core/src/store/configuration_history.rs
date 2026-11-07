@@ -4,6 +4,8 @@ use super::*;
 use crate::access::Preparation;
 use crate::history::{ConfigurationBinding, ConfigurationIdentity, HistoryOptions, ReadLimit};
 
+pub(super) mod primary;
+
 #[cfg(test)]
 mod tests;
 

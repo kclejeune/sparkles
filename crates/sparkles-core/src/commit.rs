@@ -931,6 +931,11 @@ pub(crate) fn gen_commit_bytes_with_binding(
 /// The commit a generation's base index holds, from `gen-NNNN/commit.json`, with the
 /// dataset id and the file's origin (`create`, `baseline`, `bulk`, `compaction`).
 pub(crate) fn read_gen_commit(dir: &Path) -> Result<Option<(uuid::Uuid, CommitInfo, String)>> {
+    Ok(read_gen_commit_full(dir)?
+        .map(|physical| (physical.dataset_id, physical.commit, physical.origin)))
+}
+
+pub(crate) fn read_gen_commit_full(dir: &Path) -> Result<Option<RetainedGenerationCommit>> {
     let path = dir.join("commit.json");
     let b = match std::fs::read(&path) {
         Ok(b) => b,
@@ -938,8 +943,7 @@ pub(crate) fn read_gen_commit(dir: &Path) -> Result<Option<(uuid::Uuid, CommitIn
         Err(e) => return Err(e.into()),
     };
     let f = parse_gen_commit(&path, &b)?;
-    let decoded = decode_gen_commit_file(f, &path)?;
-    Ok(Some((decoded.dataset_id, decoded.commit, decoded.origin)))
+    Ok(Some(decode_gen_commit_file(f, &path)?))
 }
 
 /// Physical generation identity decoded without opening or recovering a Store.

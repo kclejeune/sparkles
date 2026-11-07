@@ -2290,41 +2290,70 @@ impl Store {
         // WAL commits without metadata that precede the first one with it are part of a
         // baseline commit (written by an older version before the upgrade)
         let mut fold_legacy = true;
-        let (base, rebased) = match commit::read_gen_commit(&root.join(&name))? {
-            Some((id, c, origin)) if !migrating => {
-                if id != dataset_id {
-                    return Err(Error::Corrupt(format!(
-                        "{name}/commit.json belongs to dataset {id}, not {dataset_id}"
-                    )));
+        let (base, rebased, base_configuration) =
+            match commit::read_gen_commit_full(&root.join(&name))? {
+                Some(physical) if !migrating => {
+                    let commit::RetainedGenerationCommit {
+                        dataset_id: id,
+                        commit: c,
+                        origin,
+                        configuration: binding,
+                        ..
+                    } = physical;
+                    if id != dataset_id {
+                        return Err(Error::Corrupt(format!(
+                            "{name}/commit.json belongs to dataset {id}, not {dataset_id}"
+                        )));
+                    }
+                    fold_legacy = origin == "baseline";
+                    (c, false, binding)
                 }
-                fold_legacy = origin == "baseline";
-                (c, false)
-            }
-            // a generation without commit metadata (built by an older version): its
-            // content becomes a baseline commit after the last cataloged one
-            _ => {
-                let prev = match commit::read_catalog(&catalog_path)? {
-                    Some((id, recs)) if id == dataset_id && !migrating => recs.last().copied(),
-                    _ => None,
-                };
-                let c = CommitInfo {
-                    seq: prev.map_or(0, |c| c.seq + 1),
-                    timestamp_ms: prev.map_or(0, |c| c.timestamp_ms).max(commit::now_ms()),
-                    kind: CommitKind::Baseline,
-                    inserted: gen_.meta.quads,
-                    deleted: 0,
-                    quads: gen_.meta.quads,
-                    generation: gen_no,
-                    bulk: false,
-                    // counts relative to an earlier commit are unknown
-                    exact: prev.is_none(),
-                    reconstructed: false,
-                    default_graph: true,
-                    unvalidated: false,
-                };
-                (c, true)
-            }
+                // a generation without commit metadata (built by an older version): its
+                // content becomes a baseline commit after the last cataloged one
+                _ => {
+                    let prev = match commit::read_catalog(&catalog_path)? {
+                        Some((id, recs)) if id == dataset_id && !migrating => recs.last().copied(),
+                        _ => None,
+                    };
+                    let c = CommitInfo {
+                        seq: prev.map_or(0, |c| c.seq + 1),
+                        timestamp_ms: prev.map_or(0, |c| c.timestamp_ms).max(commit::now_ms()),
+                        kind: CommitKind::Baseline,
+                        inserted: gen_.meta.quads,
+                        deleted: 0,
+                        quads: gen_.meta.quads,
+                        generation: gen_no,
+                        bulk: false,
+                        // counts relative to an earlier commit are unknown
+                        exact: prev.is_none(),
+                        reconstructed: false,
+                        default_graph: true,
+                        unvalidated: false,
+                    };
+                    (c, true, crate::history::ConfigurationBinding::LegacyUnbound)
+                }
+            };
+        let configuration_preparation = managed_history::administrative_preparation()?;
+        let configuration_root = if ctx.is_some() {
+            link::dataset_root_of(root)?
+        } else {
+            root.to_path_buf()
         };
+        let configuration_state = family.managed.load_full();
+        let mut configuration_references = configuration_history::primary::References::new(
+            &configuration_root,
+            ctx.as_ref().map_or(dataset_id, |ctx| ctx.ident.dataset_id),
+            dataset_id,
+            ctx.as_ref().and_then(|ctx| {
+                ctx.ident
+                    .configuration_origin
+                    .as_ref()
+                    .map(|origin| (ctx.ident.from.seq, origin))
+            }),
+            configuration_state.as_deref(),
+            &configuration_preparation,
+        )?;
+        configuration_references.generation(base.seq, base_configuration)?;
         // replay the WAL (a linked generation's onto the delta of its starting commit)
         let wal_path = root.join(&name).join("wal.log");
         let mut delta = gen_.base_delta();
@@ -2372,7 +2401,9 @@ impl Store {
                 annotated: annotated.as_ref(),
                 strict_from,
             };
-            let r = replay_wal(&from, &buf, &mut |_, _| Ok(()))?;
+            let r = replay_wal(&from, &buf, &mut |_, _| Ok(()), &mut |seq, digest| {
+                configuration_references.observation(seq, digest)
+            })?;
             if r.good != buf.len() {
                 OpenOptions::new()
                     .write(true)
@@ -2392,6 +2423,9 @@ impl Store {
             next_bnode = r.next_bnode.max(bnode_floor);
             wal_text = r.touched;
         }
+        drop(configuration_references);
+        drop(configuration_state);
+        drop(configuration_preparation);
         let mut base = base;
         if rebased {
             // record the baseline: in the generation, the catalog, and (for an upgrade)
@@ -3199,6 +3233,13 @@ impl Store {
         if owner == current {
             return Ok(live.generation.clone());
         }
+        let history_options = crate::history::HistoryOptions::default();
+        let history_limit = crate::history::ReadLimit {
+            options: &history_options,
+            memory: None,
+            held: 0,
+        };
+        branching::readonly::authenticate_retained_generation(self, entry, &history_limit)?;
         if let Some(i) = h.open.iter().position(|(n, _)| *n == owner) {
             let e = h.open.remove(i);
             let g = e.1.clone();
@@ -8009,6 +8050,7 @@ pub(crate) fn replay_wal(
     from: &ReplayFrom<'_>,
     buf: &[u8],
     check: &mut dyn FnMut(u64, &Delta) -> Result<()>,
+    configuration: &mut dyn FnMut(u64, Option<crate::evidence::Sha256Digest>) -> Result<()>,
 ) -> Result<Replay> {
     let cache = from.cache;
     let wal_version = wal::version_of(buf, from.path)?;
@@ -8102,7 +8144,7 @@ pub(crate) fn replay_wal(
                 }
                 // A complete sealed malformed binding is corruption, even in the
                 // last transaction. It must not become a convenient torn tail.
-                wal::configuration_records(
+                let configuration_digest = wal::configuration_records(
                     &buf[txn_start * WAL_REC..i * WAL_REC],
                     wal_version,
                     match &meta {
@@ -8220,6 +8262,13 @@ pub(crate) fn replay_wal(
                 if from.keep_touched && out.commits.len() > before {
                     out.touched.push((out.commits.last().unwrap().seq, touched));
                 }
+                // The original framing/term/sequence rules accepted this
+                // complete event. A lost/orphan reference refuses here, before
+                // any caller may truncate a tail or publish recovered data.
+                configuration(
+                    out.commits.last().map_or(from.base.seq, |c| c.seq),
+                    configuration_digest,
+                )?;
                 out.good = (i + 1) * WAL_REC;
                 out.index.note(wal::WalPoint {
                     seq: out.commits.last().map_or(from.base.seq, |c| c.seq),
