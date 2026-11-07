@@ -19,6 +19,8 @@ pub(crate) const MAX_BYTES: usize = 64 << 20;
 const PARSE_BYTES: u64 = 32;
 const DIRECTORY: &str = "evidence-history";
 
+pub(super) mod capture;
+
 #[cfg(test)]
 mod tests;
 
@@ -114,11 +116,17 @@ pub(crate) struct Prepared {
 /// overlap and decoding. It does not preallocate those bytes. Controlled readers
 /// and prepared mutations still use their caller's own, possibly smaller limit.
 pub(crate) fn administrative_preparation() -> Result<Preparation> {
+    administrative_preparation_with(crate::task::Control::none())
+}
+
+pub(crate) fn administrative_preparation_with(
+    control: crate::task::Control,
+) -> Result<Preparation> {
     let allowance = (MAX_BYTES as u64)
         .checked_mul(PARSE_BYTES * 2 + 8)
         .and_then(|bytes| bytes.checked_add(16 << 20))
         .ok_or_else(|| unavailable("configuration administrative allowance overflows"))?;
-    Preparation::new(crate::task::Control::none(), allowance)
+    Preparation::new(control, allowance)
 }
 
 /// Persistent linked ownership avoids copying every old generation on a change.

@@ -28,7 +28,7 @@ mod commit_stats;
 mod compaction;
 #[cfg(test)]
 mod compaction_tests;
-mod configuration_history;
+pub(crate) mod configuration_history;
 mod evidence_view;
 pub use evidence_view::BoundEvidenceView;
 pub mod definitions;

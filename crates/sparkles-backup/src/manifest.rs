@@ -194,13 +194,43 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
     }
     let mut seen = HashSet::with_capacity(m.files.len());
     let mut total = 0u64;
+    let history_required = m
+        .requires
+        .iter()
+        .any(|feature| feature == "evidence-configuration-history/1");
+    let mut history_files = false;
     for (i, f) in m.files.iter().enumerate() {
         let field = |k: &str| format!("files[{i}].{k}");
+        let history = crate::layout::configuration_history_path(&f.path);
+        if history {
+            history_files = true;
+            if !history_required {
+                return bad(
+                    &field("path"),
+                    "configuration history needs evidence-configuration-history/1".into(),
+                );
+            }
+            if f.definition.is_some() || f.kind != sparkles_core::store::FileKind::Immutable {
+                return bad(
+                    &field("path"),
+                    "configuration history must be immutable primary data".into(),
+                );
+            }
+            if let Some((_, file)) = f.path.rsplit_once("/generations/")
+                && file.strip_suffix(".json") != Some(f.sha256.as_str())
+            {
+                return bad(
+                    &field("sha256"),
+                    "configuration generation name differs from its digest".into(),
+                );
+            }
+        }
         if let Some(d) = &f.definition {
             check_definition(m, i, f, d)?;
         } else if !valid_backup_path(&f.path) {
             return bad(&field("path"), format!("{:?} is not allowed", f.path));
-        } else if let Some((dir, _)) = f.path.split_once('/')
+        } else if !history
+            && let Some((dir, _)) = f.path.split_once('/')
             && dir != m.generation
         {
             return bad(
@@ -247,6 +277,12 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
     }
     if !seen.contains("CURRENT") {
         return bad("files", "no CURRENT".into());
+    }
+    if history_required && (!history_files || !seen.contains("managed.json")) {
+        return bad(
+            "files",
+            "configuration history needs its primary closure and managed.json".into(),
+        );
     }
     Ok(())
 }
@@ -517,6 +553,39 @@ mod tests {
             f.path = f.path.replace("gen-0001/", "gen-0002/");
         }
         validate(&m, PIECE, &[2]).unwrap();
+    }
+
+    #[test]
+    fn configuration_history_requires_immutable_digest_named_primary_files() {
+        let lineage = "0b6e5c1a-0000-4000-8000-000000000001";
+        let mut manifest = good();
+        let mut generation = file(
+            &format!("evidence-history/{lineage}/generations/{}.json", hex64('a')),
+            &[33],
+        );
+        generation.kind = sparkles_core::store::FileKind::Immutable;
+        generation.sha256 = hex64('a');
+        manifest.files.push(file("managed.json", &[32]));
+        manifest.files.push(generation);
+        assert!(validate(&manifest, PIECE, &[2]).is_err());
+        manifest
+            .requires
+            .push("evidence-configuration-history/1".into());
+        validate(&manifest, PIECE, &[2]).unwrap();
+        let original = manifest.clone();
+        manifest.files.last_mut().unwrap().kind = sparkles_core::store::FileKind::Meta;
+        assert!(validate(&manifest, PIECE, &[2]).is_err());
+        manifest = original.clone();
+        manifest.files.last_mut().unwrap().sha256 = hex64('b');
+        assert!(validate(&manifest, PIECE, &[2]).is_err());
+        manifest = original.clone();
+        manifest.files.retain(|file| file.path != "managed.json");
+        assert!(validate(&manifest, PIECE, &[2]).is_err());
+        manifest = good();
+        manifest
+            .requires
+            .push("evidence-configuration-history/1".into());
+        assert!(validate(&manifest, PIECE, &[2]).is_err());
     }
 
     #[test]

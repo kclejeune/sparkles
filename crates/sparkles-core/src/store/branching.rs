@@ -234,7 +234,7 @@ pub(crate) struct BranchFile {
 }
 
 impl BranchFile {
-    fn check_configuration(&self, encoded: &[u8]) -> Result<()> {
+    pub(crate) fn check_configuration(&self, encoded: &[u8]) -> Result<()> {
         if self.format == 1 {
             if self.configuration_origin.is_some() {
                 return Err(Error::Corrupt(

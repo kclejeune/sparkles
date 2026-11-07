@@ -1,4 +1,5 @@
 use super::*;
+use crate::history::At;
 use crate::task::Control;
 
 fn preparation() -> Preparation {
@@ -601,4 +602,267 @@ fn activation_refuses_unpublished_retained_wal_before_modifying_current() {
     assert_eq!(std::fs::read(hot).unwrap(), hot_before);
     assert_eq!(std::fs::read(old).unwrap(), bytes);
     assert!(!root.join("evidence-history").exists());
+}
+
+#[test]
+fn copied_primary_validation_reads_a_valid_closure_without_recovery() {
+    let (_temporary, root, store, preparation) = primary_fixture();
+    drop(store);
+    let wal = primary_wal(&root);
+    let mut bytes = std::fs::read(&wal).unwrap();
+    bytes.extend_from_slice(&[0; WAL_REC]);
+    std::fs::write(&wal, &bytes).unwrap();
+    validate_copy(&root, true, &preparation).unwrap();
+    assert_eq!(std::fs::read(wal).unwrap(), bytes);
+}
+
+#[test]
+fn copied_primary_validation_refuses_a_resealed_unpublished_target() {
+    let (_temporary, root, store, preparation) = primary_fixture();
+    let orphan = primary_orphan(&store, &preparation);
+    drop(store);
+    let wal = primary_wal(&root);
+    let mut bytes = std::fs::read(&wal).unwrap();
+    reseal_primary_reference(&mut bytes, Some(orphan.identity.generation()));
+    std::fs::write(&wal, &bytes).unwrap();
+    assert!(validate_copy(&root, true, &preparation).is_err());
+    assert_eq!(std::fs::read(wal).unwrap(), bytes);
+}
+
+#[test]
+fn copied_primary_validation_refuses_a_cleared_covered_reference() {
+    let (_temporary, root, store, preparation) = primary_fixture();
+    drop(store);
+    let wal = primary_wal(&root);
+    let mut bytes = std::fs::read(&wal).unwrap();
+    reseal_primary_reference(&mut bytes, None);
+    std::fs::write(&wal, &bytes).unwrap();
+    assert!(validate_copy(&root, true, &preparation).is_err());
+    assert_eq!(std::fs::read(wal).unwrap(), bytes);
+}
+
+#[test]
+fn copied_primary_validation_refuses_a_missing_publication_before_torn_suffix_recovery() {
+    let (_temporary, root, store, preparation) = primary_fixture();
+    let identity = store
+        .evidence_view(&At::Head, &preparation)
+        .unwrap()
+        .configuration();
+    drop(store);
+    let wal = primary_wal(&root);
+    let mut bytes = std::fs::read(&wal).unwrap();
+    bytes.extend_from_slice(&[0; WAL_REC]);
+    std::fs::write(&wal, &bytes).unwrap();
+    std::fs::remove_file(
+        root.join("evidence-history")
+            .join(identity.lineage_id().to_string())
+            .join("generations")
+            .join(format!("{}.json", &identity.generation().to_string()[7..])),
+    )
+    .unwrap();
+    assert!(validate_copy(&root, true, &preparation).is_err());
+    assert_eq!(std::fs::read(wal).unwrap(), bytes);
+}
+
+#[test]
+fn copied_primary_validation_refuses_unknown_coverage_and_missing_required_root() {
+    let (_temporary, root, store, preparation) = primary_fixture();
+    let identity = store
+        .evidence_view(&At::Head, &preparation)
+        .unwrap()
+        .configuration();
+    drop(store);
+    let coverage = root
+        .join("evidence-history")
+        .join(identity.lineage_id().to_string())
+        .join("coverage.json");
+    let bytes = std::fs::read(&coverage).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value["format"] = 99.into();
+    std::fs::write(&coverage, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(validate_copy(&root, true, &preparation).is_err());
+    std::fs::write(coverage, bytes).unwrap();
+    std::fs::remove_file(root.join("managed.json")).unwrap();
+    assert!(validate_copy(&root, true, &preparation).is_err());
+}
+
+#[test]
+fn copied_primary_validation_keeps_genuinely_unmarked_upgrade_behavior() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("legacy");
+    let store = Store::open(&root, StoreOptions::default()).unwrap();
+    update(&store, "legacy");
+    drop(store);
+    let wal = primary_wal(&root);
+    let before = std::fs::read(&wal).unwrap();
+    std::fs::remove_file(wal.parent().unwrap().join("commit.json")).unwrap();
+    validate_copy(&root, false, &preparation()).unwrap();
+    std::fs::remove_file(root.join("dataset.json")).unwrap();
+    validate_copy(&root, false, &preparation()).unwrap();
+    assert_eq!(std::fs::read(wal).unwrap(), before);
+}
+
+#[test]
+fn copied_primary_validation_preserves_cancellation_and_deadline() {
+    let (_temporary, root, store, _preparation) = primary_fixture();
+    drop(store);
+    let cancel = crate::task::Cancel::new();
+    let preparation = Preparation::new(
+        Control {
+            cancel: cancel.clone(),
+            ..Default::default()
+        },
+        64 << 20,
+    )
+    .unwrap();
+    cancel.cancel();
+    assert!(matches!(
+        validate_copy(&root, true, &preparation),
+        Err(Error::Cancelled)
+    ));
+    let preparation = Preparation::new(
+        Control {
+            deadline: Some(std::time::Instant::now()),
+            ..Default::default()
+        },
+        64 << 20,
+    );
+    match preparation {
+        Ok(preparation) => assert!(matches!(
+            validate_copy(&root, true, &preparation),
+            Err(Error::Timeout)
+        )),
+        Err(error) => assert!(matches!(error, Error::Timeout)),
+    }
+}
+
+#[test]
+fn copied_primary_validation_refuses_before_exceeding_its_preparation() {
+    let (_temporary, root, store, _preparation) = primary_fixture();
+    drop(store);
+    let wal = primary_wal(&root);
+    let before = std::fs::read(&wal).unwrap();
+    let preparation = Preparation::new(Control::none(), 1024).unwrap();
+    assert!(matches!(
+        validate_copy(&root, true, &preparation),
+        Err(Error::BudgetExceeded(_))
+    ));
+    assert_eq!(std::fs::read(wal).unwrap(), before);
+}
+
+#[test]
+fn copied_primary_validation_refuses_native_base_after_identity_markers_are_removed() {
+    let (_temporary, root, store, preparation) = primary_fixture();
+    store.compact().unwrap();
+    drop(store);
+    validate_copy(&root, true, &preparation).unwrap();
+    let wal = primary_wal(&root);
+    let before = std::fs::read(&wal).unwrap();
+    std::fs::remove_file(root.join("dataset.json")).unwrap();
+    std::fs::remove_file(root.join("managed.json")).unwrap();
+    assert!(validate_copy(&root, false, &preparation).is_err());
+    assert_eq!(std::fs::read(wal).unwrap(), before);
+}
+
+#[test]
+fn copied_primary_validation_refuses_wal_only_native_seal_after_marker_removal() {
+    let (_temporary, root, store, preparation) = primary_fixture();
+    drop(store);
+    validate_copy(&root, true, &preparation).unwrap();
+    let wal = primary_wal(&root);
+    let mut before = std::fs::read(&wal).unwrap();
+    before.extend_from_slice(&[0; WAL_REC]);
+    std::fs::write(&wal, &before).unwrap();
+    for path in [
+        root.join("managed.json"),
+        wal.parent().unwrap().join("commit.json"),
+    ] {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert!(
+        validate_copy(&root, false, &preparation).is_err(),
+        "the surviving dataset identity cannot excuse a missing base marker"
+    );
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+    std::fs::remove_file(root.join("dataset.json")).unwrap();
+    assert!(validate_copy(&root, false, &preparation).is_err());
+    assert_eq!(std::fs::read(wal).unwrap(), before);
+}
+
+#[test]
+fn copied_primary_validation_refuses_native_seal_with_unreadable_registry_and_no_identity() {
+    let (_temporary, root, store, preparation) = primary_fixture();
+    drop(store);
+    validate_copy(&root, true, &preparation).unwrap();
+    let registry = std::fs::read(root.join("managed.json")).unwrap();
+    let wal = primary_wal(&root);
+    let before = std::fs::read(&wal).unwrap();
+    std::fs::remove_file(root.join("dataset.json")).unwrap();
+    std::fs::remove_file(wal.parent().unwrap().join("commit.json")).unwrap();
+    std::fs::write(root.join("managed.json"), b"unreadable legacy registry").unwrap();
+    assert!(validate_copy(&root, false, &preparation).is_err());
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+    let mut registry: serde_json::Value = serde_json::from_slice(&registry).unwrap();
+    registry["format"] = 99.into();
+    std::fs::write(
+        root.join("managed.json"),
+        serde_json::to_vec(&registry).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        validate_copy(&root, false, &preparation),
+        Err(Error::Unsupported(_))
+    ));
+    registry["format"] = 3.into();
+    registry
+        .as_object_mut()
+        .unwrap()
+        .remove("configurationHistory");
+    std::fs::write(
+        root.join("managed.json"),
+        serde_json::to_vec(&registry).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        validate_copy(&root, false, &preparation),
+        Err(Error::Unsupported(_))
+    ));
+    assert_eq!(std::fs::read(wal).unwrap(), before);
+}
+
+#[test]
+fn copied_primary_validation_keeps_real_pre_metadata_wal_upgrade() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("legacy");
+    let store = Store::open(&root, StoreOptions::default()).unwrap();
+    update(&store, "legacy");
+    drop(store);
+    let wal = primary_wal(&root);
+    let bytes = std::fs::read(&wal).unwrap();
+    assert_eq!(bytes[0], WAL_HEADER);
+    let mut legacy = bytes[WAL_REC..].to_vec();
+    let mut seals = 0;
+    for record in legacy.as_chunks_mut::<WAL_REC>().0 {
+        if record[0] == WAL_COMMIT {
+            // The original pre-metadata record has its opcode and blank-node
+            // prefix, with no sequence, checksum, flags or configuration seal.
+            record[9..].fill(0);
+            assert!(commit::open_wal_commit(record, &[]).is_none());
+            seals += 1;
+        }
+    }
+    assert_eq!(seals, 1);
+    std::fs::write(&wal, &legacy).unwrap();
+    for path in [
+        root.join("dataset.json"),
+        root.join("commits.bin"),
+        wal.parent().unwrap().join("commit.json"),
+    ] {
+        std::fs::remove_file(path).unwrap();
+    }
+    validate_copy(&root, false, &preparation()).unwrap();
+    assert_eq!(std::fs::read(&wal).unwrap(), legacy);
+    let upgraded = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(upgraded.snapshot().len(), 1);
+    assert!(upgraded.evidence_view(&At::Head, &preparation()).is_err());
 }

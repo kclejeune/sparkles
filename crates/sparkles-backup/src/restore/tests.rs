@@ -308,6 +308,124 @@ async fn a_blob_that_fails_its_hash_is_fetched_again_twice() {
     assert!(!dir.path().join("b").exists());
 }
 
+/// Add all closed history path shapes, reusing a genuine fixture blob. These
+/// download-only controls test staging, before history document authentication.
+fn nested_history_manifest(mut manifest: Manifest) -> (Manifest, Vec<String>) {
+    let lineage = "00000000-0000-0000-0000-000000000001";
+    let paths = vec![
+        format!("evidence-history/{lineage}/coverage.json"),
+        format!(
+            "evidence-history/{lineage}/generations/{}.json",
+            "ab".repeat(32)
+        ),
+        "evidence-history/origin.json".into(),
+    ];
+    let entry = manifest
+        .files
+        .iter()
+        .find(|file| file.path == "CURRENT")
+        .unwrap()
+        .clone();
+    for path in &paths {
+        assert!(layout::configuration_history_path(path));
+        manifest.files.push(crate::FileEntry {
+            path: path.clone(),
+            ..entry.clone()
+        });
+    }
+    (manifest, paths)
+}
+
+#[tokio::test]
+async fn nested_history_download_stages_plain_parents_and_syncs() {
+    let (dir, repo, manifest) = setup().await;
+    let (manifest, paths) = nested_history_manifest(manifest);
+    let target = dir.path().join("staged");
+    std::fs::create_dir(&target).unwrap();
+    repo.download(
+        &manifest,
+        &target,
+        &Ctl::default(),
+        &crate::security::Security::default(),
+    )
+    .await
+    .unwrap();
+    let expected = std::fs::read(dir.path().join("src/CURRENT")).unwrap();
+    for path in paths {
+        assert_eq!(std::fs::read(target.join(&path)).unwrap(), expected);
+        let mut parent = target.join(&path);
+        while parent.pop() && parent != target {
+            assert!(std::fs::symlink_metadata(&parent).unwrap().is_dir());
+        }
+    }
+    // The production restore uses this same bottom-up recursion before returning
+    // a publishable directory. Newly staged history participates in that tree.
+    sync_tree(&target).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_history_download_refuses_parent_aliases_and_existing_leaves() {
+    use std::os::unix::fs::symlink;
+
+    let (dir, repo, manifest) = setup().await;
+    let (manifest, paths) = nested_history_manifest(manifest);
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let sentinel = outside.join("sentinel");
+    std::fs::write(&sentinel, b"unchanged").unwrap();
+    let lineage = "evidence-history/00000000-0000-0000-0000-000000000001";
+    for (index, parent) in [
+        "evidence-history".to_string(),
+        lineage.to_string(),
+        format!("{lineage}/generations"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        for alias in [true, false] {
+            let target = dir.path().join(format!("parent-{index}-{alias}"));
+            std::fs::create_dir(&target).unwrap();
+            let blocked = target.join(parent);
+            std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+            if alias {
+                symlink(&outside, &blocked).unwrap();
+            } else {
+                std::fs::write(&blocked, b"parent file").unwrap();
+            }
+            let error: BackupError = repo
+                .download(
+                    &manifest,
+                    &target,
+                    &Ctl::default(),
+                    &crate::security::Security::default(),
+                )
+                .await
+                .unwrap_err()
+                .into();
+            assert_eq!(error.code(), Code::InvalidBackup, "{parent}: {error}");
+            assert_eq!(entries(&outside), ["sentinel"]);
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        }
+    }
+    let target = dir.path().join("leaf");
+    std::fs::create_dir(&target).unwrap();
+    let leaf = sparkles_core::store::definitions::stage_file(&target, &paths[0]).unwrap();
+    symlink(&sentinel, &leaf).unwrap();
+    assert!(
+        repo.download(
+            &manifest,
+            &target,
+            &Ctl::default(),
+            &crate::security::Security::default(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(std::fs::symlink_metadata(&leaf).unwrap().is_symlink());
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+}
+
 #[tokio::test]
 async fn hostile_manifests_are_refused_before_anything_is_written() {
     let (dir, repo, good) = setup().await;
@@ -336,6 +454,14 @@ async fn hostile_manifests_are_refused_before_anything_is_written() {
         ("../x", format!("files[{i}].path")),
         ("gen-0001/../../x", format!("files[{i}].path")),
         ("/etc/passwd", format!("files[{i}].path")),
+        (
+            "evidence-history/../managed.json",
+            format!("files[{i}].path"),
+        ),
+        (
+            "evidence-history/00000000-0000-0000-0000-000000000001/other.json",
+            format!("files[{i}].path"),
+        ),
         ("CURRENT", format!("files[{}].path", i.max(1))),
     ] {
         let mut m = good.clone();

@@ -248,6 +248,14 @@ impl BackupCapture {
     /// `commit`, which opens with head `commit.seq`. For tests and local copies; files
     /// are synced, and `dir` itself is created last by rename.
     pub fn write_to(&self, dir: &Path) -> Result<()> {
+        self.write_to_with_sync_hook(dir, &mut |_| Ok(()))
+    }
+
+    fn write_to_with_sync_hook(
+        &self,
+        dir: &Path,
+        after_directory_sync: &mut dyn FnMut(&Path) -> Result<()>,
+    ) -> Result<()> {
         if dir.exists() {
             return Err(Error::Invalid(format!("{} exists", dir.display())));
         }
@@ -255,11 +263,20 @@ impl BackupCapture {
         let tmp = tempfile::Builder::new()
             .prefix(".capture-")
             .tempdir_in(parent)?;
+        let mut directories = std::collections::BTreeSet::new();
+        directories.insert(tmp.path().join(&self.generation));
         let mut buf = vec![0u8; 1 << 20];
         for f in &self.files {
             let path = tmp.path().join(&f.path);
             if let Some(p) = path.parent() {
                 std::fs::create_dir_all(p)?;
+                let mut ancestor = Some(p);
+                while let Some(directory) = ancestor.filter(|directory| {
+                    directory.starts_with(tmp.path()) && *directory != tmp.path()
+                }) {
+                    directories.insert(directory.to_path_buf());
+                    ancestor = directory.parent();
+                }
             }
             let mut out = std::fs::OpenOptions::new()
                 .write(true)
@@ -283,8 +300,19 @@ impl BackupCapture {
                 self.next_ordinal as u64,
             )?;
         }
-        super::sync_dir(&tmp.path().join(&self.generation))?;
+        let required = self
+            .files
+            .iter()
+            .any(|file| file.path.starts_with("evidence-history/"));
+        crate::check::configuration_history(tmp.path(), required, &crate::task::Control::none())?;
+        // A synced file is not sufficient to persist its name in each newly
+        // created parent. Persist descendants before their parents, then publish.
+        for directory in directories.iter().rev() {
+            super::sync_dir(directory)?;
+            after_directory_sync(directory)?;
+        }
         super::sync_dir(tmp.path())?;
+        after_directory_sync(tmp.path())?;
         std::fs::rename(tmp.keep(), dir)?;
         super::sync_dir(parent)?;
         Ok(())
@@ -470,18 +498,43 @@ impl Store {
         };
         control.check()?;
         let t0 = Instant::now();
-        let (snap, next_bnode, head, prefixes, definitions, managed) = {
+        let (snap, next_bnode, head, prefixes, definitions, managed, managed_state, binding) = {
             let w = self.lock_writer(&control)?;
             if w.poisoned {
                 return Err(Error::Poisoned);
             }
+            let state = self.managed_state_shared();
+            let history = matches!(state.as_deref(), Some(crate::managed::ManagedState::Installed(installed)) if installed.configuration_history.is_some());
+            let managed = if history {
+                Vec::new()
+            } else {
+                self.managed_files_at(state.as_deref())?
+            };
+            let binding = if history {
+                let preparation = super::managed_history::administrative_preparation_with(
+                    crate::task::Control {
+                        cancel: control
+                            .cancel
+                            .clone()
+                            .map(crate::task::Cancel::from_flag)
+                            .unwrap_or_default(),
+                        deadline: control.deadline,
+                        ..Default::default()
+                    },
+                )?;
+                self.configuration_binding_at(w.head.seq, &preparation)?
+            } else {
+                crate::history::ConfigurationBinding::LegacyUnbound
+            };
             (
                 self.snapshot().without_cache_fill(),
                 w.next_bnode,
                 w.head,
                 self.prefixes.lock().clone(),
                 self.capture_definitions()?,
-                self.managed_files()?,
+                managed,
+                state,
+                binding,
             )
         };
         let lock_hold = t0.elapsed();
@@ -490,6 +543,32 @@ impl Store {
             .prefix(MEMORY_CAPTURE_PREFIX)
             .tempdir_in(&o.tmp_dir)?;
         let dir = tmp.path();
+        let history_files = match managed_state.as_deref() {
+            Some(crate::managed::ManagedState::Installed(installed))
+                if installed.configuration_history.is_some() =>
+            {
+                match self.managed_root() {
+                    Some(root) => super::managed_history::capture::files(
+                        &root,
+                        self.owner_dataset_id(),
+                        installed,
+                        &control,
+                    )?,
+                    None => super::managed_history::capture::memory_files(
+                        dir,
+                        self.owner_dataset_id(),
+                        installed,
+                        &control,
+                    )?,
+                }
+            }
+            _ => Vec::new(),
+        };
+        if !self.same_managed_state(&managed_state) {
+            return Err(Error::Conflict(
+                "configuration changed while establishing a materialized capture; retry".into(),
+            ));
+        }
         let generation = "gen-0001";
         let gdir = dir.join(generation);
         let total = snap.len().max(1);
@@ -522,7 +601,12 @@ impl Store {
         };
         super::write_synced(
             &gdir.join("commit.json"),
-            &crate::commit::gen_commit_bytes(self.dataset_id, "memory", &commit),
+            &crate::commit::gen_commit_bytes_with_binding(
+                self.dataset_id,
+                "memory",
+                &commit,
+                binding,
+            ),
         )?;
         super::wal::create(&gdir.join("wal.log"))?;
         super::sync_dir(&gdir)?;
@@ -574,6 +658,7 @@ impl Store {
         for (name, bytes) in managed {
             files.push(meta_file(name, bytes));
         }
+        files.extend(history_files);
         files.push(meta_file(
             "prefixes.json",
             serde_json::to_vec_pretty(&prefixes).unwrap(),
@@ -678,8 +763,22 @@ impl Store {
         let prefixes = self.prefixes.lock().clone();
         // the definitions current at the head, before the lock lets either change
         let definitions = self.capture_definitions()?;
-        // and the managed-graph registry, which a branch shares with main
-        let managed = self.managed_files()?;
+        // A branch writer does not exclude main configure. Retain one family
+        // state across the RDF capture and every configuration descriptor open.
+        let managed_state = self.managed_state_shared();
+        let history_installed = managed_state.as_deref().and_then(|state| match state {
+            crate::managed::ManagedState::Installed(installed)
+                if installed.configuration_history.is_some() =>
+            {
+                Some(installed)
+            }
+            _ => None,
+        });
+        let managed = if history_installed.is_some() {
+            Vec::new()
+        } else {
+            self.managed_files_at(managed_state.as_deref())?
+        };
         self.failpoint("backup-capture-locked");
         let lease_id = hist.lock().lease(gen_no, label);
         drop(w);
@@ -724,6 +823,30 @@ impl Store {
         if String::from_utf8_lossy(&current).trim() != generation {
             return Ok(None);
         }
+        if !self.same_managed_state(&managed_state) {
+            return Ok(None);
+        }
+        let history_files = match history_installed {
+            Some(installed) => {
+                let family_root = self.managed_root().ok_or_else(|| {
+                    Error::Corrupt("captured configuration has no family root".into())
+                })?;
+                let captured = super::managed_history::capture::files(
+                    &family_root,
+                    self.owner_dataset_id(),
+                    installed,
+                    control,
+                );
+                control.check()?;
+                // Configure may replace settings names while descriptors open.
+                // Retry an unstable selection before interpreting its I/O result.
+                if !self.same_managed_state(&managed_state) {
+                    return Ok(None);
+                }
+                captured?
+            }
+            None => Vec::new(),
+        };
         let mut files = Vec::with_capacity(gen_files.len() + 8);
         gen_files.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, f, len) in gen_files {
@@ -766,7 +889,7 @@ impl Store {
                 )));
             }
         }
-        let dataset = if managed.is_empty() {
+        let dataset = if managed.is_empty() && history_files.is_empty() {
             dataset
         } else {
             crate::commit::with_reader(&dataset, crate::managed::READER)?
@@ -775,6 +898,7 @@ impl Store {
         for (name, bytes) in managed {
             files.push(meta(name, bytes));
         }
+        files.extend(history_files);
         files.push(meta(
             "prefixes.json",
             serde_json::to_vec_pretty(&prefixes).unwrap(),
@@ -785,6 +909,10 @@ impl Store {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
+        }
+        control.check()?;
+        if !self.same_managed_state(&managed_state) {
+            return Ok(None);
         }
         Ok(Some(BackupCapture {
             dataset_id: self.dataset_id,
@@ -935,6 +1063,7 @@ mod tests {
     use crate::sparql::update::update;
     use crate::store::StoreOptions;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     fn upd(s: &Store, u: &str) {
@@ -979,6 +1108,354 @@ mod tests {
 
     fn leases(s: &Store) -> usize {
         s.history.as_ref().unwrap().lock().leases.len()
+    }
+
+    fn history_store(root: &Path) -> Store {
+        drop(Store::open(root, StoreOptions::default()).unwrap());
+        let preparation =
+            crate::access::Preparation::new(crate::task::Control::none(), 64 << 20).unwrap();
+        crate::migrate::activate_configuration_history(root, false, &preparation).unwrap();
+        Store::open(root, StoreOptions::default()).unwrap()
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CaptureParentEntry {
+        kind: &'static str,
+        #[cfg(unix)]
+        unix_identity: (u64, u64, u32, u32, u32),
+    }
+
+    fn history_capture_parent_entries(
+        parent: &Path,
+    ) -> BTreeMap<std::ffi::OsString, CaptureParentEntry> {
+        let entries = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+                let file_type = metadata.file_type();
+                let kind = if file_type.is_dir() {
+                    "directory"
+                } else if file_type.is_file() {
+                    "regular file"
+                } else if file_type.is_symlink() {
+                    "symlink"
+                } else {
+                    "other"
+                };
+                #[cfg(unix)]
+                let unix_identity = {
+                    use std::os::unix::fs::MetadataExt;
+                    (
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.uid(),
+                        metadata.gid(),
+                        metadata.mode(),
+                    )
+                };
+                (
+                    entry.file_name(),
+                    CaptureParentEntry {
+                        kind,
+                        #[cfg(unix)]
+                        unix_identity,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            entries.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsString::from(".migrate.lock-source"),
+                std::ffi::OsString::from("source"),
+            ],
+            "capture parent entries: {entries:?}"
+        );
+        let source = &entries[std::ffi::OsStr::new("source")];
+        let migration_lock = &entries[std::ffi::OsStr::new(".migrate.lock-source")];
+        assert_eq!(source.kind, "directory", "{entries:?}");
+        assert_eq!(migration_lock.kind, "regular file", "{entries:?}");
+        #[cfg(unix)]
+        {
+            let owner = |entry: &CaptureParentEntry| {
+                let (_, _, uid, gid, _) = entry.unix_identity;
+                (uid, gid)
+            };
+            assert_eq!(owner(source), owner(migration_lock), "{entries:?}");
+        }
+        entries
+    }
+
+    #[test]
+    fn configuration_history_capture_keeps_actual_descriptor_bytes_and_closure() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        let capture = store.backup_capture("history").unwrap();
+        let history: Vec<_> = capture
+            .files
+            .iter()
+            .filter(|file| file.path.starts_with("evidence-history/"))
+            .collect();
+        assert_eq!(history.len(), 2, "coverage and the published genesis");
+        assert!(history.iter().all(|file| {
+            file.kind == FileKind::Immutable && matches!(&file.src, FileSource::File(_))
+        }));
+        assert!(matches!(
+            &capture.file("managed.json").unwrap().src,
+            FileSource::File(_)
+        ));
+        let state = store.managed_state_shared().unwrap();
+        let crate::managed::ManagedState::Installed(installed) = state.as_ref() else {
+            panic!("installed configuration")
+        };
+        let expected_registry = installed.file_bytes();
+        // Replacing the mutable name after capture must not replace its source.
+        super::super::write_atomic(&root.join("managed.json"), b"changed later").unwrap();
+        let captured = capture.file("managed.json").unwrap();
+        let mut bytes = vec![0; captured.len as usize];
+        captured.read_exact_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes, expected_registry);
+        let restored = directory.path().join("restored");
+        capture.write_to(&restored).unwrap();
+        let reopened = Store::open(&restored, StoreOptions::default()).unwrap();
+        assert_eq!(reopened.head_commit(), capture.commit);
+        let preparation =
+            crate::access::Preparation::new(crate::task::Control::none(), 64 << 20).unwrap();
+        let before = store
+            .evidence_view(&At::Commit(capture.commit.seq), &preparation)
+            .unwrap();
+        let after = reopened
+            .evidence_view(&At::Commit(capture.commit.seq), &preparation)
+            .unwrap();
+        assert_eq!(before.configuration(), after.configuration());
+    }
+
+    #[test]
+    fn configuration_history_capture_refuses_missing_published_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = history_store(directory.path());
+        let state = store.managed_state_shared().unwrap();
+        let crate::managed::ManagedState::Installed(installed) = state.as_ref() else {
+            panic!("installed configuration")
+        };
+        let root = installed.configuration_history.as_ref().unwrap();
+        let path = directory
+            .path()
+            .join("evidence-history")
+            .join(root.lineage_id.to_string())
+            .join("generations")
+            .join(format!(
+                "{}.json",
+                &root.current_generation.to_string()[7..]
+            ));
+        std::fs::remove_file(path).unwrap();
+        assert!(store.backup_capture("missing-history").is_err());
+        assert_eq!(leases(&store), 0);
+    }
+
+    #[test]
+    fn configuration_history_capture_refuses_incomplete_closure_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = history_store(&directory.path().join("source"));
+        ins(&store, 1);
+        let mut capture = store.backup_capture("incomplete").unwrap();
+        capture
+            .files
+            .retain(|file| !file.path.contains("/generations/"));
+        let output = directory.path().join("destination");
+        let before = history_capture_parent_entries(directory.path());
+        assert!(capture.write_to(&output).is_err());
+        assert!(!output.exists());
+        assert_eq!(history_capture_parent_entries(directory.path()), before);
+        drop(capture);
+        assert_eq!(leases(&store), 0);
+    }
+
+    #[test]
+    fn configuration_history_capture_syncs_real_nested_directories_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = history_store(&directory.path().join("source"));
+        ins(&store, 1);
+        let preparation =
+            crate::access::Preparation::new(crate::task::Control::none(), 64 << 20).unwrap();
+        let selected = store.evidence_view(&At::Head, &preparation).unwrap();
+        let capture = store.backup_capture("directory-order").unwrap();
+        let destination = directory.path().join("destination");
+        let mut synced = Vec::new();
+        capture
+            .write_to_with_sync_hook(&destination, &mut |path| {
+                assert!(
+                    !destination.exists(),
+                    "a directory sync must precede publication"
+                );
+                assert!(path.is_dir(), "the hook follows a real directory fsync");
+                let relative = path
+                    .strip_prefix(directory.path())
+                    .unwrap()
+                    .components()
+                    .skip(1)
+                    .collect::<PathBuf>();
+                synced.push(relative);
+                Ok(())
+            })
+            .unwrap();
+        let history = PathBuf::from("evidence-history");
+        let lineage = history.join(selected.configuration().lineage_id().to_string());
+        let position = |path: &Path| {
+            synced
+                .iter()
+                .position(|seen| seen == path)
+                .unwrap_or_else(|| {
+                    panic!("required directory {path:?} was not synced before publication")
+                })
+        };
+        assert!(position(&lineage.join("generations")) < position(&lineage));
+        assert!(position(&lineage) < position(&history));
+        assert!(position(&history) < position(Path::new("")));
+        assert_eq!(synced.last().unwrap(), Path::new(""));
+        let restored = Store::open(&destination, StoreOptions::default()).unwrap();
+        assert_eq!(
+            restored
+                .evidence_view(&At::Commit(capture.commit.seq), &preparation)
+                .unwrap()
+                .configuration(),
+            selected.configuration()
+        );
+    }
+
+    #[test]
+    fn configuration_history_capture_directory_sync_interruption_leaves_no_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = history_store(&directory.path().join("source"));
+        ins(&store, 1);
+        let capture = store.backup_capture("directory-failure").unwrap();
+        let destination = directory.path().join("destination");
+        let mut interrupted = false;
+        let before = history_capture_parent_entries(directory.path());
+        let result = capture.write_to_with_sync_hook(&destination, &mut |path| {
+            if path.file_name().is_some_and(|name| name == "generations") {
+                assert!(std::fs::read_dir(path)?.next().is_some());
+                assert!(!destination.exists());
+                interrupted = true;
+                return Err(Error::Cancelled);
+            }
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(
+            interrupted,
+            "the failure follows a real nested-directory fsync"
+        );
+        assert!(!destination.exists());
+        assert_eq!(history_capture_parent_entries(directory.path()), before);
+        drop(capture);
+        assert_eq!(leases(&store), 0);
+    }
+
+    #[test]
+    fn configuration_history_memory_capture_preserves_exact_binding_and_removes_scratch() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::in_memory(StoreOptions::default());
+        let preparation =
+            crate::access::Preparation::new(crate::task::Control::none(), 64 << 20).unwrap();
+        store
+            .activate_memory_configuration_history(&preparation)
+            .unwrap();
+        ins(&store, 1);
+        let selected = store
+            .evidence_view(&At::Commit(store.head_commit().seq), &preparation)
+            .unwrap();
+        let scratch = directory.path().join("scratch");
+        let capture = store
+            .memory_backup_capture(
+                "history-memory",
+                &MemoryCaptureOptions {
+                    tmp_dir: scratch.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            capture
+                .files
+                .iter()
+                .filter(|file| file.path.starts_with("evidence-history/"))
+                .count(),
+            2
+        );
+        let output = directory.path().join("destination");
+        capture.write_to(&output).unwrap();
+        let restored = Store::open(&output, StoreOptions::default()).unwrap();
+        assert_eq!(dump(&store), dump(&restored));
+        assert_eq!(
+            restored
+                .evidence_view(&At::Commit(capture.commit.seq), &preparation)
+                .unwrap()
+                .configuration(),
+            selected.configuration()
+        );
+        drop(capture);
+        assert_eq!(std::fs::read_dir(scratch).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn configuration_history_capture_retries_a_real_configure_without_an_rdf_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        let head = store.head_commit();
+        let calls = Arc::new(AtomicU64::new(0));
+        let observed = calls.clone();
+        store.set_failpoint(
+            "backup-capture-unlocked",
+            Some(Arc::new(move |store| {
+                if observed.fetch_add(1, Ordering::SeqCst) != 0 {
+                    return;
+                }
+                let settings = crate::evidence::Settings::default();
+                let canonical = settings.canonical(&crate::task::Control::none()).unwrap();
+                store
+                    .enable_managed(
+                        crate::managed::OwnerKind::Evidence,
+                        crate::managed::OwnerEntry::for_settings(
+                            1,
+                            settings.managed_graphs(),
+                            canonical.bytes(),
+                        ),
+                        canonical.bytes(),
+                    )
+                    .unwrap();
+            })),
+        );
+        let capture = store.backup_capture("racing-configure").unwrap();
+        store.set_failpoint("backup-capture-unlocked", None);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(store.head_commit(), head, "configure did not write RDF");
+        let preparation =
+            crate::access::Preparation::new(crate::task::Control::none(), 64 << 20).unwrap();
+        let selected = store.evidence_view(&At::Head, &preparation).unwrap();
+        let restored = directory.path().join("restored");
+        capture.write_to(&restored).unwrap();
+        let reopened = Store::open(&restored, StoreOptions::default()).unwrap();
+        assert_eq!(
+            reopened
+                .evidence_view(&At::Head, &preparation)
+                .unwrap()
+                .configuration(),
+            selected.configuration()
+        );
+        assert_ne!(
+            reopened
+                .evidence_view(&At::Commit(head.seq), &preparation)
+                .unwrap()
+                .configuration(),
+            selected.configuration(),
+            "capturing current settings must not rebind the original data commit"
+        );
     }
 
     /// Materialize `c` into `dir`, check it, open it, and compare it with the source's

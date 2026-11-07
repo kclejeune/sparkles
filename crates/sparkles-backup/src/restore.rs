@@ -244,11 +244,31 @@ impl Repository {
         };
         {
             let dir = tmp.to_path_buf();
+            let control = o.ctl.control();
+            let configuration_required = m
+                .requires
+                .iter()
+                .any(|feature| feature == "evidence-configuration-history/1");
             blocking(move || {
                 // Refuse a newer dataset before reidentification or publication,
                 // including restores that request no integrity check.
                 sparkles_core::commit::check_dataset_compatibility(&dir)?;
+                sparkles_core::check::configuration_history(
+                    &dir,
+                    configuration_required,
+                    &control,
+                )?;
                 if let Some(from) = forked_from {
+                    if configuration_required {
+                        // Imported prefix authority needs the versioned source
+                        // proof. Never publish foreign native bindings under a
+                        // fresh identity while that path is unavailable.
+                        return Err(sparkles_core::Error::Unsupported(
+                            "new-identity configuration history requires imported-origin support"
+                                .into(),
+                        )
+                        .into());
+                    }
                     sparkles_core::commit::reidentify(&dir, dataset_id, from)?;
                 }
                 if let Some(next) = next_ordinal {
@@ -327,7 +347,8 @@ impl Repository {
         ctl: &Ctl,
         security: &crate::security::Security,
     ) -> std::result::Result<(), Failure> {
-        // every path was validated: a root file, or a file of the one generation
+        // Every path was validated against its closed root, generation, history
+        // or definition grammar before this unpublished directory is populated.
         let files: Arc<Vec<(PathBuf, File)>> = {
             let (dir, m) = (dir.to_path_buf(), m.clone());
             Arc::new(
@@ -340,8 +361,10 @@ impl Repository {
                     }
                     let mut out = Vec::with_capacity(m.files.len());
                     for f in &m.files {
-                        let p = if f.definition.is_some() {
-                            // nested directories, created here and never through a link
+                        let p = if f.definition.is_some()
+                            || crate::layout::configuration_history_path(&f.path)
+                        {
+                            // Nested directories, created here and never through a link.
                             sparkles_core::store::definitions::stage_file(&dir, &f.path)
                                 .map_err(|e| BackupError::invalid_backup("files", e))?
                         } else {

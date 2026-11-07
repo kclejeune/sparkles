@@ -105,6 +105,14 @@ impl Store {
         self.managed_state()
     }
 
+    pub(super) fn same_managed_state(&self, captured: &Option<Arc<ManagedState>>) -> bool {
+        match (self.managed_state(), captured) {
+            (None, None) => true,
+            (Some(current), Some(captured)) => Arc::ptr_eq(&current, captured),
+            _ => false,
+        }
+    }
+
     /// The managed graphs of this store's dataset, `None` when no owner manages any.
     /// Fails with `managed-unavailable` when the registry cannot be enforced.
     pub fn managed_graphs(&self) -> Result<Option<ManagedGraphs>> {
@@ -755,7 +763,15 @@ impl Store {
     /// settings, as installed. An unavailable registry is copied from the directory as
     /// it is, so that the copy refuses writes too.
     pub(crate) fn managed_files(&self) -> Result<Vec<(&'static str, Vec<u8>)>> {
-        match self.managed_state().as_deref() {
+        let state = self.managed_state();
+        self.managed_files_at(state.as_deref())
+    }
+
+    pub(super) fn managed_files_at(
+        &self,
+        state: Option<&ManagedState>,
+    ) -> Result<Vec<(&'static str, Vec<u8>)>> {
+        match state {
             None => Ok(Vec::new()),
             Some(ManagedState::Installed(i)) => {
                 let mut out = vec![(crate::managed::FILE, i.file_bytes())];
@@ -787,6 +803,9 @@ impl Store {
                     }
                     Err(e) => return Err(e.into()),
                 };
+                if crate::managed::recorded_history(&bytes)?.is_some() {
+                    return refuse("its anchored configuration history is unavailable");
+                }
                 let owners = match crate::managed::recorded_owners(&bytes) {
                     Ok(owners) => owners,
                     Err(why) => return refuse(&why),

@@ -305,7 +305,10 @@ impl<'a> References<'a> {
     }
 }
 
-fn recorded_root(root: &Path, preparation: &Preparation) -> Result<Option<managed_history::Root>> {
+pub(super) fn recorded_root(
+    root: &Path,
+    preparation: &Preparation,
+) -> Result<Option<managed_history::Root>> {
     #[derive(serde::Deserialize)]
     struct Envelope {
         format: Option<u64>,
@@ -332,9 +335,14 @@ fn recorded_root(root: &Path, preparation: &Preparation) -> Result<Option<manage
     })?;
     let envelope = budget.json::<Envelope>(&bytes.value)?;
     let format = envelope.value.format.unwrap_or(1);
-    if !matches!(format, 1..=3) || (format == 3) != envelope.value.history.is_some() {
-        return Err(managed_history::unavailable(
-            "unsupported primary configuration root envelope",
+    if !matches!(format, 1..=3) {
+        return Err(Error::Unsupported(format!(
+            "primary configuration registry has format {format}; this release reads 1 through 3"
+        )));
+    }
+    if (format == 3) != envelope.value.history.is_some() {
+        return Err(Error::Unsupported(
+            "inconsistent primary configuration root envelope".into(),
         ));
     }
     if let Some(history) = &envelope.value.history {

@@ -5,6 +5,14 @@ use crate::access::Preparation;
 use crate::history::{ConfigurationBinding, ConfigurationIdentity, HistoryOptions, ReadLimit};
 
 pub(super) mod primary;
+mod validation;
+
+/// Authenticate copied primary configuration references without opening a writer,
+/// recovering a WAL or publishing the directory. Backup restores call this even
+/// when the caller disabled optional index integrity checking.
+pub(crate) fn validate_copy(root: &Path, required: bool, preparation: &Preparation) -> Result<()> {
+    validation::validate(root, required, preparation)
+}
 
 #[cfg(test)]
 mod tests;
