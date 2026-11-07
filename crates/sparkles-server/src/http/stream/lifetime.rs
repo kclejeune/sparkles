@@ -406,16 +406,16 @@ impl Producer {
         }
         self.shared.changed.notify_one();
         let began = std::time::Instant::now();
-        if let Some(task) = self.task.take() {
-            if let Err(error) = self.runtime.block_on(task) {
-                let action = Shared::abort_locked(
-                    &mut self.shared.state.lock(),
-                    &sparkles::Error::Io(io::Error::other(format!(
-                        "response timer stopped unexpectedly: {error}"
-                    ))),
-                );
-                self.shared.complete_abort(action);
-            }
+        if let Some(task) = self.task.take()
+            && let Err(error) = self.runtime.block_on(task)
+        {
+            let action = Shared::abort_locked(
+                &mut self.shared.state.lock(),
+                &sparkles::Error::Io(io::Error::other(format!(
+                    "response timer stopped unexpectedly: {error}"
+                ))),
+            );
+            self.shared.complete_abort(action);
         }
         if let Some(wait_ns) = &self.wait_ns {
             let ns = began.elapsed().as_nanos().min(u64::MAX as u128) as u64;
