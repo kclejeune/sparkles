@@ -210,6 +210,17 @@ Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds wit
 hierarchical budget of item 675 and the decoding twins of item 678 remain.
 [Item 453](../../ROADMAP.md) tracks the rest of the work.
 
+Native SELECT output and standard solution responses of at most 65,536 rows admit and
+decode a complete row before serializing its cells. Row storage and decoded terms keep
+query credit until their payloads are freed. A required decode refusal returns its
+original local or shared-pool memory error, preserves earlier complete-row counts and
+stops before successful completion metadata. Native output holds a whole decoded row
+rather than one cell at a time, and its additional live storage counts against the
+budget. These remain estimated heap charges rather than process RSS limits.
+
+Hierarchical ownership of public results, native buffers, reasoner work and views, and
+strict decoding throughout their callers remain part of item 675.
+
 ### Dead compaction arm and one generation switch
 
 Item 474 shipped. `rebuild_locked` takes a plain `BulkCommit` and its write options,
