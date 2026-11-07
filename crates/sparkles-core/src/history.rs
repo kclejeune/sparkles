@@ -19,6 +19,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod configuration;
+pub(crate) use configuration::{
+    BranchConfigurationOrigin, ConfigurationSelector, PinnedConfiguration,
+};
+pub use configuration::{ConfigurationBinding, ConfigurationIdentity};
+
 /// Which state of a dataset to read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum At {
@@ -449,6 +455,8 @@ struct PinFile {
     expires: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     warm: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    configuration: Option<PinnedConfiguration>,
 }
 
 #[derive(Clone, Debug)]
@@ -459,6 +467,7 @@ pub(crate) struct Pin {
     pub expires_ms: Option<i64>,
     /// kept materialized in the history cache
     pub warm: bool,
+    pub configuration: Option<PinnedConfiguration>,
 }
 
 /// What `history.json` holds.
@@ -485,6 +494,46 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
     crate::formats::check_settings("history.json", &v)?;
     let f: HistoryFile =
         serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
+    if f.format == 1 && f.snapshots.iter().any(|pin| pin.configuration.is_some()) {
+        return Err(Error::Corrupt(
+            "legacy history cannot certify a configuration binding".into(),
+        ));
+    }
+    if f.format == 2 {
+        if bytes.len() > super::store::managed_history::MAX_BYTES
+            || serde_json::to_vec_pretty(&f)
+                .map_err(|_| Error::Corrupt("history metadata does not encode".into()))?
+                != bytes
+        {
+            return Err(Error::Corrupt(
+                "invalid canonical history configuration bindings".into(),
+            ));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for pin in &f.snapshots {
+            let configuration = pin.configuration.as_ref().ok_or_else(|| {
+                Error::Corrupt("named snapshot configuration binding is missing".into())
+            })?;
+            let family = configuration
+                .binding
+                .configuration()
+                .map_or(dataset_id, |identity| identity.dataset_id());
+            configuration.validate(family)?;
+            if !valid_name(&pin.name)
+                || !names.insert(pin.name.as_str())
+                || pin.note.as_ref().is_some_and(|note| note.len() > 1024)
+                || pin.created.len() > 64
+                || pin.expires.as_ref().is_some_and(|date| date.len() > 64)
+                || commit::parse_rfc3339_ms(&pin.created).is_none()
+                || pin
+                    .expires
+                    .as_ref()
+                    .is_some_and(|date| commit::parse_rfc3339_ms(date).is_none())
+            {
+                return Err(Error::Corrupt("invalid named snapshot metadata".into()));
+            }
+        }
+    }
     if f.dataset_id != dataset_id {
         return Err(Error::Corrupt(format!(
             "history.json belongs to dataset {}, not {dataset_id}",
@@ -504,6 +553,7 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
                     note: p.note,
                     expires_ms: p.expires.as_deref().and_then(commit::parse_rfc3339_ms),
                     warm: p.warm,
+                    configuration: p.configuration,
                 },
             )
         })
@@ -525,8 +575,13 @@ pub(crate) fn write_file(
     schedules: &[Schedule],
     catalog: CatalogHorizon,
 ) -> Result<()> {
+    let format = if pins.values().any(|pin| pin.configuration.is_some()) {
+        2
+    } else {
+        1
+    };
     let f = HistoryFile {
-        format: 1,
+        format,
         dataset_id,
         retention,
         snapshots: pins
@@ -538,15 +593,38 @@ pub(crate) fn write_file(
                 note: p.note.clone(),
                 expires: p.expires_ms.map(commit::rfc3339_ms),
                 warm: p.warm,
+                configuration: if format == 2 {
+                    Some(
+                        p.configuration
+                            .clone()
+                            .unwrap_or_else(PinnedConfiguration::legacy),
+                    )
+                } else {
+                    None
+                },
             })
             .collect(),
         schedules: schedules.to_vec(),
         catalog,
     };
-    crate::store::write_atomic(
-        &root.join("history.json"),
-        &serde_json::to_vec_pretty(&f).unwrap(),
-    )
+    let bytes = serde_json::to_vec_pretty(&f).expect("history serializes");
+    if format == 2 {
+        if bytes.len() > super::store::managed_history::MAX_BYTES
+            || pins.values().any(|pin| {
+                commit::parse_rfc3339_ms(&commit::rfc3339_ms(pin.created_ms))
+                    != Some(pin.created_ms)
+                    || pin.expires_ms.is_some_and(|expiry| {
+                        commit::parse_rfc3339_ms(&commit::rfc3339_ms(expiry)) != Some(expiry)
+                    })
+            })
+        {
+            return Err(Error::invalid(
+                "history configuration metadata exceeds its format limits",
+            ));
+        }
+        crate::commit::require_reader(root, super::store::managed_history::READER)?;
+    }
+    crate::store::write_atomic(&root.join("history.json"), &bytes)
 }
 
 /// Give `history.json` (if any) the dataset id `new` in place of `old` (a restore that
@@ -555,7 +633,16 @@ pub(crate) fn reidentify_file(root: &Path, old: uuid::Uuid, new: uuid::Uuid) -> 
     if !root.join("history.json").exists() {
         return Ok(());
     }
-    let c = read_file(root, old)?;
+    let mut c = read_file(root, old)?;
+    for pin in c.pins.values_mut() {
+        if let Some(configuration) = &mut pin.configuration
+            && let ConfigurationBinding::Known {
+                configuration: source,
+            } = configuration.binding
+        {
+            configuration.binding = ConfigurationBinding::ImportedUnbound { source };
+        }
+    }
     write_file(root, new, &c.pins, c.retention, &c.schedules, c.catalog)
 }
 
@@ -937,9 +1024,30 @@ pub(crate) struct MemHistory {
     pub window: std::collections::VecDeque<Arc<Snapshot>>,
     pub schedules: Vec<Schedule>,
     pub hits: u64,
+    /// Primary in-memory publication bindings, kept only with live/retained data.
+    /// Named pins carry their selected semantic binding separately: Head at a
+    /// sequence can differ from that data commit's original admission.
+    pub configurations: BTreeMap<u64, ConfigurationBinding>,
 }
 
 impl MemHistory {
+    pub(crate) fn trim_configurations(&mut self, head: u64) {
+        let Self {
+            configurations,
+            branch_bases,
+            pins,
+            held,
+            window,
+            ..
+        } = self;
+        configurations.retain(|seq, _| {
+            *seq == head
+                || branch_bases.contains_key(seq)
+                || held.contains_key(seq)
+                || window.binary_search_by_key(seq, |s| s.commit).is_ok()
+                || pins.values().any(|(pin, _)| pin.seq == *seq)
+        });
+    }
     pub(crate) fn get_limited(
         &self,
         seq: u64,
@@ -1021,6 +1129,7 @@ impl MemHistory {
             by_count || by_age
         };
         self.window.retain(|s| s.commit < head && keep(s.commit));
+        self.trim_configurations(head);
     }
 }
 
@@ -1510,6 +1619,7 @@ mod tests {
                 note: None,
                 expires_ms: None,
                 warm: false,
+                configuration: None,
             },
         );
         h.pins.insert(
@@ -1520,6 +1630,7 @@ mod tests {
                 note: None,
                 expires_ms: None,
                 warm: false,
+                configuration: None,
             },
         );
         let n = h.needed(3, 12, 0, &ts, 8);
@@ -1535,6 +1646,7 @@ mod tests {
                 note: None,
                 expires_ms: None,
                 warm: false,
+                configuration: None,
             },
         );
         assert!(h.needed(3, 12, 0, &ts, 8).is_empty());
@@ -1594,6 +1706,7 @@ mod tests {
                 note: None,
                 expires_ms: None,
                 warm: false,
+                configuration: None,
             },
         );
         assert_eq!(keep(&h), [1]);

@@ -33,7 +33,7 @@ fn durable_after(
             budget.key_step("WAL durability record", index)?;
             reader.read_exact(&mut record)?;
             match record[0] {
-                WAL_INSERT | WAL_DELETE => crc.update(&record),
+                WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION => crc.update(&record),
                 WAL_COMMIT => {
                     match commit::open_wal_commit_with_crc(&record, crc) {
                         Some(Ok((s, ..)))
@@ -461,6 +461,7 @@ pub(crate) struct ProvenWal {
 pub(crate) struct WalCommitObservation {
     pub(crate) point: WalPoint,
     pub(crate) metadata: Option<(i64, CommitKind, u8)>,
+    pub(crate) configuration: Option<crate::evidence::Sha256Digest>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -490,6 +491,8 @@ pub(crate) fn prove_prefix_with(
     let mut needed = 0;
     let mut seen_modern = false;
     let mut header = false;
+    let mut wal_version = 0;
+    let mut configuration = ConfigurationRecords::default();
     let mut record = [0; WAL_REC];
     let corrupt = || Error::Corrupt(format!("{}: invalid committed WAL prefix", path.display()));
     for index in 0..(extent / WAL_REC as u64) as usize {
@@ -498,12 +501,14 @@ pub(crate) fn prove_prefix_with(
         match record[0] {
             WAL_HEADER if index == 0 => {
                 header = true;
-                if header_version(&record, path)? == 1 {
+                wal_version = header_version(&record, path)?;
+                if wal_version >= 1 {
                     framing = Framing::Strict { from: 1 };
                 }
                 head.offset = WAL_REC as u64;
             }
             WAL_INSERT | WAL_DELETE => {
+                configuration.data(&record);
                 crc.update(&record);
                 let quad = std::array::from_fn(|j| {
                     Id(u64::from_le_bytes(
@@ -511,6 +516,10 @@ pub(crate) fn prove_prefix_with(
                     ))
                 });
                 needed = needed.max(delta_ids_end(std::iter::once(&quad)));
+            }
+            WAL_CONFIGURATION => {
+                configuration.data(&record);
+                crc.update(&record);
             }
             WAL_COMMIT => {
                 let meta = commit::open_wal_commit_with_crc(&record, crc);
@@ -524,6 +533,13 @@ pub(crate) fn prove_prefix_with(
                     }
                     break;
                 }
+                let configuration_digest = configuration.finish(
+                    wal_version,
+                    match &meta {
+                        Some(Ok((_, _, _, flags))) => *flags,
+                        _ => 0,
+                    },
+                )?;
                 if let (Some(seqs), Some(Ok((seq, _, _, flags)))) = (annotated, &meta)
                     && flags & commit::WAL_FLAG_ANNOTATED != 0
                     && seqs.binary_search(seq).is_err()
@@ -550,6 +566,7 @@ pub(crate) fn prove_prefix_with(
                 budget.check()?;
                 visit(WalCommitObservation {
                     point: head,
+                    configuration: configuration_digest,
                     metadata: match meta {
                         Some(Ok((_, timestamp, kind, flags))) => Some((timestamp, kind, flags)),
                         _ => None,
@@ -558,6 +575,7 @@ pub(crate) fn prove_prefix_with(
                 budget.check()?;
                 crc = flate2::Crc::new();
                 needed = 0;
+                configuration = ConfigurationRecords::default();
             }
             _ => {
                 let next = head.seq.checked_add(1).ok_or_else(corrupt)?;

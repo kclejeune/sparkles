@@ -10,7 +10,7 @@ fn check_identity(
     family: uuid::Uuid,
     entry: &Entry,
     budget: &mut ColdBudget<'_>,
-) -> Result<()> {
+) -> Result<Option<crate::history::ConfigurationBinding>> {
     let start = budget.used();
     budget.charge(
         (root.as_os_str().len() as u64)
@@ -34,6 +34,7 @@ fn check_identity(
             object.entry("format").or_insert(1.into());
         }
         let descriptor: BranchFile = budget.value(raw.value)?;
+        descriptor.check_configuration(&bytes)?;
         if descriptor.dataset_id != family
             || descriptor.id != entry.id
             || descriptor.ordinal != entry.ordinal
@@ -48,7 +49,11 @@ fn check_identity(
                 "retained branch dataset identity is missing or foreign".into(),
             ));
         }
-        budget.check()
+        budget.check()?;
+        Ok(descriptor
+            .configuration_origin
+            .as_ref()
+            .map(|origin| origin.binding))
     })();
     // Parsed names/extensions and temporary paths drop before their charge returns.
     budget.release(budget.used() - start);
@@ -62,6 +67,7 @@ struct Current {
     base: CommitInfo,
     folding: bool,
     strict_from: Option<u64>,
+    configuration: crate::history::ConfigurationBinding,
 }
 
 fn current_controlled(
@@ -156,6 +162,7 @@ fn current_controlled(
             base: physical.value.commit,
             folding: physical.value.origin == "baseline",
             strict_from: physical.value.wal_strict_from,
+            configuration: physical.value.configuration,
         };
         drop(physical.value);
         budget.release(physical.charge);
@@ -337,6 +344,7 @@ fn generation_for(
                 base: identity.value.commit,
                 folding: identity.value.origin == "baseline",
                 strict_from: identity.value.wal_strict_from,
+                configuration: identity.value.configuration,
             };
             drop(identity.value);
             budget.release(identity.charge);
@@ -366,6 +374,7 @@ fn generation_for(
 
 pub(in crate::store) enum Purpose {
     Snapshot,
+    Configuration,
     Clock,
     TimeGone(i64),
 }
@@ -374,6 +383,10 @@ pub(in crate::store) enum OriginRead {
     Clock(i64),
     Resident(Arc<Store>),
     View(Arc<Snapshot>, crate::history::Resolved),
+    Configuration {
+        binding: crate::history::ConfigurationBinding,
+        first_bound_own: Option<u64>,
+    },
     Inherited(CommitRef),
 }
 
@@ -426,7 +439,8 @@ impl Store {
                 .saturating_add(4096),
         )?;
         let root = set.branch_root(id);
-        check_identity(&root, set.dataset_id, entry, &mut budget)?;
+        let root_configuration = check_identity(&root, set.dataset_id, entry, &mut budget)?;
+        let first_bound_own = root_configuration.and_then(|_| entry.from.seq.checked_add(1));
         let current = current_controlled(&root, id, &mut budget)?;
         let head = head_controlled(&root, id, &current.value, &mut budget)?;
         if let Purpose::TimeGone(ms) = purpose {
@@ -455,6 +469,14 @@ impl Store {
                     branch_id: entry.from.branch_id,
                     seq,
                 }));
+            }
+            if seq == entry.from.seq && matches!(purpose, Purpose::Configuration) {
+                // The child's primary root wins even when all of its root RDF
+                // is now served by a retained ancestor generation.
+                return Ok(OriginRead::Configuration {
+                    binding: root_configuration.unwrap_or_default(),
+                    first_bound_own,
+                });
             }
         }
         let mut selection =
@@ -523,6 +545,65 @@ impl Store {
                 &mut budget,
             )?);
         };
+        if matches!(purpose, Purpose::Configuration) {
+            if metadata.seq == selected.value.base.seq {
+                return Ok(OriginRead::Configuration {
+                    binding: selected.value.configuration,
+                    first_bound_own,
+                });
+            }
+            let vocabulary =
+                cold::head_vocabulary_controlled(&selected.value.dir, &root, &mut budget)?;
+            let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
+            let mut digest = None;
+            let proof = prove_file_with(
+                &root,
+                id,
+                &selected.value,
+                metadata.seq,
+                terms,
+                &mut budget,
+                &mut |observation| {
+                    if observation.point.seq == metadata.seq && !observation.point.folding {
+                        digest = observation.configuration;
+                    }
+                    Ok(())
+                },
+            )?;
+            if proof.selected.is_none() {
+                return Err(super::super::managed_history::unavailable(
+                    "retained configuration WAL state is unavailable",
+                ));
+            }
+            let binding = match digest {
+                None => crate::history::ConfigurationBinding::LegacyUnbound,
+                Some(generation) => {
+                    let state = self.managed_state_shared();
+                    let lineage = match state.as_deref() {
+                        Some(crate::managed::ManagedState::Installed(installed)) => {
+                            installed.configuration_history.as_ref()
+                        }
+                        _ => None,
+                    }
+                    .ok_or_else(|| {
+                        super::super::managed_history::unavailable(
+                            "retained WAL binding has no configuration lineage",
+                        )
+                    })?;
+                    crate::history::ConfigurationBinding::Known {
+                        configuration: crate::history::ConfigurationIdentity {
+                            dataset_id: self.owner_dataset_id(),
+                            lineage_id: lineage.lineage_id,
+                            generation,
+                        },
+                    }
+                }
+            };
+            return Ok(OriginRead::Configuration {
+                binding,
+                first_bound_own,
+            });
+        }
         let geo = historical_geo_controlled(&root, &set.opts, &mut budget)?;
         let loaded = match cold::read_link_controlled(&selected.value.dir, &mut budget)? {
             Some(file) => Generation::open_linked_controlled(

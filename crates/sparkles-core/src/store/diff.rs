@@ -457,6 +457,9 @@ fn walk_wal(
         };
         if seq > after && seq <= through {
             for d in txn.as_chunks::<WAL_REC>().0 {
+                if d[0] == WAL_CONFIGURATION {
+                    continue;
+                }
                 f(d[0], super::wal::record_quad(d))?;
                 changes += 1;
                 if changes & 0xFFFF == 0 {

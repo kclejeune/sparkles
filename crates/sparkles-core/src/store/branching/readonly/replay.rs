@@ -37,7 +37,9 @@ pub(super) fn selected_metadata(
         // Remember each record's original visibility. Sorting by key and original
         // position later identifies the first observation without a sparse map or
         // another materialized Delta. The cursor's bytes remain admitted too.
-        let count = transaction.len() / WAL_REC;
+        let records = transaction.as_chunks::<WAL_REC>().0;
+        let count =
+            records.len() - usize::from(records.last().is_some_and(|r| r[0] == WAL_CONFIGURATION));
         let mut touched: Vec<([u64; 4], usize, bool, bool)> = Vec::new();
         let bytes = (count as u64)
             .checked_mul(std::mem::size_of::<([u64; 4], usize, bool, bool)>() as u64)
@@ -51,6 +53,9 @@ pub(super) fn selected_metadata(
         let spo = generation.perm(Perm::Spo);
         let mut default_graph = false;
         for (index, record) in transaction.as_chunks::<WAL_REC>().0.iter().enumerate() {
+            if record[0] == WAL_CONFIGURATION {
+                continue;
+            }
             let held = history_limited::preparation_mutation_bytes(delta).saturating_add(buffers);
             budget.owned_limit()?.check(held)?;
             let quad = std::array::from_fn(|j| {

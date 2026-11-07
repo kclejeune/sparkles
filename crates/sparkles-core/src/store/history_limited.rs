@@ -641,7 +641,7 @@ impl Store {
                 OriginRead::Resident(store) => {
                     selected = Source::Resident(branching::BranchStore::Other(store))
                 }
-                OriginRead::Clock(_) => {
+                OriginRead::Clock(_) | OriginRead::Configuration { .. } => {
                     return Err(Error::Corrupt(
                         "snapshot lookup returned only a fork clock".into(),
                     ));

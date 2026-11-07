@@ -35,6 +35,10 @@ impl From<RecordVersion> for u32 {
 pub struct Sha256Digest(pub(super) [u8; 32]);
 
 impl Sha256Digest {
+    pub(crate) const fn from_digest_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     pub fn of_bytes(bytes: &[u8], control: &Control) -> Result<Self> {
         control.check()?;
         let mut hash = Sha256::new();

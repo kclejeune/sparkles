@@ -164,7 +164,7 @@ pub const READABLE_INDEX_FORMATS: &[u32] = &[2, 3, 4];
 /// The write-ahead log version this build writes: a header record with the magic and
 /// this version starts every new `wal.log` (see [`crate::store::wal`]). Version 0 is a
 /// log without the header, written before it existed.
-pub const WAL_VERSION: u32 = 1;
+pub const WAL_VERSION: u32 = 2;
 
 /// `dataset.json`: the dataset id and the reader capabilities a database needs.
 pub const DATASET: FileKind = FileKind {
@@ -173,7 +173,7 @@ pub const DATASET: FileKind = FileKind {
     marker: "`format` 1, `minimumReader` (the reader capability the database needs) and `writtenBy`",
     class: Class::Primary,
     writes: crate::commit::DATASET_READER,
-    reads: &[1, 2, 3, 4, 5, 6, 7],
+    reads: &[1, 2, 3, 4, 5, 6, 7, 8],
 };
 
 /// A generation's index: `gen-*/meta.json` and the permutation and vocabulary files.
@@ -260,10 +260,47 @@ pub const DELTA_VOCAB: FileKind = FileKind {
 pub const WAL: FileKind = FileKind {
     id: "wal",
     files: "gen-*/wal.log",
-    marker: "a 33-byte header record (magic `\\x89SPKWAL\\n` and the version); version 0 is a log without it. Commit-record flag bits in byte 27 are added compatibly. A version 0 log is strictly framed from `walStrictFrom` of its generation's `commit.json`, an additive member",
+    marker: "a 33-byte header record (magic `\\x89SPKWAL\\n` and the version); version 0 is headerless. Version 2 seals a final configuration-reference record with commit flag 4. Headerless strict framing starts at walStrictFrom",
     class: Class::Primary,
     writes: WAL_VERSION,
-    reads: &[0, 1],
+    reads: &[0, 1, 2],
+};
+
+/// Primary configuration binding of a generation's base data revision.
+pub const GENERATION_COMMIT: FileKind = FileKind {
+    id: "generation-commit",
+    files: "gen-*/commit.json",
+    marker: "format; version 2 requires an explicit configurationBinding",
+    class: Class::Primary,
+    writes: 2,
+    reads: &[1, 2],
+};
+
+pub const CONFIGURATION_GENERATION: FileKind = FileKind {
+    id: "configuration-generation",
+    files: "evidence-history/LINEAGE/generations/SHA256.json",
+    marker: "format 1 and the digest of the unique canonical document",
+    class: Class::Primary,
+    writes: 1,
+    reads: &[1],
+};
+
+pub const CONFIGURATION_COVERAGE: FileKind = FileKind {
+    id: "configuration-coverage",
+    files: "evidence-history/LINEAGE/coverage.json",
+    marker: "format 1 and its digest anchored in managed.json",
+    class: Class::Primary,
+    writes: 1,
+    reads: &[1],
+};
+
+pub const CONFIGURATION_ORIGIN: FileKind = FileKind {
+    id: "configuration-origin",
+    files: "evidence-history/origin.json",
+    marker: "format 1 and the exact imported source prefix/identity closure",
+    class: Class::Primary,
+    writes: 1,
+    reads: &[1],
 };
 
 /// The commit catalog.
@@ -465,7 +502,7 @@ pub const BACKUP_DEFINITION: FileKind = FileKind {
 
 /// The features a backup manifest may require in `requires`, which this build reads.
 /// A manifest that requires another feature is refused before anything is written.
-pub const BACKUP_MANIFEST_FEATURES: &[&str] = &["definitions"];
+pub const BACKUP_MANIFEST_FEATURES: &[&str] = &["definitions", "evidence-configuration-history/1"];
 
 /// A kind of dataset-managed definition that backups and clones carry beside the data,
 /// at `DIR/NAME/FILE` under the dataset root. The file is the registered settings file
@@ -599,6 +636,10 @@ pub const KINDS: &[&FileKind] = &[
     &PLANNER_STATISTICS,
     &DELTA_VOCAB,
     &WAL,
+    &GENERATION_COMMIT,
+    &CONFIGURATION_GENERATION,
+    &CONFIGURATION_COVERAGE,
+    &CONFIGURATION_ORIGIN,
     &COMMITS,
     &CHANGE_LOG,
     &ANNOTATIONS,
@@ -691,9 +732,9 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("compaction.json", 1),
     ds("quota.json", 1),
     ds("changelog.json", 1),
-    ds("history.json", 1),
+    ds("history.json", 2),
     ds("branches.json", 2),
-    ds("branch.json", 1),
+    ds("branch.json", 2),
     ds("queries.json", 1),
     ds("mappings.json", 1),
     ds("algo.json", 2),
@@ -716,7 +757,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("paths.json", 1),
     ds("forms.json", 1),
     // the managed-graph registry and its owners' settings (see `crate::managed`)
-    ds("managed.json", 2),
+    ds("managed.json", 3),
     ds("evidence.json", 1),
     // durable source holds (see `crate::holds`)
     ds("holds.json", 1),

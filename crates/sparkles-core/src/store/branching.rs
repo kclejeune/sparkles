@@ -227,6 +227,44 @@ pub(crate) struct BranchFile {
     pub ordinal: u16,
     pub from: FromRef,
     pub created: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_origin: Option<crate::history::BranchConfigurationOrigin>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl BranchFile {
+    fn check_configuration(&self, encoded: &[u8]) -> Result<()> {
+        if self.format == 1 {
+            if self.configuration_origin.is_some() {
+                return Err(Error::Corrupt(
+                    "a legacy branch cannot certify configuration".into(),
+                ));
+            }
+            return Ok(());
+        }
+        crate::formats::check_settings(BRANCH_FILE, &serde_json::json!({"format":self.format}))?;
+        let origin = self
+            .configuration_origin
+            .as_ref()
+            .ok_or_else(|| Error::Corrupt("branch configuration origin is missing".into()))?;
+        origin.validate(self.dataset_id, self.from.seq)?;
+        if self.dataset_id.is_nil()
+            || self.id.is_nil()
+            || self.name.len() > 64
+            || self.created.len() > 64
+            || !self.extra.is_empty()
+            || encoded.len() > 16 << 10
+            || serde_json::to_vec_pretty(self)
+                .map_err(|_| Error::Corrupt("branch identity does not encode".into()))?
+                != encoded
+        {
+            return Err(Error::Corrupt(
+                "invalid canonical branch configuration origin".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn read_branch_file(root: &Path) -> Result<Option<BranchFile>> {
@@ -240,9 +278,10 @@ pub(crate) fn read_branch_file(root: &Path) -> Result<Option<BranchFile>> {
             if let Some(o) = v.as_object_mut() {
                 o.entry("format").or_insert(1.into());
             }
-            serde_json::from_value(v)
-                .map(Some)
-                .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))
+            let branch: BranchFile = serde_json::from_value(v)
+                .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
+            branch.check_configuration(&b)?;
+            Ok(Some(branch))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
@@ -432,6 +471,7 @@ pub(crate) struct Ident {
     /// the dataset's id (the store's own id is the branch id)
     pub dataset_id: uuid::Uuid,
     pub from: CommitRef,
+    pub configuration_origin: Option<crate::history::BranchConfigurationOrigin>,
 }
 
 /// How a store reaches the dataset's branch set.
@@ -874,12 +914,28 @@ impl BranchSet {
         if let Some(c) = self.main_current.lock().upgrade() {
             share.push(c.load().generation.clone());
         }
+        let configuration_origin = match read_branch_file(&self.branch_root(id))? {
+            Some(file) => {
+                if file.dataset_id != self.dataset_id
+                    || file.id != entry.id
+                    || file.ordinal != entry.ordinal
+                    || file.from != entry.from
+                {
+                    return Err(Error::Corrupt(
+                        "branch descriptor disagrees with its family table".into(),
+                    ));
+                }
+                file.configuration_origin
+            }
+            None => None,
+        };
         let ctx = OpenCtx {
             ident: Ident {
                 name: entry.name.clone(),
                 ordinal: entry.ordinal,
                 dataset_id: self.dataset_id,
                 from: entry.from.into(),
+                configuration_origin,
             },
             set: self.me.clone(),
             cache: self.cache.clone(),
@@ -2025,7 +2081,13 @@ impl Store {
         let id = uuid::Uuid::new_v4();
         // under the upstream's writer lock: the starting commit, where it ends in the
         // log, the delta vocabulary's length, and the holds (in memory first)
-        let start = up.capture_start(&o.at)?;
+        let preparation = super::managed_history::administrative_preparation()?;
+        let pair = self.select_branch_configuration(&up, &o.at, &preparation)?;
+        let captured_at = pair
+            .as_ref()
+            .map_or_else(|| o.at.clone(), |pair| At::Commit(pair.commit.seq));
+        let configuration_origin = pair.as_ref().map(|pair| pair.branch_origin()).transpose()?;
+        let start = up.capture_start(&captured_at)?;
         let (start, up_store): (Start, BranchStore<'_>) = match start {
             Captured::Here(s) => (s, up),
             Captured::Inherited(c) => {
@@ -2091,7 +2153,15 @@ impl Store {
             drop(t);
             set.refresh_holds(self);
         };
-        let r = self.write_branch_dir(&root, &set, &entry, &start, &up_store, build);
+        let r = self.write_branch_dir(
+            &root,
+            &set,
+            &entry,
+            &start,
+            &up_store,
+            build,
+            configuration_origin.as_ref(),
+        );
         if let Err(e) = r {
             undo(&set);
             return Err(e);
@@ -2130,7 +2200,15 @@ impl Store {
         o: &BranchOptions,
         set: &Arc<BranchSet>,
     ) -> Result<BranchInfo> {
-        let (snap, resolved) = self.branch_snapshot_at(&o.from, &o.at, &Default::default())?;
+        let source = self.branch(&o.from)?;
+        let preparation = super::managed_history::administrative_preparation()?;
+        let pair = self.select_branch_configuration(&source, &o.at, &preparation)?;
+        let captured_at = pair
+            .as_ref()
+            .map_or_else(|| o.at.clone(), |pair| At::Commit(pair.commit.seq));
+        let configuration_origin = pair.as_ref().map(|pair| pair.branch_origin()).transpose()?;
+        let (snap, resolved) =
+            self.branch_snapshot_at(&o.from, &captured_at, &Default::default())?;
         let (_, owner_id) = self.branch_resolve(&o.from, &At::Commit(resolved.commit.seq))?;
         let up = self.branch_by_id(owner_id)?;
         let admit = |t: &TableFile, ordinal: bool| {
@@ -2197,6 +2275,7 @@ impl Store {
             ordinal,
             dataset_id: self.dataset_id,
             from: from.into(),
+            configuration_origin,
         });
         *store.branching.name.write() = name.into();
         store.branching.set = SetRef::Member(set.me.clone());
@@ -2267,6 +2346,7 @@ impl Store {
         start: &Start,
         up: &Store,
         build: bool,
+        configuration_origin: Option<&crate::history::BranchConfigurationOrigin>,
     ) -> Result<()> {
         let dir = root.join(BRANCHES_DIR);
         std::fs::create_dir_all(&dir)?;
@@ -2277,13 +2357,15 @@ impl Store {
         std::fs::create_dir_all(&tmp)?;
         let r = (|| -> Result<()> {
             let bf = BranchFile {
-                format: 1,
+                format: if configuration_origin.is_some() { 2 } else { 1 },
                 dataset_id: self.dataset_id,
                 name: e.name.clone(),
                 id: e.id,
                 ordinal: e.ordinal,
                 from: e.from,
                 created: e.created.clone(),
+                configuration_origin: configuration_origin.cloned(),
+                extra: Default::default(),
             };
             write_synced(
                 &tmp.join(BRANCH_FILE),
@@ -2329,10 +2411,13 @@ impl Store {
                 write_synced(&gdir.join("delta.vocab"), &[])?;
             }
             super::wal::create(&gdir.join("wal.log"))?;
-            write_synced(
-                &gdir.join("commit.json"),
-                &commit::gen_commit_bytes(e.id, "branch", &base),
-            )?;
+            let commit_bytes = match configuration_origin {
+                Some(origin) => {
+                    commit::gen_commit_bytes_with_binding(e.id, "branch", &base, origin.binding)
+                }
+                None => commit::gen_commit_bytes(e.id, "branch", &base),
+            };
+            write_synced(&gdir.join("commit.json"), &commit_bytes)?;
             sync_dir(&gdir)?;
             write_synced(&tmp.join("CURRENT"), gen_name.as_bytes())?;
             Catalog::create(&tmp.join("commits.bin"), e.id, base)?;
@@ -2382,8 +2467,9 @@ impl Store {
     }
 
     /// Capture where a new branch starts on this store: the commit `at` names, the log
-    /// segments that lead to it, and the delta vocabulary's length. The upstream holds
-    /// are registered by the caller before the writer lock is released.
+    /// segments that lead to it, and the delta vocabulary's length. A generation
+    /// lease is installed under the writer lock and held until the caller has
+    /// published the branch's durable holds.
     fn capture_start(&self, at: &At) -> Result<Captured> {
         let (Some(root), Some(hist)) = (&self.root, &self.history) else {
             return Err(BranchError::error(
@@ -2446,6 +2532,18 @@ impl Store {
             .map(|l| l.file.segments.clone())
             .unwrap_or_default();
         segments.push(seg);
+        let label = "branch-create";
+        let lease_id = h.lease(owner, label);
+        let collector = self.collector();
+        let lease = LeaseGuard {
+            generation: owner,
+            label: label.into(),
+            release: Some(Box::new(move || {
+                if let Some(collector) = collector {
+                    collector.release(lease_id);
+                }
+            })),
+        };
         let snapshot = if segments.len() > self.opts.max_branch_depth {
             drop(h);
             drop(w);
@@ -2457,6 +2555,7 @@ impl Store {
             commit: r.commit,
             segments,
             snapshot,
+            _lease: lease,
         }))
     }
 
@@ -3051,6 +3150,7 @@ pub(crate) struct Start {
     pub segments: Vec<Segment>,
     /// the state to build from, when the branch is built rather than linked
     pub snapshot: Option<Arc<Snapshot>>,
+    _lease: LeaseGuard,
 }
 
 pub(crate) enum Captured {
